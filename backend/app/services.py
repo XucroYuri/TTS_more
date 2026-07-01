@@ -1,0 +1,1049 @@
+from __future__ import annotations
+
+import json
+import os
+import base64
+from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+
+import httpx
+
+from app.adapters.base import SynthesisRequest, SynthesisResult
+from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
+
+
+class TTSServiceClient(Protocol):
+    endpoint: TTSServiceEndpoint
+
+    def health(self) -> dict[str, Any]:
+        ...
+
+    def capabilities(self) -> dict[str, Any]:
+        ...
+
+    def load(self, profile: str, parameters: dict[str, Any] | None = None) -> None:
+        ...
+
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        ...
+
+    def unload(self) -> None:
+        ...
+
+
+@dataclass(frozen=True)
+class ServiceRoute:
+    endpoint: TTSServiceEndpoint
+    client: TTSServiceClient
+    binding: VoiceBinding | None = None
+
+
+class ServiceRegistry:
+    def __init__(self, services: list[TTSServiceEndpoint]) -> None:
+        self.services = services
+        self._by_id = {service.service_id: service for service in services}
+
+    @classmethod
+    def load(cls, path: Path) -> "ServiceRegistry":
+        if not path.exists():
+            return cls.default_local(repo_root=Path("repo"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return cls([TTSServiceEndpoint.model_validate(item) for item in raw])
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps([service.model_dump(mode="json") for service in self.services], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def default_local(cls, repo_root: Path) -> "ServiceRegistry":
+        return cls(
+            [
+                TTSServiceEndpoint(
+                    service_id="local-gpt-sovits",
+                    display_name="GPT-SoVITS Local",
+                    service_kind="tts",
+                    engine=EngineName.GPT_SOVITS,
+                    provider_type=ProviderType.GPT_SOVITS,
+                    api_contract="gpt-sovits-api-v2",
+                    base_url="http://127.0.0.1:9880",
+                    network_scope="localhost",
+                    managed=True,
+                    repo_path=str(repo_root / "GPT-SoVITS"),
+                    resource_group="local-gpu-0",
+                    priority=10,
+                    capabilities=["tts", "gpt-weights", "sovits-weights", "gpt-sovits-api-v2"],
+                ),
+                TTSServiceEndpoint(
+                    service_id="local-indextts",
+                    display_name="IndexTTS Local",
+                    service_kind="tts",
+                    engine=EngineName.INDEX_TTS,
+                    provider_type=ProviderType.INDEX_TTS,
+                    api_contract="tts-more-v1",
+                    base_url="http://127.0.0.1:9881",
+                    network_scope="localhost",
+                    managed=True,
+                    repo_path=str(repo_root / "index-tts"),
+                    resource_group="local-gpu-0",
+                    priority=20,
+                    capabilities=["tts", "reference-audio", "emotion-text"],
+                ),
+            ]
+        )
+
+    def get(self, service_id: str) -> TTSServiceEndpoint:
+        return self._by_id[service_id]
+
+    def by_engine(self, engine: EngineName) -> list[TTSServiceEndpoint]:
+        return sorted(
+            [service for service in self.services if service.enabled and service.service_kind == "tts" and service.engine == engine],
+            key=lambda service: service.priority,
+        )
+
+    def by_provider(self, provider_type: ProviderType) -> list[TTSServiceEndpoint]:
+        return sorted(
+            [service for service in self.services if service.enabled and service.service_kind == "tts" and service.provider_type == provider_type],
+            key=lambda service: service.priority,
+        )
+
+
+class ServiceRouter:
+    def __init__(
+        self,
+        registry: ServiceRegistry,
+        clients: dict[str, TTSServiceClient] | None = None,
+    ) -> None:
+        self.registry = registry
+        self.clients = clients or {service.service_id: build_service_client(service) for service in registry.services}
+
+    def resolve(
+        self,
+        engine: EngineName,
+        service_id: str | None = None,
+        fallback_service_ids: list[str] | None = None,
+    ) -> ServiceRoute:
+        for endpoint in self._candidate_endpoints(engine, service_id, fallback_service_ids or []):
+            client = self.clients.get(endpoint.service_id)
+            if client is not None and self._client_ready(client):
+                return ServiceRoute(endpoint=endpoint, client=client)
+        raise RuntimeError(f"no ready TTS service for engine {engine.value}")
+
+    def resolve_intent(self, intent: TTSIntent) -> ServiceRoute:
+        for binding in intent.bindings:
+            if not _has_capabilities(binding.capabilities, intent.required_capabilities):
+                continue
+            for endpoint in self._candidate_endpoints_for_binding(binding, intent):
+                if not _has_capabilities(endpoint.capabilities, ["tts", *intent.required_capabilities]):
+                    continue
+                client = self.clients.get(endpoint.service_id)
+                if client is not None and self._client_ready(client):
+                    return ServiceRoute(endpoint=endpoint, client=client, binding=binding)
+        for endpoint in self._candidate_endpoints_for_intent(intent):
+            if not _has_capabilities(endpoint.capabilities, ["tts", *intent.required_capabilities]):
+                continue
+            client = self.clients.get(endpoint.service_id)
+            if client is not None and self._client_ready(client):
+                return ServiceRoute(endpoint=endpoint, client=client)
+        raise RuntimeError("no ready TTS service matches requested capabilities")
+
+    def resolve_task(self, task: Any) -> ServiceRoute:
+        if getattr(task, "provider_type", None) is not None or getattr(task, "required_capabilities", None):
+            binding = None
+            if getattr(task, "provider_type", None) is not None:
+                binding = VoiceBinding(
+                    binding_id=task.binding_id or task.profile,
+                    provider_type=task.provider_type,
+                    service_id=task.service_id or getattr(task.line, "service_override", None),
+                    fallback_services=task.fallback_service_ids,
+                    capabilities=task.required_capabilities,
+                    config=task.parameters,
+                )
+            return self.resolve_intent(
+                TTSIntent(
+                    text=task.line.text,
+                    character_id=task.line.character_id,
+                    language=task.line.language,
+                    note=task.line.note,
+                    required_capabilities=task.required_capabilities,
+                    bindings=[binding] if binding else [],
+                    service_id=task.service_id or getattr(task.line, "service_override", None),
+                    fallback_service_ids=task.fallback_service_ids,
+                )
+            )
+        service_id = task.service_id or getattr(task.line, "service_override", None)
+        return self.resolve(task.engine, service_id=service_id, fallback_service_ids=task.fallback_service_ids)
+
+    def health(self) -> list[dict[str, Any]]:
+        if not self.registry.services:
+            return []
+        max_workers = min(len(self.registry.services), 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {endpoint.service_id: executor.submit(self._service_health, endpoint) for endpoint in self.registry.services}
+            return [futures[endpoint.service_id].result() for endpoint in self.registry.services]
+
+    def _service_health(self, endpoint: TTSServiceEndpoint) -> dict[str, Any]:
+        if not endpoint.enabled:
+            return {
+                **endpoint.model_dump(mode="json"),
+                "ready": False,
+                "health": {"ready": False, "status": "disabled"},
+            }
+        client = self.clients.get(endpoint.service_id)
+        try:
+            health = client.health() if client is not None else {"ready": False, "error": "client not configured"}
+        except Exception as exc:
+            health = {"ready": False, "error": str(exc)}
+        return {
+            **endpoint.model_dump(mode="json"),
+            "ready": bool(health.get("ready")),
+            "health": health,
+        }
+
+    def _candidate_endpoints_for_binding(self, binding: VoiceBinding, intent: TTSIntent) -> list[TTSServiceEndpoint]:
+        seen: set[str] = set()
+        candidates: list[TTSServiceEndpoint] = []
+
+        def add(service: TTSServiceEndpoint) -> None:
+            if service.enabled and service.service_kind == "tts" and service.provider_type == binding.provider_type and service.service_id not in seen:
+                candidates.append(service)
+                seen.add(service.service_id)
+
+        for service_id in [intent.service_id, binding.service_id, *intent.fallback_service_ids, *binding.fallback_services]:
+            if service_id:
+                add(self.registry.get(service_id))
+        for service in self.registry.by_provider(binding.provider_type):
+            add(service)
+        return candidates
+
+    def _candidate_endpoints_for_intent(self, intent: TTSIntent) -> list[TTSServiceEndpoint]:
+        return sorted([service for service in self.registry.services if service.enabled and service.service_kind == "tts"], key=lambda service: service.priority)
+
+    def _candidate_endpoints(
+        self,
+        engine: EngineName,
+        service_id: str | None,
+        fallback_service_ids: list[str],
+    ) -> list[TTSServiceEndpoint]:
+        seen: set[str] = set()
+        candidates: list[TTSServiceEndpoint] = []
+
+        def add(service: TTSServiceEndpoint) -> None:
+            if service.enabled and service.service_kind == "tts" and service.engine == engine and service.service_id not in seen:
+                candidates.append(service)
+                seen.add(service.service_id)
+
+        if service_id:
+            add(self.registry.get(service_id))
+        for fallback_id in fallback_service_ids:
+            add(self.registry.get(fallback_id))
+        for service in self.registry.by_engine(engine):
+            add(service)
+        return candidates
+
+    def _client_ready(self, client: TTSServiceClient) -> bool:
+        try:
+            return bool(client.health().get("ready"))
+        except Exception:
+            return False
+
+
+def build_service_client(endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> TTSServiceClient:
+    if endpoint.base_url.startswith("mock://"):
+        return MockServiceClient(endpoint)
+    if endpoint.api_contract.startswith("gradio-"):
+        return GradioWebUIServiceClient(endpoint, transport=transport)
+    if endpoint.provider_type == ProviderType.GPT_SOVITS or "gpt-sovits-api-v2" in endpoint.capabilities:
+        return GPTSoVITSApiV2ServiceClient(endpoint, transport=transport)
+    if endpoint.provider_type == ProviderType.OPENAI:
+        return OpenAISpeechClient(endpoint, transport=transport)
+    if endpoint.provider_type == ProviderType.XAI:
+        return XAISpeechClient(endpoint, transport=transport)
+    if endpoint.provider_type == ProviderType.GEMINI:
+        return GeminiSpeechClient(endpoint, transport=transport)
+    if endpoint.provider_type == ProviderType.VOLCENGINE:
+        return VolcengineSpeechClient(endpoint, transport=transport)
+    return HttpTTSServiceClient(endpoint, transport=transport)
+
+
+class MockServiceClient:
+    def __init__(self, endpoint: TTSServiceEndpoint) -> None:
+        self.endpoint = endpoint
+        self.loaded_profile: str | None = None
+
+    def health(self) -> dict[str, Any]:
+        return {"engine": self.endpoint.engine.value, "ready": True, "mode": "mock-service"}
+
+    def capabilities(self) -> dict[str, Any]:
+        return {"capabilities": self.endpoint.capabilities}
+
+    def load(self, profile: str, parameters: dict[str, Any] | None = None) -> None:
+        self.loaded_profile = profile
+
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.output_path.write_bytes(_tiny_wav_bytes())
+        return SynthesisResult(audio_path=request.output_path, metadata={"service_id": self.endpoint.service_id})
+
+    def unload(self) -> None:
+        self.loaded_profile = None
+
+
+class HttpTTSServiceClient:
+    def __init__(self, endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> None:
+        self.endpoint = endpoint
+        self.transport = transport
+
+    def health(self) -> dict[str, Any]:
+        missing = self._missing_env()
+        if missing:
+            return {"engine": self.endpoint.engine.value, "ready": False, "status": "needs key", "missing_env": missing}
+        url = self.endpoint.health_url or self.endpoint.base_url.rstrip("/") + "/health"
+        try:
+            with httpx.Client(timeout=_health_timeout_seconds(), transport=self.transport) as client:
+                response = client.get(url, headers=self._headers())
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            return {"engine": self.endpoint.engine.value, "ready": False, "error": str(exc)}
+        return {"engine": self.endpoint.engine.value, "ready": True, **payload}
+
+    def capabilities(self) -> dict[str, Any]:
+        try:
+            with httpx.Client(timeout=5.0, transport=self.transport) as client:
+                response = client.get(self.endpoint.base_url.rstrip("/") + "/capabilities", headers=self._headers())
+                response.raise_for_status()
+                return response.json()
+        except Exception:
+            return {"capabilities": self.endpoint.capabilities}
+
+    def load(self, profile: str, parameters: dict[str, Any] | None = None) -> None:
+        payload = {"profile": profile, "parameters": parameters or {}}
+        with httpx.Client(timeout=120.0, transport=self.transport) as client:
+            response = client.post(self.endpoint.base_url.rstrip("/") + "/load", json=payload, headers=self._headers())
+            response.raise_for_status()
+
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        payload = {
+            "line": request.line.model_dump(mode="json"),
+            "profile": request.profile,
+            "output_path": str(request.output_path),
+            "parameters": request.parameters,
+        }
+        with httpx.Client(timeout=request.parameters.get("timeout_seconds", 600.0), transport=self.transport) as client:
+            response = client.post(self.endpoint.base_url.rstrip("/") + "/synthesize", json=payload, headers=self._headers())
+            response.raise_for_status()
+            data = response.json()
+        return SynthesisResult(audio_path=Path(data["audio_path"]), metadata=data.get("metadata", {}))
+
+    def unload(self) -> None:
+        try:
+            with httpx.Client(timeout=120.0, transport=self.transport) as client:
+                response = client.post(self.endpoint.base_url.rstrip("/") + "/unload", headers=self._headers())
+                response.raise_for_status()
+        except httpx.HTTPError:
+            return
+
+    def _headers(self) -> dict[str, str]:
+        if not self.endpoint.auth_header_env:
+            api_key_env = self.endpoint.auth_profile.get("api_key_env")
+            if api_key_env:
+                value = os.environ.get(api_key_env)
+                return {"Authorization": f"Bearer {value}"} if value else {}
+            return {}
+        value = os.environ.get(self.endpoint.auth_header_env)
+        return {"Authorization": value} if value else {}
+
+    def _missing_env(self) -> list[str]:
+        keys = [value for key, value in self.endpoint.auth_profile.items() if key.endswith("_env")]
+        if self.endpoint.auth_header_env:
+            keys.append(self.endpoint.auth_header_env)
+        return [key for key in keys if not os.environ.get(key)]
+
+
+class GradioWebUIServiceClient(HttpTTSServiceClient):
+    def __init__(self, endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> None:
+        super().__init__(endpoint, transport=transport)
+        self._config_cache: dict[str, Any] | None = None
+
+    def load(self, profile: str, parameters: dict[str, Any] | None = None) -> None:
+        # Gradio WebUIs keep model state behind their own event handlers. GPT-SoVITS
+        # switches weights inside synthesize(), while IndexTTS has no explicit load API.
+        return
+
+    def unload(self) -> None:
+        return
+
+    def health(self) -> dict[str, Any]:
+        missing = self._missing_env()
+        if missing:
+            return {"engine": self.endpoint.engine.value, "ready": False, "status": "needs key", "missing_env": missing}
+        try:
+            payload = self._config()
+        except Exception as exc:
+            return {"engine": self.endpoint.engine.value, "ready": False, "reachable": False, "error": str(exc)}
+
+        api_names = sorted(
+            {
+                item.get("api_name")
+                for item in payload.get("dependencies", [])
+                if isinstance(item, dict) and item.get("api_name")
+            }
+        )
+        expected = _expected_gradio_api_names(self.endpoint.api_contract)
+        missing_api_names = [name for name in expected if name not in api_names]
+        status = "unsupported gradio app" if missing_api_names else "ready"
+        return {
+            "engine": self.endpoint.engine.value,
+            "ready": not missing_api_names,
+            "reachable": True,
+            "status": status,
+            "mode": "gradio-webui",
+            "api_contract": self.endpoint.api_contract,
+            "api_prefix": payload.get("api_prefix") or "",
+            "available_api_names": api_names,
+            "expected_api_names": expected,
+            "missing_api_names": missing_api_names,
+            "title": payload.get("title") or "",
+            "version": payload.get("version") or "",
+        }
+
+    def capabilities(self) -> dict[str, Any]:
+        return {"capabilities": [*self.endpoint.capabilities, "gradio_webui"]}
+
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        if self.endpoint.api_contract == "gradio-gpt-sovits-webui":
+            return self._synthesize_gpt_sovits(request)
+        if self.endpoint.api_contract == "gradio-indextts2-webui":
+            return self._synthesize_indextts(request)
+        raise RuntimeError(f"unsupported Gradio API contract: {self.endpoint.api_contract}")
+
+    def gradio_index(self) -> dict[str, Any]:
+        payload = self._config()
+        if self.endpoint.api_contract != "gradio-gpt-sovits-webui":
+            return {"service_id": self.endpoint.service_id, "candidates": [], "raw": _gradio_api_summary(payload)}
+        return {
+            "service_id": self.endpoint.service_id,
+            "candidates": _gpt_sovits_gradio_logs_candidates(self.endpoint.service_id, payload),
+            "raw": _gradio_api_summary(payload),
+        }
+
+    def _synthesize_gpt_sovits(self, request: SynthesisRequest) -> SynthesisResult:
+        params = {**self.endpoint.default_params, **request.parameters}
+        gpt_weights = str(params.get("gpt_weights_path") or params.get("gpt_weights") or "")
+        sovits_weights = str(params.get("sovits_weights_path") or params.get("sovits_weights") or "")
+        prompt_lang = _gradio_language(params.get("prompt_lang") or "zh")
+        text_lang = _gradio_language(params.get("text_lang") or request.line.language or "zh")
+        if gpt_weights:
+            self._post_gradio_api("change_gpt_weights", [gpt_weights], timeout=params.get("timeout_seconds", 600.0))
+        if sovits_weights:
+            self._post_gradio_api("change_sovits_weights", [sovits_weights, prompt_lang, text_lang], timeout=params.get("timeout_seconds", 600.0))
+        ref_audio = params.get("ref_audio_path") or params.get("reference_audio")
+        prompt_text = str(params.get("prompt_text") or "")
+        selected_audio: Any = ref_audio
+        if params.get("ref_audio_choice"):
+            selected = self._post_gradio_api(
+                "on_select_ref_audio",
+                [params.get("ref_audio_choice"), params.get("character_filter", "全部")],
+                timeout=params.get("timeout_seconds", 600.0),
+            )
+            data = selected.get("data") or []
+            selected_audio = _component_value(data[0]) if data else selected_audio
+            if len(data) > 1 and not prompt_text:
+                prompt_text = str(_component_value(data[1]) or "")
+        selected_audio = self._prepare_gradio_file(selected_audio, timeout=params.get("timeout_seconds", 900.0))
+        aux_ref_audio_paths = [
+            self._prepare_gradio_file(path, timeout=params.get("timeout_seconds", 900.0))
+            for path in (params.get("aux_ref_audio_paths") or [])
+        ]
+        payload = params.get("gradio_data")
+        if not isinstance(payload, list):
+            payload = [
+                selected_audio,
+                prompt_text,
+                prompt_lang,
+                request.line.text,
+                text_lang,
+                params.get("text_split_method", "凑四句一切"),
+                params.get("top_k", 15),
+                params.get("top_p", 1.0),
+                params.get("temperature", 1.0),
+                bool(params.get("ref_free", not prompt_text)),
+                params.get("speed_factor", params.get("speed", 1.0)),
+                bool(params.get("if_freeze", False)),
+                aux_ref_audio_paths,
+                params.get("sample_steps", 8),
+                bool(params.get("super_sampling", False)),
+                params.get("fragment_interval", 0.3),
+            ]
+        response = self._post_gradio_api("get_tts_wav", payload, timeout=params.get("timeout_seconds", 900.0))
+        return self._write_gradio_audio(request, response, {"api_contract": self.endpoint.api_contract, "gradio_api_name": "get_tts_wav"})
+
+    def _synthesize_indextts(self, request: SynthesisRequest) -> SynthesisResult:
+        params = {**self.endpoint.default_params, **request.parameters}
+        payload = params.get("gradio_data")
+        if not isinstance(payload, list):
+            emotion_mode = str(params.get("emotion_mode", "same_as_voice"))
+            example_values: list[Any] = []
+            if not (params.get("voice") or params.get("ref_audio_path") or params.get("reference_audio")) and params.get("gradio_example_index") is not None:
+                example = self._post_gradio_api("load_example", [params.get("gradio_example_index")], timeout=params.get("timeout_seconds", 900.0))
+                example_values = [_component_value(item) for item in (example.get("data") or [])]
+                if len(example_values) > 1 and emotion_mode == "same_as_voice":
+                    emotion_mode = str(example_values[1] or emotion_mode)
+            example_vector = example_values[6:14] if len(example_values) >= 14 else []
+            emotion_vector = list(params.get("emotion_vector") or example_vector or [0.0] * 8)[:8]
+            emotion_vector.extend([0.0] * (8 - len(emotion_vector)))
+            voice_reference = self._prepare_gradio_file(
+                params.get("voice") or params.get("ref_audio_path") or params.get("reference_audio") or (example_values[0] if example_values else ""),
+                timeout=params.get("timeout_seconds", 900.0),
+            )
+            emotion_audio = self._prepare_gradio_file(
+                params.get("emotion_audio") or (example_values[3] if len(example_values) > 3 else ""),
+                timeout=params.get("timeout_seconds", 900.0),
+            )
+            payload = [
+                _indextts_emotion_mode_label(emotion_mode),
+                voice_reference,
+                request.line.text,
+                emotion_audio,
+                params.get("emotion_weight", example_values[4] if len(example_values) > 4 else 0.8),
+                *emotion_vector,
+                params.get("emotion_text") or request.line.note or (example_values[5] if len(example_values) > 5 else ""),
+                bool(params.get("emotion_random", False)),
+                params.get("max_text_tokens_per_segment", 120),
+                bool(params.get("do_sample", True)),
+                params.get("top_p", 0.8),
+                params.get("top_k", 30),
+                params.get("temperature", 0.8),
+                params.get("length_penalty", 0.0),
+                params.get("num_beams", 3),
+                params.get("repetition_penalty", 10.0),
+                params.get("max_mel_tokens", 1500),
+            ]
+        response = self._post_gradio_api("gen_single", payload, timeout=params.get("timeout_seconds", 900.0))
+        return self._write_gradio_audio(request, response, {"api_contract": self.endpoint.api_contract, "gradio_api_name": "gen_single"})
+
+    def _config(self) -> dict[str, Any]:
+        if self._config_cache is not None:
+            return self._config_cache
+        with httpx.Client(timeout=_health_timeout_seconds(), transport=self.transport) as client:
+            response = client.get(self.endpoint.base_url.rstrip("/") + "/config", headers=self._headers())
+            response.raise_for_status()
+            self._config_cache = response.json()
+            return self._config_cache
+
+    def _post_gradio_api(self, api_name: str, data: list[Any], timeout: float | int | None = None) -> dict[str, Any]:
+        config = self._config()
+        api_prefix = str(config.get("api_prefix") or "").strip("/")
+        path_candidates = []
+        if api_prefix:
+            path_candidates.append(f"/{api_prefix}/api/{api_name}")
+        path_candidates.append(f"/api/{api_name}")
+        if api_prefix:
+            path_candidates.append(f"/{api_prefix}/run/{api_name}")
+        path_candidates.append(f"/run/{api_name}")
+        payload = {"data": data}
+        last_error: Exception | None = None
+        with httpx.Client(timeout=float(timeout or 900.0), transport=self.transport) as client:
+            for path in path_candidates:
+                try:
+                    response = client.post(self.endpoint.base_url.rstrip("/") + path, json=payload, headers=self._headers())
+                    if response.status_code == 404:
+                        continue
+                    if response.status_code >= 400:
+                        raise RuntimeError(f"{response.status_code} {response.text[:800]}")
+                    response.raise_for_status()
+                    return response.json()
+                except Exception as exc:
+                    last_error = exc
+        raise RuntimeError(f"Gradio API {api_name!r} failed: {last_error}")
+
+    def _write_gradio_audio(self, request: SynthesisRequest, payload: dict[str, Any], metadata: dict[str, Any]) -> SynthesisResult:
+        data = payload.get("data")
+        audio_ref = _first_audio_reference(data)
+        if audio_ref is None:
+            raise RuntimeError("Gradio response did not include audio output")
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        audio_bytes = self._download_gradio_audio(audio_ref)
+        request.output_path.write_bytes(audio_bytes)
+        return SynthesisResult(
+            audio_path=request.output_path,
+            metadata={
+                "service_id": self.endpoint.service_id,
+                **metadata,
+                "remote_audio_path": _audio_reference_path(audio_ref),
+            },
+        )
+
+    def _download_gradio_audio(self, audio_ref: Any) -> bytes:
+        if isinstance(audio_ref, (bytes, bytearray)):
+            return bytes(audio_ref)
+        path = _audio_reference_path(audio_ref)
+        if not path:
+            raise RuntimeError("Gradio audio output path is empty")
+        url = path if path.startswith(("http://", "https://")) else self.endpoint.base_url.rstrip("/") + _gradio_file_path(path)
+        with httpx.Client(timeout=120.0, transport=self.transport) as client:
+            response = client.get(url, headers=self._headers())
+            response.raise_for_status()
+            return response.content
+
+    def _prepare_gradio_file(self, value: Any, timeout: float | int | None = None) -> Any:
+        path = _audio_reference_path(value)
+        if not path or path.startswith(("http://", "https://", "/file=", "file=")):
+            return value
+        local_path = Path(path)
+        if not local_path.exists() or not local_path.is_file():
+            return value
+        return self._upload_gradio_file(local_path, timeout=timeout)
+
+    def _upload_gradio_file(self, path: Path, timeout: float | int | None = None) -> dict[str, Any]:
+        upload_paths = ["/upload"]
+        config = self._config()
+        api_prefix = str(config.get("api_prefix") or "").strip("/")
+        if api_prefix:
+            upload_paths.append(f"/{api_prefix}/upload")
+        last_error: Exception | None = None
+        with httpx.Client(timeout=float(timeout or 120.0), transport=self.transport) as client:
+            for upload_path in upload_paths:
+                try:
+                    with path.open("rb") as file_handle:
+                        response = client.post(
+                            self.endpoint.base_url.rstrip("/") + upload_path,
+                            files={"files": (path.name, file_handle, "application/octet-stream")},
+                            headers=self._headers(),
+                        )
+                    if response.status_code == 404:
+                        continue
+                    if response.status_code >= 400:
+                        raise RuntimeError(f"{response.status_code} {response.text[:800]}")
+                    data = response.json()
+                    if isinstance(data, list) and data:
+                        if isinstance(data[0], dict):
+                            uploaded = dict(data[0])
+                        else:
+                            uploaded = {"path": str(data[0])}
+                        self._normalize_uploaded_gradio_file(uploaded, path)
+                        return uploaded
+                    if isinstance(data, dict) and data.get("path"):
+                        uploaded = dict(data)
+                        self._normalize_uploaded_gradio_file(uploaded, path)
+                        return uploaded
+                    raise RuntimeError("Gradio upload response did not include a path")
+                except Exception as exc:
+                    last_error = exc
+        raise RuntimeError(f"Gradio upload failed for {path}: {last_error}")
+
+    def _normalize_uploaded_gradio_file(self, uploaded: dict[str, Any], path: Path) -> None:
+        uploaded.setdefault("orig_name", path.name)
+        uploaded.setdefault("mime_type", "audio/wav")
+        uploaded.setdefault("size", None)
+        uploaded.setdefault("is_stream", False)
+        uploaded.setdefault("meta", {"_type": "gradio.FileData"})
+        if "url" not in uploaded and uploaded.get("path"):
+            config = self._config()
+            api_prefix = str(config.get("api_prefix") or "").strip("/")
+            file_prefix = f"/{api_prefix}/file=" if api_prefix else "/file="
+            uploaded["url"] = self.endpoint.base_url.rstrip("/") + file_prefix + quote(str(uploaded["path"]), safe=":/\\")
+
+
+class GPTSoVITSApiV2ServiceClient(HttpTTSServiceClient):
+    def health(self) -> dict[str, Any]:
+        try:
+            with httpx.Client(timeout=_health_timeout_seconds(), transport=self.transport) as client:
+                response = client.get(self.endpoint.base_url.rstrip("/") + "/docs", headers=self._headers())
+                response.raise_for_status()
+        except Exception as exc:
+            return {"engine": self.endpoint.engine.value, "ready": False, "error": str(exc)}
+        return {"engine": self.endpoint.engine.value, "ready": True, "mode": "gpt-sovits-api-v2"}
+
+    def load(self, profile: str, parameters: dict[str, Any] | None = None) -> None:
+        parameters = parameters or {}
+        with httpx.Client(timeout=300.0, transport=self.transport) as client:
+            if parameters.get("gpt_weights_path"):
+                response = client.get(
+                    self.endpoint.base_url.rstrip("/") + "/set_gpt_weights",
+                    params={"weights_path": parameters["gpt_weights_path"]},
+                    headers=self._headers(),
+                )
+                response.raise_for_status()
+            if parameters.get("sovits_weights_path"):
+                response = client.get(
+                    self.endpoint.base_url.rstrip("/") + "/set_sovits_weights",
+                    params={"weights_path": parameters["sovits_weights_path"]},
+                    headers=self._headers(),
+                )
+                response.raise_for_status()
+
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        payload = {
+            "text": request.line.text,
+            "text_lang": request.parameters.get("text_lang", request.line.language or "zh"),
+            "ref_audio_path": request.parameters.get("ref_audio_path"),
+            "prompt_lang": request.parameters.get("prompt_lang", "zh"),
+            "prompt_text": request.parameters.get("prompt_text", ""),
+            "media_type": "wav",
+            "streaming_mode": False,
+        }
+        payload.update(request.parameters.get("gpt_sovits_payload", {}))
+        with httpx.Client(timeout=request.parameters.get("timeout_seconds", 600.0), transport=self.transport) as client:
+            response = client.post(self.endpoint.base_url.rstrip("/") + "/tts", json=payload, headers=self._headers())
+            response.raise_for_status()
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.output_path.write_bytes(response.content)
+        return SynthesisResult(audio_path=request.output_path, metadata={"service_id": self.endpoint.service_id})
+
+
+class CommercialSpeechClient(HttpTTSServiceClient):
+    def health(self) -> dict[str, Any]:
+        missing = self._missing_env()
+        if missing:
+            return {"engine": self.endpoint.engine.value, "ready": False, "status": "needs key", "missing_env": missing}
+        return {"engine": self.endpoint.engine.value, "ready": True, "provider_type": self.endpoint.provider_type.value}
+
+    def _merged_params(self, request: SynthesisRequest) -> dict[str, Any]:
+        return {**self.endpoint.default_params, **request.parameters}
+
+    def _write_response_bytes(self, request: SynthesisRequest, content: bytes, metadata: dict[str, Any]) -> SynthesisResult:
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.output_path.write_bytes(content)
+        return SynthesisResult(audio_path=request.output_path, metadata={"service_id": self.endpoint.service_id, **metadata})
+
+
+class OpenAISpeechClient(CommercialSpeechClient):
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        params = self._merged_params(request)
+        payload = {
+            "model": params.get("model", "gpt-4o-mini-tts"),
+            "voice": params.get("voice", "alloy"),
+            "input": request.line.text,
+            "response_format": params.get("response_format", "wav"),
+        }
+        if params.get("instructions"):
+            payload["instructions"] = params["instructions"]
+        with httpx.Client(timeout=params.get("timeout_seconds", 600.0), transport=self.transport) as client:
+            response = client.post(self.endpoint.base_url.rstrip("/") + "/audio/speech", json=payload, headers=self._headers())
+            response.raise_for_status()
+        return self._write_response_bytes(request, response.content, {"provider_type": "openai"})
+
+
+class XAISpeechClient(OpenAISpeechClient):
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        params = self._merged_params(request)
+        payload = {
+            "model": params.get("model", "grok-tts"),
+            "voice": params.get("voice") or params.get("voice_id", "voice-1"),
+            "input": request.line.text,
+            "response_format": params.get("response_format", "wav"),
+        }
+        with httpx.Client(timeout=params.get("timeout_seconds", 600.0), transport=self.transport) as client:
+            response = client.post(self.endpoint.base_url.rstrip("/") + "/audio/speech", json=payload, headers=self._headers())
+            response.raise_for_status()
+        return self._write_response_bytes(request, response.content, {"provider_type": "xai"})
+
+
+class GeminiSpeechClient(CommercialSpeechClient):
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        params = self._merged_params(request)
+        model = params.get("model", "gemini-2.5-flash-preview-tts")
+        payload = {
+            "contents": [{"parts": [{"text": request.line.text}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {
+                            "voiceName": params.get("voice_name", "Kore"),
+                        }
+                    }
+                },
+            },
+        }
+        key = os.environ.get(self.endpoint.auth_profile.get("api_key_env", ""))
+        with httpx.Client(timeout=params.get("timeout_seconds", 600.0), transport=self.transport) as client:
+            response = client.post(
+                self.endpoint.base_url.rstrip("/") + f"/models/{model}:generateContent",
+                params={"key": key},
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+        audio_data = _extract_gemini_audio(data)
+        return self._write_response_bytes(request, audio_data, {"provider_type": "gemini"})
+
+
+class VolcengineSpeechClient(CommercialSpeechClient):
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        params = self._merged_params(request)
+        app_id = os.environ.get(self.endpoint.auth_profile.get("app_id_env", ""))
+        access_token = os.environ.get(self.endpoint.auth_profile.get("access_token_env", ""))
+        cluster = os.environ.get(self.endpoint.auth_profile.get("cluster_id_env", ""))
+        payload = {
+            "app": {"appid": app_id, "token": access_token, "cluster": cluster},
+            "user": {"uid": params.get("uid", "tts-more")},
+            "audio": {
+                "voice_type": params.get("voice_type"),
+                "encoding": params.get("encoding", "wav"),
+                "speed_ratio": params.get("speed_ratio", params.get("speed", 1.0)),
+                "pitch_ratio": params.get("pitch_ratio", params.get("pitch", 1.0)),
+            },
+            "request": {
+                "reqid": params.get("reqid", request.line.id),
+                "text": request.line.text,
+                "operation": params.get("operation", "query"),
+            },
+        }
+        if params.get("emotion"):
+            payload["audio"]["emotion"] = params["emotion"]
+        headers = {"Authorization": f"Bearer;{access_token}"}
+        with httpx.Client(timeout=params.get("timeout_seconds", 600.0), transport=self.transport) as client:
+            response = client.post(self.endpoint.base_url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+        audio_data = base64.b64decode(data.get("data", ""))
+        return self._write_response_bytes(request, audio_data, {"provider_type": "volcengine"})
+
+
+def _has_capabilities(actual: list[str], required: list[str]) -> bool:
+    return set(required).issubset(set(actual))
+
+
+def _health_timeout_seconds() -> float:
+    raw = os.environ.get("TTS_MORE_HEALTH_TIMEOUT_SECONDS", "0.75")
+    try:
+        return min(max(float(raw), 0.1), 10.0)
+    except ValueError:
+        return 0.75
+
+
+def _expected_gradio_api_names(api_contract: str) -> list[str]:
+    if api_contract == "gradio-gpt-sovits-webui":
+        return ["get_tts_wav"]
+    if api_contract == "gradio-indextts2-webui":
+        return ["gen_single"]
+    return []
+
+
+def _gradio_api_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": payload.get("title") or "",
+        "version": payload.get("version") or "",
+        "api_prefix": payload.get("api_prefix") or "",
+        "api_names": sorted(
+            {
+                item.get("api_name")
+                for item in payload.get("dependencies", [])
+                if isinstance(item, dict) and item.get("api_name")
+            }
+        ),
+    }
+
+
+def _gpt_sovits_gradio_logs_candidates(service_id: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    components = {component.get("id"): component for component in payload.get("components", []) if isinstance(component, dict)}
+    dependencies = [item for item in payload.get("dependencies", []) if isinstance(item, dict)]
+    by_api = {item.get("api_name"): item for item in dependencies if item.get("api_name")}
+    model_dep = by_api.get("update_model_choices") or {}
+    ref_dep = by_api.get("refresh_ref_audio_choices") or {}
+    gpt_component = components.get((model_dep.get("outputs") or [None, None])[1])
+    sovits_component = components.get((model_dep.get("outputs") or [None, None, None])[2])
+    ref_component = components.get((ref_dep.get("outputs") or [None])[0])
+    role_component = components.get((model_dep.get("outputs") or [None])[0])
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for role in _gradio_choices(role_component):
+        if role in {"全部", "All", "all"}:
+            continue
+        item = _logs_candidate(grouped, service_id, role, source="gradio")
+        item.setdefault("aliases", []).append(role)
+    for choice in _gradio_choices(gpt_component):
+        name = _extract_logs_name(choice)
+        item = _logs_candidate(grouped, service_id, name, source="gradio")
+        option = {"name": Path(choice).name or choice, "path": choice, "value": choice, "score": _weight_score_tuple(choice)}
+        item.setdefault("gpt_weights", []).append(option)
+        _prefer_recommended(item, "gpt", option)
+    for choice in _gradio_choices(sovits_component):
+        name = _extract_logs_name(choice)
+        item = _logs_candidate(grouped, service_id, name, source="gradio")
+        option = {"name": Path(choice).name or choice, "path": choice, "value": choice, "score": _weight_score_tuple(choice)}
+        item.setdefault("sovits_weights", []).append(option)
+        _prefer_recommended(item, "sovits", option)
+    for choice in _gradio_choices(ref_component):
+        name = _extract_logs_name(choice)
+        item = _logs_candidate(grouped, service_id, name, source="gradio")
+        group = {
+            "id": _slugish(choice),
+            "name": Path(choice).stem or choice,
+            "paths": [choice],
+            "samples": [{"path": choice, "text": "", "text_source": "none"}],
+        }
+        item.setdefault("reference_audio_groups", []).append(group)
+        item.setdefault("recommended_ref_audio_path", choice)
+    candidates = list(grouped.values())
+    candidates.sort(key=lambda item: (0 if item.get("recommended_gpt_weights_path") and item.get("recommended_sovits_weights_path") else 1, item["logs_name"]))
+    return candidates
+
+
+def _logs_candidate(grouped: dict[str, dict[str, Any]], service_id: str, logs_name: str, source: str) -> dict[str, Any]:
+    name = logs_name.strip() or "unknown"
+    key = _slugish(name)
+    if key not in grouped:
+        grouped[key] = {
+            "id": key,
+            "logs_id": key,
+            "logs_name": name,
+            "name": name,
+            "aliases": [name],
+            "service_id": service_id,
+            "source": source,
+            "gpt_weights": [],
+            "sovits_weights": [],
+            "reference_audio_groups": [],
+        }
+    elif grouped[key].get("source") != source:
+        grouped[key]["source"] = "merged"
+    return grouped[key]
+
+
+def _prefer_recommended(item: dict[str, Any], kind: str, option: dict[str, Any]) -> None:
+    score = tuple(option.get("score") or (0, 0))
+    key = f"recommended_{kind}_weights_path"
+    score_key = f"{key}_score"
+    if key not in item or score > tuple(item.get(score_key) or (-1, -1)):
+        item[key] = option.get("path") or option.get("value")
+        item[score_key] = score
+
+
+def _gradio_choices(component: dict[str, Any] | None) -> list[str]:
+    if not component:
+        return []
+    props = component.get("props") or {}
+    output: list[str] = []
+    for choice in props.get("choices") or []:
+        value = choice
+        if isinstance(choice, (list, tuple)) and choice:
+            value = choice[1] if len(choice) > 1 else choice[0]
+        elif isinstance(choice, dict):
+            value = choice.get("value") or choice.get("label") or choice.get("name")
+        if value not in (None, ""):
+            output.append(str(value))
+    value = props.get("value")
+    if isinstance(value, str) and value and value not in output:
+        output.append(value)
+    return output
+
+
+def _extract_logs_name(raw: str) -> str:
+    text = Path(raw).stem
+    text = text.replace("\\", "/").split("/")[-1]
+    text = text.split("_e", 1)[0]
+    text = text.split("-e", 1)[0]
+    text = text.split("_s", 1)[0]
+    text = text.split("-s", 1)[0]
+    text = text.split("-", 1)[0]
+    text = text.split("_", 1)[0]
+    text = "".join(ch for ch in text.lstrip("0123456789") if ch not in "（）()").strip()
+    return text or raw
+
+
+def _weight_score_tuple(value: str) -> tuple[int, int]:
+    import re
+
+    epoch = max([int(match) for match in re.findall(r"(?:^|[-_])e(\d+)", value, flags=re.IGNORECASE)] or [0])
+    step = max([int(match) for match in re.findall(r"(?:^|[-_])s(\d+)", value, flags=re.IGNORECASE)] or [0])
+    return (epoch, step)
+
+
+def _slugish(value: str) -> str:
+    import re
+
+    fallback = {"小": "xiao", "品": "pin", "光": "guang", "严": "yan", "镜": "jing", "王": "wang", "强": "qiang", "旁": "pang", "白": "bai"}
+    tokens: list[str] = []
+    for char in value.strip():
+        if char.isascii() and char.isalnum():
+            tokens.append(char.lower())
+        elif char in fallback:
+            tokens.append(fallback[char])
+    if tokens:
+        return "-".join(tokens)
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "logs"
+
+
+def _gradio_language(value: Any) -> str:
+    raw = str(value or "zh").lower()
+    if raw in {"zh", "zh-cn", "chinese"}:
+        return "中文"
+    if raw in {"en", "en-us", "english"}:
+        return "英文"
+    if raw in {"ja", "jp", "japanese"}:
+        return "日文"
+    return str(value or "中文")
+
+
+def _indextts_emotion_mode_label(mode: str) -> str:
+    return {
+        "same_as_voice": "与音色参考音频相同",
+        "emotion_audio": "使用情感参考音频",
+        "emotion_vector": "使用情感向量控制",
+        "emotion_text": "使用情感描述文本控制",
+    }.get(mode, mode)
+
+
+def _first_audio_reference(data: Any) -> Any:
+    if isinstance(data, list):
+        for item in data:
+            if _audio_reference_path(item):
+                return item
+    if _audio_reference_path(data):
+        return data
+    return None
+
+
+def _component_value(value: Any) -> Any:
+    if isinstance(value, dict) and "value" in value:
+        return value["value"]
+    return value
+
+
+def _audio_reference_path(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        if "value" in value:
+            return _audio_reference_path(value["value"])
+        for key in ("url", "path", "name"):
+            if value.get(key):
+                return str(value[key])
+    return ""
+
+
+def _gradio_file_path(path: str) -> str:
+    if path.startswith("/"):
+        return path
+    if path.startswith("file="):
+        return "/" + path
+    return "/file=" + quote(path, safe=":/\\")
+
+
+def _extract_gemini_audio(data: dict[str, Any]) -> bytes:
+    candidates = data.get("candidates") or []
+    for candidate in candidates:
+        parts = candidate.get("content", {}).get("parts", [])
+        for part in parts:
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                return base64.b64decode(inline["data"])
+    raise RuntimeError("Gemini response did not include inline audio data")
+
+
+def _tiny_wav_bytes() -> bytes:
+    return (
+        b"RIFF$\x00\x00\x00WAVEfmt "
+        b"\x10\x00\x00\x00\x01\x00\x01\x00"
+        b"@\x1f\x00\x00@\x1f\x00\x00"
+        b"\x01\x00\x08\x00data\x00\x00\x00\x00"
+    )

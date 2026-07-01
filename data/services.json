@@ -1,0 +1,311 @@
+[
+  {
+    "service_id": "local-gpt-sovits",
+    "service_kind": "tts",
+    "display_name": "GPT-SoVITS Local",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "api_contract": "gpt-sovits-api-v2",
+    "base_url": "http://127.0.0.1:9880",
+    "mode": "local",
+    "network_scope": "localhost",
+    "managed": true,
+    "enabled": false,
+    "poll_interval_seconds": 5,
+    "repo_path": "repo/GPT-SoVITS",
+    "start_cwd": ".",
+    "start_command": [
+      "repo\\\\GPT-SoVITS\\\\.venv\\\\Scripts\\\\python.exe",
+      "backend\\\\app\\\\workers\\\\gpt_sovits_launcher.py",
+      "-a",
+      "127.0.0.1",
+      "-p",
+      "9880",
+      "-c",
+      "GPT_SoVITS/configs/tts_infer.yaml"
+    ],
+    "env": {
+      "PATH": "repo\\\\GPT-SoVITS\\\\ffmpeg-shared\\\\bin;{PATH}"
+    },
+    "health_url": "http://127.0.0.1:9880/docs",
+    "resource_group": "local-gpu-0",
+    "capacity": 1,
+    "priority": 90,
+    "capabilities": [
+      "tts",
+      "trained_weights_voice",
+      "reference_audio_voice",
+      "gpt-weights",
+      "sovits-weights",
+      "wav_output"
+    ]
+  },
+  {
+    "service_id": "local-indextts",
+    "service_kind": "tts",
+    "display_name": "IndexTTS Local",
+    "engine": "indextts",
+    "provider_type": "indextts",
+    "api_contract": "tts-more-v1",
+    "base_url": "http://127.0.0.1:9881",
+    "mode": "local",
+    "network_scope": "localhost",
+    "managed": true,
+    "enabled": false,
+    "poll_interval_seconds": 5,
+    "repo_path": "repo/index-tts",
+    "start_cwd": ".",
+    "env": {
+      "TTS_MORE_INDEXTTS_PYTHON": "repo\\\\index-tts\\\\.venv\\\\Scripts\\\\python.exe",
+      "TTS_MORE_INDEXTTS_MODEL_DIR": "repo\\\\index-tts\\\\checkpoints",
+      "INDEXTTS2_MODEL_DIR": "repo\\\\index-tts\\\\checkpoints"
+    },
+    "start_command": [
+      ".venv\\\\Scripts\\\\python.exe",
+      "-m",
+      "uvicorn",
+      "app.workers.indextts_worker:app",
+      "--app-dir",
+      "backend",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "9881"
+    ],
+    "health_url": "http://127.0.0.1:9881/health",
+    "resource_group": "local-gpu-0",
+    "capacity": 1,
+    "priority": 95,
+    "capabilities": [
+      "tts",
+      "reference_audio_voice",
+      "emotion_text",
+      "emotion_audio",
+      "wav_output"
+    ]
+  },
+  {
+    "service_id": "lan-gpt-sovits-gradio-166",
+    "service_kind": "tts",
+    "display_name": "GPT-SoVITS WebUI · 192.168.2.166",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "api_contract": "gradio-gpt-sovits-webui",
+    "base_url": "http://192.168.2.166:9872",
+    "mode": "external",
+    "network_scope": "lan",
+    "managed": false,
+    "enabled": true,
+    "poll_interval_seconds": 10,
+    "resource_group": "lan-192-168-2-166-gpu",
+    "capacity": 1,
+    "priority": 10,
+    "capabilities": [
+      "tts",
+      "trained_weights_voice",
+      "reference_audio_voice",
+      "gradio_webui",
+      "wav_output",
+      "logs_first",
+      "gpt-weights",
+      "sovits-weights"
+    ]
+  },
+  {
+    "service_id": "lan-indextts2-gradio-166",
+    "service_kind": "tts",
+    "display_name": "IndexTTS2 WebUI · 192.168.2.166",
+    "engine": "indextts",
+    "provider_type": "indextts",
+    "api_contract": "gradio-indextts2-webui",
+    "base_url": "http://192.168.2.166:7860",
+    "mode": "external",
+    "network_scope": "lan",
+    "managed": false,
+    "enabled": true,
+    "poll_interval_seconds": 10,
+    "resource_group": "lan-192-168-2-166-gpu",
+    "capacity": 1,
+    "priority": 20,
+    "capabilities": [
+      "tts",
+      "reference_audio_voice",
+      "emotion_text",
+      "emotion_audio",
+      "gradio_webui",
+      "wav_output"
+    ]
+  },
+  {
+    "service_id": "openai-tts",
+    "service_kind": "tts",
+    "display_name": "OpenAI TTS",
+    "engine": "commercial",
+    "provider_type": "openai",
+    "api_contract": "openai-speech-v1",
+    "base_url": "https://api.openai.com/v1",
+    "mode": "external",
+    "network_scope": "commercial",
+    "managed": false,
+    "enabled": true,
+    "poll_interval_seconds": 30,
+    "resource_group": "paid-openai",
+    "capacity": 8,
+    "priority": 80,
+    "capabilities": [
+      "tts",
+      "commercial_voice",
+      "style_instruction",
+      "paid_provider"
+    ],
+    "auth_profile": {
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    "default_params": {
+      "model": "gpt-4o-mini-tts",
+      "voice": "alloy",
+      "response_format": "wav"
+    },
+    "cost_policy": {
+      "paid": true,
+      "default_rank": "optional"
+    }
+  },
+  {
+    "service_id": "gemini-tts",
+    "service_kind": "tts",
+    "display_name": "Gemini TTS",
+    "engine": "commercial",
+    "provider_type": "gemini",
+    "api_contract": "gemini-tts-v1",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta",
+    "mode": "external",
+    "network_scope": "commercial",
+    "managed": false,
+    "enabled": true,
+    "poll_interval_seconds": 30,
+    "resource_group": "paid-gemini",
+    "capacity": 8,
+    "priority": 90,
+    "capabilities": [
+      "tts",
+      "commercial_voice",
+      "style_instruction",
+      "multi_speaker_tts",
+      "paid_provider"
+    ],
+    "auth_profile": {
+      "api_key_env": "GEMINI_API_KEY"
+    },
+    "default_params": {
+      "model": "gemini-2.5-flash-preview-tts",
+      "voice_name": "Kore"
+    },
+    "cost_policy": {
+      "paid": true,
+      "default_rank": "optional"
+    }
+  },
+  {
+    "service_id": "xai-tts",
+    "service_kind": "tts",
+    "display_name": "xAI TTS",
+    "engine": "commercial",
+    "provider_type": "xai",
+    "api_contract": "xai-tts-v1",
+    "base_url": "https://api.x.ai/v1",
+    "mode": "external",
+    "network_scope": "commercial",
+    "managed": false,
+    "enabled": true,
+    "poll_interval_seconds": 30,
+    "resource_group": "paid-xai",
+    "capacity": 8,
+    "priority": 100,
+    "capabilities": [
+      "tts",
+      "commercial_voice",
+      "style_instruction",
+      "paid_provider"
+    ],
+    "auth_profile": {
+      "api_key_env": "XAI_API_KEY"
+    },
+    "default_params": {
+      "model": "grok-tts",
+      "voice_id": "voice-1",
+      "response_format": "wav"
+    },
+    "cost_policy": {
+      "paid": true,
+      "default_rank": "optional"
+    }
+  },
+  {
+    "service_id": "volcengine-tts",
+    "service_kind": "tts",
+    "display_name": "Volcengine TTS",
+    "engine": "commercial",
+    "provider_type": "volcengine",
+    "api_contract": "volcengine-tts-v1",
+    "base_url": "https://openspeech.bytedance.com/api/v1/tts",
+    "mode": "external",
+    "network_scope": "commercial",
+    "managed": false,
+    "enabled": true,
+    "poll_interval_seconds": 30,
+    "resource_group": "paid-volcengine",
+    "capacity": 8,
+    "priority": 110,
+    "capabilities": [
+      "tts",
+      "commercial_voice",
+      "emotion_text",
+      "paid_provider"
+    ],
+    "auth_profile": {
+      "app_id_env": "VOLCENGINE_APP_ID",
+      "access_token_env": "VOLCENGINE_ACCESS_TOKEN",
+      "cluster_id_env": "VOLCENGINE_CLUSTER_ID"
+    },
+    "default_params": {
+      "voice_type": "zh_female_xiaoxiao",
+      "encoding": "wav"
+    },
+    "cost_policy": {
+      "paid": true,
+      "default_rank": "optional"
+    }
+  },
+  {
+    "service_id": "generic-http-tts",
+    "service_kind": "tts",
+    "display_name": "Generic HTTP TTS",
+    "engine": "commercial",
+    "provider_type": "generic-http",
+    "api_contract": "tts-more-v1",
+    "base_url": "http://127.0.0.1:9890",
+    "mode": "external",
+    "network_scope": "lan",
+    "managed": false,
+    "enabled": false,
+    "poll_interval_seconds": 10,
+    "resource_group": "external-generic",
+    "capacity": 2,
+    "priority": 120,
+    "capabilities": [
+      "tts",
+      "reference_audio_voice",
+      "voice_preset",
+      "wav_output"
+    ],
+    "auth_profile": {
+      "api_key_env": "GENERIC_TTS_API_KEY"
+    },
+    "default_params": {},
+    "cost_policy": {
+      "paid": false,
+      "default_rank": "optional"
+    }
+  }
+]

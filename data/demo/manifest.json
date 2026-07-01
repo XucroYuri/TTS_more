@@ -1,0 +1,84 @@
+{
+  "project_id": "demo",
+  "lines": {
+    "l0011": {
+      "line_id": "l0011",
+      "versions": [
+        {
+          "version_id": "v001",
+          "engine": "gpt-sovits",
+          "profile": "xiaoguang-gpt-gradio",
+          "service_id": "lan-gpt-sovits-gradio-166",
+          "resource_group": "lan-192-168-2-166-gpu",
+          "provider_type": "gpt-sovits",
+          "binding_id": "xiaoguang-gpt-gradio",
+          "status": "completed",
+          "audio_path": "data\\demo\\audio\\gpt-sovits\\lan-gpt-sovits-gradio-166\\xiaoguang-gpt-gradio\\l0011_v001.wav",
+          "parameters": {
+            "logs_name": "光头TTS新-20260611",
+            "logs_id": "光头TTS新-20260611",
+            "gpt_weights_path": "GPT_weights_v2ProPlus/光头TTS新-20260611-e50.ckpt",
+            "sovits_weights_path": "SoVITS_weights_v2ProPlus/光头TTS新-20260611_e24_s264.pth",
+            "gpt_weights_options": [
+              "GPT_weights_v2ProPlus/光头TTS新-20260611-e50.ckpt"
+            ],
+            "sovits_weights_options": [
+              "SoVITS_weights_v2ProPlus/光头TTS新-20260611_e24_s264.pth"
+            ],
+            "ref_audio_path": "\\\\192.168.2.12\\ai\\项目\\音色克隆\\模型训练\\logs\\光头TTS新-20260611\\5-wav32k\\光头TTS新_01.wav",
+            "prompt_text": "不好!地板开始裂开了!再不跑我们全都要掉下去!",
+            "prompt_lang": "zh",
+            "text_lang": "zh",
+            "text_split_method": "凑四句一切",
+            "sample_steps": 8,
+            "timeout_seconds": 900,
+            "logs_first": true,
+            "verified": true
+          },
+          "metadata": {
+            "service_id": "lan-gpt-sovits-gradio-166",
+            "api_contract": "gradio-gpt-sovits-webui",
+            "gradio_api_name": "get_tts_wav",
+            "remote_audio_path": "http://192.168.2.166:9872/file=D:\\TTS\\GPT-SoVITS-v2ProPlus-Portable-20260611\\GPT-SoVITS-v2ProPlus-Portable-20260611\\tmp\\2465c57a657d8700d59552330b354fd2549b742175ac2f0b1481d1a6dba2b5d7\\audio.wav",
+            "cluster_key": "provider=gpt-sovits|service_id=lan-gpt-sovits-gradio-166|gpt_weights_path=GPT_weights_v2ProPlus/光头TTS新-20260611-e50.ckpt|sovits_weights_path=SoVITS_weights_v2ProPlus/光头TTS新-20260611_e24_s264.pth|aux_ref_audio_paths=|ref_audio_path=\\\\192.168.2.12\\ai\\项目\\音色克隆\\模型训练\\logs\\光头TTS新-20260611\\5-wav32k\\光头TTS新_01.wav"
+          },
+          "log_summary": "",
+          "error": null,
+          "created_at": "2026-07-01T09:22:24.015642Z"
+        }
+      ]
+    },
+    "l0013": {
+      "line_id": "l0013",
+      "versions": [
+        {
+          "version_id": "v001",
+          "engine": "indextts",
+          "profile": "heibang-zhangguan-index-example",
+          "service_id": "lan-indextts2-gradio-166",
+          "resource_group": "lan-192-168-2-166-gpu",
+          "provider_type": "indextts",
+          "binding_id": "heibang-zhangguan-index-example",
+          "status": "completed",
+          "audio_path": "data\\demo\\audio\\indextts\\lan-indextts2-gradio-166\\heibang-zhangguan-index-example\\l0013_v001.wav",
+          "parameters": {
+            "gradio_example_index": 2,
+            "emotion_mode": "same_as_voice",
+            "timeout_seconds": 900,
+            "emotion_text_hint": "暴怒、威严、训斥"
+          },
+          "metadata": {
+            "service_id": "lan-indextts2-gradio-166",
+            "api_contract": "gradio-indextts2-webui",
+            "gradio_api_name": "gen_single",
+            "remote_audio_path": "http://192.168.2.166:7860/gradio_api/file=C:\\Users\\FFFF\\AppData\\Local\\Temp\\gradio\\941aaacc31751aea4d8d563f51407821fc3e30b6698a17e12c2936cd6eb90c7c\\spk_1782897746.wav",
+            "cluster_key": "provider=indextts|service_id=lan-indextts2-gradio-166|voice=|emotion_mode=same_as_voice|emotion_source=|do_sample=|top_p=|top_k=|temperature=|length_penalty=|num_beams=|repetition_penalty=|max_mel_tokens=|max_text_tokens_per_segment="
+          },
+          "log_summary": "",
+          "error": null,
+          "created_at": "2026-07-01T09:23:33.407527Z"
+        }
+      ]
+    }
+  }
+}

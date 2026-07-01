@@ -1,0 +1,18 @@
+{
+  "repositories": [
+    {
+      "name": "GPT-SoVITS",
+      "path": "repo/GPT-SoVITS",
+      "remote": "https://github.com/XucroYuri/GPT-SoVITS.git",
+      "branch": "xucroyuri/proplus-hc-dev",
+      "commit": "b6b2a9da2eade248cf03f89195c79f49d8cd8e22"
+    },
+    {
+      "name": "index-tts",
+      "path": "repo/index-tts",
+      "remote": "https://github.com/XucroYuri/index-tts.git",
+      "branch": "main",
+      "commit": "7264ce2a9a0924becb6b8da3f60725f7663de089"
+    }
+  ]
+}
