@@ -32,6 +32,9 @@ importers:
       vite:
         specifier: ^7.3.0
         version: 7.3.6
+      wavesurfer.js:
+        specifier: ^7.12.8
+        version: 7.12.8
     devDependencies:
       '@types/react':
         specifier: ^19.2.8
@@ -829,6 +832,9 @@ packages:
     resolution: {integrity: sha512-Dhxzh5HZuiHQhbvTW9AMetFfBHDMYpo23Uo9btPXgdYP+3T5S+p+jgNy7spra+veYhBP2dCSgxR/i2Y02h5/6w==}
     engines: {node: '>=0.10.0'}
 
+  wavesurfer.js@7.12.8:
+    resolution: {integrity: sha512-G3nxzcC4X+ZWrLtcIV17kCWHVq3ysJCS4dS0YkGKILrQ2esAb8cScw965zKNKYxUvpiZsPK93KLWgWTYdIBQiw==}
+
   why-is-node-running@2.3.0:
     resolution: {integrity: sha512-hUrmaWBdVDcxvYqnyh09zunKzROWjbZTiNy8dBEjkS7ehEDQibXJ7XvlmtbwuTclUiIyN+CyXQD4Vmko8fNm8w==}
     engines: {node: '>=8'}
@@ -1467,6 +1473,8 @@ snapshots:
       - msw
 
   void-elements@3.1.0: {}
+
+  wavesurfer.js@7.12.8: {}
 
   why-is-node-running@2.3.0:
     dependencies:

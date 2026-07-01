@@ -502,7 +502,7 @@ def create_app(
 
     @app.get("/api/audio")
     def get_audio(path: str) -> FileResponse:
-        audio_path = Path(path)
+        audio_path = _resolve_data_audio_path(Path(app.state.store.root), path)
         if not audio_path.is_file():
             raise HTTPException(status_code=404, detail="audio not found")
         return FileResponse(audio_path, media_type="audio/wav")
@@ -686,6 +686,20 @@ def _enrich_tasks_for_project(store: ProjectStore, project_id: str, tasks: list[
             )
         )
     return output
+
+
+def _resolve_data_audio_path(data_root: Path, raw_path: str) -> Path:
+    root = data_root.resolve()
+    requested = Path(raw_path)
+    candidates = [requested] if requested.is_absolute() else [Path.cwd() / requested, root / requested]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return resolved
+    raise HTTPException(status_code=400, detail="audio path is outside data root")
 
 
 def _manifest_summary(manifest: GenerationManifest) -> dict[str, int]:

@@ -12,6 +12,8 @@ from app.adapters.base import EngineAdapter, SynthesisRequest
 from app.models import EngineName, GenerationJob, GenerationManifest, GenerationQueueItem, GenerationStatus, GenerationTask, GenerationVersion, ProviderType
 from app.services import ServiceRoute
 
+StatusCallback = Callable[[GenerationTask, GenerationStatus, float, str | None, str | None], None]
+
 
 class GenerationQueue:
     def __init__(self, adapters: dict[EngineName, EngineAdapter]) -> None:
@@ -85,9 +87,15 @@ class ServiceGenerationQueue:
         self._resource_semaphores: dict[str, threading.Semaphore] = {}
         self._resource_guard = threading.Lock()
         self._manifest_lock = threading.Lock()
-        self.status_callback: Callable[[GenerationTask, GenerationStatus, float, str | None, str | None], None] | None = None
+        self.status_callback: StatusCallback | None = None
 
-    def run(self, tasks: list[GenerationTask], manifest: GenerationManifest, output_dir: Path) -> GenerationManifest:
+    def run(
+        self,
+        tasks: list[GenerationTask],
+        manifest: GenerationManifest,
+        output_dir: Path,
+        status_callback: StatusCallback | None = None,
+    ) -> GenerationManifest:
         grouped: "OrderedDict[str, OrderedDict[str, list[tuple[int, GenerationTask, ServiceRoute, str]]]]" = OrderedDict()
         for index, task in enumerate(tasks):
             route = self.router.resolve_task(task)
@@ -106,7 +114,7 @@ class ServiceGenerationQueue:
 
         with ThreadPoolExecutor(max_workers=len(work_items)) as executor:
             futures = [
-                executor.submit(self._run_resource_clusters, resource_group, clusters, manifest, output_dir)
+                executor.submit(self._run_resource_clusters, resource_group, clusters, manifest, output_dir, status_callback)
                 for resource_group, clusters in work_items
             ]
             for future in futures:
@@ -119,9 +127,10 @@ class ServiceGenerationQueue:
         clusters: list[tuple[str, list[tuple[int, GenerationTask, ServiceRoute, str]]]],
         manifest: GenerationManifest,
         output_dir: Path,
+        status_callback: StatusCallback | None,
     ) -> None:
         for cluster_key, group in clusters:
-            self._run_service_cluster(resource_group, cluster_key, group, manifest, output_dir)
+            self._run_service_cluster(resource_group, cluster_key, group, manifest, output_dir, status_callback)
 
     def _run_service_cluster(
         self,
@@ -130,15 +139,16 @@ class ServiceGenerationQueue:
         group: list[tuple[int, GenerationTask, ServiceRoute, str]],
         manifest: GenerationManifest,
         output_dir: Path,
+        status_callback: StatusCallback | None,
     ) -> None:
         semaphore = self._resource_semaphore(resource_group, capacity=group[0][2].endpoint.capacity)
         with semaphore:
             (_index, first_task, route, _first_cluster) = group[0]
-            self._emit(first_task, "loading", 0.05, cluster_key, None)
+            self._emit(first_task, "loading", 0.05, cluster_key, None, status_callback)
             route.client.load(first_task.profile, first_task.parameters)
             try:
                 for _index, task, task_route, task_cluster_key in group:
-                    self._run_task(task_route, task, manifest, output_dir, task_cluster_key)
+                    self._run_task(task_route, task, manifest, output_dir, task_cluster_key, status_callback)
             finally:
                 route.client.unload()
 
@@ -149,8 +159,9 @@ class ServiceGenerationQueue:
         manifest: GenerationManifest,
         output_dir: Path,
         cluster_key: str | None = None,
+        status_callback: StatusCallback | None = None,
     ) -> None:
-        self._emit(task, "running", 0.35, cluster_key, None)
+        self._emit(task, "running", 0.35, cluster_key, None, status_callback)
         with self._manifest_lock:
             history = manifest.lines.get(task.line.id)
             version_number = len(history.versions) + 1 if history else 1
@@ -171,7 +182,7 @@ class ServiceGenerationQueue:
                     parameters=task.parameters,
                 )
             )
-            self._emit(task, "finalizing", 0.9, cluster_key, version_id)
+            self._emit(task, "finalizing", 0.9, cluster_key, version_id, status_callback)
             version = GenerationVersion(
                 version_id=version_id,
                 engine=task.engine,
@@ -198,11 +209,11 @@ class ServiceGenerationQueue:
                 parameters=task.parameters,
                 error=str(exc),
             )
-            self._emit(task, "failed", 1.0, cluster_key, version_id)
+            self._emit(task, "failed", 1.0, cluster_key, version_id, status_callback)
         with self._manifest_lock:
             manifest.append_version(task.line.id, version)
         if version.status == "completed":
-            self._emit(task, "completed", 1.0, cluster_key, version_id)
+            self._emit(task, "completed", 1.0, cluster_key, version_id, status_callback)
 
     def _resource_semaphore(self, resource_group: str, capacity: int) -> threading.Semaphore:
         with self._resource_guard:
@@ -217,9 +228,11 @@ class ServiceGenerationQueue:
         progress: float,
         cluster_key: str | None,
         version_id: str | None,
+        status_callback: StatusCallback | None = None,
     ) -> None:
-        if self.status_callback:
-            self.status_callback(task, status, progress, cluster_key, version_id)
+        callback = status_callback or self.status_callback
+        if callback:
+            callback(task, status, progress, cluster_key, version_id)
 
 
 def build_cluster_key(task: GenerationTask, route: ServiceRoute) -> str:
@@ -326,10 +339,6 @@ class GenerationJobManager:
             return job
 
     def _run_job(self, job_id: str, tasks: list[GenerationTask]) -> None:
-        previous_callback = self.queue.status_callback
-        self.queue.status_callback = lambda task, status, progress, cluster_key, version_id: self._update_item(
-            job_id, task, status, progress, cluster_key, version_id
-        )
         try:
             with self._lock:
                 job = self._jobs[job_id]
@@ -340,7 +349,14 @@ class GenerationJobManager:
             manifest = self.store.load_manifest(self.get(job_id).project_id)
             output_dir = self.store.project_dir(self.get(job_id).project_id) / "audio"
             runnable_tasks = self._runnable_tasks(job_id, tasks)
-            self.queue.run(runnable_tasks, manifest, output_dir=output_dir)
+            self.queue.run(
+                runnable_tasks,
+                manifest,
+                output_dir=output_dir,
+                status_callback=lambda task, status, progress, cluster_key, version_id: self._update_item(
+                    job_id, task, status, progress, cluster_key, version_id
+                ),
+            )
             self.store.save_manifest(manifest)
             self._finish_job(job_id)
         except Exception as exc:
@@ -349,8 +365,6 @@ class GenerationJobManager:
                 job.status = "failed"
                 job.error = str(exc)
                 job.updated_at = datetime.now(timezone.utc)
-        finally:
-            self.queue.status_callback = previous_callback
 
     def _runnable_tasks(self, job_id: str, tasks: list[GenerationTask]) -> list[GenerationTask]:
         with self._lock:

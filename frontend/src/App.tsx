@@ -61,6 +61,8 @@ import {
   uploadProjectReferenceAudio
 } from "./api";
 import { defaultLanguage, languageOptions, nextLanguage, normalizeLanguage } from "./i18n";
+import { WaveformPlayer } from "./components/WaveformPlayer";
+import { groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
 import { ensureProjectCharacters, freezeProjectCharacterLocally, projectCharacterRows, resolveProjectCharacters } from "./lib/projectCharacters";
 import { buildGenerationTask, lineBinding, lineEngine, lineProfile, lineServiceId } from "./lib/routing";
 import { parserProviderKeyState, toParserProviderSavePayload } from "./lib/parserConfig";
@@ -85,6 +87,7 @@ import type {
   VoiceProfile,
   WorkerHealth,
   GenerationJob,
+  GenerationVersion,
   GenerationTask,
   ProviderType,
   QueueStatus
@@ -112,6 +115,9 @@ export default function App() {
   const [voiceCandidates, setVoiceCandidates] = useState<VoiceCandidates | null>(null);
   const [referenceGroups, setReferenceGroups] = useState<ReferenceAudioGroup[]>([]);
   const [activeLineId, setActiveLineId] = useState(project.lines[1]?.id ?? project.lines[0]?.id ?? "");
+  const [expandedLineId, setExpandedLineId] = useState<string | null>(null);
+  const [selectedHistoryVersions, setSelectedHistoryVersions] = useState<Record<string, string>>({});
+  const [versionDrafts, setVersionDrafts] = useState<Record<string, InspectorVersionDraft & { version_id: string }>>({});
   const [selectedLineIds, setSelectedLineIds] = useState<string[]>([]);
   const [scriptInput, setScriptInput] = useState(() => projectToScriptSourceText(initialProject, initialCharacters));
   const [scriptSourceMode, setScriptSourceMode] = useState<ScriptSourceMode>("project");
@@ -171,6 +177,9 @@ export default function App() {
       .then((payload) => {
         setProject(payload);
         setActiveLineId(payload.lines[0]?.id ?? "");
+        setExpandedLineId(null);
+        setSelectedHistoryVersions({});
+        setVersionDrafts({});
         setIsProjectLoaded(true);
         return fetchProjectCharacters(currentProjectId)
           .then((projectCharactersPayload) => {
@@ -181,6 +190,9 @@ export default function App() {
       .catch(() => {
         setProject(initialProject);
         setActiveLineId(initialProject.lines[0]?.id ?? "");
+        setExpandedLineId(null);
+        setSelectedHistoryVersions({});
+        setVersionDrafts({});
         setScriptSourceMode("project");
         setDraft(null);
         setIsProjectLoaded(true);
@@ -228,14 +240,20 @@ export default function App() {
     return roleLibraryCandidates.filter((candidate) => `${candidate.name} ${candidate.id} ${(candidate.aliases ?? []).join(" ")}`.toLocaleLowerCase().includes(query));
   }, [roleLibraryCandidates, roleLibrarySearch]);
   const activeLine = useMemo(() => project.lines.find((line) => line.id === activeLineId) ?? project.lines[0], [activeLineId, project.lines]);
+  const activeVersions = useMemo(() => (activeLine ? manifest.lines[activeLine.id]?.versions ?? [] : []), [activeLine, manifest.lines]);
+  const selectedHistoryVersion = useMemo(
+    () => activeVersions.find((version) => version.version_id === selectedHistoryVersions[activeLine?.id ?? ""]),
+    [activeLine?.id, activeVersions, selectedHistoryVersions]
+  );
+  const activeVersionDraft = activeLine ? versionDrafts[activeLine.id] : undefined;
   const activeSummary = useMemo(() => summarizeLineHistory(activeLine ? manifest.lines[activeLine.id] : undefined), [activeLine, manifest]);
   const activeBindings = useMemo(() => (activeLine ? bindingsForLine(activeLine, resolvedCharacters) : []), [activeLine, resolvedCharacters]);
   const activeBinding = useMemo(() => (activeLine ? lineBinding(activeLine, resolvedCharacters) : undefined), [activeLine, resolvedCharacters]);
   const activeProfiles = useMemo(() => (activeLine ? profilesForLine(activeLine, resolvedCharacters) : []), [activeLine, resolvedCharacters]);
   const expandedProjectCharacter = useMemo(() => projectCharacters.find((character) => character.project_character_id === expandedCharacterId), [expandedCharacterId, projectCharacters]);
   const expandedCharacter = useMemo(() => resolvedCharacters.find((character) => character.id === expandedCharacterId), [resolvedCharacters, expandedCharacterId]);
-  const activeProvider: ProviderType = activeLine ? activeBinding?.provider_type ?? providerFromEngine(activeLine.engine_override) ?? "indextts" : "gpt-sovits";
-  const activeBindingConfig = useMemo(() => activeBinding?.config ?? {}, [activeBinding]);
+  const activeProvider: ProviderType = activeLine ? activeVersionDraft?.provider_type ?? activeBinding?.provider_type ?? providerFromEngine(activeLine.engine_override) ?? "indextts" : "gpt-sovits";
+  const activeBindingConfig = useMemo(() => activeVersionDraft?.parameters ?? activeBinding?.config ?? {}, [activeBinding, activeVersionDraft]);
   const candidateReferenceGroups = useMemo(
     () => prioritizedReferenceGroups(voiceCandidates?.reference_audio.groups?.length ? voiceCandidates.reference_audio.groups : referenceGroups, activeLine, resolvedCharacters),
     [activeLine, referenceGroups, resolvedCharacters, voiceCandidates]
@@ -518,6 +536,9 @@ export default function App() {
     if (projectId === currentProjectId) return;
     setCurrentProjectId(projectId);
     setSelectedLineIds([]);
+    setExpandedLineId(null);
+    setSelectedHistoryVersions({});
+    setVersionDrafts({});
     setDraft(null);
     setIsProjectMenuOpen(false);
     setNotice(t("app.ready"));
@@ -549,13 +570,74 @@ export default function App() {
   }
 
   function playLine(lineId: string) {
-    const latest = manifest.lines[lineId]?.versions.filter((version) => version.status === "completed" && version.audio_path).at(-1);
+    const latest = newestPlayableVersion(manifest.lines[lineId]?.versions ?? []);
     if (!latest?.audio_path) {
       setNotice(t("empty.noPlayableVersion"));
       return;
     }
     const audio = new Audio(`/api/audio?path=${encodeURIComponent(latest.audio_path)}`);
     void audio.play();
+  }
+
+  function focusLine(lineId: string) {
+    setActiveLineId(lineId);
+    setExpandedLineId((current) => (current === lineId ? null : lineId));
+  }
+
+  function selectHistoryVersion(lineId: string, version: GenerationVersion) {
+    setActiveLineId(lineId);
+    setExpandedLineId(lineId);
+    setSelectedHistoryVersions((current) => ({ ...current, [lineId]: version.version_id }));
+    setVersionDrafts((current) => ({
+      ...current,
+      [lineId]: { ...versionToInspectorDraft(version), version_id: version.version_id }
+    }));
+  }
+
+  function clearSelectedHistoryVersion(lineId: string) {
+    setSelectedHistoryVersions((current) => {
+      const next = { ...current };
+      delete next[lineId];
+      return next;
+    });
+    setVersionDrafts((current) => {
+      const next = { ...current };
+      delete next[lineId];
+      return next;
+    });
+  }
+
+  function updateActiveVersionDraft(patch: Partial<InspectorVersionDraft>) {
+    if (!activeLine || !activeVersionDraft) return;
+    setVersionDrafts((current) => ({
+      ...current,
+      [activeLine.id]: { ...activeVersionDraft, ...patch }
+    }));
+  }
+
+  async function runInspectorGeneration() {
+    if (!activeLine) return;
+    if (!activeVersionDraft) {
+      await runQueue([activeLine]);
+      return;
+    }
+    const provider = activeVersionDraft.provider_type ?? activeProvider;
+    const lineFromDraft: ScriptLine = {
+      ...activeLine,
+      engine_override: engineFromProvider(provider),
+      profile_override: activeVersionDraft.profile,
+      binding_override: null,
+      service_override: activeVersionDraft.service_id ?? null,
+      temporary_binding: {
+        binding_id: activeVersionDraft.binding_id ?? `${activeLine.id}-${provider}-history-draft`,
+        provider_type: provider,
+        service_id: activeVersionDraft.service_id,
+        fallback_services: [],
+        capabilities: defaultCapabilitiesForProvider(provider),
+        config: activeVersionDraft.parameters
+      }
+    };
+    await runQueue([lineFromDraft]);
   }
 
   function toggleVisibleSelection() {
@@ -1114,7 +1196,7 @@ export default function App() {
                       <span className="role-avatar" aria-hidden="true"><UserRound size={13} /></span>
                       <span className="role-chip-text">
                         <strong>{role.name}</strong>
-                        <small>{t("characters.lines", { count: role.lineCount })} · {t(`characters.${role.mode}`)}</small>
+                        <small>{role.lineCount}</small>
                       </span>
                     </button>
                   );
@@ -1193,18 +1275,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="line-table">
-              <div className="table-head">
-                <button className="select-all" onClick={toggleVisibleSelection}>{t("table.select")}</button>
-                <span>{t("table.line")}</span>
-                <span>{t("table.character")}</span>
-                <span>{t("table.note")}</span>
-                <span>{t("table.provider")}</span>
-                <span>{t("table.binding")}</span>
-                <span>{t("table.service")}</span>
-                <span>{t("table.status")}</span>
-                <span>{t("table.actions")}</span>
-              </div>
+            <div className="line-table line-card-list">
               {filteredLines.map((line) => {
                 const summary = summarizeLineHistory(manifest.lines[line.id]);
                 const queueItem = activeJob?.items.find((item) => item.line_id === line.id);
@@ -1213,31 +1284,51 @@ export default function App() {
                 const selected = selectedLineIds.includes(line.id);
                 const rowBinding = lineBinding(line, resolvedCharacters);
                 const canGenerateLine = Boolean(rowBinding);
+                const historyVersions = manifest.lines[line.id]?.versions ?? [];
+                const expanded = expandedLineId === line.id;
                 return (
-                  <div
-                    className={`line-row ${activeLineId === line.id ? "active" : ""}`}
+                  <article
+                    className={`line-row line-card ${activeLineId === line.id ? "active" : ""} ${expanded ? "expanded" : ""}`}
                     data-queue-state={queueItem?.status ?? summary.tone}
                     key={line.id}
-                    onClick={() => setActiveLineId(line.id)}
+                    onClick={() => focusLine(line.id)}
                   >
-                    <label className="line-check" onClick={(event) => event.stopPropagation()}>
-                      <input type="checkbox" checked={selected} onChange={() => setSelectedLineIds((current) => toggleLineSelection(current, line.id))} />
-                    </label>
-                    <span className="line-id">{line.id}</span>
-                    <span>{characterName(resolvedCharacters, line.character_id)}</span>
-                    <span className="muted" title={line.note}>{line.note || "-"}</span>
-                    <span>{rowBinding?.provider_type ?? t("status.unassigned")}</span>
-                    <span className="muted" title={rowBinding?.binding_id ?? t("status.unassigned")}>{rowBinding?.binding_id ?? t("status.unassigned")}</span>
-                    <span className="muted">{rowBinding ? lineServiceId(line, resolvedCharacters) ?? t("status.auto") : t("status.needsSetup")}</span>
-                    <span><StatusPill tone={visibleTone} label={visibleLabel} /></span>
-                    <span className="row-actions">
-                      <button className="icon-button tiny" onClick={(event) => { event.stopPropagation(); playLine(line.id); }} title={t("actions.playLatest")}><Play size={14} /></button>
-                      <button className="icon-button tiny" disabled={!canGenerateLine} onClick={(event) => { event.stopPropagation(); void runQueue([line]); }} title={canGenerateLine ? t("actions.regenerate") : t("inspector.needsTemporaryBinding")}><RefreshCw size={14} /></button>
-                      <History size={14} />
-                    </span>
+                    <div className="line-primary-row">
+                      <label className="line-check" onClick={(event) => event.stopPropagation()}>
+                        <input type="checkbox" checked={selected} onChange={() => setSelectedLineIds((current) => toggleLineSelection(current, line.id))} />
+                      </label>
+                      <div className="line-speaker">
+                        <span className="role-avatar" aria-hidden="true"><UserRound size={13} /></span>
+                        <strong>{characterName(resolvedCharacters, line.character_id)}</strong>
+                        <small>{line.id}</small>
+                      </div>
+                      <div className="line-copy">
+                        <span className="line-note" title={line.note}>{line.note || t("status.unset")}</span>
+                        <p className="line-dialogue">{line.text}</p>
+                      </div>
+                      <StatusPill tone={visibleTone} label={visibleLabel} />
+                    </div>
+                    <div className="line-secondary-row">
+                      <span className="line-meta-chip">{rowBinding?.provider_type ?? t("status.unassigned")}</span>
+                      <span className="line-meta-chip" title={rowBinding?.binding_id ?? t("status.unassigned")}>{rowBinding?.binding_id ?? t("status.unassigned")}</span>
+                      <span className="line-meta-chip">{rowBinding ? lineServiceId(line, resolvedCharacters) ?? t("status.auto") : t("status.needsSetup")}</span>
+                      <span className="line-meta-chip">{historyVersions.length > 0 ? t("history.versionCount", { count: historyVersions.length }) : t("inspector.noVersions")}</span>
+                      <span className="row-actions">
+                        <button className="icon-button tiny" onClick={(event) => { event.stopPropagation(); playLine(line.id); }} title={t("actions.playLatest")}><Play size={14} /></button>
+                        <button className="icon-button tiny" disabled={!canGenerateLine} onClick={(event) => { event.stopPropagation(); void runQueue([line]); }} title={canGenerateLine ? t("actions.regenerate") : t("inspector.needsTemporaryBinding")}><RefreshCw size={14} /></button>
+                        <button className="icon-button tiny" onClick={(event) => { event.stopPropagation(); focusLine(line.id); }} title={t("history.toggle")}><History size={14} /></button>
+                      </span>
+                    </div>
                     {queueItem && <div className="line-progress"><span style={{ width: `${Math.round(queueItem.progress * 100)}%` }} /></div>}
-                    <p className="line-text">{line.text}</p>
-                  </div>
+                    {expanded && (
+                      <LineHistoryPanel
+                        versions={historyVersions}
+                        selectedVersionId={selectedHistoryVersions[line.id]}
+                        onSelect={(version) => selectHistoryVersion(line.id, version)}
+                        t={t}
+                      />
+                    )}
+                  </article>
                 );
               })}
               {filteredLines.length === 0 && <div className="empty-row table-empty">{t("empty.noLines")}</div>}
@@ -1255,10 +1346,35 @@ export default function App() {
                   <StatusPill tone={activeSummary.tone} label={summaryLabel(activeSummary, t)} />
                 </div>
                 <p className="dialogue">{activeLine.text}</p>
+                {selectedHistoryVersion && activeVersionDraft && (
+                  <div className="version-context-banner">
+                    <div>
+                      <span>{t("inspector.editingVersion")}</span>
+                      <strong>{selectedHistoryVersion.version_id} · {selectedHistoryVersion.provider_type ?? selectedHistoryVersion.engine}</strong>
+                    </div>
+                    <button className="secondary-button compact-button" onClick={() => clearSelectedHistoryVersion(activeLine.id)}>{t("inspector.returnToCurrentBinding")}</button>
+                  </div>
+                )}
+                <div className="inspector-action-row">
+                  <button className="primary-button" onClick={() => void runInspectorGeneration()} disabled={isGenerating || (!activeVersionDraft && !activeBinding)}>
+                    {isGenerating ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
+                    {activeVersionDraft ? t("inspector.generateFromVersion") : t("actions.regenerate")}
+                  </button>
+                </div>
                 <div className="field-grid">
                   <label>
                     <span>{t("inspector.provider")}</span>
-                    <select value={activeProvider} onChange={(event) => setTemporaryBindingProvider(activeLine.id, event.target.value as ProviderType)}>
+                    <select value={activeProvider} onChange={(event) => {
+                      const provider = event.target.value as ProviderType;
+                      if (activeVersionDraft) {
+                        updateActiveVersionDraft({
+                          provider_type: provider,
+                          parameters: { ...defaultTemporaryConfig(provider, activeLine), ...activeVersionDraft.parameters }
+                        });
+                      } else {
+                        setTemporaryBindingProvider(activeLine.id, provider);
+                      }
+                    }}>
                       <option value="gpt-sovits">GPT-SoVITS</option>
                       <option value="indextts">IndexTTS</option>
                       <option value="openai">OpenAI</option>
@@ -1269,7 +1385,13 @@ export default function App() {
                   </label>
                   <label>
                     <span>{t("inspector.profile")}</span>
-                    <select value={lineProfile(activeLine, resolvedCharacters)} onChange={(event) => updateLine(activeLine.id, { profile_override: event.target.value, binding_override: null, service_override: null, engine_override: null })}>
+                    <select value={activeVersionDraft?.profile ?? lineProfile(activeLine, resolvedCharacters)} onChange={(event) => {
+                      if (activeVersionDraft) {
+                        updateActiveVersionDraft({ profile: event.target.value });
+                      } else {
+                        updateLine(activeLine.id, { profile_override: event.target.value, binding_override: null, service_override: null, engine_override: null });
+                      }
+                    }}>
                       {activeLine.temporary_binding && <option value={activeLine.temporary_binding.binding_id}>{t("inspector.temporaryBinding")}</option>}
                       {activeProfiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}
                       {activeProfiles.length === 0 && <option value={lineProfile(activeLine, resolvedCharacters)}>{lineProfile(activeLine, resolvedCharacters) || t("inspector.noProfile")}</option>}
@@ -1277,7 +1399,14 @@ export default function App() {
                   </label>
                   <label className="wide">
                     <span>{t("inspector.voiceBinding")}</span>
-                    <select value={activeLine.binding_override ?? ""} onChange={(event) => updateLine(activeLine.id, { binding_override: event.target.value || null, service_override: null })}>
+                    <select value={activeVersionDraft?.binding_id ?? activeLine.binding_override ?? ""} onChange={(event) => {
+                      if (activeVersionDraft) {
+                        updateActiveVersionDraft({ binding_id: event.target.value || null });
+                      } else {
+                        updateLine(activeLine.id, { binding_override: event.target.value || null, service_override: null });
+                      }
+                    }}>
+                      {activeVersionDraft && <option value={activeVersionDraft.binding_id ?? ""}>{t("inspector.versionDraft")} · {activeVersionDraft.binding_id ?? selectedHistoryVersion?.version_id}</option>}
                       {activeLine.temporary_binding && <option value="">{t("inspector.temporaryBinding")} · {activeLine.temporary_binding.provider_type}</option>}
                       {!activeLine.temporary_binding && <option value="">{t("inspector.profileDefault")}{activeBinding ? ` · ${activeBinding.provider_type}` : ""}</option>}
                       {activeBindings.map((binding) => <option value={binding.binding_id} key={binding.binding_id}>{binding.provider_type} · {binding.binding_id}</option>)}
@@ -1285,7 +1414,13 @@ export default function App() {
                   </label>
                   <label className="wide">
                     <span>{t("inspector.service")}</span>
-                    <select value={lineServiceId(activeLine, resolvedCharacters) ?? ""} onChange={(event) => updateLineService(activeLine.id, event.target.value || null)}>
+                    <select value={activeVersionDraft?.service_id ?? lineServiceId(activeLine, resolvedCharacters) ?? ""} onChange={(event) => {
+                      if (activeVersionDraft) {
+                        updateActiveVersionDraft({ service_id: event.target.value || null });
+                      } else {
+                        updateLineService(activeLine.id, event.target.value || null);
+                      }
+                    }}>
                       <option value="">{t("inspector.autoRoute")}</option>
                       {servicesForProvider(visibleServices, activeProvider).map((service) => <option value={service.service_id} key={service.service_id ?? service.engine}>{service.display_name ?? service.service_id} · {service.resource_group ?? t("status.resource")}</option>)}
                     </select>
@@ -1313,7 +1448,7 @@ export default function App() {
                   <div className="resource-context">
                     <div>
                       <span>{t("inspector.bindingConfig")}</span>
-                      <strong>{activeBinding?.binding_id ?? lineProfile(activeLine, resolvedCharacters)}</strong>
+                      <strong>{activeVersionDraft?.binding_id ?? activeBinding?.binding_id ?? lineProfile(activeLine, resolvedCharacters)}</strong>
                     </div>
                     <div>
                       <span>{t("inspector.provider")}</span>
@@ -1425,16 +1560,16 @@ export default function App() {
 
                 <div className="version-list">
                   <div className="panel-title"><History size={15} /> {t("inspector.versions")}</div>
-                  {(manifest.lines[activeLine.id]?.versions ?? []).map((version) => (
-                    <div className="version-row" key={version.version_id}>
+                  {activeVersions.map((version) => (
+                    <button className={`version-row ${selectedHistoryVersion?.version_id === version.version_id ? "active" : ""}`} key={version.version_id} onClick={() => selectHistoryVersion(activeLine.id, version)}>
                       {version.status === "completed" ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
                       <strong>{version.version_id}</strong>
                       <span>{version.provider_type ?? version.engine}</span>
                       <span>{version.binding_id ?? version.service_id ?? version.profile}</span>
                       {version.error && <small>{version.error}</small>}
-                    </div>
+                    </button>
                   ))}
-                  {!manifest.lines[activeLine.id] && <div className="empty-row">{t("inspector.noVersions")}</div>}
+                  {activeVersions.length === 0 && <div className="empty-row">{t("inspector.noVersions")}</div>}
                 </div>
               </>
             )}
@@ -1469,6 +1604,10 @@ export default function App() {
 
   function updateActiveBindingConfig(patch: Record<string, unknown>) {
     if (!activeLine) return;
+    if (activeVersionDraft) {
+      updateActiveVersionDraft({ parameters: { ...activeVersionDraft.parameters, ...patch } });
+      return;
+    }
     if (activeLine.temporary_binding || !activeBinding) {
       upsertTemporaryBinding(activeLine.id, activeProvider, { configPatch: patch });
       return;
@@ -1766,6 +1905,11 @@ function buildRunnableTasks(lines: ScriptLine[], characters: Character[]): { tas
 function providerFromEngine(engine: ScriptLine["engine_override"]): ProviderType | null {
   if (engine === "gpt-sovits" || engine === "indextts" || engine === "vibevoice") return engine;
   return null;
+}
+
+function engineFromProvider(provider: ProviderType): ScriptLine["engine_override"] {
+  if (provider === "gpt-sovits" || provider === "indextts" || provider === "vibevoice") return provider;
+  return "commercial";
 }
 
 function defaultServiceForProvider(services: WorkerHealth[], provider: ProviderType): string | null {
@@ -2134,6 +2278,53 @@ function queueStatusTone(status: string): "idle" | "queued" | "running" | "compl
   if (status === "queued") return "queued";
   if (status === "loading" || status === "finalizing" || status === "running") return "running";
   return "idle";
+}
+
+function LineHistoryPanel({
+  versions,
+  selectedVersionId,
+  onSelect,
+  t
+}: {
+  versions: GenerationVersion[];
+  selectedVersionId?: string;
+  onSelect: (version: GenerationVersion) => void;
+  t: Translate;
+}) {
+  const groups = groupGenerationVersions(versions);
+  if (groups.length === 0) {
+    return <div className="line-history-panel empty">{t("inspector.noVersions")}</div>;
+  }
+  return (
+    <div className="line-history-panel" onClick={(event) => event.stopPropagation()}>
+      {groups.map((group) => (
+        <section className="history-batch" key={group.groupId}>
+          <div className="history-batch-head">
+            <strong>{t("history.batch")} {group.label}</strong>
+            <StatusPill tone={queueStatusTone(group.latestStatus)} label={statusText(group.latestStatus, t)} />
+          </div>
+          {group.versions.map((version) => (
+            <div className={`history-version ${selectedVersionId === version.version_id ? "active" : ""}`} key={version.version_id}>
+              <button className="history-version-head" type="button" onClick={() => onSelect(version)}>
+                {version.status === "completed" ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
+                <strong>{version.version_id}</strong>
+                <span>{version.provider_type ?? version.engine}</span>
+                <span>{version.binding_id ?? version.service_id ?? version.profile}</span>
+                <small>{new Date(version.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small>
+              </button>
+              {version.status === "completed" && version.audio_path ? (
+                <WaveformPlayer audioPath={version.audio_path} label={`${t("actions.playLatest")} ${version.version_id}`} />
+              ) : version.error ? (
+                <p className="history-version-error">{version.error}</p>
+              ) : (
+                <p className="history-version-empty">{statusText(version.status, t)}</p>
+              )}
+            </div>
+          ))}
+        </section>
+      ))}
+    </div>
+  );
 }
 
 function StatusPill({ tone, label }: { tone: "idle" | "queued" | "running" | "completed" | "failed"; label: string }) {

@@ -183,6 +183,53 @@ def test_service_queue_runs_different_resource_groups_in_parallel(tmp_path: Path
     assert manifest.lines["l2"].versions[0].status == "completed"
 
 
+def test_service_queue_keeps_concurrent_run_callbacks_isolated(tmp_path: Path) -> None:
+    release = threading.Event()
+    first = BlockingServiceClient(endpoint("first-gpt", EngineName.GPT_SOVITS, "gpu-a"), release)
+    second = BlockingServiceClient(endpoint("second-index", EngineName.INDEX_TTS, "gpu-b"), release)
+    queue = ServiceGenerationQueue(StaticRouter({"first-gpt": first, "second-index": second}))
+    first_events: list[str] = []
+    second_events: list[str] = []
+    errors: list[BaseException] = []
+
+    first_worker = threading.Thread(
+        target=lambda: _run_queue_with_callback(
+            queue,
+            [task("first-line", EngineName.GPT_SOVITS, "p1", "first-gpt")],
+            GenerationManifest(project_id="first"),
+            tmp_path / "first",
+            first_events,
+            errors,
+        ),
+        daemon=True,
+    )
+    second_worker = threading.Thread(
+        target=lambda: _run_queue_with_callback(
+            queue,
+            [task("second-line", EngineName.INDEX_TTS, "p2", "second-index")],
+            GenerationManifest(project_id="second"),
+            tmp_path / "second",
+            second_events,
+            errors,
+        ),
+        daemon=True,
+    )
+
+    first_worker.start()
+    assert first.started.wait(1), "first job did not start"
+    second_worker.start()
+    assert second.started.wait(1), "second job did not start"
+    release.set()
+    first_worker.join(2)
+    second_worker.join(2)
+
+    assert errors == []
+    assert first_events
+    assert second_events
+    assert all(event.startswith("first-line:") for event in first_events)
+    assert all(event.startswith("second-line:") for event in second_events)
+
+
 def _run_queue(queue: ServiceGenerationQueue, manifest: GenerationManifest, output_dir: Path, errors: list[BaseException]) -> None:
     try:
         queue.run(
@@ -192,6 +239,25 @@ def _run_queue(queue: ServiceGenerationQueue, manifest: GenerationManifest, outp
             ],
             manifest,
             output_dir=output_dir,
+        )
+    except BaseException as exc:
+        errors.append(exc)
+
+
+def _run_queue_with_callback(
+    queue: ServiceGenerationQueue,
+    tasks: list[GenerationTask],
+    manifest: GenerationManifest,
+    output_dir: Path,
+    events: list[str],
+    errors: list[BaseException],
+) -> None:
+    try:
+        queue.run(
+            tasks,
+            manifest,
+            output_dir=output_dir,
+            status_callback=lambda task, status, _progress, _cluster_key, _version_id: events.append(f"{task.line.id}:{status}"),
         )
     except BaseException as exc:
         errors.append(exc)

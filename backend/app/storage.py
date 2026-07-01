@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import TypeVar
 
@@ -17,7 +18,7 @@ class ProjectStore:
         self.root = root
 
     def project_dir(self, project_id: str) -> Path:
-        return self.root / project_id
+        return self.root / self._safe_project_id(project_id)
 
     def project_path(self, project_id: str) -> Path:
         return self.project_dir(project_id) / "project.json"
@@ -77,7 +78,9 @@ class ProjectStore:
 
     def _write_json(self, path: Path, payload: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
 
     def _read_model(self, path: Path, model_type: type[T]) -> T:
         return model_type.model_validate(self._read_structured(path))
@@ -87,3 +90,13 @@ class ProjectStore:
         if path.suffix.lower() in {".yaml", ".yml"}:
             return yaml.safe_load(text)
         return json.loads(text)
+
+    def _safe_project_id(self, project_id: str) -> str:
+        value = project_id.strip()
+        if not value:
+            raise ValueError("project id is required")
+        if value in {".", ".."} or any(separator in value for separator in ("/", "\\")):
+            raise ValueError("project id must be a single path segment")
+        if ":" in value or Path(value).is_absolute():
+            raise ValueError("project id must be relative")
+        return value

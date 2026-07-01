@@ -195,6 +195,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       visibleLines: "{{count}} 行",
       selectedLines: "已选 {{count}} 行"
     },
+    history: {
+      batch: "批次",
+      versionCount: "{{count}} 个版本",
+      toggle: "展开历史"
+    },
     actions: {
       playLatest: "试听最新",
       regenerate: "重跑",
@@ -252,7 +257,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       emotionVector: "情绪向量",
       emotionText: "情绪文本",
       emotionTextPlaceholder: "例如：焦急、惊恐、压低声音",
-      advancedParams: "高级参数"
+      advancedParams: "高级参数",
+      editingVersion: "基于历史版本调整",
+      returnToCurrentBinding: "返回当前绑定",
+      generateFromVersion: "生成新版本",
+      versionDraft: "版本参数"
     },
     validation: {
       title: "真实 TTS 验收",
@@ -531,6 +540,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       visibleLines: "{{count}} lines",
       selectedLines: "{{count}} selected"
     },
+    history: {
+      batch: "Batch",
+      versionCount: "{{count}} versions",
+      toggle: "Expand history"
+    },
     actions: {
       playLatest: "Play latest",
       regenerate: "Regenerate",
@@ -588,7 +602,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       emotionVector: "Emotion vector",
       emotionText: "Emotion text",
       emotionTextPlaceholder: "For example: anxious, frightened, low voice",
-      advancedParams: "Advanced params"
+      advancedParams: "Advanced params",
+      editingVersion: "Editing from history version",
+      returnToCurrentBinding: "Return to current binding",
+      generateFromVersion: "Generate new version",
+      versionDraft: "Version params"
     },
     validation: {
       title: "Real TTS Validation",
