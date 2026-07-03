@@ -78,7 +78,8 @@ def create_app(
     env_file = Path(env_path) if env_path else project_root / ".env.local"
     load_dotenv(env_file, override=False)
     parser = _build_parser(parser_config_file)
-    service_registry = _load_service_registry(Path(services_path) if services_path else store.root / "services.json")
+    services_file, writable_services_file = _resolve_service_settings_paths(store.root, Path(services_path) if services_path else None)
+    service_registry = _load_service_registry(services_file)
     service_router = ServiceRouter(service_registry)
     queue = ServiceGenerationQueue(service_router)
     job_manager = GenerationJobManager(queue, store)
@@ -93,7 +94,8 @@ def create_app(
     app.state.job_manager = job_manager
     app.state.reference_audio_root = ref_root
     app.state.supervisor = supervisor
-    app.state.services_path = Path(services_path) if services_path else store.root / "services.json"
+    app.state.services_path = services_file
+    app.state.writable_services_path = writable_services_file
     app.state.parser_config_path = parser_config_file
     app.state.env_path = env_file
 
@@ -116,7 +118,7 @@ def create_app(
 
     @app.put("/api/settings/services")
     def put_service_settings(request: ServiceSettingsUpdate) -> dict[str, Any]:
-        registry = save_service_settings(app.state.services_path, env_file, request)
+        registry = save_service_settings(app.state.writable_services_path, env_file, request)
         if _service_mode() == "mock":
             registry = _mocked_registry(registry)
         router = ServiceRouter(registry)
@@ -125,6 +127,7 @@ def create_app(
         app.state.service_router = router
         app.state.queue = queue
         app.state.job_manager = GenerationJobManager(queue, store)
+        app.state.services_path = app.state.writable_services_path
         return public_service_settings(registry, env_file)
 
     @app.post("/api/services/{service_id}/test")
@@ -443,6 +446,37 @@ def create_app(
     def get_manifest(project_id: str) -> dict[str, Any]:
         return store.load_manifest(project_id).model_dump(mode="json")
 
+    @app.delete("/api/projects/{project_id}/manifest/lines/{line_key}/versions/{version_id}")
+    def delete_generation_version(project_id: str, line_key: str, version_id: str) -> dict[str, Any]:
+        manifest = store.load_manifest(project_id)
+        resolved_line_key, history = _resolve_manifest_history_for_version(manifest, line_key, version_id)
+        if history is None:
+            raise HTTPException(status_code=404, detail="line history not found")
+        target = next((version for version in history.versions if version.version_id == version_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="generation version not found")
+        history.versions = [version for version in history.versions if version.version_id != version_id]
+        audio_deleted = False
+        warning: str | None = None
+        if target.audio_path:
+            resolved = _resolve_project_audio_file(store.project_dir(project_id) / "audio", Path(app.state.store.root), target.audio_path)
+            if resolved is None:
+                warning = "audio path is outside project audio directory"
+            elif resolved.exists():
+                resolved.unlink()
+                audio_deleted = True
+            else:
+                warning = "audio file not found"
+        store.save_manifest(manifest)
+        return {
+            "status": "deleted",
+            "project_id": project_id,
+            "line_key": resolved_line_key,
+            "version_id": version_id,
+            "audio_deleted": audio_deleted,
+            "warning": warning,
+        }
+
     @app.post("/api/generate")
     def generate(request: GenerateRequest) -> dict[str, Any]:
         try:
@@ -510,6 +544,18 @@ def create_app(
     return app
 
 
+def _resolve_manifest_history_for_version(manifest: GenerationManifest, line_key: str, version_id: str) -> tuple[str, Any | None]:
+    history = manifest.lines.get(line_key)
+    if history is not None:
+        return line_key, history
+    if ":" in line_key:
+        legacy_key = line_key.rsplit(":", 1)[-1]
+        legacy_history = manifest.lines.get(legacy_key)
+        if legacy_history is not None and any(version.version_id == version_id for version in legacy_history.versions):
+            return legacy_key, legacy_history
+    return line_key, None
+
+
 def _build_parser(config_path: Path | None = None) -> MultiProviderParser:
     providers: list[OpenAICompatibleProvider] = []
     if config_path is not None:
@@ -528,6 +574,22 @@ def _load_service_registry(path: Path) -> ServiceRegistry:
     if _service_mode() == "mock":
         return _mocked_registry(registry)
     return registry
+
+
+def _resolve_service_settings_paths(data_root: Path, explicit_path: Path | None) -> tuple[Path, Path]:
+    if explicit_path is not None:
+        return explicit_path, explicit_path
+    env_path = os.environ.get("TTS_MORE_SERVICES_PATH")
+    if env_path:
+        resolved_env_path = Path(env_path)
+        return resolved_env_path, resolved_env_path
+    local_path = data_root / "local" / "services.json"
+    committed_path = data_root / "services.json"
+    template_path = data_root / "templates" / "services.example.json"
+    for candidate in (local_path, committed_path, template_path):
+        if candidate.exists():
+            return candidate, local_path
+    return local_path, local_path
 
 
 def _mocked_registry(registry: ServiceRegistry) -> ServiceRegistry:
@@ -686,6 +748,20 @@ def _enrich_tasks_for_project(store: ProjectStore, project_id: str, tasks: list[
             )
         )
     return output
+
+
+def _resolve_project_audio_file(project_audio_root: Path, data_root: Path, raw_path: str) -> Path | None:
+    root = project_audio_root.resolve()
+    requested = Path(raw_path)
+    candidates = [requested] if requested.is_absolute() else [Path.cwd() / requested, data_root / requested, root / requested]
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return resolved
+    return None
 
 
 def _resolve_data_audio_path(data_root: Path, raw_path: str) -> Path:
