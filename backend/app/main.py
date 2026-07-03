@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -14,14 +18,14 @@ from pydantic import BaseModel
 
 from app.adapter_factory import build_adapters
 from app.hardware import collect_local_hardware_status
-from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ProjectCharacter, ProjectCharacterMode, ScriptProject
+from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptLine, ScriptProject, ScriptRevision
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, RuleBasedParser
-from app.parser_config import ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
-from app.queue import GenerationJobManager, ServiceGenerationQueue
-from app.resources import collect_voice_candidates
-from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_logs_index_candidates, scan_role_library_candidates
+from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
+from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
+from app.resources import collect_voice_candidates, scan_reference_audio_groups
+from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
-from app.services import ServiceRegistry, ServiceRouter
+from app.services import ServiceRegistry, ServiceRouter, build_load_signature
 from app.storage import ProjectStore
 from app.supervisor import ServiceSupervisor
 
@@ -29,6 +33,7 @@ DEFAULT_REFERENCE_AUDIO_ROOT = Path("data") / "local" / "reference-audio"
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_ROOT = Path("data") / ".runtime"
 REPO_LOCK_PATH = Path(__file__).resolve().parents[2] / "repo.lock.json"
+AUDIO_UPLOAD_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".webm", ".aac", ".opus"}
 
 load_dotenv(".env.local")
 load_dotenv(".env")
@@ -36,6 +41,10 @@ load_dotenv(".env")
 
 class ParseScriptRequest(BaseModel):
     text: str
+
+
+class ParserProviderTestRequest(BaseModel):
+    provider: ParserProviderUpdate
 
 
 class GenerateRequest(BaseModel):
@@ -55,6 +64,20 @@ class ProjectCharactersUpdate(BaseModel):
     project_characters: list[ProjectCharacter]
 
 
+class ScriptRevisionCreate(BaseModel):
+    source_markdown: str
+    summary: str = ""
+
+
+class ParseRevisionCreate(BaseModel):
+    script_revision_id: str
+
+
+class ActivateRevisionRequest(BaseModel):
+    script_revision_id: str | None = None
+    parse_revision_id: str | None = None
+
+
 def create_app(
     data_root: Path | str = DEFAULT_DATA_ROOT,
     reference_audio_root: Path | str = DEFAULT_REFERENCE_AUDIO_ROOT,
@@ -66,7 +89,7 @@ def create_app(
     app = FastAPI(title="TTS More Orchestrator", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -130,6 +153,22 @@ def create_app(
         app.state.services_path = app.state.writable_services_path
         return public_service_settings(registry, env_file)
 
+    @app.post("/api/settings/services/reload")
+    def reload_service_settings() -> dict[str, Any]:
+        try:
+            if services_path is None:
+                app.state.services_path, app.state.writable_services_path = _resolve_service_settings_paths(store.root, None)
+            registry = _load_service_registry(app.state.services_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"failed to reload services: {exc}") from exc
+        router = ServiceRouter(registry)
+        queue = ServiceGenerationQueue(router)
+        app.state.service_registry = registry
+        app.state.service_router = router
+        app.state.queue = queue
+        app.state.job_manager = GenerationJobManager(queue, store)
+        return public_service_settings(registry, env_file)
+
     @app.post("/api/services/{service_id}/test")
     def test_service(service_id: str) -> dict[str, Any]:
         try:
@@ -150,8 +189,8 @@ def create_app(
     def startup_checks() -> dict[str, Any]:
         resources = collect_voice_candidates(
             reference_audio_root=ref_root,
-            gpt_weights_roots=_configured_weight_roots(store.load_characters(), "gpt_weights_root"),
-            sovits_weights_roots=_configured_weight_roots(store.load_characters(), "sovits_weights_root"),
+            gpt_weights_roots=_configured_weight_roots(store.load_characters(), "gpt_weights_root", app.state.service_registry),
+            sovits_weights_roots=_configured_weight_roots(store.load_characters(), "sovits_weights_root", app.state.service_registry),
             indextts_model_dir=_indextts_model_dir(),
             runtime_checks=_runtime_checks(app.state.service_registry),
             limit=20,
@@ -190,8 +229,8 @@ def create_app(
     def voice_candidates(limit: int = 80) -> dict[str, Any]:
         return collect_voice_candidates(
             reference_audio_root=ref_root,
-            gpt_weights_roots=_configured_weight_roots(store.load_characters(), "gpt_weights_root"),
-            sovits_weights_roots=_configured_weight_roots(store.load_characters(), "sovits_weights_root"),
+            gpt_weights_roots=_configured_weight_roots(store.load_characters(), "gpt_weights_root", app.state.service_registry),
+            sovits_weights_roots=_configured_weight_roots(store.load_characters(), "sovits_weights_root", app.state.service_registry),
             indextts_model_dir=_indextts_model_dir(),
             runtime_checks=_runtime_checks(app.state.service_registry),
             limit=limit,
@@ -200,10 +239,28 @@ def create_app(
     @app.post("/api/services/{service_id}/start")
     def start_service(service_id: str) -> dict[str, Any]:
         try:
-            endpoint = service_registry.get(service_id)
+            endpoint = app.state.service_registry.get(service_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="service not found") from exc
         return supervisor.start(endpoint)
+
+    @app.post("/api/services/{service_id}/start-and-wait")
+    def start_and_wait_service(service_id: str, timeout_seconds: float = 30.0) -> dict[str, Any]:
+        try:
+            endpoint = app.state.service_registry.get(service_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="service not found") from exc
+        started = supervisor.start(endpoint)
+        if started.get("status") == "not manageable":
+            raise HTTPException(status_code=409, detail=started.get("reason", "service is not manageable"))
+        deadline = datetime.now(timezone.utc).timestamp() + max(1.0, min(timeout_seconds, 180.0))
+        last_health: dict[str, Any] = {}
+        while datetime.now(timezone.utc).timestamp() < deadline:
+            last_health = app.state.service_router._service_health(endpoint)
+            if last_health.get("ready"):
+                return {"status": "ready", "service_id": service_id, "start": started, "health": last_health}
+            time.sleep(1.0)
+        return {"status": "timeout", "service_id": service_id, "start": started, "health": last_health}
 
     @app.post("/api/services/{service_id}/stop")
     def stop_service(service_id: str) -> dict[str, Any]:
@@ -212,6 +269,14 @@ def create_app(
     @app.get("/api/services/{service_id}/logs")
     def service_logs(service_id: str, lines: int = 120) -> dict[str, Any]:
         return supervisor.logs(service_id, lines=lines)
+
+    @app.get("/api/services/{service_id}/load-state")
+    def service_load_state(service_id: str) -> dict[str, Any]:
+        try:
+            app.state.service_registry.get(service_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="service not found") from exc
+        return app.state.queue.load_state(service_id)
 
     @app.get("/api/services/{service_id}/gradio/index")
     def service_gradio_index(service_id: str) -> dict[str, Any]:
@@ -252,6 +317,69 @@ def create_app(
         app.state.parser = _build_parser(parser_config_file)
         return public_parser_providers(parser_config_file, env_file)
 
+    @app.post("/api/parser/providers/test")
+    def test_parser_provider(request: ParserProviderTestRequest) -> dict[str, Any]:
+        provider = request.provider
+        if not provider.enabled:
+            return {
+                "ok": False,
+                "state": "disabled",
+                "message": "provider is disabled",
+                "provider": provider.name,
+            }
+        if not provider.base_url.strip() or not provider.model.strip():
+            return {
+                "ok": False,
+                "state": "blocked",
+                "message": "base_url and model are required",
+                "provider": provider.name,
+            }
+        api_key = provider.api_key or os.environ.get(provider.api_key_env)
+        if not api_key:
+            return {
+                "ok": False,
+                "state": "needs_key",
+                "message": f"missing env {provider.api_key_env}",
+                "provider": provider.name,
+            }
+        started = time.time()
+        try:
+            with httpx.Client(timeout=provider.timeout_seconds) as client:
+                response = client.post(
+                    provider.base_url.rstrip("/") + "/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": provider.model,
+                        "messages": [
+                            {"role": "system", "content": "Return a small JSON object."},
+                            {"role": "user", "content": "Return exactly {\"ok\": true}."},
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "max_tokens": 32,
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+                content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return {
+                    "ok": True,
+                    "state": "ready",
+                    "message": "chat completions request succeeded",
+                    "provider": provider.name,
+                    "model": provider.model,
+                    "latency_ms": round((time.time() - started) * 1000),
+                    "content_preview": str(content)[:120],
+                }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "state": "blocked",
+                "message": str(exc),
+                "provider": provider.name,
+                "model": provider.model,
+                "latency_ms": round((time.time() - started) * 1000),
+            }
+
     @app.get("/api/characters")
     def get_characters() -> list[dict[str, Any]]:
         return [character.model_dump(mode="json") for character in store.load_characters()]
@@ -260,6 +388,79 @@ def create_app(
     def put_characters(characters: list[Character]) -> dict[str, str]:
         store.save_characters(characters)
         return {"status": "saved"}
+
+    @app.post("/api/characters/{character_id}/avatar/upload")
+    async def upload_character_avatar(character_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+        suffix = Path(file.filename or "").suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise HTTPException(status_code=400, detail="unsupported avatar image")
+        characters = store.load_characters()
+        character = next((item for item in characters if item.id == character_id), None)
+        if character is None:
+            raise HTTPException(status_code=404, detail="character not found")
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="avatar image is empty")
+
+        output_dir = Path(app.state.store.root) / "character_avatars"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        safe_id = _safe_upload_name(character_id).removesuffix(Path(_safe_upload_name(character_id)).suffix)
+        output_path = output_dir / f"{safe_id}{suffix}"
+        counter = 1
+        while output_path.exists():
+            output_path = output_dir / f"{safe_id}-{counter}{suffix}"
+            counter += 1
+        output_path.write_bytes(content)
+        character.avatar_path = str(output_path)
+        character.updated_at = datetime.now(timezone.utc)
+        store.save_characters(characters)
+        return {"character": character.model_dump(mode="json")}
+
+    @app.post("/api/characters/{character_id}/reference-audio/upload")
+    async def upload_character_reference_audio(character_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
+        suffix = Path(file.filename or "").suffix.lower()
+        if suffix not in AUDIO_UPLOAD_SUFFIXES:
+            raise HTTPException(status_code=400, detail="unsupported audio file")
+        characters = store.load_characters()
+        character = next((item for item in characters if item.id == character_id), None)
+        if character is None:
+            raise HTTPException(status_code=404, detail="character not found")
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="audio file is empty")
+
+        safe_character_id = _safe_upload_name(character_id).removesuffix(Path(_safe_upload_name(character_id)).suffix)
+        output_dir = Path(app.state.store.root) / "character_reference_audio" / safe_character_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / _safe_upload_name(file.filename or f"reference{suffix}")
+        counter = 1
+        while output_path.exists():
+            output_path = output_dir / f"{output_path.stem}-{counter}{suffix}"
+            counter += 1
+        output_path.write_bytes(content)
+
+        sample = ReferenceAudioSample(path=str(output_path), text="", text_source="manual")
+        group_id = "manual-uploads"
+        group = next((item for item in character.reference_audio_groups if item.id == group_id), None)
+        if group is None:
+            character.reference_audio_groups.append(
+                ReferenceAudioGroup(
+                    id=group_id,
+                    name="手动上传",
+                    paths=[str(output_dir)],
+                    copied_paths=[str(output_path)],
+                    samples=[sample],
+                )
+            )
+        else:
+            if str(output_dir) not in group.paths:
+                group.paths.append(str(output_dir))
+            if str(output_path) not in group.copied_paths:
+                group.copied_paths.append(str(output_path))
+            group.samples.append(sample)
+        character.updated_at = datetime.now(timezone.utc)
+        store.save_characters(characters)
+        return {"character": character.model_dump(mode="json"), "sample": sample.model_dump(mode="json")}
 
     @app.get("/api/character-library")
     def character_library() -> dict[str, Any]:
@@ -270,8 +471,12 @@ def create_app(
         return {
             "candidates": scan_role_library_candidates(
                 reference_audio_root=ref_root,
-                gpt_weights_roots=_configured_weight_roots(store.load_characters(), "gpt_weights_root"),
-                sovits_weights_roots=_configured_weight_roots(store.load_characters(), "sovits_weights_root"),
+                gpt_weights_roots=_configured_weight_roots(store.load_characters(), "gpt_weights_root", app.state.service_registry),
+                sovits_weights_roots=_configured_weight_roots(store.load_characters(), "sovits_weights_root", app.state.service_registry),
+                logs_roots=[
+                    *_configured_weight_roots(store.load_characters(), "logs_root", app.state.service_registry),
+                    *_configured_weight_roots(store.load_characters(), "logs_roots", app.state.service_registry),
+                ],
                 limit=request.limit,
             )
         }
@@ -301,13 +506,53 @@ def create_app(
         return {
             "candidates": scan_logs_index_candidates(
                 reference_audio_root=ref_root,
-                gpt_weights_roots=_configured_weight_roots(store.load_characters(), "gpt_weights_root"),
-                sovits_weights_roots=_configured_weight_roots(store.load_characters(), "sovits_weights_root"),
+                gpt_weights_roots=_configured_weight_roots(store.load_characters(), "gpt_weights_root", app.state.service_registry),
+                sovits_weights_roots=_configured_weight_roots(store.load_characters(), "sovits_weights_root", app.state.service_registry),
+                logs_roots=[
+                    *_configured_weight_roots(store.load_characters(), "logs_root", app.state.service_registry),
+                    *_configured_weight_roots(store.load_characters(), "logs_roots", app.state.service_registry),
+                ],
                 service_id=service_id,
                 gradio_candidates=gradio_candidates,
                 limit=limit,
             ),
             "diagnostics": diagnostics,
+        }
+
+    @app.get("/api/character-library/logs-reference-audio")
+    def character_library_logs_reference_audio(
+        service_id: str | None = None,
+        logs_name: str = "",
+        gpt_weights_path: str | None = None,
+        sovits_weights_path: str | None = None,
+        limit: int = 120,
+    ) -> dict[str, Any]:
+        del gpt_weights_path, sovits_weights_path
+        characters = store.load_characters()
+        if service_id:
+            logs_roots = [
+                *_configured_weight_roots_for_service(characters, "logs_root", app.state.service_registry, service_id),
+                *_configured_weight_roots_for_service(characters, "logs_roots", app.state.service_registry, service_id),
+            ]
+            if not logs_roots:
+                return {
+                    "service_id": service_id,
+                    "logs_name": logs_name,
+                    "samples": [],
+                    "diagnostics": [{
+                        "status": "service_logs_roots_missing",
+                        "detail": f"service {service_id!r} has no configured logs_roots; reference audio samples are service-scoped",
+                    }],
+                }
+        else:
+            logs_roots = [
+                *_configured_weight_roots(characters, "logs_root", app.state.service_registry),
+                *_configured_weight_roots(characters, "logs_roots", app.state.service_registry),
+            ]
+        payload = scan_logs_reference_audio_samples(logs_roots=logs_roots, logs_name=logs_name, limit=limit)
+        return {
+            **payload,
+            "service_id": service_id,
         }
 
     @app.get("/api/character-library/common-logs-presets")
@@ -323,24 +568,39 @@ def create_app(
         return {"character": character.model_dump(mode="json")}
 
     @app.post("/api/character-library/import-common-presets")
-    def import_common_logs_preset_characters(service_id: str | None = None) -> dict[str, Any]:
-        candidate_payload = character_library_logs_candidates(service_id=service_id, include_gradio=False, limit=200)
+    def import_common_logs_preset_characters(service_id: str | None = None, replace_existing: bool = False) -> dict[str, Any]:
+        candidate_payload = character_library_logs_candidates(service_id=service_id, include_gradio=True, limit=200)
         preset_names = {item["name"] for item in common_logs_presets()}
         preset_candidates = [item for item in candidate_payload["candidates"] if item.get("name") in preset_names]
         existing = store.load_characters()
         existing_ids = {character.id for character in existing}
         imported: list[Character] = []
+        updated: list[Character] = []
         skipped: list[str] = []
         for candidate in preset_candidates:
             character = candidate_to_character(candidate)
-            if character.id in existing_ids:
-                skipped.append(character.id)
+            existing_match = _find_existing_character_for_candidate(existing, candidate, character)
+            if character.id in existing_ids or existing_match is not None:
+                matched_id = existing_match.id if existing_match else character.id
+                if replace_existing:
+                    for index, item in enumerate(existing):
+                        if item.id == matched_id:
+                            avatar_path = item.avatar_path if item.avatar_path and not character.avatar_path else character.avatar_path
+                            existing[index] = character.model_copy(update={"id": item.id, "avatar_path": avatar_path})
+                            updated.append(existing[index])
+                            break
+                else:
+                    skipped.append(matched_id)
                 continue
             imported.append(character)
             existing_ids.add(character.id)
-        if imported:
+        if imported or updated:
             store.save_characters([*existing, *imported])
-        return {"imported": [character.model_dump(mode="json") for character in imported], "skipped": skipped}
+        return {
+            "imported": [character.model_dump(mode="json") for character in imported],
+            "updated": [character.model_dump(mode="json") for character in updated],
+            "skipped": skipped,
+        }
 
     @app.delete("/api/character-library/{character_id}")
     def delete_character_library_item(character_id: str) -> dict[str, str]:
@@ -370,10 +630,106 @@ def create_app(
         store.save_project(project_id, project)
         return {"status": "saved"}
 
+    @app.get("/api/projects/{project_id}/script-revisions")
+    def get_script_revisions(project_id: str) -> dict[str, Any]:
+        try:
+            project = store.load_project(project_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        return {
+            "active_script_revision_id": project.active_script_revision_id,
+            "active_parse_revision_id": project.active_parse_revision_id,
+            "script_revisions": [revision.model_dump(mode="json") for revision in project.script_revisions],
+            "parse_revisions": [revision.model_dump(mode="json") for revision in project.parse_revisions],
+        }
+
+    @app.post("/api/projects/{project_id}/script-revisions")
+    def create_script_revision(project_id: str, request: ScriptRevisionCreate) -> dict[str, Any]:
+        if not request.source_markdown.strip():
+            raise HTTPException(status_code=400, detail="source_markdown is required")
+        try:
+            project = store.load_project(project_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        revision = ScriptRevision(
+            revision_id=_next_revision_id("script", [item.revision_id for item in project.script_revisions]),
+            source_markdown=request.source_markdown,
+            parent_revision_id=project.active_script_revision_id,
+            summary=request.summary,
+        )
+        project.script_revisions.append(revision)
+        project.active_script_revision_id = revision.revision_id
+        store.save_project(project_id, project)
+        return {"revision": revision.model_dump(mode="json"), "project": project.model_dump(mode="json")}
+
+    @app.post("/api/projects/{project_id}/parse-revisions")
+    def create_parse_revision(project_id: str, request: ParseRevisionCreate) -> dict[str, Any]:
+        try:
+            project = store.load_project(project_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        script_revision = next((item for item in project.script_revisions if item.revision_id == request.script_revision_id), None)
+        if script_revision is None:
+            raise HTTPException(status_code=404, detail="script revision not found")
+        draft = app.state.parser.parse(script_revision.source_markdown)
+        revision_id = _next_revision_id("parse", [item.revision_id for item in project.parse_revisions])
+        project_characters = [
+            ProjectCharacter(
+                project_character_id=character.id,
+                name=character.name,
+                library_character_id=None,
+                match_status="unmatched",
+            )
+            for character in draft.characters
+        ]
+        lines = [line.model_copy(update={"line_uid": f"{revision_id}:{line.id}"}) for line in draft.lines]
+        draft_project = project.model_copy(
+            deep=True,
+            update={"project_characters": project_characters, "lines": lines},
+        )
+        project_characters = match_project_characters(draft_project, store.load_characters(), force=True)
+        revision = ParseRevision(
+            revision_id=revision_id,
+            script_revision_id=script_revision.revision_id,
+            parent_parse_revision_id=project.active_parse_revision_id,
+            provider=draft.provider,
+            warnings=draft.warnings,
+            project_characters=project_characters,
+            lines=lines,
+        )
+        project.parse_revisions.append(revision)
+        project.active_script_revision_id = script_revision.revision_id
+        project.active_parse_revision_id = revision.revision_id
+        project.project_characters = project_characters
+        project.lines = lines
+        store.save_project(project_id, project)
+        return {"revision": revision.model_dump(mode="json"), "project": project.model_dump(mode="json")}
+
+    @app.post("/api/projects/{project_id}/activate-revision")
+    def activate_revision(project_id: str, request: ActivateRevisionRequest) -> dict[str, Any]:
+        try:
+            project = store.load_project(project_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        if request.script_revision_id:
+            if not any(item.revision_id == request.script_revision_id for item in project.script_revisions):
+                raise HTTPException(status_code=404, detail="script revision not found")
+            project.active_script_revision_id = request.script_revision_id
+        if request.parse_revision_id:
+            parse_revision = next((item for item in project.parse_revisions if item.revision_id == request.parse_revision_id), None)
+            if parse_revision is None:
+                raise HTTPException(status_code=404, detail="parse revision not found")
+            project.active_parse_revision_id = parse_revision.revision_id
+            project.active_script_revision_id = parse_revision.script_revision_id
+            project.project_characters = parse_revision.project_characters
+            project.lines = parse_revision.lines
+        store.save_project(project_id, project)
+        return {"project": project.model_dump(mode="json")}
+
     @app.post("/api/projects/{project_id}/reference-audio/upload")
     async def upload_project_reference_audio(project_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
         suffix = Path(file.filename or "").suffix.lower()
-        if suffix not in {".wav", ".mp3", ".flac", ".m4a", ".ogg"}:
+        if suffix not in AUDIO_UPLOAD_SUFFIXES:
             raise HTTPException(status_code=400, detail="unsupported audio file")
         output_dir = store.project_dir(project_id) / "reference_audio" / "temporary"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -413,6 +769,23 @@ def create_app(
         project.project_characters = request.project_characters
         store.save_project(project_id, project)
         return {"project_characters": [item.model_dump(mode="json") for item in project.project_characters]}
+
+    @app.post("/api/projects/{project_id}/characters/rematch")
+    def rematch_project_characters(project_id: str) -> dict[str, Any]:
+        try:
+            project = store.load_project(project_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        library = store.load_characters()
+        project.project_characters = match_project_characters(project, library, force=True)
+        active_parse = next((item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id), None)
+        if active_parse is not None:
+            active_parse.project_characters = project.project_characters
+        store.save_project(project_id, project)
+        return {
+            "project_characters": [item.model_dump(mode="json") for item in project.project_characters],
+            "characters": [character.model_dump(mode="json") for character in resolve_project_characters(project, library)],
+        }
 
     @app.post("/api/projects/{project_id}/characters/{project_character_id}/freeze")
     def freeze_character(project_id: str, project_character_id: str) -> dict[str, Any]:
@@ -481,22 +854,35 @@ def create_app(
     def generate(request: GenerateRequest) -> dict[str, Any]:
         try:
             tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks)
+            _validate_generation_tasks(tasks)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         manifest = store.load_manifest(request.project_id)
         output_dir = store.project_dir(request.project_id) / "audio"
-        queue.run(tasks, manifest, output_dir=output_dir)
+        app.state.queue.run(tasks, manifest, output_dir=output_dir)
         store.save_manifest(manifest)
         return manifest.model_dump(mode="json")
 
     @app.post("/api/jobs/generation")
     def create_generation_job(request: GenerateRequest) -> dict[str, Any]:
+        tasks = _prepare_tasks_for_async_job(store, request.project_id, request.tasks)
+        job = app.state.job_manager.submit(request.project_id, tasks)
+        return job.model_dump(mode="json")
+
+    @app.post("/api/generation/preflight")
+    def generation_preflight(request: GenerateRequest) -> dict[str, Any]:
         try:
             tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        job = app.state.job_manager.submit(request.project_id, tasks)
-        return job.model_dump(mode="json")
+        items = [_preflight_task(app.state.service_router, supervisor, app.state.queue, task) for task in tasks]
+        if all(item["status"] == "ready" for item in items):
+            status = "ready"
+        elif any(item["status"] == "needs_user_action" for item in items):
+            status = "needs_user_action"
+        else:
+            status = "blocked"
+        return {"status": status, "items": items}
 
     @app.get("/api/jobs/{job_id}")
     def get_generation_job(job_id: str) -> dict[str, Any]:
@@ -520,40 +906,106 @@ def create_app(
     def run_real_tts_validation(request: GenerateRequest) -> dict[str, Any]:
         try:
             tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks)
+            _validate_generation_tasks(tasks)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if _service_mode() == "real":
-            _reject_mock_validation_services(tasks, service_registry)
+            _reject_mock_validation_services(tasks, app.state.service_registry)
         manifest = store.load_manifest(request.project_id)
         output_dir = store.project_dir(request.project_id) / "audio"
-        queue.run(tasks, manifest, output_dir=output_dir)
+        app.state.queue.run(tasks, manifest, output_dir=output_dir)
         store.save_manifest(manifest)
         return {"summary": _manifest_summary(manifest), "manifest": manifest.model_dump(mode="json")}
 
+    @app.get("/api/validation/demo-plan")
+    def demo_validation_plan(project_id: str = "demo", limit: int = 30, repeats: int = 1) -> dict[str, Any]:
+        try:
+            project = store.load_project(project_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        line_limit = max(1, min(limit, 200))
+        repeat_count = max(1, min(repeats, 10))
+        runnable: list[GenerationTask] = []
+        blocked: list[dict[str, Any]] = []
+        for line in project.lines[:line_limit]:
+            base_task = GenerationTask(
+                line=line,
+                engine=line.engine_override or EngineName.GPT_SOVITS,
+                profile=line.profile_override or "default",
+                service_id=line.service_override,
+                parameters={},
+            )
+            try:
+                runnable.append(_enrich_tasks_for_project(store, project_id, [base_task])[0])
+            except ValueError as exc:
+                blocked.append({"line_id": line.id, "line_uid": line.line_uid or line.id, "character_id": line.character_id, "reason": str(exc)})
+        tasks = [task for _ in range(repeat_count) for task in runnable]
+        preflight_items = [_preflight_task(app.state.service_router, supervisor, app.state.queue, task) for task in tasks]
+        if not preflight_items:
+            preflight_status = "blocked"
+        elif all(item["status"] == "ready" for item in preflight_items):
+            preflight_status = "ready"
+        elif any(item["status"] == "needs_user_action" for item in preflight_items):
+            preflight_status = "needs_user_action"
+        else:
+            preflight_status = "blocked"
+        clusters: dict[str, dict[str, Any]] = {}
+        for task in tasks:
+            try:
+                route = app.state.service_router.resolve_task(task)
+                key = build_cluster_key(task, route)
+            except Exception:
+                key = "unresolved"
+            item = clusters.setdefault(key, {"cluster_key": key, "count": 0, "line_ids": []})
+            item["count"] += 1
+            item["line_ids"].append(task.line.id)
+        return {
+            "project_id": project_id,
+            "title": project.title,
+            "summary": {
+                "line_count": len(project.lines),
+                "considered_line_count": min(line_limit, len(project.lines)),
+                "runnable_line_count": len(runnable),
+                "blocked_line_count": len(blocked),
+                "task_count": len(tasks),
+                "repeats": repeat_count,
+            },
+            "blocked_lines": blocked,
+            "tasks": [task.model_dump(mode="json") for task in tasks],
+            "preflight": {"status": preflight_status, "items": preflight_items},
+            "clusters": sorted(clusters.values(), key=lambda item: (-item["count"], item["cluster_key"])),
+        }
+
     @app.get("/api/reference-audio/scan")
     def scan_reference_audio(limit: int = 80) -> dict[str, Any]:
-        return {"root": str(ref_root), "groups": _scan_reference_audio(ref_root, limit=limit)}
+        return {"root": str(ref_root), "groups": scan_reference_audio_groups(ref_root, limit=limit)}
 
     @app.get("/api/audio")
     def get_audio(path: str) -> FileResponse:
-        audio_path = _resolve_data_audio_path(Path(app.state.store.root), path)
+        audio_path = _resolve_data_audio_path(
+            Path(app.state.store.root),
+            path,
+            allowed_roots=[
+                ref_root,
+                *_configured_weight_roots(store.load_characters(), "logs_root", app.state.service_registry),
+                *_configured_weight_roots(store.load_characters(), "logs_roots", app.state.service_registry),
+            ],
+        )
         if not audio_path.is_file():
             raise HTTPException(status_code=404, detail="audio not found")
-        return FileResponse(audio_path, media_type="audio/wav")
+        return FileResponse(audio_path, media_type=_audio_media_type(audio_path))
+
+    @app.get("/api/assets/image")
+    def get_image_asset(path: str) -> FileResponse:
+        image_path = _resolve_data_asset_path(Path(app.state.store.root), path)
+        if not image_path.is_file():
+            raise HTTPException(status_code=404, detail="image not found")
+        media_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
+        if not media_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="asset is not an image")
+        return FileResponse(image_path, media_type=media_type)
 
     return app
-
-
-def _resolve_manifest_history_for_version(manifest: GenerationManifest, line_key: str, version_id: str) -> tuple[str, Any | None]:
-    history = manifest.lines.get(line_key)
-    if history is not None:
-        return line_key, history
-    if ":" in line_key:
-        legacy_key = line_key.rsplit(":", 1)[-1]
-        legacy_history = manifest.lines.get(legacy_key)
-        if legacy_history is not None and any(version.version_id == version_id for version in legacy_history.versions):
-            return legacy_key, legacy_history
-    return line_key, None
 
 
 def _build_parser(config_path: Path | None = None) -> MultiProviderParser:
@@ -592,6 +1044,18 @@ def _resolve_service_settings_paths(data_root: Path, explicit_path: Path | None)
     return local_path, local_path
 
 
+def _resolve_manifest_history_for_version(manifest: GenerationManifest, line_key: str, version_id: str) -> tuple[str, Any | None]:
+    history = manifest.lines.get(line_key)
+    if history is not None:
+        return line_key, history
+    if ":" in line_key:
+        legacy_key = line_key.rsplit(":", 1)[-1]
+        legacy_history = manifest.lines.get(legacy_key)
+        if legacy_history is not None and any(version.version_id == version_id for version in legacy_history.versions):
+            return legacy_key, legacy_history
+    return line_key, None
+
+
 def _mocked_registry(registry: ServiceRegistry) -> ServiceRegistry:
     return ServiceRegistry(
         [
@@ -611,8 +1075,133 @@ def _service_health_with_supervisor(router: ServiceRouter, supervisor: ServiceSu
     output: list[dict[str, Any]] = []
     for service in router.health():
         endpoint = router.registry.get(service["service_id"])
-        output.append({**service, "supervisor": supervisor.status(endpoint)})
+        supervisor_state = supervisor.status(endpoint)
+        output.append(_layer_service_status({**service, "supervisor": supervisor_state}, supervisor_state))
     return output
+
+
+def _layer_service_status(service: dict[str, Any], supervisor_state: dict[str, Any]) -> dict[str, Any]:
+    health = service.get("health") or {}
+    managed_local_stopped = bool(supervisor_state.get("manageable") and not supervisor_state.get("running") and service.get("network_scope") == "localhost")
+    if service.get("enabled") is False:
+        state = "disabled"
+        severity = "neutral"
+    elif managed_local_stopped and health.get("state") == "ready":
+        state = "partial"
+        severity = "attention"
+    elif health.get("state"):
+        state = str(health["state"])
+        severity = str(health.get("severity") or ("ready" if state == "ready" else "attention"))
+    elif managed_local_stopped:
+        state = "blocked"
+        severity = "danger"
+    elif service.get("ready"):
+        state = "ready"
+        severity = "ready"
+    elif health.get("reachable") or health.get("status") == "needs key":
+        state = "partial"
+        severity = "attention"
+    else:
+        state = "blocked"
+        severity = "danger"
+    return {
+        **service,
+        "ready": bool(service.get("ready")) and state in {"ready", "running"},
+        "state": state,
+        "severity": severity,
+        "port_reachable": bool(health.get("port_reachable", service.get("ready", False))),
+        "config_ok": bool(health.get("config_ok", service.get("ready", False))),
+        "required_api_ok": bool(health.get("required_api_ok", service.get("ready", False))),
+        "auth_ok": bool(health.get("auth_ok", True)),
+        "can_start": bool(supervisor_state.get("manageable") and not supervisor_state.get("running")),
+        "supervisor_state": "running" if supervisor_state.get("running") else "stopped",
+    }
+
+
+def _preflight_task(router: ServiceRouter, supervisor: ServiceSupervisor, queue: ServiceGenerationQueue, task: GenerationTask) -> dict[str, Any]:
+    try:
+        _assert_generation_inputs(task)
+    except ValueError as exc:
+        return {
+            "line_id": task.line.id,
+            "line_uid": task.line.line_uid or task.line.id,
+            "status": "blocked",
+            "selected_service_id": None,
+            "load_signature": None,
+            "current_loaded_signature": None,
+            "load_state": "unresolved",
+            "load_match": False,
+            "verification_level": None,
+            "last_load_error": None,
+            "fallback_action": None,
+            "reason": str(exc),
+        }
+    try:
+        route = router.resolve_task(task)
+        load_signature = build_load_signature(route.endpoint, task.parameters)
+        load_state = queue.load_state(route.endpoint.service_id)
+        current_loaded_signature = load_state.get("loaded_signature")
+        load_match = bool(current_loaded_signature and current_loaded_signature == load_signature)
+        return {
+            "line_id": task.line.id,
+            "line_uid": task.line.line_uid or task.line.id,
+            "status": "ready",
+            "selected_service_id": route.endpoint.service_id,
+            "load_signature": load_signature,
+            "current_loaded_signature": current_loaded_signature,
+            "load_state": "loaded" if load_match else ("switch_required" if current_loaded_signature else "not_loaded"),
+            "load_match": load_match,
+            "verification_level": load_state.get("verification_level"),
+            "last_load_error": load_state.get("last_error"),
+            "fallback_action": None,
+            "reason": None,
+        }
+    except Exception as exc:
+        fallback_action = _local_fallback_action(router, supervisor, task)
+        return {
+            "line_id": task.line.id,
+            "line_uid": task.line.line_uid or task.line.id,
+            "status": "needs_user_action" if fallback_action else "blocked",
+            "selected_service_id": None,
+            "load_signature": None,
+            "current_loaded_signature": None,
+            "load_state": "unresolved",
+            "load_match": False,
+            "verification_level": None,
+            "last_load_error": None,
+            "fallback_action": fallback_action,
+            "reason": str(exc),
+        }
+
+
+def _local_fallback_action(router: ServiceRouter, supervisor: ServiceSupervisor, task: GenerationTask) -> dict[str, str] | None:
+    candidate_ids = [*task.fallback_service_ids]
+    services = router.registry.by_provider(task.provider_type) if task.provider_type else router.registry.by_engine(task.engine)
+    for service in services:
+        candidate_ids.append(service.service_id)
+    seen: set[str] = set()
+    for service_id in candidate_ids:
+        if not service_id or service_id in seen:
+            continue
+        seen.add(service_id)
+        try:
+            endpoint = router.registry.get(service_id)
+        except KeyError:
+            continue
+        supervisor_state = supervisor.status(endpoint)
+        if endpoint.network_scope == "localhost" and supervisor_state.get("manageable") and not supervisor_state.get("running"):
+            return {"type": "start_service", "service_id": endpoint.service_id}
+    return None
+
+
+def _next_revision_id(prefix: str, existing_ids: list[str]) -> str:
+    pattern = re.compile(rf"^{re.escape(prefix)}-r(?P<num>\d+)$")
+    highest = 0
+    for revision_id in existing_ids:
+        match = pattern.match(revision_id)
+        if match:
+            highest = max(highest, int(match.group("num")))
+    return f"{prefix}-r{highest + 1:03d}"
 
 
 def _read_repo_lock() -> dict[str, Any]:
@@ -652,17 +1241,58 @@ def _runtime_checks(service_registry: ServiceRegistry) -> dict[str, dict[str, An
     return checks
 
 
-def _configured_weight_roots(characters: list[Character], key: str) -> list[Path]:
+def _configured_weight_roots(characters: list[Character], key: str, service_registry: ServiceRegistry | None = None) -> list[Path]:
     roots: list[Path] = []
     seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                add(item)
+            return
+        if value and str(value) not in seen:
+            roots.append(Path(str(value)))
+            seen.add(str(value))
+
     for character in characters:
         for profile in character.profiles:
             values = [profile.config.get(key)]
             values.extend(binding.config.get(key) for binding in profile.bindings)
             for value in values:
-                if value and str(value) not in seen:
-                    roots.append(Path(str(value)))
-                    seen.add(str(value))
+                add(value)
+    if service_registry is not None:
+        for service in service_registry.services:
+            add(service.default_params.get(key))
+    return roots
+
+
+def _configured_weight_roots_for_service(characters: list[Character], key: str, service_registry: ServiceRegistry | None, service_id: str) -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                add(item)
+            return
+        if value and str(value) not in seen:
+            roots.append(Path(str(value)))
+            seen.add(str(value))
+
+    for character in characters:
+        for profile in character.profiles:
+            if profile.service_id == service_id:
+                add(profile.config.get(key))
+            for binding in profile.bindings:
+                if binding.service_id == service_id:
+                    add(binding.config.get(key))
+    if service_registry is not None:
+        try:
+            service = service_registry.get(service_id)
+        except KeyError:
+            service = None
+        if service is not None:
+            add(service.default_params.get(key))
     return roots
 
 
@@ -693,26 +1323,39 @@ def _enrich_tasks_for_project(store: ProjectStore, project_id: str, tasks: list[
     for task in tasks:
         stored_line = project_lines.get(task.line.id)
         line = task.line
+        if stored_line is not None:
+            line_updates: dict[str, Any] = {"line_uid": stored_line.line_uid}
+            if not line.language and stored_line.language:
+                line_updates["language"] = stored_line.language
+            if line.temporary_binding is None and stored_line.temporary_binding:
+                line_updates["temporary_binding"] = stored_line.temporary_binding
+            if line_updates:
+                line = line.model_copy(update=line_updates)
+                task = task.model_copy(update={"line": line})
         if line.temporary_binding is None and stored_line and stored_line.temporary_binding:
             line = line.model_copy(update={"temporary_binding": stored_line.temporary_binding})
             task = task.model_copy(update={"line": line})
+        revision_parameters = {
+            "_script_revision_id": project.active_script_revision_id,
+            "_parse_revision_id": project.active_parse_revision_id,
+        }
         if line.temporary_binding is not None:
             binding = line.temporary_binding
-            parameters = {**binding.config, **task.parameters, "binding_source": "temporary"}
-            output.append(
-                task.model_copy(
-                    update={
-                        "engine": PROVIDER_ENGINE_DEFAULTS[binding.provider_type],
-                        "profile": binding.binding_id,
-                        "service_id": task.service_id or line.service_override or binding.service_id,
-                        "fallback_service_ids": task.fallback_service_ids or binding.fallback_services,
-                        "parameters": parameters,
-                        "binding_id": binding.binding_id,
-                        "provider_type": binding.provider_type,
-                        "required_capabilities": task.required_capabilities or binding.capabilities,
-                    }
-                )
+            parameters = {**binding.config, **task.parameters, **revision_parameters, "binding_source": "temporary"}
+            enriched = task.model_copy(
+                update={
+                    "engine": PROVIDER_ENGINE_DEFAULTS[binding.provider_type],
+                    "profile": binding.binding_id,
+                    "service_id": task.service_id or line.service_override or binding.service_id,
+                    "fallback_service_ids": task.fallback_service_ids or binding.fallback_services,
+                    "parameters": parameters,
+                    "binding_id": binding.binding_id,
+                    "provider_type": binding.provider_type,
+                    "required_capabilities": task.required_capabilities or binding.capabilities,
+                }
             )
+            _assert_generation_inputs(enriched)
+            output.append(enriched)
             continue
         character = by_id.get(line.character_id)
         if character is None:
@@ -732,22 +1375,78 @@ def _enrich_tasks_for_project(store: ProjectStore, project_id: str, tasks: list[
             binding = next((item for item in profile.bindings if item.binding_id == line.binding_override), None)
         if binding is None and profile.bindings:
             binding = profile.bindings[0]
-        parameters = {**profile.config, **(binding.config if binding else {}), **task.parameters}
-        output.append(
-            task.model_copy(
-                update={
-                    "engine": profile.engine,
-                    "profile": profile.id,
-                    "service_id": task.service_id or (binding.service_id if binding else None) or profile.service_id,
-                    "fallback_service_ids": task.fallback_service_ids or (binding.fallback_services if binding else []) or profile.fallback_services,
-                    "parameters": parameters,
-                    "binding_id": task.binding_id or (binding.binding_id if binding else None),
-                    "provider_type": task.provider_type or (binding.provider_type if binding else None),
-                    "required_capabilities": task.required_capabilities or (binding.capabilities if binding else []),
-                }
-            )
+        parameters = {**profile.config, **(binding.config if binding else {}), **task.parameters, **revision_parameters}
+        enriched = task.model_copy(
+            update={
+                "engine": profile.engine,
+                "profile": profile.id,
+                "service_id": task.service_id or (binding.service_id if binding else None) or profile.service_id,
+                "fallback_service_ids": task.fallback_service_ids or (binding.fallback_services if binding else []) or profile.fallback_services,
+                "parameters": parameters,
+                "binding_id": task.binding_id or (binding.binding_id if binding else None),
+                "provider_type": task.provider_type or (binding.provider_type if binding else None),
+                "required_capabilities": task.required_capabilities or (binding.capabilities if binding else []),
+            }
         )
+        _assert_generation_inputs(enriched)
+        output.append(enriched)
     return output
+
+
+def _prepare_tasks_for_async_job(store: ProjectStore, project_id: str, tasks: list[GenerationTask]) -> list[GenerationTask]:
+    output: list[GenerationTask] = []
+    for task in tasks:
+        try:
+            enriched_tasks = _enrich_tasks_for_project(store, project_id, [task])
+        except ValueError as exc:
+            output.append(_prefailed_task(task, str(exc)))
+            continue
+        for enriched in enriched_tasks:
+            try:
+                _assert_generation_inputs(enriched)
+            except ValueError as exc:
+                output.append(_prefailed_task(enriched, str(exc)))
+            else:
+                output.append(enriched)
+    return output
+
+
+def _prefailed_task(task: GenerationTask, error: str) -> GenerationTask:
+    return task.model_copy(update={"parameters": {**task.parameters, "_prefail_error": error}})
+
+
+def _validate_generation_tasks(tasks: list[GenerationTask]) -> None:
+    for task in tasks:
+        _assert_generation_inputs(task)
+
+
+def _assert_generation_inputs(task: GenerationTask) -> None:
+    provider = task.provider_type.value if task.provider_type is not None else task.engine.value
+    params = task.parameters
+    if provider == "gpt-sovits":
+        missing = []
+        if not _has_text(params.get("gpt_weights_path") or params.get("gpt_weights")):
+            missing.append("gpt_weights_path")
+        if not _has_text(params.get("sovits_weights_path") or params.get("sovits_weights")):
+            missing.append("sovits_weights_path")
+        if not _has_text(params.get("ref_audio_path") or params.get("reference_audio") or params.get("voice")):
+            missing.append("ref_audio_path")
+        if not _has_text(params.get("prompt_text")):
+            missing.append("prompt_text")
+        if missing:
+            raise ValueError(f"line {task.line.id} GPT-SoVITS binding is incomplete: missing {', '.join(missing)}")
+    if provider == "indextts" and not _has_text(params.get("voice") or params.get("ref_audio_path") or params.get("reference_audio")):
+        raise ValueError(f"line {task.line.id} IndexTTS binding is incomplete: missing voice reference audio")
+
+
+def _has_text(value: Any) -> bool:
+    return value is not None and str(value).strip() != ""
+
+
+def _resolve_data_audio_path(data_root: Path, raw_path: str, allowed_roots: list[Path] | None = None) -> Path:
+    path = _resolve_data_asset_path(data_root, raw_path, outside_detail="audio path is outside data root", allowed_roots=allowed_roots)
+    _audio_media_type(path)
+    return path
 
 
 def _resolve_project_audio_file(project_audio_root: Path, data_root: Path, raw_path: str) -> Path | None:
@@ -764,18 +1463,39 @@ def _resolve_project_audio_file(project_audio_root: Path, data_root: Path, raw_p
     return None
 
 
-def _resolve_data_audio_path(data_root: Path, raw_path: str) -> Path:
-    root = data_root.resolve()
+def _resolve_data_asset_path(data_root: Path, raw_path: str, outside_detail: str = "asset path is outside data root", allowed_roots: list[Path] | None = None) -> Path:
+    roots = [data_root.resolve()]
+    for root in allowed_roots or []:
+        if root.exists():
+            roots.append(root.resolve())
     requested = Path(raw_path)
-    candidates = [requested] if requested.is_absolute() else [Path.cwd() / requested, root / requested]
+    candidates = [requested] if requested.is_absolute() else [Path.cwd() / requested, *[root / requested for root in roots]]
     for candidate in candidates:
         resolved = candidate.resolve()
-        try:
-            resolved.relative_to(root)
-        except ValueError:
-            continue
-        return resolved
-    raise HTTPException(status_code=400, detail="audio path is outside data root")
+        for root in roots:
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                continue
+            return resolved
+    raise HTTPException(status_code=400, detail=outside_detail)
+
+
+def _audio_media_type(path: Path) -> str:
+    suffix_media_types = {
+        ".aac": "audio/aac",
+        ".flac": "audio/flac",
+        ".m4a": "audio/mp4",
+        ".mp3": "audio/mpeg",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/ogg",
+        ".wav": "audio/wav",
+        ".webm": "audio/webm",
+    }
+    media_type = suffix_media_types.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0] or ""
+    if not media_type.startswith("audio/"):
+        raise HTTPException(status_code=400, detail="asset is not an audio file")
+    return media_type
 
 
 def _manifest_summary(manifest: GenerationManifest) -> dict[str, int]:
@@ -812,23 +1532,37 @@ def _path_report(path: Path) -> dict[str, Any]:
     return {"path": str(path), "exists": path.exists(), "is_dir": path.is_dir()}
 
 
-def _scan_reference_audio(root: Path, limit: int) -> list[dict[str, Any]]:
-    if not root.exists():
-        return []
-    groups: list[dict[str, Any]] = []
-    for child in root.iterdir():
-        if not child.is_dir():
-            continue
-        audio_paths = [
-            str(path)
-            for path in child.rglob("*")
-            if path.is_file() and path.suffix.lower() in {".wav", ".mp3", ".flac", ".m4a", ".ogg"}
-        ]
-        if audio_paths:
-            groups.append({"id": child.name, "name": child.name, "path": str(child), "audio_count": len(audio_paths), "samples": audio_paths[:5]})
-        if len(groups) >= limit:
-            break
-    return groups
+def _find_existing_character_for_candidate(existing: list[Character], candidate: dict[str, Any], character: Character) -> Character | None:
+    candidate_keys = _character_identity_keys(character)
+    for value in [
+        candidate.get("logs_name"),
+        candidate.get("logs_id"),
+        *(candidate.get("aliases") or []),
+        *(candidate.get("nicknames") or []),
+        *(candidate.get("match_names") or []),
+    ]:
+        key = _identity_key(value)
+        if key:
+            candidate_keys.add(key)
+    for item in existing:
+        if candidate_keys.intersection(_character_identity_keys(item)):
+            return item
+    return None
+
+
+def _character_identity_keys(character: Character) -> set[str]:
+    values: list[Any] = [character.id, character.name, *character.aliases, *character.nicknames, *character.match_names]
+    for profile in character.profiles:
+        values.extend([profile.id, profile.name])
+        for binding in profile.bindings:
+            values.extend([binding.binding_id, binding.config.get("logs_name"), binding.config.get("logs_id"), binding.config.get("character_filter")])
+    return {key for value in values if (key := _identity_key(value))}
+
+
+def _identity_key(value: Any) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value).casefold())
 
 
 app = create_app()

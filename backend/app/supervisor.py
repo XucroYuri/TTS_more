@@ -53,7 +53,7 @@ class ServiceSupervisor:
             "close_fds": False,
         }
         if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         process = subprocess.Popen(command, **popen_kwargs)
         log_file.close()
         record = {

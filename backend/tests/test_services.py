@@ -6,7 +6,7 @@ import httpx
 
 from app.adapters.base import SynthesisRequest
 from app.models import EngineName, ScriptLine, TTSServiceEndpoint
-from app.services import ServiceRegistry, ServiceRouter, _health_timeout_seconds, build_service_client
+from app.services import ServiceRegistry, ServiceRouter, build_load_signature, _health_timeout_seconds, build_service_client
 
 
 class ReadyClient:
@@ -188,6 +188,33 @@ def test_gradio_endpoint_missing_required_api_is_blocked() -> None:
     assert health["expected_api_names"] == ["gen_single"]
 
 
+def test_gradio_config_timeout_is_partial_not_ready() -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="lan-gpt-gradio",
+        engine=EngineName.GPT_SOVITS,
+        provider_type="gpt-sovits",
+        api_contract="gradio-gpt-sovits-webui",
+        base_url="http://192.0.2.166:9872",
+        mode="external",
+        network_scope="lan",
+        managed=False,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("config timed out", request=request)
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+
+    health = client.health()
+
+    assert health["ready"] is False
+    assert health["state"] == "partial"
+    assert health["severity"] == "attention"
+    assert health["port_reachable"] is True
+    assert health["config_ok"] is False
+    assert "timed out" in health["error"]
+
+
 def test_indextts_gradio_uses_example_voice_when_binding_only_has_example_index(tmp_path: Path) -> None:
     endpoint = TTSServiceEndpoint(
         service_id="lan-indextts2-gradio",
@@ -246,6 +273,56 @@ def test_indextts_gradio_uses_example_voice_when_binding_only_has_example_index(
     assert result.audio_path.read_bytes() == b"RIFFexample"
 
 
+def test_indextts_gradio_uses_queue_call_when_dependency_is_queued(tmp_path: Path) -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="lan-indextts2-gradio",
+        engine=EngineName.INDEX_TTS,
+        provider_type="indextts",
+        api_contract="gradio-indextts2-webui",
+        base_url="http://192.0.2.166:7860",
+        mode="external",
+        network_scope="lan",
+        managed=False,
+    )
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == "http://192.0.2.166:7860/config":
+            return httpx.Response(200, json={"api_prefix": "/gradio_api", "dependencies": [{"api_name": "gen_single", "queue": True}]})
+        if url == "http://192.0.2.166:7860/gradio_api/call/gen_single":
+            calls.append("call")
+            payload = json.loads(request.content.decode("utf-8"))
+            assert payload["data"][0] == "与音色参考音频相同"
+            assert payload["data"][1] == "ref.wav"
+            assert payload["data"][3] is None
+            return httpx.Response(200, json={"event_id": "evt-1"})
+        if url == "http://192.0.2.166:7860/gradio_api/call/gen_single/evt-1":
+            calls.append("stream")
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b'event: complete\ndata: [{"url": "/file=/tmp/generated.wav"}]\n\n',
+            )
+        if url == "http://192.0.2.166:7860/file=/tmp/generated.wav":
+            return httpx.Response(200, content=b"RIFFqueued")
+        return httpx.Response(404, json={"detail": url})
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+
+    result = client.synthesize(
+        SynthesisRequest(
+            line=ScriptLine(id="l1", character_id="xiao-pin", text="当前台词"),
+            profile="xiao-pin-index",
+            output_path=tmp_path / "queued.wav",
+            parameters={"voice": "ref.wav", "emotion_mode": "same_as_voice"},
+        )
+    )
+
+    assert calls == ["call", "stream"]
+    assert result.audio_path.read_bytes() == b"RIFFqueued"
+
+
 def test_gpt_sovits_gradio_uses_selected_reference_audio_update(tmp_path: Path) -> None:
     endpoint = TTSServiceEndpoint(
         service_id="lan-gpt-gradio",
@@ -295,6 +372,48 @@ def test_gpt_sovits_gradio_uses_selected_reference_audio_update(tmp_path: Path) 
     assert result.audio_path.read_bytes() == b"RIFFgpt"
 
 
+def test_gpt_sovits_gradio_index_preserves_full_logs_names_from_choices() -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="lan-gpt-gradio",
+        engine=EngineName.GPT_SOVITS,
+        provider_type="gpt-sovits",
+        api_contract="gradio-gpt-sovits-webui",
+        base_url="http://192.0.2.166:9872",
+        mode="external",
+        network_scope="lan",
+        managed=False,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://192.0.2.166:9872/config":
+            return httpx.Response(
+                200,
+                json={
+                    "components": [
+                        {"id": 1, "props": {"choices": ["全部", "demo-hero-logs"]}},
+                        {"id": 2, "props": {"choices": ["demo-hero-logs-e50.ckpt"]}},
+                        {"id": 3, "props": {"choices": ["demo-hero-logs_e24_s264.pth"]}},
+                        {"id": 4, "props": {"choices": ["参考音频/demo-hero-logs/ref.wav"]}},
+                    ],
+                    "dependencies": [
+                        {"api_name": "get_tts_wav"},
+                        {"api_name": "update_model_choices", "outputs": [1, 2, 3]},
+                        {"api_name": "refresh_ref_audio_choices", "outputs": [4]},
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+
+    index = client.gradio_index()
+
+    by_logs = {candidate["logs_name"]: candidate for candidate in index["candidates"]}
+    assert "demo-hero-logs" in by_logs
+    assert by_logs["demo-hero-logs"]["recommended_gpt_weights_path"] == "demo-hero-logs-e50.ckpt"
+    assert by_logs["demo-hero-logs"]["recommended_sovits_weights_path"] == "demo-hero-logs_e24_s264.pth"
+
+
 def test_gpt_sovits_gradio_uploads_local_reference_audio(tmp_path: Path) -> None:
     ref = tmp_path / "ref.wav"
     ref.write_bytes(b"RIFFref")
@@ -336,6 +455,126 @@ def test_gpt_sovits_gradio_uploads_local_reference_audio(tmp_path: Path) -> None
     )
 
     assert result.audio_path.read_bytes() == b"RIFFgpt"
+
+
+def test_gradio_upload_prefers_api_prefix_when_present(tmp_path: Path) -> None:
+    ref = tmp_path / "ref.wav"
+    ref.write_bytes(b"RIFFref")
+    endpoint = TTSServiceEndpoint(
+        service_id="lan-indextts2-gradio",
+        engine=EngineName.INDEX_TTS,
+        provider_type="indextts",
+        api_contract="gradio-indextts2-webui",
+        base_url="http://192.0.2.166:7860",
+        mode="external",
+        network_scope="lan",
+        managed=False,
+    )
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == "http://192.0.2.166:7860/config":
+            return httpx.Response(200, json={"api_prefix": "/gradio_api", "dependencies": [{"api_name": "gen_single"}]})
+        if url == "http://192.0.2.166:7860/upload":
+            calls.append("bare-upload")
+            return httpx.Response(404)
+        if url == "http://192.0.2.166:7860/gradio_api/upload":
+            calls.append("prefixed-upload")
+            return httpx.Response(200, json=["D:/gradio/tmp/ref.wav"])
+        if url == "http://192.0.2.166:7860/gradio_api/api/gen_single":
+            payload = json.loads(request.content.decode("utf-8"))
+            assert payload["data"][1]["path"] == "D:/gradio/tmp/ref.wav"
+            assert "url" not in payload["data"][1]
+            return httpx.Response(200, json={"data": [{"url": "/file=/tmp/generated.wav"}]})
+        if url == "http://192.0.2.166:7860/file=/tmp/generated.wav":
+            return httpx.Response(200, content=b"RIFFprefixed")
+        return httpx.Response(404)
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+
+    result = client.synthesize(
+        SynthesisRequest(
+            line=ScriptLine(id="l1", character_id="xiao-pin", text="当前台词"),
+            profile="xiao-pin-index",
+            output_path=tmp_path / "prefixed.wav",
+            parameters={"voice": str(ref), "emotion_mode": "same_as_voice"},
+        )
+    )
+
+    assert calls == ["prefixed-upload"]
+    assert result.audio_path.read_bytes() == b"RIFFprefixed"
+
+
+def test_gradio_synthesis_uses_operation_timeout_for_config_fetch(tmp_path: Path) -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="lan-indextts2-gradio",
+        engine=EngineName.INDEX_TTS,
+        provider_type="indextts",
+        api_contract="gradio-indextts2-webui",
+        base_url="http://192.0.2.166:7860",
+        mode="external",
+        network_scope="lan",
+        managed=False,
+    )
+    config_timeouts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == "http://192.0.2.166:7860/config":
+            timeout = request.extensions.get("timeout") or {}
+            config_timeouts.append(timeout.get("read"))
+            return httpx.Response(200, json={"api_prefix": "/gradio_api", "dependencies": [{"api_name": "gen_single"}]})
+        if url == "http://192.0.2.166:7860/gradio_api/api/gen_single":
+            return httpx.Response(200, json={"data": [{"url": "/file=/tmp/generated.wav"}]})
+        if url == "http://192.0.2.166:7860/file=/tmp/generated.wav":
+            return httpx.Response(200, content=b"RIFFtimeout")
+        return httpx.Response(404)
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+
+    result = client.synthesize(
+        SynthesisRequest(
+            line=ScriptLine(id="l1", character_id="xiao-pin", text="当前台词"),
+            profile="xiao-pin-index",
+            output_path=tmp_path / "timeout.wav",
+            parameters={"voice": "ref.wav", "emotion_mode": "same_as_voice", "timeout_seconds": 123},
+        )
+    )
+
+    assert result.audio_path.read_bytes() == b"RIFFtimeout"
+    assert config_timeouts[0] == 123
+
+
+def test_gpt_sovits_load_signature_covers_weights_reference_and_prompt() -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="lan-gpt-gradio",
+        engine=EngineName.GPT_SOVITS,
+        provider_type="gpt-sovits",
+        api_contract="gradio-gpt-sovits-webui",
+        base_url="http://192.0.2.166:9872",
+    )
+
+    signature = build_load_signature(
+        endpoint,
+        {
+            "logs_name": "demo-hero-logs",
+            "gpt_weights_path": "GPT_weights_v2ProPlus/demo-hero-e50.ckpt",
+            "sovits_weights_path": "SoVITS_weights_v2ProPlus/demo-hero_e24_s264.pth",
+            "ref_audio_path": "logs/demo-hero/5-wav32k/ref.wav",
+            "prompt_text": "不好！",
+            "prompt_lang": "zh",
+            "text_lang": "zh",
+        },
+    )
+
+    assert signature == (
+        "service_id=lan-gpt-gradio|logs_name=demo-hero-logs|"
+        "gpt_weights_path=GPT_weights_v2ProPlus/demo-hero-e50.ckpt|"
+        "sovits_weights_path=SoVITS_weights_v2ProPlus/demo-hero_e24_s264.pth|"
+        "ref_audio_path=logs/demo-hero/5-wav32k/ref.wav|"
+        "prompt_text=不好！|prompt_lang=zh|text_lang=zh"
+    )
 
 
 def test_router_checks_service_health_concurrently() -> None:

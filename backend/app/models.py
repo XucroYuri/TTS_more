@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
@@ -197,6 +198,7 @@ class ReferenceAudioGroup(BaseModel):
 class Character(BaseModel):
     id: str
     name: str
+    avatar_path: str | None = None
     aliases: list[str] = Field(default_factory=list)
     nicknames: list[str] = Field(default_factory=list)
     match_names: list[str] = Field(default_factory=list)
@@ -233,6 +235,7 @@ class ProjectCharacter(BaseModel):
 
 class ScriptLine(BaseModel):
     id: str
+    line_uid: str = ""
     character_id: str
     text: str
     note: str = ""
@@ -243,15 +246,75 @@ class ScriptLine(BaseModel):
     service_override: str | None = None
     temporary_binding: VoiceBinding | None = None
 
+    @model_validator(mode="after")
+    def populate_line_uid(self) -> "ScriptLine":
+        if not self.line_uid:
+            self.line_uid = self.id
+        return self
+
+
+class ScriptRevision(BaseModel):
+    revision_id: str
+    source_markdown: str
+    parent_revision_id: str | None = None
+    summary: str = ""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ParseRevision(BaseModel):
+    revision_id: str
+    script_revision_id: str
+    parent_parse_revision_id: str | None = None
+    provider: str = "legacy"
+    warnings: list[str] = Field(default_factory=list)
+    project_characters: list[ProjectCharacter] = Field(default_factory=list)
+    lines: list[ScriptLine] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 
 class ScriptProject(BaseModel):
     title: str
     default_language: str = "zh"
+    active_script_revision_id: str | None = None
+    active_parse_revision_id: str | None = None
+    script_revisions: list[ScriptRevision] = Field(default_factory=list)
+    parse_revisions: list[ParseRevision] = Field(default_factory=list)
     project_characters: list[ProjectCharacter] = Field(default_factory=list)
     lines: list[ScriptLine] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_unique_line_ids(self) -> "ScriptProject":
+    def materialize_revision_tree_and_validate_lines(self) -> "ScriptProject":
+        if not self.script_revisions:
+            self.script_revisions = [
+                ScriptRevision(
+                    revision_id="script-r001",
+                    source_markdown=_project_lines_to_markdown(self.project_characters, self.lines),
+                    summary="Initial imported script",
+                )
+            ]
+        if self.active_script_revision_id is None:
+            self.active_script_revision_id = self.script_revisions[-1].revision_id
+
+        if not self.parse_revisions:
+            parse_revision_id = "parse-r001"
+            initial_lines = [_line_with_revision_uid(line, parse_revision_id) for line in self.lines]
+            self.parse_revisions = [
+                ParseRevision(
+                    revision_id=parse_revision_id,
+                    script_revision_id=self.active_script_revision_id,
+                    project_characters=self.project_characters,
+                    lines=initial_lines,
+                )
+            ]
+        if self.active_parse_revision_id is None:
+            self.active_parse_revision_id = self.parse_revisions[-1].revision_id
+
+        active_parse = next((item for item in self.parse_revisions if item.revision_id == self.active_parse_revision_id), None)
+        if active_parse is not None:
+            self.lines = [_line_with_revision_uid(line, active_parse.revision_id) for line in active_parse.lines]
+            if active_parse.project_characters and not self.project_characters:
+                self.project_characters = active_parse.project_characters
+
         seen: set[str] = set()
         for line in self.lines:
             if line.id in seen:
@@ -289,12 +352,18 @@ GenerationStatus = Literal["queued", "loading", "running", "finalizing", "comple
 
 class GenerationVersion(BaseModel):
     version_id: str
+    line_uid: str | None = None
+    script_revision_id: str | None = None
+    parse_revision_id: str | None = None
     engine: EngineName
     profile: str
     service_id: str | None = None
     resource_group: str | None = None
     provider_type: ProviderType | None = None
     binding_id: str | None = None
+    binding_snapshot: dict[str, Any] | None = None
+    requested_load_signature: str | None = None
+    verified_load_signature: str | None = None
     status: GenerationStatus
     audio_path: str | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
@@ -307,10 +376,14 @@ class GenerationVersion(BaseModel):
 class GenerationQueueItem(BaseModel):
     task_id: str
     line_id: str
+    line_uid: str | None = None
     status: GenerationStatus = "queued"
     progress: float = 0.0
     queue_position: int | None = None
     cluster_key: str = ""
+    cluster_size: int | None = None
+    cluster_position: int | None = None
+    load_signature: str | None = None
     service_id: str | None = None
     resource_group: str | None = None
     error: str | None = None
@@ -337,6 +410,46 @@ class GenerationManifest(BaseModel):
     project_id: str
     lines: dict[str, LineGenerationHistory] = Field(default_factory=dict)
 
+    def line_key(self, line_id: str, line_uid: str | None = None) -> str:
+        return line_uid or line_id
+
+    def history_for_line(self, line_id: str, line_uid: str | None = None) -> LineGenerationHistory | None:
+        if line_uid:
+            return self.lines.get(line_uid)
+        return self.lines.get(line_id)
+
     def append_version(self, line_id: str, version: GenerationVersion) -> None:
-        history = self.lines.setdefault(line_id, LineGenerationHistory(line_id=line_id))
+        key = self.line_key(line_id, version.line_uid)
+        history = self.lines.setdefault(key, LineGenerationHistory(line_id=key))
+        version = version.model_copy(update={"version_id": _next_generation_version_id(history.versions, version.version_id)})
         history.versions.append(version)
+
+
+def _line_with_revision_uid(line: ScriptLine, parse_revision_id: str) -> ScriptLine:
+    if line.line_uid and line.line_uid.startswith(f"{parse_revision_id}:"):
+        return line
+    return line.model_copy(update={"line_uid": f"{parse_revision_id}:{line.id}"})
+
+
+def _project_lines_to_markdown(project_characters: list[ProjectCharacter], lines: list[ScriptLine]) -> str:
+    names = {character.project_character_id: character.name for character in project_characters}
+    output: list[str] = []
+    for line in lines:
+        name = names.get(line.character_id, line.character_id)
+        note = f"（{line.note.strip()}）" if line.note.strip() else ""
+        output.append(f"{name}{note}: {line.text}")
+    return "\n".join(output)
+
+
+def _next_generation_version_id(existing_versions: list[GenerationVersion], requested: str) -> str:
+    max_number = 0
+    existing_ids: set[str] = set()
+    for version in existing_versions:
+        existing_ids.add(version.version_id)
+        match = re.fullmatch(r"v(\d+)", version.version_id)
+        if match:
+            max_number = max(max_number, int(match.group(1)))
+    requested_match = re.fullmatch(r"v(\d+)", requested)
+    if requested_match and requested not in existing_ids and int(requested_match.group(1)) > max_number:
+        return requested
+    return f"v{max_number + 1:03d}"

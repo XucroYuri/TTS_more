@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from app.resources import collect_voice_candidates
-from app.role_library import scan_role_library_candidates
+from app.role_library import candidate_to_character, scan_logs_index_candidates, scan_role_library_candidates
 
 
 def test_collect_voice_candidates_scans_core_weights_reference_audio_and_index_model(tmp_path: Path) -> None:
@@ -51,6 +51,27 @@ def test_collect_voice_candidates_scans_core_weights_reference_audio_and_index_m
     assert result["gpt_sovits"]["sovits_weights"][0]["path"].endswith("xiao.pth")
     assert "vibevoice" not in result
     assert result["ready"] is True
+
+
+def test_reference_audio_scan_keeps_nested_leaf_group_and_sidecar_text(tmp_path: Path) -> None:
+    ref_root = tmp_path / "refs"
+    leaf = ref_root / "00未检查音-不要删" / "3功夫毒角-李坤" / "音频"
+    leaf.mkdir(parents=True)
+    (leaf / "line.wav").write_bytes(b"wav")
+    (leaf / "line.txt").write_text("别回头。", encoding="utf-8")
+
+    result = collect_voice_candidates(
+        reference_audio_root=ref_root,
+        gpt_weights_roots=[],
+        sovits_weights_roots=[],
+        indextts_model_dir=tmp_path / "missing-index",
+    )
+
+    group = result["reference_audio"]["groups"][0]
+    assert group["name"] == "00未检查音-不要删 / 3功夫毒角-李坤 / 音频"
+    assert group["samples"][0].endswith("line.wav")
+    assert group["sample_details"][0]["text"] == "别回头。"
+    assert group["sample_details"][0]["text_source"] == "sidecar"
 
 
 def test_collect_voice_candidates_reports_missing_roots_without_crashing(tmp_path: Path) -> None:
@@ -115,3 +136,29 @@ def test_scan_role_library_candidates_pairs_weights_and_reads_sidecar_text(tmp_p
     sample = candidates[0]["reference_audio_groups"][0]["samples"][0]
     assert sample["text"] == "参考文本"
     assert sample["text_source"] == "sidecar"
+
+
+def test_logs_candidates_preserve_full_logs_name_from_weight_files(tmp_path: Path) -> None:
+    gpt_root = tmp_path / "GPT_weights_v2ProPlus"
+    sovits_root = tmp_path / "SoVITS_weights_v2ProPlus"
+    ref_root = tmp_path / "refs"
+    gpt_root.mkdir()
+    sovits_root.mkdir()
+    ref_root.mkdir()
+    (gpt_root / "demo-hero-logs-e50.ckpt").write_bytes(b"gpt")
+    (sovits_root / "demo-hero-logs_e24_s264.pth").write_bytes(b"sovits")
+
+    candidates = scan_logs_index_candidates(
+        reference_audio_root=ref_root,
+        gpt_weights_roots=[gpt_root],
+        sovits_weights_roots=[sovits_root],
+        service_id="local-gpt-sovits-proplus",
+        limit=20,
+    )
+
+    by_name = {candidate["name"]: candidate for candidate in candidates}
+    assert by_name["主角"]["logs_name"] == "demo-hero-logs"
+    assert by_name["主角"]["id"] == "zhu-jue"
+    assert candidate_to_character(by_name["主角"]).id == "zhu-jue"
+    assert by_name["主角"]["recommended_gpt_weights_path"].endswith("demo-hero-logs-e50.ckpt")
+    assert by_name["主角"]["recommended_sovits_weights_path"].endswith("demo-hero-logs_e24_s264.pth")

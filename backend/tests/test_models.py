@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from app.models import Character, EngineName, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptLine, ScriptProject, VoiceBinding
+from app.models import Character, EngineName, GenerationManifest, GenerationVersion, LineGenerationHistory, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptLine, ScriptProject, VoiceBinding
 from app.storage import ProjectStore
 
 
@@ -116,3 +116,81 @@ def test_script_project_can_reference_and_snapshot_library_characters() -> None:
 
     assert project.project_characters[0].mode == ProjectCharacterMode.REFERENCE
     assert project.project_characters[1].character_snapshot == snapshot
+
+
+def test_legacy_project_materializes_initial_script_and_parse_revisions() -> None:
+    project = ScriptProject(
+        title="demo",
+        default_language="zh",
+        project_characters=[
+            ProjectCharacter(project_character_id="xiao-pin", name="小品"),
+            ProjectCharacter(project_character_id="xiao-guang", name="小光"),
+        ],
+        lines=[
+            ScriptLine(id="l001", character_id="xiao-pin", text="严镜、小光，我来救你们了！", note="目光坚定"),
+            ScriptLine(id="l002", character_id="xiao-guang", text="呃……", note="痛苦呻吟"),
+        ],
+    )
+
+    assert project.active_script_revision_id == "script-r001"
+    assert project.active_parse_revision_id == "parse-r001"
+    assert project.script_revisions[0].source_markdown.startswith("小品（目光坚定）")
+    assert project.parse_revisions[0].script_revision_id == "script-r001"
+    assert [line.line_uid for line in project.lines] == ["parse-r001:l001", "parse-r001:l002"]
+    assert [line.line_uid for line in project.parse_revisions[0].lines] == ["parse-r001:l001", "parse-r001:l002"]
+
+
+def test_manifest_append_version_keeps_version_ids_monotonic_per_line_uid() -> None:
+    manifest = GenerationManifest(project_id="demo")
+    manifest.append_version(
+        "l001",
+        GenerationVersion(
+            version_id="v003",
+            line_uid="parse-r001:l001",
+            engine=EngineName.GPT_SOVITS,
+            profile="a",
+            status="failed",
+        ),
+    )
+    manifest.append_version(
+        "l001",
+        GenerationVersion(
+            version_id="v002",
+            line_uid="parse-r001:l001",
+            engine=EngineName.GPT_SOVITS,
+            profile="a",
+            status="completed",
+        ),
+    )
+
+    assert [version.version_id for version in manifest.lines["parse-r001:l001"].versions] == ["v003", "v004"]
+
+
+def test_manifest_history_for_stable_line_uid_does_not_fallback_to_legacy_line_id() -> None:
+    manifest = GenerationManifest(project_id="demo")
+    manifest.lines["l001"] = LineGenerationHistory(
+        line_id="l001",
+        versions=[
+            GenerationVersion(
+                version_id="v001",
+                engine=EngineName.GPT_SOVITS,
+                profile="legacy",
+                status="completed",
+            )
+        ],
+    )
+
+    assert manifest.history_for_line("l001", "parse-r001:l001") is None
+
+    manifest.append_version(
+        "l001",
+        GenerationVersion(
+            version_id="v001",
+            line_uid="parse-r001:l001",
+            engine=EngineName.GPT_SOVITS,
+            profile="current",
+            status="completed",
+        ),
+    )
+
+    assert [version.version_id for version in manifest.lines["parse-r001:l001"].versions] == ["v001"]

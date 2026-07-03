@@ -1,5 +1,5 @@
 from app.models import Character, EngineName, ScriptLine, ScriptProject, VoiceBinding, VoiceProfile
-from app.role_library import common_logs_presets, match_project_characters, resolve_project_characters
+from app.role_library import common_logs_presets, match_project_characters, resolve_project_characters, slugify_role_name
 
 
 def test_project_character_matching_uses_aliases_nicknames_and_match_names() -> None:
@@ -52,6 +52,12 @@ def test_common_logs_presets_include_user_supplied_roles() -> None:
     assert "队长" in by_name["主角"]["nicknames"]
     assert by_name["导师"]["logs_name"] == "demo-mentor-logs"
     assert "顾问" in by_name["导师"]["nicknames"]
+
+
+def test_slugify_role_name_has_stable_ids_for_common_chinese_roles() -> None:
+    assert slugify_role_name("主角") == "zhu-jue"
+    assert slugify_role_name("导师") == "dao-shi"
+    assert slugify_role_name("反派") == "fan-pai"
 
 
 def test_resolved_matched_character_keeps_logs_first_gpt_binding() -> None:

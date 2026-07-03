@@ -37,6 +37,55 @@ PINYIN_FALLBACK = {
     "白": "bai",
     "九": "jiu",
     "妈": "ma",
+    "光": "guang",
+    "头": "tou",
+    "眼": "yan",
+    "镜": "jing",
+    "严": "yan",
+    "珊": "shan",
+    "卡": "ka",
+    "皮": "pi",
+    "巴": "ba",
+    "拉": "la",
+    "胶": "jiao",
+    "布": "bu",
+    "泽": "ze",
+    "死": "si",
+    "神": "shen",
+    "断": "duan",
+    "恶": "e",
+    "心": "xin",
+    "辰": "chen",
+    "弱": "ruo",
+    "黑": "hei",
+    "帮": "bang",
+    "长": "zhang",
+    "官": "guan",
+    "机": "ji",
+    "械": "xie",
+    "特": "te",
+    "警": "jing",
+    "们": "men",
+    "队": "dui",
+    "通": "tong",
+    "讯": "xun",
+    "员": "yuan",
+    "桃": "tao",
+    "主": "zhu",
+    "角": "jue",
+    "导": "dao",
+    "师": "shi",
+    "顾": "gu",
+    "问": "wen",
+    "反": "fan",
+    "派": "pai",
+    "对": "dui",
+    "手": "shou",
+    "英": "ying",
+    "雄": "xiong",
+    "叙": "xu",
+    "述": "shu",
+    "者": "zhe",
 }
 
 
@@ -48,12 +97,14 @@ def scan_role_library_candidates(
     reference_audio_root: Path,
     gpt_weights_roots: list[Path],
     sovits_weights_roots: list[Path],
+    logs_roots: list[Path] | None = None,
     limit: int = 80,
 ) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     _collect_weight_candidates(grouped, "gpt", gpt_weights_roots, GPT_WEIGHT_SUFFIXES)
     _collect_weight_candidates(grouped, "sovits", sovits_weights_roots, SOVITS_WEIGHT_SUFFIXES)
     _collect_reference_candidates(grouped, reference_audio_root)
+    _collect_logs_reference_candidates(grouped, logs_roots or [])
 
     candidates = [item for item in grouped.values() if item.get("gpt_weights") or item.get("sovits_weights") or item.get("reference_audio_groups")]
     candidates.sort(key=lambda item: (0 if item.get("recommended_gpt_weights_path") and item.get("recommended_sovits_weights_path") else 1, item["name"]))
@@ -64,12 +115,13 @@ def scan_logs_index_candidates(
     reference_audio_root: Path,
     gpt_weights_roots: list[Path],
     sovits_weights_roots: list[Path],
+    logs_roots: list[Path] | None = None,
     service_id: str | None = None,
     gradio_candidates: list[dict[str, Any]] | None = None,
     limit: int = 80,
 ) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
-    for candidate in scan_role_library_candidates(reference_audio_root, gpt_weights_roots, sovits_weights_roots, limit=limit * 2):
+    for candidate in scan_role_library_candidates(reference_audio_root, gpt_weights_roots, sovits_weights_roots, logs_roots=logs_roots, limit=limit * 2):
         _merge_logs_candidate(grouped, _logs_candidate_from_scan(candidate, service_id=service_id, source="filesystem"))
     for candidate in gradio_candidates or []:
         _merge_logs_candidate(grouped, _logs_candidate_from_scan(candidate, service_id=candidate.get("service_id") or service_id, source=candidate.get("source", "gradio")))
@@ -77,6 +129,53 @@ def scan_logs_index_candidates(
     candidates = list(grouped.values())
     candidates.sort(key=lambda item: (0 if item.get("recommended_gpt_weights_path") and item.get("recommended_sovits_weights_path") else 1, item["logs_name"]))
     return candidates[:limit]
+
+
+def scan_logs_reference_audio_samples(logs_roots: list[Path], logs_name: str, limit: int = 120) -> dict[str, Any]:
+    diagnostics: list[dict[str, str]] = []
+    samples: list[dict[str, Any]] = []
+    if not logs_name.strip():
+        return {"logs_name": logs_name, "samples": samples, "diagnostics": [{"status": "missing_logs_name", "detail": "logs_name is required"}]}
+
+    for logs_dir in _matching_logs_dirs(logs_roots, logs_name):
+        wav_dir = logs_dir / "5-wav32k"
+        if not wav_dir.exists() or not wav_dir.is_dir():
+            diagnostics.append({"status": "missing_wav_dir", "path": str(wav_dir), "detail": "5-wav32k directory not found"})
+            continue
+        text_records = _read_gpt_sovits_name2text_records(logs_dir / "2-name2text.txt")
+        metadata = _read_audio_metadata(logs_dir / "audio_metadata.json")
+        for path in sorted(wav_dir.iterdir(), key=lambda item: item.name.lower()):
+            if not path.is_file() or path.suffix.lower() not in AUDIO_SUFFIXES:
+                continue
+            record = text_records.get(path.name) or text_records.get(path.stem) or {}
+            meta = metadata.get(path.name) if isinstance(metadata.get(path.name), dict) else {}
+            sidecar_sample = _reference_sample(path)
+            text = str(meta.get("text_override") or sidecar_sample.text or record.get("text") or "").strip()
+            text_source = _logs_text_source(meta, sidecar_sample, record)
+            character = str(meta.get("character") or _extract_role_name(logs_dir.name) or "").strip()
+            emotion = str(meta.get("emotion") or "").strip()
+            remark = str(meta.get("remark") or "").strip()
+            prompt_lang = str(meta.get("lang") or record.get("lang") or _infer_prompt_lang(text) or "zh").strip()
+            samples.append(
+                {
+                    "sample_id": f"{logs_dir.name}:{path.name}",
+                    "display_label": _logs_reference_display_label(path.name, text, character, emotion, remark),
+                    "path": str(path),
+                    "text": text,
+                    "text_source": text_source,
+                    "character": character,
+                    "emotion": emotion,
+                    "remark": remark,
+                    "prompt_lang": prompt_lang,
+                    "source": "logs",
+                    "logs_name": logs_dir.name,
+                }
+            )
+            if len(samples) >= limit:
+                return {"logs_name": logs_name, "samples": samples, "diagnostics": diagnostics}
+    if not samples and not diagnostics:
+        diagnostics.append({"status": "logs_not_found", "detail": f"logs {logs_name!r} was not found"})
+    return {"logs_name": logs_name, "samples": samples, "diagnostics": diagnostics}
 
 
 def candidate_to_character(candidate: dict[str, Any]) -> Character:
@@ -96,6 +195,7 @@ def candidate_to_character(candidate: dict[str, Any]) -> Character:
         config = {
             "logs_id": candidate.get("logs_id"),
             "logs_name": candidate.get("logs_name"),
+            "path_service_id": service_id,
             "character_filter": candidate.get("logs_name"),
             "gpt_weight_options": candidate.get("gpt_weights") or [],
             "sovits_weight_options": candidate.get("sovits_weights") or [],
@@ -168,21 +268,23 @@ def candidate_to_character(candidate: dict[str, Any]) -> Character:
     )
 
 
-def match_project_characters(project: ScriptProject, library: list[Character]) -> list[ProjectCharacter]:
-    if project.project_characters:
+def match_project_characters(project: ScriptProject, library: list[Character], force: bool = False) -> list[ProjectCharacter]:
+    if project.project_characters and not force:
         return project.project_characters
     output: list[ProjectCharacter] = []
     seen: set[str] = set()
     by_name = _library_lookup(library)
+    existing_names = {item.project_character_id: item.name for item in project.project_characters}
     for line in project.lines:
         if line.character_id in seen:
             continue
         seen.add(line.character_id)
-        character = by_name.get(_normalize(line.character_id))
+        display_name = existing_names.get(line.character_id, line.character_id)
+        character = by_name.get(_normalize(display_name)) or by_name.get(_normalize(line.character_id))
         output.append(
             ProjectCharacter(
                 project_character_id=line.character_id,
-                name=character.name if character else line.character_id,
+                name=character.name if character else display_name,
                 library_character_id=character.id if character else None,
                 mode=ProjectCharacterMode.REFERENCE,
                 match_confidence=1.0 if character else None,
@@ -269,7 +371,12 @@ def _collect_weight_candidates(grouped: dict[str, dict[str, Any]], kind: str, ro
             if not path.is_file() or path.suffix.lower() not in suffixes:
                 continue
             name = _extract_role_name(path.stem)
+            logs_name = _extract_logs_name_from_weight(path.stem)
             item = _candidate(grouped, name)
+            item["logs_name"] = logs_name
+            item.setdefault("logs_match_names", [])
+            if logs_name not in item["logs_match_names"]:
+                item["logs_match_names"].append(logs_name)
             score = _weight_score(path.stem)
             item.setdefault(field, []).append({"name": path.name, "path": str(path), "score": score})
             current = item.get(recommended)
@@ -302,6 +409,135 @@ def _collect_reference_candidates(grouped: dict[str, dict[str, Any]], root: Path
         )
 
 
+def _collect_logs_reference_candidates(grouped: dict[str, dict[str, Any]], roots: list[Path]) -> None:
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for logs_dir in root.iterdir():
+            if not logs_dir.is_dir():
+                continue
+            wav_dir = logs_dir / "5-wav32k"
+            if not wav_dir.exists() or not wav_dir.is_dir():
+                continue
+            text_by_name = _read_gpt_sovits_name2text(logs_dir / "2-name2text.txt")
+            samples: list[ReferenceAudioSample] = []
+            for path in sorted(wav_dir.iterdir()):
+                if not path.is_file() or path.suffix.lower() not in AUDIO_SUFFIXES:
+                    continue
+                sample = _reference_sample(path)
+                if not sample.text:
+                    text = text_by_name.get(path.name) or text_by_name.get(path.stem) or ""
+                    if text:
+                        sample = ReferenceAudioSample(path=str(path), text=text, text_source="sidecar")
+                samples.append(sample)
+                if len(samples) >= 8:
+                    break
+            if not samples:
+                continue
+            name = _extract_role_name(logs_dir.name)
+            item = _candidate(grouped, name)
+            item["logs_name"] = logs_dir.name
+            item.setdefault("logs_match_names", [])
+            if logs_dir.name not in item["logs_match_names"]:
+                item["logs_match_names"].append(logs_dir.name)
+            item.setdefault("reference_audio_groups", []).append(
+                ReferenceAudioGroup(
+                    id=f"{logs_dir.name}-logs",
+                    name=f"{logs_dir.name} logs",
+                    paths=[str(wav_dir)],
+                    samples=samples,
+                ).model_dump(mode="json")
+            )
+
+
+def _read_gpt_sovits_name2text(path: Path) -> dict[str, str]:
+    records = _read_gpt_sovits_name2text_records(path)
+    return {key: str(value.get("text") or "") for key, value in records.items()}
+
+
+def _read_gpt_sovits_name2text_records(path: Path) -> dict[str, dict[str, str]]:
+    if not path.exists():
+        return {}
+    output: dict[str, dict[str, str]] = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            key = parts[0].strip()
+            lang = parts[2].strip() if len(parts) >= 4 else ""
+            text = parts[3].strip() if len(parts) >= 4 else parts[-1].strip()
+            if key and text:
+                record = {"text": text, "lang": lang}
+                output[key] = record
+                output[Path(key).stem] = record
+    except OSError:
+        return {}
+    return output
+
+
+def _read_audio_metadata(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _matching_logs_dirs(logs_roots: list[Path], logs_name: str) -> list[Path]:
+    output: list[Path] = []
+    normalized = _normalize(logs_name)
+    seen: set[str] = set()
+    for root in logs_roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        direct = root / logs_name
+        candidates = [direct] if direct.is_dir() else []
+        candidates.extend(child for child in root.iterdir() if child.is_dir() and _normalize(child.name) == normalized)
+        for candidate in candidates:
+            marker = str(candidate.resolve())
+            if marker in seen:
+                continue
+            seen.add(marker)
+            output.append(candidate)
+    return output
+
+
+def _logs_text_source(meta: dict[str, Any], sidecar_sample: ReferenceAudioSample, record: dict[str, str]) -> str:
+    if meta.get("text_override"):
+        return "audio_metadata"
+    if sidecar_sample.text:
+        return sidecar_sample.text_source
+    if record.get("text"):
+        return "name2text"
+    return "none"
+
+
+def _logs_reference_display_label(name: str, text: str, character: str, emotion: str, remark: str) -> str:
+    prefix_parts = []
+    if character:
+        prefix_parts.append(character)
+    if emotion:
+        prefix_parts.append(f"({emotion})")
+    if remark:
+        prefix_parts.append(f"[{remark}]")
+    prefix = "".join(prefix_parts)
+    preview = text[:42]
+    if prefix and preview:
+        return f"{name} · {prefix}: {preview}"
+    if preview:
+        return f"{name} · {preview}"
+    return name
+
+
+def _infer_prompt_lang(text: str) -> str:
+    if not text:
+        return ""
+    return "zh" if re.search(r"[\u4e00-\u9fff]", text) else "en"
+
+
 def _candidate(grouped: dict[str, dict[str, Any]], name: str) -> dict[str, Any]:
     key = _normalize(name)
     if key not in grouped:
@@ -314,6 +550,25 @@ def _extract_role_name(raw: str) -> str:
     text = re.split(r"[-_]", text, maxsplit=1)[0]
     text = re.sub(r"[（(].*", "", text).strip()
     return text or raw
+
+
+def _extract_logs_name_from_weight(raw: str) -> str:
+    text = re.sub(r"^\d+", "", raw).strip()
+    cleanup_patterns = [
+        r"(?:[-_])e\d+(?:[-_])s\d+$",
+        r"(?:[-_])e\d+$",
+        r"(?:[-_])s\d+$",
+        r"(?:[-_])epoch=\d+(?:[-_])step=\d+$",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for pattern in cleanup_patterns:
+            next_text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+            if next_text != text:
+                text = next_text
+                changed = True
+    return text.strip("-_ ") or raw
 
 
 def _weight_score(stem: str) -> tuple[int, int]:
@@ -455,6 +710,8 @@ def _merge_common_logs_presets(grouped: dict[str, dict[str, Any]], service_id: s
             _merge_logs_candidate(grouped, candidate)
             continue
         current = grouped[matched_key]
+        current["id"] = candidate["id"]
+        current["logs_id"] = candidate["logs_id"]
         current["name"] = candidate["name"]
         current["aliases"] = list(dict.fromkeys([*(current.get("aliases") or []), candidate["name"], logs_name]))
         current["nicknames"] = list(dict.fromkeys([*(current.get("nicknames") or []), *(candidate.get("nicknames") or [])]))

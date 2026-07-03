@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
 
 
 AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg"}
+TEXT_SUFFIXES = {".txt", ".lab", ".json"}
 GPT_WEIGHT_SUFFIXES = {".ckpt", ".pth", ".pt"}
 SOVITS_WEIGHT_SUFFIXES = {".pth", ".ckpt", ".pt"}
 
@@ -38,6 +40,10 @@ def collect_voice_candidates(
             "diagnostics": [] if reference["exists"] else [{"path": str(reference_audio_root), "status": "missing"}],
         },
     }
+
+
+def scan_reference_audio_groups(root: Path, limit: int = 80) -> list[dict[str, Any]]:
+    return _scan_reference_audio(root, limit=limit)["groups"]
 
 
 def _check_python_runtimes(checks: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -88,19 +94,59 @@ def _scan_reference_audio(root: Path, limit: int) -> dict[str, Any]:
     if not root.exists():
         return {"path": str(root), "exists": False, "is_dir": False, "groups": []}
     groups: list[dict[str, Any]] = []
-    for child in root.iterdir():
+    for child in root.rglob("*"):
         if not child.is_dir():
             continue
-        samples = [
-            str(path)
-            for path in child.rglob("*")
-            if path.is_file() and path.suffix.lower() in AUDIO_SUFFIXES
-        ]
-        if samples:
-            groups.append({"id": child.name, "name": child.name, "path": str(child), "audio_count": len(samples), "samples": samples[:5]})
+        sample_paths = sorted(path for path in child.iterdir() if path.is_file() and path.suffix.lower() in AUDIO_SUFFIXES)
+        if sample_paths:
+            relative = _safe_relative(child, root)
+            sample_details = [_reference_audio_detail(path) for path in sample_paths[:8]]
+            groups.append(
+                {
+                    "id": relative,
+                    "name": relative,
+                    "path": str(child),
+                    "audio_count": len(sample_paths),
+                    "samples": [item["path"] for item in sample_details[:5]],
+                    "sample_details": sample_details,
+                }
+            )
         if len(groups) >= limit:
             break
     return {"path": str(root), "exists": True, "is_dir": root.is_dir(), "groups": groups}
+
+
+def _safe_relative(path: Path, root: Path) -> str:
+    try:
+        return " / ".join(path.relative_to(root).parts)
+    except ValueError:
+        return path.name
+
+
+def _reference_audio_detail(path: Path) -> dict[str, Any]:
+    text = ""
+    text_source = "none"
+    for suffix in TEXT_SUFFIXES:
+        sidecar = path.with_suffix(suffix)
+        if sidecar.exists():
+            text = _read_text_sidecar(sidecar)
+            text_source = "sidecar" if text else "none"
+            break
+    return {"path": str(path), "text": text, "text_source": text_source}
+
+
+def _read_text_sidecar(path: Path) -> str:
+    try:
+        if path.suffix.lower() == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, str):
+                return payload.strip()
+            if isinstance(payload, dict):
+                return str(payload.get("text") or payload.get("prompt_text") or "").strip()
+            return ""
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
 
 
 def _check_indextts_model(model_dir: Path) -> dict[str, Any]:

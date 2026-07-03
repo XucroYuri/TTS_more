@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import base64
+import re
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -113,6 +114,37 @@ class ServiceRegistry:
         )
 
 
+def build_load_signature(endpoint: TTSServiceEndpoint, parameters: dict[str, Any]) -> str:
+    if endpoint.provider_type == ProviderType.GPT_SOVITS or endpoint.engine == EngineName.GPT_SOVITS:
+        parts = [
+            f"service_id={endpoint.service_id}",
+            f"logs_name={parameters.get('logs_name', parameters.get('logs_id', ''))}",
+            f"gpt_weights_path={parameters.get('gpt_weights_path', parameters.get('gpt_weights', ''))}",
+            f"sovits_weights_path={parameters.get('sovits_weights_path', parameters.get('sovits_weights', ''))}",
+            f"ref_audio_path={parameters.get('ref_audio_path', parameters.get('reference_audio', ''))}",
+            f"prompt_text={parameters.get('prompt_text', '')}",
+            f"prompt_lang={parameters.get('prompt_lang', '')}",
+            f"text_lang={parameters.get('text_lang', '')}",
+        ]
+        return "|".join(parts)
+    if endpoint.provider_type == ProviderType.INDEX_TTS or endpoint.engine == EngineName.INDEX_TTS:
+        parts = [
+            f"service_id={endpoint.service_id}",
+            f"voice={parameters.get('voice', parameters.get('ref_audio_path', parameters.get('reference_audio', '')))}",
+            f"emotion_mode={parameters.get('emotion_mode', 'same_as_voice')}",
+            f"emotion_audio={parameters.get('emotion_audio', '')}",
+            f"emotion_text={parameters.get('emotion_text', '')}",
+        ]
+        return "|".join(parts)
+    return "|".join(
+        [
+            f"service_id={endpoint.service_id}",
+            f"model={parameters.get('model', '')}",
+            f"voice={parameters.get('voice', parameters.get('voice_id', parameters.get('voice_name', '')))}",
+        ]
+    )
+
+
 class ServiceRouter:
     def __init__(
         self,
@@ -139,11 +171,15 @@ class ServiceRouter:
             if not _has_capabilities(binding.capabilities, intent.required_capabilities):
                 continue
             for endpoint in self._candidate_endpoints_for_binding(binding, intent):
+                if not _endpoint_can_use_binding(endpoint, binding):
+                    continue
                 if not _has_capabilities(endpoint.capabilities, ["tts", *intent.required_capabilities]):
                     continue
                 client = self.clients.get(endpoint.service_id)
                 if client is not None and self._client_ready(client):
                     return ServiceRoute(endpoint=endpoint, client=client, binding=binding)
+        if intent.bindings:
+            raise RuntimeError("no ready TTS service matches requested voice binding")
         for endpoint in self._candidate_endpoints_for_intent(intent):
             if not _has_capabilities(endpoint.capabilities, ["tts", *intent.required_capabilities]):
                 continue
@@ -208,17 +244,19 @@ class ServiceRouter:
     def _candidate_endpoints_for_binding(self, binding: VoiceBinding, intent: TTSIntent) -> list[TTSServiceEndpoint]:
         seen: set[str] = set()
         candidates: list[TTSServiceEndpoint] = []
+        explicit_ids = [intent.service_id, binding.service_id, *intent.fallback_service_ids, *binding.fallback_services]
 
         def add(service: TTSServiceEndpoint) -> None:
             if service.enabled and service.service_kind == "tts" and service.provider_type == binding.provider_type and service.service_id not in seen:
                 candidates.append(service)
                 seen.add(service.service_id)
 
-        for service_id in [intent.service_id, binding.service_id, *intent.fallback_service_ids, *binding.fallback_services]:
+        for service_id in explicit_ids:
             if service_id:
                 add(self.registry.get(service_id))
-        for service in self.registry.by_provider(binding.provider_type):
-            add(service)
+        if not any(explicit_ids):
+            for service in self.registry.by_provider(binding.provider_type):
+                add(service)
         return candidates
 
     def _candidate_endpoints_for_intent(self, intent: TTSIntent) -> list[TTSServiceEndpoint]:
@@ -269,6 +307,72 @@ def build_service_client(endpoint: TTSServiceEndpoint, transport: httpx.BaseTran
     if endpoint.provider_type == ProviderType.VOLCENGINE:
         return VolcengineSpeechClient(endpoint, transport=transport)
     return HttpTTSServiceClient(endpoint, transport=transport)
+
+
+def _endpoint_can_use_binding(endpoint: TTSServiceEndpoint, binding: VoiceBinding) -> bool:
+    params = binding.config or {}
+    origin_service_id = str(params.get("path_service_id") or params.get("asset_service_id") or params.get("source_service_id") or "")
+    if origin_service_id and origin_service_id == endpoint.service_id:
+        return True
+    if endpoint.network_scope == "localhost":
+        return True
+    if endpoint.provider_type == ProviderType.GPT_SOVITS or endpoint.engine == EngineName.GPT_SOVITS:
+        for field in ("gpt_weights_path", "gpt_weights", "sovits_weights_path", "sovits_weights"):
+            value = params.get(field)
+            if value and not _endpoint_can_access_path(endpoint, str(value)):
+                return False
+    return True
+
+
+def _endpoint_can_access_path(endpoint: TTSServiceEndpoint, raw_path: str) -> bool:
+    if _is_remote_reference(raw_path):
+        return True
+    if not _looks_like_absolute_filesystem_path(raw_path):
+        return True
+    roots = _endpoint_accessible_roots(endpoint)
+    if not roots:
+        return False
+    normalized = _normalize_path_for_compare(raw_path)
+    return any(normalized == root or normalized.startswith(root.rstrip("\\/") + "\\") or normalized.startswith(root.rstrip("\\/") + "/") for root in roots)
+
+
+def _endpoint_accessible_roots(endpoint: TTSServiceEndpoint) -> list[str]:
+    params = endpoint.default_params or {}
+    roots: list[str] = []
+
+    def add(value: Any) -> None:
+        if not value:
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                add(item)
+            return
+        roots.append(_normalize_path_for_compare(str(value)))
+
+    for key in (
+        "accessible_path_roots",
+        "remote_path_roots",
+        "gpt_weights_root",
+        "sovits_weights_root",
+        "reference_audio_root",
+        "logs_root",
+        "logs_roots",
+    ):
+        add(params.get(key))
+    return roots
+
+
+def _is_remote_reference(value: str) -> bool:
+    lowered = value.lower()
+    return lowered.startswith(("http://", "https://", "file=", "/file=", "data:"))
+
+
+def _looks_like_absolute_filesystem_path(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z]:[\\/]", value) or value.startswith("\\\\") or value.startswith("//") or value.startswith("/"))
+
+
+def _normalize_path_for_compare(value: str) -> str:
+    return value.replace("/", "\\").rstrip("\\").casefold()
 
 
 class MockServiceClient:
@@ -382,11 +486,44 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
     def health(self) -> dict[str, Any]:
         missing = self._missing_env()
         if missing:
-            return {"engine": self.endpoint.engine.value, "ready": False, "status": "needs key", "missing_env": missing}
+            return {
+                "engine": self.endpoint.engine.value,
+                "ready": False,
+                "state": "blocked",
+                "severity": "danger",
+                "status": "needs key",
+                "auth_ok": False,
+                "missing_env": missing,
+            }
         try:
-            payload = self._config()
+            payload = self._config(timeout=_health_timeout_seconds())
+        except httpx.TimeoutException as exc:
+            return {
+                "engine": self.endpoint.engine.value,
+                "ready": False,
+                "state": "partial",
+                "severity": "attention",
+                "reachable": True,
+                "port_reachable": True,
+                "config_ok": False,
+                "required_api_ok": False,
+                "auth_ok": True,
+                "status": "config timeout",
+                "error": str(exc),
+            }
         except Exception as exc:
-            return {"engine": self.endpoint.engine.value, "ready": False, "reachable": False, "error": str(exc)}
+            return {
+                "engine": self.endpoint.engine.value,
+                "ready": False,
+                "state": "blocked",
+                "severity": "danger",
+                "reachable": False,
+                "port_reachable": False,
+                "config_ok": False,
+                "required_api_ok": False,
+                "auth_ok": True,
+                "error": str(exc),
+            }
 
         api_names = sorted(
             {
@@ -398,10 +535,18 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         expected = _expected_gradio_api_names(self.endpoint.api_contract)
         missing_api_names = [name for name in expected if name not in api_names]
         status = "unsupported gradio app" if missing_api_names else "ready"
+        state = "blocked" if missing_api_names else "ready"
+        severity = "danger" if missing_api_names else "ready"
         return {
             "engine": self.endpoint.engine.value,
             "ready": not missing_api_names,
+            "state": state,
+            "severity": severity,
             "reachable": True,
+            "port_reachable": True,
+            "config_ok": True,
+            "required_api_ok": not missing_api_names,
+            "auth_ok": True,
             "status": status,
             "mode": "gradio-webui",
             "api_contract": self.endpoint.api_contract,
@@ -502,9 +647,11 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
                 params.get("voice") or params.get("ref_audio_path") or params.get("reference_audio") or (example_values[0] if example_values else ""),
                 timeout=params.get("timeout_seconds", 900.0),
             )
-            emotion_audio = self._prepare_gradio_file(
-                params.get("emotion_audio") or (example_values[3] if len(example_values) > 3 else ""),
-                timeout=params.get("timeout_seconds", 900.0),
+            raw_emotion_audio = params.get("emotion_audio") or (example_values[3] if len(example_values) > 3 else None)
+            emotion_audio = (
+                self._prepare_gradio_file(raw_emotion_audio, timeout=params.get("timeout_seconds", 900.0))
+                if raw_emotion_audio
+                else None
             )
             payload = [
                 _indextts_emotion_mode_label(emotion_mode),
@@ -528,18 +675,20 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         response = self._post_gradio_api("gen_single", payload, timeout=params.get("timeout_seconds", 900.0))
         return self._write_gradio_audio(request, response, {"api_contract": self.endpoint.api_contract, "gradio_api_name": "gen_single"})
 
-    def _config(self) -> dict[str, Any]:
+    def _config(self, timeout: float | int | None = None) -> dict[str, Any]:
         if self._config_cache is not None:
             return self._config_cache
-        with httpx.Client(timeout=_health_timeout_seconds(), transport=self.transport) as client:
+        with httpx.Client(timeout=float(timeout or _health_timeout_seconds()), transport=self.transport) as client:
             response = client.get(self.endpoint.base_url.rstrip("/") + "/config", headers=self._headers())
             response.raise_for_status()
             self._config_cache = response.json()
             return self._config_cache
 
     def _post_gradio_api(self, api_name: str, data: list[Any], timeout: float | int | None = None) -> dict[str, Any]:
-        config = self._config()
+        config = self._config(timeout=timeout)
         api_prefix = str(config.get("api_prefix") or "").strip("/")
+        if _gradio_api_is_queued(config, api_name):
+            return self._post_gradio_queue_api(api_name, data, timeout=timeout, api_prefix=api_prefix)
         path_candidates = []
         if api_prefix:
             path_candidates.append(f"/{api_prefix}/api/{api_name}")
@@ -562,6 +711,61 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
                 except Exception as exc:
                     last_error = exc
         raise RuntimeError(f"Gradio API {api_name!r} failed: {last_error}")
+
+    def _post_gradio_queue_api(self, api_name: str, data: list[Any], timeout: float | int | None = None, api_prefix: str = "") -> dict[str, Any]:
+        path_candidates = []
+        if api_prefix:
+            path_candidates.append(f"/{api_prefix}/call/{api_name}")
+        path_candidates.append(f"/call/{api_name}")
+        payload = {"data": data}
+        last_error: Exception | None = None
+        with httpx.Client(timeout=float(timeout or 900.0), transport=self.transport) as client:
+            for path in path_candidates:
+                try:
+                    response = client.post(self.endpoint.base_url.rstrip("/") + path, json=payload, headers=self._headers())
+                    if response.status_code == 404:
+                        continue
+                    if response.status_code >= 400:
+                        raise RuntimeError(f"{response.status_code} {response.text[:800]}")
+                    response.raise_for_status()
+                    event_id = response.json().get("event_id")
+                    if not event_id:
+                        raise RuntimeError("Gradio queue response did not include event_id")
+                    return self._read_gradio_queue_result(client, f"{path}/{event_id}")
+                except Exception as exc:
+                    last_error = exc
+        raise RuntimeError(f"Gradio queued API {api_name!r} failed: {last_error}")
+
+    def _read_gradio_queue_result(self, client: httpx.Client, stream_path: str) -> dict[str, Any]:
+        current_event = ""
+        last_data: Any = None
+        with client.stream("GET", self.endpoint.base_url.rstrip("/") + stream_path, headers=self._headers()) as response:
+            if response.status_code >= 400:
+                raise RuntimeError(f"{response.status_code} {response.text[:800]}")
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith("event:"):
+                    current_event = line.removeprefix("event:").strip()
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data_text = line.removeprefix("data:").strip()
+                if data_text == "null":
+                    continue
+                try:
+                    last_data = json.loads(data_text)
+                except json.JSONDecodeError:
+                    last_data = data_text
+                if current_event == "error":
+                    raise RuntimeError(f"Gradio queued API error: {last_data}")
+                if current_event == "complete":
+                    return {"data": last_data}
+        if last_data is not None:
+            return {"data": last_data}
+        raise RuntimeError("Gradio queue stream ended without result data")
 
     def _write_gradio_audio(self, request: SynthesisRequest, payload: dict[str, Any], metadata: dict[str, Any]) -> SynthesisResult:
         data = payload.get("data")
@@ -602,11 +806,9 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         return self._upload_gradio_file(local_path, timeout=timeout)
 
     def _upload_gradio_file(self, path: Path, timeout: float | int | None = None) -> dict[str, Any]:
-        upload_paths = ["/upload"]
-        config = self._config()
+        config = self._config(timeout=timeout)
         api_prefix = str(config.get("api_prefix") or "").strip("/")
-        if api_prefix:
-            upload_paths.append(f"/{api_prefix}/upload")
+        upload_paths = [f"/{api_prefix}/upload", "/upload"] if api_prefix else ["/upload"]
         last_error: Exception | None = None
         with httpx.Client(timeout=float(timeout or 120.0), transport=self.transport) as client:
             for upload_path in upload_paths:
@@ -644,11 +846,6 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         uploaded.setdefault("size", None)
         uploaded.setdefault("is_stream", False)
         uploaded.setdefault("meta", {"_type": "gradio.FileData"})
-        if "url" not in uploaded and uploaded.get("path"):
-            config = self._config()
-            api_prefix = str(config.get("api_prefix") or "").strip("/")
-            file_prefix = f"/{api_prefix}/file=" if api_prefix else "/file="
-            uploaded["url"] = self.endpoint.base_url.rstrip("/") + file_prefix + quote(str(uploaded["path"]), safe=":/\\")
 
 
 class GPTSoVITSApiV2ServiceClient(HttpTTSServiceClient):
@@ -828,6 +1025,13 @@ def _expected_gradio_api_names(api_contract: str) -> list[str]:
     return []
 
 
+def _gradio_api_is_queued(config: dict[str, Any], api_name: str) -> bool:
+    for dependency in config.get("dependencies") or []:
+        if dependency.get("api_name") == api_name:
+            return dependency.get("queue") is True
+    return False
+
+
 def _gradio_api_summary(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "title": payload.get("title") or "",
@@ -940,13 +1144,22 @@ def _gradio_choices(component: dict[str, Any] | None) -> list[str]:
 def _extract_logs_name(raw: str) -> str:
     text = Path(raw).stem
     text = text.replace("\\", "/").split("/")[-1]
-    text = text.split("_e", 1)[0]
-    text = text.split("-e", 1)[0]
-    text = text.split("_s", 1)[0]
-    text = text.split("-s", 1)[0]
-    text = text.split("-", 1)[0]
-    text = text.split("_", 1)[0]
-    text = "".join(ch for ch in text.lstrip("0123456789") if ch not in "（）()").strip()
+    text = text.lstrip("0123456789").strip()
+    cleanup_patterns = [
+        r"(?:[-_])e\d+(?:[-_])s\d+$",
+        r"(?:[-_])e\d+$",
+        r"(?:[-_])s\d+$",
+        r"(?:[-_])epoch=\d+(?:[-_])step=\d+$",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for pattern in cleanup_patterns:
+            next_text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+            if next_text != text:
+                text = next_text
+                changed = True
+    text = "".join(ch for ch in text if ch not in "（）()").strip("-_ ")
     return text or raw
 
 
