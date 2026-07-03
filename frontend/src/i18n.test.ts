@@ -29,4 +29,19 @@ describe("i18n configuration", () => {
     expect(nextLanguage("en-US")).toBe("zh-CN");
     expect(nextLanguage("fr-FR")).toBe("en-US");
   });
+
+  it("keeps production workstation labels fully localized", () => {
+    expect(tText(resources["zh-CN"], "topbar.roleLibrary")).toBe("角色库");
+    expect(tText(resources["zh-CN"], "inspector.title")).toBe("台词检查器");
+    expect(tText(resources["zh-CN"], "inspector.provider")).toBe("服务商");
+    expect(tText(resources["zh-CN"], "inspector.voiceBinding")).toBe("音色绑定");
+    expect(tText(resources["zh-CN"], "characters.uploadAvatar")).toBe("上传头像");
+    expect(tText(resources["zh-CN"], "audioInput.record")).toBe("录音");
+    expect(tText(resources["zh-CN"], "script.drawer.list")).toBe("剧本列表");
+    expect(tText(resources["en-US"], "topbar.roleLibrary")).toBe("Role Library");
+    expect(tText(resources["en-US"], "inspector.title")).toBe("Line Inspector");
+    expect(tText(resources["en-US"], "characters.uploadAvatar")).toBe("Upload avatar");
+    expect(tText(resources["en-US"], "audioInput.record")).toBe("Record");
+    expect(tText(resources["en-US"], "script.drawer.preview")).toBe("Preview");
+  });
 });

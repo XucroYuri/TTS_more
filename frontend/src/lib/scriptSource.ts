@@ -1,4 +1,5 @@
 import type { Character, ScriptLine, ScriptProject } from "../types";
+import { formatScriptNote } from "./lineNote";
 
 export function projectToScriptSourceText(project: ScriptProject, characters: Character[]): string {
   return project.lines.map((line) => lineToScriptSourceText(project, characters, line)).join("\n");
@@ -6,7 +7,7 @@ export function projectToScriptSourceText(project: ScriptProject, characters: Ch
 
 function lineToScriptSourceText(project: ScriptProject, characters: Character[], line: ScriptLine): string {
   const name = characterDisplayName(project, characters, line.character_id);
-  const note = line.note?.trim() ? `（${line.note.trim()}）` : "";
+  const note = formatScriptNote(line.note);
   return `${name}${note}: ${line.text}`;
 }
 

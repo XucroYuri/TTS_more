@@ -3,6 +3,8 @@ import type { Character, ProjectCharacter, ScriptProject } from "../types";
 export interface ProjectCharacterRow {
   id: string;
   name: string;
+  avatarPath?: string | null;
+  avatarFallback: string;
   mode: ProjectCharacter["mode"];
   provider: string;
   profile: string;
@@ -50,6 +52,8 @@ export function projectCharacterRows(project: ScriptProject, library: Character[
     return {
       id: item.project_character_id,
       name: item.name,
+      avatarPath: character?.avatar_path ?? null,
+      avatarFallback: avatarFallback(item.name),
       mode: item.mode,
       provider: binding?.provider_type ?? profile?.engine ?? character?.default_engine ?? "unassigned",
       profile: profile?.name ?? character?.default_profile ?? "unassigned",
@@ -99,6 +103,10 @@ export function ensureProjectCharacters(project: ScriptProject, library: Charact
 
 function cloneCharacter(character: Character): Character {
   return JSON.parse(JSON.stringify(character)) as Character;
+}
+
+function avatarFallback(name: string): string {
+  return name.trim().slice(0, 1).toLocaleUpperCase() || "?";
 }
 
 function normalize(value: string): string {

@@ -1,4 +1,4 @@
-import type { GenerationManifest, ParserProviderConfig, RuntimeMode, ScriptLine, VoiceCandidates, WorkerHealth } from "../types";
+import type { GenerationManifest, LineHistory, ParserProviderConfig, RuntimeMode, ScriptLine, VoiceCandidates, WorkerHealth } from "../types";
 
 export type LineStatusFilter = "all" | "not-generated" | "queued" | "loading" | "running" | "finalizing" | "completed" | "failed" | "cancelled";
 
@@ -26,15 +26,30 @@ export interface ServiceTopbarSummary {
   overallTone: ServiceTone;
 }
 
+export type ServiceTopbarHealthItemId = "local" | "paid" | "parser" | "resources";
+
+export interface ServiceTopbarHealthItem {
+  id: ServiceTopbarHealthItemId;
+  labelKey: string;
+  tone: ServiceTone;
+  value: string;
+}
+
 export const coreLocalProviders = new Set(["gpt-sovits", "indextts"]);
 
 export function isServiceOperational(service: WorkerHealth): boolean {
   if (service.enabled === false) return false;
   if (service.base_url?.startsWith("mock://")) return false;
   if (!service.base_url) return false;
+  if (service.state && !["ready", "running"].includes(service.state)) return false;
+  if (service.severity === "danger") return false;
   if (service.supervisor?.manageable && !service.supervisor.running) return false;
   if (service.capabilities?.includes("paid_provider") && service.key_configured === false) return false;
   return Boolean(service.ready);
+}
+
+export function routableProviderServices(services: WorkerHealth[], provider: string): WorkerHealth[] {
+  return services.filter((service) => service.provider_type === provider && Boolean(service.service_id) && isServiceOperational(service));
 }
 
 export function validationRunState(
@@ -64,7 +79,7 @@ export function filterScriptLines(lines: ScriptLine[], manifest: GenerationManif
   return lines.filter((line) => {
     if (filters.characterId && filters.characterId !== "all" && line.character_id !== filters.characterId) return false;
     if (filters.provider && filters.provider !== "all" && (filters.providerForLine?.(line) ?? inferLineProvider(line)) !== filters.provider) return false;
-    if (filters.status && filters.status !== "all" && lineStatus(line.id, manifest) !== filters.status) return false;
+    if (filters.status && filters.status !== "all" && lineStatus(line, manifest) !== filters.status) return false;
     if (normalizedSearch) {
       const haystack = `${line.id} ${line.character_id} ${line.note} ${line.text}`.toLocaleLowerCase();
       if (!haystack.includes(normalizedSearch)) return false;
@@ -77,8 +92,14 @@ export function toggleLineSelection(selected: string[], lineId: string): string[
   return selected.includes(lineId) ? selected.filter((id) => id !== lineId) : [...selected, lineId];
 }
 
-export function lineStatus(lineId: string, manifest: GenerationManifest): LineStatusFilter {
-  const latest = manifest.lines[lineId]?.versions.at(-1);
+export function lineHistoryForLine(manifest: GenerationManifest, line: Pick<ScriptLine, "id" | "line_uid">): LineHistory | undefined {
+  if (line.line_uid && manifest.lines[line.line_uid]) return manifest.lines[line.line_uid];
+  return manifest.lines[line.id];
+}
+
+export function lineStatus(line: Pick<ScriptLine, "id" | "line_uid"> | string, manifest: GenerationManifest): LineStatusFilter {
+  const history = typeof line === "string" ? manifest.lines[line] : lineHistoryForLine(manifest, line);
+  const latest = history?.versions.at(-1);
   return latest?.status ?? "not-generated";
 }
 
@@ -117,6 +138,15 @@ export function serviceTopbarSummary(
       ? "attention"
       : "ready";
   return { local, paid, parser, resources, overallTone };
+}
+
+export function serviceTopbarHealthItems(summary: ServiceTopbarSummary): ServiceTopbarHealthItem[] {
+  return [
+    { id: "local", labelKey: "services.localShort", tone: summary.local.tone, value: `${summary.local.ready}/${summary.local.total}` },
+    { id: "paid", labelKey: "services.apiShort", tone: summary.paid.tone, value: `${summary.paid.ready}/${summary.paid.total}` },
+    { id: "parser", labelKey: "services.parserShort", tone: summary.parser.tone, value: `${summary.parser.ready}/${summary.parser.total}` },
+    { id: "resources", labelKey: "services.resourcesShort", tone: summary.resources.tone, value: "" }
+  ];
 }
 
 function inferLineProvider(line: ScriptLine): string {

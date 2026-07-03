@@ -25,7 +25,7 @@ export function WaveformPlayer({ audioPath, label }: WaveformPlayerProps) {
       waveColor: "#d4d4d4",
       progressColor: "#111111",
       cursorColor: "#0070f3",
-      height: 36,
+      height: 28,
       barWidth: 2,
       barGap: 2,
       barRadius: 2,

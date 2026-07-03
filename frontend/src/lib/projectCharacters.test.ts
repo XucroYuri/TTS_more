@@ -7,6 +7,7 @@ const library: Character[] = [
   {
     id: "xiao-pin",
     name: "小品",
+    avatar_path: "data/character_avatars/xiao-pin.png",
     aliases: ["小品"],
     notes: "",
     default_engine: "gpt-sovits",
@@ -103,8 +104,8 @@ describe("project character helpers", () => {
   it("summarizes project role rows with mode, provider, and line count", () => {
     const rows = projectCharacterRows(project, library);
 
-    expect(rows[0]).toMatchObject({ id: "role-1", name: "小品", mode: "reference", provider: "gpt-sovits", lineCount: 1 });
-    expect(rows[1]).toMatchObject({ id: "role-2", name: "快照小品", mode: "snapshot", provider: "gpt-sovits", lineCount: 1 });
+    expect(rows[0]).toMatchObject({ id: "role-1", name: "小品", mode: "reference", provider: "gpt-sovits", lineCount: 1, avatarPath: "data/character_avatars/xiao-pin.png", avatarFallback: "小" });
+    expect(rows[1]).toMatchObject({ id: "role-2", name: "快照小品", mode: "snapshot", provider: "gpt-sovits", lineCount: 1, avatarPath: "data/character_avatars/xiao-pin.png", avatarFallback: "快" });
   });
 
   it("can create a local snapshot from a library reference for optimistic UI", () => {

@@ -4,6 +4,7 @@ export type StatusTone = "idle" | "queued" | "running" | "completed" | "failed";
 
 export interface LineSummary {
   label: string;
+  latestVersionId?: string;
   canPlay: boolean;
   tone: StatusTone;
 }
@@ -14,7 +15,8 @@ export function summarizeLineHistory(history?: LineHistory): LineSummary {
   }
   const latest = history.versions[history.versions.length - 1];
   return {
-    label: `${latest.version_id} ${latest.status}`,
+    label: latest.status,
+    latestVersionId: latest.version_id,
     canPlay: latest.status === "completed" && Boolean(latest.audio_path),
     tone: statusTone(latest.status)
   };

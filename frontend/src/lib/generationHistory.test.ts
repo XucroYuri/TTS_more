@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { GenerationVersion } from "../types";
-import { groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft } from "./generationHistory";
+import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft } from "./generationHistory";
 
 const versions: GenerationVersion[] = [
   {
@@ -65,6 +65,52 @@ describe("generation history helpers", () => {
       profile: "temp-index",
       binding_id: "temp-index",
       parameters: { emotion_mode: "emotion_text", emotion_text: "焦急" }
+    });
+  });
+
+  it("summarizes failed versions by failure stage for the history panel", () => {
+    expect(generationFailureView({
+      version_id: "v004",
+      engine: "gpt-sovits",
+      profile: "xiaopin",
+      status: "failed",
+      error: "service missing-gpt not found",
+      created_at: "2026-07-01T10:03:00Z",
+      metadata: { failure_stage: "routing" }
+    })).toEqual({
+      labelKey: "history.failure.routing",
+      detail: "service missing-gpt not found"
+    });
+
+    expect(generationFailureView({
+      version_id: "v005",
+      engine: "gpt-sovits",
+      profile: "xiaopin",
+      status: "failed",
+      created_at: "2026-07-01T10:04:00Z"
+    })).toEqual({
+      labelKey: "history.failure.generic",
+      detail: ""
+    });
+  });
+
+  it("summarizes service, config and verification tags for history rows", () => {
+    expect(generationVersionTags({
+      version_id: "v010",
+      engine: "gpt-sovits",
+      profile: "xiao-pin-gpt",
+      provider_type: "gpt-sovits",
+      service_id: "lan-gpt",
+      binding_id: "xiaopin-gpt",
+      status: "completed",
+      created_at: "2026-07-01T10:10:00Z",
+      requested_load_signature: "requested",
+      verified_load_signature: "verified",
+      parameters: { logs_name: "小品TTS", gpt_weights_path: "xiao-pin.ckpt", sovits_weights_path: "xiao-pin.pth" }
+    }, "GPT-SoVITS WebUI")).toEqual({
+      service: "GPT-SoVITS WebUI",
+      config: "小品TTS · xiao-pin-gpt · xiaopin-gpt",
+      verification: "verified"
     });
   });
 });

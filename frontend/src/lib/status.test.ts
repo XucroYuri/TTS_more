@@ -12,7 +12,8 @@ describe("status helpers", () => {
       ]
     });
 
-    expect(summary.label).toBe("v002 completed");
+    expect(summary.label).toBe("completed");
+    expect(summary.latestVersionId).toBe("v002");
     expect(summary.canPlay).toBe(true);
   });
 
@@ -21,4 +22,3 @@ describe("status helpers", () => {
     expect(workerReadinessLabel({ engine: "vibevoice", ready: true })).toBe("ready");
   });
 });
-

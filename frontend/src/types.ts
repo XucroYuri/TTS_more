@@ -24,6 +24,14 @@ export interface WorkerHealth {
   cost_policy?: Record<string, unknown>;
   health?: Record<string, unknown>;
   supervisor?: ServiceSupervisorStatus;
+  state?: "disabled" | "blocked" | "partial" | "ready" | "running" | string;
+  severity?: "neutral" | "attention" | "danger" | "ready" | string;
+  port_reachable?: boolean;
+  config_ok?: boolean;
+  required_api_ok?: boolean;
+  auth_ok?: boolean;
+  can_start?: boolean;
+  supervisor_state?: string;
   cli?: string;
   script?: string;
   key_configured?: boolean;
@@ -94,6 +102,7 @@ export interface ReferenceAudioSample {
 export interface Character {
   id: string;
   name: string;
+  avatar_path?: string | null;
   aliases: string[];
   nicknames?: string[];
   match_names?: string[];
@@ -131,6 +140,7 @@ export interface ProjectCharacter {
 
 export interface ScriptLine {
   id: string;
+  line_uid?: string;
   character_id: string;
   text: string;
   note: string;
@@ -142,10 +152,33 @@ export interface ScriptLine {
   temporary_binding?: VoiceBinding | null;
 }
 
+export interface ScriptRevision {
+  revision_id: string;
+  source_markdown: string;
+  parent_revision_id?: string | null;
+  summary?: string;
+  created_at: string;
+}
+
+export interface ParseRevision {
+  revision_id: string;
+  script_revision_id: string;
+  parent_parse_revision_id?: string | null;
+  provider: string;
+  warnings: string[];
+  project_characters: ProjectCharacter[];
+  lines: ScriptLine[];
+  created_at: string;
+}
+
 export interface ScriptProject {
   title: string;
   default_language: string;
   project_characters?: ProjectCharacter[];
+  active_script_revision_id?: string | null;
+  active_parse_revision_id?: string | null;
+  script_revisions?: ScriptRevision[];
+  parse_revisions?: ParseRevision[];
   lines: ScriptLine[];
 }
 
@@ -161,6 +194,12 @@ export interface GenerationVersion {
   audio_path?: string | null;
   parameters?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  line_uid?: string | null;
+  script_revision_id?: string | null;
+  parse_revision_id?: string | null;
+  binding_snapshot?: Record<string, unknown> | null;
+  requested_load_signature?: string | null;
+  verified_load_signature?: string | null;
   log_summary?: string;
   error?: string | null;
   created_at: string;
@@ -218,6 +257,16 @@ export interface ParserProvidersSavePayload {
   providers: Array<Omit<ParserProviderDraft, "key_configured">>;
 }
 
+export interface ParserProviderTestResponse {
+  ok: boolean;
+  state: "ready" | "partial" | "blocked" | "disabled" | "needs_key";
+  message: string;
+  provider: string;
+  model?: string;
+  latency_ms?: number;
+  content_preview?: string;
+}
+
 export interface ReferenceAudioGroup {
   id: string;
   name: string;
@@ -245,6 +294,27 @@ export interface RoleLibraryCandidate {
 export interface RoleLibraryScanResponse {
   candidates: RoleLibraryCandidate[];
   diagnostics?: Array<{ service_id?: string; status: string; detail: string }>;
+}
+
+export interface LogsReferenceAudioSample {
+  sample_id: string;
+  display_label: string;
+  path: string;
+  text: string;
+  text_source: "sidecar" | "manual" | "none" | "name2text" | "audio_metadata" | string;
+  character?: string;
+  emotion?: string;
+  remark?: string;
+  prompt_lang?: string;
+  source: "logs" | "refdir" | string;
+  logs_name?: string;
+}
+
+export interface LogsReferenceAudioResponse {
+  service_id?: string | null;
+  logs_name: string;
+  samples: LogsReferenceAudioSample[];
+  diagnostics?: Array<{ status: string; path?: string; detail: string }>;
 }
 
 export interface ProjectCharactersResponse {
@@ -286,10 +356,14 @@ export type QueueItemStatus = "queued" | "loading" | "running" | "finalizing" | 
 export interface GenerationQueueItem {
   task_id: string;
   line_id: string;
+  line_uid?: string | null;
   status: QueueItemStatus;
   progress: number;
   queue_position?: number | null;
   cluster_key: string;
+  cluster_size?: number | null;
+  cluster_position?: number | null;
+  load_signature?: string | null;
   service_id?: string | null;
   resource_group?: string | null;
   error?: string | null;
@@ -311,4 +385,51 @@ export interface QueueStatus {
   jobs: GenerationJob[];
   queued: number;
   running: number;
+}
+
+export interface ServiceLoadState {
+  service_id: string;
+  loaded: boolean;
+  loaded_signature?: string | null;
+  verification_level?: string | null;
+  updated_at?: string | null;
+  last_error?: string | null;
+  last_error_at?: string | null;
+}
+
+export interface GenerationPreflightItem {
+  line_id: string;
+  line_uid?: string | null;
+  status: "ready" | "needs_user_action" | "blocked";
+  selected_service_id?: string | null;
+  load_signature?: string | null;
+  current_loaded_signature?: string | null;
+  load_state?: "loaded" | "switch_required" | "not_loaded" | "unresolved" | string | null;
+  load_match?: boolean;
+  verification_level?: string | null;
+  last_load_error?: string | null;
+  fallback_action?: { type: "start_service"; service_id: string } | null;
+  reason?: string | null;
+}
+
+export interface GenerationPreflightResponse {
+  status: "ready" | "needs_user_action" | "blocked";
+  items: GenerationPreflightItem[];
+}
+
+export interface DemoValidationPlan {
+  project_id: string;
+  title: string;
+  summary: {
+    line_count: number;
+    considered_line_count: number;
+    runnable_line_count: number;
+    blocked_line_count: number;
+    task_count: number;
+    repeats: number;
+  };
+  blocked_lines: Array<{ line_id: string; line_uid?: string | null; character_id: string; reason: string }>;
+  tasks: GenerationTask[];
+  preflight: GenerationPreflightResponse;
+  clusters: Array<{ cluster_key: string; count: number; line_ids: string[] }>;
 }
