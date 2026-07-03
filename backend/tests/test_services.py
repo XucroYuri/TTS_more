@@ -36,7 +36,7 @@ def test_registry_loads_services_json(tmp_path: Path) -> None:
   {
     "service_id": "remote-gpt",
     "engine": "gpt-sovits",
-    "base_url": "http://192.168.2.20:9880",
+    "base_url": "http://192.0.2.20:9880",
     "mode": "external",
     "resource_group": "remote-a-gpu-0",
     "priority": 5,
@@ -49,7 +49,7 @@ def test_registry_loads_services_json(tmp_path: Path) -> None:
 
     registry = ServiceRegistry.load(services_path)
 
-    assert registry.get("remote-gpt").base_url == "http://192.168.2.20:9880"
+    assert registry.get("remote-gpt").base_url == "http://192.0.2.20:9880"
     assert registry.get("remote-gpt").mode == "external"
     assert registry.get("remote-gpt").resource_group == "remote-a-gpu-0"
 
@@ -73,7 +73,7 @@ def test_registry_keeps_external_vibevoice_only_as_generic_http() -> None:
         service_id="studio-vibevoice",
         provider_type="generic-http",
         api_contract="tts-more-v1",
-        base_url="http://192.168.2.50:9882",
+        base_url="http://192.0.2.50:9882",
         mode="external",
         network_scope="lan",
         capabilities=["tts", "legacy_vibevoice"],
@@ -106,14 +106,14 @@ def test_gradio_webui_endpoint_is_reachable_and_routable_with_bridge(tmp_path: P
         engine=EngineName.INDEX_TTS,
         provider_type="indextts",
         api_contract="gradio-indextts2-webui",
-        base_url="http://192.168.2.166:7860",
+        base_url="http://192.0.2.166:7860",
         mode="external",
         network_scope="lan",
         managed=False,
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == "http://192.168.2.166:7860/config":
+        if str(request.url) == "http://192.0.2.166:7860/config":
             return httpx.Response(
                 200,
                 json={
@@ -123,13 +123,13 @@ def test_gradio_webui_endpoint_is_reachable_and_routable_with_bridge(tmp_path: P
                     "dependencies": [{"api_name": "gen_single"}],
                 },
             )
-        if str(request.url) == "http://192.168.2.166:7860/gradio_api/api/gen_single":
+        if str(request.url) == "http://192.0.2.166:7860/gradio_api/api/gen_single":
             payload = json.loads(request.content.decode("utf-8"))
             assert payload["data"][0] == "与音色参考音频相同"
             assert payload["data"][1] == "ref.wav"
             assert payload["data"][2] == "你好"
             return httpx.Response(200, json={"data": [{"visible": True, "value": {"url": "/file=/tmp/generated.wav", "orig_name": "generated.wav"}, "__type__": "update"}]})
-        if str(request.url) == "http://192.168.2.166:7860/file=/tmp/generated.wav":
+        if str(request.url) == "http://192.0.2.166:7860/file=/tmp/generated.wav":
             return httpx.Response(200, content=b"RIFFfake-wav")
         return httpx.Response(404, json={"detail": str(request.url)})
 
@@ -161,7 +161,7 @@ def test_gradio_endpoint_missing_required_api_is_blocked() -> None:
         engine=EngineName.INDEX_TTS,
         provider_type="indextts",
         api_contract="gradio-indextts2-webui",
-        base_url="http://192.168.2.166:7860",
+        base_url="http://192.0.2.166:7860",
         mode="external",
         network_scope="lan",
         managed=False,
@@ -194,7 +194,7 @@ def test_indextts_gradio_uses_example_voice_when_binding_only_has_example_index(
         engine=EngineName.INDEX_TTS,
         provider_type="indextts",
         api_contract="gradio-indextts2-webui",
-        base_url="http://192.168.2.166:7860",
+        base_url="http://192.0.2.166:7860",
         mode="external",
         network_scope="lan",
         managed=False,
@@ -202,16 +202,16 @@ def test_indextts_gradio_uses_example_voice_when_binding_only_has_example_index(
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == "http://192.168.2.166:7860/config":
+        if str(request.url) == "http://192.0.2.166:7860/config":
             return httpx.Response(200, json={"api_prefix": "/gradio_api", "dependencies": [{"api_name": "gen_single"}, {"api_name": "load_example"}]})
-        if str(request.url) == "http://192.168.2.166:7860/gradio_api/api/load_example":
+        if str(request.url) == "http://192.0.2.166:7860/gradio_api/api/load_example":
             calls.append("load_example")
             assert json.loads(request.content.decode("utf-8"))["data"] == [2]
             return httpx.Response(
                 200,
                 json={
                     "data": [
-                        {"value": {"path": "C:/tmp/voice_03.wav", "url": "http://192.168.2.166:7860/gradio_api/file=C:/tmp/voice_03.wav"}},
+                        {"value": {"path": "C:/tmp/voice_03.wav", "url": "http://192.0.2.166:7860/gradio_api/file=C:/tmp/voice_03.wav"}},
                         {"value": "与音色参考音频相同"},
                         {"value": "示例文本"},
                         {"value": None},
@@ -221,13 +221,13 @@ def test_indextts_gradio_uses_example_voice_when_binding_only_has_example_index(
                     ]
                 },
             )
-        if str(request.url) == "http://192.168.2.166:7860/gradio_api/api/gen_single":
+        if str(request.url) == "http://192.0.2.166:7860/gradio_api/api/gen_single":
             calls.append("gen_single")
             payload = json.loads(request.content.decode("utf-8"))
             assert payload["data"][1]["path"] == "C:/tmp/voice_03.wav"
             assert payload["data"][2] == "当前台词"
             return httpx.Response(200, json={"data": [{"url": "/file=/tmp/generated.wav"}]})
-        if str(request.url) == "http://192.168.2.166:7860/file=/tmp/generated.wav":
+        if str(request.url) == "http://192.0.2.166:7860/file=/tmp/generated.wav":
             return httpx.Response(200, content=b"RIFFexample")
         return httpx.Response(404)
 
@@ -252,32 +252,32 @@ def test_gpt_sovits_gradio_uses_selected_reference_audio_update(tmp_path: Path) 
         engine=EngineName.GPT_SOVITS,
         provider_type="gpt-sovits",
         api_contract="gradio-gpt-sovits-webui",
-        base_url="http://192.168.2.166:9872",
+        base_url="http://192.0.2.166:9872",
         mode="external",
         network_scope="lan",
         managed=False,
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == "http://192.168.2.166:9872/config":
+        if str(request.url) == "http://192.0.2.166:9872/config":
             return httpx.Response(200, json={"dependencies": [{"api_name": "get_tts_wav"}, {"api_name": "on_select_ref_audio"}]})
-        if str(request.url) == "http://192.168.2.166:9872/api/on_select_ref_audio":
+        if str(request.url) == "http://192.0.2.166:9872/api/on_select_ref_audio":
             return httpx.Response(
                 200,
                 json={
                     "data": [
-                        {"visible": True, "value": {"path": "C:/tmp/ref.wav", "url": "http://192.168.2.166:9872/file=C:/tmp/ref.wav"}, "__type__": "update"},
+                        {"visible": True, "value": {"path": "C:/tmp/ref.wav", "url": "http://192.0.2.166:9872/file=C:/tmp/ref.wav"}, "__type__": "update"},
                         {"value": "参考文本"},
                     ]
                 },
             )
-        if str(request.url) == "http://192.168.2.166:9872/api/get_tts_wav":
+        if str(request.url) == "http://192.0.2.166:9872/api/get_tts_wav":
             payload = json.loads(request.content.decode("utf-8"))
             assert payload["data"][0]["path"] == "C:/tmp/ref.wav"
             assert payload["data"][1] == "参考文本"
             assert payload["data"][3] == "马上过去"
             return httpx.Response(200, json={"data": [{"value": {"url": "/file=/tmp/gpt.wav"}}]})
-        if str(request.url) == "http://192.168.2.166:9872/file=/tmp/gpt.wav":
+        if str(request.url) == "http://192.0.2.166:9872/file=/tmp/gpt.wav":
             return httpx.Response(200, content=b"RIFFgpt")
         return httpx.Response(404)
 
@@ -303,24 +303,24 @@ def test_gpt_sovits_gradio_uploads_local_reference_audio(tmp_path: Path) -> None
         engine=EngineName.GPT_SOVITS,
         provider_type="gpt-sovits",
         api_contract="gradio-gpt-sovits-webui",
-        base_url="http://192.168.2.166:9872",
+        base_url="http://192.0.2.166:9872",
         mode="external",
         network_scope="lan",
         managed=False,
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == "http://192.168.2.166:9872/config":
+        if str(request.url) == "http://192.0.2.166:9872/config":
             return httpx.Response(200, json={"dependencies": [{"api_name": "get_tts_wav"}]})
-        if str(request.url) == "http://192.168.2.166:9872/upload":
+        if str(request.url) == "http://192.0.2.166:9872/upload":
             assert request.method == "POST"
             return httpx.Response(200, json=["D:/gradio/tmp/ref.wav"])
-        if str(request.url) == "http://192.168.2.166:9872/api/get_tts_wav":
+        if str(request.url) == "http://192.0.2.166:9872/api/get_tts_wav":
             payload = json.loads(request.content.decode("utf-8"))
             assert payload["data"][0]["path"] == "D:/gradio/tmp/ref.wav"
             assert payload["data"][0]["orig_name"] == "ref.wav"
             return httpx.Response(200, json={"data": [{"value": {"url": "/file=/tmp/gpt.wav"}}]})
-        if str(request.url) == "http://192.168.2.166:9872/file=/tmp/gpt.wav":
+        if str(request.url) == "http://192.0.2.166:9872/file=/tmp/gpt.wav":
             return httpx.Response(200, content=b"RIFFgpt")
         return httpx.Response(404)
 

@@ -121,8 +121,8 @@ describe("workstation helpers", () => {
       [
         { service_id: "local-gpt-sovits", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: false, enabled: false, base_url: "http://127.0.0.1:9880" },
         { service_id: "local-indextts", engine: "indextts", provider_type: "indextts", ready: false, enabled: false, base_url: "http://127.0.0.1:9881" },
-        { service_id: "lan-gpt", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, enabled: true, base_url: "http://192.168.2.166:9872", network_scope: "lan", capabilities: ["gradio_webui"] },
-        { service_id: "lan-index", engine: "indextts", provider_type: "indextts", ready: true, enabled: true, base_url: "http://192.168.2.166:7860", network_scope: "lan", capabilities: ["gradio_webui"] }
+        { service_id: "lan-gpt", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, enabled: true, base_url: "http://192.0.2.166:9872", network_scope: "lan", capabilities: ["gradio_webui"] },
+        { service_id: "lan-index", engine: "indextts", provider_type: "indextts", ready: true, enabled: true, base_url: "http://192.0.2.166:7860", network_scope: "lan", capabilities: ["gradio_webui"] }
       ],
       readyCandidates,
       []

@@ -37,20 +37,20 @@ const library: Character[] = [
 
 const extendedNameLibrary: Character[] = [
   {
-    id: "guangtou",
-    name: "光头",
-    aliases: ["光头胖子"],
-    nicknames: ["小光"],
-    match_names: ["光头TTS新-20260611"],
+    id: "hero",
+    name: "主角",
+    aliases: ["英雄队长"],
+    nicknames: ["队长"],
+    match_names: ["demo-hero-logs"],
     notes: "",
     fallback_profiles: []
   },
   {
-    id: "yanjing",
-    name: "眼镜",
-    aliases: ["眼镜哥"],
-    nicknames: ["严镜"],
-    match_names: ["TTS-大鹏眼镜"],
+    id: "mentor",
+    name: "导师",
+    aliases: ["顾问"],
+    nicknames: ["顾问"],
+    match_names: ["demo-mentor-logs"],
     notes: "",
     fallback_profiles: []
   }
@@ -120,14 +120,14 @@ describe("project character helpers", () => {
       title: "demo",
       default_language: "zh",
       lines: [
-        { id: "l1", character_id: "小光", text: "怎么爆炸了……", note: "" },
-        { id: "l2", character_id: "严镜", text: "没有用！", note: "" }
+        { id: "l1", character_id: "队长", text: "我们必须出发。", note: "" },
+        { id: "l2", character_id: "顾问", text: "保持阵型。", note: "" }
       ]
     };
 
     const rows = projectCharacterRows(nextProject, extendedNameLibrary);
 
-    expect(rows[0]).toMatchObject({ id: "小光", name: "光头", linked: true });
-    expect(rows[1]).toMatchObject({ id: "严镜", name: "眼镜", linked: true });
+    expect(rows[0]).toMatchObject({ id: "队长", name: "主角", linked: true });
+    expect(rows[1]).toMatchObject({ id: "顾问", name: "导师", linked: true });
   });
 });

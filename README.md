@@ -60,7 +60,7 @@ For local GPT-SoVITS and IndexTTS generation:
 
 The routing layer uses provider type, API contract, capabilities, voice bindings, health, priority, and resource group. Default priority keeps GPT-SoVITS first and IndexTTS second, with commercial or generic HTTP providers available as opt-in profiles or lower-priority candidates. VibeVoice is no longer a local core model; register it as an external generic HTTP endpoint only if you still want to use it.
 
-Reference audio is scanned from `\\192.168.2.12\ai\项目\音色克隆\音源归档` by default. GPT-SoVITS trained weights are expected under `\\192.168.2.12\ai\项目\音色克隆\模型训练`.
+Reference audio and trained weights are loaded from local runtime configuration. Keep private paths in `.env.local` or `data/local/services.json`; the repository only ships neutral templates under `data/templates/`.
 
 ## Verify
 

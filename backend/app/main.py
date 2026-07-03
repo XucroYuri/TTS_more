@@ -25,7 +25,7 @@ from app.services import ServiceRegistry, ServiceRouter
 from app.storage import ProjectStore
 from app.supervisor import ServiceSupervisor
 
-DEFAULT_REFERENCE_AUDIO_ROOT = Path(r"\\192.168.2.12\ai\项目\音色克隆\音源归档")
+DEFAULT_REFERENCE_AUDIO_ROOT = Path("data") / "local" / "reference-audio"
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_ROOT = Path("data") / ".runtime"
 REPO_LOCK_PATH = Path(__file__).resolve().parents[2] / "repo.lock.json"

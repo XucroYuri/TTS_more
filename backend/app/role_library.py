@@ -22,17 +22,10 @@ from app.resources import AUDIO_SUFFIXES, GPT_WEIGHT_SUFFIXES, SOVITS_WEIGHT_SUF
 
 TEXT_SUFFIXES = [".txt", ".lab", ".json"]
 COMMON_LOGS_PRESETS: list[dict[str, Any]] = [
-    {"name": "珊珊", "logs_name": "许珺雯-山海奇缘-珊珊20260629", "nicknames": [], "match_names": ["珊珊"]},
-    {"name": "卡皮巴拉", "logs_name": "张博华-卡皮巴拉", "nicknames": [], "match_names": ["卡皮巴拉"]},
-    {"name": "九九", "logs_name": "许珺雯-虚拟游戏-九九", "nicknames": [], "match_names": ["九九"]},
-    {"name": "胶布", "logs_name": "胶布TTS新-20260611", "nicknames": [], "match_names": ["胶布"]},
-    {"name": "白泽", "logs_name": "白泽TTS新-20260611", "nicknames": [], "match_names": ["白泽"]},
-    {"name": "死神", "logs_name": "死神TTS-华-v2ProPlus", "nicknames": [], "match_names": ["死神"]},
-    {"name": "断恶", "logs_name": "断恶TTS-华-20251128", "nicknames": [], "match_names": ["断恶"]},
-    {"name": "心辰", "logs_name": "心辰TTS-3", "nicknames": [], "match_names": ["心辰"]},
-    {"name": "光头", "logs_name": "光头TTS新-20260611", "nicknames": ["小光", "光头胖子"], "match_names": ["光头", "光头TTS新"]},
-    {"name": "眼镜", "logs_name": "TTS-大鹏眼镜", "nicknames": ["严镜", "眼镜哥"], "match_names": ["眼镜", "TTS-大鹏眼镜"]},
-    {"name": "弱弱", "logs_name": "2张悦荷-弱弱-251126-已训练2r", "nicknames": [], "match_names": ["弱弱"]},
+    {"name": "主角", "logs_name": "demo-hero-logs", "nicknames": ["队长"], "match_names": ["主角", "英雄"]},
+    {"name": "导师", "logs_name": "demo-mentor-logs", "nicknames": ["顾问"], "match_names": ["导师", "顾问"]},
+    {"name": "反派", "logs_name": "demo-antagonist-logs", "nicknames": ["对手"], "match_names": ["反派", "对手"]},
+    {"name": "旁白", "logs_name": "demo-narrator-logs", "nicknames": [], "match_names": ["旁白", "叙述者"]},
 ]
 PINYIN_FALLBACK = {
     "小": "xiao",
@@ -482,7 +475,7 @@ def _preset_candidate(preset: dict[str, Any], service_id: str | None) -> dict[st
         "nicknames": list(preset.get("nicknames") or []),
         "match_names": list(dict.fromkeys([*(preset.get("match_names") or []), logs_name])),
         "logs_match_names": [logs_name],
-        "service_id": service_id or "lan-gpt-sovits-gradio-166",
+        "service_id": service_id or "example-gpt-sovits-gradio",
         "source": "preset",
         "preset": True,
         "tags": ["common-preset"],
