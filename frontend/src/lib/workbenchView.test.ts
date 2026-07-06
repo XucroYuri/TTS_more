@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Character, GenerationVersion, ScriptLine, WorkerHealth } from "../types";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorConfigPanelLayout, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorSpeechWorkbenchLayout, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, referenceResourcePanelLayout, roleAccentClass, roleChipInteractionState, roleFilterCardView, scriptConsoleActionPlacement, scriptConsoleBodyMode, scriptDrawerTabs, scriptExcerptLines, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups } from "./workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorConfigPanelLayout, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorSpeechWorkbenchLayout, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, referenceResourcePanelLayout, resourceQueueLayout, roleAccentClass, roleChipInteractionState, roleFilterCardView, roleLibraryLayout, scriptConsoleActionPlacement, scriptConsoleBodyMode, scriptDrawerTabs, scriptExcerptLines, scriptModuleLayout, serviceTopologyLayout, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups } from "./workbenchView";
 
 describe("workbench view helpers", () => {
   it("keeps role filter names and count badges as separate visual parts", () => {
@@ -323,8 +323,47 @@ describe("workbench view helpers", () => {
     expect(preflightLoadLabelKey({ ...ready, load_state: "switch_required", current_loaded_signature: "sig-old", load_match: false }, null)).toBe("preflight.switchNeeded");
   });
 
-  it("defines the script drawer tabs in production workflow order", () => {
-    expect(scriptDrawerTabs().map((tab) => tab.id)).toEqual(["list", "edit", "preview", "history"]);
+  it("keeps the script manager as a single-page workflow without nested drawer tabs", () => {
+    expect(scriptDrawerTabs()).toEqual([]);
+  });
+
+  it("keeps the script module focused on list, editor preview, and extraction versions", () => {
+    expect(scriptModuleLayout()).toEqual({
+      managementSurface: "main_interface",
+      sidebarSections: ["new_script", "existing_script_list", "script_editor_preview", "extract_lines"],
+      hiddenSidebarSections: ["metric_cards", "autosave_card", "duplicate_manage_button"],
+      hiddenSurfaces: ["script_modal", "drawer_backdrop"],
+      hiddenManagementSections: ["editor_preview", "parse_revision_history", "revision_task_buttons", "modal_close_button"],
+      defaultEditorMode: "preview"
+    });
+  });
+
+  it("splits service setup, role library, and resource queue into independent surfaces", () => {
+    expect(serviceTopologyLayout()).toEqual({
+      primaryMenus: ["tts_config", "llm_api_config"],
+      serviceSurface: "split_tts_and_llm",
+      serviceNestedNav: false,
+      serviceSections: ["tts_access", "llm_api"],
+      detachedSurfaces: ["role_library", "resource_queue"]
+    });
+  });
+
+  it("keeps the resource queue focused on dispatch progress and polling state", () => {
+    expect(resourceQueueLayout()).toEqual({
+      focus: "queue_dispatch",
+      sections: ["dispatch_progress", "polling_state", "recent_jobs"],
+      progress: "queue_progress_bar",
+      hiddenSections: ["resource_groups", "model_assets"]
+    });
+  });
+
+  it("keeps the role library as a simple list and selected-role editor", () => {
+    expect(roleLibraryLayout()).toEqual({
+      focus: "role_defaults",
+      sections: ["role_list", "selected_role_detail"],
+      visibleControls: ["search", "scan_candidates", "add_role"],
+      hiddenSections: ["workflow_overview", "project_match_column", "scan_candidates_column", "binding_inventory_panel"]
+    });
   });
 
   it("builds a compact script excerpt for the left console without editing controls", () => {

@@ -114,6 +114,37 @@ export interface ScriptConsoleActionPlacement {
   parseRevision: "footer";
 }
 
+export interface ServiceTopologyLayout {
+  primaryMenus: ["tts_config", "llm_api_config"];
+  serviceSurface: "split_tts_and_llm";
+  serviceNestedNav: false;
+  serviceSections: ["tts_access", "llm_api"];
+  detachedSurfaces: ["role_library", "resource_queue"];
+}
+
+export interface ResourceQueueLayout {
+  focus: "queue_dispatch";
+  sections: ["dispatch_progress", "polling_state", "recent_jobs"];
+  progress: "queue_progress_bar";
+  hiddenSections: ["resource_groups", "model_assets"];
+}
+
+export interface RoleLibraryLayout {
+  focus: "role_defaults";
+  sections: ["role_list", "selected_role_detail"];
+  visibleControls: ["search", "scan_candidates", "add_role"];
+  hiddenSections: ["workflow_overview", "project_match_column", "scan_candidates_column", "binding_inventory_panel"];
+}
+
+export interface ScriptModuleLayout {
+  managementSurface: "main_interface";
+  sidebarSections: ["new_script", "existing_script_list", "script_editor_preview", "extract_lines"];
+  hiddenSidebarSections: ["metric_cards", "autosave_card", "duplicate_manage_button"];
+  hiddenSurfaces: ["script_modal", "drawer_backdrop"];
+  hiddenManagementSections: ["editor_preview", "parse_revision_history", "revision_task_buttons", "modal_close_button"];
+  defaultEditorMode: "preview";
+}
+
 export type ScriptConsoleBodyMode = "preview" | "edit";
 
 type PreflightFallbackEntry = {
@@ -435,12 +466,46 @@ export function preflightFallbackAction(
 }
 
 export function scriptDrawerTabs(): ScriptDrawerTab[] {
-  return [
-    { id: "list", labelKey: "script.drawer.list" },
-    { id: "edit", labelKey: "script.drawer.edit" },
-    { id: "preview", labelKey: "script.drawer.preview" },
-    { id: "history", labelKey: "script.drawer.history" }
-  ];
+  return [];
+}
+
+export function scriptModuleLayout(): ScriptModuleLayout {
+  return {
+    managementSurface: "main_interface",
+    sidebarSections: ["new_script", "existing_script_list", "script_editor_preview", "extract_lines"],
+    hiddenSidebarSections: ["metric_cards", "autosave_card", "duplicate_manage_button"],
+    hiddenSurfaces: ["script_modal", "drawer_backdrop"],
+    hiddenManagementSections: ["editor_preview", "parse_revision_history", "revision_task_buttons", "modal_close_button"],
+    defaultEditorMode: "preview"
+  };
+}
+
+export function serviceTopologyLayout(): ServiceTopologyLayout {
+  return {
+    primaryMenus: ["tts_config", "llm_api_config"],
+    serviceSurface: "split_tts_and_llm",
+    serviceNestedNav: false,
+    serviceSections: ["tts_access", "llm_api"],
+    detachedSurfaces: ["role_library", "resource_queue"]
+  };
+}
+
+export function resourceQueueLayout(): ResourceQueueLayout {
+  return {
+    focus: "queue_dispatch",
+    sections: ["dispatch_progress", "polling_state", "recent_jobs"],
+    progress: "queue_progress_bar",
+    hiddenSections: ["resource_groups", "model_assets"]
+  };
+}
+
+export function roleLibraryLayout(): RoleLibraryLayout {
+  return {
+    focus: "role_defaults",
+    sections: ["role_list", "selected_role_detail"],
+    visibleControls: ["search", "scan_candidates", "add_role"],
+    hiddenSections: ["workflow_overview", "project_match_column", "scan_candidates_column", "binding_inventory_panel"]
+  };
 }
 
 export function scriptExcerptLines(source: string, maxLines = 6): string[] {
