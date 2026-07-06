@@ -2,7 +2,6 @@ import {
   AlertCircle,
   Bot,
   CheckCircle2,
-  ChevronDown,
   Cpu,
   FileText,
   FolderKanban,
@@ -20,7 +19,6 @@ import {
   SlidersHorizontal,
   Square,
   Trash2,
-  UserRound,
   Upload,
   Wand2,
   X
@@ -57,7 +55,6 @@ import {
   createScriptRevision,
   deleteGenerationVersion,
   importRoleLibraryCandidate,
-  parseScript,
   reloadServiceSettings,
   runRealValidation,
   saveCharacters,
@@ -84,17 +81,16 @@ import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from ".
 import { formatScriptNote } from "./lib/lineNote";
 import { ensureProjectCharacters, freezeProjectCharacterLocally, projectCharacterRows, resolveProjectCharacters } from "./lib/projectCharacters";
 import { buildGenerationTask, lineBinding, lineEngine, lineProfile, lineServiceId } from "./lib/routing";
-import { parserProviderKeyState, toParserProviderSavePayload } from "./lib/parserConfig";
-import { createEmptyManifest, createEmptyProject, readStoredProjectId, selectStartupProjectId, writeStoredProjectId } from "./lib/projectStartup";
+import { createDefaultParserProviderDraft, KWJM_API_KEY_ENV, KWJM_BASE_URL_PLACEHOLDER, KWJM_MODEL, parserProviderKeyState, toParserProviderSavePayload } from "./lib/parserConfig";
+import { createEmptyManifest, createEmptyProject, createProjectId, readStoredProjectId, selectStartupProjectId, writeStoredProjectId } from "./lib/projectStartup";
 import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, roleChipInteractionState, roleFilterCardView, scriptConsoleBodyMode, scriptDrawerTabs, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge, type ScriptDrawerTabId } from "./lib/workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, roleChipInteractionState, roleFilterCardView, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
   Character,
   CharacterReferenceAudioGroup,
   GenerationManifest,
-  ParsedDraft,
   ParserProviderDraft,
   ParserProviderTestResponse,
   ProjectCharacter,
@@ -125,7 +121,7 @@ import type {
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 type SaveState = "idle" | "saving" | "saved" | "error";
 type ServicePanelSection = "overview" | "open-source" | "tts" | "llm" | "resources" | "roles";
-type ScriptSourceMode = "project" | "manual" | "draft";
+type ScriptSourceMode = "project" | "manual";
 type ConfirmationTone = "warning" | "danger" | "info";
 const LINE_PAGE_SIZE = 10;
 
@@ -164,7 +160,6 @@ export default function App() {
   const [selectedLineIds, setSelectedLineIds] = useState<string[]>([]);
   const [scriptInput, setScriptInput] = useState("");
   const [scriptSourceMode, setScriptSourceMode] = useState<ScriptSourceMode>("project");
-  const [draft, setDraft] = useState<ParsedDraft | null>(null);
   const [parserProviders, setParserProviders] = useState<ParserProviderDraft[]>([]);
   const [roleLibraryCandidates, setRoleLibraryCandidates] = useState<RoleLibraryCandidate[]>([]);
   const [isParsing, setIsParsing] = useState(false);
@@ -178,7 +173,7 @@ export default function App() {
   const [testingServiceId, setTestingServiceId] = useState<string | null>(null);
   const [isScanningRoleLibrary, setIsScanningRoleLibrary] = useState(false);
   const [isTopologyMenuOpen, setIsTopologyMenuOpen] = useState(false);
-  const [servicePanelSection, setServicePanelSection] = useState<ServicePanelSection>("overview");
+  const [servicePanelSection, setServicePanelSection] = useState<ServicePanelSection>("open-source");
   const [openSourceCatalog, setOpenSourceCatalog] = useState<OpenSourceTTSCatalogItem[]>([]);
   const [selectedOpenSourceProvider, setSelectedOpenSourceProvider] = useState<CatalogProvider>("gpt-sovits");
   const [openSourceSourceProfile, setOpenSourceSourceProfile] = useState<SourceProfile>("local_repo");
@@ -192,9 +187,10 @@ export default function App() {
   const [openSourceDetectResult, setOpenSourceDetectResult] = useState<OpenSourceTTSDetectResponse | null>(null);
   const [isDetectingOpenSource, setIsDetectingOpenSource] = useState(false);
   const [isConfiguringOpenSource, setIsConfiguringOpenSource] = useState(false);
-  const [scriptDrawerOpen, setScriptDrawerOpen] = useState(false);
-  const [scriptDrawerTab, setScriptDrawerTab] = useState<ScriptDrawerTabId>("list");
   const [isSidebarScriptEditing, setIsSidebarScriptEditing] = useState(false);
+  const [newScriptTitle, setNewScriptTitle] = useState("");
+  const [newScriptSource, setNewScriptSource] = useState("");
+  const [isCreatingScript, setIsCreatingScript] = useState(false);
   const [isProjectLoaded, setIsProjectLoaded] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
@@ -263,7 +259,6 @@ export default function App() {
       setScriptInput("");
       setScriptSourceMode("project");
       setIsSidebarScriptEditing(false);
-      setDraft(null);
       setIsProjectLoaded(true);
       setSaveState("idle");
       return;
@@ -271,7 +266,6 @@ export default function App() {
     setIsProjectLoaded(false);
     setScriptSourceMode("project");
     setIsSidebarScriptEditing(false);
-    setDraft(null);
     fetchProject(currentProjectId)
       .then((payload) => {
         setProject(payload);
@@ -296,7 +290,6 @@ export default function App() {
         setScriptInput("");
         setScriptSourceMode("project");
         setIsSidebarScriptEditing(false);
-        setDraft(null);
         setIsProjectLoaded(true);
         setNotice(t("empty.projectLoadFailed"));
       });
@@ -348,17 +341,6 @@ export default function App() {
     () => filteredLibraryCharacters.find((character) => character.id === activeLibraryCharacterId) ?? filteredLibraryCharacters[0] ?? null,
     [activeLibraryCharacterId, filteredLibraryCharacters]
   );
-  const activeLibraryGptBinding = useMemo(
-    () => (activeLibraryCharacter?.profiles ?? []).flatMap((profile) => profile.bindings ?? []).find((binding) => binding.provider_type === "gpt-sovits"),
-    [activeLibraryCharacter]
-  );
-  const activeLibraryLogsReferenceRequest = useMemo(
-    () => logsReferenceRequest("gpt-sovits", activeLibraryGptBinding?.service_id ?? "", activeLibraryGptBinding?.config ?? {}),
-    [activeLibraryGptBinding]
-  );
-  const activeLibraryLogsReferencePayload = activeLibraryLogsReferenceRequest ? logsReferenceAudio[activeLibraryLogsReferenceRequest.key] : undefined;
-  const activeLibraryLogsReferenceSamples = activeLibraryLogsReferencePayload?.samples ?? [];
-  const activeLibraryLogsReferenceSample = selectedLogsReferenceSample(activeLibraryLogsReferenceSamples, activeLibraryGptBinding?.config ?? {}, { serviceId: activeLibraryGptBinding?.service_id });
   const activeRoleCandidate = useMemo(
     () => roleLibraryCandidates.find((candidate) => candidate.id === activeRoleCandidateId) ?? null,
     [activeRoleCandidateId, roleLibraryCandidates]
@@ -456,11 +438,10 @@ export default function App() {
   const selectedLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language ?? defaultLanguage);
   const selectedLanguageLabel = languageOptions.find((option) => option.value === selectedLanguage)?.label ?? selectedLanguage;
   const displayProjectTitle = project.title || currentProjectId ? standardProjectName(project.title || currentProjectId || "") : t("empty.noProjectSelected");
-  const scriptSourceTone = scriptSourceMode === "project" ? "completed" : scriptSourceMode === "draft" ? "running" : "queued";
+  const scriptSourceTone = scriptSourceMode === "project" ? "completed" : "queued";
   const scriptSourceLabel = t(`parser.source.${scriptSourceMode}`);
-  const scriptSourceHint = t(`parser.sourceHint.${scriptSourceMode}`, { projectLines: project.lines.length, draftLines: draft?.lines.length ?? 0 });
+  const scriptSourceHint = t(`parser.sourceHint.${scriptSourceMode}`, { projectLines: project.lines.length });
   const projectRows = useMemo<ProjectSummary[]>(() => projectSummaries, [projectSummaries]);
-  const drawerTabs = useMemo(() => scriptDrawerTabs(), []);
   const scriptConsoleText = useMemo(
     () => scriptInput || projectToScriptSourceText(projectWithCharacters, characters),
     [characters, projectWithCharacters, scriptInput]
@@ -497,22 +478,59 @@ export default function App() {
   }, [activeJob]);
   const activeRouteServices = useMemo(() => routableProviderServices(visibleServices, activeProvider), [activeProvider, visibleServices]);
   const activeSelectedServiceUnavailable = Boolean(activeServiceId && !activeRouteServices.some((service) => service.service_id === activeServiceId));
-  const servicePanelItems = useMemo(
-    () => [
-      { id: "overview" as const, label: t("services.panelOverview"), meta: topbarToneText(serviceSummary.overallTone, t) },
-      { id: "open-source" as const, label: t("services.panelOpenSource"), meta: `${openSourceCatalog.length || 3}` },
-      { id: "tts" as const, label: t("services.panelTTS"), meta: `${ttsServices.length}` },
-      { id: "llm" as const, label: t("services.panelLLM"), meta: `${serviceSummary.parser.ready}/${serviceSummary.parser.total}` },
-      { id: "resources" as const, label: t("services.panelResources"), meta: queueStatus ? `${queueStatus.running}/${queueStatus.queued}` : "-" },
-      { id: "roles" as const, label: t("services.panelRoles"), meta: `${characters.length}` }
-    ],
-    [characters.length, openSourceCatalog.length, queueStatus, serviceSummary, t, ttsServices.length]
-  );
-
   const selectedOpenSourceCatalog = useMemo(
     () => openSourceCatalog.find((item) => item.provider_type === selectedOpenSourceProvider) ?? openSourceCatalog[0],
     [openSourceCatalog, selectedOpenSourceProvider]
   );
+  const ttsHealthItems = useMemo(
+    () => serviceHealthItems.filter((item) => item.id === "local" || item.id === "paid"),
+    [serviceHealthItems]
+  );
+  const llmHealthItem = useMemo(
+    () => serviceHealthItems.find((item) => item.id === "parser"),
+    [serviceHealthItems]
+  );
+  const queueJobs = useMemo(() => queueStatus?.jobs ?? [], [queueStatus]);
+  const queueItems = useMemo(() => queueJobs.flatMap((job) => job.items), [queueJobs]);
+  const queueRunningItems = queueStatus?.running ?? queueItems.filter((item) => ["loading", "running", "finalizing"].includes(item.status)).length;
+  const queueQueuedItems = queueStatus?.queued ?? queueItems.filter((item) => item.status === "queued").length;
+  const queueCompletedItems = queueItems.filter((item) => item.status === "completed").length;
+  const queueFailedItems = queueItems.filter((item) => item.status === "failed" || item.status === "cancelled").length;
+  const queueProcessedItems = queueCompletedItems + queueFailedItems;
+  const queueTotalItems = Math.max(queueItems.length, queueProcessedItems + queueRunningItems + queueQueuedItems);
+  const queueActiveJob = activeJob && !["completed", "failed", "cancelled"].includes(activeJob.status)
+    ? activeJob
+    : queueJobs.find((job) => !["completed", "failed", "cancelled"].includes(job.status)) ?? null;
+  const queueProgressRatio = queueActiveJob
+    ? queueActiveJob.progress
+    : queueTotalItems > 0
+      ? queueProcessedItems / queueTotalItems
+      : 0;
+  const queueProgressPercent = Math.round(Math.max(0, Math.min(1, queueProgressRatio)) * 100);
+  const topologyModalTitle =
+    servicePanelSection === "roles"
+      ? t("characters.libraryManager")
+      : servicePanelSection === "resources"
+        ? t("services.resourceQueueTitle")
+        : servicePanelSection === "llm"
+          ? t("services.llmApiTitle")
+          : t("services.ttsAccessTitle");
+  const topologyModalDescription =
+    servicePanelSection === "roles"
+      ? t("characters.libraryHint")
+      : servicePanelSection === "resources"
+        ? t("services.resourceQueueDescription")
+        : servicePanelSection === "llm"
+          ? t("services.llmApiDescription")
+          : t("services.ttsAccessDescription");
+  const topologyModalClass =
+    servicePanelSection === "roles"
+      ? "role-library-modal"
+      : servicePanelSection === "resources"
+        ? "resource-queue-modal"
+        : servicePanelSection === "llm"
+          ? "llm-api-modal"
+          : "service-access-modal";
 
   const configuredOpenSourceServices = useMemo(
     () => ttsServices.filter((service) => (service.catalog_provider ?? service.provider_type) === selectedOpenSourceProvider),
@@ -561,29 +579,6 @@ export default function App() {
       })))
       .finally(() => setLoadingLogsReferenceKey((current) => (current === activeLogsReferenceRequest.key ? null : current)));
   }, [activeLogsReferenceRequest, logsReferenceAudio, t]);
-
-  useEffect(() => {
-    if (!activeLibraryLogsReferenceRequest) return;
-    if (logsReferenceAudio[activeLibraryLogsReferenceRequest.key]) return;
-    setLoadingLogsReferenceKey(activeLibraryLogsReferenceRequest.key);
-    fetchLogsReferenceAudio({
-      serviceId: activeLibraryLogsReferenceRequest.serviceId,
-      logsName: activeLibraryLogsReferenceRequest.logsName,
-      gptWeightsPath: activeLibraryLogsReferenceRequest.gptWeightsPath,
-      sovitsWeightsPath: activeLibraryLogsReferenceRequest.sovitsWeightsPath,
-    })
-      .then((payload) => setLogsReferenceAudio((current) => ({ ...current, [activeLibraryLogsReferenceRequest.key]: payload })))
-      .catch(() => setLogsReferenceAudio((current) => ({
-        ...current,
-        [activeLibraryLogsReferenceRequest.key]: {
-          service_id: activeLibraryLogsReferenceRequest.serviceId,
-          logs_name: activeLibraryLogsReferenceRequest.logsName,
-          samples: [],
-          diagnostics: [{ status: "unreachable", detail: t("inspector.logsReferenceLoadFailed") }],
-        }
-      })))
-      .finally(() => setLoadingLogsReferenceKey((current) => (current === activeLibraryLogsReferenceRequest.key ? null : current)));
-  }, [activeLibraryLogsReferenceRequest, logsReferenceAudio, t]);
 
   const selectedParserProvider = parserProviders[selectedParserProviderIndex];
   const logsServiceOptions = useMemo(
@@ -683,27 +678,54 @@ export default function App() {
     }
   }
 
+  async function createNewScriptProject() {
+    const title = newScriptTitle.trim();
+    const source = newScriptSource.trim();
+    if (!title) {
+      setNotice(t("script.newScriptTitleRequired"));
+      return;
+    }
+    const projectId = createProjectId(title);
+    const nextProject: ScriptProject = { ...createEmptyProject(), title };
+    setIsCreatingScript(true);
+    setSaveState("saving");
+    try {
+      await saveProject(projectId, nextProject);
+      const savedProject = source
+        ? (await createScriptRevision(projectId, source, t("script.initialScriptRevision"))).project
+        : nextProject;
+      setCurrentProjectId(projectId);
+      writeStoredProjectId(projectId);
+      setProject(savedProject);
+      setManifest(createEmptyManifest(projectId));
+      setActiveLineId("");
+      setExpandedLineId(null);
+      setSelectedLineIds([]);
+      setSelectedHistoryVersions({});
+      setVersionDrafts({});
+      setScriptInput(source);
+      setScriptSourceMode(source ? "project" : "manual");
+      setIsSidebarScriptEditing(!source);
+      setNewScriptTitle("");
+      setNewScriptSource("");
+      setSaveState("saved");
+      setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+      setNotice(t("script.newScriptCreated"));
+      await refreshProjects();
+    } catch (error) {
+      setSaveState("error");
+      setNotice(error instanceof Error ? error.message : t("script.newScriptCreateFailed"));
+    } finally {
+      setIsCreatingScript(false);
+    }
+  }
+
   async function refreshParserProviders() {
     try {
       const payload = await fetchParserProviders();
       setParserProviders(payload.providers.map((provider) => ({ ...provider, api_key: "" })));
     } catch {
       setParserProviders([]);
-    }
-  }
-
-  async function handleParse() {
-    setIsParsing(true);
-    setNotice(t("parser.parsing"));
-    try {
-      const parsed = await parseScript(scriptInput);
-      setDraft(parsed);
-      setScriptSourceMode("draft");
-      setNotice(t("parser.parsedBy", { provider: parsed.provider }));
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : t("parser.parseFailed"));
-    } finally {
-      setIsParsing(false);
     }
   }
 
@@ -752,7 +774,6 @@ export default function App() {
       const scriptPayload = await createScriptRevision(currentProjectId, scriptInput, t("script.parseRevision"));
       const parsePayload = await createParseRevision(currentProjectId, scriptPayload.script_revision.revision_id);
       setProject(parsePayload.project);
-      setDraft(null);
       setScriptSourceMode("project");
       setIsSidebarScriptEditing(false);
       setActiveLineId(parsePayload.project.lines[0]?.id ?? "");
@@ -760,31 +781,13 @@ export default function App() {
       setSelectedLineIds([]);
       setSelectedHistoryVersions({});
       setVersionDrafts({});
-      setNotice(t("parser.draftApplied"));
+      setNotice(t("script.parseApplied"));
       await refreshProjects();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("parser.parseFailed"));
     } finally {
       setIsParsing(false);
     }
-  }
-
-  async function acceptDraft() {
-    if (!draft) return;
-    if (!(await confirmRevisionRisk())) return;
-    const nextProject = {
-      title: project.title,
-      default_language: project.default_language,
-      project_characters: projectCharactersFromDraft(draft.characters, characters),
-      lines: draft.lines
-    };
-    setProject(nextProject);
-    setActiveLineId(draft.lines[0]?.id ?? "");
-    setSelectedLineIds([]);
-    setDraft(null);
-    setScriptSourceMode("project");
-    setScriptInput(projectToScriptSourceText(nextProject, characters));
-    setNotice(t("parser.draftApplied"));
   }
 
   async function activateProjectRevision(parseRevisionId: string) {
@@ -798,7 +801,6 @@ export default function App() {
       project_characters: revision.project_characters,
       lines: revision.lines
     }));
-    setScriptDrawerTab("edit");
     setActiveLineId(revision.lines[0]?.id ?? "");
     setExpandedLineId(null);
     setSelectedLineIds([]);
@@ -807,7 +809,6 @@ export default function App() {
   function updateScriptInput(value: string) {
     setScriptInput(value);
     setScriptSourceMode("manual");
-    setDraft(null);
   }
 
   function beginSidebarScriptEdit() {
@@ -815,7 +816,6 @@ export default function App() {
       setScriptInput(projectToScriptSourceText(projectWithCharacters, characters));
     }
     setScriptSourceMode("manual");
-    setDraft(null);
     setIsSidebarScriptEditing(true);
   }
 
@@ -825,20 +825,7 @@ export default function App() {
 
   function addParserProvider() {
     const next = parserProviders.length + 1;
-    setParserProviders((current) => [
-      ...current,
-      {
-        name: `openai-compatible-${next}`,
-        base_url: "https://api.openai.com/v1",
-        api_key_env: `PARSER_PROVIDER_${next}_API_KEY`,
-        model: "gpt-4o-mini",
-        enabled: true,
-        timeout_seconds: 45,
-        priority: 100 + next,
-        key_configured: false,
-        api_key: "",
-      },
-    ]);
+    setParserProviders((current) => [...current, createDefaultParserProviderDraft(next)]);
     setSelectedParserProviderIndex(parserProviders.length);
   }
 
@@ -1084,7 +1071,6 @@ export default function App() {
     setExpandedLineId(null);
     setSelectedHistoryVersions({});
     setVersionDrafts({});
-    setDraft(null);
     setNotice(t("app.ready"));
   }
 
@@ -1270,29 +1256,60 @@ export default function App() {
         </div>
 
         <section className="panel compact parser-panel script-console-panel">
-          <div className="script-console-head">
-            <button className="project-trigger sidebar-project-trigger" onClick={() => { setScriptDrawerTab("list"); setScriptDrawerOpen(true); }}>
+          <div className="script-inline-manager" aria-label={t("script.managerTitle")}>
+            <div className="script-inline-manager-head">
               <FolderKanban size={14} />
-              <span>{t("app.project")}</span>
-              <strong>{displayProjectTitle}</strong>
-              <ChevronDown size={13} />
-            </button>
-            <StatusPill tone={scriptSourceTone} label={scriptSourceLabel} />
-          </div>
+              <div>
+                <span>{t("script.managerTitle")}</span>
+                <strong>{displayProjectTitle}</strong>
+              </div>
+              <StatusPill tone={scriptSourceTone} label={scriptSourceLabel} />
+            </div>
 
-          <div className="script-console-metrics">
-            <div>
-              <span>{t("script.lineCount")}</span>
-              <strong>{project.lines.length}</strong>
-            </div>
-            <div>
-              <span>{t("script.parseRevisionShort")}</span>
-              <strong>{project.active_parse_revision_id ? shortRevisionId(project.active_parse_revision_id) : "-"}</strong>
-            </div>
-            <div>
-              <span>{t("app.autoSave")}</span>
-              <strong>{lastSavedAt ?? saveStateLabel(saveState, t)}</strong>
-            </div>
+            <section className="script-create-panel" aria-label={t("script.newScript")}>
+              <div className="script-pane-summary">
+                <strong>{t("script.newScript")}</strong>
+              </div>
+              <div className="script-create-form">
+                <label>
+                  <span>{t("script.newScriptTitle")}</span>
+                  <input value={newScriptTitle} onChange={(event) => setNewScriptTitle(event.target.value)} placeholder={t("script.newScriptTitlePlaceholder")} />
+                </label>
+                <label>
+                  <span>{t("script.newScriptSource")}</span>
+                  <textarea value={newScriptSource} onChange={(event) => setNewScriptSource(event.target.value)} placeholder={t("script.newScriptSourcePlaceholder")} rows={3} />
+                </label>
+                <button className="primary-button" type="button" onClick={() => void createNewScriptProject()} disabled={isCreatingScript}>
+                  {isCreatingScript ? <Loader2 className="spin" size={15} /> : <Plus size={15} />} {t("script.createScript")}
+                </button>
+              </div>
+            </section>
+
+            <section className="script-existing-panel" aria-label={t("script.existingScripts")}>
+              <div className="script-pane-summary compact-summary">
+                <div>
+                  <strong>{t("script.existingScripts")}</strong>
+                  <span>{t("app.projectCount", { count: projectRows.length })}</span>
+                </div>
+              </div>
+              <div className="script-project-list compact-project-list">
+                {projectRows.map((item) => (
+                  <button className={`project-row ${item.project_id === currentProjectId ? "active" : ""}`} key={item.project_id} onClick={() => switchProject(item.project_id)}>
+                    <span className="project-row-title">
+                      <strong>{standardProjectName(item.title || item.project_id)}</strong>
+                      {item.project_id === currentProjectId && <small>{t("app.currentProject")}</small>}
+                    </span>
+                    <small>{item.default_language} · {t("table.visibleLines", { count: item.line_count })}</small>
+                  </button>
+                ))}
+                {projectRows.length === 0 && (
+                  <div className="empty-row project-empty-state">
+                    <strong>{t("empty.noProjects")}</strong>
+                    <span>{t("empty.noProjectsHint")}</span>
+                  </div>
+                )}
+              </div>
+            </section>
           </div>
 
           <div className={`script-console-preview source-${scriptSourceMode} mode-${scriptConsoleMode}`}>
@@ -1311,9 +1328,6 @@ export default function App() {
                     <FileText size={13} /> {t("script.editSource")}
                   </button>
                 )}
-                <button className="secondary-button compact-button" type="button" onClick={() => { setScriptDrawerTab("list"); setScriptDrawerOpen(true); }}>
-                  {t("script.drawer.list")}
-                </button>
               </div>
             </div>
             {scriptConsoleMode === "edit" ? (
@@ -1339,116 +1353,6 @@ export default function App() {
           </div>
         </section>
 
-        {scriptDrawerOpen && (
-          <div className="script-drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setScriptDrawerOpen(false); }}>
-            <section className="script-management-drawer" role="dialog" aria-modal="true" aria-label={t("script.managerTitle")}>
-              <header className="script-management-head">
-                <div>
-                  <span>{t("script.managerTitle")}</span>
-                  <strong>{displayProjectTitle}</strong>
-                  <small>{scriptSourceHint}</small>
-                </div>
-                <div className="script-management-actions">
-                  <button className="secondary-button" onClick={() => void saveScriptRevisionOnly()} disabled={saveState === "saving" || !currentProjectId}>
-                    {saveState === "saving" ? <Loader2 className="spin" size={15} /> : <FileText size={15} />} {t("script.saveRevision")}
-                  </button>
-                  <button className="primary-button" onClick={() => void parseAsRevision()} disabled={isParsing || !currentProjectId}>
-                    {isParsing ? <Loader2 className="spin" size={15} /> : <Wand2 size={15} />} {t("script.parseRevision")}
-                  </button>
-                  <button className="icon-button small" onClick={() => setScriptDrawerOpen(false)} title={t("actions.close")}><X size={14} /></button>
-                </div>
-              </header>
-
-              <div className="script-management-body">
-                <nav className="script-management-nav" aria-label={t("app.projectManager")}>
-                  {drawerTabs.map((tab) => (
-                    <button
-                      className={scriptDrawerTab === tab.id ? "active" : ""}
-                      key={tab.id}
-                      onClick={() => setScriptDrawerTab(tab.id)}
-                      type="button"
-                    >
-                      <span>{t(tab.labelKey)}</span>
-                      {tab.id === "list" && <small>{projectRows.length}</small>}
-                      {tab.id === "edit" && <small>{scriptSourceLabel}</small>}
-                      {tab.id === "preview" && <small>{project.lines.length}</small>}
-                      {tab.id === "history" && <small>{project.parse_revisions?.length ?? 0}</small>}
-                    </button>
-                  ))}
-                </nav>
-
-                <div className="script-management-content">
-                  {scriptDrawerTab === "list" && (
-                    <div className="script-drawer-pane project-list compact-project-list">
-                      <div className="script-pane-summary">
-                        <strong>{t("app.projectManager")}</strong>
-                        <span>{t("app.projectCount", { count: projectRows.length })} · {t("app.autoSave")} {lastSavedAt ?? saveStateLabel(saveState, t)}</span>
-                      </div>
-                      {projectRows.map((item) => (
-                        <button className={`project-row ${item.project_id === currentProjectId ? "active" : ""}`} key={item.project_id} onClick={() => switchProject(item.project_id)}>
-                          <span className="project-row-title">
-                            <strong>{standardProjectName(item.title || item.project_id)}</strong>
-                            {item.project_id === currentProjectId && <small>{t("app.currentProject")}</small>}
-                          </span>
-                          <small>{item.default_language} · {t("table.visibleLines", { count: item.line_count })}</small>
-                        </button>
-                      ))}
-                      {projectRows.length === 0 && (
-                        <div className="empty-row project-empty-state">
-                          <strong>{t("empty.noProjects")}</strong>
-                          <span>{t("empty.noProjectsHint")}</span>
-                        </div>
-                      )}
-                      <div className="project-actions">
-                        <button className="secondary-button" disabled title={t("app.newProject")}><Plus size={14} /> {t("app.newProject")}</button>
-                        <button className="secondary-button" disabled title={t("app.importProject")}><FileText size={14} /> {t("app.importProject")}</button>
-                      </div>
-                    </div>
-                  )}
-                  {scriptDrawerTab === "edit" && (
-                    <div className="script-editor-pane">
-                      <div className="script-editor-toolbar">
-                        <div>
-                          <strong>{t("script.activeScript")}</strong>
-                          <span>{scriptSourceHint}</span>
-                        </div>
-                        <div className="script-actions">
-                          <button className="secondary-button" onClick={handleParse} disabled={isParsing}>
-                            {isParsing ? <Loader2 className="spin" size={15} /> : <Wand2 size={15} />} {t("parser.parse")}
-                          </button>
-                          <button className="secondary-button" onClick={() => void acceptDraft()} disabled={!draft || !currentProjectId}>{t("parser.accept")}</button>
-                        </div>
-                      </div>
-                      <textarea className="script-input script-editor-input" value={scriptInput} onChange={(event) => updateScriptInput(event.target.value)} aria-label={t("parser.title")} />
-                    </div>
-                  )}
-                  {scriptDrawerTab === "preview" && (
-                    <div className="script-drawer-pane markdown-preview script-preview-pane" aria-label={t("script.drawer.preview")}>
-                      {renderMarkdownPreview(scriptInput)}
-                    </div>
-                  )}
-                  {scriptDrawerTab === "history" && (
-                    <div className="script-drawer-pane revision-list script-history-pane">
-                      <div className="script-pane-summary">
-                        <strong>{t("script.activeRevision")}</strong>
-                        <span>{project.active_script_revision_id ?? "-"} · {project.active_parse_revision_id ?? "-"}</span>
-                      </div>
-                      {(project.parse_revisions ?? []).map((revision) => (
-                        <button className={`revision-row ${revision.revision_id === project.active_parse_revision_id ? "active" : ""}`} key={revision.revision_id} onClick={() => void activateProjectRevision(revision.revision_id)}>
-                          <strong>{revision.revision_id}</strong>
-                          <span>{revision.provider} · {revision.lines.length}</span>
-                          <small>{new Date(revision.created_at).toLocaleString()}</small>
-                        </button>
-                      ))}
-                      {(project.parse_revisions ?? []).length === 0 && <div className="empty-row">{t("script.noRevisions")}</div>}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </section>
-          </div>
-        )}
-
       </aside>
 
       <main className="workspace">
@@ -1466,28 +1370,57 @@ export default function App() {
               <Library size={15} />
               <span className="menu-trigger-label">{t("topbar.roleLibrary")}</span>
             </button>
-            <div className="topbar-menu-wrap">
+            <button
+              className={`topbar-action-button menu-trigger ${servicePanelSection === "resources" && isTopologyMenuOpen ? "active" : ""}`}
+              onClick={() => {
+                setServicePanelSection("resources");
+                setIsTopologyMenuOpen(true);
+              }}
+              title={t("services.resourceQueueTitle")}
+            >
+              <History size={15} />
+              <span className="menu-trigger-label">{t("topbar.resourceQueue")}</span>
+            </button>
+            <div className="topbar-menu-wrap topbar-config-actions">
               <button
-                className={`topbar-action-button menu-trigger service-status-trigger tone-${serviceSummary.overallTone} ${isTopologyMenuOpen ? "active" : ""}`}
-                onClick={() => setIsTopologyMenuOpen((open) => !open)}
-                title={serviceTopbarTitle(serviceSummary, t)}
+                className={`topbar-action-button menu-trigger service-status-trigger tone-${serviceSummary.parser.tone} ${servicePanelSection === "llm" && isTopologyMenuOpen ? "active" : ""}`}
+                onClick={() => {
+                  setServicePanelSection("llm");
+                  setIsTopologyMenuOpen((open) => servicePanelSection === "llm" ? !open : true);
+                }}
+                title={llmTopbarTitle(serviceSummary, t)}
+              >
+                <Bot size={15} />
+                <span className="menu-trigger-label">{t("topbar.llmConfig")}</span>
+                {llmHealthItem && (
+                  <span className="service-health-strip" aria-hidden="true">
+                    <span className={`service-health-dot tone-${llmHealthItem.tone}`} title={`${t(llmHealthItem.labelKey)} ${llmHealthItem.value}`.trim()} />
+                  </span>
+                )}
+              </button>
+              <button
+                className={`topbar-action-button menu-trigger service-status-trigger tone-${ttsTopbarTone(serviceSummary)} ${servicePanelSection === "open-source" && isTopologyMenuOpen ? "active" : ""}`}
+                onClick={() => {
+                  setServicePanelSection("open-source");
+                  setIsTopologyMenuOpen((open) => servicePanelSection === "open-source" ? !open : true);
+                }}
+                title={ttsTopbarTitle(serviceSummary, t)}
               >
                 <Cpu size={15} />
-                <span className="menu-trigger-label">{t("topbar.services")}</span>
+                <span className="menu-trigger-label">{t("topbar.ttsConfig")}</span>
                 <span className="service-health-strip" aria-hidden="true">
-                  {serviceHealthItems.map((item) => (
+                  {ttsHealthItems.map((item) => (
                     <span className={`service-health-dot tone-${item.tone}`} key={item.id} title={`${t(item.labelKey)} ${item.value}`.trim()} />
                   ))}
                 </span>
-                <ChevronDown size={14} />
               </button>
               {isTopologyMenuOpen && (
                 <div className="service-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsTopologyMenuOpen(false); }}>
-                  <div className="service-modal" role="dialog" aria-modal="true" aria-label={t("nav.serviceResources")}>
+                  <div className={`service-modal ${topologyModalClass}`} role="dialog" aria-modal="true" aria-label={topologyModalTitle}>
                     <header className="service-modal-head">
                       <div>
-                        <strong>{t("nav.serviceResources")}</strong>
-                        <span>{runtime?.service_mode ? `${t("validation.mode")} ${statusText(runtime.service_mode, t)} · ${t("services.description")}` : t("status.needsSetup")}</span>
+                        <strong>{topologyModalTitle}</strong>
+                        <span>{topologyModalDescription}</span>
                       </div>
                       <div className="service-modal-actions">
                         <button className="icon-button small" onClick={() => void refreshTopology(true)} title={t("actions.refresh")}>
@@ -1497,32 +1430,7 @@ export default function App() {
                       </div>
                     </header>
 
-                    <div className="service-modal-status-strip">
-                      {validationSteps.map((step) => (
-                        <span className={`modal-status-chip ${step.state}`} key={step.id}>
-                          <small>{t(`validation.${step.id}`)}</small>
-                          <strong>{step.label}</strong>
-                        </span>
-                      ))}
-                      <button className="secondary-button compact-button" onClick={() => void runValidation()} disabled={validationState.disabled} title={validationReasonText(validationState, t)}>
-                        {isValidating ? <Loader2 className="spin" size={13} /> : <Play size={13} />} {t("validation.run")}
-                      </button>
-                    </div>
-
                     <div className="service-modal-body">
-                      <aside className="service-modal-nav">
-                        {servicePanelItems.map((item) => (
-                          <button
-                            className={`service-nav-item ${servicePanelSection === item.id ? "active" : ""}`}
-                            key={item.id}
-                            onClick={() => setServicePanelSection(item.id)}
-                          >
-                            <span>{item.label}</span>
-                            <strong>{item.meta}</strong>
-                          </button>
-                        ))}
-                      </aside>
-
                       <section className="service-modal-content">
                         {servicePanelSection === "overview" && (
                           <div className="service-section-stack">
@@ -1562,48 +1470,32 @@ export default function App() {
                         )}
 
                         {servicePanelSection === "open-source" && (
-                          <div className="open-source-onboarding">
-                            <section className="open-source-catalog-panel">
-                              <div className="panel-title"><Library size={15} /> {t("services.openSourceTitle")}</div>
-                              <p className="section-help">{t("services.openSourceHint")}</p>
-                              <div className="open-source-provider-list">
-                                {openSourceCatalog.map((item, index) => (
-                                  <button
-                                    className={`open-source-provider-card ${selectedOpenSourceProvider === item.provider_type ? "active" : ""}`}
-                                    key={item.provider_type}
-                                    onClick={() => setSelectedOpenSourceProvider(item.provider_type)}
-                                    type="button"
-                                  >
-                                    <span className="provider-order">{index + 1}</span>
-                                    <span>
-                                      <strong>{item.display_name}</strong>
-                                      <small>{item.default_base_url}</small>
-                                    </span>
-                                    <span className="tracker-chip neutral">{providerLabel(item.provider_type)}</span>
-                                  </button>
-                                ))}
-                                {openSourceCatalog.length === 0 && <div className="empty-row">{t("services.openSourceNoCatalog")}</div>}
-                              </div>
-                              {selectedOpenSourceCatalog && (
-                                <div className="clone-command-card">
-                                  <span>{t("services.openSourceCloneCommand")}</span>
-                                  <code>{selectedOpenSourceCatalog.recommended_clone_command}</code>
-                                </div>
-                              )}
-                            </section>
-
-                            <section className="open-source-setup-panel">
+                          <div className="tts-access-panel">
+                            <section className="tts-access-card tts-access-primary">
                               <div className="open-source-panel-head">
                                 <div>
                                   <strong>{selectedOpenSourceCatalog?.display_name ?? t("services.openSourceProvider")}</strong>
-                                  <span>{t("services.openSourceLocalRepoHint")}</span>
+                                  <span>{t("services.ttsAccessDescription")}</span>
                                 </div>
                                 <button className="secondary-button compact-button" onClick={() => void refreshOpenSourceCatalog()}>
                                   <RefreshCw size={13} /> {t("actions.refresh")}
                                 </button>
                               </div>
-
-                              <div className="open-source-mode-grid">
+                              <div className="tts-provider-segment">
+                                {openSourceCatalog.map((item) => (
+                                  <button
+                                    className={`open-source-mode-card ${selectedOpenSourceProvider === item.provider_type ? "active" : ""}`}
+                                    key={item.provider_type}
+                                    onClick={() => setSelectedOpenSourceProvider(item.provider_type)}
+                                    type="button"
+                                  >
+                                    <strong>{item.display_name}</strong>
+                                    <span>{providerLabel(item.provider_type)}</span>
+                                  </button>
+                                ))}
+                                {openSourceCatalog.length === 0 && <div className="empty-row">{t("services.openSourceNoCatalog")}</div>}
+                              </div>
+                              <div className="open-source-mode-grid compact">
                                 {(["local_repo", "local_endpoint", "lan_endpoint", "cloud_endpoint"] as SourceProfile[]).map((mode) => (
                                   <button
                                     className={`open-source-mode-card ${openSourceSourceProfile === mode ? "active" : ""}`}
@@ -1616,23 +1508,10 @@ export default function App() {
                                   </button>
                                 ))}
                               </div>
-
-                              <div className="open-source-form-grid">
-                                <label>
-                                  <span>{t("services.openSourceServiceId")}</span>
-                                  <input value={openSourceServiceId} onChange={(event) => setOpenSourceServiceId(event.target.value)} placeholder={`${selectedOpenSourceProvider}-endpoint`} />
-                                </label>
+                              <div className="open-source-form-grid tts-access-form">
                                 <label>
                                   <span>{t("services.openSourceDisplayName")}</span>
-                                  <input value={openSourceDisplayName} onChange={(event) => setOpenSourceDisplayName(event.target.value)} />
-                                </label>
-                                <label className="wide">
-                                  <span>{t("services.openSourceRepoPath")}</span>
-                                  <input value={openSourceRepoPath} onChange={(event) => setOpenSourceRepoPath(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_repo_path} />
-                                </label>
-                                <label className="wide">
-                                  <span>{t("services.openSourceBaseUrl")}</span>
-                                  <input value={openSourceBaseUrl} onChange={(event) => setOpenSourceBaseUrl(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_base_url} />
+                                  <input value={openSourceDisplayName} onChange={(event) => setOpenSourceDisplayName(event.target.value)} placeholder={selectedOpenSourceCatalog?.display_name} />
                                 </label>
                                 <label>
                                   <span>{t("services.openSourceApiContract")}</span>
@@ -1642,16 +1521,17 @@ export default function App() {
                                     ))}
                                   </select>
                                 </label>
-                                <label>
-                                  <span>{t("services.openSourceResource")}</span>
-                                  <input value={openSourceResourceGroup} onChange={(event) => setOpenSourceResourceGroup(event.target.value)} />
-                                </label>
-                                <label>
-                                  <span>{t("services.openSourceCapacity")}</span>
-                                  <input type="number" min={1} value={openSourceCapacity} onChange={(event) => setOpenSourceCapacity(Number(event.target.value) || 1)} />
+                                {openSourceSourceProfile === "local_repo" && (
+                                  <label className="wide">
+                                    <span>{t("services.openSourceRepoPath")}</span>
+                                    <input value={openSourceRepoPath} onChange={(event) => setOpenSourceRepoPath(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_repo_path} />
+                                  </label>
+                                )}
+                                <label className="wide">
+                                  <span>{t("services.openSourceBaseUrl")}</span>
+                                  <input value={openSourceBaseUrl} onChange={(event) => setOpenSourceBaseUrl(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_base_url} />
                                 </label>
                               </div>
-
                               <div className="open-source-actions">
                                 <button className="secondary-button compact-button" onClick={() => void runOpenSourceDetect()} disabled={isDetectingOpenSource || !openSourceBaseUrl}>
                                   {isDetectingOpenSource ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("services.openSourceDetect")}
@@ -1662,25 +1542,17 @@ export default function App() {
                               </div>
                             </section>
 
-                            <section className="open-source-result-panel">
+                            <section className="tts-access-card">
                               <div className="panel-title"><CheckCircle2 size={15} /> {t("services.openSourceSetupState")}</div>
                               {openSourceDetectResult ? (
-                                <div className={`open-source-detect-card state-${setupStateTone(openSourceDetectResult.setup_state)}`}>
+                                <div className={`open-source-detect-card compact state-${setupStateTone(openSourceDetectResult.setup_state)}`}>
                                   <div>
                                     <span>{t("services.openSourceSetupState")}</span>
                                     <strong>{setupStateLabel(openSourceDetectResult.setup_state, t)}</strong>
                                   </div>
                                   <div>
-                                    <span>{t("services.openSourceRepoFound")}</span>
-                                    <strong>{booleanLabel(openSourceDetectResult.repo_found, t)}</strong>
-                                  </div>
-                                  <div>
                                     <span>{t("services.openSourceEndpointReachable")}</span>
                                     <strong>{booleanLabel(openSourceDetectResult.endpoint_reachable, t)}</strong>
-                                  </div>
-                                  <div>
-                                    <span>{t("services.openSourceContractOk")}</span>
-                                    <strong>{booleanLabel(openSourceDetectResult.api_contract_ok, t)}</strong>
                                   </div>
                                   <p>{openSourceDetectResult.env_hint}</p>
                                 </div>
@@ -1690,7 +1562,6 @@ export default function App() {
                                   <span>{t("services.openSourceEndpointHint")}</span>
                                 </div>
                               )}
-
                               <div className="open-source-existing">
                                 <div className="open-source-section-head">
                                   <strong>{t("services.openSourceExisting")}</strong>
@@ -2008,7 +1879,7 @@ export default function App() {
                                         </label>
                                         <label className="wide">
                                           <span>{t("parser.baseUrl")}</span>
-                                          <input value={selectedParserProvider.base_url} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { base_url: event.target.value })} placeholder="https://api.openai.com/v1" />
+                                          <input value={selectedParserProvider.base_url} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { base_url: event.target.value })} placeholder={KWJM_BASE_URL_PLACEHOLDER} />
                                         </label>
                                       </div>
                                     </section>
@@ -2021,7 +1892,7 @@ export default function App() {
                                       <div className="llm-form-grid">
                                         <label>
                                           <span>{t("parser.model")}</span>
-                                          <input value={selectedParserProvider.model} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { model: event.target.value })} placeholder="gpt-4o-mini" />
+                                          <input value={selectedParserProvider.model} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { model: event.target.value })} placeholder={KWJM_MODEL} />
                                         </label>
                                         <label>
                                           <span>{t("parser.priority")}</span>
@@ -2039,7 +1910,7 @@ export default function App() {
                                       <div className="llm-form-grid">
                                         <label>
                                           <span>{t("parser.apiKeyEnv")}</span>
-                                          <input value={selectedParserProvider.api_key_env} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { api_key_env: event.target.value })} placeholder="OPENAI_API_KEY" />
+                                          <input value={selectedParserProvider.api_key_env} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { api_key_env: event.target.value })} placeholder={KWJM_API_KEY_ENV} />
                                         </label>
                                         <label>
                                           <span>{t("parser.apiKey")}</span>
@@ -2094,44 +1965,55 @@ export default function App() {
                         )}
 
                         {servicePanelSection === "resources" && (
-                          <div className="resource-dashboard">
-                            <section className="service-modal-card resource-dashboard-card">
-                              <div className="panel-title"><Cpu size={15} /> {t("services.resourceGroups")}</div>
-                              <div className="resource-card-grid">
-                                {resourceGroups(visibleServices).map((group) => {
-                                  const tone = resourceGroupTone(group);
-                                  const percent = group.total > 0 ? Math.round((group.ready / group.total) * 100) : 0;
+                          <div className="queue-workbench">
+                            <section className="queue-progress-card">
+                              <div className="queue-progress-head">
+                                <div>
+                                  <strong><History size={15} /> {t("queue.dispatchTitle")}</strong>
+                                  <span>{t("queue.dispatchHint")}</span>
+                                </div>
+                                <StatusPill
+                                  tone={queueActiveJob ? queueStatusTone(queueActiveJob.status) : isRefreshingTopology ? "running" : "idle"}
+                                  label={queueActiveJob ? statusText(queueActiveJob.status, t) : isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced")}
+                                />
+                              </div>
+                              <div className="queue-progress-value">
+                                <strong>{queueProgressPercent}%</strong>
+                                <span>{queueTotalItems > 0 ? t("queue.processedRatio", { processed: queueProcessedItems, total: queueTotalItems }) : t("queue.noJobs")}</span>
+                              </div>
+                              <div className="queue-dispatch-bar" aria-label={t("queue.progressLabel", { percent: queueProgressPercent })}>
+                                <span style={{ width: `${queueProgressPercent}%` }} />
+                              </div>
+                              <div className="queue-meter-grid">
+                                <div><span>{t("filters.queued")}</span><strong>{queueQueuedItems}</strong></div>
+                                <div><span>{t("filters.running")}</span><strong>{queueRunningItems}</strong></div>
+                                <div><span>{t("status.completed")}</span><strong>{queueCompletedItems}</strong></div>
+                                <div><span>{t("status.failed")}</span><strong>{queueFailedItems}</strong></div>
+                              </div>
+                            </section>
+
+                            <section className="queue-job-panel">
+                              <div className="queue-panel-title">
+                                <strong>{t("queue.recentJobs")}</strong>
+                                <span>{t("queue.pollingState")}: {isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced")}</span>
+                              </div>
+                              <div className="queue-job-list">
+                                {queueJobs.slice(0, 5).map((job) => {
+                                  const jobPercent = Math.round(Math.max(0, Math.min(1, job.progress)) * 100);
                                   return (
-                                    <div className={`resource-status-card service-state-${tone}`} key={group.name}>
+                                    <article className={`queue-job-card state-${queueStatusTone(job.status)}`} key={job.job_id}>
                                       <div>
-                                        <strong>{group.name === "unassigned" ? t("status.unassigned") : group.name}</strong>
-                                        <span>{group.ready}/{group.total}</span>
+                                        <strong>{job.job_id}</strong>
+                                        <span>{t("queue.itemCount", { count: job.items.length })}</span>
                                       </div>
-                                      <div className="resource-meter"><span style={{ width: `${percent}%` }} /></div>
-                                      <small>{topbarToneText(tone === "ok" ? "ready" : tone === "warn" ? "attention" : "offline", t)}</small>
-                                    </div>
+                                      <div className="queue-job-meta">
+                                        <StatusPill tone={queueStatusTone(job.status)} label={statusText(job.status, t)} />
+                                        <span>{jobPercent}%</span>
+                                      </div>
+                                    </article>
                                   );
                                 })}
-                              </div>
-                            </section>
-
-                            <section className="service-modal-card resource-dashboard-card">
-                              <div className="panel-title"><Library size={15} /> {t("services.modelAssets")}</div>
-                              <div className="resource-asset-grid">
-                                <div className="overview-card state-ready"><span>GPT</span><strong>{voiceCandidates?.gpt_sovits.gpt_weights.length ?? 0}</strong></div>
-                                <div className="overview-card state-ready"><span>SoVITS</span><strong>{voiceCandidates?.gpt_sovits.sovits_weights.length ?? 0}</strong></div>
-                                <div className={`overview-card state-${voiceCandidates?.indextts.model.ready ? "ready" : "attention"}`}><span>IndexTTS</span><strong>{voiceCandidates?.indextts.model.ready ? t("status.ready") : `${voiceCandidates?.indextts.model.missing.length ?? 0} ${t("status.missing")}`}</strong></div>
-                                <div className={`overview-card state-${voiceCandidates?.ready ? "ready" : "attention"}`}><span>{t("services.resourceReady")}</span><strong>{voiceCandidates?.ready ? t("status.ready") : t("status.needsMapping")}</strong></div>
-                              </div>
-                            </section>
-
-                            <section className="service-modal-card resource-dashboard-card">
-                              <div className="panel-title"><History size={15} /> {t("queue.title")}</div>
-                              <div className="queue-resource-strip">
-                                <div><span>{t("filters.queued")}</span><strong>{queueStatus?.queued ?? 0}</strong></div>
-                                <div><span>{t("filters.running")}</span><strong>{queueStatus?.running ?? 0}</strong></div>
-                                <div><span>{t("status.completed")}</span><strong>{queueStatus?.jobs.filter((job) => job.status === "completed").length ?? 0}</strong></div>
-                                <div><span>{t("status.failed")}</span><strong>{queueStatus?.jobs.filter((job) => job.status === "failed").length ?? 0}</strong></div>
+                                {queueJobs.length === 0 && <div className="queue-empty">{t("queue.noJobs")}</div>}
                               </div>
                             </section>
                           </div>
@@ -2139,40 +2021,28 @@ export default function App() {
 
                         {servicePanelSection === "roles" && (
                           <div className="role-library-workbench">
-                            <section className="role-library-overview">
-                              <div className="role-library-overview-title">
-                                <strong>{t("characters.libraryWorkflow")}</strong>
-                                <span>{t("characters.libraryWorkflowHint")}</span>
-                              </div>
-                              <div className="role-library-overview-steps">
-                                <div className="role-workflow-step ready">
-                                  <span>{t("characters.projectMatch")}</span>
-                                  <strong>{projectCharacters.filter((item) => item.match_status === "matched" || item.library_character_id).length}/{projectRoleRows.length}</strong>
-                                </div>
-                                <div className="role-workflow-step ready">
-                                  <span>{t("characters.confirmedLibrary")}</span>
-                                  <strong>{characters.filter((character) => character.library_status === "confirmed").length}</strong>
-                                </div>
-                                <div className="role-workflow-step warn">
-                                  <span>{t("characters.scanDrafts")}</span>
-                                  <strong>{filteredRoleCandidates.length}</strong>
-                                </div>
-                                <div className="role-workflow-step neutral">
-                                  <span>{t("characters.readyToGenerate")}</span>
-                                  <strong>{characters.filter((character) => characterBindingSummary(character).completeCount > 0).length}</strong>
-                                </div>
-                              </div>
-                            </section>
-                            <section className="role-library-rail">
+                            <section className="role-library-directory">
                               <div className="role-library-title-block">
-                                <strong>{t("characters.libraryManager")}</strong>
-                                <span>{t("characters.libraryHint")}</span>
+                                <strong>{t("characters.library")}</strong>
                               </div>
-                              <label className="search-field library-search">
-                                <Search size={14} />
-                                <input value={roleLibrarySearch} onChange={(event) => setRoleLibrarySearch(event.target.value)} placeholder={t("characters.searchLibrary")} />
-                              </label>
-                              <label className="library-field">
+                              <div className="role-library-toolbar">
+                                <label className="search-field library-search">
+                                  <Search size={14} />
+                                  <input value={roleLibrarySearch} onChange={(event) => setRoleLibrarySearch(event.target.value)} placeholder={t("characters.searchLibrary")} />
+                                </label>
+                                <div className="role-library-actions">
+                                  <button className="secondary-button compact-button" onClick={() => void scanRoles()} disabled={isScanningRoleLibrary}>
+                                    {isScanningRoleLibrary ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} {t("characters.scanCandidates")}
+                                  </button>
+                                  <button className="secondary-button compact-button" onClick={addEmptyLibraryCharacter}><Plus size={13} /> {t("characters.addRole")}</button>
+                                </div>
+                              </div>
+                              <div className="role-library-status-row">
+                                <div><span>{t("characters.confirmedLibrary")}</span><strong>{characters.filter((character) => character.library_status === "confirmed").length}</strong></div>
+                                <div><span>{t("characters.scanDrafts")}</span><strong>{filteredRoleCandidates.length}</strong></div>
+                                <div><span>{t("characters.projectMatch")}</span><strong>{projectCharacters.filter((item) => item.match_status === "matched" || item.library_character_id).length}/{projectRoleRows.length}</strong></div>
+                              </div>
+                              <label className="library-field compact">
                                 <span>{t("characters.logsService")}</span>
                                 <select value={selectedLogsServiceId} onChange={(event) => setSelectedLogsServiceId(event.target.value)}>
                                   <option value="">{t("characters.allGptServices")}</option>
@@ -2181,42 +2051,6 @@ export default function App() {
                                   ))}
                                 </select>
                               </label>
-                              <div className="role-library-actions">
-                                <button className="secondary-button compact-button" onClick={() => void scanRoles()} disabled={isScanningRoleLibrary}>
-                                  {isScanningRoleLibrary ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} {t("characters.scanCandidates")}
-                                </button>
-                                <button className="secondary-button compact-button" onClick={addEmptyLibraryCharacter}><Plus size={13} /> {t("characters.addRole")}</button>
-                              </div>
-                              <div className="role-library-meter-grid">
-                                <div className="role-meter ready"><span>{t("characters.confirmedLibrary")}</span><strong>{characters.filter((character) => character.library_status === "confirmed").length}</strong></div>
-                                <div className="role-meter warn"><span>{t("characters.partialRoles")}</span><strong>{characters.filter((character) => character.library_status === "partial").length}</strong></div>
-                                <div className="role-meter neutral"><span>{t("characters.scanDrafts")}</span><strong>{filteredRoleCandidates.length}</strong></div>
-                                <div className="role-meter ready"><span>{t("characters.projectRoles")}</span><strong>{projectRoleRows.length}</strong></div>
-                              </div>
-                              <section className="role-library-project-summary">
-                                <div className="role-library-section-head">
-                                  <strong>{t("characters.projectMatch")}</strong>
-                                  <span>{projectCharacters.filter((item) => item.match_status === "matched" || item.library_character_id).length}/{projectRoleRows.length}</span>
-                                </div>
-                                <div className="project-role-compact-list">
-                                  {projectRoleRows.slice(0, 8).map((role) => (
-                                    <button className={`project-role-compact ${role.linked ? "matched" : "unmatched"}`} key={role.id} onClick={() => focusFirstLineForCharacter(role.id)}>
-                                      <RoleAvatar avatarPath={role.avatarPath} fallback={role.avatarFallback} size="sm" />
-                                      <span>
-                                        <strong>{role.name}</strong>
-                                        <small>{t("characters.lines", { count: role.lineCount })}</small>
-                                      </span>
-                                    </button>
-                                  ))}
-                                </div>
-                              </section>
-                            </section>
-
-                            <section className="role-library-directory">
-                              <div className="role-library-section-head">
-                                <strong><UserRound size={15} /> {t("characters.confirmedLibrary")}</strong>
-                                <span>{filteredLibraryCharacters.length}</span>
-                              </div>
                               <div className="role-directory-list">
                                 {filteredLibraryCharacters.map((character, index) => {
                                   const summary = characterBindingSummary(character);
@@ -2243,16 +2077,12 @@ export default function App() {
                                     </button>
                                   );
                                 })}
-                                {filteredLibraryCharacters.length === 0 && <div className="empty-row">{t("characters.noProjectRoles")}</div>}
-                              </div>
-                            </section>
-
-                            <section className="role-library-candidates">
-                              <div className="role-library-section-head">
-                                <strong><RefreshCw size={15} /> {t("characters.scanDrafts")}</strong>
-                                <span>{filteredRoleCandidates.length}</span>
-                              </div>
-                              <div className="candidate-strip-list">
+                                {filteredRoleCandidates.length > 0 && (
+                                  <div className="role-list-subhead">
+                                    <span><RefreshCw size={13} /> {t("characters.scanDrafts")}</span>
+                                    <strong>{filteredRoleCandidates.length}</strong>
+                                  </div>
+                                )}
                                 {filteredRoleCandidates.map((candidate) => {
                                   const selected = activeRoleCandidate?.id === candidate.id;
                                   return (
@@ -2273,7 +2103,7 @@ export default function App() {
                                     </button>
                                   );
                                 })}
-                                {roleLibraryCandidates.length === 0 && <div className="empty-row">{t("characters.noScanDrafts")}</div>}
+                                {filteredLibraryCharacters.length === 0 && filteredRoleCandidates.length === 0 && <div className="empty-row">{t("characters.noProjectRoles")}</div>}
                               </div>
                             </section>
 
@@ -2336,7 +2166,7 @@ export default function App() {
                                       </label>
                                       <button className="icon-button danger" onClick={() => void removeLibraryCharacter(activeLibraryCharacter.id)} title={t("characters.deleteRole")}><X size={14} /></button>
                                     </div>
-                                    <div className="role-detail-metrics">
+                                    <div className="role-detail-mini-strip">
                                       <div><span>{t("characters.status")}</span><strong>{t(`characters.status_${activeLibraryCharacter.library_status ?? "draft"}`)}</strong></div>
                                       <div><span>{t("characters.bindings")}</span><strong>{summary.completeCount}/{summary.bindingCount || 1}</strong></div>
                                       <div><span>{t("characters.referenceAudio")}</span><strong>{referenceSampleCount(activeLibraryCharacter.reference_audio_groups)}</strong></div>
@@ -2366,17 +2196,9 @@ export default function App() {
                                           <span>{t("characters.aliases")}</span>
                                           <textarea rows={2} value={(activeLibraryCharacter.aliases ?? []).join("，")} onChange={(event) => updateLibraryCharacterListField(activeLibraryCharacter.id, "aliases", event.target.value)} />
                                         </label>
-                                        <label>
-                                          <span>{t("characters.nicknames")}</span>
-                                          <textarea rows={2} value={(activeLibraryCharacter.nicknames ?? []).join("，")} onChange={(event) => updateLibraryCharacterListField(activeLibraryCharacter.id, "nicknames", event.target.value)} />
-                                        </label>
-                                        <label>
-                                          <span>{t("characters.matchNames")}</span>
-                                          <textarea rows={2} value={(activeLibraryCharacter.match_names ?? []).join("，")} onChange={(event) => updateLibraryCharacterListField(activeLibraryCharacter.id, "match_names", event.target.value)} />
-                                        </label>
                                         <label className="wide">
                                           <span>{t("characters.notes")}</span>
-                                          <textarea rows={3} value={activeLibraryCharacter.notes ?? ""} onChange={(event) => updateLibraryCharacter(activeLibraryCharacter.id, { notes: event.target.value })} />
+                                          <textarea rows={2} value={activeLibraryCharacter.notes ?? ""} onChange={(event) => updateLibraryCharacter(activeLibraryCharacter.id, { notes: event.target.value })} />
                                         </label>
                                       </div>
                                     </section>
@@ -2432,30 +2254,6 @@ export default function App() {
                                               ))}
                                             </select>
                                           </label>
-                                          <label className="wide">
-                                            <span>{t("characters.logsReferenceAudio")}</span>
-                                            <select
-                                              value={activeLibraryLogsReferenceSample?.sample_id ?? ""}
-                                              disabled={!activeLibraryLogsReferenceRequest || loadingLogsReferenceKey === activeLibraryLogsReferenceRequest?.key}
-                                              onChange={(event) => {
-                                                const sample = activeLibraryLogsReferenceSamples.find((item) => item.sample_id === event.target.value);
-                                                if (sample) {
-                                                  updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, applyLogsReferenceSampleToConfig(gptConfig, sample, { serviceId: activeLibraryGptBinding?.service_id }));
-                                                }
-                                              }}
-                                            >
-                                              <option value="">{activeLibraryLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
-                                              {activeLibraryLogsReferenceSamples.map((sample) => (
-                                                <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
-                                              ))}
-                                            </select>
-                                          </label>
-                                          {activeLibraryLogsReferenceSample && (
-                                            <div className="wide logs-reference-preview role-logs-reference-preview">
-                                              <span>{t("inspector.textSource")}: {activeLibraryLogsReferenceSample.text_source}</span>
-                                              <strong>{activeLibraryLogsReferenceSample.text || t("inspector.emptyPromptText")}</strong>
-                                            </div>
-                                          )}
                                           <div className="wide role-audio-uploader">
                                             <ReferenceAudioInput
                                               label={t("characters.addReferenceAudio")}
@@ -2473,43 +2271,6 @@ export default function App() {
                                         <div className="role-empty-config">{t("characters.noGptBindingHint")}</div>
                                       )}
                                     </section>
-
-                                    <section className="role-config-card">
-                                      <div className="role-config-head">
-                                        <strong>{t("characters.bindingInventory")}</strong>
-                                        <span>{allBindings.length}</span>
-                                      </div>
-                                      <div className="role-binding-list compact">
-                                        {allBindings.map((binding) => {
-                                          const config = binding.config ?? {};
-                                          const service = serviceById.get(binding.service_id ?? "");
-                                          const complete = bindingCompleteness(binding);
-                                          const logsName = stringConfigValue(config.logs_name);
-                                          const gptWeightsPath = stringConfigValue(config.gpt_weights_path);
-                                          const sovitsWeightsPath = stringConfigValue(config.sovits_weights_path);
-                                          const refAudioPath = stringConfigValue(config.ref_audio_path);
-                                          return (
-                                            <div className="role-binding-card" key={binding.binding_id}>
-                                              <div className="role-binding-card-head">
-                                                <strong>{providerLabel(binding.provider_type)}</strong>
-                                                <span className={`role-state-dot ${complete.complete ? "ready" : "warn"}`} />
-                                              </div>
-                                              <small>{binding.service_id ? serviceDisplayName(service ?? ({ engine: "gpt-sovits", display_name: binding.service_id, ready: false } as WorkerHealth)) : t("services.noService")}</small>
-                                              <div className="role-binding-fields">
-                                                {logsName && <span>logs: {logsName}</span>}
-                                                {gptWeightsPath && <span>GPT: {shortPath(gptWeightsPath)}</span>}
-                                                {sovitsWeightsPath && <span>SoVITS: {shortPath(sovitsWeightsPath)}</span>}
-                                                {refAudioPath && <span>Ref: {shortPath(refAudioPath)}</span>}
-                                                {!complete.complete && <span className="missing">{t("characters.missingFields")}: {complete.missing.join(", ")}</span>}
-                                              </div>
-                                            </div>
-                                          );
-                                        })}
-                                        {allBindings.length === 0 && <div className="empty-row">{t("characters.noBindings")}</div>}
-                                      </div>
-                                    </section>
-
-                                    <ReferencePreview groups={activeLibraryCharacter.reference_audio_groups ?? []} t={t} />
                                   </div>
                                 );
                               })() : (
@@ -3639,34 +3400,6 @@ export default function App() {
   }
 }
 
-function projectCharactersFromDraft(draftCharacters: Character[], library: Character[]): ProjectCharacter[] {
-  return draftCharacters.map((character) => {
-    const match = library.find((item) =>
-      characterMatchValues(item).some((value) => normalizeRoleToken(value) === normalizeRoleToken(character.name) || normalizeRoleToken(value) === normalizeRoleToken(character.id))
-    );
-    if (match) {
-      return {
-        project_character_id: character.id,
-        name: character.name,
-        library_character_id: match.id,
-        mode: "reference",
-        character_snapshot: null,
-        match_confidence: 1,
-        match_status: "matched"
-      };
-    }
-    return {
-      project_character_id: character.id,
-      name: character.name,
-      library_character_id: null,
-      mode: "reference",
-      character_snapshot: null,
-      match_confidence: null,
-      match_status: "unmatched"
-    };
-  });
-}
-
 function characterMatchValues(character: Character): string[] {
   return Array.from(new Set([
     character.id,
@@ -3840,12 +3573,24 @@ function compactConfig(config: Record<string, unknown>): Record<string, unknown>
   return Object.fromEntries(Object.entries(config).filter(([, value]) => value !== undefined && value !== ""));
 }
 
-function serviceTopbarTitle(summary: ReturnType<typeof serviceTopbarSummary>, t: Translate): string {
+function ttsTopbarTone(summary: ReturnType<typeof serviceTopbarSummary>): "ready" | "attention" | "offline" {
+  if (summary.local.tone === "offline") return "offline";
+  if (summary.local.tone === "attention") return "attention";
+  if (summary.paid.total > 0 && summary.paid.tone !== "ready") return "attention";
+  return "ready";
+}
+
+function ttsTopbarTitle(summary: ReturnType<typeof serviceTopbarSummary>, t: Translate): string {
   return [
     `${t("services.localReady")}: ${summary.local.ready}/${summary.local.total}`,
     `${t("services.paidReady")}: ${summary.paid.ready}/${summary.paid.total}`,
+  ].join(" · ");
+}
+
+function llmTopbarTitle(summary: ReturnType<typeof serviceTopbarSummary>, t: Translate): string {
+  return [
     `${t("services.parserReady")}: ${summary.parser.ready}/${summary.parser.total}`,
-    `${t("services.resourceReady")}: ${summary.resources.ready ? t("status.ready") : t("status.needsMapping")}`,
+    `${t("parser.keyReady")}: ${summary.parser.ready}/${summary.parser.total}`,
   ].join(" · ");
 }
 

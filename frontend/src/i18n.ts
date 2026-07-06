@@ -34,7 +34,10 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     topbar: {
       roleLibrary: "角色库",
-      services: "服务"
+      resourceQueue: "资源队列",
+      services: "服务",
+      ttsConfig: "TTS 配置",
+      llmConfig: "LLM API"
     },
     audioInput: {
       upload: "上传",
@@ -62,6 +65,12 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     services: {
       description: "统一管理本机和远端 TTS 服务端点、LLM 解析服务、GPU 资源组、商用服务商密钥状态与真实验收。",
+      ttsAccessTitle: "TTS 接入",
+      ttsAccessDescription: "选择一个 TTS 引擎，填写服务地址，检测后保存为本地端点。",
+      llmApiTitle: "LLM API 配置",
+      llmApiDescription: "单独配置解析用 LLM Provider、模型、API Key 和连接测试。",
+      resourceQueueTitle: "资源队列",
+      resourceQueueDescription: "查看生成队列的分发进度、轮询状态和最近任务。",
       statusHint: "每个 TTS 服务和 LLM 解析服务都按健康、生命周期、资源组或密钥状态追踪。绿色表示可用于路由，黄色表示需要配置。",
       configHint: "选择一个服务查看真实调用配置；密钥仅从 .env.local 读取，不写入项目文件。",
       localReady: "本地服务",
@@ -167,7 +176,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       projectRoles: "项目角色",
       library: "角色库",
       libraryManager: "角色库管理",
-      libraryHint: "扫描候选、确认入库，并管理常用角色的默认 TTS 配置。",
+      libraryHint: "搜索或新增角色，维护默认 TTS 音色配置。",
       libraryWorkflow: "角色库工作流",
       libraryWorkflowHint: "先确认剧本角色匹配，再维护常用角色配置；未匹配角色保持手动临时配音。",
       searchLibrary: "搜索角色或候选",
@@ -240,12 +249,12 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       draftApplied: "草稿已应用",
       source: {
         project: "剧本同步",
-        manual: "未应用草稿",
+        manual: "未保存编辑",
         draft: "已解析草稿"
       },
       sourceHint: {
         project: "内容来自当前剧本任务表，和右侧角色/台词列表保持同步",
-        manual: "你正在编辑新的剧本源；解析并应用后才会更新任务表",
+        manual: "你正在编辑新的剧本源；保存或提取台词后才会更新任务表",
         draft: "已生成解析草稿 · {{draftLines}} 行，确认无误后应用到当前项目"
       },
       llmProviders: "LLM 解析服务",
@@ -308,6 +317,18 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       previewSource: "预览",
       saveRevision: "保存新版本",
       parseRevision: "提取剧本台词",
+      parseApplied: "台词已提取",
+      newScript: "新增剧本",
+      existingScripts: "现有剧本",
+      newScriptTitle: "标题",
+      newScriptTitlePlaceholder: "输入剧本标题",
+      newScriptSource: "原文",
+      newScriptSourcePlaceholder: "粘贴剧本文本",
+      createScript: "创建剧本",
+      initialScriptRevision: "初始原文",
+      newScriptCreated: "剧本已创建",
+      newScriptTitleRequired: "请输入剧本标题",
+      newScriptCreateFailed: "创建剧本失败",
       revisionRisk: "保存或重新解析会创建新的剧本/解析版本分支，不会覆盖旧台词和旧音频。是否继续？",
       activeRevision: "活动版本",
       noRevisions: "暂无版本历史"
@@ -611,6 +632,17 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     queue: {
       title: "队列",
+      dispatchTitle: "队列分发",
+      dispatchHint: "分发进度与轮询状态",
+      pollingState: "轮询",
+      polling: "轮询中",
+      synced: "已同步",
+      notSynced: "未同步",
+      processedRatio: "{{processed}}/{{total}} 已处理",
+      progressLabel: "队列进度 {{percent}}%",
+      recentJobs: "最近任务",
+      itemCount: "{{count}} 条",
+      noJobs: "暂无队列任务",
       position: "排队 #{{position}}",
       cluster: "同簇 {{current}}/{{total}}",
       routeError: "路由错误"
@@ -689,7 +721,10 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     topbar: {
       roleLibrary: "Role Library",
-      services: "Services"
+      resourceQueue: "Queue",
+      services: "Services",
+      ttsConfig: "TTS Config",
+      llmConfig: "LLM API"
     },
     audioInput: {
       upload: "Upload",
@@ -717,6 +752,12 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     services: {
       description: "Manage local and remote TTS endpoints, LLM parser providers, GPU resource groups, commercial provider key status, and real validation.",
+      ttsAccessTitle: "TTS setup",
+      ttsAccessDescription: "Choose a TTS engine, enter the service URL, then detect and save it as a local endpoint.",
+      llmApiTitle: "LLM API setup",
+      llmApiDescription: "Configure parser LLM providers, models, API keys, and connection tests in a separate menu.",
+      resourceQueueTitle: "Resource queue",
+      resourceQueueDescription: "Track generation dispatch progress, polling state, and recent queue jobs.",
       statusHint: "Each TTS service and LLM parser provider is tracked by health, lifecycle, resource group, or key status. Green means routable; amber means setup is needed.",
       configHint: "Select a service to inspect the real call configuration. Secrets are read from .env.local and never saved into project files.",
       localReady: "Local services",
@@ -822,7 +863,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       projectRoles: "Project roles",
       library: "Role library",
       libraryManager: "Role library",
-      libraryHint: "Scan candidates, confirm imports, and manage default TTS settings for reusable roles.",
+      libraryHint: "Search or add roles, then maintain their default TTS voice settings.",
       libraryWorkflow: "Role library workflow",
       libraryWorkflowHint: "Confirm script role matching first, then maintain reusable role configs. Unmatched roles stay manual and temporary.",
       searchLibrary: "Search roles or candidates",
@@ -895,12 +936,12 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       draftApplied: "Draft applied",
       source: {
         project: "Script synced",
-        manual: "Unapplied draft",
+        manual: "Unsaved edits",
         draft: "Parsed draft"
       },
       sourceHint: {
         project: "Content mirrors the current project task table and stays aligned with roles and lines · {{projectLines}} lines",
-        manual: "You are editing a new script source; parse and apply it before it updates the task table",
+        manual: "You are editing a new script source; save or extract lines before it updates the task table",
         draft: "Parsed draft ready · {{draftLines}} lines. Apply it after review"
       },
       llmProviders: "LLM parser providers",
@@ -963,6 +1004,18 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       previewSource: "Preview",
       saveRevision: "Save revision",
       parseRevision: "Extract script lines",
+      parseApplied: "Script lines extracted",
+      newScript: "New script",
+      existingScripts: "Existing scripts",
+      newScriptTitle: "Title",
+      newScriptTitlePlaceholder: "Script title",
+      newScriptSource: "Source",
+      newScriptSourcePlaceholder: "Paste script text",
+      createScript: "Create script",
+      initialScriptRevision: "Initial source",
+      newScriptCreated: "Script created",
+      newScriptTitleRequired: "Enter a script title",
+      newScriptCreateFailed: "Script creation failed",
       revisionRisk: "Saving or parsing creates a new script/parse branch and keeps old lines and audio history. Continue?",
       activeRevision: "Active revision",
       noRevisions: "No revision history"
@@ -1266,6 +1319,17 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     queue: {
       title: "Queue",
+      dispatchTitle: "Dispatch",
+      dispatchHint: "Dispatch progress and polling state",
+      pollingState: "Polling",
+      polling: "Polling",
+      synced: "Synced",
+      notSynced: "Not synced",
+      processedRatio: "{{processed}}/{{total}} processed",
+      progressLabel: "Queue progress {{percent}}%",
+      recentJobs: "Recent jobs",
+      itemCount: "{{count}} items",
+      noJobs: "No queue jobs",
       position: "Queue #{{position}}",
       cluster: "Cluster {{current}}/{{total}}",
       routeError: "Route error"
