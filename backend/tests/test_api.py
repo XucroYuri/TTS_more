@@ -29,6 +29,21 @@ def test_parse_script_uses_rule_based_fallback(tmp_path: Path) -> None:
     assert payload["lines"][0]["note"] == "焦急"
 
 
+def test_default_parser_provider_uses_kwjm_gpt_55(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path, env_path=tmp_path / ".env.local"))
+
+    response = client.get("/api/parser/providers")
+
+    assert response.status_code == 200
+    provider = response.json()["providers"][0]
+    assert provider["name"] == "开物基模"
+    assert provider["base_url"] == ""
+    assert provider["api_key_env"] == "KWJM_API_KEY"
+    assert provider["model"] == "gpt-5.5"
+    assert provider["enabled"] is False
+    assert provider["priority"] == 10
+
+
 def test_parser_provider_config_masks_secret_and_writes_env(tmp_path: Path) -> None:
     env_path = tmp_path / ".env.local"
     client = TestClient(create_app(data_root=tmp_path, env_path=env_path))

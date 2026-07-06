@@ -33,10 +33,10 @@ class ParserProvidersUpdate(BaseModel):
 def default_parser_providers() -> list[ParserProviderRecord]:
     return [
         ParserProviderRecord(
-            name="openai-compatible",
-            base_url="https://api.openai.com/v1",
-            api_key_env="OPENAI_API_KEY",
-            model="gpt-4o-mini",
+            name="开物基模",
+            base_url="",
+            api_key_env="KWJM_API_KEY",
+            model="gpt-5.5",
             enabled=False,
             timeout_seconds=45.0,
             priority=10,
