@@ -16,14 +16,13 @@ from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from app.adapter_factory import build_adapters
 from app.hardware import collect_local_hardware_status
-from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptLine, ScriptProject, ScriptRevision
+from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, RuleBasedParser
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
-from app.resources import collect_voice_candidates, scan_reference_audio_groups
+from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
 from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
 from app.services import ServiceRegistry, ServiceRouter, build_load_signature
@@ -34,7 +33,7 @@ DEFAULT_REFERENCE_AUDIO_ROOT = Path("data") / "local" / "reference-audio"
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_ROOT = Path("data") / ".runtime"
 REPO_LOCK_PATH = Path(__file__).resolve().parents[2] / "repo.lock.json"
-AUDIO_UPLOAD_SUFFIXES = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".webm", ".aac", ".opus"}
+AUDIO_UPLOAD_SUFFIXES = AUDIO_SUFFIXES | {".webm", ".aac", ".opus"}
 
 load_dotenv(".env.local")
 load_dotenv(".env")
@@ -145,12 +144,7 @@ def create_app(
         registry = save_service_settings(app.state.writable_services_path, env_file, request)
         if _service_mode() == "mock":
             registry = _mocked_registry(registry)
-        router = ServiceRouter(registry)
-        queue = ServiceGenerationQueue(router)
-        app.state.service_registry = registry
-        app.state.service_router = router
-        app.state.queue = queue
-        app.state.job_manager = GenerationJobManager(queue, store)
+        _apply_registry(app, registry, store)
         app.state.services_path = app.state.writable_services_path
         return public_service_settings(registry, env_file)
 
@@ -162,12 +156,7 @@ def create_app(
             registry = _load_service_registry(app.state.services_path)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"failed to reload services: {exc}") from exc
-        router = ServiceRouter(registry)
-        queue = ServiceGenerationQueue(router)
-        app.state.service_registry = registry
-        app.state.service_router = router
-        app.state.queue = queue
-        app.state.job_manager = GenerationJobManager(queue, store)
+        _apply_registry(app, registry, store)
         return public_service_settings(registry, env_file)
 
     @app.get("/api/open-source-tts/catalog")
@@ -186,12 +175,7 @@ def create_app(
             app.state.writable_services_path,
             project_root,
         )
-        router = ServiceRouter(registry)
-        queue = ServiceGenerationQueue(router)
-        app.state.service_registry = registry
-        app.state.service_router = router
-        app.state.queue = queue
-        app.state.job_manager = GenerationJobManager(queue, store)
+        _apply_registry(app, registry, store)
         app.state.services_path = app.state.writable_services_path
         return {
             "service": endpoint.model_dump(mode="json"),
@@ -1059,6 +1043,20 @@ def _load_service_registry(path: Path) -> ServiceRegistry:
     if _service_mode() == "mock":
         return _mocked_registry(registry)
     return registry
+
+
+def _apply_registry(app: FastAPI, registry: ServiceRegistry, store: ProjectStore) -> None:
+    """Rebuild router/queue/job_manager from a (possibly updated) registry.
+
+    Called after every mutation of the service registry (save settings, reload,
+    open-source configure) to keep the routing layer in sync.
+    """
+    router = ServiceRouter(registry)
+    queue = ServiceGenerationQueue(router)
+    app.state.service_registry = registry
+    app.state.service_router = router
+    app.state.queue = queue
+    app.state.job_manager = GenerationJobManager(queue, store)
 
 
 def _resolve_service_settings_paths(data_root: Path, explicit_path: Path | None) -> tuple[Path, Path]:
