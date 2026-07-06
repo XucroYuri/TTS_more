@@ -1,17 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { Character, GenerationVersion, ScriptLine, WorkerHealth } from "../types";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorConfigPanelLayout, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorSpeechWorkbenchLayout, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, referenceResourcePanelLayout, resourceQueueLayout, roleAccentClass, roleChipInteractionState, roleFilterCardView, roleLibraryLayout, scriptConsoleActionPlacement, scriptConsoleBodyMode, scriptDrawerTabs, scriptExcerptLines, scriptModuleLayout, serviceTopologyLayout, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups } from "./workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups } from "./workbenchView";
 
 describe("workbench view helpers", () => {
-  it("keeps role filter names and count badges as separate visual parts", () => {
-    expect(roleFilterCardView("小品", 9, "小")).toEqual({
-      name: "小品",
-      countLabel: "9",
-      avatarLabel: "小",
-      ariaLabel: "小品 · 9 行"
-    });
-    expect(roleFilterCardView("全部", 30, "全").ariaLabel).toBe("全部 · 30 行");
+  it("maps a role index to a stable accent class", () => {
     expect(roleAccentClass(0)).toBe("role-accent-0");
     expect(roleAccentClass(9)).toBe("role-accent-1");
   });
@@ -54,33 +47,6 @@ describe("workbench view helpers", () => {
     expect(generationMethodRouteLabels("commercial").bindingLabelKey).toBe("inspector.commercialVoiceBinding");
   });
 
-  it("keeps the current line summary inside the generation workbench", () => {
-    expect(inspectorSpeechWorkbenchLayout()).toEqual({
-      currentLineSummary: "dock",
-      separateHero: false,
-      primaryAction: "dock",
-      serviceStatus: "config",
-      diagnosticsAction: "config"
-    });
-  });
-
-  it("keeps voice resources as compact mixed-axis controls instead of explanatory text", () => {
-    expect(referenceResourcePanelLayout()).toEqual({
-      summary: "compact_grid",
-      controls: "model_reference_columns",
-      manualFallback: "inline",
-      standaloneHelpText: false
-    });
-  });
-
-  it("keeps performance prompts out of the primary generation route controls", () => {
-    expect(inspectorConfigPanelLayout()).toEqual({
-      generationMethodTabs: true,
-      routeControls: "method_scoped",
-      standalonePerformancePrompt: false
-    });
-  });
-
   it("paginates line lists with bounded page metadata", () => {
     const items = Array.from({ length: 30 }, (_, index) => `l${index + 1}`);
 
@@ -113,29 +79,9 @@ describe("workbench view helpers", () => {
     });
   });
 
-  it("keeps script management as a header-level action", () => {
-    expect(scriptConsoleActionPlacement()).toEqual({
-      management: "header",
-      parseRevision: "footer"
-    });
-  });
-
   it("keeps the sidebar script body in markdown preview until editing is requested", () => {
     expect(scriptConsoleBodyMode(false)).toBe("preview");
     expect(scriptConsoleBodyMode(true)).toBe("edit");
-  });
-
-  it("distinguishes focused and filtered role chip state", () => {
-    expect(roleChipInteractionState("xiao-pin", "xiao-pin", "all")).toEqual({
-      isFocused: true,
-      isFiltered: false,
-      ariaPressed: false
-    });
-    expect(roleChipInteractionState("xiao-pin", "dao-shi", "xiao-pin")).toEqual({
-      isFocused: false,
-      isFiltered: true,
-      ariaPressed: true
-    });
   });
 
   it("keeps technical service details out of the collapsed line card", () => {
@@ -321,55 +267,6 @@ describe("workbench view helpers", () => {
     expect(preflightLoadLabelKey(ready, null)).toBe("preflight.notLoaded");
     expect(preflightLoadTone({ ...ready, load_state: "loaded", current_loaded_signature: "sig-a", load_match: true }, null)).toBe("ok");
     expect(preflightLoadLabelKey({ ...ready, load_state: "switch_required", current_loaded_signature: "sig-old", load_match: false }, null)).toBe("preflight.switchNeeded");
-  });
-
-  it("keeps the script manager as a single-page workflow without nested drawer tabs", () => {
-    expect(scriptDrawerTabs()).toEqual([]);
-  });
-
-  it("keeps the script module focused on list, editor preview, and extraction versions", () => {
-    expect(scriptModuleLayout()).toEqual({
-      managementSurface: "main_interface",
-      sidebarSections: ["new_script", "existing_script_list", "script_editor_preview", "extract_lines"],
-      hiddenSidebarSections: ["metric_cards", "autosave_card", "duplicate_manage_button"],
-      hiddenSurfaces: ["script_modal", "drawer_backdrop"],
-      hiddenManagementSections: ["editor_preview", "parse_revision_history", "revision_task_buttons", "modal_close_button"],
-      defaultEditorMode: "preview"
-    });
-  });
-
-  it("splits service setup, role library, and resource queue into independent surfaces", () => {
-    expect(serviceTopologyLayout()).toEqual({
-      primaryMenus: ["tts_config", "llm_api_config"],
-      serviceSurface: "split_tts_and_llm",
-      serviceNestedNav: false,
-      serviceSections: ["tts_access", "llm_api"],
-      detachedSurfaces: ["role_library", "resource_queue"]
-    });
-  });
-
-  it("keeps the resource queue focused on dispatch progress and polling state", () => {
-    expect(resourceQueueLayout()).toEqual({
-      focus: "queue_dispatch",
-      sections: ["dispatch_progress", "polling_state", "recent_jobs"],
-      progress: "queue_progress_bar",
-      hiddenSections: ["resource_groups", "model_assets"]
-    });
-  });
-
-  it("keeps the role library as a simple list and selected-role editor", () => {
-    expect(roleLibraryLayout()).toEqual({
-      focus: "role_defaults",
-      sections: ["role_list", "selected_role_detail"],
-      visibleControls: ["search", "scan_candidates", "add_role"],
-      hiddenSections: ["workflow_overview", "project_match_column", "scan_candidates_column", "binding_inventory_panel"]
-    });
-  });
-
-  it("builds a compact script excerpt for the left console without editing controls", () => {
-    const excerpt = scriptExcerptLines("第一行\n\n第二行\n第三行\n第四行\n第五行\n第六行\n第七行", 4);
-
-    expect(excerpt).toEqual(["第一行", "第二行", "第三行", "第四行", "…"]);
   });
 
   it("only requests revision confirmation after history exists", () => {

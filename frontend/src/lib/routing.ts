@@ -25,7 +25,7 @@ export function lineFallbackServiceIds(line: ScriptLine, characters: Character[]
   return binding?.fallback_services ?? findProfile(line, characters)?.fallback_services ?? [];
 }
 
-export function lineParameters(line: ScriptLine, characters: Character[]): Record<string, unknown> {
+function lineParameters(line: ScriptLine, characters: Character[]): Record<string, unknown> {
   const binding = lineBinding(line, characters);
   return binding?.config ?? findProfile(line, characters)?.config ?? {};
 }

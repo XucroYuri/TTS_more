@@ -1,12 +1,5 @@
 import type { Character, GenerationVersion, ProviderType, ReferenceAudioGroup, ScriptLine, WorkerHealth } from "../types";
 
-export type ScriptDrawerTabId = "list" | "edit" | "preview" | "history";
-
-export interface ScriptDrawerTab {
-  id: ScriptDrawerTabId;
-  labelKey: string;
-}
-
 export interface FallbackActionView {
   type: "start_service";
   serviceId: string;
@@ -63,13 +56,6 @@ export interface PaginationView<T> {
   hasNext: boolean;
 }
 
-export interface RoleFilterCardView {
-  name: string;
-  countLabel: string;
-  avatarLabel: string;
-  ariaLabel: string;
-}
-
 export interface LineFocusState {
   activeLineId: string | null;
   expandedLineId: string | null;
@@ -86,63 +72,6 @@ export interface GenerationMethodRouteLabels {
   profileLabelKey: string;
   bindingLabelKey: string;
   serviceLabelKey: string;
-}
-
-export interface InspectorSpeechWorkbenchLayout {
-  currentLineSummary: "dock";
-  separateHero: false;
-  primaryAction: "dock";
-  serviceStatus: "config";
-  diagnosticsAction: "config";
-}
-
-export interface ReferenceResourcePanelLayout {
-  summary: "compact_grid";
-  controls: "model_reference_columns";
-  manualFallback: "inline";
-  standaloneHelpText: false;
-}
-
-export interface InspectorConfigPanelLayout {
-  generationMethodTabs: true;
-  routeControls: "method_scoped";
-  standalonePerformancePrompt: false;
-}
-
-export interface ScriptConsoleActionPlacement {
-  management: "header";
-  parseRevision: "footer";
-}
-
-export interface ServiceTopologyLayout {
-  primaryMenus: ["tts_config", "llm_api_config"];
-  serviceSurface: "split_tts_and_llm";
-  serviceNestedNav: false;
-  serviceSections: ["tts_access", "llm_api"];
-  detachedSurfaces: ["role_library", "resource_queue"];
-}
-
-export interface ResourceQueueLayout {
-  focus: "queue_dispatch";
-  sections: ["dispatch_progress", "polling_state", "recent_jobs"];
-  progress: "queue_progress_bar";
-  hiddenSections: ["resource_groups", "model_assets"];
-}
-
-export interface RoleLibraryLayout {
-  focus: "role_defaults";
-  sections: ["role_list", "selected_role_detail"];
-  visibleControls: ["search", "scan_candidates", "add_role"];
-  hiddenSections: ["workflow_overview", "project_match_column", "scan_candidates_column", "binding_inventory_panel"];
-}
-
-export interface ScriptModuleLayout {
-  managementSurface: "main_interface";
-  sidebarSections: ["new_script", "existing_script_list", "script_editor_preview", "extract_lines"];
-  hiddenSidebarSections: ["metric_cards", "autosave_card", "duplicate_manage_button"];
-  hiddenSurfaces: ["script_modal", "drawer_backdrop"];
-  hiddenManagementSections: ["editor_preview", "parse_revision_history", "revision_task_buttons", "modal_close_button"];
-  defaultEditorMode: "preview";
 }
 
 export type ScriptConsoleBodyMode = "preview" | "edit";
@@ -190,17 +119,6 @@ export function preflightLoadLabelKey(item: PreflightFallbackEntry | undefined, 
   if (tone === "ok") return "preflight.loaded";
   if (tone === "warn") return "preflight.switchNeeded";
   return "preflight.notLoaded";
-}
-
-export function roleFilterCardView(name: string, lineCount: number, avatarLabel: string): RoleFilterCardView {
-  const safeName = name.trim() || "-";
-  const safeAvatar = avatarLabel.trim() || safeName.slice(0, 1) || "?";
-  return {
-    name: safeName,
-    countLabel: String(Math.max(0, lineCount)),
-    avatarLabel: safeAvatar,
-    ariaLabel: `${safeName} · ${Math.max(0, lineCount)} 行`
-  };
 }
 
 export function lineFocusTransition(current: LineFocusState, lineId: string, intent: LineFocusIntent): LineFocusState {
@@ -282,40 +200,6 @@ export function generationMethodRouteLabels(methodId: GenerationMethodId): Gener
   };
 }
 
-export function inspectorSpeechWorkbenchLayout(): InspectorSpeechWorkbenchLayout {
-  return {
-    currentLineSummary: "dock",
-    separateHero: false,
-    primaryAction: "dock",
-    serviceStatus: "config",
-    diagnosticsAction: "config"
-  };
-}
-
-export function referenceResourcePanelLayout(): ReferenceResourcePanelLayout {
-  return {
-    summary: "compact_grid",
-    controls: "model_reference_columns",
-    manualFallback: "inline",
-    standaloneHelpText: false
-  };
-}
-
-export function inspectorConfigPanelLayout(): InspectorConfigPanelLayout {
-  return {
-    generationMethodTabs: true,
-    routeControls: "method_scoped",
-    standalonePerformancePrompt: false
-  };
-}
-
-export function scriptConsoleActionPlacement(): ScriptConsoleActionPlacement {
-  return {
-    management: "header",
-    parseRevision: "footer"
-  };
-}
-
 export function scriptConsoleBodyMode(isEditing: boolean): ScriptConsoleBodyMode {
   return isEditing ? "edit" : "preview";
 }
@@ -344,26 +228,8 @@ export function roleAccentClass(index: number): string {
   return `role-accent-${Math.abs(index) % 8}`;
 }
 
-export function roleChipInteractionState(roleId: string, focusedCharacterId?: string | null, filteredCharacterId?: string | null) {
-  const isFiltered = filteredCharacterId === roleId;
-  return {
-    isFocused: focusedCharacterId === roleId,
-    isFiltered,
-    ariaPressed: isFiltered
-  };
-}
-
 export function shouldRequestRevisionConfirmation(scriptRevisionCount = 0, parseRevisionCount = 0): boolean {
   return scriptRevisionCount > 1 || parseRevisionCount > 1;
-}
-
-export function lineCardSecondaryLabels(latestVersion: GenerationVersion | undefined, versionCount: number): string[] {
-  return lineCardSecondaryBadges(latestVersion, versionCount).map((badge) => {
-    if (badge.kind === "latest_playable") return "latest_playable";
-    if (badge.kind === "latest_failed") return "latest_failed";
-    if (badge.kind === "version_count") return `${badge.count} 个版本`;
-    return "暂无版本";
-  });
 }
 
 export function lineCardSecondaryBadges(latestVersion: GenerationVersion | undefined, versionCount: number): LineCardSecondaryBadge[] {
@@ -463,56 +329,4 @@ export function preflightFallbackAction(
     serviceId: action.service_id,
     serviceName: service?.display_name ?? action.service_id
   };
-}
-
-export function scriptDrawerTabs(): ScriptDrawerTab[] {
-  return [];
-}
-
-export function scriptModuleLayout(): ScriptModuleLayout {
-  return {
-    managementSurface: "main_interface",
-    sidebarSections: ["new_script", "existing_script_list", "script_editor_preview", "extract_lines"],
-    hiddenSidebarSections: ["metric_cards", "autosave_card", "duplicate_manage_button"],
-    hiddenSurfaces: ["script_modal", "drawer_backdrop"],
-    hiddenManagementSections: ["editor_preview", "parse_revision_history", "revision_task_buttons", "modal_close_button"],
-    defaultEditorMode: "preview"
-  };
-}
-
-export function serviceTopologyLayout(): ServiceTopologyLayout {
-  return {
-    primaryMenus: ["tts_config", "llm_api_config"],
-    serviceSurface: "split_tts_and_llm",
-    serviceNestedNav: false,
-    serviceSections: ["tts_access", "llm_api"],
-    detachedSurfaces: ["role_library", "resource_queue"]
-  };
-}
-
-export function resourceQueueLayout(): ResourceQueueLayout {
-  return {
-    focus: "queue_dispatch",
-    sections: ["dispatch_progress", "polling_state", "recent_jobs"],
-    progress: "queue_progress_bar",
-    hiddenSections: ["resource_groups", "model_assets"]
-  };
-}
-
-export function roleLibraryLayout(): RoleLibraryLayout {
-  return {
-    focus: "role_defaults",
-    sections: ["role_list", "selected_role_detail"],
-    visibleControls: ["search", "scan_candidates", "add_role"],
-    hiddenSections: ["workflow_overview", "project_match_column", "scan_candidates_column", "binding_inventory_panel"]
-  };
-}
-
-export function scriptExcerptLines(source: string, maxLines = 6): string[] {
-  const lines = source
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (lines.length <= maxLines) return lines;
-  return [...lines.slice(0, maxLines), "…"];
 }
