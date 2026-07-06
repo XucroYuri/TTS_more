@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ProjectSummary } from "../types";
-import { createEmptyManifest, createEmptyProject, selectStartupProjectId } from "./projectStartup";
+import { createEmptyManifest, createEmptyProject, createProjectId, selectStartupProjectId } from "./projectStartup";
 
 describe("project startup helpers", () => {
   it("selects no project when the backend has no saved projects", () => {
@@ -25,5 +25,10 @@ describe("project startup helpers", () => {
     ];
 
     expect(selectStartupProjectId(projects, "demo")).toBe("official-script");
+  });
+
+  it("creates stable safe ids for new scripts", () => {
+    expect(createProjectId("  Demo Script  ", "m001")).toBe("demo-script-m001");
+    expect(createProjectId("测试剧本", "m002")).toBe("script-m002");
   });
 });

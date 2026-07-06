@@ -19,6 +19,18 @@ export function createEmptyManifest(projectId: string | null): GenerationManifes
   return { project_id: projectId ?? "", lines: {} };
 }
 
+export function createProjectId(title: string, suffix = Date.now().toString(36)): string {
+  const base = title
+    .normalize("NFKD")
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40) || "script";
+  return `${base}-${suffix}`;
+}
+
 export function selectStartupProjectId(projects: ProjectSummary[], preferredProjectId: string | null): string | null {
   if (projects.length === 0) return null;
   if (preferredProjectId && projects.some((project) => project.project_id === preferredProjectId)) return preferredProjectId;

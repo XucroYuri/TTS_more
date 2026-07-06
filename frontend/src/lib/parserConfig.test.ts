@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parserProviderKeyState, toParserProviderSavePayload } from "./parserConfig";
+import { createDefaultParserProviderDraft, parserProviderKeyState, toParserProviderSavePayload } from "./parserConfig";
 import type { ParserProviderDraft } from "../types";
 
 const provider: ParserProviderDraft = {
@@ -31,5 +31,19 @@ describe("parser provider config helpers", () => {
   it("reports parser provider key state", () => {
     expect(parserProviderKeyState(provider)).toBe("configured");
     expect(parserProviderKeyState({ ...provider, key_configured: false })).toBe("missing");
+  });
+
+  it("creates new parser providers from the kwjm gpt-5.5 template", () => {
+    expect(createDefaultParserProviderDraft(2)).toEqual({
+      name: "开物基模",
+      base_url: "",
+      api_key_env: "KWJM_API_KEY",
+      model: "gpt-5.5",
+      enabled: true,
+      timeout_seconds: 45,
+      priority: 102,
+      key_configured: false,
+      api_key: "",
+    });
   });
 });

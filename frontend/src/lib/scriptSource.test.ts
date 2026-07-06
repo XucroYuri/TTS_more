@@ -27,4 +27,20 @@ describe("projectToScriptSourceText", () => {
 
     expect(projectToScriptSourceText(project, characters)).toBe("旁白: 街道一片混乱。");
   });
+
+  it("uses the active script revision before the script has parsed lines", () => {
+    const project: ScriptProject = {
+      title: "新剧本",
+      default_language: "zh",
+      active_script_revision_id: "script-r001",
+      script_revisions: [{
+        revision_id: "script-r001",
+        source_markdown: "旁白: 第一行\n角色: 第二行",
+        created_at: "2026-07-06T00:00:00.000Z"
+      }],
+      lines: []
+    };
+
+    expect(projectToScriptSourceText(project, [])).toBe("旁白: 第一行\n角色: 第二行");
+  });
 });
