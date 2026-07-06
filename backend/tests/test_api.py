@@ -485,6 +485,30 @@ def test_project_round_trip_via_api(tmp_path: Path) -> None:
     assert load.json()["project_characters"][0]["library_character_id"] == "alice-lib"
 
 
+def test_project_save_creates_title_named_script_and_output_layout(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    project = {
+        "title": "剧本 Demo",
+        "default_language": "zh",
+        "active_script_revision_id": "script-r001",
+        "script_revisions": [
+            {"revision_id": "script-r001", "source_markdown": "小品: 你好", "summary": "初稿"}
+        ],
+        "lines": [{"id": "l001", "character_id": "xiao-pin", "text": "你好"}],
+    }
+
+    response = client.put("/api/projects/demo", json=project)
+
+    assert response.status_code == 200
+    project_dir = tmp_path / "Project" / "剧本 Demo"
+    assert (project_dir / "project.json").is_file()
+    assert (project_dir / ".project-id").read_text(encoding="utf-8") == "demo"
+    assert (project_dir / "script" / "active.md").read_text(encoding="utf-8") == "小品: 你好"
+    assert (project_dir / "script" / "revisions" / "script-r001.md").read_text(encoding="utf-8") == "小品: 你好"
+    lines_payload = json.loads((project_dir / "output" / "lines.json").read_text(encoding="utf-8"))
+    assert lines_payload[0]["text"] == "你好"
+
+
 def test_projects_endpoint_lists_saved_projects(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path))
     client.put(

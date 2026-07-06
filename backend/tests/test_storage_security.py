@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.models import GenerationManifest, GenerationVersion
+from app.models import GenerationManifest, GenerationVersion, ScriptProject
 from app.storage import ProjectStore
 
 
@@ -25,6 +25,65 @@ def test_audio_endpoint_rejects_files_outside_data_root(tmp_path: Path) -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "audio path is outside data root"
+
+
+def test_manifest_uses_output_directory_and_reads_legacy_manifest(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path)
+    legacy_dir = store.writable_project_dir("legacy")
+    legacy_dir.mkdir(parents=True)
+    legacy_manifest = GenerationManifest(project_id="legacy")
+    legacy_manifest.append_version(
+        "line-1",
+        GenerationVersion(
+            version_id="v001",
+            line_uid="line-1",
+            engine="gpt-sovits",
+            profile="default",
+            status="completed",
+        ),
+    )
+    (legacy_dir / "manifest.json").write_text(legacy_manifest.model_dump_json(), encoding="utf-8")
+
+    loaded = store.load_manifest("legacy")
+    store.save_manifest(GenerationManifest(project_id="legacy"))
+
+    assert loaded.lines["line-1"].versions[0].version_id == "v001"
+    assert (legacy_dir / "output" / "manifest.json").is_file()
+
+
+def test_title_named_project_directory_does_not_alias_different_project_id(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path)
+    store.save_project(
+        "real-id",
+        ScriptProject(
+            title="demo",
+            default_language="zh",
+            lines=[],
+        ),
+    )
+
+    with pytest.raises(FileNotFoundError):
+        store.load_project("demo")
+
+    assert store.load_project("real-id").title == "demo"
+
+
+def test_project_title_avoids_windows_reserved_directory_names(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path)
+
+    store.save_project(
+        "demo",
+        ScriptProject(
+            title="CON",
+            default_language="zh",
+            lines=[],
+        ),
+    )
+
+    project_path = store.project_path("demo")
+
+    assert project_path.parent.name == "CON_"
+    assert project_path.is_file()
 
 
 def test_audio_endpoint_serves_configured_logs_audio_root(tmp_path: Path) -> None:
@@ -85,7 +144,7 @@ def test_audio_endpoint_rejects_non_audio_assets_inside_data_root(tmp_path: Path
 
 def test_delete_generation_version_removes_manifest_and_project_audio_only(tmp_path: Path) -> None:
     store = ProjectStore(tmp_path)
-    project_audio = store.project_dir("demo") / "audio" / "l001-v001.wav"
+    project_audio = store.project_audio_dir("demo") / "l001-v001.wav"
     project_audio.parent.mkdir(parents=True)
     project_audio.write_bytes(b"RIFFproject")
     outside_audio = tmp_path.parent / "outside-generation.wav"

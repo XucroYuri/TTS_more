@@ -87,6 +87,11 @@ class MemoryStore:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def project_audio_dir(self, project_id: str) -> Path:
+        path = self.project_dir(project_id) / "output" / "audio"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def save_manifest(self, manifest: GenerationManifest) -> None:
         self.save_calls += 1
         self.manifest = manifest

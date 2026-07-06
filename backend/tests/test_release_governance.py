@@ -146,7 +146,7 @@ def test_project_store_prefers_local_runtime_projects(tmp_path: Path) -> None:
 
     local_store.save_project("demo", local_project)
 
-    assert local_store.project_path("demo") == data_root / "local" / "projects" / "demo" / "project.json"
+    assert local_store.project_path("demo") == tmp_path / "Project" / "Local Runtime Script" / "project.json"
     assert local_store.load_project("demo").title == "Local Runtime Script"
     assert local_store.list_projects() == [
         {"project_id": "demo", "title": "Local Runtime Script", "default_language": "zh", "line_count": 1}
@@ -155,7 +155,7 @@ def test_project_store_prefers_local_runtime_projects(tmp_path: Path) -> None:
 
 def test_delete_generation_version_falls_back_from_revision_uid_to_legacy_line_id(tmp_path: Path) -> None:
     store = ProjectStore(tmp_path)
-    audio = store.project_dir("demo") / "audio" / "l001-v001.wav"
+    audio = store.project_audio_dir("demo") / "l001-v001.wav"
     audio.parent.mkdir(parents=True)
     audio.write_bytes(b"RIFFproject")
     manifest = GenerationManifest(project_id="demo")
