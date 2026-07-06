@@ -690,7 +690,8 @@ def create_app(
         project.script_revisions.append(revision)
         project.active_script_revision_id = revision.revision_id
         store.save_project(project_id, project)
-        return {"revision": revision.model_dump(mode="json"), "project": project.model_dump(mode="json")}
+        revision_payload = revision.model_dump(mode="json")
+        return {"revision": revision_payload, "script_revision": revision_payload, "project": project.model_dump(mode="json")}
 
     @app.post("/api/projects/{project_id}/parse-revisions")
     def create_parse_revision(project_id: str, request: ParseRevisionCreate) -> dict[str, Any]:
@@ -733,7 +734,8 @@ def create_app(
         project.project_characters = project_characters
         project.lines = lines
         store.save_project(project_id, project)
-        return {"revision": revision.model_dump(mode="json"), "project": project.model_dump(mode="json")}
+        revision_payload = revision.model_dump(mode="json")
+        return {"revision": revision_payload, "parse_revision": revision_payload, "project": project.model_dump(mode="json")}
 
     @app.post("/api/projects/{project_id}/activate-revision")
     def activate_revision(project_id: str, request: ActivateRevisionRequest) -> dict[str, Any]:
@@ -761,7 +763,7 @@ def create_app(
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in AUDIO_UPLOAD_SUFFIXES:
             raise HTTPException(status_code=400, detail="unsupported audio file")
-        output_dir = store.project_dir(project_id) / "reference_audio" / "temporary"
+        output_dir = store.project_reference_audio_dir(project_id) / "temporary"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / _safe_upload_name(file.filename or f"reference{suffix}")
         counter = 1
@@ -862,7 +864,7 @@ def create_app(
         audio_deleted = False
         warning: str | None = None
         if target.audio_path:
-            resolved = _resolve_project_audio_file(store.project_dir(project_id) / "audio", Path(app.state.store.root), target.audio_path)
+            resolved = _resolve_project_audio_file(store.project_audio_dir(project_id), Path(app.state.store.root), target.audio_path)
             if resolved is None:
                 warning = "audio path is outside project audio directory"
             elif resolved.exists():
@@ -888,7 +890,7 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         manifest = store.load_manifest(request.project_id)
-        output_dir = store.project_dir(request.project_id) / "audio"
+        output_dir = store.project_audio_dir(request.project_id)
         app.state.queue.run(tasks, manifest, output_dir=output_dir)
         store.save_manifest(manifest)
         return manifest.model_dump(mode="json")
@@ -942,7 +944,7 @@ def create_app(
         if _service_mode() == "real":
             _reject_mock_validation_services(tasks, app.state.service_registry)
         manifest = store.load_manifest(request.project_id)
-        output_dir = store.project_dir(request.project_id) / "audio"
+        output_dir = store.project_audio_dir(request.project_id)
         app.state.queue.run(tasks, manifest, output_dir=output_dir)
         store.save_manifest(manifest)
         return {"summary": _manifest_summary(manifest), "manifest": manifest.model_dump(mode="json")}
@@ -1017,6 +1019,7 @@ def create_app(
             path,
             allowed_roots=[
                 ref_root,
+                *store.read_project_roots(),
                 *_configured_weight_roots(store.load_characters(), "logs_root", app.state.service_registry),
                 *_configured_weight_roots(store.load_characters(), "logs_roots", app.state.service_registry),
             ],

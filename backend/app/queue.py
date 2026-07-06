@@ -544,7 +544,7 @@ class GenerationJobManager:
                 job.status = "running"
                 job.updated_at = datetime.now(timezone.utc)
             manifest = self.store.load_manifest(self.get(job_id).project_id)
-            output_dir = self.store.project_dir(self.get(job_id).project_id) / "audio"
+            output_dir = self.store.project_audio_dir(self.get(job_id).project_id)
             self._record_prefailed_items(job_id, tasks, manifest)
             runnable_tasks = self._runnable_tasks(job_id, tasks)
             self.queue.run(

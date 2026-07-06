@@ -536,6 +536,77 @@ def test_projects_endpoint_lists_saved_projects(tmp_path: Path) -> None:
     ]
 
 
+def test_generate_writes_audio_manifest_under_project_output(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "mock-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "base_url": "mock://gpt",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts", "trained_weights_voice"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+    client.put(
+        "/api/projects/demo",
+        json={
+            "title": "剧本 Demo",
+            "default_language": "zh",
+            "lines": [
+                {
+                    "id": "l001",
+                    "character_id": "xiao-pin",
+                    "text": "你好",
+                    "temporary_binding": {
+                        "binding_id": "line-temp-gpt",
+                        "provider_type": "gpt-sovits",
+                        "service_id": "mock-gpt",
+                        "capabilities": ["trained_weights_voice"],
+                        "config": {
+                            "gpt_weights_path": "a.ckpt",
+                            "sovits_weights_path": "a.pth",
+                            "ref_audio_path": "ref.wav",
+                            "prompt_text": "你好",
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    response = client.post(
+        "/api/generate",
+        json={
+            "project_id": "demo",
+            "tasks": [
+                {
+                    "line": {"id": "l001", "character_id": "xiao-pin", "text": "你好"},
+                    "engine": "gpt-sovits",
+                    "profile": "default",
+                    "service_id": "mock-gpt",
+                    "provider_type": "gpt-sovits",
+                    "required_capabilities": ["trained_weights_voice"],
+                    "parameters": {},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    version = response.json()["lines"]["parse-r001:l001"]["versions"][0]
+    audio_path = Path(version["audio_path"])
+    assert "output" in audio_path.parts
+    assert audio_path.parts[-4:-1] == ("gpt-sovits", "mock-gpt", "line-temp-gpt")
+    assert (tmp_path / "Project" / "剧本 Demo" / "output" / "manifest.json").is_file()
+
+
 def test_script_revision_api_creates_parse_branch_without_overwriting_manifest(tmp_path: Path) -> None:
     services_path = tmp_path / "services.json"
     services_path.write_text(
@@ -599,6 +670,8 @@ def test_script_revision_api_creates_parse_branch_without_overwriting_manifest(t
     assert script_revision.status_code == 200
     assert parse_revision.status_code == 200
     payload = parse_revision.json()
+    assert script_revision.json()["script_revision"]["revision_id"] == script_revision.json()["revision"]["revision_id"]
+    assert payload["parse_revision"]["revision_id"] == payload["revision"]["revision_id"]
     assert payload["revision"]["script_revision_id"] == script_revision.json()["revision"]["revision_id"]
     assert payload["revision"]["parent_parse_revision_id"] == "parse-r001"
     assert payload["project"]["active_parse_revision_id"] == payload["revision"]["revision_id"]
