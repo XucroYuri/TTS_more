@@ -9,6 +9,12 @@ from app.models import EngineName
 
 
 class IndexTTSSubprocessAdapter:
+    """IndexTTS subprocess adapter used by the IndexTTS worker process.
+
+    Moved from app/adapters/indextts.py when the unused adapter/GenerationQueue
+    dual-track was removed. The worker is the only consumer of this class.
+    """
+
     engine = EngineName.INDEX_TTS
 
     def __init__(self, repo_dir: Path, python_exe: str = "python") -> None:

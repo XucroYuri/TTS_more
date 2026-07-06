@@ -8,8 +8,8 @@ from typing import Any
 from fastapi import FastAPI
 
 from app.adapters.base import SynthesisRequest
-from app.adapters.indextts import IndexTTSSubprocessAdapter
 from app.workers.contracts import LoadRequest, SynthesizeRequest
+from app.workers.indextts_subprocess import IndexTTSSubprocessAdapter
 
 REPO_DIR = Path(os.environ.get("TTS_MORE_INDEXTTS_REPO", "repo/index-tts"))
 PYTHON_EXE = os.environ.get("TTS_MORE_INDEXTTS_PYTHON", os.environ.get("TTS_MORE_PYTHON_EXE", sys.executable))

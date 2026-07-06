@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 import re
@@ -9,11 +10,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from app.adapters.base import EngineAdapter, SynthesisRequest
+from app.adapters.base import SynthesisRequest
 from app.models import EngineName, GenerationJob, GenerationManifest, GenerationQueueItem, GenerationStatus, GenerationTask, GenerationVersion, ProviderType
 from app.services import ServiceRoute, build_load_signature
 
 StatusCallback = Callable[[GenerationTask, GenerationStatus, float, str | None, str | None], None]
+
+logger = logging.getLogger(__name__)
 
 
 def _task_line_uid(task: GenerationTask) -> str:
@@ -22,75 +25,6 @@ def _task_line_uid(task: GenerationTask) -> str:
 
 def _safe_line_output_stem(task: GenerationTask) -> str:
     return re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", _task_line_uid(task)).strip("._-") or task.line.id
-
-
-class GenerationQueue:
-    def __init__(self, adapters: dict[EngineName, EngineAdapter]) -> None:
-        self.adapters = adapters
-        self._gpu_lock = threading.Lock()
-
-    def run(self, tasks: list[GenerationTask], manifest: GenerationManifest, output_dir: Path) -> GenerationManifest:
-        grouped: "OrderedDict[tuple[EngineName, str], list[GenerationTask]]" = OrderedDict()
-        for task in tasks:
-            grouped.setdefault((task.engine, task.profile), []).append(task)
-
-        with self._gpu_lock:
-            for (engine, profile), group in grouped.items():
-                adapter = self.adapters[engine]
-                adapter.load(profile)
-                try:
-                    for task in group:
-                        self._run_task(adapter, task, manifest, output_dir)
-                finally:
-                    adapter.unload()
-        return manifest
-
-    def _run_task(
-        self,
-        adapter: EngineAdapter,
-        task: GenerationTask,
-        manifest: GenerationManifest,
-        output_dir: Path,
-    ) -> None:
-        history = manifest.history_for_line(task.line.id, _task_line_uid(task))
-        version_number = len(history.versions) + 1 if history else 1
-        version_id = f"v{version_number:03d}"
-        output_path = output_dir / task.engine.value / task.profile / f"{_safe_line_output_stem(task)}_{version_id}.wav"
-        try:
-            result = adapter.synthesize(
-                SynthesisRequest(
-                    line=task.line,
-                    profile=task.profile,
-                    output_path=output_path,
-                    parameters=task.parameters,
-                )
-            )
-            manifest.append_version(
-                task.line.id,
-                GenerationVersion(
-                    version_id=version_id,
-                    line_uid=_task_line_uid(task),
-                    engine=task.engine,
-                    profile=task.profile,
-                    status="completed",
-                    audio_path=str(result.audio_path),
-                    parameters=task.parameters,
-                    metadata=result.metadata,
-                ),
-            )
-        except Exception as exc:
-            manifest.append_version(
-                task.line.id,
-                GenerationVersion(
-                    version_id=version_id,
-                    line_uid=_task_line_uid(task),
-                    engine=task.engine,
-                    profile=task.profile,
-                    status="failed",
-                    parameters=task.parameters,
-                    error=str(exc),
-                ),
-            )
 
 
 class ServiceGenerationQueue:
@@ -647,7 +581,7 @@ class GenerationJobManager:
                             item.service_id = item.service_id or route.endpoint.service_id
                             item.resource_group = item.resource_group or route.endpoint.resource_group
                         except Exception:
-                            pass
+                            logger.warning("Failed to resolve load signature for line %s", task.line.id, exc_info=True)
             job.progress = sum(item.progress for item in job.items) / max(1, len(job.items))
             job.updated_at = datetime.now(timezone.utc)
 
