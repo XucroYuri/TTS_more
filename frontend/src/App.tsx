@@ -86,7 +86,7 @@ import { createEmptyManifest, createEmptyProject, createProjectId, readStoredPro
 import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, roleChipInteractionState, roleFilterCardView, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
   Character,
   CharacterReferenceAudioGroup,
@@ -1024,29 +1024,6 @@ export default function App() {
       }
       return next;
     });
-  }
-
-  async function runPreflightCheck(lines = selectedLines.length > 0 ? selectedLines : filteredLines) {
-    if (!currentProjectId) {
-      setNotice(t("empty.noProjectAction"));
-      return;
-    }
-    const { tasks, blocked } = buildRunnableTasks(lines, resolvedCharacters);
-    if (blocked.length > 0) {
-      setNotice(t("notice.linesNeedBinding", { count: blocked.length }));
-    }
-    if (tasks.length === 0) return;
-    try {
-      const preflight = await generationPreflight(currentProjectId, tasks);
-      setPreflightResult(preflight);
-      await refreshLoadStatesForPreflight(preflight);
-      const readyCount = preflight.items.filter((item) => item.status === "ready").length;
-      const actionCount = preflight.items.filter((item) => item.status === "needs_user_action").length;
-      const blockedCount = preflight.items.filter((item) => item.status === "blocked").length;
-      setNotice(t("notice.preflightSummary", { ready: readyCount, action: actionCount, blocked: blockedCount }));
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : t("notice.preflightFailed"));
-    }
   }
 
   async function runSelectedQueue() {
@@ -2294,64 +2271,11 @@ export default function App() {
 
         <section className="workbench-grid">
           <div className="lines-panel">
-            <div className="role-strip">
-              <div className="role-avatar-row">
-                {(() => {
-                  const allCard = roleFilterCardView(t("filters.all"), project.lines.length, "全");
-                  return (
-                <button
-                  aria-pressed={characterFilter === "all"}
-                  aria-label={allCard.ariaLabel}
-                  className={`role-chip role-chip-all ${characterFilter === "all" ? "filtered" : ""}`}
-                  onClick={() => {
-                    setCharacterFilter("all");
-                    setExpandedLineId(null);
-                  }}
-                  title={t("filters.all")}
-                >
-                  <span className="role-avatar-frame">
-                    <span className="role-avatar role-avatar-lg">{allCard.avatarLabel}</span>
-                    <span className="role-count-badge">{allCard.countLabel}</span>
-                  </span>
-                  <span className="role-chip-text">
-                    <strong>{allCard.name}</strong>
-                  </span>
-                </button>
-                  );
-                })()}
-                {projectRoleRows.map((role, index) => {
-                  const chipState = roleChipInteractionState(role.id, activeLine?.character_id, characterFilter === "all" ? null : characterFilter);
-                  const card = roleFilterCardView(role.name, role.lineCount, role.avatarFallback);
-                  return (
-                    <button
-                      aria-pressed={chipState.ariaPressed}
-                      aria-label={card.ariaLabel}
-                      className={`role-chip ${chipState.isFocused ? "focused" : ""} ${chipState.isFiltered ? "filtered" : ""} ${roleAccentClass(index)}`}
-                      key={role.id}
-                      onClick={() => focusRoleChip(role.id)}
-                      title={`${role.name} · ${t("characters.lines", { count: role.lineCount })}`}
-                    >
-                      <span className="role-avatar-frame">
-                        <RoleAvatar avatarPath={role.avatarPath} fallback={role.avatarFallback} size="lg" />
-                        <span className="role-count-badge">{card.countLabel}</span>
-                      </span>
-                      <span className="role-chip-text">
-                        <strong>{card.name}</strong>
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
             <div className="filters-row">
               <label className="search-field">
                 <Search size={15} />
                 <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder={t("filters.search")} />
               </label>
-              <select value={characterFilter} onChange={(event) => setCharacterFilter(event.target.value)} aria-label={t("filters.character")}>
-                <option value="all">{t("filters.all")}</option>
-                    {projectRoleRows.map((role) => <option value={role.id} key={role.id}>{role.name}</option>)}
-              </select>
               <select value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)} aria-label={t("filters.provider")}>
                 <option value="all">{t("filters.all")}</option>
                 {providerOptions.map((provider) => <option value={provider} key={provider}>{provider}</option>)}
@@ -2366,12 +2290,42 @@ export default function App() {
               </select>
               <div className="task-actions">
                 <span>{selectedLineIds.length > 0 ? t("table.selectedLines", { count: selectedLineIds.length }) : t("table.visibleLines", { count: filteredLines.length })}</span>
-                <button className="secondary-button" onClick={() => void runPreflightCheck()} disabled={isGenerating || filteredLines.length === 0}>
-                  <CheckCircle2 size={15} /> {t("preflight.check")}
-                </button>
                 <button className="primary-button" onClick={() => void runSelectedQueue()} disabled={isGenerating || filteredLines.length === 0}>
                   {isGenerating ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />} {selectedLineIds.length > 0 ? t("app.queueSelected") : t("app.queueFiltered")}
                 </button>
+              </div>
+            </div>
+            <div className="role-strip">
+              <div className="role-pill-row">
+                <button
+                  aria-pressed={characterFilter === "all"}
+                  aria-label={`${t("filters.all")} · ${project.lines.length}`}
+                  className={`role-pill role-pill-all ${characterFilter === "all" ? "active" : ""}`}
+                  onClick={() => {
+                    setCharacterFilter("all");
+                    setExpandedLineId(null);
+                  }}
+                  title={t("filters.all")}
+                >
+                  <span className="role-pill-label">{t("filters.all")}</span>
+                  <span className="role-pill-count">{project.lines.length}</span>
+                </button>
+                {projectRoleRows.map((role, index) => {
+                  const isActive = characterFilter === role.id;
+                  return (
+                    <button
+                      aria-pressed={isActive}
+                      aria-label={`${role.name} · ${t("characters.lines", { count: role.lineCount })}`}
+                      className={`role-pill ${isActive ? "active" : ""} ${roleAccentClass(index)}`}
+                      key={role.id}
+                      onClick={() => focusRoleChip(role.id)}
+                      title={`${role.name} · ${t("characters.lines", { count: role.lineCount })}`}
+                    >
+                      <span className="role-pill-label">{role.name}</span>
+                      <span className="role-pill-count">{role.lineCount}</span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
