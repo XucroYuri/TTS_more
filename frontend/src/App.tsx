@@ -23,7 +23,7 @@ import {
   Wand2,
   X
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -51,6 +51,7 @@ import {
   fetchLogsCandidates,
   freezeProjectCharacter,
   createGenerationJob,
+  cancelGenerationJob,
   createParseRevision,
   createScriptRevision,
   deleteGenerationVersion,
@@ -86,6 +87,7 @@ import { createEmptyManifest, createEmptyProject, createProjectId, readStoredPro
 import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
+import { createToast, inferToastLevel, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
 import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
   Character,
@@ -208,9 +210,44 @@ export default function App() {
   const [activeLibraryCharacterId, setActiveLibraryCharacterId] = useState<string | null>(null);
   const [activeRoleCandidateId, setActiveRoleCandidateId] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
+  const generationAbortRef = useRef(false);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [preflightResult, setPreflightResult] = useState<GenerationPreflightResponse | null>(null);
-  const [notice, setNotice] = useState(t("app.ready"));
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const toastTimers = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
+
+  const removeToast = useCallback((toastId: number) => {
+    setToasts((current) => current.filter((item) => item.id !== toastId));
+    const timer = toastTimers.current.get(toastId);
+    if (timer) {
+      clearTimeout(timer);
+      toastTimers.current.delete(toastId);
+    }
+  }, []);
+
+  const pushToast = useCallback((message: string, options: ToastOptions = {}) => {
+    if (!message) return;
+    const toast = createToast(message, options);
+    setToasts((current) => [...current.slice(-3), toast]);
+    const duration = toastDuration(options);
+    if (duration > 0) {
+      const timer = setTimeout(() => removeToast(toast.id), duration);
+      toastTimers.current.set(toast.id, timer);
+    }
+    return toast.id;
+  }, [removeToast]);
+
+  /**
+   * Compatibility wrapper: accepts a message (usually an i18n string) and pushes
+   * it as a toast. The level is inferred from the message/keys unless overridden.
+   * All former setNotice(...) call sites continue to work through this wrapper.
+   */
+  const setNotice = useCallback((message: string, options?: { level?: ToastLevel }) => {
+    if (!message) return;
+    pushToast(message, { level: options?.level ?? inferToastLevel(message) });
+  }, [pushToast]);
+
+  const notice = toasts.length > 0 ? toasts[toasts.length - 1].message : "";
   const [searchText, setSearchText] = useState("");
   const [roleLibrarySearch, setRoleLibrarySearch] = useState("");
   const [characterFilter, setCharacterFilter] = useState("all");
@@ -234,6 +271,11 @@ export default function App() {
 
   useEffect(() => () => {
     confirmationResolverRef.current?.(false);
+  }, []);
+
+  useEffect(() => () => {
+    toastTimers.current.forEach((timer) => clearTimeout(timer));
+    toastTimers.current.clear();
   }, []);
 
   useEffect(() => {
@@ -934,11 +976,12 @@ export default function App() {
       return;
     }
     setIsGenerating(true);
+    generationAbortRef.current = false;
     setNotice(t("notice.generating"));
     try {
       const { tasks, blocked } = buildRunnableTasks(lines, resolvedCharacters);
       if (blocked.length > 0) {
-        setNotice(t("notice.linesNeedBinding", { count: blocked.length }));
+        setNotice(t("notice.linesNeedBinding", { count: blocked.length }), { level: "warning" });
       }
       if (tasks.length === 0) return;
       const preflight = await ensureGenerationPreflight(tasks);
@@ -950,12 +993,17 @@ export default function App() {
       setActiveJob(finalJob);
       const nextManifest = await fetchManifest(currentProjectId);
       setManifest(nextManifest);
-      setNotice(finalJob.status === "completed" ? t("notice.generated") : t("notice.generationFailed"));
+      if (generationAbortRef.current || finalJob.status === "cancelled") {
+        setNotice(t("notice.generationCancelled"), { level: "warning" });
+      } else {
+        setNotice(finalJob.status === "completed" ? t("notice.generated") : t("notice.generationFailed"));
+      }
       await refreshTopology();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.generationFailed"));
     } finally {
       setIsGenerating(false);
+      generationAbortRef.current = false;
     }
   }
 
@@ -1032,12 +1080,30 @@ export default function App() {
 
   async function pollGenerationJob(jobId: string): Promise<GenerationJob> {
     for (let attempt = 0; attempt < 240; attempt += 1) {
+      if (generationAbortRef.current) {
+        const cancelled = await fetchGenerationJob(jobId);
+        setActiveJob(cancelled);
+        return cancelled;
+      }
       const job = await fetchGenerationJob(jobId);
       setActiveJob(job);
       if (["completed", "failed", "cancelled"].includes(job.status)) return job;
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
     }
     throw new Error(t("notice.jobTimeout"));
+  }
+
+  async function cancelGeneration() {
+    const jobId = activeJob?.job_id;
+    generationAbortRef.current = true;
+    if (!jobId) return;
+    try {
+      const cancelled = await cancelGenerationJob(jobId);
+      setActiveJob(cancelled);
+      setNotice(t("notice.generationCancelling"), { level: "warning" });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("notice.generationFailed"));
+    }
   }
 
   function switchProject(projectId: string) {
@@ -1335,7 +1401,7 @@ export default function App() {
       <main className="workspace">
         <header className="topbar">
           <div className="toolbar topbar-toolbar">
-            <span className="notice" title={notice}>{notice}</span>
+            <span className={`notice ${toasts.length > 0 ? `notice-${toasts[toasts.length - 1].level}` : ""}`} title={notice}>{notice || t("app.ready")}</span>
             <button
               className={`topbar-action-button menu-trigger ${servicePanelSection === "roles" && isTopologyMenuOpen ? "active" : ""}`}
               onClick={() => {
@@ -2290,9 +2356,20 @@ export default function App() {
               </select>
               <div className="task-actions">
                 <span>{selectedLineIds.length > 0 ? t("table.selectedLines", { count: selectedLineIds.length }) : t("table.visibleLines", { count: filteredLines.length })}</span>
-                <button className="primary-button" onClick={() => void runSelectedQueue()} disabled={isGenerating || filteredLines.length === 0}>
-                  {isGenerating ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />} {selectedLineIds.length > 0 ? t("app.queueSelected") : t("app.queueFiltered")}
-                </button>
+                {isGenerating && activeJob && (
+                  <span className="generation-progress-inline" aria-label={t("queue.progressLabel", { percent: Math.round((activeJob.progress ?? 0) * 100) })}>
+                    {t("queue.progressLabel", { percent: Math.round((activeJob.progress ?? 0) * 100) })}
+                  </span>
+                )}
+                {isGenerating && activeJob ? (
+                  <button className="secondary-button cancel-button" onClick={() => void cancelGeneration()} title={t("actions.cancel")}>
+                    <X size={15} /> {t("actions.cancel")}
+                  </button>
+                ) : (
+                  <button className="primary-button" onClick={() => void runSelectedQueue()} disabled={isGenerating || filteredLines.length === 0}>
+                    <RefreshCw size={15} /> {selectedLineIds.length > 0 ? t("app.queueSelected") : t("app.queueFiltered")}
+                  </button>
+                )}
               </div>
             </div>
             <div className="role-strip">
@@ -2943,6 +3020,16 @@ export default function App() {
               <button className="primary-button" type="button" onClick={() => resolveConfirmation(true)}>{confirmationDialog.confirmLabel}</button>
             </div>
           </section>
+        </div>
+      )}
+      {toasts.length > 0 && (
+        <div className="toast-stack" role="region" aria-label="通知" aria-live="polite">
+          {toasts.map((toast) => (
+            <div key={toast.id} className={`toast toast-${toast.level}`} role="status">
+              <span className="toast-message">{toast.message}</span>
+              <button className="toast-close" type="button" aria-label="关闭通知" onClick={() => removeToast(toast.id)}>×</button>
+            </div>
+          ))}
         </div>
       )}
     </div>
