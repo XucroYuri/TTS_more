@@ -1,4 +1,4 @@
-import type { Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, LogsReferenceAudioResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
+import type { Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -41,6 +41,26 @@ export async function testService(serviceId: string): Promise<{ service_id: stri
 
 export async function fetchServicesStatus(): Promise<{ services: WorkerHealth[]; hardware: Record<string, unknown> }> {
   return request("/api/services/status");
+}
+
+export async function fetchOpenSourceTTSCatalog(): Promise<{ providers: OpenSourceTTSCatalogItem[] }> {
+  return request("/api/open-source-tts/catalog");
+}
+
+export async function detectOpenSourceTTS(payload: OpenSourceTTSDetectRequest): Promise<OpenSourceTTSDetectResponse> {
+  return request("/api/open-source-tts/detect", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function configureOpenSourceTTS(payload: OpenSourceTTSConfigureRequest): Promise<{ service: WorkerHealth; detect: OpenSourceTTSDetectResponse; settings: ServiceSettingsResponse }> {
+  return request("/api/open-source-tts/configure", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify(payload)
+  });
 }
 
 export async function fetchStartupChecks(): Promise<Record<string, unknown>> {

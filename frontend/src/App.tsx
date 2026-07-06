@@ -33,6 +33,7 @@ import {
   fetchProjectCharacters,
   fetchManifest,
   fetchLogsReferenceAudio,
+  fetchOpenSourceTTSCatalog,
   fetchParserProviders,
   fetchProject,
   fetchProjects,
@@ -40,6 +41,8 @@ import {
   fetchServiceSettings,
   fetchServiceLoadState,
   saveServiceSettings,
+  configureOpenSourceTTS,
+  detectOpenSourceTTS,
   fetchServiceLogs,
   fetchServices,
   fetchServicesStatus,
@@ -85,7 +88,7 @@ import { parserProviderKeyState, toParserProviderSavePayload } from "./lib/parse
 import { createEmptyManifest, createEmptyProject, readStoredProjectId, selectStartupProjectId, writeStoredProjectId } from "./lib/projectStartup";
 import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
-import { coreLocalProviders, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
+import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
 import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, roleChipInteractionState, roleFilterCardView, scriptConsoleBodyMode, scriptDrawerTabs, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge, type ScriptDrawerTabId } from "./lib/workbenchView";
 import type {
   Character,
@@ -110,14 +113,18 @@ import type {
   GenerationPreflightResponse,
   LogsReferenceAudioResponse,
   LogsReferenceAudioSample,
+  CatalogProvider,
+  OpenSourceTTSCatalogItem,
+  OpenSourceTTSDetectResponse,
   ProviderType,
   QueueStatus,
-  ServiceLoadState
+  ServiceLoadState,
+  SourceProfile
 } from "./types";
 
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 type SaveState = "idle" | "saving" | "saved" | "error";
-type ServicePanelSection = "overview" | "tts" | "llm" | "resources" | "roles";
+type ServicePanelSection = "overview" | "open-source" | "tts" | "llm" | "resources" | "roles";
 type ScriptSourceMode = "project" | "manual" | "draft";
 type ConfirmationTone = "warning" | "danger" | "info";
 const LINE_PAGE_SIZE = 10;
@@ -172,6 +179,19 @@ export default function App() {
   const [isScanningRoleLibrary, setIsScanningRoleLibrary] = useState(false);
   const [isTopologyMenuOpen, setIsTopologyMenuOpen] = useState(false);
   const [servicePanelSection, setServicePanelSection] = useState<ServicePanelSection>("overview");
+  const [openSourceCatalog, setOpenSourceCatalog] = useState<OpenSourceTTSCatalogItem[]>([]);
+  const [selectedOpenSourceProvider, setSelectedOpenSourceProvider] = useState<CatalogProvider>("gpt-sovits");
+  const [openSourceSourceProfile, setOpenSourceSourceProfile] = useState<SourceProfile>("local_repo");
+  const [openSourceRepoPath, setOpenSourceRepoPath] = useState("");
+  const [openSourceBaseUrl, setOpenSourceBaseUrl] = useState("");
+  const [openSourceApiContract, setOpenSourceApiContract] = useState("");
+  const [openSourceResourceGroup, setOpenSourceResourceGroup] = useState("local-gpu-0");
+  const [openSourceCapacity, setOpenSourceCapacity] = useState(1);
+  const [openSourceDisplayName, setOpenSourceDisplayName] = useState("");
+  const [openSourceServiceId, setOpenSourceServiceId] = useState("");
+  const [openSourceDetectResult, setOpenSourceDetectResult] = useState<OpenSourceTTSDetectResponse | null>(null);
+  const [isDetectingOpenSource, setIsDetectingOpenSource] = useState(false);
+  const [isConfiguringOpenSource, setIsConfiguringOpenSource] = useState(false);
   const [scriptDrawerOpen, setScriptDrawerOpen] = useState(false);
   const [scriptDrawerTab, setScriptDrawerTab] = useState<ScriptDrawerTabId>("list");
   const [isSidebarScriptEditing, setIsSidebarScriptEditing] = useState(false);
@@ -223,6 +243,7 @@ export default function App() {
   useEffect(() => {
     setNotice(t("app.ready"));
     void refreshTopology();
+    void refreshOpenSourceCatalog();
     void refreshProjects();
     void refreshParserProviders();
     fetchCharacters()
@@ -479,13 +500,37 @@ export default function App() {
   const servicePanelItems = useMemo(
     () => [
       { id: "overview" as const, label: t("services.panelOverview"), meta: topbarToneText(serviceSummary.overallTone, t) },
+      { id: "open-source" as const, label: t("services.panelOpenSource"), meta: `${openSourceCatalog.length || 3}` },
       { id: "tts" as const, label: t("services.panelTTS"), meta: `${ttsServices.length}` },
       { id: "llm" as const, label: t("services.panelLLM"), meta: `${serviceSummary.parser.ready}/${serviceSummary.parser.total}` },
       { id: "resources" as const, label: t("services.panelResources"), meta: queueStatus ? `${queueStatus.running}/${queueStatus.queued}` : "-" },
       { id: "roles" as const, label: t("services.panelRoles"), meta: `${characters.length}` }
     ],
-    [characters.length, queueStatus, serviceSummary, t, ttsServices.length]
+    [characters.length, openSourceCatalog.length, queueStatus, serviceSummary, t, ttsServices.length]
   );
+
+  const selectedOpenSourceCatalog = useMemo(
+    () => openSourceCatalog.find((item) => item.provider_type === selectedOpenSourceProvider) ?? openSourceCatalog[0],
+    [openSourceCatalog, selectedOpenSourceProvider]
+  );
+
+  const configuredOpenSourceServices = useMemo(
+    () => ttsServices.filter((service) => (service.catalog_provider ?? service.provider_type) === selectedOpenSourceProvider),
+    [selectedOpenSourceProvider, ttsServices]
+  );
+
+  useEffect(() => {
+    if (!selectedOpenSourceCatalog) return;
+    setSelectedOpenSourceProvider(selectedOpenSourceCatalog.provider_type);
+    setOpenSourceRepoPath(selectedOpenSourceCatalog.resolved_default_repo_path ?? selectedOpenSourceCatalog.default_repo_path);
+    setOpenSourceBaseUrl(selectedOpenSourceCatalog.default_base_url);
+    setOpenSourceApiContract(selectedOpenSourceCatalog.api_contracts[0] ?? "");
+    setOpenSourceResourceGroup(selectedOpenSourceCatalog.resource_group);
+    setOpenSourceCapacity(1);
+    setOpenSourceDisplayName(selectedOpenSourceCatalog.display_name);
+    setOpenSourceServiceId("");
+    setOpenSourceDetectResult(null);
+  }, [selectedOpenSourceCatalog?.provider_type]);
 
   useEffect(() => {
     if (!activeServiceId) return;
@@ -565,6 +610,60 @@ export default function App() {
       setQueueStatus(queuePayload);
     } finally {
       setIsRefreshingTopology(false);
+    }
+  }
+
+  async function refreshOpenSourceCatalog() {
+    try {
+      const payload = await fetchOpenSourceTTSCatalog();
+      setOpenSourceCatalog(payload.providers);
+    } catch {
+      setOpenSourceCatalog([]);
+    }
+  }
+
+  async function runOpenSourceDetect() {
+    setIsDetectingOpenSource(true);
+    try {
+      const payload = await detectOpenSourceTTS({
+        provider_type: selectedOpenSourceProvider,
+        repo_path: openSourceRepoPath || null,
+        base_url: openSourceBaseUrl || null,
+        api_contract: openSourceApiContract || null
+      });
+      setOpenSourceDetectResult(payload);
+      setNotice(t("services.openSourceDetectDone", { state: setupStateLabel(payload.setup_state, t) }));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("services.openSourceDetectFailed"));
+    } finally {
+      setIsDetectingOpenSource(false);
+    }
+  }
+
+  async function saveOpenSourceService() {
+    setIsConfiguringOpenSource(true);
+    try {
+      const payload = await configureOpenSourceTTS({
+        provider_type: selectedOpenSourceProvider,
+        service_id: openSourceServiceId || null,
+        display_name: openSourceDisplayName || null,
+        source_profile: openSourceSourceProfile,
+        repo_path: openSourceRepoPath || null,
+        base_url: openSourceBaseUrl,
+        api_contract: openSourceApiContract || null,
+        network_scope: sourceProfileNetworkScope(openSourceSourceProfile),
+        managed: openSourceSourceProfile === "local_repo",
+        enabled: openSourceDetectResult ? ["partial", "ready"].includes(openSourceDetectResult.setup_state) : false,
+        resource_group: openSourceResourceGroup,
+        capacity: openSourceCapacity
+      });
+      setOpenSourceDetectResult(payload.detect);
+      setNotice(t("services.openSourceSaved"));
+      await refreshTopology(true);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("services.openSourceSaveFailed"));
+    } finally {
+      setIsConfiguringOpenSource(false);
     }
   }
 
@@ -1063,6 +1162,10 @@ export default function App() {
       selectGenerationProvider("indextts");
       return;
     }
+    if (methodId === "cosyvoice") {
+      selectGenerationProvider("cosyvoice");
+      return;
+    }
     if (!["openai", "gemini", "xai", "volcengine"].includes(activeProvider)) {
       selectGenerationProvider("openai");
     }
@@ -1455,6 +1558,162 @@ export default function App() {
                                 <span className="legend-dot running">{t("services.legendRunning")}</span>
                               </div>
                             </div>
+                          </div>
+                        )}
+
+                        {servicePanelSection === "open-source" && (
+                          <div className="open-source-onboarding">
+                            <section className="open-source-catalog-panel">
+                              <div className="panel-title"><Library size={15} /> {t("services.openSourceTitle")}</div>
+                              <p className="section-help">{t("services.openSourceHint")}</p>
+                              <div className="open-source-provider-list">
+                                {openSourceCatalog.map((item, index) => (
+                                  <button
+                                    className={`open-source-provider-card ${selectedOpenSourceProvider === item.provider_type ? "active" : ""}`}
+                                    key={item.provider_type}
+                                    onClick={() => setSelectedOpenSourceProvider(item.provider_type)}
+                                    type="button"
+                                  >
+                                    <span className="provider-order">{index + 1}</span>
+                                    <span>
+                                      <strong>{item.display_name}</strong>
+                                      <small>{item.default_base_url}</small>
+                                    </span>
+                                    <span className="tracker-chip neutral">{providerLabel(item.provider_type)}</span>
+                                  </button>
+                                ))}
+                                {openSourceCatalog.length === 0 && <div className="empty-row">{t("services.openSourceNoCatalog")}</div>}
+                              </div>
+                              {selectedOpenSourceCatalog && (
+                                <div className="clone-command-card">
+                                  <span>{t("services.openSourceCloneCommand")}</span>
+                                  <code>{selectedOpenSourceCatalog.recommended_clone_command}</code>
+                                </div>
+                              )}
+                            </section>
+
+                            <section className="open-source-setup-panel">
+                              <div className="open-source-panel-head">
+                                <div>
+                                  <strong>{selectedOpenSourceCatalog?.display_name ?? t("services.openSourceProvider")}</strong>
+                                  <span>{t("services.openSourceLocalRepoHint")}</span>
+                                </div>
+                                <button className="secondary-button compact-button" onClick={() => void refreshOpenSourceCatalog()}>
+                                  <RefreshCw size={13} /> {t("actions.refresh")}
+                                </button>
+                              </div>
+
+                              <div className="open-source-mode-grid">
+                                {(["local_repo", "local_endpoint", "lan_endpoint", "cloud_endpoint"] as SourceProfile[]).map((mode) => (
+                                  <button
+                                    className={`open-source-mode-card ${openSourceSourceProfile === mode ? "active" : ""}`}
+                                    key={mode}
+                                    onClick={() => setOpenSourceSourceProfile(mode)}
+                                    type="button"
+                                  >
+                                    <strong>{sourceProfileLabel(mode, t)}</strong>
+                                    <span>{mode === "local_repo" ? t("services.localManaged") : t("services.remoteExternal")}</span>
+                                  </button>
+                                ))}
+                              </div>
+
+                              <div className="open-source-form-grid">
+                                <label>
+                                  <span>{t("services.openSourceServiceId")}</span>
+                                  <input value={openSourceServiceId} onChange={(event) => setOpenSourceServiceId(event.target.value)} placeholder={`${selectedOpenSourceProvider}-endpoint`} />
+                                </label>
+                                <label>
+                                  <span>{t("services.openSourceDisplayName")}</span>
+                                  <input value={openSourceDisplayName} onChange={(event) => setOpenSourceDisplayName(event.target.value)} />
+                                </label>
+                                <label className="wide">
+                                  <span>{t("services.openSourceRepoPath")}</span>
+                                  <input value={openSourceRepoPath} onChange={(event) => setOpenSourceRepoPath(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_repo_path} />
+                                </label>
+                                <label className="wide">
+                                  <span>{t("services.openSourceBaseUrl")}</span>
+                                  <input value={openSourceBaseUrl} onChange={(event) => setOpenSourceBaseUrl(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_base_url} />
+                                </label>
+                                <label>
+                                  <span>{t("services.openSourceApiContract")}</span>
+                                  <select value={openSourceApiContract} onChange={(event) => setOpenSourceApiContract(event.target.value)}>
+                                    {(selectedOpenSourceCatalog?.api_contracts ?? [openSourceApiContract]).map((contract) => (
+                                      <option value={contract} key={contract}>{contract}</option>
+                                    ))}
+                                  </select>
+                                </label>
+                                <label>
+                                  <span>{t("services.openSourceResource")}</span>
+                                  <input value={openSourceResourceGroup} onChange={(event) => setOpenSourceResourceGroup(event.target.value)} />
+                                </label>
+                                <label>
+                                  <span>{t("services.openSourceCapacity")}</span>
+                                  <input type="number" min={1} value={openSourceCapacity} onChange={(event) => setOpenSourceCapacity(Number(event.target.value) || 1)} />
+                                </label>
+                              </div>
+
+                              <div className="open-source-actions">
+                                <button className="secondary-button compact-button" onClick={() => void runOpenSourceDetect()} disabled={isDetectingOpenSource || !openSourceBaseUrl}>
+                                  {isDetectingOpenSource ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("services.openSourceDetect")}
+                                </button>
+                                <button className="primary-button compact-button" onClick={() => void saveOpenSourceService()} disabled={isConfiguringOpenSource || !openSourceBaseUrl}>
+                                  {isConfiguringOpenSource ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("services.openSourceSave")}
+                                </button>
+                              </div>
+                            </section>
+
+                            <section className="open-source-result-panel">
+                              <div className="panel-title"><CheckCircle2 size={15} /> {t("services.openSourceSetupState")}</div>
+                              {openSourceDetectResult ? (
+                                <div className={`open-source-detect-card state-${setupStateTone(openSourceDetectResult.setup_state)}`}>
+                                  <div>
+                                    <span>{t("services.openSourceSetupState")}</span>
+                                    <strong>{setupStateLabel(openSourceDetectResult.setup_state, t)}</strong>
+                                  </div>
+                                  <div>
+                                    <span>{t("services.openSourceRepoFound")}</span>
+                                    <strong>{booleanLabel(openSourceDetectResult.repo_found, t)}</strong>
+                                  </div>
+                                  <div>
+                                    <span>{t("services.openSourceEndpointReachable")}</span>
+                                    <strong>{booleanLabel(openSourceDetectResult.endpoint_reachable, t)}</strong>
+                                  </div>
+                                  <div>
+                                    <span>{t("services.openSourceContractOk")}</span>
+                                    <strong>{booleanLabel(openSourceDetectResult.api_contract_ok, t)}</strong>
+                                  </div>
+                                  <p>{openSourceDetectResult.env_hint}</p>
+                                </div>
+                              ) : (
+                                <div className="open-source-empty-detect">
+                                  <strong>{t("services.openSourceDetect")}</strong>
+                                  <span>{t("services.openSourceEndpointHint")}</span>
+                                </div>
+                              )}
+
+                              <div className="open-source-existing">
+                                <div className="open-source-section-head">
+                                  <strong>{t("services.openSourceExisting")}</strong>
+                                  <span>{configuredOpenSourceServices.length}</span>
+                                </div>
+                                <div className="open-source-existing-list">
+                                  {configuredOpenSourceServices.map((service) => {
+                                    const state = ttsServiceState(service, runningServiceIds.has(service.service_id ?? ""), runtime?.service_mode);
+                                    return (
+                                      <article className={`open-source-existing-card state-${state}`} key={service.service_id ?? service.engine}>
+                                        <span className={`tts-state-dot ${state}`} />
+                                        <span>
+                                          <strong>{serviceDisplayName(service)}</strong>
+                                          <small>{service.base_url || t("services.endpointMissing")}</small>
+                                        </span>
+                                        <span className={`tracker-chip ${ttsStateToneClass(state)}`}>{ttsServiceStateLabel(service, state, t, runtime?.service_mode)}</span>
+                                      </article>
+                                    );
+                                  })}
+                                  {configuredOpenSourceServices.length === 0 && <div className="empty-row">{t("services.noService")}</div>}
+                                </div>
+                              </div>
+                            </section>
                           </div>
                         )}
 
@@ -2832,6 +3091,71 @@ export default function App() {
                       </div>
                     )}
 
+                    {activeProvider === "cosyvoice" && (
+                      <div className="cosyvoice-temporary-panel">
+                        <div className="emotion-mode-control cosyvoice-mode-control" role="radiogroup" aria-label={t("inspector.cosyVoiceMode")}>
+                          <span>{t("inspector.cosyVoiceMode")}</span>
+                          <div>
+                            {([
+                              ["sft", t("inspector.cosyModeSft")],
+                              ["zero_shot", t("inspector.cosyModeZeroShot")],
+                              ["cross_lingual", t("inspector.cosyModeCrossLingual")],
+                              ["instruct", t("inspector.cosyModeInstruct")]
+                            ] as const).map(([mode, label]) => {
+                              const currentMode = stringConfig(activeBindingConfig.mode) || "zero_shot";
+                              return (
+                                <button
+                                  aria-checked={currentMode === mode}
+                                  className={`emotion-mode-option ${currentMode === mode ? "active" : ""}`}
+                                  key={mode}
+                                  onClick={() => updateActiveBindingConfig({ mode })}
+                                  role="radio"
+                                  type="button"
+                                >
+                                  {label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                        {((stringConfig(activeBindingConfig.mode) || "zero_shot") === "sft" || (stringConfig(activeBindingConfig.mode) || "zero_shot") === "instruct") ? (
+                          <label className="resource-field">
+                            <span>{t("inspector.cosySpeaker")}</span>
+                            <input value={stringConfig(activeBindingConfig.speaker_id)} onChange={(event) => updateActiveBindingConfig({ speaker_id: event.target.value })} placeholder={t("inspector.cosySpeakerPlaceholder")} />
+                          </label>
+                        ) : null}
+                        {((stringConfig(activeBindingConfig.mode) || "zero_shot") === "zero_shot" || (stringConfig(activeBindingConfig.mode) || "zero_shot") === "cross_lingual") ? (
+                          <>
+                            <ReferenceAudioInput
+                              label={t("inspector.cosyReferenceAudio")}
+                              value={stringConfig(activeBindingConfig.prompt_audio_path)}
+                              onUpload={(file) => uploadLineReference(file, "prompt_audio_path")}
+                            />
+                            <label className="resource-field">
+                              <span>{t("inspector.cosyPromptText")}</span>
+                              <textarea value={stringConfig(activeBindingConfig.prompt_text)} onChange={(event) => updateActiveBindingConfig({ prompt_text: event.target.value })} placeholder={t("inspector.cosyPromptTextPlaceholder")} rows={3} />
+                            </label>
+                          </>
+                        ) : null}
+                        {(stringConfig(activeBindingConfig.mode) || "zero_shot") === "instruct" && (
+                          <label className="resource-field">
+                            <span>{t("inspector.cosyInstruction")}</span>
+                            <textarea value={stringConfig(activeBindingConfig.instruct_text)} onChange={(event) => updateActiveBindingConfig({ instruct_text: event.target.value })} placeholder={t("inspector.cosyInstructionPlaceholder")} rows={3} />
+                          </label>
+                        )}
+                        <div className="advanced-grid compact-cosyvoice-grid">
+                          <label>
+                            <span>{t("inspector.cosySpeed")}</span>
+                            <input value={String(activeBindingConfig.speed ?? 1)} onChange={(event) => updateActiveBindingConfig({ speed: Number(event.target.value) })} />
+                          </label>
+                          <label>
+                            <span>{t("inspector.cosySeed")}</span>
+                            <input value={String(activeBindingConfig.seed ?? -1)} onChange={(event) => updateActiveBindingConfig({ seed: Number(event.target.value) })} />
+                          </label>
+                        </div>
+                      </div>
+                    )}
+
                     {activeProvider === "vibevoice" ? (
                       <div className="voice-source-summary">
                         <div className="empty-row">{t("inspector.legacyVibeVoice")}</div>
@@ -2851,7 +3175,7 @@ export default function App() {
                         </label>
                         <p className="resource-help">{t("inspector.voiceSourceHelp")}</p>
                       </div>
-                    ) : activeProvider === "gpt-sovits" || activeProvider === "indextts" ? (
+                    ) : activeProvider === "gpt-sovits" || activeProvider === "indextts" || activeProvider === "cosyvoice" ? (
                       null
                     ) : (
                       <div className="empty-row">{t("inspector.commercialResourceHint")}</div>
@@ -3254,6 +3578,8 @@ export default function App() {
       updateActiveBindingConfig({ voice: path || undefined });
     } else if (provider === "gpt-sovits") {
       updateActiveBindingConfig({ ref_audio_path: path || undefined });
+    } else if (provider === "cosyvoice") {
+      updateActiveBindingConfig({ prompt_audio_path: path || undefined });
     } else {
       updateActiveBindingConfig({ ref_audio_path: path || undefined });
     }
@@ -3265,7 +3591,7 @@ export default function App() {
     setNotice(t("notice.logsReferenceApplied"));
   }
 
-  async function uploadLineReference(file: File | undefined, target: "voice" | "emotion_audio" | "ref_audio_path") {
+  async function uploadLineReference(file: File | undefined, target: "voice" | "emotion_audio" | "ref_audio_path" | "prompt_audio_path") {
     if (!file || !activeLine) return;
     if (!currentProjectId) {
       setNotice(t("empty.noProjectAction"));
@@ -3369,12 +3695,12 @@ function buildRunnableTasks(lines: ScriptLine[], characters: Character[]): { tas
 }
 
 function providerFromEngine(engine: ScriptLine["engine_override"]): ProviderType | null {
-  if (engine === "gpt-sovits" || engine === "indextts" || engine === "vibevoice") return engine;
+  if (engine === "gpt-sovits" || engine === "indextts" || engine === "cosyvoice" || engine === "vibevoice") return engine;
   return null;
 }
 
 function engineFromProvider(provider: ProviderType): ScriptLine["engine_override"] {
-  if (provider === "gpt-sovits" || provider === "indextts" || provider === "vibevoice") return provider;
+  if (provider === "gpt-sovits" || provider === "indextts" || provider === "cosyvoice" || provider === "vibevoice") return provider;
   return "commercial";
 }
 
@@ -3382,9 +3708,42 @@ function defaultServiceForProvider(services: WorkerHealth[], provider: ProviderT
   return routableProviderServices(services, provider)[0]?.service_id ?? null;
 }
 
+function sourceProfileNetworkScope(sourceProfile: SourceProfile): WorkerHealth["network_scope"] {
+  if (sourceProfile === "lan_endpoint") return "lan";
+  if (sourceProfile === "cloud_endpoint") return "public";
+  if (sourceProfile === "api_placeholder") return "commercial";
+  return "localhost";
+}
+
+function sourceProfileLabel(sourceProfile: SourceProfile, t: Translate): string {
+  return t(`services.openSourceMode_${sourceProfile}`);
+}
+
+function setupStateLabel(setupState: string | null | undefined, t: Translate): string {
+  if (setupState === "ready") return t("services.setup_ready");
+  if (setupState === "partial") return t("services.setup_partial");
+  if (setupState === "repo_found") return t("services.setup_repo_found");
+  if (setupState === "repo_missing") return t("services.setup_repo_missing");
+  if (setupState === "env_missing") return t("services.setup_env_missing");
+  if (setupState === "endpoint_unreachable") return t("services.setup_endpoint_unreachable");
+  return t("services.setup_not_configured");
+}
+
+function setupStateTone(setupState: string | null | undefined): "ready" | "partial" | "blocked" | "neutral" {
+  if (setupState === "ready") return "ready";
+  if (setupState === "partial" || setupState === "repo_found") return "partial";
+  if (setupState === "repo_missing" || setupState === "env_missing" || setupState === "endpoint_unreachable") return "blocked";
+  return "neutral";
+}
+
+function booleanLabel(value: boolean | null | undefined, t: Translate): string {
+  return value ? t("status.yes") : t("status.no");
+}
+
 function defaultCapabilitiesForProvider(provider: ProviderType): string[] {
   if (provider === "gpt-sovits") return ["trained_weights_voice", "reference_audio_voice"];
   if (provider === "indextts") return ["reference_audio_voice", "emotion_text"];
+  if (provider === "cosyvoice") return ["tts", "reference_audio_voice", "zero_shot_voice", "cross_lingual_voice", "style_instruction", "wav_output"];
   if (provider === "openai" || provider === "gemini" || provider === "xai") return ["commercial_voice", "style_instruction"];
   if (provider === "volcengine") return ["commercial_voice", "emotion_text"];
   return ["tts"];
@@ -3405,6 +3764,14 @@ function defaultTemporaryConfig(provider: ProviderType, line: ScriptLine): Recor
   }
   if (provider === "gpt-sovits") {
     return { prompt_lang: "zh", text_lang: line.language ?? "zh", text_split_method: "cut5" };
+  }
+  if (provider === "cosyvoice") {
+    return {
+      mode: "zero_shot",
+      prompt_text: line.note || undefined,
+      speed: 1,
+      seed: -1
+    };
   }
   return {};
 }
@@ -3437,6 +3804,7 @@ function parseVectorConfig(value: string): number[] {
 
 function referencePathForProvider(provider: string, config: Record<string, unknown>): string {
   if (provider === "indextts") return stringConfig(config.voice);
+  if (provider === "cosyvoice") return stringConfig(config.prompt_audio_path) || stringConfig(config.reference_audio);
   return stringConfig(config.ref_audio_path);
 }
 
@@ -3521,6 +3889,7 @@ function defaultServiceBaseUrl(id: string, provider?: string): string | undefine
   const defaults: Record<string, string> = {
     "local-gpt-sovits": "http://127.0.0.1:9880",
     "local-indextts": "http://127.0.0.1:9881",
+    "local-cosyvoice": "http://127.0.0.1:50000",
     "openai-tts": "https://api.openai.com/v1",
     "gemini-tts": "https://generativelanguage.googleapis.com/v1beta",
     "xai-tts": "https://api.x.ai/v1",
@@ -3531,6 +3900,7 @@ function defaultServiceBaseUrl(id: string, provider?: string): string | undefine
   if (provider === "gemini") return defaults["gemini-tts"];
   if (provider === "xai") return defaults["xai-tts"];
   if (provider === "volcengine") return defaults["volcengine-tts"];
+  if (provider === "cosyvoice") return defaults["local-cosyvoice"];
   return undefined;
 }
 
@@ -3540,6 +3910,7 @@ function serviceDisplayName(service: WorkerHealth): string {
   const nameMap: Record<string, string> = {
     "gpt-sovits": "GPT-SoVITS",
     indextts: "IndexTTS",
+    cosyvoice: "CosyVoice",
     vibevoice: "VibeVoice",
     openai: "OpenAI TTS",
     gemini: "Gemini TTS",
@@ -3651,13 +4022,14 @@ function buildValidationSteps(
   manifest: GenerationManifest,
   t: Translate
 ): Array<{ id: "mode" | "services" | "resources" | "generation"; label: string; state: "ready" | "attention" | "done" }> {
-  const localServices = services.filter((service) => coreLocalProviders.has(service.provider_type ?? service.engine));
+  const localCoverage = coreProviderCoverage(services);
+  const localReady = localCoverage.filter((item) => item.operational).length;
   const completed = Object.values(manifest.lines)
     .flatMap((history) => history.versions)
     .filter((version) => version.status === "completed" && coreLocalProviders.has(version.provider_type ?? version.engine)).length;
   return [
     { id: "mode", label: statusText(runtime?.service_mode ?? "real", t), state: runtime?.service_mode === "real" ? "done" : "attention" },
-    { id: "services", label: `${localServices.filter(isServiceOperational).length}/${localServices.length}`, state: localServices.length >= coreLocalProviders.size && localServices.every(isServiceOperational) ? "done" : "attention" },
+    { id: "services", label: `${localReady}/${localCoverage.length}`, state: localReady === localCoverage.length ? "done" : "attention" },
     { id: "resources", label: candidates?.ready ? t("status.ready") : t("status.needsMapping"), state: candidates?.ready ? "done" : "attention" },
     { id: "generation", label: `${completed}/${coreLocalProviders.size}`, state: completed >= coreLocalProviders.size ? "done" : "ready" }
   ];
@@ -3955,6 +4327,7 @@ function providerLabel(provider: string | null | undefined): string {
   const labels: Record<string, string> = {
     "gpt-sovits": "GPT-SoVITS",
     indextts: "IndexTTS",
+    cosyvoice: "CosyVoice",
     openai: "OpenAI",
     gemini: "Gemini",
     xai: "xAI",

@@ -4,7 +4,8 @@ TTS More is an outer orchestration project for local and external TTS services:
 
 - `GPT-SoVITS` for trained character weights and reference-audio generation.
 - `index-tts` for strong emotional speech from per-character references.
-- Commercial and generic HTTP endpoints for optional network TTS providers.
+- `CosyVoice` for zero-shot, cross-lingual, and instruction-style open-source TTS.
+- TTS API and generic HTTP endpoints are kept as optional placeholders while the core workflow focuses on the three open-source providers.
 
 The outer app keeps local repos independent and adds a FastAPI orchestration layer plus a React script dubbing workstation.
 
@@ -23,7 +24,7 @@ The outer app keeps local repos independent and adds a FastAPI orchestration lay
 ## Setup
 
 ```powershell
-& 'C:\Users\xuyu_\AppData\Roaming\uv\python\cpython-3.10.20-windows-x86_64-none\python.exe' -m venv .venv
+py -3.10 -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install -e 'backend[dev]'
 cd frontend
 pnpm install
@@ -39,6 +40,39 @@ Copy `.env.example` to `.env.local` to configure local endpoint paths, parser pr
 
 Backend: `http://127.0.0.1:8000`  
 Frontend: `http://127.0.0.1:5173`
+
+## Open-Source TTS Services
+
+TTS More itself is installed first:
+
+```powershell
+git clone https://github.com/XucroYuri/TTS_more.git
+```
+
+If you do not already have compatible TTS services, clone one or more of the supported open-source projects. The `repo/` folder is the recommended local convention, but any local path can be bound later in the app.
+
+```powershell
+git clone https://github.com/XucroYuri/GPT-SoVITS.git repo/GPT-SoVITS
+git clone https://github.com/XucroYuri/index-tts.git repo/index-tts
+git clone https://github.com/XucroYuri/CosyVoice.git repo/CosyVoice
+```
+
+These forks are stable mirrors for TTS More integration. Compatible upstream deployments can also be used as long as their HTTP contract matches.
+
+In the app, open `服务与资源 -> 开源接入` to choose one of four access paths:
+
+- Local repo: bind a local project path and optionally configure start/stop/log commands. Inference still uses the endpoint URL.
+- Local endpoint: connect to a service already running on `127.0.0.1` or `0.0.0.0`.
+- LAN endpoint: connect to a trusted machine by IP and port.
+- Public URL: connect to a cloud or public endpoint. Process control is not available for remote services.
+
+Configurations created by the onboarding flow are written to `data/local/services.json`. Templates under `data/templates/` stay sanitized and should not contain local paths, LAN IPs, generated audio, or private role bindings.
+
+The built-in provider order is:
+
+`GPT-SoVITS -> IndexTTS -> CosyVoice -> TTS API`
+
+TTS API providers are currently placeholders in the product flow. The main reliability work targets the three open-source TTS services.
 
 ## Service Mode
 
@@ -58,7 +92,9 @@ For local GPT-SoVITS and IndexTTS generation:
 3. Edit `data/services.json` for remote machines by adding external endpoints with their own `resource_group`.
 4. Optional commercial TTS providers are first-class services. Configure keys in `.env.local` only; `services.json` references env var names such as `OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, and the Volcengine app/token/cluster variables.
 
-The routing layer uses provider type, API contract, capabilities, voice bindings, health, priority, and resource group. Default priority keeps GPT-SoVITS first and IndexTTS second, with commercial or generic HTTP providers available as opt-in profiles or lower-priority candidates. VibeVoice is no longer a local core model; register it as an external generic HTTP endpoint only if you still want to use it.
+The routing layer uses provider type, API contract, capabilities, voice bindings, health, priority, and resource group. Default priority keeps GPT-SoVITS first, IndexTTS second, and CosyVoice third, with TTS API or generic HTTP providers available as opt-in placeholders. VibeVoice is no longer a local core model; register it as an external generic HTTP endpoint only if you still want to use it.
+
+For a deeper deployment and scheduling guide, see [docs/open-source-tts-services.md](docs/open-source-tts-services.md).
 
 Reference audio and trained weights are loaded from local runtime configuration. Keep private paths in `.env.local` or `data/local/services.json`; the repository only ships neutral templates under `data/templates/`.
 
