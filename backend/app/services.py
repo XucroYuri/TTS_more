@@ -603,6 +603,8 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
             return self._synthesize_gpt_sovits(request)
         if self.endpoint.api_contract == "gradio-indextts2-webui":
             return self._synthesize_indextts(request)
+        if self.endpoint.api_contract == "gradio-cosyvoice-webui":
+            return self._synthesize_cosyvoice(request)
         raise RuntimeError(f"unsupported Gradio API contract: {self.endpoint.api_contract}")
 
     def gradio_index(self) -> dict[str, Any]:
@@ -711,6 +713,37 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
             ]
         response = self._post_gradio_api("gen_single", payload, timeout=params.get("timeout_seconds", 900.0))
         return self._write_gradio_audio(request, response, {"api_contract": self.endpoint.api_contract, "gradio_api_name": "gen_single"})
+
+    def _synthesize_cosyvoice(self, request: SynthesisRequest) -> SynthesisResult:
+        params = {**self.endpoint.default_params, **request.parameters}
+        payload = params.get("gradio_data")
+        if not isinstance(payload, list):
+            mode = str(params.get("mode") or params.get("mode_checkbox_group") or "预训练音色")
+            supported_modes = ("预训练音色", "3s极速复刻", "跨语种复刻", "自然语言控制")
+            if mode not in supported_modes:
+                mode = "预训练音色"
+            sft_voice = str(params.get("sft_voice") or params.get("sft_dropdown") or "")
+            prompt_text = str(params.get("prompt_text") or "")
+            ref_audio = params.get("ref_audio_path") or params.get("reference_audio") or params.get("prompt_wav_upload")
+            prompt_wav = self._prepare_gradio_file(ref_audio, timeout=params.get("timeout_seconds", 900.0)) if ref_audio else None
+            instruct_text = str(params.get("instruct_text") or "")
+            seed = params.get("seed", 0)
+            stream = bool(params.get("stream", False))
+            speed = float(params.get("speed", 1.0))
+            payload = [
+                request.line.text,
+                mode,
+                sft_voice,
+                prompt_text,
+                prompt_wav,
+                None,
+                instruct_text,
+                seed,
+                stream,
+                speed,
+            ]
+        response = self._post_gradio_api("generate_audio", payload, timeout=params.get("timeout_seconds", 900.0))
+        return self._write_gradio_audio(request, response, {"api_contract": self.endpoint.api_contract, "gradio_api_name": "generate_audio"})
 
     def _config(self, timeout: float | int | None = None) -> dict[str, Any]:
         if self._config_cache is not None:
@@ -1059,6 +1092,8 @@ def _expected_gradio_api_names(api_contract: str) -> list[str]:
         return ["get_tts_wav"]
     if api_contract == "gradio-indextts2-webui":
         return ["gen_single"]
+    if api_contract == "gradio-cosyvoice-webui":
+        return ["generate_audio"]
     return []
 
 
