@@ -95,6 +95,23 @@ class ServiceRegistry:
                     priority=20,
                     capabilities=["tts", "reference-audio", "emotion-text"],
                 ),
+                TTSServiceEndpoint(
+                    service_id="local-cosyvoice",
+                    display_name="CosyVoice Local",
+                    service_kind="tts",
+                    engine=EngineName.COSYVOICE,
+                    provider_type=ProviderType.COSYVOICE,
+                    api_contract="cosyvoice-http-v1",
+                    base_url="http://127.0.0.1:50000",
+                    network_scope="localhost",
+                    managed=False,
+                    enabled=False,
+                    repo_path=str(repo_root / "CosyVoice"),
+                    resource_group="local-gpu-0",
+                    priority=30,
+                    capabilities=["tts", "reference_audio_voice", "zero_shot_voice", "cross_lingual_voice", "style_instruction", "wav_output"],
+                    default_params={"mode": "zero_shot", "response_format": "wav"},
+                ),
             ]
         )
 
@@ -103,13 +120,13 @@ class ServiceRegistry:
 
     def by_engine(self, engine: EngineName) -> list[TTSServiceEndpoint]:
         return sorted(
-            [service for service in self.services if service.enabled and service.service_kind == "tts" and service.engine == engine],
+            [service for service in self.services if _is_generation_candidate(service) and service.engine == engine],
             key=lambda service: service.priority,
         )
 
     def by_provider(self, provider_type: ProviderType) -> list[TTSServiceEndpoint]:
         return sorted(
-            [service for service in self.services if service.enabled and service.service_kind == "tts" and service.provider_type == provider_type],
+            [service for service in self.services if _is_generation_candidate(service) and service.provider_type == provider_type],
             key=lambda service: service.priority,
         )
 
@@ -134,6 +151,18 @@ def build_load_signature(endpoint: TTSServiceEndpoint, parameters: dict[str, Any
             f"emotion_mode={parameters.get('emotion_mode', 'same_as_voice')}",
             f"emotion_audio={parameters.get('emotion_audio', '')}",
             f"emotion_text={parameters.get('emotion_text', '')}",
+        ]
+        return "|".join(parts)
+    if endpoint.provider_type == ProviderType.COSYVOICE or endpoint.engine == EngineName.COSYVOICE:
+        parts = [
+            f"service_id={endpoint.service_id}",
+            f"mode={parameters.get('mode', 'zero_shot')}",
+            f"speaker_id={parameters.get('speaker_id', parameters.get('voice', ''))}",
+            f"prompt_audio_path={parameters.get('prompt_audio_path', parameters.get('prompt_audio', parameters.get('reference_audio', '')))}",
+            f"prompt_text={parameters.get('prompt_text', '')}",
+            f"instruct_text={parameters.get('instruct_text', parameters.get('instruction', ''))}",
+            f"speed={parameters.get('speed', '')}",
+            f"seed={parameters.get('seed', '')}",
         ]
         return "|".join(parts)
     return "|".join(
@@ -247,7 +276,7 @@ class ServiceRouter:
         explicit_ids = [intent.service_id, binding.service_id, *intent.fallback_service_ids, *binding.fallback_services]
 
         def add(service: TTSServiceEndpoint) -> None:
-            if service.enabled and service.service_kind == "tts" and service.provider_type == binding.provider_type and service.service_id not in seen:
+            if _is_generation_candidate(service) and service.provider_type == binding.provider_type and service.service_id not in seen:
                 candidates.append(service)
                 seen.add(service.service_id)
 
@@ -260,7 +289,7 @@ class ServiceRouter:
         return candidates
 
     def _candidate_endpoints_for_intent(self, intent: TTSIntent) -> list[TTSServiceEndpoint]:
-        return sorted([service for service in self.registry.services if service.enabled and service.service_kind == "tts"], key=lambda service: service.priority)
+        return sorted([service for service in self.registry.services if _is_generation_candidate(service)], key=lambda service: service.priority)
 
     def _candidate_endpoints(
         self,
@@ -272,7 +301,7 @@ class ServiceRouter:
         candidates: list[TTSServiceEndpoint] = []
 
         def add(service: TTSServiceEndpoint) -> None:
-            if service.enabled and service.service_kind == "tts" and service.engine == engine and service.service_id not in seen:
+            if _is_generation_candidate(service) and service.engine == engine and service.service_id not in seen:
                 candidates.append(service)
                 seen.add(service.service_id)
 
@@ -321,6 +350,14 @@ def _endpoint_can_use_binding(endpoint: TTSServiceEndpoint, binding: VoiceBindin
             value = params.get(field)
             if value and not _endpoint_can_access_path(endpoint, str(value)):
                 return False
+    return True
+
+
+def _is_generation_candidate(service: TTSServiceEndpoint) -> bool:
+    if not service.enabled or service.service_kind != "tts":
+        return False
+    if service.setup_state in {"not_configured", "repo_missing", "env_missing", "endpoint_unreachable"}:
+        return False
     return True
 
 

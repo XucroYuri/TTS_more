@@ -69,6 +69,6 @@ function findProfile(line: ScriptLine, characters: Character[]): VoiceProfile | 
 }
 
 function engineForProvider(provider: VoiceBinding["provider_type"]): EngineName {
-  if (provider === "gpt-sovits" || provider === "indextts" || provider === "vibevoice") return provider;
+  if (provider === "gpt-sovits" || provider === "indextts" || provider === "cosyvoice" || provider === "vibevoice") return provider;
   return "commercial";
 }

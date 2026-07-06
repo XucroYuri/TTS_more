@@ -8,14 +8,16 @@ describe("validation wizard helpers", () => {
       { service_mode: "real" },
       [
         { service_id: "local-gpt", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, base_url: "http://127.0.0.1:9880", supervisor: { service_id: "local-gpt", manageable: true, running: true } },
-        { service_id: "local-index", engine: "indextts", provider_type: "indextts", ready: true, base_url: "http://127.0.0.1:9881", supervisor: { service_id: "local-index", manageable: true, running: true } }
+        { service_id: "local-index", engine: "indextts", provider_type: "indextts", ready: true, base_url: "http://127.0.0.1:9881", supervisor: { service_id: "local-index", manageable: true, running: true } },
+        { service_id: "local-cosyvoice", engine: "cosyvoice", provider_type: "cosyvoice", ready: true, base_url: "http://127.0.0.1:50000" }
       ],
       { ready: true },
       {
         project_id: "validation",
         lines: {
           a: { line_id: "a", versions: [{ version_id: "v001", engine: "gpt-sovits", profile: "a", status: "completed", audio_path: "a.wav", created_at: "now" }] },
-          b: { line_id: "b", versions: [{ version_id: "v001", engine: "indextts", profile: "b", status: "completed", audio_path: "b.wav", created_at: "now" }] }
+          b: { line_id: "b", versions: [{ version_id: "v001", engine: "indextts", profile: "b", status: "completed", audio_path: "b.wav", created_at: "now" }] },
+          c: { line_id: "c", versions: [{ version_id: "v001", engine: "cosyvoice", profile: "c", status: "completed", audio_path: "c.wav", created_at: "now" }] }
         }
       }
     );

@@ -11,7 +11,8 @@ const lines: ScriptLine[] = [
 
 const services: WorkerHealth[] = [
   { service_id: "local-gpt-sovits", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, base_url: "http://127.0.0.1:9880", supervisor: { service_id: "local-gpt-sovits", manageable: true, running: true } },
-  { service_id: "local-indextts", engine: "indextts", provider_type: "indextts", ready: true, base_url: "http://127.0.0.1:9881", supervisor: { service_id: "local-indextts", manageable: true, running: true } }
+  { service_id: "local-indextts", engine: "indextts", provider_type: "indextts", ready: true, base_url: "http://127.0.0.1:9881", supervisor: { service_id: "local-indextts", manageable: true, running: true } },
+  { service_id: "local-cosyvoice", engine: "cosyvoice", provider_type: "cosyvoice", ready: true, base_url: "http://127.0.0.1:50000" }
 ];
 
 const realRuntime: RuntimeMode = { service_mode: "real", data_root: "data", runtime_root: "data/.runtime", services: [] };
@@ -129,7 +130,7 @@ describe("workstation helpers", () => {
       ]
     );
 
-    expect(summary.local).toEqual({ ready: 2, total: 2, tone: "ready" });
+    expect(summary.local).toEqual({ ready: 3, total: 3, tone: "ready" });
     expect(summary.paid).toEqual({ ready: 1, total: 2, tone: "attention" });
     expect(summary.parser).toEqual({ ready: 1, total: 2, tone: "attention" });
     expect(summary.resources).toEqual({ ready: true, tone: "ready" });
@@ -147,7 +148,7 @@ describe("workstation helpers", () => {
     );
 
     expect(serviceTopbarHealthItems(summary)).toEqual([
-      { id: "local", labelKey: "services.localShort", tone: "ready", value: "2/2" },
+      { id: "local", labelKey: "services.localShort", tone: "ready", value: "3/3" },
       { id: "paid", labelKey: "services.apiShort", tone: "offline", value: "0/1" },
       { id: "parser", labelKey: "services.parserShort", tone: "offline", value: "0/1" },
       { id: "resources", labelKey: "services.resourcesShort", tone: "ready", value: "" }
@@ -159,30 +160,33 @@ describe("workstation helpers", () => {
       [
         { service_id: "local-gpt-sovits", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: false, enabled: false, base_url: "http://127.0.0.1:9880" },
         { service_id: "local-indextts", engine: "indextts", provider_type: "indextts", ready: false, enabled: false, base_url: "http://127.0.0.1:9881" },
+        { service_id: "local-cosyvoice", engine: "cosyvoice", provider_type: "cosyvoice", ready: false, enabled: false, base_url: "http://127.0.0.1:50000" },
         { service_id: "lan-gpt", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, enabled: true, base_url: "http://192.0.2.166:9872", network_scope: "lan", capabilities: ["gradio_webui"] },
-        { service_id: "lan-index", engine: "indextts", provider_type: "indextts", ready: true, enabled: true, base_url: "http://192.0.2.166:7860", network_scope: "lan", capabilities: ["gradio_webui"] }
+        { service_id: "lan-index", engine: "indextts", provider_type: "indextts", ready: true, enabled: true, base_url: "http://192.0.2.166:7860", network_scope: "lan", capabilities: ["gradio_webui"] },
+        { service_id: "lan-cosyvoice", engine: "cosyvoice", provider_type: "cosyvoice", ready: true, enabled: true, base_url: "http://192.0.2.166:50000", network_scope: "lan", capabilities: ["cosyvoice-http-v1"] }
       ],
       readyCandidates,
       []
     );
 
-    expect(summary.local).toEqual({ ready: 2, total: 2, tone: "ready" });
+    expect(summary.local).toEqual({ ready: 3, total: 3, tone: "ready" });
     expect(summary.overallTone).toBe("ready");
   });
 
-  it("only offers operational provider services for generation routing", () => {
+  it("only offers routable provider services for generation routing", () => {
     const routeServices = routableProviderServices(
       [
         { service_id: "local-gpt-disabled", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: false, enabled: false, base_url: "http://127.0.0.1:9880" },
         { service_id: "local-gpt-stopped", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, base_url: "http://127.0.0.1:9881", supervisor: { service_id: "local-gpt-stopped", manageable: true, running: false } },
-        { service_id: "lan-gpt-partial", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, state: "partial", severity: "attention", base_url: "http://192.0.2.166:9872" },
+        { service_id: "lan-gpt-partial", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, state: "partial", severity: "attention", setup_state: "partial", base_url: "http://192.0.2.166:9872" },
         { service_id: "lan-gpt-blocked", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, state: "blocked", severity: "danger", base_url: "http://192.0.2.166:9873" },
+        { service_id: "lan-gpt-repo-missing", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, state: "ready", severity: "ready", setup_state: "repo_missing", base_url: "http://192.0.2.166:9874" },
         { service_id: "lan-gpt-ready", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, base_url: "http://192.0.2.166:9872" },
         { service_id: "lan-index-ready", engine: "indextts", provider_type: "indextts", ready: true, base_url: "http://192.0.2.166:7860" }
       ],
       "gpt-sovits"
     );
 
-    expect(routeServices.map((service) => service.service_id)).toEqual(["lan-gpt-ready"]);
+    expect(routeServices.map((service) => service.service_id)).toEqual(["lan-gpt-partial", "lan-gpt-ready"]);
   });
 });

@@ -60,12 +60,17 @@ def test_registry_default_local_services_share_one_gpu() -> None:
     assert {service.service_id for service in registry.services} == {
         "local-gpt-sovits",
         "local-indextts",
+        "local-cosyvoice",
     }
     assert {service.resource_group for service in registry.services} == {"local-gpu-0"}
     assert all(service.capacity == 1 for service in registry.services)
     assert all(service.base_url.startswith("http://") for service in registry.services)
     assert all(service.service_kind == "tts" for service in registry.services)
     assert all(service.network_scope == "localhost" for service in registry.services)
+    cosyvoice = registry.get("local-cosyvoice")
+    assert cosyvoice.enabled is False
+    assert cosyvoice.provider_type.value == "cosyvoice"
+    assert cosyvoice.api_contract == "cosyvoice-http-v1"
 
 
 def test_registry_keeps_external_vibevoice_only_as_generic_http() -> None:

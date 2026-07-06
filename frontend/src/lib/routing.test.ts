@@ -131,6 +131,49 @@ describe("routing helpers", () => {
     });
   });
 
+  it("maps CosyVoice bindings to the CosyVoice engine bucket", () => {
+    const cosyCharacters: Character[] = [
+      {
+        id: "alice",
+        name: "Alice",
+        aliases: [],
+        notes: "",
+        default_engine: "cosyvoice",
+        default_profile: "alice-cosyvoice",
+        fallback_profiles: [],
+        profiles: [
+          {
+            id: "alice-cosyvoice",
+            name: "Alice CosyVoice",
+            engine: "cosyvoice",
+            service_id: "cosyvoice-http",
+            fallback_services: [],
+            bindings: [
+              {
+                binding_id: "alice-cosyvoice",
+                provider_type: "cosyvoice",
+                service_id: "cosyvoice-http",
+                fallback_services: [],
+                capabilities: ["zero_shot_voice", "reference_audio_voice"],
+                config: { mode: "zero_shot", prompt_audio_path: "alice.wav" }
+              }
+            ],
+            config: {}
+          }
+        ]
+      }
+    ];
+
+    const line: ScriptLine = { id: "l-cosy", character_id: "alice", text: "hello", note: "" };
+
+    expect(buildGenerationTask(line, cosyCharacters)).toMatchObject({
+      engine: "cosyvoice",
+      provider_type: "cosyvoice",
+      binding_id: "alice-cosyvoice",
+      service_id: "cosyvoice-http"
+    });
+  });
+
   it("uses a line binding override when one profile has multiple bindings", () => {
     const line: ScriptLine = { id: "l4", character_id: "alice", text: "hello", note: "", binding_override: "alice-openai" };
 

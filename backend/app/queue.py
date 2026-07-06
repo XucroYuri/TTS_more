@@ -410,6 +410,19 @@ def build_cluster_key(task: GenerationTask, route: ServiceRoute) -> str:
             *[f"{key}={params.get(key, '')}" for key in advanced_keys],
         ]
         return "|".join(parts)
+    if provider == ProviderType.COSYVOICE or task.engine == EngineName.COSYVOICE:
+        parts = [
+            "provider=cosyvoice",
+            f"service_id={service_id}",
+            f"mode={params.get('mode', 'zero_shot')}",
+            f"speaker_id={params.get('speaker_id', params.get('voice', ''))}",
+            f"prompt_audio_path={params.get('prompt_audio_path', params.get('prompt_audio', params.get('reference_audio', '')))}",
+            f"prompt_text={params.get('prompt_text', '')}",
+            f"instruct_text={params.get('instruct_text', params.get('instruction', ''))}",
+            f"speed={params.get('speed', '')}",
+            f"seed={params.get('seed', '')}",
+        ]
+        return "|".join(parts)
     parts = [
         f"provider={provider.value if provider else task.engine.value}",
         f"service_id={service_id}",

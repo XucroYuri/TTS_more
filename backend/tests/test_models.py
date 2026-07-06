@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from app.models import Character, EngineName, GenerationManifest, GenerationVersion, LineGenerationHistory, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptLine, ScriptProject, VoiceBinding
+from app.models import Character, EngineName, GenerationManifest, GenerationVersion, LineGenerationHistory, ProjectCharacter, ProjectCharacterMode, ProviderType, ReferenceAudioGroup, ReferenceAudioSample, ScriptLine, ScriptProject, TTSServiceEndpoint, VoiceBinding
 from app.storage import ProjectStore
 
 
@@ -89,6 +89,34 @@ def test_script_line_can_hold_temporary_voice_binding() -> None:
 
     assert line.temporary_binding == binding
     assert line.temporary_binding.config["voice"] == "tmp/ref.wav"
+
+
+def test_cosyvoice_endpoint_defaults_to_core_engine_and_contract() -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="cosyvoice-http",
+        provider_type=ProviderType.COSYVOICE,
+        base_url="http://127.0.0.1:50000",
+        managed=False,
+        enabled=False,
+        capabilities=["tts", "reference_audio_voice", "zero_shot_voice", "wav_output"],
+    )
+
+    assert endpoint.engine == EngineName.COSYVOICE
+    assert endpoint.provider_type == ProviderType.COSYVOICE
+    assert endpoint.api_contract == "cosyvoice-http-v1"
+
+
+def test_character_voice_binding_can_target_cosyvoice() -> None:
+    binding = VoiceBinding(
+        binding_id="line-temp-cosyvoice",
+        provider_type=ProviderType.COSYVOICE,
+        service_id="cosyvoice-http",
+        capabilities=["zero_shot_voice", "reference_audio_voice"],
+        config={"mode": "zero_shot", "prompt_audio_path": "refs/voice.wav", "prompt_text": "hello"},
+    )
+
+    assert binding.provider_type == ProviderType.COSYVOICE
+    assert binding.config["mode"] == "zero_shot"
 
 
 def test_script_project_can_reference_and_snapshot_library_characters() -> None:

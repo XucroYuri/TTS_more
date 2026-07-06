@@ -124,6 +124,27 @@ def gpt_task(line_id: str, ref: str) -> GenerationTask:
     )
 
 
+def cosyvoice_task(line_id: str, prompt_audio: str, instruct_text: str = "") -> GenerationTask:
+    return GenerationTask(
+        line=ScriptLine(id=line_id, character_id="role", text=f"text {line_id}"),
+        engine=EngineName.COSYVOICE,
+        profile="cosy-role",
+        service_id="local-cosyvoice",
+        provider_type=ProviderType.COSYVOICE,
+        binding_id="cosy-role-binding",
+        required_capabilities=["tts", "zero_shot_voice"],
+        parameters={
+            "mode": "zero_shot",
+            "speaker_id": "",
+            "prompt_audio_path": prompt_audio,
+            "prompt_text": "reference prompt",
+            "instruct_text": instruct_text,
+            "speed": 1.0,
+            "seed": 42,
+        },
+    )
+
+
 def test_service_queue_serializes_services_in_same_resource_group(tmp_path: Path) -> None:
     first = RecordingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
     second = RecordingServiceClient(endpoint("local-index", EngineName.INDEX_TTS, "local-gpu-0"))
@@ -164,6 +185,31 @@ def test_service_queue_clusters_same_weights_and_reference_before_switching(tmp_
     assert synth_calls == ["synthesize:a1", "synthesize:a2", "synthesize:b1"]
     assert client.calls.count("load:gpt-role") == 2
     assert manifest.lines["a1"].versions[0].metadata["cluster_key"].endswith("ref_audio_path=a.wav")
+
+
+def test_service_queue_clusters_cosyvoice_by_mode_reference_and_instruction(tmp_path: Path) -> None:
+    client = RecordingServiceClient(endpoint("local-cosyvoice", EngineName.COSYVOICE, "local-gpu-0"))
+    queue = ServiceGenerationQueue(StaticRouter({"local-cosyvoice": client}))
+    manifest = GenerationManifest(project_id="demo")
+
+    queue.run(
+        [
+            cosyvoice_task("a1", "a.wav", "calm"),
+            cosyvoice_task("b1", "b.wav", "calm"),
+            cosyvoice_task("a2", "a.wav", "calm"),
+            cosyvoice_task("a3", "a.wav", "urgent"),
+        ],
+        manifest,
+        output_dir=tmp_path,
+    )
+
+    synth_calls = [call for call in client.calls if call.startswith("synthesize")]
+    assert synth_calls == ["synthesize:a1", "synthesize:a2", "synthesize:b1", "synthesize:a3"]
+    first_cluster = manifest.lines["a1"].versions[0].metadata["cluster_key"]
+    assert "provider=cosyvoice" in first_cluster
+    assert "prompt_audio_path=a.wav" in first_cluster
+    assert "instruct_text=calm" in first_cluster
+    assert manifest.lines["a3"].versions[0].metadata["cluster_key"] != first_cluster
 
 
 def test_service_queue_keeps_generation_history_separate_by_line_uid(tmp_path: Path) -> None:

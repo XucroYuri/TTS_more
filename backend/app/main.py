@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from app.adapter_factory import build_adapters
 from app.hardware import collect_local_hardware_status
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptLine, ScriptProject, ScriptRevision
+from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, RuleBasedParser
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
@@ -169,6 +170,35 @@ def create_app(
         app.state.job_manager = GenerationJobManager(queue, store)
         return public_service_settings(registry, env_file)
 
+    @app.get("/api/open-source-tts/catalog")
+    def open_source_tts_catalog() -> dict[str, Any]:
+        return {"providers": open_source_catalog(project_root)}
+
+    @app.post("/api/open-source-tts/detect")
+    def open_source_tts_detect(request: OpenSourceTTSDetectRequest) -> dict[str, Any]:
+        return detect_open_source_tts(request, project_root)
+
+    @app.post("/api/open-source-tts/configure")
+    def open_source_tts_configure(request: OpenSourceTTSConfigureRequest) -> dict[str, Any]:
+        registry, endpoint, detect_payload = configure_open_source_tts(
+            request,
+            app.state.service_registry,
+            app.state.writable_services_path,
+            project_root,
+        )
+        router = ServiceRouter(registry)
+        queue = ServiceGenerationQueue(router)
+        app.state.service_registry = registry
+        app.state.service_router = router
+        app.state.queue = queue
+        app.state.job_manager = GenerationJobManager(queue, store)
+        app.state.services_path = app.state.writable_services_path
+        return {
+            "service": endpoint.model_dump(mode="json"),
+            "detect": detect_payload,
+            "settings": public_service_settings(registry, env_file),
+        }
+
     @app.post("/api/services/{service_id}/test")
     def test_service(service_id: str) -> dict[str, Any]:
         try:
@@ -181,7 +211,7 @@ def create_app(
     @app.get("/api/services/status")
     def services_status() -> dict[str, Any]:
         return {
-            "services": _service_health_with_supervisor(app.state.service_router, supervisor),
+            "services": _service_health_with_supervisor(app.state.service_router, supervisor, app.state.queue),
             "hardware": collect_local_hardware_status(),
         }
 
@@ -1071,21 +1101,31 @@ def _service_mode() -> str:
     return os.environ.get("TTS_MORE_SERVICE_MODE", os.environ.get("TTS_MORE_ADAPTER_MODE", "real"))
 
 
-def _service_health_with_supervisor(router: ServiceRouter, supervisor: ServiceSupervisor) -> list[dict[str, Any]]:
+def _service_health_with_supervisor(
+    router: ServiceRouter,
+    supervisor: ServiceSupervisor,
+    queue: ServiceGenerationQueue | None = None,
+) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for service in router.health():
         endpoint = router.registry.get(service["service_id"])
         supervisor_state = supervisor.status(endpoint)
-        output.append(_layer_service_status({**service, "supervisor": supervisor_state}, supervisor_state))
+        load_state = queue.load_state(endpoint.service_id) if queue is not None else {}
+        output.append(_layer_service_status({**service, "supervisor": supervisor_state, "load_state": load_state}, supervisor_state))
     return output
 
 
 def _layer_service_status(service: dict[str, Any], supervisor_state: dict[str, Any]) -> dict[str, Any]:
     health = service.get("health") or {}
+    setup_state = _effective_setup_state(service, health)
     managed_local_stopped = bool(supervisor_state.get("manageable") and not supervisor_state.get("running") and service.get("network_scope") == "localhost")
+    hard_blocked_setup = setup_state in {"not_configured", "repo_missing", "env_missing", "endpoint_unreachable"}
     if service.get("enabled") is False:
         state = "disabled"
         severity = "neutral"
+    elif hard_blocked_setup:
+        state = "blocked"
+        severity = "danger"
     elif managed_local_stopped and health.get("state") == "ready":
         state = "partial"
         severity = "attention"
@@ -1104,6 +1144,11 @@ def _layer_service_status(service: dict[str, Any], supervisor_state: dict[str, A
     else:
         state = "blocked"
         severity = "danger"
+    load_state = service.get("load_state") or {}
+    repo_path = service.get("repo_path")
+    repo_found = _repo_path_exists(repo_path)
+    endpoint_reachable = bool(health.get("reachable") or health.get("port_reachable") or service.get("ready"))
+    api_contract_ok = bool(health.get("config_ok") or health.get("required_api_ok") or service.get("ready"))
     return {
         **service,
         "ready": bool(service.get("ready")) and state in {"ready", "running"},
@@ -1115,7 +1160,45 @@ def _layer_service_status(service: dict[str, Any], supervisor_state: dict[str, A
         "auth_ok": bool(health.get("auth_ok", True)),
         "can_start": bool(supervisor_state.get("manageable") and not supervisor_state.get("running")),
         "supervisor_state": "running" if supervisor_state.get("running") else "stopped",
+        "source_profile": service.get("source_profile"),
+        "catalog_provider": service.get("catalog_provider"),
+        "setup_state": setup_state,
+        "repo_found": repo_found,
+        "repo_path_exists": repo_found,
+        "endpoint_reachable": endpoint_reachable,
+        "api_contract_ok": api_contract_ok,
+        "loaded_signature": load_state.get("loaded_signature"),
+        "verification_level": load_state.get("verification_level"),
+        "last_load_error": load_state.get("last_error"),
     }
+
+
+def _effective_setup_state(service: dict[str, Any], health: dict[str, Any]) -> str:
+    explicit = service.get("setup_state")
+    repo_path = service.get("repo_path")
+    source_profile = service.get("source_profile")
+    if repo_path and source_profile == "local_repo" and not _repo_path_exists(repo_path):
+        return "repo_missing"
+    if explicit:
+        return str(explicit)
+    if service.get("enabled") is False:
+        return "not_configured"
+    if service.get("ready") or health.get("state") == "ready":
+        return "ready"
+    if health.get("reachable") or health.get("port_reachable") or health.get("status") == "needs key":
+        return "partial"
+    if service.get("base_url"):
+        return "endpoint_unreachable"
+    return "not_configured"
+
+
+def _repo_path_exists(raw_path: Any) -> bool | None:
+    if not raw_path:
+        return None
+    try:
+        return Path(str(raw_path)).exists()
+    except OSError:
+        return False
 
 
 def _preflight_task(router: ServiceRouter, supervisor: ServiceSupervisor, queue: ServiceGenerationQueue, task: GenerationTask) -> dict[str, Any]:

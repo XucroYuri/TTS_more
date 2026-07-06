@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 class EngineName(str, Enum):
     GPT_SOVITS = "gpt-sovits"
     INDEX_TTS = "indextts"
+    COSYVOICE = "cosyvoice"
     VIBEVOICE = "vibevoice"
     COMMERCIAL = "commercial"
 
@@ -18,6 +19,7 @@ class EngineName(str, Enum):
 class ProviderType(str, Enum):
     GPT_SOVITS = "gpt-sovits"
     INDEX_TTS = "indextts"
+    COSYVOICE = "cosyvoice"
     VIBEVOICE = "vibevoice"
     OPENAI = "openai"
     GEMINI = "gemini"
@@ -26,9 +28,23 @@ class ProviderType(str, Enum):
     GENERIC_HTTP = "generic-http"
 
 
+SourceProfile = Literal["local_repo", "local_endpoint", "lan_endpoint", "cloud_endpoint", "api_placeholder"]
+CatalogProvider = Literal["gpt-sovits", "indextts", "cosyvoice"]
+SetupState = Literal[
+    "not_configured",
+    "repo_missing",
+    "repo_found",
+    "env_missing",
+    "endpoint_unreachable",
+    "partial",
+    "ready",
+]
+
+
 PROVIDER_ENGINE_DEFAULTS: dict[ProviderType, EngineName] = {
     ProviderType.GPT_SOVITS: EngineName.GPT_SOVITS,
     ProviderType.INDEX_TTS: EngineName.INDEX_TTS,
+    ProviderType.COSYVOICE: EngineName.COSYVOICE,
     ProviderType.VIBEVOICE: EngineName.VIBEVOICE,
     ProviderType.OPENAI: EngineName.COMMERCIAL,
     ProviderType.GEMINI: EngineName.COMMERCIAL,
@@ -105,6 +121,9 @@ class TTSServiceEndpoint(BaseModel):
     auth_profile: dict[str, str] = Field(default_factory=dict)
     default_params: dict[str, Any] = Field(default_factory=dict)
     cost_policy: dict[str, Any] = Field(default_factory=dict)
+    source_profile: SourceProfile | None = None
+    catalog_provider: CatalogProvider | None = None
+    setup_state: SetupState | None = None
 
     @model_validator(mode="after")
     def populate_compat_fields(self) -> "TTSServiceEndpoint":
@@ -121,10 +140,28 @@ class TTSServiceEndpoint(BaseModel):
                 self.provider_type = ProviderType.GENERIC_HTTP
         if self.engine is None:
             self.engine = PROVIDER_ENGINE_DEFAULTS[self.provider_type]
+        if self.source_profile is None:
+            if "paid_provider" in self.capabilities or self.network_scope == "commercial":
+                self.source_profile = "api_placeholder"
+            elif self.repo_path:
+                self.source_profile = "local_repo"
+            elif self.network_scope == "localhost":
+                self.source_profile = "local_endpoint"
+            elif self.network_scope == "lan":
+                self.source_profile = "lan_endpoint"
+            else:
+                self.source_profile = "cloud_endpoint"
+        if self.catalog_provider is None and self.provider_type in {
+            ProviderType.GPT_SOVITS,
+            ProviderType.INDEX_TTS,
+            ProviderType.COSYVOICE,
+        }:
+            self.catalog_provider = self.provider_type.value  # type: ignore[assignment]
         if not self.api_contract or self.api_contract == "tts-more-v1":
             contract_by_provider = {
                 ProviderType.GPT_SOVITS: "gpt-sovits-api-v2",
                 ProviderType.INDEX_TTS: "tts-more-v1",
+                ProviderType.COSYVOICE: "cosyvoice-http-v1",
                 ProviderType.VIBEVOICE: "tts-more-v1",
                 ProviderType.OPENAI: "openai-speech-v1",
                 ProviderType.GEMINI: "gemini-tts-v1",

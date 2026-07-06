@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import time
 
@@ -14,7 +15,7 @@ def test_health_reports_repos_and_workers(tmp_path: Path) -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ok"
-    assert {worker["engine"] for worker in payload["workers"]} == {"gpt-sovits", "indextts"}
+    assert {worker["engine"] for worker in payload["workers"]} == {"gpt-sovits", "indextts", "cosyvoice"}
 
 
 def test_parse_script_uses_rule_based_fallback(tmp_path: Path) -> None:
@@ -753,6 +754,114 @@ def test_service_settings_reload_picks_up_external_services_file_changes(tmp_pat
     assert reload_response.status_code == 200
     assert {item["service_id"] for item in settings_response.json()["services"]} == {"initial-gpt", "local-gpt-sovits-proplus"}
     assert {item["service_id"] for item in status_response.json()["services"]} == {"initial-gpt", "local-gpt-sovits-proplus"}
+
+
+def test_open_source_tts_catalog_lists_core_providers_in_priority_order(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.get("/api/open-source-tts/catalog")
+
+    assert response.status_code == 200
+    providers = response.json()["providers"]
+    assert [item["provider_type"] for item in providers] == ["gpt-sovits", "indextts", "cosyvoice"]
+    assert providers[0]["clone_url"] == "https://github.com/XucroYuri/GPT-SoVITS.git"
+    assert providers[1]["default_repo_path"].endswith("repo/index-tts")
+    assert providers[2]["api_contracts"][0] == "cosyvoice-http-v1"
+    assert providers[2]["priority"] == 30
+
+
+def test_open_source_tts_detect_reports_missing_repo_and_unreachable_endpoint(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.post(
+        "/api/open-source-tts/detect",
+        json={
+            "provider_type": "gpt-sovits",
+            "repo_path": str(tmp_path / "missing-gpt"),
+            "base_url": "http://127.0.0.1:9",
+            "api_contract": "gradio-gpt-sovits-webui",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["repo_found"] is False
+    assert payload["endpoint_reachable"] is False
+    assert payload["api_contract_ok"] is False
+    assert payload["setup_state"] == "repo_missing"
+    assert "git clone https://github.com/XucroYuri/GPT-SoVITS.git" in payload["env_hint"]
+
+
+def test_open_source_tts_configure_writes_local_services_without_touching_template(tmp_path: Path) -> None:
+    templates_dir = tmp_path / "templates"
+    templates_dir.mkdir(parents=True)
+    template_path = templates_dir / "services.example.json"
+    template_text = '[{"service_id":"template-only","engine":"gpt-sovits","base_url":"http://example.invalid"}]'
+    template_path.write_text(template_text, encoding="utf-8")
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.post(
+        "/api/open-source-tts/configure",
+        json={
+            "provider_type": "cosyvoice",
+            "service_id": "lan-cosyvoice-test",
+            "display_name": "CosyVoice LAN",
+            "source_profile": "lan_endpoint",
+            "base_url": "http://cosyvoice.local:50000",
+            "resource_group": "lan-cosyvoice",
+            "capacity": 2,
+            "enabled": True,
+        },
+    )
+
+    assert response.status_code == 200
+    local_services_path = tmp_path / "local" / "services.json"
+    assert local_services_path.exists()
+    saved = json.loads(local_services_path.read_text(encoding="utf-8"))
+    assert saved[0]["service_id"] == "lan-cosyvoice-test"
+    assert saved[0]["catalog_provider"] == "cosyvoice"
+    assert saved[0]["source_profile"] == "lan_endpoint"
+    assert saved[0]["setup_state"] == "endpoint_unreachable"
+    assert template_path.read_text(encoding="utf-8") == template_text
+
+
+def test_service_status_exposes_setup_and_repository_detection(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    missing_repo = tmp_path / "missing-cosyvoice"
+    services_path.write_text(
+        json.dumps(
+            [
+                {
+                    "service_id": "local-cosyvoice",
+                    "engine": "cosyvoice",
+                    "provider_type": "cosyvoice",
+                    "api_contract": "cosyvoice-http-v1",
+                    "base_url": "http://127.0.0.1:50000",
+                    "network_scope": "localhost",
+                    "repo_path": str(missing_repo),
+                    "source_profile": "local_repo",
+                    "catalog_provider": "cosyvoice",
+                    "setup_state": "repo_missing",
+                    "capabilities": ["tts"],
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+
+    response = client.get("/api/services/status")
+
+    assert response.status_code == 200
+    service = response.json()["services"][0]
+    assert service["source_profile"] == "local_repo"
+    assert service["catalog_provider"] == "cosyvoice"
+    assert service["setup_state"] == "repo_missing"
+    assert service["repo_found"] is False
+    assert service["endpoint_reachable"] is False
+    assert service["api_contract_ok"] is False
+    assert service["state"] == "blocked"
 
 
 def test_real_tts_validation_uses_reloaded_service_queue(tmp_path: Path, monkeypatch) -> None:

@@ -35,7 +35,24 @@ export interface ServiceTopbarHealthItem {
   value: string;
 }
 
-export const coreLocalProviders = new Set(["gpt-sovits", "indextts"]);
+export const coreLocalProviders = new Set(["gpt-sovits", "indextts", "cosyvoice"]);
+
+export interface CoreProviderCoverage {
+  provider: string;
+  services: WorkerHealth[];
+  operational: boolean;
+}
+
+export function coreProviderCoverage(services: WorkerHealth[]): CoreProviderCoverage[] {
+  return Array.from(coreLocalProviders).map((provider) => {
+    const providerServices = services.filter((service) => service.enabled !== false && (service.provider_type ?? service.engine) === provider);
+    return {
+      provider,
+      services: providerServices,
+      operational: providerServices.some(isServiceOperational)
+    };
+  });
+}
 
 export function isServiceOperational(service: WorkerHealth): boolean {
   if (service.enabled === false) return false;
@@ -48,8 +65,20 @@ export function isServiceOperational(service: WorkerHealth): boolean {
   return Boolean(service.ready);
 }
 
+export function isServiceRoutable(service: WorkerHealth): boolean {
+  if (service.enabled === false) return false;
+  if (service.base_url?.startsWith("mock://")) return false;
+  if (!service.base_url) return false;
+  if (["not_configured", "repo_missing", "env_missing", "endpoint_unreachable"].includes(service.setup_state ?? "")) return false;
+  if (service.state && !["ready", "running", "partial"].includes(service.state)) return false;
+  if (service.severity === "danger") return false;
+  if (service.supervisor?.manageable && !service.supervisor.running) return false;
+  if (service.capabilities?.includes("paid_provider") && service.key_configured === false) return false;
+  return Boolean(service.ready || service.state === "partial");
+}
+
 export function routableProviderServices(services: WorkerHealth[], provider: string): WorkerHealth[] {
-  return services.filter((service) => service.provider_type === provider && Boolean(service.service_id) && isServiceOperational(service));
+  return services.filter((service) => service.provider_type === provider && Boolean(service.service_id) && isServiceRoutable(service));
 }
 
 export function validationRunState(
@@ -64,12 +93,15 @@ export function validationRunState(
   if (isGenerating) return { disabled: true, reasonKey: "validation.reason.generating" };
   if (runtime?.service_mode !== "real") return { disabled: true, reasonKey: "validation.reason.mockMode" };
 
-  const localServices = services.filter((service) => service.enabled !== false && coreLocalProviders.has(service.provider_type ?? service.engine));
-  const missingService = localServices.find((service) => !isServiceOperational(service));
-  if (missingService) {
-    return { disabled: true, reasonKey: "validation.reason.serviceNotReady", serviceId: missingService.service_id ?? missingService.engine };
+  const coverage = coreProviderCoverage(services);
+  const missingProvider = coverage.find((item) => !item.operational);
+  if (missingProvider) {
+    const firstService = missingProvider.services[0];
+    if (firstService) {
+      return { disabled: true, reasonKey: "validation.reason.serviceNotReady", serviceId: firstService.service_id ?? firstService.engine };
+    }
+    return { disabled: true, reasonKey: "validation.reason.serviceMissing", serviceId: missingProvider.provider };
   }
-  if (localServices.length < coreLocalProviders.size) return { disabled: true, reasonKey: "validation.reason.serviceMissing" };
   if (!candidates?.ready) return { disabled: true, reasonKey: "validation.reason.resourcesNotReady" };
   return { disabled: false, reasonKey: null };
 }
@@ -120,13 +152,13 @@ export function serviceTopbarSummary(
   candidates: Pick<VoiceCandidates, "ready"> | null,
   parserProviders: Array<Pick<ParserProviderConfig, "enabled" | "key_configured">> = []
 ): ServiceTopbarSummary {
-  const localServices = services.filter((service) => service.enabled !== false && coreLocalProviders.has(service.provider_type ?? service.engine));
+  const localCoverage = coreProviderCoverage(services);
   const paidServices = services.filter((service) => service.capabilities?.includes("paid_provider"));
-  const localReady = localServices.filter(isServiceOperational).length;
+  const localReady = localCoverage.filter((item) => item.operational).length;
   const paidReady = paidServices.filter(isServiceOperational).length;
   const parserReady = parserProviders.filter((provider) => provider.enabled && provider.key_configured).length;
   const resourcesReady = Boolean(candidates?.ready);
-  const local = { ready: localReady, total: localServices.length, tone: groupTone(localReady, localServices.length) };
+  const local = { ready: localReady, total: localCoverage.length, tone: groupTone(localReady, localCoverage.length) };
   const paid = { ready: paidReady, total: paidServices.length, tone: groupTone(paidReady, paidServices.length) };
   const parser = { ready: parserReady, total: parserProviders.length, tone: groupTone(parserReady, parserProviders.length) };
   const resources = { ready: resourcesReady, tone: resourcesReady ? "ready" as const : "attention" as const };
@@ -152,6 +184,7 @@ export function serviceTopbarHealthItems(summary: ServiceTopbarSummary): Service
 function inferLineProvider(line: ScriptLine): string {
   const raw = `${line.engine_override ?? ""} ${line.binding_override ?? ""} ${line.profile_override ?? ""}`.toLowerCase();
   if (raw.includes("index")) return "indextts";
+  if (raw.includes("cosy")) return "cosyvoice";
   if (raw.includes("vibe")) return "vibevoice";
   if (raw.includes("openai")) return "openai";
   if (raw.includes("gemini")) return "gemini";

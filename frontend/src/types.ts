@@ -1,5 +1,8 @@
-export type EngineName = "gpt-sovits" | "indextts" | "vibevoice" | "commercial";
-export type ProviderType = "gpt-sovits" | "indextts" | "vibevoice" | "openai" | "gemini" | "xai" | "volcengine" | "generic-http";
+export type EngineName = "gpt-sovits" | "indextts" | "cosyvoice" | "vibevoice" | "commercial";
+export type ProviderType = "gpt-sovits" | "indextts" | "cosyvoice" | "vibevoice" | "openai" | "gemini" | "xai" | "volcengine" | "generic-http";
+export type SourceProfile = "local_repo" | "local_endpoint" | "lan_endpoint" | "cloud_endpoint" | "api_placeholder";
+export type CatalogProvider = "gpt-sovits" | "indextts" | "cosyvoice";
+export type SetupState = "not_configured" | "repo_missing" | "repo_found" | "env_missing" | "endpoint_unreachable" | "partial" | "ready";
 export type GenerationStatus = "queued" | "loading" | "running" | "finalizing" | "completed" | "failed" | "cancelled";
 
 export interface WorkerHealth {
@@ -35,6 +38,69 @@ export interface WorkerHealth {
   cli?: string;
   script?: string;
   key_configured?: boolean;
+  source_profile?: SourceProfile | null;
+  catalog_provider?: CatalogProvider | null;
+  setup_state?: SetupState | null;
+  repo_path?: string | null;
+  repo_found?: boolean | null;
+  repo_path_exists?: boolean | null;
+  endpoint_reachable?: boolean;
+  api_contract_ok?: boolean;
+  loaded_signature?: string | null;
+  verification_level?: string | null;
+  last_load_error?: string | null;
+}
+
+export interface OpenSourceTTSCatalogItem {
+  provider_type: CatalogProvider;
+  display_name: string;
+  clone_url: string;
+  default_repo_path: string;
+  resolved_default_repo_path?: string;
+  default_base_url: string;
+  default_ports: number[];
+  api_contracts: string[];
+  capabilities: string[];
+  priority: number;
+  resource_group: string;
+  recommended_clone_command: string;
+  start_hint: string;
+}
+
+export interface OpenSourceTTSDetectRequest {
+  provider_type: CatalogProvider;
+  repo_path?: string | null;
+  base_url?: string | null;
+  api_contract?: string | null;
+}
+
+export interface OpenSourceTTSDetectResponse {
+  provider_type: CatalogProvider;
+  repo_path?: string | null;
+  repo_found: boolean;
+  base_url?: string | null;
+  endpoint_reachable: boolean;
+  api_contract_ok: boolean;
+  health: Record<string, unknown>;
+  setup_state: SetupState;
+  env_hint: string;
+}
+
+export interface OpenSourceTTSConfigureRequest {
+  provider_type: CatalogProvider;
+  service_id?: string | null;
+  display_name?: string | null;
+  source_profile: SourceProfile;
+  repo_path?: string | null;
+  base_url: string;
+  api_contract?: string | null;
+  network_scope?: "localhost" | "lan" | "public" | "commercial" | null;
+  managed?: boolean;
+  enabled?: boolean;
+  resource_group?: string;
+  capacity?: number;
+  start_command?: string[];
+  start_cwd?: string | null;
 }
 
 export interface ServiceSupervisorStatus {

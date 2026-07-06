@@ -27,7 +27,7 @@ export type InspectorSectionId = "config" | "reference" | "version" | "diagnosti
 export type InspectorDiagnosticsTone = "neutral" | "warn" | "danger";
 export type InspectorDiagnosticsReason = "ready" | "not_loaded" | "signature_mismatch" | "error" | "manual";
 export type LineFocusIntent = "card" | "checkbox" | "role";
-export type GenerationMethodId = "gpt-sovits" | "indextts" | "commercial";
+export type GenerationMethodId = "gpt-sovits" | "indextts" | "cosyvoice" | "commercial";
 
 export interface InspectorDiagnosticsInput {
   loaded?: boolean | null;
@@ -189,6 +189,7 @@ export function lineFocusTransition(current: LineFocusState, lineId: string, int
 export function generationMethodForProvider(provider: ProviderType): GenerationMethodId {
   if (provider === "gpt-sovits") return "gpt-sovits";
   if (provider === "indextts") return "indextts";
+  if (provider === "cosyvoice") return "cosyvoice";
   return "commercial";
 }
 
@@ -205,6 +206,12 @@ export function generationMethodOptions(): GenerationMethodOption[] {
       labelKey: "inspector.method.indextts",
       hintKey: "inspector.methodHint.indextts",
       providers: ["indextts"]
+    },
+    {
+      id: "cosyvoice",
+      labelKey: "inspector.method.cosyvoice",
+      hintKey: "inspector.methodHint.cosyvoice",
+      providers: ["cosyvoice"]
     },
     {
       id: "commercial",
@@ -228,6 +235,13 @@ export function generationMethodRouteLabels(methodId: GenerationMethodId): Gener
       profileLabelKey: "inspector.indexRolePreset",
       bindingLabelKey: "inspector.indexVoiceBinding",
       serviceLabelKey: "inspector.indexService"
+    };
+  }
+  if (methodId === "cosyvoice") {
+    return {
+      profileLabelKey: "inspector.cosyVoicePreset",
+      bindingLabelKey: "inspector.cosyVoiceBinding",
+      serviceLabelKey: "inspector.cosyVoiceService"
     };
   }
   return {

@@ -34,8 +34,9 @@ describe("workbench view helpers", () => {
   it("groups generation providers into user-facing method tabs", () => {
     expect(generationMethodForProvider("gpt-sovits")).toBe("gpt-sovits");
     expect(generationMethodForProvider("indextts")).toBe("indextts");
+    expect(generationMethodForProvider("cosyvoice")).toBe("cosyvoice");
     expect(generationMethodForProvider("openai")).toBe("commercial");
-    expect(generationMethodOptions().map((item) => item.id)).toEqual(["gpt-sovits", "indextts", "commercial"]);
+    expect(generationMethodOptions().map((item) => item.id)).toEqual(["gpt-sovits", "indextts", "cosyvoice", "commercial"]);
   });
 
   it("uses method-specific route labels instead of provider internals", () => {
@@ -45,6 +46,11 @@ describe("workbench view helpers", () => {
       serviceLabelKey: "inspector.gptService"
     });
     expect(generationMethodRouteLabels("indextts").serviceLabelKey).toBe("inspector.indexService");
+    expect(generationMethodRouteLabels("cosyvoice")).toEqual({
+      profileLabelKey: "inspector.cosyVoicePreset",
+      bindingLabelKey: "inspector.cosyVoiceBinding",
+      serviceLabelKey: "inspector.cosyVoiceService"
+    });
     expect(generationMethodRouteLabels("commercial").bindingLabelKey).toBe("inspector.commercialVoiceBinding");
   });
 
