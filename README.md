@@ -1,27 +1,310 @@
 # TTS More
 
-TTS More is an outer orchestration project for local and external TTS services:
+TTS More 是一个面向剧本配音生产的多 TTS 服务调度工作台。项目目标不是重写各个 TTS 模型，而是在 GPT-SoVITS、IndexTTS、CosyVoice 以及未来 TTS API 之上建立统一的剧本解析、角色音色配置、任务队列、服务状态感知和生成历史管理能力。
 
-- `GPT-SoVITS` for trained character weights and reference-audio generation.
-- `index-tts` for strong emotional speech from per-character references.
-- `CosyVoice` for zero-shot, cross-lingual, and instruction-style open-source TTS.
-- TTS API and generic HTTP endpoints are kept as optional placeholders while the core workflow focuses on the three open-source providers.
+当前主线开发重点是三个开源 TTS 服务：
 
-The outer app keeps local repos independent and adds a FastAPI orchestration layer plus a React script dubbing workstation.
+```text
+GPT-SoVITS -> IndexTTS -> CosyVoice -> TTS API
+```
 
-## Workbench
+其中 TTS API 暂时保留为占位入口，当前核心开发资源集中在 GPT-SoVITS、IndexTTS、CosyVoice 三个开源服务上。
 
-- Product-style three-column script dubbing workstation: service/resources sidebar, script line task table, and line inspector.
-- Chinese and English UI through i18next; Chinese is the fallback, with browser language detection and a top-bar language switch.
-- File-based projects and manifests.
-- Character library with reusable voice bindings, model profiles, service overrides, and reference audio groups.
-- OpenAI-compatible multi-provider parser contract with rule-based fallback.
-- Service endpoint registry in `data/services.json`, so local repo workers and remote API services share one scheduling model.
-- Queue grouping by service/profile/resource group, with same-resource serial execution and different-resource parallel execution.
-- Real network endpoint mode by default, using the standard worker contract for `/health`, `/capabilities`, `/load`, `/synthesize`, and `/unload`.
-- Geist-inspired compact visual baseline is stored in `frontend/design.md`.
+## 当前定位
 
-## Setup
+TTS More 是外层独立框架项目，`repo/` 下的 TTS 项目保持为可更新的上游仓库或本地部署目录。外层框架只负责：
+
+- 导入和解析剧本，将自由文本转为角色、括注、台词行。
+- 管理全局角色库和项目角色映射。
+- 根据角色、台词、音色绑定和服务状态选择 TTS 服务。
+- 通过 HTTP endpoint 调用本机、局域网或公网 TTS 服务。
+- 将生成任务放入队列，按资源组和模型加载签名调度。
+- 保存每行台词的多批次音频历史和参数快照。
+- 提供 React 工作台完成普通用户可操作的配音生产流程。
+
+重要原则：
+
+- 所有推理调用都走 HTTP endpoint。
+- 本机 repo path 只用于诊断、启动、停止、日志和资源管理。
+- 不把真实角色库、本机路径、局域网 IP、模型权重、生成音频或 `.env.local` 提交到远端仓库。
+- Mock 只允许存在于测试和开发 fixture，产品默认路径必须面向真实服务或空状态。
+
+## 总体架构
+
+```text
+React/Vite 工作台
+  |
+  | REST API
+  v
+FastAPI Orchestrator
+  |
+  |-- 项目与版本存储
+  |-- 角色库与 Voice Binding
+  |-- 服务注册与状态轮询
+  |-- Provider Router
+  |-- 异步任务队列
+  |-- Manifest / 音频历史
+  |
+  +--> GPT-SoVITS Endpoint
+  +--> IndexTTS Endpoint
+  +--> CosyVoice Endpoint
+  +--> TTS API Endpoint 占位
+```
+
+### 前端
+
+前端位于 `frontend/`，使用 React、Vite、TypeScript 和 i18next。
+
+当前工作台由三部分组成：
+
+- 左侧剧本控制台：剧本选择、原文预览、编辑入口、解析入口。
+- 中间台词任务列表：角色筛选、台词行、生成状态、行级历史音频。
+- 右侧生成配置面板：当前行的生成方式、声音资源、服务诊断和生成确认。
+
+界面已经从早期 demo 表格逐步改为生产工作台形态：
+
+- 角色筛选使用头像卡。
+- 台词行聚焦角色、括注、台词和生成状态。
+- 历史音频归属中间台词行展开区域。
+- 右侧只保留当前行配置和生成确认。
+- 选中态和主操作正在统一为蓝色系视觉，不再使用黑色作为主流程焦点。
+
+### 后端
+
+后端位于 `backend/`，使用 FastAPI。
+
+核心模块包括：
+
+- `models.py`：项目、角色、服务、任务、manifest 等核心 schema。
+- `services.py`：TTS service endpoint 注册、状态检查、HTTP contract 调用。
+- `queue.py`：资源组、cluster key、异步任务调度和状态追踪。
+- `open_source_tts.py`：开源 TTS 服务目录、检测和本地配置写入。
+- `role_library.py`：角色库、logs 扫描、参考音频候选和 binding 生成。
+- `storage.py`：文件制项目存储、模板数据、运行数据隔离。
+- `main.py`：REST API 入口。
+
+## 数据与配置
+
+仓库只提交脱敏模板，真实运行数据默认进入本地目录。
+
+推荐结构：
+
+```text
+data/
+  templates/
+    services.example.json
+    characters.example.json
+    demo-hollywood/
+      project.json
+  local/
+    services.json          # 本机或团队内部真实服务配置，不提交
+    characters.json        # 本机或团队内部真实角色库，不提交
+    projects/              # 真实项目、manifest、生成历史，不提交
+```
+
+配置加载优先级：
+
+```text
+.env.local / data/local/services.json > data/services.json > data/templates/services.example.json
+```
+
+`.env.local` 用于保存 API key、本机路径和私有参数。它不应提交到 GitHub 或 Gitee。
+
+## 服务接入
+
+### 推荐安装顺序
+
+先获取 TTS More：
+
+```powershell
+git clone https://github.com/XucroYuri/TTS_more.git
+```
+
+如果本机没有可用 TTS 服务，可以按需克隆以下项目。推荐放在 `repo/`，也可以放在任意路径后通过接入向导绑定。
+
+```powershell
+git clone https://github.com/XucroYuri/GPT-SoVITS.git repo/GPT-SoVITS
+git clone https://github.com/XucroYuri/index-tts.git repo/index-tts
+git clone https://github.com/XucroYuri/CosyVoice.git repo/CosyVoice
+```
+
+这些 fork 作为稳定镜像使用，目的是降低上游更新导致集成失效的风险。只要 HTTP contract 兼容，官方源头仓库或已经部署好的服务也可以接入。
+
+### 四种接入方式
+
+在工作台打开 `服务与资源 -> 开源接入`，可选择：
+
+1. 本机项目路径
+   绑定本机 repo path，可配置启动、停止、日志和资源诊断。推理仍然通过 endpoint URL。
+
+2. 本机端口
+   TTS 服务已经在本机运行，只填写 `base_url` 和协议。
+
+3. 局域网端点
+   使用 IP + 端口接入可信局域网服务。
+
+4. 公网 URL
+   使用公网 URL 接入云端服务。公网 endpoint 不提供远程进程控制，只做健康检查、能力检查和任务调用。
+
+接入向导会写入 `data/local/services.json`，不会污染可提交模板。
+
+## Provider 能力
+
+### GPT-SoVITS
+
+GPT-SoVITS 是默认优先级最高的训练音色 provider。
+
+当前设计采用 logs-first：
+
+```text
+角色名称 / 昵称 / 别名
+  -> logs_name
+  -> GPT 权重
+  -> SoVITS 权重
+  -> 参考音频
+  -> 参考文本
+  -> 生成台词音频
+```
+
+生成前会计算加载签名：
+
+```text
+service_id + logs_name + gpt_weights_path + sovits_weights_path + ref_audio_path + prompt_text + prompt_lang + text_lang
+```
+
+同一服务内签名一致时可以复用加载状态；签名变化时必须切换权重和参考音频。无法从 WebUI 强回读状态时，只能标记为假定成功，不应显示强验证绿色。
+
+### IndexTTS
+
+IndexTTS 是强情绪和临时配音能力的核心 provider。
+
+当前重点不是强制每个角色都配置 IndexTTS 角色库，而是在右侧配置面板中复现原生 IndexTTS 的临时生成能力：
+
+- 上传参考音频。
+- 拖拽参考音频。
+- 录音作为参考音频。
+- 选择情绪控制方式。
+- 展开高级参数。
+
+未命中角色库的角色默认不会自动兜底到 IndexTTS，避免错误音色批量生成。用户需要手动建立当前行临时配置。
+
+### CosyVoice
+
+CosyVoice 已作为一等开源 provider 接入，排序在 IndexTTS 之后、TTS API 之前。
+
+第一版以 endpoint 接入为主，不强制要求 `repo/CosyVoice` 存在。计划支持：
+
+- `sft`
+- `zero_shot`
+- `cross_lingual`
+- `instruct`
+
+CosyVoice 的 cluster key 设计为：
+
+```text
+service_id + mode + speaker_id + prompt_audio_path + prompt_text + instruct_text + speed + seed
+```
+
+### TTS API
+
+TTS API 当前是占位入口，用于后续接入 OpenAI、Gemini、xAI、火山引擎等商业或云端 TTS 服务。
+
+当前阶段不把 TTS API 作为核心验收目标，也不让它抢占 GPT-SoVITS、IndexTTS、CosyVoice 的主流程。
+
+## 队列与资源调度
+
+调度层使用 `resource_group` 和 `capacity` 控制并发。
+
+典型场景：
+
+- 本机单 GPU：`local-gpu-0 capacity=1`，三个开源 TTS 串行执行。
+- 局域网 GPU 机器：独立资源组，可和本机并行。
+- 云端 endpoint：独立资源组，可按服务声明容量并行。
+
+队列按 provider、service 和 cluster key 聚合：
+
+- GPT-SoVITS：按 logs、GPT 权重、SoVITS 权重、参考音频和参考文本聚合。
+- IndexTTS：按参考音频、情绪模式、情绪来源和高级参数聚合。
+- CosyVoice：按模式、speaker、prompt audio、prompt text、instruction、speed 和 seed 聚合。
+
+当前策略：
+
+- 同资源组按容量限制执行。
+- 不同资源组可以并行。
+- 当前已加载 cluster 有待执行任务时优先继续执行。
+- 否则优先选择待执行数量最多的 cluster。
+- 使用等待时间避免长期饥饿。
+- 本机服务不在每组任务后强制 unload，优先减少频繁加载卸载成本。
+
+## 角色库与项目角色
+
+角色库支持全局预设角色和项目角色引用。
+
+当前规则：
+
+- 全局角色库保存角色名、别名、昵称、匹配名和多个 provider binding。
+- 项目剧本解析后，项目角色按名称、别名、昵称等字段匹配全局角色。
+- 命中角色库时，项目角色默认引用全局配置。
+- 生成或交付前可以冻结为项目快照。
+- 未命中角色不会自动分配错误音色，需要用户手动配置当前行或加入角色库。
+
+GPT-SoVITS 角色配置以 logs 为核心入口。IndexTTS 以行级临时参考音频配置为主要入口。CosyVoice 绑定为普通 voice binding，不影响 GPT-SoVITS 的 logs-first 逻辑。
+
+## 剧本与生成历史
+
+项目数据采用文件制。
+
+核心概念：
+
+- `ScriptProject`：一个剧本配音项目。
+- `ScriptRevision`：剧本文本版本。
+- `ParseRevision`：某个剧本文本版本对应的解析结果。
+- `ScriptLine`：稳定台词行，使用 `line_uid` 关联生成历史。
+- `GenerationVersion`：某一行的某次生成结果。
+
+重新编辑或重新解析剧本会创建新版本分支，不覆盖旧台词和旧音频。生成历史记录中会保存：
+
+- provider
+- service
+- binding
+- 参数摘要
+- requested load signature
+- verified load signature
+- 音频路径
+- 状态
+- 错误摘要
+
+历史音频播放器保留在中间台词行展开区域；右侧面板只在用户选中某个历史版本时显示对应参数。
+
+## 当前开发进展
+
+截至当前主分支，已经完成：
+
+- 建立外层 FastAPI + React 工作台框架。
+- 建立真实网络 endpoint 优先的服务抽象。
+- 将 GPT-SoVITS、IndexTTS、CosyVoice 纳入核心开源 provider 队列。
+- 将 TTS API 保留为占位 provider。
+- 增加开源 TTS 接入目录、检测和本地配置写入接口。
+- 增加 `服务与资源 -> 开源接入` 向导。
+- 建立 data/templates 与 data/local 的发布隔离策略。
+- 清理旧 mock demo 和真实本机资源泄漏风险。
+- 建立脱敏演示项目模板。
+- 增强服务状态、队列状态、生成签名和真实模式校验。
+- 优化生成工作台信息架构，持续向紧凑、生产型 UI 收敛。
+- GitHub 与 Gitee 团队仓库主分支同步流程已打通。
+
+近期仍在推进：
+
+- 进一步压缩右侧生成配置面板的视觉噪音。
+- 优化角色筛选、台词行和历史音频播放器的空间效率。
+- 强化服务下拉只展示真实可用 endpoint 的规则。
+- 完善 CosyVoice 实际 endpoint 的 smoke test。
+- 完善本机 managed 服务启动、停止和日志标准化。
+- 增加更完整的端到端真实服务验收。
+
+## 本地开发
+
+### 安装依赖
 
 ```powershell
 py -3.10 -m venv .venv
@@ -30,87 +313,79 @@ cd frontend
 pnpm install
 ```
 
-Copy `.env.example` to `.env.local` to configure local endpoint paths, parser providers, or commercial TTS keys. Do not commit `.env.local`.
-
-## Run
+### 启动开发环境
 
 ```powershell
 .\scripts\start-dev.ps1
 ```
 
-Backend: `http://127.0.0.1:8000`  
-Frontend: `http://127.0.0.1:5173`
+默认地址：
 
-## Open-Source TTS Services
+- 后端：`http://127.0.0.1:8000`
+- 前端：`http://127.0.0.1:5173`
 
-TTS More itself is installed first:
+### 模型准备
+
+本机模型准备脚本：
 
 ```powershell
-git clone https://github.com/XucroYuri/TTS_more.git
+.\scripts\prepare-models.ps1 -Source ModelScope -Device CU128
 ```
 
-If you do not already have compatible TTS services, clone one or more of the supported open-source projects. The `repo/` folder is the recommended local convention, but any local path can be bound later in the app.
+该脚本面向本机真实环境，可能下载大模型并创建子项目虚拟环境。运行前请确认磁盘、网络、CUDA 和 Python 环境。
+
+## 验证
+
+常规回归：
 
 ```powershell
-git clone https://github.com/XucroYuri/GPT-SoVITS.git repo/GPT-SoVITS
-git clone https://github.com/XucroYuri/index-tts.git repo/index-tts
-git clone https://github.com/XucroYuri/CosyVoice.git repo/CosyVoice
-```
-
-These forks are stable mirrors for TTS More integration. Compatible upstream deployments can also be used as long as their HTTP contract matches.
-
-In the app, open `服务与资源 -> 开源接入` to choose one of four access paths:
-
-- Local repo: bind a local project path and optionally configure start/stop/log commands. Inference still uses the endpoint URL.
-- Local endpoint: connect to a service already running on `127.0.0.1` or `0.0.0.0`.
-- LAN endpoint: connect to a trusted machine by IP and port.
-- Public URL: connect to a cloud or public endpoint. Process control is not available for remote services.
-
-Configurations created by the onboarding flow are written to `data/local/services.json`. Templates under `data/templates/` stay sanitized and should not contain local paths, LAN IPs, generated audio, or private role bindings.
-
-The built-in provider order is:
-
-`GPT-SoVITS -> IndexTTS -> CosyVoice -> TTS API`
-
-TTS API providers are currently placeholders in the product flow. The main reliability work targets the three open-source TTS services.
-
-## Service Mode
-
-TTS More defaults to real network endpoint mode. Local and remote services are both called through the URLs in `data/services.json`; a stopped local service is shown as not started and is not treated as ready.
-
-For local GPT-SoVITS and IndexTTS generation:
-
-1. Prepare local model resources:
-
-   ```powershell
-   .\scripts\prepare-models.ps1 -Source ModelScope -Device CU128
-   ```
-
-   The script creates separate virtual environments under `repo/GPT-SoVITS/.venv` and `repo/index-tts/.venv`; downloads IndexTTS checkpoints to `repo/index-tts/checkpoints`; and writes suggested real-mode values to `.env.local` when that file does not exist.
-
-2. Start local standard workers with `.\scripts\start-service-workers.ps1`. Add `-StartGPTSoVITS` if the GPT-SoVITS Python environment is ready.
-3. Edit `data/services.json` for remote machines by adding external endpoints with their own `resource_group`.
-4. Optional commercial TTS providers are first-class services. Configure keys in `.env.local` only; `services.json` references env var names such as `OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, and the Volcengine app/token/cluster variables.
-
-The routing layer uses provider type, API contract, capabilities, voice bindings, health, priority, and resource group. Default priority keeps GPT-SoVITS first, IndexTTS second, and CosyVoice third, with TTS API or generic HTTP providers available as opt-in placeholders. VibeVoice is no longer a local core model; register it as an external generic HTTP endpoint only if you still want to use it.
-
-For a deeper deployment and scheduling guide, see [docs/open-source-tts-services.md](docs/open-source-tts-services.md).
-
-Reference audio and trained weights are loaded from local runtime configuration. Keep private paths in `.env.local` or `data/local/services.json`; the repository only ships neutral templates under `data/templates/`.
-
-## Verify
-
-```powershell
-& .\.venv\Scripts\python.exe -m pytest backend
+& .\.venv\Scripts\python.exe -m pytest backend -q
 cd frontend
 pnpm test -- --run
 pnpm build
 ```
 
-Real core-model validation is gated because it requires large models and local GPU resources:
+真实 TTS 验收需要本机或网络 endpoint、模型资源和 GPU：
 
 ```powershell
 $env:TTS_MORE_SERVICE_MODE="real"
 $env:TTS_MORE_RUN_REAL_TTS="1"
 & .\.venv\Scripts\python.exe -m pytest backend/tests/test_real_tts_validation.py -q
 ```
+
+真实模式下禁止伪装 mock 成功。如果模型、权重、参考音频或服务端口缺失，验收应返回明确诊断。
+
+## 发布与安全治理
+
+提交前必须确认：
+
+- `repo/` 不提交。
+- `.env.local` 不提交。
+- `data/local/` 不提交。
+- 生成音频、模型权重、manifest 运行历史不提交。
+- 本机路径、UNC 路径、局域网 IP 不进入模板和 README。
+- 真实角色库不进入公开模板。
+- 测试 fixture 中的 mock 不进入产品默认路径。
+
+可使用：
+
+```powershell
+git status --short
+git check-ignore -v data/local/services.json data/local/characters.json .env.local repo/GPT-SoVITS/README.md
+& .\.venv\Scripts\python.exe -m pytest backend/tests/test_release_governance.py -q
+```
+
+## 远端仓库
+
+当前主分支已同步到：
+
+- GitHub：`https://github.com/XucroYuri/TTS_more`
+- Gitee 团队仓库：`https://gitee.com/chengdu-flower-food/TTS_more`
+
+团队内部提交和 PR 默认使用中文标题与中文描述，便于开发同步和审查。
+
+## 参考文档
+
+- [开源 TTS 服务接入与混合部署](docs/open-source-tts-services.md)
+- [发布治理说明](docs/release-governance.md)
+- [前端设计基线](frontend/design.md)
