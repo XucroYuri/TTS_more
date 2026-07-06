@@ -329,7 +329,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       newScriptCreated: "剧本已创建",
       newScriptTitleRequired: "请输入剧本标题",
       newScriptCreateFailed: "创建剧本失败",
-      revisionRisk: "保存或重新解析会创建新的剧本/解析版本分支，不会覆盖旧台词和旧音频。是否继续？",
+      revisionRisk: "保存或重新解析会创建新的版本，已有的台词和音频不会被删除。是否继续？",
       activeRevision: "活动版本",
       noRevisions: "暂无版本历史"
     },
@@ -409,13 +409,13 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     confirm: {
       revision: {
-        title: "创建新的剧本版本分支",
-        detail: "旧剧本、旧解析结果和已经生成的音频会保留在历史中；新解析结果会成为当前工作版本。",
-        confirm: "创建新分支"
+        title: "创建新版本",
+        detail: "已有的台词、解析结果和音频会保留在历史中，新版本会成为当前工作版本。",
+        confirm: "创建新版本"
       },
       fallback: {
-        title: "启动本机兜底服务",
-        detail: "启动后会占用本机显存和推理资源；完成启动检查后会重新执行生成前检查。",
+        title: "改用本地服务",
+        detail: "本地服务会使用本机显存和推理资源，启动后会重新检查并继续生成。",
         confirm: "启动并继续"
       }
     },
@@ -551,11 +551,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       loadVerificationLevel: "验证等级",
       lastLoadError: "最近加载错误",
       diagnosticsReason: {
-        ready: "加载状态正常",
-        not_loaded: "当前服务尚未加载本行所需配置",
-        signature_mismatch: "当前服务加载配置与本行预期不一致",
-        error: "服务最近一次加载失败",
-        manual: "手动展开服务加载细节"
+        ready: "音色已就绪",
+        not_loaded: "服务尚未加载本行所需音色",
+        signature_mismatch: "当前加载的音色与本行设置不一致",
+        error: "音色加载失败",
+        manual: "查看音色加载详情"
       }
     },
     validation: {
@@ -577,12 +577,12 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     preflight: {
       check: "生成前检查",
-      ready: "检查就绪",
-      needsAction: "需启动兜底",
-      blocked: "检查阻塞",
-      loaded: "当前已加载",
-      switchNeeded: "需切换加载",
-      notLoaded: "待加载"
+      ready: "可以生成",
+      needsAction: "需启动本地服务",
+      blocked: "暂无法生成",
+      loaded: "音色已加载",
+      switchNeeded: "需切换音色",
+      notLoaded: "等待加载"
     },
     status: {
       saved: "已保存",
@@ -654,6 +654,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       generating: "正在生成…",
       generated: "生成完成",
       generationFailed: "生成失败",
+      generationCancelled: "已取消生成",
+      generationCancelling: "正在取消…",
       jobQueued: "任务已入队 {{job}}",
       jobTimeout: "任务轮询超时",
       validating: "正在验收…",
@@ -692,9 +694,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       avatarUploaded: "角色头像已更新",
       avatarUploadFailed: "角色头像上传失败",
       linesNeedBinding: "{{count}} 行缺少音色绑定，已跳过",
-      preflightNeedsFallback: "局域网服务不可用，可启动本机兜底服务：{{service}}",
-      preflightBlocked: "生成前检查未通过：{{reason}}",
-      preflightSummary: "生成前检查：{{ready}} 条就绪，{{action}} 条需处理，{{blocked}} 条阻塞",
+      preflightNeedsFallback: "网络服务暂不可用，可以改用本地服务：{{service}}",
+      preflightBlocked: "暂时无法生成：{{reason}}",
+      preflightSummary: "已检查：{{ready}} 条就绪，{{action}} 条需处理，{{blocked}} 条暂不可用",
       preflightFailed: "生成前检查失败",
       fallbackStarted: "本机兜底服务已启动",
       fallbackStartFailed: "本机兜底服务启动失败",
@@ -1016,7 +1018,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       newScriptCreated: "Script created",
       newScriptTitleRequired: "Enter a script title",
       newScriptCreateFailed: "Script creation failed",
-      revisionRisk: "Saving or parsing creates a new script/parse branch and keeps old lines and audio history. Continue?",
+      revisionRisk: "Saving or parsing creates a new version. Existing lines and audio are kept in history. Continue?",
       activeRevision: "Active revision",
       noRevisions: "No revision history"
     },
@@ -1096,13 +1098,13 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     confirm: {
       revision: {
-        title: "Create a new script branch",
-        detail: "Existing script revisions, parse results, and generated audio stay in history. The new parse result becomes the active working version.",
-        confirm: "Create branch"
+        title: "Create a new version",
+        detail: "Existing lines, parse results, and generated audio stay in history. The new version becomes the active working copy.",
+        confirm: "Create new version"
       },
       fallback: {
-        title: "Start local fallback service",
-        detail: "This will use local GPU and inference resources. After startup checks pass, generation preflight runs again.",
+        title: "Use local service instead",
+        detail: "The local service uses this machine's GPU and inference resources. After startup checks pass, generation continues.",
         confirm: "Start and continue"
       }
     },
@@ -1238,11 +1240,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       loadVerificationLevel: "Verification level",
       lastLoadError: "Last load error",
       diagnosticsReason: {
-        ready: "Load state is ready",
-        not_loaded: "The current service has not loaded this line's required config",
-        signature_mismatch: "The service load config does not match this line",
-        error: "The last service load failed",
-        manual: "Service load details are expanded manually"
+        ready: "Voice is ready",
+        not_loaded: "The service has not loaded the voice this line needs",
+        signature_mismatch: "The loaded voice does not match this line's settings",
+        error: "Voice loading failed",
+        manual: "View voice loading details"
       }
     },
     validation: {
@@ -1264,12 +1266,12 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     preflight: {
       check: "Preflight",
-      ready: "Preflight ready",
-      needsAction: "Needs fallback",
-      blocked: "Preflight blocked",
-      loaded: "Loaded now",
-      switchNeeded: "Switch needed",
-      notLoaded: "Not loaded"
+      ready: "Ready to generate",
+      needsAction: "Start local service",
+      blocked: "Cannot generate yet",
+      loaded: "Voice loaded",
+      switchNeeded: "Voice switch needed",
+      notLoaded: "Waiting to load"
     },
     status: {
       saved: "Saved",
@@ -1341,6 +1343,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       generating: "Generating…",
       generated: "Generated",
       generationFailed: "Generation failed",
+      generationCancelled: "Generation cancelled",
+      generationCancelling: "Cancelling…",
       jobQueued: "Job queued {{job}}",
       jobTimeout: "Job polling timed out",
       validating: "Validating…",
@@ -1379,12 +1383,12 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       avatarUploaded: "Role avatar updated",
       avatarUploadFailed: "Role avatar upload failed",
       linesNeedBinding: "{{count}} lines need a Voice Binding and were skipped",
-      preflightNeedsFallback: "LAN service is unavailable. Start local fallback service: {{service}}",
-      preflightBlocked: "Generation preflight blocked: {{reason}}",
-      preflightSummary: "Preflight: {{ready}} ready, {{action}} need action, {{blocked}} blocked",
-      preflightFailed: "Preflight failed",
-      fallbackStarted: "Local fallback service started",
-      fallbackStartFailed: "Failed to start local fallback service",
+      preflightNeedsFallback: "Network service is unavailable. You can switch to a local service: {{service}}",
+      preflightBlocked: "Cannot generate yet: {{reason}}",
+      preflightSummary: "Checked: {{ready}} ready, {{action}} need attention, {{blocked}} unavailable",
+      preflightFailed: "Pre-check failed",
+      fallbackStarted: "Local service started",
+      fallbackStartFailed: "Failed to start local service",
       uploadingReference: "Uploading reference audio…",
       referenceUploaded: "Reference audio saved to this project",
       referenceUploadFailed: "Reference audio upload failed"
