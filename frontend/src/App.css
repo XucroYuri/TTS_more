@@ -2029,6 +2029,8 @@ h3 {
 .open-source-existing-list {
   display: grid;
   gap: 6px;
+  max-height: 132px;
+  overflow: auto;
 }
 
 .open-source-existing-card {
@@ -2040,6 +2042,14 @@ h3 {
   border: 1px solid var(--geist-gray-200);
   border-radius: var(--radius-sm);
   background: var(--geist-bg-subtle);
+}
+
+.open-source-existing-card strong,
+.open-source-existing-card small {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .llm-provider-card,
@@ -4548,7 +4558,7 @@ h3 {
 .tts-access-card {
   display: grid;
   align-content: start;
-  gap: var(--space-3);
+  gap: var(--space-2);
   min-width: 0;
   padding: var(--space-3);
   border: 1px solid var(--geist-gray-200);
@@ -4567,13 +4577,8 @@ h3 {
 }
 
 .tts-provider-segment .open-source-mode-card {
-  min-height: 44px;
-}
-
-.tts-provider-segment .open-source-mode-card span {
-  color: var(--geist-blue-700);
-  font-size: 11px;
-  line-height: 14px;
+  align-content: center;
+  min-height: 38px;
 }
 
 .open-source-mode-grid.compact {
@@ -4582,6 +4587,10 @@ h3 {
 
 .tts-access-form {
   grid-template-columns: 1fr;
+}
+
+.tts-access-form .wide {
+  gap: 6px;
 }
 
 .open-source-detect-card.compact {
@@ -4596,8 +4605,10 @@ h3 {
 }
 
 .tts-access-maintenance summary {
-  display: grid;
-  gap: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
   min-width: 0;
   padding: var(--space-2);
   cursor: pointer;
@@ -4625,6 +4636,23 @@ h3 {
   display: grid;
   gap: var(--space-2);
   padding: 0 var(--space-2) var(--space-2);
+}
+
+.tts-access-maintenance[open] summary {
+  border-bottom: 1px solid var(--geist-gray-200);
+}
+
+.tts-access-maintenance[open] .tts-access-maintenance-body {
+  padding-top: var(--space-2);
+}
+
+.tts-maintenance-tools {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  align-items: end;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--geist-gray-200);
 }
 
 .open-source-actions.compact {
@@ -7477,6 +7505,7 @@ h3 {
 
   .tts-access-panel,
   .tts-access-form,
+  .tts-maintenance-tools,
   .open-source-detect-card.compact {
     grid-template-columns: 1fr;
   }
@@ -7537,7 +7566,8 @@ h3 {
     min-height: 0;
   }
 
-  .llm-api-modal {
+  .llm-api-modal,
+  .service-access-modal {
     height: auto;
     max-height: calc(100vh - 16px);
   }

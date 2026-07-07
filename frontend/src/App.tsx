@@ -94,7 +94,7 @@ import { filterAndSortProjectSummaries, nextProjectAfterDelete } from "./lib/scr
 import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
-import { buildGradioEndpointRequest, gradioContractForProvider, sourceProfileForEndpointUrl } from "./lib/ttsAccess";
+import { buildGradioEndpointRequest, gradioContractForProvider } from "./lib/ttsAccess";
 import { createToast, inferToastLevel, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
 import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
@@ -1941,13 +1941,7 @@ export default function App() {
                         {servicePanelSection === "open-source" && (
                           <div className="tts-access-panel">
                             <section className="tts-access-card tts-access-primary">
-                              <div className="open-source-panel-head">
-                                <div>
-                                  <strong>{t("services.openSourceChooseEngine")}</strong>
-                                  <span>{t("services.openSourceSimpleHint")}</span>
-                                </div>
-                              </div>
-                              <div className="tts-provider-segment">
+                              <div className="tts-provider-segment" aria-label={t("services.openSourceChooseEngine")}>
                                 {openSourceCatalog.map((item) => (
                                   <button
                                     className={`open-source-mode-card ${selectedOpenSourceProvider === item.provider_type ? "active" : ""}`}
@@ -1956,7 +1950,6 @@ export default function App() {
                                     type="button"
                                   >
                                     <strong>{item.display_name}</strong>
-                                    {selectedOpenSourceProvider === item.provider_type && <span>{t("audioInput.current")}</span>}
                                   </button>
                                 ))}
                                 {openSourceCatalog.length === 0 && <div className="empty-row">{t("services.openSourceNoCatalog")}</div>}
@@ -1965,7 +1958,6 @@ export default function App() {
                                 <label className="wide">
                                   <span>{t("services.openSourceBaseUrl")}</span>
                                   <input value={openSourceBaseUrl} onChange={(event) => setOpenSourceBaseUrl(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_base_url} />
-                                  <small>{t("services.openSourceEndpointHint")}</small>
                                 </label>
                               </div>
                               <div className="open-source-actions">
@@ -1980,41 +1972,7 @@ export default function App() {
                                   <small>{openSourceDetectResult ? setupStateLabel(openSourceDetectResult.setup_state, t) : t("services.openSourceAdvancedHint", { count: configuredOpenSourceServices.length })}</small>
                                 </summary>
                                 <div className="tts-access-maintenance-body">
-                                  <label className="library-field compact">
-                                    <span>{t("services.openSourceDisplayName")}</span>
-                                    <input value={openSourceDisplayName} onChange={(event) => setOpenSourceDisplayName(event.target.value)} placeholder={selectedOpenSourceCatalog?.display_name} />
-                                  </label>
-                                  <div className="open-source-actions compact">
-                                    <button className="secondary-button compact-button" onClick={() => void refreshOpenSourceCatalog()}>
-                                      <RefreshCw size={13} /> {t("services.openSourceRefreshCatalog")}
-                                    </button>
-                                    <button className="secondary-button compact-button" onClick={() => void runOpenSourceDetect()} disabled={isDetectingOpenSource || isConfiguringOpenSource || !openSourceBaseUrl}>
-                                      {isDetectingOpenSource ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("services.openSourceDetect")}
-                                    </button>
-                                  </div>
-                                  <div className="open-source-detect-summary">
-                                    <span>{t("services.openSourceApiContract")}</span>
-                                    <strong>{gradioContractForProvider(selectedOpenSourceProvider)}</strong>
-                                    <small>{sourceProfileLabel(sourceProfileForEndpointUrl(openSourceBaseUrl || selectedOpenSourceCatalog?.default_base_url || ""), t)}</small>
-                                  </div>
-                                  {openSourceDetectResult && (
-                                    <div className={`open-source-detect-card compact state-${setupStateTone(openSourceDetectResult.setup_state)}`}>
-                                      <div>
-                                        <span>{t("services.openSourceSetupState")}</span>
-                                        <strong>{setupStateLabel(openSourceDetectResult.setup_state, t)}</strong>
-                                      </div>
-                                      <div>
-                                        <span>{t("services.openSourceEndpointReachable")}</span>
-                                        <strong>{booleanLabel(openSourceDetectResult.endpoint_reachable, t)}</strong>
-                                      </div>
-                                      <p>{openSourceDetectResult.env_hint}</p>
-                                    </div>
-                                  )}
                                   <div className="open-source-existing">
-                                    <div className="open-source-section-head">
-                                      <strong>{t("services.openSourceExisting")}</strong>
-                                      <span>{configuredOpenSourceServices.length}</span>
-                                    </div>
                                     <div className="open-source-existing-list">
                                       {configuredOpenSourceServices.map((service) => {
                                         const state = ttsServiceState(service, runningServiceIds.has(service.service_id ?? ""), runtime?.service_mode);
@@ -2030,6 +1988,33 @@ export default function App() {
                                         );
                                       })}
                                       {configuredOpenSourceServices.length === 0 && <div className="empty-row compact">{t("services.noService")}</div>}
+                                    </div>
+                                  </div>
+                                  {openSourceDetectResult && (
+                                    <div className={`open-source-detect-card compact state-${setupStateTone(openSourceDetectResult.setup_state)}`}>
+                                      <div>
+                                        <span>{t("services.openSourceSetupState")}</span>
+                                        <strong>{setupStateLabel(openSourceDetectResult.setup_state, t)}</strong>
+                                      </div>
+                                      <div>
+                                        <span>{t("services.openSourceEndpointReachable")}</span>
+                                        <strong>{booleanLabel(openSourceDetectResult.endpoint_reachable, t)}</strong>
+                                      </div>
+                                      <p>{openSourceDetectResult.env_hint}</p>
+                                    </div>
+                                  )}
+                                  <div className="tts-maintenance-tools">
+                                    <label className="library-field compact">
+                                      <span>{t("services.openSourceDisplayName")}</span>
+                                      <input value={openSourceDisplayName} onChange={(event) => setOpenSourceDisplayName(event.target.value)} placeholder={selectedOpenSourceCatalog?.display_name} />
+                                    </label>
+                                    <div className="open-source-actions compact">
+                                      <button className="secondary-button compact-button" onClick={() => void refreshOpenSourceCatalog()}>
+                                        <RefreshCw size={13} /> {t("services.openSourceRefreshCatalog")}
+                                      </button>
+                                      <button className="secondary-button compact-button" onClick={() => void runOpenSourceDetect()} disabled={isDetectingOpenSource || isConfiguringOpenSource || !openSourceBaseUrl}>
+                                        {isDetectingOpenSource ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("services.openSourceDetect")}
+                                      </button>
                                     </div>
                                   </div>
                                 </div>
