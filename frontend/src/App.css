@@ -5928,6 +5928,7 @@ h3 {
   gap: 5px;
   max-width: 178px;
   min-height: 24px;
+  min-width: 24px;
   padding: 0 7px;
   border: 1px solid var(--geist-gray-200);
   border-radius: 999px;
@@ -5945,6 +5946,19 @@ h3 {
   flex: 0 0 auto;
   border-radius: 999px;
   background: var(--geist-green-600);
+}
+
+.generation-method-state-pill:not(.tone-warn):not(.tone-danger) {
+  justify-content: center;
+  width: 24px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+}
+
+.generation-method-state-pill:not(.tone-warn):not(.tone-danger):hover {
+  border-color: var(--geist-gray-200);
+  background: var(--geist-bg-subtle);
 }
 
 .generation-method-state-pill > span:not(.state-dot):not(.state-action) {
@@ -5981,7 +5995,7 @@ h3 {
 
 .generation-method-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 5px;
 }
 
@@ -5990,8 +6004,8 @@ h3 {
   align-items: center;
   justify-content: center;
   min-width: 0;
-  min-height: 32px;
-  padding: 0 8px;
+  min-height: 30px;
+  padding: 0 6px;
   border: 1px solid var(--geist-gray-200);
   border-radius: var(--radius-sm);
   text-align: center;
@@ -6024,6 +6038,61 @@ h3 {
 .generation-method-panel {
   display: grid;
   gap: var(--space-2);
+}
+
+.voice-route-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.single-field-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.inspector-more-settings {
+  display: grid;
+  min-width: 0;
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg-subtle);
+}
+
+.inspector-more-settings > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-height: 30px;
+  padding: 0 8px;
+  cursor: pointer;
+  color: var(--geist-gray-1000);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  list-style: none;
+}
+
+.inspector-more-settings > summary::-webkit-details-marker {
+  display: none;
+}
+
+.inspector-more-settings > summary::after {
+  content: "+";
+  color: var(--geist-gray-700);
+  font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.inspector-more-settings[open] > summary::after {
+  content: "-";
+}
+
+.inspector-more-body {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-2);
+  border-top: 1px solid var(--geist-gray-200);
 }
 
 .route-status-inline {
@@ -6529,7 +6598,8 @@ h3 {
 }
 
 .index-temporary-panel,
-.advanced-params {
+.advanced-params,
+.cosyvoice-temporary-panel {
   display: grid;
   gap: var(--space-2);
 }
@@ -7141,7 +7211,8 @@ h3 {
 
   .gpt-resource-summary-grid,
   .gpt-resource-control-grid,
-  .gpt-manual-reference-card {
+  .gpt-manual-reference-card,
+  .voice-route-grid {
     grid-template-columns: 1fr;
   }
 

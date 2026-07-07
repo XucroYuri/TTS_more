@@ -524,7 +524,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       clearTemporaryBinding: "清除临时配置",
       needsTemporaryBinding: "该角色未匹配角色库，需要先建立临时 TTS 配置",
       needsTemporaryBindingShort: "需临时配置",
-      createIndexTemporary: "使用 IndexTTS 临时配音",
+      createIndexTemporary: "临时配音",
       uploadVoiceReference: "上传音色参考",
       uploadEmotionReference: "上传情绪参考",
       emotionMode: "情绪控制",
@@ -549,7 +549,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       currentLineSummary: "当前台词摘要",
       routeAndVoice: "生成路由",
       generationMethod: "生成方式",
+      voiceSetup: "配音设置",
       methodHelp: "先选择生成方式，再配置该方式需要的音色和参考资源。",
+      routeSettings: "路由设置",
       commercialProvider: "商用服务",
       genericHttp: "通用 HTTP",
       gptRolePreset: "角色预设",
@@ -585,10 +587,10 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       hideDiagnosticsShort: "收起",
       noRoutableService: "暂无可用服务",
       method: {
-        gpt: "GPT-SoVITS 训练音色",
-        indextts: "IndexTTS 参考音频",
-        cosyvoice: "CosyVoice 零样本/预设",
-        commercial: "TTS API"
+        gpt: "GPT",
+        indextts: "Index",
+        cosyvoice: "Cosy",
+        commercial: "API"
       },
       methodHint: {
         gpt: "使用训练好的角色音色，适合固定角色长期配音",
@@ -597,6 +599,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         commercial: "调用外部 TTS API 的声音和风格参数"
       },
       soundReference: "声音资源",
+      voiceReference: "音色参考",
+      weightsAndReference: "权重与参考",
+      emotionAndParams: "情绪与参数",
       referenceSectionHint: "参考音频、参考文本和情绪控制只跟随当前服务与配置方案生效",
       backupReferenceAudio: "备用参考来源",
       versionParamsApplied: "已载入选中版本参数，可调整后生成新版本",
@@ -1280,7 +1285,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       clearTemporaryBinding: "Clear temporary binding",
       needsTemporaryBinding: "This role is not matched to the library. Create a temporary TTS binding first.",
       needsTemporaryBindingShort: "Needs setup",
-      createIndexTemporary: "Use temporary IndexTTS",
+      createIndexTemporary: "Temporary voice",
       uploadVoiceReference: "Upload voice reference",
       uploadEmotionReference: "Upload emotion reference",
       emotionMode: "Emotion control",
@@ -1305,7 +1310,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       currentLineSummary: "Current line summary",
       routeAndVoice: "Generation route",
       generationMethod: "Generation method",
+      voiceSetup: "Voice setup",
       methodHelp: "Choose the generation method first, then configure only the voice and reference resources it needs.",
+      routeSettings: "Route settings",
       commercialProvider: "Commercial provider",
       genericHttp: "Generic HTTP",
       gptRolePreset: "Role preset",
@@ -1341,10 +1348,10 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       hideDiagnosticsShort: "Hide",
       noRoutableService: "No usable service",
       method: {
-        gpt: "GPT-SoVITS trained voice",
-        indextts: "IndexTTS reference audio",
-        cosyvoice: "CosyVoice zero-shot/preset",
-        commercial: "TTS API"
+        gpt: "GPT",
+        indextts: "Index",
+        cosyvoice: "Cosy",
+        commercial: "API"
       },
       methodHint: {
         gpt: "Use a trained character voice for recurring roles",
@@ -1353,6 +1360,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         commercial: "Use voice and style parameters from an external TTS API"
       },
       soundReference: "Voice resources",
+      voiceReference: "Voice reference",
+      weightsAndReference: "Weights and reference",
+      emotionAndParams: "Emotion and params",
       referenceSectionHint: "Reference audio, transcripts, and emotion controls follow the selected service and profile",
       backupReferenceAudio: "Backup reference source",
       versionParamsApplied: "Selected version parameters are loaded; adjust them to generate a new version",

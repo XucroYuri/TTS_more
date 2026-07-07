@@ -3056,7 +3056,7 @@ export default function App() {
                   <section className="inspector-card inspector-config-card">
                     <div className="inspector-section-head compact generation-method-head">
                       <div>
-                        <strong>{t("inspector.generationMethod")}</strong>
+                        <strong>{t("inspector.voiceSetup")}</strong>
                       </div>
                       <button
                         className={`generation-method-state-pill tone-${activeInspectorDiagnostics.tone}`}
@@ -3065,11 +3065,7 @@ export default function App() {
                         title={diagnosticsExpanded || activeInspectorDiagnostics.expanded ? t("inspector.hideDiagnosticsShort") : t("inspector.showDiagnosticsShort")}
                       >
                         <span className="state-dot" />
-                        <span>
-                          {activeInspectorDiagnostics.visible
-                            ? t(`inspector.diagnosticsReason.${activeInspectorDiagnostics.reason}`)
-                            : t("inspector.diagnosticsReadyShort")}
-                        </span>
+                        {activeInspectorDiagnostics.visible && <span>{t(`inspector.diagnosticsReason.${activeInspectorDiagnostics.reason}`)}</span>}
                         {activeInspectorDiagnostics.visible && (
                           <span className="state-action">
                             {diagnosticsExpanded || activeInspectorDiagnostics.expanded ? t("inspector.hideDiagnosticsShort") : t("inspector.showDiagnosticsShort")}
@@ -3108,55 +3104,62 @@ export default function App() {
                           </select>
                         </label>
                       )}
-                      <div className="field-grid compact-field-grid">
-                      <label>
-                        <span>{t(activeGenerationRouteLabels.profileLabelKey)}</span>
-                        <select value={activeVersionDraft?.profile ?? lineProfile(activeLine, resolvedCharacters)} onChange={(event) => {
-                          if (activeVersionDraft) {
-                            updateActiveVersionDraft({ profile: event.target.value });
-                          } else {
-                            updateLine(activeLine.id, { profile_override: event.target.value, binding_override: null, service_override: null, engine_override: null });
-                          }
-                        }}>
-                          {activeLine.temporary_binding && <option value={activeLine.temporary_binding.binding_id}>{t("inspector.temporaryBinding")}</option>}
-                          {activeProfiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}
-                          {activeProfiles.length === 0 && <option value={lineProfile(activeLine, resolvedCharacters)}>{lineProfile(activeLine, resolvedCharacters) || t("inspector.noProfile")}</option>}
-                        </select>
-                      </label>
-                      <label>
-                        <span>{t(activeGenerationRouteLabels.bindingLabelKey)}</span>
-                        <select value={activeVersionDraft?.binding_id ?? activeLine.binding_override ?? ""} onChange={(event) => {
-                          if (activeVersionDraft) {
-                            updateActiveVersionDraft({ binding_id: event.target.value || null });
-                          } else {
-                            updateLine(activeLine.id, { binding_override: event.target.value || null, service_override: null });
-                          }
-                        }}>
-                          {activeVersionDraft && <option value={activeVersionDraft.binding_id ?? ""}>{t("inspector.versionDraft")} · {activeVersionDraft.binding_id ?? selectedHistoryVersion?.version_id}</option>}
-                          {activeLine.temporary_binding && <option value="">{t("inspector.temporaryBinding")} · {activeLine.temporary_binding.provider_type}</option>}
-                          {!activeLine.temporary_binding && <option value="">{t("inspector.profileDefault")}{activeBinding ? ` · ${activeBinding.provider_type}` : ""}</option>}
-                          {activeBindings.map((binding) => <option value={binding.binding_id} key={binding.binding_id}>{binding.provider_type} · {binding.binding_id}</option>)}
-                        </select>
-                      </label>
-                      <label>
-                        <span>{t(activeGenerationRouteLabels.serviceLabelKey)}</span>
-                        <select value={activeSelectedServiceUnavailable ? "" : (activeVersionDraft?.service_id ?? lineServiceId(activeLine, resolvedCharacters) ?? "")} onChange={(event) => {
-                          const nextServiceId = event.target.value || null;
-                          if (activeVersionDraft) {
-                            updateActiveVersionDraft({
-                              service_id: nextServiceId,
-                              parameters: clearServiceScopedBindingConfig(activeProvider, activeVersionDraft.parameters)
-                            });
-                          } else {
-                            updateLineService(activeLine.id, nextServiceId);
-                          }
-                        }}>
-                          <option value="">{t("inspector.autoRoute")}</option>
-                          {activeRouteServices.length === 0 && <option value="" disabled>{t("inspector.noRoutableService")}</option>}
-                          {activeRouteServices.map((service) => <option value={service.service_id} key={service.service_id ?? service.engine}>{service.display_name ?? service.service_id} · {service.resource_group ?? t("status.resource")}</option>)}
-                        </select>
-                      </label>
+                      <div className="field-grid compact-field-grid voice-route-grid">
+                        <label>
+                          <span>{t(activeGenerationRouteLabels.profileLabelKey)}</span>
+                          <select value={activeVersionDraft?.profile ?? lineProfile(activeLine, resolvedCharacters)} onChange={(event) => {
+                            if (activeVersionDraft) {
+                              updateActiveVersionDraft({ profile: event.target.value });
+                            } else {
+                              updateLine(activeLine.id, { profile_override: event.target.value, binding_override: null, service_override: null, engine_override: null });
+                            }
+                          }}>
+                            {activeLine.temporary_binding && <option value={activeLine.temporary_binding.binding_id}>{t("inspector.temporaryBinding")}</option>}
+                            {activeProfiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}
+                            {activeProfiles.length === 0 && <option value={lineProfile(activeLine, resolvedCharacters)}>{lineProfile(activeLine, resolvedCharacters) || t("inspector.noProfile")}</option>}
+                          </select>
+                        </label>
+                        <label>
+                          <span>{t(activeGenerationRouteLabels.bindingLabelKey)}</span>
+                          <select value={activeVersionDraft?.binding_id ?? activeLine.binding_override ?? ""} onChange={(event) => {
+                            if (activeVersionDraft) {
+                              updateActiveVersionDraft({ binding_id: event.target.value || null });
+                            } else {
+                              updateLine(activeLine.id, { binding_override: event.target.value || null, service_override: null });
+                            }
+                          }}>
+                            {activeVersionDraft && <option value={activeVersionDraft.binding_id ?? ""}>{t("inspector.versionDraft")} · {activeVersionDraft.binding_id ?? selectedHistoryVersion?.version_id}</option>}
+                            {activeLine.temporary_binding && <option value="">{t("inspector.temporaryBinding")} · {activeLine.temporary_binding.provider_type}</option>}
+                            {!activeLine.temporary_binding && <option value="">{t("inspector.profileDefault")}{activeBinding ? ` · ${activeBinding.provider_type}` : ""}</option>}
+                            {activeBindings.map((binding) => <option value={binding.binding_id} key={binding.binding_id}>{binding.provider_type} · {binding.binding_id}</option>)}
+                          </select>
+                        </label>
                       </div>
+                      <details className="inspector-more-settings route-settings" open={activeSelectedServiceUnavailable || undefined}>
+                        <summary>{t("inspector.routeSettings")}</summary>
+                        <div className="inspector-more-body">
+                          <div className="field-grid compact-field-grid single-field-grid">
+                            <label>
+                              <span>{t(activeGenerationRouteLabels.serviceLabelKey)}</span>
+                              <select value={activeSelectedServiceUnavailable ? "" : (activeVersionDraft?.service_id ?? lineServiceId(activeLine, resolvedCharacters) ?? "")} onChange={(event) => {
+                                const nextServiceId = event.target.value || null;
+                                if (activeVersionDraft) {
+                                  updateActiveVersionDraft({
+                                    service_id: nextServiceId,
+                                    parameters: clearServiceScopedBindingConfig(activeProvider, activeVersionDraft.parameters)
+                                  });
+                                } else {
+                                  updateLineService(activeLine.id, nextServiceId);
+                                }
+                              }}>
+                                <option value="">{t("inspector.autoRoute")}</option>
+                                {activeRouteServices.length === 0 && <option value="" disabled>{t("inspector.noRoutableService")}</option>}
+                                {activeRouteServices.map((service) => <option value={service.service_id} key={service.service_id ?? service.engine}>{service.display_name ?? service.service_id} · {service.resource_group ?? t("status.resource")}</option>)}
+                              </select>
+                            </label>
+                          </div>
+                        </div>
+                      </details>
                     </div>
                     {(diagnosticsExpanded || activeInspectorDiagnostics.expanded) && (
                       <div className={`load-signature-panel inspector-inline-diagnostics tone-${activeInspectorDiagnostics.tone} ${activeServiceLoadState?.last_error ? "attention" : ""}`}>
@@ -3181,7 +3184,7 @@ export default function App() {
                   <section className="inspector-card reference-panel inspector-reference-card">
                     <div className="inspector-section-head compact reference-section-head">
                       <div>
-                        <strong><Library size={15} /> {t("inspector.soundReference")}</strong>
+                        <strong><Library size={15} /> {t("inspector.voiceReference")}</strong>
                       </div>
                       <div className="reference-head-actions">
                         {activeLine.temporary_binding && (
@@ -3217,94 +3220,99 @@ export default function App() {
                             </div>
                           </div>
 
-                          <div className="gpt-resource-control-grid">
-                            <div className="gpt-resource-column">
-                              <label className="resource-field">
-                                <span>{t("inspector.gptWeights")}</span>
-                                <select value={stringConfig(activeBindingConfig.gpt_weights_path)} onChange={(event) => updateActiveBindingConfig({ gpt_weights_path: event.target.value || undefined })}>
-                                  <option value="">{t("inspector.autoDefault")}</option>
-                                  {voiceCandidates?.gpt_sovits.gpt_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
-                                </select>
-                              </label>
-                              <label className="resource-field">
-                                <span>{t("inspector.sovitsWeights")}</span>
-                                <select value={stringConfig(activeBindingConfig.sovits_weights_path)} onChange={(event) => updateActiveBindingConfig({ sovits_weights_path: event.target.value || undefined })}>
-                                  <option value="">{t("inspector.autoDefault")}</option>
-                                  {voiceCandidates?.gpt_sovits.sovits_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
-                                </select>
-                              </label>
-                            </div>
-
-                            <div className="gpt-resource-column">
-                              <div className="logs-reference-picker">
-                                <label className="resource-field">
-                                  <span>{t("inspector.logsReferenceAudio")}</span>
-                                  <select
-                                    value={activeLogsReferenceSample?.sample_id ?? ""}
-                                    disabled={!activeLogsReferenceRequest || loadingLogsReferenceKey === activeLogsReferenceRequest?.key}
-                                    onChange={(event) => {
-                                      const sample = activeLogsReferenceSamples.find((item) => item.sample_id === event.target.value);
-                                      if (sample) applyLogsReferenceSample(sample);
-                                    }}
-                                  >
-                                    <option value="">{activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
-                                    {activeLogsReferenceSamples.map((sample) => (
-                                      <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
-                                    ))}
-                                  </select>
-                                </label>
-                                <button
-                                  className="icon-button"
-                                  disabled={!activeLogsReferenceRequest}
-                                  onClick={() => {
-                                    if (!activeLogsReferenceRequest) return;
-                                    setLogsReferenceAudio((current) => {
-                                      const next = { ...current };
-                                      delete next[activeLogsReferenceRequest.key];
-                                      return next;
-                                    });
-                                  }}
-                                  title={t("inspector.refreshLogsReference")}
-                                >
-                                  <RefreshCw size={14} />
-                                </button>
-                              </div>
-                              {isLogsReferenceFromOtherService && (
-                                <div className="empty-row compact attention">
-                                  {t("inspector.logsReferenceServiceMismatch")}
+                          <details className="inspector-more-settings reference-settings">
+                            <summary>{t("inspector.weightsAndReference")}</summary>
+                            <div className="inspector-more-body">
+                              <div className="gpt-resource-control-grid">
+                                <div className="gpt-resource-column">
+                                  <label className="resource-field">
+                                    <span>{t("inspector.gptWeights")}</span>
+                                    <select value={stringConfig(activeBindingConfig.gpt_weights_path)} onChange={(event) => updateActiveBindingConfig({ gpt_weights_path: event.target.value || undefined })}>
+                                      <option value="">{t("inspector.autoDefault")}</option>
+                                      {voiceCandidates?.gpt_sovits.gpt_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
+                                    </select>
+                                  </label>
+                                  <label className="resource-field">
+                                    <span>{t("inspector.sovitsWeights")}</span>
+                                    <select value={stringConfig(activeBindingConfig.sovits_weights_path)} onChange={(event) => updateActiveBindingConfig({ sovits_weights_path: event.target.value || undefined })}>
+                                      <option value="">{t("inspector.autoDefault")}</option>
+                                      {voiceCandidates?.gpt_sovits.sovits_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
+                                    </select>
+                                  </label>
                                 </div>
-                              )}
-                              {activeLogsReferenceRequest && activeLogsReferenceSamples.length === 0 && (
-                                <div className="empty-row compact">
-                                  {loadingLogsReferenceKey === activeLogsReferenceRequest.key ? t("inspector.loadingLogsReference") : (activeLogsReferencePayload?.diagnostics?.[0]?.detail ?? t("inspector.noLogsReferenceAudio"))}
-                                </div>
-                              )}
 
-                              {activeLogsReferenceSample && (
-                                <div className="logs-reference-preview compact-reference-preview">
-                                  <div>
-                                    <span>{t("inspector.textSource")}: {activeLogsReferenceSample.text_source || t("status.unset")}</span>
-                                    <strong>{activeLogsReferenceSample.text || t("inspector.emptyPromptText")}</strong>
+                                <div className="gpt-resource-column">
+                                  <div className="logs-reference-picker">
+                                    <label className="resource-field">
+                                      <span>{t("inspector.logsReferenceAudio")}</span>
+                                      <select
+                                        value={activeLogsReferenceSample?.sample_id ?? ""}
+                                        disabled={!activeLogsReferenceRequest || loadingLogsReferenceKey === activeLogsReferenceRequest?.key}
+                                        onChange={(event) => {
+                                          const sample = activeLogsReferenceSamples.find((item) => item.sample_id === event.target.value);
+                                          if (sample) applyLogsReferenceSample(sample);
+                                        }}
+                                      >
+                                        <option value="">{activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
+                                        {activeLogsReferenceSamples.map((sample) => (
+                                          <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
+                                        ))}
+                                      </select>
+                                    </label>
+                                    <button
+                                      className="icon-button"
+                                      disabled={!activeLogsReferenceRequest}
+                                      onClick={() => {
+                                        if (!activeLogsReferenceRequest) return;
+                                        setLogsReferenceAudio((current) => {
+                                          const next = { ...current };
+                                          delete next[activeLogsReferenceRequest.key];
+                                          return next;
+                                        });
+                                      }}
+                                      title={t("inspector.refreshLogsReference")}
+                                    >
+                                      <RefreshCw size={14} />
+                                    </button>
                                   </div>
-                                  {isLocalAudioAsset(activeLogsReferenceSample.path) && <WaveformPlayer audioPath={activeLogsReferenceSample.path} label={activeLogsReferenceSample.display_label} />}
-                                </div>
-                              )}
-                            </div>
-                          </div>
+                                  {isLogsReferenceFromOtherService && (
+                                    <div className="empty-row compact attention">
+                                      {t("inspector.logsReferenceServiceMismatch")}
+                                    </div>
+                                  )}
+                                  {activeLogsReferenceRequest && activeLogsReferenceSamples.length === 0 && (
+                                    <div className="empty-row compact">
+                                      {loadingLogsReferenceKey === activeLogsReferenceRequest.key ? t("inspector.loadingLogsReference") : (activeLogsReferencePayload?.diagnostics?.[0]?.detail ?? t("inspector.noLogsReferenceAudio"))}
+                                    </div>
+                                  )}
 
-                          <div className="gpt-manual-reference-card">
-                            <label className="resource-field manual-reference-text-field">
-                              <span>{t("inspector.promptText")}</span>
-                              <textarea value={stringConfig(activeBindingConfig.prompt_text)} onChange={(event) => updateActiveBindingConfig({ prompt_text: event.target.value })} placeholder={t("inspector.promptPlaceholder")} rows={3} />
-                            </label>
-                            <div className="manual-reference-audio-field">
-                              <ReferenceAudioInput
-                                label={t("inspector.referenceAudio")}
-                                value={stringConfig(activeBindingConfig.ref_audio_path)}
-                                onUpload={(file) => uploadLineReference(file, "ref_audio_path")}
-                              />
+                                  {activeLogsReferenceSample && (
+                                    <div className="logs-reference-preview compact-reference-preview">
+                                      <div>
+                                        <span>{t("inspector.textSource")}: {activeLogsReferenceSample.text_source || t("status.unset")}</span>
+                                        <strong>{activeLogsReferenceSample.text || t("inspector.emptyPromptText")}</strong>
+                                      </div>
+                                      {isLocalAudioAsset(activeLogsReferenceSample.path) && <WaveformPlayer audioPath={activeLogsReferenceSample.path} label={activeLogsReferenceSample.display_label} />}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="gpt-manual-reference-card">
+                                <label className="resource-field manual-reference-text-field">
+                                  <span>{t("inspector.promptText")}</span>
+                                  <textarea value={stringConfig(activeBindingConfig.prompt_text)} onChange={(event) => updateActiveBindingConfig({ prompt_text: event.target.value })} placeholder={t("inspector.promptPlaceholder")} rows={3} />
+                                </label>
+                                <div className="manual-reference-audio-field">
+                                  <ReferenceAudioInput
+                                    label={t("inspector.referenceAudio")}
+                                    value={stringConfig(activeBindingConfig.ref_audio_path)}
+                                    onUpload={(file) => uploadLineReference(file, "ref_audio_path")}
+                                  />
+                                </div>
+                              </div>
                             </div>
-                          </div>
+                          </details>
                         </div>
                       </>
                     )}
@@ -3316,66 +3324,68 @@ export default function App() {
                           value={stringConfig(activeBindingConfig.voice)}
                           onUpload={(file) => uploadLineReference(file, "voice")}
                         />
-                        <div className="emotion-mode-control" role="radiogroup" aria-label={t("inspector.emotionMode")}>
-                          <span>{t("inspector.emotionMode")}</span>
-                          <div>
-                            {([
-                              ["same_as_voice", t("inspector.emotionSameAsVoice")],
-                              ["emotion_audio", t("inspector.emotionAudio")],
-                              ["emotion_vector", t("inspector.emotionVector")],
-                              ["emotion_text", t("inspector.emotionText")]
-                            ] as const).map(([mode, label]) => {
-                              const currentMode = stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice";
-                              return (
-                                <button
-                                  aria-checked={currentMode === mode}
-                                  className={`emotion-mode-option ${currentMode === mode ? "active" : ""}`}
-                                  key={mode}
-                                  onClick={() => updateActiveBindingConfig({ emotion_mode: mode })}
-                                  role="radio"
-                                  type="button"
-                                >
-                                  {label}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                        {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_text" && (
-                          <label className="resource-field">
-                            <span>{t("inspector.emotionText")}</span>
-                            <input value={stringConfig(activeBindingConfig.emotion_text)} onChange={(event) => updateActiveBindingConfig({ emotion_text: event.target.value })} placeholder={activeLine.note || t("inspector.emotionTextPlaceholder")} />
-                          </label>
-                        )}
-                        {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_audio" && (
-                          <ReferenceAudioInput
-                            label={t("inspector.uploadEmotionReference")}
-                            value={stringConfig(activeBindingConfig.emotion_audio)}
-                            onUpload={(file) => uploadLineReference(file, "emotion_audio")}
-                          />
-                        )}
-                        {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_vector" && (
-                          <label className="resource-field">
-                            <span>{t("inspector.emotionVector")}</span>
-                            <input value={vectorConfig(activeBindingConfig.emotion_vector)} onChange={(event) => updateActiveBindingConfig({ emotion_vector: parseVectorConfig(event.target.value) })} placeholder="0,0,0,0,0,0,0,0" />
-                          </label>
-                        )}
-                        <details className="advanced-params">
-                          <summary>{t("inspector.advancedParams")}</summary>
-                          <div className="advanced-grid">
-                            {[
-                              ["top_p", 0.8],
-                              ["top_k", 30],
-                              ["temperature", 0.8],
-                              ["num_beams", 3],
-                              ["repetition_penalty", 10],
-                              ["max_mel_tokens", 1500]
-                            ].map(([key, fallback]) => (
-                              <label key={String(key)}>
-                                <span>{String(key)}</span>
-                                <input value={String(activeBindingConfig[String(key)] ?? fallback)} onChange={(event) => updateActiveBindingConfig({ [String(key)]: Number(event.target.value) })} />
+                        <details className="inspector-more-settings reference-settings">
+                          <summary>{t("inspector.emotionAndParams")}</summary>
+                          <div className="inspector-more-body">
+                            <div className="emotion-mode-control" role="radiogroup" aria-label={t("inspector.emotionMode")}>
+                              <span>{t("inspector.emotionMode")}</span>
+                              <div>
+                                {([
+                                  ["same_as_voice", t("inspector.emotionSameAsVoice")],
+                                  ["emotion_audio", t("inspector.emotionAudio")],
+                                  ["emotion_vector", t("inspector.emotionVector")],
+                                  ["emotion_text", t("inspector.emotionText")]
+                                ] as const).map(([mode, label]) => {
+                                  const currentMode = stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice";
+                                  return (
+                                    <button
+                                      aria-checked={currentMode === mode}
+                                      className={`emotion-mode-option ${currentMode === mode ? "active" : ""}`}
+                                      key={mode}
+                                      onClick={() => updateActiveBindingConfig({ emotion_mode: mode })}
+                                      role="radio"
+                                      type="button"
+                                    >
+                                      {label}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                            {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_text" && (
+                              <label className="resource-field">
+                                <span>{t("inspector.emotionText")}</span>
+                                <input value={stringConfig(activeBindingConfig.emotion_text)} onChange={(event) => updateActiveBindingConfig({ emotion_text: event.target.value })} placeholder={activeLine.note || t("inspector.emotionTextPlaceholder")} />
                               </label>
-                            ))}
+                            )}
+                            {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_audio" && (
+                              <ReferenceAudioInput
+                                label={t("inspector.uploadEmotionReference")}
+                                value={stringConfig(activeBindingConfig.emotion_audio)}
+                                onUpload={(file) => uploadLineReference(file, "emotion_audio")}
+                              />
+                            )}
+                            {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_vector" && (
+                              <label className="resource-field">
+                                <span>{t("inspector.emotionVector")}</span>
+                                <input value={vectorConfig(activeBindingConfig.emotion_vector)} onChange={(event) => updateActiveBindingConfig({ emotion_vector: parseVectorConfig(event.target.value) })} placeholder="0,0,0,0,0,0,0,0" />
+                              </label>
+                            )}
+                            <div className="advanced-grid">
+                              {[
+                                ["top_p", 0.8],
+                                ["top_k", 30],
+                                ["temperature", 0.8],
+                                ["num_beams", 3],
+                                ["repetition_penalty", 10],
+                                ["max_mel_tokens", 1500]
+                              ].map(([key, fallback]) => (
+                                <label key={String(key)}>
+                                  <span>{String(key)}</span>
+                                  <input value={String(activeBindingConfig[String(key)] ?? fallback)} onChange={(event) => updateActiveBindingConfig({ [String(key)]: Number(event.target.value) })} />
+                                </label>
+                              ))}
+                            </div>
                           </div>
                         </details>
                       </div>
@@ -3433,16 +3443,21 @@ export default function App() {
                             <textarea value={stringConfig(activeBindingConfig.instruct_text)} onChange={(event) => updateActiveBindingConfig({ instruct_text: event.target.value })} placeholder={t("inspector.cosyInstructionPlaceholder")} rows={3} />
                           </label>
                         )}
-                        <div className="advanced-grid compact-cosyvoice-grid">
-                          <label>
-                            <span>{t("inspector.cosySpeed")}</span>
-                            <input value={String(activeBindingConfig.speed ?? 1)} onChange={(event) => updateActiveBindingConfig({ speed: Number(event.target.value) })} />
-                          </label>
-                          <label>
-                            <span>{t("inspector.cosySeed")}</span>
-                            <input value={String(activeBindingConfig.seed ?? -1)} onChange={(event) => updateActiveBindingConfig({ seed: Number(event.target.value) })} />
-                          </label>
-                        </div>
+                        <details className="inspector-more-settings reference-settings">
+                          <summary>{t("inspector.advancedParams")}</summary>
+                          <div className="inspector-more-body">
+                            <div className="advanced-grid compact-cosyvoice-grid">
+                              <label>
+                                <span>{t("inspector.cosySpeed")}</span>
+                                <input value={String(activeBindingConfig.speed ?? 1)} onChange={(event) => updateActiveBindingConfig({ speed: Number(event.target.value) })} />
+                              </label>
+                              <label>
+                                <span>{t("inspector.cosySeed")}</span>
+                                <input value={String(activeBindingConfig.seed ?? -1)} onChange={(event) => updateActiveBindingConfig({ seed: Number(event.target.value) })} />
+                              </label>
+                            </div>
+                          </div>
+                        </details>
                       </div>
                     )}
 

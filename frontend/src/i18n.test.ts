@@ -51,6 +51,8 @@ describe("i18n configuration", () => {
     expect(tText(resources["zh-CN"], "script.manageScriptShort")).toBe("切换");
     expect(tText(resources["zh-CN"], "script.sourceExcerpt")).toBe("原文摘录");
     expect(tText(resources["zh-CN"], "script.parseRevision")).toBe("提取台词");
+    expect(tText(resources["zh-CN"], "inspector.method.gpt")).toBe("GPT");
+    expect(tText(resources["zh-CN"], "inspector.createIndexTemporary")).toBe("临时配音");
     expect(tText(resources["en-US"], "topbar.roleLibrary")).toBe("Roles");
     expect(tText(resources["en-US"], "characters.libraryManager")).toBe("Roles and voices");
     expect(tText(resources["en-US"], "characters.bindToProjectRole")).toBe("Use in this project");
@@ -69,5 +71,7 @@ describe("i18n configuration", () => {
     expect(tText(resources["en-US"], "script.manageScriptShort")).toBe("Switch");
     expect(tText(resources["en-US"], "script.sourceExcerpt")).toBe("Source excerpt");
     expect(tText(resources["en-US"], "script.parseRevision")).toBe("Extract lines");
+    expect(tText(resources["en-US"], "inspector.method.indextts")).toBe("Index");
+    expect(tText(resources["en-US"], "inspector.createIndexTemporary")).toBe("Temporary voice");
   });
 });
