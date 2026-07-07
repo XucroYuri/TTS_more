@@ -1130,6 +1130,15 @@ def _gpt_sovits_gradio_logs_candidates(service_id: str, payload: dict[str, Any])
     ref_component = components.get((ref_dep.get("outputs") or [None])[0])
     role_component = components.get((model_dep.get("outputs") or [None])[0])
 
+    # GPT-SoVITS WebUI does not define api_name on its refresh button, so the
+    # dependency-based lookup above returns nothing. Fall back to finding the
+    # dropdown components by label — GPT-SoVITS uses "GPT模型列表" /
+    # "SoVITS模型列表" (and the English equivalents in localized builds).
+    if gpt_component is None:
+        gpt_component = _find_dropdown_by_label(components, ("GPT",), ("SoVITS",))
+    if sovits_component is None:
+        sovits_component = _find_dropdown_by_label(components, ("SoVITS",), ("GPT",))
+
     grouped: dict[str, dict[str, Any]] = {}
     for role in _gradio_choices(role_component):
         if role in {"全部", "All", "all"}:
@@ -1194,6 +1203,29 @@ def _prefer_recommended(item: dict[str, Any], kind: str, option: dict[str, Any])
         item[score_key] = score
 
 
+def _find_dropdown_by_label(
+    components: dict[Any, dict[str, Any]],
+    include_keywords: tuple[str, ...],
+    exclude_keywords: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    """Find a Gradio dropdown component by matching its label keywords.
+
+    GPT-SoVITS labels its model dropdowns "GPT模型列表" / "SoVITS模型列表".
+    Localized builds may use "GPT model list" / "SoVITS model list".
+    """
+    for component in components.values():
+        props = component.get("props") or {}
+        if component.get("type") != "dropdown":
+            continue
+        label = str(props.get("label") or "")
+        if not any(keyword.lower() in label.lower() for keyword in include_keywords):
+            continue
+        if any(keyword.lower() in label.lower() for keyword in exclude_keywords):
+            continue
+        return component
+    return None
+
+
 def _gradio_choices(component: dict[str, Any] | None) -> list[str]:
     if not component:
         return []
@@ -1245,17 +1277,36 @@ def _weight_score_tuple(value: str) -> tuple[int, int]:
 
 def _slugish(value: str) -> str:
     import re
+    import unicodedata
 
-    fallback = {"小": "xiao", "品": "pin", "光": "guang", "严": "yan", "镜": "jing", "王": "wang", "强": "qiang", "旁": "pang", "白": "bai"}
     tokens: list[str] = []
+    current: list[str] = []
+    current_is_ascii: bool | None = None
     for char in value.strip():
-        if char.isascii() and char.isalnum():
-            tokens.append(char.lower())
-        elif char in fallback:
-            tokens.append(fallback[char])
-    if tokens:
-        return "-".join(tokens)
-    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "logs"
+        normalized = unicodedata.normalize("NFKC", char)
+        is_ascii_alnum = normalized.isascii() and normalized.isalnum()
+        is_non_ascii_alnum = (not normalized.isascii()) and normalized.isalnum()
+        if not (is_ascii_alnum or is_non_ascii_alnum):
+            # Separator character — flush current token.
+            if current:
+                tokens.append("".join(current))
+                current = []
+                current_is_ascii = None
+            continue
+        if current_is_ascii is None:
+            current_is_ascii = is_ascii_alnum
+            current.append(normalized.lower() if is_ascii_alnum else normalized)
+        elif is_ascii_alnum == current_is_ascii:
+            current.append(normalized.lower() if is_ascii_alnum else normalized)
+        else:
+            tokens.append("".join(current))
+            current = [normalized.lower() if is_ascii_alnum else normalized]
+            current_is_ascii = is_ascii_alnum
+    if current:
+        tokens.append("".join(current))
+    slug = "-".join(token for token in tokens if token)
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug or "logs"
 
 
 def _gradio_language(value: Any) -> str:

@@ -6,7 +6,7 @@ import httpx
 
 from app.adapters.base import SynthesisRequest
 from app.models import EngineName, ScriptLine, TTSServiceEndpoint
-from app.services import ServiceRegistry, ServiceRouter, build_load_signature, _health_timeout_seconds, build_service_client
+from app.services import ServiceRegistry, ServiceRouter, build_load_signature, _health_timeout_seconds, build_service_client, _gpt_sovits_gradio_logs_candidates, _slugish
 
 
 class ReadyClient:
@@ -655,3 +655,63 @@ def test_router_falls_back_to_first_ready_service() -> None:
     route = router.resolve(EngineName.GPT_SOVITS, fallback_service_ids=["offline-gpt", "online-gpt"])
 
     assert route.endpoint.service_id == "online-gpt"
+
+
+def test_slugish_keeps_distinct_chinese_names_separate() -> None:
+    """Regression: _slugish previously mapped all Chinese names not in a small
+    fallback dict to the same key 'logs', collapsing distinct characters into
+    one candidate. Chinese characters must be preserved so each role groups
+    independently."""
+    assert _slugish("主角") != _slugish("导师")
+    assert _slugish("主角") == "主角"
+    assert _slugish("导师") == "导师"
+    assert _slugish("English-Name") == "english-name"
+
+
+def test_gradio_logs_candidates_extracts_weights_by_label_without_api_name() -> None:
+    """GPT-SoVITS WebUI does not define api_name on its refresh button, so the
+    dependency-based component lookup returns nothing. Candidates must still be
+    extracted by matching dropdown labels ('GPT模型列表' / 'SoVITS模型列表')."""
+    config = {
+        "components": [
+            {
+                "id": 0,
+                "type": "dropdown",
+                "props": {
+                    "label": "GPT模型列表",
+                    "choices": [
+                        "GPT_weights/主角-e20.ckpt",
+                        "GPT_weights/导师-e15.ckpt",
+                    ],
+                    "value": "GPT_weights/主角-e20.ckpt",
+                },
+            },
+            {
+                "id": 1,
+                "type": "dropdown",
+                "props": {
+                    "label": "SoVITS模型列表",
+                    "choices": [
+                        "SoVITS_weights/主角-e20.pth",
+                        "SoVITS_weights/导师-e15.pth",
+                    ],
+                    "value": "SoVITS_weights/主角-e20.pth",
+                },
+            },
+        ],
+        "dependencies": [],
+    }
+
+    candidates = _gpt_sovits_gradio_logs_candidates("lan-gpt-sovits", config)
+
+    assert len(candidates) == 2
+    by_name = {c["logs_name"]: c for c in candidates}
+
+    assert "主角" in by_name
+    assert "导师" in by_name
+
+    hero = by_name["主角"]
+    assert hero["recommended_gpt_weights_path"] == "GPT_weights/主角-e20.ckpt"
+    assert hero["recommended_sovits_weights_path"] == "SoVITS_weights/主角-e20.pth"
+    assert len(hero["gpt_weights"]) == 1
+    assert len(hero["sovits_weights"]) == 1
