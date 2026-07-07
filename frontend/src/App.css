@@ -2093,10 +2093,7 @@ h3 {
 }
 
 .llm-preset-line {
-  padding: 8px 10px;
-  border: 1px solid var(--geist-gray-200);
-  border-radius: var(--radius-sm);
-  background: var(--geist-bg-subtle);
+  color: var(--geist-gray-900);
 }
 
 .llm-preset-grid {
@@ -2228,6 +2225,7 @@ h3 {
 }
 
 .llm-title-block,
+.llm-section-title,
 .llm-policy-card,
 .llm-provider-main {
   display: grid;
@@ -2243,6 +2241,7 @@ h3 {
 }
 
 .llm-title-block span,
+.llm-section-title span,
 .llm-policy-card span,
 .llm-section-head span,
 .llm-provider-card small,
@@ -2341,13 +2340,13 @@ h3 {
 
 .llm-provider-card {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
   grid-template-areas:
-    "dot main priority"
-    "dot endpoint endpoint"
-    "dot chips chips";
+    "dot main"
+    "dot chips";
   gap: 5px var(--space-2);
-  min-height: 82px;
+  min-height: 58px;
   padding: var(--space-2);
   border: 1px solid var(--geist-gray-200);
   border-radius: var(--radius-sm);
@@ -2538,6 +2537,30 @@ h3 {
 .llm-detail-actions {
   padding-top: var(--space-2);
   border-top: 1px solid var(--geist-gray-200);
+}
+
+.llm-extra-settings {
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg);
+}
+
+.llm-extra-settings summary {
+  min-height: 32px;
+  padding: 7px 9px;
+  color: var(--geist-gray-1000);
+  font-size: 12px;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.llm-extra-settings[open] summary {
+  border-bottom: 1px solid var(--geist-gray-200);
+}
+
+.llm-extra-form {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  padding: var(--space-2);
 }
 
 .llm-detail-grid {
@@ -7479,7 +7502,8 @@ h3 {
   .llm-preset-grid,
   .llm-api-key-row,
   .llm-advanced-layout,
-  .llm-simple-form {
+  .llm-simple-form,
+  .llm-extra-form {
     grid-template-columns: 1fr;
   }
 

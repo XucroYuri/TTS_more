@@ -38,7 +38,7 @@ describe("i18n configuration", () => {
     expect(tText(resources["zh-CN"], "services.ttsAccessTitle")).toBe("添加 TTS 服务");
     expect(tText(resources["zh-CN"], "services.openSourceDetect")).toBe("检测连接");
     expect(tText(resources["zh-CN"], "services.llmApiTitle")).toBe("剧本解析");
-    expect(tText(resources["zh-CN"], "parser.advancedConfig")).toBe("其他解析服务");
+    expect(tText(resources["zh-CN"], "parser.advancedConfig")).toBe("高级服务");
     expect(tText(resources["zh-CN"], "services.openSourceDetectAndSave")).toBe("检测并保存");
     expect(tText(resources["zh-CN"], "services.openSourceDetectNotSaved")).toBe("检测完成：{{state}}，未保存");
     expect(tText(resources["zh-CN"], "inspector.diagnosticsReadyShort")).toBe("API 正常");
@@ -60,7 +60,7 @@ describe("i18n configuration", () => {
     expect(tText(resources["en-US"], "services.openSourceDetect")).toBe("Test connection");
     expect(tText(resources["en-US"], "topbar.ttsConfig")).toBe("Setup");
     expect(tText(resources["en-US"], "services.llmApiTitle")).toBe("Script parser");
-    expect(tText(resources["en-US"], "parser.advancedConfig")).toBe("Other parser services");
+    expect(tText(resources["en-US"], "parser.advancedConfig")).toBe("Advanced services");
     expect(tText(resources["en-US"], "services.openSourceDetectAndSave")).toBe("Detect and save");
     expect(tText(resources["en-US"], "services.openSourceDetectNotSaved")).toBe("Detection complete: {{state}}; not saved");
     expect(tText(resources["en-US"], "inspector.diagnosticsReadyShort")).toBe("API ready");

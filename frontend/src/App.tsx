@@ -1852,8 +1852,10 @@ export default function App() {
               <button
                 className={`topbar-action-button menu-trigger service-status-trigger tone-${serviceSummary.parser.tone} ${servicePanelSection === "llm" && isTopologyMenuOpen ? "active" : ""}`}
                 onClick={() => {
+                  const shouldOpen = servicePanelSection !== "llm" || !isTopologyMenuOpen;
                   setServicePanelSection("llm");
-                  setIsTopologyMenuOpen((open) => servicePanelSection === "llm" ? !open : true);
+                  setIsTopologyMenuOpen(shouldOpen);
+                  if (shouldOpen) setIsLlmAdvancedOpen(false);
                 }}
                 title={llmTopbarTitle(serviceSummary, t)}
               >
@@ -2229,7 +2231,7 @@ export default function App() {
                                     <span className={`llm-state-dot ${kwjmActivationState}`} />
                                     {kwjmActivationStateLabel(kwjmActivationState, t)}
                                   </span>
-                                  <button className="secondary-button compact-button" onClick={() => setIsLlmAdvancedOpen((open) => !open)}>
+                                  <button className="secondary-button compact-button" onClick={() => setIsLlmAdvancedOpen((open) => !open)} aria-expanded={isLlmAdvancedOpen}>
                                     <SlidersHorizontal size={14} /> {t(isLlmAdvancedOpen ? "parser.hideAdvancedConfig" : "parser.advancedConfig")}
                                   </button>
                                 </div>
@@ -2265,15 +2267,17 @@ export default function App() {
 
                             {isLlmAdvancedOpen && (
                               <section className="llm-advanced-panel">
-                              <div className="llm-section-head">
-                                <strong><SlidersHorizontal size={15} /> {t("parser.providerDirectory")}</strong>
-                                <span>{t("parser.advancedSummary", {
-                                  enabled: parserProviders.filter((provider) => provider.enabled).length,
-                                  total: parserProviders.length,
-                                  keys: parserProviders.filter((provider) => parserProviderHasUsableKey(provider)).length
-                                })}</span>
-                              </div>
-                              <p className="llm-advanced-hint">{t("parser.providerHint")}</p>
+                                <div className="llm-section-head">
+                                  <div className="llm-section-title">
+                                    <strong><SlidersHorizontal size={15} /> {t("parser.providerDirectory")}</strong>
+                                    <span>{t("parser.providerHint")}</span>
+                                  </div>
+                                  <span>{t("parser.advancedSummary", {
+                                    enabled: parserProviders.filter((provider) => provider.enabled).length,
+                                    total: parserProviders.length,
+                                    keys: parserProviders.filter((provider) => parserProviderHasUsableKey(provider)).length
+                                  })}</span>
+                                </div>
                               <div className="llm-advanced-layout">
                                 <div className="llm-provider-list compact">
                                 {parserProviders.map((provider, index) => {
@@ -2291,12 +2295,9 @@ export default function App() {
                                         <strong>{provider.name || t("parser.providerName")}</strong>
                                         <small>{provider.model || t("status.unset")}</small>
                                       </span>
-                                      <span className="llm-priority-badge">{provider.priority}</span>
-                                      <span className="llm-provider-endpoint">{provider.base_url || t("services.endpointMissing")}</span>
                                       <span className="llm-chip-row">
                                         <span className={`tracker-chip ${state === "ready" ? "ok" : state === "blocked" ? "danger" : "warn"}`}>{parserProviderStateLabel(provider, t)}</span>
                                         <span className={`tracker-chip ${parserProviderHasUsableKey(provider) ? "ok" : "warn"}`}>{t(parserProviderHasUsableKey(provider) ? "parser.keyConfigured" : "parser.keyMissing")}</span>
-                                        <span className="tracker-chip neutral">{provider.timeout_seconds}s</span>
                                         {parserProviderTestResults[index] && (
                                           <span className={`tracker-chip ${parserProviderTestResults[index].ok ? "ok" : "danger"}`}>{parserProviderTestResults[index].ok ? t("parser.testPassed") : t("parser.testFailed")}</span>
                                         )}
@@ -2341,14 +2342,6 @@ export default function App() {
                                           <input value={selectedParserProvider.model} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { model: event.target.value })} placeholder={KWJM_MODEL} />
                                         </label>
                                         <label>
-                                          <span>{t("parser.priority")}</span>
-                                          <input type="number" min={1} value={selectedParserProvider.priority} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { priority: Number(event.target.value) || 100 })} />
-                                        </label>
-                                        <label>
-                                          <span>{t("parser.apiKeyEnv")}</span>
-                                          <input value={selectedParserProvider.api_key_env} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { api_key_env: event.target.value })} placeholder={KWJM_API_KEY_ENV} />
-                                        </label>
-                                        <label>
                                           <span>{t("parser.apiKey")}</span>
                                           <input
                                             type="password"
@@ -2357,11 +2350,24 @@ export default function App() {
                                             placeholder={t(parserProviderKeyState(selectedParserProvider) === "configured" ? "parser.apiKeyPlaceholderConfigured" : "parser.apiKeyPlaceholderMissing")}
                                           />
                                         </label>
-                                        <label>
-                                          <span>{t("parser.timeout")}</span>
-                                          <input type="number" min={5} max={300} value={selectedParserProvider.timeout_seconds} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { timeout_seconds: Number(event.target.value) || 45 })} />
-                                        </label>
                                       </div>
+                                      <details className="llm-extra-settings">
+                                        <summary>{t("parser.advancedParameters")}</summary>
+                                        <div className="llm-form-grid llm-extra-form">
+                                          <label>
+                                            <span>{t("parser.priority")}</span>
+                                            <input type="number" min={1} value={selectedParserProvider.priority} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { priority: Number(event.target.value) || 100 })} />
+                                          </label>
+                                          <label>
+                                            <span>{t("parser.apiKeyEnv")}</span>
+                                            <input value={selectedParserProvider.api_key_env} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { api_key_env: event.target.value })} placeholder={KWJM_API_KEY_ENV} />
+                                          </label>
+                                          <label>
+                                            <span>{t("parser.timeout")}</span>
+                                            <input type="number" min={5} max={300} value={selectedParserProvider.timeout_seconds} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { timeout_seconds: Number(event.target.value) || 45 })} />
+                                          </label>
+                                        </div>
+                                      </details>
                                       {selectedTestResult && (
                                         <section className={`llm-test-result ${selectedTestResult.ok ? "ok" : "danger"}`}>
                                       <div>
