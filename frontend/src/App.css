@@ -7842,11 +7842,30 @@ h3 {
   }
 
   .line-table {
-    overflow-x: auto;
+    overflow-x: visible;
   }
 
-  .table-head,
+  .table-head {
+    display: none;
+  }
+
   .line-row {
-    min-width: 980px;
+    min-width: 0;
+  }
+
+  .line-primary-row {
+    grid-template-columns: 18px minmax(72px, 0.28fr) minmax(0, 1fr) auto;
+  }
+
+  .line-copy {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+  }
+
+  .line-dialogue {
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
   }
 }
