@@ -4,6 +4,8 @@ import json
 import os
 import base64
 import re
+import time
+import uuid
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -623,10 +625,15 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         sovits_weights = str(params.get("sovits_weights_path") or params.get("sovits_weights") or "")
         prompt_lang = _gradio_language(params.get("prompt_lang") or "zh")
         text_lang = _gradio_language(params.get("text_lang") or request.line.language or "zh")
+
+        # 1. Switch weights (before assembling payload).
+        weight_changed = bool(sovits_weights)
         if gpt_weights:
             self._post_gradio_api("change_gpt_weights", [gpt_weights], timeout=params.get("timeout_seconds", 600.0))
         if sovits_weights:
             self._post_gradio_api("change_sovits_weights", [sovits_weights, prompt_lang, text_lang], timeout=params.get("timeout_seconds", 600.0))
+
+        # 2. Assemble the get_tts_wav payload.
         ref_audio = params.get("ref_audio_path") or params.get("reference_audio")
         prompt_text = str(params.get("prompt_text") or "")
         selected_audio: Any = ref_audio
@@ -664,8 +671,20 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
                 params.get("sample_steps", 8),
                 bool(params.get("super_sampling", False)),
                 params.get("fragment_interval", 0.3),
+                bool(params.get("parallel_infer", True)),
             ]
+
+        # 3. Synthesize. When weights were just changed, change_sovits_weights is a
+        # generator whose Gradio queue stream closes on the first yield while model
+        # loading continues asynchronously on the server. Wait for loading to finish
+        # before calling get_tts_wav (the Gradio queue is serial — submitting
+        # get_tts_wav while the generator is still loading would queue behind it
+        # and return null, and rapid retries would flood the queue).
+        if weight_changed:
+            time.sleep(params.get("weight_load_wait_seconds", 5))
         response = self._post_gradio_api("get_tts_wav", payload, timeout=params.get("timeout_seconds", 900.0))
+        if response.get("data") is None:
+            raise RuntimeError("GPT-SoVITS get_tts_wav returned no audio (model may still be loading — try increasing weight_load_wait_seconds)")
         return self._write_gradio_audio(request, response, {"api_contract": self.endpoint.api_contract, "gradio_api_name": "get_tts_wav"})
 
     def _synthesize_indextts(self, request: SynthesisRequest) -> SynthesisResult:
@@ -783,30 +802,56 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         raise RuntimeError(f"Gradio API {api_name!r} failed: {last_error}")
 
     def _post_gradio_queue_api(self, api_name: str, data: list[Any], timeout: float | int | None = None, api_prefix: str = "") -> dict[str, Any]:
-        path_candidates = []
-        if api_prefix:
-            path_candidates.append(f"/{api_prefix}/call/{api_name}")
-        path_candidates.append(f"/call/{api_name}")
-        payload = {"data": data}
-        last_error: Exception | None = None
-        with httpx.Client(timeout=float(timeout or 900.0), transport=self.transport) as client:
-            for path in path_candidates:
-                try:
-                    response = client.post(self.endpoint.base_url.rstrip("/") + path, json=payload, headers=self._headers())
-                    if response.status_code == 404:
-                        continue
-                    if response.status_code >= 400:
-                        raise RuntimeError(f"{response.status_code} {response.text[:800]}")
-                    response.raise_for_status()
-                    event_id = response.json().get("event_id")
-                    if not event_id:
-                        raise RuntimeError("Gradio queue response did not include event_id")
-                    return self._read_gradio_queue_result(client, f"{path}/{event_id}")
-                except Exception as exc:
-                    last_error = exc
-        raise RuntimeError(f"Gradio queued API {api_name!r} failed: {last_error}")
+        config = self._config(timeout=timeout)
+        fn_index = _gradio_fn_index(config, api_name)
+        if fn_index is None:
+            raise RuntimeError(f"Gradio API {api_name!r} not found in dependencies")
+        session_hash = uuid.uuid4().hex[:12]
+        join_paths = [f"/{api_prefix}/queue/join", "/queue/join"] if api_prefix else ["/queue/join"]
+        data_paths = [f"/{api_prefix}/queue/data", "/queue/data"] if api_prefix else ["/queue/data"]
+        join_payload = {
+            "data": data,
+            "event_data": None,
+            "fn_index": fn_index,
+            "trigger_id": None,
+            "session_hash": session_hash,
+        }
+        # POST /queue/join with a short-lived client, then GET /queue/data with a
+        # separate streaming client. Reusing the same httpx.Client for both causes
+        # keep-alive connection issues with SSE streams on some Gradio servers.
+        request_timeout = float(timeout or 900.0)
+        joined = False
+        for join_path in join_paths:
+            try:
+                with httpx.Client(timeout=30.0, transport=self.transport) as join_client:
+                    response = join_client.post(self.endpoint.base_url.rstrip("/") + join_path, json=join_payload, headers=self._headers())
+                if response.status_code == 404:
+                    continue
+                response.raise_for_status()
+                joined = True
+                break
+            except httpx.HTTPStatusError:
+                continue
+        if not joined:
+            raise RuntimeError(f"Gradio queue join failed for {api_name!r}: no /queue/join endpoint accepted the request")
+        for data_path in data_paths:
+            try:
+                with httpx.Client(timeout=request_timeout, transport=self.transport) as stream_client:
+                    return self._read_gradio_queue_result(stream_client, f"{data_path}?session_hash={session_hash}")
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    continue
+                raise
+        raise RuntimeError(f"Gradio queued API {api_name!r} failed: no /queue/data endpoint available")
 
     def _read_gradio_queue_result(self, client: httpx.Client, stream_path: str) -> dict[str, Any]:
+        # Gradio 4.x queue/data SSE uses JSON messages with a "msg" field:
+        #   data: {"msg":"estimation","rank":0,"queue_size":1}
+        #   data: {"msg":"process_completed","output":{"data":[...]}}
+        # Gradio /call/ simple-predict uses event:/data: pairs:
+        #   event: complete
+        #   data: [...]
+        # This reader handles both formats.
         current_event = ""
         last_data: Any = None
         with client.stream("GET", self.endpoint.base_url.rstrip("/") + stream_path, headers=self._headers()) as response:
@@ -829,6 +874,17 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
                     last_data = json.loads(data_text)
                 except json.JSONDecodeError:
                     last_data = data_text
+                # Gradio 4.x queue protocol: check msg field
+                if isinstance(last_data, dict):
+                    msg = last_data.get("msg", "")
+                    if msg == "process_completed":
+                        output = last_data.get("output") or {}
+                        return {"data": output.get("data")}
+                    if msg == "close_stream":
+                        break
+                    if msg == "error" or last_data.get("success") is False:
+                        raise RuntimeError(f"Gradio queue error: {last_data.get('message') or last_data}")
+                # Gradio /call/ simple-predict protocol: check event type
                 if current_event == "error":
                     raise RuntimeError(f"Gradio queued API error: {last_data}")
                 if current_event == "complete":
@@ -1102,6 +1158,17 @@ def _gradio_api_is_queued(config: dict[str, Any], api_name: str) -> bool:
         if dependency.get("api_name") == api_name:
             return dependency.get("queue") is True
     return False
+
+
+def _gradio_fn_index(config: dict[str, Any], api_name: str) -> int | None:
+    """Find the fn_index (position in dependencies array) for a named Gradio API.
+
+    Gradio 4.x /queue/join requires fn_index instead of api_name.
+    """
+    for index, dependency in enumerate(config.get("dependencies") or []):
+        if isinstance(dependency, dict) and dependency.get("api_name") == api_name:
+            return index
+    return None
 
 
 def _gradio_api_summary(payload: dict[str, Any]) -> dict[str, Any]:

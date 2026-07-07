@@ -294,22 +294,24 @@ def test_indextts_gradio_uses_queue_call_when_dependency_is_queued(tmp_path: Pat
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url == "http://192.0.2.166:7860/config":
+            # gen_single is the first dependency (fn_index=0), queued
             return httpx.Response(200, json={"api_prefix": "/gradio_api", "dependencies": [{"api_name": "gen_single", "queue": True}]})
-        if url == "http://192.0.2.166:7860/gradio_api/call/gen_single":
-            calls.append("call")
+        if url == "http://192.0.2.166:7860/gradio_api/queue/join":
+            calls.append("join")
             payload = json.loads(request.content.decode("utf-8"))
             assert payload["data"][0] == "与音色参考音频相同"
             assert payload["data"][1] == "ref.wav"
             assert payload["data"][3] is None
+            assert payload["fn_index"] == 0
             return httpx.Response(200, json={"event_id": "evt-1"})
-        if url == "http://192.0.2.166:7860/gradio_api/call/gen_single/evt-1":
+        if "queue/data" in url and "session_hash" in url:
             calls.append("stream")
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
-                content=b'event: complete\ndata: [{"url": "/file=/tmp/generated.wav"}]\n\n',
+                content=b'data: {"msg":"process_completed","output":{"data":[{"url": "/gradio_api/file=/tmp/generated.wav"}]}}\n\n',
             )
-        if url == "http://192.0.2.166:7860/file=/tmp/generated.wav":
+        if "/file=/tmp/generated.wav" in url:
             return httpx.Response(200, content=b"RIFFqueued")
         return httpx.Response(404, json={"detail": url})
 
@@ -324,7 +326,7 @@ def test_indextts_gradio_uses_queue_call_when_dependency_is_queued(tmp_path: Pat
         )
     )
 
-    assert calls == ["call", "stream"]
+    assert calls == ["join", "stream"]
     assert result.audio_path.read_bytes() == b"RIFFqueued"
 
 
