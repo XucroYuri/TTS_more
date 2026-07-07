@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeVar
 
@@ -103,10 +105,31 @@ class ProjectStore:
                         "title": project.title,
                         "default_language": project.default_language,
                         "line_count": len(project.lines),
+                        "character_count": len(project.project_characters),
+                        "script_revision_count": len(project.script_revisions),
+                        "parse_revision_count": len(project.parse_revisions),
+                        "updated_at": datetime.fromtimestamp(project_path.stat().st_mtime, timezone.utc).isoformat(),
                     }
                 )
                 seen.add(project_id)
         return projects
+
+    def delete_project(self, project_id: str) -> Path:
+        safe_id = self._safe_project_id(project_id)
+        project_dir = self.project_dir(safe_id)
+        if not self._is_project_dir(project_dir):
+            raise FileNotFoundError(project_id)
+
+        trash_root = self.writable_projects_root() / ".trash"
+        trash_root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target = trash_root / f"{safe_id}-{timestamp}"
+        for index in range(1000):
+            candidate = target if index == 0 else trash_root / f"{safe_id}-{timestamp}-{index + 1}"
+            if not candidate.exists():
+                shutil.move(str(project_dir), str(candidate))
+                return candidate
+        raise FileExistsError("unable to allocate trash directory")
 
     def read_project_roots(self) -> list[Path]:
         env_path = os.environ.get("TTS_MORE_PROJECTS_PATH")

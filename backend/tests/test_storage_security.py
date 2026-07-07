@@ -16,6 +16,14 @@ def test_project_store_rejects_project_ids_that_escape_data_root(tmp_path: Path,
         store.project_dir(project_id)
 
 
+@pytest.mark.parametrize("project_id", ["../escape", "..\\escape", "/absolute", "C:\\temp\\escape", ""])
+def test_project_store_rejects_delete_project_ids_that_escape_data_root(tmp_path: Path, project_id: str) -> None:
+    store = ProjectStore(tmp_path)
+
+    with pytest.raises(ValueError):
+        store.delete_project(project_id)
+
+
 def test_audio_endpoint_rejects_files_outside_data_root(tmp_path: Path) -> None:
     outside_audio = tmp_path.parent / "outside.wav"
     outside_audio.write_bytes(b"RIFFfake")

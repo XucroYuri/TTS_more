@@ -129,7 +129,7 @@ class TTSServiceEndpoint(BaseModel):
     def populate_compat_fields(self) -> "TTSServiceEndpoint":
         if not self.display_name:
             self.display_name = self.service_id
-        if self.mode == "external" and self.network_scope == "localhost":
+        if self.mode == "external" and self.network_scope == "localhost" and self.source_profile != "local_endpoint":
             self.network_scope = "commercial" if self.cost_policy or "paid_provider" in self.capabilities else "lan"
         if self.mode == "external":
             self.managed = False
@@ -159,9 +159,9 @@ class TTSServiceEndpoint(BaseModel):
             self.catalog_provider = self.provider_type.value  # type: ignore[assignment]
         if not self.api_contract or self.api_contract == "tts-more-v1":
             contract_by_provider = {
-                ProviderType.GPT_SOVITS: "gpt-sovits-api-v2",
-                ProviderType.INDEX_TTS: "tts-more-v1",
-                ProviderType.COSYVOICE: "cosyvoice-http-v1",
+                ProviderType.GPT_SOVITS: "gradio-gpt-sovits-webui",
+                ProviderType.INDEX_TTS: "gradio-indextts2-webui",
+                ProviderType.COSYVOICE: "gradio-cosyvoice-webui",
                 ProviderType.VIBEVOICE: "tts-more-v1",
                 ProviderType.OPENAI: "openai-speech-v1",
                 ProviderType.GEMINI: "gemini-tts-v1",
@@ -266,6 +266,7 @@ class ProjectCharacter(BaseModel):
     library_character_id: str | None = None
     mode: ProjectCharacterMode = ProjectCharacterMode.REFERENCE
     character_snapshot: Character | None = None
+    project_binding: VoiceBinding | None = None
     match_confidence: float | None = None
     match_status: Literal["matched", "unmatched", "ambiguous", "manual"] | None = None
 

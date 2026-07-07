@@ -10,8 +10,8 @@ const lines: ScriptLine[] = [
 ];
 
 const services: WorkerHealth[] = [
-  { service_id: "local-gpt-sovits", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, base_url: "http://127.0.0.1:9880", supervisor: { service_id: "local-gpt-sovits", manageable: true, running: true } },
-  { service_id: "local-indextts", engine: "indextts", provider_type: "indextts", ready: true, base_url: "http://127.0.0.1:9881", supervisor: { service_id: "local-indextts", manageable: true, running: true } },
+  { service_id: "local-gpt-sovits", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, base_url: "http://127.0.0.1:9872", supervisor: { service_id: "local-gpt-sovits", manageable: true, running: true } },
+  { service_id: "local-indextts", engine: "indextts", provider_type: "indextts", ready: true, base_url: "http://127.0.0.1:7860", supervisor: { service_id: "local-indextts", manageable: true, running: true } },
   { service_id: "local-cosyvoice", engine: "cosyvoice", provider_type: "cosyvoice", ready: true, base_url: "http://127.0.0.1:50000" }
 ];
 
@@ -158,12 +158,12 @@ describe("workstation helpers", () => {
   it("ignores disabled optional local endpoints when LAN Gradio core services are ready", () => {
     const summary = serviceTopbarSummary(
       [
-        { service_id: "local-gpt-sovits", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: false, enabled: false, base_url: "http://127.0.0.1:9880" },
-        { service_id: "local-indextts", engine: "indextts", provider_type: "indextts", ready: false, enabled: false, base_url: "http://127.0.0.1:9881" },
+        { service_id: "local-gpt-sovits", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: false, enabled: false, base_url: "http://127.0.0.1:9872" },
+        { service_id: "local-indextts", engine: "indextts", provider_type: "indextts", ready: false, enabled: false, base_url: "http://127.0.0.1:7860" },
         { service_id: "local-cosyvoice", engine: "cosyvoice", provider_type: "cosyvoice", ready: false, enabled: false, base_url: "http://127.0.0.1:50000" },
         { service_id: "lan-gpt", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, enabled: true, base_url: "http://192.0.2.166:9872", network_scope: "lan", capabilities: ["gradio_webui"] },
         { service_id: "lan-index", engine: "indextts", provider_type: "indextts", ready: true, enabled: true, base_url: "http://192.0.2.166:7860", network_scope: "lan", capabilities: ["gradio_webui"] },
-        { service_id: "lan-cosyvoice", engine: "cosyvoice", provider_type: "cosyvoice", ready: true, enabled: true, base_url: "http://192.0.2.166:50000", network_scope: "lan", capabilities: ["cosyvoice-http-v1"] }
+        { service_id: "lan-cosyvoice", engine: "cosyvoice", provider_type: "cosyvoice", ready: true, enabled: true, base_url: "http://192.0.2.166:50000", network_scope: "lan", capabilities: ["gradio_webui"] }
       ],
       readyCandidates,
       []
@@ -176,8 +176,8 @@ describe("workstation helpers", () => {
   it("only offers routable provider services for generation routing", () => {
     const routeServices = routableProviderServices(
       [
-        { service_id: "local-gpt-disabled", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: false, enabled: false, base_url: "http://127.0.0.1:9880" },
-        { service_id: "local-gpt-stopped", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, base_url: "http://127.0.0.1:9881", supervisor: { service_id: "local-gpt-stopped", manageable: true, running: false } },
+        { service_id: "local-gpt-disabled", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: false, enabled: false, base_url: "http://127.0.0.1:9872" },
+        { service_id: "local-gpt-stopped", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, base_url: "http://127.0.0.1:9873", supervisor: { service_id: "local-gpt-stopped", manageable: true, running: false } },
         { service_id: "lan-gpt-partial", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, state: "partial", severity: "attention", setup_state: "partial", base_url: "http://192.0.2.166:9872" },
         { service_id: "lan-gpt-blocked", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, state: "blocked", severity: "danger", base_url: "http://192.0.2.166:9873" },
         { service_id: "lan-gpt-repo-missing", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, state: "ready", severity: "ready", setup_state: "repo_missing", base_url: "http://192.0.2.166:9874" },

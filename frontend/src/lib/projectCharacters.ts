@@ -1,4 +1,4 @@
-import type { Character, ProjectCharacter, ScriptProject } from "../types";
+import type { Character, EngineName, ProjectCharacter, ProviderType, ScriptProject, VoiceBinding, VoiceProfile } from "../types";
 
 export interface ProjectCharacterRow {
   id: string;
@@ -19,7 +19,7 @@ export function resolveProjectCharacters(project: ScriptProject, library: Charac
       ? item.character_snapshot
       : library.find((character) => character.id === item.library_character_id);
     if (!source) {
-      return {
+      return applyProjectBinding(item, {
         id: item.project_character_id,
         name: item.name,
         aliases: [item.name],
@@ -28,13 +28,13 @@ export function resolveProjectCharacters(project: ScriptProject, library: Charac
         notes: "",
         library_status: "draft",
         fallback_profiles: []
-      };
+      });
     }
-    return {
+    return applyProjectBinding(item, {
       ...cloneCharacter(source),
       id: item.project_character_id,
       name: item.name || source.name
-    };
+    });
   });
 }
 
@@ -101,8 +101,33 @@ export function ensureProjectCharacters(project: ScriptProject, library: Charact
   return output;
 }
 
+function applyProjectBinding(projectCharacter: ProjectCharacter, character: Character): Character {
+  const binding = projectCharacter.project_binding;
+  if (!binding) return character;
+  const profileId = `${binding.binding_id}-profile`;
+  const profile: VoiceProfile = {
+    id: profileId,
+    name: `${projectCharacter.name} Project GPT-SoVITS`,
+    engine: engineForProvider(binding.provider_type),
+    service_id: binding.service_id,
+    fallback_services: binding.fallback_services ?? [],
+    bindings: [cloneBinding(binding)],
+    config: {}
+  };
+  return {
+    ...character,
+    profiles: [profile, ...(character.profiles ?? []).filter((item) => item.id !== profileId)],
+    default_engine: profile.engine,
+    default_profile: profile.id
+  };
+}
+
 function cloneCharacter(character: Character): Character {
   return JSON.parse(JSON.stringify(character)) as Character;
+}
+
+function cloneBinding(binding: VoiceBinding): VoiceBinding {
+  return JSON.parse(JSON.stringify(binding)) as VoiceBinding;
 }
 
 function avatarFallback(name: string): string {
@@ -121,4 +146,9 @@ function matchValues(character: Character): string[] {
     ...(character.nicknames ?? []),
     ...(character.match_names ?? [])
   ]));
+}
+
+function engineForProvider(provider: ProviderType): EngineName {
+  if (provider === "gpt-sovits" || provider === "indextts" || provider === "cosyvoice" || provider === "vibevoice") return provider;
+  return "commercial";
 }

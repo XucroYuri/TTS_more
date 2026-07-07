@@ -69,49 +69,52 @@ class ServiceRegistry:
             [
                 TTSServiceEndpoint(
                     service_id="local-gpt-sovits",
-                    display_name="GPT-SoVITS Local",
+                    display_name="GPT-SoVITS Gradio",
                     service_kind="tts",
                     engine=EngineName.GPT_SOVITS,
                     provider_type=ProviderType.GPT_SOVITS,
-                    api_contract="gpt-sovits-api-v2",
-                    base_url="http://127.0.0.1:9880",
+                    api_contract="gradio-gpt-sovits-webui",
+                    base_url="http://127.0.0.1:9872",
                     network_scope="localhost",
-                    managed=True,
-                    repo_path=str(repo_root / "GPT-SoVITS"),
-                    resource_group="local-gpu-0",
+                    mode="external",
+                    managed=False,
+                    source_profile="local_endpoint",
+                    resource_group="gradio-gpu-0",
                     priority=10,
-                    capabilities=["tts", "gpt-weights", "sovits-weights", "gpt-sovits-api-v2"],
+                    capabilities=["tts", "trained_weights_voice", "reference_audio_voice", "gpt-weights", "sovits-weights", "wav_output", "gradio_webui"],
                 ),
                 TTSServiceEndpoint(
                     service_id="local-indextts",
-                    display_name="IndexTTS Local",
+                    display_name="IndexTTS Gradio",
                     service_kind="tts",
                     engine=EngineName.INDEX_TTS,
                     provider_type=ProviderType.INDEX_TTS,
-                    api_contract="tts-more-v1",
-                    base_url="http://127.0.0.1:9881",
+                    api_contract="gradio-indextts2-webui",
+                    base_url="http://127.0.0.1:7860",
                     network_scope="localhost",
-                    managed=True,
-                    repo_path=str(repo_root / "index-tts"),
-                    resource_group="local-gpu-0",
+                    mode="external",
+                    managed=False,
+                    source_profile="local_endpoint",
+                    resource_group="gradio-gpu-0",
                     priority=20,
-                    capabilities=["tts", "reference-audio", "emotion-text"],
+                    capabilities=["tts", "reference_audio_voice", "emotion_text", "emotion_audio", "wav_output", "gradio_webui"],
                 ),
                 TTSServiceEndpoint(
                     service_id="local-cosyvoice",
-                    display_name="CosyVoice Local",
+                    display_name="CosyVoice Gradio",
                     service_kind="tts",
                     engine=EngineName.COSYVOICE,
                     provider_type=ProviderType.COSYVOICE,
-                    api_contract="cosyvoice-http-v1",
+                    api_contract="gradio-cosyvoice-webui",
                     base_url="http://127.0.0.1:50000",
                     network_scope="localhost",
+                    mode="external",
                     managed=False,
                     enabled=False,
-                    repo_path=str(repo_root / "CosyVoice"),
-                    resource_group="local-gpu-0",
+                    source_profile="local_endpoint",
+                    resource_group="gradio-gpu-0",
                     priority=30,
-                    capabilities=["tts", "reference_audio_voice", "zero_shot_voice", "cross_lingual_voice", "style_instruction", "wav_output"],
+                    capabilities=["tts", "reference_audio_voice", "zero_shot_voice", "cross_lingual_voice", "style_instruction", "wav_output", "gradio_webui"],
                     default_params={"mode": "zero_shot", "response_format": "wav"},
                 ),
             ]
@@ -983,6 +986,63 @@ class GPTSoVITSApiV2ServiceClient(HttpTTSServiceClient):
         except Exception as exc:
             return {"engine": self.endpoint.engine.value, "ready": False, "error": str(exc)}
         return {"engine": self.endpoint.engine.value, "ready": True, "mode": "gpt-sovits-api-v2"}
+
+    def model_catalog(self, limit: int = 120) -> dict[str, Any]:
+        with httpx.Client(timeout=self.endpoint.default_params.get("timeout_seconds", 30.0), transport=self.transport) as client:
+            response = client.get(self.endpoint.base_url.rstrip("/") + "/models", headers=self._headers())
+            response.raise_for_status()
+            payload = response.json()
+        candidates: list[dict[str, Any]] = []
+        for item in (payload.get("models") or [])[:limit]:
+            name = str(item.get("name") or item.get("model_name") or "").strip()
+            if not name:
+                continue
+            candidate = _logs_candidate({}, self.endpoint.service_id, name, source="api_v2")
+            candidate["sample_count"] = int(item.get("sample_count") or 0)
+            candidate["has_training_data"] = bool(item.get("has_training_data") or candidate["sample_count"] > 0)
+            for path in item.get("gpt_weights") or []:
+                option = {"name": Path(str(path)).name or str(path), "path": str(path), "value": str(path), "score": _weight_score_tuple(str(path))}
+                candidate.setdefault("gpt_weights", []).append(option)
+                _prefer_recommended(candidate, "gpt", option)
+            for path in item.get("sovits_weights") or []:
+                option = {"name": Path(str(path)).name or str(path), "path": str(path), "value": str(path), "score": _weight_score_tuple(str(path))}
+                candidate.setdefault("sovits_weights", []).append(option)
+                _prefer_recommended(candidate, "sovits", option)
+            candidates.append(candidate)
+        return {"service_id": self.endpoint.service_id, "candidates": candidates, "raw": payload}
+
+    def model_samples(self, logs_name: str, limit: int = 120) -> dict[str, Any]:
+        encoded_name = quote(logs_name, safe="")
+        with httpx.Client(timeout=self.endpoint.default_params.get("timeout_seconds", 30.0), transport=self.transport) as client:
+            response = client.get(self.endpoint.base_url.rstrip("/") + f"/models/{encoded_name}/samples", headers=self._headers())
+            response.raise_for_status()
+            payload = response.json()
+        samples: list[dict[str, Any]] = []
+        for item in (payload.get("samples") or [])[:limit]:
+            audio_name = str(item.get("audio_name") or Path(str(item.get("audio_path") or "")).name)
+            text = str(item.get("text") or "")
+            emotion = str(item.get("emotion") or "")
+            label = audio_name
+            if text:
+                label = f"{label} · {text[:42]}"
+            if emotion:
+                label = f"{label} · {emotion}"
+            samples.append(
+                {
+                    "sample_id": f"{logs_name}:{audio_name}",
+                    "display_label": label,
+                    "path": str(item.get("audio_path") or ""),
+                    "text": text,
+                    "text_source": "api_v2",
+                    "character": logs_name,
+                    "emotion": emotion,
+                    "remark": "",
+                    "prompt_lang": str(item.get("lang") or "zh"),
+                    "source": "api_v2",
+                    "logs_name": logs_name,
+                }
+            )
+        return {"service_id": self.endpoint.service_id, "logs_name": logs_name, "samples": samples, "diagnostics": []}
 
     def load(self, profile: str, parameters: dict[str, Any] | None = None) -> None:
         parameters = parameters or {}

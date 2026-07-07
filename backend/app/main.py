@@ -19,11 +19,11 @@ from pydantic import BaseModel
 from app.hardware import collect_local_hardware_status
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
-from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, RuleBasedParser
+from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserQualityError, RuleBasedParser, chat_completions_url, parser_contract_probe_messages, validate_parser_contract_response
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
 from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
-from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
+from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
 from app.services import ServiceRegistry, ServiceRouter, build_load_signature
 from app.storage import ProjectStore
@@ -316,7 +316,10 @@ def create_app(
     def parse_script(request: ParseScriptRequest) -> dict[str, Any]:
         if not request.text.strip():
             raise HTTPException(status_code=400, detail="text is required")
-        return app.state.parser.parse(request.text).model_dump(mode="json")
+        try:
+            return app.state.parser.parse(request.text).model_dump(mode="json")
+        except ParserQualityError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/parser/providers")
     def get_parser_providers() -> dict[str, Any]:
@@ -360,25 +363,24 @@ def create_app(
         try:
             with httpx.Client(timeout=provider.timeout_seconds) as client:
                 response = client.post(
-                    provider.base_url.rstrip("/") + "/chat/completions",
+                    chat_completions_url(provider.base_url),
                     headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                     json={
                         "model": provider.model,
-                        "messages": [
-                            {"role": "system", "content": "Return a small JSON object."},
-                            {"role": "user", "content": "Return exactly {\"ok\": true}."},
-                        ],
+                        "messages": parser_contract_probe_messages(),
                         "response_format": {"type": "json_object"},
-                        "max_tokens": 32,
+                        "temperature": 0,
+                        "max_tokens": 512,
                     },
                 )
                 response.raise_for_status()
                 payload = response.json()
                 content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+                validate_parser_contract_response(provider.name, str(content))
                 return {
                     "ok": True,
                     "state": "ready",
-                    "message": "chat completions request succeeded",
+                    "message": "parser contract request succeeded",
                     "provider": provider.name,
                     "model": provider.model,
                     "latency_ms": round((time.time() - started) * 1000),
@@ -533,6 +535,79 @@ def create_app(
             "diagnostics": diagnostics,
         }
 
+    @app.get("/api/model-catalog/gpt-sovits")
+    def gpt_sovits_model_catalog(
+        service_id: str | None = None,
+        include_gradio: bool = True,
+        include_api: bool = True,
+        limit: int = 120,
+    ) -> dict[str, Any]:
+        diagnostics: list[dict[str, str]] = []
+        gradio_candidates, api_candidates = _collect_gpt_sovits_catalog_candidates(
+            app,
+            service_id=service_id,
+            include_gradio=include_gradio,
+            include_api=include_api,
+            diagnostics=diagnostics,
+            limit=limit,
+        )
+        characters = store.load_characters()
+        if service_id:
+            gpt_roots = _configured_weight_roots_for_service(characters, "gpt_weights_root", app.state.service_registry, service_id)
+            sovits_roots = _configured_weight_roots_for_service(characters, "sovits_weights_root", app.state.service_registry, service_id)
+            logs_roots = [
+                *_configured_weight_roots_for_service(characters, "logs_root", app.state.service_registry, service_id),
+                *_configured_weight_roots_for_service(characters, "logs_roots", app.state.service_registry, service_id),
+            ]
+        else:
+            gpt_roots = _configured_weight_roots(characters, "gpt_weights_root", app.state.service_registry)
+            sovits_roots = _configured_weight_roots(characters, "sovits_weights_root", app.state.service_registry)
+            logs_roots = [
+                *_configured_weight_roots(characters, "logs_root", app.state.service_registry),
+                *_configured_weight_roots(characters, "logs_roots", app.state.service_registry),
+            ]
+        return {
+            "models": scan_gpt_sovits_model_catalog_candidates(
+                reference_audio_root=ref_root,
+                gpt_weights_roots=gpt_roots,
+                sovits_weights_roots=sovits_roots,
+                logs_roots=logs_roots,
+                service_id=service_id,
+                gradio_candidates=gradio_candidates,
+                api_candidates=api_candidates,
+                limit=limit,
+            ),
+            "diagnostics": diagnostics,
+        }
+
+    @app.get("/api/model-catalog/gpt-sovits/samples")
+    def gpt_sovits_model_catalog_samples(service_id: str | None = None, logs_name: str = "", limit: int = 120) -> dict[str, Any]:
+        diagnostics: list[dict[str, str]] = []
+        if service_id:
+            client = app.state.service_router.clients.get(service_id)
+            if client is not None and hasattr(client, "model_samples"):
+                try:
+                    return client.model_samples(logs_name, limit=limit)  # type: ignore[attr-defined]
+                except Exception as exc:
+                    diagnostics.append({"service_id": service_id, "status": "api_v2_unavailable", "detail": str(exc)})
+            characters = store.load_characters()
+            logs_roots = [
+                *_configured_weight_roots_for_service(characters, "logs_root", app.state.service_registry, service_id),
+                *_configured_weight_roots_for_service(characters, "logs_roots", app.state.service_registry, service_id),
+            ]
+        else:
+            characters = store.load_characters()
+            logs_roots = [
+                *_configured_weight_roots(characters, "logs_root", app.state.service_registry),
+                *_configured_weight_roots(characters, "logs_roots", app.state.service_registry),
+            ]
+        payload = scan_logs_reference_audio_samples(logs_roots=logs_roots, logs_name=logs_name, limit=limit)
+        return {
+            **payload,
+            "service_id": service_id,
+            "diagnostics": [*diagnostics, *(payload.get("diagnostics") or [])],
+        }
+
     @app.get("/api/character-library/logs-reference-audio")
     def character_library_logs_reference_audio(
         service_id: str | None = None,
@@ -644,6 +719,18 @@ def create_app(
         store.save_project(project_id, project)
         return {"status": "saved"}
 
+    @app.delete("/api/projects/{project_id}")
+    def delete_project(project_id: str) -> dict[str, str]:
+        try:
+            trashed_path = store.delete_project(project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except OSError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"status": "deleted", "project_id": project_id, "trashed_path": str(trashed_path)}
+
     @app.get("/api/projects/{project_id}/script-revisions")
     def get_script_revisions(project_id: str) -> dict[str, Any]:
         try:
@@ -686,7 +773,10 @@ def create_app(
         script_revision = next((item for item in project.script_revisions if item.revision_id == request.script_revision_id), None)
         if script_revision is None:
             raise HTTPException(status_code=404, detail="script revision not found")
-        draft = app.state.parser.parse(script_revision.source_markdown)
+        try:
+            draft = app.state.parser.parse(script_revision.source_markdown)
+        except ParserQualityError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         revision_id = _next_revision_id("parse", [item.revision_id for item in project.parse_revisions])
         project_characters = [
             ProjectCharacter(
@@ -783,6 +873,9 @@ def create_app(
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
         project.project_characters = request.project_characters
+        active_parse = next((item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id), None)
+        if active_parse is not None:
+            active_parse.project_characters = project.project_characters
         store.save_project(project_id, project)
         return {"project_characters": [item.model_dump(mode="json") for item in project.project_characters]}
 
@@ -1323,6 +1416,41 @@ def _runtime_checks(service_registry: ServiceRegistry) -> dict[str, dict[str, An
         if endpoint.provider_type.value == "indextts":
             checks[endpoint.service_id] = {"python": endpoint.env.get("TTS_MORE_INDEXTTS_PYTHON", os.environ.get("TTS_MORE_INDEXTTS_PYTHON", os.environ.get("TTS_MORE_PYTHON_EXE", "python"))), "modules": ["torch", "indextts"]}
     return checks
+
+
+def _collect_gpt_sovits_catalog_candidates(
+    app: FastAPI,
+    service_id: str | None,
+    include_gradio: bool,
+    include_api: bool,
+    diagnostics: list[dict[str, str]],
+    limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    gradio_candidates: list[dict[str, Any]] = []
+    api_candidates: list[dict[str, Any]] = []
+    for service in app.state.service_registry.services:
+        if not service.enabled or service.provider_type is None or service.provider_type.value != "gpt-sovits":
+            continue
+        if service_id is not None and service.service_id != service_id:
+            continue
+        client = app.state.service_router.clients.get(service.service_id)
+        if include_gradio and service.api_contract == "gradio-gpt-sovits-webui":
+            if client is None or not hasattr(client, "gradio_index"):
+                diagnostics.append({"service_id": service.service_id, "status": "unsupported", "detail": "Gradio index is not available"})
+            else:
+                try:
+                    gradio_candidates.extend((client.gradio_index()).get("candidates", [])[:limit])  # type: ignore[attr-defined]
+                except Exception as exc:
+                    diagnostics.append({"service_id": service.service_id, "status": "unreachable", "detail": str(exc)})
+        if include_api and (service.api_contract == "gpt-sovits-api-v2" or "gpt-sovits-api-v2" in service.capabilities):
+            if client is None or not hasattr(client, "model_catalog"):
+                diagnostics.append({"service_id": service.service_id, "status": "unsupported", "detail": "GPT-SoVITS API v2 model catalog is not available"})
+            else:
+                try:
+                    api_candidates.extend((client.model_catalog(limit=limit)).get("candidates", []))  # type: ignore[attr-defined]
+                except Exception as exc:
+                    diagnostics.append({"service_id": service.service_id, "status": "api_v2_unreachable", "detail": str(exc)})
+    return gradio_candidates, api_candidates
 
 
 def _configured_weight_roots(characters: list[Character], key: str, service_registry: ServiceRegistry | None = None) -> list[Path]:

@@ -34,7 +34,7 @@ def default_parser_providers() -> list[ParserProviderRecord]:
     return [
         ParserProviderRecord(
             name="开物基模",
-            base_url="",
+            base_url="https://kwjm.com",
             api_key_env="KWJM_API_KEY",
             model="gpt-5.5",
             enabled=False,

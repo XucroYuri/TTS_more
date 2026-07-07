@@ -9,6 +9,7 @@ from typing import Any
 from app.models import (
     Character,
     EngineName,
+    PROVIDER_ENGINE_DEFAULTS,
     ProjectCharacter,
     ProjectCharacterMode,
     ReferenceAudioGroup,
@@ -131,6 +132,31 @@ def scan_logs_index_candidates(
     return candidates[:limit]
 
 
+def scan_gpt_sovits_model_catalog_candidates(
+    reference_audio_root: Path,
+    gpt_weights_roots: list[Path],
+    sovits_weights_roots: list[Path],
+    logs_roots: list[Path] | None = None,
+    service_id: str | None = None,
+    gradio_candidates: list[dict[str, Any]] | None = None,
+    api_candidates: list[dict[str, Any]] | None = None,
+    limit: int = 120,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for candidate in gradio_candidates or []:
+        _merge_model_catalog_candidate(grouped, _logs_candidate_from_scan(candidate, service_id=candidate.get("service_id") or service_id, source=candidate.get("source", "gradio")))
+    for candidate in api_candidates or []:
+        _merge_model_catalog_candidate(grouped, _logs_candidate_from_scan(candidate, service_id=candidate.get("service_id") or service_id, source=candidate.get("source", "api_v2")))
+    for candidate in scan_role_library_candidates(reference_audio_root, gpt_weights_roots, sovits_weights_roots, logs_roots=logs_roots, limit=limit * 2):
+        _merge_model_catalog_candidate(grouped, _logs_candidate_from_scan(candidate, service_id=service_id, source="filesystem"))
+    candidates = list(grouped.values())
+    for candidate in candidates:
+        candidate["sample_count"] = max(int(candidate.get("sample_count") or 0), _candidate_reference_sample_count(candidate))
+        candidate["has_training_data"] = bool(candidate.get("has_training_data") or candidate["sample_count"] > 0)
+    candidates.sort(key=lambda item: (0 if item.get("recommended_gpt_weights_path") and item.get("recommended_sovits_weights_path") else 1, item["logs_name"]))
+    return candidates[:limit]
+
+
 def scan_logs_reference_audio_samples(logs_roots: list[Path], logs_name: str, limit: int = 120) -> dict[str, Any]:
     diagnostics: list[dict[str, str]] = []
     samples: list[dict[str, Any]] = []
@@ -155,7 +181,7 @@ def scan_logs_reference_audio_samples(logs_roots: list[Path], logs_name: str, li
             character = str(meta.get("character") or _extract_role_name(logs_dir.name) or "").strip()
             emotion = str(meta.get("emotion") or "").strip()
             remark = str(meta.get("remark") or "").strip()
-            prompt_lang = str(meta.get("lang") or record.get("lang") or _infer_prompt_lang(text) or "zh").strip()
+            prompt_lang = _normalize_prompt_lang(meta.get("lang") or record.get("lang")) or _infer_prompt_lang(text) or "zh"
             samples.append(
                 {
                     "sample_id": f"{logs_dir.name}:{path.name}",
@@ -274,12 +300,14 @@ def match_project_characters(project: ScriptProject, library: list[Character], f
     output: list[ProjectCharacter] = []
     seen: set[str] = set()
     by_name = _library_lookup(library)
-    existing_names = {item.project_character_id: item.name for item in project.project_characters}
+    existing_by_id = {item.project_character_id: item for item in project.project_characters}
+    existing_by_name = {_normalize(item.name): item for item in project.project_characters}
     for line in project.lines:
         if line.character_id in seen:
             continue
         seen.add(line.character_id)
-        display_name = existing_names.get(line.character_id, line.character_id)
+        existing = existing_by_id.get(line.character_id) or existing_by_name.get(_normalize(line.character_id))
+        display_name = existing.name if existing else line.character_id
         character = by_name.get(_normalize(display_name)) or by_name.get(_normalize(line.character_id))
         output.append(
             ProjectCharacter(
@@ -287,6 +315,7 @@ def match_project_characters(project: ScriptProject, library: list[Character], f
                 name=character.name if character else display_name,
                 library_character_id=character.id if character else None,
                 mode=ProjectCharacterMode.REFERENCE,
+                project_binding=existing.project_binding if existing else None,
                 match_confidence=1.0 if character else None,
                 match_status="matched" if character else "unmatched",
             )
@@ -305,20 +334,47 @@ def resolve_project_characters(project: ScriptProject, library: list[Character])
         elif item.library_character_id:
             source = by_id.get(item.library_character_id)
         if source is None:
-            output.append(
+            output.append(_apply_project_binding(
+                item,
                 Character(
                     id=item.project_character_id,
                     name=item.name,
                     aliases=[item.name],
-                    library_status="draft",
+                    library_status="partial" if item.project_binding else "draft",
                     profiles=[],
                     default_engine=None,
                     default_profile=None,
-                )
+                ),
+            )
             )
             continue
-        output.append(source.model_copy(deep=True, update={"id": item.project_character_id, "name": item.name or source.name}))
+        output.append(_apply_project_binding(item, source.model_copy(deep=True, update={"id": item.project_character_id, "name": item.name or source.name})))
     return output
+
+
+def _apply_project_binding(project_character: ProjectCharacter, character: Character) -> Character:
+    binding = project_character.project_binding
+    if binding is None:
+        return character
+    profile_id = f"{binding.binding_id}-profile"
+    profile = VoiceProfile(
+        id=profile_id,
+        name=f"{project_character.name} Project GPT-SoVITS",
+        engine=PROVIDER_ENGINE_DEFAULTS[binding.provider_type],
+        service_id=binding.service_id,
+        fallback_services=list(binding.fallback_services),
+        config={},
+        bindings=[binding.model_copy(deep=True)],
+    )
+    remaining_profiles = [item for item in character.profiles if item.id != profile_id]
+    return character.model_copy(
+        deep=True,
+        update={
+            "profiles": [profile, *remaining_profiles],
+            "default_engine": profile.engine,
+            "default_profile": profile.id,
+        },
+    )
 
 
 def freeze_project_character(project: ScriptProject, project_character_id: str, library: list[Character]) -> ProjectCharacter:
@@ -538,6 +594,11 @@ def _infer_prompt_lang(text: str) -> str:
     return "zh" if re.search(r"[\u4e00-\u9fff]", text) else "en"
 
 
+def _normalize_prompt_lang(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in {"zh", "en", "ja", "ko", "yue"} else ""
+
+
 def _candidate(grouped: dict[str, dict[str, Any]], name: str) -> dict[str, Any]:
     key = _normalize(name)
     if key not in grouped:
@@ -678,6 +739,38 @@ def _merge_logs_candidate(grouped: dict[str, dict[str, Any]], candidate: dict[st
                 current[field] = candidate[field]
             elif isinstance(candidate.get(field), list):
                 current[field] = list(dict.fromkeys([*(current.get(field) or []), *candidate[field]]))
+
+
+def _merge_model_catalog_candidate(grouped: dict[str, dict[str, Any]], candidate: dict[str, Any]) -> None:
+    key = f"{candidate.get('service_id') or 'filesystem'}::{_normalize(str(candidate.get('logs_name') or candidate.get('name') or candidate.get('id') or ''))}"
+    if key not in grouped:
+        grouped[key] = candidate
+        return
+    current = grouped[key]
+    current["source"] = "merged" if current.get("source") != candidate.get("source") else current.get("source")
+    current["aliases"] = list(dict.fromkeys([*(current.get("aliases") or []), *(candidate.get("aliases") or [])]))
+    current["gpt_weights"] = _merge_options(current.get("gpt_weights") or [], candidate.get("gpt_weights") or [])
+    current["sovits_weights"] = _merge_options(current.get("sovits_weights") or [], candidate.get("sovits_weights") or [])
+    current["reference_audio_groups"] = _merge_options(current.get("reference_audio_groups") or [], candidate.get("reference_audio_groups") or [])
+    for field in ["recommended_gpt_weights_path", "recommended_sovits_weights_path", "recommended_ref_audio_path"]:
+        if not current.get(field) and candidate.get(field):
+            current[field] = candidate[field]
+    for field in ["name", "nicknames", "match_names", "logs_match_names"]:
+        if field in candidate and candidate.get(field):
+            if field == "name" and (not current.get("name") or current.get("name") == current.get("logs_name")):
+                current[field] = candidate[field]
+            elif isinstance(candidate.get(field), list):
+                current[field] = list(dict.fromkeys([*(current.get(field) or []), *candidate[field]]))
+    current["sample_count"] = max(int(current.get("sample_count") or 0), int(candidate.get("sample_count") or 0))
+    current["has_training_data"] = bool(current.get("has_training_data") or candidate.get("has_training_data"))
+
+
+def _candidate_reference_sample_count(candidate: dict[str, Any]) -> int:
+    count = 0
+    for group in candidate.get("reference_audio_groups") or []:
+        samples = group.get("samples") if isinstance(group, dict) else []
+        count += len(samples or [])
+    return count
 
 
 def _merge_options(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> list[dict[str, Any]]:

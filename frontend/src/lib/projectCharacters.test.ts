@@ -131,4 +131,41 @@ describe("project character helpers", () => {
     expect(rows[0]).toMatchObject({ id: "队长", name: "主角", linked: true });
     expect(rows[1]).toMatchObject({ id: "顾问", name: "导师", linked: true });
   });
+
+  it("resolves a project-level binding before the linked library profile", () => {
+    const nextProject: ScriptProject = {
+      title: "demo",
+      default_language: "zh",
+      project_characters: [
+        {
+          project_character_id: "role-1",
+          name: "小品",
+          library_character_id: "xiao-pin",
+          mode: "reference",
+          project_binding: {
+            binding_id: "role-1-project-gpt",
+            provider_type: "gpt-sovits",
+            service_id: "local-gpt-sovits",
+            fallback_services: [],
+            capabilities: ["trained_weights_voice", "reference_audio_voice"],
+            config: {
+              logs_name: "project-logs",
+              gpt_weights_path: "project.ckpt",
+              sovits_weights_path: "project.pth",
+              ref_audio_path: "project.wav",
+              prompt_text: "项目参考文本"
+            }
+          }
+        } as ProjectCharacter
+      ],
+      lines: [{ id: "l1", character_id: "role-1", text: "你好", note: "" }]
+    };
+
+    const resolved = resolveProjectCharacters(nextProject, library);
+
+    expect(resolved[0].default_profile).toBe("role-1-project-gpt-profile");
+    expect(resolved[0].profiles?.[0].bindings?.[0].binding_id).toBe("role-1-project-gpt");
+    expect(resolved[0].profiles?.[0].bindings?.[0].config.gpt_weights_path).toBe("project.ckpt");
+    expect(resolved[0].profiles?.[1].bindings?.[0].config.gpt_weights_path).toBe("gpt-v1.ckpt");
+  });
 });

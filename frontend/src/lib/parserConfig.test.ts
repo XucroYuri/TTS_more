@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createDefaultParserProviderDraft, parserProviderKeyState, toParserProviderSavePayload } from "./parserConfig";
+import { createDefaultParserProviderDraft, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./parserConfig";
 import type { ParserProviderDraft } from "../types";
 
 const provider: ParserProviderDraft = {
@@ -36,7 +36,7 @@ describe("parser provider config helpers", () => {
   it("creates new parser providers from the kwjm gpt-5.5 template", () => {
     expect(createDefaultParserProviderDraft(2)).toEqual({
       name: "开物基模",
-      base_url: "",
+      base_url: "https://kwjm.com",
       api_key_env: "KWJM_API_KEY",
       model: "gpt-5.5",
       enabled: true,
@@ -44,6 +44,51 @@ describe("parser provider config helpers", () => {
       priority: 102,
       key_configured: false,
       api_key: "",
+    });
+  });
+
+  it("activates the kwjm preset with a trimmed api key while preserving other providers", () => {
+    const existingKwjm: ParserProviderDraft = {
+      name: "开物基模",
+      base_url: "",
+      api_key_env: "OLD_KWJM_KEY",
+      model: "old-model",
+      enabled: false,
+      timeout_seconds: 10,
+      priority: 99,
+      key_configured: false,
+      api_key: "",
+    };
+
+    const result = upsertKwjmParserProvider([provider, existingKwjm], "  kwjm-secret  ");
+
+    expect(result[0]).toEqual(provider);
+    expect(result[1]).toEqual({
+      name: "开物基模",
+      base_url: "https://kwjm.com",
+      api_key_env: "KWJM_API_KEY",
+      model: "gpt-5.5",
+      enabled: true,
+      timeout_seconds: 45,
+      priority: 10,
+      key_configured: false,
+      api_key: "kwjm-secret",
+    });
+  });
+
+  it("creates the kwjm preset when no existing provider is present", () => {
+    const result = upsertKwjmParserProvider([provider], "kwjm-secret");
+
+    expect(result).toHaveLength(2);
+    expect(result[1]).toMatchObject({
+      name: "开物基模",
+      base_url: "https://kwjm.com",
+      api_key_env: "KWJM_API_KEY",
+      model: "gpt-5.5",
+      enabled: true,
+      timeout_seconds: 45,
+      priority: 10,
+      api_key: "kwjm-secret",
     });
   });
 });
