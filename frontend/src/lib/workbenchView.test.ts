@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Character, GenerationVersion, ScriptLine, WorkerHealth } from "../types";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups } from "./workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups } from "./workbenchView";
 
 describe("workbench view helpers", () => {
   it("maps a role index to a stable accent class", () => {
@@ -50,6 +50,51 @@ describe("workbench view helpers", () => {
   it("keeps the sidebar script body in markdown preview until editing is requested", () => {
     expect(scriptConsoleBodyMode(false)).toBe("preview");
     expect(scriptConsoleBodyMode(true)).toBe("edit");
+  });
+
+  it("summarizes line filters without exposing inactive controls", () => {
+    const labels = {
+      filtersMore: "筛选",
+      selectedLines: (count: number) => `已选 ${count}`,
+      visibleLines: (count: number) => `可见 ${count}`,
+      status: (status: string) => `状态:${status}`
+    };
+
+    expect(lineFilterToolbarState({
+      providerFilter: "all",
+      statusFilter: "all",
+      selectedLineCount: 0,
+      filteredLineCount: 12,
+      labels
+    })).toEqual({
+      hasFilters: false,
+      title: "筛选",
+      countLabel: "可见 12",
+      activeBadgeVisible: false,
+      clearButtonVisible: false
+    });
+
+    expect(lineFilterToolbarState({
+      providerFilter: "indextts",
+      statusFilter: "completed",
+      selectedLineCount: 2,
+      filteredLineCount: 5,
+      labels
+    })).toEqual({
+      hasFilters: true,
+      title: "indextts · 状态:completed",
+      countLabel: "已选 2",
+      activeBadgeVisible: true,
+      clearButtonVisible: true
+    });
+
+    expect(lineFilterToolbarState({
+      providerFilter: "all",
+      statusFilter: "not-generated",
+      selectedLineCount: 0,
+      filteredLineCount: 3,
+      labels
+    }).title).toBe("状态:not generated");
   });
 
   it("keeps technical service details out of the collapsed line card", () => {

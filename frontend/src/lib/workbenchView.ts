@@ -64,6 +64,29 @@ export interface GenerationMethodRouteLabels {
 
 export type ScriptConsoleBodyMode = "preview" | "edit";
 
+export interface LineFilterToolbarLabels {
+  filtersMore: string;
+  selectedLines: (count: number) => string;
+  visibleLines: (count: number) => string;
+  status: (status: string) => string;
+}
+
+export interface LineFilterToolbarInput {
+  providerFilter: string;
+  statusFilter: string;
+  selectedLineCount: number;
+  filteredLineCount: number;
+  labels: LineFilterToolbarLabels;
+}
+
+export interface LineFilterToolbarState {
+  hasFilters: boolean;
+  title: string;
+  countLabel: string;
+  activeBadgeVisible: boolean;
+  clearButtonVisible: boolean;
+}
+
 type PreflightFallbackEntry = {
   fallback_action?: { type?: string; service_id?: string } | null;
   line_id?: string;
@@ -190,6 +213,24 @@ export function generationMethodRouteLabels(methodId: GenerationMethodId): Gener
 
 export function scriptConsoleBodyMode(isEditing: boolean): ScriptConsoleBodyMode {
   return isEditing ? "edit" : "preview";
+}
+
+export function lineFilterToolbarState(input: LineFilterToolbarInput): LineFilterToolbarState {
+  const hasProviderFilter = input.providerFilter !== "all";
+  const hasStatusFilter = input.statusFilter !== "all";
+  const hasFilters = hasProviderFilter || hasStatusFilter;
+  const titleParts = [
+    hasProviderFilter ? input.providerFilter : null,
+    hasStatusFilter ? input.labels.status(input.statusFilter === "not-generated" ? "not generated" : input.statusFilter) : null
+  ].filter(Boolean);
+
+  return {
+    hasFilters,
+    title: hasFilters ? titleParts.join(" · ") : input.labels.filtersMore,
+    countLabel: input.selectedLineCount > 0 ? input.labels.selectedLines(input.selectedLineCount) : input.labels.visibleLines(input.filteredLineCount),
+    activeBadgeVisible: hasFilters,
+    clearButtonVisible: hasFilters
+  };
 }
 
 export function roleAccentClass(index: number): string {

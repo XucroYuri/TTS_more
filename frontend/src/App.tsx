@@ -96,7 +96,7 @@ import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
 import { buildGradioEndpointRequest, gradioContractForProvider } from "./lib/ttsAccess";
 import { createToast, inferToastLevel, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
   Character,
   CharacterReferenceAudioGroup,
@@ -564,14 +564,20 @@ export default function App() {
   const hasMoreFilteredLines = displayedLines.length < filteredLines.length;
   const selectedLines = useMemo(() => project.lines.filter((line) => selectedLineIds.includes(line.id)), [project.lines, selectedLineIds]);
   const providerOptions = useMemo(() => Array.from(new Set(project.lines.map((line) => lineBinding(line, resolvedCharacters)?.provider_type ?? "unassigned"))), [project.lines, resolvedCharacters]);
-  const hasLineFilters = providerFilter !== "all" || statusFilter !== "all";
-  const lineFilterTitle = hasLineFilters
-    ? [
-        providerFilter !== "all" ? providerFilter : null,
-        statusFilter !== "all" ? statusText(statusFilter === "not-generated" ? "not generated" : statusFilter, t) : null
-      ].filter(Boolean).join(" · ")
-    : t("filters.more");
-  const visibleLineLabel = selectedLineIds.length > 0 ? t("table.selectedLines", { count: selectedLineIds.length }) : t("table.visibleLines", { count: filteredLines.length });
+  const lineToolbarState = lineFilterToolbarState({
+    providerFilter,
+    statusFilter,
+    selectedLineCount: selectedLineIds.length,
+    filteredLineCount: filteredLines.length,
+    labels: {
+      filtersMore: t("filters.more"),
+      selectedLines: (count) => t("table.selectedLines", { count }),
+      visibleLines: (count) => t("table.visibleLines", { count }),
+      status: (status) => statusText(status, t)
+    }
+  });
+  const lineFilterTitle = lineToolbarState.title;
+  const visibleLineLabel = lineToolbarState.countLabel;
   const selectedLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language ?? defaultLanguage);
   const selectedLanguageLabel = languageOptions.find((option) => option.value === selectedLanguage)?.label ?? selectedLanguage;
   const displayProjectTitle = project.title || currentProjectId ? standardProjectName(project.title || currentProjectId || "") : t("empty.noProjectSelected");
@@ -2950,7 +2956,7 @@ export default function App() {
                 <summary title={lineFilterTitle}>
                   <SlidersHorizontal size={14} />
                   <span>{t("filters.more")}</span>
-                  {hasLineFilters && <b>{t("filters.active")}</b>}
+                  {lineToolbarState.activeBadgeVisible && <b>{t("filters.active")}</b>}
                 </summary>
                 <div className="line-filter-popover">
                   <label>
@@ -2971,7 +2977,7 @@ export default function App() {
                       <option value="failed">{t("filters.failed")}</option>
                     </select>
                   </label>
-                  {hasLineFilters && (
+                  {lineToolbarState.clearButtonVisible && (
                     <button
                       className="secondary-button compact-button"
                       onClick={() => {
