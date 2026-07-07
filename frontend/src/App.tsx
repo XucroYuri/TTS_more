@@ -3186,21 +3186,19 @@ export default function App() {
                       <div>
                         <strong><Library size={15} /> {t("inspector.voiceReference")}</strong>
                       </div>
-                      <div className="reference-head-actions">
-                        {activeLine.temporary_binding && (
-                          <>
-                            <span className="reference-head-pill">{t("inspector.temporaryBindingShort")}</span>
-                            <button className="secondary-button compact-button" onClick={() => clearTemporaryBinding(activeLine.id)}>{t("inspector.clearTemporaryBinding")}</button>
-                          </>
-                        )}
-                        {!activeBinding && (
-                          <>
-                            <span className="reference-head-pill attention">{t("inspector.needsTemporaryBindingShort")}</span>
-                            <button className="secondary-button compact-button" onClick={() => setTemporaryBindingProvider(activeLine.id, "indextts")}>{t("inspector.createIndexTemporary")}</button>
-                          </>
-                        )}
-                      </div>
                     </div>
+
+                    {activeLine.temporary_binding ? (
+                      <div className="reference-setup-callout" aria-live="polite">
+                        <span>{t("inspector.temporaryBindingShort")}</span>
+                        <button className="secondary-button compact-button" type="button" onClick={() => clearTemporaryBinding(activeLine.id)}>{t("inspector.clearTemporaryBinding")}</button>
+                      </div>
+                    ) : !activeBinding ? (
+                      <div className="reference-setup-callout attention" aria-live="polite">
+                        <span>{t("inspector.needsTemporaryBindingShort")}</span>
+                        <button className="secondary-button compact-button" type="button" onClick={() => setTemporaryBindingProvider(activeLine.id, "indextts")}>{t("inspector.createIndexTemporary")}</button>
+                      </div>
+                    ) : null}
 
                     {activeProvider === "gpt-sovits" && (
                       <>
