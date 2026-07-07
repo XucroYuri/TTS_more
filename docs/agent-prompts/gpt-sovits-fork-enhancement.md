@@ -4,7 +4,7 @@
 
 你是一个 GPT-SoVITS 仓库的维护者。本仓库是我们团队的 fork（`https://github.com/XucroYuri/GPT-SoVITS`），服务于一个名为"TTS More"的多 TTS 服务调度工作台。TTS More 通过 HTTP API 调用 GPT-SoVITS 进行语音合成。
 
-**目标**：对 GPT-SoVITS 做最小化改造，增加"训练角色（模型名）选择"和"训练样本浏览"两个功能，让 TTS More 能通过 API 获取到之前无法远程获取的训练数据（参考音频 + 参考文本），消除手动填写参考音频路径和文本的痛点。
+**目标**：对 GPT-SoVITS 做最小化改造，增加"训练角色（模型名）选择"和"训练样本浏览"两个功能，让 TTS More 能通过 API 获取到之前无法远程获取的训练数据（参考音频 + 参考文本），消除手动填写参考音频路径和文本的痛点。同时解除参考音频时长的硬编码校验限制（3~10 秒），不再因时长阻断合法的生成任务。
 
 ## 约束
 
@@ -456,6 +456,75 @@ from fastapi import FastAPI, Response
 from fastapi import FastAPI, Response, UploadFile, File
 ```
 
+### 任务五：解除参考音频时长的硬编码限制
+
+**背景**：GPT-SoVITS 在两处对参考音频时长做了硬编码校验（3~10 秒），超出范围直接 `raise OSError` 阻断生成。但实际上超出此范围的参考音频仍可正常推理（只是质量和显存占用有差异），这个校验过于严苛，导致合法的生成任务被禁止。
+
+**涉及文件和精确行号**（两处校验逻辑完全相同）：
+
+#### 位置 1：`GPT_SoVITS/inference_webui.py` 第 853-856 行
+
+```python
+# 当前代码（第 853-856 行）:
+wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+if wav16k.shape[0] > 160000 or wav16k.shape[0] < 48000:
+    gr.Warning(i18n("参考音频在3~10秒范围外，请更换！"))
+    raise OSError(i18n("参考音频在3~10秒范围外，请更换！"))
+```
+
+#### 位置 2：`GPT_SoVITS/TTS_infer_pack/TTS.py` 第 815-817 行
+
+```python
+# 当前代码（第 815-817 行，_set_prompt_semantic 方法内）:
+wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+if wav16k.shape[0] > 160000 or wav16k.shape[0] < 48000:
+    raise OSError(i18n("参考音频在3~10秒范围外，请更换！"))
+```
+
+**改造要求**：
+
+将两处硬编码的时长阻断改为**软警告**——超限时打印日志/Warning 提示但不 `raise`，让推理继续执行。同时将阈值改为可配置。
+
+#### inference_webui.py 第 853-856 行改为：
+
+```python
+wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+ref_duration = wav16k.shape[0] / 16000
+if ref_duration < 3 or ref_duration > 10:
+    gr.Warning(i18n(f"参考音频时长 {ref_duration:.1f} 秒，超出推荐的 3~10 秒范围，可能影响合成质量"))
+```
+
+**改动要点**：
+- 删除 `raise OSError(...)` 行，改为仅 `gr.Warning` 提示
+- 用 `ref_duration` 变量（秒）替代原始采样点数比较，提高可读性
+- Warning 文案从"请更换！"改为"可能影响合成质量"（建议性而非阻断性）
+
+#### TTS.py 第 815-817 行改为：
+
+```python
+wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+ref_duration = wav16k.shape[0] / 16000
+if ref_duration < 3 or ref_duration > 10:
+    print(f"[Warning] Reference audio duration {ref_duration:.1f}s is outside the recommended 3~10s range, proceeding anyway")
+```
+
+**改动要点**：
+- 删除 `raise OSError(...)` 行
+- TTS.py 是 pipeline 层（非 Gradio），不能用 `gr.Warning`，改用 `print` 输出警告
+- 不中断执行流程，让后续的 HuBERT 特征提取和 VQ 编码正常进行
+
+#### Gradio UI 标签文案更新（inference_webui.py 第 1234 行）
+
+```python
+# 当前代码（第 1234 行）:
+inp_ref = gr.Audio(label=i18n("请上传3~10秒内参考音频，超过会报错！"), type="filepath", scale=13)
+
+# 改为:
+inp_ref = gr.Audio(label=i18n("请上传参考音频（推荐3~10秒）"), type="filepath", scale=13)
+```
+
+**改动要点**：标签从"超过会报错！"改为"推荐3~10秒"——不再用恐吓性文案，改为推荐性提示。
+
 ## 验证清单
 
 完成改造后，需要验证：
@@ -469,3 +538,6 @@ from fastapi import FastAPI, Response, UploadFile, File
 7. **点击"自动匹配权重"后，GPT/SoVITS 下拉菜单选中对应权重**
 8. **现有功能不受影响**（`/tts`、`/set_gpt_weights`、`/set_sovits_weights` 正常工作）
 9. **所有新增端点返回的音频路径都是服务端可访问的相对路径**（相对于 GPT-SoVITS 根目录）
+10. **时长校验已解除**：传入 2 秒或 15 秒的参考音频不再报错阻断，仅打印/Warning 提示，合成正常完成
+11. **inference_webui.py 和 TTS.py 两处校验都已改为软警告**（不 raise）
+12. **Gradio 参考音频标签文案已更新**为推荐性提示
