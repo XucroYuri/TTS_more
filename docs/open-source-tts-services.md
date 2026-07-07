@@ -35,12 +35,17 @@ flowchart LR
 | --- | --- | --- | --- |
 | `not_configured` | 还没有 endpoint | 否 | 粘贴 Gradio URL |
 | `endpoint_unreachable` | 端口或网络不可达 | 否 | 启动 WebUI，检查地址 |
-| `repo_missing` / `env_missing` | 旧本机仓库模式缺资源 | 否 | 不走旧路径，改用 Gradio URL |
-| `repo_found` | 旧模式识别到资源 | 仅兼容 | 仍建议改用 endpoint |
 | `partial` | 端点可达，但协议或能力没有完全确认 | 是 | 只在可解释时进入候选，生成前仍会检查 |
 | `ready` | endpoint 与 Gradio contract 匹配 | 是 | 可以作为生成服务 |
+| `blocked` | endpoint 或协议不能被当前 provider 使用 | 否 | 按提示检查地址、provider 或 WebUI 版本 |
 
 工作台的服务下拉只展示当前 provider 下可解释的 `ready` 或 `partial` endpoint。`blocked`、`disabled` 和 mock endpoint 不进入生成候选。
+
+兼容状态：
+
+- `repo_missing`、`env_missing`、`repo_found` 属于旧本机仓库模式的兼容状态。
+- 新接入不要从 repo path 开始，不要让 Agent 扫描本机模型仓库来判断服务是否可用。
+- 如果旧数据里出现这些状态，主路径仍然是回到 `接入`，粘贴已经运行的 Gradio URL，然后 `检测并保存`。
 
 ## 常见失败
 
