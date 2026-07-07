@@ -832,6 +832,42 @@ export default function App() {
     }
   }
 
+  async function detectAndSaveOpenSourceService() {
+    setIsDetectingOpenSource(true);
+    setIsConfiguringOpenSource(true);
+    try {
+      const detectPayload = await detectOpenSourceTTS({
+        provider_type: selectedOpenSourceProvider,
+        repo_path: null,
+        base_url: openSourceBaseUrl || null,
+        api_contract: gradioContractForProvider(selectedOpenSourceProvider)
+      });
+      setOpenSourceDetectResult(detectPayload);
+      if (!["partial", "ready"].includes(detectPayload.setup_state)) {
+        setNotice(t("services.openSourceDetectNotSaved", { state: setupStateLabel(detectPayload.setup_state, t) }));
+        return;
+      }
+      const payload = await configureOpenSourceTTS({
+        ...buildGradioEndpointRequest({
+          provider_type: selectedOpenSourceProvider,
+          display_name: openSourceDisplayName || null,
+          base_url: openSourceBaseUrl,
+          resource_group: openSourceResourceGroup,
+          capacity: openSourceCapacity,
+          enabled: true,
+        })
+      });
+      setOpenSourceDetectResult(payload.detect);
+      setNotice(t("services.openSourceDetectAndSaveDone", { state: setupStateLabel(payload.detect.setup_state, t) }));
+      await refreshTopology(true);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("services.openSourceSaveFailed"));
+    } finally {
+      setIsDetectingOpenSource(false);
+      setIsConfiguringOpenSource(false);
+    }
+  }
+
   async function refreshProjects(preferredProjectId?: string | null) {
     try {
       const payload = await fetchProjects();
@@ -1864,11 +1900,11 @@ export default function App() {
                                 </label>
                               </div>
                               <div className="open-source-actions">
-                                <button className="secondary-button compact-button" onClick={() => void runOpenSourceDetect()} disabled={isDetectingOpenSource || !openSourceBaseUrl}>
+                                <button className="secondary-button compact-button" onClick={() => void runOpenSourceDetect()} disabled={isDetectingOpenSource || isConfiguringOpenSource || !openSourceBaseUrl}>
                                   {isDetectingOpenSource ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("services.openSourceDetect")}
                                 </button>
-                                <button className="primary-button compact-button" onClick={() => void saveOpenSourceService()} disabled={isConfiguringOpenSource || !openSourceBaseUrl}>
-                                  {isConfiguringOpenSource ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("services.openSourceSave")}
+                                <button className="primary-button compact-button" onClick={() => void detectAndSaveOpenSourceService()} disabled={isDetectingOpenSource || isConfiguringOpenSource || !openSourceBaseUrl}>
+                                  {isConfiguringOpenSource ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("services.openSourceDetectAndSave")}
                                 </button>
                               </div>
                             </section>
@@ -3165,7 +3201,11 @@ export default function App() {
                             ? t(`inspector.diagnosticsReason.${activeInspectorDiagnostics.reason}`)
                             : t("inspector.diagnosticsReadyShort")}
                         </span>
-                        <span className="state-action">{t("inspector.showDiagnosticsShort")}</span>
+                        {activeInspectorDiagnostics.visible && (
+                          <span className="state-action">
+                            {diagnosticsExpanded || activeInspectorDiagnostics.expanded ? t("inspector.hideDiagnosticsShort") : t("inspector.showDiagnosticsShort")}
+                          </span>
+                        )}
                       </button>
                     </div>
                     <div className="generation-method-tabs" role="tablist" aria-label={t("inspector.generationMethod")}>
@@ -3177,9 +3217,10 @@ export default function App() {
                           role="tab"
                           type="button"
                           aria-selected={activeGenerationMethod === method.id}
+                          aria-label={`${t(method.labelKey)} · ${t(method.hintKey)}`}
+                          title={t(method.hintKey)}
                         >
                           <strong>{t(method.labelKey)}</strong>
-                          <span>{t(method.hintKey)}</span>
                         </button>
                       ))}
                     </div>

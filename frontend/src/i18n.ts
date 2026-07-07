@@ -33,11 +33,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       queueFiltered: "生成当前列表"
     },
     topbar: {
-      roleLibrary: "角色库",
-      resourceQueue: "资源队列",
+      roleLibrary: "角色",
+      resourceQueue: "队列",
       services: "服务",
-      ttsConfig: "TTS 配置",
-      llmConfig: "LLM API"
+      ttsConfig: "接入",
+      llmConfig: "解析"
     },
     audioInput: {
       upload: "上传",
@@ -107,7 +107,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       openSourceApiContract: "Gradio 协议",
       openSourceResource: "资源组",
       openSourceCapacity: "容量",
-      openSourceDetect: "检测配置",
+      openSourceDetect: "仅检测",
+      openSourceDetectAndSave: "检测并保存",
       openSourceGradioContract: "Gradio 协议",
       openSourceSave: "保存端点",
       openSourceSetupState: "配置状态",
@@ -116,6 +117,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       openSourceContractOk: "协议匹配",
       openSourceExisting: "已配置端点",
       openSourceDetectDone: "检测完成：{{state}}",
+      openSourceDetectAndSaveDone: "已检测并保存：{{state}}",
+      openSourceDetectNotSaved: "检测完成：{{state}}，未保存",
       openSourceDetectFailed: "检测失败",
       openSourceSaved: "已保存到服务目录",
       openSourceSaveFailed: "保存失败",
@@ -167,8 +170,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       blocked: "阻塞",
       localManaged: "历史托管",
       remoteExternal: "外部服务",
-      noService: "未选择服务"
-      ,
+      noService: "未选择服务",
       resourceGroups: "资源组",
       modelAssets: "模型资源"
     },
@@ -559,7 +561,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       commercialEndpoint: "API 服务",
       generateLine: "生成本行",
       serviceState: "服务状态",
-      diagnosticsReadyShort: "服务正常",
+      diagnosticsReadyShort: "API 正常",
       showDiagnosticsShort: "诊断",
       hideDiagnosticsShort: "收起",
       noRoutableService: "暂无可用服务",
@@ -570,10 +572,10 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         commercial: "TTS API"
       },
       methodHint: {
-        gpt: "logs、权重、参考音频闭环",
-        indextts: "上传或录制参考音频",
-        cosyvoice: "预设、零样本、跨语种与指令",
-        commercial: "厂商模型、声音与风格"
+        gpt: "使用训练好的角色音色，适合固定角色长期配音",
+        indextts: "用上传、拖入或录制的参考音频临时生成",
+        cosyvoice: "可用预设、零样本、跨语种或风格指令",
+        commercial: "调用外部 TTS API 的声音和风格参数"
       },
       soundReference: "声音资源",
       referenceSectionHint: "参考音频、参考文本和情绪控制只跟随当前服务与配置方案生效",
@@ -767,11 +769,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       queueFiltered: "Generate filtered"
     },
     topbar: {
-      roleLibrary: "Role Library",
+      roleLibrary: "Roles",
       resourceQueue: "Queue",
       services: "Services",
-      ttsConfig: "TTS Config",
-      llmConfig: "LLM API"
+      ttsConfig: "Setup",
+      llmConfig: "Parser"
     },
     audioInput: {
       upload: "Upload",
@@ -841,7 +843,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       openSourceApiContract: "Gradio contract",
       openSourceResource: "Resource group",
       openSourceCapacity: "Capacity",
-      openSourceDetect: "Detect config",
+      openSourceDetect: "Detect only",
+      openSourceDetectAndSave: "Detect and save",
       openSourceGradioContract: "Gradio contract",
       openSourceSave: "Save endpoint",
       openSourceSetupState: "Setup state",
@@ -850,6 +853,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       openSourceContractOk: "Contract matched",
       openSourceExisting: "Configured endpoints",
       openSourceDetectDone: "Detection complete: {{state}}",
+      openSourceDetectAndSaveDone: "Detected and saved: {{state}}",
+      openSourceDetectNotSaved: "Detection complete: {{state}}; not saved",
       openSourceDetectFailed: "Detection failed",
       openSourceSaved: "Saved to service directory",
       openSourceSaveFailed: "Save failed",
@@ -901,8 +906,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       blocked: "Blocked",
       localManaged: "Legacy managed",
       remoteExternal: "External",
-      noService: "No service selected"
-      ,
+      noService: "No service selected",
       resourceGroups: "Resource groups",
       modelAssets: "Model assets"
     },
@@ -1293,7 +1297,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       commercialEndpoint: "API service",
       generateLine: "Generate line",
       serviceState: "Service state",
-      diagnosticsReadyShort: "Service ready",
+      diagnosticsReadyShort: "API ready",
       showDiagnosticsShort: "Diagnostics",
       hideDiagnosticsShort: "Hide",
       noRoutableService: "No usable service",
@@ -1304,10 +1308,10 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         commercial: "TTS API"
       },
       methodHint: {
-        gpt: "Logs, weights, reference audio",
-        indextts: "Upload or record reference audio",
-        cosyvoice: "Preset, zero-shot, cross-lingual, instruct",
-        commercial: "Vendor model, voice, and style"
+        gpt: "Use a trained character voice for recurring roles",
+        indextts: "Generate from uploaded, dropped, or recorded reference audio",
+        cosyvoice: "Use preset, zero-shot, cross-lingual, or instructed voice modes",
+        commercial: "Use voice and style parameters from an external TTS API"
       },
       soundReference: "Voice resources",
       referenceSectionHint: "Reference audio, transcripts, and emotion controls follow the selected service and profile",

@@ -404,6 +404,18 @@ components:
     height: 48px
 ---
 
+# TTS More 设计阅读规则
+
+这份文件保留 Geist Light 作为视觉 token 基线，但 TTS More 不是营销页，也不是展示型 demo。默认目标是密集、可扫描、低打扰的剧本配音生产工作台。
+
+后续改 UI 时先遵守这三条：
+
+- 先复用现有 CSS token、按钮、状态 chip、行卡和面板密度；不要为单个场景新增一套视觉语言。
+- 主路径只展示当前任务需要的信息：剧本、台词、角色音色、TTS 接入、生成和历史试听。
+- 高级配置、兼容旧路径、加载签名和诊断只在异常、展开或明确配置任务中出现。
+
+Geist token 只回答“颜色、字号、间距从哪里来”；TTS More 的信息架构以 `README.md` 和 `docs/minimal-workbench-audit.md` 为准。
+
 # Geist
 
 ## Overview

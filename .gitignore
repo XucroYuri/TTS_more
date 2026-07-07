@@ -23,11 +23,16 @@ data/demo/
 data/lan-tts-demo/
 data/real-validation/
 data/validation/
+data/parser_providers.json
 data/cache/
 data/models/
 data/characters.json
 data/characters.local.json
 data/services.local.json
+Project/
+.omc/
+.omo/
+.omx/
 data/**/audio/
 data/projects/*/audio/
 *.wav

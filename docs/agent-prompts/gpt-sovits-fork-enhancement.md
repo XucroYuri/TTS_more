@@ -1,5 +1,9 @@
 # GPT-SoVITS Fork 改造 Prompt
 
+> 使用前先读这里：这是一份历史改造提示，不是可直接照抄的补丁。
+> 执行 Agent 必须先在当前 GPT-SoVITS fork 中重新搜索文件、函数和端点；本文中的旧行号、示例代码和“已确认”描述只能作为意图说明，不能作为当前事实。
+> 保留的硬规则只有：兼容现有 API、路径安全、不泄露本机路径、真实验证通过后再交付。
+
 ## 角色与目标
 
 你是一个 GPT-SoVITS 仓库的维护者。本仓库是我们团队的 fork（`https://github.com/XucroYuri/GPT-SoVITS`），服务于一个名为"TTS More"的多 TTS 服务调度工作台。TTS More 通过 HTTP API 调用 GPT-SoVITS 进行语音合成。

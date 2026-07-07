@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import subprocess
 
 from fastapi.testclient import TestClient
 
@@ -40,6 +41,34 @@ def test_repository_does_not_publish_demo_script_templates() -> None:
 
     for path in forbidden_paths:
         assert not path.exists(), f"{path} must not be published"
+
+
+def test_local_runtime_paths_are_gitignored() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    runtime_paths = [
+        "data/local/services.json",
+        "data/local/characters.json",
+        "data/parser_providers.json",
+        "Project/example/.project-id",
+        ".env.local",
+        "repo/GPT-SoVITS/README.md",
+        ".omc/state/example",
+        ".omo/run-continuation/example",
+        ".omx/state/example",
+    ]
+
+    result = subprocess.run(
+        ["git", "check-ignore", "--stdin"],
+        cwd=repo_root,
+        input="\n".join(runtime_paths) + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    ignored_paths = set(result.stdout.splitlines())
+
+    assert result.returncode == 0
+    assert ignored_paths == set(runtime_paths)
 
 
 def test_committable_character_template_is_empty() -> None:

@@ -5769,14 +5769,15 @@ h3 {
 }
 
 .generation-method-tab {
-  display: grid;
-  gap: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-width: 0;
-  min-height: 44px;
-  padding: 6px 7px;
+  min-height: 32px;
+  padding: 0 8px;
   border: 1px solid var(--geist-gray-200);
   border-radius: var(--radius-sm);
-  text-align: left;
+  text-align: center;
   background: var(--geist-bg);
   cursor: pointer;
 }
@@ -5792,8 +5793,7 @@ h3 {
   box-shadow: inset 0 0 0 1px var(--geist-blue-600);
 }
 
-.generation-method-tab strong,
-.generation-method-tab span {
+.generation-method-tab strong {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -5802,12 +5802,6 @@ h3 {
 .generation-method-tab strong {
   font-size: 12px;
   line-height: 16px;
-}
-
-.generation-method-tab span {
-  color: var(--geist-gray-900);
-  font-size: 11px;
-  line-height: 13px;
 }
 
 .generation-method-panel {
