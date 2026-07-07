@@ -3205,23 +3205,6 @@ export default function App() {
                         )}
                       </button>
                     </div>
-                    <div className="generation-method-tabs" role="tablist" aria-label={t("inspector.generationMethod")}>
-                      {generationMethods.map((method) => (
-                        <button
-                          className={`generation-method-tab ${activeGenerationMethod === method.id ? "active" : ""}`}
-                          key={method.id}
-                          onClick={() => selectGenerationMethod(method.id)}
-                          role="tab"
-                          type="button"
-                          aria-selected={activeGenerationMethod === method.id}
-                          aria-label={`${t(method.labelKey)} · ${t(method.hintKey)}`}
-                          title={t(method.hintKey)}
-                        >
-                          <strong>{t(method.labelKey)}</strong>
-                        </button>
-                      ))}
-                    </div>
-
                     <div className={`generation-method-panel method-${activeGenerationMethod}`}>
                       <div className="voice-route-summary compact-route-summary" aria-label={t("inspector.routeAndVoice")}>
                         <div>
@@ -3243,6 +3226,22 @@ export default function App() {
                       >
                         <summary>{t("inspector.routeSettings")}</summary>
                         <div className="inspector-more-body">
+                          <div className="generation-method-tabs" role="tablist" aria-label={t("inspector.generationMethod")}>
+                            {generationMethods.map((method) => (
+                              <button
+                                className={`generation-method-tab ${activeGenerationMethod === method.id ? "active" : ""}`}
+                                key={method.id}
+                                onClick={() => selectGenerationMethod(method.id)}
+                                role="tab"
+                                type="button"
+                                aria-selected={activeGenerationMethod === method.id}
+                                aria-label={`${t(method.labelKey)} · ${t(method.hintKey)}`}
+                                title={t(method.hintKey)}
+                              >
+                                <strong>{t(method.labelKey)}</strong>
+                              </button>
+                            ))}
+                          </div>
                           {activeGenerationMethod === "commercial" && (
                             <label className="resource-field">
                               <span>{t("inspector.commercialProvider")}</span>
