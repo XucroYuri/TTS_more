@@ -743,6 +743,7 @@ export default function App() {
       : 0;
   const queueProgressPercent = Math.round(Math.max(0, Math.min(1, queueProgressRatio)) * 100);
   const queueHasWork = queueTotalItems > 0 || queueJobs.length > 0;
+  const queueTopbarEntryVisible = queueHasWork || Boolean(queueActiveJob);
   const queueSyncLabel = isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced");
   const queueVisibleStatusLabel = queueActiveJob ? statusText(queueActiveJob.status, t) : queueSyncLabel;
   const queueVisibleTone = queueActiveJob ? queueStatusTone(queueActiveJob.status) : isRefreshingTopology ? "running" : "idle";
@@ -1880,17 +1881,19 @@ export default function App() {
               <Library size={15} />
               <span className="menu-trigger-label">{t("topbar.roleLibrary")}</span>
             </button>
-            <button
-              className={`topbar-action-button menu-trigger ${servicePanelSection === "resources" && isTopologyMenuOpen ? "active" : ""}`}
-              onClick={() => {
-                setServicePanelSection("resources");
-                setIsTopologyMenuOpen(true);
-              }}
-              title={t("services.resourceQueueTitle")}
-            >
-              <History size={15} />
-              <span className="menu-trigger-label">{t("topbar.resourceQueue")}</span>
-            </button>
+            {queueTopbarEntryVisible && (
+              <button
+                className={`topbar-action-button menu-trigger ${servicePanelSection === "resources" && isTopologyMenuOpen ? "active" : ""}`}
+                onClick={() => {
+                  setServicePanelSection("resources");
+                  setIsTopologyMenuOpen(true);
+                }}
+                title={t("services.resourceQueueTitle")}
+              >
+                <History size={15} />
+                <span className="menu-trigger-label">{t("topbar.resourceQueue")}</span>
+              </button>
+            )}
             <div className="topbar-menu-wrap topbar-config-actions">
               <button
                 className={`topbar-action-button menu-trigger service-status-trigger tone-${serviceSummary.parser.tone} ${servicePanelSection === "llm" && isTopologyMenuOpen ? "active" : ""}`}
