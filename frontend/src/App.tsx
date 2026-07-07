@@ -141,8 +141,15 @@ const COSY_VOICE_MODE_OPTIONS = [
   { id: "cross_lingual", labelKey: "inspector.cosyModeCrossLingual" },
   { id: "instruct", labelKey: "inspector.cosyModeInstruct" }
 ] as const;
+const INDEX_EMOTION_MODE_OPTIONS = [
+  { id: "same_as_voice", labelKey: "inspector.emotionSameAsVoice" },
+  { id: "emotion_text", labelKey: "inspector.emotionText" },
+  { id: "emotion_audio", labelKey: "inspector.emotionAudio" },
+  { id: "emotion_vector", labelKey: "inspector.emotionVector" }
+] as const;
 
 type CosyVoiceMode = (typeof COSY_VOICE_MODE_OPTIONS)[number]["id"];
+type IndexEmotionMode = (typeof INDEX_EMOTION_MODE_OPTIONS)[number]["id"];
 
 interface ConfirmationDialogState {
   title: string;
@@ -176,6 +183,7 @@ export default function App() {
   const [selectedHistoryVersions, setSelectedHistoryVersions] = useState<Record<string, string>>({});
   const [versionDrafts, setVersionDrafts] = useState<Record<string, InspectorVersionDraft & { version_id: string }>>({});
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
+  const [routeSettingsOpen, setRouteSettingsOpen] = useState(false);
   const [selectedLineIds, setSelectedLineIds] = useState<string[]>([]);
   const [lineTextDrafts, setLineTextDrafts] = useState<Record<string, string>>({});
   const [scriptInput, setScriptInput] = useState("");
@@ -507,6 +515,7 @@ export default function App() {
     [activeLine?.service_override, activeProvider, activeRawBindingConfig, activeVersionDraft]
   );
   const cosyVoiceMode = cosyVoiceModeFromConfig(activeBindingConfig.mode);
+  const indexEmotionMode = indexEmotionModeFromConfig(activeBindingConfig.emotion_mode);
   const cosyVoiceNeedsSpeaker = cosyVoiceMode === "sft" || cosyVoiceMode === "instruct";
   const cosyVoiceNeedsPrompt = cosyVoiceMode === "zero_shot" || cosyVoiceMode === "cross_lingual";
   const cosyVoiceNeedsInstruction = cosyVoiceMode === "instruct";
@@ -514,6 +523,10 @@ export default function App() {
   useEffect(() => {
     setDiagnosticsExpanded(false);
   }, [activeLine?.id, activeServiceId]);
+
+  useEffect(() => {
+    setRouteSettingsOpen(false);
+  }, [activeLine?.id, activeGenerationMethod]);
 
   const activeLogsReferenceRequest = useMemo(
     () => logsReferenceRequest(activeProvider, activeServiceId, activeBindingConfig),
@@ -3201,7 +3214,12 @@ export default function App() {
                           <small title={activeServiceContract}>{activeServiceContract}</small>
                         </div>
                       </div>
-                      <details className="inspector-more-settings route-settings" key={`${activeLine?.id ?? "none"}-${activeGenerationMethod}`}>
+                      <details
+                        className="inspector-more-settings route-settings"
+                        key={`${activeLine?.id ?? "none"}-${activeGenerationMethod}`}
+                        onToggle={(event) => setRouteSettingsOpen(event.currentTarget.open)}
+                        open={routeSettingsOpen}
+                      >
                         <summary>{t("inspector.routeSettings")}</summary>
                         <div className="inspector-more-body">
                           {activeGenerationMethod === "commercial" && (
@@ -3266,6 +3284,15 @@ export default function App() {
                               </select>
                             </label>
                           </div>
+                          {activeLine.temporary_binding && !activeVersionDraft && (
+                            <button
+                              className="secondary-button compact-button route-clear-temporary"
+                              type="button"
+                              onClick={() => clearTemporaryBinding(activeLine.id)}
+                            >
+                              {t("inspector.clearTemporaryBinding")}
+                            </button>
+                          )}
                         </div>
                       </details>
                     </div>
@@ -3296,12 +3323,7 @@ export default function App() {
                       </div>
                     </div>
 
-                    {activeLine.temporary_binding ? (
-                      <div className="reference-setup-callout" aria-live="polite">
-                        <span>{t("inspector.temporaryBindingShort")}</span>
-                        <button className="secondary-button compact-button" type="button" onClick={() => clearTemporaryBinding(activeLine.id)}>{t("inspector.clearTemporaryBinding")}</button>
-                      </div>
-                    ) : !activeBinding ? (
+                    {!activeLine.temporary_binding && !activeBinding ? (
                       <div className="reference-setup-callout attention" aria-live="polite">
                         <span>{t("inspector.needsTemporaryBindingShort")}</span>
                         <button className="secondary-button compact-button" type="button" onClick={() => setTemporaryBindingProvider(activeLine.id, "indextts")}>{t("inspector.createIndexTemporary")}</button>
@@ -3443,45 +3465,28 @@ export default function App() {
                         <details className="inspector-more-settings reference-settings">
                           <summary>{t("inspector.emotionAndParams")}</summary>
                           <div className="inspector-more-body">
-                            <div className="emotion-mode-control" role="radiogroup" aria-label={t("inspector.emotionMode")}>
+                            <label className="resource-field index-emotion-mode-field">
                               <span>{t("inspector.emotionMode")}</span>
-                              <div>
-                                {([
-                                  ["same_as_voice", t("inspector.emotionSameAsVoice")],
-                                  ["emotion_audio", t("inspector.emotionAudio")],
-                                  ["emotion_vector", t("inspector.emotionVector")],
-                                  ["emotion_text", t("inspector.emotionText")]
-                                ] as const).map(([mode, label]) => {
-                                  const currentMode = stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice";
-                                  return (
-                                    <button
-                                      aria-checked={currentMode === mode}
-                                      className={`emotion-mode-option ${currentMode === mode ? "active" : ""}`}
-                                      key={mode}
-                                      onClick={() => updateActiveBindingConfig({ emotion_mode: mode })}
-                                      role="radio"
-                                      type="button"
-                                    >
-                                      {label}
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                            {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_text" && (
+                              <select value={indexEmotionMode} onChange={(event) => updateActiveBindingConfig({ emotion_mode: event.target.value })}>
+                                {INDEX_EMOTION_MODE_OPTIONS.map((mode) => (
+                                  <option value={mode.id} key={mode.id}>{t(mode.labelKey)}</option>
+                                ))}
+                              </select>
+                            </label>
+                            {indexEmotionMode === "emotion_text" && (
                               <label className="resource-field">
                                 <span>{t("inspector.emotionText")}</span>
                                 <input value={stringConfig(activeBindingConfig.emotion_text)} onChange={(event) => updateActiveBindingConfig({ emotion_text: event.target.value })} placeholder={activeLine.note || t("inspector.emotionTextPlaceholder")} />
                               </label>
                             )}
-                            {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_audio" && (
+                            {indexEmotionMode === "emotion_audio" && (
                               <ReferenceAudioInput
                                 label={t("inspector.uploadEmotionReference")}
                                 value={stringConfig(activeBindingConfig.emotion_audio)}
                                 onUpload={(file) => uploadLineReference(file, "emotion_audio")}
                               />
                             )}
-                            {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_vector" && (
+                            {indexEmotionMode === "emotion_vector" && (
                               <label className="resource-field">
                                 <span>{t("inspector.emotionVector")}</span>
                                 <input value={vectorConfig(activeBindingConfig.emotion_vector)} onChange={(event) => updateActiveBindingConfig({ emotion_vector: parseVectorConfig(event.target.value) })} placeholder="0,0,0,0,0,0,0,0" />
@@ -4356,6 +4361,11 @@ function stringConfig(value: unknown): string {
 function cosyVoiceModeFromConfig(value: unknown): CosyVoiceMode {
   const mode = stringConfig(value);
   return COSY_VOICE_MODE_OPTIONS.some((item) => item.id === mode) ? (mode as CosyVoiceMode) : "zero_shot";
+}
+
+function indexEmotionModeFromConfig(value: unknown): IndexEmotionMode {
+  const mode = stringConfig(value);
+  return INDEX_EMOTION_MODE_OPTIONS.some((item) => item.id === mode) ? (mode as IndexEmotionMode) : "same_as_voice";
 }
 
 function vectorConfig(value: unknown): string {
