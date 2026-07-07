@@ -48,6 +48,9 @@ describe("i18n configuration", () => {
     expect(tText(resources["zh-CN"], "characters.uploadAvatar")).toBe("上传头像");
     expect(tText(resources["zh-CN"], "audioInput.record")).toBe("录音");
     expect(tText(resources["zh-CN"], "script.drawer.list")).toBe("剧本列表");
+    expect(tText(resources["zh-CN"], "script.manageScriptShort")).toBe("切换");
+    expect(tText(resources["zh-CN"], "script.sourceExcerpt")).toBe("原文摘录");
+    expect(tText(resources["zh-CN"], "script.parseRevision")).toBe("提取台词");
     expect(tText(resources["en-US"], "topbar.roleLibrary")).toBe("Roles");
     expect(tText(resources["en-US"], "characters.libraryManager")).toBe("Roles and voices");
     expect(tText(resources["en-US"], "characters.bindToProjectRole")).toBe("Use in this project");
@@ -63,5 +66,8 @@ describe("i18n configuration", () => {
     expect(tText(resources["en-US"], "characters.uploadAvatar")).toBe("Upload avatar");
     expect(tText(resources["en-US"], "audioInput.record")).toBe("Record");
     expect(tText(resources["en-US"], "script.drawer.preview")).toBe("Preview");
+    expect(tText(resources["en-US"], "script.manageScriptShort")).toBe("Switch");
+    expect(tText(resources["en-US"], "script.sourceExcerpt")).toBe("Source excerpt");
+    expect(tText(resources["en-US"], "script.parseRevision")).toBe("Extract lines");
   });
 });

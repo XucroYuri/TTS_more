@@ -534,12 +534,25 @@ export default function App() {
   const displayProjectTitle = project.title || currentProjectId ? standardProjectName(project.title || currentProjectId || "") : t("empty.noProjectSelected");
   const scriptSourceTone = scriptSourceMode === "project" ? "completed" : "queued";
   const scriptSourceLabel = t(`parser.source.${scriptSourceMode}`);
-  const scriptSourceHint = t(`parser.sourceHint.${scriptSourceMode}`, { projectLines: project.lines.length });
   const projectRows = useMemo<ProjectSummary[]>(() => projectSummaries, [projectSummaries]);
   const scriptConsoleText = useMemo(
     () => scriptInput || projectToScriptSourceText(projectWithCharacters, characters),
     [characters, projectWithCharacters, scriptInput]
   );
+  const scriptSourceExcerpt = useMemo(
+    () =>
+      scriptConsoleText
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .slice(0, 5),
+    [scriptConsoleText]
+  );
+  const scriptSidebarMeta = t("script.sidebarMeta", {
+    lines: project.lines.length,
+    characters: projectCharacters.length,
+    revisions: project.parse_revisions?.length ?? 0
+  });
   const scriptConsoleMode = scriptConsoleBodyMode(isSidebarScriptEditing);
 
   useEffect(() => {
@@ -1644,38 +1657,27 @@ export default function App() {
         </div>
 
         <section className="panel compact parser-panel script-console-panel">
-          <div className="script-inline-manager" aria-label={t("script.managerTitle")}>
-            <div className="script-inline-manager-head">
-              <FolderKanban size={14} />
+          <section className="script-sidebar-current" aria-label={t("script.activeScript")}>
+            <div className="script-sidebar-current-head">
               <div>
-                <span>{t("script.managerTitle")}</span>
+                <span>{t("script.activeScript")}</span>
                 <strong>{displayProjectTitle}</strong>
               </div>
+              <button className="secondary-button compact-button script-manager-open-button" type="button" onClick={() => setIsScriptManagerOpen(true)}>
+                <FolderKanban size={14} /> {t("script.manageScriptShort")}
+              </button>
+            </div>
+            <div className="script-sidebar-meta">
+              <span>{scriptSidebarMeta}</span>
               <StatusPill tone={scriptSourceTone} label={scriptSourceLabel} />
             </div>
-
-            <section className="script-sidebar-current" aria-label={t("script.activeScript")}>
-              <div className="script-sidebar-current-title">
-                <span>{t("app.projectCount", { count: projectRows.length })}</span>
-                <strong>{displayProjectTitle}</strong>
-              </div>
-              <div className="script-sidebar-stats">
-                <div><span>{t("script.lineCount")}</span><strong>{project.lines.length}</strong></div>
-                <div><span>{t("script.characters")}</span><strong>{projectCharacters.length}</strong></div>
-                <div><span>{t("script.parseRevisions")}</span><strong>{project.parse_revisions?.length ?? 0}</strong></div>
-              </div>
-              <button className="secondary-button script-manager-open-button" type="button" onClick={() => setIsScriptManagerOpen(true)}>
-                <FolderKanban size={14} /> {t("script.manageScript")}
-              </button>
-              {projectRows.length === 0 && <span className="script-sidebar-empty-hint">{t("empty.noProjectsHint")}</span>}
-            </section>
-          </div>
+            {projectRows.length === 0 && <span className="script-sidebar-empty-hint">{t("empty.noProjectsHint")}</span>}
+          </section>
 
           <div className={`script-console-preview source-${scriptSourceMode} mode-${scriptConsoleMode}`}>
             <div className="script-console-preview-head">
               <div>
-                <span>{t("script.currentSource")}</span>
-                <strong>{scriptSourceLabel}</strong>
+                <span>{t("script.sourceExcerpt")}</span>
               </div>
               <div className="script-console-preview-actions">
                 {scriptConsoleMode === "edit" ? (
@@ -1696,9 +1698,11 @@ export default function App() {
                 onChange={(event) => updateScriptInput(event.target.value)}
                 aria-label={t("script.editSource")}
               />
-            ) : scriptConsoleText.trim().length > 0 ? (
-              <div className="script-console-markdown markdown-preview" aria-label={t("script.previewSource")}>
-                {renderMarkdownPreview(scriptConsoleText)}
+            ) : scriptSourceExcerpt.length > 0 ? (
+              <div className="script-excerpt-lines" aria-label={t("script.previewSource")}>
+                {scriptSourceExcerpt.map((line, index) => (
+                  <p key={`${line}-${index}`}>{line}</p>
+                ))}
               </div>
             ) : (
               <div className="empty-row compact">{t("empty.noProjectsHint")}</div>
@@ -4719,26 +4723,6 @@ function FailureHistoryMessage({ version, t }: { version: GenerationVersion; t: 
       {failure.detail && <span>{failure.detail}</span>}
     </p>
   );
-}
-
-function renderMarkdownPreview(markdown: string) {
-  const lines = markdown.split(/\r?\n/);
-  return lines.map((line, index) => {
-    const key = `${index}-${line.slice(0, 12)}`;
-    if (!line.trim()) return <div className="markdown-line blank" key={key} />;
-    const heading = line.match(/^(#{1,4})\s+(.+)$/);
-    if (heading) {
-      const level = heading[1].length;
-      return <div className={`markdown-line heading h${level}`} key={key}>{heading[2]}</div>;
-    }
-    if (line.trimStart().startsWith(">")) {
-      return <blockquote className="markdown-line quote" key={key}>{line.replace(/^\s*>\s?/, "")}</blockquote>;
-    }
-    if (line.trimStart().startsWith("`") && line.trimEnd().endsWith("`")) {
-      return <code className="markdown-line inline-code" key={key}>{line.replace(/^`|`$/g, "")}</code>;
-    }
-    return <p className="markdown-line" key={key}>{line}</p>;
-  });
 }
 
 function ReferencePreview({ groups, t }: { groups: CharacterReferenceAudioGroup[]; t: Translate }) {
