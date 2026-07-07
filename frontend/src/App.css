@@ -3418,8 +3418,7 @@ h3 {
 
 .project-current span,
 .project-current small,
-.project-row small,
-.task-actions span {
+.project-row small {
   color: var(--geist-gray-900);
   font-size: 12px;
   line-height: 16px;
@@ -5185,13 +5184,30 @@ h3 {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto minmax(188px, auto);
+  grid-template-columns: minmax(220px, 1fr) auto auto minmax(156px, auto);
   gap: var(--space-2);
   align-items: center;
   min-height: 48px;
   padding: var(--space-3);
   border-bottom: 1px solid var(--geist-alpha-200);
   background: var(--geist-bg);
+}
+
+.line-toolbar-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 58px;
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--geist-gray-900);
+  background: var(--geist-bg-subtle);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 16px;
+  white-space: nowrap;
 }
 
 .line-filter-menu {
@@ -5218,6 +5234,11 @@ h3 {
   list-style: none;
 }
 
+.line-filter-menu[open] > summary {
+  border-color: var(--geist-blue-600);
+  background: var(--geist-blue-50);
+}
+
 .line-filter-menu > summary::-webkit-details-marker {
   display: none;
 }
@@ -5236,7 +5257,7 @@ h3 {
   top: calc(100% + 6px);
   right: 0;
   z-index: 8;
-  display: grid;
+  display: none;
   gap: var(--space-2);
   width: min(280px, calc(100vw - 48px));
   padding: var(--space-2);
@@ -5244,6 +5265,10 @@ h3 {
   border-radius: var(--radius-sm);
   background: var(--geist-bg);
   box-shadow: 0 16px 38px #00000018;
+}
+
+.line-filter-menu[open] .line-filter-popover {
+  display: grid;
 }
 
 .line-filter-popover label {
@@ -7748,6 +7773,25 @@ h3 {
   .validation-flow,
   .filters-row {
     grid-template-columns: 1fr;
+  }
+
+  .line-toolbar-count,
+  .line-filter-menu > summary,
+  .task-actions,
+  .task-actions .primary-button,
+  .task-actions .secondary-button {
+    width: 100%;
+  }
+
+  .task-actions {
+    justify-content: stretch;
+  }
+
+  .line-filter-popover {
+    position: static;
+    width: 100%;
+    margin-top: var(--space-2);
+    box-shadow: none;
   }
 
   .script-actions {

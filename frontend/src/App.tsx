@@ -564,6 +564,14 @@ export default function App() {
   const hasMoreFilteredLines = displayedLines.length < filteredLines.length;
   const selectedLines = useMemo(() => project.lines.filter((line) => selectedLineIds.includes(line.id)), [project.lines, selectedLineIds]);
   const providerOptions = useMemo(() => Array.from(new Set(project.lines.map((line) => lineBinding(line, resolvedCharacters)?.provider_type ?? "unassigned"))), [project.lines, resolvedCharacters]);
+  const hasLineFilters = providerFilter !== "all" || statusFilter !== "all";
+  const lineFilterTitle = hasLineFilters
+    ? [
+        providerFilter !== "all" ? providerFilter : null,
+        statusFilter !== "all" ? statusText(statusFilter === "not-generated" ? "not generated" : statusFilter, t) : null
+      ].filter(Boolean).join(" · ")
+    : t("filters.more");
+  const visibleLineLabel = selectedLineIds.length > 0 ? t("table.selectedLines", { count: selectedLineIds.length }) : t("table.visibleLines", { count: filteredLines.length });
   const selectedLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language ?? defaultLanguage);
   const selectedLanguageLabel = languageOptions.find((option) => option.value === selectedLanguage)?.label ?? selectedLanguage;
   const displayProjectTitle = project.title || currentProjectId ? standardProjectName(project.title || currentProjectId || "") : t("empty.noProjectSelected");
@@ -2937,11 +2945,12 @@ export default function App() {
                 <Search size={15} />
                 <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder={t("filters.search")} />
               </label>
+              <span className="line-toolbar-count">{visibleLineLabel}</span>
               <details className="line-filter-menu">
-                <summary>
+                <summary title={lineFilterTitle}>
                   <SlidersHorizontal size={14} />
                   <span>{t("filters.more")}</span>
-                  {(providerFilter !== "all" || statusFilter !== "all") && <b>{t("filters.active")}</b>}
+                  {hasLineFilters && <b>{t("filters.active")}</b>}
                 </summary>
                 <div className="line-filter-popover">
                   <label>
@@ -2962,21 +2971,21 @@ export default function App() {
                       <option value="failed">{t("filters.failed")}</option>
                     </select>
                   </label>
-                  <button
-                    className="secondary-button compact-button"
-                    disabled={providerFilter === "all" && statusFilter === "all"}
-                    onClick={() => {
-                      setProviderFilter("all");
-                      setStatusFilter("all");
-                    }}
-                    type="button"
-                  >
-                    {t("filters.clear")}
-                  </button>
+                  {hasLineFilters && (
+                    <button
+                      className="secondary-button compact-button"
+                      onClick={() => {
+                        setProviderFilter("all");
+                        setStatusFilter("all");
+                      }}
+                      type="button"
+                    >
+                      {t("filters.clear")}
+                    </button>
+                  )}
                 </div>
               </details>
               <div className="task-actions">
-                <span>{selectedLineIds.length > 0 ? t("table.selectedLines", { count: selectedLineIds.length }) : t("table.visibleLines", { count: filteredLines.length })}</span>
                 {isGenerating && activeJob && (
                   <span className="generation-progress-inline" aria-label={t("queue.progressLabel", { percent: Math.round((activeJob.progress ?? 0) * 100) })}>
                     {t("queue.progressLabel", { percent: Math.round((activeJob.progress ?? 0) * 100) })}
