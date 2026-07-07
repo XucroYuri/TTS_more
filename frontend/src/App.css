@@ -560,7 +560,7 @@ h3 {
 }
 
 .service-access-modal {
-  width: min(920px, calc(100vw - 32px));
+  width: min(760px, calc(100vw - 32px));
   height: auto;
   min-height: 0;
   max-height: calc(100vh - 32px);
@@ -4481,8 +4481,8 @@ h3 {
 
 .tts-access-panel {
   display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.85fr);
-  gap: var(--space-3);
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-2);
   min-width: 0;
 }
 
@@ -4507,16 +4507,89 @@ h3 {
   gap: 6px;
 }
 
+.tts-provider-segment .open-source-mode-card {
+  min-height: 44px;
+}
+
+.tts-provider-segment .open-source-mode-card span {
+  color: var(--geist-blue-700);
+  font-size: 11px;
+  line-height: 14px;
+}
+
 .open-source-mode-grid.compact {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .tts-access-form {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: 1fr;
 }
 
 .open-source-detect-card.compact {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.tts-access-maintenance {
+  min-width: 0;
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg);
+}
+
+.tts-access-maintenance summary {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: var(--space-2);
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.tts-access-maintenance summary span {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+}
+
+.tts-access-maintenance summary small,
+.open-source-detect-summary span,
+.open-source-detect-summary small {
+  overflow: hidden;
+  color: var(--geist-gray-900);
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.tts-access-maintenance-body {
+  display: grid;
+  gap: var(--space-2);
+  padding: 0 var(--space-2) var(--space-2);
+}
+
+.open-source-actions.compact {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  justify-content: stretch;
+}
+
+.open-source-detect-summary {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: var(--space-2);
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg-subtle);
+}
+
+.open-source-detect-summary strong {
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .script-create-panel,

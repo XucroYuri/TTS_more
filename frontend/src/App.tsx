@@ -1867,12 +1867,9 @@ export default function App() {
                             <section className="tts-access-card tts-access-primary">
                               <div className="open-source-panel-head">
                                 <div>
-                                  <strong>{selectedOpenSourceCatalog?.display_name ?? t("services.openSourceProvider")}</strong>
-                                  <span>{t("services.ttsAccessDescription")}</span>
+                                  <strong>{t("services.openSourceChooseEngine")}</strong>
+                                  <span>{t("services.openSourceSimpleHint")}</span>
                                 </div>
-                                <button className="secondary-button compact-button" onClick={() => void refreshOpenSourceCatalog()}>
-                                  <RefreshCw size={13} /> {t("actions.refresh")}
-                                </button>
                               </div>
                               <div className="tts-provider-segment">
                                 {openSourceCatalog.map((item) => (
@@ -1883,74 +1880,84 @@ export default function App() {
                                     type="button"
                                   >
                                     <strong>{item.display_name}</strong>
-                                    <span>{providerLabel(item.provider_type)}</span>
+                                    {selectedOpenSourceProvider === item.provider_type && <span>{t("audioInput.current")}</span>}
                                   </button>
                                 ))}
                                 {openSourceCatalog.length === 0 && <div className="empty-row">{t("services.openSourceNoCatalog")}</div>}
                               </div>
                               <div className="open-source-form-grid tts-access-form">
-                                <label>
-                                  <span>{t("services.openSourceDisplayName")}</span>
-                                  <input value={openSourceDisplayName} onChange={(event) => setOpenSourceDisplayName(event.target.value)} placeholder={selectedOpenSourceCatalog?.display_name} />
-                                </label>
                                 <label className="wide">
                                   <span>{t("services.openSourceBaseUrl")}</span>
                                   <input value={openSourceBaseUrl} onChange={(event) => setOpenSourceBaseUrl(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_base_url} />
-                                  <small>{t("services.openSourceGradioContract")}: {gradioContractForProvider(selectedOpenSourceProvider)} · {sourceProfileLabel(sourceProfileForEndpointUrl(openSourceBaseUrl || selectedOpenSourceCatalog?.default_base_url || ""), t)}</small>
+                                  <small>{t("services.openSourceEndpointHint")}</small>
                                 </label>
                               </div>
                               <div className="open-source-actions">
-                                <button className="secondary-button compact-button" onClick={() => void runOpenSourceDetect()} disabled={isDetectingOpenSource || isConfiguringOpenSource || !openSourceBaseUrl}>
-                                  {isDetectingOpenSource ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("services.openSourceDetect")}
-                                </button>
                                 <button className="primary-button compact-button" onClick={() => void detectAndSaveOpenSourceService()} disabled={isDetectingOpenSource || isConfiguringOpenSource || !openSourceBaseUrl}>
                                   {isConfiguringOpenSource ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("services.openSourceDetectAndSave")}
                                 </button>
                               </div>
-                            </section>
 
-                            <section className="tts-access-card">
-                              <div className="panel-title"><CheckCircle2 size={15} /> {t("services.openSourceSetupState")}</div>
-                              {openSourceDetectResult ? (
-                                <div className={`open-source-detect-card compact state-${setupStateTone(openSourceDetectResult.setup_state)}`}>
-                                  <div>
-                                    <span>{t("services.openSourceSetupState")}</span>
-                                    <strong>{setupStateLabel(openSourceDetectResult.setup_state, t)}</strong>
+                              <details className="tts-access-maintenance">
+                                <summary>
+                                  <span>{t("services.openSourceAdvanced")}</span>
+                                  <small>{openSourceDetectResult ? setupStateLabel(openSourceDetectResult.setup_state, t) : t("services.openSourceAdvancedHint", { count: configuredOpenSourceServices.length })}</small>
+                                </summary>
+                                <div className="tts-access-maintenance-body">
+                                  <label className="library-field compact">
+                                    <span>{t("services.openSourceDisplayName")}</span>
+                                    <input value={openSourceDisplayName} onChange={(event) => setOpenSourceDisplayName(event.target.value)} placeholder={selectedOpenSourceCatalog?.display_name} />
+                                  </label>
+                                  <div className="open-source-actions compact">
+                                    <button className="secondary-button compact-button" onClick={() => void refreshOpenSourceCatalog()}>
+                                      <RefreshCw size={13} /> {t("services.openSourceRefreshCatalog")}
+                                    </button>
+                                    <button className="secondary-button compact-button" onClick={() => void runOpenSourceDetect()} disabled={isDetectingOpenSource || isConfiguringOpenSource || !openSourceBaseUrl}>
+                                      {isDetectingOpenSource ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("services.openSourceDetect")}
+                                    </button>
                                   </div>
-                                  <div>
-                                    <span>{t("services.openSourceEndpointReachable")}</span>
-                                    <strong>{booleanLabel(openSourceDetectResult.endpoint_reachable, t)}</strong>
+                                  <div className="open-source-detect-summary">
+                                    <span>{t("services.openSourceApiContract")}</span>
+                                    <strong>{gradioContractForProvider(selectedOpenSourceProvider)}</strong>
+                                    <small>{sourceProfileLabel(sourceProfileForEndpointUrl(openSourceBaseUrl || selectedOpenSourceCatalog?.default_base_url || ""), t)}</small>
                                   </div>
-                                  <p>{openSourceDetectResult.env_hint}</p>
+                                  {openSourceDetectResult && (
+                                    <div className={`open-source-detect-card compact state-${setupStateTone(openSourceDetectResult.setup_state)}`}>
+                                      <div>
+                                        <span>{t("services.openSourceSetupState")}</span>
+                                        <strong>{setupStateLabel(openSourceDetectResult.setup_state, t)}</strong>
+                                      </div>
+                                      <div>
+                                        <span>{t("services.openSourceEndpointReachable")}</span>
+                                        <strong>{booleanLabel(openSourceDetectResult.endpoint_reachable, t)}</strong>
+                                      </div>
+                                      <p>{openSourceDetectResult.env_hint}</p>
+                                    </div>
+                                  )}
+                                  <div className="open-source-existing">
+                                    <div className="open-source-section-head">
+                                      <strong>{t("services.openSourceExisting")}</strong>
+                                      <span>{configuredOpenSourceServices.length}</span>
+                                    </div>
+                                    <div className="open-source-existing-list">
+                                      {configuredOpenSourceServices.map((service) => {
+                                        const state = ttsServiceState(service, runningServiceIds.has(service.service_id ?? ""), runtime?.service_mode);
+                                        return (
+                                          <article className={`open-source-existing-card state-${state}`} key={service.service_id ?? service.engine}>
+                                            <span className={`tts-state-dot ${state}`} />
+                                            <span>
+                                              <strong>{serviceDisplayName(service)}</strong>
+                                              <small>{service.base_url || t("services.endpointMissing")}</small>
+                                            </span>
+                                            <span className={`tracker-chip ${ttsStateToneClass(state)}`}>{ttsServiceStateLabel(service, state, t, runtime?.service_mode)}</span>
+                                          </article>
+                                        );
+                                      })}
+                                      {configuredOpenSourceServices.length === 0 && <div className="empty-row compact">{t("services.noService")}</div>}
+                                    </div>
+                                  </div>
                                 </div>
-                              ) : (
-                                <div className="open-source-empty-detect">
-                                  <strong>{t("services.openSourceDetect")}</strong>
-                                  <span>{t("services.openSourceEndpointHint")}</span>
-                                </div>
-                              )}
-                              <div className="open-source-existing">
-                                <div className="open-source-section-head">
-                                  <strong>{t("services.openSourceExisting")}</strong>
-                                  <span>{configuredOpenSourceServices.length}</span>
-                                </div>
-                                <div className="open-source-existing-list">
-                                  {configuredOpenSourceServices.map((service) => {
-                                    const state = ttsServiceState(service, runningServiceIds.has(service.service_id ?? ""), runtime?.service_mode);
-                                    return (
-                                      <article className={`open-source-existing-card state-${state}`} key={service.service_id ?? service.engine}>
-                                        <span className={`tts-state-dot ${state}`} />
-                                        <span>
-                                          <strong>{serviceDisplayName(service)}</strong>
-                                          <small>{service.base_url || t("services.endpointMissing")}</small>
-                                        </span>
-                                        <span className={`tracker-chip ${ttsStateToneClass(state)}`}>{ttsServiceStateLabel(service, state, t, runtime?.service_mode)}</span>
-                                      </article>
-                                    );
-                                  })}
-                                  {configuredOpenSourceServices.length === 0 && <div className="empty-row">{t("services.noService")}</div>}
-                                </div>
-                              </div>
+                              </details>
                             </section>
                           </div>
                         )}
