@@ -2369,173 +2369,63 @@ export default function App() {
 
                         {servicePanelSection === "roles" && (
                           <div className="role-library-workbench">
-                            <section className="model-mapping-center">
-                              <div className="model-mapping-head">
-                                <div>
-                                  <strong>GPT-SoVITS 模型映射</strong>
-                                  <span>{activeProjectCharacter?.name ?? t("status.unset")} · {activeModelCatalogItem?.logs_name ?? activeModelCatalogItem?.name ?? t("status.unset")}</span>
-                                </div>
-                                <div className="role-library-actions">
-                                  <button className="secondary-button compact-button" onClick={() => void refreshModelCatalog()} disabled={isScanningModelCatalog}>
-                                    {isScanningModelCatalog ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} 刷新模型
-                                  </button>
-                                  <button className="secondary-button compact-button" onClick={clearActiveProjectRoleBinding} disabled={!activeProjectCharacter?.project_binding}>清除临时匹配</button>
-                                </div>
-                              </div>
-                              <div className="model-mapping-grid">
-                                <div className="model-mapping-column">
-                                  <div className="model-mapping-column-head">
-                                    <span>剧本角色</span>
-                                    <strong>{projectRoleRows.length}</strong>
-                                  </div>
-                                  <div className="model-mapping-list">
-                                    {projectRoleRows.map((role, index) => {
-                                      const mapping = projectCharacters.find((item) => item.project_character_id === role.id);
-                                      const selected = activeProjectCharacter?.project_character_id === role.id;
-                                      return (
-                                        <button
-                                          className={`model-map-row ${selected ? "selected" : ""} ${roleAccentClass(index)}`}
-                                          key={role.id}
-                                          onClick={() => setActiveProjectRoleId(role.id)}
-                                        >
-                                          <RoleAvatar avatarPath={role.avatarPath} fallback={role.avatarFallback} size="sm" />
-                                          <span>
-                                            <strong>{role.name}</strong>
-                                            <small>{role.lineCount} lines · {mapping?.project_binding ? "项目临时" : role.profile}</small>
-                                          </span>
-                                        </button>
-                                      );
-                                    })}
-                                    {projectRoleRows.length === 0 && <div className="empty-row compact">{t("characters.noProjectRoles")}</div>}
-                                  </div>
-                                </div>
-
-                                <div className="model-mapping-column">
-                                  <div className="model-mapping-column-head">
-                                    <span>模型目录</span>
-                                    <strong>{filteredGptModelCatalog.length}</strong>
-                                  </div>
-                                  <div className="model-mapping-list">
-                                    {filteredGptModelCatalog.map((model) => {
-                                      const selected = activeModelCatalogItem?.id === model.id;
-                                      return (
-                                        <button
-                                          className={`model-map-row model-row ${selected ? "selected" : ""}`}
-                                          key={`${model.service_id ?? "all"}:${model.id}`}
-                                          onClick={() => {
-                                            setActiveModelCatalogId(model.id);
-                                            setActiveModelSampleId(null);
-                                          }}
-                                        >
-                                          <span>
-                                            <strong>{model.name}</strong>
-                                            <small>{model.logs_name ?? model.id}</small>
-                                          </span>
-                                          <span className="candidate-strip-counts">
-                                            <b>GPT {model.gpt_weights?.length ?? 0}</b>
-                                            <b>SoVITS {model.sovits_weights?.length ?? 0}</b>
-                                            <b>Ref {model.sample_count ?? referenceSampleCount(model.reference_audio_groups)}</b>
-                                          </span>
-                                        </button>
-                                      );
-                                    })}
-                                    {filteredGptModelCatalog.length === 0 && (
-                                      <button className="empty-row compact action-empty-row" onClick={() => void refreshModelCatalog()} type="button">
-                                        {isScanningModelCatalog ? t("status.loading") : "刷新 GPT-SoVITS 模型目录"}
-                                      </button>
-                                    )}
-                                  </div>
-                                </div>
-
-                                <div className="model-mapping-column model-mapping-detail">
-                                  <div className="model-mapping-column-head">
-                                    <span>模型详情</span>
-                                    <strong>{activeModelCatalogItem?.source ?? "-"}</strong>
-                                  </div>
-                                  {activeModelCatalogItem ? (
-                                    <>
-                                      <div className="model-detail-fields">
-                                        <div><span>Logs</span><strong>{activeModelCatalogItem.logs_name ?? activeModelCatalogItem.name}</strong></div>
-                                        <div><span>GPT</span><strong>{activeModelCatalogItem.recommended_gpt_weights_path ? shortPath(activeModelCatalogItem.recommended_gpt_weights_path) : t("status.unset")}</strong></div>
-                                        <div><span>SoVITS</span><strong>{activeModelCatalogItem.recommended_sovits_weights_path ? shortPath(activeModelCatalogItem.recommended_sovits_weights_path) : t("status.unset")}</strong></div>
-                                      </div>
-                                      <label className="resource-field">
-                                        <span>训练样本</span>
-                                        <select
-                                          value={(activeModelSelectedSample && "sample_id" in activeModelSelectedSample ? activeModelSelectedSample.sample_id : "")}
-                                          disabled={loadingModelCatalogSamplesKey === activeModelSamplesKey}
-                                          onChange={(event) => setActiveModelSampleId(event.target.value || null)}
-                                        >
-                                          <option value="">{loadingModelCatalogSamplesKey === activeModelSamplesKey ? t("status.loading") : t("status.auto")}</option>
-                                          {activeModelSamples.map((sample) => (
-                                            <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
-                                          ))}
-                                        </select>
-                                      </label>
-                                      {activeModelSelectedSample && (
-                                        <div className="logs-reference-preview compact-reference-preview">
-                                          <div>
-                                            <span>{referenceSampleSourceLabel(activeModelSelectedSample) || t("status.unset")}</span>
-                                            <strong>{activeModelSelectedSample.text || t("inspector.emptyPromptText")}</strong>
-                                          </div>
-                                          {isLocalAudioAsset(activeModelSelectedSample.path) && <WaveformPlayer audioPath={activeModelSelectedSample.path} label={referenceSampleDisplayLabel(activeModelSelectedSample)} />}
-                                        </div>
-                                      )}
-                                      <div className="model-mapping-actions">
-                                        <button className="primary-button compact-button" onClick={bindActiveModelToProjectRole} disabled={!activeProjectCharacter}>绑定到当前剧本角色</button>
-                                        <button className="secondary-button compact-button" onClick={writeActiveModelToLibrary} disabled={!activeProjectCharacter}>写入角色库</button>
-                                      </div>
-                                    </>
-                                  ) : (
-                                    <div className="empty-row compact">选择或刷新模型目录</div>
-                                  )}
-                                </div>
-                              </div>
-                            </section>
-
-                            <section className="role-library-directory">
+                            <section className="role-library-rail">
                               <div className="role-library-title-block">
-                                <strong>{t("characters.library")}</strong>
+                                <strong>{t("characters.currentScriptRoles")}</strong>
+                                <span>{t("characters.currentScriptRolesHint")}</span>
                               </div>
-                              <div className="role-library-toolbar">
-                                <label className="search-field library-search">
-                                  <Search size={14} />
-                                  <input value={roleLibrarySearch} onChange={(event) => setRoleLibrarySearch(event.target.value)} placeholder={t("characters.searchLibrary")} />
-                                </label>
-                                <div className="role-library-actions">
-                                  <button className="secondary-button compact-button" onClick={() => void scanRoles()} disabled={isScanningRoleLibrary}>
-                                    {isScanningRoleLibrary ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} {t("characters.scanCandidates")}
-                                  </button>
-                                  <button className="secondary-button compact-button" onClick={addEmptyLibraryCharacter}><Plus size={13} /> {t("characters.addRole")}</button>
-                                </div>
+                              <div className="project-role-compact-list">
+                                {projectRoleRows.map((role, index) => {
+                                  const mapping = projectCharacters.find((item) => item.project_character_id === role.id);
+                                  const linkedCharacter = mapping?.library_character_id
+                                    ? characters.find((character) => character.id === mapping.library_character_id)
+                                    : null;
+                                  const selected = activeProjectCharacter?.project_character_id === role.id;
+                                  const profileLabel = role.profile === "unassigned" ? t("status.unassigned") : role.profile;
+                                  const bindingLabel = mapping?.project_binding
+                                    ? t("characters.projectTemporaryVoice")
+                                    : linkedCharacter?.name ?? profileLabel;
+                                  return (
+                                    <button
+                                      className={`project-role-compact ${selected ? "selected" : ""} ${mapping?.project_binding || linkedCharacter ? "matched" : "unmatched"} ${roleAccentClass(index)}`}
+                                      key={role.id}
+                                      onClick={() => {
+                                        setActiveProjectRoleId(role.id);
+                                        setActiveRoleCandidateId(null);
+                                        setActiveModelCatalogId(null);
+                                      }}
+                                    >
+                                      <RoleAvatar avatarPath={role.avatarPath} fallback={role.avatarFallback} size="sm" />
+                                      <span>
+                                        <strong>{role.name}</strong>
+                                        <small>{t("characters.lines", { count: role.lineCount })} · {bindingLabel}</small>
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                                {projectRoleRows.length === 0 && <div className="empty-row compact">{t("characters.noProjectRoles")}</div>}
                               </div>
-                              <div className="role-library-status-row">
-                                <div><span>{t("characters.confirmedLibrary")}</span><strong>{characters.filter((character) => character.library_status === "confirmed").length}</strong></div>
-                                <div><span>{t("characters.scanDrafts")}</span><strong>{filteredRoleCandidates.length + filteredGptModelCatalog.length}</strong></div>
-                                <div><span>{t("characters.projectMatch")}</span><strong>{projectCharacters.filter((item) => item.match_status === "matched" || item.library_character_id).length}/{projectRoleRows.length}</strong></div>
+
+                              <div className="role-library-active-summary">
+                                <span>{t("characters.selectedProjectRole")}</span>
+                                <strong>{activeProjectCharacter?.name ?? t("status.unassigned")}</strong>
+                                <small>
+                                  {activeProjectCharacter?.project_binding
+                                    ? `${t("characters.projectTemporaryVoice")} · ${activeProjectCharacter.project_binding.service_id ?? t("services.noService")}`
+                                    : t("characters.noProjectBinding")}
+                                </small>
+                                {activeProjectCharacter?.project_binding && (
+                                  <button className="secondary-button compact-button" onClick={clearActiveProjectRoleBinding}>{t("characters.clearProjectBinding")}</button>
+                                )}
                               </div>
-                              <div className="role-library-service-strip">
-                                <div className="role-service-summary">
-                                  <span>{t("characters.ttsAccess")}</span>
-                                  <strong>{roleLibraryTtsServices.filter((service) => service.state === "ready").length}/{roleLibraryTtsServices.length}</strong>
-                                  <small>{t("characters.modelCatalog")}: {roleLibraryCatalogServices.length}</small>
-                                </div>
-                                {roleLibraryTtsServices.slice(0, 3).map((service) => (
-                                  <div className={`role-service-chip state-${service.state}`} key={service.serviceId}>
-                                    <span>{providerLabel(service.providerType)}</span>
-                                    <strong>{service.label}</strong>
-                                    <small>{service.apiContract}</small>
-                                  </div>
-                                ))}
+
+                              <div className="role-library-section-head">
+                                <strong><Library size={13} /> {t("characters.commonVoices")}</strong>
+                                <button className="secondary-button compact-button" onClick={addEmptyLibraryCharacter}><Plus size={13} /> {t("characters.addRole")}</button>
                               </div>
-                              <label className="library-field compact">
-                                <span>{t("characters.logsService")}</span>
-                                <select value={selectedLogsServiceId} onChange={(event) => setSelectedLogsServiceId(event.target.value)}>
-                                  <option value="">{t("characters.allGptServices")}</option>
-                                  {roleLibraryCatalogServices.map((service) => (
-                                    <option value={service.serviceId} key={service.serviceId}>{service.label} · {providerLabel(service.providerType)}</option>
-                                  ))}
-                                </select>
+                              <label className="search-field library-search">
+                                <Search size={14} />
+                                <input value={roleLibrarySearch} onChange={(event) => setRoleLibrarySearch(event.target.value)} placeholder={t("characters.searchLibrary")} />
                               </label>
                               <div className="role-directory-list">
                                 {filteredLibraryCharacters.map((character, index) => {
@@ -2564,66 +2454,100 @@ export default function App() {
                                     </button>
                                   );
                                 })}
-                                {filteredRoleCandidates.length > 0 && (
-                                  <div className="role-list-subhead">
-                                    <span><RefreshCw size={13} /> {t("characters.scanDrafts")}</span>
-                                    <strong>{filteredRoleCandidates.length}</strong>
-                                  </div>
-                                )}
-                                {filteredRoleCandidates.map((candidate) => {
-                                  const selected = activeRoleCandidate?.id === candidate.id;
-                                  return (
-                                    <button
-                                      className={`candidate-strip-card ${selected ? "selected" : ""}`}
-                                      key={candidate.id}
-                                      onClick={() => {
-                                        setActiveRoleCandidateId(candidate.id);
-                                        setActiveModelCatalogId(null);
-                                      }}
-                                    >
-                                      <span className="candidate-strip-title">
-                                        <strong>{candidate.name}</strong>
-                                        <small>{candidate.logs_name ?? candidate.id}</small>
-                                      </span>
-                                      <span className="candidate-strip-counts">
-                                        <b>GPT {candidate.gpt_weights?.length ?? 0}</b>
-                                        <b>SoVITS {candidate.sovits_weights?.length ?? 0}</b>
-                                        <b>Ref {candidate.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? 0}</b>
-                                      </span>
-                                    </button>
-                                  );
-                                })}
-                                {filteredGptModelCatalog.length > 0 && (
-                                  <div className="role-list-subhead">
-                                    <span><Cpu size={13} /> {t("characters.modelCatalog")}</span>
-                                    <strong>{filteredGptModelCatalog.length}</strong>
-                                  </div>
-                                )}
-                                {filteredGptModelCatalog.map((model) => {
-                                  const selected = activeModelCatalogItem?.id === model.id;
-                                  const sourceService = roleLibraryTtsServices.find((service) => service.serviceId === model.service_id);
-                                  return (
-                                    <button
-                                      className={`candidate-strip-card model-catalog-card ${selected ? "selected" : ""}`}
-                                      key={model.id}
-                                      onClick={() => {
-                                        setActiveModelCatalogId(model.id);
-                                        setActiveRoleCandidateId(null);
-                                      }}
-                                    >
-                                      <span className="candidate-strip-title">
-                                        <strong>{model.name}</strong>
-                                        <small>{model.logs_name ?? model.id}</small>
-                                      </span>
-                                      <span className="candidate-strip-counts">
-                                        <b>{sourceService?.label ?? model.service_id ?? t("services.noService")}</b>
-                                        <b>Ref {model.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? 0}</b>
-                                      </span>
-                                    </button>
-                                  );
-                                })}
-                                {filteredLibraryCharacters.length === 0 && filteredRoleCandidates.length === 0 && filteredGptModelCatalog.length === 0 && <div className="empty-row">{t("characters.noProjectRoles")}</div>}
+                                {filteredLibraryCharacters.length === 0 && <div className="empty-row compact">{t("characters.noCommonVoices")}</div>}
                               </div>
+
+                              <details className="role-maintenance-panel">
+                                <summary>
+                                  <span>{t("characters.roleMaintenance")}</span>
+                                  <small>{t("characters.roleMaintenanceHint")}</small>
+                                </summary>
+                                <div className="role-maintenance-body">
+                                  <div className="role-maintenance-actions">
+                                    <button className="secondary-button compact-button" onClick={() => void scanRoles()} disabled={isScanningRoleLibrary}>
+                                      {isScanningRoleLibrary ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} {t("characters.scanCandidates")}
+                                    </button>
+                                    <button className="secondary-button compact-button" onClick={() => void refreshModelCatalog()} disabled={isScanningModelCatalog}>
+                                      {isScanningModelCatalog ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} {t("characters.refreshModelCatalog")}
+                                    </button>
+                                  </div>
+                                  <label className="library-field compact">
+                                    <span>{t("characters.logsService")}</span>
+                                    <select value={selectedLogsServiceId} onChange={(event) => setSelectedLogsServiceId(event.target.value)}>
+                                      <option value="">{t("characters.allGptServices")}</option>
+                                      {roleLibraryCatalogServices.map((service) => (
+                                        <option value={service.serviceId} key={service.serviceId}>{service.label} · {providerLabel(service.providerType)}</option>
+                                      ))}
+                                    </select>
+                                  </label>
+                                  <div className="role-library-status-row">
+                                    <div><span>{t("characters.confirmedLibrary")}</span><strong>{characters.filter((character) => character.library_status === "confirmed").length}</strong></div>
+                                    <div><span>{t("characters.scanDrafts")}</span><strong>{filteredRoleCandidates.length + filteredGptModelCatalog.length}</strong></div>
+                                    <div><span>{t("characters.projectMatch")}</span><strong>{projectCharacters.filter((item) => item.match_status === "matched" || item.library_character_id).length}/{projectRoleRows.length}</strong></div>
+                                  </div>
+                                  <div className="role-maintenance-list">
+                                    {filteredRoleCandidates.length > 0 && (
+                                      <div className="role-list-subhead">
+                                        <span><RefreshCw size={13} /> {t("characters.scanDrafts")}</span>
+                                        <strong>{filteredRoleCandidates.length}</strong>
+                                      </div>
+                                    )}
+                                    {filteredRoleCandidates.map((candidate) => {
+                                      const selected = activeRoleCandidate?.id === candidate.id;
+                                      return (
+                                        <button
+                                          className={`candidate-strip-card ${selected ? "selected" : ""}`}
+                                          key={candidate.id}
+                                          onClick={() => {
+                                            setActiveRoleCandidateId(candidate.id);
+                                            setActiveModelCatalogId(null);
+                                          }}
+                                        >
+                                          <span className="candidate-strip-title">
+                                            <strong>{candidate.name}</strong>
+                                            <small>{candidate.logs_name ?? candidate.id}</small>
+                                          </span>
+                                          <span className="candidate-strip-counts">
+                                            <b>GPT {candidate.gpt_weights?.length ?? 0}</b>
+                                            <b>SoVITS {candidate.sovits_weights?.length ?? 0}</b>
+                                            <b>Ref {candidate.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? 0}</b>
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                    {filteredGptModelCatalog.length > 0 && (
+                                      <div className="role-list-subhead">
+                                        <span><Cpu size={13} /> {t("characters.modelCatalog")}</span>
+                                        <strong>{filteredGptModelCatalog.length}</strong>
+                                      </div>
+                                    )}
+                                    {filteredGptModelCatalog.map((model) => {
+                                      const selected = activeModelCatalogItem?.id === model.id;
+                                      const sourceService = roleLibraryTtsServices.find((service) => service.serviceId === model.service_id);
+                                      return (
+                                        <button
+                                          className={`candidate-strip-card model-catalog-card ${selected ? "selected" : ""}`}
+                                          key={model.id}
+                                          onClick={() => {
+                                            setActiveModelCatalogId(model.id);
+                                            setActiveRoleCandidateId(null);
+                                          }}
+                                        >
+                                          <span className="candidate-strip-title">
+                                            <strong>{model.name}</strong>
+                                            <small>{model.logs_name ?? model.id}</small>
+                                          </span>
+                                          <span className="candidate-strip-counts">
+                                            <b>{sourceService?.label ?? model.service_id ?? t("services.noService")}</b>
+                                            <b>Ref {model.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? 0}</b>
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                    {filteredRoleCandidates.length === 0 && filteredGptModelCatalog.length === 0 && <div className="empty-row compact">{t("characters.noMaintenanceItems")}</div>}
+                                  </div>
+                                </div>
+                              </details>
                             </section>
 
                             <section className="role-library-detail-pane">
@@ -2726,18 +2650,21 @@ export default function App() {
                                         <strong>{activeLibraryCharacter.name}</strong>
                                         <span>{characterMatchValues(activeLibraryCharacter).slice(0, 4).join(" · ") || activeLibraryCharacter.id}</span>
                                       </div>
-                                      <label className="secondary-button compact-button avatar-upload-button">
-                                        <Upload size={13} /> {t("characters.uploadAvatar")}
-                                        <input
-                                          type="file"
-                                          accept="image/png,image/jpeg,image/webp"
-                                          onChange={(event) => {
-                                            void uploadAvatar(activeLibraryCharacter.id, event.currentTarget.files?.[0]);
-                                            event.currentTarget.value = "";
-                                          }}
-                                        />
-                                      </label>
-                                      <button className="icon-button danger" onClick={() => void removeLibraryCharacter(activeLibraryCharacter.id)} title={t("characters.deleteRole")}><X size={14} /></button>
+                                      <div className="role-detail-hero-actions">
+                                        <button className="primary-button compact-button" onClick={() => applyLibraryCharacterToProjectRole(activeLibraryCharacter)} disabled={!activeProjectCharacter}>{t("characters.bindToProjectRole")}</button>
+                                        <label className="secondary-button compact-button avatar-upload-button">
+                                          <Upload size={13} /> {t("characters.uploadAvatar")}
+                                          <input
+                                            type="file"
+                                            accept="image/png,image/jpeg,image/webp"
+                                            onChange={(event) => {
+                                              void uploadAvatar(activeLibraryCharacter.id, event.currentTarget.files?.[0]);
+                                              event.currentTarget.value = "";
+                                            }}
+                                          />
+                                        </label>
+                                        <button className="icon-button danger" onClick={() => void removeLibraryCharacter(activeLibraryCharacter.id)} title={t("characters.deleteRole")}><X size={14} /></button>
+                                      </div>
                                     </div>
                                     <div className="role-detail-mini-strip">
                                       <div><span>{t("characters.status")}</span><strong>{t(`characters.status_${activeLibraryCharacter.library_status ?? "draft"}`)}</strong></div>
@@ -2872,7 +2799,7 @@ export default function App() {
                                   </div>
                                 );
                               })() : (
-                                <div className="empty-row">{t("characters.noProjectRoles")}</div>
+                                <div className="empty-row">{t("characters.noCommonVoices")}</div>
                               )}
                             </section>
                           </div>
@@ -3797,6 +3724,29 @@ export default function App() {
       );
       return projectWithProjectCharacters(current, nextProjectCharacters);
     });
+    setNotice(t("notice.roleSaved"));
+  }
+
+  function applyLibraryCharacterToProjectRole(character: Character | null) {
+    if (!activeProjectCharacter || !character) return;
+    setProject((current) => {
+      const nextProjectCharacters = ensureProjectCharacters(current, characters).map((item) =>
+        item.project_character_id === activeProjectCharacter.project_character_id
+          ? {
+              ...item,
+              library_character_id: character.id,
+              mode: "reference" as const,
+              character_snapshot: null,
+              project_binding: null,
+              match_status: "matched" as const
+            }
+          : item
+      );
+      return projectWithProjectCharacters(current, nextProjectCharacters);
+    });
+    setActiveLibraryCharacterId(character.id);
+    setActiveRoleCandidateId(null);
+    setActiveModelCatalogId(null);
     setNotice(t("notice.roleSaved"));
   }
 
