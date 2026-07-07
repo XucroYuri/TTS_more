@@ -91,7 +91,7 @@ def test_script_line_can_hold_temporary_voice_binding() -> None:
     assert line.temporary_binding.config["voice"] == "tmp/ref.wav"
 
 
-def test_cosyvoice_endpoint_defaults_to_core_engine_and_contract() -> None:
+def test_cosyvoice_endpoint_defaults_to_core_engine_and_gradio_contract() -> None:
     endpoint = TTSServiceEndpoint(
         service_id="cosyvoice-http",
         provider_type=ProviderType.COSYVOICE,
@@ -103,7 +103,7 @@ def test_cosyvoice_endpoint_defaults_to_core_engine_and_contract() -> None:
 
     assert endpoint.engine == EngineName.COSYVOICE
     assert endpoint.provider_type == ProviderType.COSYVOICE
-    assert endpoint.api_contract == "cosyvoice-http-v1"
+    assert endpoint.api_contract == "gradio-cosyvoice-webui"
 
 
 def test_character_voice_binding_can_target_cosyvoice() -> None:

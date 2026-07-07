@@ -5,6 +5,7 @@ import time
 from fastapi.testclient import TestClient
 
 from app.main import _layer_service_status, create_app
+from app.parser import ParserQualityError
 
 
 def test_health_reports_repos_and_workers(tmp_path: Path) -> None:
@@ -37,11 +38,44 @@ def test_default_parser_provider_uses_kwjm_gpt_55(tmp_path: Path) -> None:
     assert response.status_code == 200
     provider = response.json()["providers"][0]
     assert provider["name"] == "开物基模"
-    assert provider["base_url"] == ""
+    assert provider["base_url"] == "https://kwjm.com"
     assert provider["api_key_env"] == "KWJM_API_KEY"
     assert provider["model"] == "gpt-5.5"
     assert provider["enabled"] is False
     assert provider["priority"] == 10
+
+
+def test_parser_provider_config_activates_kwjm_with_api_key_only_flow(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env.local"
+    client = TestClient(create_app(data_root=tmp_path, env_path=env_path))
+
+    response = client.put(
+        "/api/parser/providers",
+        json={
+            "providers": [
+                {
+                    "name": "开物基模",
+                    "base_url": "https://kwjm.com",
+                    "api_key_env": "KWJM_API_KEY",
+                    "api_key": "kwjm-test-secret",
+                    "model": "gpt-5.5",
+                    "enabled": True,
+                    "timeout_seconds": 45,
+                    "priority": 10,
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    provider = response.json()["providers"][0]
+    assert provider["name"] == "开物基模"
+    assert provider["base_url"] == "https://kwjm.com"
+    assert provider["key_configured"] is True
+    assert provider["enabled"] is True
+    assert "api_key" not in provider
+    assert "kwjm-test-secret" not in (tmp_path / "parser_providers.json").read_text(encoding="utf-8")
+    assert "KWJM_API_KEY=kwjm-test-secret" in env_path.read_text(encoding="utf-8")
 
 
 def test_parser_provider_config_masks_secret_and_writes_env(tmp_path: Path) -> None:
@@ -127,6 +161,132 @@ def test_parser_provider_test_does_not_call_disabled_provider(tmp_path: Path) ->
     assert response.status_code == 200
     assert response.json()["ok"] is False
     assert response.json()["state"] == "disabled"
+
+
+def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "characters": [{"id": "narrator", "name": "NARRATOR"}],
+                                    "lines": [
+                                        {
+                                            "id": "l001",
+                                            "character_id": "narrator",
+                                            "text": "Hello from the contract test.",
+                                            "note": "calm",
+                                            "language": "en",
+                                        }
+                                    ],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            captured["timeout"] = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("app.main.httpx.Client", FakeClient)
+    client = TestClient(create_app(data_root=tmp_path, env_path=tmp_path / ".env.local"))
+
+    response = client.post(
+        "/api/parser/providers/test",
+        json={
+            "provider": {
+                "name": "开物基模",
+                "base_url": "https://kwjm.com",
+                "api_key_env": "KWJM_API_KEY",
+                "api_key": "kwjm-test-secret",
+                "model": "gpt-5.5",
+                "enabled": True,
+                "timeout_seconds": 45,
+                "priority": 10,
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert captured["url"] == "https://kwjm.com/v1/chat/completions"
+    assert captured["headers"] == {"Authorization": "Bearer kwjm-test-secret", "Content-Type": "application/json"}
+    assert captured["json"]["model"] == "gpt-5.5"
+    messages = captured["json"]["messages"]
+    assert "screenplay" in messages[0]["content"].lower()
+    assert "**NARRATOR**" in messages[1]["content"]
+    assert response.json()["message"] == "parser contract request succeeded"
+    assert '"characters"' in response.json()["content_preview"]
+
+
+def test_parse_script_returns_422_when_parser_quality_gate_fails(tmp_path: Path) -> None:
+    class QualityFailingParser:
+        def parse(self, _text: str):
+            raise ParserQualityError("non-dialogue role SFX is not allowed")
+
+    client = TestClient(create_app(data_root=tmp_path))
+    client.app.state.parser = QualityFailingParser()
+
+    response = client.post("/api/parse-script", json={"text": "> **SFX**: Rain hits metal."})
+
+    assert response.status_code == 422
+    assert "SFX" in response.text
+
+
+def test_create_parse_revision_quality_failure_does_not_mutate_project(tmp_path: Path) -> None:
+    class QualityFailingParser:
+        def parse(self, _text: str):
+            raise ParserQualityError("missing dialogue lines: expected at least 2, got 1")
+
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put(
+        "/api/projects/demo",
+        json={
+            "title": "剧本 Demo",
+            "default_language": "zh",
+            "lines": [{"id": "l001", "character_id": "xiao-pin", "text": "旧台词"}],
+        },
+    )
+    script_revision = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "小品：新台词", "summary": "改台词"},
+    )
+    before = client.get("/api/projects/demo").json()
+    client.app.state.parser = QualityFailingParser()
+
+    response = client.post(
+        "/api/projects/demo/parse-revisions",
+        json={"script_revision_id": script_revision.json()["revision"]["revision_id"]},
+    )
+    after = client.get("/api/projects/demo").json()
+
+    assert response.status_code == 422
+    assert "missing dialogue lines" in response.text
+    assert after["active_parse_revision_id"] == before["active_parse_revision_id"]
+    assert after["parse_revisions"] == before["parse_revisions"]
+    assert after["lines"] == before["lines"]
 
 
 def test_services_status_marks_stopped_local_endpoint_as_blocked(tmp_path: Path) -> None:
@@ -526,14 +686,58 @@ def test_projects_endpoint_lists_saved_projects(tmp_path: Path) -> None:
     response = client.get("/api/projects")
 
     assert response.status_code == 200
-    assert response.json()["projects"] == [
-        {
-            "project_id": "demo",
-            "title": "demo-script",
+    projects = response.json()["projects"]
+    assert len(projects) == 1
+    assert projects[0] == {
+        "project_id": "demo",
+        "title": "demo-script",
+        "default_language": "zh",
+        "line_count": 2,
+        "character_count": 0,
+        "script_revision_count": 1,
+        "parse_revision_count": 1,
+        "updated_at": projects[0]["updated_at"],
+    }
+    assert isinstance(projects[0]["updated_at"], str)
+
+
+def test_delete_project_moves_directory_to_trash_and_removes_from_list(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put(
+        "/api/projects/demo",
+        json={
+            "title": "Trash Demo",
             "default_language": "zh",
-            "line_count": 2,
-        }
-    ]
+            "lines": [{"id": "l001", "character_id": "alice", "text": "你好"}],
+        },
+    )
+    project_dir = tmp_path / "Project" / "Trash Demo"
+    audio_path = project_dir / "output" / "audio" / "l001-v001.wav"
+    audio_path.parent.mkdir(parents=True)
+    audio_path.write_bytes(b"RIFFdemo")
+
+    response = client.delete("/api/projects/demo")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "deleted"
+    assert payload["project_id"] == "demo"
+    assert ".trash" in payload["trashed_path"]
+    assert project_dir.exists() is False
+    assert client.get("/api/projects").json()["projects"] == []
+    trash_entries = list((tmp_path / "Project" / ".trash").iterdir())
+    assert len(trash_entries) == 1
+    assert (trash_entries[0] / ".project-id").read_text(encoding="utf-8") == "demo"
+    assert (trash_entries[0] / "output" / "audio" / "l001-v001.wav").read_bytes() == b"RIFFdemo"
+
+
+def test_delete_project_returns_404_for_missing_project(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.delete("/api/projects/missing")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "project not found"
 
 
 def test_generate_writes_audio_manifest_under_project_output(tmp_path: Path) -> None:
@@ -878,11 +1082,14 @@ def test_open_source_tts_catalog_lists_core_providers_in_priority_order(tmp_path
     assert [item["provider_type"] for item in providers] == ["gpt-sovits", "indextts", "cosyvoice"]
     assert providers[0]["clone_url"] == "https://github.com/XucroYuri/GPT-SoVITS.git"
     assert providers[1]["default_repo_path"].endswith("repo/index-tts")
-    assert providers[2]["api_contracts"][0] == "cosyvoice-http-v1"
+    assert providers[0]["default_base_url"] == "http://127.0.0.1:9872"
+    assert providers[0]["api_contracts"] == ["gradio-gpt-sovits-webui"]
+    assert providers[1]["api_contracts"] == ["gradio-indextts2-webui"]
+    assert providers[2]["api_contracts"] == ["gradio-cosyvoice-webui"]
     assert providers[2]["priority"] == 30
 
 
-def test_open_source_tts_detect_reports_missing_repo_and_unreachable_endpoint(tmp_path: Path) -> None:
+def test_open_source_tts_detect_ignores_repo_path_for_gradio_endpoint_onboarding(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path))
 
     response = client.post(
@@ -900,8 +1107,8 @@ def test_open_source_tts_detect_reports_missing_repo_and_unreachable_endpoint(tm
     assert payload["repo_found"] is False
     assert payload["endpoint_reachable"] is False
     assert payload["api_contract_ok"] is False
-    assert payload["setup_state"] == "repo_missing"
-    assert "git clone https://github.com/XucroYuri/GPT-SoVITS.git" in payload["env_hint"]
+    assert payload["setup_state"] == "endpoint_unreachable"
+    assert "Gradio WebUI" in payload["env_hint"]
 
 
 def test_open_source_tts_configure_writes_local_services_without_touching_template(tmp_path: Path) -> None:
@@ -935,6 +1142,39 @@ def test_open_source_tts_configure_writes_local_services_without_touching_templa
     assert saved[0]["source_profile"] == "lan_endpoint"
     assert saved[0]["setup_state"] == "endpoint_unreachable"
     assert template_path.read_text(encoding="utf-8") == template_text
+
+
+def test_open_source_tts_configure_saves_gradio_endpoint_without_local_management(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.post(
+        "/api/open-source-tts/configure",
+        json={
+            "provider_type": "gpt-sovits",
+            "display_name": "GPT-SoVITS Studio",
+            "source_profile": "local_endpoint",
+            "repo_path": str(tmp_path / "unused-local-repo"),
+            "base_url": "http://127.0.0.1:9872",
+            "api_contract": "gpt-sovits-api-v2",
+            "managed": True,
+            "enabled": True,
+            "start_command": ["python", "api_v2.py"],
+            "start_cwd": "repo/GPT-SoVITS",
+        },
+    )
+
+    assert response.status_code == 200
+    service = response.json()["service"]
+    assert service["service_id"] == "local-gpt-sovits"
+    assert service["api_contract"] == "gradio-gpt-sovits-webui"
+    assert service["base_url"] == "http://127.0.0.1:9872"
+    assert service["source_profile"] == "local_endpoint"
+    assert service["network_scope"] == "localhost"
+    assert service["mode"] == "external"
+    assert service["managed"] is False
+    assert service["repo_path"] is None
+    assert service["start_command"] == []
+    assert "gradio_webui" in service["capabilities"]
 
 
 def test_service_status_exposes_setup_and_repository_detection(tmp_path: Path) -> None:
@@ -1712,6 +1952,125 @@ def test_character_library_logs_candidates_merge_weights_refs_and_sidecar_text(t
     assert candidate["reference_audio_groups"][0]["samples"][0]["text_source"] == "sidecar"
 
 
+def test_gpt_sovits_model_catalog_prefers_gradio_and_supplements_from_roots(tmp_path: Path) -> None:
+    gpt_root = tmp_path / "GPT_weights_v2ProPlus"
+    sovits_root = tmp_path / "SoVITS_weights_v2ProPlus"
+    logs_root = tmp_path / "logs"
+    wav_dir = logs_root / "demo-hero-logs" / "5-wav32k"
+    gpt_root.mkdir()
+    sovits_root.mkdir()
+    wav_dir.mkdir(parents=True)
+    (gpt_root / "demo-hero-logs-e50.ckpt").write_bytes(b"gpt")
+    (sovits_root / "demo-hero-logs_e24_s264.pth").write_bytes(b"sovits")
+    (wav_dir / "hero_001.wav").write_bytes(b"wav")
+    (logs_root / "demo-hero-logs" / "2-name2text.txt").write_text(
+        "hero_001.wav\tphoneme\t[1]\t不好！地板开始裂开了！\n",
+        encoding="utf-8",
+    )
+    services_path = tmp_path / "services.json"
+    gpt_root_json = str(gpt_root).replace("\\", "\\\\")
+    sovits_root_json = str(sovits_root).replace("\\", "\\\\")
+    logs_root_json = str(logs_root).replace("\\", "\\\\")
+    services_path.write_text(
+        f"""
+[
+  {{
+    "service_id": "local-gpt-gradio",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "api_contract": "gradio-gpt-sovits-webui",
+    "base_url": "http://127.0.0.1:9872",
+    "mode": "local",
+    "enabled": true,
+    "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice"],
+    "default_params": {{
+      "gpt_weights_root": "{gpt_root_json}",
+      "sovits_weights_root": "{sovits_root_json}",
+      "logs_roots": ["{logs_root_json}"]
+    }}
+  }}
+]
+""",
+        encoding="utf-8",
+    )
+    app = create_app(data_root=tmp_path, services_path=services_path)
+
+    class FakeGradioClient:
+        def gradio_index(self) -> dict:
+            return {
+                "candidates": [
+                    {
+                        "id": "demo-hero-logs",
+                        "logs_id": "demo-hero-logs",
+                        "logs_name": "demo-hero-logs",
+                        "name": "主角",
+                        "aliases": ["主角", "队长"],
+                        "service_id": "local-gpt-gradio",
+                        "source": "gradio",
+                        "gpt_weights": [{"name": "gradio-e40.ckpt", "path": "gradio-e40.ckpt", "score": [40, 0]}],
+                        "sovits_weights": [],
+                        "reference_audio_groups": [],
+                        "recommended_gpt_weights_path": "gradio-e40.ckpt",
+                    }
+                ]
+            }
+
+    app.state.service_router.clients["local-gpt-gradio"] = FakeGradioClient()
+    client = TestClient(app)
+
+    response = client.get("/api/model-catalog/gpt-sovits?service_id=local-gpt-gradio")
+
+    assert response.status_code == 200
+    model = response.json()["models"][0]
+    assert model["logs_name"] == "demo-hero-logs"
+    assert model["recommended_gpt_weights_path"] == "gradio-e40.ckpt"
+    assert model["recommended_sovits_weights_path"].endswith("demo-hero-logs_e24_s264.pth")
+    assert model["sample_count"] == 1
+    assert model["source"] == "merged"
+
+
+def test_gpt_sovits_model_catalog_samples_reads_logs_reference_audio(tmp_path: Path) -> None:
+    logs_root = tmp_path / "logs"
+    wav_dir = logs_root / "demo-hero-logs" / "5-wav32k"
+    wav_dir.mkdir(parents=True)
+    (wav_dir / "hero_001.wav").write_bytes(b"wav")
+    (logs_root / "demo-hero-logs" / "2-name2text.txt").write_text(
+        "hero_001.wav\tphoneme\t[1]\t不好！地板开始裂开了！\n",
+        encoding="utf-8",
+    )
+    services_path = tmp_path / "services.json"
+    logs_root_json = str(logs_root).replace("\\", "\\\\")
+    services_path.write_text(
+        f"""
+[
+  {{
+    "service_id": "local-gpt-gradio",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "api_contract": "gradio-gpt-sovits-webui",
+    "base_url": "http://127.0.0.1:9872",
+    "mode": "local",
+    "enabled": true,
+    "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice"],
+    "default_params": {{
+      "logs_roots": ["{logs_root_json}"]
+    }}
+  }}
+]
+""",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+
+    response = client.get("/api/model-catalog/gpt-sovits/samples?service_id=local-gpt-gradio&logs_name=demo-hero-logs")
+
+    assert response.status_code == 200
+    sample = response.json()["samples"][0]
+    assert sample["path"].endswith("hero_001.wav")
+    assert sample["text"] == "不好！地板开始裂开了！"
+    assert sample["prompt_lang"] == "zh"
+
+
 def test_logs_candidates_include_weight_roots_declared_by_service(tmp_path: Path) -> None:
     gpt_root = tmp_path / "GPT_weights_v2ProPlus"
     sovits_root = tmp_path / "SoVITS_weights_v2ProPlus"
@@ -2061,6 +2420,239 @@ def test_generate_enriches_tasks_from_project_character_reference(tmp_path: Path
     assert version["binding_id"] == "xiao-pin-gpt-binding"
     assert version["parameters"]["gpt_weights_path"] == "gpt-v1.ckpt"
     assert version["parameters"]["ref_audio_path"] == "xiao-pin.wav"
+
+
+def test_generate_uses_project_character_binding_before_library_reference(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "mock-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "base_url": "mock://gpt",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+    client.put(
+        "/api/characters",
+        json=[
+            {
+                "id": "xiao-pin",
+                "name": "小品",
+                "profiles": [
+                    {
+                        "id": "xiao-pin-gpt",
+                        "name": "小品 GPT",
+                        "engine": "gpt-sovits",
+                        "service_id": "mock-gpt",
+                        "bindings": [
+                            {
+                                "binding_id": "xiao-pin-gpt-binding",
+                                "provider_type": "gpt-sovits",
+                                "service_id": "mock-gpt",
+                                "capabilities": ["trained_weights_voice", "reference_audio_voice"],
+                                "config": {
+                                    "gpt_weights_path": "library.ckpt",
+                                    "sovits_weights_path": "library.pth",
+                                    "ref_audio_path": "library.wav",
+                                    "prompt_text": "长期参考文本",
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "default_profile": "xiao-pin-gpt",
+            }
+        ],
+    )
+    client.put(
+        "/api/projects/demo",
+        json={
+            "title": "demo",
+            "default_language": "zh",
+            "project_characters": [
+                {
+                    "project_character_id": "role-1",
+                    "name": "小品",
+                    "library_character_id": "xiao-pin",
+                    "mode": "reference",
+                    "project_binding": {
+                        "binding_id": "role-1-project-gpt",
+                        "provider_type": "gpt-sovits",
+                        "service_id": "mock-gpt",
+                        "fallback_services": [],
+                        "capabilities": ["trained_weights_voice", "reference_audio_voice"],
+                        "config": {
+                            "logs_name": "project-logs",
+                            "gpt_weights_path": "project.ckpt",
+                            "sovits_weights_path": "project.pth",
+                            "ref_audio_path": "project.wav",
+                            "prompt_text": "项目参考文本",
+                        },
+                    },
+                }
+            ],
+            "lines": [{"id": "l001", "character_id": "role-1", "text": "你好"}],
+        },
+    )
+
+    response = client.post(
+        "/api/generate",
+        json={
+            "project_id": "demo",
+            "tasks": [
+                {
+                    "line": {"id": "l001", "character_id": "role-1", "text": "你好"},
+                    "engine": "gpt-sovits",
+                    "profile": "default",
+                    "parameters": {},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    version = response.json()["lines"]["parse-r001:l001"]["versions"][0]
+    assert version["profile"] == "role-1-project-gpt-profile"
+    assert version["binding_id"] == "role-1-project-gpt"
+    assert version["parameters"]["gpt_weights_path"] == "project.ckpt"
+    assert version["parameters"]["prompt_text"] == "项目参考文本"
+
+
+def test_line_temporary_binding_overrides_project_character_binding(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "mock-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "base_url": "mock://gpt",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice"]
+  },
+  {
+    "service_id": "mock-index",
+    "engine": "indextts",
+    "provider_type": "indextts",
+    "base_url": "mock://index",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts", "reference_audio_voice", "emotion_text"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+    client.put(
+        "/api/projects/demo",
+        json={
+            "title": "demo",
+            "default_language": "zh",
+            "project_characters": [
+                {
+                    "project_character_id": "role-1",
+                    "name": "小品",
+                    "library_character_id": None,
+                    "mode": "reference",
+                    "project_binding": {
+                        "binding_id": "role-1-project-gpt",
+                        "provider_type": "gpt-sovits",
+                        "service_id": "mock-gpt",
+                        "capabilities": ["trained_weights_voice", "reference_audio_voice"],
+                        "config": {"gpt_weights_path": "project.ckpt", "ref_audio_path": "project.wav", "prompt_text": "项目参考文本"},
+                    },
+                }
+            ],
+            "lines": [
+                {
+                    "id": "l001",
+                    "character_id": "role-1",
+                    "text": "临时换音色。",
+                    "temporary_binding": {
+                        "binding_id": "line-temp-index",
+                        "provider_type": "indextts",
+                        "service_id": "mock-index",
+                        "capabilities": ["reference_audio_voice", "emotion_text"],
+                        "config": {"voice": "tmp/ref.wav", "emotion_mode": "emotion_text", "emotion_text": "焦急"},
+                    },
+                }
+            ],
+        },
+    )
+
+    response = client.post(
+        "/api/generate",
+        json={
+            "project_id": "demo",
+            "tasks": [
+                {
+                    "line": {"id": "l001", "character_id": "role-1", "text": "临时换音色。"},
+                    "engine": "gpt-sovits",
+                    "profile": "default",
+                    "parameters": {},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    version = response.json()["lines"]["parse-r001:l001"]["versions"][0]
+    assert version["engine"] == "indextts"
+    assert version["binding_id"] == "line-temp-index"
+    assert version["parameters"]["voice"] == "tmp/ref.wav"
+    assert "gpt_weights_path" not in version["parameters"]
+
+
+def test_put_project_characters_syncs_active_parse_revision_project_binding(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put(
+        "/api/projects/demo",
+        json={
+            "title": "demo",
+            "default_language": "zh",
+            "project_characters": [
+                {"project_character_id": "role-1", "name": "小品", "library_character_id": None, "mode": "reference"}
+            ],
+            "lines": [{"id": "l001", "character_id": "role-1", "text": "你好"}],
+        },
+    )
+
+    update = client.put(
+        "/api/projects/demo/characters",
+        json={
+            "project_characters": [
+                {
+                    "project_character_id": "role-1",
+                    "name": "小品",
+                    "library_character_id": None,
+                    "mode": "reference",
+                    "project_binding": {
+                        "binding_id": "role-1-project-gpt",
+                        "provider_type": "gpt-sovits",
+                        "service_id": "mock-gpt",
+                        "capabilities": ["trained_weights_voice", "reference_audio_voice"],
+                        "config": {"gpt_weights_path": "project.ckpt", "ref_audio_path": "project.wav", "prompt_text": "项目参考文本"},
+                    },
+                }
+            ]
+        },
+    )
+    assert update.status_code == 200
+
+    activated = client.post("/api/projects/demo/activate-revision", json={"parse_revision_id": "parse-r001"})
+
+    assert activated.status_code == 200
+    project_character = activated.json()["project"]["project_characters"][0]
+    assert project_character["project_binding"]["binding_id"] == "role-1-project-gpt"
 
 
 def test_generate_uses_line_temporary_binding_before_library_reference(tmp_path: Path) -> None:

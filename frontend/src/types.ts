@@ -122,6 +122,10 @@ export interface ProjectSummary {
   title: string;
   default_language: string;
   line_count: number;
+  updated_at?: string;
+  script_revision_count?: number;
+  parse_revision_count?: number;
+  character_count?: number;
 }
 
 export interface ServiceActionResult {
@@ -200,6 +204,7 @@ export interface ProjectCharacter {
   library_character_id?: string | null;
   mode: ProjectCharacterMode;
   character_snapshot?: Character | null;
+  project_binding?: VoiceBinding | null;
   match_confidence?: number | null;
   match_status?: "matched" | "unmatched" | "ambiguous" | "manual" | null;
 }
@@ -349,6 +354,8 @@ export interface RoleLibraryCandidate {
   logs_name?: string;
   service_id?: string | null;
   source?: "filesystem" | "gradio" | "merged" | string;
+  sample_count?: number;
+  has_training_data?: boolean;
   recommended_gpt_weights_path?: string;
   recommended_sovits_weights_path?: string;
   recommended_ref_audio_path?: string;
@@ -381,6 +388,11 @@ export interface LogsReferenceAudioResponse {
   logs_name: string;
   samples: LogsReferenceAudioSample[];
   diagnostics?: Array<{ status: string; path?: string; detail: string }>;
+}
+
+export interface GPTSoVITSModelCatalogResponse {
+  models: RoleLibraryCandidate[];
+  diagnostics?: Array<{ service_id?: string; status: string; detail: string }>;
 }
 
 export interface ProjectCharactersResponse {

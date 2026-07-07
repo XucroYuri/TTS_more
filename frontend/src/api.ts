@@ -1,4 +1,4 @@
-import type { Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
+import type { Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -167,6 +167,10 @@ export async function fetchProjects(): Promise<{ projects: ProjectSummary[] }> {
   return request("/api/projects");
 }
 
+export async function deleteProject(projectId: string): Promise<{ status: string; project_id: string; trashed_path: string }> {
+  return request(`/api/projects/${encodeURIComponent(projectId)}`, { method: "DELETE" });
+}
+
 export async function fetchManifest(projectId: string): Promise<GenerationManifest> {
   return request(`/api/projects/${projectId}/manifest`);
 }
@@ -296,6 +300,21 @@ export async function fetchLogsReferenceAudio(options: { serviceId?: string | nu
   if (options.gptWeightsPath) params.set("gpt_weights_path", options.gptWeightsPath);
   if (options.sovitsWeightsPath) params.set("sovits_weights_path", options.sovitsWeightsPath);
   return request(`/api/character-library/logs-reference-audio?${params.toString()}`);
+}
+
+export async function fetchGptSovitsModelCatalog(serviceId?: string | null, limit = 120): Promise<GPTSoVITSModelCatalogResponse> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (serviceId) params.set("service_id", serviceId);
+  return request(`/api/model-catalog/gpt-sovits?${params.toString()}`);
+}
+
+export async function fetchGptSovitsModelSamples(options: { serviceId?: string | null; logsName: string; limit?: number }): Promise<LogsReferenceAudioResponse> {
+  const params = new URLSearchParams({
+    logs_name: options.logsName,
+    limit: String(options.limit ?? 120)
+  });
+  if (options.serviceId) params.set("service_id", options.serviceId);
+  return request(`/api/model-catalog/gpt-sovits/samples?${params.toString()}`);
 }
 
 export async function importRoleLibraryCandidate(candidate: RoleLibraryCandidate): Promise<{ character: Character }> {

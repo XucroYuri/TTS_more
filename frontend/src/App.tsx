@@ -30,6 +30,8 @@ import {
   fetchCharacters,
   fetchProjectCharacters,
   fetchManifest,
+  fetchGptSovitsModelCatalog,
+  fetchGptSovitsModelSamples,
   fetchLogsReferenceAudio,
   fetchOpenSourceTTSCatalog,
   fetchParserProviders,
@@ -54,6 +56,7 @@ import {
   cancelGenerationJob,
   createParseRevision,
   createScriptRevision,
+  deleteProject,
   deleteGenerationVersion,
   importRoleLibraryCandidate,
   reloadServiceSettings,
@@ -76,17 +79,22 @@ import {
 import { defaultLanguage, languageOptions, nextLanguage, normalizeLanguage } from "./i18n";
 import { ReferenceAudioInput } from "./components/ReferenceAudioInput";
 import { RoleAvatar } from "./components/RoleAvatar";
+import { ScriptManagerModal } from "./components/ScriptManagerModal";
 import { WaveformPlayer } from "./components/WaveformPlayer";
 import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
 import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./lib/gptSovitsReference";
 import { formatScriptNote } from "./lib/lineNote";
+import { firstReferenceSampleFromModel, gptSovitsProjectBindingFromModel } from "./lib/modelCatalog";
 import { ensureProjectCharacters, freezeProjectCharacterLocally, projectCharacterRows, resolveProjectCharacters } from "./lib/projectCharacters";
+import { bindingCompleteness, catalogServiceOptions, roleLibraryBindingRows, roleLibraryServiceOptions, selectedCatalogServiceId } from "./lib/roleLibraryView";
 import { buildGenerationTask, lineBinding, lineEngine, lineProfile, lineServiceId } from "./lib/routing";
-import { createDefaultParserProviderDraft, KWJM_API_KEY_ENV, KWJM_BASE_URL_PLACEHOLDER, KWJM_MODEL, parserProviderKeyState, toParserProviderSavePayload } from "./lib/parserConfig";
+import { createDefaultParserProviderDraft, KWJM_API_KEY_ENV, KWJM_BASE_URL, KWJM_BASE_URL_PLACEHOLDER, KWJM_MODEL, KWJM_PROVIDER_NAME, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./lib/parserConfig";
 import { createEmptyManifest, createEmptyProject, createProjectId, readStoredProjectId, selectStartupProjectId, writeStoredProjectId } from "./lib/projectStartup";
+import { filterAndSortProjectSummaries, nextProjectAfterDelete } from "./lib/scriptManagement";
 import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
+import { buildGradioEndpointRequest, gradioContractForProvider, sourceProfileForEndpointUrl } from "./lib/ttsAccess";
 import { createToast, inferToastLevel, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
 import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
@@ -116,8 +124,8 @@ import type {
   OpenSourceTTSDetectResponse,
   ProviderType,
   QueueStatus,
-  ServiceLoadState,
-  SourceProfile
+  ReferenceAudioSample,
+  ServiceLoadState
 } from "./types";
 
 type Translate = (key: string, options?: Record<string, unknown>) => string;
@@ -125,6 +133,7 @@ type SaveState = "idle" | "saving" | "saved" | "error";
 type ServicePanelSection = "overview" | "open-source" | "tts" | "llm" | "resources" | "roles";
 type ScriptSourceMode = "project" | "manual";
 type ConfirmationTone = "warning" | "danger" | "info";
+const KWJM_TESTING_INDEX = -1;
 const LINE_PAGE_SIZE = 10;
 
 interface ConfirmationDialogState {
@@ -164,10 +173,20 @@ export default function App() {
   const [scriptSourceMode, setScriptSourceMode] = useState<ScriptSourceMode>("project");
   const [parserProviders, setParserProviders] = useState<ParserProviderDraft[]>([]);
   const [roleLibraryCandidates, setRoleLibraryCandidates] = useState<RoleLibraryCandidate[]>([]);
+  const [gptModelCatalog, setGptModelCatalog] = useState<RoleLibraryCandidate[]>([]);
+  const [isScanningModelCatalog, setIsScanningModelCatalog] = useState(false);
+  const [activeModelCatalogId, setActiveModelCatalogId] = useState<string | null>(null);
+  const [activeModelSampleId, setActiveModelSampleId] = useState<string | null>(null);
+  const [activeProjectRoleId, setActiveProjectRoleId] = useState<string | null>(null);
+  const [modelCatalogSamples, setModelCatalogSamples] = useState<Record<string, LogsReferenceAudioResponse>>({});
+  const [loadingModelCatalogSamplesKey, setLoadingModelCatalogSamplesKey] = useState<string | null>(null);
   const [isParsing, setIsParsing] = useState(false);
   const [isSavingParserConfig, setIsSavingParserConfig] = useState(false);
   const [testingParserProviderIndex, setTestingParserProviderIndex] = useState<number | null>(null);
   const [parserProviderTestResults, setParserProviderTestResults] = useState<Record<number, ParserProviderTestResponse>>({});
+  const [kwjmApiKeyInput, setKwjmApiKeyInput] = useState("");
+  const [kwjmParserTestResult, setKwjmParserTestResult] = useState<ParserProviderTestResponse | null>(null);
+  const [isLlmAdvancedOpen, setIsLlmAdvancedOpen] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isRefreshingTopology, setIsRefreshingTopology] = useState(false);
   const [isValidating, setIsValidating] = useState(false);
@@ -178,14 +197,10 @@ export default function App() {
   const [servicePanelSection, setServicePanelSection] = useState<ServicePanelSection>("open-source");
   const [openSourceCatalog, setOpenSourceCatalog] = useState<OpenSourceTTSCatalogItem[]>([]);
   const [selectedOpenSourceProvider, setSelectedOpenSourceProvider] = useState<CatalogProvider>("gpt-sovits");
-  const [openSourceSourceProfile, setOpenSourceSourceProfile] = useState<SourceProfile>("local_repo");
-  const [openSourceRepoPath, setOpenSourceRepoPath] = useState("");
   const [openSourceBaseUrl, setOpenSourceBaseUrl] = useState("");
-  const [openSourceApiContract, setOpenSourceApiContract] = useState("");
-  const [openSourceResourceGroup, setOpenSourceResourceGroup] = useState("local-gpu-0");
+  const [openSourceResourceGroup, setOpenSourceResourceGroup] = useState("gradio-gpu-0");
   const [openSourceCapacity, setOpenSourceCapacity] = useState(1);
   const [openSourceDisplayName, setOpenSourceDisplayName] = useState("");
-  const [openSourceServiceId, setOpenSourceServiceId] = useState("");
   const [openSourceDetectResult, setOpenSourceDetectResult] = useState<OpenSourceTTSDetectResponse | null>(null);
   const [isDetectingOpenSource, setIsDetectingOpenSource] = useState(false);
   const [isConfiguringOpenSource, setIsConfiguringOpenSource] = useState(false);
@@ -193,6 +208,16 @@ export default function App() {
   const [newScriptTitle, setNewScriptTitle] = useState("");
   const [newScriptSource, setNewScriptSource] = useState("");
   const [isCreatingScript, setIsCreatingScript] = useState(false);
+  const [isScriptManagerOpen, setIsScriptManagerOpen] = useState(false);
+  const [managerSearchText, setManagerSearchText] = useState("");
+  const [managedProjectId, setManagedProjectId] = useState<string | null>(null);
+  const [managedProject, setManagedProject] = useState<ScriptProject | null>(null);
+  const [isManagedProjectLoading, setIsManagedProjectLoading] = useState(false);
+  const [managerTitleDraft, setManagerTitleDraft] = useState("");
+  const [managerSourceDraft, setManagerSourceDraft] = useState("");
+  const [isManagerSaving, setIsManagerSaving] = useState(false);
+  const [isManagerParsing, setIsManagerParsing] = useState(false);
+  const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [isProjectLoaded, setIsProjectLoaded] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
@@ -387,6 +412,33 @@ export default function App() {
     () => roleLibraryCandidates.find((candidate) => candidate.id === activeRoleCandidateId) ?? null,
     [activeRoleCandidateId, roleLibraryCandidates]
   );
+  const filteredGptModelCatalog = useMemo(() => {
+    const query = roleLibrarySearch.trim().toLocaleLowerCase();
+    if (!query) return gptModelCatalog;
+    return gptModelCatalog.filter((model) =>
+      `${model.name} ${model.id} ${model.logs_name ?? ""} ${(model.aliases ?? []).join(" ")}`.toLocaleLowerCase().includes(query)
+    );
+  }, [gptModelCatalog, roleLibrarySearch]);
+  const activeProjectCharacter = useMemo(
+    () => {
+      const currentLineCharacterId = project.lines.find((line) => line.id === activeLineId)?.character_id ?? project.lines[0]?.character_id;
+      return projectCharacters.find((item) => item.project_character_id === activeProjectRoleId)
+        ?? projectCharacters.find((item) => item.project_character_id === currentLineCharacterId)
+        ?? projectCharacters[0]
+        ?? null;
+    },
+    [activeLineId, activeProjectRoleId, project.lines, projectCharacters]
+  );
+  const activeModelCatalogItem = useMemo(
+    () => activeModelCatalogId ? filteredGptModelCatalog.find((model) => model.id === activeModelCatalogId) ?? null : null,
+    [activeModelCatalogId, filteredGptModelCatalog]
+  );
+  const activeModelSamplesKey = activeModelCatalogItem
+    ? [activeModelCatalogItem.service_id ?? selectedLogsServiceId ?? "", activeModelCatalogItem.logs_name ?? activeModelCatalogItem.name].join("|")
+    : "";
+  const activeModelSamplesPayload = activeModelSamplesKey ? modelCatalogSamples[activeModelSamplesKey] : undefined;
+  const activeModelSamples = activeModelSamplesPayload?.samples ?? [];
+  const activeModelSelectedSample = activeModelSamples.find((sample) => sample.sample_id === activeModelSampleId) ?? activeModelSamples[0] ?? (activeModelCatalogItem ? firstReferenceSampleFromModel(activeModelCatalogItem) : null);
   const preflightByLine = useMemo(() => new Map((preflightResult?.items ?? []).map((item) => [item.line_uid ?? item.line_id, item])), [preflightResult]);
   const activeLine = useMemo(() => project.lines.find((line) => line.id === activeLineId) ?? project.lines[0], [activeLineId, project.lines]);
   const activeRoleRow = useMemo(
@@ -491,6 +543,49 @@ export default function App() {
   const scriptConsoleMode = scriptConsoleBodyMode(isSidebarScriptEditing);
 
   useEffect(() => {
+    if (!isScriptManagerOpen) return;
+    setManagedProjectId((current) => {
+      if (current && projectRows.some((item) => item.project_id === current)) return current;
+      return currentProjectId ?? projectRows[0]?.project_id ?? null;
+    });
+  }, [currentProjectId, isScriptManagerOpen, projectRows]);
+
+  useEffect(() => {
+    if (!isScriptManagerOpen || !managedProjectId) {
+      setManagedProject(null);
+      setManagerTitleDraft("");
+      setManagerSourceDraft("");
+      setIsManagedProjectLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setIsManagedProjectLoading(true);
+    const projectPromise = managedProjectId === currentProjectId && isProjectLoaded
+      ? Promise.resolve(projectWithCharacters)
+      : fetchProject(managedProjectId);
+    projectPromise
+      .then((payload) => {
+        if (cancelled) return;
+        setManagedProject(payload);
+        setManagerTitleDraft(payload.title);
+        setManagerSourceDraft(projectToScriptSourceText(payload, characters));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setManagedProject(null);
+        setManagerTitleDraft("");
+        setManagerSourceDraft("");
+        setNotice(t("empty.projectLoadFailed"));
+      })
+      .finally(() => {
+        if (!cancelled) setIsManagedProjectLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [characters, currentProjectId, isProjectLoaded, isScriptManagerOpen, managedProjectId, projectWithCharacters, setNotice, t]);
+
+  useEffect(() => {
     setLinePage(1);
   }, [characterFilter, currentProjectId, providerFilter, searchText, statusFilter]);
 
@@ -502,6 +597,16 @@ export default function App() {
 
   const visibleServices = useMemo(() => services.filter((service) => !isUnsupportedLocalVibeVoice(service)), [services]);
   const ttsServices = useMemo(() => visibleServices.filter((service) => service.service_kind !== "llm-parser"), [visibleServices]);
+  const roleLibraryTtsServices = useMemo(() => roleLibraryServiceOptions(ttsServices), [ttsServices]);
+  const roleLibraryCatalogServices = useMemo(() => catalogServiceOptions(ttsServices), [ttsServices]);
+  const selectedModelCatalogServiceId = useMemo(
+    () => selectedCatalogServiceId(selectedLogsServiceId, roleLibraryCatalogServices),
+    [roleLibraryCatalogServices, selectedLogsServiceId]
+  );
+  const gptSovitsBindingServiceOptions = useMemo(
+    () => roleLibraryTtsServices.filter((service) => service.providerType === "gpt-sovits"),
+    [roleLibraryTtsServices]
+  );
   const serviceById = useMemo(() => new Map(visibleServices.map((service) => [service.service_id ?? "", service])), [visibleServices]);
   const localServiceCount = useMemo(() => visibleServices.filter((service) => ["gpt-sovits", "indextts"].includes(service.provider_type ?? service.engine)), [visibleServices]);
   const paidServiceCount = useMemo(() => visibleServices.filter((service) => service.capabilities?.includes("paid_provider")), [visibleServices]);
@@ -582,13 +687,10 @@ export default function App() {
   useEffect(() => {
     if (!selectedOpenSourceCatalog) return;
     setSelectedOpenSourceProvider(selectedOpenSourceCatalog.provider_type);
-    setOpenSourceRepoPath(selectedOpenSourceCatalog.resolved_default_repo_path ?? selectedOpenSourceCatalog.default_repo_path);
     setOpenSourceBaseUrl(selectedOpenSourceCatalog.default_base_url);
-    setOpenSourceApiContract(selectedOpenSourceCatalog.api_contracts[0] ?? "");
     setOpenSourceResourceGroup(selectedOpenSourceCatalog.resource_group);
     setOpenSourceCapacity(1);
     setOpenSourceDisplayName(selectedOpenSourceCatalog.display_name);
-    setOpenSourceServiceId("");
     setOpenSourceDetectResult(null);
   }, [selectedOpenSourceCatalog?.provider_type]);
 
@@ -622,11 +724,41 @@ export default function App() {
       .finally(() => setLoadingLogsReferenceKey((current) => (current === activeLogsReferenceRequest.key ? null : current)));
   }, [activeLogsReferenceRequest, logsReferenceAudio, t]);
 
+  useEffect(() => {
+    if (!activeModelCatalogItem || !activeModelSamplesKey) return;
+    if (modelCatalogSamples[activeModelSamplesKey]) return;
+    setLoadingModelCatalogSamplesKey(activeModelSamplesKey);
+    fetchGptSovitsModelSamples({
+      serviceId: (activeModelCatalogItem.service_id ?? selectedModelCatalogServiceId) || null,
+      logsName: activeModelCatalogItem.logs_name ?? activeModelCatalogItem.name,
+      limit: 40
+    })
+      .then((payload) => setModelCatalogSamples((current) => ({ ...current, [activeModelSamplesKey]: payload })))
+      .catch(() => setModelCatalogSamples((current) => ({
+        ...current,
+        [activeModelSamplesKey]: {
+          service_id: (activeModelCatalogItem.service_id ?? selectedModelCatalogServiceId) || null,
+          logs_name: activeModelCatalogItem.logs_name ?? activeModelCatalogItem.name,
+          samples: [],
+          diagnostics: [{ status: "unreachable", detail: t("inspector.logsReferenceLoadFailed") }],
+        }
+      })))
+      .finally(() => setLoadingModelCatalogSamplesKey((current) => (current === activeModelSamplesKey ? null : current)));
+  }, [activeModelCatalogItem, activeModelSamplesKey, modelCatalogSamples, selectedModelCatalogServiceId, t]);
+
   const selectedParserProvider = parserProviders[selectedParserProviderIndex];
-  const logsServiceOptions = useMemo(
-    () => visibleServices.filter((service) => service.enabled !== false && service.api_contract === "gradio-gpt-sovits-webui" && service.service_id),
-    [visibleServices]
-  );
+  const kwjmParserProviderIndex = useMemo(() => parserProviders.findIndex(isKwjmParserProvider), [parserProviders]);
+  const kwjmParserProvider = kwjmParserProviderIndex >= 0 ? parserProviders[kwjmParserProviderIndex] : createDefaultParserProviderDraft();
+  const kwjmHasUsableKey = parserProviderHasUsableKey(kwjmParserProvider);
+  const kwjmActivationState: ParserProviderState = kwjmHasUsableKey ? (kwjmParserProvider.enabled ? "ready" : "disabled") : "partial";
+  const kwjmCanActivate = Boolean(kwjmApiKeyInput.trim() || kwjmHasUsableKey);
+  const kwjmDisplayTestResult = kwjmParserTestResult ?? (kwjmParserProviderIndex >= 0 ? parserProviderTestResults[kwjmParserProviderIndex] ?? null : null);
+  useEffect(() => {
+    if (!selectedLogsServiceId) return;
+    if (!roleLibraryCatalogServices.some((option) => option.serviceId === selectedLogsServiceId)) {
+      setSelectedLogsServiceId("");
+    }
+  }, [roleLibraryCatalogServices, selectedLogsServiceId]);
 
   async function refreshTopology(reloadConfig = false) {
     setIsRefreshingTopology(true);
@@ -664,9 +796,9 @@ export default function App() {
     try {
       const payload = await detectOpenSourceTTS({
         provider_type: selectedOpenSourceProvider,
-        repo_path: openSourceRepoPath || null,
+        repo_path: null,
         base_url: openSourceBaseUrl || null,
-        api_contract: openSourceApiContract || null
+        api_contract: gradioContractForProvider(selectedOpenSourceProvider)
       });
       setOpenSourceDetectResult(payload);
       setNotice(t("services.openSourceDetectDone", { state: setupStateLabel(payload.setup_state, t) }));
@@ -681,18 +813,14 @@ export default function App() {
     setIsConfiguringOpenSource(true);
     try {
       const payload = await configureOpenSourceTTS({
-        provider_type: selectedOpenSourceProvider,
-        service_id: openSourceServiceId || null,
-        display_name: openSourceDisplayName || null,
-        source_profile: openSourceSourceProfile,
-        repo_path: openSourceRepoPath || null,
-        base_url: openSourceBaseUrl,
-        api_contract: openSourceApiContract || null,
-        network_scope: sourceProfileNetworkScope(openSourceSourceProfile),
-        managed: openSourceSourceProfile === "local_repo",
-        enabled: openSourceDetectResult ? ["partial", "ready"].includes(openSourceDetectResult.setup_state) : false,
-        resource_group: openSourceResourceGroup,
-        capacity: openSourceCapacity
+        ...buildGradioEndpointRequest({
+          provider_type: selectedOpenSourceProvider,
+          display_name: openSourceDisplayName || null,
+          base_url: openSourceBaseUrl,
+          resource_group: openSourceResourceGroup,
+          capacity: openSourceCapacity,
+          enabled: openSourceDetectResult ? ["partial", "ready"].includes(openSourceDetectResult.setup_state) : false,
+        })
       });
       setOpenSourceDetectResult(payload.detect);
       setNotice(t("services.openSourceSaved"));
@@ -704,12 +832,13 @@ export default function App() {
     }
   }
 
-  async function refreshProjects() {
+  async function refreshProjects(preferredProjectId?: string | null) {
     try {
       const payload = await fetchProjects();
       setProjectSummaries(payload.projects);
       setCurrentProjectId((current) => {
-        const next = selectStartupProjectId(payload.projects, current ?? readStoredProjectId());
+        const preferred = preferredProjectId !== undefined ? preferredProjectId : current ?? readStoredProjectId();
+        const next = selectStartupProjectId(payload.projects, preferred);
         writeStoredProjectId(next);
         return next;
       });
@@ -748,12 +877,16 @@ export default function App() {
       setScriptInput(source);
       setScriptSourceMode(source ? "project" : "manual");
       setIsSidebarScriptEditing(!source);
+      setManagedProjectId(projectId);
+      setManagedProject(savedProject);
+      setManagerTitleDraft(savedProject.title);
+      setManagerSourceDraft(source || projectToScriptSourceText(savedProject, characters));
       setNewScriptTitle("");
       setNewScriptSource("");
       setSaveState("saved");
       setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
       setNotice(t("script.newScriptCreated"));
-      await refreshProjects();
+      await refreshProjects(projectId);
     } catch (error) {
       setSaveState("error");
       setNotice(error instanceof Error ? error.message : t("script.newScriptCreateFailed"));
@@ -771,8 +904,8 @@ export default function App() {
     }
   }
 
-  async function confirmRevisionRisk(): Promise<boolean> {
-    if (!shouldRequestRevisionConfirmation(project.script_revisions?.length ?? 0, project.parse_revisions?.length ?? 0)) return true;
+  async function confirmRevisionRisk(targetProject: ScriptProject = project): Promise<boolean> {
+    if (!shouldRequestRevisionConfirmation(targetProject.script_revisions?.length ?? 0, targetProject.parse_revisions?.length ?? 0)) return true;
     return requestConfirmation({
       title: t("confirm.revision.title"),
       body: t("script.revisionRisk"),
@@ -881,6 +1014,46 @@ export default function App() {
       setNotice(error instanceof Error ? error.message : t("notice.parserConfigFailed"));
     } finally {
       setIsSavingParserConfig(false);
+    }
+  }
+
+  async function activateKwjmParserProvider() {
+    const nextProviders = upsertKwjmParserProvider(parserProviders, kwjmApiKeyInput);
+    setIsSavingParserConfig(true);
+    try {
+      const payload = await saveParserProviders(toParserProviderSavePayload(nextProviders));
+      setParserProviders(payload.providers.map((provider) => ({ ...provider, api_key: "" })));
+      setKwjmApiKeyInput("");
+      setNotice(t("notice.parserConfigSaved"));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("notice.parserConfigFailed"));
+    } finally {
+      setIsSavingParserConfig(false);
+    }
+  }
+
+  async function testKwjmParserProviderSettings() {
+    const provider = upsertKwjmParserProvider(parserProviders, kwjmApiKeyInput).find(isKwjmParserProvider);
+    if (!provider) return;
+    setTestingParserProviderIndex(KWJM_TESTING_INDEX);
+    try {
+      const result = await testParserProvider(toParserProviderSavePayload([provider]).providers[0]);
+      setKwjmParserTestResult(result);
+      if (kwjmParserProviderIndex >= 0) {
+        setParserProviderTestResults((current) => ({ ...current, [kwjmParserProviderIndex]: result }));
+      }
+      setNotice(result.ok ? t("notice.parserProviderTestReady", { provider: provider.name }) : t("notice.parserProviderTestFailed", { provider: provider.name }));
+    } catch (error) {
+      const result: ParserProviderTestResponse = {
+        ok: false,
+        state: "blocked",
+        message: error instanceof Error ? error.message : t("notice.parserProviderTestFailed", { provider: provider.name }),
+        provider: provider.name,
+      };
+      setKwjmParserTestResult(result);
+      setNotice(result.message);
+    } finally {
+      setTestingParserProviderIndex(null);
     }
   }
 
@@ -1117,6 +1290,142 @@ export default function App() {
     setNotice(t("app.ready"));
   }
 
+  function applyManagedProjectToWorkspace(projectId: string, nextProject: ScriptProject, resetLineState = false) {
+    if (projectId !== currentProjectId) return;
+    setProject(nextProject);
+    if (resetLineState) {
+      setActiveLineId(nextProject.lines[0]?.id ?? "");
+      setExpandedLineId(null);
+      setSelectedLineIds([]);
+      setSelectedHistoryVersions({});
+      setVersionDrafts({});
+    }
+    if (scriptSourceMode === "project") {
+      setScriptInput(projectToScriptSourceText(nextProject, characters));
+    }
+  }
+
+  async function renameManagedProject() {
+    if (!managedProjectId || !managedProject) return;
+    const title = managerTitleDraft.trim();
+    if (!title) {
+      setNotice(t("script.newScriptTitleRequired"));
+      return;
+    }
+    const nextProject = { ...managedProject, title };
+    setIsManagerSaving(true);
+    try {
+      await saveProject(managedProjectId, nextProject);
+      setManagedProject(nextProject);
+      applyManagedProjectToWorkspace(managedProjectId, nextProject);
+      setSaveState("saved");
+      setNotice(t("notice.projectRenamed"));
+      await refreshProjects(currentProjectId);
+    } catch (error) {
+      setSaveState("error");
+      setNotice(error instanceof Error ? error.message : t("notice.autoSaveFailed"));
+    } finally {
+      setIsManagerSaving(false);
+    }
+  }
+
+  async function saveManagedScriptRevision() {
+    if (!managedProjectId || !managedProject) return;
+    const source = managerSourceDraft.trim();
+    if (!source) {
+      setNotice(t("script.sourceRequired"));
+      return;
+    }
+    if (!(await confirmRevisionRisk(managedProject))) return;
+    setIsManagerSaving(true);
+    try {
+      const payload = await createScriptRevision(managedProjectId, source, t("script.currentSource"));
+      setManagedProject(payload.project);
+      setManagerTitleDraft(payload.project.title);
+      setManagerSourceDraft(projectToScriptSourceText(payload.project, characters));
+      applyManagedProjectToWorkspace(managedProjectId, payload.project);
+      setScriptSourceMode(managedProjectId === currentProjectId ? "project" : scriptSourceMode);
+      setSaveState("saved");
+      setNotice(t("notice.projectSaved"));
+      await refreshProjects(currentProjectId);
+    } catch (error) {
+      setSaveState("error");
+      setNotice(error instanceof Error ? error.message : t("notice.autoSaveFailed"));
+    } finally {
+      setIsManagerSaving(false);
+    }
+  }
+
+  async function parseManagedScriptRevision() {
+    if (!managedProjectId || !managedProject) return;
+    const source = managerSourceDraft.trim();
+    if (!source) {
+      setNotice(t("script.sourceRequired"));
+      return;
+    }
+    if (!(await confirmRevisionRisk(managedProject))) return;
+    setIsManagerParsing(true);
+    setNotice(t("parser.parsing"));
+    try {
+      const scriptPayload = await createScriptRevision(managedProjectId, source, t("script.parseRevision"));
+      const parsePayload = await createParseRevision(managedProjectId, scriptPayload.script_revision.revision_id);
+      setManagedProject(parsePayload.project);
+      setManagerTitleDraft(parsePayload.project.title);
+      setManagerSourceDraft(projectToScriptSourceText(parsePayload.project, characters));
+      applyManagedProjectToWorkspace(managedProjectId, parsePayload.project, true);
+      setNotice(t("script.parseApplied"));
+      await refreshProjects(currentProjectId);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("parser.parseFailed"));
+    } finally {
+      setIsManagerParsing(false);
+    }
+  }
+
+  async function deleteManagedProject() {
+    if (!managedProjectId) return;
+    const title = managerTitleDraft.trim() || managedProject?.title || managedProjectId;
+    const confirmed = await requestConfirmation({
+      title: t("script.deleteScriptTitle"),
+      body: t("script.deleteScriptBody", { title }),
+      detail: t("script.deleteScriptDetail"),
+      confirmLabel: t("script.deleteScript"),
+      cancelLabel: t("actions.cancel"),
+      tone: "danger"
+    });
+    if (!confirmed) return;
+    const allRows = filterAndSortProjectSummaries(projectRows, "");
+    const visibleRows = filterAndSortProjectSummaries(projectRows, managerSearchText);
+    const nextCurrentProjectId = nextProjectAfterDelete(allRows, managedProjectId, currentProjectId);
+    const nextManagedProjectId = nextProjectAfterDelete(visibleRows, managedProjectId, managedProjectId) ?? nextCurrentProjectId;
+    const deletedCurrentProject = managedProjectId === currentProjectId;
+    setDeletingProjectId(managedProjectId);
+    try {
+      await deleteProject(managedProjectId);
+      setManagedProjectId(nextManagedProjectId);
+      setManagedProject(null);
+      if (deletedCurrentProject) {
+        setCurrentProjectId(nextCurrentProjectId);
+        writeStoredProjectId(nextCurrentProjectId);
+        if (!nextCurrentProjectId) {
+          setProject(createEmptyProject());
+          setManifest(createEmptyManifest(null));
+          setActiveLineId("");
+          setExpandedLineId(null);
+          setSelectedLineIds([]);
+          setSelectedHistoryVersions({});
+          setVersionDrafts({});
+        }
+      }
+      setNotice(t("notice.projectDeleted"));
+      await refreshProjects(deletedCurrentProject ? nextCurrentProjectId : currentProjectId);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("notice.projectDeleteFailed"));
+    } finally {
+      setDeletingProjectId(null);
+    }
+  }
+
   async function cycleLanguage() {
     await i18n.changeLanguage(nextLanguage(selectedLanguage));
   }
@@ -1309,49 +1618,20 @@ export default function App() {
               <StatusPill tone={scriptSourceTone} label={scriptSourceLabel} />
             </div>
 
-            <section className="script-create-panel" aria-label={t("script.newScript")}>
-              <div className="script-pane-summary">
-                <strong>{t("script.newScript")}</strong>
+            <section className="script-sidebar-current" aria-label={t("script.activeScript")}>
+              <div className="script-sidebar-current-title">
+                <span>{t("app.projectCount", { count: projectRows.length })}</span>
+                <strong>{displayProjectTitle}</strong>
               </div>
-              <div className="script-create-form">
-                <label>
-                  <span>{t("script.newScriptTitle")}</span>
-                  <input value={newScriptTitle} onChange={(event) => setNewScriptTitle(event.target.value)} placeholder={t("script.newScriptTitlePlaceholder")} />
-                </label>
-                <label>
-                  <span>{t("script.newScriptSource")}</span>
-                  <textarea value={newScriptSource} onChange={(event) => setNewScriptSource(event.target.value)} placeholder={t("script.newScriptSourcePlaceholder")} rows={3} />
-                </label>
-                <button className="primary-button" type="button" onClick={() => void createNewScriptProject()} disabled={isCreatingScript}>
-                  {isCreatingScript ? <Loader2 className="spin" size={15} /> : <Plus size={15} />} {t("script.createScript")}
-                </button>
+              <div className="script-sidebar-stats">
+                <div><span>{t("script.lineCount")}</span><strong>{project.lines.length}</strong></div>
+                <div><span>{t("script.characters")}</span><strong>{projectCharacters.length}</strong></div>
+                <div><span>{t("script.parseRevisions")}</span><strong>{project.parse_revisions?.length ?? 0}</strong></div>
               </div>
-            </section>
-
-            <section className="script-existing-panel" aria-label={t("script.existingScripts")}>
-              <div className="script-pane-summary compact-summary">
-                <div>
-                  <strong>{t("script.existingScripts")}</strong>
-                  <span>{t("app.projectCount", { count: projectRows.length })}</span>
-                </div>
-              </div>
-              <div className="script-project-list compact-project-list">
-                {projectRows.map((item) => (
-                  <button className={`project-row ${item.project_id === currentProjectId ? "active" : ""}`} key={item.project_id} onClick={() => switchProject(item.project_id)}>
-                    <span className="project-row-title">
-                      <strong>{standardProjectName(item.title || item.project_id)}</strong>
-                      {item.project_id === currentProjectId && <small>{t("app.currentProject")}</small>}
-                    </span>
-                    <small>{item.default_language} · {t("table.visibleLines", { count: item.line_count })}</small>
-                  </button>
-                ))}
-                {projectRows.length === 0 && (
-                  <div className="empty-row project-empty-state">
-                    <strong>{t("empty.noProjects")}</strong>
-                    <span>{t("empty.noProjectsHint")}</span>
-                  </div>
-                )}
-              </div>
+              <button className="secondary-button script-manager-open-button" type="button" onClick={() => setIsScriptManagerOpen(true)}>
+                <FolderKanban size={14} /> {t("script.manageScript")}
+              </button>
+              {projectRows.length === 0 && <span className="script-sidebar-empty-hint">{t("empty.noProjectsHint")}</span>}
             </section>
           </div>
 
@@ -1397,6 +1677,40 @@ export default function App() {
         </section>
 
       </aside>
+
+      <ScriptManagerModal
+        open={isScriptManagerOpen}
+        projects={projectRows}
+        currentProjectId={currentProjectId}
+        selectedProjectId={managedProjectId}
+        selectedProject={managedProject}
+        isSelectedProjectLoading={isManagedProjectLoading}
+        searchText={managerSearchText}
+        titleDraft={managerTitleDraft}
+        sourceDraft={managerSourceDraft}
+        newScriptTitle={newScriptTitle}
+        newScriptSource={newScriptSource}
+        isCreatingScript={isCreatingScript}
+        isSavingScript={isManagerSaving}
+        isParsingScript={isManagerParsing}
+        deletingProjectId={deletingProjectId}
+        onClose={() => setIsScriptManagerOpen(false)}
+        onSearchTextChange={setManagerSearchText}
+        onSelectProject={setManagedProjectId}
+        onOpenProject={(projectId) => {
+          switchProject(projectId);
+          setManagedProjectId(projectId);
+        }}
+        onTitleDraftChange={setManagerTitleDraft}
+        onSourceDraftChange={setManagerSourceDraft}
+        onNewScriptTitleChange={setNewScriptTitle}
+        onNewScriptSourceChange={setNewScriptSource}
+        onCreateScript={() => void createNewScriptProject()}
+        onRenameScript={() => void renameManagedProject()}
+        onSaveRevision={() => void saveManagedScriptRevision()}
+        onParseRevision={() => void parseManagedScriptRevision()}
+        onDeleteScript={() => void deleteManagedProject()}
+      />
 
       <main className="workspace">
         <header className="topbar">
@@ -1538,41 +1852,15 @@ export default function App() {
                                 ))}
                                 {openSourceCatalog.length === 0 && <div className="empty-row">{t("services.openSourceNoCatalog")}</div>}
                               </div>
-                              <div className="open-source-mode-grid compact">
-                                {(["local_repo", "local_endpoint", "lan_endpoint", "cloud_endpoint"] as SourceProfile[]).map((mode) => (
-                                  <button
-                                    className={`open-source-mode-card ${openSourceSourceProfile === mode ? "active" : ""}`}
-                                    key={mode}
-                                    onClick={() => setOpenSourceSourceProfile(mode)}
-                                    type="button"
-                                  >
-                                    <strong>{sourceProfileLabel(mode, t)}</strong>
-                                    <span>{mode === "local_repo" ? t("services.localManaged") : t("services.remoteExternal")}</span>
-                                  </button>
-                                ))}
-                              </div>
                               <div className="open-source-form-grid tts-access-form">
                                 <label>
                                   <span>{t("services.openSourceDisplayName")}</span>
                                   <input value={openSourceDisplayName} onChange={(event) => setOpenSourceDisplayName(event.target.value)} placeholder={selectedOpenSourceCatalog?.display_name} />
                                 </label>
-                                <label>
-                                  <span>{t("services.openSourceApiContract")}</span>
-                                  <select value={openSourceApiContract} onChange={(event) => setOpenSourceApiContract(event.target.value)}>
-                                    {(selectedOpenSourceCatalog?.api_contracts ?? [openSourceApiContract]).map((contract) => (
-                                      <option value={contract} key={contract}>{contract}</option>
-                                    ))}
-                                  </select>
-                                </label>
-                                {openSourceSourceProfile === "local_repo" && (
-                                  <label className="wide">
-                                    <span>{t("services.openSourceRepoPath")}</span>
-                                    <input value={openSourceRepoPath} onChange={(event) => setOpenSourceRepoPath(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_repo_path} />
-                                  </label>
-                                )}
                                 <label className="wide">
                                   <span>{t("services.openSourceBaseUrl")}</span>
                                   <input value={openSourceBaseUrl} onChange={(event) => setOpenSourceBaseUrl(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_base_url} />
+                                  <small>{t("services.openSourceGradioContract")}: {gradioContractForProvider(selectedOpenSourceProvider)} · {sourceProfileLabel(sourceProfileForEndpointUrl(openSourceBaseUrl || selectedOpenSourceCatalog?.default_base_url || ""), t)}</small>
                                 </label>
                               </div>
                               <div className="open-source-actions">
@@ -1744,7 +2032,7 @@ export default function App() {
                                     </label>
                                     <label className="wide">
                                       <span>{t("services.endpoint")}</span>
-                                      <input value={selectedConfigService.base_url ?? ""} onChange={(event) => updateServiceDraft(selectedConfigService.service_id, { base_url: event.target.value })} placeholder="http://127.0.0.1:9880" />
+                                      <input value={selectedConfigService.base_url ?? ""} onChange={(event) => updateServiceDraft(selectedConfigService.service_id, { base_url: event.target.value })} placeholder="http://127.0.0.1:9872" />
                                     </label>
                                     <label>
                                       <span>{t("services.networkScope")}</span>
@@ -1812,7 +2100,55 @@ export default function App() {
                         )}
 
                         {servicePanelSection === "llm" && (
-                          <div className="llm-ops-workbench">
+                          <div className="llm-activation-workbench">
+                            <section className="llm-activation-panel">
+                              <div className="llm-activation-head">
+                                <div className="llm-title-block">
+                                  <strong><Bot size={15} /> {t("parser.kwjmActivationTitle")}</strong>
+                                  <span>{t("parser.kwjmActivationHint")}</span>
+                                </div>
+                                <span className={`llm-detail-state state-${kwjmActivationState}`}>
+                                  <span className={`llm-state-dot ${kwjmActivationState}`} />
+                                  {kwjmActivationStateLabel(kwjmActivationState, t)}
+                                </span>
+                              </div>
+                              <div className="llm-preset-grid">
+                                <div><span>{t("parser.providerName")}</span><strong>{KWJM_PROVIDER_NAME}</strong></div>
+                                <div><span>{t("parser.baseUrl")}</span><strong>{KWJM_BASE_URL}</strong></div>
+                                <div><span>{t("parser.model")}</span><strong>{KWJM_MODEL}</strong></div>
+                                <div><span>{t("parser.openAIProtocol")}</span><strong>{t("parser.jsonDraft")}</strong></div>
+                              </div>
+                              <div className="llm-api-key-row">
+                                <label className="llm-api-key-field">
+                                  <span>{t("parser.apiKey")}</span>
+                                  <input
+                                    type="password"
+                                    value={kwjmApiKeyInput}
+                                    onChange={(event) => setKwjmApiKeyInput(event.target.value)}
+                                    placeholder={t(kwjmHasUsableKey ? "parser.apiKeyPlaceholderConfigured" : "parser.apiKeyPlaceholderMissing")}
+                                  />
+                                </label>
+                                <button className="secondary-button compact-button" onClick={() => void testKwjmParserProviderSettings()} disabled={testingParserProviderIndex !== null || !kwjmCanActivate}>
+                                  {testingParserProviderIndex === KWJM_TESTING_INDEX ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("parser.testProvider")}
+                                </button>
+                                <button className="primary-button compact-button" onClick={() => void activateKwjmParserProvider()} disabled={isSavingParserConfig || !kwjmCanActivate}>
+                                  {isSavingParserConfig ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("parser.activateKwjm")}
+                                </button>
+                                <button className="secondary-button compact-button" onClick={() => setIsLlmAdvancedOpen((open) => !open)}>
+                                  <SlidersHorizontal size={14} /> {t(isLlmAdvancedOpen ? "parser.hideAdvancedConfig" : "parser.advancedConfig")}
+                                </button>
+                              </div>
+                              <section className={`llm-test-result ${kwjmDisplayTestResult?.ok ? "ok" : kwjmDisplayTestResult ? "danger" : "empty"}`}>
+                                <div>
+                                  <strong>{kwjmHasUsableKey ? t("parser.kwjmConfigured") : t("parser.kwjmMissingKey")}</strong>
+                                  <span>{kwjmDisplayTestResult ? kwjmDisplayTestResult.message : t("parser.noTestYet")}</span>
+                                </div>
+                                {kwjmDisplayTestResult?.latency_ms != null && <small>{kwjmDisplayTestResult.latency_ms}ms</small>}
+                              </section>
+                            </section>
+
+                            {isLlmAdvancedOpen && (
+                            <div className="llm-ops-workbench llm-advanced-workbench">
                             <section className="llm-ops-rail">
                               <div className="llm-title-block">
                                 <strong><Bot size={15} /> {t("parser.llmProviders")}</strong>
@@ -2005,6 +2341,8 @@ export default function App() {
                               )}
                             </section>
                           </div>
+                            )}
+                          </div>
                         )}
 
                         {servicePanelSection === "resources" && (
@@ -2064,6 +2402,130 @@ export default function App() {
 
                         {servicePanelSection === "roles" && (
                           <div className="role-library-workbench">
+                            <section className="model-mapping-center">
+                              <div className="model-mapping-head">
+                                <div>
+                                  <strong>GPT-SoVITS 模型映射</strong>
+                                  <span>{activeProjectCharacter?.name ?? t("status.unset")} · {activeModelCatalogItem?.logs_name ?? activeModelCatalogItem?.name ?? t("status.unset")}</span>
+                                </div>
+                                <div className="role-library-actions">
+                                  <button className="secondary-button compact-button" onClick={() => void refreshModelCatalog()} disabled={isScanningModelCatalog}>
+                                    {isScanningModelCatalog ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} 刷新模型
+                                  </button>
+                                  <button className="secondary-button compact-button" onClick={clearActiveProjectRoleBinding} disabled={!activeProjectCharacter?.project_binding}>清除临时匹配</button>
+                                </div>
+                              </div>
+                              <div className="model-mapping-grid">
+                                <div className="model-mapping-column">
+                                  <div className="model-mapping-column-head">
+                                    <span>剧本角色</span>
+                                    <strong>{projectRoleRows.length}</strong>
+                                  </div>
+                                  <div className="model-mapping-list">
+                                    {projectRoleRows.map((role, index) => {
+                                      const mapping = projectCharacters.find((item) => item.project_character_id === role.id);
+                                      const selected = activeProjectCharacter?.project_character_id === role.id;
+                                      return (
+                                        <button
+                                          className={`model-map-row ${selected ? "selected" : ""} ${roleAccentClass(index)}`}
+                                          key={role.id}
+                                          onClick={() => setActiveProjectRoleId(role.id)}
+                                        >
+                                          <RoleAvatar avatarPath={role.avatarPath} fallback={role.avatarFallback} size="sm" />
+                                          <span>
+                                            <strong>{role.name}</strong>
+                                            <small>{role.lineCount} lines · {mapping?.project_binding ? "项目临时" : role.profile}</small>
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                    {projectRoleRows.length === 0 && <div className="empty-row compact">{t("characters.noProjectRoles")}</div>}
+                                  </div>
+                                </div>
+
+                                <div className="model-mapping-column">
+                                  <div className="model-mapping-column-head">
+                                    <span>模型目录</span>
+                                    <strong>{filteredGptModelCatalog.length}</strong>
+                                  </div>
+                                  <div className="model-mapping-list">
+                                    {filteredGptModelCatalog.map((model) => {
+                                      const selected = activeModelCatalogItem?.id === model.id;
+                                      return (
+                                        <button
+                                          className={`model-map-row model-row ${selected ? "selected" : ""}`}
+                                          key={`${model.service_id ?? "all"}:${model.id}`}
+                                          onClick={() => {
+                                            setActiveModelCatalogId(model.id);
+                                            setActiveModelSampleId(null);
+                                          }}
+                                        >
+                                          <span>
+                                            <strong>{model.name}</strong>
+                                            <small>{model.logs_name ?? model.id}</small>
+                                          </span>
+                                          <span className="candidate-strip-counts">
+                                            <b>GPT {model.gpt_weights?.length ?? 0}</b>
+                                            <b>SoVITS {model.sovits_weights?.length ?? 0}</b>
+                                            <b>Ref {model.sample_count ?? referenceSampleCount(model.reference_audio_groups)}</b>
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                    {filteredGptModelCatalog.length === 0 && (
+                                      <button className="empty-row compact action-empty-row" onClick={() => void refreshModelCatalog()} type="button">
+                                        {isScanningModelCatalog ? t("status.loading") : "刷新 GPT-SoVITS 模型目录"}
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+
+                                <div className="model-mapping-column model-mapping-detail">
+                                  <div className="model-mapping-column-head">
+                                    <span>模型详情</span>
+                                    <strong>{activeModelCatalogItem?.source ?? "-"}</strong>
+                                  </div>
+                                  {activeModelCatalogItem ? (
+                                    <>
+                                      <div className="model-detail-fields">
+                                        <div><span>Logs</span><strong>{activeModelCatalogItem.logs_name ?? activeModelCatalogItem.name}</strong></div>
+                                        <div><span>GPT</span><strong>{activeModelCatalogItem.recommended_gpt_weights_path ? shortPath(activeModelCatalogItem.recommended_gpt_weights_path) : t("status.unset")}</strong></div>
+                                        <div><span>SoVITS</span><strong>{activeModelCatalogItem.recommended_sovits_weights_path ? shortPath(activeModelCatalogItem.recommended_sovits_weights_path) : t("status.unset")}</strong></div>
+                                      </div>
+                                      <label className="resource-field">
+                                        <span>训练样本</span>
+                                        <select
+                                          value={(activeModelSelectedSample && "sample_id" in activeModelSelectedSample ? activeModelSelectedSample.sample_id : "")}
+                                          disabled={loadingModelCatalogSamplesKey === activeModelSamplesKey}
+                                          onChange={(event) => setActiveModelSampleId(event.target.value || null)}
+                                        >
+                                          <option value="">{loadingModelCatalogSamplesKey === activeModelSamplesKey ? t("status.loading") : t("status.auto")}</option>
+                                          {activeModelSamples.map((sample) => (
+                                            <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
+                                          ))}
+                                        </select>
+                                      </label>
+                                      {activeModelSelectedSample && (
+                                        <div className="logs-reference-preview compact-reference-preview">
+                                          <div>
+                                            <span>{referenceSampleSourceLabel(activeModelSelectedSample) || t("status.unset")}</span>
+                                            <strong>{activeModelSelectedSample.text || t("inspector.emptyPromptText")}</strong>
+                                          </div>
+                                          {isLocalAudioAsset(activeModelSelectedSample.path) && <WaveformPlayer audioPath={activeModelSelectedSample.path} label={referenceSampleDisplayLabel(activeModelSelectedSample)} />}
+                                        </div>
+                                      )}
+                                      <div className="model-mapping-actions">
+                                        <button className="primary-button compact-button" onClick={bindActiveModelToProjectRole} disabled={!activeProjectCharacter}>绑定到当前剧本角色</button>
+                                        <button className="secondary-button compact-button" onClick={writeActiveModelToLibrary} disabled={!activeProjectCharacter}>写入角色库</button>
+                                      </div>
+                                    </>
+                                  ) : (
+                                    <div className="empty-row compact">选择或刷新模型目录</div>
+                                  )}
+                                </div>
+                              </div>
+                            </section>
+
                             <section className="role-library-directory">
                               <div className="role-library-title-block">
                                 <strong>{t("characters.library")}</strong>
@@ -2082,22 +2544,36 @@ export default function App() {
                               </div>
                               <div className="role-library-status-row">
                                 <div><span>{t("characters.confirmedLibrary")}</span><strong>{characters.filter((character) => character.library_status === "confirmed").length}</strong></div>
-                                <div><span>{t("characters.scanDrafts")}</span><strong>{filteredRoleCandidates.length}</strong></div>
+                                <div><span>{t("characters.scanDrafts")}</span><strong>{filteredRoleCandidates.length + filteredGptModelCatalog.length}</strong></div>
                                 <div><span>{t("characters.projectMatch")}</span><strong>{projectCharacters.filter((item) => item.match_status === "matched" || item.library_character_id).length}/{projectRoleRows.length}</strong></div>
+                              </div>
+                              <div className="role-library-service-strip">
+                                <div className="role-service-summary">
+                                  <span>{t("characters.ttsAccess")}</span>
+                                  <strong>{roleLibraryTtsServices.filter((service) => service.state === "ready").length}/{roleLibraryTtsServices.length}</strong>
+                                  <small>{t("characters.modelCatalog")}: {roleLibraryCatalogServices.length}</small>
+                                </div>
+                                {roleLibraryTtsServices.slice(0, 3).map((service) => (
+                                  <div className={`role-service-chip state-${service.state}`} key={service.serviceId}>
+                                    <span>{providerLabel(service.providerType)}</span>
+                                    <strong>{service.label}</strong>
+                                    <small>{service.apiContract}</small>
+                                  </div>
+                                ))}
                               </div>
                               <label className="library-field compact">
                                 <span>{t("characters.logsService")}</span>
                                 <select value={selectedLogsServiceId} onChange={(event) => setSelectedLogsServiceId(event.target.value)}>
                                   <option value="">{t("characters.allGptServices")}</option>
-                                  {logsServiceOptions.map((service) => (
-                                    <option value={service.service_id ?? ""} key={service.service_id}>{serviceDisplayName(service)}</option>
+                                  {roleLibraryCatalogServices.map((service) => (
+                                    <option value={service.serviceId} key={service.serviceId}>{service.label} · {providerLabel(service.providerType)}</option>
                                   ))}
                                 </select>
                               </label>
                               <div className="role-directory-list">
                                 {filteredLibraryCharacters.map((character, index) => {
                                   const summary = characterBindingSummary(character);
-                                  const selected = activeRoleCandidateId === null && activeLibraryCharacter?.id === character.id;
+                                  const selected = activeModelCatalogId === null && activeRoleCandidateId === null && activeLibraryCharacter?.id === character.id;
                                   return (
                                     <button
                                       className={`role-directory-card ${selected ? "selected" : ""} ${roleAccentClass(index)}`}
@@ -2105,6 +2581,7 @@ export default function App() {
                                       onClick={() => {
                                         setActiveLibraryCharacterId(character.id);
                                         setActiveRoleCandidateId(null);
+                                        setActiveModelCatalogId(null);
                                       }}
                                     >
                                       <RoleAvatar avatarPath={character.avatar_path} fallback={avatarFallback(character.name)} size="lg" />
@@ -2132,7 +2609,10 @@ export default function App() {
                                     <button
                                       className={`candidate-strip-card ${selected ? "selected" : ""}`}
                                       key={candidate.id}
-                                      onClick={() => setActiveRoleCandidateId(candidate.id)}
+                                      onClick={() => {
+                                        setActiveRoleCandidateId(candidate.id);
+                                        setActiveModelCatalogId(null);
+                                      }}
                                     >
                                       <span className="candidate-strip-title">
                                         <strong>{candidate.name}</strong>
@@ -2146,12 +2626,95 @@ export default function App() {
                                     </button>
                                   );
                                 })}
-                                {filteredLibraryCharacters.length === 0 && filteredRoleCandidates.length === 0 && <div className="empty-row">{t("characters.noProjectRoles")}</div>}
+                                {filteredGptModelCatalog.length > 0 && (
+                                  <div className="role-list-subhead">
+                                    <span><Cpu size={13} /> {t("characters.modelCatalog")}</span>
+                                    <strong>{filteredGptModelCatalog.length}</strong>
+                                  </div>
+                                )}
+                                {filteredGptModelCatalog.map((model) => {
+                                  const selected = activeModelCatalogItem?.id === model.id;
+                                  const sourceService = roleLibraryTtsServices.find((service) => service.serviceId === model.service_id);
+                                  return (
+                                    <button
+                                      className={`candidate-strip-card model-catalog-card ${selected ? "selected" : ""}`}
+                                      key={model.id}
+                                      onClick={() => {
+                                        setActiveModelCatalogId(model.id);
+                                        setActiveRoleCandidateId(null);
+                                      }}
+                                    >
+                                      <span className="candidate-strip-title">
+                                        <strong>{model.name}</strong>
+                                        <small>{model.logs_name ?? model.id}</small>
+                                      </span>
+                                      <span className="candidate-strip-counts">
+                                        <b>{sourceService?.label ?? model.service_id ?? t("services.noService")}</b>
+                                        <b>Ref {model.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? 0}</b>
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                                {filteredLibraryCharacters.length === 0 && filteredRoleCandidates.length === 0 && filteredGptModelCatalog.length === 0 && <div className="empty-row">{t("characters.noProjectRoles")}</div>}
                               </div>
                             </section>
 
                             <section className="role-library-detail-pane">
-                              {activeRoleCandidate ? (
+                              {activeModelCatalogItem ? (
+                                <div className="role-detail-stack">
+                                  <div className="role-detail-hero">
+                                    <RoleAvatar fallback={avatarFallback(activeModelCatalogItem.name)} size="lg" />
+                                    <div>
+                                      <strong>{activeModelCatalogItem.name}</strong>
+                                      <span>{providerLabel("gpt-sovits")} · {activeModelCatalogItem.logs_name ?? activeModelCatalogItem.id}</span>
+                                    </div>
+                                    <button className="secondary-button compact-button" onClick={() => void refreshModelCatalog()} disabled={isScanningModelCatalog}>
+                                      {isScanningModelCatalog ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} {t("characters.modelCatalog")}
+                                    </button>
+                                  </div>
+                                  <div className="role-detail-metrics">
+                                    <div><span>GPT</span><strong>{activeModelCatalogItem.gpt_weights?.length ?? 0}</strong></div>
+                                    <div><span>SoVITS</span><strong>{activeModelCatalogItem.sovits_weights?.length ?? 0}</strong></div>
+                                    <div><span>Ref</span><strong>{activeModelCatalogItem.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? activeModelSamples.length}</strong></div>
+                                  </div>
+                                  <section className="role-config-card">
+                                    <div className="role-config-head">
+                                      <strong>{t("characters.projectRoleBinding")}</strong>
+                                      <select value={activeProjectCharacter?.project_character_id ?? ""} onChange={(event) => setActiveProjectRoleId(event.target.value || null)}>
+                                        {projectRoleRows.map((role) => (
+                                          <option value={role.id} key={role.id}>{role.name}</option>
+                                        ))}
+                                      </select>
+                                    </div>
+                                    <div className="role-model-actions">
+                                      <button className="primary-button compact-button" onClick={bindActiveModelToProjectRole} disabled={!activeProjectCharacter}>{t("characters.bindToProjectRole")}</button>
+                                      <button className="secondary-button compact-button" onClick={writeActiveModelToLibrary} disabled={!activeProjectCharacter}>{t("characters.writeToLibrary")}</button>
+                                      <button className="secondary-button compact-button" onClick={clearActiveProjectRoleBinding} disabled={!activeProjectCharacter?.project_binding}>{t("characters.clearProjectBinding")}</button>
+                                    </div>
+                                    <div className="role-detail-card">
+                                      <span>{t("characters.selectedProjectRole")}</span>
+                                      <strong>{activeProjectCharacter?.name ?? t("status.unassigned")}</strong>
+                                      <small>{activeProjectCharacter?.project_binding ? `${activeProjectCharacter.project_binding.provider_type} · ${activeProjectCharacter.project_binding.service_id ?? t("services.noService")}` : t("characters.noProjectBinding")}</small>
+                                    </div>
+                                  </section>
+                                  <div className="role-detail-card">
+                                    <span>{t("characters.sourceService")}</span>
+                                    <strong>{serviceDisplayName(serviceById.get(activeModelCatalogItem.service_id ?? "") ?? ({ engine: "gpt-sovits", display_name: activeModelCatalogItem.service_id ?? t("services.noService"), ready: false } as WorkerHealth))}</strong>
+                                    <small>{activeModelCatalogItem.source ?? "model_catalog"}</small>
+                                  </div>
+                                  <div className="role-detail-card">
+                                    <span>{t("characters.selectedReference")}</span>
+                                    <strong>{activeModelSelectedSample ? shortPath(activeModelSelectedSample.path) : t("status.unset")}</strong>
+                                    <small>{activeModelSelectedSample ? referenceSampleDisplayLabel(activeModelSelectedSample) : t("status.unset")}</small>
+                                  </div>
+                                  <div className="role-detail-card">
+                                    <span>{t("characters.recommendedAssets")}</span>
+                                    <strong>{activeModelCatalogItem.recommended_gpt_weights_path ? shortPath(activeModelCatalogItem.recommended_gpt_weights_path) : t("status.unset")}</strong>
+                                    <small>{activeModelCatalogItem.recommended_sovits_weights_path ? shortPath(activeModelCatalogItem.recommended_sovits_weights_path) : t("status.unset")}</small>
+                                  </div>
+                                  <ReferencePreview groups={activeModelCatalogItem.reference_audio_groups ?? []} t={t} />
+                                </div>
+                              ) : activeRoleCandidate ? (
                                 <div className="role-detail-stack">
                                   <div className="role-detail-hero">
                                     <RoleAvatar fallback={avatarFallback(activeRoleCandidate.name)} size="lg" />
@@ -2179,8 +2742,8 @@ export default function App() {
                                   <ReferencePreview groups={activeRoleCandidate.reference_audio_groups ?? []} t={t} />
                                 </div>
                               ) : activeLibraryCharacter ? (() => {
-                                const allBindings = (activeLibraryCharacter.profiles ?? []).flatMap((profile) => profile.bindings ?? []);
-                                const gptBinding = allBindings.find((binding) => binding.provider_type === "gpt-sovits");
+                                const bindingRows = roleLibraryBindingRows(activeLibraryCharacter, ttsServices);
+                                const gptBinding = bindingRows.find((row) => row.providerType === "gpt-sovits")?.binding;
                                 const gptConfig = gptBinding?.config ?? {};
                                 const gptComplete = gptBinding ? bindingCompleteness(gptBinding) : null;
                                 const referenceSamples = (activeLibraryCharacter.reference_audio_groups ?? []).flatMap((group) =>
@@ -2248,68 +2811,93 @@ export default function App() {
 
                                     <section className="role-config-card">
                                       <div className="role-config-head">
-                                        <strong>{t("characters.gptBinding")}</strong>
+                                        <strong>{t("characters.ttsBindings")}</strong>
                                         {gptBinding ? (
                                           <span className={`tracker-chip ${gptComplete?.complete ? "ok" : "warn"}`}>{gptComplete?.complete ? t("characters.readyToGenerate") : `${t("characters.missingFields")}: ${gptComplete?.missing.join(", ")}`}</span>
                                         ) : (
                                           <button className="secondary-button compact-button" onClick={() => addGptBindingForCharacter(activeLibraryCharacter.id)}><Plus size={13} /> {t("characters.createGptBinding")}</button>
                                         )}
                                       </div>
-                                      {gptBinding ? (
-                                        <div className="role-config-form">
-                                          <label>
-                                            <span>{t("characters.logsName")}</span>
-                                            <input value={stringConfigValue(gptConfig.logs_name)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { logs_name: event.target.value })} />
-                                          </label>
-                                          <label>
-                                            <span>{t("services.selectedService")}</span>
-                                            <select value={gptBinding.service_id ?? ""} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, {}, { service_id: event.target.value || null })}>
-                                              <option value="">{t("services.noService")}</option>
-                                              {logsServiceOptions.map((service) => (
-                                                <option value={service.service_id ?? ""} key={service.service_id}>{serviceDisplayName(service)}</option>
-                                              ))}
-                                            </select>
-                                          </label>
-                                          <label>
-                                            <span>{t("characters.defaultGpt")}</span>
-                                            <select value={stringConfigValue(gptConfig.gpt_weights_path)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { gpt_weights_path: event.target.value })}>
-                                              <option value="">{t("status.auto")}</option>
-                                              {(voiceCandidates?.gpt_sovits.gpt_weights ?? []).map((item) => (
-                                                <option value={item.path} key={item.path}>{item.name}</option>
-                                              ))}
-                                            </select>
-                                          </label>
-                                          <label>
-                                            <span>{t("characters.defaultSovits")}</span>
-                                            <select value={stringConfigValue(gptConfig.sovits_weights_path)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { sovits_weights_path: event.target.value })}>
-                                              <option value="">{t("status.auto")}</option>
-                                              {(voiceCandidates?.gpt_sovits.sovits_weights ?? []).map((item) => (
-                                                <option value={item.path} key={item.path}>{item.name}</option>
-                                              ))}
-                                            </select>
-                                          </label>
-                                          <label>
-                                            <span>{t("characters.referenceAudio")}</span>
-                                            <select value={stringConfigValue(gptConfig.ref_audio_path)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { ref_audio_path: event.target.value })}>
-                                              <option value="">{t("status.unset")}</option>
-                                              {referenceSamples.map((sample) => (
-                                                <option value={sample.path} key={sample.path}>{shortPath(sample.path)}</option>
-                                              ))}
-                                            </select>
-                                          </label>
-                                          <div className="wide role-audio-uploader">
-                                            <ReferenceAudioInput
-                                              label={t("characters.addReferenceAudio")}
-                                              value={stringConfigValue(gptConfig.ref_audio_path)}
-                                              onUpload={(file) => uploadCharacterReference(activeLibraryCharacter.id, gptBinding.binding_id, file)}
-                                            />
-                                            <small>{t("characters.referenceUploadHint")}</small>
-                                          </div>
-                                          <label className="wide">
-                                            <span>{t("characters.promptText")}</span>
-                                            <textarea rows={2} value={stringConfigValue(gptConfig.prompt_text)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { prompt_text: event.target.value })} />
-                                          </label>
+                                      {bindingRows.length > 0 ? (
+                                        <div className="role-binding-table">
+                                          {bindingRows.map((row) => (
+                                            <div className="role-binding-row" key={row.bindingId}>
+                                              <div>
+                                                <strong>{providerLabel(row.providerType)}</strong>
+                                                <small>{row.profileName} · {row.serviceLabel || t("services.noService")}</small>
+                                              </div>
+                                              <div className="role-binding-fields">
+                                                <span>{row.bindingId}</span>
+                                                {row.complete ? <span>{t("characters.readyToGenerate")}</span> : row.missing.map((field) => <span className="missing" key={`${row.bindingId}-${field}`}>{field}</span>)}
+                                                {row.binding.capabilities.slice(0, 2).map((capability) => <span key={`${row.bindingId}-${capability}`}>{capability}</span>)}
+                                              </div>
+                                            </div>
+                                          ))}
                                         </div>
+                                      ) : (
+                                        <div className="role-empty-config">{t("characters.noTtsBindingsHint")}</div>
+                                      )}
+                                      {gptBinding ? (
+                                        <>
+                                          <div className="role-config-subhead">
+                                            <strong>{t("characters.gptBinding")}</strong>
+                                            <span>{t("characters.modelCatalogService")}</span>
+                                          </div>
+                                          <div className="role-config-form">
+                                            <label>
+                                              <span>{t("characters.logsName")}</span>
+                                              <input value={stringConfigValue(gptConfig.logs_name)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { logs_name: event.target.value })} />
+                                            </label>
+                                            <label>
+                                              <span>{t("services.selectedService")}</span>
+                                              <select value={gptBinding.service_id ?? ""} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, {}, { service_id: event.target.value || null })}>
+                                                <option value="">{t("services.noService")}</option>
+                                                {gptSovitsBindingServiceOptions.map((service) => (
+                                                  <option value={service.serviceId} key={service.serviceId}>{service.label}</option>
+                                                ))}
+                                              </select>
+                                            </label>
+                                            <label>
+                                              <span>{t("characters.defaultGpt")}</span>
+                                              <select value={stringConfigValue(gptConfig.gpt_weights_path)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { gpt_weights_path: event.target.value })}>
+                                                <option value="">{t("status.auto")}</option>
+                                                {(voiceCandidates?.gpt_sovits.gpt_weights ?? []).map((item) => (
+                                                  <option value={item.path} key={item.path}>{item.name}</option>
+                                                ))}
+                                              </select>
+                                            </label>
+                                            <label>
+                                              <span>{t("characters.defaultSovits")}</span>
+                                              <select value={stringConfigValue(gptConfig.sovits_weights_path)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { sovits_weights_path: event.target.value })}>
+                                                <option value="">{t("status.auto")}</option>
+                                                {(voiceCandidates?.gpt_sovits.sovits_weights ?? []).map((item) => (
+                                                  <option value={item.path} key={item.path}>{item.name}</option>
+                                                ))}
+                                              </select>
+                                            </label>
+                                            <label>
+                                              <span>{t("characters.referenceAudio")}</span>
+                                              <select value={stringConfigValue(gptConfig.ref_audio_path)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { ref_audio_path: event.target.value })}>
+                                                <option value="">{t("status.unset")}</option>
+                                                {referenceSamples.map((sample) => (
+                                                  <option value={sample.path} key={sample.path}>{shortPath(sample.path)}</option>
+                                                ))}
+                                              </select>
+                                            </label>
+                                            <div className="wide role-audio-uploader">
+                                              <ReferenceAudioInput
+                                                label={t("characters.addReferenceAudio")}
+                                                value={stringConfigValue(gptConfig.ref_audio_path)}
+                                                onUpload={(file) => uploadCharacterReference(activeLibraryCharacter.id, gptBinding.binding_id, file)}
+                                              />
+                                              <small>{t("characters.referenceUploadHint")}</small>
+                                            </div>
+                                            <label className="wide">
+                                              <span>{t("characters.promptText")}</span>
+                                              <textarea rows={2} value={stringConfigValue(gptConfig.prompt_text)} onChange={(event) => updateLibraryBindingConfig(activeLibraryCharacter.id, gptBinding.binding_id, { prompt_text: event.target.value })} />
+                                            </label>
+                                          </div>
+                                        </>
                                       ) : (
                                         <div className="role-empty-config">{t("characters.noGptBindingHint")}</div>
                                       )}
@@ -3124,13 +3712,11 @@ export default function App() {
   function updateSourceCharacterForRole(projectCharacterId: string, updater: (character: Character) => Character) {
     const mapping = projectCharacters.find((item) => item.project_character_id === projectCharacterId);
     if (mapping?.mode === "snapshot") {
-      setProject((current) => ({
-        ...current,
-        project_characters: ensureProjectCharacters(current, characters).map((item) => {
+      setProject((current) => projectWithProjectCharacters(current, ensureProjectCharacters(current, characters).map((item) => {
           if (item.project_character_id !== projectCharacterId || !item.character_snapshot) return item;
           return { ...item, character_snapshot: updater(item.character_snapshot) };
         })
-      }));
+      ));
       return;
     }
     const libraryId = mapping?.library_character_id ?? projectCharacterId;
@@ -3138,12 +3724,10 @@ export default function App() {
   }
 
   function updateProjectCharacter(nextProjectCharacter: ProjectCharacter) {
-    setProject((current) => ({
-      ...current,
-      project_characters: ensureProjectCharacters(current, characters).map((item) =>
+    setProject((current) => projectWithProjectCharacters(current, ensureProjectCharacters(current, characters).map((item) =>
         item.project_character_id === nextProjectCharacter.project_character_id ? nextProjectCharacter : item
-      )
-    }));
+      ))
+    );
   }
 
   async function freezeRole(projectCharacterId: string) {
@@ -3184,15 +3768,131 @@ export default function App() {
     setIsScanningRoleLibrary(true);
     setNotice(t("notice.scanningRoles"));
     try {
-      const payload = await fetchLogsCandidates(selectedLogsServiceId || null, true, 80).catch(() => scanCharacterLibrary(80));
+      const [payload, modelPayload] = await Promise.all([
+        fetchLogsCandidates(selectedModelCatalogServiceId, true, 80).catch(() => scanCharacterLibrary(80)),
+        fetchGptSovitsModelCatalog(selectedModelCatalogServiceId, 120).catch(() => ({ models: [], diagnostics: [] }))
+      ]);
       setRoleLibraryCandidates(payload.candidates);
-      const diagnostics = payload.diagnostics?.length ? ` · ${payload.diagnostics.length} ${t("characters.diagnostics")}` : "";
-      setNotice(`${t("notice.roleScanDone", { count: payload.candidates.length })}${diagnostics}`);
+      setGptModelCatalog(modelPayload.models);
+      setActiveModelCatalogId((current) => current && modelPayload.models.some((model) => model.id === current) ? current : modelPayload.models[0]?.id ?? null);
+      const diagnosticCount = (payload.diagnostics?.length ?? 0) + (modelPayload.diagnostics?.length ?? 0);
+      const diagnostics = diagnosticCount ? ` · ${diagnosticCount} ${t("characters.diagnostics")}` : "";
+      setNotice(`${t("notice.roleScanDone", { count: payload.candidates.length + modelPayload.models.length })}${diagnostics}`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.roleScanFailed"));
     } finally {
       setIsScanningRoleLibrary(false);
     }
+  }
+
+  async function refreshModelCatalog() {
+    setIsScanningModelCatalog(true);
+    setNotice(t("notice.scanningRoles"));
+    try {
+      const payload = await fetchGptSovitsModelCatalog(selectedModelCatalogServiceId, 120);
+      setGptModelCatalog(payload.models);
+      setActiveModelCatalogId((current) => current && payload.models.some((model) => model.id === current) ? current : payload.models[0]?.id ?? null);
+      const diagnostics = payload.diagnostics?.length ? ` · ${payload.diagnostics.length} ${t("characters.diagnostics")}` : "";
+      setNotice(`${t("notice.roleScanDone", { count: payload.models.length })}${diagnostics}`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("notice.roleScanFailed"));
+    } finally {
+      setIsScanningModelCatalog(false);
+    }
+  }
+
+  function bindActiveModelToProjectRole() {
+    if (!activeProjectCharacter || !activeModelCatalogItem) return;
+    const binding = gptSovitsProjectBindingFromModel(activeProjectCharacter.project_character_id, activeModelCatalogItem, activeModelSelectedSample);
+    setProject((current) => {
+      const nextProjectCharacters = ensureProjectCharacters(current, characters).map((item) =>
+        item.project_character_id === activeProjectCharacter.project_character_id
+          ? { ...item, project_binding: binding, match_status: item.match_status ?? "manual" }
+          : item
+      );
+      return projectWithProjectCharacters(current, nextProjectCharacters);
+    });
+    setNotice(t("notice.roleSaved"));
+  }
+
+  function clearActiveProjectRoleBinding() {
+    if (!activeProjectCharacter) return;
+    setProject((current) => {
+      const nextProjectCharacters = ensureProjectCharacters(current, characters).map((item) =>
+        item.project_character_id === activeProjectCharacter.project_character_id
+          ? { ...item, project_binding: null }
+          : item
+      );
+      return projectWithProjectCharacters(current, nextProjectCharacters);
+    });
+    setNotice(t("notice.roleSaved"));
+  }
+
+  function writeActiveModelToLibrary() {
+    if (!activeProjectCharacter || !activeModelCatalogItem) return;
+    const libraryId = activeProjectCharacter.library_character_id ?? stableLibraryCharacterId(activeProjectCharacter.name, activeProjectCharacter.project_character_id);
+    const binding = gptSovitsProjectBindingFromModel(libraryId, activeModelCatalogItem, activeModelSelectedSample);
+    const profileId = `${libraryId}-gpt-sovits`;
+    const bindingId = `${libraryId}-gpt-sovits-binding`;
+    const libraryBinding: VoiceBinding = {
+      ...binding,
+      binding_id: bindingId,
+      service_id: binding.service_id,
+      config: {
+        ...binding.config,
+        path_service_id: binding.service_id ?? undefined
+      }
+    };
+    setCharacters((current) => {
+      const existing = current.find((character) => character.id === libraryId);
+      const baseCharacter: Character = existing ?? {
+        id: libraryId,
+        name: activeProjectCharacter.name,
+        aliases: [activeProjectCharacter.name],
+        nicknames: [],
+        match_names: [activeModelCatalogItem.logs_name ?? activeModelCatalogItem.name],
+        notes: "",
+        tags: ["model-mapping"],
+        library_status: "confirmed",
+        reference_audio_groups: activeModelCatalogItem.reference_audio_groups ?? [],
+        profiles: [],
+        default_engine: "gpt-sovits",
+        default_profile: profileId,
+        fallback_profiles: []
+      };
+      const nextProfile: VoiceProfile = {
+        id: profileId,
+        name: `${baseCharacter.name} GPT-SoVITS`,
+        engine: "gpt-sovits",
+        service_id: libraryBinding.service_id,
+        fallback_services: [],
+        config: {},
+        bindings: [libraryBinding]
+      };
+      const nextCharacter: Character = {
+        ...baseCharacter,
+        aliases: Array.from(new Set([...(baseCharacter.aliases ?? []), activeProjectCharacter.name])),
+        match_names: Array.from(new Set([...(baseCharacter.match_names ?? []), activeModelCatalogItem.logs_name ?? activeModelCatalogItem.name])),
+        tags: Array.from(new Set([...(baseCharacter.tags ?? []), "model-mapping"])),
+        library_status: "confirmed",
+        reference_audio_groups: activeModelCatalogItem.reference_audio_groups?.length ? activeModelCatalogItem.reference_audio_groups : baseCharacter.reference_audio_groups,
+        default_engine: "gpt-sovits",
+        default_profile: profileId,
+        profiles: [nextProfile, ...(baseCharacter.profiles ?? []).filter((profile) => profile.id !== profileId)],
+        updated_at: new Date().toISOString()
+      };
+      return [...current.filter((character) => character.id !== libraryId), nextCharacter];
+    });
+    setProject((current) => {
+      const nextProjectCharacters = ensureProjectCharacters(current, characters).map((item) =>
+        item.project_character_id === activeProjectCharacter.project_character_id
+          ? { ...item, library_character_id: libraryId, mode: "reference" as const, character_snapshot: null }
+          : item
+      );
+      return projectWithProjectCharacters(current, nextProjectCharacters);
+    });
+    setActiveLibraryCharacterId(libraryId);
+    setNotice(t("notice.roleSaved"));
   }
 
   async function importCandidate(candidate: RoleLibraryCandidate) {
@@ -3203,14 +3903,12 @@ export default function App() {
       setRoleLibraryCandidates((current) => current.filter((item) => item.id !== candidate.id));
       setActiveRoleCandidateId(null);
       setActiveLibraryCharacterId(payload.character.id);
-      setProject((current) => ({
-        ...current,
-        project_characters: ensureProjectCharacters(current, characters).map((item) =>
+      setProject((current) => projectWithProjectCharacters(current, ensureProjectCharacters(current, characters).map((item) =>
           normalizeRoleToken(item.name) === normalizeRoleToken(payload.character.name)
             ? { ...item, library_character_id: payload.character.id, mode: "reference", character_snapshot: null }
             : item
-        )
-      }));
+        ))
+      );
       setNotice(t("notice.roleImported"));
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.roleImportFailed"));
@@ -3285,7 +3983,7 @@ export default function App() {
   }
 
   function addGptBindingForCharacter(characterId: string) {
-    const serviceId = selectedLogsServiceId || logsServiceOptions[0]?.service_id || null;
+    const serviceId = selectedModelCatalogServiceId || gptSovitsBindingServiceOptions[0]?.serviceId || null;
     setCharacters((current) =>
       current.map((character) => {
         if (character.id !== characterId) return character;
@@ -3468,6 +4166,35 @@ function buildRunnableTasks(lines: ScriptLine[], characters: Character[]): { tas
   return { tasks, blocked };
 }
 
+function projectWithProjectCharacters(project: ScriptProject, projectCharacters: ProjectCharacter[]): ScriptProject {
+  return {
+    ...project,
+    project_characters: projectCharacters,
+    parse_revisions: project.parse_revisions?.map((revision) =>
+      revision.revision_id === project.active_parse_revision_id
+        ? { ...revision, project_characters: projectCharacters }
+        : revision
+    )
+  };
+}
+
+function stableLibraryCharacterId(name: string, fallback: string): string {
+  const ascii = name
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return ascii || fallback || `role-${Date.now().toString(36)}`;
+}
+
+function referenceSampleSourceLabel(sample: LogsReferenceAudioSample | ReferenceAudioSample): string {
+  return "text_source" in sample ? sample.text_source ?? "sample" : sample.text_source ?? "sample";
+}
+
+function referenceSampleDisplayLabel(sample: LogsReferenceAudioSample | ReferenceAudioSample): string {
+  return "display_label" in sample ? sample.display_label : shortPath(sample.path);
+}
+
 function providerFromEngine(engine: ScriptLine["engine_override"]): ProviderType | null {
   if (engine === "gpt-sovits" || engine === "indextts" || engine === "cosyvoice" || engine === "vibevoice") return engine;
   return null;
@@ -3482,14 +4209,7 @@ function defaultServiceForProvider(services: WorkerHealth[], provider: ProviderT
   return routableProviderServices(services, provider)[0]?.service_id ?? null;
 }
 
-function sourceProfileNetworkScope(sourceProfile: SourceProfile): WorkerHealth["network_scope"] {
-  if (sourceProfile === "lan_endpoint") return "lan";
-  if (sourceProfile === "cloud_endpoint") return "public";
-  if (sourceProfile === "api_placeholder") return "commercial";
-  return "localhost";
-}
-
-function sourceProfileLabel(sourceProfile: SourceProfile, t: Translate): string {
+function sourceProfileLabel(sourceProfile: string, t: Translate): string {
   return t(`services.openSourceMode_${sourceProfile}`);
 }
 
@@ -3673,8 +4393,8 @@ function mergeServiceRecords(settings: WorkerHealth[], health: WorkerHealth[]): 
 
 function defaultServiceBaseUrl(id: string, provider?: string): string | undefined {
   const defaults: Record<string, string> = {
-    "local-gpt-sovits": "http://127.0.0.1:9880",
-    "local-indextts": "http://127.0.0.1:9881",
+    "local-gpt-sovits": "http://127.0.0.1:9872",
+    "local-indextts": "http://127.0.0.1:7860",
     "local-cosyvoice": "http://127.0.0.1:50000",
     "openai-tts": "https://api.openai.com/v1",
     "gemini-tts": "https://generativelanguage.googleapis.com/v1beta",
@@ -3721,6 +4441,7 @@ function serviceLifecycleText(service: WorkerHealth, t: Translate): string {
 }
 
 function serviceEndpointMode(service: WorkerHealth, t: Translate): string {
+  if (service.source_profile) return sourceProfileLabel(service.source_profile, t);
   if (service.mode === "external") return t("services.remoteExternal");
   if (service.supervisor?.manageable || service.service_id?.startsWith("local-")) return t("services.localManaged");
   return service.mode ?? t("services.remoteExternal");
@@ -3958,6 +4679,10 @@ function ttsStateToneClass(state: TTSServiceState): "ok" | "warn" | "danger" | "
 
 type ParserProviderState = "ready" | "partial" | "blocked" | "disabled";
 
+function isKwjmParserProvider(provider: Pick<ParserProviderDraft, "name" | "api_key_env">): boolean {
+  return provider.name.trim() === KWJM_PROVIDER_NAME || provider.api_key_env.trim() === KWJM_API_KEY_ENV;
+}
+
 function parserProviderState(provider: ParserProviderDraft): ParserProviderState {
   if (!provider.enabled) return "disabled";
   if (!provider.base_url || !provider.model || !provider.api_key_env) return "blocked";
@@ -3974,6 +4699,13 @@ function parserProviderStateLabel(provider: ParserProviderDraft, t: Translate): 
   if (state === "ready") return t("status.ready");
   if (state === "partial") return t("status.needsKey");
   if (state === "disabled") return t("status.disabled");
+  return t("services.blocked");
+}
+
+function kwjmActivationStateLabel(state: ParserProviderState, t: Translate): string {
+  if (state === "ready") return t("status.ready");
+  if (state === "disabled") return t("parser.readyToActivate");
+  if (state === "partial") return t("status.needsKey");
   return t("services.blocked");
 }
 
@@ -4145,27 +4877,16 @@ function characterBindingSummary(character: Character): { bindingCount: number; 
   };
 }
 
-function bindingCompleteness(binding: VoiceBinding): { complete: boolean; missing: string[] } {
-  const config = binding.config ?? {};
-  const missing: string[] = [];
-  if (binding.provider_type === "gpt-sovits") {
-    if (!config.logs_name) missing.push("logs");
-    if (!config.gpt_weights_path) missing.push("GPT");
-    if (!config.sovits_weights_path) missing.push("SoVITS");
-    if (!config.ref_audio_path) missing.push("ref");
-    if (!config.prompt_text) missing.push("prompt");
-  } else if (binding.provider_type === "indextts") {
-    if (!config.voice && !config.ref_audio_path && !config.reference_audio) missing.push("voice");
-  } else if (!config.voice && !config.voice_id && !config.model) {
-    missing.push("voice");
-  }
-  return { complete: missing.length === 0, missing };
-}
-
 function stringConfigValue(value: unknown): string {
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return "";
+}
+
+function referenceSampleDisplayText(sample: unknown): string {
+  if (!sample || typeof sample !== "object") return "";
+  const record = sample as Record<string, unknown>;
+  return stringConfigValue(record.display_label) || stringConfigValue(record.text) || stringConfigValue(record.path);
 }
 
 function splitEditableList(value: string): string[] {

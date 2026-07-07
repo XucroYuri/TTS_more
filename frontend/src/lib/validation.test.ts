@@ -7,8 +7,8 @@ describe("validation wizard helpers", () => {
     const steps = validationSteps(
       { service_mode: "real" },
       [
-        { service_id: "local-gpt", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, base_url: "http://127.0.0.1:9880", supervisor: { service_id: "local-gpt", manageable: true, running: true } },
-        { service_id: "local-index", engine: "indextts", provider_type: "indextts", ready: true, base_url: "http://127.0.0.1:9881", supervisor: { service_id: "local-index", manageable: true, running: true } },
+        { service_id: "local-gpt", engine: "gpt-sovits", provider_type: "gpt-sovits", ready: true, base_url: "http://127.0.0.1:9872", supervisor: { service_id: "local-gpt", manageable: true, running: true } },
+        { service_id: "local-index", engine: "indextts", provider_type: "indextts", ready: true, base_url: "http://127.0.0.1:7860", supervisor: { service_id: "local-index", manageable: true, running: true } },
         { service_id: "local-cosyvoice", engine: "cosyvoice", provider_type: "cosyvoice", ready: true, base_url: "http://127.0.0.1:50000" }
       ],
       { ready: true },

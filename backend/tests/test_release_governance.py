@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from fastapi.testclient import TestClient
 
@@ -13,7 +14,6 @@ def test_committable_templates_do_not_contain_local_runtime_identifiers() -> Non
         repo_root / "data" / "services.json",
         repo_root / "data" / "templates" / "services.example.json",
         repo_root / "data" / "templates" / "characters.example.json",
-        repo_root / "data" / "templates" / "demo-hollywood" / "project.json",
     ]
     forbidden_tokens = [
         "192.168.2.",
@@ -29,6 +29,66 @@ def test_committable_templates_do_not_contain_local_runtime_identifiers() -> Non
         text = path.read_text(encoding="utf-8")
         for token in forbidden_tokens:
             assert token not in text, f"{path} contains local/private token {token!r}"
+
+
+def test_repository_does_not_publish_demo_script_templates() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    forbidden_paths = [
+        repo_root / "data" / "templates" / "demo-hollywood",
+        repo_root / "docs" / "demo-hollywood-prompt.md",
+    ]
+
+    for path in forbidden_paths:
+        assert not path.exists(), f"{path} must not be published"
+
+
+def test_committable_character_template_is_empty() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    template_path = repo_root / "data" / "templates" / "characters.example.json"
+
+    assert json.loads(template_path.read_text(encoding="utf-8")) == []
+
+
+def test_product_source_does_not_embed_fixed_script_sample_text() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    checked_roots = [
+        repo_root / "README.md",
+        repo_root / "docs",
+        repo_root / "data",
+        repo_root / "backend" / "app",
+        repo_root / "frontend" / "src",
+    ]
+    skipped_parts = {
+        "tests",
+        "superpowers",
+        "__pycache__",
+    }
+    forbidden_tokens = [
+        "Signal Over Blackridge",
+        "BLACKRIDGE",
+        "MARA REYES",
+        "JONAH VALE",
+        "CAEL ORRIN",
+        "角色A（焦急）",
+        "角色B（低声）",
+        "Character A (urgent)",
+        "Character B (low voice)",
+        "The wind swallowed the footsteps",
+        "风声吞没了街角的脚步",
+    ]
+
+    for root in checked_roots:
+        paths = [root] if root.is_file() else [path for path in root.rglob("*") if path.is_file()]
+        for path in paths:
+            if skipped_parts.intersection(path.parts):
+                continue
+            if ".test." in path.name:
+                continue
+            if path.suffix.lower() not in {".css", ".html", ".json", ".md", ".py", ".ts", ".tsx"}:
+                continue
+            text = path.read_text(encoding="utf-8")
+            for token in forbidden_tokens:
+                assert token not in text, f"{path} contains fixed script sample text {token!r}"
 
 
 def test_character_library_prefers_local_runtime_config_and_saves_there(tmp_path: Path) -> None:
@@ -148,9 +208,18 @@ def test_project_store_prefers_local_runtime_projects(tmp_path: Path) -> None:
 
     assert local_store.project_path("demo") == tmp_path / "Project" / "Local Runtime Script" / "project.json"
     assert local_store.load_project("demo").title == "Local Runtime Script"
-    assert local_store.list_projects() == [
-        {"project_id": "demo", "title": "Local Runtime Script", "default_language": "zh", "line_count": 1}
-    ]
+    projects = local_store.list_projects()
+    assert len(projects) == 1
+    assert projects[0] == {
+        "project_id": "demo",
+        "title": "Local Runtime Script",
+        "default_language": "zh",
+        "line_count": 1,
+        "character_count": 0,
+        "script_revision_count": 1,
+        "parse_revision_count": 1,
+        "updated_at": projects[0]["updated_at"],
+    }
 
 
 def test_delete_generation_version_falls_back_from_revision_uid_to_legacy_line_id(tmp_path: Path) -> None:

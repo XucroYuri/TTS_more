@@ -36,7 +36,7 @@ def test_registry_loads_services_json(tmp_path: Path) -> None:
   {
     "service_id": "remote-gpt",
     "engine": "gpt-sovits",
-    "base_url": "http://192.0.2.20:9880",
+    "base_url": "http://192.0.2.20:9872",
     "mode": "external",
     "resource_group": "remote-a-gpu-0",
     "priority": 5,
@@ -49,12 +49,12 @@ def test_registry_loads_services_json(tmp_path: Path) -> None:
 
     registry = ServiceRegistry.load(services_path)
 
-    assert registry.get("remote-gpt").base_url == "http://192.0.2.20:9880"
+    assert registry.get("remote-gpt").base_url == "http://192.0.2.20:9872"
     assert registry.get("remote-gpt").mode == "external"
     assert registry.get("remote-gpt").resource_group == "remote-a-gpu-0"
 
 
-def test_registry_default_local_services_share_one_gpu() -> None:
+def test_registry_default_services_use_gradio_endpoints() -> None:
     registry = ServiceRegistry.default_local(repo_root=Path("repo"))
 
     assert {service.service_id for service in registry.services} == {
@@ -62,15 +62,18 @@ def test_registry_default_local_services_share_one_gpu() -> None:
         "local-indextts",
         "local-cosyvoice",
     }
-    assert {service.resource_group for service in registry.services} == {"local-gpu-0"}
+    assert {service.resource_group for service in registry.services} == {"gradio-gpu-0"}
     assert all(service.capacity == 1 for service in registry.services)
     assert all(service.base_url.startswith("http://") for service in registry.services)
     assert all(service.service_kind == "tts" for service in registry.services)
     assert all(service.network_scope == "localhost" for service in registry.services)
+    assert all(service.mode == "external" for service in registry.services)
+    assert all(service.managed is False for service in registry.services)
+    assert all(service.repo_path is None for service in registry.services)
     cosyvoice = registry.get("local-cosyvoice")
     assert cosyvoice.enabled is False
     assert cosyvoice.provider_type.value == "cosyvoice"
-    assert cosyvoice.api_contract == "cosyvoice-http-v1"
+    assert cosyvoice.api_contract == "gradio-cosyvoice-webui"
 
 
 def test_registry_keeps_external_vibevoice_only_as_generic_http() -> None:
@@ -582,6 +585,64 @@ def test_gpt_sovits_load_signature_covers_weights_reference_and_prompt() -> None
         "ref_audio_path=logs/demo-hero/5-wav32k/ref.wav|"
         "prompt_text=不好！|prompt_lang=zh|text_lang=zh"
     )
+
+
+def test_gpt_sovits_api_v2_exposes_model_catalog_and_samples() -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="api-gpt",
+        engine=EngineName.GPT_SOVITS,
+        provider_type="gpt-sovits",
+        api_contract="gpt-sovits-api-v2",
+        base_url="http://127.0.0.1:9880",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://127.0.0.1:9880/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "name": "demo-hero-logs",
+                            "gpt_weights": ["GPT_weights/demo-hero-logs-e40.ckpt"],
+                            "sovits_weights": ["SoVITS_weights/demo-hero-logs_e24_s264.pth"],
+                            "has_training_data": True,
+                            "sample_count": 1,
+                        }
+                    ]
+                },
+            )
+        if str(request.url) == "http://127.0.0.1:9880/models/demo-hero-logs/samples":
+            return httpx.Response(
+                200,
+                json={
+                    "model_name": "demo-hero-logs",
+                    "samples": [
+                        {
+                            "audio_name": "hero_001.wav",
+                            "audio_path": "logs/demo-hero-logs/5-wav32k/hero_001.wav",
+                            "text": "不好！",
+                            "lang": "zh",
+                            "emotion": "紧张",
+                        }
+                    ],
+                    "total": 1,
+                },
+            )
+        return httpx.Response(404)
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+
+    catalog = client.model_catalog()
+    samples = client.model_samples("demo-hero-logs")
+
+    model = catalog["candidates"][0]
+    assert model["logs_name"] == "demo-hero-logs"
+    assert model["recommended_gpt_weights_path"] == "GPT_weights/demo-hero-logs-e40.ckpt"
+    assert model["recommended_sovits_weights_path"] == "SoVITS_weights/demo-hero-logs_e24_s264.pth"
+    assert model["sample_count"] == 1
+    assert samples["samples"][0]["path"] == "logs/demo-hero-logs/5-wav32k/hero_001.wav"
+    assert samples["samples"][0]["prompt_lang"] == "zh"
 
 
 def test_router_checks_service_health_concurrently() -> None:
