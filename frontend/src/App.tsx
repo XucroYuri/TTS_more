@@ -135,6 +135,14 @@ type ScriptSourceMode = "project" | "manual";
 type ConfirmationTone = "warning" | "danger" | "info";
 const KWJM_TESTING_INDEX = -1;
 const LINE_LOAD_BATCH_SIZE = 40;
+const COSY_VOICE_MODE_OPTIONS = [
+  { id: "sft", labelKey: "inspector.cosyModeSft" },
+  { id: "zero_shot", labelKey: "inspector.cosyModeZeroShot" },
+  { id: "cross_lingual", labelKey: "inspector.cosyModeCrossLingual" },
+  { id: "instruct", labelKey: "inspector.cosyModeInstruct" }
+] as const;
+
+type CosyVoiceMode = (typeof COSY_VOICE_MODE_OPTIONS)[number]["id"];
 
 interface ConfirmationDialogState {
   title: string;
@@ -498,6 +506,10 @@ export default function App() {
     () => (!activeVersionDraft && activeLine?.service_override ? clearServiceScopedBindingConfig(activeProvider, activeRawBindingConfig) : activeRawBindingConfig),
     [activeLine?.service_override, activeProvider, activeRawBindingConfig, activeVersionDraft]
   );
+  const cosyVoiceMode = cosyVoiceModeFromConfig(activeBindingConfig.mode);
+  const cosyVoiceNeedsSpeaker = cosyVoiceMode === "sft" || cosyVoiceMode === "instruct";
+  const cosyVoiceNeedsPrompt = cosyVoiceMode === "zero_shot" || cosyVoiceMode === "cross_lingual";
+  const cosyVoiceNeedsInstruction = cosyVoiceMode === "instruct";
 
   useEffect(() => {
     setDiagnosticsExpanded(false);
@@ -3189,7 +3201,7 @@ export default function App() {
                           <small title={activeServiceContract}>{activeServiceContract}</small>
                         </div>
                       </div>
-                      <details className="inspector-more-settings route-settings">
+                      <details className="inspector-more-settings route-settings" key={`${activeLine?.id ?? "none"}-${activeGenerationMethod}`}>
                         <summary>{t("inspector.routeSettings")}</summary>
                         <div className="inspector-more-body">
                           {activeGenerationMethod === "commercial" && (
@@ -3497,38 +3509,21 @@ export default function App() {
 
                     {activeProvider === "cosyvoice" && (
                       <div className="cosyvoice-temporary-panel">
-                        <div className="emotion-mode-control cosyvoice-mode-control" role="radiogroup" aria-label={t("inspector.cosyVoiceMode")}>
+                        <label className="resource-field cosyvoice-mode-field">
                           <span>{t("inspector.cosyVoiceMode")}</span>
-                          <div>
-                            {([
-                              ["sft", t("inspector.cosyModeSft")],
-                              ["zero_shot", t("inspector.cosyModeZeroShot")],
-                              ["cross_lingual", t("inspector.cosyModeCrossLingual")],
-                              ["instruct", t("inspector.cosyModeInstruct")]
-                            ] as const).map(([mode, label]) => {
-                              const currentMode = stringConfig(activeBindingConfig.mode) || "zero_shot";
-                              return (
-                                <button
-                                  aria-checked={currentMode === mode}
-                                  className={`emotion-mode-option ${currentMode === mode ? "active" : ""}`}
-                                  key={mode}
-                                  onClick={() => updateActiveBindingConfig({ mode })}
-                                  role="radio"
-                                  type="button"
-                                >
-                                  {label}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                        {((stringConfig(activeBindingConfig.mode) || "zero_shot") === "sft" || (stringConfig(activeBindingConfig.mode) || "zero_shot") === "instruct") ? (
+                          <select value={cosyVoiceMode} onChange={(event) => updateActiveBindingConfig({ mode: event.target.value })}>
+                            {COSY_VOICE_MODE_OPTIONS.map((mode) => (
+                              <option value={mode.id} key={mode.id}>{t(mode.labelKey)}</option>
+                            ))}
+                          </select>
+                        </label>
+                        {cosyVoiceNeedsSpeaker ? (
                           <label className="resource-field">
                             <span>{t("inspector.cosySpeaker")}</span>
                             <input value={stringConfig(activeBindingConfig.speaker_id)} onChange={(event) => updateActiveBindingConfig({ speaker_id: event.target.value })} placeholder={t("inspector.cosySpeakerPlaceholder")} />
                           </label>
                         ) : null}
-                        {((stringConfig(activeBindingConfig.mode) || "zero_shot") === "zero_shot" || (stringConfig(activeBindingConfig.mode) || "zero_shot") === "cross_lingual") ? (
+                        {cosyVoiceNeedsPrompt ? (
                           <>
                             <ReferenceAudioInput
                               label={t("inspector.cosyReferenceAudio")}
@@ -3541,7 +3536,7 @@ export default function App() {
                             </label>
                           </>
                         ) : null}
-                        {(stringConfig(activeBindingConfig.mode) || "zero_shot") === "instruct" && (
+                        {cosyVoiceNeedsInstruction && (
                           <label className="resource-field">
                             <span>{t("inspector.cosyInstruction")}</span>
                             <textarea value={stringConfig(activeBindingConfig.instruct_text)} onChange={(event) => updateActiveBindingConfig({ instruct_text: event.target.value })} placeholder={t("inspector.cosyInstructionPlaceholder")} rows={3} />
@@ -4356,6 +4351,11 @@ function profilesForLine(line: ScriptLine, characters: Character[]): VoiceProfil
 
 function stringConfig(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+function cosyVoiceModeFromConfig(value: unknown): CosyVoiceMode {
+  const mode = stringConfig(value);
+  return COSY_VOICE_MODE_OPTIONS.some((item) => item.id === mode) ? (mode as CosyVoiceMode) : "zero_shot";
 }
 
 function vectorConfig(value: unknown): string {
