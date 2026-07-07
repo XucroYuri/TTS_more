@@ -575,6 +575,9 @@ h3 {
 
 .llm-api-modal {
   width: min(1180px, calc(100vw - 24px));
+  height: auto;
+  min-height: 0;
+  max-height: calc(100vh - 32px);
 }
 
 .role-library-modal {
@@ -1962,7 +1965,7 @@ h3 {
 .llm-activation-workbench {
   display: grid;
   gap: var(--space-3);
-  min-height: min(760px, calc(100vh - 170px));
+  min-height: 0;
   align-content: start;
 }
 
@@ -1982,6 +1985,28 @@ h3 {
   justify-content: space-between;
   gap: var(--space-3);
   min-width: 0;
+}
+
+.llm-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.llm-preset-line,
+.llm-advanced-hint {
+  margin: 0;
+  color: var(--geist-gray-900);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.llm-preset-line {
+  padding: 8px 10px;
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg-subtle);
 }
 
 .llm-preset-grid {
@@ -2018,7 +2043,7 @@ h3 {
 
 .llm-api-key-row {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) auto auto auto;
+  grid-template-columns: minmax(260px, 1fr) auto auto;
   align-items: end;
   gap: var(--space-2);
 }
@@ -2041,6 +2066,34 @@ h3 {
 
 .llm-advanced-workbench {
   min-height: min(620px, calc(100vh - 260px));
+}
+
+.llm-advanced-panel {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg);
+}
+
+.llm-advanced-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(360px, 1.2fr);
+  gap: var(--space-3);
+  align-items: start;
+  min-width: 0;
+}
+
+.llm-provider-editor {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg-subtle);
 }
 
 .llm-ops-workbench {
@@ -2192,6 +2245,10 @@ h3 {
   overflow: auto;
 }
 
+.llm-provider-list.compact {
+  max-height: min(360px, calc(100vh - 380px));
+}
+
 .llm-provider-card {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -2270,6 +2327,11 @@ h3 {
   text-overflow: ellipsis;
 }
 
+.llm-detail-hero.compact {
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--geist-gray-200);
+}
+
 .llm-priority-badge {
   grid-area: priority;
   padding: 1px 7px;
@@ -2320,6 +2382,24 @@ h3 {
 
 .llm-form-grid .wide {
   grid-column: 1 / -1;
+}
+
+.llm-simple-form {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.llm-simple-form .wide {
+  grid-column: span 2;
+}
+
+.llm-switch-field {
+  justify-content: start;
+  align-self: end;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg);
 }
 
 .llm-form-grid input {
@@ -6743,9 +6823,12 @@ h3 {
     grid-template-columns: minmax(260px, 1fr) auto auto;
   }
 
-  .llm-api-key-row .secondary-button:last-child {
-    grid-column: 1 / -1;
-    justify-self: start;
+  .llm-advanced-layout {
+    grid-template-columns: minmax(220px, 0.75fr) minmax(320px, 1.25fr);
+  }
+
+  .llm-simple-form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .llm-ops-workbench {
@@ -6919,13 +7002,20 @@ h3 {
   }
 
   .llm-preset-grid,
-  .llm-api-key-row {
+  .llm-api-key-row,
+  .llm-advanced-layout,
+  .llm-simple-form {
     grid-template-columns: 1fr;
   }
 
-  .llm-api-key-row .secondary-button:last-child {
+  .llm-simple-form .wide {
     grid-column: auto;
-    justify-self: stretch;
+  }
+
+  .llm-head-actions,
+  .llm-detail-actions {
+    display: grid;
+    justify-items: stretch;
   }
 
   .topbar,
@@ -6946,6 +7036,11 @@ h3 {
     width: 100%;
     height: 100%;
     min-height: 0;
+  }
+
+  .llm-api-modal {
+    height: auto;
+    max-height: calc(100vh - 16px);
   }
 
   .service-modal-head {

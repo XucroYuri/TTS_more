@@ -2143,17 +2143,17 @@ export default function App() {
                                   <strong><Bot size={15} /> {t("parser.kwjmActivationTitle")}</strong>
                                   <span>{t("parser.kwjmActivationHint")}</span>
                                 </div>
-                                <span className={`llm-detail-state state-${kwjmActivationState}`}>
-                                  <span className={`llm-state-dot ${kwjmActivationState}`} />
-                                  {kwjmActivationStateLabel(kwjmActivationState, t)}
-                                </span>
+                                <div className="llm-head-actions">
+                                  <span className={`llm-detail-state state-${kwjmActivationState}`}>
+                                    <span className={`llm-state-dot ${kwjmActivationState}`} />
+                                    {kwjmActivationStateLabel(kwjmActivationState, t)}
+                                  </span>
+                                  <button className="secondary-button compact-button" onClick={() => setIsLlmAdvancedOpen((open) => !open)}>
+                                    <SlidersHorizontal size={14} /> {t(isLlmAdvancedOpen ? "parser.hideAdvancedConfig" : "parser.advancedConfig")}
+                                  </button>
+                                </div>
                               </div>
-                              <div className="llm-preset-grid">
-                                <div><span>{t("parser.providerName")}</span><strong>{KWJM_PROVIDER_NAME}</strong></div>
-                                <div><span>{t("parser.baseUrl")}</span><strong>{KWJM_BASE_URL}</strong></div>
-                                <div><span>{t("parser.model")}</span><strong>{KWJM_MODEL}</strong></div>
-                                <div><span>{t("parser.openAIProtocol")}</span><strong>{t("parser.jsonDraft")}</strong></div>
-                              </div>
+                              <p className="llm-preset-line">{t("parser.kwjmPresetMeta", { model: KWJM_MODEL, baseUrl: KWJM_BASE_URL })}</p>
                               <div className="llm-api-key-row">
                                 <label className="llm-api-key-field">
                                   <span>{t("parser.apiKey")}</span>
@@ -2170,62 +2170,31 @@ export default function App() {
                                 <button className="primary-button compact-button" onClick={() => void activateKwjmParserProvider()} disabled={isSavingParserConfig || !kwjmCanActivate}>
                                   {isSavingParserConfig ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("parser.activateKwjm")}
                                 </button>
-                                <button className="secondary-button compact-button" onClick={() => setIsLlmAdvancedOpen((open) => !open)}>
-                                  <SlidersHorizontal size={14} /> {t(isLlmAdvancedOpen ? "parser.hideAdvancedConfig" : "parser.advancedConfig")}
-                                </button>
                               </div>
-                              <section className={`llm-test-result ${kwjmDisplayTestResult?.ok ? "ok" : kwjmDisplayTestResult ? "danger" : "empty"}`}>
-                                <div>
-                                  <strong>{kwjmHasUsableKey ? t("parser.kwjmConfigured") : t("parser.kwjmMissingKey")}</strong>
-                                  <span>{kwjmDisplayTestResult ? kwjmDisplayTestResult.message : t("parser.noTestYet")}</span>
-                                </div>
-                                {kwjmDisplayTestResult?.latency_ms != null && <small>{kwjmDisplayTestResult.latency_ms}ms</small>}
-                              </section>
+                              {kwjmDisplayTestResult && (
+                                <section className={`llm-test-result ${kwjmDisplayTestResult.ok ? "ok" : "danger"}`}>
+                                  <div>
+                                    <strong>{kwjmHasUsableKey ? t("parser.kwjmConfigured") : t("parser.kwjmMissingKey")}</strong>
+                                    <span>{kwjmDisplayTestResult ? kwjmDisplayTestResult.message : t("parser.noTestYet")}</span>
+                                  </div>
+                                  {kwjmDisplayTestResult?.latency_ms != null && <small>{kwjmDisplayTestResult.latency_ms}ms</small>}
+                                </section>
+                              )}
                             </section>
 
                             {isLlmAdvancedOpen && (
-                            <div className="llm-ops-workbench llm-advanced-workbench">
-                            <section className="llm-ops-rail">
-                              <div className="llm-title-block">
-                                <strong><Bot size={15} /> {t("parser.llmProviders")}</strong>
-                                <span>{t("parser.providerHint")}</span>
-                              </div>
-                              <div className="llm-metric-grid">
-                                <div className="llm-meter ready"><span>{t("parser.enabledProviders")}</span><strong>{parserProviders.filter((provider) => provider.enabled).length}/{parserProviders.length}</strong></div>
-                                <div className="llm-meter ready"><span>{t("parser.keyReady")}</span><strong>{parserProviders.filter((provider) => parserProviderHasUsableKey(provider)).length}/{parserProviders.length}</strong></div>
-                                <div className="llm-meter warn"><span>{t("parser.needsKey")}</span><strong>{parserProviders.filter((provider) => parserProviderState(provider) === "partial").length}</strong></div>
-                                <div className="llm-meter neutral"><span>{t("parser.routeOrder")}</span><strong>{parserProviders.length}</strong></div>
-                              </div>
-                              <div className="llm-policy-card">
-                                <strong>{t("parser.contract")}</strong>
-                                <span>{t("parser.contractHint")}</span>
-                                <div className="llm-policy-pills">
-                                  <span>{t("parser.openAIProtocol")}</span>
-                                  <span>{t("parser.jsonDraft")}</span>
-                                  <span>{t("parser.ruleFallback")}</span>
-                                </div>
-                              </div>
-                              <div className="llm-policy-card">
-                                <strong>{t("parser.secretPolicy")}</strong>
-                                <span>{t("parser.secretPolicyHint")}</span>
-                              </div>
-                              <div className="llm-rail-actions">
-                                <button className="secondary-button compact-button" onClick={addParserProvider}><Plus size={13} /> {t("parser.addProvider")}</button>
-                                <button className="secondary-button compact-button" onClick={() => void testParserProviderSettings(selectedParserProviderIndex)} disabled={!selectedParserProvider || testingParserProviderIndex !== null}>
-                                  {testingParserProviderIndex === selectedParserProviderIndex ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("parser.testProvider")}
-                                </button>
-                                <button className="primary-button compact-button" onClick={() => void saveParserProviderSettings()} disabled={isSavingParserConfig || parserProviders.length === 0}>
-                                  {isSavingParserConfig ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("parser.saveProviders")}
-                                </button>
-                              </div>
-                            </section>
-
-                            <section className="llm-provider-directory">
+                              <section className="llm-advanced-panel">
                               <div className="llm-section-head">
                                 <strong><SlidersHorizontal size={15} /> {t("parser.providerDirectory")}</strong>
-                                <span>{t("parser.providerCount", { count: parserProviders.length })}</span>
+                                <span>{t("parser.advancedSummary", {
+                                  enabled: parserProviders.filter((provider) => provider.enabled).length,
+                                  total: parserProviders.length,
+                                  keys: parserProviders.filter((provider) => parserProviderHasUsableKey(provider)).length
+                                })}</span>
                               </div>
-                              <div className="llm-provider-list">
+                              <p className="llm-advanced-hint">{t("parser.providerHint")}</p>
+                              <div className="llm-advanced-layout">
+                                <div className="llm-provider-list compact">
                                 {parserProviders.map((provider, index) => {
                                   const state = parserProviderState(provider);
                                   const selected = selectedParserProviderIndex === index;
@@ -2255,16 +2224,15 @@ export default function App() {
                                   );
                                 })}
                                 {parserProviders.length === 0 && <div className="empty-row">{t("empty.noParserProviders")}</div>}
-                              </div>
-                            </section>
+                                </div>
 
-                            <section className="llm-provider-detail">
-                              {selectedParserProvider ? (() => {
+                                <div className="llm-provider-editor">
+                                  {selectedParserProvider ? (() => {
                                 const selectedState = parserProviderState(selectedParserProvider);
                                 const selectedTestResult = parserProviderTestResults[selectedParserProviderIndex];
                                 return (
                                   <>
-                                  <div className="llm-detail-hero">
+                                      <div className="llm-detail-hero compact">
                                     <div>
                                       <strong>{selectedParserProvider.name || t("parser.providerName")}</strong>
                                       <span>{selectedParserProvider.model || t("status.unset")} · {selectedParserProvider.base_url || t("services.endpointMissing")}</span>
@@ -2274,37 +2242,19 @@ export default function App() {
                                       {parserProviderStateLabel(selectedParserProvider, t)}
                                     </span>
                                   </div>
-                                  <div className="llm-detail-grid">
-                                    <section className="llm-detail-card llm-card-primary">
-                                      <div className="llm-card-head">
-                                        <strong>{t("parser.connection")}</strong>
-                                        <label className="llm-switch">
+                                      <div className="llm-form-grid llm-simple-form">
+                                        <label className="llm-switch llm-switch-field">
                                           <input type="checkbox" checked={selectedParserProvider.enabled} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { enabled: event.target.checked })} />
                                           <span>{t("parser.enabled")}</span>
                                         </label>
-                                      </div>
-                                      <div className="llm-form-grid">
                                         <label>
                                           <span>{t("parser.providerName")}</span>
                                           <input value={selectedParserProvider.name} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { name: event.target.value })} />
-                                        </label>
-                                        <label>
-                                          <span>{t("parser.timeout")}</span>
-                                          <input type="number" min={5} max={300} value={selectedParserProvider.timeout_seconds} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { timeout_seconds: Number(event.target.value) || 45 })} />
                                         </label>
                                         <label className="wide">
                                           <span>{t("parser.baseUrl")}</span>
                                           <input value={selectedParserProvider.base_url} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { base_url: event.target.value })} placeholder={KWJM_BASE_URL_PLACEHOLDER} />
                                         </label>
-                                      </div>
-                                    </section>
-
-                                    <section className="llm-detail-card">
-                                      <div className="llm-card-head">
-                                        <strong>{t("parser.modelAndRouting")}</strong>
-                                        <span className="llm-priority-badge">{selectedParserProvider.priority}</span>
-                                      </div>
-                                      <div className="llm-form-grid">
                                         <label>
                                           <span>{t("parser.model")}</span>
                                           <input value={selectedParserProvider.model} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { model: event.target.value })} placeholder={KWJM_MODEL} />
@@ -2313,16 +2263,6 @@ export default function App() {
                                           <span>{t("parser.priority")}</span>
                                           <input type="number" min={1} value={selectedParserProvider.priority} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { priority: Number(event.target.value) || 100 })} />
                                         </label>
-                                      </div>
-                                      <p>{t("parser.routeHint")}</p>
-                                    </section>
-
-                                    <section className="llm-detail-card">
-                                      <div className="llm-card-head">
-                                        <strong>{t("parser.credentials")}</strong>
-                                        <span className={`tracker-chip ${parserProviderHasUsableKey(selectedParserProvider) ? "ok" : "warn"}`}>{t(parserProviderHasUsableKey(selectedParserProvider) ? "parser.keyConfigured" : "parser.keyMissing")}</span>
-                                      </div>
-                                      <div className="llm-form-grid">
                                         <label>
                                           <span>{t("parser.apiKeyEnv")}</span>
                                           <input value={selectedParserProvider.api_key_env} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { api_key_env: event.target.value })} placeholder={KWJM_API_KEY_ENV} />
@@ -2336,47 +2276,38 @@ export default function App() {
                                             placeholder={t(parserProviderKeyState(selectedParserProvider) === "configured" ? "parser.apiKeyPlaceholderConfigured" : "parser.apiKeyPlaceholderMissing")}
                                           />
                                         </label>
+                                        <label>
+                                          <span>{t("parser.timeout")}</span>
+                                          <input type="number" min={5} max={300} value={selectedParserProvider.timeout_seconds} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { timeout_seconds: Number(event.target.value) || 45 })} />
+                                        </label>
                                       </div>
-                                      <p>{t("parser.secretPolicyHint")}</p>
-                                    </section>
-
-                                    <section className="llm-detail-card llm-card-primary">
-                                      <div className="llm-card-head">
-                                        <strong>{t("parser.contract")}</strong>
-                                        <span className="tracker-chip neutral">{t("parser.openAIProtocol")}</span>
-                                      </div>
-                                      <div className="llm-contract-grid">
-                                        <div><span>{t("parser.contract")}</span><strong>{t("parser.openAIProtocol")}</strong></div>
-                                        <div><span>{t("parser.outputMode")}</span><strong>{t("parser.jsonDraft")}</strong></div>
-                                        <div><span>{t("parser.fallbackPolicy")}</span><strong>{t("parser.ruleFallback")}</strong></div>
-                                      </div>
-                                      <p>{t("parser.contractHint")}</p>
-                                    </section>
-
-                                    <section className={`llm-test-result ${selectedTestResult?.ok ? "ok" : selectedTestResult ? "danger" : "empty"}`}>
+                                      {selectedTestResult && (
+                                        <section className={`llm-test-result ${selectedTestResult.ok ? "ok" : "danger"}`}>
                                       <div>
                                         <strong>{t("parser.lastTest")}</strong>
-                                        <span>{selectedTestResult ? selectedTestResult.message : t("parser.noTestYet")}</span>
+                                            <span>{selectedTestResult.message}</span>
                                       </div>
                                       {selectedTestResult?.latency_ms != null && <small>{selectedTestResult.latency_ms}ms</small>}
                                     </section>
-                                  </div>
-                                  <div className="llm-detail-actions">
-                                    <span>{t("parser.providerDetailHint")}</span>
-                                    <button className="secondary-button compact-button" onClick={() => void testParserProviderSettings(selectedParserProviderIndex)} disabled={testingParserProviderIndex !== null}>
-                                      {testingParserProviderIndex === selectedParserProviderIndex ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("parser.testProvider")}
-                                    </button>
-                                    <button className="primary-button compact-button" onClick={() => void saveParserProviderSettings()} disabled={isSavingParserConfig}>
-                                      {isSavingParserConfig ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("parser.saveProviders")}
-                                    </button>
-                                  </div>
+                                      )}
                                   </>
                                 );
                               })() : (
                                 <div className="empty-row">{t("empty.noParserProviders")}</div>
                               )}
-                            </section>
-                          </div>
+                                </div>
+                              </div>
+                                <div className="llm-detail-actions">
+                                  <span>{t("parser.providerDetailHint")}</span>
+                                  <button className="secondary-button compact-button" onClick={addParserProvider}><Plus size={13} /> {t("parser.addProvider")}</button>
+                                  <button className="secondary-button compact-button" onClick={() => void testParserProviderSettings(selectedParserProviderIndex)} disabled={!selectedParserProvider || testingParserProviderIndex !== null}>
+                                    {testingParserProviderIndex === selectedParserProviderIndex ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("parser.testProvider")}
+                                  </button>
+                                  <button className="primary-button compact-button" onClick={() => void saveParserProviderSettings()} disabled={isSavingParserConfig || parserProviders.length === 0}>
+                                    {isSavingParserConfig ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("parser.saveProviders")}
+                                  </button>
+                                </div>
+                              </section>
                             )}
                           </div>
                         )}
