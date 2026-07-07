@@ -728,6 +728,10 @@ export default function App() {
       ? queueProcessedItems / queueTotalItems
       : 0;
   const queueProgressPercent = Math.round(Math.max(0, Math.min(1, queueProgressRatio)) * 100);
+  const queueHasWork = queueTotalItems > 0 || queueJobs.length > 0;
+  const queueSyncLabel = isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced");
+  const queueVisibleStatusLabel = queueActiveJob ? statusText(queueActiveJob.status, t) : queueSyncLabel;
+  const queueVisibleTone = queueActiveJob ? queueStatusTone(queueActiveJob.status) : isRefreshingTopology ? "running" : "idle";
   const topologyModalTitle =
     servicePanelSection === "roles"
       ? t("characters.libraryManager")
@@ -2411,55 +2415,57 @@ export default function App() {
 
                         {servicePanelSection === "resources" && (
                           <div className="queue-workbench">
-                            <section className="queue-progress-card">
-                              <div className="queue-progress-head">
+                            <section className={`queue-status-card ${queueHasWork ? "has-work" : "is-empty"}`}>
+                              <div className="queue-status-head">
                                 <div>
-                                  <strong><History size={15} /> {t("queue.dispatchTitle")}</strong>
-                                  <span>{t("queue.dispatchHint")}</span>
+                                  <strong><History size={15} /> {t("queue.title")}</strong>
+                                  <span>{queueHasWork ? t("queue.processedRatio", { processed: queueProcessedItems, total: queueTotalItems }) : t("queue.noJobs")}</span>
                                 </div>
-                                <StatusPill
-                                  tone={queueActiveJob ? queueStatusTone(queueActiveJob.status) : isRefreshingTopology ? "running" : "idle"}
-                                  label={queueActiveJob ? statusText(queueActiveJob.status, t) : isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced")}
-                                />
+                                <StatusPill tone={queueVisibleTone} label={queueVisibleStatusLabel} />
                               </div>
-                              <div className="queue-progress-value">
-                                <strong>{queueProgressPercent}%</strong>
-                                <span>{queueTotalItems > 0 ? t("queue.processedRatio", { processed: queueProcessedItems, total: queueTotalItems }) : t("queue.noJobs")}</span>
-                              </div>
-                              <div className="queue-dispatch-bar" aria-label={t("queue.progressLabel", { percent: queueProgressPercent })}>
-                                <span style={{ width: `${queueProgressPercent}%` }} />
-                              </div>
-                              <div className="queue-meter-grid">
-                                <div><span>{t("filters.queued")}</span><strong>{queueQueuedItems}</strong></div>
-                                <div><span>{t("filters.running")}</span><strong>{queueRunningItems}</strong></div>
-                                <div><span>{t("status.completed")}</span><strong>{queueCompletedItems}</strong></div>
-                                <div><span>{t("status.failed")}</span><strong>{queueFailedItems}</strong></div>
-                              </div>
-                            </section>
 
-                            <section className="queue-job-panel">
-                              <div className="queue-panel-title">
-                                <strong>{t("queue.recentJobs")}</strong>
-                                <span>{t("queue.pollingState")}: {isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced")}</span>
-                              </div>
-                              <div className="queue-job-list">
-                                {queueJobs.slice(0, 5).map((job) => {
-                                  const jobPercent = Math.round(Math.max(0, Math.min(1, job.progress)) * 100);
-                                  return (
-                                    <article className={`queue-job-card state-${queueStatusTone(job.status)}`} key={job.job_id}>
-                                      <div>
-                                        <strong>{job.job_id}</strong>
-                                        <span>{t("queue.itemCount", { count: job.items.length })}</span>
-                                      </div>
-                                      <div className="queue-job-meta">
-                                        <StatusPill tone={queueStatusTone(job.status)} label={statusText(job.status, t)} />
-                                        <span>{jobPercent}%</span>
-                                      </div>
-                                    </article>
-                                  );
-                                })}
-                                {queueJobs.length === 0 && <div className="queue-empty">{t("queue.noJobs")}</div>}
-                              </div>
+                              {queueHasWork && (
+                                <>
+                                  <div className="queue-progress-row">
+                                    <strong>{queueProgressPercent}%</strong>
+                                    <div className="queue-dispatch-bar" aria-label={t("queue.progressLabel", { percent: queueProgressPercent })}>
+                                      <span style={{ width: `${queueProgressPercent}%` }} />
+                                    </div>
+                                  </div>
+                                  <div className="queue-count-strip" aria-label={t("queue.countSummary")}>
+                                    <span><strong>{queueQueuedItems}</strong>{t("filters.queued")}</span>
+                                    <span><strong>{queueRunningItems}</strong>{t("filters.running")}</span>
+                                    <span><strong>{queueCompletedItems}</strong>{t("status.completed")}</span>
+                                    <span><strong>{queueFailedItems}</strong>{t("status.failed")}</span>
+                                  </div>
+                                </>
+                              )}
+
+                              {queueJobs.length > 0 && (
+                                <details className="queue-job-details" open={Boolean(queueActiveJob)}>
+                                  <summary>
+                                    <span>{t("queue.recentJobs")}</span>
+                                    <small>{t("queue.itemCount", { count: queueJobs.length })}</small>
+                                  </summary>
+                                  <div className="queue-job-list">
+                                    {queueJobs.slice(0, 5).map((job) => {
+                                      const jobPercent = Math.round(Math.max(0, Math.min(1, job.progress)) * 100);
+                                      return (
+                                        <article className={`queue-job-card state-${queueStatusTone(job.status)}`} key={job.job_id}>
+                                          <div>
+                                            <strong>{job.job_id}</strong>
+                                            <span>{t("queue.itemCount", { count: job.items.length })}</span>
+                                          </div>
+                                          <div className="queue-job-meta">
+                                            <StatusPill tone={queueStatusTone(job.status)} label={statusText(job.status, t)} />
+                                            <span>{jobPercent}%</span>
+                                          </div>
+                                        </article>
+                                      );
+                                    })}
+                                  </div>
+                                </details>
+                              )}
                             </section>
                           </div>
                         )}

@@ -738,8 +738,7 @@ h3 {
   min-width: 0;
 }
 
-.queue-progress-card,
-.queue-job-panel {
+.queue-status-card {
   display: grid;
   gap: var(--space-3);
   min-width: 0;
@@ -749,8 +748,7 @@ h3 {
   background: var(--geist-bg);
 }
 
-.queue-progress-head,
-.queue-panel-title,
+.queue-status-head,
 .queue-job-card {
   display: flex;
   align-items: center;
@@ -759,42 +757,41 @@ h3 {
   min-width: 0;
 }
 
-.queue-progress-head > div,
-.queue-panel-title {
+.queue-status-head > div {
   min-width: 0;
 }
 
-.queue-progress-head strong,
-.queue-panel-title strong {
+.queue-status-head strong {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
 }
 
-.queue-progress-head span,
-.queue-panel-title span,
-.queue-progress-value span,
+.queue-status-head span,
+.queue-count-strip span,
+.queue-job-details summary small,
 .queue-job-card span {
   color: var(--geist-gray-900);
   font-size: 12px;
   line-height: 16px;
 }
 
-.queue-progress-value {
-  display: flex;
-  align-items: end;
-  justify-content: space-between;
+.queue-progress-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
   gap: var(--space-3);
 }
 
-.queue-progress-value strong {
-  font-size: 32px;
-  line-height: 36px;
+.queue-progress-row strong {
+  color: var(--geist-primary);
+  font-size: 18px;
+  line-height: 24px;
 }
 
 .queue-dispatch-bar {
-  height: 10px;
+  height: 8px;
   overflow: hidden;
   border-radius: 999px;
   background: var(--geist-gray-200);
@@ -808,26 +805,64 @@ h3 {
   transition: width 180ms ease;
 }
 
-.queue-meter-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--space-2);
+.queue-count-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
 }
 
-.queue-meter-grid > div {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-  padding: var(--space-2);
+.queue-count-strip span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 26px;
+  padding: 0 8px;
   border: 1px solid var(--geist-gray-200);
   border-radius: var(--radius-sm);
   background: var(--geist-bg-subtle);
 }
 
-.queue-meter-grid span {
-  color: var(--geist-gray-900);
+.queue-count-strip strong {
+  color: var(--geist-primary);
   font-size: 12px;
   line-height: 16px;
+}
+
+.queue-job-details {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.queue-job-details > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-height: 28px;
+  cursor: pointer;
+  color: var(--geist-primary);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  list-style: none;
+}
+
+.queue-job-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.queue-job-details > summary::after {
+  content: "+";
+  color: var(--geist-gray-700);
+  font-family: "Geist Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.queue-job-details[open] > summary::after {
+  content: "-";
 }
 
 .queue-job-list {
@@ -835,6 +870,7 @@ h3 {
   gap: var(--space-2);
   min-width: 0;
   max-height: 220px;
+  padding-top: var(--space-1);
   overflow: auto;
 }
 
@@ -865,14 +901,6 @@ h3 {
   align-items: center;
   gap: var(--space-2);
   flex: 0 0 auto;
-}
-
-.queue-empty {
-  padding: var(--space-4);
-  border: 1px dashed var(--geist-gray-300);
-  border-radius: var(--radius-sm);
-  color: var(--geist-gray-900);
-  text-align: center;
 }
 
 .role-library-workbench {
@@ -7595,6 +7623,7 @@ h3 {
   }
 
   .llm-api-modal,
+  .resource-queue-modal,
   .service-access-modal {
     height: auto;
     max-height: calc(100vh - 16px);
@@ -7612,16 +7641,19 @@ h3 {
     overflow: auto;
   }
 
-  .queue-progress-head,
-  .queue-progress-value,
-  .queue-panel-title,
+  .queue-status-head,
+  .queue-progress-row,
   .queue-job-card {
     align-items: stretch;
+  }
+
+  .queue-status-head,
+  .queue-job-card {
     flex-direction: column;
   }
 
-  .queue-meter-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .queue-progress-row {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .llm-ops-workbench {
