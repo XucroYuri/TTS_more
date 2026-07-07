@@ -2491,43 +2491,50 @@ export default function App() {
                                 )}
                               </div>
 
-                              <div className="role-library-section-head">
-                                <strong><Library size={13} /> {t("characters.commonVoices")}</strong>
-                                <button className="secondary-button compact-button" onClick={addEmptyLibraryCharacter}><Plus size={13} /> {t("characters.addRole")}</button>
-                              </div>
-                              <label className="search-field library-search">
-                                <Search size={14} />
-                                <input value={roleLibrarySearch} onChange={(event) => setRoleLibrarySearch(event.target.value)} placeholder={t("characters.searchLibrary")} />
-                              </label>
-                              <div className="role-directory-list">
-                                {filteredLibraryCharacters.map((character, index) => {
-                                  const summary = characterBindingSummary(character);
-                                  const selected = activeModelCatalogId === null && activeRoleCandidateId === null && activeLibraryCharacter?.id === character.id;
-                                  return (
-                                    <button
-                                      className={`role-directory-card ${selected ? "selected" : ""} ${roleAccentClass(index)}`}
-                                      key={character.id}
-                                      onClick={() => {
-                                        setActiveLibraryCharacterId(character.id);
-                                        setActiveRoleCandidateId(null);
-                                        setActiveModelCatalogId(null);
-                                      }}
-                                    >
-                                      <RoleAvatar avatarPath={character.avatar_path} fallback={avatarFallback(character.name)} size="lg" />
-                                      <span className="role-directory-main">
-                                        <strong>{character.name}</strong>
-                                        <small>{summary.providerLabel} · {summary.bindingCount} {t("characters.bindings")}</small>
-                                      </span>
-                                      <span className={`role-state-dot ${characterStatusTone(character)}`} />
-                                      <span className="role-directory-meta">
-                                        <strong>{summary.completeCount}/{summary.bindingCount || 1}</strong>
-                                        <small>{t("characters.completeBindings")}</small>
-                                      </span>
-                                    </button>
-                                  );
-                                })}
-                                {filteredLibraryCharacters.length === 0 && <div className="empty-row compact">{t("characters.noCommonVoices")}</div>}
-                              </div>
+                              <details className="role-maintenance-panel role-library-collapsible">
+                                <summary>
+                                  <span><Library size={13} /> {t("characters.commonVoices")}</span>
+                                  <small>{t("characters.commonVoicesHint")}</small>
+                                </summary>
+                                <div className="role-library-collapsible-body">
+                                  <div className="role-library-drawer-actions">
+                                    <label className="search-field library-search">
+                                      <Search size={14} />
+                                      <input value={roleLibrarySearch} onChange={(event) => setRoleLibrarySearch(event.target.value)} placeholder={t("characters.searchLibrary")} />
+                                    </label>
+                                    <button className="secondary-button compact-button" onClick={addEmptyLibraryCharacter}><Plus size={13} /> {t("characters.addRole")}</button>
+                                  </div>
+                                  <div className="role-directory-list">
+                                    {filteredLibraryCharacters.map((character, index) => {
+                                      const summary = characterBindingSummary(character);
+                                      const selected = activeModelCatalogId === null && activeRoleCandidateId === null && activeLibraryCharacter?.id === character.id;
+                                      return (
+                                        <button
+                                          className={`role-directory-card ${selected ? "selected" : ""} ${roleAccentClass(index)}`}
+                                          key={character.id}
+                                          onClick={() => {
+                                            setActiveLibraryCharacterId(character.id);
+                                            setActiveRoleCandidateId(null);
+                                            setActiveModelCatalogId(null);
+                                          }}
+                                        >
+                                          <RoleAvatar avatarPath={character.avatar_path} fallback={avatarFallback(character.name)} size="lg" />
+                                          <span className="role-directory-main">
+                                            <strong>{character.name}</strong>
+                                            <small>{summary.providerLabel} · {summary.bindingCount} {t("characters.bindings")}</small>
+                                          </span>
+                                          <span className={`role-state-dot ${characterStatusTone(character)}`} />
+                                          <span className="role-directory-meta">
+                                            <strong>{summary.completeCount}/{summary.bindingCount || 1}</strong>
+                                            <small>{t("characters.completeBindings")}</small>
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                    {filteredLibraryCharacters.length === 0 && <div className="empty-row compact">{t("characters.noCommonVoices")}</div>}
+                                  </div>
+                                </div>
+                              </details>
 
                               <details className="role-maintenance-panel">
                                 <summary>
@@ -2871,7 +2878,10 @@ export default function App() {
                                   </div>
                                 );
                               })() : (
-                                <div className="empty-row">{t("characters.noCommonVoices")}</div>
+                                <div className="role-empty-config role-detail-empty-state">
+                                  <strong>{t("characters.roleDetailEmptyTitle")}</strong>
+                                  <span>{t("characters.roleDetailEmptyHint")}</span>
+                                </div>
                               )}
                             </section>
                           </div>

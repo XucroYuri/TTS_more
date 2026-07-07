@@ -880,7 +880,7 @@ h3 {
   grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
   gap: var(--space-3);
   min-width: 0;
-  height: min(620px, calc(100vh - 170px));
+  height: min(560px, calc(100vh - 170px));
   min-height: 0;
   max-height: calc(100vh - 170px);
   align-items: stretch;
@@ -1087,10 +1087,11 @@ h3 {
 
 .role-library-rail {
   display: grid;
-  grid-template-rows: auto minmax(96px, 0.8fr) auto auto auto minmax(96px, 1fr) auto;
+  grid-template-rows: auto minmax(116px, 1fr) auto auto auto;
+  align-content: start;
   gap: var(--space-2);
   padding: var(--space-2);
-  overflow: hidden;
+  overflow: auto;
 }
 
 .role-library-directory {
@@ -1510,9 +1511,36 @@ h3 {
 }
 
 .role-maintenance-panel summary span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
   font-size: 12px;
   font-weight: 600;
   line-height: 16px;
+}
+
+.role-library-collapsible-body {
+  display: grid;
+  gap: var(--space-2);
+  padding: 0 var(--space-2) var(--space-2);
+}
+
+.role-maintenance-panel:not([open]) > .role-library-collapsible-body,
+.role-maintenance-panel:not([open]) > .role-maintenance-body {
+  display: none;
+}
+
+.role-library-drawer-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  align-items: center;
+  min-width: 0;
+}
+
+.role-library-collapsible .role-directory-list {
+  max-height: 220px;
 }
 
 .role-maintenance-body {
@@ -1703,6 +1731,25 @@ h3 {
   line-height: 18px;
   text-align: center;
   background: var(--geist-bg-subtle);
+}
+
+.role-detail-empty-state {
+  place-items: start;
+  align-content: start;
+  gap: var(--space-2);
+  min-height: 112px;
+  text-align: left;
+}
+
+.role-detail-empty-state strong {
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.role-detail-empty-state span {
+  color: var(--geist-gray-900);
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .role-binding-list.compact {
