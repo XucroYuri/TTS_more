@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from app.hardware import collect_local_hardware_status
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
-from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserQualityError, RuleBasedParser, chat_completions_url, parser_contract_probe_messages, validate_parser_contract_response
+from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, chat_completions_url, parser_contract_probe_messages, validate_parser_contract_response
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
 from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
@@ -318,6 +318,8 @@ def create_app(
             raise HTTPException(status_code=400, detail="text is required")
         try:
             return app.state.parser.parse(request.text).model_dump(mode="json")
+        except ParserProviderUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ParserQualityError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -775,6 +777,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="script revision not found")
         try:
             draft = app.state.parser.parse(script_revision.source_markdown)
+        except ParserProviderUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ParserQualityError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         revision_id = _next_revision_id("parse", [item.revision_id for item in project.parse_revisions])
@@ -1128,7 +1132,7 @@ def _build_parser(config_path: Path | None = None) -> MultiProviderParser:
         if raw:
             for item in json.loads(raw):
                 providers.append(OpenAICompatibleProvider(ParserProviderConfig.model_validate(item)))
-    return MultiProviderParser(providers, fallback=RuleBasedParser())
+    return MultiProviderParser(providers)
 
 
 def _load_service_registry(path: Path) -> ServiceRegistry:

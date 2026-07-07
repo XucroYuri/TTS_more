@@ -83,6 +83,8 @@ Return one JSON object only:
 }
 
 Rules:
+- Before returning JSON, perform an internal audit: identify every candidate dialogue line, reject non-TTS cues, verify character references, verify traceability to the source text, and verify original ordering.
+- Do not reveal the audit, chain-of-thought, or reasoning notes. Return only the final JSON object.
 - Output only lines that should be synthesized by TTS: character dialogue and narrator/voice-over lines.
 - Exclude scene headings, action descriptions, SFX, MUSIC, ON SCREEN text, camera directions, transitions, timestamps, and metadata.
 - Preserve original dialogue order and exact wording. Do not summarize, translate, invent, merge unrelated speakers, or add stage directions to text.
@@ -105,7 +107,8 @@ def parser_contract_probe_messages() -> list[dict[str, str]]:
 
 
 def validate_parser_contract_response(provider: str, content: str) -> ParsedScriptDraft:
-    return _draft_from_provider_payload(provider, _decode_json_content(content), source_text=_CONTRACT_PROBE_SCRIPT)
+    draft = _draft_from_provider_payload(provider, _decode_json_content(content))
+    return ScriptParseVerifier().verify(_CONTRACT_PROBE_SCRIPT, draft)
 
 
 def slugify_name(name: str) -> str:
@@ -218,72 +221,68 @@ def _finalize_lines(
     return ParsedScriptDraft(provider=provider, characters=list(characters.values()), lines=lines, warnings=warnings or [])
 
 
-class RuleBasedParser:
-    name = "rule-based"
+class ScriptParseVerifier:
+    def verify(self, source_text: str, draft: ParsedScriptDraft) -> ParsedScriptDraft:
+        reasons = _quality_reasons(draft, source_text)
+        if reasons:
+            raise ParserQualityError("; ".join(reasons))
+        return draft
 
-    def parse(self, text: str) -> ParsedScriptDraft:
-        records: list[dict[str, str]] = []
-        warnings: list[str] = []
-        raw_lines = text.splitlines()
-        index = 0
-        while index < len(raw_lines):
-            raw = raw_lines[index]
-            if not raw.strip():
-                index += 1
-                continue
-            if _is_non_tts_cue(raw):
-                warnings.append(f"Skipped non-TTS cue: {raw[:80]}")
-                index += 1
-                continue
-            match = _LINE_RE.match(raw)
-            if match is not None:
-                speaker = match.group("speaker").strip()
-                if _is_non_dialogue_role(speaker):
-                    warnings.append(f"Skipped non-TTS cue: {raw[:80]}")
-                    index += 1
-                    continue
-                note = (match.group("note") or "").strip()
-                line_text = match.group("text").strip()
-                leading_note = _LEADING_NOTE_RE.match(line_text)
-                if leading_note:
-                    note = note or leading_note.group("note").strip()
-                    line_text = leading_note.group("text").strip()
-                records.append({"speaker": speaker, "note": note, "text": line_text})
-                index += 1
-                continue
-            speaker = _markdown_speaker(raw)
-            if speaker is not None:
-                note = ""
-                dialogue: list[str] = []
-                index += 1
-                if index < len(raw_lines):
-                    note_match = _NOTE_ONLY_RE.match(raw_lines[index].strip())
-                    if note_match:
-                        note = note_match.group("note").strip()
-                        index += 1
-                while index < len(raw_lines):
-                    candidate = raw_lines[index]
-                    if not candidate.strip():
-                        index += 1
-                        break
-                    if _is_non_tts_cue(candidate) or _LINE_RE.match(candidate) or _markdown_speaker(candidate):
-                        break
-                    dialogue.append(_clean_dialogue(candidate))
-                    index += 1
-                if dialogue:
-                    records.append({"speaker": speaker, "note": note, "text": " ".join(dialogue)})
-                else:
-                    warnings.append(f"Skipped speaker without dialogue: {raw[:80]}")
-                continue
-            warnings.append(f"Skipped unrecognized line: {raw[:80]}")
+
+def _reference_dialogue_texts(text: str) -> list[str]:
+    dialogue_lines: list[str] = []
+    raw_lines = text.splitlines()
+    index = 0
+    while index < len(raw_lines):
+        raw = raw_lines[index]
+        if not raw.strip():
             index += 1
-        return _finalize_lines(self.name, records, warnings)
+            continue
+        if _is_non_tts_cue(raw):
+            index += 1
+            continue
+        match = _LINE_RE.match(raw)
+        if match is not None:
+            speaker = match.group("speaker").strip()
+            if _is_non_dialogue_role(speaker):
+                index += 1
+                continue
+            line_text = match.group("text").strip()
+            leading_note = _LEADING_NOTE_RE.match(line_text)
+            if leading_note:
+                line_text = leading_note.group("text").strip()
+            cleaned = _clean_dialogue(line_text)
+            if cleaned:
+                dialogue_lines.append(cleaned)
+            index += 1
+            continue
+        speaker = _markdown_speaker(raw)
+        if speaker is not None:
+            dialogue: list[str] = []
+            index += 1
+            if index < len(raw_lines) and _NOTE_ONLY_RE.match(raw_lines[index].strip()):
+                index += 1
+            while index < len(raw_lines):
+                candidate = raw_lines[index]
+                if not candidate.strip():
+                    index += 1
+                    break
+                if _is_non_tts_cue(candidate) or _LINE_RE.match(candidate) or _markdown_speaker(candidate):
+                    break
+                dialogue.append(_clean_dialogue(candidate))
+                index += 1
+            if dialogue:
+                dialogue_lines.append(" ".join(dialogue))
+            continue
+        index += 1
+    return dialogue_lines
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, config: ParserProviderConfig) -> None:
+    def __init__(self, config: ParserProviderConfig, verifier: ScriptParseVerifier | None = None) -> None:
         self.config = config
         self.name = config.name
+        self.verifier = verifier or ScriptParseVerifier()
 
     def parse(self, text: str) -> ParsedScriptDraft:
         if not self.config.enabled:
@@ -301,7 +300,8 @@ class OpenAICompatibleProvider:
         with httpx.Client(timeout=self.config.timeout_seconds) as client:
             decoded = self._post_json(client, url, headers, messages)
             try:
-                return _draft_from_provider_payload(self.name, decoded, source_text=text)
+                draft = _draft_from_provider_payload(self.name, decoded)
+                return self.verifier.verify(text, draft)
             except ParserQualityError as first_error:
                 repair_messages = [
                     {"role": "system", "content": _SYSTEM_PROMPT},
@@ -316,7 +316,8 @@ class OpenAICompatibleProvider:
                     },
                 ]
                 repaired = self._post_json(client, url, headers, repair_messages)
-                draft = _draft_from_provider_payload(self.name, repaired, source_text=text)
+                draft = _draft_from_provider_payload(self.name, repaired)
+                self.verifier.verify(text, draft)
                 draft.warnings = [f"LLM output repaired after quality failure: {first_error}", *draft.warnings]
                 return draft
 
@@ -354,9 +355,8 @@ def _decode_json_content(content: str) -> dict[str, Any]:
     return decoded
 
 
-def _draft_from_provider_payload(provider: str, payload: dict[str, Any], source_text: str | None = None) -> ParsedScriptDraft:
+def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> ParsedScriptDraft:
     warnings = [str(item) for item in payload.get("warnings", [])]
-    duplicate_ids = _duplicate_line_ids(payload.get("lines", []))
     records: list[dict[str, str]] = []
     raw_characters = payload.get("characters", [])
     names_by_key: dict[str, str] = {}
@@ -399,40 +399,21 @@ def _draft_from_provider_payload(provider: str, payload: dict[str, Any], source_
             }
         )
     draft = _finalize_lines(provider, records, warnings)
-    reasons = _quality_reasons(draft, source_text, duplicate_ids, non_dialogue_names)
+    reasons = _payload_reasons(non_dialogue_names)
     if reasons:
         raise ParserQualityError("; ".join(reasons))
     return draft
 
 
-def _duplicate_line_ids(raw_lines: Any) -> list[str]:
-    if not isinstance(raw_lines, list):
-        return []
-    seen: set[str] = set()
-    duplicates: list[str] = []
-    for item in raw_lines:
-        if not isinstance(item, dict):
-            continue
-        raw_id = str(item.get("id") or "").strip()
-        if not raw_id:
-            continue
-        if raw_id in seen and raw_id not in duplicates:
-            duplicates.append(raw_id)
-        seen.add(raw_id)
-    return duplicates
-
-
-def _quality_reasons(
-    draft: ParsedScriptDraft,
-    source_text: str | None,
-    duplicate_ids: list[str],
-    raw_non_dialogue_names: list[str],
-) -> list[str]:
+def _payload_reasons(raw_non_dialogue_names: list[str]) -> list[str]:
     reasons: list[str] = []
-    if duplicate_ids:
-        reasons.append(f"duplicate line ids: {', '.join(duplicate_ids)}")
     for name in raw_non_dialogue_names:
         reasons.append(f"non-dialogue role {name} is not allowed")
+    return reasons
+
+
+def _quality_reasons(draft: ParsedScriptDraft, source_text: str) -> list[str]:
+    reasons: list[str] = []
     if not draft.lines:
         reasons.append("no TTS dialogue lines were extracted")
     character_ids = {character.id for character in draft.characters}
@@ -448,43 +429,51 @@ def _quality_reasons(
             reasons.append(f"{line.id} has empty text")
         if line.character_id not in character_ids:
             reasons.append(f"{line.id} references unknown character {line.character_id}")
-    if source_text:
-        expected = RuleBasedParser().parse(source_text)
-        if expected.lines and len(draft.lines) < len(expected.lines):
-            reasons.append(f"missing dialogue lines: expected at least {len(expected.lines)}, got {len(draft.lines)}")
-        source = _source_match_text(source_text)
-        cursor = 0
-        for line in draft.lines:
-            needle = _source_match_text(line.text)
-            if not needle:
-                continue
-            position = source.find(needle, cursor)
-            if position < 0:
-                reasons.append(f"{line.id} text is not traceable in source order")
-            else:
-                cursor = position + len(needle)
+    expected = _reference_dialogue_texts(source_text)
+    if expected and len(draft.lines) < len(expected):
+        reasons.append(f"missing dialogue lines: expected at least {len(expected)}, got {len(draft.lines)}")
+    source = _source_match_text(source_text)
+    cursor = 0
+    for line in draft.lines:
+        needle = _source_match_text(line.text)
+        if not needle:
+            continue
+        position = source.find(needle, cursor)
+        if position < 0:
+            reasons.append(f"{line.id} text is not traceable in source order")
+        else:
+            cursor = position + len(needle)
     return list(dict.fromkeys(reasons))
 
 
 class MultiProviderParser:
-    def __init__(self, providers: list[ParserProvider], fallback: ParserProvider | None = None) -> None:
+    def __init__(self, providers: list[ParserProvider]) -> None:
         self.providers = providers
-        self.fallback = fallback or RuleBasedParser()
 
     def parse(self, text: str) -> ParsedScriptDraft:
-        warnings: list[str] = []
         quality_errors: list[str] = []
+        availability_errors: list[str] = []
+        attempted_provider = False
         for provider in self.providers:
+            if not _provider_enabled(provider):
+                continue
+            attempted_provider = True
             try:
                 draft = provider.parse(text)
-                draft.warnings = warnings + draft.warnings
                 return draft
             except ParserQualityError as exc:
                 quality_errors.append(f"{provider.name}: {exc}")
+            except ParserProviderUnavailable as exc:
+                availability_errors.append(f"{provider.name}: {exc}")
             except Exception as exc:
-                warnings.append(f"{provider.name}: {exc}")
+                availability_errors.append(f"{provider.name}: {exc}")
         if quality_errors:
             raise ParserQualityError("; ".join(quality_errors))
-        draft = self.fallback.parse(text)
-        draft.warnings = warnings + draft.warnings
-        return draft
+        if attempted_provider and availability_errors:
+            raise ParserProviderUnavailable("; ".join(availability_errors))
+        raise ParserProviderUnavailable("no enabled parser providers")
+
+
+def _provider_enabled(provider: ParserProvider) -> bool:
+    config = getattr(provider, "config", None)
+    return bool(getattr(config, "enabled", True))

@@ -5,94 +5,111 @@ import pytest
 from app.parser import (
     MultiProviderParser,
     OpenAICompatibleProvider,
+    ParsedScriptDraft,
     ParserProviderConfig,
+    ParserProviderUnavailable,
     ParserQualityError,
-    RuleBasedParser,
+    ScriptParseVerifier,
     chat_completions_url,
+    parser_contract_probe_messages,
 )
+from app.models import Character, ScriptLine
 
 
-def test_rule_based_parser_extracts_character_note_and_lines() -> None:
-    text = "小美（压低声音）: 你终于来了。\n王强: 我一直都在。"
-
-    draft = RuleBasedParser().parse(text)
-
-    assert [c.name for c in draft.characters] == ["小美", "王强"]
-    assert draft.lines[0].character_id == "xiao-mei"
-    assert draft.lines[0].id == "l001"
-    assert draft.lines[0].note == "压低声音"
-    assert draft.lines[0].text == "你终于来了。"
-
-
-def test_rule_based_parser_extracts_hollywood_screenplay_fixture_without_non_dialogue_roles() -> None:
-    source = """### SC1: INT. TEST BAY - NIGHT
-
-**NARRATOR**
-(quiet)
-The console blinked once.
-
-**LEAD**
-(urgent)
-Keep the signal low.
-
-> **SFX**: Static crackles.
-
-`ON SCREEN: READY`
-
-### SC2: EXT. ROOFTOP - DAWN
-
-**TECH**
-(dry)
-That antenna is listening.
-
-**CONTROL VOICE**
-(calm)
-Unauthorized access detected.
-"""
-
-    draft = RuleBasedParser().parse(source)
-
-    assert [line.text for line in draft.lines] == [
-        "The console blinked once.",
-        "Keep the signal low.",
-        "That antenna is listening.",
-        "Unauthorized access detected.",
-    ]
-    assert [character.name for character in draft.characters] == [
-        "NARRATOR",
-        "LEAD",
-        "TECH",
-        "CONTROL VOICE",
-    ]
-    assert [line.note for line in draft.lines[:3]] == ["quiet", "urgent", "dry"]
-    assert not {"SC1", "SFX", "MUSIC", "ON SCREEN"} & {character.name for character in draft.characters}
+def make_draft(
+    *,
+    characters: list[Character] | None = None,
+    lines: list[ScriptLine] | None = None,
+    provider: str = "llm-test",
+) -> ParsedScriptDraft:
+    return ParsedScriptDraft(
+        provider=provider,
+        characters=characters or [Character(id="narrator", name="NARRATOR")],
+        lines=lines or [ScriptLine(id="l001", character_id="narrator", text="Hello.", language="en")],
+    )
 
 
-def test_rule_based_parser_extracts_chinese_colon_and_markdown_role_blocks() -> None:
-    text = "\n".join(
-        [
-            "**旁白**",
-            "（低声）",
-            "天亮了。",
-            "",
-            "小美：快走！",
-            "",
-            "**王强**",
-            "(喘息)",
-            "我一直都在。",
+def test_script_parse_verifier_accepts_llm_draft_with_traceable_dialogue() -> None:
+    source = "**NARRATOR**\n(calm)\nHello."
+    draft = make_draft(lines=[ScriptLine(id="l001", character_id="narrator", note="calm", text="Hello.", language="en")])
+
+    ScriptParseVerifier().verify(source, draft)
+
+
+def test_script_parse_verifier_rejects_non_dialogue_roles() -> None:
+    draft = make_draft(
+        characters=[Character(id="sfx", name="SFX")],
+        lines=[ScriptLine(id="l001", character_id="sfx", text="Rain hits metal.", language="en")],
+    )
+
+    with pytest.raises(ParserQualityError, match="non-dialogue role SFX"):
+        ScriptParseVerifier().verify("> **SFX**: Rain hits metal.", draft)
+
+
+def test_script_parse_verifier_rejects_empty_line_text() -> None:
+    draft = make_draft(lines=[ScriptLine(id="l001", character_id="narrator", text="", language="en")])
+
+    with pytest.raises(ParserQualityError, match="l001 has empty text"):
+        ScriptParseVerifier().verify("**NARRATOR**\nHello.", draft)
+
+
+def test_script_parse_verifier_rejects_duplicate_line_ids() -> None:
+    draft = make_draft(
+        lines=[
+            ScriptLine(id="l001", character_id="narrator", text="Hello.", language="en"),
+            ScriptLine(id="l001", character_id="narrator", text="Again.", language="en"),
         ]
     )
 
-    draft = RuleBasedParser().parse(text)
-
-    assert [(line.character_id, line.note, line.text) for line in draft.lines] == [
-        ("pang-bai", "低声", "天亮了。"),
-        ("xiao-mei", "", "快走！"),
-        ("wang-qiang", "喘息", "我一直都在。"),
-    ]
+    with pytest.raises(ParserQualityError, match="duplicate normalized line id: l001"):
+        ScriptParseVerifier().verify("**NARRATOR**\nHello.\nAgain.", draft)
 
 
-def test_multi_provider_parser_falls_back_when_provider_has_no_key(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_script_parse_verifier_rejects_unknown_character_reference() -> None:
+    draft = make_draft(lines=[ScriptLine(id="l001", character_id="ghost", text="Hello.", language="en")])
+
+    with pytest.raises(ParserQualityError, match="l001 references unknown character ghost"):
+        ScriptParseVerifier().verify("**NARRATOR**\nHello.", draft)
+
+
+def test_script_parse_verifier_rejects_untraceable_text() -> None:
+    draft = make_draft(lines=[ScriptLine(id="l001", character_id="narrator", text="Invented line.", language="en")])
+
+    with pytest.raises(ParserQualityError, match="l001 text is not traceable in source order"):
+        ScriptParseVerifier().verify("**NARRATOR**\nHello.", draft)
+
+
+def test_script_parse_verifier_rejects_out_of_order_dialogue() -> None:
+    draft = make_draft(
+        characters=[Character(id="alice", name="ALICE"), Character(id="bob", name="BOB")],
+        lines=[
+            ScriptLine(id="l001", character_id="bob", text="Second line.", language="en"),
+            ScriptLine(id="l002", character_id="alice", text="First line.", language="en"),
+        ],
+    )
+
+    with pytest.raises(ParserQualityError, match="l002 text is not traceable in source order"):
+        ScriptParseVerifier().verify("ALICE: First line.\nBOB: Second line.", draft)
+
+
+def test_script_parse_verifier_rejects_missing_recognizable_dialogue() -> None:
+    draft = make_draft(lines=[ScriptLine(id="l001", character_id="narrator", text="First line.", language="en")])
+
+    with pytest.raises(ParserQualityError, match="missing dialogue lines: expected at least 2, got 1"):
+        ScriptParseVerifier().verify("NARRATOR: First line.\nNARRATOR: Second line.", draft)
+
+
+def test_parser_contract_prompt_requires_internal_quality_audit() -> None:
+    messages = parser_contract_probe_messages()
+
+    system_prompt = messages[0]["content"].lower()
+
+    assert "internal audit" in system_prompt
+    assert "traceability" in system_prompt
+    assert "do not reveal" in system_prompt
+
+
+def test_multi_provider_parser_requires_enabled_llm_provider_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MISSING_KEY", raising=False)
     provider = OpenAICompatibleProvider(
         ParserProviderConfig(
@@ -103,10 +120,23 @@ def test_multi_provider_parser_falls_back_when_provider_has_no_key(monkeypatch: 
         )
     )
 
-    draft = MultiProviderParser([provider], fallback=RuleBasedParser()).parse("旁白: 天亮了。")
+    with pytest.raises(ParserProviderUnavailable, match="missing env MISSING_KEY"):
+        MultiProviderParser([provider]).parse("旁白: 天亮了。")
 
-    assert draft.lines[0].character_id == "pang-bai"
-    assert draft.provider == "rule-based"
+
+def test_multi_provider_parser_requires_at_least_one_enabled_llm_provider() -> None:
+    provider = OpenAICompatibleProvider(
+        ParserProviderConfig(
+            name="disabled",
+            base_url="https://example.invalid/v1",
+            api_key_env="DISABLED_KEY",
+            model="fake",
+            enabled=False,
+        )
+    )
+
+    with pytest.raises(ParserProviderUnavailable, match="no enabled parser providers"):
+        MultiProviderParser([provider]).parse("旁白: 天亮了。")
 
 
 def test_multi_provider_parser_does_not_fallback_after_quality_failure() -> None:
@@ -117,7 +147,57 @@ def test_multi_provider_parser_does_not_fallback_after_quality_failure() -> None
             raise ParserQualityError("non-dialogue role SFX is not allowed")
 
     with pytest.raises(ParserQualityError, match="SFX"):
-        MultiProviderParser([BadQualityProvider()], fallback=RuleBasedParser()).parse("旁白: 天亮了。")
+        MultiProviderParser([BadQualityProvider()]).parse("旁白: 天亮了。")
+
+
+def test_openai_provider_accepts_valid_llm_output_without_repair(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_TEST_KEY", "sk-test")
+    calls: list[dict[str, object]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "characters": [{"id": "narrator", "name": "NARRATOR"}],
+                                    "lines": [{"id": "l001", "character_id": "narrator", "note": "calm", "text": "Hello."}],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            calls.append({"url": url, "headers": headers, "json": json})
+            return FakeResponse()
+
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
+    provider = OpenAICompatibleProvider(
+        ParserProviderConfig(name="openai-test", base_url="https://example.invalid", api_key_env="OPENAI_TEST_KEY", model="fake")
+    )
+
+    draft = provider.parse("**NARRATOR**\n(calm)\nHello.")
+
+    assert len(calls) == 1
+    assert draft.provider == "openai-test"
+    assert draft.lines[0].text == "Hello."
 
 
 def test_openai_provider_repairs_invalid_quality_output_once(monkeypatch: pytest.MonkeyPatch) -> None:
