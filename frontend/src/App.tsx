@@ -3177,20 +3177,7 @@ export default function App() {
                     </div>
 
                     <div className={`generation-method-panel method-${activeGenerationMethod}`}>
-                      {activeGenerationMethod === "commercial" && (
-                        <label className="resource-field">
-                          <span>{t("inspector.commercialProvider")}</span>
-                          <select value={activeProvider} onChange={(event) => selectGenerationProvider(event.target.value as ProviderType)}>
-                            <option value="openai">OpenAI</option>
-                            <option value="gemini">Gemini</option>
-                            <option value="xai">xAI</option>
-                            <option value="volcengine">Volcengine</option>
-                            <option value="generic-http">{t("inspector.genericHttp")}</option>
-                            {activeProvider === "vibevoice" && <option value="vibevoice">VibeVoice Legacy</option>}
-                          </select>
-                        </label>
-                      )}
-                      <div className="voice-route-summary" aria-label={t("inspector.routeAndVoice")}>
+                      <div className="voice-route-summary compact-route-summary" aria-label={t("inspector.routeAndVoice")}>
                         <div>
                           <span>{t("inspector.currentVoice")}</span>
                           <strong title={activeProfileLabel}>{activeProfileLabel}</strong>
@@ -3202,9 +3189,22 @@ export default function App() {
                           <small title={activeServiceContract}>{activeServiceContract}</small>
                         </div>
                       </div>
-                      <details className="inspector-more-settings route-settings" open={activeSelectedServiceUnavailable || undefined}>
+                      <details className="inspector-more-settings route-settings">
                         <summary>{t("inspector.routeSettings")}</summary>
                         <div className="inspector-more-body">
+                          {activeGenerationMethod === "commercial" && (
+                            <label className="resource-field">
+                              <span>{t("inspector.commercialProvider")}</span>
+                              <select value={activeProvider} onChange={(event) => selectGenerationProvider(event.target.value as ProviderType)}>
+                                <option value="openai">OpenAI</option>
+                                <option value="gemini">Gemini</option>
+                                <option value="xai">xAI</option>
+                                <option value="volcengine">Volcengine</option>
+                                <option value="generic-http">{t("inspector.genericHttp")}</option>
+                                {activeProvider === "vibevoice" && <option value="vibevoice">VibeVoice Legacy</option>}
+                              </select>
+                            </label>
+                          )}
                           <div className="field-grid compact-field-grid voice-route-grid">
                             <label>
                               <span>{t(activeGenerationRouteLabels.profileLabelKey)}</span>
@@ -3280,7 +3280,7 @@ export default function App() {
                   <section className="inspector-card reference-panel inspector-reference-card">
                     <div className="inspector-section-head compact reference-section-head">
                       <div>
-                        <strong><Library size={15} /> {t("inspector.voiceReference")}</strong>
+                        <strong><Library size={15} /> {activeGenerationMethod === "commercial" ? t("inspector.apiVoiceReference") : t("inspector.voiceReference")}</strong>
                       </div>
                     </div>
 
@@ -3587,7 +3587,7 @@ export default function App() {
                     ) : activeProvider === "gpt-sovits" || activeProvider === "indextts" || activeProvider === "cosyvoice" ? (
                       null
                     ) : (
-                      <div className="empty-row">{t("inspector.commercialResourceHint")}</div>
+                      <div className="commercial-reference-note">{t("inspector.commercialResourceHint")}</div>
                     )}
                   </section>
                 )}

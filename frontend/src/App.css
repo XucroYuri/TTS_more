@@ -6251,6 +6251,15 @@ h3 {
   gap: var(--space-2);
 }
 
+.compact-route-summary {
+  gap: 6px;
+}
+
+.compact-route-summary > div {
+  padding: 6px 7px;
+  background: var(--geist-bg);
+}
+
 .voice-route-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -6358,6 +6367,10 @@ h3 {
   min-width: 0;
   padding: var(--space-2);
   border-top: 1px solid var(--geist-gray-200);
+}
+
+.inspector-more-settings:not([open]) > .inspector-more-body {
+  display: none;
 }
 
 .route-status-inline {
@@ -6588,6 +6601,16 @@ h3 {
 .fallback-reference-source {
   padding-top: var(--space-2);
   border-top: 1px solid var(--geist-gray-200);
+}
+
+.commercial-reference-note {
+  padding: 7px 8px;
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  color: var(--geist-gray-900);
+  font-size: 12px;
+  line-height: 18px;
+  background: var(--geist-bg-subtle);
 }
 
 .inspector-diagnostics-card {
