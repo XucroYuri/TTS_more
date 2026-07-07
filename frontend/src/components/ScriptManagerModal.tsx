@@ -7,6 +7,7 @@ import type { ProjectSummary, ScriptProject } from "../types";
 
 interface ScriptManagerModalProps {
   open: boolean;
+  variant?: "modal" | "inline";
   projects: ProjectSummary[];
   currentProjectId: string | null;
   selectedProjectId: string | null;
@@ -38,6 +39,7 @@ interface ScriptManagerModalProps {
 
 export function ScriptManagerModal({
   open,
+  variant = "modal",
   projects,
   currentProjectId,
   selectedProjectId,
@@ -80,9 +82,8 @@ export function ScriptManagerModal({
 
   if (!open) return null;
 
-  return (
-    <div className="script-manager-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className="script-manager-modal" role="dialog" aria-modal="true" aria-labelledby="script-manager-title">
+  const content = (
+      <section className={`script-manager-modal ${variant === "inline" ? "script-manager-inline" : ""}`} role={variant === "modal" ? "dialog" : "region"} aria-modal={variant === "modal" ? true : undefined} aria-labelledby="script-manager-title">
         <header className="script-manager-head">
           <div>
             <strong id="script-manager-title">{t("script.managerTitle")}</strong>
@@ -203,6 +204,13 @@ export function ScriptManagerModal({
           </aside>
         </div>
       </section>
+  );
+
+  if (variant === "inline") return content;
+
+  return (
+    <div className="script-manager-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      {content}
     </div>
   );
 }

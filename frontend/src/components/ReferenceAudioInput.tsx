@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { audioExtensionFromMimeType, isAcceptedAudioFile, pickRecordingMimeType } from "../lib/audioInput";
+import { WaveformPlayer } from "./WaveformPlayer";
 
 const RECORDING_BITS_PER_SECOND = 256_000;
 
@@ -166,8 +167,11 @@ export function ReferenceAudioInput({ label, value, disabled = false, onUpload }
       </div>
       {value && (
         <div className="reference-audio-current">
-          <span>{t("audioInput.current")}</span>
-          <strong title={value}>{currentName || value}</strong>
+          <div>
+            <span>{t("audioInput.current")}</span>
+            <strong title={value}>{currentName || value}</strong>
+          </div>
+          <WaveformPlayer audioPath={value} label={currentName || value} compact />
         </div>
       )}
       <input ref={inputRef} className="sr-only" type="file" accept="audio/*" disabled={disabled || isUploading} onChange={handleFileChange} />

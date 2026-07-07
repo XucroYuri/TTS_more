@@ -96,7 +96,7 @@ import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
 import { buildGradioEndpointRequest, gradioContractForProvider, sourceProfileForEndpointUrl } from "./lib/ttsAccess";
 import { createToast, inferToastLevel, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
   Character,
   CharacterReferenceAudioGroup,
@@ -134,7 +134,7 @@ type ServicePanelSection = "overview" | "open-source" | "tts" | "llm" | "resourc
 type ScriptSourceMode = "project" | "manual";
 type ConfirmationTone = "warning" | "danger" | "info";
 const KWJM_TESTING_INDEX = -1;
-const LINE_PAGE_SIZE = 10;
+const LINE_LOAD_BATCH_SIZE = 40;
 
 interface ConfirmationDialogState {
   title: string;
@@ -169,6 +169,7 @@ export default function App() {
   const [versionDrafts, setVersionDrafts] = useState<Record<string, InspectorVersionDraft & { version_id: string }>>({});
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
   const [selectedLineIds, setSelectedLineIds] = useState<string[]>([]);
+  const [lineTextDrafts, setLineTextDrafts] = useState<Record<string, string>>({});
   const [scriptInput, setScriptInput] = useState("");
   const [scriptSourceMode, setScriptSourceMode] = useState<ScriptSourceMode>("project");
   const [parserProviders, setParserProviders] = useState<ParserProviderDraft[]>([]);
@@ -278,7 +279,8 @@ export default function App() {
   const [characterFilter, setCharacterFilter] = useState("all");
   const [providerFilter, setProviderFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState<LineStatusFilter>("all");
-  const [linePage, setLinePage] = useState(1);
+  const [visibleLineCount, setVisibleLineCount] = useState(LINE_LOAD_BATCH_SIZE);
+  const lineLoadMoreRef = useRef<HTMLDivElement | null>(null);
 
   function requestConfirmation(dialog: ConfirmationDialogState): Promise<boolean> {
     confirmationResolverRef.current?.(false);
@@ -323,6 +325,7 @@ export default function App() {
       setSelectedHistoryVersions({});
       setVersionDrafts({});
       setSelectedLineIds([]);
+      setLineTextDrafts({});
       setScriptInput("");
       setScriptSourceMode("project");
       setIsSidebarScriptEditing(false);
@@ -340,6 +343,7 @@ export default function App() {
         setExpandedLineId(null);
         setSelectedHistoryVersions({});
         setVersionDrafts({});
+        setLineTextDrafts({});
         setIsProjectLoaded(true);
         return fetchProjectCharacters(currentProjectId)
           .then((projectCharactersPayload) => {
@@ -354,6 +358,7 @@ export default function App() {
         setSelectedHistoryVersions({});
         setVersionDrafts({});
         setSelectedLineIds([]);
+        setLineTextDrafts({});
         setScriptInput("");
         setScriptSourceMode("project");
         setIsSidebarScriptEditing(false);
@@ -464,6 +469,8 @@ export default function App() {
   const activeVersionDraft = activeLine ? versionDrafts[activeLine.id] : undefined;
   const activeInspectorMode = inspectorPanelMode(selectedHistoryVersion?.version_id);
   const activeSummary = useMemo(() => summarizeLineHistory(activeLine ? lineHistoryForLine(manifest, activeLine) : undefined), [activeLine, manifest]);
+  const activePlayableVersion = useMemo(() => newestPlayableVersion(activeVersions), [activeVersions]);
+  const activeLineTextDraft = activeLine ? lineTextDrafts[activeLine.id] ?? activeLine.text : "";
   const activeBindings = useMemo(() => (activeLine ? bindingsForLine(activeLine, resolvedCharacters) : []), [activeLine, resolvedCharacters]);
   const activeBinding = useMemo(() => (activeLine ? lineBinding(activeLine, resolvedCharacters) : undefined), [activeLine, resolvedCharacters]);
   const activeProfiles = useMemo(() => (activeLine ? profilesForLine(activeLine, resolvedCharacters) : []), [activeLine, resolvedCharacters]);
@@ -503,6 +510,8 @@ export default function App() {
   const activeLogsReferencePayload = activeLogsReferenceRequest ? logsReferenceAudio[activeLogsReferenceRequest.key] : undefined;
   const activeLogsReferenceSamples = activeLogsReferencePayload?.samples ?? [];
   const activeLogsReferenceSample = selectedLogsReferenceSample(activeLogsReferenceSamples, activeBindingConfig, { serviceId: activeServiceId });
+  const activeReferenceAudioPath = activeProvider === "gpt-sovits" ? activeLogsReferenceSample?.path ?? stringConfig(activeBindingConfig.ref_audio_path) : "";
+  const activeReferenceAudioLabel = activeLogsReferenceSample?.display_label || shortPath(activeReferenceAudioPath) || t("inspector.referenceAudio");
   const staleLogsReferenceServiceId = stringConfig(activeBindingConfig.logs_reference_service_id);
   const isLogsReferenceFromOtherService = Boolean(activeProvider === "gpt-sovits" && staleLogsReferenceServiceId && activeServiceId && staleLogsReferenceServiceId !== activeServiceId);
   const candidateReferenceGroups = useMemo(
@@ -526,7 +535,8 @@ export default function App() {
       }),
     [characterFilter, manifest, project.lines, providerFilter, resolvedCharacters, searchText, statusFilter]
   );
-  const paginatedLines = useMemo(() => paginateItems(filteredLines, linePage, LINE_PAGE_SIZE), [filteredLines, linePage]);
+  const displayedLines = useMemo(() => filteredLines.slice(0, visibleLineCount), [filteredLines, visibleLineCount]);
+  const hasMoreFilteredLines = displayedLines.length < filteredLines.length;
   const selectedLines = useMemo(() => project.lines.filter((line) => selectedLineIds.includes(line.id)), [project.lines, selectedLineIds]);
   const providerOptions = useMemo(() => Array.from(new Set(project.lines.map((line) => lineBinding(line, resolvedCharacters)?.provider_type ?? "unassigned"))), [project.lines, resolvedCharacters]);
   const selectedLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language ?? defaultLanguage);
@@ -599,14 +609,28 @@ export default function App() {
   }, [characters, currentProjectId, isProjectLoaded, isScriptManagerOpen, managedProjectId, projectWithCharacters, setNotice, t]);
 
   useEffect(() => {
-    setLinePage(1);
+    setVisibleLineCount(LINE_LOAD_BATCH_SIZE);
   }, [characterFilter, currentProjectId, providerFilter, searchText, statusFilter]);
 
   useEffect(() => {
-    if (linePage !== paginatedLines.page) {
-      setLinePage(paginatedLines.page);
+    if (!hasMoreFilteredLines) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setVisibleLineCount(filteredLines.length);
+      return;
     }
-  }, [linePage, paginatedLines.page]);
+    const target = lineLoadMoreRef.current;
+    if (!target) return;
+    const root = target.closest(".line-table");
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      setVisibleLineCount((current) => Math.min(filteredLines.length, current + LINE_LOAD_BATCH_SIZE));
+    }, {
+      root,
+      rootMargin: "160px 0px"
+    });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [filteredLines.length, hasMoreFilteredLines]);
 
   const visibleServices = useMemo(() => services.filter((service) => !isUnsupportedLocalVibeVoice(service)), [services]);
   const ttsServices = useMemo(() => visibleServices.filter((service) => service.service_kind !== "llm-parser"), [visibleServices]);
@@ -621,6 +645,18 @@ export default function App() {
     [roleLibraryTtsServices]
   );
   const serviceById = useMemo(() => new Map(visibleServices.map((service) => [service.service_id ?? "", service])), [visibleServices]);
+  const activeService = activeServiceId ? serviceById.get(activeServiceId) : undefined;
+  const activeProfileValue = activeLine ? activeVersionDraft?.profile ?? lineProfile(activeLine, resolvedCharacters) : "";
+  const activeProfileLabel = activeLine?.temporary_binding
+    ? t("inspector.temporaryBinding")
+    : activeProfiles.find((profile) => profile.id === activeProfileValue)?.name || activeProfileValue || t("inspector.noProfile");
+  const activeBindingLabel = activeVersionDraft?.binding_id
+    ?? activeBinding?.binding_id
+    ?? (activeLine?.temporary_binding ? `${t("inspector.temporaryBinding")} · ${activeLine.temporary_binding.provider_type}` : t("inspector.profileDefault"));
+  const activeServiceLabel = activeServiceId
+    ? serviceDisplayName(activeService ?? ({ engine: activeProvider, display_name: activeServiceId, ready: false } as WorkerHealth))
+    : t("inspector.autoRoute");
+  const activeServiceContract = activeService?.api_contract ?? activeProvider;
   const localServiceCount = useMemo(() => visibleServices.filter((service) => ["gpt-sovits", "indextts"].includes(service.provider_type ?? service.engine)), [visibleServices]);
   const paidServiceCount = useMemo(() => visibleServices.filter((service) => service.capabilities?.includes("paid_provider")), [visibleServices]);
   const serviceSummary = useMemo(() => serviceTopbarSummary(visibleServices, voiceCandidates, parserProviders), [parserProviders, visibleServices, voiceCandidates]);
@@ -718,12 +754,22 @@ export default function App() {
     if (!activeLogsReferenceRequest) return;
     if (logsReferenceAudio[activeLogsReferenceRequest.key]) return;
     setLoadingLogsReferenceKey(activeLogsReferenceRequest.key);
-    fetchLogsReferenceAudio({
-      serviceId: activeLogsReferenceRequest.serviceId,
-      logsName: activeLogsReferenceRequest.logsName,
-      gptWeightsPath: activeLogsReferenceRequest.gptWeightsPath,
-      sovitsWeightsPath: activeLogsReferenceRequest.sovitsWeightsPath,
-    })
+    const referenceService = (activeLogsReferenceRequest.serviceId ? serviceById.get(activeLogsReferenceRequest.serviceId) : undefined)
+      ?? activeRouteServices.find(isGptSovitsApiV2Service);
+    const referenceServiceId = activeLogsReferenceRequest.serviceId || referenceService?.service_id || null;
+    const referenceRequest = isGptSovitsApiV2Service(referenceService)
+      ? fetchGptSovitsModelSamples({
+        serviceId: referenceServiceId,
+        logsName: activeLogsReferenceRequest.logsName,
+        limit: 120
+      })
+      : fetchLogsReferenceAudio({
+        serviceId: referenceServiceId,
+        logsName: activeLogsReferenceRequest.logsName,
+        gptWeightsPath: activeLogsReferenceRequest.gptWeightsPath,
+        sovitsWeightsPath: activeLogsReferenceRequest.sovitsWeightsPath,
+      });
+    referenceRequest
       .then((payload) => setLogsReferenceAudio((current) => ({ ...current, [activeLogsReferenceRequest.key]: payload })))
       .catch(() => setLogsReferenceAudio((current) => ({
         ...current,
@@ -735,7 +781,7 @@ export default function App() {
         }
       })))
       .finally(() => setLoadingLogsReferenceKey((current) => (current === activeLogsReferenceRequest.key ? null : current)));
-  }, [activeLogsReferenceRequest, logsReferenceAudio, t]);
+  }, [activeLogsReferenceRequest, activeRouteServices, logsReferenceAudio, serviceById, t]);
 
   useEffect(() => {
     if (!activeModelCatalogItem || !activeModelSamplesKey) return;
@@ -1614,15 +1660,34 @@ export default function App() {
     }));
   }
 
+  function updateLineTextDraft(lineId: string, text: string) {
+    setLineTextDrafts((current) => ({ ...current, [lineId]: text }));
+  }
+
+  function resetLineTextDraft(lineId: string) {
+    setLineTextDrafts((current) => {
+      const next = { ...current };
+      delete next[lineId];
+      return next;
+    });
+  }
+
+  function lineWithGenerationText(line: ScriptLine): ScriptLine {
+    const draft = lineTextDrafts[line.id];
+    if (draft === undefined || draft === line.text) return line;
+    return { ...line, text: draft };
+  }
+
   async function runInspectorGeneration() {
     if (!activeLine) return;
+    const lineForGeneration = lineWithGenerationText(activeLine);
     if (!activeVersionDraft) {
-      await runQueue([activeLine]);
+      await runQueue([lineForGeneration]);
       return;
     }
     const provider = activeVersionDraft.provider_type ?? activeProvider;
     const lineFromDraft: ScriptLine = {
-      ...activeLine,
+      ...lineForGeneration,
       engine_override: engineFromProvider(provider),
       profile_override: activeVersionDraft.profile,
       binding_override: null,
@@ -1640,10 +1705,47 @@ export default function App() {
   }
 
   function toggleVisibleSelection() {
-    const visibleIds = paginatedLines.items.map((line) => line.id);
+    const visibleIds = displayedLines.map((line) => line.id);
     const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedLineIds.includes(id));
     setSelectedLineIds(allVisibleSelected ? selectedLineIds.filter((id) => !visibleIds.includes(id)) : Array.from(new Set([...selectedLineIds, ...visibleIds])));
   }
+
+  const scriptManagerPane = (
+    <ScriptManagerModal
+      open={isScriptManagerOpen}
+      variant="inline"
+      projects={projectRows}
+      currentProjectId={currentProjectId}
+      selectedProjectId={managedProjectId}
+      selectedProject={managedProject}
+      isSelectedProjectLoading={isManagedProjectLoading}
+      searchText={managerSearchText}
+      titleDraft={managerTitleDraft}
+      sourceDraft={managerSourceDraft}
+      newScriptTitle={newScriptTitle}
+      newScriptSource={newScriptSource}
+      isCreatingScript={isCreatingScript}
+      isSavingScript={isManagerSaving}
+      isParsingScript={isManagerParsing}
+      deletingProjectId={deletingProjectId}
+      onClose={() => setIsScriptManagerOpen(false)}
+      onSearchTextChange={setManagerSearchText}
+      onSelectProject={setManagedProjectId}
+      onOpenProject={(projectId) => {
+        switchProject(projectId);
+        setManagedProjectId(projectId);
+      }}
+      onTitleDraftChange={setManagerTitleDraft}
+      onSourceDraftChange={setManagerSourceDraft}
+      onNewScriptTitleChange={setNewScriptTitle}
+      onNewScriptSourceChange={setNewScriptSource}
+      onCreateScript={() => void createNewScriptProject()}
+      onRenameScript={() => void renameManagedProject()}
+      onSaveRevision={() => void saveManagedScriptRevision()}
+      onParseRevision={() => void parseManagedScriptRevision()}
+      onDeleteScript={() => void deleteManagedProject()}
+    />
+  );
 
   return (
     <div className="app-shell">
@@ -1663,8 +1765,8 @@ export default function App() {
                 <span>{t("script.activeScript")}</span>
                 <strong>{displayProjectTitle}</strong>
               </div>
-              <button className="secondary-button compact-button script-manager-open-button" type="button" onClick={() => setIsScriptManagerOpen(true)}>
-                <FolderKanban size={14} /> {t("script.manageScriptShort")}
+              <button className="secondary-button compact-button script-manager-open-button" type="button" onClick={() => setIsScriptManagerOpen((current) => !current)}>
+                <FolderKanban size={14} /> {isScriptManagerOpen ? t("actions.close") : t("script.manageScriptShort")}
               </button>
             </div>
             <div className="script-sidebar-meta">
@@ -1674,6 +1776,7 @@ export default function App() {
             {projectRows.length === 0 && <span className="script-sidebar-empty-hint">{t("empty.noProjectsHint")}</span>}
           </section>
 
+          {isScriptManagerOpen ? scriptManagerPane : (
           <div className={`script-console-preview source-${scriptSourceMode} mode-${scriptConsoleMode}`}>
             <div className="script-console-preview-head">
               <div>
@@ -1708,6 +1811,7 @@ export default function App() {
               <div className="empty-row compact">{t("empty.noProjectsHint")}</div>
             )}
           </div>
+          )}
 
           <div className="script-console-actions">
             <button className="primary-button script-extract-button" onClick={() => void parseAsRevision()} disabled={isParsing || !currentProjectId}>
@@ -1717,40 +1821,6 @@ export default function App() {
         </section>
 
       </aside>
-
-      <ScriptManagerModal
-        open={isScriptManagerOpen}
-        projects={projectRows}
-        currentProjectId={currentProjectId}
-        selectedProjectId={managedProjectId}
-        selectedProject={managedProject}
-        isSelectedProjectLoading={isManagedProjectLoading}
-        searchText={managerSearchText}
-        titleDraft={managerTitleDraft}
-        sourceDraft={managerSourceDraft}
-        newScriptTitle={newScriptTitle}
-        newScriptSource={newScriptSource}
-        isCreatingScript={isCreatingScript}
-        isSavingScript={isManagerSaving}
-        isParsingScript={isManagerParsing}
-        deletingProjectId={deletingProjectId}
-        onClose={() => setIsScriptManagerOpen(false)}
-        onSearchTextChange={setManagerSearchText}
-        onSelectProject={setManagedProjectId}
-        onOpenProject={(projectId) => {
-          switchProject(projectId);
-          setManagedProjectId(projectId);
-        }}
-        onTitleDraftChange={setManagerTitleDraft}
-        onSourceDraftChange={setManagerSourceDraft}
-        onNewScriptTitleChange={setNewScriptTitle}
-        onNewScriptSourceChange={setNewScriptSource}
-        onCreateScript={() => void createNewScriptProject()}
-        onRenameScript={() => void renameManagedProject()}
-        onSaveRevision={() => void saveManagedScriptRevision()}
-        onParseRevision={() => void parseManagedScriptRevision()}
-        onDeleteScript={() => void deleteManagedProject()}
-      />
 
       <main className="workspace">
         <header className="topbar">
@@ -2900,7 +2970,7 @@ export default function App() {
             </div>
 
             <div className="line-table line-card-list">
-              {paginatedLines.items.map((line) => {
+              {displayedLines.map((line) => {
                 const summary = summarizeLineHistory(lineHistoryForLine(manifest, line));
                 const queueItem = activeJob?.items.find((item) => item.line_uid ? item.line_uid === (line.line_uid ?? line.id) : item.line_id === line.id);
                 const visibleTone = queueItem ? queueStatusTone(queueItem.status) : summary.tone;
@@ -2979,6 +3049,11 @@ export default function App() {
                   </article>
                 );
               })}
+              {hasMoreFilteredLines && (
+                <div className="line-scroll-sentinel" ref={lineLoadMoreRef}>
+                  {t("table.loadingMore", { visible: displayedLines.length, total: filteredLines.length })}
+                </div>
+              )}
               {filteredLines.length === 0 && (
                 <div className="empty-row table-empty line-empty-state">
                   <strong>{t("empty.noLines")}</strong>
@@ -2997,22 +3072,6 @@ export default function App() {
                 </div>
               )}
             </div>
-            {paginatedLines.totalItems > 0 && (
-              <div className="line-pagination">
-                <span>
-                  {t("table.pageRange", { start: paginatedLines.startItem, end: paginatedLines.endItem, total: paginatedLines.totalItems })}
-                </span>
-                <div>
-                  <button className="secondary-button compact-button" onClick={() => setLinePage((page) => Math.max(1, page - 1))} disabled={!paginatedLines.hasPrevious}>
-                    {t("table.previousPage")}
-                  </button>
-                  <strong>{t("table.pageIndex", { page: paginatedLines.page, total: paginatedLines.totalPages })}</strong>
-                  <button className="secondary-button compact-button" onClick={() => setLinePage((page) => page + 1)} disabled={!paginatedLines.hasNext}>
-                    {t("table.nextPage")}
-                  </button>
-                </div>
-              </div>
-            )}
           </div>
 
           <aside className={`inspector inspector-${activeInspectorMode}`}>
@@ -3104,41 +3163,51 @@ export default function App() {
                           </select>
                         </label>
                       )}
-                      <div className="field-grid compact-field-grid voice-route-grid">
-                        <label>
-                          <span>{t(activeGenerationRouteLabels.profileLabelKey)}</span>
-                          <select value={activeVersionDraft?.profile ?? lineProfile(activeLine, resolvedCharacters)} onChange={(event) => {
-                            if (activeVersionDraft) {
-                              updateActiveVersionDraft({ profile: event.target.value });
-                            } else {
-                              updateLine(activeLine.id, { profile_override: event.target.value, binding_override: null, service_override: null, engine_override: null });
-                            }
-                          }}>
-                            {activeLine.temporary_binding && <option value={activeLine.temporary_binding.binding_id}>{t("inspector.temporaryBinding")}</option>}
-                            {activeProfiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}
-                            {activeProfiles.length === 0 && <option value={lineProfile(activeLine, resolvedCharacters)}>{lineProfile(activeLine, resolvedCharacters) || t("inspector.noProfile")}</option>}
-                          </select>
-                        </label>
-                        <label>
-                          <span>{t(activeGenerationRouteLabels.bindingLabelKey)}</span>
-                          <select value={activeVersionDraft?.binding_id ?? activeLine.binding_override ?? ""} onChange={(event) => {
-                            if (activeVersionDraft) {
-                              updateActiveVersionDraft({ binding_id: event.target.value || null });
-                            } else {
-                              updateLine(activeLine.id, { binding_override: event.target.value || null, service_override: null });
-                            }
-                          }}>
-                            {activeVersionDraft && <option value={activeVersionDraft.binding_id ?? ""}>{t("inspector.versionDraft")} · {activeVersionDraft.binding_id ?? selectedHistoryVersion?.version_id}</option>}
-                            {activeLine.temporary_binding && <option value="">{t("inspector.temporaryBinding")} · {activeLine.temporary_binding.provider_type}</option>}
-                            {!activeLine.temporary_binding && <option value="">{t("inspector.profileDefault")}{activeBinding ? ` · ${activeBinding.provider_type}` : ""}</option>}
-                            {activeBindings.map((binding) => <option value={binding.binding_id} key={binding.binding_id}>{binding.provider_type} · {binding.binding_id}</option>)}
-                          </select>
-                        </label>
+                      <div className="voice-route-summary" aria-label={t("inspector.routeAndVoice")}>
+                        <div>
+                          <span>{t("inspector.currentVoice")}</span>
+                          <strong title={activeProfileLabel}>{activeProfileLabel}</strong>
+                          <small title={activeBindingLabel}>{activeBindingLabel}</small>
+                        </div>
+                        <div>
+                          <span>{t("inspector.routeService")}</span>
+                          <strong title={activeServiceLabel}>{activeServiceLabel}</strong>
+                          <small title={activeServiceContract}>{activeServiceContract}</small>
+                        </div>
                       </div>
                       <details className="inspector-more-settings route-settings" open={activeSelectedServiceUnavailable || undefined}>
                         <summary>{t("inspector.routeSettings")}</summary>
                         <div className="inspector-more-body">
-                          <div className="field-grid compact-field-grid single-field-grid">
+                          <div className="field-grid compact-field-grid voice-route-grid">
+                            <label>
+                              <span>{t(activeGenerationRouteLabels.profileLabelKey)}</span>
+                              <select value={activeVersionDraft?.profile ?? lineProfile(activeLine, resolvedCharacters)} onChange={(event) => {
+                                if (activeVersionDraft) {
+                                  updateActiveVersionDraft({ profile: event.target.value });
+                                } else {
+                                  updateLine(activeLine.id, { profile_override: event.target.value, binding_override: null, service_override: null, engine_override: null });
+                                }
+                              }}>
+                                {activeLine.temporary_binding && <option value={activeLine.temporary_binding.binding_id}>{t("inspector.temporaryBinding")}</option>}
+                                {activeProfiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}
+                                {activeProfiles.length === 0 && <option value={lineProfile(activeLine, resolvedCharacters)}>{lineProfile(activeLine, resolvedCharacters) || t("inspector.noProfile")}</option>}
+                              </select>
+                            </label>
+                            <label>
+                              <span>{t(activeGenerationRouteLabels.bindingLabelKey)}</span>
+                              <select value={activeVersionDraft?.binding_id ?? activeLine.binding_override ?? ""} onChange={(event) => {
+                                if (activeVersionDraft) {
+                                  updateActiveVersionDraft({ binding_id: event.target.value || null });
+                                } else {
+                                  updateLine(activeLine.id, { binding_override: event.target.value || null, service_override: null });
+                                }
+                              }}>
+                                {activeVersionDraft && <option value={activeVersionDraft.binding_id ?? ""}>{t("inspector.versionDraft")} · {activeVersionDraft.binding_id ?? selectedHistoryVersion?.version_id}</option>}
+                                {activeLine.temporary_binding && <option value="">{t("inspector.temporaryBinding")} · {activeLine.temporary_binding.provider_type}</option>}
+                                {!activeLine.temporary_binding && <option value="">{t("inspector.profileDefault")}{activeBinding ? ` · ${activeBinding.provider_type}` : ""}</option>}
+                                {activeBindings.map((binding) => <option value={binding.binding_id} key={binding.binding_id}>{binding.provider_type} · {binding.binding_id}</option>)}
+                              </select>
+                            </label>
                             <label>
                               <span>{t(activeGenerationRouteLabels.serviceLabelKey)}</span>
                               <select value={activeSelectedServiceUnavailable ? "" : (activeVersionDraft?.service_id ?? lineServiceId(activeLine, resolvedCharacters) ?? "")} onChange={(event) => {
@@ -3210,13 +3279,23 @@ export default function App() {
                             </div>
                             <div>
                               <span>{t("inspector.service")}</span>
-                              <strong>{activeServiceId ? serviceDisplayName(serviceById.get(activeServiceId) ?? ({ engine: activeProvider, display_name: activeServiceId, ready: false } as WorkerHealth)) : t("inspector.autoRoute")}</strong>
+                              <strong>{activeServiceLabel}</strong>
+                              <small title={activeServiceContract}>{activeServiceContract}</small>
                             </div>
                             <div>
                               <span>{t("inspector.currentReference")}</span>
                               <strong>{activeLogsReferenceSample?.display_label ?? shortPath(stringConfig(activeBindingConfig.ref_audio_path)) ?? t("status.unset")}</strong>
                             </div>
                           </div>
+                          {activeReferenceAudioPath && isLocalAudioAsset(activeReferenceAudioPath) && (
+                            <div className="active-reference-player">
+                              <div>
+                                <span>{t("inspector.selectedReferenceAudio")}</span>
+                                <strong title={activeReferenceAudioLabel}>{activeReferenceAudioLabel}</strong>
+                              </div>
+                              <WaveformPlayer audioPath={activeReferenceAudioPath} label={activeReferenceAudioLabel} compact />
+                            </div>
+                          )}
 
                           <details className="inspector-more-settings reference-settings">
                             <summary>{t("inspector.weightsAndReference")}</summary>
@@ -3494,9 +3573,31 @@ export default function App() {
                         <span className={`generate-status-light tone-${activeInspectorDiagnostics.tone} summary-${activeSummary.tone}`} title={summaryLabel(activeSummary, t)} />
                       </div>
                       {formatScriptNote(activeLine.note) && <p className="speech-workbench-note">{formatScriptNote(activeLine.note)}</p>}
-                      <p>{activeLine.text}</p>
+                      <label className="speech-workbench-editor">
+                        <span>{t("inspector.lineTextForGeneration")}</span>
+                        <textarea
+                          value={activeLineTextDraft}
+                          onChange={(event) => updateLineTextDraft(activeLine.id, event.target.value)}
+                          placeholder={activeLine.text}
+                          rows={3}
+                        />
+                      </label>
+                      {activeLineTextDraft !== activeLine.text && (
+                        <button className="secondary-button compact-button speech-workbench-reset" type="button" onClick={() => resetLineTextDraft(activeLine.id)}>
+                          {t("inspector.resetLineText")}
+                        </button>
+                      )}
                     </div>
                   </div>
+                  {activePlayableVersion?.audio_path && (
+                    <div className="generated-result-player">
+                      <div>
+                        <span>{t("inspector.generatedResult")}</span>
+                        <strong>{activePlayableVersion.version_id}</strong>
+                      </div>
+                      <WaveformPlayer audioPath={activePlayableVersion.audio_path} label={activePlayableVersion.version_id} compact />
+                    </div>
+                  )}
                   <div className="generate-dock-actions">
                     <button className="primary-button inspector-generate-button" onClick={() => void runInspectorGeneration()} disabled={isGenerating || (!activeVersionDraft && !activeBinding)}>
                       {isGenerating ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
@@ -4374,6 +4475,12 @@ function serviceDisplayName(service: WorkerHealth): string {
   if (service.mode === "external" || service.capabilities?.includes("paid_provider")) return base;
   if (service.service_id?.startsWith("local-")) return `${base} Local`;
   return base;
+}
+
+function isGptSovitsApiV2Service(service: WorkerHealth | undefined): boolean {
+  if (!service) return false;
+  return service.api_contract === "gpt-sovits-api-v2"
+    || Boolean(service.capabilities?.some((capability) => capability === "gpt-sovits-api-v2" || capability === "model_catalog"));
 }
 
 function serviceHealthText(service: WorkerHealth, t: Translate, runtimeMode?: string): string {
