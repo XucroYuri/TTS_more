@@ -195,7 +195,12 @@ def _probe_endpoint(base_url: str | None, api_contract: str) -> dict[str, Any]:
     health: dict[str, Any] = {}
     reachable = False
     contract_ok = False
-    with httpx.Client(timeout=timeout) as client:
+    # trust_env=False so the probe ignores host-level HTTP/HTTPS/SOCKS proxies.
+    # Otherwise a host with a SOCKS proxy configured system-wide raises
+    # ``ImportError: Using SOCKS proxy, but the 'socksio' package is not installed``
+    # before the request even leaves the process, which masks the real
+    # endpoint-unreachable diagnostic we want to surface.
+    with httpx.Client(timeout=timeout, trust_env=False) as client:
         for suffix in ("/health", "/config"):
             try:
                 response = client.get(f"{base_url.rstrip('/')}{suffix}")

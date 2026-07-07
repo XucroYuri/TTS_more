@@ -11,6 +11,33 @@ from typing import Any
 from app.models import TTSServiceEndpoint
 
 
+def is_windows_platform() -> bool:
+    """Platform check isolated for testability.
+
+    Patching ``os.name`` globally breaks ``pathlib`` on non-Windows hosts
+    (``Path()`` raises ``NotImplementedError: cannot instantiate 'WindowsPath'``),
+    so callers and tests must use this helper instead of monkeypatching ``os.name``.
+    """
+    return os.name == "nt"
+
+
+def windows_creation_flags() -> int:
+    """Return Windows subprocess creation flags, or 0 on non-Windows / missing constants.
+
+    Composed of ``CREATE_NEW_PROCESS_GROUP`` and ``CREATE_NO_WINDOW`` when available.
+    Tests assert against the well-known constant value ``0x00000200`` rather than
+    the ``subprocess`` attribute, which only exists on Windows.
+    """
+    if not is_windows_platform():
+        return 0
+    flags = 0
+    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        flags |= subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        flags |= subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    return flags
+
+
 class ServiceSupervisor:
     def __init__(self, project_root: Path, runtime_root: Path) -> None:
         self.project_root = project_root.resolve()
@@ -52,8 +79,9 @@ class ServiceSupervisor:
             "env": {**os.environ, **self._resolve_env(endpoint.env)},
             "close_fds": False,
         }
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        creation_flags = windows_creation_flags()
+        if creation_flags:
+            popen_kwargs["creationflags"] = creation_flags
         process = subprocess.Popen(command, **popen_kwargs)
         log_file.close()
         record = {
@@ -73,7 +101,7 @@ class ServiceSupervisor:
             return {"status": "not running", "service_id": service_id}
         pid = record.get("pid")
         if pid:
-            if os.name == "nt":
+            if is_windows_platform():
                 subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, check=False)
             else:
                 try:
@@ -171,7 +199,7 @@ class ServiceSupervisor:
         if not pid:
             return False
         try:
-            if os.name == "nt":
+            if is_windows_platform():
                 result = subprocess.run(["tasklist", "/FI", f"PID eq {int(pid)}"], capture_output=True, text=True, check=False)
                 return str(pid) in result.stdout
             os.kill(int(pid), 0)

@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from app.models import EngineName, TTSServiceEndpoint
 from app.supervisor import ServiceSupervisor
+from app import supervisor as supervisor_module
+
+
+# subprocess.CREATE_NEW_PROCESS_GROUP / CREATE_NO_WINDOW only exist on Windows.
+# Assert against their well-known numeric values so the tests are cross-platform.
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
 
 
 class FakePopen:
@@ -52,7 +62,14 @@ def test_supervisor_detaches_windows_process_group(monkeypatch, tmp_path: Path) 
         return FakePopen(command, **kwargs)
 
     monkeypatch.setattr("app.supervisor.subprocess.Popen", fake_popen)
-    monkeypatch.setattr("app.supervisor.os.name", "nt")
+    # Cross-platform way to simulate Windows: patch the helper instead of ``os.name``,
+    # which would corrupt ``pathlib.Path()`` instantiation on non-Windows hosts.
+    monkeypatch.setattr(supervisor_module, "is_windows_platform", lambda: True)
+    monkeypatch.setattr(
+        supervisor_module,
+        "windows_creation_flags",
+        lambda: _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW,
+    )
     endpoint = TTSServiceEndpoint(
         service_id="local-indextts",
         engine=EngineName.INDEX_TTS,
@@ -65,7 +82,7 @@ def test_supervisor_detaches_windows_process_group(monkeypatch, tmp_path: Path) 
 
     supervisor.start(endpoint)
 
-    assert calls[0]["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
+    assert calls[0]["creationflags"] & _CREATE_NEW_PROCESS_GROUP
 
 
 def test_supervisor_passes_endpoint_environment_to_process(monkeypatch, tmp_path: Path) -> None:
@@ -94,6 +111,7 @@ def test_supervisor_passes_endpoint_environment_to_process(monkeypatch, tmp_path
     assert Path(calls[0]["env"]["TTS_MORE_INDEXTTS_MODEL_DIR"]).parts[-3:] == ("repo", "index-tts", "checkpoints")
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows path normalization only applies on Windows")
 def test_supervisor_resolves_path_environment_entries(monkeypatch, tmp_path: Path) -> None:
     calls: list[dict] = []
 
@@ -103,6 +121,10 @@ def test_supervisor_resolves_path_environment_entries(monkeypatch, tmp_path: Pat
 
     monkeypatch.setattr("app.supervisor.subprocess.Popen", fake_popen)
     monkeypatch.setenv("PATH", r"C:\System")
+    # This test exercises the Windows PATH layout (drive letters, ';'-separated entries,
+    # backslash path components). Patch ``os.pathsep`` so the same assertion works on
+    # POSIX hosts without polluting ``pathlib`` the way patching ``os.name`` would.
+    monkeypatch.setattr("app.supervisor.os.pathsep", ";")
     endpoint = TTSServiceEndpoint(
         service_id="local-gpt-sovits",
         engine=EngineName.GPT_SOVITS,
@@ -151,7 +173,7 @@ def test_supervisor_stop_uses_pid_record_and_removes_it(monkeypatch, tmp_path: P
         return Completed()
 
     monkeypatch.setattr("app.supervisor.subprocess.run", fake_run)
-    monkeypatch.setattr("app.supervisor.os.name", "nt")
+    monkeypatch.setattr(supervisor_module, "is_windows_platform", lambda: True)
 
     result = supervisor.stop("local-indextts")
 
