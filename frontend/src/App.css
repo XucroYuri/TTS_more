@@ -5059,13 +5059,81 @@ h3 {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) 128px 128px minmax(188px, auto);
+  grid-template-columns: minmax(220px, 1fr) auto minmax(188px, auto);
   gap: var(--space-2);
   align-items: center;
   min-height: 48px;
   padding: var(--space-3);
   border-bottom: 1px solid var(--geist-alpha-200);
   background: var(--geist-bg);
+}
+
+.line-filter-menu {
+  position: relative;
+  min-width: 0;
+}
+
+.line-filter-menu > summary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  min-width: 88px;
+  padding: 0 10px;
+  border: 1px solid var(--geist-alpha-200);
+  border-radius: var(--radius-sm);
+  color: var(--geist-primary);
+  background: var(--geist-bg);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 16px;
+  list-style: none;
+}
+
+.line-filter-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.line-filter-menu > summary b {
+  width: 6px;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  color: transparent;
+  background: var(--geist-blue-600);
+}
+
+.line-filter-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 8;
+  display: grid;
+  gap: var(--space-2);
+  width: min(280px, calc(100vw - 48px));
+  padding: var(--space-2);
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg);
+  box-shadow: 0 16px 38px #00000018;
+}
+
+.line-filter-popover label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.line-filter-popover span {
+  color: var(--geist-gray-900);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.line-filter-popover .secondary-button {
+  justify-content: center;
 }
 
 .task-actions {
@@ -5116,40 +5184,6 @@ h3 {
   align-content: start;
   min-height: 0;
   overflow: auto;
-}
-
-.line-pagination {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--space-2);
-  min-height: 38px;
-  padding: 6px var(--space-3);
-  border-top: 1px solid var(--geist-alpha-200);
-  background: var(--geist-bg);
-}
-
-.line-pagination > span {
-  overflow: hidden;
-  color: var(--geist-gray-900);
-  font-size: 12px;
-  line-height: 16px;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.line-pagination > div {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.line-pagination strong {
-  min-width: 46px;
-  color: var(--geist-gray-1000);
-  font-size: 12px;
-  line-height: 16px;
-  text-align: center;
 }
 
 .line-scroll-sentinel {

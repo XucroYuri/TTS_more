@@ -2905,18 +2905,44 @@ export default function App() {
                 <Search size={15} />
                 <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder={t("filters.search")} />
               </label>
-              <select value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)} aria-label={t("filters.provider")}>
-                <option value="all">{t("filters.all")}</option>
-                {providerOptions.map((provider) => <option value={provider} key={provider}>{provider}</option>)}
-              </select>
-              <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as LineStatusFilter)} aria-label={t("filters.status")}>
-                <option value="all">{t("filters.all")}</option>
-                <option value="not-generated">{t("filters.notGenerated")}</option>
-                <option value="queued">{t("filters.queued")}</option>
-                <option value="running">{t("filters.running")}</option>
-                <option value="completed">{t("filters.completed")}</option>
-                <option value="failed">{t("filters.failed")}</option>
-              </select>
+              <details className="line-filter-menu">
+                <summary>
+                  <SlidersHorizontal size={14} />
+                  <span>{t("filters.more")}</span>
+                  {(providerFilter !== "all" || statusFilter !== "all") && <b>{t("filters.active")}</b>}
+                </summary>
+                <div className="line-filter-popover">
+                  <label>
+                    <span>{t("filters.provider")}</span>
+                    <select value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)} aria-label={t("filters.provider")}>
+                      <option value="all">{t("filters.all")}</option>
+                      {providerOptions.map((provider) => <option value={provider} key={provider}>{provider}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    <span>{t("filters.status")}</span>
+                    <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as LineStatusFilter)} aria-label={t("filters.status")}>
+                      <option value="all">{t("filters.all")}</option>
+                      <option value="not-generated">{t("filters.notGenerated")}</option>
+                      <option value="queued">{t("filters.queued")}</option>
+                      <option value="running">{t("filters.running")}</option>
+                      <option value="completed">{t("filters.completed")}</option>
+                      <option value="failed">{t("filters.failed")}</option>
+                    </select>
+                  </label>
+                  <button
+                    className="secondary-button compact-button"
+                    disabled={providerFilter === "all" && statusFilter === "all"}
+                    onClick={() => {
+                      setProviderFilter("all");
+                      setStatusFilter("all");
+                    }}
+                    type="button"
+                  >
+                    {t("filters.clear")}
+                  </button>
+                </div>
+              </details>
               <div className="task-actions">
                 <span>{selectedLineIds.length > 0 ? t("table.selectedLines", { count: selectedLineIds.length }) : t("table.visibleLines", { count: filteredLines.length })}</span>
                 {isGenerating && activeJob && (

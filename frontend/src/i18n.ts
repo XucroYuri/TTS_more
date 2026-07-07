@@ -402,6 +402,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       provider: "服务商",
       status: "状态",
       all: "全部",
+      more: "筛选",
+      active: "已启用",
       clear: "清除筛选",
       notGenerated: "未生成",
       queued: "排队中",
@@ -421,11 +423,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       actions: "操作",
       visibleLines: "{{count}} 行",
       selectedLines: "已选 {{count}} 行",
-      loadingMore: "已显示 {{visible}} / {{total}} 行",
-      pageRange: "{{start}}-{{end}} / {{total}} 行",
-      pageIndex: "{{page}} / {{total}}",
-      previousPage: "上一页",
-      nextPage: "下一页"
+      loadingMore: "已显示 {{visible}} / {{total}} 行"
     },
     history: {
       batch: "批次",
@@ -1170,6 +1168,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       provider: "Provider",
       status: "Status",
       all: "All",
+      more: "Filters",
+      active: "Active",
       clear: "Clear filters",
       notGenerated: "Not generated",
       queued: "Queued",
@@ -1189,11 +1189,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       actions: "Actions",
       visibleLines: "{{count}} lines",
       selectedLines: "{{count}} selected",
-      loadingMore: "{{visible}} / {{total}} lines shown",
-      pageRange: "{{start}}-{{end}} / {{total}} lines",
-      pageIndex: "{{page}} / {{total}}",
-      previousPage: "Prev",
-      nextPage: "Next"
+      loadingMore: "{{visible}} / {{total}} lines shown"
     },
     history: {
       batch: "Batch",

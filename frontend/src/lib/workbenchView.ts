@@ -44,18 +44,6 @@ export interface HistoryPlayerSummary {
   audioPath: string | null;
 }
 
-export interface PaginationView<T> {
-  items: T[];
-  page: number;
-  pageSize: number;
-  totalItems: number;
-  totalPages: number;
-  startItem: number;
-  endItem: number;
-  hasPrevious: boolean;
-  hasNext: boolean;
-}
-
 export interface LineFocusState {
   activeLineId: string | null;
   expandedLineId: string | null;
@@ -202,26 +190,6 @@ export function generationMethodRouteLabels(methodId: GenerationMethodId): Gener
 
 export function scriptConsoleBodyMode(isEditing: boolean): ScriptConsoleBodyMode {
   return isEditing ? "edit" : "preview";
-}
-
-export function paginateItems<T>(items: T[], requestedPage: number, requestedPageSize: number): PaginationView<T> {
-  const pageSize = Math.max(1, Math.floor(requestedPageSize));
-  const totalItems = items.length;
-  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
-  const page = Math.min(totalPages, Math.max(1, Math.floor(requestedPage) || 1));
-  const startIndex = (page - 1) * pageSize;
-  const pageItems = items.slice(startIndex, startIndex + pageSize);
-  return {
-    items: pageItems,
-    page,
-    pageSize,
-    totalItems,
-    totalPages,
-    startItem: totalItems === 0 ? 0 : startIndex + 1,
-    endItem: totalItems === 0 ? 0 : startIndex + pageItems.length,
-    hasPrevious: page > 1,
-    hasNext: page < totalPages
-  };
 }
 
 export function roleAccentClass(index: number): string {
