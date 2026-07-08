@@ -20,6 +20,8 @@ data/.runtime/
 data/local/
 data/projects/
 data/demo/
+# Title-named project directories created by ProjectStore (sibling of data/)
+Project/
 data/lan-tts-demo/
 data/real-validation/
 data/validation/

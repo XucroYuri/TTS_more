@@ -11,6 +11,13 @@ from typing import Any
 from app.models import TTSServiceEndpoint
 
 
+def _is_windows() -> bool:
+    """Platform check isolated as a function so tests can mock it without
+    mutating the global ``os`` module (which would corrupt ``pathlib.Path``
+    on non-Windows hosts)."""
+    return os.name == "nt"
+
+
 class ServiceSupervisor:
     def __init__(self, project_root: Path, runtime_root: Path) -> None:
         self.project_root = project_root.resolve()
@@ -52,7 +59,7 @@ class ServiceSupervisor:
             "env": {**os.environ, **self._resolve_env(endpoint.env)},
             "close_fds": False,
         }
-        if os.name == "nt":
+        if _is_windows():
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         process = subprocess.Popen(command, **popen_kwargs)
         log_file.close()
@@ -73,7 +80,7 @@ class ServiceSupervisor:
             return {"status": "not running", "service_id": service_id}
         pid = record.get("pid")
         if pid:
-            if os.name == "nt":
+            if _is_windows():
                 subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, check=False)
             else:
                 try:
@@ -146,19 +153,28 @@ class ServiceSupervisor:
         return resolved
 
     def _resolve_path_env(self, value: str) -> str:
+        # The PATH value follows the convention of the *target* service config
+        # (Windows uses ";", POSIX uses ":"), not the host running this code.
+        # Using the host's os.pathsep would break PATH values authored for a
+        # different platform (e.g. a macOS host managing a Windows service).
+        separator = ";" if _is_windows() else ":"
         parts: list[str] = []
-        for item in value.replace("%PATH%", "{PATH}").split(os.pathsep):
+        for item in value.replace("%PATH%", "{PATH}").split(separator):
             if item == "{PATH}":
                 parts.append(os.environ.get("PATH", ""))
                 continue
-            path = Path(item)
-            if item and not path.is_absolute() and ("\\" in item or "/" in item):
+            # Normalize backslashes to forward slashes so that Path() treats
+            # Windows-style config values ("repo\GPT-SoVITS\bin") as a real
+            # path hierarchy on every host platform.
+            normalized = item.replace("\\", "/")
+            path = Path(normalized)
+            if normalized and not path.is_absolute() and ("/" in normalized):
                 candidate = (self.project_root / path).resolve(strict=False)
                 if self._inside_project(candidate):
                     parts.append(str(candidate))
                     continue
             parts.append(item)
-        return os.pathsep.join(part for part in parts if part)
+        return separator.join(part for part in parts if part)
 
     def _inside_project(self, path: Path) -> bool:
         try:
@@ -171,7 +187,7 @@ class ServiceSupervisor:
         if not pid:
             return False
         try:
-            if os.name == "nt":
+            if _is_windows():
                 result = subprocess.run(["tasklist", "/FI", f"PID eq {int(pid)}"], capture_output=True, text=True, check=False)
                 return str(pid) in result.stdout
             os.kill(int(pid), 0)

@@ -52,7 +52,9 @@ def test_supervisor_detaches_windows_process_group(monkeypatch, tmp_path: Path) 
         return FakePopen(command, **kwargs)
 
     monkeypatch.setattr("app.supervisor.subprocess.Popen", fake_popen)
-    monkeypatch.setattr("app.supervisor.os.name", "nt")
+    monkeypatch.setattr("app.supervisor._is_windows", lambda: True)
+    monkeypatch.setattr("app.supervisor.subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False)
+    monkeypatch.setattr("app.supervisor.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False)
     endpoint = TTSServiceEndpoint(
         service_id="local-indextts",
         engine=EngineName.INDEX_TTS,
@@ -65,7 +67,7 @@ def test_supervisor_detaches_windows_process_group(monkeypatch, tmp_path: Path) 
 
     supervisor.start(endpoint)
 
-    assert calls[0]["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
+    assert calls[0]["creationflags"] & 0x00000200
 
 
 def test_supervisor_passes_endpoint_environment_to_process(monkeypatch, tmp_path: Path) -> None:
@@ -102,6 +104,9 @@ def test_supervisor_resolves_path_environment_entries(monkeypatch, tmp_path: Pat
         return FakePopen(command, **kwargs)
 
     monkeypatch.setattr("app.supervisor.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("app.supervisor._is_windows", lambda: True)
+    monkeypatch.setattr("app.supervisor.subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False)
+    monkeypatch.setattr("app.supervisor.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False)
     monkeypatch.setenv("PATH", r"C:\System")
     endpoint = TTSServiceEndpoint(
         service_id="local-gpt-sovits",
@@ -151,7 +156,7 @@ def test_supervisor_stop_uses_pid_record_and_removes_it(monkeypatch, tmp_path: P
         return Completed()
 
     monkeypatch.setattr("app.supervisor.subprocess.run", fake_run)
-    monkeypatch.setattr("app.supervisor.os.name", "nt")
+    monkeypatch.setattr("app.supervisor._is_windows", lambda: True)
 
     result = supervisor.stop("local-indextts")
 

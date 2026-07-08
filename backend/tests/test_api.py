@@ -1089,8 +1089,13 @@ def test_open_source_tts_catalog_lists_core_providers_in_priority_order(tmp_path
     assert providers[2]["priority"] == 30
 
 
-def test_open_source_tts_detect_ignores_repo_path_for_gradio_endpoint_onboarding(tmp_path: Path) -> None:
+def test_open_source_tts_detect_ignores_repo_path_for_gradio_endpoint_onboarding(tmp_path: Path, monkeypatch) -> None:
     client = TestClient(create_app(data_root=tmp_path))
+
+    def _fake_get(self, url, *args, **kwargs):
+        raise ConnectionError("connection refused")
+
+    monkeypatch.setattr("httpx.Client.get", _fake_get)
 
     response = client.post(
         "/api/open-source-tts/detect",
