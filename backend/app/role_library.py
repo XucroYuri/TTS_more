@@ -412,6 +412,14 @@ def slugify_role_name(name: str) -> str:
             tokens.append(char.lower())
         elif char in PINYIN_FALLBACK:
             tokens.append(PINYIN_FALLBACK[char])
+        elif char.isascii():
+            # ASCII 非字母数字（标点、空白）作为分隔符跳过
+            continue
+        else:
+            # PINYIN_FALLBACK 未覆盖的 CJK / 全角字符：
+            # 不能丢弃，否则不同角色名会被压缩成同一 slug。
+            # 用 Unicode 码点 hex 占位，保证不同字符产出不同 token。
+            tokens.append(f"u{ord(char):04x}")
     if not tokens:
         tokens = [re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "role"]
     return "-".join(tokens)

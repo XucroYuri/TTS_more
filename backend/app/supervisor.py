@@ -18,6 +18,23 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def windows_creation_flags() -> int:
+    """Return Windows subprocess creation flags, or 0 on non-Windows / missing constants.
+
+    Uses ``hasattr`` guards so importing this module never references Windows-only
+    ``subprocess`` attributes on POSIX. Composed of ``CREATE_NEW_PROCESS_GROUP``
+    (0x00000200) and ``CREATE_NO_WINDOW`` (0x08000000) when available.
+    """
+    if not _is_windows():
+        return 0
+    flags = 0
+    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        flags |= subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        flags |= subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    return flags
+
+
 # Bare executable names that may be invoked as start_command[0] without being
 # an in-project path. These are resolved through PATH by the OS. Extend via
 # the TTS_MORE_ALLOWED_EXECUTABLES env var (os.pathsep-separated).
@@ -84,8 +101,9 @@ class ServiceSupervisor:
             "env": {**os.environ, **self._resolve_env(endpoint.env)},
             "close_fds": False,
         }
-        if _is_windows():
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        creation_flags = windows_creation_flags()
+        if creation_flags:
+            popen_kwargs["creationflags"] = creation_flags
         process = subprocess.Popen(command, **popen_kwargs)
         log_file.close()
         record = {

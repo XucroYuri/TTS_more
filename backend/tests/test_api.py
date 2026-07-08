@@ -4,8 +4,17 @@ import time
 
 from fastapi.testclient import TestClient
 
+from app.models import Character, ScriptLine
 from app.main import _layer_service_status, create_app
-from app.parser import ParserQualityError
+from app.parser import ParsedScriptDraft, ParserProviderUnavailable, ParserQualityError
+
+
+class StaticParser:
+    def __init__(self, draft: ParsedScriptDraft) -> None:
+        self.draft = draft
+
+    def parse(self, _text: str) -> ParsedScriptDraft:
+        return self.draft
 
 
 def test_health_reports_repos_and_workers(tmp_path: Path) -> None:
@@ -19,15 +28,13 @@ def test_health_reports_repos_and_workers(tmp_path: Path) -> None:
     assert {worker["engine"] for worker in payload["workers"]} == {"gpt-sovits", "indextts", "cosyvoice"}
 
 
-def test_parse_script_uses_rule_based_fallback(tmp_path: Path) -> None:
+def test_parse_script_requires_enabled_llm_parser(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path))
 
     response = client.post("/api/parse-script", json={"text": "小美（焦急）: 快走！"})
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["provider"] == "rule-based"
-    assert payload["lines"][0]["note"] == "焦急"
+    assert response.status_code == 503
+    assert "no enabled parser providers" in response.text
 
 
 def test_default_parser_provider_uses_kwjm_gpt_55(tmp_path: Path) -> None:
@@ -255,6 +262,40 @@ def test_parse_script_returns_422_when_parser_quality_gate_fails(tmp_path: Path)
     assert "SFX" in response.text
 
 
+def test_parse_script_reports_enabled_llm_unavailable_without_rule_fallback(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("TTS_MORE_TEST_MISSING_KEY", raising=False)
+    parser_config_path = tmp_path / "parser_providers.json"
+    parser_config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "missing-key-llm",
+                    "base_url": "https://example.invalid/v1",
+                    "api_key_env": "TTS_MORE_TEST_MISSING_KEY",
+                    "model": "fake",
+                    "enabled": True,
+                    "timeout_seconds": 30,
+                    "priority": 10,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(
+        create_app(
+            data_root=tmp_path,
+            parser_config_path=parser_config_path,
+            env_path=tmp_path / ".env.local",
+        )
+    )
+
+    response = client.post("/api/parse-script", json={"text": "旁白: 天亮了。"})
+
+    assert response.status_code == 503
+    assert "missing env TTS_MORE_TEST_MISSING_KEY" in response.text
+    assert "rule-based" not in response.text
+
+
 def test_create_parse_revision_quality_failure_does_not_mutate_project(tmp_path: Path) -> None:
     class QualityFailingParser:
         def parse(self, _text: str):
@@ -284,6 +325,40 @@ def test_create_parse_revision_quality_failure_does_not_mutate_project(tmp_path:
 
     assert response.status_code == 422
     assert "missing dialogue lines" in response.text
+    assert after["active_parse_revision_id"] == before["active_parse_revision_id"]
+    assert after["parse_revisions"] == before["parse_revisions"]
+    assert after["lines"] == before["lines"]
+
+
+def test_create_parse_revision_provider_unavailable_does_not_mutate_project(tmp_path: Path) -> None:
+    class UnavailableParser:
+        def parse(self, _text: str):
+            raise ParserProviderUnavailable("no enabled parser providers")
+
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put(
+        "/api/projects/demo",
+        json={
+            "title": "剧本 Demo",
+            "default_language": "zh",
+            "lines": [{"id": "l001", "character_id": "xiao-pin", "text": "旧台词"}],
+        },
+    )
+    script_revision = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "小品：新台词", "summary": "改台词"},
+    )
+    before = client.get("/api/projects/demo").json()
+    client.app.state.parser = UnavailableParser()
+
+    response = client.post(
+        "/api/projects/demo/parse-revisions",
+        json={"script_revision_id": script_revision.json()["revision"]["revision_id"]},
+    )
+    after = client.get("/api/projects/demo").json()
+
+    assert response.status_code == 503
+    assert "no enabled parser providers" in response.text
     assert after["active_parse_revision_id"] == before["active_parse_revision_id"]
     assert after["parse_revisions"] == before["parse_revisions"]
     assert after["lines"] == before["lines"]
@@ -829,6 +904,13 @@ def test_script_revision_api_creates_parse_branch_without_overwriting_manifest(t
         encoding="utf-8",
     )
     client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+    client.app.state.parser = StaticParser(
+        ParsedScriptDraft(
+            provider="llm-test",
+            characters=[Character(id="xiao-pin", name="小品")],
+            lines=[ScriptLine(id="l001", character_id="xiao-pin", note="坚定", text="新台词", language="zh")],
+        )
+    )
     client.put(
         "/api/projects/demo",
         json={
@@ -878,6 +960,7 @@ def test_script_revision_api_creates_parse_branch_without_overwriting_manifest(t
     assert payload["parse_revision"]["revision_id"] == payload["revision"]["revision_id"]
     assert payload["revision"]["script_revision_id"] == script_revision.json()["revision"]["revision_id"]
     assert payload["revision"]["parent_parse_revision_id"] == "parse-r001"
+    assert payload["revision"]["provider"] == "llm-test"
     assert payload["project"]["active_parse_revision_id"] == payload["revision"]["revision_id"]
     assert payload["project"]["lines"][0]["text"] == "新台词"
 
@@ -889,6 +972,13 @@ def test_script_revision_api_creates_parse_branch_without_overwriting_manifest(t
 
 def test_create_parse_revision_matches_project_characters_to_library(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path))
+    client.app.state.parser = StaticParser(
+        ParsedScriptDraft(
+            provider="llm-test",
+            characters=[Character(id="dui-zhang", name="队长")],
+            lines=[ScriptLine(id="l001", character_id="dui-zhang", note="虚弱", text="我们必须出发。", language="zh")],
+        )
+    )
     client.put(
         "/api/characters",
         json=[
@@ -935,6 +1025,7 @@ def test_create_parse_revision_matches_project_characters_to_library(tmp_path: P
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["revision"]["provider"] == "llm-test"
     mapping = payload["revision"]["project_characters"][0]
     assert mapping["project_character_id"] == payload["project"]["lines"][0]["character_id"]
     assert mapping["library_character_id"] == "zhu-jue"

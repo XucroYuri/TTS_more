@@ -4,7 +4,6 @@ import {
   CheckCircle2,
   Cpu,
   FileText,
-  FolderKanban,
   History,
   Languages,
   Library,
@@ -95,9 +94,9 @@ import { filterAndSortProjectSummaries, nextProjectAfterDelete } from "./lib/scr
 import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
-import { buildGradioEndpointRequest, gradioContractForProvider, sourceProfileForEndpointUrl } from "./lib/ttsAccess";
+import { buildGradioEndpointRequest, gradioContractForProvider } from "./lib/ttsAccess";
 import { createToast, inferToastLevel, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFocusTransition, paginateItems, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
   Character,
   CharacterReferenceAudioGroup,
@@ -132,10 +131,24 @@ import type {
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 type SaveState = "idle" | "saving" | "saved" | "error";
 type ServicePanelSection = "overview" | "open-source" | "tts" | "llm" | "resources" | "roles";
-type ScriptSourceMode = "project" | "manual";
 type ConfirmationTone = "warning" | "danger" | "info";
 const KWJM_TESTING_INDEX = -1;
-const LINE_PAGE_SIZE = 10;
+const LINE_LOAD_BATCH_SIZE = 40;
+const COSY_VOICE_MODE_OPTIONS = [
+  { id: "sft", labelKey: "inspector.cosyModeSft" },
+  { id: "zero_shot", labelKey: "inspector.cosyModeZeroShot" },
+  { id: "cross_lingual", labelKey: "inspector.cosyModeCrossLingual" },
+  { id: "instruct", labelKey: "inspector.cosyModeInstruct" }
+] as const;
+const INDEX_EMOTION_MODE_OPTIONS = [
+  { id: "same_as_voice", labelKey: "inspector.emotionSameAsVoice" },
+  { id: "emotion_text", labelKey: "inspector.emotionText" },
+  { id: "emotion_audio", labelKey: "inspector.emotionAudio" },
+  { id: "emotion_vector", labelKey: "inspector.emotionVector" }
+] as const;
+
+type CosyVoiceMode = (typeof COSY_VOICE_MODE_OPTIONS)[number]["id"];
+type IndexEmotionMode = (typeof INDEX_EMOTION_MODE_OPTIONS)[number]["id"];
 
 interface ConfirmationDialogState {
   title: string;
@@ -169,9 +182,9 @@ export default function App() {
   const [selectedHistoryVersions, setSelectedHistoryVersions] = useState<Record<string, string>>({});
   const [versionDrafts, setVersionDrafts] = useState<Record<string, InspectorVersionDraft & { version_id: string }>>({});
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
+  const [routeSettingsOpen, setRouteSettingsOpen] = useState(false);
   const [selectedLineIds, setSelectedLineIds] = useState<string[]>([]);
-  const [scriptInput, setScriptInput] = useState("");
-  const [scriptSourceMode, setScriptSourceMode] = useState<ScriptSourceMode>("project");
+  const [lineTextDrafts, setLineTextDrafts] = useState<Record<string, string>>({});
   const [parserProviders, setParserProviders] = useState<ParserProviderDraft[]>([]);
   const [roleLibraryCandidates, setRoleLibraryCandidates] = useState<RoleLibraryCandidate[]>([]);
   const [gptModelCatalog, setGptModelCatalog] = useState<RoleLibraryCandidate[]>([]);
@@ -181,7 +194,6 @@ export default function App() {
   const [activeProjectRoleId, setActiveProjectRoleId] = useState<string | null>(null);
   const [modelCatalogSamples, setModelCatalogSamples] = useState<Record<string, LogsReferenceAudioResponse>>({});
   const [loadingModelCatalogSamplesKey, setLoadingModelCatalogSamplesKey] = useState<string | null>(null);
-  const [isParsing, setIsParsing] = useState(false);
   const [isSavingParserConfig, setIsSavingParserConfig] = useState(false);
   const [testingParserProviderIndex, setTestingParserProviderIndex] = useState<number | null>(null);
   const [parserProviderTestResults, setParserProviderTestResults] = useState<Record<number, ParserProviderTestResponse>>({});
@@ -205,11 +217,9 @@ export default function App() {
   const [openSourceDetectResult, setOpenSourceDetectResult] = useState<OpenSourceTTSDetectResponse | null>(null);
   const [isDetectingOpenSource, setIsDetectingOpenSource] = useState(false);
   const [isConfiguringOpenSource, setIsConfiguringOpenSource] = useState(false);
-  const [isSidebarScriptEditing, setIsSidebarScriptEditing] = useState(false);
   const [newScriptTitle, setNewScriptTitle] = useState("");
   const [newScriptSource, setNewScriptSource] = useState("");
   const [isCreatingScript, setIsCreatingScript] = useState(false);
-  const [isScriptManagerOpen, setIsScriptManagerOpen] = useState(false);
   const [managerSearchText, setManagerSearchText] = useState("");
   const [managedProjectId, setManagedProjectId] = useState<string | null>(null);
   const [managedProject, setManagedProject] = useState<ScriptProject | null>(null);
@@ -279,7 +289,8 @@ export default function App() {
   const [characterFilter, setCharacterFilter] = useState("all");
   const [providerFilter, setProviderFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState<LineStatusFilter>("all");
-  const [linePage, setLinePage] = useState(1);
+  const [visibleLineCount, setVisibleLineCount] = useState(LINE_LOAD_BATCH_SIZE);
+  const lineLoadMoreRef = useRef<HTMLDivElement | null>(null);
 
   function requestConfirmation(dialog: ConfirmationDialogState): Promise<boolean> {
     confirmationResolverRef.current?.(false);
@@ -324,16 +335,12 @@ export default function App() {
       setSelectedHistoryVersions({});
       setVersionDrafts({});
       setSelectedLineIds([]);
-      setScriptInput("");
-      setScriptSourceMode("project");
-      setIsSidebarScriptEditing(false);
+      setLineTextDrafts({});
       setIsProjectLoaded(true);
       setSaveState("idle");
       return;
     }
     setIsProjectLoaded(false);
-    setScriptSourceMode("project");
-    setIsSidebarScriptEditing(false);
     fetchProject(currentProjectId)
       .then((payload) => {
         setProject(payload);
@@ -341,6 +348,7 @@ export default function App() {
         setExpandedLineId(null);
         setSelectedHistoryVersions({});
         setVersionDrafts({});
+        setLineTextDrafts({});
         setIsProjectLoaded(true);
         return fetchProjectCharacters(currentProjectId)
           .then((projectCharactersPayload) => {
@@ -355,9 +363,7 @@ export default function App() {
         setSelectedHistoryVersions({});
         setVersionDrafts({});
         setSelectedLineIds([]);
-        setScriptInput("");
-        setScriptSourceMode("project");
-        setIsSidebarScriptEditing(false);
+        setLineTextDrafts({});
         setIsProjectLoaded(true);
         setNotice(t("empty.projectLoadFailed"));
       });
@@ -389,10 +395,6 @@ export default function App() {
   const resolvedCharacters = useMemo(() => resolveProjectCharacters(projectWithCharacters, characters), [characters, projectWithCharacters]);
   const projectRoleRows = useMemo(() => projectCharacterRows(projectWithCharacters, characters), [characters, projectWithCharacters]);
 
-  useEffect(() => {
-    if (!isProjectLoaded || scriptSourceMode !== "project") return;
-    setScriptInput(projectToScriptSourceText(projectWithCharacters, characters));
-  }, [characters, isProjectLoaded, projectWithCharacters, scriptSourceMode]);
   const filteredLibraryCharacters = useMemo(() => {
     const query = roleLibrarySearch.trim().toLocaleLowerCase();
     if (!query) return characters;
@@ -465,6 +467,8 @@ export default function App() {
   const activeVersionDraft = activeLine ? versionDrafts[activeLine.id] : undefined;
   const activeInspectorMode = inspectorPanelMode(selectedHistoryVersion?.version_id);
   const activeSummary = useMemo(() => summarizeLineHistory(activeLine ? lineHistoryForLine(manifest, activeLine) : undefined), [activeLine, manifest]);
+  const activePlayableVersion = useMemo(() => newestPlayableVersion(activeVersions), [activeVersions]);
+  const activeLineTextDraft = activeLine ? lineTextDrafts[activeLine.id] ?? activeLine.text : "";
   const activeBindings = useMemo(() => (activeLine ? bindingsForLine(activeLine, resolvedCharacters) : []), [activeLine, resolvedCharacters]);
   const activeBinding = useMemo(() => (activeLine ? lineBinding(activeLine, resolvedCharacters) : undefined), [activeLine, resolvedCharacters]);
   const activeProfiles = useMemo(() => (activeLine ? profilesForLine(activeLine, resolvedCharacters) : []), [activeLine, resolvedCharacters]);
@@ -492,10 +496,19 @@ export default function App() {
     () => (!activeVersionDraft && activeLine?.service_override ? clearServiceScopedBindingConfig(activeProvider, activeRawBindingConfig) : activeRawBindingConfig),
     [activeLine?.service_override, activeProvider, activeRawBindingConfig, activeVersionDraft]
   );
+  const cosyVoiceMode = cosyVoiceModeFromConfig(activeBindingConfig.mode);
+  const indexEmotionMode = indexEmotionModeFromConfig(activeBindingConfig.emotion_mode);
+  const cosyVoiceNeedsSpeaker = cosyVoiceMode === "sft" || cosyVoiceMode === "instruct";
+  const cosyVoiceNeedsPrompt = cosyVoiceMode === "zero_shot" || cosyVoiceMode === "cross_lingual";
+  const cosyVoiceNeedsInstruction = cosyVoiceMode === "instruct";
 
   useEffect(() => {
     setDiagnosticsExpanded(false);
   }, [activeLine?.id, activeServiceId]);
+
+  useEffect(() => {
+    setRouteSettingsOpen(false);
+  }, [activeLine?.id, activeGenerationMethod]);
 
   const activeLogsReferenceRequest = useMemo(
     () => logsReferenceRequest(activeProvider, activeServiceId, activeBindingConfig),
@@ -504,6 +517,8 @@ export default function App() {
   const activeLogsReferencePayload = activeLogsReferenceRequest ? logsReferenceAudio[activeLogsReferenceRequest.key] : undefined;
   const activeLogsReferenceSamples = activeLogsReferencePayload?.samples ?? [];
   const activeLogsReferenceSample = selectedLogsReferenceSample(activeLogsReferenceSamples, activeBindingConfig, { serviceId: activeServiceId });
+  const activeReferenceAudioPath = activeProvider === "gpt-sovits" ? activeLogsReferenceSample?.path ?? stringConfig(activeBindingConfig.ref_audio_path) : "";
+  const activeReferenceAudioLabel = activeLogsReferenceSample?.display_label || shortPath(activeReferenceAudioPath) || t("inspector.referenceAudio");
   const staleLogsReferenceServiceId = stringConfig(activeBindingConfig.logs_reference_service_id);
   const isLogsReferenceFromOtherService = Boolean(activeProvider === "gpt-sovits" && staleLogsReferenceServiceId && activeServiceId && staleLogsReferenceServiceId !== activeServiceId);
   const candidateReferenceGroups = useMemo(
@@ -527,32 +542,37 @@ export default function App() {
       }),
     [characterFilter, manifest, project.lines, providerFilter, resolvedCharacters, searchText, statusFilter]
   );
-  const paginatedLines = useMemo(() => paginateItems(filteredLines, linePage, LINE_PAGE_SIZE), [filteredLines, linePage]);
+  const displayedLines = useMemo(() => filteredLines.slice(0, visibleLineCount), [filteredLines, visibleLineCount]);
+  const hasMoreFilteredLines = displayedLines.length < filteredLines.length;
   const selectedLines = useMemo(() => project.lines.filter((line) => selectedLineIds.includes(line.id)), [project.lines, selectedLineIds]);
   const providerOptions = useMemo(() => Array.from(new Set(project.lines.map((line) => lineBinding(line, resolvedCharacters)?.provider_type ?? "unassigned"))), [project.lines, resolvedCharacters]);
+  const lineToolbarState = lineFilterToolbarState({
+    providerFilter,
+    statusFilter,
+    selectedLineCount: selectedLineIds.length,
+    filteredLineCount: filteredLines.length,
+    labels: {
+      filtersMore: t("filters.more"),
+      selectedLines: (count) => t("table.selectedLines", { count }),
+      visibleLines: (count) => t("table.visibleLines", { count }),
+      status: (status) => statusText(status, t)
+    }
+  });
+  const lineFilterTitle = lineToolbarState.title;
+  const visibleLineLabel = lineToolbarState.countLabel;
   const selectedLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language ?? defaultLanguage);
   const selectedLanguageLabel = languageOptions.find((option) => option.value === selectedLanguage)?.label ?? selectedLanguage;
-  const displayProjectTitle = project.title || currentProjectId ? standardProjectName(project.title || currentProjectId || "") : t("empty.noProjectSelected");
-  const scriptSourceTone = scriptSourceMode === "project" ? "completed" : "queued";
-  const scriptSourceLabel = t(`parser.source.${scriptSourceMode}`);
-  const scriptSourceHint = t(`parser.sourceHint.${scriptSourceMode}`, { projectLines: project.lines.length });
   const projectRows = useMemo<ProjectSummary[]>(() => projectSummaries, [projectSummaries]);
-  const scriptConsoleText = useMemo(
-    () => scriptInput || projectToScriptSourceText(projectWithCharacters, characters),
-    [characters, projectWithCharacters, scriptInput]
-  );
-  const scriptConsoleMode = scriptConsoleBodyMode(isSidebarScriptEditing);
 
   useEffect(() => {
-    if (!isScriptManagerOpen) return;
     setManagedProjectId((current) => {
       if (current && projectRows.some((item) => item.project_id === current)) return current;
       return currentProjectId ?? projectRows[0]?.project_id ?? null;
     });
-  }, [currentProjectId, isScriptManagerOpen, projectRows]);
+  }, [currentProjectId, projectRows]);
 
   useEffect(() => {
-    if (!isScriptManagerOpen || !managedProjectId) {
+    if (!managedProjectId) {
       setManagedProject(null);
       setManagerTitleDraft("");
       setManagerSourceDraft("");
@@ -584,17 +604,31 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [characters, currentProjectId, isProjectLoaded, isScriptManagerOpen, managedProjectId, projectWithCharacters, setNotice, t]);
+  }, [characters, currentProjectId, isProjectLoaded, managedProjectId, projectWithCharacters, setNotice, t]);
 
   useEffect(() => {
-    setLinePage(1);
+    setVisibleLineCount(LINE_LOAD_BATCH_SIZE);
   }, [characterFilter, currentProjectId, providerFilter, searchText, statusFilter]);
 
   useEffect(() => {
-    if (linePage !== paginatedLines.page) {
-      setLinePage(paginatedLines.page);
+    if (!hasMoreFilteredLines) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setVisibleLineCount(filteredLines.length);
+      return;
     }
-  }, [linePage, paginatedLines.page]);
+    const target = lineLoadMoreRef.current;
+    if (!target) return;
+    const root = target.closest(".line-table");
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      setVisibleLineCount((current) => Math.min(filteredLines.length, current + LINE_LOAD_BATCH_SIZE));
+    }, {
+      root,
+      rootMargin: "160px 0px"
+    });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [filteredLines.length, hasMoreFilteredLines]);
 
   const visibleServices = useMemo(() => services.filter((service) => !isUnsupportedLocalVibeVoice(service)), [services]);
   const ttsServices = useMemo(() => visibleServices.filter((service) => service.service_kind !== "llm-parser"), [visibleServices]);
@@ -609,6 +643,18 @@ export default function App() {
     [roleLibraryTtsServices]
   );
   const serviceById = useMemo(() => new Map(visibleServices.map((service) => [service.service_id ?? "", service])), [visibleServices]);
+  const activeService = activeServiceId ? serviceById.get(activeServiceId) : undefined;
+  const activeProfileValue = activeLine ? activeVersionDraft?.profile ?? lineProfile(activeLine, resolvedCharacters) : "";
+  const activeProfileLabel = activeLine?.temporary_binding
+    ? t("inspector.temporaryBinding")
+    : activeProfiles.find((profile) => profile.id === activeProfileValue)?.name || activeProfileValue || t("inspector.noProfile");
+  const activeBindingLabel = activeVersionDraft?.binding_id
+    ?? activeBinding?.binding_id
+    ?? (activeLine?.temporary_binding ? `${t("inspector.temporaryBinding")} · ${activeLine.temporary_binding.provider_type}` : t("inspector.profileDefault"));
+  const activeServiceLabel = activeServiceId
+    ? serviceDisplayName(activeService ?? ({ engine: activeProvider, display_name: activeServiceId, ready: false } as WorkerHealth))
+    : t("inspector.autoRoute");
+  const activeServiceContract = activeService?.api_contract ?? activeProvider;
   const localServiceCount = useMemo(() => visibleServices.filter((service) => ["gpt-sovits", "indextts"].includes(service.provider_type ?? service.engine)), [visibleServices]);
   const paidServiceCount = useMemo(() => visibleServices.filter((service) => service.capabilities?.includes("paid_provider")), [visibleServices]);
   const serviceSummary = useMemo(() => serviceTopbarSummary(visibleServices, voiceCandidates, parserProviders), [parserProviders, visibleServices, voiceCandidates]);
@@ -655,6 +701,11 @@ export default function App() {
       ? queueProcessedItems / queueTotalItems
       : 0;
   const queueProgressPercent = Math.round(Math.max(0, Math.min(1, queueProgressRatio)) * 100);
+  const queueHasWork = queueTotalItems > 0 || queueJobs.length > 0;
+  const queueTopbarEntryVisible = queueHasWork || Boolean(queueActiveJob);
+  const queueSyncLabel = isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced");
+  const queueVisibleStatusLabel = queueActiveJob ? statusText(queueActiveJob.status, t) : queueSyncLabel;
+  const queueVisibleTone = queueActiveJob ? queueStatusTone(queueActiveJob.status) : isRefreshingTopology ? "running" : "idle";
   const topologyModalTitle =
     servicePanelSection === "roles"
       ? t("characters.libraryManager")
@@ -706,12 +757,22 @@ export default function App() {
     if (!activeLogsReferenceRequest) return;
     if (logsReferenceAudio[activeLogsReferenceRequest.key]) return;
     setLoadingLogsReferenceKey(activeLogsReferenceRequest.key);
-    fetchLogsReferenceAudio({
-      serviceId: activeLogsReferenceRequest.serviceId,
-      logsName: activeLogsReferenceRequest.logsName,
-      gptWeightsPath: activeLogsReferenceRequest.gptWeightsPath,
-      sovitsWeightsPath: activeLogsReferenceRequest.sovitsWeightsPath,
-    })
+    const referenceService = (activeLogsReferenceRequest.serviceId ? serviceById.get(activeLogsReferenceRequest.serviceId) : undefined)
+      ?? activeRouteServices.find(isGptSovitsApiV2Service);
+    const referenceServiceId = activeLogsReferenceRequest.serviceId || referenceService?.service_id || null;
+    const referenceRequest = isGptSovitsApiV2Service(referenceService)
+      ? fetchGptSovitsModelSamples({
+        serviceId: referenceServiceId,
+        logsName: activeLogsReferenceRequest.logsName,
+        limit: 120
+      })
+      : fetchLogsReferenceAudio({
+        serviceId: referenceServiceId,
+        logsName: activeLogsReferenceRequest.logsName,
+        gptWeightsPath: activeLogsReferenceRequest.gptWeightsPath,
+        sovitsWeightsPath: activeLogsReferenceRequest.sovitsWeightsPath,
+      });
+    referenceRequest
       .then((payload) => setLogsReferenceAudio((current) => ({ ...current, [activeLogsReferenceRequest.key]: payload })))
       .catch(() => setLogsReferenceAudio((current) => ({
         ...current,
@@ -723,7 +784,7 @@ export default function App() {
         }
       })))
       .finally(() => setLoadingLogsReferenceKey((current) => (current === activeLogsReferenceRequest.key ? null : current)));
-  }, [activeLogsReferenceRequest, logsReferenceAudio, t]);
+  }, [activeLogsReferenceRequest, activeRouteServices, logsReferenceAudio, serviceById, t]);
 
   useEffect(() => {
     if (!activeModelCatalogItem || !activeModelSamplesKey) return;
@@ -833,6 +894,42 @@ export default function App() {
     }
   }
 
+  async function detectAndSaveOpenSourceService() {
+    setIsDetectingOpenSource(true);
+    setIsConfiguringOpenSource(true);
+    try {
+      const detectPayload = await detectOpenSourceTTS({
+        provider_type: selectedOpenSourceProvider,
+        repo_path: null,
+        base_url: openSourceBaseUrl || null,
+        api_contract: gradioContractForProvider(selectedOpenSourceProvider)
+      });
+      setOpenSourceDetectResult(detectPayload);
+      if (!["partial", "ready"].includes(detectPayload.setup_state)) {
+        setNotice(t("services.openSourceDetectNotSaved", { state: setupStateLabel(detectPayload.setup_state, t) }));
+        return;
+      }
+      const payload = await configureOpenSourceTTS({
+        ...buildGradioEndpointRequest({
+          provider_type: selectedOpenSourceProvider,
+          display_name: openSourceDisplayName || null,
+          base_url: openSourceBaseUrl,
+          resource_group: openSourceResourceGroup,
+          capacity: openSourceCapacity,
+          enabled: true,
+        })
+      });
+      setOpenSourceDetectResult(payload.detect);
+      setNotice(t("services.openSourceDetectAndSaveDone", { state: setupStateLabel(payload.detect.setup_state, t) }));
+      await refreshTopology(true);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("services.openSourceSaveFailed"));
+    } finally {
+      setIsDetectingOpenSource(false);
+      setIsConfiguringOpenSource(false);
+    }
+  }
+
   async function refreshProjects(preferredProjectId?: string | null) {
     try {
       const payload = await fetchProjects();
@@ -875,9 +972,6 @@ export default function App() {
       setSelectedLineIds([]);
       setSelectedHistoryVersions({});
       setVersionDrafts({});
-      setScriptInput(source);
-      setScriptSourceMode(source ? "project" : "manual");
-      setIsSidebarScriptEditing(!source);
       setManagedProjectId(projectId);
       setManagedProject(savedProject);
       setManagerTitleDraft(savedProject.title);
@@ -917,55 +1011,6 @@ export default function App() {
     });
   }
 
-  async function saveScriptRevisionOnly() {
-    if (!currentProjectId) {
-      setNotice(t("empty.noProjectAction"));
-      return;
-    }
-    if (!(await confirmRevisionRisk())) return;
-    setSaveState("saving");
-    try {
-      const payload = await createScriptRevision(currentProjectId, scriptInput, t("script.currentSource"));
-      setProject(payload.project);
-      setScriptSourceMode("project");
-      setIsSidebarScriptEditing(false);
-      setSaveState("saved");
-      setNotice(t("notice.projectSaved"));
-      await refreshProjects();
-    } catch (error) {
-      setSaveState("error");
-      setNotice(error instanceof Error ? error.message : t("notice.autoSaveFailed"));
-    }
-  }
-
-  async function parseAsRevision() {
-    if (!currentProjectId) {
-      setNotice(t("empty.noProjectAction"));
-      return;
-    }
-    if (!(await confirmRevisionRisk())) return;
-    setIsParsing(true);
-    setNotice(t("parser.parsing"));
-    try {
-      const scriptPayload = await createScriptRevision(currentProjectId, scriptInput, t("script.parseRevision"));
-      const parsePayload = await createParseRevision(currentProjectId, scriptPayload.script_revision.revision_id);
-      setProject(parsePayload.project);
-      setScriptSourceMode("project");
-      setIsSidebarScriptEditing(false);
-      setActiveLineId(parsePayload.project.lines[0]?.id ?? "");
-      setExpandedLineId(null);
-      setSelectedLineIds([]);
-      setSelectedHistoryVersions({});
-      setVersionDrafts({});
-      setNotice(t("script.parseApplied"));
-      await refreshProjects();
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : t("parser.parseFailed"));
-    } finally {
-      setIsParsing(false);
-    }
-  }
-
   async function activateProjectRevision(parseRevisionId: string) {
     const revision = project.parse_revisions?.find((item) => item.revision_id === parseRevisionId);
     if (!revision) return;
@@ -980,19 +1025,6 @@ export default function App() {
     setActiveLineId(revision.lines[0]?.id ?? "");
     setExpandedLineId(null);
     setSelectedLineIds([]);
-  }
-
-  function updateScriptInput(value: string) {
-    setScriptInput(value);
-    setScriptSourceMode("manual");
-  }
-
-  function beginSidebarScriptEdit() {
-    if (!scriptInput) {
-      setScriptInput(projectToScriptSourceText(projectWithCharacters, characters));
-    }
-    setScriptSourceMode("manual");
-    setIsSidebarScriptEditing(true);
   }
 
   function updateParserProvider(index: number, patch: Partial<ParserProviderDraft>) {
@@ -1301,9 +1333,6 @@ export default function App() {
       setSelectedHistoryVersions({});
       setVersionDrafts({});
     }
-    if (scriptSourceMode === "project") {
-      setScriptInput(projectToScriptSourceText(nextProject, characters));
-    }
   }
 
   async function renameManagedProject() {
@@ -1332,7 +1361,12 @@ export default function App() {
 
   async function saveManagedScriptRevision() {
     if (!managedProjectId || !managedProject) return;
+    const title = managerTitleDraft.trim();
     const source = managerSourceDraft.trim();
+    if (!title) {
+      setNotice(t("script.newScriptTitleRequired"));
+      return;
+    }
     if (!source) {
       setNotice(t("script.sourceRequired"));
       return;
@@ -1340,12 +1374,14 @@ export default function App() {
     if (!(await confirmRevisionRisk(managedProject))) return;
     setIsManagerSaving(true);
     try {
+      if (title !== managedProject.title) {
+        await saveProject(managedProjectId, { ...managedProject, title });
+      }
       const payload = await createScriptRevision(managedProjectId, source, t("script.currentSource"));
       setManagedProject(payload.project);
       setManagerTitleDraft(payload.project.title);
       setManagerSourceDraft(projectToScriptSourceText(payload.project, characters));
       applyManagedProjectToWorkspace(managedProjectId, payload.project);
-      setScriptSourceMode(managedProjectId === currentProjectId ? "project" : scriptSourceMode);
       setSaveState("saved");
       setNotice(t("notice.projectSaved"));
       await refreshProjects(currentProjectId);
@@ -1359,7 +1395,12 @@ export default function App() {
 
   async function parseManagedScriptRevision() {
     if (!managedProjectId || !managedProject) return;
+    const title = managerTitleDraft.trim();
     const source = managerSourceDraft.trim();
+    if (!title) {
+      setNotice(t("script.newScriptTitleRequired"));
+      return;
+    }
     if (!source) {
       setNotice(t("script.sourceRequired"));
       return;
@@ -1368,6 +1409,9 @@ export default function App() {
     setIsManagerParsing(true);
     setNotice(t("parser.parsing"));
     try {
+      if (title !== managedProject.title) {
+        await saveProject(managedProjectId, { ...managedProject, title });
+      }
       const scriptPayload = await createScriptRevision(managedProjectId, source, t("script.parseRevision"));
       const parsePayload = await createParseRevision(managedProjectId, scriptPayload.script_revision.revision_id);
       setManagedProject(parsePayload.project);
@@ -1566,15 +1610,34 @@ export default function App() {
     }));
   }
 
+  function updateLineTextDraft(lineId: string, text: string) {
+    setLineTextDrafts((current) => ({ ...current, [lineId]: text }));
+  }
+
+  function resetLineTextDraft(lineId: string) {
+    setLineTextDrafts((current) => {
+      const next = { ...current };
+      delete next[lineId];
+      return next;
+    });
+  }
+
+  function lineWithGenerationText(line: ScriptLine): ScriptLine {
+    const draft = lineTextDrafts[line.id];
+    if (draft === undefined || draft === line.text) return line;
+    return { ...line, text: draft };
+  }
+
   async function runInspectorGeneration() {
     if (!activeLine) return;
+    const lineForGeneration = lineWithGenerationText(activeLine);
     if (!activeVersionDraft) {
-      await runQueue([activeLine]);
+      await runQueue([lineForGeneration]);
       return;
     }
     const provider = activeVersionDraft.provider_type ?? activeProvider;
     const lineFromDraft: ScriptLine = {
-      ...activeLine,
+      ...lineForGeneration,
       engine_override: engineFromProvider(provider),
       profile_override: activeVersionDraft.profile,
       binding_override: null,
@@ -1592,10 +1655,47 @@ export default function App() {
   }
 
   function toggleVisibleSelection() {
-    const visibleIds = paginatedLines.items.map((line) => line.id);
+    const visibleIds = displayedLines.map((line) => line.id);
     const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedLineIds.includes(id));
     setSelectedLineIds(allVisibleSelected ? selectedLineIds.filter((id) => !visibleIds.includes(id)) : Array.from(new Set([...selectedLineIds, ...visibleIds])));
   }
+
+  const scriptManagerPane = (
+    <ScriptManagerModal
+      open
+      variant="inline"
+      projects={projectRows}
+      currentProjectId={currentProjectId}
+      selectedProjectId={managedProjectId}
+      selectedProject={managedProject}
+      isSelectedProjectLoading={isManagedProjectLoading}
+      searchText={managerSearchText}
+      titleDraft={managerTitleDraft}
+      sourceDraft={managerSourceDraft}
+      newScriptTitle={newScriptTitle}
+      newScriptSource={newScriptSource}
+      isCreatingScript={isCreatingScript}
+      isSavingScript={isManagerSaving}
+      isParsingScript={isManagerParsing}
+      deletingProjectId={deletingProjectId}
+      onClose={() => undefined}
+      onSearchTextChange={setManagerSearchText}
+      onSelectProject={setManagedProjectId}
+      onOpenProject={(projectId) => {
+        switchProject(projectId);
+        setManagedProjectId(projectId);
+      }}
+      onTitleDraftChange={setManagerTitleDraft}
+      onSourceDraftChange={setManagerSourceDraft}
+      onNewScriptTitleChange={setNewScriptTitle}
+      onNewScriptSourceChange={setNewScriptSource}
+      onCreateScript={() => void createNewScriptProject()}
+      onRenameScript={() => void renameManagedProject()}
+      onSaveRevision={() => void saveManagedScriptRevision()}
+      onParseRevision={() => void parseManagedScriptRevision()}
+      onDeleteScript={() => void deleteManagedProject()}
+    />
+  );
 
   return (
     <div className="app-shell">
@@ -1609,110 +1709,11 @@ export default function App() {
           </div>
         </div>
 
-        <section className="panel compact parser-panel script-console-panel">
-          <div className="script-inline-manager" aria-label={t("script.managerTitle")}>
-            <div className="script-inline-manager-head">
-              <FolderKanban size={14} />
-              <div>
-                <span>{t("script.managerTitle")}</span>
-                <strong>{displayProjectTitle}</strong>
-              </div>
-              <StatusPill tone={scriptSourceTone} label={scriptSourceLabel} />
-            </div>
-
-            <section className="script-sidebar-current" aria-label={t("script.activeScript")}>
-              <div className="script-sidebar-current-title">
-                <span>{t("app.projectCount", { count: projectRows.length })}</span>
-                <strong>{displayProjectTitle}</strong>
-              </div>
-              <div className="script-sidebar-stats">
-                <div><span>{t("script.lineCount")}</span><strong>{project.lines.length}</strong></div>
-                <div><span>{t("script.characters")}</span><strong>{projectCharacters.length}</strong></div>
-                <div><span>{t("script.parseRevisions")}</span><strong>{project.parse_revisions?.length ?? 0}</strong></div>
-              </div>
-              <button className="secondary-button script-manager-open-button" type="button" onClick={() => setIsScriptManagerOpen(true)}>
-                <FolderKanban size={14} /> {t("script.manageScript")}
-              </button>
-              {projectRows.length === 0 && <span className="script-sidebar-empty-hint">{t("empty.noProjectsHint")}</span>}
-            </section>
-          </div>
-
-          <div className={`script-console-preview source-${scriptSourceMode} mode-${scriptConsoleMode}`}>
-            <div className="script-console-preview-head">
-              <div>
-                <span>{t("script.currentSource")}</span>
-                <strong>{scriptSourceLabel}</strong>
-              </div>
-              <div className="script-console-preview-actions">
-                {scriptConsoleMode === "edit" ? (
-                  <button className="secondary-button compact-button" type="button" onClick={() => setIsSidebarScriptEditing(false)}>
-                    {t("script.previewSource")}
-                  </button>
-                ) : (
-                  <button className="secondary-button compact-button" type="button" onClick={beginSidebarScriptEdit}>
-                    <FileText size={13} /> {t("script.editSource")}
-                  </button>
-                )}
-              </div>
-            </div>
-            {scriptConsoleMode === "edit" ? (
-              <textarea
-                className="script-console-editor"
-                value={scriptInput}
-                onChange={(event) => updateScriptInput(event.target.value)}
-                aria-label={t("script.editSource")}
-              />
-            ) : scriptConsoleText.trim().length > 0 ? (
-              <div className="script-console-markdown markdown-preview" aria-label={t("script.previewSource")}>
-                {renderMarkdownPreview(scriptConsoleText)}
-              </div>
-            ) : (
-              <div className="empty-row compact">{t("empty.noProjectsHint")}</div>
-            )}
-          </div>
-
-          <div className="script-console-actions">
-            <button className="primary-button script-extract-button" onClick={() => void parseAsRevision()} disabled={isParsing || !currentProjectId}>
-              {isParsing ? <Loader2 className="spin" size={15} /> : <Wand2 size={15} />} {t("script.parseRevision")}
-            </button>
-          </div>
+        <section className="panel compact parser-panel script-workspace-panel">
+          {scriptManagerPane}
         </section>
 
       </aside>
-
-      <ScriptManagerModal
-        open={isScriptManagerOpen}
-        projects={projectRows}
-        currentProjectId={currentProjectId}
-        selectedProjectId={managedProjectId}
-        selectedProject={managedProject}
-        isSelectedProjectLoading={isManagedProjectLoading}
-        searchText={managerSearchText}
-        titleDraft={managerTitleDraft}
-        sourceDraft={managerSourceDraft}
-        newScriptTitle={newScriptTitle}
-        newScriptSource={newScriptSource}
-        isCreatingScript={isCreatingScript}
-        isSavingScript={isManagerSaving}
-        isParsingScript={isManagerParsing}
-        deletingProjectId={deletingProjectId}
-        onClose={() => setIsScriptManagerOpen(false)}
-        onSearchTextChange={setManagerSearchText}
-        onSelectProject={setManagedProjectId}
-        onOpenProject={(projectId) => {
-          switchProject(projectId);
-          setManagedProjectId(projectId);
-        }}
-        onTitleDraftChange={setManagerTitleDraft}
-        onSourceDraftChange={setManagerSourceDraft}
-        onNewScriptTitleChange={setNewScriptTitle}
-        onNewScriptSourceChange={setNewScriptSource}
-        onCreateScript={() => void createNewScriptProject()}
-        onRenameScript={() => void renameManagedProject()}
-        onSaveRevision={() => void saveManagedScriptRevision()}
-        onParseRevision={() => void parseManagedScriptRevision()}
-        onDeleteScript={() => void deleteManagedProject()}
-      />
 
       <main className="workspace">
         <header className="topbar">
@@ -1729,23 +1730,27 @@ export default function App() {
               <Library size={15} />
               <span className="menu-trigger-label">{t("topbar.roleLibrary")}</span>
             </button>
-            <button
-              className={`topbar-action-button menu-trigger ${servicePanelSection === "resources" && isTopologyMenuOpen ? "active" : ""}`}
-              onClick={() => {
-                setServicePanelSection("resources");
-                setIsTopologyMenuOpen(true);
-              }}
-              title={t("services.resourceQueueTitle")}
-            >
-              <History size={15} />
-              <span className="menu-trigger-label">{t("topbar.resourceQueue")}</span>
-            </button>
+            {queueTopbarEntryVisible && (
+              <button
+                className={`topbar-action-button menu-trigger ${servicePanelSection === "resources" && isTopologyMenuOpen ? "active" : ""}`}
+                onClick={() => {
+                  setServicePanelSection("resources");
+                  setIsTopologyMenuOpen(true);
+                }}
+                title={t("services.resourceQueueTitle")}
+              >
+                <History size={15} />
+                <span className="menu-trigger-label">{t("topbar.resourceQueue")}</span>
+              </button>
+            )}
             <div className="topbar-menu-wrap topbar-config-actions">
               <button
                 className={`topbar-action-button menu-trigger service-status-trigger tone-${serviceSummary.parser.tone} ${servicePanelSection === "llm" && isTopologyMenuOpen ? "active" : ""}`}
                 onClick={() => {
+                  const shouldOpen = servicePanelSection !== "llm" || !isTopologyMenuOpen;
                   setServicePanelSection("llm");
-                  setIsTopologyMenuOpen((open) => servicePanelSection === "llm" ? !open : true);
+                  setIsTopologyMenuOpen(shouldOpen);
+                  if (shouldOpen) setIsLlmAdvancedOpen(false);
                 }}
                 title={llmTopbarTitle(serviceSummary, t)}
               >
@@ -1831,16 +1836,7 @@ export default function App() {
                         {servicePanelSection === "open-source" && (
                           <div className="tts-access-panel">
                             <section className="tts-access-card tts-access-primary">
-                              <div className="open-source-panel-head">
-                                <div>
-                                  <strong>{selectedOpenSourceCatalog?.display_name ?? t("services.openSourceProvider")}</strong>
-                                  <span>{t("services.ttsAccessDescription")}</span>
-                                </div>
-                                <button className="secondary-button compact-button" onClick={() => void refreshOpenSourceCatalog()}>
-                                  <RefreshCw size={13} /> {t("actions.refresh")}
-                                </button>
-                              </div>
-                              <div className="tts-provider-segment">
+                              <div className="tts-provider-segment" aria-label={t("services.openSourceChooseEngine")}>
                                 {openSourceCatalog.map((item) => (
                                   <button
                                     className={`open-source-mode-card ${selectedOpenSourceProvider === item.provider_type ? "active" : ""}`}
@@ -1849,74 +1845,75 @@ export default function App() {
                                     type="button"
                                   >
                                     <strong>{item.display_name}</strong>
-                                    <span>{providerLabel(item.provider_type)}</span>
                                   </button>
                                 ))}
                                 {openSourceCatalog.length === 0 && <div className="empty-row">{t("services.openSourceNoCatalog")}</div>}
                               </div>
                               <div className="open-source-form-grid tts-access-form">
-                                <label>
-                                  <span>{t("services.openSourceDisplayName")}</span>
-                                  <input value={openSourceDisplayName} onChange={(event) => setOpenSourceDisplayName(event.target.value)} placeholder={selectedOpenSourceCatalog?.display_name} />
-                                </label>
                                 <label className="wide">
                                   <span>{t("services.openSourceBaseUrl")}</span>
                                   <input value={openSourceBaseUrl} onChange={(event) => setOpenSourceBaseUrl(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_base_url} />
-                                  <small>{t("services.openSourceGradioContract")}: {gradioContractForProvider(selectedOpenSourceProvider)} · {sourceProfileLabel(sourceProfileForEndpointUrl(openSourceBaseUrl || selectedOpenSourceCatalog?.default_base_url || ""), t)}</small>
                                 </label>
                               </div>
                               <div className="open-source-actions">
-                                <button className="secondary-button compact-button" onClick={() => void runOpenSourceDetect()} disabled={isDetectingOpenSource || !openSourceBaseUrl}>
-                                  {isDetectingOpenSource ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("services.openSourceDetect")}
-                                </button>
-                                <button className="primary-button compact-button" onClick={() => void saveOpenSourceService()} disabled={isConfiguringOpenSource || !openSourceBaseUrl}>
-                                  {isConfiguringOpenSource ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("services.openSourceSave")}
+                                <button className="primary-button compact-button" onClick={() => void detectAndSaveOpenSourceService()} disabled={isDetectingOpenSource || isConfiguringOpenSource || !openSourceBaseUrl}>
+                                  {isConfiguringOpenSource ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("services.openSourceDetectAndSave")}
                                 </button>
                               </div>
-                            </section>
 
-                            <section className="tts-access-card">
-                              <div className="panel-title"><CheckCircle2 size={15} /> {t("services.openSourceSetupState")}</div>
-                              {openSourceDetectResult ? (
-                                <div className={`open-source-detect-card compact state-${setupStateTone(openSourceDetectResult.setup_state)}`}>
-                                  <div>
-                                    <span>{t("services.openSourceSetupState")}</span>
-                                    <strong>{setupStateLabel(openSourceDetectResult.setup_state, t)}</strong>
+                              <details className="tts-access-maintenance">
+                                <summary>
+                                  <span>{t("services.openSourceAdvanced")}</span>
+                                  <small>{openSourceDetectResult ? setupStateLabel(openSourceDetectResult.setup_state, t) : t("services.openSourceAdvancedHint", { count: configuredOpenSourceServices.length })}</small>
+                                </summary>
+                                <div className="tts-access-maintenance-body">
+                                  <div className="open-source-existing">
+                                    <div className="open-source-existing-list">
+                                      {configuredOpenSourceServices.map((service) => {
+                                        const state = ttsServiceState(service, runningServiceIds.has(service.service_id ?? ""), runtime?.service_mode);
+                                        return (
+                                          <article className={`open-source-existing-card state-${state}`} key={service.service_id ?? service.engine}>
+                                            <span className={`tts-state-dot ${state}`} />
+                                            <span>
+                                              <strong>{serviceDisplayName(service)}</strong>
+                                              <small>{service.base_url || t("services.endpointMissing")}</small>
+                                            </span>
+                                            <span className={`tracker-chip ${ttsStateToneClass(state)}`}>{ttsServiceStateLabel(service, state, t, runtime?.service_mode)}</span>
+                                          </article>
+                                        );
+                                      })}
+                                      {configuredOpenSourceServices.length === 0 && <div className="empty-row compact">{t("services.noService")}</div>}
+                                    </div>
                                   </div>
-                                  <div>
-                                    <span>{t("services.openSourceEndpointReachable")}</span>
-                                    <strong>{booleanLabel(openSourceDetectResult.endpoint_reachable, t)}</strong>
+                                  {openSourceDetectResult && (
+                                    <div className={`open-source-detect-card compact state-${setupStateTone(openSourceDetectResult.setup_state)}`}>
+                                      <div>
+                                        <span>{t("services.openSourceSetupState")}</span>
+                                        <strong>{setupStateLabel(openSourceDetectResult.setup_state, t)}</strong>
+                                      </div>
+                                      <div>
+                                        <span>{t("services.openSourceEndpointReachable")}</span>
+                                        <strong>{booleanLabel(openSourceDetectResult.endpoint_reachable, t)}</strong>
+                                      </div>
+                                      <p>{openSourceDetectResult.env_hint}</p>
+                                    </div>
+                                  )}
+                                  <div className="tts-maintenance-tools">
+                                    <label className="library-field compact">
+                                      <span>{t("services.openSourceDisplayName")}</span>
+                                      <input value={openSourceDisplayName} onChange={(event) => setOpenSourceDisplayName(event.target.value)} placeholder={selectedOpenSourceCatalog?.display_name} />
+                                    </label>
+                                    <div className="open-source-actions compact">
+                                      <button className="secondary-button compact-button" onClick={() => void refreshOpenSourceCatalog()}>
+                                        <RefreshCw size={13} /> {t("services.openSourceRefreshCatalog")}
+                                      </button>
+                                      <button className="secondary-button compact-button" onClick={() => void runOpenSourceDetect()} disabled={isDetectingOpenSource || isConfiguringOpenSource || !openSourceBaseUrl}>
+                                        {isDetectingOpenSource ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("services.openSourceDetect")}
+                                      </button>
+                                    </div>
                                   </div>
-                                  <p>{openSourceDetectResult.env_hint}</p>
                                 </div>
-                              ) : (
-                                <div className="open-source-empty-detect">
-                                  <strong>{t("services.openSourceDetect")}</strong>
-                                  <span>{t("services.openSourceEndpointHint")}</span>
-                                </div>
-                              )}
-                              <div className="open-source-existing">
-                                <div className="open-source-section-head">
-                                  <strong>{t("services.openSourceExisting")}</strong>
-                                  <span>{configuredOpenSourceServices.length}</span>
-                                </div>
-                                <div className="open-source-existing-list">
-                                  {configuredOpenSourceServices.map((service) => {
-                                    const state = ttsServiceState(service, runningServiceIds.has(service.service_id ?? ""), runtime?.service_mode);
-                                    return (
-                                      <article className={`open-source-existing-card state-${state}`} key={service.service_id ?? service.engine}>
-                                        <span className={`tts-state-dot ${state}`} />
-                                        <span>
-                                          <strong>{serviceDisplayName(service)}</strong>
-                                          <small>{service.base_url || t("services.endpointMissing")}</small>
-                                        </span>
-                                        <span className={`tracker-chip ${ttsStateToneClass(state)}`}>{ttsServiceStateLabel(service, state, t, runtime?.service_mode)}</span>
-                                      </article>
-                                    );
-                                  })}
-                                  {configuredOpenSourceServices.length === 0 && <div className="empty-row">{t("services.noService")}</div>}
-                                </div>
-                              </div>
+                              </details>
                             </section>
                           </div>
                         )}
@@ -2109,17 +2106,17 @@ export default function App() {
                                   <strong><Bot size={15} /> {t("parser.kwjmActivationTitle")}</strong>
                                   <span>{t("parser.kwjmActivationHint")}</span>
                                 </div>
-                                <span className={`llm-detail-state state-${kwjmActivationState}`}>
-                                  <span className={`llm-state-dot ${kwjmActivationState}`} />
-                                  {kwjmActivationStateLabel(kwjmActivationState, t)}
-                                </span>
+                                <div className="llm-head-actions">
+                                  <span className={`llm-detail-state state-${kwjmActivationState}`}>
+                                    <span className={`llm-state-dot ${kwjmActivationState}`} />
+                                    {kwjmActivationStateLabel(kwjmActivationState, t)}
+                                  </span>
+                                  <button className="secondary-button compact-button" onClick={() => setIsLlmAdvancedOpen((open) => !open)} aria-expanded={isLlmAdvancedOpen}>
+                                    <SlidersHorizontal size={14} /> {t(isLlmAdvancedOpen ? "parser.hideAdvancedConfig" : "parser.advancedConfig")}
+                                  </button>
+                                </div>
                               </div>
-                              <div className="llm-preset-grid">
-                                <div><span>{t("parser.providerName")}</span><strong>{KWJM_PROVIDER_NAME}</strong></div>
-                                <div><span>{t("parser.baseUrl")}</span><strong>{KWJM_BASE_URL}</strong></div>
-                                <div><span>{t("parser.model")}</span><strong>{KWJM_MODEL}</strong></div>
-                                <div><span>{t("parser.openAIProtocol")}</span><strong>{t("parser.jsonDraft")}</strong></div>
-                              </div>
+                              <p className="llm-preset-line">{t("parser.kwjmPresetMeta", { model: KWJM_MODEL, baseUrl: KWJM_BASE_URL })}</p>
                               <div className="llm-api-key-row">
                                 <label className="llm-api-key-field">
                                   <span>{t("parser.apiKey")}</span>
@@ -2136,62 +2133,33 @@ export default function App() {
                                 <button className="primary-button compact-button" onClick={() => void activateKwjmParserProvider()} disabled={isSavingParserConfig || !kwjmCanActivate}>
                                   {isSavingParserConfig ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("parser.activateKwjm")}
                                 </button>
-                                <button className="secondary-button compact-button" onClick={() => setIsLlmAdvancedOpen((open) => !open)}>
-                                  <SlidersHorizontal size={14} /> {t(isLlmAdvancedOpen ? "parser.hideAdvancedConfig" : "parser.advancedConfig")}
-                                </button>
                               </div>
-                              <section className={`llm-test-result ${kwjmDisplayTestResult?.ok ? "ok" : kwjmDisplayTestResult ? "danger" : "empty"}`}>
-                                <div>
-                                  <strong>{kwjmHasUsableKey ? t("parser.kwjmConfigured") : t("parser.kwjmMissingKey")}</strong>
-                                  <span>{kwjmDisplayTestResult ? kwjmDisplayTestResult.message : t("parser.noTestYet")}</span>
-                                </div>
-                                {kwjmDisplayTestResult?.latency_ms != null && <small>{kwjmDisplayTestResult.latency_ms}ms</small>}
-                              </section>
+                              {kwjmDisplayTestResult && (
+                                <section className={`llm-test-result ${kwjmDisplayTestResult.ok ? "ok" : "danger"}`}>
+                                  <div>
+                                    <strong>{kwjmHasUsableKey ? t("parser.kwjmConfigured") : t("parser.kwjmMissingKey")}</strong>
+                                    <span>{kwjmDisplayTestResult ? kwjmDisplayTestResult.message : t("parser.noTestYet")}</span>
+                                  </div>
+                                  {kwjmDisplayTestResult?.latency_ms != null && <small>{kwjmDisplayTestResult.latency_ms}ms</small>}
+                                </section>
+                              )}
                             </section>
 
                             {isLlmAdvancedOpen && (
-                            <div className="llm-ops-workbench llm-advanced-workbench">
-                            <section className="llm-ops-rail">
-                              <div className="llm-title-block">
-                                <strong><Bot size={15} /> {t("parser.llmProviders")}</strong>
-                                <span>{t("parser.providerHint")}</span>
-                              </div>
-                              <div className="llm-metric-grid">
-                                <div className="llm-meter ready"><span>{t("parser.enabledProviders")}</span><strong>{parserProviders.filter((provider) => provider.enabled).length}/{parserProviders.length}</strong></div>
-                                <div className="llm-meter ready"><span>{t("parser.keyReady")}</span><strong>{parserProviders.filter((provider) => parserProviderHasUsableKey(provider)).length}/{parserProviders.length}</strong></div>
-                                <div className="llm-meter warn"><span>{t("parser.needsKey")}</span><strong>{parserProviders.filter((provider) => parserProviderState(provider) === "partial").length}</strong></div>
-                                <div className="llm-meter neutral"><span>{t("parser.routeOrder")}</span><strong>{parserProviders.length}</strong></div>
-                              </div>
-                              <div className="llm-policy-card">
-                                <strong>{t("parser.contract")}</strong>
-                                <span>{t("parser.contractHint")}</span>
-                                <div className="llm-policy-pills">
-                                  <span>{t("parser.openAIProtocol")}</span>
-                                  <span>{t("parser.jsonDraft")}</span>
-                                  <span>{t("parser.ruleFallback")}</span>
+                              <section className="llm-advanced-panel">
+                                <div className="llm-section-head">
+                                  <div className="llm-section-title">
+                                    <strong><SlidersHorizontal size={15} /> {t("parser.providerDirectory")}</strong>
+                                    <span>{t("parser.providerHint")}</span>
+                                  </div>
+                                  <span>{t("parser.advancedSummary", {
+                                    enabled: parserProviders.filter((provider) => provider.enabled).length,
+                                    total: parserProviders.length,
+                                    keys: parserProviders.filter((provider) => parserProviderHasUsableKey(provider)).length
+                                  })}</span>
                                 </div>
-                              </div>
-                              <div className="llm-policy-card">
-                                <strong>{t("parser.secretPolicy")}</strong>
-                                <span>{t("parser.secretPolicyHint")}</span>
-                              </div>
-                              <div className="llm-rail-actions">
-                                <button className="secondary-button compact-button" onClick={addParserProvider}><Plus size={13} /> {t("parser.addProvider")}</button>
-                                <button className="secondary-button compact-button" onClick={() => void testParserProviderSettings(selectedParserProviderIndex)} disabled={!selectedParserProvider || testingParserProviderIndex !== null}>
-                                  {testingParserProviderIndex === selectedParserProviderIndex ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("parser.testProvider")}
-                                </button>
-                                <button className="primary-button compact-button" onClick={() => void saveParserProviderSettings()} disabled={isSavingParserConfig || parserProviders.length === 0}>
-                                  {isSavingParserConfig ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("parser.saveProviders")}
-                                </button>
-                              </div>
-                            </section>
-
-                            <section className="llm-provider-directory">
-                              <div className="llm-section-head">
-                                <strong><SlidersHorizontal size={15} /> {t("parser.providerDirectory")}</strong>
-                                <span>{t("parser.providerCount", { count: parserProviders.length })}</span>
-                              </div>
-                              <div className="llm-provider-list">
+                              <div className="llm-advanced-layout">
+                                <div className="llm-provider-list compact">
                                 {parserProviders.map((provider, index) => {
                                   const state = parserProviderState(provider);
                                   const selected = selectedParserProviderIndex === index;
@@ -2207,12 +2175,9 @@ export default function App() {
                                         <strong>{provider.name || t("parser.providerName")}</strong>
                                         <small>{provider.model || t("status.unset")}</small>
                                       </span>
-                                      <span className="llm-priority-badge">{provider.priority}</span>
-                                      <span className="llm-provider-endpoint">{provider.base_url || t("services.endpointMissing")}</span>
                                       <span className="llm-chip-row">
                                         <span className={`tracker-chip ${state === "ready" ? "ok" : state === "blocked" ? "danger" : "warn"}`}>{parserProviderStateLabel(provider, t)}</span>
                                         <span className={`tracker-chip ${parserProviderHasUsableKey(provider) ? "ok" : "warn"}`}>{t(parserProviderHasUsableKey(provider) ? "parser.keyConfigured" : "parser.keyMissing")}</span>
-                                        <span className="tracker-chip neutral">{provider.timeout_seconds}s</span>
                                         {parserProviderTestResults[index] && (
                                           <span className={`tracker-chip ${parserProviderTestResults[index].ok ? "ok" : "danger"}`}>{parserProviderTestResults[index].ok ? t("parser.testPassed") : t("parser.testFailed")}</span>
                                         )}
@@ -2221,16 +2186,15 @@ export default function App() {
                                   );
                                 })}
                                 {parserProviders.length === 0 && <div className="empty-row">{t("empty.noParserProviders")}</div>}
-                              </div>
-                            </section>
+                                </div>
 
-                            <section className="llm-provider-detail">
-                              {selectedParserProvider ? (() => {
+                                <div className="llm-provider-editor">
+                                  {selectedParserProvider ? (() => {
                                 const selectedState = parserProviderState(selectedParserProvider);
                                 const selectedTestResult = parserProviderTestResults[selectedParserProviderIndex];
                                 return (
                                   <>
-                                  <div className="llm-detail-hero">
+                                      <div className="llm-detail-hero compact">
                                     <div>
                                       <strong>{selectedParserProvider.name || t("parser.providerName")}</strong>
                                       <span>{selectedParserProvider.model || t("status.unset")} · {selectedParserProvider.base_url || t("services.endpointMissing")}</span>
@@ -2240,58 +2204,22 @@ export default function App() {
                                       {parserProviderStateLabel(selectedParserProvider, t)}
                                     </span>
                                   </div>
-                                  <div className="llm-detail-grid">
-                                    <section className="llm-detail-card llm-card-primary">
-                                      <div className="llm-card-head">
-                                        <strong>{t("parser.connection")}</strong>
-                                        <label className="llm-switch">
+                                      <div className="llm-form-grid llm-simple-form">
+                                        <label className="llm-switch llm-switch-field">
                                           <input type="checkbox" checked={selectedParserProvider.enabled} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { enabled: event.target.checked })} />
                                           <span>{t("parser.enabled")}</span>
                                         </label>
-                                      </div>
-                                      <div className="llm-form-grid">
                                         <label>
                                           <span>{t("parser.providerName")}</span>
                                           <input value={selectedParserProvider.name} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { name: event.target.value })} />
-                                        </label>
-                                        <label>
-                                          <span>{t("parser.timeout")}</span>
-                                          <input type="number" min={5} max={300} value={selectedParserProvider.timeout_seconds} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { timeout_seconds: Number(event.target.value) || 45 })} />
                                         </label>
                                         <label className="wide">
                                           <span>{t("parser.baseUrl")}</span>
                                           <input value={selectedParserProvider.base_url} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { base_url: event.target.value })} placeholder={KWJM_BASE_URL_PLACEHOLDER} />
                                         </label>
-                                      </div>
-                                    </section>
-
-                                    <section className="llm-detail-card">
-                                      <div className="llm-card-head">
-                                        <strong>{t("parser.modelAndRouting")}</strong>
-                                        <span className="llm-priority-badge">{selectedParserProvider.priority}</span>
-                                      </div>
-                                      <div className="llm-form-grid">
                                         <label>
                                           <span>{t("parser.model")}</span>
                                           <input value={selectedParserProvider.model} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { model: event.target.value })} placeholder={KWJM_MODEL} />
-                                        </label>
-                                        <label>
-                                          <span>{t("parser.priority")}</span>
-                                          <input type="number" min={1} value={selectedParserProvider.priority} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { priority: Number(event.target.value) || 100 })} />
-                                        </label>
-                                      </div>
-                                      <p>{t("parser.routeHint")}</p>
-                                    </section>
-
-                                    <section className="llm-detail-card">
-                                      <div className="llm-card-head">
-                                        <strong>{t("parser.credentials")}</strong>
-                                        <span className={`tracker-chip ${parserProviderHasUsableKey(selectedParserProvider) ? "ok" : "warn"}`}>{t(parserProviderHasUsableKey(selectedParserProvider) ? "parser.keyConfigured" : "parser.keyMissing")}</span>
-                                      </div>
-                                      <div className="llm-form-grid">
-                                        <label>
-                                          <span>{t("parser.apiKeyEnv")}</span>
-                                          <input value={selectedParserProvider.api_key_env} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { api_key_env: event.target.value })} placeholder={KWJM_API_KEY_ENV} />
                                         </label>
                                         <label>
                                           <span>{t("parser.apiKey")}</span>
@@ -2303,362 +2231,299 @@ export default function App() {
                                           />
                                         </label>
                                       </div>
-                                      <p>{t("parser.secretPolicyHint")}</p>
-                                    </section>
-
-                                    <section className="llm-detail-card llm-card-primary">
-                                      <div className="llm-card-head">
-                                        <strong>{t("parser.contract")}</strong>
-                                        <span className="tracker-chip neutral">{t("parser.openAIProtocol")}</span>
-                                      </div>
-                                      <div className="llm-contract-grid">
-                                        <div><span>{t("parser.contract")}</span><strong>{t("parser.openAIProtocol")}</strong></div>
-                                        <div><span>{t("parser.outputMode")}</span><strong>{t("parser.jsonDraft")}</strong></div>
-                                        <div><span>{t("parser.fallbackPolicy")}</span><strong>{t("parser.ruleFallback")}</strong></div>
-                                      </div>
-                                      <p>{t("parser.contractHint")}</p>
-                                    </section>
-
-                                    <section className={`llm-test-result ${selectedTestResult?.ok ? "ok" : selectedTestResult ? "danger" : "empty"}`}>
+                                      <details className="llm-extra-settings">
+                                        <summary>{t("parser.advancedParameters")}</summary>
+                                        <div className="llm-form-grid llm-extra-form">
+                                          <label>
+                                            <span>{t("parser.priority")}</span>
+                                            <input type="number" min={1} value={selectedParserProvider.priority} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { priority: Number(event.target.value) || 100 })} />
+                                          </label>
+                                          <label>
+                                            <span>{t("parser.apiKeyEnv")}</span>
+                                            <input value={selectedParserProvider.api_key_env} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { api_key_env: event.target.value })} placeholder={KWJM_API_KEY_ENV} />
+                                          </label>
+                                          <label>
+                                            <span>{t("parser.timeout")}</span>
+                                            <input type="number" min={5} max={300} value={selectedParserProvider.timeout_seconds} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { timeout_seconds: Number(event.target.value) || 45 })} />
+                                          </label>
+                                        </div>
+                                      </details>
+                                      {selectedTestResult && (
+                                        <section className={`llm-test-result ${selectedTestResult.ok ? "ok" : "danger"}`}>
                                       <div>
                                         <strong>{t("parser.lastTest")}</strong>
-                                        <span>{selectedTestResult ? selectedTestResult.message : t("parser.noTestYet")}</span>
+                                            <span>{selectedTestResult.message}</span>
                                       </div>
                                       {selectedTestResult?.latency_ms != null && <small>{selectedTestResult.latency_ms}ms</small>}
                                     </section>
-                                  </div>
-                                  <div className="llm-detail-actions">
-                                    <span>{t("parser.providerDetailHint")}</span>
-                                    <button className="secondary-button compact-button" onClick={() => void testParserProviderSettings(selectedParserProviderIndex)} disabled={testingParserProviderIndex !== null}>
-                                      {testingParserProviderIndex === selectedParserProviderIndex ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("parser.testProvider")}
-                                    </button>
-                                    <button className="primary-button compact-button" onClick={() => void saveParserProviderSettings()} disabled={isSavingParserConfig}>
-                                      {isSavingParserConfig ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("parser.saveProviders")}
-                                    </button>
-                                  </div>
+                                      )}
                                   </>
                                 );
                               })() : (
                                 <div className="empty-row">{t("empty.noParserProviders")}</div>
                               )}
-                            </section>
-                          </div>
+                                </div>
+                              </div>
+                                <div className="llm-detail-actions">
+                                  <span>{t("parser.providerDetailHint")}</span>
+                                  <button className="secondary-button compact-button" onClick={addParserProvider}><Plus size={13} /> {t("parser.addProvider")}</button>
+                                  <button className="secondary-button compact-button" onClick={() => void testParserProviderSettings(selectedParserProviderIndex)} disabled={!selectedParserProvider || testingParserProviderIndex !== null}>
+                                    {testingParserProviderIndex === selectedParserProviderIndex ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />} {t("parser.testProvider")}
+                                  </button>
+                                  <button className="primary-button compact-button" onClick={() => void saveParserProviderSettings()} disabled={isSavingParserConfig || parserProviders.length === 0}>
+                                    {isSavingParserConfig ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />} {t("parser.saveProviders")}
+                                  </button>
+                                </div>
+                              </section>
                             )}
                           </div>
                         )}
 
                         {servicePanelSection === "resources" && (
                           <div className="queue-workbench">
-                            <section className="queue-progress-card">
-                              <div className="queue-progress-head">
+                            <section className={`queue-status-card ${queueHasWork ? "has-work" : "is-empty"}`}>
+                              <div className="queue-status-head">
                                 <div>
-                                  <strong><History size={15} /> {t("queue.dispatchTitle")}</strong>
-                                  <span>{t("queue.dispatchHint")}</span>
+                                  <strong><History size={15} /> {t("queue.title")}</strong>
+                                  <span>{queueHasWork ? t("queue.processedRatio", { processed: queueProcessedItems, total: queueTotalItems }) : t("queue.noJobs")}</span>
                                 </div>
-                                <StatusPill
-                                  tone={queueActiveJob ? queueStatusTone(queueActiveJob.status) : isRefreshingTopology ? "running" : "idle"}
-                                  label={queueActiveJob ? statusText(queueActiveJob.status, t) : isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced")}
-                                />
+                                <StatusPill tone={queueVisibleTone} label={queueVisibleStatusLabel} />
                               </div>
-                              <div className="queue-progress-value">
-                                <strong>{queueProgressPercent}%</strong>
-                                <span>{queueTotalItems > 0 ? t("queue.processedRatio", { processed: queueProcessedItems, total: queueTotalItems }) : t("queue.noJobs")}</span>
-                              </div>
-                              <div className="queue-dispatch-bar" aria-label={t("queue.progressLabel", { percent: queueProgressPercent })}>
-                                <span style={{ width: `${queueProgressPercent}%` }} />
-                              </div>
-                              <div className="queue-meter-grid">
-                                <div><span>{t("filters.queued")}</span><strong>{queueQueuedItems}</strong></div>
-                                <div><span>{t("filters.running")}</span><strong>{queueRunningItems}</strong></div>
-                                <div><span>{t("status.completed")}</span><strong>{queueCompletedItems}</strong></div>
-                                <div><span>{t("status.failed")}</span><strong>{queueFailedItems}</strong></div>
-                              </div>
-                            </section>
 
-                            <section className="queue-job-panel">
-                              <div className="queue-panel-title">
-                                <strong>{t("queue.recentJobs")}</strong>
-                                <span>{t("queue.pollingState")}: {isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced")}</span>
-                              </div>
-                              <div className="queue-job-list">
-                                {queueJobs.slice(0, 5).map((job) => {
-                                  const jobPercent = Math.round(Math.max(0, Math.min(1, job.progress)) * 100);
-                                  return (
-                                    <article className={`queue-job-card state-${queueStatusTone(job.status)}`} key={job.job_id}>
-                                      <div>
-                                        <strong>{job.job_id}</strong>
-                                        <span>{t("queue.itemCount", { count: job.items.length })}</span>
-                                      </div>
-                                      <div className="queue-job-meta">
-                                        <StatusPill tone={queueStatusTone(job.status)} label={statusText(job.status, t)} />
-                                        <span>{jobPercent}%</span>
-                                      </div>
-                                    </article>
-                                  );
-                                })}
-                                {queueJobs.length === 0 && <div className="queue-empty">{t("queue.noJobs")}</div>}
-                              </div>
+                              {queueHasWork && (
+                                <>
+                                  <div className="queue-progress-row">
+                                    <strong>{queueProgressPercent}%</strong>
+                                    <div className="queue-dispatch-bar" aria-label={t("queue.progressLabel", { percent: queueProgressPercent })}>
+                                      <span style={{ width: `${queueProgressPercent}%` }} />
+                                    </div>
+                                  </div>
+                                  <div className="queue-count-strip" aria-label={t("queue.countSummary")}>
+                                    <span><strong>{queueQueuedItems}</strong>{t("filters.queued")}</span>
+                                    <span><strong>{queueRunningItems}</strong>{t("filters.running")}</span>
+                                    <span><strong>{queueCompletedItems}</strong>{t("status.completed")}</span>
+                                    <span><strong>{queueFailedItems}</strong>{t("status.failed")}</span>
+                                  </div>
+                                </>
+                              )}
+
+                              {queueJobs.length > 0 && (
+                                <details className="queue-job-details" open={Boolean(queueActiveJob)}>
+                                  <summary>
+                                    <span>{t("queue.recentJobs")}</span>
+                                    <small>{t("queue.itemCount", { count: queueJobs.length })}</small>
+                                  </summary>
+                                  <div className="queue-job-list">
+                                    {queueJobs.slice(0, 5).map((job) => {
+                                      const jobPercent = Math.round(Math.max(0, Math.min(1, job.progress)) * 100);
+                                      return (
+                                        <article className={`queue-job-card state-${queueStatusTone(job.status)}`} key={job.job_id}>
+                                          <div>
+                                            <strong>{job.job_id}</strong>
+                                            <span>{t("queue.itemCount", { count: job.items.length })}</span>
+                                          </div>
+                                          <div className="queue-job-meta">
+                                            <StatusPill tone={queueStatusTone(job.status)} label={statusText(job.status, t)} />
+                                            <span>{jobPercent}%</span>
+                                          </div>
+                                        </article>
+                                      );
+                                    })}
+                                  </div>
+                                </details>
+                              )}
                             </section>
                           </div>
                         )}
 
                         {servicePanelSection === "roles" && (
                           <div className="role-library-workbench">
-                            <section className="model-mapping-center">
-                              <div className="model-mapping-head">
-                                <div>
-                                  <strong>GPT-SoVITS 模型映射</strong>
-                                  <span>{activeProjectCharacter?.name ?? t("status.unset")} · {activeModelCatalogItem?.logs_name ?? activeModelCatalogItem?.name ?? t("status.unset")}</span>
-                                </div>
-                                <div className="role-library-actions">
-                                  <button className="secondary-button compact-button" onClick={() => void refreshModelCatalog()} disabled={isScanningModelCatalog}>
-                                    {isScanningModelCatalog ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} 刷新模型
-                                  </button>
-                                  <button className="secondary-button compact-button" onClick={clearActiveProjectRoleBinding} disabled={!activeProjectCharacter?.project_binding}>清除临时匹配</button>
-                                </div>
+                            <section className="role-library-rail">
+                              <div className="role-library-title-block">
+                                <strong>{t("characters.currentScriptRoles")}</strong>
+                                <span>{t("characters.currentScriptRolesHint")}</span>
                               </div>
-                              <div className="model-mapping-grid">
-                                <div className="model-mapping-column">
-                                  <div className="model-mapping-column-head">
-                                    <span>剧本角色</span>
-                                    <strong>{projectRoleRows.length}</strong>
+                              <div className="project-role-compact-list">
+                                {projectRoleRows.map((role, index) => {
+                                  const mapping = projectCharacters.find((item) => item.project_character_id === role.id);
+                                  const linkedCharacter = mapping?.library_character_id
+                                    ? characters.find((character) => character.id === mapping.library_character_id)
+                                    : null;
+                                  const selected = activeProjectCharacter?.project_character_id === role.id;
+                                  const profileLabel = role.profile === "unassigned" ? t("status.unassigned") : role.profile;
+                                  const bindingLabel = mapping?.project_binding
+                                    ? t("characters.projectTemporaryVoice")
+                                    : linkedCharacter?.name ?? profileLabel;
+                                  return (
+                                    <button
+                                      className={`project-role-compact ${selected ? "selected" : ""} ${mapping?.project_binding || linkedCharacter ? "matched" : "unmatched"} ${roleAccentClass(index)}`}
+                                      key={role.id}
+                                      onClick={() => {
+                                        setActiveProjectRoleId(role.id);
+                                        setActiveRoleCandidateId(null);
+                                        setActiveModelCatalogId(null);
+                                      }}
+                                    >
+                                      <RoleAvatar avatarPath={role.avatarPath} fallback={role.avatarFallback} size="sm" />
+                                      <span>
+                                        <strong>{role.name}</strong>
+                                        <small>{t("characters.lines", { count: role.lineCount })} · {bindingLabel}</small>
+                                      </span>
+                                    </button>
+                                  );
+                                })}
+                                {projectRoleRows.length === 0 && <div className="empty-row compact">{t("characters.noProjectRoles")}</div>}
+                              </div>
+
+                              <div className="role-library-active-summary">
+                                <span>{t("characters.selectedProjectRole")}</span>
+                                <strong>{activeProjectCharacter?.name ?? t("status.unassigned")}</strong>
+                                <small>
+                                  {activeProjectCharacter?.project_binding
+                                    ? `${t("characters.projectTemporaryVoice")} · ${activeProjectCharacter.project_binding.service_id ?? t("services.noService")}`
+                                    : t("characters.noProjectBinding")}
+                                </small>
+                                {activeProjectCharacter?.project_binding && (
+                                  <button className="secondary-button compact-button" onClick={clearActiveProjectRoleBinding}>{t("characters.clearProjectBinding")}</button>
+                                )}
+                              </div>
+
+                              <details className="role-maintenance-panel role-library-collapsible">
+                                <summary>
+                                  <span><Library size={13} /> {t("characters.commonVoices")}</span>
+                                  <small>{t("characters.commonVoicesHint")}</small>
+                                </summary>
+                                <div className="role-library-collapsible-body">
+                                  <div className="role-library-drawer-actions">
+                                    <label className="search-field library-search">
+                                      <Search size={14} />
+                                      <input value={roleLibrarySearch} onChange={(event) => setRoleLibrarySearch(event.target.value)} placeholder={t("characters.searchLibrary")} />
+                                    </label>
+                                    <button className="secondary-button compact-button" onClick={addEmptyLibraryCharacter}><Plus size={13} /> {t("characters.addRole")}</button>
                                   </div>
-                                  <div className="model-mapping-list">
-                                    {projectRoleRows.map((role, index) => {
-                                      const mapping = projectCharacters.find((item) => item.project_character_id === role.id);
-                                      const selected = activeProjectCharacter?.project_character_id === role.id;
+                                  <div className="role-directory-list">
+                                    {filteredLibraryCharacters.map((character, index) => {
+                                      const summary = characterBindingSummary(character);
+                                      const selected = activeModelCatalogId === null && activeRoleCandidateId === null && activeLibraryCharacter?.id === character.id;
                                       return (
                                         <button
-                                          className={`model-map-row ${selected ? "selected" : ""} ${roleAccentClass(index)}`}
-                                          key={role.id}
-                                          onClick={() => setActiveProjectRoleId(role.id)}
+                                          className={`role-directory-card ${selected ? "selected" : ""} ${roleAccentClass(index)}`}
+                                          key={character.id}
+                                          onClick={() => {
+                                            setActiveLibraryCharacterId(character.id);
+                                            setActiveRoleCandidateId(null);
+                                            setActiveModelCatalogId(null);
+                                          }}
                                         >
-                                          <RoleAvatar avatarPath={role.avatarPath} fallback={role.avatarFallback} size="sm" />
-                                          <span>
-                                            <strong>{role.name}</strong>
-                                            <small>{role.lineCount} lines · {mapping?.project_binding ? "项目临时" : role.profile}</small>
+                                          <RoleAvatar avatarPath={character.avatar_path} fallback={avatarFallback(character.name)} size="lg" />
+                                          <span className="role-directory-main">
+                                            <strong>{character.name}</strong>
+                                            <small>{summary.providerLabel} · {summary.bindingCount} {t("characters.bindings")}</small>
+                                          </span>
+                                          <span className={`role-state-dot ${characterStatusTone(character)}`} />
+                                          <span className="role-directory-meta">
+                                            <strong>{summary.completeCount}/{summary.bindingCount || 1}</strong>
+                                            <small>{t("characters.completeBindings")}</small>
                                           </span>
                                         </button>
                                       );
                                     })}
-                                    {projectRoleRows.length === 0 && <div className="empty-row compact">{t("characters.noProjectRoles")}</div>}
+                                    {filteredLibraryCharacters.length === 0 && <div className="empty-row compact">{t("characters.noCommonVoices")}</div>}
                                   </div>
                                 </div>
+                              </details>
 
-                                <div className="model-mapping-column">
-                                  <div className="model-mapping-column-head">
-                                    <span>模型目录</span>
-                                    <strong>{filteredGptModelCatalog.length}</strong>
+                              <details className="role-maintenance-panel">
+                                <summary>
+                                  <span>{t("characters.roleMaintenance")}</span>
+                                  <small>{t("characters.roleMaintenanceHint")}</small>
+                                </summary>
+                                <div className="role-maintenance-body">
+                                  <div className="role-maintenance-actions">
+                                    <button className="secondary-button compact-button" onClick={() => void scanRoles()} disabled={isScanningRoleLibrary}>
+                                      {isScanningRoleLibrary ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} {t("characters.scanCandidates")}
+                                    </button>
+                                    <button className="secondary-button compact-button" onClick={() => void refreshModelCatalog()} disabled={isScanningModelCatalog}>
+                                      {isScanningModelCatalog ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} {t("characters.refreshModelCatalog")}
+                                    </button>
                                   </div>
-                                  <div className="model-mapping-list">
-                                    {filteredGptModelCatalog.map((model) => {
-                                      const selected = activeModelCatalogItem?.id === model.id;
+                                  <label className="library-field compact">
+                                    <span>{t("characters.logsService")}</span>
+                                    <select value={selectedLogsServiceId} onChange={(event) => setSelectedLogsServiceId(event.target.value)}>
+                                      <option value="">{t("characters.allGptServices")}</option>
+                                      {roleLibraryCatalogServices.map((service) => (
+                                        <option value={service.serviceId} key={service.serviceId}>{service.label} · {providerLabel(service.providerType)}</option>
+                                      ))}
+                                    </select>
+                                  </label>
+                                  <div className="role-library-status-row">
+                                    <div><span>{t("characters.confirmedLibrary")}</span><strong>{characters.filter((character) => character.library_status === "confirmed").length}</strong></div>
+                                    <div><span>{t("characters.scanDrafts")}</span><strong>{filteredRoleCandidates.length + filteredGptModelCatalog.length}</strong></div>
+                                    <div><span>{t("characters.projectMatch")}</span><strong>{projectCharacters.filter((item) => item.match_status === "matched" || item.library_character_id).length}/{projectRoleRows.length}</strong></div>
+                                  </div>
+                                  <div className="role-maintenance-list">
+                                    {filteredRoleCandidates.length > 0 && (
+                                      <div className="role-list-subhead">
+                                        <span><RefreshCw size={13} /> {t("characters.scanDrafts")}</span>
+                                        <strong>{filteredRoleCandidates.length}</strong>
+                                      </div>
+                                    )}
+                                    {filteredRoleCandidates.map((candidate) => {
+                                      const selected = activeRoleCandidate?.id === candidate.id;
                                       return (
                                         <button
-                                          className={`model-map-row model-row ${selected ? "selected" : ""}`}
-                                          key={`${model.service_id ?? "all"}:${model.id}`}
+                                          className={`candidate-strip-card ${selected ? "selected" : ""}`}
+                                          key={candidate.id}
                                           onClick={() => {
-                                            setActiveModelCatalogId(model.id);
-                                            setActiveModelSampleId(null);
+                                            setActiveRoleCandidateId(candidate.id);
+                                            setActiveModelCatalogId(null);
                                           }}
                                         >
-                                          <span>
+                                          <span className="candidate-strip-title">
+                                            <strong>{candidate.name}</strong>
+                                            <small>{candidate.logs_name ?? candidate.id}</small>
+                                          </span>
+                                          <span className="candidate-strip-counts">
+                                            <b>GPT {candidate.gpt_weights?.length ?? 0}</b>
+                                            <b>SoVITS {candidate.sovits_weights?.length ?? 0}</b>
+                                            <b>Ref {candidate.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? 0}</b>
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                    {filteredGptModelCatalog.length > 0 && (
+                                      <div className="role-list-subhead">
+                                        <span><Cpu size={13} /> {t("characters.modelCatalog")}</span>
+                                        <strong>{filteredGptModelCatalog.length}</strong>
+                                      </div>
+                                    )}
+                                    {filteredGptModelCatalog.map((model) => {
+                                      const selected = activeModelCatalogItem?.id === model.id;
+                                      const sourceService = roleLibraryTtsServices.find((service) => service.serviceId === model.service_id);
+                                      return (
+                                        <button
+                                          className={`candidate-strip-card model-catalog-card ${selected ? "selected" : ""}`}
+                                          key={model.id}
+                                          onClick={() => {
+                                            setActiveModelCatalogId(model.id);
+                                            setActiveRoleCandidateId(null);
+                                          }}
+                                        >
+                                          <span className="candidate-strip-title">
                                             <strong>{model.name}</strong>
                                             <small>{model.logs_name ?? model.id}</small>
                                           </span>
                                           <span className="candidate-strip-counts">
-                                            <b>GPT {model.gpt_weights?.length ?? 0}</b>
-                                            <b>SoVITS {model.sovits_weights?.length ?? 0}</b>
-                                            <b>Ref {model.sample_count ?? referenceSampleCount(model.reference_audio_groups)}</b>
+                                            <b>{sourceService?.label ?? model.service_id ?? t("services.noService")}</b>
+                                            <b>Ref {model.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? 0}</b>
                                           </span>
                                         </button>
                                       );
                                     })}
-                                    {filteredGptModelCatalog.length === 0 && (
-                                      <button className="empty-row compact action-empty-row" onClick={() => void refreshModelCatalog()} type="button">
-                                        {isScanningModelCatalog ? t("status.loading") : "刷新 GPT-SoVITS 模型目录"}
-                                      </button>
-                                    )}
+                                    {filteredRoleCandidates.length === 0 && filteredGptModelCatalog.length === 0 && <div className="empty-row compact">{t("characters.noMaintenanceItems")}</div>}
                                   </div>
                                 </div>
-
-                                <div className="model-mapping-column model-mapping-detail">
-                                  <div className="model-mapping-column-head">
-                                    <span>模型详情</span>
-                                    <strong>{activeModelCatalogItem?.source ?? "-"}</strong>
-                                  </div>
-                                  {activeModelCatalogItem ? (
-                                    <>
-                                      <div className="model-detail-fields">
-                                        <div><span>Logs</span><strong>{activeModelCatalogItem.logs_name ?? activeModelCatalogItem.name}</strong></div>
-                                        <div><span>GPT</span><strong>{activeModelCatalogItem.recommended_gpt_weights_path ? shortPath(activeModelCatalogItem.recommended_gpt_weights_path) : t("status.unset")}</strong></div>
-                                        <div><span>SoVITS</span><strong>{activeModelCatalogItem.recommended_sovits_weights_path ? shortPath(activeModelCatalogItem.recommended_sovits_weights_path) : t("status.unset")}</strong></div>
-                                      </div>
-                                      <label className="resource-field">
-                                        <span>训练样本</span>
-                                        <select
-                                          value={(activeModelSelectedSample && "sample_id" in activeModelSelectedSample ? activeModelSelectedSample.sample_id : "")}
-                                          disabled={loadingModelCatalogSamplesKey === activeModelSamplesKey}
-                                          onChange={(event) => setActiveModelSampleId(event.target.value || null)}
-                                        >
-                                          <option value="">{loadingModelCatalogSamplesKey === activeModelSamplesKey ? t("status.loading") : t("status.auto")}</option>
-                                          {activeModelSamples.map((sample) => (
-                                            <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
-                                          ))}
-                                        </select>
-                                      </label>
-                                      {activeModelSelectedSample && (
-                                        <div className="logs-reference-preview compact-reference-preview">
-                                          <div>
-                                            <span>{referenceSampleSourceLabel(activeModelSelectedSample) || t("status.unset")}</span>
-                                            <strong>{activeModelSelectedSample.text || t("inspector.emptyPromptText")}</strong>
-                                          </div>
-                                          {isLocalAudioAsset(activeModelSelectedSample.path) && <WaveformPlayer audioPath={activeModelSelectedSample.path} label={referenceSampleDisplayLabel(activeModelSelectedSample)} />}
-                                        </div>
-                                      )}
-                                      <div className="model-mapping-actions">
-                                        <button className="primary-button compact-button" onClick={bindActiveModelToProjectRole} disabled={!activeProjectCharacter}>绑定到当前剧本角色</button>
-                                        <button className="secondary-button compact-button" onClick={writeActiveModelToLibrary} disabled={!activeProjectCharacter}>写入角色库</button>
-                                      </div>
-                                    </>
-                                  ) : (
-                                    <div className="empty-row compact">选择或刷新模型目录</div>
-                                  )}
-                                </div>
-                              </div>
-                            </section>
-
-                            <section className="role-library-directory">
-                              <div className="role-library-title-block">
-                                <strong>{t("characters.library")}</strong>
-                              </div>
-                              <div className="role-library-toolbar">
-                                <label className="search-field library-search">
-                                  <Search size={14} />
-                                  <input value={roleLibrarySearch} onChange={(event) => setRoleLibrarySearch(event.target.value)} placeholder={t("characters.searchLibrary")} />
-                                </label>
-                                <div className="role-library-actions">
-                                  <button className="secondary-button compact-button" onClick={() => void scanRoles()} disabled={isScanningRoleLibrary}>
-                                    {isScanningRoleLibrary ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} {t("characters.scanCandidates")}
-                                  </button>
-                                  <button className="secondary-button compact-button" onClick={addEmptyLibraryCharacter}><Plus size={13} /> {t("characters.addRole")}</button>
-                                </div>
-                              </div>
-                              <div className="role-library-status-row">
-                                <div><span>{t("characters.confirmedLibrary")}</span><strong>{characters.filter((character) => character.library_status === "confirmed").length}</strong></div>
-                                <div><span>{t("characters.scanDrafts")}</span><strong>{filteredRoleCandidates.length + filteredGptModelCatalog.length}</strong></div>
-                                <div><span>{t("characters.projectMatch")}</span><strong>{projectCharacters.filter((item) => item.match_status === "matched" || item.library_character_id).length}/{projectRoleRows.length}</strong></div>
-                              </div>
-                              <div className="role-library-service-strip">
-                                <div className="role-service-summary">
-                                  <span>{t("characters.ttsAccess")}</span>
-                                  <strong>{roleLibraryTtsServices.filter((service) => service.state === "ready").length}/{roleLibraryTtsServices.length}</strong>
-                                  <small>{t("characters.modelCatalog")}: {roleLibraryCatalogServices.length}</small>
-                                </div>
-                                {roleLibraryTtsServices.slice(0, 3).map((service) => (
-                                  <div className={`role-service-chip state-${service.state}`} key={service.serviceId}>
-                                    <span>{providerLabel(service.providerType)}</span>
-                                    <strong>{service.label}</strong>
-                                    <small>{service.apiContract}</small>
-                                  </div>
-                                ))}
-                              </div>
-                              <label className="library-field compact">
-                                <span>{t("characters.logsService")}</span>
-                                <select value={selectedLogsServiceId} onChange={(event) => setSelectedLogsServiceId(event.target.value)}>
-                                  <option value="">{t("characters.allGptServices")}</option>
-                                  {roleLibraryCatalogServices.map((service) => (
-                                    <option value={service.serviceId} key={service.serviceId}>{service.label} · {providerLabel(service.providerType)}</option>
-                                  ))}
-                                </select>
-                              </label>
-                              <div className="role-directory-list">
-                                {filteredLibraryCharacters.map((character, index) => {
-                                  const summary = characterBindingSummary(character);
-                                  const selected = activeModelCatalogId === null && activeRoleCandidateId === null && activeLibraryCharacter?.id === character.id;
-                                  return (
-                                    <button
-                                      className={`role-directory-card ${selected ? "selected" : ""} ${roleAccentClass(index)}`}
-                                      key={character.id}
-                                      onClick={() => {
-                                        setActiveLibraryCharacterId(character.id);
-                                        setActiveRoleCandidateId(null);
-                                        setActiveModelCatalogId(null);
-                                      }}
-                                    >
-                                      <RoleAvatar avatarPath={character.avatar_path} fallback={avatarFallback(character.name)} size="lg" />
-                                      <span className="role-directory-main">
-                                        <strong>{character.name}</strong>
-                                        <small>{summary.providerLabel} · {summary.bindingCount} {t("characters.bindings")}</small>
-                                      </span>
-                                      <span className={`role-state-dot ${characterStatusTone(character)}`} />
-                                      <span className="role-directory-meta">
-                                        <strong>{summary.completeCount}/{summary.bindingCount || 1}</strong>
-                                        <small>{t("characters.completeBindings")}</small>
-                                      </span>
-                                    </button>
-                                  );
-                                })}
-                                {filteredRoleCandidates.length > 0 && (
-                                  <div className="role-list-subhead">
-                                    <span><RefreshCw size={13} /> {t("characters.scanDrafts")}</span>
-                                    <strong>{filteredRoleCandidates.length}</strong>
-                                  </div>
-                                )}
-                                {filteredRoleCandidates.map((candidate) => {
-                                  const selected = activeRoleCandidate?.id === candidate.id;
-                                  return (
-                                    <button
-                                      className={`candidate-strip-card ${selected ? "selected" : ""}`}
-                                      key={candidate.id}
-                                      onClick={() => {
-                                        setActiveRoleCandidateId(candidate.id);
-                                        setActiveModelCatalogId(null);
-                                      }}
-                                    >
-                                      <span className="candidate-strip-title">
-                                        <strong>{candidate.name}</strong>
-                                        <small>{candidate.logs_name ?? candidate.id}</small>
-                                      </span>
-                                      <span className="candidate-strip-counts">
-                                        <b>GPT {candidate.gpt_weights?.length ?? 0}</b>
-                                        <b>SoVITS {candidate.sovits_weights?.length ?? 0}</b>
-                                        <b>Ref {candidate.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? 0}</b>
-                                      </span>
-                                    </button>
-                                  );
-                                })}
-                                {filteredGptModelCatalog.length > 0 && (
-                                  <div className="role-list-subhead">
-                                    <span><Cpu size={13} /> {t("characters.modelCatalog")}</span>
-                                    <strong>{filteredGptModelCatalog.length}</strong>
-                                  </div>
-                                )}
-                                {filteredGptModelCatalog.map((model) => {
-                                  const selected = activeModelCatalogItem?.id === model.id;
-                                  const sourceService = roleLibraryTtsServices.find((service) => service.serviceId === model.service_id);
-                                  return (
-                                    <button
-                                      className={`candidate-strip-card model-catalog-card ${selected ? "selected" : ""}`}
-                                      key={model.id}
-                                      onClick={() => {
-                                        setActiveModelCatalogId(model.id);
-                                        setActiveRoleCandidateId(null);
-                                      }}
-                                    >
-                                      <span className="candidate-strip-title">
-                                        <strong>{model.name}</strong>
-                                        <small>{model.logs_name ?? model.id}</small>
-                                      </span>
-                                      <span className="candidate-strip-counts">
-                                        <b>{sourceService?.label ?? model.service_id ?? t("services.noService")}</b>
-                                        <b>Ref {model.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? 0}</b>
-                                      </span>
-                                    </button>
-                                  );
-                                })}
-                                {filteredLibraryCharacters.length === 0 && filteredRoleCandidates.length === 0 && filteredGptModelCatalog.length === 0 && <div className="empty-row">{t("characters.noProjectRoles")}</div>}
-                              </div>
+                              </details>
                             </section>
 
                             <section className="role-library-detail-pane">
@@ -2761,18 +2626,21 @@ export default function App() {
                                         <strong>{activeLibraryCharacter.name}</strong>
                                         <span>{characterMatchValues(activeLibraryCharacter).slice(0, 4).join(" · ") || activeLibraryCharacter.id}</span>
                                       </div>
-                                      <label className="secondary-button compact-button avatar-upload-button">
-                                        <Upload size={13} /> {t("characters.uploadAvatar")}
-                                        <input
-                                          type="file"
-                                          accept="image/png,image/jpeg,image/webp"
-                                          onChange={(event) => {
-                                            void uploadAvatar(activeLibraryCharacter.id, event.currentTarget.files?.[0]);
-                                            event.currentTarget.value = "";
-                                          }}
-                                        />
-                                      </label>
-                                      <button className="icon-button danger" onClick={() => void removeLibraryCharacter(activeLibraryCharacter.id)} title={t("characters.deleteRole")}><X size={14} /></button>
+                                      <div className="role-detail-hero-actions">
+                                        <button className="primary-button compact-button" onClick={() => applyLibraryCharacterToProjectRole(activeLibraryCharacter)} disabled={!activeProjectCharacter}>{t("characters.bindToProjectRole")}</button>
+                                        <label className="secondary-button compact-button avatar-upload-button">
+                                          <Upload size={13} /> {t("characters.uploadAvatar")}
+                                          <input
+                                            type="file"
+                                            accept="image/png,image/jpeg,image/webp"
+                                            onChange={(event) => {
+                                              void uploadAvatar(activeLibraryCharacter.id, event.currentTarget.files?.[0]);
+                                              event.currentTarget.value = "";
+                                            }}
+                                          />
+                                        </label>
+                                        <button className="icon-button danger" onClick={() => void removeLibraryCharacter(activeLibraryCharacter.id)} title={t("characters.deleteRole")}><X size={14} /></button>
+                                      </div>
                                     </div>
                                     <div className="role-detail-mini-strip">
                                       <div><span>{t("characters.status")}</span><strong>{t(`characters.status_${activeLibraryCharacter.library_status ?? "draft"}`)}</strong></div>
@@ -2907,7 +2775,10 @@ export default function App() {
                                   </div>
                                 );
                               })() : (
-                                <div className="empty-row">{t("characters.noProjectRoles")}</div>
+                                <div className="role-empty-config role-detail-empty-state">
+                                  <strong>{t("characters.roleDetailEmptyTitle")}</strong>
+                                  <span>{t("characters.roleDetailEmptyHint")}</span>
+                                </div>
                               )}
                             </section>
                           </div>
@@ -2932,20 +2803,47 @@ export default function App() {
                 <Search size={15} />
                 <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder={t("filters.search")} />
               </label>
-              <select value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)} aria-label={t("filters.provider")}>
-                <option value="all">{t("filters.all")}</option>
-                {providerOptions.map((provider) => <option value={provider} key={provider}>{provider}</option>)}
-              </select>
-              <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as LineStatusFilter)} aria-label={t("filters.status")}>
-                <option value="all">{t("filters.all")}</option>
-                <option value="not-generated">{t("filters.notGenerated")}</option>
-                <option value="queued">{t("filters.queued")}</option>
-                <option value="running">{t("filters.running")}</option>
-                <option value="completed">{t("filters.completed")}</option>
-                <option value="failed">{t("filters.failed")}</option>
-              </select>
+              <span className="line-toolbar-count">{visibleLineLabel}</span>
+              <details className="line-filter-menu">
+                <summary title={lineFilterTitle}>
+                  <SlidersHorizontal size={14} />
+                  <span>{t("filters.more")}</span>
+                  {lineToolbarState.activeBadgeVisible && <b>{t("filters.active")}</b>}
+                </summary>
+                <div className="line-filter-popover">
+                  <label>
+                    <span>{t("filters.provider")}</span>
+                    <select value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)} aria-label={t("filters.provider")}>
+                      <option value="all">{t("filters.all")}</option>
+                      {providerOptions.map((provider) => <option value={provider} key={provider}>{provider}</option>)}
+                    </select>
+                  </label>
+                  <label>
+                    <span>{t("filters.status")}</span>
+                    <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as LineStatusFilter)} aria-label={t("filters.status")}>
+                      <option value="all">{t("filters.all")}</option>
+                      <option value="not-generated">{t("filters.notGenerated")}</option>
+                      <option value="queued">{t("filters.queued")}</option>
+                      <option value="running">{t("filters.running")}</option>
+                      <option value="completed">{t("filters.completed")}</option>
+                      <option value="failed">{t("filters.failed")}</option>
+                    </select>
+                  </label>
+                  {lineToolbarState.clearButtonVisible && (
+                    <button
+                      className="secondary-button compact-button"
+                      onClick={() => {
+                        setProviderFilter("all");
+                        setStatusFilter("all");
+                      }}
+                      type="button"
+                    >
+                      {t("filters.clear")}
+                    </button>
+                  )}
+                </div>
+              </details>
               <div className="task-actions">
-                <span>{selectedLineIds.length > 0 ? t("table.selectedLines", { count: selectedLineIds.length }) : t("table.visibleLines", { count: filteredLines.length })}</span>
                 {isGenerating && activeJob && (
                   <span className="generation-progress-inline" aria-label={t("queue.progressLabel", { percent: Math.round((activeJob.progress ?? 0) * 100) })}>
                     {t("queue.progressLabel", { percent: Math.round((activeJob.progress ?? 0) * 100) })}
@@ -2997,7 +2895,7 @@ export default function App() {
             </div>
 
             <div className="line-table line-card-list">
-              {paginatedLines.items.map((line) => {
+              {displayedLines.map((line) => {
                 const summary = summarizeLineHistory(lineHistoryForLine(manifest, line));
                 const queueItem = activeJob?.items.find((item) => item.line_uid ? item.line_uid === (line.line_uid ?? line.id) : item.line_id === line.id);
                 const visibleTone = queueItem ? queueStatusTone(queueItem.status) : summary.tone;
@@ -3076,6 +2974,11 @@ export default function App() {
                   </article>
                 );
               })}
+              {hasMoreFilteredLines && (
+                <div className="line-scroll-sentinel" ref={lineLoadMoreRef}>
+                  {t("table.loadingMore", { visible: displayedLines.length, total: filteredLines.length })}
+                </div>
+              )}
               {filteredLines.length === 0 && (
                 <div className="empty-row table-empty line-empty-state">
                   <strong>{t("empty.noLines")}</strong>
@@ -3094,22 +2997,6 @@ export default function App() {
                 </div>
               )}
             </div>
-            {paginatedLines.totalItems > 0 && (
-              <div className="line-pagination">
-                <span>
-                  {t("table.pageRange", { start: paginatedLines.startItem, end: paginatedLines.endItem, total: paginatedLines.totalItems })}
-                </span>
-                <div>
-                  <button className="secondary-button compact-button" onClick={() => setLinePage((page) => Math.max(1, page - 1))} disabled={!paginatedLines.hasPrevious}>
-                    {t("table.previousPage")}
-                  </button>
-                  <strong>{t("table.pageIndex", { page: paginatedLines.page, total: paginatedLines.totalPages })}</strong>
-                  <button className="secondary-button compact-button" onClick={() => setLinePage((page) => page + 1)} disabled={!paginatedLines.hasNext}>
-                    {t("table.nextPage")}
-                  </button>
-                </div>
-              </div>
-            )}
           </div>
 
           <aside className={`inspector inspector-${activeInspectorMode}`}>
@@ -3153,7 +3040,7 @@ export default function App() {
                   <section className="inspector-card inspector-config-card">
                     <div className="inspector-section-head compact generation-method-head">
                       <div>
-                        <strong>{t("inspector.generationMethod")}</strong>
+                        <strong>{t("inspector.voiceSetup")}</strong>
                       </div>
                       <button
                         className={`generation-method-state-pill tone-${activeInspectorDiagnostics.tone}`}
@@ -3162,93 +3049,124 @@ export default function App() {
                         title={diagnosticsExpanded || activeInspectorDiagnostics.expanded ? t("inspector.hideDiagnosticsShort") : t("inspector.showDiagnosticsShort")}
                       >
                         <span className="state-dot" />
-                        <span>
-                          {activeInspectorDiagnostics.visible
-                            ? t(`inspector.diagnosticsReason.${activeInspectorDiagnostics.reason}`)
-                            : t("inspector.diagnosticsReadyShort")}
-                        </span>
-                        <span className="state-action">{t("inspector.showDiagnosticsShort")}</span>
+                        {activeInspectorDiagnostics.visible && <span>{t(`inspector.diagnosticsReason.${activeInspectorDiagnostics.reason}`)}</span>}
+                        {activeInspectorDiagnostics.visible && (
+                          <span className="state-action">
+                            {diagnosticsExpanded || activeInspectorDiagnostics.expanded ? t("inspector.hideDiagnosticsShort") : t("inspector.showDiagnosticsShort")}
+                          </span>
+                        )}
                       </button>
                     </div>
-                    <div className="generation-method-tabs" role="tablist" aria-label={t("inspector.generationMethod")}>
-                      {generationMethods.map((method) => (
-                        <button
-                          className={`generation-method-tab ${activeGenerationMethod === method.id ? "active" : ""}`}
-                          key={method.id}
-                          onClick={() => selectGenerationMethod(method.id)}
-                          role="tab"
-                          type="button"
-                          aria-selected={activeGenerationMethod === method.id}
-                        >
-                          <strong>{t(method.labelKey)}</strong>
-                          <span>{t(method.hintKey)}</span>
-                        </button>
-                      ))}
-                    </div>
-
                     <div className={`generation-method-panel method-${activeGenerationMethod}`}>
-                      {activeGenerationMethod === "commercial" && (
-                        <label className="resource-field">
-                          <span>{t("inspector.commercialProvider")}</span>
-                          <select value={activeProvider} onChange={(event) => selectGenerationProvider(event.target.value as ProviderType)}>
-                            <option value="openai">OpenAI</option>
-                            <option value="gemini">Gemini</option>
-                            <option value="xai">xAI</option>
-                            <option value="volcengine">Volcengine</option>
-                            <option value="generic-http">{t("inspector.genericHttp")}</option>
-                            {activeProvider === "vibevoice" && <option value="vibevoice">VibeVoice Legacy</option>}
-                          </select>
-                        </label>
-                      )}
-                      <div className="field-grid compact-field-grid">
-                      <label>
-                        <span>{t(activeGenerationRouteLabels.profileLabelKey)}</span>
-                        <select value={activeVersionDraft?.profile ?? lineProfile(activeLine, resolvedCharacters)} onChange={(event) => {
-                          if (activeVersionDraft) {
-                            updateActiveVersionDraft({ profile: event.target.value });
-                          } else {
-                            updateLine(activeLine.id, { profile_override: event.target.value, binding_override: null, service_override: null, engine_override: null });
-                          }
-                        }}>
-                          {activeLine.temporary_binding && <option value={activeLine.temporary_binding.binding_id}>{t("inspector.temporaryBinding")}</option>}
-                          {activeProfiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}
-                          {activeProfiles.length === 0 && <option value={lineProfile(activeLine, resolvedCharacters)}>{lineProfile(activeLine, resolvedCharacters) || t("inspector.noProfile")}</option>}
-                        </select>
-                      </label>
-                      <label>
-                        <span>{t(activeGenerationRouteLabels.bindingLabelKey)}</span>
-                        <select value={activeVersionDraft?.binding_id ?? activeLine.binding_override ?? ""} onChange={(event) => {
-                          if (activeVersionDraft) {
-                            updateActiveVersionDraft({ binding_id: event.target.value || null });
-                          } else {
-                            updateLine(activeLine.id, { binding_override: event.target.value || null, service_override: null });
-                          }
-                        }}>
-                          {activeVersionDraft && <option value={activeVersionDraft.binding_id ?? ""}>{t("inspector.versionDraft")} · {activeVersionDraft.binding_id ?? selectedHistoryVersion?.version_id}</option>}
-                          {activeLine.temporary_binding && <option value="">{t("inspector.temporaryBinding")} · {activeLine.temporary_binding.provider_type}</option>}
-                          {!activeLine.temporary_binding && <option value="">{t("inspector.profileDefault")}{activeBinding ? ` · ${activeBinding.provider_type}` : ""}</option>}
-                          {activeBindings.map((binding) => <option value={binding.binding_id} key={binding.binding_id}>{binding.provider_type} · {binding.binding_id}</option>)}
-                        </select>
-                      </label>
-                      <label>
-                        <span>{t(activeGenerationRouteLabels.serviceLabelKey)}</span>
-                        <select value={activeSelectedServiceUnavailable ? "" : (activeVersionDraft?.service_id ?? lineServiceId(activeLine, resolvedCharacters) ?? "")} onChange={(event) => {
-                          const nextServiceId = event.target.value || null;
-                          if (activeVersionDraft) {
-                            updateActiveVersionDraft({
-                              service_id: nextServiceId,
-                              parameters: clearServiceScopedBindingConfig(activeProvider, activeVersionDraft.parameters)
-                            });
-                          } else {
-                            updateLineService(activeLine.id, nextServiceId);
-                          }
-                        }}>
-                          <option value="">{t("inspector.autoRoute")}</option>
-                          {activeRouteServices.length === 0 && <option value="" disabled>{t("inspector.noRoutableService")}</option>}
-                          {activeRouteServices.map((service) => <option value={service.service_id} key={service.service_id ?? service.engine}>{service.display_name ?? service.service_id} · {service.resource_group ?? t("status.resource")}</option>)}
-                        </select>
-                      </label>
+                      <div className="voice-route-summary compact-route-summary" aria-label={t("inspector.routeAndVoice")}>
+                        <div>
+                          <span>{t("inspector.currentVoice")}</span>
+                          <strong title={activeProfileLabel}>{activeProfileLabel}</strong>
+                          <small title={activeBindingLabel}>{activeBindingLabel}</small>
+                        </div>
+                        <div>
+                          <span>{t("inspector.routeService")}</span>
+                          <strong title={activeServiceLabel}>{activeServiceLabel}</strong>
+                          <small title={activeServiceContract}>{activeServiceContract}</small>
+                        </div>
                       </div>
+                      <details
+                        className="inspector-more-settings route-settings"
+                        key={`${activeLine?.id ?? "none"}-${activeGenerationMethod}`}
+                        onToggle={(event) => setRouteSettingsOpen(event.currentTarget.open)}
+                        open={routeSettingsOpen}
+                      >
+                        <summary>{t("inspector.routeSettings")}</summary>
+                        <div className="inspector-more-body">
+                          <div className="generation-method-tabs" role="tablist" aria-label={t("inspector.generationMethod")}>
+                            {generationMethods.map((method) => (
+                              <button
+                                className={`generation-method-tab ${activeGenerationMethod === method.id ? "active" : ""}`}
+                                key={method.id}
+                                onClick={() => selectGenerationMethod(method.id)}
+                                role="tab"
+                                type="button"
+                                aria-selected={activeGenerationMethod === method.id}
+                                aria-label={`${t(method.labelKey)} · ${t(method.hintKey)}`}
+                                title={t(method.hintKey)}
+                              >
+                                <strong>{t(method.labelKey)}</strong>
+                              </button>
+                            ))}
+                          </div>
+                          {activeGenerationMethod === "commercial" && (
+                            <label className="resource-field">
+                              <span>{t("inspector.commercialProvider")}</span>
+                              <select value={activeProvider} onChange={(event) => selectGenerationProvider(event.target.value as ProviderType)}>
+                                <option value="openai">OpenAI</option>
+                                <option value="gemini">Gemini</option>
+                                <option value="xai">xAI</option>
+                                <option value="volcengine">Volcengine</option>
+                                <option value="generic-http">{t("inspector.genericHttp")}</option>
+                                {activeProvider === "vibevoice" && <option value="vibevoice">VibeVoice Legacy</option>}
+                              </select>
+                            </label>
+                          )}
+                          <div className="field-grid compact-field-grid voice-route-grid">
+                            <label>
+                              <span>{t(activeGenerationRouteLabels.profileLabelKey)}</span>
+                              <select value={activeVersionDraft?.profile ?? lineProfile(activeLine, resolvedCharacters)} onChange={(event) => {
+                                if (activeVersionDraft) {
+                                  updateActiveVersionDraft({ profile: event.target.value });
+                                } else {
+                                  updateLine(activeLine.id, { profile_override: event.target.value, binding_override: null, service_override: null, engine_override: null });
+                                }
+                              }}>
+                                {activeLine.temporary_binding && <option value={activeLine.temporary_binding.binding_id}>{t("inspector.temporaryBinding")}</option>}
+                                {activeProfiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}
+                                {activeProfiles.length === 0 && <option value={lineProfile(activeLine, resolvedCharacters)}>{lineProfile(activeLine, resolvedCharacters) || t("inspector.noProfile")}</option>}
+                              </select>
+                            </label>
+                            <label>
+                              <span>{t(activeGenerationRouteLabels.bindingLabelKey)}</span>
+                              <select value={activeVersionDraft?.binding_id ?? activeLine.binding_override ?? ""} onChange={(event) => {
+                                if (activeVersionDraft) {
+                                  updateActiveVersionDraft({ binding_id: event.target.value || null });
+                                } else {
+                                  updateLine(activeLine.id, { binding_override: event.target.value || null, service_override: null });
+                                }
+                              }}>
+                                {activeVersionDraft && <option value={activeVersionDraft.binding_id ?? ""}>{t("inspector.versionDraft")} · {activeVersionDraft.binding_id ?? selectedHistoryVersion?.version_id}</option>}
+                                {activeLine.temporary_binding && <option value="">{t("inspector.temporaryBinding")} · {activeLine.temporary_binding.provider_type}</option>}
+                                {!activeLine.temporary_binding && <option value="">{t("inspector.profileDefault")}{activeBinding ? ` · ${activeBinding.provider_type}` : ""}</option>}
+                                {activeBindings.map((binding) => <option value={binding.binding_id} key={binding.binding_id}>{binding.provider_type} · {binding.binding_id}</option>)}
+                              </select>
+                            </label>
+                            <label>
+                              <span>{t(activeGenerationRouteLabels.serviceLabelKey)}</span>
+                              <select value={activeSelectedServiceUnavailable ? "" : (activeVersionDraft?.service_id ?? lineServiceId(activeLine, resolvedCharacters) ?? "")} onChange={(event) => {
+                                const nextServiceId = event.target.value || null;
+                                if (activeVersionDraft) {
+                                  updateActiveVersionDraft({
+                                    service_id: nextServiceId,
+                                    parameters: clearServiceScopedBindingConfig(activeProvider, activeVersionDraft.parameters)
+                                  });
+                                } else {
+                                  updateLineService(activeLine.id, nextServiceId);
+                                }
+                              }}>
+                                <option value="">{t("inspector.autoRoute")}</option>
+                                {activeRouteServices.length === 0 && <option value="" disabled>{t("inspector.noRoutableService")}</option>}
+                                {activeRouteServices.map((service) => <option value={service.service_id} key={service.service_id ?? service.engine}>{service.display_name ?? service.service_id} · {service.resource_group ?? t("status.resource")}</option>)}
+                              </select>
+                            </label>
+                          </div>
+                          {activeLine.temporary_binding && !activeVersionDraft && (
+                            <button
+                              className="secondary-button compact-button route-clear-temporary"
+                              type="button"
+                              onClick={() => clearTemporaryBinding(activeLine.id)}
+                            >
+                              {t("inspector.clearTemporaryBinding")}
+                            </button>
+                          )}
+                        </div>
+                      </details>
                     </div>
                     {(diagnosticsExpanded || activeInspectorDiagnostics.expanded) && (
                       <div className={`load-signature-panel inspector-inline-diagnostics tone-${activeInspectorDiagnostics.tone} ${activeServiceLoadState?.last_error ? "attention" : ""}`}>
@@ -3273,23 +3191,16 @@ export default function App() {
                   <section className="inspector-card reference-panel inspector-reference-card">
                     <div className="inspector-section-head compact reference-section-head">
                       <div>
-                        <strong><Library size={15} /> {t("inspector.soundReference")}</strong>
-                      </div>
-                      <div className="reference-head-actions">
-                        {activeLine.temporary_binding && (
-                          <>
-                            <span className="reference-head-pill">{t("inspector.temporaryBindingShort")}</span>
-                            <button className="secondary-button compact-button" onClick={() => clearTemporaryBinding(activeLine.id)}>{t("inspector.clearTemporaryBinding")}</button>
-                          </>
-                        )}
-                        {!activeBinding && (
-                          <>
-                            <span className="reference-head-pill attention">{t("inspector.needsTemporaryBindingShort")}</span>
-                            <button className="secondary-button compact-button" onClick={() => setTemporaryBindingProvider(activeLine.id, "indextts")}>{t("inspector.createIndexTemporary")}</button>
-                          </>
-                        )}
+                        <strong><Library size={15} /> {activeGenerationMethod === "commercial" ? t("inspector.apiVoiceReference") : t("inspector.voiceReference")}</strong>
                       </div>
                     </div>
+
+                    {!activeLine.temporary_binding && !activeBinding ? (
+                      <div className="reference-setup-callout attention" aria-live="polite">
+                        <span>{t("inspector.needsTemporaryBindingShort")}</span>
+                        <button className="secondary-button compact-button" type="button" onClick={() => setTemporaryBindingProvider(activeLine.id, "indextts")}>{t("inspector.createIndexTemporary")}</button>
+                      </div>
+                    ) : null}
 
                     {activeProvider === "gpt-sovits" && (
                       <>
@@ -3301,102 +3212,117 @@ export default function App() {
                             </div>
                             <div>
                               <span>{t("inspector.service")}</span>
-                              <strong>{activeServiceId ? serviceDisplayName(serviceById.get(activeServiceId) ?? ({ engine: activeProvider, display_name: activeServiceId, ready: false } as WorkerHealth)) : t("inspector.autoRoute")}</strong>
+                              <strong>{activeServiceLabel}</strong>
+                              <small title={activeServiceContract}>{activeServiceContract}</small>
                             </div>
                             <div>
                               <span>{t("inspector.currentReference")}</span>
                               <strong>{activeLogsReferenceSample?.display_label ?? shortPath(stringConfig(activeBindingConfig.ref_audio_path)) ?? t("status.unset")}</strong>
                             </div>
                           </div>
-
-                          <div className="gpt-resource-control-grid">
-                            <div className="gpt-resource-column">
-                              <label className="resource-field">
-                                <span>{t("inspector.gptWeights")}</span>
-                                <select value={stringConfig(activeBindingConfig.gpt_weights_path)} onChange={(event) => updateActiveBindingConfig({ gpt_weights_path: event.target.value || undefined })}>
-                                  <option value="">{t("inspector.autoDefault")}</option>
-                                  {voiceCandidates?.gpt_sovits.gpt_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
-                                </select>
-                              </label>
-                              <label className="resource-field">
-                                <span>{t("inspector.sovitsWeights")}</span>
-                                <select value={stringConfig(activeBindingConfig.sovits_weights_path)} onChange={(event) => updateActiveBindingConfig({ sovits_weights_path: event.target.value || undefined })}>
-                                  <option value="">{t("inspector.autoDefault")}</option>
-                                  {voiceCandidates?.gpt_sovits.sovits_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
-                                </select>
-                              </label>
-                            </div>
-
-                            <div className="gpt-resource-column">
-                              <div className="logs-reference-picker">
-                                <label className="resource-field">
-                                  <span>{t("inspector.logsReferenceAudio")}</span>
-                                  <select
-                                    value={activeLogsReferenceSample?.sample_id ?? ""}
-                                    disabled={!activeLogsReferenceRequest || loadingLogsReferenceKey === activeLogsReferenceRequest?.key}
-                                    onChange={(event) => {
-                                      const sample = activeLogsReferenceSamples.find((item) => item.sample_id === event.target.value);
-                                      if (sample) applyLogsReferenceSample(sample);
-                                    }}
-                                  >
-                                    <option value="">{activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
-                                    {activeLogsReferenceSamples.map((sample) => (
-                                      <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
-                                    ))}
-                                  </select>
-                                </label>
-                                <button
-                                  className="icon-button"
-                                  disabled={!activeLogsReferenceRequest}
-                                  onClick={() => {
-                                    if (!activeLogsReferenceRequest) return;
-                                    setLogsReferenceAudio((current) => {
-                                      const next = { ...current };
-                                      delete next[activeLogsReferenceRequest.key];
-                                      return next;
-                                    });
-                                  }}
-                                  title={t("inspector.refreshLogsReference")}
-                                >
-                                  <RefreshCw size={14} />
-                                </button>
+                          {activeReferenceAudioPath && isLocalAudioAsset(activeReferenceAudioPath) && (
+                            <div className="active-reference-player">
+                              <div>
+                                <span>{t("inspector.selectedReferenceAudio")}</span>
+                                <strong title={activeReferenceAudioLabel}>{activeReferenceAudioLabel}</strong>
                               </div>
-                              {isLogsReferenceFromOtherService && (
-                                <div className="empty-row compact attention">
-                                  {t("inspector.logsReferenceServiceMismatch")}
-                                </div>
-                              )}
-                              {activeLogsReferenceRequest && activeLogsReferenceSamples.length === 0 && (
-                                <div className="empty-row compact">
-                                  {loadingLogsReferenceKey === activeLogsReferenceRequest.key ? t("inspector.loadingLogsReference") : (activeLogsReferencePayload?.diagnostics?.[0]?.detail ?? t("inspector.noLogsReferenceAudio"))}
-                                </div>
-                              )}
+                              <WaveformPlayer audioPath={activeReferenceAudioPath} label={activeReferenceAudioLabel} compact />
+                            </div>
+                          )}
 
-                              {activeLogsReferenceSample && (
-                                <div className="logs-reference-preview compact-reference-preview">
-                                  <div>
-                                    <span>{t("inspector.textSource")}: {activeLogsReferenceSample.text_source || t("status.unset")}</span>
-                                    <strong>{activeLogsReferenceSample.text || t("inspector.emptyPromptText")}</strong>
+                          <details className="inspector-more-settings reference-settings">
+                            <summary>{t("inspector.weightsAndReference")}</summary>
+                            <div className="inspector-more-body">
+                              <div className="gpt-resource-control-grid">
+                                <div className="gpt-resource-column">
+                                  <label className="resource-field">
+                                    <span>{t("inspector.gptWeights")}</span>
+                                    <select value={stringConfig(activeBindingConfig.gpt_weights_path)} onChange={(event) => updateActiveBindingConfig({ gpt_weights_path: event.target.value || undefined })}>
+                                      <option value="">{t("inspector.autoDefault")}</option>
+                                      {voiceCandidates?.gpt_sovits.gpt_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
+                                    </select>
+                                  </label>
+                                  <label className="resource-field">
+                                    <span>{t("inspector.sovitsWeights")}</span>
+                                    <select value={stringConfig(activeBindingConfig.sovits_weights_path)} onChange={(event) => updateActiveBindingConfig({ sovits_weights_path: event.target.value || undefined })}>
+                                      <option value="">{t("inspector.autoDefault")}</option>
+                                      {voiceCandidates?.gpt_sovits.sovits_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
+                                    </select>
+                                  </label>
+                                </div>
+
+                                <div className="gpt-resource-column">
+                                  <div className="logs-reference-picker">
+                                    <label className="resource-field">
+                                      <span>{t("inspector.logsReferenceAudio")}</span>
+                                      <select
+                                        value={activeLogsReferenceSample?.sample_id ?? ""}
+                                        disabled={!activeLogsReferenceRequest || loadingLogsReferenceKey === activeLogsReferenceRequest?.key}
+                                        onChange={(event) => {
+                                          const sample = activeLogsReferenceSamples.find((item) => item.sample_id === event.target.value);
+                                          if (sample) applyLogsReferenceSample(sample);
+                                        }}
+                                      >
+                                        <option value="">{activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
+                                        {activeLogsReferenceSamples.map((sample) => (
+                                          <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
+                                        ))}
+                                      </select>
+                                    </label>
+                                    <button
+                                      className="icon-button"
+                                      disabled={!activeLogsReferenceRequest}
+                                      onClick={() => {
+                                        if (!activeLogsReferenceRequest) return;
+                                        setLogsReferenceAudio((current) => {
+                                          const next = { ...current };
+                                          delete next[activeLogsReferenceRequest.key];
+                                          return next;
+                                        });
+                                      }}
+                                      title={t("inspector.refreshLogsReference")}
+                                    >
+                                      <RefreshCw size={14} />
+                                    </button>
                                   </div>
-                                  {isLocalAudioAsset(activeLogsReferenceSample.path) && <WaveformPlayer audioPath={activeLogsReferenceSample.path} label={activeLogsReferenceSample.display_label} />}
-                                </div>
-                              )}
-                            </div>
-                          </div>
+                                  {isLogsReferenceFromOtherService && (
+                                    <div className="empty-row compact attention">
+                                      {t("inspector.logsReferenceServiceMismatch")}
+                                    </div>
+                                  )}
+                                  {activeLogsReferenceRequest && activeLogsReferenceSamples.length === 0 && (
+                                    <div className="empty-row compact">
+                                      {loadingLogsReferenceKey === activeLogsReferenceRequest.key ? t("inspector.loadingLogsReference") : (activeLogsReferencePayload?.diagnostics?.[0]?.detail ?? t("inspector.noLogsReferenceAudio"))}
+                                    </div>
+                                  )}
 
-                          <div className="gpt-manual-reference-card">
-                            <label className="resource-field manual-reference-text-field">
-                              <span>{t("inspector.promptText")}</span>
-                              <textarea value={stringConfig(activeBindingConfig.prompt_text)} onChange={(event) => updateActiveBindingConfig({ prompt_text: event.target.value })} placeholder={t("inspector.promptPlaceholder")} rows={3} />
-                            </label>
-                            <div className="manual-reference-audio-field">
-                              <ReferenceAudioInput
-                                label={t("inspector.referenceAudio")}
-                                value={stringConfig(activeBindingConfig.ref_audio_path)}
-                                onUpload={(file) => uploadLineReference(file, "ref_audio_path")}
-                              />
+                                  {activeLogsReferenceSample && (
+                                    <div className="logs-reference-preview compact-reference-preview">
+                                      <div>
+                                        <span>{t("inspector.textSource")}: {activeLogsReferenceSample.text_source || t("status.unset")}</span>
+                                        <strong>{activeLogsReferenceSample.text || t("inspector.emptyPromptText")}</strong>
+                                      </div>
+                                      {isLocalAudioAsset(activeLogsReferenceSample.path) && <WaveformPlayer audioPath={activeLogsReferenceSample.path} label={activeLogsReferenceSample.display_label} />}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="gpt-manual-reference-card">
+                                <label className="resource-field manual-reference-text-field">
+                                  <span>{t("inspector.promptText")}</span>
+                                  <textarea value={stringConfig(activeBindingConfig.prompt_text)} onChange={(event) => updateActiveBindingConfig({ prompt_text: event.target.value })} placeholder={t("inspector.promptPlaceholder")} rows={3} />
+                                </label>
+                                <div className="manual-reference-audio-field">
+                                  <ReferenceAudioInput
+                                    label={t("inspector.referenceAudio")}
+                                    value={stringConfig(activeBindingConfig.ref_audio_path)}
+                                    onUpload={(file) => uploadLineReference(file, "ref_audio_path")}
+                                  />
+                                </div>
+                              </div>
                             </div>
-                          </div>
+                          </details>
                         </div>
                       </>
                     )}
@@ -3408,66 +3334,51 @@ export default function App() {
                           value={stringConfig(activeBindingConfig.voice)}
                           onUpload={(file) => uploadLineReference(file, "voice")}
                         />
-                        <div className="emotion-mode-control" role="radiogroup" aria-label={t("inspector.emotionMode")}>
-                          <span>{t("inspector.emotionMode")}</span>
-                          <div>
-                            {([
-                              ["same_as_voice", t("inspector.emotionSameAsVoice")],
-                              ["emotion_audio", t("inspector.emotionAudio")],
-                              ["emotion_vector", t("inspector.emotionVector")],
-                              ["emotion_text", t("inspector.emotionText")]
-                            ] as const).map(([mode, label]) => {
-                              const currentMode = stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice";
-                              return (
-                                <button
-                                  aria-checked={currentMode === mode}
-                                  className={`emotion-mode-option ${currentMode === mode ? "active" : ""}`}
-                                  key={mode}
-                                  onClick={() => updateActiveBindingConfig({ emotion_mode: mode })}
-                                  role="radio"
-                                  type="button"
-                                >
-                                  {label}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                        {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_text" && (
-                          <label className="resource-field">
-                            <span>{t("inspector.emotionText")}</span>
-                            <input value={stringConfig(activeBindingConfig.emotion_text)} onChange={(event) => updateActiveBindingConfig({ emotion_text: event.target.value })} placeholder={activeLine.note || t("inspector.emotionTextPlaceholder")} />
-                          </label>
-                        )}
-                        {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_audio" && (
-                          <ReferenceAudioInput
-                            label={t("inspector.uploadEmotionReference")}
-                            value={stringConfig(activeBindingConfig.emotion_audio)}
-                            onUpload={(file) => uploadLineReference(file, "emotion_audio")}
-                          />
-                        )}
-                        {(stringConfig(activeBindingConfig.emotion_mode) || "same_as_voice") === "emotion_vector" && (
-                          <label className="resource-field">
-                            <span>{t("inspector.emotionVector")}</span>
-                            <input value={vectorConfig(activeBindingConfig.emotion_vector)} onChange={(event) => updateActiveBindingConfig({ emotion_vector: parseVectorConfig(event.target.value) })} placeholder="0,0,0,0,0,0,0,0" />
-                          </label>
-                        )}
-                        <details className="advanced-params">
-                          <summary>{t("inspector.advancedParams")}</summary>
-                          <div className="advanced-grid">
-                            {[
-                              ["top_p", 0.8],
-                              ["top_k", 30],
-                              ["temperature", 0.8],
-                              ["num_beams", 3],
-                              ["repetition_penalty", 10],
-                              ["max_mel_tokens", 1500]
-                            ].map(([key, fallback]) => (
-                              <label key={String(key)}>
-                                <span>{String(key)}</span>
-                                <input value={String(activeBindingConfig[String(key)] ?? fallback)} onChange={(event) => updateActiveBindingConfig({ [String(key)]: Number(event.target.value) })} />
+                        <details className="inspector-more-settings reference-settings">
+                          <summary>{t("inspector.emotionAndParams")}</summary>
+                          <div className="inspector-more-body">
+                            <label className="resource-field index-emotion-mode-field">
+                              <span>{t("inspector.emotionMode")}</span>
+                              <select value={indexEmotionMode} onChange={(event) => updateActiveBindingConfig({ emotion_mode: event.target.value })}>
+                                {INDEX_EMOTION_MODE_OPTIONS.map((mode) => (
+                                  <option value={mode.id} key={mode.id}>{t(mode.labelKey)}</option>
+                                ))}
+                              </select>
+                            </label>
+                            {indexEmotionMode === "emotion_text" && (
+                              <label className="resource-field">
+                                <span>{t("inspector.emotionText")}</span>
+                                <input value={stringConfig(activeBindingConfig.emotion_text)} onChange={(event) => updateActiveBindingConfig({ emotion_text: event.target.value })} placeholder={activeLine.note || t("inspector.emotionTextPlaceholder")} />
                               </label>
-                            ))}
+                            )}
+                            {indexEmotionMode === "emotion_audio" && (
+                              <ReferenceAudioInput
+                                label={t("inspector.uploadEmotionReference")}
+                                value={stringConfig(activeBindingConfig.emotion_audio)}
+                                onUpload={(file) => uploadLineReference(file, "emotion_audio")}
+                              />
+                            )}
+                            {indexEmotionMode === "emotion_vector" && (
+                              <label className="resource-field">
+                                <span>{t("inspector.emotionVector")}</span>
+                                <input value={vectorConfig(activeBindingConfig.emotion_vector)} onChange={(event) => updateActiveBindingConfig({ emotion_vector: parseVectorConfig(event.target.value) })} placeholder="0,0,0,0,0,0,0,0" />
+                              </label>
+                            )}
+                            <div className="advanced-grid">
+                              {[
+                                ["top_p", 0.8],
+                                ["top_k", 30],
+                                ["temperature", 0.8],
+                                ["num_beams", 3],
+                                ["repetition_penalty", 10],
+                                ["max_mel_tokens", 1500]
+                              ].map(([key, fallback]) => (
+                                <label key={String(key)}>
+                                  <span>{String(key)}</span>
+                                  <input value={String(activeBindingConfig[String(key)] ?? fallback)} onChange={(event) => updateActiveBindingConfig({ [String(key)]: Number(event.target.value) })} />
+                                </label>
+                              ))}
+                            </div>
                           </div>
                         </details>
                       </div>
@@ -3475,38 +3386,21 @@ export default function App() {
 
                     {activeProvider === "cosyvoice" && (
                       <div className="cosyvoice-temporary-panel">
-                        <div className="emotion-mode-control cosyvoice-mode-control" role="radiogroup" aria-label={t("inspector.cosyVoiceMode")}>
+                        <label className="resource-field cosyvoice-mode-field">
                           <span>{t("inspector.cosyVoiceMode")}</span>
-                          <div>
-                            {([
-                              ["sft", t("inspector.cosyModeSft")],
-                              ["zero_shot", t("inspector.cosyModeZeroShot")],
-                              ["cross_lingual", t("inspector.cosyModeCrossLingual")],
-                              ["instruct", t("inspector.cosyModeInstruct")]
-                            ] as const).map(([mode, label]) => {
-                              const currentMode = stringConfig(activeBindingConfig.mode) || "zero_shot";
-                              return (
-                                <button
-                                  aria-checked={currentMode === mode}
-                                  className={`emotion-mode-option ${currentMode === mode ? "active" : ""}`}
-                                  key={mode}
-                                  onClick={() => updateActiveBindingConfig({ mode })}
-                                  role="radio"
-                                  type="button"
-                                >
-                                  {label}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                        {((stringConfig(activeBindingConfig.mode) || "zero_shot") === "sft" || (stringConfig(activeBindingConfig.mode) || "zero_shot") === "instruct") ? (
+                          <select value={cosyVoiceMode} onChange={(event) => updateActiveBindingConfig({ mode: event.target.value })}>
+                            {COSY_VOICE_MODE_OPTIONS.map((mode) => (
+                              <option value={mode.id} key={mode.id}>{t(mode.labelKey)}</option>
+                            ))}
+                          </select>
+                        </label>
+                        {cosyVoiceNeedsSpeaker ? (
                           <label className="resource-field">
                             <span>{t("inspector.cosySpeaker")}</span>
                             <input value={stringConfig(activeBindingConfig.speaker_id)} onChange={(event) => updateActiveBindingConfig({ speaker_id: event.target.value })} placeholder={t("inspector.cosySpeakerPlaceholder")} />
                           </label>
                         ) : null}
-                        {((stringConfig(activeBindingConfig.mode) || "zero_shot") === "zero_shot" || (stringConfig(activeBindingConfig.mode) || "zero_shot") === "cross_lingual") ? (
+                        {cosyVoiceNeedsPrompt ? (
                           <>
                             <ReferenceAudioInput
                               label={t("inspector.cosyReferenceAudio")}
@@ -3519,22 +3413,27 @@ export default function App() {
                             </label>
                           </>
                         ) : null}
-                        {(stringConfig(activeBindingConfig.mode) || "zero_shot") === "instruct" && (
+                        {cosyVoiceNeedsInstruction && (
                           <label className="resource-field">
                             <span>{t("inspector.cosyInstruction")}</span>
                             <textarea value={stringConfig(activeBindingConfig.instruct_text)} onChange={(event) => updateActiveBindingConfig({ instruct_text: event.target.value })} placeholder={t("inspector.cosyInstructionPlaceholder")} rows={3} />
                           </label>
                         )}
-                        <div className="advanced-grid compact-cosyvoice-grid">
-                          <label>
-                            <span>{t("inspector.cosySpeed")}</span>
-                            <input value={String(activeBindingConfig.speed ?? 1)} onChange={(event) => updateActiveBindingConfig({ speed: Number(event.target.value) })} />
-                          </label>
-                          <label>
-                            <span>{t("inspector.cosySeed")}</span>
-                            <input value={String(activeBindingConfig.seed ?? -1)} onChange={(event) => updateActiveBindingConfig({ seed: Number(event.target.value) })} />
-                          </label>
-                        </div>
+                        <details className="inspector-more-settings reference-settings">
+                          <summary>{t("inspector.advancedParams")}</summary>
+                          <div className="inspector-more-body">
+                            <div className="advanced-grid compact-cosyvoice-grid">
+                              <label>
+                                <span>{t("inspector.cosySpeed")}</span>
+                                <input value={String(activeBindingConfig.speed ?? 1)} onChange={(event) => updateActiveBindingConfig({ speed: Number(event.target.value) })} />
+                              </label>
+                              <label>
+                                <span>{t("inspector.cosySeed")}</span>
+                                <input value={String(activeBindingConfig.seed ?? -1)} onChange={(event) => updateActiveBindingConfig({ seed: Number(event.target.value) })} />
+                              </label>
+                            </div>
+                          </div>
+                        </details>
                       </div>
                     )}
 
@@ -3560,7 +3459,7 @@ export default function App() {
                     ) : activeProvider === "gpt-sovits" || activeProvider === "indextts" || activeProvider === "cosyvoice" ? (
                       null
                     ) : (
-                      <div className="empty-row">{t("inspector.commercialResourceHint")}</div>
+                      <div className="commercial-reference-note">{t("inspector.commercialResourceHint")}</div>
                     )}
                   </section>
                 )}
@@ -3573,9 +3472,31 @@ export default function App() {
                         <span className={`generate-status-light tone-${activeInspectorDiagnostics.tone} summary-${activeSummary.tone}`} title={summaryLabel(activeSummary, t)} />
                       </div>
                       {formatScriptNote(activeLine.note) && <p className="speech-workbench-note">{formatScriptNote(activeLine.note)}</p>}
-                      <p>{activeLine.text}</p>
+                      <label className="speech-workbench-editor">
+                        <span>{t("inspector.lineTextForGeneration")}</span>
+                        <textarea
+                          value={activeLineTextDraft}
+                          onChange={(event) => updateLineTextDraft(activeLine.id, event.target.value)}
+                          placeholder={activeLine.text}
+                          rows={3}
+                        />
+                      </label>
+                      {activeLineTextDraft !== activeLine.text && (
+                        <button className="secondary-button compact-button speech-workbench-reset" type="button" onClick={() => resetLineTextDraft(activeLine.id)}>
+                          {t("inspector.resetLineText")}
+                        </button>
+                      )}
                     </div>
                   </div>
+                  {activePlayableVersion?.audio_path && (
+                    <div className="generated-result-player">
+                      <div>
+                        <span>{t("inspector.generatedResult")}</span>
+                        <strong>{activePlayableVersion.version_id}</strong>
+                      </div>
+                      <WaveformPlayer audioPath={activePlayableVersion.audio_path} label={activePlayableVersion.version_id} compact />
+                    </div>
+                  )}
                   <div className="generate-dock-actions">
                     <button className="primary-button inspector-generate-button" onClick={() => void runInspectorGeneration()} disabled={isGenerating || (!activeVersionDraft && !activeBinding)}>
                       {isGenerating ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
@@ -3827,6 +3748,29 @@ export default function App() {
       );
       return projectWithProjectCharacters(current, nextProjectCharacters);
     });
+    setNotice(t("notice.roleSaved"));
+  }
+
+  function applyLibraryCharacterToProjectRole(character: Character | null) {
+    if (!activeProjectCharacter || !character) return;
+    setProject((current) => {
+      const nextProjectCharacters = ensureProjectCharacters(current, characters).map((item) =>
+        item.project_character_id === activeProjectCharacter.project_character_id
+          ? {
+              ...item,
+              library_character_id: character.id,
+              mode: "reference" as const,
+              character_snapshot: null,
+              project_binding: null,
+              match_status: "matched" as const
+            }
+          : item
+      );
+      return projectWithProjectCharacters(current, nextProjectCharacters);
+    });
+    setActiveLibraryCharacterId(character.id);
+    setActiveRoleCandidateId(null);
+    setActiveModelCatalogId(null);
     setNotice(t("notice.roleSaved"));
   }
 
@@ -4286,6 +4230,16 @@ function stringConfig(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function cosyVoiceModeFromConfig(value: unknown): CosyVoiceMode {
+  const mode = stringConfig(value);
+  return COSY_VOICE_MODE_OPTIONS.some((item) => item.id === mode) ? (mode as CosyVoiceMode) : "zero_shot";
+}
+
+function indexEmotionModeFromConfig(value: unknown): IndexEmotionMode {
+  const mode = stringConfig(value);
+  return INDEX_EMOTION_MODE_OPTIONS.some((item) => item.id === mode) ? (mode as IndexEmotionMode) : "same_as_voice";
+}
+
 function vectorConfig(value: unknown): string {
   return Array.isArray(value) ? value.join(",") : "";
 }
@@ -4430,6 +4384,12 @@ function serviceDisplayName(service: WorkerHealth): string {
   if (service.mode === "external" || service.capabilities?.includes("paid_provider")) return base;
   if (service.service_id?.startsWith("local-")) return `${base} Local`;
   return base;
+}
+
+function isGptSovitsApiV2Service(service: WorkerHealth | undefined): boolean {
+  if (!service) return false;
+  return service.api_contract === "gpt-sovits-api-v2"
+    || Boolean(service.capabilities?.some((capability) => capability === "gpt-sovits-api-v2" || capability === "model_catalog"));
 }
 
 function serviceHealthText(service: WorkerHealth, t: Translate, runtimeMode?: string): string {
@@ -4792,26 +4752,6 @@ function FailureHistoryMessage({ version, t }: { version: GenerationVersion; t: 
       {failure.detail && <span>{failure.detail}</span>}
     </p>
   );
-}
-
-function renderMarkdownPreview(markdown: string) {
-  const lines = markdown.split(/\r?\n/);
-  return lines.map((line, index) => {
-    const key = `${index}-${line.slice(0, 12)}`;
-    if (!line.trim()) return <div className="markdown-line blank" key={key} />;
-    const heading = line.match(/^(#{1,4})\s+(.+)$/);
-    if (heading) {
-      const level = heading[1].length;
-      return <div className={`markdown-line heading h${level}`} key={key}>{heading[2]}</div>;
-    }
-    if (line.trimStart().startsWith(">")) {
-      return <blockquote className="markdown-line quote" key={key}>{line.replace(/^\s*>\s?/, "")}</blockquote>;
-    }
-    if (line.trimStart().startsWith("`") && line.trimEnd().endsWith("`")) {
-      return <code className="markdown-line inline-code" key={key}>{line.replace(/^`|`$/g, "")}</code>;
-    }
-    return <p className="markdown-line" key={key}>{line}</p>;
-  });
 }
 
 function ReferencePreview({ groups, t }: { groups: CharacterReferenceAudioGroup[]; t: Translate }) {

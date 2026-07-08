@@ -5,9 +5,10 @@ import WaveSurfer from "wavesurfer.js";
 interface WaveformPlayerProps {
   audioPath: string;
   label: string;
+  compact?: boolean;
 }
 
-export function WaveformPlayer({ audioPath, label }: WaveformPlayerProps) {
+export function WaveformPlayer({ audioPath, label, compact = false }: WaveformPlayerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const waveRef = useRef<WaveSurfer | null>(null);
   const [ready, setReady] = useState(false);
@@ -44,7 +45,7 @@ export function WaveformPlayer({ audioPath, label }: WaveformPlayerProps) {
   }, [audioPath]);
 
   return (
-    <div className="waveform-player" onClick={(event) => event.stopPropagation()}>
+    <div className={`waveform-player ${compact ? "compact" : ""}`} onClick={(event) => event.stopPropagation()}>
       <button className="icon-button tiny" onClick={() => void waveRef.current?.playPause()} disabled={!ready || Boolean(error)} title={label}>
         {isPlaying ? <Pause size={13} /> : <Play size={13} />}
       </button>

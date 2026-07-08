@@ -60,6 +60,22 @@ def test_slugify_role_name_has_stable_ids_for_common_chinese_roles() -> None:
     assert slugify_role_name("反派") == "fan-pai"
 
 
+def test_slugify_role_name_preserves_unmapped_chinese_characters() -> None:
+    # PINYIN_FALLBACK 字典未覆盖的字不能被丢弃，
+    # 否则不同中文名（例如“小明”和“小红”）会被压缩成同一个 slug。
+    assert slugify_role_name("小明") != slugify_role_name("小红")
+    assert slugify_role_name("小明") != slugify_role_name("小美")
+    assert slugify_role_name("小明").startswith("xiao-")
+    assert slugify_role_name("小红").startswith("xiao-")
+    # 字典里 “美” = “mei”，不应被 Unicode fallback 替换。
+    assert slugify_role_name("小美") == "xiao-mei"
+    # 完全未覆盖的角色名必须自洽：相同输入稳定，不同输入不冲突。
+    assert slugify_role_name("阿古") == slugify_role_name("阿古")
+    assert slugify_role_name("阿古") != slugify_role_name("阿明")
+    # 多字符全角名（包含字典外字符）每个未覆盖字符都要贡献 token。
+    assert slugify_role_name("柊筱") == "u67ca-u7b71"
+
+
 def test_resolved_matched_character_keeps_logs_first_gpt_binding() -> None:
     library = [
         Character(

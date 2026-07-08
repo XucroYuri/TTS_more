@@ -44,18 +44,6 @@ export interface HistoryPlayerSummary {
   audioPath: string | null;
 }
 
-export interface PaginationView<T> {
-  items: T[];
-  page: number;
-  pageSize: number;
-  totalItems: number;
-  totalPages: number;
-  startItem: number;
-  endItem: number;
-  hasPrevious: boolean;
-  hasNext: boolean;
-}
-
 export interface LineFocusState {
   activeLineId: string | null;
   expandedLineId: string | null;
@@ -74,7 +62,28 @@ export interface GenerationMethodRouteLabels {
   serviceLabelKey: string;
 }
 
-export type ScriptConsoleBodyMode = "preview" | "edit";
+export interface LineFilterToolbarLabels {
+  filtersMore: string;
+  selectedLines: (count: number) => string;
+  visibleLines: (count: number) => string;
+  status: (status: string) => string;
+}
+
+export interface LineFilterToolbarInput {
+  providerFilter: string;
+  statusFilter: string;
+  selectedLineCount: number;
+  filteredLineCount: number;
+  labels: LineFilterToolbarLabels;
+}
+
+export interface LineFilterToolbarState {
+  hasFilters: boolean;
+  title: string;
+  countLabel: string;
+  activeBadgeVisible: boolean;
+  clearButtonVisible: boolean;
+}
 
 type PreflightFallbackEntry = {
   fallback_action?: { type?: string; service_id?: string } | null;
@@ -200,27 +209,21 @@ export function generationMethodRouteLabels(methodId: GenerationMethodId): Gener
   };
 }
 
-export function scriptConsoleBodyMode(isEditing: boolean): ScriptConsoleBodyMode {
-  return isEditing ? "edit" : "preview";
-}
+export function lineFilterToolbarState(input: LineFilterToolbarInput): LineFilterToolbarState {
+  const hasProviderFilter = input.providerFilter !== "all";
+  const hasStatusFilter = input.statusFilter !== "all";
+  const hasFilters = hasProviderFilter || hasStatusFilter;
+  const titleParts = [
+    hasProviderFilter ? input.providerFilter : null,
+    hasStatusFilter ? input.labels.status(input.statusFilter === "not-generated" ? "not generated" : input.statusFilter) : null
+  ].filter(Boolean);
 
-export function paginateItems<T>(items: T[], requestedPage: number, requestedPageSize: number): PaginationView<T> {
-  const pageSize = Math.max(1, Math.floor(requestedPageSize));
-  const totalItems = items.length;
-  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
-  const page = Math.min(totalPages, Math.max(1, Math.floor(requestedPage) || 1));
-  const startIndex = (page - 1) * pageSize;
-  const pageItems = items.slice(startIndex, startIndex + pageSize);
   return {
-    items: pageItems,
-    page,
-    pageSize,
-    totalItems,
-    totalPages,
-    startItem: totalItems === 0 ? 0 : startIndex + 1,
-    endItem: totalItems === 0 ? 0 : startIndex + pageItems.length,
-    hasPrevious: page > 1,
-    hasNext: page < totalPages
+    hasFilters,
+    title: hasFilters ? titleParts.join(" · ") : input.labels.filtersMore,
+    countLabel: input.selectedLineCount > 0 ? input.labels.selectedLines(input.selectedLineCount) : input.labels.visibleLines(input.filteredLineCount),
+    activeBadgeVisible: hasFilters,
+    clearButtonVisible: hasFilters
   };
 }
 
