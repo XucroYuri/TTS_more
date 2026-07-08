@@ -2,21 +2,37 @@
 
 TTS More 的核心开源 TTS 顺序固定为：
 
-`GPT-SoVITS -> IndexTTS -> CosyVoice -> TTS API`
+`GPT-SoVITS → IndexTTS → CosyVoice → TTS API`
 
 TTS API 目前是占位入口，产品重点先放在 GPT-SoVITS、IndexTTS、CosyVoice 三个开源服务。
+
+## provider 优先级与资源组调度
+
+```mermaid
+flowchart TD
+    Gen["生成请求"] --> Route["服务路由"]
+    Route --> P1["1. GPT-SoVITS<br/>训练音色 / 参考音频"]
+    Route --> P2["2. IndexTTS<br/>强情绪 / 临时配音"]
+    Route --> P3["3. CosyVoice<br/>多模式"]
+    Route --> P4["4. 商业/通用 HTTP<br/>可选"]
+    P1 --> RG["按 resource_group + capacity<br/>串行/并行"]
+    P2 --> RG
+    P3 --> RG
+    P4 --> RG
+    RG --> Cluster["按 cluster key 聚合<br/>同资源优先复用加载状态"]
+```
 
 ## 安装入口
 
 先部署 TTS More：
 
-```powershell
+```bash
 git clone https://github.com/XucroYuri/TTS_more.git
 ```
 
 如果本机或局域网还没有可用 TTS 服务，可以按需部署以下项目，并启动它们各自的推理 WebUI。
 
-```powershell
+```bash
 git clone https://github.com/XucroYuri/GPT-SoVITS.git repo/GPT-SoVITS
 git clone https://github.com/XucroYuri/index-tts.git repo/index-tts
 git clone https://github.com/XucroYuri/CosyVoice.git repo/CosyVoice
@@ -26,7 +42,7 @@ git clone https://github.com/XucroYuri/CosyVoice.git repo/CosyVoice
 
 ## 接入方式
 
-在工作台打开 `服务与资源 -> 开源接入`，选择一个开源 provider 后只需要配置一个字段：
+在工作台打开 `服务与资源 → 开源接入`，选择一个开源 provider 后只需要配置一个字段：
 
 ```text
 Gradio WebUI 地址，例如 http://tts-webui.local:9872

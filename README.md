@@ -1,316 +1,67 @@
 # TTS More
 
-TTS More 是一个面向剧本配音生产的多 TTS 服务调度工作台。项目目标不是重写各个 TTS 模型，而是在 GPT-SoVITS、IndexTTS、CosyVoice 以及未来 TTS API 之上建立统一的剧本解析、角色音色配置、任务队列、服务状态感知和生成历史管理能力。
+TTS More 是一个**剧本配音工作台**：在 GPT-SoVITS、IndexTTS、CosyVoice 等开源 TTS 与商业 HTTP 服务之上，提供统一的剧本解析、角色音色配置、任务队列和生成历史管理。它不重写模型，只做编排。
 
-当前主线开发重点是三个开源 TTS 服务：
+本地优先：默认绑 `127.0.0.1`，单用户零配置即可跑起来。
 
-```text
-GPT-SoVITS -> IndexTTS -> CosyVoice -> TTS API
+## 架构
+
+```mermaid
+flowchart LR
+    Browser["浏览器<br/>React 工作台"] -- "HTTP /api" --> Backend["FastAPI 编排后端"]
+    Backend -- "调度/合成" --> Local["本地工作器<br/>GPT-SoVITS / index-tts"]
+    Backend -- "调度/合成" --> Remote["远端服务<br/>Gradio / 商业 API"]
+    Backend -- "读写" --> Data[("data/<br/>项目/角色/配置")]
+    Local -- "产出音频" --> Data
+    Remote -- "回传音频" --> Backend
 ```
 
-其中 TTS API 暂时保留为占位入口，当前核心开发资源集中在 GPT-SoVITS、IndexTTS、CosyVoice 三个开源服务上。
+三栏工作台：左侧服务与资源、中间台词任务表、右侧台词检视器。中英双语 i18n，中文兜底。
 
-## 当前定位
+更多见 [架构文档](docs/architecture.md) 与 [安全模型](docs/security.md)。
 
-TTS More 是外层独立框架项目，`repo/` 下的 TTS 项目保持为可更新的上游仓库或本地部署目录。外层框架只负责：
+## 快速开始
 
-- 导入和解析剧本，将自由文本转为角色、括注、台词行。
-- 管理全局角色库和项目角色映射。
-- 根据角色、台词、音色绑定和服务状态选择 TTS 服务。
-- 通过 HTTP endpoint 调用本机、局域网或公网 TTS 服务。
-- 将生成任务放入队列，按资源组和模型加载签名调度。
-- 保存每行台词的多批次音频历史和参数快照。
-- 提供 React 工作台完成普通用户可操作的配音生产流程。
+### 1. 获取代码
 
-重要原则：
-
-- 所有推理调用都走 HTTP endpoint。
-- 本机 repo path 不作为产品配置发布；运行时只保存已启动服务的 HTTP endpoint。
-- 不把真实角色库、本机路径、局域网 IP、模型权重、生成音频或 `.env.local` 提交到远端仓库。
-- Mock 只允许存在于测试和开发 fixture，产品默认路径必须面向真实服务或空状态。
-
-## 总体架构
-
-```text
-React/Vite 工作台
-  |
-  | REST API
-  v
-FastAPI Orchestrator
-  |
-  |-- 项目与版本存储
-  |-- 角色库与 Voice Binding
-  |-- 服务注册与状态轮询
-  |-- Provider Router
-  |-- 异步任务队列
-  |-- Manifest / 音频历史
-  |
-  +--> GPT-SoVITS Endpoint
-  +--> IndexTTS Endpoint
-  +--> CosyVoice Endpoint
-  +--> TTS API Endpoint 占位
-```
-
-### 前端
-
-前端位于 `frontend/`，使用 React、Vite、TypeScript 和 i18next。
-
-当前工作台由三部分组成：
-
-- 左侧剧本控制台：剧本选择、原文预览、编辑入口、解析入口。
-- 中间台词任务列表：角色筛选、台词行、生成状态、行级历史音频。
-- 右侧生成配置面板：当前行的生成方式、声音资源、服务诊断和生成确认。
-
-界面已经从早期 demo 表格逐步改为生产工作台形态：
-
-- 角色筛选使用头像卡。
-- 台词行聚焦角色、括注、台词和生成状态。
-- 历史音频归属中间台词行展开区域。
-- 右侧只保留当前行配置和生成确认。
-- 选中态和主操作正在统一为蓝色系视觉，不再使用黑色作为主流程焦点。
-
-### 后端
-
-后端位于 `backend/`，使用 FastAPI。
-
-核心模块包括：
-
-- `models.py`：项目、角色、服务、任务、manifest 等核心 schema。
-- `services.py`：TTS service endpoint 注册、状态检查、HTTP contract 调用。
-- `queue.py`：资源组、cluster key、异步任务调度和状态追踪。
-- `open_source_tts.py`：开源 TTS 服务目录、检测和本地配置写入。
-- `role_library.py`：角色库、logs 扫描、参考音频候选和 binding 生成。
-- `storage.py`：文件制项目存储、模板数据、运行数据隔离。
-- `main.py`：REST API 入口。
-
-## 数据与配置
-
-仓库只提交空模板和不含个人数据的配置样板，真实运行数据默认进入本地目录。
-
-推荐结构：
-
-```text
-data/
-  templates/
-    services.example.json
-    characters.example.json
-  local/
-    services.json          # 本机或团队内部真实服务配置，不提交
-    characters.json        # 本机或团队内部真实角色库，不提交
-    projects/              # 真实项目、manifest、生成历史，不提交
-```
-
-配置加载优先级：
-
-```text
-.env.local / data/local/services.json > data/services.json > data/templates/services.example.json
-```
-
-`.env.local` 用于保存 API key、本机路径和私有参数。它不应提交到 GitHub 或 Gitee。
-
-## 服务接入
-
-### 推荐安装顺序
-
-先获取 TTS More：
-
-```powershell
+```bash
 git clone https://github.com/XucroYuri/TTS_more.git
+cd TTS_more
 ```
 
-如果本机或局域网还没有可用 TTS 服务，可以按需部署以下项目，并启动它们各自的推理 WebUI：
+### 2. 安装依赖
+
+**macOS / Linux：**
+
+```bash
+# 后端（需 Python 3.10–3.11）
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -e 'backend[dev]'
+# 或用 uv：uv venv --python 3.11 .venv && uv pip install --python .venv/bin/python -e 'backend[dev]'
+
+# 前端（需 Node ≥ 20、pnpm ≥ 9）
+cd frontend && pnpm install && cd ..
+```
+
+**Windows (PowerShell)：**
 
 ```powershell
-git clone https://github.com/XucroYuri/GPT-SoVITS.git repo/GPT-SoVITS
-git clone https://github.com/XucroYuri/index-tts.git repo/index-tts
-git clone https://github.com/XucroYuri/CosyVoice.git repo/CosyVoice
-```
-
-这些 fork 作为稳定镜像使用，目的是降低上游更新导致集成失效的风险。TTS More 不再绑定本机 repo 路径，也不托管启动进程；只接入已经运行的 Gradio WebUI。
-
-### 极简 Gradio 接入
-
-在工作台打开 `服务与资源 -> 开源接入`：
-
-1. 选择 GPT-SoVITS、IndexTTS 或 CosyVoice。
-2. 粘贴推理 WebUI 的 Gradio 地址，例如 `http://tts-webui.local:9872`。
-3. 点击检测配置，确认 `/config` 与所需 api_name 可用。
-4. 保存端点。
-
-`127.0.0.1` 和 `localhost` 仍然兼容，本质上也是 Gradio endpoint。局域网或公网 endpoint 不提供远程进程控制，只做健康检查、能力检查和任务调用。
-
-接入向导会写入 `data/local/services.json`，不会污染可提交模板。
-
-### LLM 解析激活
-
-在工作台打开 `服务与资源 -> LLM 配置`，输入开物基模 API Key 并保存激活即可。开物基模已内置 `https://kwjm.com`、`gpt-5.5` 和 `KWJM_API_KEY` 预设；高级配置折叠区仍可维护其他 OpenAI-compatible 服务。
-
-## Provider 能力
-
-### GPT-SoVITS
-
-GPT-SoVITS 是默认优先级最高的训练音色 provider。
-
-当前设计采用 logs-first：
-
-```text
-角色名称 / 昵称 / 别名
-  -> logs_name
-  -> GPT 权重
-  -> SoVITS 权重
-  -> 参考音频
-  -> 参考文本
-  -> 生成台词音频
-```
-
-生成前会计算加载签名：
-
-```text
-service_id + logs_name + gpt_weights_path + sovits_weights_path + ref_audio_path + prompt_text + prompt_lang + text_lang
-```
-
-同一服务内签名一致时可以复用加载状态；签名变化时必须切换权重和参考音频。无法从 WebUI 强回读状态时，只能标记为假定成功，不应显示强验证绿色。
-
-### IndexTTS
-
-IndexTTS 是强情绪和临时配音能力的核心 provider。
-
-当前重点不是强制每个角色都配置 IndexTTS 角色库，而是在右侧配置面板中复现原生 IndexTTS 的临时生成能力：
-
-- 上传参考音频。
-- 拖拽参考音频。
-- 录音作为参考音频。
-- 选择情绪控制方式。
-- 展开高级参数。
-
-未命中角色库的角色默认不会自动兜底到 IndexTTS，避免错误音色批量生成。用户需要手动建立当前行临时配置。
-
-### CosyVoice
-
-CosyVoice 已作为一等开源 provider 接入，排序在 IndexTTS 之后、TTS API 之前。
-
-第一版以 endpoint 接入为主，不强制要求 `repo/CosyVoice` 存在。计划支持：
-
-- `sft`
-- `zero_shot`
-- `cross_lingual`
-- `instruct`
-
-CosyVoice 的 cluster key 设计为：
-
-```text
-service_id + mode + speaker_id + prompt_audio_path + prompt_text + instruct_text + speed + seed
-```
-
-### TTS API
-
-TTS API 当前是占位入口，用于后续接入 OpenAI、Gemini、xAI、火山引擎等商业或云端 TTS 服务。
-
-当前阶段不把 TTS API 作为核心验收目标，也不让它抢占 GPT-SoVITS、IndexTTS、CosyVoice 的主流程。
-
-## 队列与资源调度
-
-调度层使用 `resource_group` 和 `capacity` 控制并发。
-
-典型场景：
-
-- 本机单 GPU：`local-gpu-0 capacity=1`，三个开源 TTS 串行执行。
-- 局域网 GPU 机器：独立资源组，可和本机并行。
-- 云端 endpoint：独立资源组，可按服务声明容量并行。
-
-队列按 provider、service 和 cluster key 聚合：
-
-- GPT-SoVITS：按 logs、GPT 权重、SoVITS 权重、参考音频和参考文本聚合。
-- IndexTTS：按参考音频、情绪模式、情绪来源和高级参数聚合。
-- CosyVoice：按模式、speaker、prompt audio、prompt text、instruction、speed 和 seed 聚合。
-
-当前策略：
-
-- 同资源组按容量限制执行。
-- 不同资源组可以并行。
-- 当前已加载 cluster 有待执行任务时优先继续执行。
-- 否则优先选择待执行数量最多的 cluster。
-- 使用等待时间避免长期饥饿。
-- 本机服务不在每组任务后强制 unload，优先减少频繁加载卸载成本。
-
-## 角色库与项目角色
-
-角色库支持全局预设角色和项目角色引用。
-
-当前规则：
-
-- 全局角色库保存角色名、别名、昵称、匹配名和多个 provider binding。
-- 项目剧本解析后，项目角色按名称、别名、昵称等字段匹配全局角色。
-- 命中角色库时，项目角色默认引用全局配置。
-- 生成或交付前可以冻结为项目快照。
-- 未命中角色不会自动分配错误音色，需要用户手动配置当前行或加入角色库。
-
-GPT-SoVITS 角色配置以 logs 为核心入口。IndexTTS 以行级临时参考音频配置为主要入口。CosyVoice 绑定为普通 voice binding，不影响 GPT-SoVITS 的 logs-first 逻辑。
-
-## 剧本与生成历史
-
-项目数据采用文件制。
-
-核心概念：
-
-- `ScriptProject`：一个剧本配音项目。
-- `ScriptRevision`：剧本文本版本。
-- `ParseRevision`：某个剧本文本版本对应的解析结果。
-- `ScriptLine`：稳定台词行，使用 `line_uid` 关联生成历史。
-- `GenerationVersion`：某一行的某次生成结果。
-
-重新编辑或重新解析剧本会创建新版本分支，不覆盖旧台词和旧音频。生成历史记录中会保存：
-
-- provider
-- service
-- binding
-- 参数摘要
-- requested load signature
-- verified load signature
-- 音频路径
-- 状态
-- 错误摘要
-
-历史音频播放器保留在中间台词行展开区域；右侧面板只在用户选中某个历史版本时显示对应参数。
-
-## 当前开发进展
-
-截至当前主分支，已经完成：
-
-- 建立外层 FastAPI + React 工作台框架。
-- 建立真实网络 endpoint 优先的服务抽象。
-- 将 GPT-SoVITS、IndexTTS、CosyVoice 纳入核心开源 provider 队列。
-- 将 TTS API 保留为占位 provider。
-- 增加开源 TTS 接入目录、检测和本地配置写入接口。
-- 增加 `服务与资源 -> 开源接入` 向导。
-- 建立 data/templates 与 data/local 的发布隔离策略。
-- 清理旧 mock demo 和真实本机资源泄漏风险。
-- 建立脱敏演示项目模板。
-- 增强服务状态、队列状态、生成签名和真实模式校验。
-- 优化生成工作台信息架构，持续向紧凑、生产型 UI 收敛。
-- GitHub 与 Gitee 团队仓库主分支同步流程已打通。
-
-近期仍在推进：
-
-- 进一步压缩右侧生成配置面板的视觉噪音。
-- 优化角色筛选、台词行和历史音频播放器的空间效率。
-- 强化服务下拉只展示真实可用 endpoint 的规则。
-- 完善 CosyVoice 实际 endpoint 的 smoke test。
-- 完善 Gradio endpoint smoke test 与失败诊断。
-- 增加更完整的端到端真实服务验收。
-
-## 本地开发
-
-### 安装依赖
-
-```powershell
-py -3.10 -m venv .venv
+py -3.11 -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install -e 'backend[dev]'
-cd frontend
-pnpm install
+cd frontend; pnpm install; cd ..
 ```
 
-### 启动开发环境
+> 也可以直接 `make install`（跨平台，自动用 uv 或 venv）。
+
+### 3. 启动开发环境
+
+**macOS / Linux：**
+
+```bash
+make dev        # 或 scripts/start-dev.sh
+```
+
+**Windows：**
 
 ```powershell
 .\scripts\start-dev.ps1
@@ -321,68 +72,95 @@ pnpm install
 - 后端：`http://127.0.0.1:8000`
 - 前端：`http://127.0.0.1:5173`
 
-### 模型准备
+### 4. 接入 TTS 服务
 
-本机模型准备脚本：
+在工作台打开 `服务与资源 → 开源接入`，选择 GPT-SoVITS / IndexTTS / CosyVoice，粘贴推理 WebUI 的 Gradio 地址（如 `http://127.0.0.1:9872`），点检测后保存即可。`127.0.0.1`/`localhost` 与局域网地址都支持；接入向导写入 `data/local/services.json`，不污染可提交模板。
 
-```powershell
-.\scripts\prepare-models.ps1 -Source ModelScope -Device CU128
+如需克隆本地 TTS 仓库到 `repo/`：
+
+```bash
+git clone https://github.com/XucroYuri/GPT-SoVITS.git repo/GPT-SoVITS
+git clone https://github.com/XucroYuri/index-tts.git repo/index-tts
 ```
 
-该脚本面向本机真实环境，可能下载大模型并创建子项目虚拟环境。运行前请确认磁盘、网络、CUDA 和 Python 环境。
+> 模型准备脚本 `scripts/prepare-models.ps1` 是 Windows 专属（含 CUDA/uv 布局）。macOS/Linux 用户请按各 TTS 项目的说明手动准备模型，或在 `.env.local` 里指向已运行的服务地址。
 
 ## 验证
 
-常规回归：
-
-```powershell
-& .\.venv\Scripts\python.exe -m pytest backend -q
-cd frontend
-pnpm test -- --run
-pnpm build
+```bash
+make test          # 后端 pytest + 前端 vitest
+make build         # 前端生产构建
 ```
 
-真实 TTS 验收需要本机或网络 endpoint、模型资源和 GPU：
+或分开跑：
 
-```powershell
-$env:TTS_MORE_SERVICE_MODE="real"
-$env:TTS_MORE_RUN_REAL_TTS="1"
-& .\.venv\Scripts\python.exe -m pytest backend/tests/test_real_tts_validation.py -q
+```bash
+.venv/bin/python -m pytest backend -q      # macOS/Linux
+# Windows: & .\.venv\Scripts\python.exe -m pytest backend -q
+cd frontend && pnpm test && pnpm build
 ```
 
-真实模式下禁止伪装 mock 成功。如果模型、权重、参考音频或服务端口缺失，验收应返回明确诊断。
+真实 TTS 验收（需要本机/网络 endpoint、模型、GPU）：
 
-## 发布与安全治理
-
-提交前必须确认：
-
-- `repo/` 不提交。
-- `.env.local` 不提交。
-- `data/local/` 不提交。
-- 生成音频、模型权重、manifest 运行历史不提交。
-- 本机路径、UNC 路径、局域网 IP 不进入模板和 README。
-- 真实角色库不进入公开模板。
-- 测试 fixture 中的 mock 不进入产品默认路径。
-
-可使用：
-
-```powershell
-git status --short
-git check-ignore -v data/local/services.json data/local/characters.json .env.local repo/GPT-SoVITS/README.md
-& .\.venv\Scripts\python.exe -m pytest backend/tests/test_release_governance.py -q
+```bash
+export TTS_MORE_SERVICE_MODE=real
+export TTS_MORE_RUN_REAL_TTS=1
+.venv/bin/python -m pytest backend/tests/test_real_tts_validation.py -q
 ```
 
-## 远端仓库
+## 服务模式
 
-当前主分支已同步到：
+默认真实网络 endpoint 模式：本地和远端服务都通过 `data/services.json` 里的 `base_url` 调用；未启动的服务显示为未就绪，不会被调度。商业 TSS（OpenAI/Gemini/xAI/火山）作为一等服务，key 只存在 `.env.local`，`services.json` 只引用 env 变量名。
 
-- GitHub：`https://github.com/XucroYuri/TTS_more`
-- Gitee 团队仓库：`https://gitee.com/chengdu-flower-food/TTS_more`
+provider 优先级：`GPT-SoVITS → IndexTTS → CosyVoice → 商业/通用 HTTP`。
 
-团队内部提交和 PR 默认使用中文标题与中文描述，便于开发同步和审查。
+## 队列与调度
+
+```mermaid
+flowchart TD
+    Job["生成作业"] --> Q["有界队列<br/>MAX_JOBS / MAX_ACTIVE_JOBS"]
+    Q --> RG1["资源组 A<br/>capacity=1 串行"]
+    Q --> RG2["资源组 B<br/>并行"]
+    RG1 --> ClsA["按 cluster key 聚合<br/>同权重+参考音频优先"]
+    RG2 --> ClsB["不同资源组并行"]
+```
+
+- 同资源组按 `capacity` 限制并发；不同资源组并行。
+- 同一已加载 cluster 有待执行任务时优先继续；否则选待执行最多的 cluster。
+- 生成前计算加载签名（service + logs_name + 权重 + 参考音频 + 文本），签名一致可复用加载状态。
+
+## 项目与历史
+
+文件制存储。核心概念：
+
+- `ScriptProject` → `ScriptRevision`（文本版本）→ `ParseRevision`（解析结果）→ `ScriptLine`（稳定行，`line_uid` 关联历史）→ `GenerationVersion`（每次生成）。
+- 重新编辑/解析创建新版本分支，不覆盖旧音频。
+- 历史保留 provider、service、binding、参数摘要、加载签名、音频路径、状态、错误。
+
+## 安全
+
+默认开放（本地单用户）。设置 `TTS_MORE_API_TOKEN` 后，写/出口端点强制 Bearer 校验。详见 [安全模型](docs/security.md)：
+
+- SSRF 防护（出口 URL 校验，link-local/云元数据永远拒绝）
+- 文件读根约束（角色库配置不得越界）
+- 命令白名单（`start_command[0]` 校验）
+- 上传大小上限 + 图片 magic-byte 校验
+- 错误脱敏（密钥不进响应）
+- 有界作业队列（防 DoS）
+
+## 发布治理
+
+提交前确认：`repo/`、`.env.local`、`data/local/`、生成音频、模型权重、本机路径/UNC/局域网 IP、真实角色库**均不提交**。
+
+```bash
+git check-ignore -v data/local/services.json .env.local repo/GPT-SoVITS
+.venv/bin/python -m pytest backend/tests/test_release_governance.py -q
+```
 
 ## 参考文档
 
-- [开源 TTS 服务接入与混合部署](docs/open-source-tts-services.md)
-- [发布治理说明](docs/release-governance.md)
+- [架构](docs/architecture.md)
+- [安全模型](docs/security.md)
+- [开源 TTS 服务接入](docs/open-source-tts-services.md)
+- [发布治理](docs/release-governance.md)
 - [前端设计基线](frontend/design.md)

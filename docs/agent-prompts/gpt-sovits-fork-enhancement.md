@@ -1,5 +1,7 @@
 # GPT-SoVITS Fork 改造 Prompt
 
+> **作用域说明：** 本文档针对 GPT-SoVITS **子仓库**（`repo/GPT-SoVITS`，即 fork `https://github.com/XucroYuri/GPT-SoVITS`）的改造，**不是** TTS More 本仓库的代码。TTS More 通过 HTTP API 调用 GPT-SoVITS，本文档描述如何让 GPT-SoVITS 那一侧暴露 TTS More 需要的端点。
+
 ## 角色与目标
 
 你是一个 GPT-SoVITS 仓库的维护者。本仓库是我们团队的 fork（`https://github.com/XucroYuri/GPT-SoVITS`），服务于一个名为"TTS More"的多 TTS 服务调度工作台。TTS More 通过 HTTP API 调用 GPT-SoVITS 进行语音合成。
