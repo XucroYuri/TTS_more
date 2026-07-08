@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from app.hardware import collect_local_hardware_status
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
+from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserQualityError, RuleBasedParser, chat_completions_url, parser_contract_probe_messages, validate_parser_contract_response
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
@@ -306,7 +307,7 @@ def create_app(
         try:
             return client.gradio_index()  # type: ignore[attr-defined]
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            raise HTTPException(status_code=502, detail=scrub_error(exc, getattr(endpoint, "base_url", None))) from exc
 
     @app.get("/api/repos")
     def repos() -> dict[str, Any]:
@@ -351,6 +352,18 @@ def create_app(
                 "message": "base_url and model are required",
                 "provider": provider.name,
             }
+        # SSRF guard: the parser provider base_url is user-supplied and the
+        # server will POST to it. Loopback is allowed (local LLM gateways),
+        # but private/LAN/link-local/metadata targets are blocked by default.
+        try:
+            validate_egress_url(provider.base_url, allow_loopback=True)
+        except EgressError as exc:
+            return {
+                "ok": False,
+                "state": "blocked",
+                "message": f"base_url is not allowed: {exc}",
+                "provider": provider.name,
+            }
         api_key = provider.api_key or os.environ.get(provider.api_key_env)
         if not api_key:
             return {
@@ -390,7 +403,7 @@ def create_app(
             return {
                 "ok": False,
                 "state": "blocked",
-                "message": str(exc),
+                "message": scrub_error(exc, provider.base_url),
                 "provider": provider.name,
                 "model": provider.model,
                 "latency_ms": round((time.time() - started) * 1000),
@@ -1441,7 +1454,7 @@ def _collect_gpt_sovits_catalog_candidates(
                 try:
                     gradio_candidates.extend((client.gradio_index()).get("candidates", [])[:limit])  # type: ignore[attr-defined]
                 except Exception as exc:
-                    diagnostics.append({"service_id": service.service_id, "status": "unreachable", "detail": str(exc)})
+                    diagnostics.append({"service_id": service.service_id, "status": "unreachable", "detail": scrub_error(exc, getattr(service, "base_url", None))})
         if include_api and (service.api_contract == "gpt-sovits-api-v2" or "gpt-sovits-api-v2" in service.capabilities):
             if client is None or not hasattr(client, "model_catalog"):
                 diagnostics.append({"service_id": service.service_id, "status": "unsupported", "detail": "GPT-SoVITS API v2 model catalog is not available"})
@@ -1449,7 +1462,7 @@ def _collect_gpt_sovits_catalog_candidates(
                 try:
                     api_candidates.extend((client.model_catalog(limit=limit)).get("candidates", []))  # type: ignore[attr-defined]
                 except Exception as exc:
-                    diagnostics.append({"service_id": service.service_id, "status": "api_v2_unreachable", "detail": str(exc)})
+                    diagnostics.append({"service_id": service.service_id, "status": "api_v2_unreachable", "detail": scrub_error(exc, getattr(service, "base_url", None))})
     return gradio_candidates, api_candidates
 
 

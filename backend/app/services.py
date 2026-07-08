@@ -16,6 +16,7 @@ import httpx
 
 from app.adapters.base import SynthesisRequest, SynthesisResult
 from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
+from app.net_guard import scrub_error
 
 
 class TTSServiceClient(Protocol):
@@ -268,7 +269,7 @@ class ServiceRouter:
         try:
             health = client.health() if client is not None else {"ready": False, "error": "client not configured"}
         except Exception as exc:
-            health = {"ready": False, "error": str(exc)}
+            health = {"ready": False, "error": scrub_error(exc, getattr(endpoint, "base_url", None))}
         return {
             **endpoint.model_dump(mode="json"),
             "ready": bool(health.get("ready")),
@@ -456,7 +457,7 @@ class HttpTTSServiceClient:
                 response.raise_for_status()
                 payload = response.json()
         except Exception as exc:
-            return {"engine": self.endpoint.engine.value, "ready": False, "error": str(exc)}
+            return {"engine": self.endpoint.engine.value, "ready": False, "error": scrub_error(exc, self.endpoint.base_url)}
         return {"engine": self.endpoint.engine.value, "ready": True, **payload}
 
     def capabilities(self) -> dict[str, Any]:
@@ -551,7 +552,7 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
                 "required_api_ok": False,
                 "auth_ok": True,
                 "status": "config timeout",
-                "error": str(exc),
+                "error": scrub_error(exc, self.endpoint.base_url),
             }
         except Exception as exc:
             return {
@@ -564,7 +565,7 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
                 "config_ok": False,
                 "required_api_ok": False,
                 "auth_ok": True,
-                "error": str(exc),
+                "error": scrub_error(exc, self.endpoint.base_url),
             }
 
         api_names = sorted(
@@ -797,12 +798,12 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
                     if response.status_code == 404:
                         continue
                     if response.status_code >= 400:
-                        raise RuntimeError(f"{response.status_code} {response.text[:800]}")
+                        raise RuntimeError(f"{response.status_code} {scrub_error(response.text[:800], self.endpoint.base_url)}")
                     response.raise_for_status()
                     return response.json()
                 except Exception as exc:
                     last_error = exc
-        raise RuntimeError(f"Gradio API {api_name!r} failed: {last_error}")
+        raise RuntimeError(f"Gradio API {api_name!r} failed: {scrub_error(last_error, self.endpoint.base_url)}")
 
     def _post_gradio_queue_api(self, api_name: str, data: list[Any], timeout: float | int | None = None, api_prefix: str = "") -> dict[str, Any]:
         config = self._config(timeout=timeout)
@@ -859,7 +860,7 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         last_data: Any = None
         with client.stream("GET", self.endpoint.base_url.rstrip("/") + stream_path, headers=self._headers()) as response:
             if response.status_code >= 400:
-                raise RuntimeError(f"{response.status_code} {response.text[:800]}")
+                raise RuntimeError(f"{response.status_code} {scrub_error(response.text[:800], self.endpoint.base_url)}")
             response.raise_for_status()
             for raw_line in response.iter_lines():
                 line = raw_line.strip()
@@ -951,7 +952,7 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
                     if response.status_code == 404:
                         continue
                     if response.status_code >= 400:
-                        raise RuntimeError(f"{response.status_code} {response.text[:800]}")
+                        raise RuntimeError(f"{response.status_code} {scrub_error(response.text[:800], self.endpoint.base_url)}")
                     data = response.json()
                     if isinstance(data, list) and data:
                         if isinstance(data[0], dict):
@@ -984,7 +985,7 @@ class GPTSoVITSApiV2ServiceClient(HttpTTSServiceClient):
                 response = client.get(self.endpoint.base_url.rstrip("/") + "/docs", headers=self._headers())
                 response.raise_for_status()
         except Exception as exc:
-            return {"engine": self.endpoint.engine.value, "ready": False, "error": str(exc)}
+            return {"engine": self.endpoint.engine.value, "ready": False, "error": scrub_error(exc, self.endpoint.base_url)}
         return {"engine": self.endpoint.engine.value, "ready": True, "mode": "gpt-sovits-api-v2"}
 
     def model_catalog(self, limit: int = 120) -> dict[str, Any]:

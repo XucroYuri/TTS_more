@@ -9,6 +9,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from app.models import EngineName, ProviderType, TTSServiceEndpoint
+from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.services import ServiceRegistry
 
 OpenSourceProvider = Literal["gpt-sovits", "indextts", "cosyvoice"]
@@ -191,6 +192,13 @@ def _probe_endpoint(base_url: str | None, api_contract: str) -> dict[str, Any]:
         return {"endpoint_reachable": False, "api_contract_ok": False, "health": {"status": "missing base_url"}}
     if base_url.startswith("mock://"):
         return {"endpoint_reachable": True, "api_contract_ok": True, "health": {"ready": True, "status": "mock"}}
+    # SSRF guard: local (loopback) and LAN (private) endpoints are legitimate
+    # here — a user points this at their own Gradio WebUI — but link-local
+    # (169.254.0.0/16, covers cloud metadata) is always blocked.
+    try:
+        validate_egress_url(base_url, allow_loopback=True, allow_private=True)
+    except EgressError as exc:
+        return {"endpoint_reachable": False, "api_contract_ok": False, "health": {"status": "blocked", "reason": str(exc)}}
     timeout = httpx.Timeout(1.5, connect=0.8)
     health: dict[str, Any] = {}
     reachable = False
@@ -200,7 +208,7 @@ def _probe_endpoint(base_url: str | None, api_contract: str) -> dict[str, Any]:
             try:
                 response = client.get(f"{base_url.rstrip('/')}{suffix}")
             except Exception as exc:
-                health[suffix] = {"ok": False, "error": str(exc)}
+                health[suffix] = {"ok": False, "error": scrub_error(exc, base_url)}
                 continue
             reachable = True
             health[suffix] = {"ok": response.is_success, "status_code": response.status_code}

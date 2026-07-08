@@ -1116,6 +1116,50 @@ def test_open_source_tts_detect_ignores_repo_path_for_gradio_endpoint_onboarding
     assert "Gradio WebUI" in payload["env_hint"]
 
 
+def test_open_source_tts_detect_blocks_cloud_metadata_url(tmp_path: Path) -> None:
+    """The detect endpoint must not probe cloud metadata / link-local URLs."""
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.post(
+        "/api/open-source-tts/detect",
+        json={
+            "provider_type": "gpt-sovits",
+            "base_url": "http://169.254.169.254/latest/meta-data/",
+            "api_contract": "gradio-gpt-sovits-webui",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["endpoint_reachable"] is False
+    assert payload["api_contract_ok"] is False
+    assert payload["health"]["status"] == "blocked"
+
+
+def test_parser_provider_test_blocks_private_url(tmp_path: Path) -> None:
+    """The parser provider test endpoint must reject private/metadata base_urls."""
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.post(
+        "/api/parser/providers/test",
+        json={
+            "provider": {
+                "name": "evil",
+                "base_url": "http://169.254.169.254/",
+                "model": "gpt-4o-mini",
+                "api_key_env": "OPENAI_API_KEY",
+                "enabled": True,
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["state"] == "blocked"
+    assert "not allowed" in payload["message"]
+
+
 def test_open_source_tts_configure_writes_local_services_without_touching_template(tmp_path: Path) -> None:
     templates_dir = tmp_path / "templates"
     templates_dir.mkdir(parents=True)

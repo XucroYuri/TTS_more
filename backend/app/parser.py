@@ -10,6 +10,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from app.models import Character, ScriptLine
+from app.net_guard import scrub_error
 from app.role_library import slugify_role_name
 
 
@@ -482,7 +483,7 @@ class MultiProviderParser:
             except ParserQualityError as exc:
                 quality_errors.append(f"{provider.name}: {exc}")
             except Exception as exc:
-                warnings.append(f"{provider.name}: {exc}")
+                warnings.append(f"{provider.name}: {scrub_error(exc, getattr(provider.config, 'base_url', None))}")
         if quality_errors:
             raise ParserQualityError("; ".join(quality_errors))
         draft = self.fallback.parse(text)
