@@ -35,6 +35,8 @@ DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_ROOT = Path("data") / ".runtime"
 REPO_LOCK_PATH = Path(__file__).resolve().parents[2] / "repo.lock.json"
 AUDIO_UPLOAD_SUFFIXES = AUDIO_SUFFIXES | {".webm", ".aac", ".opus"}
+# Maximum accepted upload size for avatar / reference-audio endpoints.
+MAX_UPLOAD_BYTES = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
 
 load_dotenv(".env.local")
 load_dotenv(".env")
@@ -122,6 +124,8 @@ def create_app(
     app.state.writable_services_path = writable_services_file
     app.state.parser_config_path = parser_config_file
     app.state.env_path = env_file
+    # Read at app-creation time so tests/processes can override via env.
+    app.state.max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(MAX_UPLOAD_BYTES)))
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -430,6 +434,8 @@ def create_app(
         content = await file.read()
         if not content:
             raise HTTPException(status_code=400, detail="avatar image is empty")
+        if len(content) > app.state.max_upload_bytes:
+            raise HTTPException(status_code=413, detail=f"avatar image exceeds upload limit")
 
         output_dir = Path(app.state.store.root) / "character_avatars"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -457,6 +463,8 @@ def create_app(
         content = await file.read()
         if not content:
             raise HTTPException(status_code=400, detail="audio file is empty")
+        if len(content) > app.state.max_upload_bytes:
+            raise HTTPException(status_code=413, detail=f"audio file exceeds upload limit")
 
         safe_character_id = _safe_upload_name(character_id).removesuffix(Path(_safe_upload_name(character_id)).suffix)
         output_dir = Path(app.state.store.root) / "character_reference_audio" / safe_character_id
@@ -860,6 +868,8 @@ def create_app(
         content = await file.read()
         if not content:
             raise HTTPException(status_code=400, detail="audio file is empty")
+        if len(content) > app.state.max_upload_bytes:
+            raise HTTPException(status_code=413, detail=f"audio file exceeds upload limit")
         output_path.write_bytes(content)
         return {"sample": {"path": str(output_path), "text": "", "text_source": "manual"}}
 
@@ -1104,14 +1114,15 @@ def create_app(
 
     @app.get("/api/audio")
     def get_audio(path: str) -> FileResponse:
+        data_root = Path(app.state.store.root)
+        extra_safe = [data_root, ref_root, *store.read_project_roots()]
         audio_path = _resolve_data_audio_path(
-            Path(app.state.store.root),
+            data_root,
             path,
             allowed_roots=[
-                ref_root,
-                *store.read_project_roots(),
-                *_configured_weight_roots(store.load_characters(), "logs_root", app.state.service_registry),
-                *_configured_weight_roots(store.load_characters(), "logs_roots", app.state.service_registry),
+                *extra_safe,
+                *_confined_weight_roots(store.load_characters(), "logs_root", app.state.service_registry, project_root, extra_safe),
+                *_confined_weight_roots(store.load_characters(), "logs_roots", app.state.service_registry, project_root, extra_safe),
             ],
         )
         if not audio_path.is_file():
@@ -1120,12 +1131,20 @@ def create_app(
 
     @app.get("/api/assets/image")
     def get_image_asset(path: str) -> FileResponse:
-        image_path = _resolve_data_asset_path(Path(app.state.store.root), path)
+        data_root = Path(app.state.store.root)
+        extra_safe = [data_root, ref_root, *store.read_project_roots()]
+        image_path = _resolve_data_asset_path(
+            data_root,
+            path,
+            allowed_roots=[
+                *extra_safe,
+                *_confined_weight_roots(store.load_characters(), "logs_root", app.state.service_registry, project_root, extra_safe),
+                *_confined_weight_roots(store.load_characters(), "logs_roots", app.state.service_registry, project_root, extra_safe),
+            ],
+        )
         if not image_path.is_file():
             raise HTTPException(status_code=404, detail="image not found")
-        media_type = mimetypes.guess_type(image_path.name)[0] or "application/octet-stream"
-        if not media_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="asset is not an image")
+        media_type = _image_media_type(image_path)
         return FileResponse(image_path, media_type=media_type)
 
     return app
@@ -1466,6 +1485,41 @@ def _collect_gpt_sovits_catalog_candidates(
     return gradio_candidates, api_candidates
 
 
+def _allowed_data_roots() -> list[Path]:
+    """Extra filesystem roots the operator explicitly permits the audio/image
+    read endpoints to serve from (os.pathsep-separated, env
+    TTS_MORE_ALLOWED_DATA_ROOTS). Used for legitimate model weight dirs that
+    live outside the project tree (e.g. a shared NAS mount)."""
+    raw = os.environ.get("TTS_MORE_ALLOWED_DATA_ROOTS", "")
+    roots: list[Path] = []
+    for item in raw.split(os.pathsep):
+        item = item.strip()
+        if item:
+            roots.append(Path(item).resolve(strict=False))
+    return roots
+
+
+def _is_safe_data_root(candidate: Path, project_root: Path, allowed: list[Path]) -> bool:
+    """A configured weight/logs root is safe to serve files from if it is
+    inside the project root or explicitly allowlisted by the operator."""
+    try:
+        resolved = candidate.resolve(strict=False)
+    except (OSError, ValueError):
+        return False
+    try:
+        resolved.relative_to(project_root)
+        return True
+    except ValueError:
+        pass
+    for root in allowed:
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def _configured_weight_roots(characters: list[Character], key: str, service_registry: ServiceRegistry | None = None) -> list[Path]:
     roots: list[Path] = []
     seen: set[str] = set()
@@ -1488,6 +1542,43 @@ def _configured_weight_roots(characters: list[Character], key: str, service_regi
     if service_registry is not None:
         for service in service_registry.services:
             add(service.default_params.get(key))
+    return roots
+
+
+def _confined_weight_roots(characters: list[Character], key: str, service_registry: ServiceRegistry | None, project_root: Path, extra_safe_roots: list[Path]) -> list[Path]:
+    """Like _configured_weight_roots but confines user-writable (character)
+    roots to the project / data root / operator allowlist. Service-config roots
+    (from services.json default_params) are operator-trusted and pass through.
+    Used only by the file-READ endpoints (/api/audio, /api/assets/image)."""
+    roots: list[Path] = []
+    seen: set[str] = set()
+    allowed = _allowed_data_roots()
+
+    def add(value: Any, *, trusted: bool) -> None:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                add(item, trusted=trusted)
+            return
+        if not value:
+            return
+        candidate = Path(str(value))
+        if not trusted:
+            if not _is_safe_data_root(candidate, project_root, allowed) and not _is_safe_data_root(candidate, project_root, extra_safe_roots):
+                return
+        key_str = str(candidate.resolve(strict=False))
+        if key_str not in seen:
+            roots.append(candidate)
+            seen.add(key_str)
+
+    for character in characters:
+        for profile in character.profiles:
+            values = [profile.config.get(key)]
+            values.extend(binding.config.get(key) for binding in profile.bindings)
+            for value in values:
+                add(value, trusted=False)
+    if service_registry is not None:
+        for service in service_registry.services:
+            add(service.default_params.get(key), trusted=True)
     return roots
 
 
@@ -1524,7 +1615,8 @@ def _configured_weight_roots_for_service(characters: list[Character], key: str, 
 def _safe_upload_name(filename: str) -> str:
     path = Path(filename)
     stem = re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", path.stem).strip("._-") or "reference"
-    suffix = path.suffix.lower()
+    stem = stem[:64]  # bound stem length to avoid pathological filenames
+    suffix = path.suffix.lower()[:8]  # bound suffix (e.g. .jpeg is 5)
     return f"{stem}{suffix}"
 
 
@@ -1721,6 +1813,43 @@ def _audio_media_type(path: Path) -> str:
     if not media_type.startswith("audio/"):
         raise HTTPException(status_code=400, detail="asset is not an audio file")
     return media_type
+
+
+# Magic-byte signatures for image types the avatar endpoint accepts. Checking
+# the file header (not just the extension) stops a non-image file renamed to
+# .png from being served as an image.
+_IMAGE_SIGNATURES: list[tuple[bytes, str]] = [
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"RIFF", "image/webp"),  # RIFF....WEBP
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+]
+
+
+def _image_media_type(path: Path) -> str:
+    """Determine the image media type from the file's magic bytes. The
+    extension is only used to pick among ambiguous signatures; a file whose
+    bytes do not match any known image signature is rejected even if its
+    name ends in .png/.jpg. This stops a renamed non-image from being served
+    as an image."""
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(16)
+    except OSError:
+        header = b""
+    for signature, media_type in _IMAGE_SIGNATURES:
+        if header.startswith(signature):
+            # WebP needs the WEBP marker at offset 8.
+            if media_type == "image/webp" and header[8:12] != b"WEBP":
+                continue
+            return media_type
+    # Bytes did not match any image signature. If the file is empty, treat it
+    # as a missing image; otherwise reject it as a non-image regardless of the
+    # extension (prevents serving renamed payloads).
+    if not header:
+        raise HTTPException(status_code=400, detail="image is empty or unreadable")
+    raise HTTPException(status_code=400, detail="asset is not an image")
 
 
 def _manifest_summary(manifest: GenerationManifest) -> dict[str, int]:

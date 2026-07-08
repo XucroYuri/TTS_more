@@ -18,6 +18,28 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+# Bare executable names that may be invoked as start_command[0] without being
+# an in-project path. These are resolved through PATH by the OS. Extend via
+# the TTS_MORE_ALLOWED_EXECUTABLES env var (os.pathsep-separated).
+_DEFAULT_ALLOWED_EXECUTABLES = {
+    "python", "python3", "python3.10", "python3.11", "python.exe",
+    "uvicorn", "uvicorn.exe",
+    "node", "node.exe",
+    "bash", "sh", "zsh",
+    "pwsh", "powershell",
+}
+
+
+def _allowed_executables() -> set[str]:
+    names = set(_DEFAULT_ALLOWED_EXECUTABLES)
+    extra = os.environ.get("TTS_MORE_ALLOWED_EXECUTABLES", "")
+    for name in extra.split(os.pathsep):
+        name = name.strip()
+        if name:
+            names.add(name)
+    return names
+
+
 class ServiceSupervisor:
     def __init__(self, project_root: Path, runtime_root: Path) -> None:
         self.project_root = project_root.resolve()
@@ -44,7 +66,10 @@ class ServiceSupervisor:
         if existing and self._is_pid_running(existing.get("pid")):
             return {"status": "already running", **existing}
 
-        command = self._resolve_command(endpoint.start_command)
+        try:
+            command = self._resolve_command(endpoint.start_command)
+        except ValueError as exc:
+            return {"status": "not manageable", "reason": str(exc)}
         cwd = self._resolve_cwd(endpoint)
         log_path = self.logs_dir / f"{endpoint.service_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,7 +149,40 @@ class ServiceSupervisor:
             candidate = (self.project_root / executable).resolve()
             if self._inside_project(candidate):
                 return [str(candidate), *command[1:]]
+        # Validate the executable: it must be either a bare allowed name
+        # (resolved via PATH) or an absolute path inside the project. This
+        # prevents a attacker-controlled start_command from running arbitrary
+        # binaries (e.g. /tmp/evil or C:\Tools\payload.exe) when service
+        # settings are writable.
+        self._validate_executable(command[0])
         return command
+
+    def _validate_executable(self, raw: str) -> None:
+        """Raise ValueError if ``raw`` is not an allowed start_command[0]."""
+        executable = Path(raw)
+        if executable.is_absolute():
+            resolved = executable.resolve(strict=False)
+            if not self._inside_project(resolved):
+                raise ValueError(
+                    f"start_command executable is outside project root: {raw}"
+                )
+            return
+        # Relative path with a separator must already have been resolved into
+        # the project above; a relative path that escapes is rejected here.
+        if "\\" in raw or "/" in raw:
+            candidate = (self.project_root / raw).resolve(strict=False)
+            if not self._inside_project(candidate):
+                raise ValueError(
+                    f"start_command executable escapes project root: {raw}"
+                )
+            return
+        # Bare name: must be in the allowlist.
+        if raw not in _allowed_executables():
+            raise ValueError(
+                f"start_command executable not allowed: {raw!r} "
+                f"(allowed: bare names in TTS_MORE_ALLOWED_EXECUTABLES, "
+                f"or a path inside the project root)"
+            )
 
     def _resolve_cwd(self, endpoint: TTSServiceEndpoint) -> Path:
         raw = endpoint.start_cwd or ("." if endpoint.service_id in {"local-indextts"} else endpoint.repo_path) or "."

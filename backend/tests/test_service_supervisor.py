@@ -142,6 +142,65 @@ def test_supervisor_rejects_external_or_unmanaged_service(tmp_path: Path) -> Non
     assert "external" in result["reason"]
 
 
+def test_supervisor_rejects_disallowed_executable(tmp_path: Path) -> None:
+    """A start_command[0] that is an absolute path outside the project or a
+    non-allowlisted bare name must be refused before Popen is called."""
+    supervisor = ServiceSupervisor(project_root=tmp_path, runtime_root=tmp_path / ".runtime")
+
+    # Absolute path outside project root.
+    endpoint = TTSServiceEndpoint(
+        service_id="evil-1",
+        engine=EngineName.INDEX_TTS,
+        base_url="http://127.0.0.1:9881",
+        mode="local",
+        start_command=["/tmp/definitely-not-real/evil"],
+        start_cwd=".",
+    )
+    result = supervisor.start(endpoint)
+    assert result["status"] == "not manageable"
+    assert "outside project root" in result["reason"]
+
+    # Bare name not in the allowlist.
+    endpoint2 = TTSServiceEndpoint(
+        service_id="evil-2",
+        engine=EngineName.INDEX_TTS,
+        base_url="http://127.0.0.1:9881",
+        mode="local",
+        start_command=["totally-not-a-real-binary"],
+        start_cwd=".",
+    )
+    result2 = supervisor.start(endpoint2)
+    assert result2["status"] == "not manageable"
+    assert "not allowed" in result2["reason"]
+
+
+def test_supervisor_allows_in_project_executable(monkeypatch, tmp_path: Path) -> None:
+    """An executable path inside the project root is allowed."""
+    calls: list[dict] = []
+
+    def fake_popen(command, **kwargs):
+        calls.append({"command": command, **kwargs})
+        return FakePopen(command, **kwargs)
+
+    monkeypatch.setattr("app.supervisor.subprocess.Popen", fake_popen)
+    exe = tmp_path / "bin" / "myrunner"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("#!/bin/sh\n")
+    endpoint = TTSServiceEndpoint(
+        service_id="local-ok",
+        engine=EngineName.INDEX_TTS,
+        base_url="http://127.0.0.1:9881",
+        mode="local",
+        start_command=[str(exe)],
+        start_cwd=".",
+    )
+    supervisor = ServiceSupervisor(project_root=tmp_path, runtime_root=tmp_path / ".runtime")
+
+    result = supervisor.start(endpoint)
+
+    assert result["status"] == "started"
+
+
 def test_supervisor_stop_uses_pid_record_and_removes_it(monkeypatch, tmp_path: Path) -> None:
     commands: list[list[str]] = []
     supervisor = ServiceSupervisor(project_root=tmp_path, runtime_root=tmp_path / ".runtime")

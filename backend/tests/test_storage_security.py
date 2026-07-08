@@ -195,3 +195,83 @@ def test_delete_generation_version_removes_manifest_and_project_audio_only(tmp_p
     assert outside_audio.exists() is True
     payload = client.get("/api/projects/demo/manifest").json()
     assert payload["lines"]["line-uid-001"]["versions"] == []
+
+
+def test_audio_endpoint_rejects_logs_root_outside_project(tmp_path: Path, monkeypatch) -> None:
+    """A character config logs_root pointing outside the project/data root
+    must NOT widen /api/audio to read arbitrary files."""
+    # Disable operator allowlist so the only safe roots are project + data.
+    monkeypatch.delenv("TTS_MORE_ALLOWED_DATA_ROOTS", raising=False)
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    # A secret file outside any allowed root.
+    secret_dir = tmp_path / "secret"
+    secret_dir.mkdir()
+    secret_file = secret_dir / "leak.wav"
+    secret_file.write_bytes(b"RIFFsecret")
+    client = TestClient(create_app(data_root=data_root))
+    client.put(
+        "/api/characters",
+        json=[
+            {
+                "id": "evil",
+                "name": "Evil",
+                "profiles": [
+                    {
+                        "id": "evil-gpt",
+                        "name": "Evil GPT",
+                        "engine": "gpt-sovits",
+                        "config": {"logs_root": str(secret_dir)},
+                    }
+                ],
+            }
+        ],
+    )
+
+    response = client.get("/api/audio", params={"path": str(secret_file)})
+
+    assert response.status_code == 400
+    assert "outside" in response.json()["detail"]
+
+
+def test_upload_avatar_rejects_oversized_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TTS_MORE_MAX_UPLOAD_BYTES", "16")
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put("/api/characters", json=[{"id": "c1", "name": "C1", "profiles": []}])
+
+    response = client.post(
+        "/api/characters/c1/avatar/upload",
+        files={"file": ("x.png", b"\x89PNG\r\n\x1a\n" + b"a" * 32, "image/png")},
+    )
+
+    assert response.status_code == 413
+
+
+def test_image_endpoint_rejects_non_image_with_image_extension(tmp_path: Path) -> None:
+    """A file named .png but containing non-image bytes must be rejected by
+    the magic-byte check, not served."""
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    fake = data_root / "evil.png"
+    fake.write_bytes(b"not-an-image-at-all")
+    client = TestClient(create_app(data_root=data_root))
+
+    response = client.get("/api/assets/image", params={"path": str(fake)})
+
+    assert response.status_code == 400
+    assert "not an image" in response.json()["detail"]
+
+
+def test_image_endpoint_serves_real_png(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    # Minimal valid PNG signature + IHDR.
+    png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    img = data_root / "ok.png"
+    img.write_bytes(png_bytes)
+    client = TestClient(create_app(data_root=data_root))
+
+    response = client.get("/api/assets/image", params={"path": str(img)})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
