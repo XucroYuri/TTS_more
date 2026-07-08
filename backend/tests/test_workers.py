@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.workers import discovery
 from app.workers.gpt_sovits_worker import app as gpt_app
+from app.workers.cosyvoice_worker import app as cosyvoice_app
 
 
 # --- worker contract shape (no GPU/torch needed) -------------------------------
@@ -137,3 +138,31 @@ def test_models_endpoint_discovers_roles_from_weights(tmp_path: Path, monkeypatc
     assert role["sovits_weights"][0].endswith("hero_e24_s360.pth")
     assert role["sample_count"] == 1
     assert role["has_training_data"] is True
+
+
+# --- CosyVoice worker ---------------------------------------------------------
+
+
+def test_cosyvoice_worker_health_and_capabilities() -> None:
+    client = TestClient(cosyvoice_app)
+    health = client.get("/health").json()
+    assert health["worker"] == "cosyvoice-standard"
+    assert health["pipeline_loaded"] is False
+    caps = client.get("/capabilities").json()["capabilities"]
+    assert "zero-shot-voice" in caps
+    assert "style-instruction" in caps
+
+
+def test_cosyvoice_worker_status_reports_repo_state(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("app.workers.cosyvoice_worker.REPO_DIR", tmp_path)
+    client = TestClient(cosyvoice_app)
+    status = client.get("/status").json()
+    assert status["ready"] is False
+    assert status["repo_found"] is True  # tmp_path exists
+
+
+def test_cosyvoice_worker_openapi_lists_standard_contract() -> None:
+    client = TestClient(cosyvoice_app)
+    paths = client.get("/openapi.json").json()["paths"]
+    for endpoint in ("/health", "/capabilities", "/load", "/synthesize", "/unload", "/status", "/upload_ref"):
+        assert endpoint in paths, f"missing {endpoint}"
