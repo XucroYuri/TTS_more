@@ -161,6 +161,7 @@ git check-ignore -v data/local/services.json .env.local repo/GPT-SoVITS
 
 - [架构](docs/architecture.md)
 - [安全模型](docs/security.md)
+- [GPT-SoVITS 接入能力分析](docs/gpt-sovits-integration.md)
+- [CI 架构与真实 TTS 验收](docs/ci-architecture.md)
 - [开源 TTS 服务接入](docs/open-source-tts-services.md)
 - [发布治理](docs/release-governance.md)
-- [前端设计基线](frontend/design.md)
