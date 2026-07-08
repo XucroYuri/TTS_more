@@ -376,7 +376,7 @@ def _endpoint_can_access_path(endpoint: TTSServiceEndpoint, raw_path: str) -> bo
     if not roots:
         return False
     normalized = _normalize_path_for_compare(raw_path)
-    return any(normalized == root or normalized.startswith(root.rstrip("\\/") + "\\") or normalized.startswith(root.rstrip("\\/") + "/") for root in roots)
+    return any(normalized == root or normalized.startswith(root.rstrip("/") + "/") for root in roots)
 
 
 def _endpoint_accessible_roots(endpoint: TTSServiceEndpoint) -> list[str]:
@@ -415,7 +415,11 @@ def _looks_like_absolute_filesystem_path(value: str) -> bool:
 
 
 def _normalize_path_for_compare(value: str) -> str:
-    return value.replace("/", "\\").rstrip("\\").casefold()
+    # Normalize to forward slashes — the portable neutral form. Both Windows
+    # backslashes and POSIX forward slashes fold to "/", so comparisons are
+    # correct on every host platform. (Previously this forced backslashes,
+    # which worked only by coincidence on POSIX.)
+    return value.replace("\\", "/").rstrip("/").casefold()
 
 
 class MockServiceClient:

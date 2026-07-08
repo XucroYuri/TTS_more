@@ -1,6 +1,9 @@
 # TTS More — cross-platform development Makefile.
-# Works on macOS, Linux, and Windows (Git Bash / WSL). PowerShell-native users
-# can still use scripts/*.ps1 directly; this Makefile mirrors the common tasks.
+# Works on macOS, Linux, and Windows. On Windows it targets native cmd /
+# PowerShell (make is uncommon there; PowerShell users can use scripts/*.ps1
+# directly). Under Git Bash/MSYS2 the .sh scripts work but $(OS) is still
+# Windows_NT, so the Windows venv path is selected — run via the .ps1 scripts
+# if the MSYS path translation causes trouble.
 
 ROOT := $(shell pwd)
 BACKEND_PY := $(ROOT)/.venv/bin/python
@@ -27,8 +30,12 @@ install-backend: ## Create .venv and install backend[dev] (uses uv if available)
 install-frontend: ## Install frontend dependencies with pnpm
 	cd frontend && pnpm install
 
-dev: ## Start backend and frontend (POSIX shells; on Windows use scripts/start-dev.ps1)
-	@scripts/start-dev.sh
+dev: ## Start backend and frontend (cross-platform)
+	@ifeq ($(OS),Windows_NT)
+		powershell -ExecutionPolicy Bypass -File scripts/start-dev.ps1
+	@else
+		scripts/start-dev.sh
+	@endif
 
 test: test-backend test-frontend ## Run all tests
 

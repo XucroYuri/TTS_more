@@ -12,7 +12,24 @@ from app.workers.contracts import LoadRequest, SynthesizeRequest
 from app.workers.indextts_subprocess import IndexTTSSubprocessAdapter
 
 REPO_DIR = Path(os.environ.get("TTS_MORE_INDEXTTS_REPO", "repo/index-tts"))
-PYTHON_EXE = os.environ.get("TTS_MORE_INDEXTTS_PYTHON", os.environ.get("TTS_MORE_PYTHON_EXE", sys.executable))
+
+
+def _resolve_python_exe() -> str:
+    """Resolve the per-service Python interpreter, with a cross-platform guard.
+
+    TTS_MORE_INDEXTTS_PYTHON / TTS_MORE_PYTHON_EXE may point at a venv path
+    authored for a different OS (e.g. .venv\\Scripts\\python.exe from a Windows
+    .env.example copied onto macOS). If the configured path does not exist,
+    fall back to sys.executable so the worker still runs instead of failing to
+    spawn a missing interpreter.
+    """
+    candidate = os.environ.get("TTS_MORE_INDEXTTS_PYTHON") or os.environ.get("TTS_MORE_PYTHON_EXE")
+    if candidate and Path(candidate).exists():
+        return candidate
+    return sys.executable
+
+
+PYTHON_EXE = _resolve_python_exe()
 
 app = FastAPI(title="TTS More IndexTTS Worker", version="0.1.0")
 adapter = IndexTTSSubprocessAdapter(REPO_DIR, python_exe=PYTHON_EXE)

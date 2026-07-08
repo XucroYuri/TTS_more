@@ -275,3 +275,30 @@ def test_image_endpoint_serves_real_png(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/png"
+
+
+def test_path_compare_normalizes_mixed_separators() -> None:
+    """_normalize_path_for_compare must fold both / and \\ to a single form so
+    that an access check works regardless of which separator the config or the
+    request used (cross-platform correctness)."""
+    from app.services import _endpoint_can_access_path, _normalize_path_for_compare
+
+    # Forward-slash and backslash forms of the same path compare equal.
+    assert _normalize_path_for_compare("C:/Users/models") == _normalize_path_for_compare("C:\\Users\\models")
+    assert _normalize_path_for_compare("/data/weights") == _normalize_path_for_compare("\\data\\weights")
+
+    # A path inside a root declared with the other separator is accessible.
+    endpoint = _make_endpoint_with_roots(["/data/weights"])
+    assert _endpoint_can_access_path(endpoint, "/data/weights/role/gpt.ckpt")
+    assert _endpoint_can_access_path(endpoint, "\\data\\weights\\role\\gpt.ckpt")
+    # Outside the root is rejected.
+    assert not _endpoint_can_access_path(endpoint, "/data/other/x.ckpt")
+
+
+def _make_endpoint_with_roots(roots):
+    from app.models import TTSServiceEndpoint
+    return TTSServiceEndpoint(
+        service_id="t",
+        base_url="mock://t",
+        default_params={"accessible_path_roots": roots},
+    )
