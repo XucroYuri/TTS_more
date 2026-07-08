@@ -81,6 +81,7 @@ import { ReferenceAudioInput } from "./components/ReferenceAudioInput";
 import { RoleAvatar } from "./components/RoleAvatar";
 import { ScriptManagerModal } from "./components/ScriptManagerModal";
 import { WaveformPlayer } from "./components/WaveformPlayer";
+import { TokenGate } from "./components/TokenGate";
 import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
 import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./lib/gptSovitsReference";
 import { formatScriptNote } from "./lib/lineNote";
@@ -1598,6 +1599,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <TokenGate />
       <aside className="sidebar">
         <div className="brand-row">
           <div className="brand-mark"><Mic2 size={17} /></div>

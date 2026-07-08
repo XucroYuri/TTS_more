@@ -2,8 +2,51 @@ import type { Character, DemoValidationPlan, GenerationJob, GenerationManifest, 
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
+const TOKEN_STORAGE_KEY = "tts_more_token";
+
+/** Read the optional API token from localStorage (set when the backend has
+ * TTS_MORE_API_TOKEN configured). Returns "" when unset. */
+export function getApiToken(): string {
+  try {
+    return localStorage.getItem(TOKEN_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function setApiToken(token: string): void {
+  try {
+    if (token) {
+      localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    } else {
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    /* ignore storage errors (private mode etc.) */
+  }
+}
+
+export async function fetchAuthStatus(): Promise<{ auth_required: boolean }> {
+  return request("/api/auth/status");
+}
+
+function withAuthHeader(init?: RequestInit): RequestInit {
+  const token = getApiToken();
+  if (!token) return init ?? {};
+  const headers = new Headers(init?.headers);
+  headers.set("Authorization", `Bearer ${token}`);
+  return { ...init, headers };
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const response = await fetch(url, withAuthHeader(init));
+  if (response.status === 401) {
+    // Notify the UI to prompt for the API token. Listeners in App.tsx show
+    // a token-entry dialog; the rejected promise still propagates the error.
+    window.dispatchEvent(new CustomEvent("tts-more:auth-required"));
+    const body = await response.text();
+    throw new Error(body || "API token required");
+  }
   if (!response.ok) {
     const body = await response.text();
     throw new Error(body || response.statusText);

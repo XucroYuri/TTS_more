@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from app.hardware import collect_local_hardware_status
+from app.auth import auth_status_endpoint, install_token_middleware
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
@@ -97,6 +98,10 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Optional shared bearer token. No-op (all requests pass through) when
+    # TTS_MORE_API_TOKEN is unset; enforces Authorization: Bearer <token> on
+    # mutating/egress endpoints when it is set.
+    install_token_middleware(app)
 
     store = ProjectStore(Path(data_root))
     project_root = Path(__file__).resolve().parents[2]
@@ -126,6 +131,10 @@ def create_app(
     app.state.env_path = env_file
     # Read at app-creation time so tests/processes can override via env.
     app.state.max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(MAX_UPLOAD_BYTES)))
+
+    @app.get("/api/auth/status")
+    def auth_status() -> dict[str, Any]:
+        return auth_status_endpoint()
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:

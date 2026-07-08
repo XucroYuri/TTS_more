@@ -7125,3 +7125,76 @@ h3 {
     min-width: 980px;
   }
 }
+
+/* TokenGate — optional API token entry dialog */
+.token-gate-badge {
+  position: fixed;
+  top: 10px;
+  right: 12px;
+  z-index: 60;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--border, #e5e5e5);
+  background: var(--bg-elevated, #fff);
+  color: var(--text-muted, #888);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.token-gate-badge:hover { color: var(--text, #111); }
+.token-gate-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.35);
+}
+.token-gate-dialog {
+  width: 340px;
+  max-width: calc(100vw - 32px);
+  background: var(--bg-elevated, #fff);
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 10px;
+  padding: 16px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+}
+.token-gate-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.token-gate-header span { display: inline-flex; align-items: center; gap: 6px; }
+.token-gate-hint {
+  font-size: 12px;
+  color: var(--text-muted, #888);
+  margin: 0 0 10px;
+}
+.token-gate-dialog input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 6px;
+  font-size: 13px;
+  box-sizing: border-box;
+}
+.token-gate-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+.token-gate-actions button.primary {
+  padding: 7px 14px;
+  border: none;
+  border-radius: 6px;
+  background: #111;
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+.token-gate-actions button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
