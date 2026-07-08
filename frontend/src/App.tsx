@@ -4,7 +4,6 @@ import {
   CheckCircle2,
   Cpu,
   FileText,
-  FolderKanban,
   History,
   Languages,
   Library,
@@ -96,7 +95,7 @@ import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
 import { buildGradioEndpointRequest, gradioContractForProvider } from "./lib/ttsAccess";
 import { createToast, inferToastLevel, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
   Character,
   CharacterReferenceAudioGroup,
@@ -131,7 +130,6 @@ import type {
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 type SaveState = "idle" | "saving" | "saved" | "error";
 type ServicePanelSection = "overview" | "open-source" | "tts" | "llm" | "resources" | "roles";
-type ScriptSourceMode = "project" | "manual";
 type ConfirmationTone = "warning" | "danger" | "info";
 const KWJM_TESTING_INDEX = -1;
 const LINE_LOAD_BATCH_SIZE = 40;
@@ -186,8 +184,6 @@ export default function App() {
   const [routeSettingsOpen, setRouteSettingsOpen] = useState(false);
   const [selectedLineIds, setSelectedLineIds] = useState<string[]>([]);
   const [lineTextDrafts, setLineTextDrafts] = useState<Record<string, string>>({});
-  const [scriptInput, setScriptInput] = useState("");
-  const [scriptSourceMode, setScriptSourceMode] = useState<ScriptSourceMode>("project");
   const [parserProviders, setParserProviders] = useState<ParserProviderDraft[]>([]);
   const [roleLibraryCandidates, setRoleLibraryCandidates] = useState<RoleLibraryCandidate[]>([]);
   const [gptModelCatalog, setGptModelCatalog] = useState<RoleLibraryCandidate[]>([]);
@@ -197,7 +193,6 @@ export default function App() {
   const [activeProjectRoleId, setActiveProjectRoleId] = useState<string | null>(null);
   const [modelCatalogSamples, setModelCatalogSamples] = useState<Record<string, LogsReferenceAudioResponse>>({});
   const [loadingModelCatalogSamplesKey, setLoadingModelCatalogSamplesKey] = useState<string | null>(null);
-  const [isParsing, setIsParsing] = useState(false);
   const [isSavingParserConfig, setIsSavingParserConfig] = useState(false);
   const [testingParserProviderIndex, setTestingParserProviderIndex] = useState<number | null>(null);
   const [parserProviderTestResults, setParserProviderTestResults] = useState<Record<number, ParserProviderTestResponse>>({});
@@ -221,11 +216,9 @@ export default function App() {
   const [openSourceDetectResult, setOpenSourceDetectResult] = useState<OpenSourceTTSDetectResponse | null>(null);
   const [isDetectingOpenSource, setIsDetectingOpenSource] = useState(false);
   const [isConfiguringOpenSource, setIsConfiguringOpenSource] = useState(false);
-  const [isSidebarScriptEditing, setIsSidebarScriptEditing] = useState(false);
   const [newScriptTitle, setNewScriptTitle] = useState("");
   const [newScriptSource, setNewScriptSource] = useState("");
   const [isCreatingScript, setIsCreatingScript] = useState(false);
-  const [isScriptManagerOpen, setIsScriptManagerOpen] = useState(false);
   const [managerSearchText, setManagerSearchText] = useState("");
   const [managedProjectId, setManagedProjectId] = useState<string | null>(null);
   const [managedProject, setManagedProject] = useState<ScriptProject | null>(null);
@@ -342,16 +335,11 @@ export default function App() {
       setVersionDrafts({});
       setSelectedLineIds([]);
       setLineTextDrafts({});
-      setScriptInput("");
-      setScriptSourceMode("project");
-      setIsSidebarScriptEditing(false);
       setIsProjectLoaded(true);
       setSaveState("idle");
       return;
     }
     setIsProjectLoaded(false);
-    setScriptSourceMode("project");
-    setIsSidebarScriptEditing(false);
     fetchProject(currentProjectId)
       .then((payload) => {
         setProject(payload);
@@ -375,9 +363,6 @@ export default function App() {
         setVersionDrafts({});
         setSelectedLineIds([]);
         setLineTextDrafts({});
-        setScriptInput("");
-        setScriptSourceMode("project");
-        setIsSidebarScriptEditing(false);
         setIsProjectLoaded(true);
         setNotice(t("empty.projectLoadFailed"));
       });
@@ -409,10 +394,6 @@ export default function App() {
   const resolvedCharacters = useMemo(() => resolveProjectCharacters(projectWithCharacters, characters), [characters, projectWithCharacters]);
   const projectRoleRows = useMemo(() => projectCharacterRows(projectWithCharacters, characters), [characters, projectWithCharacters]);
 
-  useEffect(() => {
-    if (!isProjectLoaded || scriptSourceMode !== "project") return;
-    setScriptInput(projectToScriptSourceText(projectWithCharacters, characters));
-  }, [characters, isProjectLoaded, projectWithCharacters, scriptSourceMode]);
   const filteredLibraryCharacters = useMemo(() => {
     const query = roleLibrarySearch.trim().toLocaleLowerCase();
     if (!query) return characters;
@@ -580,40 +561,17 @@ export default function App() {
   const visibleLineLabel = lineToolbarState.countLabel;
   const selectedLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language ?? defaultLanguage);
   const selectedLanguageLabel = languageOptions.find((option) => option.value === selectedLanguage)?.label ?? selectedLanguage;
-  const displayProjectTitle = project.title || currentProjectId ? standardProjectName(project.title || currentProjectId || "") : t("empty.noProjectSelected");
-  const scriptSourceTone = scriptSourceMode === "project" ? "completed" : "queued";
-  const scriptSourceLabel = t(`parser.source.${scriptSourceMode}`);
   const projectRows = useMemo<ProjectSummary[]>(() => projectSummaries, [projectSummaries]);
-  const scriptConsoleText = useMemo(
-    () => scriptInput || projectToScriptSourceText(projectWithCharacters, characters),
-    [characters, projectWithCharacters, scriptInput]
-  );
-  const scriptSourceExcerpt = useMemo(
-    () =>
-      scriptConsoleText
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .slice(0, 5),
-    [scriptConsoleText]
-  );
-  const scriptSidebarMeta = t("script.sidebarMeta", {
-    lines: project.lines.length,
-    characters: projectCharacters.length,
-    revisions: project.parse_revisions?.length ?? 0
-  });
-  const scriptConsoleMode = scriptConsoleBodyMode(isSidebarScriptEditing);
 
   useEffect(() => {
-    if (!isScriptManagerOpen) return;
     setManagedProjectId((current) => {
       if (current && projectRows.some((item) => item.project_id === current)) return current;
       return currentProjectId ?? projectRows[0]?.project_id ?? null;
     });
-  }, [currentProjectId, isScriptManagerOpen, projectRows]);
+  }, [currentProjectId, projectRows]);
 
   useEffect(() => {
-    if (!isScriptManagerOpen || !managedProjectId) {
+    if (!managedProjectId) {
       setManagedProject(null);
       setManagerTitleDraft("");
       setManagerSourceDraft("");
@@ -645,7 +603,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [characters, currentProjectId, isProjectLoaded, isScriptManagerOpen, managedProjectId, projectWithCharacters, setNotice, t]);
+  }, [characters, currentProjectId, isProjectLoaded, managedProjectId, projectWithCharacters, setNotice, t]);
 
   useEffect(() => {
     setVisibleLineCount(LINE_LOAD_BATCH_SIZE);
@@ -1013,9 +971,6 @@ export default function App() {
       setSelectedLineIds([]);
       setSelectedHistoryVersions({});
       setVersionDrafts({});
-      setScriptInput(source);
-      setScriptSourceMode(source ? "project" : "manual");
-      setIsSidebarScriptEditing(!source);
       setManagedProjectId(projectId);
       setManagedProject(savedProject);
       setManagerTitleDraft(savedProject.title);
@@ -1055,55 +1010,6 @@ export default function App() {
     });
   }
 
-  async function saveScriptRevisionOnly() {
-    if (!currentProjectId) {
-      setNotice(t("empty.noProjectAction"));
-      return;
-    }
-    if (!(await confirmRevisionRisk())) return;
-    setSaveState("saving");
-    try {
-      const payload = await createScriptRevision(currentProjectId, scriptInput, t("script.currentSource"));
-      setProject(payload.project);
-      setScriptSourceMode("project");
-      setIsSidebarScriptEditing(false);
-      setSaveState("saved");
-      setNotice(t("notice.projectSaved"));
-      await refreshProjects();
-    } catch (error) {
-      setSaveState("error");
-      setNotice(error instanceof Error ? error.message : t("notice.autoSaveFailed"));
-    }
-  }
-
-  async function parseAsRevision() {
-    if (!currentProjectId) {
-      setNotice(t("empty.noProjectAction"));
-      return;
-    }
-    if (!(await confirmRevisionRisk())) return;
-    setIsParsing(true);
-    setNotice(t("parser.parsing"));
-    try {
-      const scriptPayload = await createScriptRevision(currentProjectId, scriptInput, t("script.parseRevision"));
-      const parsePayload = await createParseRevision(currentProjectId, scriptPayload.script_revision.revision_id);
-      setProject(parsePayload.project);
-      setScriptSourceMode("project");
-      setIsSidebarScriptEditing(false);
-      setActiveLineId(parsePayload.project.lines[0]?.id ?? "");
-      setExpandedLineId(null);
-      setSelectedLineIds([]);
-      setSelectedHistoryVersions({});
-      setVersionDrafts({});
-      setNotice(t("script.parseApplied"));
-      await refreshProjects();
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : t("parser.parseFailed"));
-    } finally {
-      setIsParsing(false);
-    }
-  }
-
   async function activateProjectRevision(parseRevisionId: string) {
     const revision = project.parse_revisions?.find((item) => item.revision_id === parseRevisionId);
     if (!revision) return;
@@ -1118,19 +1024,6 @@ export default function App() {
     setActiveLineId(revision.lines[0]?.id ?? "");
     setExpandedLineId(null);
     setSelectedLineIds([]);
-  }
-
-  function updateScriptInput(value: string) {
-    setScriptInput(value);
-    setScriptSourceMode("manual");
-  }
-
-  function beginSidebarScriptEdit() {
-    if (!scriptInput) {
-      setScriptInput(projectToScriptSourceText(projectWithCharacters, characters));
-    }
-    setScriptSourceMode("manual");
-    setIsSidebarScriptEditing(true);
   }
 
   function updateParserProvider(index: number, patch: Partial<ParserProviderDraft>) {
@@ -1439,9 +1332,6 @@ export default function App() {
       setSelectedHistoryVersions({});
       setVersionDrafts({});
     }
-    if (scriptSourceMode === "project") {
-      setScriptInput(projectToScriptSourceText(nextProject, characters));
-    }
   }
 
   async function renameManagedProject() {
@@ -1470,7 +1360,12 @@ export default function App() {
 
   async function saveManagedScriptRevision() {
     if (!managedProjectId || !managedProject) return;
+    const title = managerTitleDraft.trim();
     const source = managerSourceDraft.trim();
+    if (!title) {
+      setNotice(t("script.newScriptTitleRequired"));
+      return;
+    }
     if (!source) {
       setNotice(t("script.sourceRequired"));
       return;
@@ -1478,12 +1373,14 @@ export default function App() {
     if (!(await confirmRevisionRisk(managedProject))) return;
     setIsManagerSaving(true);
     try {
+      if (title !== managedProject.title) {
+        await saveProject(managedProjectId, { ...managedProject, title });
+      }
       const payload = await createScriptRevision(managedProjectId, source, t("script.currentSource"));
       setManagedProject(payload.project);
       setManagerTitleDraft(payload.project.title);
       setManagerSourceDraft(projectToScriptSourceText(payload.project, characters));
       applyManagedProjectToWorkspace(managedProjectId, payload.project);
-      setScriptSourceMode(managedProjectId === currentProjectId ? "project" : scriptSourceMode);
       setSaveState("saved");
       setNotice(t("notice.projectSaved"));
       await refreshProjects(currentProjectId);
@@ -1497,7 +1394,12 @@ export default function App() {
 
   async function parseManagedScriptRevision() {
     if (!managedProjectId || !managedProject) return;
+    const title = managerTitleDraft.trim();
     const source = managerSourceDraft.trim();
+    if (!title) {
+      setNotice(t("script.newScriptTitleRequired"));
+      return;
+    }
     if (!source) {
       setNotice(t("script.sourceRequired"));
       return;
@@ -1506,6 +1408,9 @@ export default function App() {
     setIsManagerParsing(true);
     setNotice(t("parser.parsing"));
     try {
+      if (title !== managedProject.title) {
+        await saveProject(managedProjectId, { ...managedProject, title });
+      }
       const scriptPayload = await createScriptRevision(managedProjectId, source, t("script.parseRevision"));
       const parsePayload = await createParseRevision(managedProjectId, scriptPayload.script_revision.revision_id);
       setManagedProject(parsePayload.project);
@@ -1756,7 +1661,7 @@ export default function App() {
 
   const scriptManagerPane = (
     <ScriptManagerModal
-      open={isScriptManagerOpen}
+      open
       variant="inline"
       projects={projectRows}
       currentProjectId={currentProjectId}
@@ -1772,7 +1677,7 @@ export default function App() {
       isSavingScript={isManagerSaving}
       isParsingScript={isManagerParsing}
       deletingProjectId={deletingProjectId}
-      onClose={() => setIsScriptManagerOpen(false)}
+      onClose={() => undefined}
       onSearchTextChange={setManagerSearchText}
       onSelectProject={setManagedProjectId}
       onOpenProject={(projectId) => {
@@ -1802,66 +1707,8 @@ export default function App() {
           </div>
         </div>
 
-        <section className="panel compact parser-panel script-console-panel">
-          <section className="script-sidebar-current" aria-label={t("script.activeScript")}>
-            <div className="script-sidebar-current-head">
-              <div>
-                <span>{t("script.activeScript")}</span>
-                <strong>{displayProjectTitle}</strong>
-              </div>
-              <button className="secondary-button compact-button script-manager-open-button" type="button" onClick={() => setIsScriptManagerOpen((current) => !current)}>
-                <FolderKanban size={14} /> {isScriptManagerOpen ? t("actions.close") : t("script.manageScriptShort")}
-              </button>
-            </div>
-            <div className="script-sidebar-meta">
-              <span>{scriptSidebarMeta}</span>
-              <StatusPill tone={scriptSourceTone} label={scriptSourceLabel} />
-            </div>
-            {projectRows.length === 0 && <span className="script-sidebar-empty-hint">{t("empty.noProjectsHint")}</span>}
-          </section>
-
-          {isScriptManagerOpen ? scriptManagerPane : (
-          <div className={`script-console-preview source-${scriptSourceMode} mode-${scriptConsoleMode}`}>
-            <div className="script-console-preview-head">
-              <div>
-                <span>{t("script.sourceExcerpt")}</span>
-              </div>
-              <div className="script-console-preview-actions">
-                {scriptConsoleMode === "edit" ? (
-                  <button className="secondary-button compact-button" type="button" onClick={() => setIsSidebarScriptEditing(false)}>
-                    {t("script.previewSource")}
-                  </button>
-                ) : (
-                  <button className="secondary-button compact-button" type="button" onClick={beginSidebarScriptEdit}>
-                    <FileText size={13} /> {t("script.editSource")}
-                  </button>
-                )}
-              </div>
-            </div>
-            {scriptConsoleMode === "edit" ? (
-              <textarea
-                className="script-console-editor"
-                value={scriptInput}
-                onChange={(event) => updateScriptInput(event.target.value)}
-                aria-label={t("script.editSource")}
-              />
-            ) : scriptSourceExcerpt.length > 0 ? (
-              <div className="script-excerpt-lines" aria-label={t("script.previewSource")}>
-                {scriptSourceExcerpt.map((line, index) => (
-                  <p key={`${line}-${index}`}>{line}</p>
-                ))}
-              </div>
-            ) : (
-              <div className="empty-row compact">{t("empty.noProjectsHint")}</div>
-            )}
-          </div>
-          )}
-
-          <div className="script-console-actions">
-            <button className="primary-button script-extract-button" onClick={() => void parseAsRevision()} disabled={isParsing || !currentProjectId}>
-              {isParsing ? <Loader2 className="spin" size={15} /> : <Wand2 size={15} />} {t("script.parseRevision")}
-            </button>
-          </div>
+        <section className="panel compact parser-panel script-workspace-panel">
+          {scriptManagerPane}
         </section>
 
       </aside>

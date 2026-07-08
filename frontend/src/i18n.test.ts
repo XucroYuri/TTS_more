@@ -48,8 +48,8 @@ describe("i18n configuration", () => {
     expect(tText(resources["zh-CN"], "characters.uploadAvatar")).toBe("上传头像");
     expect(tText(resources["zh-CN"], "audioInput.record")).toBe("录音");
     expect(tText(resources["zh-CN"], "script.drawer.list")).toBe("剧本列表");
-    expect(tText(resources["zh-CN"], "script.manageScriptShort")).toBe("管理");
-    expect(tText(resources["zh-CN"], "script.sourceExcerpt")).toBe("原文摘录");
+    expect(tText(resources["zh-CN"], "script.workspaceTitle")).toBe("剧本");
+    expect(tText(resources["zh-CN"], "script.workspaceHint")).toBe("选择剧本，或直接在下方新建。");
     expect(tText(resources["zh-CN"], "script.parseRevision")).toBe("提取台词");
     expect(tText(resources["zh-CN"], "inspector.method.gpt")).toBe("GPT");
     expect(tText(resources["zh-CN"], "inspector.createIndexTemporary")).toBe("设为临时音色");
@@ -68,8 +68,8 @@ describe("i18n configuration", () => {
     expect(tText(resources["en-US"], "characters.uploadAvatar")).toBe("Upload avatar");
     expect(tText(resources["en-US"], "audioInput.record")).toBe("Record");
     expect(tText(resources["en-US"], "script.drawer.preview")).toBe("Preview");
-    expect(tText(resources["en-US"], "script.manageScriptShort")).toBe("Manage");
-    expect(tText(resources["en-US"], "script.sourceExcerpt")).toBe("Source excerpt");
+    expect(tText(resources["en-US"], "script.workspaceTitle")).toBe("Scripts");
+    expect(tText(resources["en-US"], "script.workspaceHint")).toBe("Select a script, or create one below.");
     expect(tText(resources["en-US"], "script.parseRevision")).toBe("Extract lines");
     expect(tText(resources["en-US"], "inspector.method.indextts")).toBe("Index");
     expect(tText(resources["en-US"], "inspector.createIndexTemporary")).toBe("Set temporary voice");

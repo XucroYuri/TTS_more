@@ -62,8 +62,6 @@ export interface GenerationMethodRouteLabels {
   serviceLabelKey: string;
 }
 
-export type ScriptConsoleBodyMode = "preview" | "edit";
-
 export interface LineFilterToolbarLabels {
   filtersMore: string;
   selectedLines: (count: number) => string;
@@ -209,10 +207,6 @@ export function generationMethodRouteLabels(methodId: GenerationMethodId): Gener
     bindingLabelKey: "inspector.commercialVoiceBinding",
     serviceLabelKey: "inspector.commercialEndpoint"
   };
-}
-
-export function scriptConsoleBodyMode(isEditing: boolean): ScriptConsoleBodyMode {
-  return isEditing ? "edit" : "preview";
 }
 
 export function lineFilterToolbarState(input: LineFilterToolbarInput): LineFilterToolbarState {

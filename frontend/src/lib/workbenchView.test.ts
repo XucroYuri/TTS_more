@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Character, GenerationVersion, ScriptLine, WorkerHealth } from "../types";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, scriptConsoleBodyMode, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups } from "./workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups } from "./workbenchView";
 
 describe("workbench view helpers", () => {
   it("maps a role index to a stable accent class", () => {
@@ -45,11 +45,6 @@ describe("workbench view helpers", () => {
       serviceLabelKey: "inspector.cosyVoiceService"
     });
     expect(generationMethodRouteLabels("commercial").bindingLabelKey).toBe("inspector.commercialVoiceBinding");
-  });
-
-  it("keeps the sidebar script body in markdown preview until editing is requested", () => {
-    expect(scriptConsoleBodyMode(false)).toBe("preview");
-    expect(scriptConsoleBodyMode(true)).toBe("edit");
   });
 
   it("summarizes line filters without exposing inactive controls", () => {

@@ -4024,77 +4024,12 @@ h3 {
   min-width: 0;
 }
 
-.script-console-panel {
+.script-workspace-panel {
   flex: 1 1 auto;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr);
   align-content: start;
-  gap: var(--space-2);
   min-height: 0;
-}
-
-.script-sidebar-current {
-  display: grid;
-  gap: var(--space-2);
-  padding: var(--space-2);
-  border: 1px solid var(--geist-gray-200);
-  border-radius: var(--radius-sm);
-  background: var(--geist-bg);
-}
-
-.script-sidebar-current-head {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
-  gap: var(--space-2);
-  min-width: 0;
-}
-
-.script-sidebar-current-head > div {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.script-sidebar-current-head span,
-.script-sidebar-empty-hint,
-.script-sidebar-meta span {
-  color: var(--geist-gray-900);
-  font-size: 12px;
-  line-height: 16px;
-}
-
-.script-sidebar-current-head strong {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--geist-primary);
-  font-size: 13px;
-  line-height: 18px;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.script-sidebar-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-  min-width: 0;
-  padding-top: var(--space-2);
-  border-top: 1px solid var(--geist-gray-200);
-}
-
-.script-sidebar-meta > span {
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.script-manager-open-button {
-  flex: 0 0 auto;
-  justify-content: center;
-  min-height: 30px;
 }
 
 .script-manager-backdrop {
@@ -4121,6 +4056,7 @@ h3 {
 }
 
 .script-manager-inline {
+  height: 100%;
   width: 100%;
   min-width: 0;
   min-height: 0;
@@ -4130,11 +4066,10 @@ h3 {
 }
 
 .script-manager-inline .script-manager-head {
-  align-items: center;
+  align-items: start;
   padding: var(--space-2);
 }
 
-.script-manager-inline .script-manager-head span,
 .script-manager-inline .script-manager-preview-panel {
   display: none;
 }
@@ -4144,9 +4079,19 @@ h3 {
   line-height: 18px;
 }
 
+.script-manager-inline .script-manager-head span {
+  overflow: hidden;
+  max-width: 100%;
+  font-size: 12px;
+  line-height: 16px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .script-manager-inline .script-manager-body {
+  grid-template-rows: minmax(108px, 0.34fr) minmax(0, 1fr);
   grid-template-columns: minmax(0, 1fr);
-  overflow: auto;
+  overflow: hidden;
 }
 
 .script-manager-inline .script-manager-list-panel,
@@ -4155,31 +4100,73 @@ h3 {
   border-right: 0;
 }
 
+.script-manager-inline .script-manager-list-panel {
+  border-bottom: 1px solid var(--geist-gray-200);
+  overflow: hidden;
+}
+
 .script-manager-inline .script-manager-list {
-  max-height: 168px;
+  max-height: none;
 }
 
 .script-manager-inline .script-manager-row {
-  min-height: 44px;
+  min-height: 42px;
   padding: 7px 8px;
 }
 
 .script-manager-inline .script-manager-action-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: var(--space-2);
-  border-top: 1px solid var(--geist-gray-200);
+  overflow: hidden;
   background: var(--geist-bg);
 }
 
-.script-manager-inline .script-manager-card {
-  padding: var(--space-2);
+.script-manager-inline .script-manager-action-panel > label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
 }
 
-.script-manager-inline .script-manager-card textarea {
-  min-height: 74px;
+.script-manager-inline .script-manager-action-panel label span {
+  color: var(--geist-gray-900);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.script-manager-inline .script-manager-action-panel input,
+.script-manager-inline .script-manager-action-panel textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  color: var(--geist-primary);
+  background: var(--geist-bg-subtle);
+  font: inherit;
+}
+
+.script-manager-inline .script-manager-source-field {
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
 }
 
 .script-manager-inline .script-manager-source-editor {
-  max-height: 132px;
+  min-height: 0;
+  height: 100%;
+  resize: none;
+  line-height: 18px;
+}
+
+.script-manager-inline-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+}
+
+.script-manager-inline-actions button {
+  justify-content: center;
+  min-width: 0;
 }
 
 .script-manager-head {
@@ -4453,155 +4440,6 @@ h3 {
 
 .danger-button {
   color: var(--geist-red-800);
-}
-
-.script-console-preview {
-  border: 1px solid var(--geist-gray-200);
-  border-radius: var(--radius-sm);
-  background: var(--geist-bg);
-}
-
-.script-console-preview-head span,
-.script-pane-summary span {
-  color: var(--geist-gray-900);
-  font-size: 12px;
-}
-
-.script-console-preview-head strong {
-  overflow: hidden;
-  font-size: 12px;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.script-console-preview {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  gap: var(--space-2);
-  min-height: 0;
-  padding: var(--space-2);
-  overflow: hidden;
-}
-
-.script-console-preview.mode-edit {
-  max-height: 320px;
-  min-height: 260px;
-}
-
-.script-console-preview:focus-visible {
-  border-color: var(--geist-gray-1000);
-  outline: none;
-}
-
-.script-console-preview.source-manual {
-  border-color: #ffdc73;
-  background: #fffaf0;
-}
-
-.script-console-preview-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--space-2);
-}
-
-.script-console-preview-head > div:first-child {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-
-.script-console-preview-actions {
-  display: flex;
-  flex: 0 0 auto;
-  gap: 4px;
-  align-items: center;
-}
-
-.script-excerpt-lines {
-  display: grid;
-  align-content: start;
-  gap: 5px;
-  min-height: 0;
-  overflow: auto;
-}
-
-.script-excerpt-lines p {
-  margin: 0;
-  overflow: hidden;
-  color: var(--geist-primary);
-  font-size: 12px;
-  line-height: 18px;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-.script-console-preview.mode-edit .script-console-editor {
-  min-height: 196px;
-}
-
-.script-console-editor {
-  width: 100%;
-  min-width: 0;
-  min-height: 0;
-  height: 100%;
-  resize: none;
-  padding: 8px;
-  border: 1px solid var(--geist-gray-200);
-  border-radius: var(--radius-sm);
-  color: var(--geist-primary);
-  background: var(--geist-bg);
-  font: 12px/18px "Geist Mono", "SFMono-Regular", Consolas, monospace;
-  white-space: pre-wrap;
-}
-
-.script-console-editor:focus {
-  border-color: var(--geist-gray-1000);
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
-}
-
-.script-console-actions {
-  align-self: end;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: var(--space-2);
-  padding-top: var(--space-2);
-  border-top: 1px solid var(--geist-gray-200);
-}
-
-.script-console-actions button {
-  position: relative;
-  justify-content: center;
-  min-height: 44px;
-  border-color: var(--geist-gray-1000);
-  color: var(--geist-bg);
-  background: var(--geist-gray-1000);
-  font-weight: 700;
-  box-shadow: 0 8px 24px #00000017;
-}
-
-.script-console-actions .script-extract-button::before {
-  content: "";
-  width: 3px;
-  height: 18px;
-  border-radius: 999px;
-  background: var(--geist-bg);
-  opacity: 0.9;
-}
-
-.script-console-actions button:hover:not(:disabled) {
-  border-color: var(--geist-gray-900);
-  background: var(--geist-gray-900);
-  transform: translateY(-1px);
-}
-
-.script-console-actions button:disabled {
-  border-color: var(--geist-gray-300);
-  color: var(--geist-gray-700);
-  background: var(--geist-gray-100);
-  box-shadow: none;
-  transform: none;
 }
 
 .role-list-subhead {
@@ -7508,19 +7346,6 @@ h3 {
     display: none;
   }
 
-  .script-console-preview {
-    max-height: 132px;
-  }
-
-  .script-console-preview.mode-edit {
-    max-height: 260px;
-    min-height: 220px;
-  }
-
-  .script-excerpt-lines p:nth-child(n + 4) {
-    display: none;
-  }
-
   .script-project-list {
     grid-template-columns: 1fr;
     max-height: 150px;
@@ -7539,6 +7364,7 @@ h3 {
   .script-manager-inline {
     width: 100%;
     max-height: none;
+    min-height: 520px;
   }
 
   .script-manager-body,

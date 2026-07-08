@@ -79,11 +79,105 @@ export function ScriptManagerModal({
   const selectedTitle = titleDraft || selectedProject?.title || selectedSummary?.title || selectedProjectId || "";
   const selectedIsCurrent = Boolean(selectedProjectId && selectedProjectId === currentProjectId);
   const busy = isCreatingScript || isSavingScript || isParsingScript || Boolean(deletingProjectId);
+  const isInline = variant === "inline";
 
   if (!open) return null;
 
+  if (isInline) {
+    const editingExistingScript = Boolean(selectedProjectId);
+    return (
+      <section className="script-manager-modal script-manager-inline" role="region" aria-labelledby="script-manager-title">
+        <header className="script-manager-head">
+          <div>
+            <strong id="script-manager-title">{t("script.workspaceTitle")}</strong>
+            <span>{selectedTitle ? t("script.workspaceActive", { title: selectedTitle }) : t("script.workspaceHint")}</span>
+          </div>
+        </header>
+
+        <div className="script-manager-body">
+          <aside className="script-manager-list-panel">
+            <label className="script-manager-search">
+              <Search size={14} />
+              <input value={searchText} onChange={(event) => onSearchTextChange(event.target.value)} placeholder={t("script.searchScripts")} />
+            </label>
+            <div className="script-manager-list" role="listbox" aria-label={t("script.existingScripts")}>
+              {visibleProjects.map((project) => (
+                <button
+                  className={`script-manager-row ${project.project_id === selectedProjectId ? "active" : ""}`}
+                  key={project.project_id}
+                  onClick={() => onSelectProject(project.project_id)}
+                  role="option"
+                  type="button"
+                  aria-selected={project.project_id === selectedProjectId}
+                >
+                  <span>
+                    <strong>{project.title || project.project_id}</strong>
+                    {project.project_id === currentProjectId && <small>{t("app.currentProject")}</small>}
+                  </span>
+                  <em>{t("script.projectRowMeta", { lines: project.line_count, revisions: project.parse_revision_count ?? 0 })}</em>
+                </button>
+              ))}
+              {visibleProjects.length === 0 && (
+                <div className="empty-row project-empty-state">
+                  <strong>{t("empty.noProjects")}</strong>
+                  <span>{t("script.noProjectMatches")}</span>
+                </div>
+              )}
+            </div>
+          </aside>
+
+          <section className="script-manager-action-panel">
+            <label>
+              <span>{t("script.newScriptTitle")}</span>
+              <input
+                value={editingExistingScript ? titleDraft : newScriptTitle}
+                onChange={(event) => editingExistingScript ? onTitleDraftChange(event.target.value) : onNewScriptTitleChange(event.target.value)}
+                disabled={editingExistingScript && isSelectedProjectLoading}
+                placeholder={t("script.newScriptTitlePlaceholder")}
+              />
+            </label>
+            <label className="script-manager-source-field">
+              <span>{t("script.currentSource")}</span>
+              <textarea
+                className="script-manager-source-editor"
+                value={editingExistingScript ? sourceDraft : newScriptSource}
+                onChange={(event) => editingExistingScript ? onSourceDraftChange(event.target.value) : onNewScriptSourceChange(event.target.value)}
+                disabled={editingExistingScript && isSelectedProjectLoading}
+                placeholder={editingExistingScript ? t("script.emptySourcePreview") : t("script.newScriptSourcePlaceholder")}
+              />
+            </label>
+            <div className="script-manager-inline-actions">
+              {editingExistingScript ? (
+                <>
+                  {selectedProjectId && !selectedIsCurrent && (
+                    <button className="secondary-button" type="button" onClick={() => onOpenProject(selectedProjectId)} disabled={busy}>
+                      <FolderOpen size={13} /> {t("script.openScript")}
+                    </button>
+                  )}
+                  <button className="secondary-button" type="button" onClick={onSaveRevision} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
+                    {isSavingScript ? <Loader2 className="spin" size={14} /> : <Save size={14} />} {t("script.saveRevision")}
+                  </button>
+                  <button className="primary-button" type="button" onClick={onParseRevision} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
+                    {isParsingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {t("script.parseRevision")}
+                  </button>
+                  <button className="secondary-button danger-button" type="button" onClick={onDeleteScript} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
+                    {deletingProjectId ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />} {t("script.deleteScript")}
+                  </button>
+                </>
+              ) : (
+                <button className="primary-button" type="button" onClick={onCreateScript} disabled={busy}>
+                  {isCreatingScript ? <Loader2 className="spin" size={15} /> : <Plus size={15} />} {t("script.createScript")}
+                </button>
+              )}
+            </div>
+          </section>
+        </div>
+      </section>
+    );
+  }
+
   const content = (
-      <section className={`script-manager-modal ${variant === "inline" ? "script-manager-inline" : ""}`} role={variant === "modal" ? "dialog" : "region"} aria-modal={variant === "modal" ? true : undefined} aria-labelledby="script-manager-title">
+      <section className="script-manager-modal" role="dialog" aria-modal aria-labelledby="script-manager-title">
         <header className="script-manager-head">
           <div>
             <strong id="script-manager-title">{t("script.managerTitle")}</strong>
@@ -205,8 +299,6 @@ export function ScriptManagerModal({
         </div>
       </section>
   );
-
-  if (variant === "inline") return content;
 
   return (
     <div className="script-manager-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
