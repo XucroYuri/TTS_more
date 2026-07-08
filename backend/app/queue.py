@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import uuid
 import re
@@ -56,6 +57,7 @@ class ServiceGenerationQueue:
         manifest: GenerationManifest,
         output_dir: Path,
         status_callback: StatusCallback | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> GenerationManifest:
         grouped: "OrderedDict[str, OrderedDict[str, list[tuple[int, GenerationTask, ServiceRoute, str]]]]" = OrderedDict()
         for index, task in enumerate(tasks):
@@ -75,7 +77,7 @@ class ServiceGenerationQueue:
 
         with ThreadPoolExecutor(max_workers=len(work_items)) as executor:
             futures = [
-                executor.submit(self._run_resource_clusters, resource_group, clusters, manifest, output_dir, status_callback)
+                executor.submit(self._run_resource_clusters, resource_group, clusters, manifest, output_dir, status_callback, cancel_check)
                 for resource_group, clusters in work_items
             ]
             for future in futures:
@@ -89,9 +91,12 @@ class ServiceGenerationQueue:
         manifest: GenerationManifest,
         output_dir: Path,
         status_callback: StatusCallback | None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         for cluster_key, group in clusters:
-            self._run_service_cluster(resource_group, cluster_key, group, manifest, output_dir, status_callback)
+            if cancel_check and cancel_check():
+                return
+            self._run_service_cluster(resource_group, cluster_key, group, manifest, output_dir, status_callback, cancel_check)
 
     def _run_service_cluster(
         self,
@@ -101,6 +106,7 @@ class ServiceGenerationQueue:
         manifest: GenerationManifest,
         output_dir: Path,
         status_callback: StatusCallback | None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         semaphore = self._resource_semaphore(resource_group, capacity=group[0][2].endpoint.capacity)
         with semaphore:
@@ -125,6 +131,9 @@ class ServiceGenerationQueue:
                     raise
                 self._mark_loaded(route.endpoint.service_id, first_signature, "loaded_unverified")
             for _index, task, task_route, task_cluster_key in group:
+                # Stop dispatching new lines in this cluster if the job was cancelled.
+                if cancel_check and cancel_check():
+                    return
                 task_signature = build_load_signature(task_route.endpoint, task.parameters)
                 if self._loaded_signatures.get(task_route.endpoint.service_id) != task_signature:
                     self._emit(task, "loading", 0.12, task_cluster_key, None, status_callback)
@@ -378,11 +387,19 @@ def _string_or_none(value: Any) -> str | None:
 
 
 class GenerationJobManager:
+    # Bounded job store and concurrency to prevent unbounded memory/thread
+    # growth from a flood of generation requests.
+    MAX_JOBS = int(os.environ.get("TTS_MORE_MAX_JOBS", "200"))
+    MAX_ACTIVE_JOBS = int(os.environ.get("TTS_MORE_MAX_ACTIVE_JOBS", "8"))
+    # Completed/failed jobs are evicted after this many seconds.
+    JOB_RETENTION_SECONDS = int(os.environ.get("TTS_MORE_JOB_RETENTION_SECONDS", "3600"))
+
     def __init__(self, queue: ServiceGenerationQueue, store: Any) -> None:
         self.queue = queue
         self.store = store
-        self._jobs: dict[str, GenerationJob] = {}
+        self._jobs: "OrderedDict[str, GenerationJob]" = OrderedDict()
         self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=self.MAX_ACTIVE_JOBS, thread_name_prefix="tts-job")
 
     def submit(self, project_id: str, tasks: list[GenerationTask]) -> GenerationJob:
         job_id = f"job-{uuid.uuid4().hex[:12]}"
@@ -407,10 +424,30 @@ class GenerationJobManager:
         ]
         job = GenerationJob(job_id=job_id, project_id=project_id, items=items)
         with self._lock:
+            self._evict_locked()
+            if len(self._jobs) >= self.MAX_JOBS:
+                job.status = "failed"
+                job.error = "job queue is full"
+                job.updated_at = datetime.now(timezone.utc)
+                self._jobs[job_id] = job
+                return job
             self._jobs[job_id] = job
-        worker = threading.Thread(target=self._run_job, args=(job_id, tasks), daemon=True)
-        worker.start()
+        self._executor.submit(self._run_job, job_id, tasks)
         return job
+
+    def _evict_locked(self) -> None:
+        """Drop finished jobs older than JOB_RETENTION_SECONDS. Caller holds the lock."""
+        if not self._jobs:
+            return
+        cutoff = datetime.now(timezone.utc).timestamp() - self.JOB_RETENTION_SECONDS
+        stale: list[str] = []
+        for job_id, job in self._jobs.items():
+            if job.status in {"completed", "failed", "cancelled"}:
+                ts = job.updated_at.timestamp() if job.updated_at else 0
+                if ts and ts < cutoff:
+                    stale.append(job_id)
+        for job_id in stale:
+            self._jobs.pop(job_id, None)
 
     def _task_diagnostics(self, tasks: list[GenerationTask]) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
@@ -451,6 +488,7 @@ class GenerationJobManager:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
+            self._evict_locked()
             jobs = list(self._jobs.values())
         queued = sum(1 for job in jobs for item in job.items if item.status == "queued")
         running = sum(1 for job in jobs for item in job.items if item.status in {"loading", "running", "finalizing"})
@@ -464,9 +502,19 @@ class GenerationJobManager:
             job.status = "cancelled"
             job.updated_at = datetime.now(timezone.utc)
             for item in job.items:
+                # Only items not yet started are flipped to cancelled; an
+                # in-flight synthesis (loading/running) cannot be interrupted
+                # mid-HTTP-call, but the job loop will stop dispatching
+                # further lines for this job.
                 if item.status == "queued":
                     item.status = "cancelled"
             return job
+
+    def _is_cancelled(self, job_id: str) -> bool:
+        """Check whether a job has been cancelled (called between line dispatches)."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return bool(job and job.status == "cancelled")
 
     def _run_job(self, job_id: str, tasks: list[GenerationTask]) -> None:
         manifest: GenerationManifest | None = None
@@ -488,6 +536,7 @@ class GenerationJobManager:
                 status_callback=lambda task, status, progress, cluster_key, version_id: self._update_item(
                     job_id, task, status, progress, cluster_key, version_id
                 ),
+                cancel_check=lambda: self._is_cancelled(job_id),
             )
             self._sync_item_errors_from_manifest(job_id, manifest)
             self.store.save_manifest(manifest)

@@ -4,6 +4,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from app.adapters.base import SynthesisRequest, SynthesisResult
 from app.models import EngineName, GenerationManifest, GenerationTask, ProviderType, ScriptLine, TTSServiceEndpoint
 from app.queue import GenerationJobManager, ServiceGenerationQueue
@@ -519,3 +521,63 @@ def _run_queue_with_callback(
         )
     except BaseException as exc:
         errors.append(exc)
+
+
+def test_generation_job_manager_rejects_when_queue_full(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(GenerationJobManager, "MAX_JOBS", 2)
+    client = RecordingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), MemoryStore(tmp_path))
+
+    first = manager.submit("demo", [gpt_task("a1", "a.wav")])
+    second = manager.submit("demo", [gpt_task("a2", "b.wav")])
+    third = manager.submit("demo", [gpt_task("a3", "c.wav")])
+
+    _wait_for_manager_job(manager, first.job_id)
+    _wait_for_manager_job(manager, second.job_id)
+    # The third submission should be rejected because the store is at capacity.
+    assert third.status == "failed"
+    assert "full" in (third.error or "")
+
+
+def test_generation_job_manager_evicts_old_finished_jobs(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(GenerationJobManager, "JOB_RETENTION_SECONDS", 0)
+    monkeypatch.setattr(GenerationJobManager, "MAX_JOBS", 5)
+    client = RecordingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), MemoryStore(tmp_path))
+
+    created = manager.submit("demo", [gpt_task("a1", "a.wav")])
+    _wait_for_manager_job(manager, created.job_id)
+    # Force the updated_at into the past so eviction picks it up.
+    from datetime import datetime, timedelta, timezone
+    with manager._lock:
+        manager._jobs[created.job_id].updated_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+
+    # status() triggers eviction; the finished job should be gone.
+    manager.status()
+    with pytest.raises(KeyError):
+        manager.get(created.job_id)
+
+
+def test_generation_job_cancel_stops_dispatching_remaining_lines(tmp_path: Path) -> None:
+    """When a job is cancelled, lines not yet started should not run."""
+    gate = threading.Event()
+    started = threading.Event()
+    client = BlockingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"), release=gate)
+    client.started = started
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), MemoryStore(tmp_path))
+
+    # Two tasks in the same resource group serialize: the first blocks, the
+    # second is queued. Cancelling after the first starts should prevent the
+    # second from synthesizing.
+    created = manager.submit("demo", [gpt_task("l1", "a.wav"), gpt_task("l2", "b.wav")])
+    assert started.wait(2), "first task did not start"
+    manager.cancel(created.job_id)
+    gate.set()  # release the blocking first task
+    final = _wait_for_manager_job(manager, created.job_id)
+
+    assert final.status == "cancelled"
+    # Only the first line should have been synthesized; the second was queued
+    # and should be cancelled, never synthesized.
+    assert any("synthesize:l1" in c for c in client.calls)
+    assert not any("synthesize:l2" in c for c in client.calls)
+
