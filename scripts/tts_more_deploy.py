@@ -123,7 +123,7 @@ def _probe_url(url: str, timeout_seconds: float) -> dict[str, Any]:
         with urlopen(request, timeout=timeout_seconds) as response:
             status = int(getattr(response, "status", 200))
         latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-        return {"url": url, "ok": 200 <= status < 500, "latency_ms": latency_ms, "error": ""}
+        return {"url": url, "ok": 200 <= status < 400, "latency_ms": latency_ms, "error": ""}
     except Exception as exc:
         latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         message = str(exc.reason) if isinstance(exc, URLError) and getattr(exc, "reason", None) else str(exc)
@@ -176,6 +176,34 @@ def _probe_all_candidates(
         if url not in probes:
             probes[url] = probe(url, timeout_seconds)
     return probes
+
+
+def _parse_expiry(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _load_cached_network_profile(root: Path) -> dict[str, Any] | None:
+    path = root / NETWORK_PROFILE_RELATIVE_PATH
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != NETWORK_PROFILE_SCHEMA_VERSION:
+        return None
+    expires_at = _parse_expiry(payload.get("expires_at"))
+    if expires_at is None or expires_at <= _utc_now():
+        return None
+    return payload
 
 
 def network_env_from_profile(profile: dict[str, Any]) -> dict[str, str]:
@@ -253,6 +281,10 @@ def resolve_network_profile(
         raise ValueError(f"unsupported network profile mode: {mode}")
     if source not in {"Auto", "ModelScope", "HF-Mirror", "HF"}:
         raise ValueError(f"unsupported model source: {source}")
+    if not force:
+        cached_profile = _load_cached_network_profile(root)
+        if cached_profile is not None:
+            return cached_profile
     probes = _probe_all_candidates(timeout_seconds, probe_func)
     model_candidate = next((item for item in MODEL_SOURCE_CANDIDATES if item["name"] == source), None)
     if model_candidate is None:

@@ -226,3 +226,51 @@ def test_resolve_network_profile_prefers_healthy_domestic_source(tmp_path: Path)
     assert env["PIP_CACHE_DIR"].endswith(os.path.join("data", "cache", "pip"))
     assert env["HF_HOME"].endswith(os.path.join("data", "cache", "huggingface"))
     assert env["MODELSCOPE_CACHE"].endswith(os.path.join("data", "cache", "modelscope"))
+
+
+def test_resolve_network_profile_reuses_valid_cached_profile_without_probe(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    cached_profile = {
+        "schema_version": deploy.NETWORK_PROFILE_SCHEMA_VERSION,
+        "mode": "auto",
+        "source": "cached",
+        "expires_at": "2099-01-01T00:00:00Z",
+        "cache_paths": {"pip_cache_dir": "data/cache/pip"},
+    }
+    deploy.write_json(tmp_path / "data" / "local" / "network-profile.json", cached_profile)
+
+    def fail_probe(url: str, timeout_seconds: float) -> dict[str, object]:
+        pytest.fail(f"probe should not be called for cached profile: {url}")
+
+    profile = deploy.resolve_network_profile(
+        tmp_path,
+        force=False,
+        probe_func=fail_probe,
+        environ={},
+    )
+
+    assert profile == cached_profile
+
+
+def test_probe_url_rejects_client_error_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+
+    class FakeResponse:
+        status = 404
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_urlopen(request, timeout=None):
+        return FakeResponse()
+
+    monkeypatch.setattr(deploy, "urlopen", fake_urlopen)
+
+    result = deploy._probe_url("https://example.invalid", 1.0)
+
+    assert result["ok"] is False
