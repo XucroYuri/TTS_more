@@ -615,6 +615,21 @@ def test_probe_network_writes_profile_json(tmp_path: Path, monkeypatch: pytest.M
     assert json.loads(profile_path.read_text(encoding="utf-8"))["env"]["PIP_CACHE_DIR"].endswith("pip")
 
 
+def test_probe_network_without_write_does_not_create_profile_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+
+    def fake_probe(url: str, timeout_seconds: float) -> dict[str, object]:
+        return {"url": url, "ok": True, "latency_ms": 10, "error": ""}
+
+    monkeypatch.setattr(deploy, "_probe_url", fake_probe)
+
+    profile = deploy.probe_network(tmp_path, write=False, force=True)
+
+    assert profile["model_source"] == "ModelScope"
+    assert not (tmp_path / "data" / "local" / "network-profile.json").exists()
+
+
 def test_doctor_reports_network_profile_and_cache_paths(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)

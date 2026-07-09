@@ -330,7 +330,6 @@ def resolve_network_profile(
         ttl_hours=ttl_hours,
         environ={**environ, "TTS_MORE_MODEL_SOURCE": source},
     )
-    write_json(root / NETWORK_PROFILE_RELATIVE_PATH, profile)
     return profile
 
 

@@ -9,6 +9,7 @@ APP_PY="$ROOT/.venv/bin/python"
 SOURCE="Auto"
 RESOLVED_SOURCE=""
 NETWORK_PROFILE_JSON=""
+SOURCE_FALLBACKS=()
 DEVICE="CU128"
 TARGETS="all"
 SYNC_REPOS=0
@@ -88,6 +89,7 @@ resolve_network_profile() {
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "[run] $APP_PY $ROOT/scripts/tts_more_deploy.py probe-network --write --source $SOURCE"
     RESOLVED_SOURCE="$([[ "$SOURCE" == "Auto" ]] && echo ModelScope || echo "$SOURCE")"
+    read -ra SOURCE_FALLBACKS <<< "$(source_fallbacks "$RESOLVED_SOURCE")"
     echo "[network] source=$RESOLVED_SOURCE"
     return 0
   fi
@@ -97,7 +99,41 @@ resolve_network_profile() {
   done < <(export_network_env)
   RESOLVED_SOURCE="$(json_field_from_profile model_source)"
   [[ -z "$RESOLVED_SOURCE" ]] && RESOLVED_SOURCE="$([[ "$SOURCE" == "Auto" ]] && echo ModelScope || echo "$SOURCE")"
+  read -ra SOURCE_FALLBACKS <<< "$(source_fallbacks "$RESOLVED_SOURCE")"
   echo "[network] source=$RESOLVED_SOURCE"
+}
+
+source_fallbacks() {
+  local primary="$1" item
+  local ordered=("$primary" ModelScope HF-Mirror HF)
+  local result=()
+  for item in "${ordered[@]}"; do
+    [[ -z "$item" ]] && continue
+    local exists=0
+    for seen in "${result[@]}"; do
+      [[ "$seen" == "$item" ]] && exists=1
+    done
+    [[ "$exists" == "0" ]] && result+=("$item")
+  done
+  printf '%s ' "${result[@]}"
+}
+
+run_with_source_fallback() {
+  local description="$1"
+  local candidate
+  shift
+  local failures=()
+  for candidate in "${SOURCE_FALLBACKS[@]}"; do
+    echo "[source] $description via $candidate"
+    if "$@" "$candidate"; then
+      return 0
+    fi
+    failures+=("$candidate")
+    echo "[warn] $description failed via $candidate" >&2
+    [[ "$DRY_RUN" == "1" ]] && return 0
+  done
+  echo "[error] $description failed for all sources: ${failures[*]}" >&2
+  return 1
 }
 
 ensure_venv() {
@@ -121,7 +157,12 @@ prepare_gpt() {
     echo "Missing GPT-SoVITS installer: $repo_path/install.sh" >&2
     exit 1
   fi
-  run bash "$repo_path/install.sh" --device "$DEVICE" --source "$RESOLVED_SOURCE"
+  run_with_source_fallback "GPT-SoVITS install for $name" run_gpt_install "$repo_path"
+}
+
+run_gpt_install() {
+  local repo_path="$1" candidate="$2"
+  run bash "$repo_path/install.sh" --device "$DEVICE" --source "$candidate"
 }
 
 prepare_index() {
@@ -143,12 +184,21 @@ prepare_index() {
   fi
   if [[ "$SKIP_DOWNLOADS" != "1" ]]; then
     local repo_python="$repo_path/.venv/bin/python"
-    local source_arg="huggingface"
-    [[ "$RESOLVED_SOURCE" == "ModelScope" ]] && source_arg="modelscope"
-    [[ "$RESOLVED_SOURCE" == "HF-Mirror" ]] && export HF_ENDPOINT="https://hf-mirror.com"
-    (cd "$repo_path" && run "$repo_python" indextts/cli_v2.py download --source "$source_arg" --model-dir checkpoints)
+    run_with_source_fallback "IndexTTS model download" run_index_download "$repo_path" "$repo_python"
     (cd "$repo_path" && run "$repo_python" indextts/cli_v2.py config set model_dir checkpoints)
   fi
+}
+
+run_index_download() {
+  local repo_path="$1" repo_python="$2" candidate="$3"
+  local source_arg="huggingface"
+  [[ "$candidate" == "ModelScope" ]] && source_arg="modelscope"
+  if [[ "$candidate" == "HF-Mirror" ]]; then
+    export HF_ENDPOINT="https://hf-mirror.com"
+  else
+    unset HF_ENDPOINT
+  fi
+  (cd "$repo_path" && run "$repo_python" indextts/cli_v2.py download --source "$source_arg" --model-dir checkpoints)
 }
 
 prepare_cosy() {
@@ -160,12 +210,22 @@ prepare_cosy() {
     (cd "$repo_path" && run "$repo_python" -m pip install -r requirements.txt)
   fi
   if [[ "$SKIP_DOWNLOADS" != "1" ]]; then
-    if [[ "$RESOLVED_SOURCE" == "ModelScope" ]]; then
-      (cd "$repo_path" && run "$repo_python" -c "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')")
+    run_with_source_fallback "CosyVoice model download" run_cosy_download "$repo_path" "$repo_python"
+  fi
+}
+
+run_cosy_download() {
+  local repo_path="$1" repo_python="$2" candidate="$3"
+  if [[ "$candidate" == "ModelScope" ]]; then
+    unset HF_ENDPOINT
+    (cd "$repo_path" && run "$repo_python" -c "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')")
+  else
+    if [[ "$candidate" == "HF-Mirror" ]]; then
+      export HF_ENDPOINT="https://hf-mirror.com"
     else
-      [[ "$RESOLVED_SOURCE" == "HF-Mirror" ]] && export HF_ENDPOINT="https://hf-mirror.com"
-      (cd "$repo_path" && run "$repo_python" -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')")
+      unset HF_ENDPOINT
     fi
+    (cd "$repo_path" && run "$repo_python" -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')")
   fi
 }
 

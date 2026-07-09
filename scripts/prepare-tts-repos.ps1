@@ -73,6 +73,41 @@ function Set-NetworkProfileEnvironment {
     }
 }
 
+function Get-SourceFallbacks {
+    param([string]$PrimarySource)
+    $ordered = @($PrimarySource, "ModelScope", "HF-Mirror", "HF")
+    $seen = @{}
+    $fallbacks = @()
+    foreach ($item in $ordered) {
+        if (-not $item) { continue }
+        if ($seen.ContainsKey($item)) { continue }
+        $seen[$item] = $true
+        $fallbacks += $item
+    }
+    return $fallbacks
+}
+
+function Invoke-WithSourceFallback {
+    param(
+        [scriptblock]$Action,
+        [string[]]$Sources,
+        [string]$Description
+    )
+    $errors = @()
+    foreach ($candidate in $Sources) {
+        Write-Host "[source] $Description via $candidate" -ForegroundColor Cyan
+        try {
+            & $Action $candidate
+            return
+        } catch {
+            $errors += "${candidate}: $($_.Exception.Message)"
+            Write-Warning "$Description failed via ${candidate}: $($_.Exception.Message)"
+            if ($DryRun) { return }
+        }
+    }
+    throw "$Description failed for all sources: $($errors -join '; ')"
+}
+
 function Test-Target {
     param($Repo)
     if ($Targets -contains "all") { return $true }
@@ -115,14 +150,20 @@ function Prepare-GPTSoVITS {
             Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
             return
         }
-        Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", $installPs1, "-Device", $Device, "-Source", $ResolvedSource) $repoPath
+        Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
+            param($CandidateSource)
+            Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", $installPs1, "-Device", $Device, "-Source", $CandidateSource) $repoPath
+        }
     } else {
         if (!(Test-Path -LiteralPath $installSh)) { throw "Missing GPT-SoVITS installer: $installSh" }
         if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
             Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
             return
         }
-        Invoke-Logged "bash" @($installSh, "--device", $Device, "--source", $ResolvedSource) $repoPath
+        Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
+            param($CandidateSource)
+            Invoke-Logged "bash" @($installSh, "--device", $Device, "--source", $CandidateSource) $repoPath
+        }
     }
 }
 
@@ -145,9 +186,16 @@ function Prepare-IndexTTS {
         if (!(Test-Path -LiteralPath $repoPython) -and $uv) {
             Invoke-Logged $uv @("sync", "--all-extras") $repoPath
         }
-        $sourceArg = if ($ResolvedSource -eq "ModelScope") { "modelscope" } else { "huggingface" }
-        if ($ResolvedSource -eq "HF-Mirror") { $env:HF_ENDPOINT = "https://hf-mirror.com" }
-        Invoke-Logged $repoPython @("indextts\cli_v2.py", "download", "--source", $sourceArg, "--model-dir", "checkpoints") $repoPath
+        Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "IndexTTS model download" -Action {
+            param($CandidateSource)
+            $sourceArg = if ($CandidateSource -eq "ModelScope") { "modelscope" } else { "huggingface" }
+            if ($CandidateSource -eq "HF-Mirror") {
+                $env:HF_ENDPOINT = "https://hf-mirror.com"
+            } else {
+                Remove-Item Env:\HF_ENDPOINT -ErrorAction SilentlyContinue
+            }
+            Invoke-Logged $repoPython @("indextts\cli_v2.py", "download", "--source", $sourceArg, "--model-dir", "checkpoints") $repoPath
+        }
         Invoke-Logged $repoPython @("indextts\cli_v2.py", "config", "set", "model_dir", "checkpoints") $repoPath
     }
 }
@@ -163,13 +211,21 @@ function Prepare-CosyVoice {
     }
     if (-not $SkipDownloads) {
         $repoPython = Resolve-RepoPython $repoPath
-        if ($ResolvedSource -eq "ModelScope") {
-            $code = "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')"
-        } else {
-            if ($ResolvedSource -eq "HF-Mirror") { $env:HF_ENDPOINT = "https://hf-mirror.com" }
-            $code = "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')"
+        Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "CosyVoice model download" -Action {
+            param($CandidateSource)
+            if ($CandidateSource -eq "ModelScope") {
+                Remove-Item Env:\HF_ENDPOINT -ErrorAction SilentlyContinue
+                $code = "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')"
+            } else {
+                if ($CandidateSource -eq "HF-Mirror") {
+                    $env:HF_ENDPOINT = "https://hf-mirror.com"
+                } else {
+                    Remove-Item Env:\HF_ENDPOINT -ErrorAction SilentlyContinue
+                }
+                $code = "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')"
+            }
+            Invoke-Logged $repoPython @("-c", $code) $repoPath
         }
-        Invoke-Logged $repoPython @("-c", $code) $repoPath
     }
 }
 
@@ -184,6 +240,7 @@ $NetworkProfile = Resolve-NetworkProfile
 Set-NetworkProfileEnvironment $NetworkProfile
 $ResolvedSource = [string]$NetworkProfile.model_source
 if (-not $ResolvedSource) { $ResolvedSource = if ($Source -eq "Auto") { "ModelScope" } else { $Source } }
+$SourceFallbacks = Get-SourceFallbacks $ResolvedSource
 Write-Host "[network] source=$ResolvedSource cache=$($NetworkProfile.cache_root)" -ForegroundColor Cyan
 
 $lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json
