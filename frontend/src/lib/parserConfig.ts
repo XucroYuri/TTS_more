@@ -20,7 +20,7 @@ export function createDefaultParserProviderDraft(index = 0): ParserProviderDraft
     name: "",
     base_url: "https://api.openai.com/v1",
     api_key_env: "",
-    model: "gpt-4o-mini",
+    model: "gpt-5.5",
     enabled: true,
     timeout_seconds: 45,
     priority: index > 0 ? 100 + index : 10,
