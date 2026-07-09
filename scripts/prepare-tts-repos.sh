@@ -85,6 +85,12 @@ PY
 }
 
 resolve_network_profile() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[run] $APP_PY $ROOT/scripts/tts_more_deploy.py probe-network --write --source $SOURCE"
+    RESOLVED_SOURCE="$([[ "$SOURCE" == "Auto" ]] && echo ModelScope || echo "$SOURCE")"
+    echo "[network] source=$RESOLVED_SOURCE"
+    return 0
+  fi
   NETWORK_PROFILE_JSON="$(run_capture "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" probe-network --write --source "$SOURCE")"
   while IFS='=' read -r key value; do
     [[ -n "$key" ]] && export "$key=$value"

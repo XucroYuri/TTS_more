@@ -26,6 +26,18 @@ def test_bash_prepare_defaults_to_auto_and_calls_probe_network() -> None:
     assert "export_network_env" in script
 
 
+def test_bash_prepare_dry_run_does_not_require_python_for_profile_json() -> None:
+    script = (REPO_ROOT / "scripts" / "prepare-tts-repos.sh").read_text(encoding="utf-8")
+
+    dry_run_profile_branch = """if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[run] $APP_PY $ROOT/scripts/tts_more_deploy.py probe-network --write --source $SOURCE"
+    RESOLVED_SOURCE="$([[ "$SOURCE" == "Auto" ]] && echo ModelScope || echo "$SOURCE")"
+    echo "[network] source=$RESOLVED_SOURCE"
+    return 0
+  fi"""
+    assert dry_run_profile_branch in script
+
+
 def test_prepare_scripts_do_not_default_to_reduced_models() -> None:
     combined = "\n".join(
         [
