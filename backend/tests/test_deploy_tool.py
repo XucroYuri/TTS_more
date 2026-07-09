@@ -239,6 +239,41 @@ def test_sync_repos_retries_clone_without_partial_filter(tmp_path: Path, monkeyp
     assert any(command[:2] == ["git", "clone"] and "--filter=blob:none" not in command for command in calls)
 
 
+def test_run_clone_with_fallback_accepts_positional_helper_interface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    actions: list[list[str]] = []
+    target = tmp_path / "repo" / "GPT-SoVITS-main"
+
+    monkeypatch.setattr(deploy, "_run_git_command", lambda command, *, cwd: None)
+
+    deploy._run_clone_with_fallback(
+        tmp_path,
+        "https://github.com/XucroYuri/GPT-SoVITS.git",
+        "main",
+        target,
+        True,
+        actions,
+    )
+
+    assert actions == [
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--branch",
+            "main",
+            "--single-branch",
+            "https://github.com/XucroYuri/GPT-SoVITS.git",
+            str(target),
+        ]
+    ]
+
+
 def test_sync_repos_preserves_existing_non_git_target_on_clone_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -324,6 +359,42 @@ def test_sync_repos_fetches_locked_commit_before_checkout_when_head_differs(
     assert dry_actions.index(fetch_command) < dry_actions.index(checkout_command)
     assert fetch_command in calls
     assert calls.index(fetch_command) < calls.index(checkout_command)
+
+
+def test_sync_repos_dry_run_skips_locked_commit_actions_when_head_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "GPT-SoVITS-main"
+    commit = "bf81cdb14a38b674b6e9996dabc97340bc9978d2"
+    (target / ".git").mkdir(parents=True)
+    (tmp_path / "repo.lock.json").write_text(
+        json.dumps(
+            {
+                "repositories": [
+                    {
+                        "name": "GPT-SoVITS-main",
+                        "provider_type": "gpt-sovits",
+                        "path": "repo/GPT-SoVITS-main",
+                        "remote": "https://github.com/XucroYuri/GPT-SoVITS.git",
+                        "branch": "main",
+                        "commit": commit,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(deploy, "_git_output", lambda command: commit if command[-2:] == ["rev-parse", "HEAD"] else "")
+
+    actions = deploy.sync_repos(tmp_path, dry_run=True)
+
+    fetch_command = ["git", "-C", str(target), "fetch", "origin", commit]
+    checkout_command = ["git", "-C", str(target), "checkout", commit]
+
+    assert fetch_command not in actions
+    assert checkout_command not in actions
 
 
 def test_resolve_command_rejects_paths_outside_project(tmp_path: Path) -> None:

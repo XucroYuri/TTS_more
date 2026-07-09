@@ -440,7 +440,6 @@ def _run_git_command(command: list[str], *, cwd: Path) -> None:
 
 def _run_clone_with_fallback(
     root: Path,
-    *,
     remote: str,
     branch: str,
     path: Path,
@@ -499,8 +498,14 @@ def sync_repos(root: Path = PROJECT_ROOT, *, clean: bool = False, dry_run: bool 
             checkout_command = ["git", "-C", str(path), "checkout", str(commit)]
             fetch_command = ["git", "-C", str(path), "fetch", "origin", str(commit)]
             if dry_run:
-                actions.append(fetch_command)
-                actions.append(checkout_command)
+                if not (path.exists() and (path / ".git").exists()):
+                    actions.append(fetch_command)
+                    actions.append(checkout_command)
+                else:
+                    head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"])
+                    if head != str(commit):
+                        actions.append(fetch_command)
+                        actions.append(checkout_command)
             else:
                 head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"])
                 if head != str(commit):
