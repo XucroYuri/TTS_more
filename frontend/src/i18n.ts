@@ -33,7 +33,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       queueFiltered: "生成当前列表"
     },
     topbar: {
-      roleLibrary: "角色",
+      roleLibrary: "角色库",
       resourceQueue: "队列",
       services: "服务",
       ttsConfig: "TTS",
@@ -183,7 +183,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       lines: "{{count}} 行",
       projectRoles: "剧本角色",
       library: "常用角色",
-      libraryManager: "角色与音色",
+      libraryManager: "角色库",
       libraryHint: "先给当前剧本角色选音色；常用音色和导入工具按需展开。",
       libraryWorkflow: "角色库工作流",
       libraryWorkflowHint: "先确认剧本角色匹配，再维护常用角色配置；未匹配角色使用临时音色。",
@@ -798,7 +798,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       queueFiltered: "Generate filtered"
     },
     topbar: {
-      roleLibrary: "Roles",
+      roleLibrary: "Character",
       resourceQueue: "Queue",
       services: "Services",
       ttsConfig: "TTS",
@@ -948,7 +948,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       lines: "{{count}} lines",
       projectRoles: "Script roles",
       library: "Saved roles",
-      libraryManager: "Roles and voices",
+      libraryManager: "Character",
       libraryHint: "Choose a voice for the current script role; expand saved voices or import tools only when needed.",
       libraryWorkflow: "Role library workflow",
       libraryWorkflowHint: "Confirm script role matching first, then maintain reusable role configs. Unmatched roles use a temporary voice.",
