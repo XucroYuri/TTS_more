@@ -6,11 +6,11 @@
 
 | # | 事项 | 状态 |
 |---|---|---|
-| 1 | 应用本体跨平台 / 下级 repo 的 CUDA 依赖 | ✅ 已核验并文档化（见下） |
-| 2 | GPT-SoVITS 接入能力与上游兼容性 | 📋 已分析（见 `docs/gpt-sovits-integration.md`） |
-| 3 | 未合并 feature 分支 | 📋 已给出方案（见下） |
+| 1 | 应用本体跨平台 / 下级 repo 的 CUDA 依赖 | ✅ 已核验 + 跨平台修复（路径 normalize/venv 守卫/Makefile） |
+| 2 | GPT-SoVITS 接入能力与上游兼容性 | ✅ 已解决（非侵入式 worker，见 `docs/workers.md`） |
+| 3 | 未合并 feature 分支 | ✅ dev-xu 已合并；两个死分支已删除 |
 | 4 | `frontend/design.md` 过时 | ✅ 已删除 |
-| 5 | 真实 TTS 端到端 CI | 📋 已探讨（见 `docs/ci-architecture.md`） |
+| 5 | 真实 TTS 端到端 CI | 📋 部署模型已定（本机应用 + 网络接入 GPU 机器），见 `docs/ci-architecture.md` |
 
 ---
 

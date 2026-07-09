@@ -14,11 +14,39 @@ flowchart LR
     F -.->|"无 GPU"| Skip
 ```
 
-- 后端：`pytest backend -q`，矩阵 `ubuntu-latest` + `windows-latest`。单元测试 + 安全测试 + 跨平台测试，**无 GPU**。
+- 后端：`pytest backend -q`，矩阵 `ubuntu-latest` + `windows-latest`。单元测试 + 安全测试 + 跨平台测试 + worker 契约测试，**无 GPU**。
 - 前端：`vitest` + `vite build`，`ubuntu-latest`。
+- worker 契约层（`test_workers.py`）验证 `/health` `/capabilities` `/models` 发现等**不需要 GPU** 的端点；`/load` `/synthesize` 真实推理需 GPU，标 TODO。
 - `test_real_tts_validation.py` 默认 skip（需 `TTS_MORE_RUN_REAL_TTS=1` + 真实模型 + GPU）。
 
-**这个 CI 验证的是"代码正确性"与"跨平台可跑性"，不验证"真实推理质量"。**
+**这个 CI 验证的是"应用本体代码正确性"与"跨平台可跑性"，不验证"真实推理质量"。**
+
+## 部署模型：本机应用 + 网络接入 GPU 机器
+
+```mermaid
+flowchart LR
+    subgraph Local["本机（任意平台）"]
+        App["TTS More 应用本体<br/>后端 + 前端 + 编排"]
+    end
+    subgraph GPU["GPU 机器（LAN/公网）"]
+        W1["GPT-SoVITS worker :9880"]
+        W2["IndexTTS worker :9881"]
+        W3["CosyVoice worker :9882"]
+        Models["模型权重<br/>（常驻显存）"]
+    end
+    App -- "HTTP tts-more-v1" --> W1
+    App -- "HTTP tts-more-v1" --> W2
+    App -- "HTTP tts-more-v1" --> W3
+    W1 --> Models
+    W2 --> Models
+    W3 --> Models
+```
+
+应用本体（`backend/app` + `frontend`）不含 CUDA/torch 硬依赖，可在任意平台本机运行。真实 TTS 推理跑在 GPU 机器上的 worker 里，本机通过 `services.json` 的 `base_url` 网络接入。验证流程：
+
+1. **CI（hosted runner）**：应用本体单元/安全/跨平台/worker 契约测试——每次 push。
+2. **本机验收**：开发者本机起 TTS More，`services.json` 指向 GPU 机器上的 worker 端点，手动跑 `test_real_tts_validation.py`。
+3. **GPU 机器**：只需克隆上游 repo + torch + 模型 + `make workers`（或单独启动某个 worker）。
 
 ## 为什么真实验收难
 
