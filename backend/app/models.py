@@ -157,7 +157,12 @@ class TTSServiceEndpoint(BaseModel):
             ProviderType.COSYVOICE,
         }:
             self.catalog_provider = self.provider_type.value  # type: ignore[assignment]
-        if not self.api_contract or self.api_contract == "tts-more-v1":
+        # Only assign a provider-specific default contract when none was
+        # explicitly set. tts-more-v1 is a legitimate worker contract (not a
+        # "unset" sentinel), so an explicitly-configured tts-more-v1 endpoint
+        # for an open-source provider must be preserved — it routes to the
+        # non-invasive worker rather than the Gradio fallback.
+        if not self.api_contract:
             contract_by_provider = {
                 ProviderType.GPT_SOVITS: "gradio-gpt-sovits-webui",
                 ProviderType.INDEX_TTS: "gradio-indextts2-webui",

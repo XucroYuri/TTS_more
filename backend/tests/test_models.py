@@ -91,7 +91,10 @@ def test_script_line_can_hold_temporary_voice_binding() -> None:
     assert line.temporary_binding.config["voice"] == "tmp/ref.wav"
 
 
-def test_cosyvoice_endpoint_defaults_to_core_engine_and_gradio_contract() -> None:
+def test_cosyvoice_endpoint_defaults_to_core_engine_and_worker_contract() -> None:
+    # With the worker-first architecture, an open-source provider endpoint
+    # with no explicit api_contract keeps the tts-more-v1 worker default
+    # (the Gradio fallback is only assigned when api_contract is empty).
     endpoint = TTSServiceEndpoint(
         service_id="cosyvoice-http",
         provider_type=ProviderType.COSYVOICE,
@@ -103,6 +106,20 @@ def test_cosyvoice_endpoint_defaults_to_core_engine_and_gradio_contract() -> Non
 
     assert endpoint.engine == EngineName.COSYVOICE
     assert endpoint.provider_type == ProviderType.COSYVOICE
+    assert endpoint.api_contract == "tts-more-v1"
+
+
+def test_cosyvoice_endpoint_explicit_gradio_contract_is_preserved() -> None:
+    # An explicitly-configured gradio- contract is preserved (Gradio fallback).
+    endpoint = TTSServiceEndpoint(
+        service_id="cosyvoice-gradio",
+        provider_type=ProviderType.COSYVOICE,
+        base_url="http://127.0.0.1:50000",
+        api_contract="gradio-cosyvoice-webui",
+        managed=False,
+        enabled=False,
+    )
+
     assert endpoint.api_contract == "gradio-cosyvoice-webui"
 
 

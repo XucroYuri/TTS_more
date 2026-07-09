@@ -1297,7 +1297,7 @@ def test_open_source_tts_configure_saves_gradio_endpoint_without_local_managemen
             "source_profile": "local_endpoint",
             "repo_path": str(tmp_path / "unused-local-repo"),
             "base_url": "http://127.0.0.1:9872",
-            "api_contract": "gpt-sovits-api-v2",
+            "api_contract": "gradio-gpt-sovits-webui",
             "managed": True,
             "enabled": True,
             "start_command": ["python", "api_v2.py"],
@@ -1308,6 +1308,7 @@ def test_open_source_tts_configure_saves_gradio_endpoint_without_local_managemen
     assert response.status_code == 200
     service = response.json()["service"]
     assert service["service_id"] == "local-gpt-sovits"
+    # An explicitly-requested gradio- contract is preserved (Gradio fallback).
     assert service["api_contract"] == "gradio-gpt-sovits-webui"
     assert service["base_url"] == "http://127.0.0.1:9872"
     assert service["source_profile"] == "local_endpoint"
