@@ -7,4 +7,4 @@ if [[ ! -x "$PYTHON" ]]; then
   PYTHON="python3"
 fi
 
-exec "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "$@"
+exec "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" update "$@"

@@ -53,7 +53,7 @@ CATALOG: list[dict[str, Any]] = [
         "priority": 10,
         "resource_group": "gradio-gpu-0",
         "recommended_clone_command": "python scripts/tts_more_deploy.py sync-repos --clean",
-        "start_hint": "启动 GPT-SoVITS 推理 WebUI 后，粘贴局域网可访问的 Gradio 地址，例如 http://tts-webui.local:9872。",
+        "start_hint": "推荐先启动 TTS More GPT-SoVITS worker，并粘贴 http://127.0.0.1:9880 或局域网 worker 地址；已有 Gradio WebUI 可作为兼容路径接入。",
     },
     {
         "provider_type": "indextts",
@@ -66,8 +66,8 @@ CATALOG: list[dict[str, Any]] = [
         "capabilities": ["tts", "reference_audio_voice", "emotion_text", "emotion_audio", "wav_output", "gradio_webui"],
         "priority": 20,
         "resource_group": "gradio-gpu-0",
-        "recommended_clone_command": "git clone https://github.com/XucroYuri/index-tts.git repo/index-tts",
-        "start_hint": "启动 IndexTTS 推理 WebUI 后，粘贴局域网可访问的 Gradio 地址，例如 http://tts-webui.local:7860。",
+        "recommended_clone_command": "python scripts/tts_more_deploy.py sync-repos --service-ids local-indextts",
+        "start_hint": "推荐先启动 TTS More IndexTTS worker，并粘贴 http://127.0.0.1:9881 或局域网 worker 地址；已有 Gradio WebUI 可作为兼容路径接入。",
     },
     {
         "provider_type": "cosyvoice",
@@ -80,8 +80,8 @@ CATALOG: list[dict[str, Any]] = [
         "capabilities": ["tts", "reference_audio_voice", "zero_shot_voice", "cross_lingual_voice", "style_instruction", "wav_output", "gradio_webui"],
         "priority": 30,
         "resource_group": "gradio-gpu-0",
-        "recommended_clone_command": "git clone https://github.com/XucroYuri/CosyVoice.git repo/CosyVoice",
-        "start_hint": "启动 CosyVoice 推理 WebUI 后，粘贴局域网可访问的 Gradio 地址，例如 http://tts-webui.local:50000。",
+        "recommended_clone_command": "python scripts/tts_more_deploy.py sync-repos --service-ids local-cosyvoice",
+        "start_hint": "推荐先启动 TTS More CosyVoice worker，并粘贴 http://127.0.0.1:9882 或局域网 worker 地址；已有 Gradio WebUI 可作为兼容路径接入。",
     },
 ]
 

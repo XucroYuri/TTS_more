@@ -716,3 +716,159 @@ def test_doctor_reports_network_profile_and_cache_paths(tmp_path: Path) -> None:
 
     assert report["network_profile"]["model_source"] == "HF-Mirror"
     assert report["cache_paths"]["cache_root"] == "data/cache"
+
+
+def test_sync_repos_latest_dry_run_skips_locked_commit_checkout(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+
+    actions = deploy.sync_repos(
+        tmp_path,
+        dry_run=True,
+        latest=True,
+        service_ids={"local-indextts"},
+    )
+
+    assert len(actions) == 1
+    assert actions[0][:2] == ["git", "clone"]
+    assert "index-tts" in actions[0][-1]
+    assert not any(command[-2:-1] == ["fetch"] for command in actions)
+
+
+def test_install_update_scripts_writes_repo_local_helpers(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    target = tmp_path / "repo" / "index-tts"
+    (target / ".git").mkdir(parents=True)
+
+    reports = deploy.install_update_scripts(tmp_path, service_ids={"local-indextts"})
+
+    sh_path = target / "tts-more-update.sh"
+    ps1_path = target / "tts-more-update.ps1"
+    assert reports == [
+        {
+            "name": "index-tts",
+            "path": "repo/index-tts",
+            "exists": True,
+            "scripts": ["repo/index-tts/tts-more-update.sh", "repo/index-tts/tts-more-update.ps1"],
+        }
+    ]
+    assert "git pull --ff-only origin" in sh_path.read_text(encoding="utf-8")
+    assert "git pull --ff-only origin" in ps1_path.read_text(encoding="utf-8")
+    assert sh_path.stat().st_mode & stat.S_IXUSR
+    exclude = (target / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert "tts-more-update.sh" in exclude
+    assert "tts-more-update.ps1" in exclude
+
+
+def test_update_project_dry_run_reports_app_and_repo_actions_without_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+
+    monkeypatch.setattr(deploy, "_git_output", lambda command: "master" if command[-2:] == ["branch", "--show-current"] else "")
+
+    payload = deploy.update_project(
+        tmp_path,
+        dry_run=True,
+        service_ids={"local-cosyvoice"},
+    )
+
+    assert payload["app_actions"] == [
+        ["git", "-C", str(tmp_path), "fetch", "--prune", "origin", "master"],
+        ["git", "-C", str(tmp_path), "pull", "--ff-only", "origin", "master"],
+    ]
+    assert any("CosyVoice" in command[-1] for command in payload["repo_actions"] if command[:2] == ["git", "clone"])
+    assert payload["update_scripts"][0]["exists"] is False
+    assert payload["services_output"] == "data/local/services.json"
+    assert payload["services_rendered"] is False
+    assert payload["services_render_policy"] == "missing-only"
+    assert not (tmp_path / "data" / "local" / "services.json").exists()
+
+
+def test_update_project_preserves_existing_local_services_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    services_path = tmp_path / "data" / "local" / "services.json"
+    services_path.parent.mkdir(parents=True)
+    services_path.write_text('[{"service_id":"custom-cloud"}]\n', encoding="utf-8")
+    monkeypatch.setattr(deploy, "_git_output", lambda command: "master" if command[-2:] == ["branch", "--show-current"] else "")
+    monkeypatch.setattr(deploy, "sync_repos", lambda *args, **kwargs: [])
+
+    payload = deploy.update_project(tmp_path, skip_app=True)
+
+    assert payload["services_rendered"] is False
+    assert json.loads(services_path.read_text(encoding="utf-8"))[0]["service_id"] == "custom-cloud"
+
+
+def test_update_project_force_render_services_overwrites_local_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    services_path = tmp_path / "data" / "local" / "services.json"
+    services_path.parent.mkdir(parents=True)
+    services_path.write_text('[{"service_id":"custom-cloud"}]\n', encoding="utf-8")
+    monkeypatch.setattr(deploy, "sync_repos", lambda *args, **kwargs: [])
+
+    payload = deploy.update_project(tmp_path, skip_app=True, force_render=True)
+
+    services = json.loads(services_path.read_text(encoding="utf-8"))
+    assert payload["services_rendered"] is True
+    assert services[0]["service_id"] == "local-gpt-sovits-main"
+
+
+def test_update_project_refuses_dirty_service_repo_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    target = tmp_path / "repo" / "index-tts"
+    (target / ".git").mkdir(parents=True)
+
+    def fake_git_output(command: list[str]) -> str:
+        if command[-2:] == ["status", "--porcelain"]:
+            return " M local_patch.py"
+        if command[-2:] == ["branch", "--show-current"]:
+            return "master"
+        return ""
+
+    monkeypatch.setattr(deploy, "_git_output", fake_git_output)
+
+    with pytest.raises(RuntimeError, match="refusing to update dirty service repository"):
+        deploy.update_project(
+            tmp_path,
+            skip_app=True,
+            dry_run=True,
+            service_ids={"local-indextts"},
+        )
+
+
+def test_update_project_force_reset_repos_allows_reset_actions_for_dirty_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    target = tmp_path / "repo" / "index-tts"
+    (target / ".git").mkdir(parents=True)
+    monkeypatch.setattr(deploy, "_git_output", lambda command: " M local_patch.py" if command[-2:] == ["status", "--porcelain"] else "")
+
+    payload = deploy.update_project(
+        tmp_path,
+        skip_app=True,
+        dry_run=True,
+        service_ids={"local-indextts"},
+        force_reset_repos=True,
+    )
+
+    assert ["git", "-C", str(target), "reset", "--hard", "origin/main"] in payload["repo_actions"]

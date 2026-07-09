@@ -56,6 +56,50 @@ macOS/Linux：
 python scripts/tts_more_deploy.py sync-repos --clean --dry-run
 ```
 
+## 一键更新
+
+应用本体更新入口：
+
+```bash
+scripts/update.sh
+```
+
+Windows：
+
+```powershell
+.\scripts\update.ps1
+```
+
+它会按顺序做四件事：
+
+1. `git fetch --prune` + `git pull --ff-only` 更新应用本体当前分支。
+2. 安全更新 `repo.lock.json` 中的服务 repo：先检查是否有本地改动，再执行 fetch / checkout / fast-forward pull。
+3. 向已存在的服务 repo 写入 `tts-more-update.sh` 和 `tts-more-update.ps1`。
+4. 如果 `data/local/services.json` 不存在，生成本机服务配置；已有本机配置默认保留。
+
+常用变体：
+
+```bash
+scripts/update.sh --dry-run
+scripts/update.sh --skip-app
+scripts/update.sh --skip-repos
+scripts/update.sh --latest-repos --write-lock
+scripts/update.sh --service-ids local-indextts
+scripts/update.sh --force-render-services
+scripts/update.sh --force-reset-repos
+```
+
+`--force-reset-repos` 会允许服务 repo 执行硬重置，只适合确认没有要保留的本地改动时使用。
+
+服务 repo 内的轻量更新脚本用于分布式部署设备。复制过去后，在服务 repo 根目录运行：
+
+```bash
+./tts-more-update.sh
+./tts-more-update.sh --pinned
+```
+
+`--pinned` 会回到 `repo.lock.json` 当前记录的提交；不加参数则快进到该服务分支最新版。生成脚本会写入该 repo 的本地 `.git/info/exclude`，避免把这些辅助脚本误当成服务 repo 的业务改动。
+
 ## 安装依赖和模型
 
 Windows：

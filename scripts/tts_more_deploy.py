@@ -83,6 +83,10 @@ def load_repo_lock(root: Path = PROJECT_ROOT) -> list[dict[str, Any]]:
     return list(payload.get("repositories") or [])
 
 
+def save_repo_lock(repositories: list[dict[str, Any]], root: Path = PROJECT_ROOT) -> None:
+    write_json(root / "repo.lock.json", {"repositories": repositories})
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -449,6 +453,59 @@ def _run_git_command(command: list[str], *, cwd: Path) -> None:
     subprocess.run(command, cwd=cwd, check=True)
 
 
+def _repo_selected(repo: dict[str, Any], service_ids: set[str] | None) -> bool:
+    if not service_ids:
+        return True
+    candidates = {
+        str(repo.get("name") or ""),
+        str(repo.get("provider_type") or ""),
+        str(repo.get("service_id") or _default_service_id(repo)),
+        str(repo.get("variant") or ""),
+        str(repo.get("branch") or ""),
+        str(repo.get("path") or ""),
+    }
+    return any(item in candidates for item in service_ids)
+
+
+def _repo_status(path: Path) -> str:
+    return _git_output(["git", "-C", str(path), "status", "--porcelain"])
+
+
+def _ensure_clean_repo(path: Path, name: str) -> None:
+    status = _repo_status(path)
+    if status:
+        raise RuntimeError(
+            f"refusing to update dirty service repository {name} at {path}; "
+            "commit, stash, or clean local changes first, or pass --force-reset-repos"
+        )
+
+
+def _git_exclude_path(repo_path: Path) -> Path | None:
+    dot_git = repo_path / ".git"
+    if dot_git.is_dir():
+        return dot_git / "info" / "exclude"
+    git_dir = _git_output(["git", "-C", str(repo_path), "rev-parse", "--git-dir"])
+    if not git_dir:
+        return None
+    candidate = Path(git_dir)
+    if not candidate.is_absolute():
+        candidate = repo_path / candidate
+    return candidate / "info" / "exclude"
+
+
+def _exclude_local_update_scripts(repo_path: Path) -> None:
+    exclude_path = _git_exclude_path(repo_path)
+    if exclude_path is None:
+        return
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+    additions = [name for name in ("tts-more-update.sh", "tts-more-update.ps1") if name not in existing.splitlines()]
+    if not additions:
+        return
+    prefix = "" if not existing or existing.endswith("\n") else "\n"
+    exclude_path.write_text(existing + prefix + "\n".join(additions) + "\n", encoding="utf-8")
+
+
 def _run_clone_with_fallback(
     root: Path,
     remote: str,
@@ -473,21 +530,42 @@ def _run_clone_with_fallback(
     _run_git_command(fallback, cwd=root)
 
 
-def sync_repos(root: Path = PROJECT_ROOT, *, clean: bool = False, dry_run: bool = False) -> list[list[str]]:
+def sync_repos(
+    root: Path = PROJECT_ROOT,
+    *,
+    clean: bool = False,
+    dry_run: bool = False,
+    latest: bool = False,
+    write_lock: bool = False,
+    service_ids: set[str] | None = None,
+    force_reset: bool = True,
+) -> list[list[str]]:
     if clean:
         _remove_repo_dir(root, dry_run=dry_run)
     actions: list[list[str]] = []
-    for repo in load_repo_lock(root):
+    repositories = load_repo_lock(root)
+    lock_changed = False
+    for repo in repositories:
+        if not _repo_selected(repo, service_ids):
+            continue
         path = _resolve_project_path(root, str(repo["path"]))
         remote = str(repo["remote"])
         branch = str(repo["branch"])
         commit = repo.get("commit")
         if path.exists() and (path / ".git").exists():
-            commands = [
-                ["git", "-C", str(path), "fetch", "--prune", "origin", branch],
-                ["git", "-C", str(path), "checkout", branch],
-                ["git", "-C", str(path), "reset", "--hard", f"origin/{branch}"],
-            ]
+            if force_reset:
+                commands = [
+                    ["git", "-C", str(path), "fetch", "--prune", "origin", branch],
+                    ["git", "-C", str(path), "checkout", branch],
+                    ["git", "-C", str(path), "reset", "--hard", f"origin/{branch}"],
+                ]
+            else:
+                _ensure_clean_repo(path, str(repo.get("name") or repo.get("service_id") or path.name))
+                commands = [
+                    ["git", "-C", str(path), "fetch", "--prune", "origin", branch],
+                    ["git", "-C", str(path), "checkout", branch],
+                    ["git", "-C", str(path), "pull", "--ff-only", "origin", branch],
+                ]
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             _run_clone_with_fallback(
@@ -505,6 +583,13 @@ def sync_repos(root: Path = PROJECT_ROOT, *, clean: bool = False, dry_run: bool 
             actions.append(command)
             if not dry_run:
                 _run_git_command(command, cwd=root)
+        if latest:
+            if not dry_run and write_lock:
+                head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"])
+                if head and repo.get("commit") != head:
+                    repo["commit"] = head
+                    lock_changed = True
+            continue
         if commit:
             checkout_command = ["git", "-C", str(path), "checkout", str(commit)]
             fetch_command = ["git", "-C", str(path), "fetch", "origin", str(commit)]
@@ -524,7 +609,158 @@ def sync_repos(root: Path = PROJECT_ROOT, *, clean: bool = False, dry_run: bool 
                     _run_git_command(fetch_command, cwd=root)
                     actions.append(checkout_command)
                     _run_git_command(checkout_command, cwd=root)
+    if lock_changed and not dry_run:
+        save_repo_lock(repositories, root)
     return actions
+
+
+def _service_update_script_sh(repo: dict[str, Any]) -> str:
+    branch = str(repo.get("branch") or "main")
+    commit = str(repo.get("commit") or "")
+    remote = str(repo.get("remote") or "")
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+BRANCH="${{TTS_MORE_UPDATE_BRANCH:-{branch}}}"
+PINNED_COMMIT="${{TTS_MORE_PINNED_COMMIT:-{commit}}}"
+
+cd "$ROOT"
+echo "[update] {repo.get('name') or repo.get('service_id') or branch}"
+echo "[remote] {remote}"
+git fetch --prune origin "$BRANCH"
+git checkout "$BRANCH"
+git pull --ff-only origin "$BRANCH"
+
+if [[ "${{1:-}}" == "--pinned" && -n "$PINNED_COMMIT" ]]; then
+  git fetch origin "$PINNED_COMMIT"
+  git checkout "$PINNED_COMMIT"
+fi
+
+git status --short --branch
+"""
+
+
+def _service_update_script_ps1(repo: dict[str, Any]) -> str:
+    branch = str(repo.get("branch") or "main")
+    commit = str(repo.get("commit") or "")
+    remote = str(repo.get("remote") or "")
+    return f"""$ErrorActionPreference = "Stop"
+
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Branch = if ($env:TTS_MORE_UPDATE_BRANCH) {{ $env:TTS_MORE_UPDATE_BRANCH }} else {{ "{branch}" }}
+$PinnedCommit = if ($env:TTS_MORE_PINNED_COMMIT) {{ $env:TTS_MORE_PINNED_COMMIT }} else {{ "{commit}" }}
+
+Set-Location $Root
+Write-Host "[update] {repo.get('name') or repo.get('service_id') or branch}" -ForegroundColor Cyan
+Write-Host "[remote] {remote}" -ForegroundColor DarkCyan
+git fetch --prune origin $Branch
+git checkout $Branch
+git pull --ff-only origin $Branch
+
+if ($args.Count -gt 0 -and $args[0] -eq "--pinned" -and $PinnedCommit) {{
+  git fetch origin $PinnedCommit
+  git checkout $PinnedCommit
+}}
+
+git status --short --branch
+exit $LASTEXITCODE
+"""
+
+
+def install_update_scripts(
+    root: Path = PROJECT_ROOT,
+    *,
+    service_ids: set[str] | None = None,
+    dry_run: bool = False,
+) -> list[dict[str, Any]]:
+    reports = []
+    for repo in load_repo_lock(root):
+        if not _repo_selected(repo, service_ids):
+            continue
+        repo_path = _resolve_project_path(root, str(repo["path"]))
+        sh_path = repo_path / "tts-more-update.sh"
+        ps1_path = repo_path / "tts-more-update.ps1"
+        exists = repo_path.exists()
+        report = {
+            "name": repo.get("name"),
+            "path": str(repo.get("path")),
+            "exists": exists,
+            "scripts": [str(sh_path.relative_to(root)), str(ps1_path.relative_to(root))],
+        }
+        reports.append(report)
+        if dry_run or not exists:
+            continue
+        sh_path.write_text(_service_update_script_sh(repo), encoding="utf-8")
+        ps1_path.write_text(_service_update_script_ps1(repo), encoding="utf-8")
+        current_mode = sh_path.stat().st_mode
+        sh_path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        _exclude_local_update_scripts(repo_path)
+    return reports
+
+
+def update_project(
+    root: Path = PROJECT_ROOT,
+    *,
+    dry_run: bool = False,
+    skip_app: bool = False,
+    skip_repos: bool = False,
+    clean: bool = False,
+    latest_repos: bool = False,
+    write_lock: bool = False,
+    service_ids: set[str] | None = None,
+    install_scripts: bool = True,
+    render: bool = True,
+    force_render: bool = False,
+    force_reset_repos: bool = False,
+    platform_name: str | None = None,
+) -> dict[str, Any]:
+    app_actions: list[list[str]] = []
+    if not skip_app:
+        branch = _git_output(["git", "-C", str(root), "branch", "--show-current"])
+        if branch:
+            app_actions = [
+                ["git", "-C", str(root), "fetch", "--prune", "origin", branch],
+                ["git", "-C", str(root), "pull", "--ff-only", "origin", branch],
+            ]
+            if not dry_run:
+                for command in app_actions:
+                    _run_git_command(command, cwd=root)
+    repo_actions: list[list[str]] = []
+    if not skip_repos:
+        repo_actions = sync_repos(
+            root,
+            clean=clean,
+            dry_run=dry_run,
+            latest=latest_repos,
+            write_lock=write_lock,
+            service_ids=service_ids,
+            force_reset=force_reset_repos,
+        )
+    update_scripts = install_update_scripts(root, service_ids=service_ids, dry_run=dry_run) if install_scripts else []
+    services_output = ""
+    services_rendered = False
+    if render:
+        services_output = "data/local/services.json"
+        output_path = root / services_output
+        should_render = force_render or not output_path.exists()
+        services_rendered = should_render and not dry_run
+        if should_render and not dry_run:
+            services = render_services(
+                root,
+                profile="local-all",
+                platform_name=platform_name,
+                service_ids=service_ids,
+            )
+            write_json(root / services_output, services)
+    return {
+        "app_actions": app_actions,
+        "repo_actions": repo_actions,
+        "update_scripts": update_scripts,
+        "services_output": services_output,
+        "services_rendered": services_rendered,
+        "services_render_policy": "force" if force_render else "missing-only",
+    }
 
 
 def doctor(root: Path = PROJECT_ROOT) -> dict[str, Any]:
@@ -805,6 +1041,9 @@ def main(argv: list[str] | None = None) -> int:
     sync = sub.add_parser("sync-repos", help="Clone/fetch repositories from repo.lock.json")
     sync.add_argument("--clean", action="store_true")
     sync.add_argument("--dry-run", action="store_true")
+    sync.add_argument("--latest", action="store_true", help="Track each configured branch instead of checking out the pinned commit")
+    sync.add_argument("--write-lock", action="store_true", help="After --latest, write current HEADs back to repo.lock.json")
+    sync.add_argument("--service-ids", default=None)
 
     probe = sub.add_parser("probe-network", help="Probe local network and choose install/download sources")
     probe.add_argument("--mode", choices=("auto", "china", "global"), default="auto")
@@ -823,6 +1062,27 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--service-ids", default=None)
     start.add_argument("--detach", action="store_true")
 
+    install_scripts = sub.add_parser(
+        "install-update-scripts",
+        help="Write small update scripts into checked-out TTS service repositories",
+    )
+    install_scripts.add_argument("--service-ids", default=None)
+    install_scripts.add_argument("--dry-run", action="store_true")
+
+    update = sub.add_parser("update", help="Fast-forward the app and service repositories")
+    update.add_argument("--dry-run", action="store_true")
+    update.add_argument("--skip-app", action="store_true")
+    update.add_argument("--skip-repos", action="store_true")
+    update.add_argument("--clean", action="store_true")
+    update.add_argument("--latest-repos", action="store_true")
+    update.add_argument("--write-lock", action="store_true")
+    update.add_argument("--force-reset-repos", action="store_true", help="Allow service repositories to be reset hard to the configured branch")
+    update.add_argument("--service-ids", default=None)
+    update.add_argument("--no-install-scripts", action="store_true")
+    update.add_argument("--no-render", action="store_true")
+    update.add_argument("--force-render-services", action="store_true")
+    update.add_argument("--platform", choices=("windows", "posix"), default=None)
+
     args = parser.parse_args(argv)
     root = Path(args.root).resolve(strict=False)
     if args.command == "render-services":
@@ -840,7 +1100,14 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(services, ensure_ascii=False, indent=2))
         return 0
     if args.command == "sync-repos":
-        actions = sync_repos(root, clean=args.clean, dry_run=args.dry_run)
+        actions = sync_repos(
+            root,
+            clean=args.clean,
+            dry_run=args.dry_run,
+            latest=args.latest,
+            write_lock=args.write_lock,
+            service_ids=_parse_service_ids(args.service_ids),
+        )
         for command in actions:
             print(" ".join(command))
         return 0
@@ -871,6 +1138,32 @@ def main(argv: list[str] | None = None) -> int:
             service_ids=_parse_service_ids(args.service_ids),
             detach=args.detach,
         )
+    if args.command == "install-update-scripts":
+        reports = install_update_scripts(
+            root,
+            service_ids=_parse_service_ids(args.service_ids),
+            dry_run=args.dry_run,
+        )
+        print(json.dumps(reports, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "update":
+        payload = update_project(
+            root,
+            dry_run=args.dry_run,
+            skip_app=args.skip_app,
+            skip_repos=args.skip_repos,
+            clean=args.clean,
+            latest_repos=args.latest_repos,
+            write_lock=args.write_lock,
+            service_ids=_parse_service_ids(args.service_ids),
+            install_scripts=not args.no_install_scripts,
+            render=not args.no_render,
+            force_render=args.force_render_services,
+            force_reset_repos=args.force_reset_repos,
+            platform_name=args.platform,
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
     return 2
 
 

@@ -72,7 +72,41 @@ make dev        # 或 scripts/start-dev.sh
 - 后端：`http://127.0.0.1:8000`
 - 前端：`http://127.0.0.1:5173`
 
-### 4. 接入 TTS 服务
+### 4. 一键更新
+
+应用本体和服务 repo 都以 GitHub 为更新来源。普通更新：
+
+```bash
+scripts/update.sh
+```
+
+Windows：
+
+```powershell
+.\scripts\update.ps1
+```
+
+这会快进应用本体当前分支，安全更新 `repo.lock.json` 中的 TTS 服务 repo，并在已存在的服务 repo 内写入可复制的 `tts-more-update.sh` / `tts-more-update.ps1`。如果某个服务 repo 有本地未提交改动，普通更新会拒绝继续，避免丢改动。若 `data/local/services.json` 不存在，它会生成一份本机服务配置；已有本机配置默认保留。
+
+只预览不写入：
+
+```bash
+scripts/update.sh --dry-run
+```
+
+确实要重写本机服务配置时，再显式加：
+
+```bash
+scripts/update.sh --force-render-services
+```
+
+确实要把服务 repo 硬重置到远端分支时，再显式加：
+
+```bash
+scripts/update.sh --force-reset-repos
+```
+
+### 5. 接入 TTS 服务
 
 在工作台打开 `接入 → TTS 服务`，选择 GPT-SoVITS / IndexTTS / CosyVoice，粘贴服务地址并执行“检测并保存”。`127.0.0.1`、`localhost`、局域网或远端 worker 地址都可以接入；向导写入 `data/local/services.json`，不污染可提交模板。
 
@@ -95,6 +129,7 @@ bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --device CU128
 准备脚本默认走 `Auto`：先跑 `probe-network`，优先选择中国大陆可达且健康的源，例如 ModelScope 或 HF Mirror，必要时再回退到全球 Hugging Face / PyPI 路线。默认安装只准备 full-quality baseline models，quantized、distilled、simplified、small、low-memory 这些都只是手动 manual 的高级选项。
 
 详细拓扑、远端 worker、离线缓存和模型下载策略见 [部署方案](docs/deployment.md)。
+当前阶段边界、设计不足和任务拆分见 [当前阶段说明与简化计划](docs/current-state-and-simplification-plan.md)。
 
 ## 验证
 

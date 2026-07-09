@@ -96,3 +96,13 @@ def test_docs_describe_auto_source_cache_and_full_quality_policy() -> None:
     assert "TTS_MORE_CACHE_ROOT" in docs
     assert "full-quality" in docs
     assert "manual" in docs
+
+
+def test_update_wrappers_call_single_deploy_update_entrypoint() -> None:
+    bash = (REPO_ROOT / "scripts" / "update.sh").read_text(encoding="utf-8")
+    powershell = (REPO_ROOT / "scripts" / "update.ps1").read_text(encoding="utf-8")
+
+    assert "tts_more_deploy.py\" update" in bash
+    assert "tts_more_deploy.py\") update" in powershell
+    assert 'exec "$PYTHON"' in bash
+    assert "exit $LASTEXITCODE" in powershell

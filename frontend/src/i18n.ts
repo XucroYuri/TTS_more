@@ -29,8 +29,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       newProject: "新建剧本",
       importProject: "导入剧本",
       projectCount: "{{count}} 个剧本",
-      queueSelected: "生成选中",
-      queueFiltered: "生成当前列表"
+      queueSelected: "生成已选台词",
+      queueFiltered: "生成筛选结果"
     },
     topbar: {
       roleLibrary: "角色",
@@ -291,7 +291,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         draft: "已生成解析草稿 · {{draftLines}} 行，确认无误后应用到当前项目"
       },
       llmProviders: "LLM 解析服务",
-      kwjmActivationTitle: "开物基模",
+      kwjmActivationTitle: "剧本解析服务",
       kwjmActivationHint: "输入 API Key，保存后即可提取台词。",
       providerHint: "只有需要多个解析服务或自定义模型时再打开。",
       kwjmPresetMeta: "{{model}} · {{baseUrl}}",
@@ -339,7 +339,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       activateKwjm: "保存并检查",
       advancedConfig: "高级服务",
       hideAdvancedConfig: "收起",
-      kwjmConfigured: "开物基模已配置",
+      kwjmConfigured: "剧本解析服务已配置",
       kwjmMissingKey: "等待 API Key",
       advancedParameters: "高级参数",
       connection: "连接设置",
@@ -460,7 +460,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     actions: {
       playLatest: "试听最新",
-      regenerate: "重跑",
+      regenerate: "重新生成",
       showLogs: "查看日志",
       startService: "启动服务",
       stopService: "停止服务",
@@ -804,8 +804,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       newProject: "New script",
       importProject: "Import script",
       projectCount: "{{count}} scripts",
-      queueSelected: "Generate selected",
-      queueFiltered: "Generate filtered"
+      queueSelected: "Generate selected lines",
+      queueFiltered: "Generate filtered lines"
     },
     topbar: {
       roleLibrary: "Roles",
@@ -1066,7 +1066,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         draft: "Parsed draft ready · {{draftLines}} lines. Apply it after review"
       },
       llmProviders: "LLM parser providers",
-      kwjmActivationTitle: "KWJM",
+      kwjmActivationTitle: "Script parsing service",
       kwjmActivationHint: "Enter an API key, save, then extract lines.",
       providerHint: "Open only for multiple parser services or a custom model.",
       kwjmPresetMeta: "{{model}} · {{baseUrl}}",
@@ -1114,7 +1114,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       activateKwjm: "Save and check",
       advancedConfig: "Advanced services",
       hideAdvancedConfig: "Hide",
-      kwjmConfigured: "KWJM configured",
+      kwjmConfigured: "Script parsing service configured",
       kwjmMissingKey: "Waiting for API key",
       advancedParameters: "Advanced parameters",
       connection: "Connection",
