@@ -37,29 +37,31 @@ def test_parse_script_requires_enabled_llm_parser(tmp_path: Path) -> None:
     assert "no enabled parser providers" in response.text
 
 
-def test_default_parser_providers_list_mainstream_first_and_kwjm_last(tmp_path: Path) -> None:
+def test_default_parser_providers_list_agentic_presets_and_kwjm_last(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path, env_path=tmp_path / ".env.local"))
 
     response = client.get("/api/parser/providers")
 
     assert response.status_code == 200
     providers = response.json()["providers"]
-    # Mainstream providers come first; OpenAI has the lowest priority.
+    names = [provider["name"] for provider in providers]
     first = providers[0]
     assert first["name"] == "OpenAI"
+    assert first["adapter"] == "openai-compatible"
     assert first["base_url"] == "https://api.openai.com/v1"
     assert first["api_key_env"] == "OPENAI_API_KEY"
+    assert first["model"] == "gpt-5.5"
     assert first["enabled"] is False
-    assert first["priority"] == 10
-    # 开物基模 (KWJM) is kept last as a project-specific fallback.
+    assert "百度千帆" not in names
+    assert "Mistral" not in names
+    assert "Anthropic" in names
+    assert "Gemini" in names
+    assert "OpenRouter" in names
+    assert "Aihubmix" in names
     last = providers[-1]
     assert last["name"] == "开物基模"
-    assert last["base_url"] == "https://kwjm.com"
-    assert last["api_key_env"] == "KWJM_API_KEY"
-    assert last["model"] == "gpt-5.5"
+    assert last["adapter"] == "openai-compatible"
     assert last["priority"] == max(p["priority"] for p in providers)
-    # At least 12 providers total (11 mainstream + KWJM).
-    assert len(providers) >= 12
 
 
 def test_parser_provider_config_activates_kwjm_with_api_key_only_flow(tmp_path: Path) -> None:
@@ -202,6 +204,8 @@ def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch
                                             "text": "Hello from the contract test.",
                                             "note": "calm",
                                             "language": "en",
+                                            "source_text": "Hello from the contract test.",
+                                            "source_excerpt": "**NARRATOR**\n(calm)\nHello from the contract test.",
                                         }
                                     ],
                                 }
@@ -227,7 +231,7 @@ def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch
             captured["json"] = json
             return FakeResponse()
 
-    monkeypatch.setattr("app.main.httpx.Client", FakeClient)
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
     client = TestClient(create_app(data_root=tmp_path, env_path=tmp_path / ".env.local"))
 
     response = client.post(
@@ -242,6 +246,7 @@ def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch
                 "enabled": True,
                 "timeout_seconds": 45,
                 "priority": 10,
+                "adapter": "openai-compatible",
             }
         },
     )
@@ -256,6 +261,80 @@ def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch
     assert "**NARRATOR**" in messages[1]["content"]
     assert response.json()["message"] == "parser contract request succeeded"
     assert '"characters"' in response.json()["content_preview"]
+
+
+def test_parser_provider_test_uses_anthropic_adapter(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "emit_tts_parse",
+                        "input": {
+                            "characters": [{"id": "narrator", "name": "NARRATOR"}],
+                            "lines": [
+                                {
+                                    "id": "l001",
+                                    "character_id": "narrator",
+                                    "text": "Hello from the contract test.",
+                                    "note": "calm",
+                                    "language": "en",
+                                    "source_text": "Hello from the contract test.",
+                                    "source_excerpt": "**NARRATOR**\n(calm)\nHello from the contract test.",
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            captured["timeout"] = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
+    client = TestClient(create_app(data_root=tmp_path, env_path=tmp_path / ".env.local"))
+
+    response = client.post(
+        "/api/parser/providers/test",
+        json={
+            "provider": {
+                "name": "Anthropic",
+                "base_url": "https://api.anthropic.com",
+                "api_key_env": "ANTHROPIC_API_KEY",
+                "api_key": "anthropic-test-secret",
+                "model": "claude-fable-5",
+                "enabled": True,
+                "timeout_seconds": 60,
+                "priority": 20,
+                "adapter": "anthropic",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert captured["url"] == "https://api.anthropic.com/v1/messages"
+    assert captured["headers"]["x-api-key"] == "anthropic-test-secret"
+    assert captured["json"]["tool_choice"] == {"type": "tool", "name": "emit_tts_parse"}
 
 
 def test_parse_script_returns_422_when_parser_quality_gate_fails(tmp_path: Path) -> None:

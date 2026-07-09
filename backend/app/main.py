@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -21,7 +20,7 @@ from app.auth import auth_status_endpoint, install_token_middleware
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
-from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, chat_completions_url, parser_contract_probe_messages, validate_parser_contract_response
+from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
 from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
@@ -389,31 +388,17 @@ def create_app(
             }
         started = time.time()
         try:
-            with httpx.Client(timeout=provider.timeout_seconds) as client:
-                response = client.post(
-                    chat_completions_url(provider.base_url),
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": provider.model,
-                        "messages": parser_contract_probe_messages(),
-                        "response_format": {"type": "json_object"},
-                        "temperature": 0,
-                        "max_tokens": 512,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-                content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
-                validate_parser_contract_response(provider.name, str(content))
-                return {
-                    "ok": True,
-                    "state": "ready",
-                    "message": "parser contract request succeeded",
-                    "provider": provider.name,
-                    "model": provider.model,
-                    "latency_ms": round((time.time() - started) * 1000),
-                    "content_preview": str(content)[:120],
-                }
+            parser_provider = build_parser_provider(ParserProviderConfig.model_validate(provider.model_dump(mode="python")))
+            probe = parser_provider.probe(api_key)
+            return {
+                "ok": True,
+                "state": "ready",
+                "message": "parser contract request succeeded",
+                "provider": provider.name,
+                "model": provider.model,
+                "latency_ms": round((time.time() - started) * 1000),
+                "content_preview": probe.content_preview,
+            }
         except Exception as exc:
             return {
                 "ok": False,
@@ -1164,15 +1149,15 @@ def create_app(
 
 
 def _build_parser(config_path: Path | None = None) -> MultiProviderParser:
-    providers: list[OpenAICompatibleProvider] = []
+    providers = []
     if config_path is not None:
         for item in load_parser_providers(config_path):
-            providers.append(OpenAICompatibleProvider(ParserProviderConfig.model_validate(item.model_dump(mode="python"))))
+            providers.append(build_parser_provider(ParserProviderConfig.model_validate(item.model_dump(mode="python"))))
     else:
         raw = os.environ.get("TTS_MORE_PARSER_PROVIDERS")
         if raw:
             for item in json.loads(raw):
-                providers.append(OpenAICompatibleProvider(ParserProviderConfig.model_validate(item)))
+                providers.append(build_parser_provider(ParserProviderConfig.model_validate(item)))
     return MultiProviderParser(providers)
 
 
