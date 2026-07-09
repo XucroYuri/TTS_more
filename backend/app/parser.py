@@ -111,6 +111,11 @@ _ATTRIBUTED_QUOTE_PATTERNS = (
         r'\s*[:：,，]?\s*[“"](?P<quote>[^“”"\n]{1,200})[”"]'
     ),
     re.compile(
+        r'[“"](?P<quote>[^“”"\n]{1,200})[”"]\s*'
+        r'(?P<speaker>[\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z .\'’·-]{0,40}?)'
+        r'(?:说|表示|称|提到|补充|问道|回应|强调|解释|写道|答道|喊道|提醒|指出|告诉记者|告诉大家)'
+    ),
+    re.compile(
         r'(?P<speaker>[A-Z][A-Za-z][A-Za-z .\'-]{0,40})'
         r'\s+(?:said|says|told|asked|replied|added|wrote|tweeted|explained|warned|noted)'
         r'\s*[,:\-]?\s*"(?P<quote>[^"\n]{1,200})"'
@@ -290,6 +295,39 @@ def _quoted_dialogue_candidates(source_text: str) -> list[str]:
         seen.add(item)
         ordered.append(item[1])
     return ordered
+
+
+def _source_excerpt_speaker(source_excerpt: str, source_text: str) -> str | None:
+    excerpt = _source_fidelity_source(source_excerpt)
+    needle = _source_fidelity_text(source_text)
+    if not excerpt or not needle:
+        return None
+
+    for pattern in _ATTRIBUTED_QUOTE_PATTERNS:
+        for match in pattern.finditer(excerpt):
+            quote = _source_fidelity_text(match.group("quote"))
+            speaker = _clean_markup(match.group("speaker"))
+            if speaker and quote == needle:
+                return speaker
+
+    line_match = _LINE_RE.match(excerpt)
+    if line_match:
+        speaker = _clean_markup(line_match.group("speaker"))
+        line_text = _source_fidelity_text(line_match.group("text"))
+        if speaker and not _is_non_dialogue_role(speaker) and line_text.find(needle) >= 0:
+            return speaker
+    return None
+
+
+def _speaker_matches_character(expected_speaker: str, character_id: str, character_name: str) -> bool:
+    expected = _clean_markup(expected_speaker)
+    actual_name = _clean_markup(character_name or character_id)
+    if not expected:
+        return True
+    if expected.casefold() == actual_name.casefold() or expected.casefold() == character_id.casefold():
+        return True
+    expected_slug = slugify_name(expected)
+    return expected_slug == character_id or expected_slug == slugify_name(actual_name)
 
 
 def _ordered_coverage_count(expected: list[str], actual: list[str]) -> int:
@@ -690,6 +728,7 @@ def _quality_reasons(draft: ParsedScriptDraft, source_text: str) -> list[str]:
     if not draft.lines:
         reasons.append("no TTS dialogue lines were extracted")
     character_ids = {character.id for character in draft.characters}
+    character_names_by_id = {character.id: character.name for character in draft.characters}
     for character in draft.characters:
         if _is_non_dialogue_role(character.name) or _is_non_dialogue_role(character.id):
             reasons.append(f"non-dialogue role {character.name} is not allowed")
@@ -734,6 +773,12 @@ def _quality_reasons(draft: ParsedScriptDraft, source_text: str) -> list[str]:
                 reasons.append(f"{line.id} source_excerpt is not traceable in source")
             if excerpt and needle and excerpt.find(needle) < 0:
                 reasons.append(f"{line.id} source_excerpt does not contain source_text")
+            expected_speaker = _source_excerpt_speaker(evidence.source_excerpt, evidence.source_text or line.text)
+            actual_character = character_names_by_id.get(line.character_id, line.character_id)
+            if expected_speaker and not _speaker_matches_character(expected_speaker, line.character_id, actual_character):
+                reasons.append(
+                    f"{line.id} source_excerpt speaker {expected_speaker} does not match character {actual_character}"
+                )
     return list(dict.fromkeys(reasons))
 
 

@@ -269,6 +269,78 @@ def test_script_parse_verifier_accepts_complete_attributed_prose_quotes() -> Non
     ScriptParseVerifier().verify(source, draft)
 
 
+def test_script_parse_verifier_rejects_missing_chinese_quote_before_attribution() -> None:
+    source = "“先撤离。”林夏说。随后，“别回头。”周明补充。"
+    draft = make_draft(
+        characters=[Character(id="lin-xia", name="林夏")],
+        lines=[ScriptLine(id="l001", character_id="lin-xia", text="先撤离。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“先撤离。”",
+                source_excerpt="“先撤离。”林夏说。",
+            )
+        },
+    )
+
+    with pytest.raises(ParserQualityError, match="missing quoted dialogue coverage: expected at least 2, got 1"):
+        ScriptParseVerifier().verify(source, draft)
+
+
+def test_script_parse_verifier_accepts_complete_chinese_quote_before_attribution() -> None:
+    source = "“先撤离。”林夏说。随后，“别回头。”周明补充。"
+    draft = make_draft(
+        characters=[Character(id="lin-xia", name="林夏"), Character(id="zhou-ming", name="周明")],
+        lines=[
+            ScriptLine(id="l001", character_id="lin-xia", text="先撤离。", language="zh"),
+            ScriptLine(id="l002", character_id="zhou-ming", text="别回头。", language="zh"),
+        ],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“先撤离。”",
+                source_excerpt="“先撤离。”林夏说。",
+            ),
+            "l002": LineSourceEvidence(
+                source_text="“别回头。”",
+                source_excerpt="“别回头。”周明补充。",
+            ),
+        },
+    )
+
+    ScriptParseVerifier().verify(source, draft)
+
+
+def test_script_parse_verifier_rejects_source_excerpt_with_wrong_colon_speaker() -> None:
+    draft = make_draft(
+        characters=[Character(id="alice", name="ALICE"), Character(id="bob", name="BOB")],
+        lines=[ScriptLine(id="l001", character_id="bob", text="Yes.", language="en")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="Yes.",
+                source_excerpt="ALICE: Yes.",
+            )
+        },
+    )
+
+    with pytest.raises(ParserQualityError, match="l001 source_excerpt speaker ALICE does not match character BOB"):
+        ScriptParseVerifier().verify("ALICE: Yes.", draft)
+
+
+def test_script_parse_verifier_rejects_source_excerpt_with_wrong_prose_speaker() -> None:
+    draft = make_draft(
+        characters=[Character(id="lin-xia", name="林夏"), Character(id="zhou-ming", name="周明")],
+        lines=[ScriptLine(id="l001", character_id="zhou-ming", text="先撤离。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“先撤离。”",
+                source_excerpt="林夏说：“先撤离。”",
+            )
+        },
+    )
+
+    with pytest.raises(ParserQualityError, match="l001 source_excerpt speaker 林夏 does not match character 周明"):
+        ScriptParseVerifier().verify("林夏说：“先撤离。”", draft)
+
+
 def test_parser_contract_prompt_requires_agentic_source_fidelity_audit() -> None:
     messages = parser_contract_probe_messages()
 
