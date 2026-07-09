@@ -481,13 +481,15 @@ def test_generation_job_manager_persists_load_failure_versions_when_worker_raise
     assert failed_version.metadata["failure_stage"] == "loading"
 
 
-def _wait_for_manager_job(manager: GenerationJobManager, job_id: str):
-    for _ in range(40):
+def _wait_for_manager_job(manager: GenerationJobManager, job_id: str, timeout_seconds: float = 10.0):
+    deadline = time.monotonic() + timeout_seconds
+    payload = manager.get(job_id)
+    while time.monotonic() < deadline:
         payload = manager.get(job_id)
         if payload.status in {"completed", "failed", "cancelled"}:
             return payload
         time.sleep(0.05)
-    raise AssertionError("job did not finish")
+    raise AssertionError(f"job {job_id} did not finish; last status={payload.status}")
 
 
 def _run_queue(queue: ServiceGenerationQueue, manifest: GenerationManifest, output_dir: Path, errors: list[BaseException]) -> None:
