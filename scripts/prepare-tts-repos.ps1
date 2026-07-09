@@ -1,6 +1,6 @@
 param(
     [string[]]$Targets = @("all"),
-    [ValidateSet("ModelScope", "HF", "HF-Mirror")][string]$Source = "ModelScope",
+    [ValidateSet("Auto", "ModelScope", "HF", "HF-Mirror")][string]$Source = "Auto",
     [ValidateSet("CU128", "CU126", "CPU", "ROCM", "MPS")][string]$Device = "CU128",
     [switch]$SyncRepos,
     [switch]$CleanRepos,
@@ -30,6 +30,46 @@ function Invoke-Logged {
         if ($LASTEXITCODE -ne 0) { throw "Command failed: $line" }
     } finally {
         Pop-Location
+    }
+}
+
+function Invoke-Captured {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory
+    )
+    $line = "$FilePath $($Arguments -join ' ')"
+    Write-Host "[run] $line" -ForegroundColor Cyan
+    if ($DryRun) { return "{}" }
+    Push-Location $WorkingDirectory
+    try {
+        $output = & $FilePath @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "Command failed: $line" }
+        return ($output -join "`n")
+    } finally {
+        Pop-Location
+    }
+}
+
+function Resolve-NetworkProfile {
+    $args = @("scripts\tts_more_deploy.py", "probe-network", "--write", "--source", $Source)
+    if ($DryRun) {
+        Write-Host "[run] $Python $($args -join ' ')" -ForegroundColor Cyan
+        return [pscustomobject]@{
+            model_source = if ($Source -eq "Auto") { "ModelScope" } else { $Source }
+            env = [pscustomobject]@{}
+        }
+    }
+    $json = Invoke-Captured $Python $args $Root
+    return $json | ConvertFrom-Json
+}
+
+function Set-NetworkProfileEnvironment {
+    param($Profile)
+    if ($null -eq $Profile.env) { return }
+    foreach ($property in $Profile.env.PSObject.Properties) {
+        [Environment]::SetEnvironmentVariable($property.Name, [string]$property.Value, "Process")
     }
 }
 
@@ -75,14 +115,14 @@ function Prepare-GPTSoVITS {
             Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
             return
         }
-        Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", $installPs1, "-Device", $Device, "-Source", $Source) $repoPath
+        Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", $installPs1, "-Device", $Device, "-Source", $ResolvedSource) $repoPath
     } else {
         if (!(Test-Path -LiteralPath $installSh)) { throw "Missing GPT-SoVITS installer: $installSh" }
         if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
             Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
             return
         }
-        Invoke-Logged "bash" @($installSh, "--device", $Device, "--source", $Source) $repoPath
+        Invoke-Logged "bash" @($installSh, "--device", $Device, "--source", $ResolvedSource) $repoPath
     }
 }
 
@@ -105,8 +145,8 @@ function Prepare-IndexTTS {
         if (!(Test-Path -LiteralPath $repoPython) -and $uv) {
             Invoke-Logged $uv @("sync", "--all-extras") $repoPath
         }
-        $sourceArg = if ($Source -eq "ModelScope") { "modelscope" } elseif ($Source -eq "HF") { "huggingface" } else { "huggingface" }
-        if ($Source -eq "HF-Mirror") { $env:HF_ENDPOINT = "https://hf-mirror.com" }
+        $sourceArg = if ($ResolvedSource -eq "ModelScope") { "modelscope" } else { "huggingface" }
+        if ($ResolvedSource -eq "HF-Mirror") { $env:HF_ENDPOINT = "https://hf-mirror.com" }
         Invoke-Logged $repoPython @("indextts\cli_v2.py", "download", "--source", $sourceArg, "--model-dir", "checkpoints") $repoPath
         Invoke-Logged $repoPython @("indextts\cli_v2.py", "config", "set", "model_dir", "checkpoints") $repoPath
     }
@@ -123,10 +163,10 @@ function Prepare-CosyVoice {
     }
     if (-not $SkipDownloads) {
         $repoPython = Resolve-RepoPython $repoPath
-        if ($Source -eq "ModelScope") {
+        if ($ResolvedSource -eq "ModelScope") {
             $code = "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')"
         } else {
-            if ($Source -eq "HF-Mirror") { $env:HF_ENDPOINT = "https://hf-mirror.com" }
+            if ($ResolvedSource -eq "HF-Mirror") { $env:HF_ENDPOINT = "https://hf-mirror.com" }
             $code = "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')"
         }
         Invoke-Logged $repoPython @("-c", $code) $repoPath
@@ -139,6 +179,12 @@ if ($SyncRepos) {
     if ($DryRun) { $syncArgs += "--dry-run" }
     Invoke-Logged $Python $syncArgs $Root
 }
+
+$NetworkProfile = Resolve-NetworkProfile
+Set-NetworkProfileEnvironment $NetworkProfile
+$ResolvedSource = [string]$NetworkProfile.model_source
+if (-not $ResolvedSource) { $ResolvedSource = if ($Source -eq "Auto") { "ModelScope" } else { $Source } }
+Write-Host "[network] source=$ResolvedSource cache=$($NetworkProfile.cache_root)" -ForegroundColor Cyan
 
 $lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json
 foreach ($repo in $lock.repositories) {
