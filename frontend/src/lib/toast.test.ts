@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createToast, inferToastLevel, toastDuration, type ToastOptions } from "./toast";
+import { createToast, inferToastLevel, shouldToastNotice, toastDuration, type ToastOptions } from "./toast";
 
 describe("toast helpers", () => {
   it("creates a toast with incremental ids and default level", () => {
@@ -37,5 +37,10 @@ describe("toast helpers", () => {
     expect(toastDuration({ duration: 0 })).toBe(0);
     const opts: ToastOptions = { duration: 3000 };
     expect(toastDuration(opts)).toBe(3000);
+  });
+
+  it("keeps passive ready notices out of the toast stack", () => {
+    expect(shouldToastNotice("app.ready")).toBe(false);
+    expect(shouldToastNotice("notice.projectSaved")).toBe(true);
   });
 });

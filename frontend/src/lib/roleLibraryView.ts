@@ -1,4 +1,4 @@
-import type { Character, VoiceBinding, WorkerHealth } from "../types";
+import type { Character, CharacterReferenceAudioGroup, ReferenceAudioSample, VoiceBinding, WorkerHealth } from "../types";
 
 export type RoleLibraryServiceState = "ready" | "partial" | "blocked" | "disabled";
 
@@ -27,6 +27,29 @@ export interface RoleLibraryBindingRow {
   missing: string[];
 }
 
+export type RoleLibraryDetailSelection =
+  | { kind: "model"; modelId: string }
+  | { kind: "candidate"; candidateId: string }
+  | { kind: "library-character"; characterId: string }
+  | { kind: "empty" };
+
+export interface RoleLibraryDetailSelectionInput {
+  selectedCharacterId?: string | null;
+  selectedCandidateId?: string | null;
+  selectedModelId?: string | null;
+  filteredCharacters: Character[];
+}
+
+export interface RoleLibraryReferencePreviewSample extends ReferenceAudioSample {
+  group: string;
+}
+
+export interface RoleLibraryReferencePreviewState {
+  visibleSamples: RoleLibraryReferencePreviewSample[];
+  hiddenSampleCount: number;
+  hasOverflow: boolean;
+}
+
 export function roleLibraryServiceOptions(services: WorkerHealth[]): RoleLibraryServiceOption[] {
   return services
     .filter((service) => service.service_kind !== "llm-parser" && Boolean(service.service_id))
@@ -47,6 +70,29 @@ export function roleLibraryServiceOptions(services: WorkerHealth[]): RoleLibrary
         supportsModelCatalog: supportsModelCatalog(service),
       };
     });
+}
+
+export function roleLibraryDetailSelection(input: RoleLibraryDetailSelectionInput): RoleLibraryDetailSelection {
+  if (input.selectedModelId) return { kind: "model", modelId: input.selectedModelId };
+  if (input.selectedCandidateId) return { kind: "candidate", candidateId: input.selectedCandidateId };
+  if (input.selectedCharacterId && input.filteredCharacters.some((character) => character.id === input.selectedCharacterId)) {
+    return { kind: "library-character", characterId: input.selectedCharacterId };
+  }
+  return { kind: "empty" };
+}
+
+export function roleLibraryReferencePreview(
+  groups: CharacterReferenceAudioGroup[],
+  maxVisible = 4
+): RoleLibraryReferencePreviewState {
+  const samples = groups.flatMap((group) => (group.samples ?? []).map((sample) => ({ ...sample, group: group.name })));
+  const visibleSamples = samples.slice(0, maxVisible);
+  const hiddenSampleCount = Math.max(0, samples.length - visibleSamples.length);
+  return {
+    visibleSamples,
+    hiddenSampleCount,
+    hasOverflow: hiddenSampleCount > 0
+  };
 }
 
 export function catalogServiceOptions(services: WorkerHealth[]): RoleLibraryServiceOption[] {

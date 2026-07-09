@@ -85,6 +85,24 @@ export interface LineFilterToolbarState {
   clearButtonVisible: boolean;
 }
 
+export type LineWorkbenchEmptyState = "no_project" | "no_lines" | "no_matches" | null;
+
+export interface LineWorkbenchControlsInput {
+  hasProject: boolean;
+  totalLineCount: number;
+  filteredLineCount: number;
+  selectedLineCount: number;
+  isGenerating: boolean;
+}
+
+export interface LineWorkbenchControlsState {
+  filtersVisible: boolean;
+  roleStripVisible: boolean;
+  generationVisible: boolean;
+  clearFiltersVisible: boolean;
+  emptyState: LineWorkbenchEmptyState;
+}
+
 type PreflightFallbackEntry = {
   fallback_action?: { type?: string; service_id?: string } | null;
   line_id?: string;
@@ -227,6 +245,37 @@ export function lineFilterToolbarState(input: LineFilterToolbarInput): LineFilte
   };
 }
 
+export function lineWorkbenchControlsState(input: LineWorkbenchControlsInput): LineWorkbenchControlsState {
+  if (!input.hasProject) {
+    return {
+      filtersVisible: false,
+      roleStripVisible: false,
+      generationVisible: false,
+      clearFiltersVisible: false,
+      emptyState: "no_project"
+    };
+  }
+
+  if (input.totalLineCount <= 0) {
+    return {
+      filtersVisible: false,
+      roleStripVisible: false,
+      generationVisible: false,
+      clearFiltersVisible: false,
+      emptyState: "no_lines"
+    };
+  }
+
+  const hasMatches = input.filteredLineCount > 0;
+  return {
+    filtersVisible: true,
+    roleStripVisible: true,
+    generationVisible: input.isGenerating || hasMatches,
+    clearFiltersVisible: !hasMatches,
+    emptyState: hasMatches ? null : "no_matches"
+  };
+}
+
 export function roleAccentClass(index: number): string {
   return `role-accent-${Math.abs(index) % 8}`;
 }
@@ -236,7 +285,7 @@ export function shouldRequestRevisionConfirmation(scriptRevisionCount = 0, parse
 }
 
 export function lineCardSecondaryBadges(latestVersion: GenerationVersion | undefined, versionCount: number): LineCardSecondaryBadge[] {
-  if (versionCount <= 0 || !latestVersion) return [{ kind: "no_versions" }];
+  if (versionCount <= 0 || !latestVersion) return [];
   const badges: LineCardSecondaryBadge[] = [];
   if (latestVersion.status === "completed" && latestVersion.audio_path) {
     badges.push({ kind: "latest_playable" });
