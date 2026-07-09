@@ -426,6 +426,42 @@ def render_services(
     return services
 
 
+def _clone_command(remote: str, branch: str, path: Path, *, partial: bool = True) -> list[str]:
+    command = ["git", "clone", "--depth", "1"]
+    if partial:
+        command.append("--filter=blob:none")
+    command.extend(["--branch", branch, "--single-branch", remote, str(path)])
+    return command
+
+
+def _run_git_command(command: list[str], *, cwd: Path) -> None:
+    subprocess.run(command, cwd=cwd, check=True)
+
+
+def _run_clone_with_fallback(
+    root: Path,
+    *,
+    remote: str,
+    branch: str,
+    path: Path,
+    dry_run: bool,
+    actions: list[list[str]],
+) -> None:
+    primary = _clone_command(remote, branch, path, partial=True)
+    actions.append(primary)
+    if dry_run:
+        return
+    try:
+        _run_git_command(primary, cwd=root)
+        return
+    except subprocess.CalledProcessError:
+        if path.exists():
+            _remove_path(path)
+    fallback = _clone_command(remote, branch, path, partial=False)
+    actions.append(fallback)
+    _run_git_command(fallback, cwd=root)
+
+
 def sync_repos(root: Path = PROJECT_ROOT, *, clean: bool = False, dry_run: bool = False) -> list[list[str]]:
     if clean:
         _remove_repo_dir(root, dry_run=dry_run)
@@ -443,13 +479,21 @@ def sync_repos(root: Path = PROJECT_ROOT, *, clean: bool = False, dry_run: bool 
             ]
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
-            commands = [["git", "clone", "--branch", branch, "--single-branch", remote, str(path)]]
+            _run_clone_with_fallback(
+                root,
+                remote=remote,
+                branch=branch,
+                path=path,
+                dry_run=dry_run,
+                actions=actions,
+            )
+            commands = []
         if repo.get("submodules"):
             commands.append(["git", "-C", str(path), "submodule", "update", "--init", "--recursive"])
         for command in commands:
             actions.append(command)
             if not dry_run:
-                subprocess.run(command, cwd=root, check=True)
+                _run_git_command(command, cwd=root)
         if commit:
             checkout_command = ["git", "-C", str(path), "checkout", str(commit)]
             if dry_run:
@@ -458,7 +502,7 @@ def sync_repos(root: Path = PROJECT_ROOT, *, clean: bool = False, dry_run: bool 
                 head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"])
                 if head != str(commit):
                     actions.append(checkout_command)
-                    subprocess.run(checkout_command, cwd=root, check=True)
+                    _run_git_command(checkout_command, cwd=root)
     return actions
 
 

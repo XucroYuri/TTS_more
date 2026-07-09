@@ -183,6 +183,62 @@ def test_sync_repos_rejects_paths_outside_project(tmp_path: Path) -> None:
         deploy.sync_repos(tmp_path, dry_run=True)
 
 
+def test_sync_repos_dry_run_uses_shallow_partial_clone(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+
+    actions = deploy.sync_repos(tmp_path, dry_run=True)
+
+    clone = actions[0]
+    assert clone[:3] == ["git", "clone", "--depth"]
+    assert "1" in clone
+    assert "--filter=blob:none" in clone
+    assert "--single-branch" in clone
+    assert "--branch" in clone
+
+
+def test_sync_repos_retries_clone_without_partial_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], cwd: Path) -> None:
+        calls.append(command)
+        if command[:2] == ["git", "clone"] and "--filter=blob:none" in command:
+            raise deploy.subprocess.CalledProcessError(128, command)
+        clone_path = Path(command[-1]) if command[:2] == ["git", "clone"] else None
+        if clone_path:
+            (clone_path / ".git").mkdir(parents=True)
+
+    monkeypatch.setattr(deploy, "_run_git_command", fake_run)
+    monkeypatch.setattr(deploy, "_git_output", lambda command: "bf81cdb14a38b674b6e9996dabc97340bc9978d2")
+    (tmp_path / "repo.lock.json").write_text(
+        json.dumps(
+            {
+                "repositories": [
+                    {
+                        "name": "GPT-SoVITS-main",
+                        "provider_type": "gpt-sovits",
+                        "variant": "main",
+                        "path": "repo/GPT-SoVITS-main",
+                        "remote": "https://github.com/XucroYuri/GPT-SoVITS.git",
+                        "branch": "main",
+                        "commit": "bf81cdb14a38b674b6e9996dabc97340bc9978d2",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    deploy.sync_repos(tmp_path, dry_run=False)
+
+    assert any("--filter=blob:none" in command for command in calls)
+    assert any(command[:2] == ["git", "clone"] and "--filter=blob:none" not in command for command in calls)
+
+
 def test_resolve_command_rejects_paths_outside_project(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
