@@ -498,31 +498,49 @@ class AnthropicProvider:
         return self._parse_with_key(text, api_key)
 
     def probe(self, api_key: str) -> ParserProbeResult:
-        draft = self._parse_with_key(_CONTRACT_PROBE_SCRIPT, api_key)
-        return ParserProbeResult(draft=draft, content_preview=json.dumps(draft.model_dump(mode="json"), ensure_ascii=False)[:120])
+        decoded = self._post_json(
+            api_key,
+            [{"role": "user", "content": f"Script:\n```text\n{_CONTRACT_PROBE_SCRIPT}\n```"}],
+        )
+        draft = self.verifier.verify(_CONTRACT_PROBE_SCRIPT, _draft_from_provider_payload(self.name, decoded))
+        return ParserProbeResult(draft=draft, content_preview=json.dumps(decoded, ensure_ascii=False)[:120])
 
     def _parse_with_key(self, text: str, api_key: str) -> ParsedScriptDraft:
-        decoded = self._post_json(api_key, text)
+        decoded = self._post_json(
+            api_key,
+            [{"role": "user", "content": f"Script:\n```text\n{text}\n```"}],
+        )
         try:
             draft = _draft_from_provider_payload(self.name, decoded)
             return self.verifier.verify(text, draft)
         except ParserQualityError as first_error:
+            repair_messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        f"{_REPAIR_PROMPT}\n\n"
+                        f"Quality errors:\n{first_error}\n\n"
+                        f"Previous JSON:\n```json\n{json.dumps(decoded, ensure_ascii=False)}\n```\n\n"
+                        f"Original script:\n```text\n{text}\n```"
+                    ),
+                }
+            ]
             repaired = self._post_json(
                 api_key,
-                f"{_REPAIR_PROMPT}\n\nQuality errors:\n{first_error}\n\nPrevious JSON:\n```json\n{json.dumps(decoded, ensure_ascii=False)}\n```\n\nOriginal script:\n```text\n{text}\n```",
+                repair_messages,
             )
             draft = _draft_from_provider_payload(self.name, repaired)
             self.verifier.verify(text, draft)
             draft.warnings = [f"LLM output repaired after quality failure: {first_error}", *draft.warnings]
             return draft
 
-    def _post_json(self, api_key: str, text: str) -> dict[str, Any]:
+    def _post_json(self, api_key: str, messages: list[dict[str, str]]) -> dict[str, Any]:
         payload = {
             "model": self.config.model,
             "max_tokens": 4096,
             "temperature": 0,
             "system": _SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": f"Script:\n```text\n{text}\n```"}],
+            "messages": messages,
             "tools": [_ANTHROPIC_TOOL],
             "tool_choice": {"type": "tool", "name": "emit_tts_parse"},
         }

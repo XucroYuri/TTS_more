@@ -511,6 +511,182 @@ def test_anthropic_provider_posts_messages_tool_contract(monkeypatch: pytest.Mon
     assert payload["tools"][0]["name"] == "emit_tts_parse"
 
 
+def test_anthropic_provider_repairs_with_explicit_repair_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_TEST_KEY", "sk-ant-test")
+    calls: list[dict[str, object]] = []
+    responses = [
+        {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "emit_tts_parse",
+                    "input": {
+                        "characters": [{"id": "sfx", "name": "SFX"}],
+                        "lines": [
+                            {
+                                "id": "l001",
+                                "character_id": "sfx",
+                                "text": "Rain hits metal.",
+                                "source_text": "Rain hits metal.",
+                                "source_excerpt": "SFX: Rain hits metal.",
+                            }
+                        ],
+                    },
+                }
+            ]
+        },
+        {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "emit_tts_parse",
+                    "input": {
+                        "characters": [{"id": "narrator", "name": "NARRATOR"}],
+                        "lines": [
+                            {
+                                "id": "l001",
+                                "character_id": "narrator",
+                                "text": "Hello.",
+                                "note": "calm",
+                                "source_text": "Hello.",
+                                "source_excerpt": "**NARRATOR**\n(calm)\nHello.",
+                            }
+                        ],
+                    },
+                }
+            ]
+        },
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self.payload
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            calls.append({"url": url, "headers": headers, "json": json})
+            return FakeResponse(responses[len(calls) - 1])
+
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
+    provider = AnthropicProvider(
+        ParserProviderConfig(
+            name="anthropic-test",
+            base_url="https://api.anthropic.com",
+            api_key_env="ANTHROPIC_TEST_KEY",
+            model="claude-fable-5",
+            adapter="anthropic",
+        )
+    )
+
+    draft = provider.parse("**NARRATOR**\n(calm)\nHello.")
+
+    assert draft.lines[0].text == "Hello."
+    assert len(calls) == 2
+    assert calls[1]["json"]["system"] == calls[0]["json"]["system"]
+    assert calls[1]["json"]["tools"] == calls[0]["json"]["tools"]
+    assert calls[1]["json"]["tool_choice"] == calls[0]["json"]["tool_choice"]
+    repair_message = calls[1]["json"]["messages"][0]["content"]
+    assert not repair_message.startswith("Script:\n```text\n")
+    assert "Repair the previous JSON" in repair_message
+    assert "Quality errors:" in repair_message
+    assert "Previous JSON:" in repair_message
+    assert '"name": "SFX"' in repair_message
+    assert "Original script:" in repair_message
+    assert "**NARRATOR**" in repair_message
+
+
+def test_anthropic_provider_probe_preview_keeps_raw_payload_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "emit_tts_parse",
+                        "input": {
+                            "characters": [{"id": "n", "name": "N"}],
+                            "lines": [
+                                {
+                                    "id": "l1",
+                                    "character_id": "n",
+                                    "text": "Hello from the contract test.",
+                                    "source_text": "Hello from the contract test.",
+                                    "source_excerpt": "Hello from the contract test.",
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            calls.append({"url": url, "headers": headers, "json": json})
+            return FakeResponse()
+
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
+    provider = AnthropicProvider(
+        ParserProviderConfig(
+            name="anthropic-test",
+            base_url="https://api.anthropic.com",
+            api_key_env="ANTHROPIC_TEST_KEY",
+            model="claude-fable-5",
+            adapter="anthropic",
+        )
+    )
+
+    result = provider.probe("sk-ant-test")
+    expected_preview = json.dumps(
+        {
+            "characters": [{"id": "n", "name": "N"}],
+            "lines": [
+                {
+                    "id": "l1",
+                    "character_id": "n",
+                    "text": "Hello from the contract test.",
+                    "source_text": "Hello from the contract test.",
+                    "source_excerpt": "Hello from the contract test.",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )[:120]
+
+    assert result.draft.lines[0].text == "Hello from the contract test."
+    assert result.content_preview == expected_preview
+    assert '"provider":' not in result.content_preview
+    assert len(calls) == 1
+
+
 def test_default_parser_providers_include_agentic_presets_and_exclude_removed_providers() -> None:
     from app.parser_config import default_parser_providers
 
