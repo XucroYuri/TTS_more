@@ -17,10 +17,31 @@ def test_committable_templates_do_not_contain_local_runtime_identifiers() -> Non
         repo_root / "data" / "templates" / "characters.example.json",
     ]
     forbidden_tokens = [
+        # LAN / private IP subnets (RFC1918) — no real internal hosts in templates.
+        "192.168.0.",
+        "192.168.1.",
         "192.168.2.",
+        "192.168.3.",
+        "10.0.",
+        "10.1.",
+        "172.16.",
+        "172.17.",
+        "172.18.",
+        # UNC paths (\\server\share) — no internal network mounts.
         "\\\\192.168.",
-        "J:\\",
+        "\\\\nas",
+        "\\\\server",
+        # Windows drive letters — no machine-specific absolute paths.
+        "C:\\",
+        "D:\\",
+        "E:\\",
         "F:\\",
+        "G:\\",
+        "J:\\",
+        # POSIX user-home paths — no developer-machine paths.
+        "/Users/",
+        "/home/",
+        # Internal project character names — no real role data.
         "电器暴走追逐战",
         "光头TTS",
         "TTS-大鹏眼镜",

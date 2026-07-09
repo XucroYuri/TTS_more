@@ -10,7 +10,7 @@ from app.main import create_app
 
 
 @pytest.mark.skipif(os.environ.get("TTS_MORE_RUN_REAL_TTS") != "1", reason="set TTS_MORE_RUN_REAL_TTS=1 to run real local TTS validation")
-def test_real_core_model_validation_generates_audio_files(monkeypatch) -> None:
+def test_real_core_model_validation_generates_audio_files(monkeypatch, tmp_path: Path) -> None:
     required_env = [
         "TTS_MORE_REAL_GPT_REF_AUDIO",
         "TTS_MORE_REAL_GPT_PROMPT_TEXT",
@@ -21,7 +21,9 @@ def test_real_core_model_validation_generates_audio_files(monkeypatch) -> None:
         pytest.skip(f"missing real validation env: {', '.join(missing)}")
 
     monkeypatch.setenv("TTS_MORE_SERVICE_MODE", "real")
-    client = TestClient(create_app())
+    # Use a tmp data root so real audio artifacts never pollute the repo's
+    # data/ tree (consistent with every other test in the suite).
+    client = TestClient(create_app(data_root=tmp_path))
     tasks = [
         {
             "line": {"id": "real-gpt", "character_id": "real-gpt", "text": "真实生成检查。", "language": "zh"},
