@@ -518,6 +518,27 @@ class HttpTTSServiceClient:
 
 
 class GradioWebUIServiceClient(HttpTTSServiceClient):
+    """FALLBACK client for services reachable only via their Gradio WebUI.
+
+    The primary integration path is the non-invasive tts-more-v1 worker
+    (see backend/app/workers/*), which imports the upstream model directly and
+    exposes a complete REST contract. This Gradio client is retained as a
+    limited fallback for users who run the upstream Gradio WebUI directly.
+
+    Limitations of the Gradio path:
+    - Model/reference auto-discovery depends on fork-specific api_names
+      (on_select_ref_audio, update_model_choices) that upstream official
+      GPT-SoVITS does not define; discovery yields partial/empty results
+      against upstream builds.
+    - The extended synthesis params (if_freeze, aux_ref_audio_paths,
+      sample_steps, super_sampling) match the v2ProPlus fork signature; upstream
+      may reject or ignore them.
+    - The 3-10s reference-audio hard limit in upstream blocks some inputs.
+
+    Prefer the worker for full capability; use Gradio only when the worker
+    cannot be deployed.
+    """
+
     def __init__(self, endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> None:
         super().__init__(endpoint, transport=transport)
         self._config_cache: dict[str, Any] | None = None
@@ -1252,6 +1273,14 @@ def _gradio_api_summary(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _gpt_sovits_gradio_logs_candidates(service_id: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """FALLBACK discovery via Gradio /config scraping (fork-specific).
+
+    The primary discovery path is the worker's GET /models endpoint (filesystem
+    scan, works against any upstream build). This Gradio-scraping path depends
+    on fork-added api_names (update_model_choices, refresh_ref_audio_choices)
+    and labeled dropdowns; it returns partial/empty results against upstream
+    official GPT-SoVITS. Kept for compatibility with existing fork deployments.
+    """
     components = {component.get("id"): component for component in payload.get("components", []) if isinstance(component, dict)}
     dependencies = [item for item in payload.get("dependencies", []) if isinstance(item, dict)]
     by_api = {item.get("api_name"): item for item in dependencies if item.get("api_name")}
