@@ -31,14 +31,16 @@ describe("i18n configuration", () => {
   });
 
   it("keeps production workstation labels fully localized", () => {
-    expect(tText(resources["zh-CN"], "topbar.roleLibrary")).toBe("角色库");
-    expect(tText(resources["zh-CN"], "topbar.llmConfig")).toBe("LLM");
+    expect(tText(resources["zh-CN"], "topbar.roleLibrary")).toBe("角色");
+    expect(tText(resources["zh-CN"], "topbar.llmConfig")).toBe("解析");
     expect(tText(resources["zh-CN"], "characters.libraryManager")).toBe("角色库");
     expect(tText(resources["zh-CN"], "characters.bindToProjectRole")).toBe("用于当前项目");
     expect(tText(resources["zh-CN"], "services.ttsAccessTitle")).toBe("添加 TTS 服务");
     expect(tText(resources["zh-CN"], "services.openSourceDetect")).toBe("检测连接");
+    expect(tText(resources["zh-CN"], "services.openSourceBaseUrl")).toBe("服务地址");
     expect(tText(resources["zh-CN"], "services.llmApiTitle")).toBe("剧本解析");
     expect(tText(resources["zh-CN"], "parser.advancedConfig")).toBe("高级服务");
+    expect(tText(resources["zh-CN"], "parser.activateKwjm")).toBe("保存并检查");
     expect(tText(resources["zh-CN"], "services.openSourceDetectAndSave")).toBe("检测并保存");
     expect(tText(resources["zh-CN"], "services.openSourceDetectNotSaved")).toBe("检测完成：{{state}}，未保存");
     expect(tText(resources["zh-CN"], "inspector.diagnosticsReadyShort")).toBe("API 正常");
@@ -53,14 +55,16 @@ describe("i18n configuration", () => {
     expect(tText(resources["zh-CN"], "script.parseRevision")).toBe("提取台词");
     expect(tText(resources["zh-CN"], "inspector.method.gpt")).toBe("GPT");
     expect(tText(resources["zh-CN"], "inspector.createIndexTemporary")).toBe("设为临时音色");
-    expect(tText(resources["en-US"], "topbar.roleLibrary")).toBe("Character");
+    expect(tText(resources["en-US"], "topbar.roleLibrary")).toBe("Roles");
     expect(tText(resources["en-US"], "characters.libraryManager")).toBe("Character");
     expect(tText(resources["en-US"], "characters.bindToProjectRole")).toBe("Use in this project");
     expect(tText(resources["en-US"], "services.ttsAccessTitle")).toBe("Add TTS service");
     expect(tText(resources["en-US"], "services.openSourceDetect")).toBe("Test connection");
-    expect(tText(resources["en-US"], "topbar.ttsConfig")).toBe("TTS");
+    expect(tText(resources["en-US"], "services.openSourceBaseUrl")).toBe("Service URL");
+    expect(tText(resources["en-US"], "topbar.ttsConfig")).toBe("Access");
     expect(tText(resources["en-US"], "services.llmApiTitle")).toBe("Script parser");
     expect(tText(resources["en-US"], "parser.advancedConfig")).toBe("Advanced services");
+    expect(tText(resources["en-US"], "parser.activateKwjm")).toBe("Save and check");
     expect(tText(resources["en-US"], "services.openSourceDetectAndSave")).toBe("Detect and save");
     expect(tText(resources["en-US"], "services.openSourceDetectNotSaved")).toBe("Detection complete: {{state}}; not saved");
     expect(tText(resources["en-US"], "inspector.diagnosticsReadyShort")).toBe("API ready");

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Character, GenerationVersion, ScriptLine, WorkerHealth } from "../types";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups } from "./workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, lineWorkbenchControlsState, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups } from "./workbenchView";
 
 describe("workbench view helpers", () => {
   it("maps a role index to a stable accent class", () => {
@@ -92,6 +92,62 @@ describe("workbench view helpers", () => {
     }).title).toBe("状态:not generated");
   });
 
+  it("hides production controls until a script has extracted lines", () => {
+    expect(lineWorkbenchControlsState({
+      hasProject: false,
+      totalLineCount: 0,
+      filteredLineCount: 0,
+      selectedLineCount: 0,
+      isGenerating: false
+    })).toEqual({
+      filtersVisible: false,
+      roleStripVisible: false,
+      generationVisible: false,
+      clearFiltersVisible: false,
+      emptyState: "no_project"
+    });
+
+    expect(lineWorkbenchControlsState({
+      hasProject: true,
+      totalLineCount: 0,
+      filteredLineCount: 0,
+      selectedLineCount: 0,
+      isGenerating: false
+    })).toMatchObject({
+      filtersVisible: false,
+      roleStripVisible: false,
+      generationVisible: false,
+      emptyState: "no_lines"
+    });
+
+    expect(lineWorkbenchControlsState({
+      hasProject: true,
+      totalLineCount: 8,
+      filteredLineCount: 0,
+      selectedLineCount: 0,
+      isGenerating: false
+    })).toMatchObject({
+      filtersVisible: true,
+      roleStripVisible: true,
+      generationVisible: false,
+      clearFiltersVisible: true,
+      emptyState: "no_matches"
+    });
+
+    expect(lineWorkbenchControlsState({
+      hasProject: true,
+      totalLineCount: 8,
+      filteredLineCount: 3,
+      selectedLineCount: 2,
+      isGenerating: false
+    })).toMatchObject({
+      filtersVisible: true,
+      roleStripVisible: true,
+      generationVisible: true,
+      emptyState: null
+    });
+  });
+
   it("keeps technical service details out of the collapsed line card", () => {
     const latest: GenerationVersion = {
       version_id: "v004",
@@ -118,7 +174,7 @@ describe("workbench view helpers", () => {
   });
 
   it("summarizes empty and failed histories without raw ids", () => {
-    expect(lineCardSecondaryBadges(undefined, 0)).toEqual([{ kind: "no_versions" }]);
+    expect(lineCardSecondaryBadges(undefined, 0)).toEqual([]);
     expect(lineCardSecondaryBadges({ version_id: "v002", engine: "gpt-sovits", profile: "p", status: "failed", created_at: "now" }, 2)).toEqual([
       { kind: "latest_failed" },
       { kind: "version_count", count: 2 }
@@ -198,18 +254,18 @@ describe("workbench view helpers", () => {
   });
 
   it("uses only current role library reference audio as backup inspector sources", () => {
-    const line: ScriptLine = { id: "l001", character_id: "zhu-jue", text: "呼……", note: "" };
+    const line: ScriptLine = { id: "l001", character_id: "role-a", text: "样例台词", note: "" };
     const characters: Character[] = [
       {
-        id: "zhu-jue",
-        name: "光头",
+        id: "role-a",
+        name: "角色甲",
         aliases: [],
         notes: "",
         fallback_profiles: [],
         reference_audio_groups: [
           {
             id: "gt-local",
-            name: "光头测试音",
+            name: "测试音色",
             paths: ["refs/gt-01.wav"],
             copied_paths: ["refs/gt-02.wav"],
             samples: [{ path: "refs/gt-01.wav", text: "样本文本" }]
@@ -221,7 +277,7 @@ describe("workbench view helpers", () => {
     expect(trustedBackupReferenceGroups(line, characters)).toEqual([
       {
         id: "gt-local",
-        name: "光头测试音",
+        name: "测试音色",
         path: "refs/gt-01.wav",
         audio_count: 2,
         samples: ["refs/gt-01.wav", "refs/gt-02.wav"]

@@ -5,6 +5,8 @@ import {
   bindingCompleteness,
   catalogServiceOptions,
   roleLibraryBindingRows,
+  roleLibraryDetailSelection,
+  roleLibraryReferencePreview,
   roleLibraryServiceOptions,
   selectedCatalogServiceId,
 } from "./roleLibraryView";
@@ -136,5 +138,46 @@ describe("role library view helpers", () => {
     expect(rows[0]).toMatchObject({ bindingId: "hero-gpt-binding", serviceLabel: "Local GPT", complete: true });
     expect(rows[1]).toMatchObject({ bindingId: "hero-index-binding", serviceLabel: "Remote Index", complete: false });
     expect(bindingCompleteness(rows[1].binding).missing).toEqual(["voice"]);
+  });
+
+  it("does not auto-open a global character detail when no explicit selection exists", () => {
+    const characters: Character[] = [
+      { id: "hero", name: "Hero", aliases: [], notes: "", fallback_profiles: [] },
+      { id: "mentor", name: "Mentor", aliases: [], notes: "", fallback_profiles: [] },
+    ];
+
+    expect(roleLibraryDetailSelection({
+      selectedCharacterId: null,
+      filteredCharacters: characters,
+      selectedCandidateId: null,
+      selectedModelId: null
+    })).toEqual({ kind: "empty" });
+
+    expect(roleLibraryDetailSelection({
+      selectedCharacterId: "mentor",
+      filteredCharacters: characters,
+      selectedCandidateId: null,
+      selectedModelId: null
+    })).toEqual({ kind: "library-character", characterId: "mentor" });
+  });
+
+  it("shows only a short reference preview by default", () => {
+    const preview = roleLibraryReferencePreview([
+      {
+        id: "core",
+        name: "Core samples",
+        paths: [],
+        samples: Array.from({ length: 7 }, (_, index) => ({ path: `refs/sample-${index + 1}.wav` }))
+      }
+    ]);
+
+    expect(preview.visibleSamples.map((sample) => sample.path)).toEqual([
+      "refs/sample-1.wav",
+      "refs/sample-2.wav",
+      "refs/sample-3.wav",
+      "refs/sample-4.wav",
+    ]);
+    expect(preview.hiddenSampleCount).toBe(3);
+    expect(preview.hasOverflow).toBe(true);
   });
 });
