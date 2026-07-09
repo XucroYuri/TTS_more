@@ -195,6 +195,10 @@ def _clean_markup(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _clean_source_excerpt(value: Any) -> str:
+    return str(value or "").strip()
+
+
 def _clean_note(value: Any) -> str:
     text = _clean_markup(value)
     match = _NOTE_ONLY_RE.match(text)
@@ -280,6 +284,69 @@ def _source_fidelity_source(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_AMBIGUOUS_SPEAKER_REFERENTS = {
+    "他",
+    "她",
+    "它",
+    "ta",
+    "他们",
+    "她们",
+    "它们",
+    "he",
+    "him",
+    "his",
+    "she",
+    "her",
+    "hers",
+    "they",
+    "them",
+    "their",
+    "theirs",
+}
+
+
+def _normalize_attributed_speaker(raw: str) -> str | None:
+    speaker = _clean_markup(raw)
+    if not speaker:
+        return None
+    if speaker.casefold() in _AMBIGUOUS_SPEAKER_REFERENTS:
+        return None
+    if re.search(r"[\u4e00-\u9fff]", speaker):
+        segments = [segment.strip() for segment in re.split(r"[\s,，、。；;：:]+", speaker) if segment.strip()]
+        if segments:
+            speaker = segments[-1]
+            if speaker.casefold() in _AMBIGUOUS_SPEAKER_REFERENTS:
+                return None
+    return speaker
+
+
+def _source_excerpt_markdown_speaker(source_excerpt: str, source_text: str) -> str | None:
+    needle = _source_fidelity_text(source_text)
+    if not needle:
+        return None
+
+    raw_lines = source_excerpt.splitlines()
+    for index, raw in enumerate(raw_lines):
+        speaker = _markdown_speaker(raw)
+        if speaker is None:
+            continue
+        dialogue: list[str] = []
+        line_index = index + 1
+        if line_index < len(raw_lines) and _NOTE_ONLY_RE.match(raw_lines[line_index].strip()):
+            line_index += 1
+        while line_index < len(raw_lines):
+            candidate = raw_lines[line_index]
+            if not candidate.strip():
+                break
+            if _is_non_tts_cue(candidate) or _LINE_RE.match(candidate) or _markdown_speaker(candidate):
+                break
+            dialogue.append(_clean_dialogue(candidate))
+            line_index += 1
+        if dialogue and _source_fidelity_text(" ".join(dialogue)).find(needle) >= 0:
+            return speaker
+    return None
+
+
 def _quoted_dialogue_candidates(source_text: str) -> list[str]:
     matches: list[tuple[int, str]] = []
     for pattern in _ATTRIBUTED_QUOTE_PATTERNS:
@@ -303,12 +370,15 @@ def _source_excerpt_speaker(source_excerpt: str, source_text: str) -> str | None
     if not excerpt or not needle:
         return None
 
+    markdown_speaker = _source_excerpt_markdown_speaker(source_excerpt, source_text)
+    if markdown_speaker:
+        return markdown_speaker
+
     for pattern in _ATTRIBUTED_QUOTE_PATTERNS:
         for match in pattern.finditer(excerpt):
             quote = _source_fidelity_text(match.group("quote"))
-            speaker = _clean_markup(match.group("speaker"))
-            if speaker and quote == needle:
-                return speaker
+            if quote == needle:
+                return _normalize_attributed_speaker(match.group("speaker"))
 
     line_match = _LINE_RE.match(excerpt)
     if line_match:
@@ -374,7 +444,7 @@ def _finalize_lines(
         )
         evidence = LineSourceEvidence(
             source_text=_clean_markup(record.get("source_text", "")),
-            source_excerpt=_clean_markup(record.get("source_excerpt", "")),
+            source_excerpt=_clean_source_excerpt(record.get("source_excerpt", "")),
         )
         if evidence.source_text or evidence.source_excerpt:
             source_evidence[line_id] = evidence
@@ -682,7 +752,7 @@ def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> Pars
             continue
         text = _clean_dialogue(item.get("text") or item.get("dialogue"))
         source_text = _clean_markup(item.get("source_text", ""))
-        source_excerpt = _clean_markup(item.get("source_excerpt", ""))
+        source_excerpt = _clean_source_excerpt(item.get("source_excerpt", ""))
         if not source_text:
             raise ParserQualityError(f"line {index} missing source_text")
         if not source_excerpt:

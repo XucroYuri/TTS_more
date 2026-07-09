@@ -325,6 +325,56 @@ def test_script_parse_verifier_rejects_source_excerpt_with_wrong_colon_speaker()
         ScriptParseVerifier().verify("ALICE: Yes.", draft)
 
 
+def test_script_parse_verifier_rejects_source_excerpt_with_wrong_markdown_speaker() -> None:
+    draft = make_draft(
+        characters=[Character(id="alice", name="ALICE"), Character(id="bob", name="BOB")],
+        lines=[ScriptLine(id="l001", character_id="bob", text="Yes.", language="en")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="Yes.",
+                source_excerpt="**ALICE**\nYes.",
+            )
+        },
+    )
+
+    with pytest.raises(ParserQualityError, match="l001 source_excerpt speaker ALICE does not match character BOB"):
+        ScriptParseVerifier().verify("**ALICE**\nYes.", draft)
+
+
+def test_provider_payload_rejects_source_excerpt_with_wrong_markdown_speaker() -> None:
+    payload = {
+        "characters": [{"id": "alice", "name": "ALICE"}, {"id": "bob", "name": "BOB"}],
+        "lines": [
+            {
+                "id": "l001",
+                "character_id": "bob",
+                "text": "Yes.",
+                "source_text": "Yes.",
+                "source_excerpt": "**ALICE**\nYes.",
+            }
+        ],
+    }
+    draft = _draft_from_provider_payload("llm-test", payload)
+
+    with pytest.raises(ParserQualityError, match="l001 source_excerpt speaker ALICE does not match character BOB"):
+        ScriptParseVerifier().verify("**ALICE**\nYes.", draft)
+
+
+def test_script_parse_verifier_accepts_source_excerpt_with_matching_markdown_speaker() -> None:
+    draft = make_draft(
+        characters=[Character(id="alice", name="ALICE")],
+        lines=[ScriptLine(id="l001", character_id="alice", text="Yes.", language="en")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="Yes.",
+                source_excerpt="**ALICE**\nYes.",
+            )
+        },
+    )
+
+    ScriptParseVerifier().verify("**ALICE**\nYes.", draft)
+
+
 def test_script_parse_verifier_rejects_source_excerpt_with_wrong_prose_speaker() -> None:
     draft = make_draft(
         characters=[Character(id="lin-xia", name="林夏"), Character(id="zhou-ming", name="周明")],
@@ -339,6 +389,51 @@ def test_script_parse_verifier_rejects_source_excerpt_with_wrong_prose_speaker()
 
     with pytest.raises(ParserQualityError, match="l001 source_excerpt speaker 林夏 does not match character 周明"):
         ScriptParseVerifier().verify("林夏说：“先撤离。”", draft)
+
+
+def test_script_parse_verifier_accepts_context_prefixed_chinese_prose_speaker() -> None:
+    draft = make_draft(
+        characters=[Character(id="lin-xia", name="林夏")],
+        lines=[ScriptLine(id="l001", character_id="lin-xia", text="先撤离。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="先撤离。",
+                source_excerpt="记者会上，林夏说：“先撤离。”",
+            )
+        },
+    )
+
+    ScriptParseVerifier().verify("记者会上，林夏说：“先撤离。”", draft)
+
+
+def test_script_parse_verifier_accepts_ambiguous_pronoun_attributed_quote() -> None:
+    draft = make_draft(
+        characters=[Character(id="lin-xia", name="林夏")],
+        lines=[ScriptLine(id="l001", character_id="lin-xia", text="先撤离。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="先撤离。",
+                source_excerpt="她说：“先撤离。”",
+            )
+        },
+    )
+
+    ScriptParseVerifier().verify("她说：“先撤离。”", draft)
+
+
+def test_script_parse_verifier_accepts_context_prefixed_chinese_speaker_with_verb() -> None:
+    draft = make_draft(
+        characters=[Character(id="zhou-ming", name="周明")],
+        lines=[ScriptLine(id="l001", character_id="zhou-ming", text="别回头。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="别回头。",
+                source_excerpt="随后，周明补充：“别回头。”",
+            )
+        },
+    )
+
+    ScriptParseVerifier().verify("随后，周明补充：“别回头。”", draft)
 
 
 def test_parser_contract_prompt_requires_agentic_source_fidelity_audit() -> None:
