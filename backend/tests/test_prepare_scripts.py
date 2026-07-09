@@ -16,6 +16,16 @@ def test_powershell_prepare_defaults_to_auto_and_calls_probe_network() -> None:
     assert "$ResolvedSource" in script
 
 
+def test_bash_prepare_defaults_to_auto_and_calls_probe_network() -> None:
+    script = (REPO_ROOT / "scripts" / "prepare-tts-repos.sh").read_text(encoding="utf-8")
+
+    assert 'SOURCE="Auto"' in script
+    assert "probe-network" in script
+    assert "--write" in script
+    assert "RESOLVED_SOURCE" in script
+    assert "export_network_env" in script
+
+
 def test_prepare_scripts_do_not_default_to_reduced_models() -> None:
     combined = "\n".join(
         [

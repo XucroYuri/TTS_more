@@ -6,7 +6,9 @@ PYTHON="${TTS_MORE_BASE_PYTHON:-python3}"
 APP_PY="$ROOT/.venv/bin/python"
 [[ -x "$APP_PY" ]] || APP_PY="$PYTHON"
 
-SOURCE="ModelScope"
+SOURCE="Auto"
+RESOLVED_SOURCE=""
+NETWORK_PROFILE_JSON=""
 DEVICE="CU128"
 TARGETS="all"
 SYNC_REPOS=0
@@ -37,6 +39,15 @@ run() {
   "$@"
 }
 
+run_capture() {
+  echo "[run] $*" >&2
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '{"model_source":"%s","env":{}}\n' "$([[ "$SOURCE" == "Auto" ]] && echo ModelScope || echo "$SOURCE")"
+    return 0
+  fi
+  "$@"
+}
+
 target_enabled() {
   local name="$1" provider="$2" service_id="$3" variant="$4"
   [[ "$TARGETS" == "all" ]] && return 0
@@ -57,6 +68,30 @@ PY
 
 field() {
   "$APP_PY" -c 'import json,sys; print(json.loads(sys.argv[1]).get(sys.argv[2], ""))' "$1" "$2"
+}
+
+json_field_from_profile() {
+  "$APP_PY" -c 'import json,sys; print(json.loads(sys.argv[1]).get(sys.argv[2], ""))' "$NETWORK_PROFILE_JSON" "$1"
+}
+
+export_network_env() {
+  "$APP_PY" - "$NETWORK_PROFILE_JSON" <<'PY'
+import json
+import sys
+profile = json.loads(sys.argv[1])
+for key, value in (profile.get("env") or {}).items():
+    print(f"{key}={value}")
+PY
+}
+
+resolve_network_profile() {
+  NETWORK_PROFILE_JSON="$(run_capture "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" probe-network --write --source "$SOURCE")"
+  while IFS='=' read -r key value; do
+    [[ -n "$key" ]] && export "$key=$value"
+  done < <(export_network_env)
+  RESOLVED_SOURCE="$(json_field_from_profile model_source)"
+  [[ -z "$RESOLVED_SOURCE" ]] && RESOLVED_SOURCE="$([[ "$SOURCE" == "Auto" ]] && echo ModelScope || echo "$SOURCE")"
+  echo "[network] source=$RESOLVED_SOURCE"
 }
 
 ensure_venv() {
@@ -80,7 +115,7 @@ prepare_gpt() {
     echo "Missing GPT-SoVITS installer: $repo_path/install.sh" >&2
     exit 1
   fi
-  run bash "$repo_path/install.sh" --device "$DEVICE" --source "$SOURCE"
+  run bash "$repo_path/install.sh" --device "$DEVICE" --source "$RESOLVED_SOURCE"
 }
 
 prepare_index() {
@@ -103,8 +138,8 @@ prepare_index() {
   if [[ "$SKIP_DOWNLOADS" != "1" ]]; then
     local repo_python="$repo_path/.venv/bin/python"
     local source_arg="huggingface"
-    [[ "$SOURCE" == "ModelScope" ]] && source_arg="modelscope"
-    [[ "$SOURCE" == "HF-Mirror" ]] && export HF_ENDPOINT="https://hf-mirror.com"
+    [[ "$RESOLVED_SOURCE" == "ModelScope" ]] && source_arg="modelscope"
+    [[ "$RESOLVED_SOURCE" == "HF-Mirror" ]] && export HF_ENDPOINT="https://hf-mirror.com"
     (cd "$repo_path" && run "$repo_python" indextts/cli_v2.py download --source "$source_arg" --model-dir checkpoints)
     (cd "$repo_path" && run "$repo_python" indextts/cli_v2.py config set model_dir checkpoints)
   fi
@@ -119,14 +154,16 @@ prepare_cosy() {
     (cd "$repo_path" && run "$repo_python" -m pip install -r requirements.txt)
   fi
   if [[ "$SKIP_DOWNLOADS" != "1" ]]; then
-    if [[ "$SOURCE" == "ModelScope" ]]; then
+    if [[ "$RESOLVED_SOURCE" == "ModelScope" ]]; then
       (cd "$repo_path" && run "$repo_python" -c "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')")
     else
-      [[ "$SOURCE" == "HF-Mirror" ]] && export HF_ENDPOINT="https://hf-mirror.com"
+      [[ "$RESOLVED_SOURCE" == "HF-Mirror" ]] && export HF_ENDPOINT="https://hf-mirror.com"
       (cd "$repo_path" && run "$repo_python" -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')")
     fi
   fi
 }
+
+resolve_network_profile
 
 if [[ "$SYNC_REPOS" == "1" ]]; then
   args=(sync-repos)
