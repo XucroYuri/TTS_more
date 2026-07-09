@@ -31,14 +31,13 @@
 
 ---
 
-## 2. GPT-SoVITS 接入能力分析 📋
+## 2. GPT-SoVITS 接入能力分析 ✅
 
-详见 `docs/gpt-sovits-integration.md`。核心结论：
+详见 `docs/gpt-sovits-integration.md`。当前结论：
 
-- **合成（生成音频）对上游官方 GPT-SoVITS 可行**：Gradio `get_tts_wav` + `change_*_weights` 或 api-v2 `/tts` + `/set_*_weights` 都是上游端点。
-- **模型/参考音频自动发现是 fork 专属**：`on_select_ref_audio`、`update_model_choices`、api-v2 `/models`、`/models/{}/samples` 都是 fork 新增，上游没有。
-- **局域网分布式部署的短板**：远端 GPT-SoVITS 的 `logs/` 目录 TTS More 无法访问，自动发现失效；参考音频需手动输入；上游 3–10s 参考音频硬限制会阻断。
-- **方案**：要么部署 fork，要么在任意 GPT-SoVITS 构建上实现 `gpt-sovits-fork-enhancement.md` 的四个端点。
+- **主路径**：使用 TTS More 的非侵入式 `tts-more-v1` worker，直接 import 上游模型类，不要求改 GPT-SoVITS 仓库。
+- **兼容路径**：用户已有 Gradio WebUI 时仍可接入，但自动发现能力少于 worker。
+- **子仓 prompt**：`docs/agent-prompts/gpt-sovits-fork-enhancement.md` 只用于明确维护 GPT-SoVITS 子仓的场景，不是 TTS More 本仓默认任务。
 
 ---
 

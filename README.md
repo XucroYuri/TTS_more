@@ -16,7 +16,7 @@ flowchart LR
     Remote -- "回传音频" --> Backend
 ```
 
-三栏工作台：左侧服务与资源、中间台词任务表、右侧台词检视器。中英双语 i18n，中文兜底。
+主路径固定为：`剧本 → 提取台词 → 角色音色 → TTS 接入 → 生成台词 → 试听历史`。工作台左侧处理剧本，中间处理台词生成，右侧只处理当前台词的音色、参考资源和生成动作。中英双语 i18n，中文兜底。
 
 更多见 [架构文档](docs/architecture.md) 与 [安全模型](docs/security.md)。
 
@@ -74,7 +74,9 @@ make dev        # 或 scripts/start-dev.sh
 
 ### 4. 接入 TTS 服务
 
-在工作台打开 `服务与资源 → 开源接入`，选择 GPT-SoVITS / IndexTTS / CosyVoice，粘贴推理 WebUI 的 Gradio 地址（如 `http://127.0.0.1:9872`），点检测后保存即可。`127.0.0.1`/`localhost` 与局域网地址都支持；接入向导写入 `data/local/services.json`，不污染可提交模板。
+在工作台打开 `接入 → TTS 服务`，选择 GPT-SoVITS / IndexTTS / CosyVoice，粘贴服务地址并执行“检测并保存”。接入向导写入 `data/local/services.json`，不污染可提交模板。
+
+TTS More 推荐 worker-first 架构：优先接入 `tts-more-v1` worker；已有 Gradio 服务也可以作为兼容端点接入。
 
 如需克隆本地 TTS 仓库到 `repo/`：
 

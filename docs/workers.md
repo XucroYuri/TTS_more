@@ -1,6 +1,8 @@
 # TTS Worker 架构
 
-TTS More 通过**非侵入式嵌入式 worker** 接入三个开源 TTS 服务（GPT-SoVITS、IndexTTS、CosyVoice）。每个 worker 是一个 FastAPI 脚本，在上游 repo 的 Python 环境里运行，**直接 import 上游模型类**，暴露统一的 REST 契约——不改上游任何文件，不依赖 Gradio WebUI 的能力披露。
+TTS More 通过**非侵入式 worker** 接入三个开源 TTS 服务（GPT-SoVITS、IndexTTS、CosyVoice）。每个 worker 是一个 FastAPI 脚本，在上游 repo 的 Python 环境里运行，**直接 import 上游模型类**，暴露统一的 REST 契约。
+
+主路径是 worker-first：工作台只需要一个“服务地址”，不要求用户理解上游 WebUI、repo 路径或模型内部目录。已有 Gradio 服务仍可作为兼容端点接入，但不要把 Gradio 写成唯一方案。
 
 ## 架构
 
@@ -17,6 +19,13 @@ flowchart TD
 ```
 
 **为什么不用 Gradio：** Gradio API 不是为 TTS More 设计的。上游官方 GPT-SoVITS 的 Gradio 不暴露模型列表、参考音频自动绑定等能力；fork 版本有但兼容性窄。worker 直接 import 模型，暴露完整 API，对上游官方版本也能用。Gradio 作为兜底保留（用户已有上游 Gradio 仍可接入，但无自动发现）。
+
+## Agent 决策规则
+
+1. 用户要接入或排障 TTS 服务时，先确认服务地址和契约，不要求填写本机 repo 路径。
+2. 能使用 `tts-more-v1` worker 时优先使用 worker。
+3. 用户已经运行 Gradio 时，可以按兼容 contract 接入；提示能力可能少于 worker。
+4. 不把真实服务地址、模型路径、参考音频名或角色训练名写进可提交文档。
 
 ## 契约
 
