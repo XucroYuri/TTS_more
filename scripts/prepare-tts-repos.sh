@@ -10,6 +10,7 @@ SOURCE="Auto"
 RESOLVED_SOURCE=""
 NETWORK_PROFILE_JSON=""
 SOURCE_FALLBACKS=()
+PACKAGE_INDEX_FALLBACKS=()
 DEVICE="CU128"
 TARGETS="all"
 SYNC_REPOS=0
@@ -90,6 +91,7 @@ resolve_network_profile() {
     echo "[run] $APP_PY $ROOT/scripts/tts_more_deploy.py probe-network --write --source $SOURCE"
     RESOLVED_SOURCE="$([[ "$SOURCE" == "Auto" ]] && echo ModelScope || echo "$SOURCE")"
     read -ra SOURCE_FALLBACKS <<< "$(source_fallbacks "$RESOLVED_SOURCE")"
+    read -ra PACKAGE_INDEX_FALLBACKS <<< "$(package_index_fallbacks "https://mirrors.aliyun.com/pypi/simple")"
     echo "[network] source=$RESOLVED_SOURCE"
     return 0
   fi
@@ -100,6 +102,7 @@ resolve_network_profile() {
   RESOLVED_SOURCE="$(json_field_from_profile model_source)"
   [[ -z "$RESOLVED_SOURCE" ]] && RESOLVED_SOURCE="$([[ "$SOURCE" == "Auto" ]] && echo ModelScope || echo "$SOURCE")"
   read -ra SOURCE_FALLBACKS <<< "$(source_fallbacks "$RESOLVED_SOURCE")"
+  read -ra PACKAGE_INDEX_FALLBACKS <<< "$(package_index_fallbacks "$(json_field_from_profile pip_index_url)")"
   echo "[network] source=$RESOLVED_SOURCE"
 }
 
@@ -136,14 +139,63 @@ run_with_source_fallback() {
   return 1
 }
 
+package_index_fallbacks() {
+  local primary="$1" item
+  local ordered=("$primary" "https://mirrors.aliyun.com/pypi/simple" "https://pypi.org/simple")
+  local result=()
+  for item in "${ordered[@]}"; do
+    [[ -z "$item" ]] && continue
+    local exists=0
+    for seen in "${result[@]}"; do
+      [[ "$seen" == "$item" ]] && exists=1
+    done
+    [[ "$exists" == "0" ]] && result+=("$item")
+  done
+  printf '%s ' "${result[@]}"
+}
+
+set_package_index_env() {
+  local index_url="$1"
+  if [[ -n "$index_url" ]]; then
+    export PIP_INDEX_URL="$index_url"
+    export UV_INDEX_URL="$index_url"
+  else
+    unset PIP_INDEX_URL
+    unset UV_INDEX_URL
+  fi
+}
+
+run_with_package_index_fallback() {
+  local description="$1"
+  local candidate
+  shift
+  local failures=()
+  for candidate in "${PACKAGE_INDEX_FALLBACKS[@]}"; do
+    echo "[package-index] $description via $candidate"
+    set_package_index_env "$candidate"
+    if "$@" "$candidate"; then
+      return 0
+    fi
+    failures+=("$candidate")
+    echo "[warn] $description failed via $candidate" >&2
+    [[ "$DRY_RUN" == "1" ]] && return 0
+  done
+  echo "[error] $description failed for all package indexes: ${failures[*]}" >&2
+  return 1
+}
+
 ensure_venv() {
   local repo_path="$1"
   local repo_python="$repo_path/.venv/bin/python"
   if [[ ! -x "$repo_python" ]]; then
     run "$PYTHON" -m venv "$repo_path/.venv"
-    run "$repo_python" -m pip install -U pip wheel setuptools
+    run_with_package_index_fallback "base Python package upgrade" run_pip_upgrade "$repo_python"
   fi
-  echo "$repo_python"
+}
+
+run_pip_upgrade() {
+  local repo_python="$1" candidate="$2"
+  run "$repo_python" -m pip install -U pip wheel setuptools
 }
 
 prepare_gpt() {
@@ -175,18 +227,32 @@ prepare_index() {
   fi
   if [[ "$SKIP_INSTALL" != "1" ]]; then
     if [[ -n "$uv_bin" ]]; then
-      (cd "$repo_path" && run "$uv_bin" sync --all-extras)
+      (cd "$repo_path" && run_with_package_index_fallback "IndexTTS dependency install" run_uv_sync "$uv_bin")
     else
       local repo_python
-      repo_python="$(ensure_venv "$repo_path")"
-      (cd "$repo_path" && run "$repo_python" -m pip install -e .)
+      ensure_venv "$repo_path"
+      repo_python="$repo_path/.venv/bin/python"
+      (cd "$repo_path" && run_with_package_index_fallback "IndexTTS editable install" run_pip_editable "$repo_python")
     fi
   fi
   if [[ "$SKIP_DOWNLOADS" != "1" ]]; then
     local repo_python="$repo_path/.venv/bin/python"
+    if [[ ! -x "$repo_python" && -n "$uv_bin" ]]; then
+      (cd "$repo_path" && run_with_package_index_fallback "IndexTTS dependency install" run_uv_sync "$uv_bin")
+    fi
     run_with_source_fallback "IndexTTS model download" run_index_download "$repo_path" "$repo_python"
     (cd "$repo_path" && run "$repo_python" indextts/cli_v2.py config set model_dir checkpoints)
   fi
+}
+
+run_uv_sync() {
+  local uv_bin="$1" candidate="$2"
+  run "$uv_bin" sync --all-extras
+}
+
+run_pip_editable() {
+  local repo_python="$1" candidate="$2"
+  run "$repo_python" -m pip install -e .
 }
 
 run_index_download() {
@@ -206,12 +272,18 @@ prepare_cosy() {
   run git -C "$repo_path" submodule update --init --recursive
   local repo_python="$repo_path/.venv/bin/python"
   if [[ "$SKIP_INSTALL" != "1" ]]; then
-    repo_python="$(ensure_venv "$repo_path")"
-    (cd "$repo_path" && run "$repo_python" -m pip install -r requirements.txt)
+    ensure_venv "$repo_path"
+    repo_python="$repo_path/.venv/bin/python"
+    (cd "$repo_path" && run_with_package_index_fallback "CosyVoice dependency install" run_pip_requirements "$repo_python" requirements.txt)
   fi
   if [[ "$SKIP_DOWNLOADS" != "1" ]]; then
     run_with_source_fallback "CosyVoice model download" run_cosy_download "$repo_path" "$repo_python"
   fi
+}
+
+run_pip_requirements() {
+  local repo_python="$1" requirements="$2" candidate="$3"
+  run "$repo_python" -m pip install -r "$requirements"
 }
 
 run_cosy_download() {

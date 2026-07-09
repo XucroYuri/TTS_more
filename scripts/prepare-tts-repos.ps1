@@ -108,6 +108,53 @@ function Invoke-WithSourceFallback {
     throw "$Description failed for all sources: $($errors -join '; ')"
 }
 
+function Get-PackageIndexFallbacks {
+    param([string]$PrimaryIndexUrl)
+    $ordered = @($PrimaryIndexUrl, "https://mirrors.aliyun.com/pypi/simple", "https://pypi.org/simple")
+    $seen = @{}
+    $fallbacks = @()
+    foreach ($item in $ordered) {
+        if (-not $item) { continue }
+        if ($seen.ContainsKey($item)) { continue }
+        $seen[$item] = $true
+        $fallbacks += $item
+    }
+    return $fallbacks
+}
+
+function Set-PackageIndexEnvironment {
+    param([string]$IndexUrl)
+    if ($IndexUrl) {
+        $env:PIP_INDEX_URL = $IndexUrl
+        $env:UV_INDEX_URL = $IndexUrl
+    } else {
+        Remove-Item Env:\PIP_INDEX_URL -ErrorAction SilentlyContinue
+        Remove-Item Env:\UV_INDEX_URL -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-WithPackageIndexFallback {
+    param(
+        [scriptblock]$Action,
+        [string[]]$Indexes,
+        [string]$Description
+    )
+    $errors = @()
+    foreach ($candidate in $Indexes) {
+        Write-Host "[package-index] $Description via $candidate" -ForegroundColor Cyan
+        Set-PackageIndexEnvironment $candidate
+        try {
+            & $Action $candidate
+            return
+        } catch {
+            $errors += "${candidate}: $($_.Exception.Message)"
+            Write-Warning "$Description failed via ${candidate}: $($_.Exception.Message)"
+            if ($DryRun) { return }
+        }
+    }
+    throw "$Description failed for all package indexes: $($errors -join '; ')"
+}
+
 function Test-Target {
     param($Repo)
     if ($Targets -contains "all") { return $true }
@@ -131,7 +178,10 @@ function Ensure-Venv {
     $basePython = $env:TTS_MORE_BASE_PYTHON
     if (-not $basePython) { $basePython = "python" }
     Invoke-Logged $basePython @("-m", "venv", ".venv") $RepoPath
-    Invoke-Logged $venvPython @("-m", "pip", "install", "-U", "pip", "wheel", "setuptools") $RepoPath
+    Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "base Python package upgrade" -Action {
+        param($IndexUrl)
+        Invoke-Logged $venvPython @("-m", "pip", "install", "-U", "pip", "wheel", "setuptools") $RepoPath
+    }
     return $venvPython
 }
 
@@ -175,16 +225,25 @@ function Prepare-IndexTTS {
     if (-not $uv -and (Test-Path -LiteralPath $repoUv)) { $uv = $repoUv }
     if (-not $SkipInstall) {
         if ($uv) {
-            Invoke-Logged $uv @("sync", "--all-extras") $repoPath
+            Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "IndexTTS dependency install" -Action {
+                param($IndexUrl)
+                Invoke-Logged $uv @("sync", "--all-extras") $repoPath
+            }
         } else {
             $repoPython = Ensure-Venv $repoPath
-            Invoke-Logged $repoPython @("-m", "pip", "install", "-e", ".") $repoPath
+            Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "IndexTTS editable install" -Action {
+                param($IndexUrl)
+                Invoke-Logged $repoPython @("-m", "pip", "install", "-e", ".") $repoPath
+            }
         }
     }
     if (-not $SkipDownloads) {
         $repoPython = Resolve-RepoPython $repoPath
         if (!(Test-Path -LiteralPath $repoPython) -and $uv) {
-            Invoke-Logged $uv @("sync", "--all-extras") $repoPath
+            Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "IndexTTS dependency install" -Action {
+                param($IndexUrl)
+                Invoke-Logged $uv @("sync", "--all-extras") $repoPath
+            }
         }
         Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "IndexTTS model download" -Action {
             param($CandidateSource)
@@ -207,7 +266,10 @@ function Prepare-CosyVoice {
     $repoPython = Resolve-RepoPython $repoPath
     if (-not $SkipInstall) {
         $repoPython = Ensure-Venv $repoPath
-        Invoke-Logged $repoPython @("-m", "pip", "install", "-r", "requirements.txt") $repoPath
+        Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "CosyVoice dependency install" -Action {
+            param($IndexUrl)
+            Invoke-Logged $repoPython @("-m", "pip", "install", "-r", "requirements.txt") $repoPath
+        }
     }
     if (-not $SkipDownloads) {
         $repoPython = Resolve-RepoPython $repoPath
@@ -241,6 +303,7 @@ Set-NetworkProfileEnvironment $NetworkProfile
 $ResolvedSource = [string]$NetworkProfile.model_source
 if (-not $ResolvedSource) { $ResolvedSource = if ($Source -eq "Auto") { "ModelScope" } else { $Source } }
 $SourceFallbacks = Get-SourceFallbacks $ResolvedSource
+$PackageIndexFallbacks = Get-PackageIndexFallbacks ([string]$NetworkProfile.pip_index_url)
 Write-Host "[network] source=$ResolvedSource cache=$($NetworkProfile.cache_root)" -ForegroundColor Cyan
 
 $lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json

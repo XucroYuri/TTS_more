@@ -33,6 +33,7 @@ def test_bash_prepare_dry_run_does_not_require_python_for_profile_json() -> None
     echo "[run] $APP_PY $ROOT/scripts/tts_more_deploy.py probe-network --write --source $SOURCE"
     RESOLVED_SOURCE="$([[ "$SOURCE" == "Auto" ]] && echo ModelScope || echo "$SOURCE")"
     read -ra SOURCE_FALLBACKS <<< "$(source_fallbacks "$RESOLVED_SOURCE")"
+    read -ra PACKAGE_INDEX_FALLBACKS <<< "$(package_index_fallbacks "https://mirrors.aliyun.com/pypi/simple")"
     echo "[network] source=$RESOLVED_SOURCE"
     return 0
   fi"""
@@ -49,6 +50,22 @@ def test_prepare_scripts_retry_model_downloads_across_full_quality_sources() -> 
     assert "source_fallbacks()" in bash
     assert "run_with_source_fallback()" in bash
     assert 'ModelScope HF-Mirror HF' in bash
+
+
+def test_prepare_scripts_retry_dependency_installs_across_package_indexes() -> None:
+    powershell = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+    bash = (REPO_ROOT / "scripts" / "prepare-tts-repos.sh").read_text(encoding="utf-8")
+
+    assert "Get-PackageIndexFallbacks" in powershell
+    assert "Invoke-WithPackageIndexFallback" in powershell
+    assert "PIP_INDEX_URL" in powershell
+    assert "UV_INDEX_URL" in powershell
+    assert "https://pypi.org/simple" in powershell
+    assert "package_index_fallbacks()" in bash
+    assert "run_with_package_index_fallback()" in bash
+    assert "PIP_INDEX_URL" in bash
+    assert "UV_INDEX_URL" in bash
+    assert "https://pypi.org/simple" in bash
 
 
 def test_prepare_scripts_do_not_default_to_reduced_models() -> None:

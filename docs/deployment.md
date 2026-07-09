@@ -72,7 +72,7 @@ bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --source ModelScope
 
 常用参数：
 
-- `Source`: `ModelScope`, `HF`, `HF-Mirror`
+- `Source`: `Auto`, `ModelScope`, `HF`, `HF-Mirror`；推荐保持默认 `Auto`
 - `Device`: Windows 支持 `CU128`, `CU126`, `CPU`；Linux 还可用 `ROCM`；macOS 可用 `MPS` 或 `CPU`
 - `Targets`: `all`, `gpt-sovits`, `indextts`, `cosyvoice`, `main`, `dev`, `proplus-hc-dev`, 或具体 `service_id`
 - `SkipInstall` / `--skip-install`：只下载模型或渲染服务

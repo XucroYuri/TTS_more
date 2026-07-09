@@ -543,6 +543,34 @@ def test_probe_url_rejects_client_error_status(monkeypatch: pytest.MonkeyPatch) 
     assert result["ok"] is False
 
 
+def test_probe_url_falls_back_to_get_when_head_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    methods: list[str] = []
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        methods.append(request.get_method())
+        if request.get_method() == "HEAD":
+            raise deploy.URLError("head refused")
+        return FakeResponse()
+
+    monkeypatch.setattr(deploy, "urlopen", fake_urlopen)
+
+    result = deploy._probe_url("https://example.invalid", 1.0)
+
+    assert result["ok"] is True
+    assert methods == ["HEAD", "GET"]
+
+
 def test_resolve_network_profile_falls_back_to_global_when_domestic_fails(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
@@ -628,6 +656,40 @@ def test_probe_network_without_write_does_not_create_profile_json(tmp_path: Path
 
     assert profile["model_source"] == "ModelScope"
     assert not (tmp_path / "data" / "local" / "network-profile.json").exists()
+
+
+def test_written_auto_network_profile_is_reused_without_reprobe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    for key in (
+        "TTS_MORE_MODEL_SOURCE",
+        "TTS_MORE_PIP_INDEX_URL",
+        "TTS_MORE_HF_ENDPOINT",
+        "TTS_MORE_EXTRA_PIP_INDEX_URL",
+        "TTS_MORE_CACHE_ROOT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    calls: list[str] = []
+
+    def fake_probe(url: str, timeout_seconds: float) -> dict[str, object]:
+        calls.append(url)
+        return {"url": url, "ok": True, "latency_ms": 10, "error": ""}
+
+    monkeypatch.setattr(deploy, "_probe_url", fake_probe)
+
+    deploy.probe_network(tmp_path, write=True, force=True)
+    first_probe_count = len(calls)
+
+    def fail_probe(url: str, timeout_seconds: float) -> dict[str, object]:
+        raise AssertionError("cached Auto profile should be reused without probing")
+
+    monkeypatch.setattr(deploy, "_probe_url", fail_probe)
+    profile = deploy.resolve_network_profile(tmp_path)
+
+    assert profile["model_source"] == "ModelScope"
+    assert len(calls) == first_probe_count
 
 
 def test_doctor_reports_network_profile_and_cache_paths(tmp_path: Path) -> None:

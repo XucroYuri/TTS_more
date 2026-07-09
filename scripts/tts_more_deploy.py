@@ -92,7 +92,8 @@ def _isoformat(value: datetime) -> str:
 
 
 def _cache_paths(root: Path, environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    environ = environ or os.environ
+    if environ is None:
+        environ = os.environ
     raw_root = environ.get("TTS_MORE_CACHE_ROOT", "")
     cache_root = Path(raw_root) if raw_root else root / DEFAULT_CACHE_RELATIVE_PATH
     if not cache_root.is_absolute():
@@ -118,16 +119,24 @@ def _cache_paths(root: Path, environ: Mapping[str, str] | None = None) -> dict[s
 
 def _probe_url(url: str, timeout_seconds: float) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
-    request = Request(url, method="HEAD", headers={"User-Agent": "tts-more-deploy/1"})
-    try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            status = int(getattr(response, "status", 200))
-        latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-        return {"url": url, "ok": 200 <= status < 400, "latency_ms": latency_ms, "error": ""}
-    except Exception as exc:
-        latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
-        message = str(exc.reason) if isinstance(exc, URLError) and getattr(exc, "reason", None) else str(exc)
-        return {"url": url, "ok": False, "latency_ms": latency_ms, "error": message}
+    last_error = ""
+    for method in ("HEAD", "GET"):
+        headers = {"User-Agent": "tts-more-deploy/1"}
+        if method == "GET":
+            headers["Range"] = "bytes=0-0"
+        request = Request(url, method=method, headers=headers)
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                status = int(getattr(response, "status", 200))
+            latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            if 200 <= status < 400:
+                return {"url": url, "ok": True, "latency_ms": latency_ms, "error": ""}
+            last_error = f"{method} returned HTTP {status}"
+        except Exception as exc:
+            message = str(exc.reason) if isinstance(exc, URLError) and getattr(exc, "reason", None) else str(exc)
+            last_error = f"{method}: {message}"
+    latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+    return {"url": url, "ok": False, "latency_ms": latency_ms, "error": last_error}
 
 
 def _candidate_allowed(candidate: dict[str, str], mode: str) -> bool:
@@ -262,6 +271,7 @@ def _profile_from_choices(
     probes: dict[str, dict[str, Any]],
     ttl_hours: float,
     environ: Mapping[str, str],
+    request_context: Mapping[str, str],
 ) -> dict[str, Any]:
     now = _utc_now()
     cache_paths = _cache_paths(root, environ)
@@ -281,7 +291,7 @@ def _profile_from_choices(
         "pytorch_index_strategy": "official",
         "cache_root": cache_paths["cache_root"],
         "cache_paths": cache_paths,
-        "request_context": _network_profile_request_context(root, mode, environ.get("TTS_MORE_MODEL_SOURCE", ""), environ),
+        "request_context": dict(request_context),
         "created_at": _isoformat(now),
         "expires_at": _isoformat(now + timedelta(hours=ttl_hours)),
         "probes": list(probes.values()),
@@ -301,7 +311,8 @@ def resolve_network_profile(
     probe_func: Callable[[str, float], dict[str, Any]] | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    environ = environ or os.environ
+    if environ is None:
+        environ = os.environ
     mode = environ.get("TTS_MORE_NETWORK_PROFILE", mode).lower()
     source = environ.get("TTS_MORE_MODEL_SOURCE", source)
     if mode not in {"auto", "china", "global"}:
@@ -328,7 +339,8 @@ def resolve_network_profile(
         pip_candidate=pip_candidate,
         probes=probes,
         ttl_hours=ttl_hours,
-        environ={**environ, "TTS_MORE_MODEL_SOURCE": source},
+        environ=environ,
+        request_context=request_context,
     )
     return profile
 
