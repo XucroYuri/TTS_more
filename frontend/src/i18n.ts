@@ -36,7 +36,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       roleLibrary: "角色",
       resourceQueue: "队列",
       services: "服务",
-      ttsConfig: "接入",
+      ttsConfig: "TTS",
       llmConfig: "LLM"
     },
     audioInput: {
@@ -801,7 +801,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       roleLibrary: "Roles",
       resourceQueue: "Queue",
       services: "Services",
-      ttsConfig: "Setup",
+      ttsConfig: "TTS",
       llmConfig: "LLM"
     },
     audioInput: {

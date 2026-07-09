@@ -58,7 +58,7 @@ describe("i18n configuration", () => {
     expect(tText(resources["en-US"], "characters.bindToProjectRole")).toBe("Use in this project");
     expect(tText(resources["en-US"], "services.ttsAccessTitle")).toBe("Add TTS service");
     expect(tText(resources["en-US"], "services.openSourceDetect")).toBe("Test connection");
-    expect(tText(resources["en-US"], "topbar.ttsConfig")).toBe("Setup");
+    expect(tText(resources["en-US"], "topbar.ttsConfig")).toBe("TTS");
     expect(tText(resources["en-US"], "services.llmApiTitle")).toBe("Script parser");
     expect(tText(resources["en-US"], "parser.advancedConfig")).toBe("Advanced services");
     expect(tText(resources["en-US"], "services.openSourceDetectAndSave")).toBe("Detect and save");
