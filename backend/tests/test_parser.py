@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from app.parser import (
+    AnthropicProvider,
     MultiProviderParser,
     OpenAICompatibleProvider,
     ParsedScriptDraft,
@@ -424,6 +425,90 @@ def test_parser_provider_record_persists_adapter(tmp_path: Path) -> None:
 
     assert loaded[0].adapter == "anthropic"
     assert '"adapter": "anthropic"' in config_path.read_text(encoding="utf-8")
+
+
+def test_build_parser_provider_uses_anthropic_adapter() -> None:
+    from app.parser import AnthropicProvider, build_parser_provider
+
+    provider = build_parser_provider(
+        ParserProviderConfig(
+            name="Anthropic",
+            base_url="https://api.anthropic.com",
+            api_key_env="ANTHROPIC_API_KEY",
+            model="claude-fable-5",
+            adapter="anthropic",
+        )
+    )
+
+    assert isinstance(provider, AnthropicProvider)
+
+
+def test_anthropic_provider_posts_messages_tool_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_TEST_KEY", "sk-ant-test")
+    calls: list[dict[str, object]] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "emit_tts_parse",
+                        "input": {
+                            "characters": [{"id": "narrator", "name": "NARRATOR"}],
+                            "lines": [
+                                {
+                                    "id": "l001",
+                                    "character_id": "narrator",
+                                    "text": "Hello.",
+                                    "note": "calm",
+                                    "source_text": "Hello.",
+                                    "source_excerpt": "**NARRATOR**\n(calm)\nHello.",
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            self.timeout = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            calls.append({"url": url, "headers": headers, "json": json})
+            return FakeResponse()
+
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
+    provider = AnthropicProvider(
+        ParserProviderConfig(
+            name="anthropic-test",
+            base_url="https://api.anthropic.com",
+            api_key_env="ANTHROPIC_TEST_KEY",
+            model="claude-fable-5",
+            adapter="anthropic",
+        )
+    )
+
+    draft = provider.parse("**NARRATOR**\n(calm)\nHello.")
+
+    assert draft.lines[0].text == "Hello."
+    assert calls[0]["url"] == "https://api.anthropic.com/v1/messages"
+    assert calls[0]["headers"]["x-api-key"] == "sk-ant-test"
+    assert calls[0]["headers"]["anthropic-version"] == "2023-06-01"
+    payload = calls[0]["json"]
+    assert payload["model"] == "claude-fable-5"
+    assert payload["tool_choice"] == {"type": "tool", "name": "emit_tts_parse"}
+    assert payload["tools"][0]["name"] == "emit_tts_parse"
 
 
 def test_default_parser_providers_include_agentic_presets_and_exclude_removed_providers() -> None:

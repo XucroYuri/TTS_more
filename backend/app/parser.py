@@ -29,10 +29,18 @@ class ParsedScriptDraft(BaseModel):
     source_evidence: dict[str, LineSourceEvidence] = Field(default_factory=dict, exclude=True)
 
 
+class ParserProbeResult(BaseModel):
+    draft: ParsedScriptDraft
+    content_preview: str
+
+
 class ParserProvider(Protocol):
     name: str
 
     def parse(self, text: str) -> ParsedScriptDraft:
+        ...
+
+    def probe(self, api_key: str) -> ParserProbeResult:
         ...
 
 
@@ -65,6 +73,16 @@ def chat_completions_url(base_url: str) -> str:
     if path.endswith("/v1"):
         return f"{normalized}/chat/completions"
     return f"{normalized}/v1/chat/completions"
+
+
+def anthropic_messages_url(base_url: str) -> str:
+    normalized = base_url.strip().rstrip("/")
+    path = urlparse(normalized).path.rstrip("/").lower()
+    if path.endswith("/v1/messages"):
+        return normalized
+    if path.endswith("/v1"):
+        return f"{normalized}/messages"
+    return f"{normalized}/v1/messages"
 
 
 _LINE_RE = re.compile(r"^\s*(?P<speaker>[^:：\n（(]+?)\s*(?:[（(](?P<note>[^）)]*)[）)])?\s*[:：]\s*(?P<text>.+?)\s*$")
@@ -398,6 +416,14 @@ class OpenAICompatibleProvider:
                 draft.warnings = [f"LLM output repaired after quality failure: {first_error}", *draft.warnings]
                 return draft
 
+    def probe(self, api_key: str) -> ParserProbeResult:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        url = chat_completions_url(self.config.base_url)
+        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            decoded = self._post_json(client, url, headers, parser_contract_probe_messages())
+        draft = self.verifier.verify(_CONTRACT_PROBE_SCRIPT, _draft_from_provider_payload(self.name, decoded))
+        return ParserProbeResult(draft=draft, content_preview=json.dumps(decoded, ensure_ascii=False)[:120])
+
     def _post_json(
         self,
         client: httpx.Client,
@@ -417,6 +443,106 @@ class OpenAICompatibleProvider:
         return _decode_json_content(content)
 
 
+_ANTHROPIC_TOOL = {
+    "name": "emit_tts_parse",
+    "description": "Emit the final TTS dialogue extraction JSON.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "characters": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "name": {"type": "string"},
+                    },
+                    "required": ["id", "name"],
+                },
+            },
+            "lines": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "character_id": {"type": "string"},
+                        "text": {"type": "string"},
+                        "note": {"type": "string"},
+                        "language": {"type": "string"},
+                        "source_text": {"type": "string"},
+                        "source_excerpt": {"type": "string"},
+                    },
+                    "required": ["id", "character_id", "text", "source_text", "source_excerpt"],
+                },
+            },
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["characters", "lines"],
+    },
+}
+
+
+class AnthropicProvider:
+    def __init__(self, config: ParserProviderConfig, verifier: ScriptParseVerifier | None = None) -> None:
+        self.config = config
+        self.name = config.name
+        self.verifier = verifier or ScriptParseVerifier()
+
+    def parse(self, text: str) -> ParsedScriptDraft:
+        if not self.config.enabled:
+            raise ParserProviderUnavailable(f"provider {self.name} is disabled")
+        api_key = os.environ.get(self.config.api_key_env)
+        if not api_key:
+            raise ParserProviderUnavailable(f"provider {self.name} missing env {self.config.api_key_env}")
+        return self._parse_with_key(text, api_key)
+
+    def probe(self, api_key: str) -> ParserProbeResult:
+        draft = self._parse_with_key(_CONTRACT_PROBE_SCRIPT, api_key)
+        return ParserProbeResult(draft=draft, content_preview=json.dumps(draft.model_dump(mode="json"), ensure_ascii=False)[:120])
+
+    def _parse_with_key(self, text: str, api_key: str) -> ParsedScriptDraft:
+        decoded = self._post_json(api_key, text)
+        try:
+            draft = _draft_from_provider_payload(self.name, decoded)
+            return self.verifier.verify(text, draft)
+        except ParserQualityError as first_error:
+            repaired = self._post_json(
+                api_key,
+                f"{_REPAIR_PROMPT}\n\nQuality errors:\n{first_error}\n\nPrevious JSON:\n```json\n{json.dumps(decoded, ensure_ascii=False)}\n```\n\nOriginal script:\n```text\n{text}\n```",
+            )
+            draft = _draft_from_provider_payload(self.name, repaired)
+            self.verifier.verify(text, draft)
+            draft.warnings = [f"LLM output repaired after quality failure: {first_error}", *draft.warnings]
+            return draft
+
+    def _post_json(self, api_key: str, text: str) -> dict[str, Any]:
+        payload = {
+            "model": self.config.model,
+            "max_tokens": 4096,
+            "temperature": 0,
+            "system": _SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": f"Script:\n```text\n{text}\n```"}],
+            "tools": [_ANTHROPIC_TOOL],
+            "tool_choice": {"type": "tool", "name": "emit_tts_parse"},
+        }
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            response = client.post(anthropic_messages_url(self.config.base_url), headers=headers, json=payload)
+            response.raise_for_status()
+            return _decode_anthropic_tool_input(response.json())
+
+
+def build_parser_provider(config: ParserProviderConfig, verifier: ScriptParseVerifier | None = None) -> ParserProvider:
+    if config.adapter == "anthropic":
+        return AnthropicProvider(config, verifier)
+    return OpenAICompatibleProvider(config, verifier)
+
+
 def _decode_json_content(content: str) -> dict[str, Any]:
     try:
         decoded = json.loads(content)
@@ -430,6 +556,15 @@ def _decode_json_content(content: str) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise ParserQualityError("parser response must be a JSON object")
     return decoded
+
+
+def _decode_anthropic_tool_input(payload: dict[str, Any]) -> dict[str, Any]:
+    for item in payload.get("content", []):
+        if isinstance(item, dict) and item.get("type") == "tool_use" and item.get("name") == "emit_tts_parse":
+            tool_input = item.get("input")
+            if isinstance(tool_input, dict):
+                return tool_input
+    raise ParserQualityError("anthropic response did not include emit_tts_parse tool input")
 
 
 def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> ParsedScriptDraft:

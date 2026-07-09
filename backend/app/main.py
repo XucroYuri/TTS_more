@@ -21,7 +21,7 @@ from app.auth import auth_status_endpoint, install_token_middleware
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
-from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, chat_completions_url, parser_contract_probe_messages, validate_parser_contract_response
+from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider, chat_completions_url, parser_contract_probe_messages, validate_parser_contract_response
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
 from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
@@ -1164,15 +1164,15 @@ def create_app(
 
 
 def _build_parser(config_path: Path | None = None) -> MultiProviderParser:
-    providers: list[OpenAICompatibleProvider] = []
+    providers = []
     if config_path is not None:
         for item in load_parser_providers(config_path):
-            providers.append(OpenAICompatibleProvider(ParserProviderConfig.model_validate(item.model_dump(mode="python"))))
+            providers.append(build_parser_provider(ParserProviderConfig.model_validate(item.model_dump(mode="python"))))
     else:
         raw = os.environ.get("TTS_MORE_PARSER_PROVIDERS")
         if raw:
             for item in json.loads(raw):
-                providers.append(OpenAICompatibleProvider(ParserProviderConfig.model_validate(item)))
+                providers.append(build_parser_provider(ParserProviderConfig.model_validate(item)))
     return MultiProviderParser(providers)
 
 
