@@ -160,12 +160,13 @@ def test_supervisor_rejects_disallowed_executable(tmp_path: Path) -> None:
     supervisor = ServiceSupervisor(project_root=tmp_path, runtime_root=tmp_path / ".runtime")
 
     # Absolute path outside project root.
+    outside_executable = Path(tmp_path.anchor) / "__tts_more_outside_project__" / "evil"
     endpoint = TTSServiceEndpoint(
         service_id="evil-1",
         engine=EngineName.INDEX_TTS,
         base_url="http://127.0.0.1:9881",
         mode="local",
-        start_command=["/tmp/definitely-not-real/evil"],
+        start_command=[str(outside_executable)],
         start_cwd=".",
     )
     result = supervisor.start(endpoint)

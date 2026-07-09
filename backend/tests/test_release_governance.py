@@ -60,12 +60,11 @@ def test_local_runtime_paths_are_gitignored() -> None:
     result = subprocess.run(
         ["git", "check-ignore", "--stdin"],
         cwd=repo_root,
-        input="\n".join(runtime_paths) + "\n",
+        input=("\n".join(runtime_paths) + "\n").encode("utf-8"),
         capture_output=True,
-        text=True,
         check=False,
     )
-    ignored_paths = set(result.stdout.splitlines())
+    ignored_paths = set(result.stdout.decode("utf-8").splitlines())
 
     assert result.returncode == 0
     assert ignored_paths == set(runtime_paths)

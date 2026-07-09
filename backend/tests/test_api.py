@@ -2082,7 +2082,7 @@ def test_character_library_logs_candidates_merge_weights_refs_and_sidecar_text(t
         ],
     )
 
-    response = client.get("/api/character-library/logs-candidates")
+    response = client.get("/api/character-library/logs-candidates?include_gradio=false")
 
     assert response.status_code == 200
     candidate = response.json()["candidates"][0]
