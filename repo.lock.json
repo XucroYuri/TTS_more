@@ -13,6 +13,13 @@
       "remote": "https://github.com/XucroYuri/index-tts.git",
       "branch": "main",
       "commit": "7264ce2a9a0924becb6b8da3f60725f7663de089"
+    },
+    {
+      "name": "CosyVoice",
+      "path": "repo/CosyVoice",
+      "remote": "https://github.com/XucroYuri/CosyVoice.git",
+      "branch": "main",
+      "commit": null
     }
   ]
 }

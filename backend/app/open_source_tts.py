@@ -46,9 +46,9 @@ CATALOG: list[dict[str, Any]] = [
         "display_name": "GPT-SoVITS",
         "clone_url": "https://github.com/XucroYuri/GPT-SoVITS.git",
         "default_repo_path": "repo/GPT-SoVITS",
-        "default_base_url": "http://127.0.0.1:9872",
-        "default_ports": [9872],
-        "api_contracts": ["gradio-gpt-sovits-webui"],
+        "default_base_url": "http://127.0.0.1:9880",
+        "default_ports": [9880, 9872],
+        "api_contracts": ["tts-more-v1", "gradio-gpt-sovits-webui"],
         "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice", "gpt-weights", "sovits-weights", "wav_output", "gradio_webui"],
         "priority": 10,
         "resource_group": "gradio-gpu-0",
@@ -60,9 +60,9 @@ CATALOG: list[dict[str, Any]] = [
         "display_name": "IndexTTS",
         "clone_url": "https://github.com/XucroYuri/index-tts.git",
         "default_repo_path": "repo/index-tts",
-        "default_base_url": "http://127.0.0.1:7860",
-        "default_ports": [7860],
-        "api_contracts": ["gradio-indextts2-webui"],
+        "default_base_url": "http://127.0.0.1:9881",
+        "default_ports": [9881, 7860],
+        "api_contracts": ["tts-more-v1", "gradio-indextts2-webui"],
         "capabilities": ["tts", "reference_audio_voice", "emotion_text", "emotion_audio", "wav_output", "gradio_webui"],
         "priority": 20,
         "resource_group": "gradio-gpu-0",
@@ -74,9 +74,9 @@ CATALOG: list[dict[str, Any]] = [
         "display_name": "CosyVoice",
         "clone_url": "https://github.com/XucroYuri/CosyVoice.git",
         "default_repo_path": "repo/CosyVoice",
-        "default_base_url": "http://127.0.0.1:50000",
-        "default_ports": [50000],
-        "api_contracts": ["gradio-cosyvoice-webui"],
+        "default_base_url": "http://127.0.0.1:9882",
+        "default_ports": [9882, 50000],
+        "api_contracts": ["tts-more-v1", "gradio-cosyvoice-webui"],
         "capabilities": ["tts", "reference_audio_voice", "zero_shot_voice", "cross_lingual_voice", "style_instruction", "wav_output", "gradio_webui"],
         "priority": 30,
         "resource_group": "gradio-gpu-0",
@@ -174,12 +174,23 @@ def _catalog_item(provider_type: OpenSourceProvider) -> dict[str, Any]:
 
 
 def _gradio_contract(catalog_item: dict[str, Any], requested_contract: str | None = None) -> str:
-    for contract in catalog_item["api_contracts"]:
-        if str(contract).startswith("gradio-"):
-            return str(contract)
+    """Resolve the API contract for a provider.
+
+    Preference order: the requested contract if it matches a declared one,
+    then the non-invasive tts-more-v1 worker contract (primary path), then any
+    gradio- contract (fallback for users running the upstream Gradio WebUI).
+    """
+    declared = [str(c) for c in catalog_item["api_contracts"]]
+    if requested_contract and requested_contract in declared:
+        return requested_contract
+    if "tts-more-v1" in declared:
+        return "tts-more-v1"
+    for contract in declared:
+        if contract.startswith("gradio-"):
+            return contract
     if requested_contract and requested_contract.startswith("gradio-"):
         return requested_contract
-    raise ValueError(f"{catalog_item['provider_type']} does not declare a Gradio contract")
+    raise ValueError(f"{catalog_item['provider_type']} does not declare a contract")
 
 
 def _resolve_path(raw_path: str | None, project_root: Path) -> Path:

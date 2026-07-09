@@ -1173,10 +1173,12 @@ def test_open_source_tts_catalog_lists_core_providers_in_priority_order(tmp_path
     assert [item["provider_type"] for item in providers] == ["gpt-sovits", "indextts", "cosyvoice"]
     assert providers[0]["clone_url"] == "https://github.com/XucroYuri/GPT-SoVITS.git"
     assert providers[1]["default_repo_path"].endswith("repo/index-tts")
-    assert providers[0]["default_base_url"] == "http://127.0.0.1:9872"
-    assert providers[0]["api_contracts"] == ["gradio-gpt-sovits-webui"]
-    assert providers[1]["api_contracts"] == ["gradio-indextts2-webui"]
-    assert providers[2]["api_contracts"] == ["gradio-cosyvoice-webui"]
+    # The worker (tts-more-v1) is now the primary contract and default port;
+    # the Gradio contract remains as a fallback.
+    assert providers[0]["default_base_url"] == "http://127.0.0.1:9880"
+    assert providers[0]["api_contracts"] == ["tts-more-v1", "gradio-gpt-sovits-webui"]
+    assert providers[1]["api_contracts"] == ["tts-more-v1", "gradio-indextts2-webui"]
+    assert providers[2]["api_contracts"] == ["tts-more-v1", "gradio-cosyvoice-webui"]
     assert providers[2]["priority"] == 30
 
 

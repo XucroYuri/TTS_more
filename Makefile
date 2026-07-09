@@ -11,7 +11,7 @@ ifeq ($(OS),Windows_NT)
 	BACKEND_PY := $(ROOT)/.venv/Scripts/python.exe
 endif
 
-.PHONY: help install install-backend install-frontend dev test test-backend test-frontend build lint clean
+.PHONY: help install install-backend install-frontend dev workers test test-backend test-frontend build lint clean
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -35,6 +35,13 @@ dev: ## Start backend and frontend (cross-platform)
 		powershell -ExecutionPolicy Bypass -File scripts/start-dev.ps1
 	@else
 		scripts/start-dev.sh
+	@endif
+
+workers: ## Start the three non-invasive TTS workers (GPT-SoVITS/IndexTTS/CosyVoice)
+	@ifeq ($(OS),Windows_NT)
+		powershell -ExecutionPolicy Bypass -File scripts/start-service-workers.ps1
+	@else
+		scripts/start-service-workers.sh
 	@endif
 
 test: test-backend test-frontend ## Run all tests
