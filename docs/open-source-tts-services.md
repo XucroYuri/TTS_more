@@ -39,6 +39,8 @@ python scripts/tts_more_deploy.py render-services --profile local-all --output d
 
 `repo.lock.json` 会拉取 GPT-SoVITS `main`、`dev`、`xucroyuri/proplus-hc-dev` 三个分支，以及 IndexTTS、CosyVoice。详见 [部署方案](deployment.md)。
 
+本地 worker 部署 profile 和源选择彼此独立。`app-only`、`worker-node`、`local-all` 都可以复用同一份生成的 `data/local/network-profile.json`；也可以让每台机器各自运行一次 `probe-network`，让包索引和模型端点和它自己的网络环境对齐。
+
 ## 接入方式
 
 首选接入方式是 TTS More worker 的 `tts-more-v1` 契约：

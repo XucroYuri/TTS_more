@@ -80,15 +80,17 @@ make dev        # 或 scripts/start-dev.sh
 
 ```powershell
 .\scripts\tts-more.ps1 sync-repos --clean
-.\scripts\prepare-tts-repos.ps1 -Source ModelScope -Device CU128
+.\scripts\prepare-tts-repos.ps1 -SyncRepos -CleanRepos -Device CU128
 ```
 
 macOS/Linux：
 
 ```bash
 ./scripts/tts-more.sh sync-repos --clean
-bash scripts/prepare-tts-repos.sh --source ModelScope --device CPU
+bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --device CU128
 ```
+
+准备脚本默认走 `Auto`：先跑 `probe-network`，优先选择中国大陆可达且健康的源，例如 ModelScope 或 HF Mirror，必要时再回退到全球 Hugging Face / PyPI 路线。默认安装只准备 full-quality baseline models，quantized、distilled、simplified、small、low-memory 这些都只是手动 manual 的高级选项。
 
 详细拓扑、远端 worker、离线缓存和模型下载策略见 [部署方案](docs/deployment.md)。
 

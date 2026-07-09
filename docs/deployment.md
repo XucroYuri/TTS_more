@@ -16,6 +16,26 @@
 - `app-only`：只跑 TTS More 应用，`services.json` 指向局域网或云端 worker。
 - `worker-node`：只在某台 CPU/GPU 机器上准备 repo、模型和 worker，不要求启动前端；渲染出来仍是该机器本地可管理的 worker 配置，通常配合 `--service-ids` 只选择本节点负责的服务。
 
+## Network Auto Mode
+
+`Source` 默认是 `Auto`。包装脚本会先执行：
+
+```text
+scripts/tts_more_deploy.py probe-network --write --source Auto
+```
+
+生成的网络 profile 会写入 `data/local/network-profile.json`，并已加入 git ignore。中国大陆网络会优先尝试国内可达的源；如果失败，再回退到全球 Hugging Face 和 PyPI 路线。
+
+覆盖行为：
+
+- `TTS_MORE_NETWORK_PROFILE=auto|china|global`
+- `TTS_MORE_MODEL_SOURCE=Auto|ModelScope|HF-Mirror|HF`
+- `TTS_MORE_CACHE_ROOT=data/cache`
+- `TTS_MORE_PIP_INDEX_URL=<custom pip index>`
+- `TTS_MORE_HF_ENDPOINT=<custom Hugging Face endpoint>`
+
+推荐安装器只准备 full-quality baseline models，不会自动选 quantized、distilled、simplified、small 或 low-memory 模型；这些都保留为 manual 高级选项。
+
 ## 清理并重拉 repo
 
 Windows：

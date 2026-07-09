@@ -36,3 +36,21 @@ def test_prepare_scripts_do_not_default_to_reduced_models() -> None:
 
     forbidden = ["quantized", "distilled", "small", "low-memory", "int8", "fp8", "q4", "q8"]
     assert not any(token in combined for token in forbidden)
+
+
+def test_docs_describe_auto_source_cache_and_full_quality_policy() -> None:
+    docs = "\n".join(
+        [
+            (REPO_ROOT / "README.md").read_text(encoding="utf-8"),
+            (REPO_ROOT / "docs" / "deployment.md").read_text(encoding="utf-8"),
+            (REPO_ROOT / "docs" / "open-source-tts-services.md").read_text(encoding="utf-8"),
+            (REPO_ROOT / ".env.example").read_text(encoding="utf-8"),
+        ]
+    )
+
+    assert "probe-network" in docs
+    assert "TTS_MORE_NETWORK_PROFILE" in docs
+    assert "TTS_MORE_MODEL_SOURCE" in docs
+    assert "TTS_MORE_CACHE_ROOT" in docs
+    assert "full-quality" in docs
+    assert "manual" in docs
