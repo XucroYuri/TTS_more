@@ -31,16 +31,28 @@ class ParserProvidersUpdate(BaseModel):
 
 
 def default_parser_providers() -> list[ParserProviderRecord]:
+    """Default OpenAI-compatible LLM parser providers.
+
+    Ordered by ``priority`` (lower = tried first). Mainstream providers come
+    first; the project-specific 开物基模 (KWJM) is kept last as a fallback.
+    All are disabled by default — the user enables the ones they have a key
+    for. Every entry must support the OpenAI /v1/chat/completions contract
+    with ``response_format: {"type": "json_object"}``.
+    """
     return [
-        ParserProviderRecord(
-            name="开物基模",
-            base_url="https://kwjm.com",
-            api_key_env="KWJM_API_KEY",
-            model="gpt-5.5",
-            enabled=False,
-            timeout_seconds=45.0,
-            priority=10,
-        )
+        ParserProviderRecord(name="OpenAI", base_url="https://api.openai.com/v1", api_key_env="OPENAI_API_KEY", model="gpt-4o-mini", enabled=False, timeout_seconds=45.0, priority=10),
+        ParserProviderRecord(name="智谱 GLM", base_url="https://open.bigmodel.cn/api/paas/v4", api_key_env="ZHIPU_API_KEY", model="glm-4-flash", enabled=False, timeout_seconds=45.0, priority=20),
+        ParserProviderRecord(name="DeepSeek", base_url="https://api.deepseek.com/v1", api_key_env="DEEPSEEK_API_KEY", model="deepseek-chat", enabled=False, timeout_seconds=45.0, priority=30),
+        ParserProviderRecord(name="阿里通义", base_url="https://dashscope.aliyuncs.com/compatible-mode/v1", api_key_env="DASHSCOPE_API_KEY", model="qwen-turbo", enabled=False, timeout_seconds=45.0, priority=40),
+        ParserProviderRecord(name="月之暗面", base_url="https://api.moonshot.cn/v1", api_key_env="MOONSHOT_API_KEY", model="moonshot-v1-8k", enabled=False, timeout_seconds=45.0, priority=50),
+        ParserProviderRecord(name="百度千帆", base_url="https://qianfan.baidubce.com/v2", api_key_env="QIANFAN_API_KEY", model="ernie-speed-8k", enabled=False, timeout_seconds=45.0, priority=60),
+        ParserProviderRecord(name="字节豆包", base_url="https://ark.cn-beijing.volces.com/api/v3", api_key_env="ARK_API_KEY", model="doubao-lite-4k", enabled=False, timeout_seconds=45.0, priority=70),
+        ParserProviderRecord(name="零一万物", base_url="https://api.lingyiwanwu.com/v1", api_key_env="YI_API_KEY", model="yi-large", enabled=False, timeout_seconds=45.0, priority=80),
+        ParserProviderRecord(name="xAI Grok", base_url="https://api.x.ai/v1", api_key_env="XAI_API_KEY", model="grok-2-latest", enabled=False, timeout_seconds=45.0, priority=90),
+        ParserProviderRecord(name="Mistral", base_url="https://api.mistral.ai/v1", api_key_env="MISTRAL_API_KEY", model="mistral-small-latest", enabled=False, timeout_seconds=45.0, priority=100),
+        ParserProviderRecord(name="Groq", base_url="https://api.groq.com/openai/v1", api_key_env="GROQ_API_KEY", model="llama-3.1-8b-instant", enabled=False, timeout_seconds=45.0, priority=110),
+        # Project-specific provider, kept last as a fallback.
+        ParserProviderRecord(name="开物基模", base_url="https://kwjm.com", api_key_env="KWJM_API_KEY", model="gpt-5.5", enabled=False, timeout_seconds=45.0, priority=200),
     ]
 
 

@@ -310,3 +310,24 @@ def test_chat_completions_url_normalizes_kwjm_root_and_legacy_v1_base() -> None:
     assert chat_completions_url("https://kwjm.com") == "https://kwjm.com/v1/chat/completions"
     assert chat_completions_url("https://example.invalid/v1") == "https://example.invalid/v1/chat/completions"
     assert chat_completions_url("https://example.invalid/v1/chat/completions") == "https://example.invalid/v1/chat/completions"
+
+
+def test_default_parser_providers_include_mainstream_and_kwjm_last() -> None:
+    from app.parser_config import default_parser_providers
+
+    providers = default_parser_providers()
+    names = [p.name for p in providers]
+    # At least 12 providers (11 mainstream + 开物基模).
+    assert len(providers) >= 12
+    # Mainstream providers present.
+    assert "OpenAI" in names
+    assert "DeepSeek" in names
+    assert "智谱 GLM" in names
+    assert "Groq" in names
+    # 开物基模 is last (highest priority = tried last as fallback).
+    assert names[-1] == "开物基模"
+    assert providers[-1].priority == max(p.priority for p in providers)
+    # All disabled by default (user opts in by setting a key).
+    assert all(p.enabled is False for p in providers)
+    # All are OpenAI-compatible (base_url is http/https).
+    assert all(p.base_url.startswith(("http://", "https://")) for p in providers)

@@ -50,3 +50,4 @@ data/projects/*/audio/
 *.pyo
 *.log
 *.egg-info/
+.zcode/

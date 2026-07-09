@@ -33,12 +33,12 @@ describe("parser provider config helpers", () => {
     expect(parserProviderKeyState({ ...provider, key_configured: false })).toBe("missing");
   });
 
-  it("creates new parser providers from the kwjm gpt-5.5 template", () => {
+  it("creates new parser providers from a generic openai-compatible template", () => {
     expect(createDefaultParserProviderDraft(2)).toEqual({
-      name: "开物基模",
-      base_url: "https://kwjm.com",
-      api_key_env: "KWJM_API_KEY",
-      model: "gpt-5.5",
+      name: "",
+      base_url: "https://api.openai.com/v1",
+      api_key_env: "",
+      model: "gpt-4o-mini",
       enabled: true,
       timeout_seconds: 45,
       priority: 102,
@@ -70,7 +70,7 @@ describe("parser provider config helpers", () => {
       model: "gpt-5.5",
       enabled: true,
       timeout_seconds: 45,
-      priority: 10,
+      priority: 200,
       key_configured: false,
       api_key: "kwjm-secret",
     });
@@ -87,7 +87,7 @@ describe("parser provider config helpers", () => {
       model: "gpt-5.5",
       enabled: true,
       timeout_seconds: 45,
-      priority: 10,
+      priority: 200,
       api_key: "kwjm-secret",
     });
   });
