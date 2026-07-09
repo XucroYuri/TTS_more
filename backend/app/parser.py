@@ -86,28 +86,39 @@ _NON_DIALOGUE_ROLE_RE = re.compile(
     r")(?:\b|[:：.-]|$)",
     re.IGNORECASE,
 )
-_SYSTEM_PROMPT = """You extract line-level TTS dialogue from screenplays.
+_SYSTEM_PROMPT = """You extract line-level TTS dialogue from scripts, prose, interviews, news articles, Markdown, and mixed-format drafts.
 
 Return one JSON object only:
 {
   "characters": [{"id": "stable-slug", "name": "display name"}],
-  "lines": [{"id": "l001", "character_id": "stable-slug", "text": "spoken dialogue", "note": "optional parenthetical", "language": "zh|en"}],
+  "lines": [
+    {
+      "id": "l001",
+      "character_id": "stable-slug",
+      "text": "spoken dialogue copied exactly from source",
+      "note": "optional emotion or parenthetical without brackets",
+      "language": "zh|en",
+      "source_text": "exact source substring used for text",
+      "source_excerpt": "smallest source excerpt containing speaker, note, and source_text"
+    }
+  ],
   "warnings": ["optional short diagnostics"]
 }
 
 Rules:
-- Before returning JSON, perform an internal audit: identify every candidate dialogue line, reject non-TTS cues, verify character references, verify traceability to the source text, and verify original ordering.
+- Before returning JSON, perform an internal audit: identify every candidate spoken line, classify speaker and emotion/note, reject non-TTS cues, verify character references, verify source_text, verify source_excerpt, verify original ordering, and check for missing dialogue.
 - Do not reveal the audit, chain-of-thought, or reasoning notes. Return only the final JSON object.
-- Output only lines that should be synthesized by TTS: character dialogue and narrator/voice-over lines.
-- Exclude scene headings, action descriptions, SFX, MUSIC, ON SCREEN text, camera directions, transitions, timestamps, and metadata.
-- Preserve original dialogue order and exact wording. Do not summarize, translate, invent, merge unrelated speakers, or add stage directions to text.
+- Output only lines that should be synthesized by TTS: character dialogue, narrator/voice-over, host, announcer, and quoted speaker lines.
+- Exclude scene headings, action descriptions, SFX, MUSIC, ON SCREEN text, camera directions, transitions, timestamps, metadata, captions that are not spoken, and article body text that is not quoted or attributed speech.
+- Preserve original dialogue order and exact wording. Do not rewrite, summarize, translate, normalize punctuation, invent, merge unrelated speakers, or add stage directions to text.
+- The text field must be copied from source_text exactly except for removing wrapping quote marks and moving a leading parenthetical into note.
 - Put parentheticals such as （压低声音）, (urgent whisper), or leading dialogue parentheticals in note without parentheses.
 - Reuse the same character_id for repeated display names. Use lowercase kebab-case ids.
-- Accept Chinese colon lines like 角色（括注）: 台词 and Markdown screenplay blocks like **CHARACTER** / (parenthetical) / dialogue.
+- Accept Chinese colon lines like 角色（括注）: 台词, Markdown screenplay blocks like **CHARACTER** / (parenthetical) / dialogue, prose quotes with speaker attribution, interview speaker labels, and news quotes attributed to named speakers.
 """
-_REPAIR_PROMPT = """Repair the previous JSON so it satisfies the TTS screenplay extraction contract.
+_REPAIR_PROMPT = """Repair the previous JSON so it satisfies the TTS dialogue extraction contract.
 
-Return JSON only. Remove non-TTS rows, restore missing dialogue from the script, keep original order, use valid character references, and keep parentheticals in note.
+Return JSON only. Remove non-TTS rows, restore missing dialogue from the script, keep original order, use valid character references, keep parentheticals in note, include source_text and source_excerpt for every line, and keep text copied exactly from source_text. Do not rewrite, translate, summarize, or normalize punctuation.
 """
 _CONTRACT_PROBE_SCRIPT = "**NARRATOR**\n(calm)\nHello from the contract test."
 

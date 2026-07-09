@@ -158,14 +158,29 @@ def test_script_parse_verifier_rejects_missing_recognizable_dialogue() -> None:
         ScriptParseVerifier().verify("NARRATOR: First line.\nNARRATOR: Second line.", draft)
 
 
-def test_parser_contract_prompt_requires_internal_quality_audit() -> None:
+def test_parser_contract_prompt_requires_agentic_source_fidelity_audit() -> None:
     messages = parser_contract_probe_messages()
 
     system_prompt = messages[0]["content"].lower()
 
     assert "internal audit" in system_prompt
-    assert "traceability" in system_prompt
+    assert "source_text" in system_prompt
+    assert "source_excerpt" in system_prompt
+    assert "prose" in system_prompt
+    assert "news" in system_prompt
     assert "do not reveal" in system_prompt
+    assert "exact" in system_prompt
+
+
+def test_repair_prompt_requires_exact_source_evidence() -> None:
+    from app.parser import _REPAIR_PROMPT
+
+    prompt = _REPAIR_PROMPT.lower()
+
+    assert "source_text" in prompt
+    assert "source_excerpt" in prompt
+    assert "exact" in prompt
+    assert "do not rewrite" in prompt
 
 
 def test_multi_provider_parser_requires_enabled_llm_provider_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
