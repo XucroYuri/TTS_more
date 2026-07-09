@@ -88,7 +88,7 @@ import { firstReferenceSampleFromModel, gptSovitsProjectBindingFromModel } from 
 import { ensureProjectCharacters, freezeProjectCharacterLocally, projectCharacterRows, resolveProjectCharacters } from "./lib/projectCharacters";
 import { bindingCompleteness, catalogServiceOptions, roleLibraryBindingRows, roleLibraryServiceOptions, selectedCatalogServiceId } from "./lib/roleLibraryView";
 import { buildGenerationTask, lineBinding, lineEngine, lineProfile, lineServiceId } from "./lib/routing";
-import { createDefaultParserProviderDraft, KWJM_API_KEY_ENV, KWJM_BASE_URL, KWJM_BASE_URL_PLACEHOLDER, KWJM_MODEL, KWJM_PROVIDER_NAME, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./lib/parserConfig";
+import { createDefaultParserProviderDraft, KWJM_API_KEY_ENV, KWJM_BASE_URL, KWJM_BASE_URL_PLACEHOLDER, KWJM_MODEL, KWJM_PROVIDER_NAME, normalizeParserProviderDrafts, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./lib/parserConfig";
 import { createEmptyManifest, createEmptyProject, createProjectId, readStoredProjectId, selectStartupProjectId, writeStoredProjectId } from "./lib/projectStartup";
 import { filterAndSortProjectSummaries, nextProjectAfterDelete } from "./lib/scriptManagement";
 import { projectToScriptSourceText } from "./lib/scriptSource";
@@ -993,7 +993,7 @@ export default function App() {
   async function refreshParserProviders() {
     try {
       const payload = await fetchParserProviders();
-      setParserProviders(payload.providers.map((provider) => ({ ...provider, api_key: "" })));
+      setParserProviders(normalizeParserProviderDrafts(payload.providers).map((provider) => ({ ...provider, api_key: "" })));
     } catch {
       setParserProviders([]);
     }
@@ -1041,7 +1041,7 @@ export default function App() {
     setIsSavingParserConfig(true);
     try {
       const payload = await saveParserProviders(toParserProviderSavePayload(parserProviders));
-      setParserProviders(payload.providers.map((provider) => ({ ...provider, api_key: "" })));
+      setParserProviders(normalizeParserProviderDrafts(payload.providers).map((provider) => ({ ...provider, api_key: "" })));
       setNotice(t("notice.parserConfigSaved"));
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.parserConfigFailed"));
@@ -1055,7 +1055,7 @@ export default function App() {
     setIsSavingParserConfig(true);
     try {
       const payload = await saveParserProviders(toParserProviderSavePayload(nextProviders));
-      setParserProviders(payload.providers.map((provider) => ({ ...provider, api_key: "" })));
+      setParserProviders(normalizeParserProviderDrafts(payload.providers).map((provider) => ({ ...provider, api_key: "" })));
       setKwjmApiKeyInput("");
       setNotice(t("notice.parserConfigSaved"));
     } catch (error) {

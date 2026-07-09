@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { createDefaultParserProviderDraft, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./parserConfig";
+import { createDefaultParserProviderDraft, normalizeParserProviderDraft, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./parserConfig";
 import type { ParserProviderDraft } from "../types";
 
 const provider: ParserProviderDraft = {
@@ -35,6 +35,35 @@ describe("parser provider config helpers", () => {
     expect(payload.providers[0]).toMatchObject({
       adapter: "anthropic",
       api_key: "sk-ant",
+    });
+  });
+
+  it("defaults missing legacy adapters to openai-compatible before rendering", () => {
+    const normalized = normalizeParserProviderDraft({
+      name: "legacy-openai",
+      base_url: "https://legacy.example/v1",
+      api_key_env: "LEGACY_API_KEY",
+      model: "gpt-4.1-mini",
+      enabled: true,
+      timeout_seconds: 45,
+      priority: 25,
+      key_configured: false,
+      api_key: "",
+    } as ParserProviderDraft);
+
+    expect(normalized.adapter).toBe("openai-compatible");
+  });
+
+  it("defaults unknown legacy adapters to openai-compatible while saving", () => {
+    const payload = toParserProviderSavePayload([{
+      ...provider,
+      adapter: "claude-native" as ParserProviderDraft["adapter"],
+      api_key: "  legacy-key  ",
+    }]);
+
+    expect(payload.providers[0]).toMatchObject({
+      adapter: "openai-compatible",
+      api_key: "legacy-key",
     });
   });
 
