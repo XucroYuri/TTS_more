@@ -398,6 +398,17 @@ def test_parser_provider_config_defaults_to_openai_compatible_adapter() -> None:
     assert config.adapter == "openai-compatible"
 
 
+def test_env_example_documents_supported_parser_provider_keys() -> None:
+    content = Path("../.env.example").read_text(encoding="utf-8")
+
+    assert "ANTHROPIC_API_KEY" in content
+    assert "GEMINI_API_KEY" in content
+    assert "OPENROUTER_API_KEY" in content
+    assert "AIHUBMIX_API_KEY" in content
+    assert "QIANFAN_API_KEY" not in content
+    assert "MISTRAL_API_KEY" not in content
+
+
 def test_parser_provider_record_persists_adapter(tmp_path: Path) -> None:
     config_path = tmp_path / "parser_providers.json"
     env_path = tmp_path / ".env.local"
