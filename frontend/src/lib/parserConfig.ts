@@ -18,6 +18,7 @@ export function createDefaultParserProviderDraft(index = 0): ParserProviderDraft
   // backend preset list as a project-specific fallback.)
   return {
     name: "",
+    adapter: "openai-compatible",
     base_url: "https://api.openai.com/v1",
     api_key_env: "",
     model: "gpt-5.5",
@@ -33,6 +34,7 @@ export function upsertKwjmParserProvider(providers: ParserProviderDraft[], apiKe
   const trimmedKey = apiKey.trim();
   const kwjmDraft: ParserProviderDraft = {
     name: KWJM_PROVIDER_NAME,
+    adapter: "openai-compatible",
     base_url: KWJM_BASE_URL,
     api_key_env: KWJM_API_KEY_ENV,
     model: KWJM_MODEL,

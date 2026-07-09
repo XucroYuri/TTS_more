@@ -295,6 +295,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       providerHint: "只有需要多个解析服务或自定义模型时再打开。",
       kwjmPresetMeta: "{{model}} · {{baseUrl}}",
       providerName: "名称",
+      adapterLabel: "调用适配器",
+      adapter: {
+        "openai-compatible": "OpenAI-compatible",
+        anthropic: "Anthropic"
+      },
       baseUrl: "Base URL",
       model: "模型",
       apiKeyEnv: "API Key 变量",
@@ -319,7 +324,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       readyToActivate: "待激活",
       routeOrder: "路由顺序",
       contract: "接口契约",
-      contractHint: "剧本解析统一走 OpenAI-compatible Chat Completions；成功返回结构化草稿，启用服务不可用时停止并报错。",
+      contractHint: "剧本解析通过 Provider Adapter 调用 LLM；OpenAI-compatible 和 Anthropic 原生适配器共享同一结构化草稿与校验契约。",
       jsonDraft: "JSON 草稿",
       ruleFallback: "LLM 不可用即失败",
       secretPolicy: "密钥策略",
@@ -1060,6 +1065,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       providerHint: "Open only for multiple parser services or a custom model.",
       kwjmPresetMeta: "{{model}} · {{baseUrl}}",
       providerName: "Name",
+      adapterLabel: "Adapter",
+      adapter: {
+        "openai-compatible": "OpenAI-compatible",
+        anthropic: "Anthropic"
+      },
       baseUrl: "Base URL",
       model: "Model",
       apiKeyEnv: "API key env",
@@ -1084,7 +1094,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       readyToActivate: "Ready to activate",
       routeOrder: "Route order",
       contract: "API contract",
-      contractHint: "Script parsing uses the OpenAI-compatible Chat Completions contract. Successful calls return structured drafts; unavailable enabled providers stop with an error.",
+      contractHint: "Script parsing calls LLMs through provider adapters; OpenAI-compatible and native Anthropic adapters share one structured draft and verification contract.",
       jsonDraft: "JSON draft",
       ruleFallback: "Fail if LLM is unavailable",
       secretPolicy: "Secret policy",

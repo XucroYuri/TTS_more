@@ -2197,7 +2197,7 @@ export default function App() {
                                       <div className="llm-detail-hero compact">
                                     <div>
                                       <strong>{selectedParserProvider.name || t("parser.providerName")}</strong>
-                                      <span>{selectedParserProvider.model || t("status.unset")} · {selectedParserProvider.base_url || t("services.endpointMissing")}</span>
+                                      <span>{selectedParserProvider.model || t("status.unset")} · {t(`parser.adapter.${selectedParserProvider.adapter}`)} · {selectedParserProvider.base_url || t("services.endpointMissing")}</span>
                                     </div>
                                     <span className={`llm-detail-state state-${selectedState}`}>
                                       <span className={`llm-state-dot ${selectedState}`} />
@@ -2212,6 +2212,13 @@ export default function App() {
                                         <label>
                                           <span>{t("parser.providerName")}</span>
                                           <input value={selectedParserProvider.name} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { name: event.target.value })} />
+                                        </label>
+                                        <label>
+                                          <span>{t("parser.adapterLabel")}</span>
+                                          <select value={selectedParserProvider.adapter} onChange={(event) => updateParserProvider(selectedParserProviderIndex, { adapter: event.target.value as ParserProviderDraft["adapter"] })}>
+                                            <option value="openai-compatible">{t("parser.adapter.openai-compatible")}</option>
+                                            <option value="anthropic">{t("parser.adapter.anthropic")}</option>
+                                          </select>
                                         </label>
                                         <label className="wide">
                                           <span>{t("parser.baseUrl")}</span>

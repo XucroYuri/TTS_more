@@ -5,6 +5,7 @@ import type { ParserProviderDraft } from "../types";
 
 const provider: ParserProviderDraft = {
   name: "openai-main",
+  adapter: "openai-compatible",
   base_url: "https://api.openai.com/v1",
   api_key_env: "OPENAI_API_KEY",
   model: "gpt-4o-mini",
@@ -28,6 +29,15 @@ describe("parser provider config helpers", () => {
     expect(payload.providers[0]).toHaveProperty("api_key", "sk-test");
   });
 
+  it("preserves the adapter while saving parser providers", () => {
+    const payload = toParserProviderSavePayload([{ ...provider, adapter: "anthropic", api_key: "  sk-ant  " }]);
+
+    expect(payload.providers[0]).toMatchObject({
+      adapter: "anthropic",
+      api_key: "sk-ant",
+    });
+  });
+
   it("reports parser provider key state", () => {
     expect(parserProviderKeyState(provider)).toBe("configured");
     expect(parserProviderKeyState({ ...provider, key_configured: false })).toBe("missing");
@@ -36,6 +46,7 @@ describe("parser provider config helpers", () => {
   it("creates new parser providers from a generic openai-compatible template", () => {
     expect(createDefaultParserProviderDraft(2)).toEqual({
       name: "",
+      adapter: "openai-compatible",
       base_url: "https://api.openai.com/v1",
       api_key_env: "",
       model: "gpt-5.5",
@@ -65,6 +76,7 @@ describe("parser provider config helpers", () => {
     expect(result[0]).toEqual(provider);
     expect(result[1]).toEqual({
       name: "开物基模",
+      adapter: "openai-compatible",
       base_url: "https://kwjm.com",
       api_key_env: "KWJM_API_KEY",
       model: "gpt-5.5",
@@ -82,6 +94,7 @@ describe("parser provider config helpers", () => {
     expect(result).toHaveLength(2);
     expect(result[1]).toMatchObject({
       name: "开物基模",
+      adapter: "openai-compatible",
       base_url: "https://kwjm.com",
       api_key_env: "KWJM_API_KEY",
       model: "gpt-5.5",
