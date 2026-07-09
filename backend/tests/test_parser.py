@@ -399,14 +399,29 @@ def test_parser_provider_config_defaults_to_openai_compatible_adapter() -> None:
 
 
 def test_env_example_documents_supported_parser_provider_keys() -> None:
-    content = Path("../.env.example").read_text(encoding="utf-8")
+    content = (Path(__file__).resolve().parents[2] / ".env.example").read_text(encoding="utf-8")
+    parser_block = content.split("# Multi-provider parser configuration.", 1)[1]
+    provider_line = next(
+        line for line in parser_block.splitlines() if line.startswith("# TTS_MORE_PARSER_PROVIDERS=")
+    )
+    providers = json.loads(provider_line.removeprefix("# TTS_MORE_PARSER_PROVIDERS="))
 
-    assert "ANTHROPIC_API_KEY" in content
-    assert "GEMINI_API_KEY" in content
-    assert "OPENROUTER_API_KEY" in content
-    assert "AIHUBMIX_API_KEY" in content
-    assert "QIANFAN_API_KEY" not in content
-    assert "MISTRAL_API_KEY" not in content
+    assert "ANTHROPIC_API_KEY" in parser_block
+    assert "GEMINI_API_KEY" in parser_block
+    assert "OPENROUTER_API_KEY" in parser_block
+    assert "AIHUBMIX_API_KEY" in parser_block
+    assert "QIANFAN_API_KEY" not in parser_block
+    assert "MISTRAL_API_KEY" not in parser_block
+    assert providers == [
+        {
+            "name": "OpenAI",
+            "adapter": "openai-compatible",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY",
+            "model": "gpt-5.5",
+            "enabled": True,
+        }
+    ]
 
 
 def test_parser_provider_record_persists_adapter(tmp_path: Path) -> None:
