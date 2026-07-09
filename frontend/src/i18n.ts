@@ -33,11 +33,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       queueFiltered: "生成当前列表"
     },
     topbar: {
-      roleLibrary: "角色库",
+      roleLibrary: "角色",
       resourceQueue: "队列",
       services: "服务",
-      ttsConfig: "TTS",
-      llmConfig: "LLM"
+      ttsConfig: "接入",
+      llmConfig: "解析"
     },
     audioInput: {
       upload: "上传",
@@ -66,7 +66,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     services: {
       description: "统一管理本机和远端 TTS 服务端点、LLM 解析服务、GPU 资源组、商用服务商密钥状态与真实验收。",
       ttsAccessTitle: "添加 TTS 服务",
-      ttsAccessDescription: "粘贴 WebUI 地址，检测并保存。",
+      ttsAccessDescription: "粘贴服务地址，检测并保存。",
       llmApiTitle: "剧本解析",
       llmApiDescription: "输入解析 API Key，保存后即可提取台词。",
       resourceQueueTitle: "资源队列",
@@ -108,7 +108,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       openSourceServiceId: "服务 ID",
       openSourceDisplayName: "名称（可选）",
       openSourceRepoPath: "历史项目路径",
-      openSourceBaseUrl: "WebUI 地址",
+      openSourceBaseUrl: "服务地址",
       openSourceApiContract: "Gradio 协议",
       openSourceResource: "资源组",
       openSourceCapacity: "容量",
@@ -234,6 +234,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       referenceAudio: "参考音频",
       logsReferenceAudio: "Logs 参考音频",
       noReferenceAudio: "暂无参考音频",
+      moreReferenceAudio: "另有 {{count}} 条，展开详情后选择",
       missingFields: "缺少",
       noBindings: "暂无绑定",
       importCandidate: "导入",
@@ -330,7 +331,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       testProvider: "测试连接",
       testPassed: "测试通过",
       testFailed: "测试失败",
-      activateKwjm: "保存并激活",
+      activateKwjm: "保存并检查",
       advancedConfig: "高级服务",
       hideAdvancedConfig: "收起",
       kwjmConfigured: "开物基模已配置",
@@ -693,6 +694,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     empty: {
       noLines: "没有符合条件的台词",
+      noMatchingLinesHint: "调整搜索或筛选后继续生成。",
+      noExtractedLines: "还没有台词",
+      noExtractedLinesHint: "先在剧本中粘贴文本并提取台词。",
       noLogs: "暂无日志",
       noPlayableVersion: "没有可试听版本",
       noParserProviders: "暂无解析服务",
@@ -702,6 +706,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       projectLoadFailed: "剧本加载失败，已进入空状态",
       noProjectAction: "请先选择或创建剧本",
       noActiveLine: "未选择台词",
+      inspectorIdle: "等待台词",
       noActiveLineHint: "选择一个剧本和台词后，这里会显示当前行配置和历史版本参数。"
     },
     queue: {
@@ -798,11 +803,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       queueFiltered: "Generate filtered"
     },
     topbar: {
-      roleLibrary: "Character",
+      roleLibrary: "Roles",
       resourceQueue: "Queue",
       services: "Services",
-      ttsConfig: "TTS",
-      llmConfig: "LLM"
+      ttsConfig: "Access",
+      llmConfig: "Parse"
     },
     audioInput: {
       upload: "Upload",
@@ -831,7 +836,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     services: {
       description: "Manage local and remote TTS endpoints, LLM parser providers, GPU resource groups, commercial provider key status, and real validation.",
       ttsAccessTitle: "Add TTS service",
-      ttsAccessDescription: "Paste the WebUI URL, then detect and save.",
+      ttsAccessDescription: "Paste the service URL, then detect and save.",
       llmApiTitle: "Script parser",
       llmApiDescription: "Enter a parser API key, then save to extract lines.",
       resourceQueueTitle: "Resource queue",
@@ -873,7 +878,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       openSourceServiceId: "Service ID",
       openSourceDisplayName: "Name (optional)",
       openSourceRepoPath: "Legacy repo path",
-      openSourceBaseUrl: "WebUI URL",
+      openSourceBaseUrl: "Service URL",
       openSourceApiContract: "Gradio contract",
       openSourceResource: "Resource group",
       openSourceCapacity: "Capacity",
@@ -999,6 +1004,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       referenceAudio: "Reference audio",
       logsReferenceAudio: "Logs reference audio",
       noReferenceAudio: "No reference audio",
+      moreReferenceAudio: "{{count}} more available in details",
       missingFields: "Missing",
       noBindings: "No bindings",
       importCandidate: "Import",
@@ -1095,7 +1101,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       testProvider: "Test connection",
       testPassed: "Test passed",
       testFailed: "Test failed",
-      activateKwjm: "Save and activate",
+      activateKwjm: "Save and check",
       advancedConfig: "Advanced services",
       hideAdvancedConfig: "Hide",
       kwjmConfigured: "KWJM configured",
@@ -1458,6 +1464,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     },
     empty: {
       noLines: "No matching lines",
+      noMatchingLinesHint: "Adjust search or filters to keep generating.",
+      noExtractedLines: "No extracted lines yet",
+      noExtractedLinesHint: "Paste script text and extract lines first.",
       noLogs: "No logs",
       noPlayableVersion: "No playable version",
       noParserProviders: "No parser providers",
@@ -1467,6 +1476,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       projectLoadFailed: "Script failed to load, showing an empty state",
       noProjectAction: "Select or create a script first",
       noActiveLine: "No line selected",
+      inspectorIdle: "Waiting for lines",
       noActiveLineHint: "Select a script and line to edit the current line config and version parameters."
     },
     queue: {

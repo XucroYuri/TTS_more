@@ -30,6 +30,11 @@ export function toastDuration(options: ToastOptions = {}): number {
   return options.duration ?? DEFAULT_DURATION_MS;
 }
 
+export function shouldToastNotice(keyOrMessage: string): boolean {
+  const normalized = keyOrMessage.trim().toLowerCase();
+  return !["app.ready", "ready", "就绪"].includes(normalized);
+}
+
 /**
  * Infer a toast level from an i18n key fragment.
  * Keys containing "fail", "error", "blocked" map to error; "warning"/"risk" to warning;

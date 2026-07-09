@@ -86,7 +86,7 @@ import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from ".
 import { formatScriptNote } from "./lib/lineNote";
 import { firstReferenceSampleFromModel, gptSovitsProjectBindingFromModel } from "./lib/modelCatalog";
 import { ensureProjectCharacters, freezeProjectCharacterLocally, projectCharacterRows, resolveProjectCharacters } from "./lib/projectCharacters";
-import { bindingCompleteness, catalogServiceOptions, roleLibraryBindingRows, roleLibraryServiceOptions, selectedCatalogServiceId } from "./lib/roleLibraryView";
+import { bindingCompleteness, catalogServiceOptions, roleLibraryBindingRows, roleLibraryDetailSelection, roleLibraryReferencePreview, roleLibraryServiceOptions, selectedCatalogServiceId } from "./lib/roleLibraryView";
 import { buildGenerationTask, lineBinding, lineEngine, lineProfile, lineServiceId } from "./lib/routing";
 import { createDefaultParserProviderDraft, KWJM_API_KEY_ENV, KWJM_BASE_URL, KWJM_BASE_URL_PLACEHOLDER, KWJM_MODEL, KWJM_PROVIDER_NAME, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./lib/parserConfig";
 import { createEmptyManifest, createEmptyProject, createProjectId, readStoredProjectId, selectStartupProjectId, writeStoredProjectId } from "./lib/projectStartup";
@@ -95,8 +95,8 @@ import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
 import { buildGradioEndpointRequest, gradioContractForProvider } from "./lib/ttsAccess";
-import { createToast, inferToastLevel, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
+import { createToast, inferToastLevel, shouldToastNotice, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, lineWorkbenchControlsState, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
   Character,
   CharacterReferenceAudioGroup,
@@ -280,6 +280,7 @@ export default function App() {
    */
   const setNotice = useCallback((message: string, options?: { level?: ToastLevel }) => {
     if (!message) return;
+    if (!shouldToastNotice(message)) return;
     pushToast(message, { level: options?.level ?? inferToastLevel(message) });
   }, [pushToast]);
 
@@ -407,9 +408,20 @@ export default function App() {
       `${candidate.name} ${candidate.id} ${candidate.logs_name ?? ""} ${(candidate.aliases ?? []).join(" ")}`.toLocaleLowerCase().includes(query)
     );
   }, [roleLibraryCandidates, roleLibrarySearch]);
+  const roleLibrarySelection = useMemo(
+    () => roleLibraryDetailSelection({
+      selectedCharacterId: activeLibraryCharacterId,
+      filteredCharacters: filteredLibraryCharacters,
+      selectedCandidateId: activeRoleCandidateId,
+      selectedModelId: activeModelCatalogId
+    }),
+    [activeLibraryCharacterId, activeModelCatalogId, activeRoleCandidateId, filteredLibraryCharacters]
+  );
   const activeLibraryCharacter = useMemo(
-    () => filteredLibraryCharacters.find((character) => character.id === activeLibraryCharacterId) ?? filteredLibraryCharacters[0] ?? null,
-    [activeLibraryCharacterId, filteredLibraryCharacters]
+    () => roleLibrarySelection.kind === "library-character"
+      ? filteredLibraryCharacters.find((character) => character.id === roleLibrarySelection.characterId) ?? null
+      : null,
+    [filteredLibraryCharacters, roleLibrarySelection]
   );
   const activeRoleCandidate = useMemo(
     () => roleLibraryCandidates.find((candidate) => candidate.id === activeRoleCandidateId) ?? null,
@@ -557,6 +569,13 @@ export default function App() {
       visibleLines: (count) => t("table.visibleLines", { count }),
       status: (status) => statusText(status, t)
     }
+  });
+  const lineWorkbenchState = lineWorkbenchControlsState({
+    hasProject: Boolean(currentProjectId),
+    totalLineCount: project.lines.length,
+    filteredLineCount: filteredLines.length,
+    selectedLineCount: selectedLineIds.length,
+    isGenerating
   });
   const lineFilterTitle = lineToolbarState.title;
   const visibleLineLabel = lineToolbarState.countLabel;
@@ -2798,6 +2817,7 @@ export default function App() {
 
         <section className="workbench-grid">
           <div className="lines-panel">
+            {lineWorkbenchState.filtersVisible && (
             <div className="filters-row">
               <label className="search-field">
                 <Search size={15} />
@@ -2843,6 +2863,7 @@ export default function App() {
                   )}
                 </div>
               </details>
+              {lineWorkbenchState.generationVisible && (
               <div className="task-actions">
                 {isGenerating && activeJob && (
                   <span className="generation-progress-inline" aria-label={t("queue.progressLabel", { percent: Math.round((activeJob.progress ?? 0) * 100) })}>
@@ -2859,7 +2880,10 @@ export default function App() {
                   </button>
                 )}
               </div>
+              )}
             </div>
+            )}
+            {lineWorkbenchState.roleStripVisible && (
             <div className="role-strip">
               <div className="role-pill-row">
                 <button
@@ -2893,6 +2917,7 @@ export default function App() {
                 })}
               </div>
             </div>
+            )}
 
             <div className="line-table line-card-list">
               {displayedLines.map((line) => {
@@ -2979,21 +3004,24 @@ export default function App() {
                   {t("table.loadingMore", { visible: displayedLines.length, total: filteredLines.length })}
                 </div>
               )}
-              {filteredLines.length === 0 && (
-                <div className="empty-row table-empty line-empty-state">
-                  <strong>{t("empty.noLines")}</strong>
-                  <button
-                    className="secondary-button compact-button"
-                    type="button"
-                    onClick={() => {
-                      setSearchText("");
-                      setCharacterFilter("all");
-                      setProviderFilter("all");
-                      setStatusFilter("all");
-                    }}
-                  >
-                    {t("filters.clear")}
-                  </button>
+              {lineWorkbenchState.emptyState && (
+                <div className="empty-row table-empty line-empty-state quiet">
+                  <strong>{lineWorkbenchEmptyTitle(lineWorkbenchState.emptyState, t)}</strong>
+                  <span>{lineWorkbenchEmptyHint(lineWorkbenchState.emptyState, t)}</span>
+                  {lineWorkbenchState.clearFiltersVisible && (
+                    <button
+                      className="secondary-button compact-button"
+                      type="button"
+                      onClick={() => {
+                        setSearchText("");
+                        setCharacterFilter("all");
+                        setProviderFilter("all");
+                        setStatusFilter("all");
+                      }}
+                    >
+                      {t("filters.clear")}
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -3507,9 +3535,9 @@ export default function App() {
               </div>
             )}
             {!activeLine && (
-              <div className="empty-row inspector-empty-state">
-                <strong>{t("empty.noActiveLine")}</strong>
-                <span>{t("empty.noActiveLineHint")}</span>
+              <div className={`empty-row inspector-empty-state ${lineWorkbenchState.emptyState ? "quiet" : ""}`}>
+                <strong>{lineWorkbenchState.emptyState ? t("empty.inspectorIdle") : t("empty.noActiveLine")}</strong>
+                {!lineWorkbenchState.emptyState && <span>{t("empty.noActiveLineHint")}</span>}
               </div>
             )}
           </aside>
@@ -4754,14 +4782,26 @@ function FailureHistoryMessage({ version, t }: { version: GenerationVersion; t: 
   );
 }
 
+function lineWorkbenchEmptyTitle(state: NonNullable<ReturnType<typeof lineWorkbenchControlsState>["emptyState"]>, t: Translate): string {
+  if (state === "no_project") return t("empty.noProjectSelected");
+  if (state === "no_lines") return t("empty.noExtractedLines");
+  return t("empty.noLines");
+}
+
+function lineWorkbenchEmptyHint(state: NonNullable<ReturnType<typeof lineWorkbenchControlsState>["emptyState"]>, t: Translate): string {
+  if (state === "no_project") return t("empty.noProjectAction");
+  if (state === "no_lines") return t("empty.noExtractedLinesHint");
+  return t("empty.noMatchingLinesHint");
+}
+
 function ReferencePreview({ groups, t }: { groups: CharacterReferenceAudioGroup[]; t: Translate }) {
-  const samples = groups.flatMap((group) => (group.samples ?? []).map((sample) => ({ ...sample, group: group.name }))).slice(0, 6);
+  const preview = roleLibraryReferencePreview(groups);
   return (
     <div className="role-detail-card reference-preview-card">
       <span>{t("characters.referenceAudio")}</span>
-      {samples.length > 0 ? (
+      {preview.visibleSamples.length > 0 ? (
         <div className="reference-preview-list">
-          {samples.map((sample) => (
+          {preview.visibleSamples.map((sample) => (
             <div className="reference-preview-row" key={`${sample.path}-${sample.group}`}>
               <div>
                 <strong>{shortPath(sample.path)}</strong>
@@ -4770,6 +4810,7 @@ function ReferencePreview({ groups, t }: { groups: CharacterReferenceAudioGroup[
               {isLocalAudioAsset(sample.path) && <WaveformPlayer audioPath={sample.path} label={shortPath(sample.path)} />}
             </div>
           ))}
+          {preview.hasOverflow && <small>{t("characters.moreReferenceAudio", { count: preview.hiddenSampleCount })}</small>}
         </div>
       ) : (
         <small>{t("characters.noReferenceAudio")}</small>
