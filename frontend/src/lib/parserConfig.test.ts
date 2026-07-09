@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { createDefaultParserProviderDraft, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./parserConfig";
+import { createDefaultParserProviderDraft, normalizeParserProviderDraft, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./parserConfig";
 import type { ParserProviderDraft } from "../types";
 
 const provider: ParserProviderDraft = {
   name: "openai-main",
+  adapter: "openai-compatible",
   base_url: "https://api.openai.com/v1",
   api_key_env: "OPENAI_API_KEY",
   model: "gpt-4o-mini",
@@ -28,6 +29,44 @@ describe("parser provider config helpers", () => {
     expect(payload.providers[0]).toHaveProperty("api_key", "sk-test");
   });
 
+  it("preserves the adapter while saving parser providers", () => {
+    const payload = toParserProviderSavePayload([{ ...provider, adapter: "anthropic", api_key: "  sk-ant  " }]);
+
+    expect(payload.providers[0]).toMatchObject({
+      adapter: "anthropic",
+      api_key: "sk-ant",
+    });
+  });
+
+  it("defaults missing legacy adapters to openai-compatible before rendering", () => {
+    const normalized = normalizeParserProviderDraft({
+      name: "legacy-openai",
+      base_url: "https://legacy.example/v1",
+      api_key_env: "LEGACY_API_KEY",
+      model: "gpt-4.1-mini",
+      enabled: true,
+      timeout_seconds: 45,
+      priority: 25,
+      key_configured: false,
+      api_key: "",
+    } as ParserProviderDraft);
+
+    expect(normalized.adapter).toBe("openai-compatible");
+  });
+
+  it("defaults unknown legacy adapters to openai-compatible while saving", () => {
+    const payload = toParserProviderSavePayload([{
+      ...provider,
+      adapter: "claude-native" as ParserProviderDraft["adapter"],
+      api_key: "  legacy-key  ",
+    }]);
+
+    expect(payload.providers[0]).toMatchObject({
+      adapter: "openai-compatible",
+      api_key: "legacy-key",
+    });
+  });
+
   it("reports parser provider key state", () => {
     expect(parserProviderKeyState(provider)).toBe("configured");
     expect(parserProviderKeyState({ ...provider, key_configured: false })).toBe("missing");
@@ -36,6 +75,7 @@ describe("parser provider config helpers", () => {
   it("creates new parser providers from a generic openai-compatible template", () => {
     expect(createDefaultParserProviderDraft(2)).toEqual({
       name: "",
+      adapter: "openai-compatible",
       base_url: "https://api.openai.com/v1",
       api_key_env: "",
       model: "gpt-5.5",
@@ -50,6 +90,7 @@ describe("parser provider config helpers", () => {
   it("activates the kwjm preset with a trimmed api key while preserving other providers", () => {
     const existingKwjm: ParserProviderDraft = {
       name: "开物基模",
+      adapter: "openai-compatible",
       base_url: "",
       api_key_env: "OLD_KWJM_KEY",
       model: "old-model",
@@ -65,6 +106,7 @@ describe("parser provider config helpers", () => {
     expect(result[0]).toEqual(provider);
     expect(result[1]).toEqual({
       name: "开物基模",
+      adapter: "openai-compatible",
       base_url: "https://kwjm.com",
       api_key_env: "KWJM_API_KEY",
       model: "gpt-5.5",
@@ -82,6 +124,7 @@ describe("parser provider config helpers", () => {
     expect(result).toHaveLength(2);
     expect(result[1]).toMatchObject({
       name: "开物基模",
+      adapter: "openai-compatible",
       base_url: "https://kwjm.com",
       api_key_env: "KWJM_API_KEY",
       model: "gpt-5.5",

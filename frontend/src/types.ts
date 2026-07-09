@@ -305,8 +305,11 @@ export interface ParsedDraft {
   warnings: string[];
 }
 
+export type ParserProviderAdapter = "openai-compatible" | "anthropic";
+
 export interface ParserProviderConfig {
   name: string;
+  adapter: ParserProviderAdapter;
   base_url: string;
   api_key_env: string;
   model: string;
