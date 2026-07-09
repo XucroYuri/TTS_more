@@ -1,0 +1,154 @@
+param(
+    [string[]]$Targets = @("all"),
+    [ValidateSet("ModelScope", "HF", "HF-Mirror")][string]$Source = "ModelScope",
+    [ValidateSet("CU128", "CU126", "CPU", "ROCM", "MPS")][string]$Device = "CU128",
+    [switch]$SyncRepos,
+    [switch]$CleanRepos,
+    [switch]$SkipInstall,
+    [switch]$SkipDownloads,
+    [switch]$DryRun
+)
+
+$ErrorActionPreference = "Stop"
+
+$Root = Split-Path -Parent $PSScriptRoot
+$Python = Join-Path $Root ".venv\Scripts\python.exe"
+if (!(Test-Path -LiteralPath $Python)) { $Python = "python" }
+
+function Invoke-Logged {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory
+    )
+    $line = "$FilePath $($Arguments -join ' ')"
+    Write-Host "[run] $line" -ForegroundColor Cyan
+    if ($DryRun) { return }
+    Push-Location $WorkingDirectory
+    try {
+        & $FilePath @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "Command failed: $line" }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Test-Target {
+    param($Repo)
+    if ($Targets -contains "all") { return $true }
+    return (
+        $Targets -contains $Repo.name -or
+        $Targets -contains $Repo.provider_type -or
+        $Targets -contains $Repo.service_id -or
+        ($Repo.variant -and $Targets -contains $Repo.variant)
+    )
+}
+
+function Resolve-RepoPython {
+    param([string]$RepoPath)
+    return Join-Path $RepoPath ".venv\Scripts\python.exe"
+}
+
+function Ensure-Venv {
+    param([string]$RepoPath)
+    $venvPython = Resolve-RepoPython $RepoPath
+    if (Test-Path -LiteralPath $venvPython) { return $venvPython }
+    $basePython = $env:TTS_MORE_BASE_PYTHON
+    if (-not $basePython) { $basePython = "python" }
+    Invoke-Logged $basePython @("-m", "venv", ".venv") $RepoPath
+    Invoke-Logged $venvPython @("-m", "pip", "install", "-U", "pip", "wheel", "setuptools") $RepoPath
+    return $venvPython
+}
+
+function Prepare-GPTSoVITS {
+    param($Repo)
+    $repoPath = Join-Path $Root $Repo.path
+    if ($SkipInstall) {
+        Write-Host "[skip] GPT-SoVITS install for $($Repo.name)"
+        return
+    }
+    $installPs1 = Join-Path $repoPath "install.ps1"
+    $installSh = Join-Path $repoPath "install.sh"
+    if ($IsWindows -or $env:OS -eq "Windows_NT") {
+        if (!(Test-Path -LiteralPath $installPs1)) { throw "Missing GPT-SoVITS installer: $installPs1" }
+        if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
+            Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
+            return
+        }
+        Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", $installPs1, "-Device", $Device, "-Source", $Source) $repoPath
+    } else {
+        if (!(Test-Path -LiteralPath $installSh)) { throw "Missing GPT-SoVITS installer: $installSh" }
+        if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
+            Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
+            return
+        }
+        Invoke-Logged "bash" @($installSh, "--device", $Device, "--source", $Source) $repoPath
+    }
+}
+
+function Prepare-IndexTTS {
+    param($Repo)
+    $repoPath = Join-Path $Root $Repo.path
+    $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
+    $repoUv = Join-Path $repoPath ".uv-bootstrap\Scripts\uv.exe"
+    if (-not $uv -and (Test-Path -LiteralPath $repoUv)) { $uv = $repoUv }
+    if (-not $SkipInstall) {
+        if ($uv) {
+            Invoke-Logged $uv @("sync", "--all-extras") $repoPath
+        } else {
+            $repoPython = Ensure-Venv $repoPath
+            Invoke-Logged $repoPython @("-m", "pip", "install", "-e", ".") $repoPath
+        }
+    }
+    if (-not $SkipDownloads) {
+        $repoPython = Resolve-RepoPython $repoPath
+        if (!(Test-Path -LiteralPath $repoPython) -and $uv) {
+            Invoke-Logged $uv @("sync", "--all-extras") $repoPath
+        }
+        $sourceArg = if ($Source -eq "ModelScope") { "modelscope" } elseif ($Source -eq "HF") { "huggingface" } else { "huggingface" }
+        if ($Source -eq "HF-Mirror") { $env:HF_ENDPOINT = "https://hf-mirror.com" }
+        Invoke-Logged $repoPython @("indextts\cli_v2.py", "download", "--source", $sourceArg, "--model-dir", "checkpoints") $repoPath
+        Invoke-Logged $repoPython @("indextts\cli_v2.py", "config", "set", "model_dir", "checkpoints") $repoPath
+    }
+}
+
+function Prepare-CosyVoice {
+    param($Repo)
+    $repoPath = Join-Path $Root $Repo.path
+    Invoke-Logged "git" @("-C", $repoPath, "submodule", "update", "--init", "--recursive") $Root
+    $repoPython = Resolve-RepoPython $repoPath
+    if (-not $SkipInstall) {
+        $repoPython = Ensure-Venv $repoPath
+        Invoke-Logged $repoPython @("-m", "pip", "install", "-r", "requirements.txt") $repoPath
+    }
+    if (-not $SkipDownloads) {
+        $repoPython = Resolve-RepoPython $repoPath
+        if ($Source -eq "ModelScope") {
+            $code = "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')"
+        } else {
+            if ($Source -eq "HF-Mirror") { $env:HF_ENDPOINT = "https://hf-mirror.com" }
+            $code = "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')"
+        }
+        Invoke-Logged $repoPython @("-c", $code) $repoPath
+    }
+}
+
+if ($SyncRepos) {
+    $syncArgs = @("scripts\tts_more_deploy.py", "sync-repos")
+    if ($CleanRepos) { $syncArgs += "--clean" }
+    if ($DryRun) { $syncArgs += "--dry-run" }
+    Invoke-Logged $Python $syncArgs $Root
+}
+
+$lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json
+foreach ($repo in $lock.repositories) {
+    if (-not (Test-Target $repo)) { continue }
+    switch ($repo.provider_type) {
+        "gpt-sovits" { Prepare-GPTSoVITS $repo }
+        "indextts" { Prepare-IndexTTS $repo }
+        "cosyvoice" { Prepare-CosyVoice $repo }
+    }
+}
+
+Invoke-Logged $Python @("scripts\tts_more_deploy.py", "render-services", "--profile", "local-all", "--platform", "windows", "--output", "data\local\services.json") $Root
+Write-Host "Prepared selected TTS repositories. Rendered data\local\services.json." -ForegroundColor Green

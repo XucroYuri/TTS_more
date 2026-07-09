@@ -1,8 +1,8 @@
 [
   {
-    "service_id": "local-gpt-sovits",
+    "service_id": "local-gpt-sovits-main",
     "service_kind": "tts",
-    "display_name": "GPT-SoVITS Worker",
+    "display_name": "GPT-SoVITS Worker (main)",
     "engine": "gpt-sovits",
     "provider_type": "gpt-sovits",
     "source_profile": "local_endpoint",
@@ -15,9 +15,9 @@
     "managed": true,
     "enabled": false,
     "poll_interval_seconds": 5,
-    "repo_path": "repo/GPT-SoVITS",
+    "repo_path": "repo/GPT-SoVITS-main",
     "start_command": [
-      "python",
+      "repo/GPT-SoVITS-main/.venv/Scripts/python.exe",
       "-m",
       "uvicorn",
       "app.workers.gpt_sovits_worker:app",
@@ -30,10 +30,110 @@
     ],
     "start_cwd": ".",
     "env": {
-      "TTS_MORE_GPTSOVITS_REPO": "repo/GPT-SoVITS"
+      "TTS_MORE_GPTSOVITS_REPO": "repo/GPT-SoVITS-main",
+      "TTS_MORE_GPTSOVITS_VARIANT": "main",
+      "PATH": "repo/GPT-SoVITS-main/ffmpeg-shared/bin;{PATH}"
     },
     "health_url": "http://127.0.0.1:9880/health",
-    "resource_group": "local-gpu-0",
+    "resource_group": "local-gpt-main",
+    "capacity": 1,
+    "priority": 10,
+    "capabilities": [
+      "tts",
+      "trained_weights_voice",
+      "reference_audio_voice",
+      "gpt-weights",
+      "sovits-weights",
+      "wav_output",
+      "tts-more-worker"
+    ]
+  },
+  {
+    "service_id": "local-gpt-sovits-dev",
+    "service_kind": "tts",
+    "display_name": "GPT-SoVITS Worker (dev)",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "source_profile": "local_endpoint",
+    "catalog_provider": "gpt-sovits",
+    "setup_state": "not_configured",
+    "api_contract": "tts-more-v1",
+    "base_url": "http://127.0.0.1:9883",
+    "mode": "local",
+    "network_scope": "localhost",
+    "managed": true,
+    "enabled": false,
+    "poll_interval_seconds": 5,
+    "repo_path": "repo/GPT-SoVITS-dev",
+    "start_command": [
+      "repo/GPT-SoVITS-dev/.venv/Scripts/python.exe",
+      "-m",
+      "uvicorn",
+      "app.workers.gpt_sovits_worker:app",
+      "--app-dir",
+      "backend",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "9883"
+    ],
+    "start_cwd": ".",
+    "env": {
+      "TTS_MORE_GPTSOVITS_REPO": "repo/GPT-SoVITS-dev",
+      "TTS_MORE_GPTSOVITS_VARIANT": "dev",
+      "PATH": "repo/GPT-SoVITS-dev/ffmpeg-shared/bin;{PATH}"
+    },
+    "health_url": "http://127.0.0.1:9883/health",
+    "resource_group": "local-gpt-dev",
+    "capacity": 1,
+    "priority": 10,
+    "capabilities": [
+      "tts",
+      "trained_weights_voice",
+      "reference_audio_voice",
+      "gpt-weights",
+      "sovits-weights",
+      "wav_output",
+      "tts-more-worker"
+    ]
+  },
+  {
+    "service_id": "local-gpt-sovits-proplus-hc-dev",
+    "service_kind": "tts",
+    "display_name": "GPT-SoVITS Worker (proplus-hc-dev)",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "source_profile": "local_endpoint",
+    "catalog_provider": "gpt-sovits",
+    "setup_state": "not_configured",
+    "api_contract": "tts-more-v1",
+    "base_url": "http://127.0.0.1:9884",
+    "mode": "local",
+    "network_scope": "localhost",
+    "managed": true,
+    "enabled": false,
+    "poll_interval_seconds": 5,
+    "repo_path": "repo/GPT-SoVITS-proplus-hc-dev",
+    "start_command": [
+      "repo/GPT-SoVITS-proplus-hc-dev/.venv/Scripts/python.exe",
+      "-m",
+      "uvicorn",
+      "app.workers.gpt_sovits_worker:app",
+      "--app-dir",
+      "backend",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "9884"
+    ],
+    "start_cwd": ".",
+    "env": {
+      "TTS_MORE_GPTSOVITS_REPO": "repo/GPT-SoVITS-proplus-hc-dev",
+      "TTS_MORE_GPTSOVITS_VARIANT": "proplus-hc-dev",
+      "PATH": "repo/GPT-SoVITS-proplus-hc-dev/ffmpeg-shared/bin;{PATH}"
+    },
+    "health_url": "http://127.0.0.1:9884/health",
+    "resource_group": "local-gpt-proplus-hc-dev",
     "capacity": 1,
     "priority": 10,
     "capabilities": [
@@ -64,7 +164,7 @@
     "poll_interval_seconds": 5,
     "repo_path": "repo/index-tts",
     "start_command": [
-      "python",
+      "repo/index-tts/.venv/Scripts/python.exe",
       "-m",
       "uvicorn",
       "app.workers.indextts_worker:app",
@@ -77,7 +177,10 @@
     ],
     "start_cwd": ".",
     "env": {
-      "TTS_MORE_INDEXTTS_REPO": "repo/index-tts"
+      "TTS_MORE_INDEXTTS_REPO": "repo/index-tts",
+      "TTS_MORE_INDEXTTS_PYTHON": "repo/index-tts/.venv/Scripts/python.exe",
+      "TTS_MORE_INDEXTTS_MODEL_DIR": "repo/index-tts/checkpoints",
+      "INDEXTTS2_MODEL_DIR": "repo/index-tts/checkpoints"
     },
     "health_url": "http://127.0.0.1:9881/health",
     "resource_group": "local-gpu-0",
@@ -98,6 +201,9 @@
     "display_name": "CosyVoice Worker",
     "engine": "cosyvoice",
     "provider_type": "cosyvoice",
+    "source_profile": "local_endpoint",
+    "catalog_provider": "cosyvoice",
+    "setup_state": "not_configured",
     "api_contract": "tts-more-v1",
     "base_url": "http://127.0.0.1:9882",
     "mode": "local",
@@ -107,7 +213,7 @@
     "poll_interval_seconds": 5,
     "repo_path": "repo/CosyVoice",
     "start_command": [
-      "python",
+      "repo/CosyVoice/.venv/Scripts/python.exe",
       "-m",
       "uvicorn",
       "app.workers.cosyvoice_worker:app",
@@ -120,7 +226,9 @@
     ],
     "start_cwd": ".",
     "env": {
-      "TTS_MORE_COSYVOICE_REPO": "repo/CosyVoice"
+      "TTS_MORE_COSYVOICE_REPO": "repo/CosyVoice",
+      "TTS_MORE_COSYVOICE_PYTHON": "repo/CosyVoice/.venv/Scripts/python.exe",
+      "TTS_MORE_COSYVOICE_MODEL_DIR": "pretrained_models/CosyVoice-300M"
     },
     "health_url": "http://127.0.0.1:9882/health",
     "resource_group": "local-gpu-0",
@@ -138,60 +246,6 @@
     "default_params": {
       "mode": "zero_shot",
       "response_format": "wav"
-    },
-    "source_profile": "local_endpoint",
-    "catalog_provider": "cosyvoice",
-    "setup_state": "not_configured"
-  },
-  {
-    "service_id": "openai-tts",
-    "service_kind": "tts",
-    "display_name": "OpenAI TTS",
-    "engine": "commercial",
-    "provider_type": "openai",
-    "api_contract": "openai-speech-v1",
-    "base_url": "https://api.openai.com/v1",
-    "mode": "external",
-    "network_scope": "commercial",
-    "managed": false,
-    "enabled": false,
-    "poll_interval_seconds": 30,
-    "resource_group": "paid-openai",
-    "capacity": 1,
-    "priority": 80,
-    "auth_header_env": "OPENAI_API_KEY",
-    "capabilities": [
-      "tts",
-      "commercial_voice",
-      "style_instruction",
-      "paid_provider"
-    ],
-    "default_params": {
-      "model": "gpt-4o-mini-tts",
-      "voice": "alloy",
-      "response_format": "wav"
     }
-  },
-  {
-    "service_id": "generic-http-tts",
-    "service_kind": "tts",
-    "display_name": "Generic HTTP TTS",
-    "engine": "commercial",
-    "provider_type": "generic-http",
-    "api_contract": "tts-more-v1",
-    "base_url": "http://example.local:9888",
-    "mode": "external",
-    "network_scope": "lan",
-    "managed": false,
-    "enabled": false,
-    "poll_interval_seconds": 10,
-    "resource_group": "external-generic",
-    "capacity": 1,
-    "priority": 120,
-    "capabilities": [
-      "tts",
-      "reference_audio_voice",
-      "wav_output"
-    ]
   }
 ]

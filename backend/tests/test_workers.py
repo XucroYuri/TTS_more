@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -46,6 +48,43 @@ def test_gpt_sovits_worker_openapi_lists_discovery_endpoints() -> None:
     for endpoint in ("/health", "/capabilities", "/load", "/synthesize", "/unload",
                      "/models", "/models/{model_name}/samples", "/status", "/upload_ref"):
         assert endpoint in paths, f"missing {endpoint}"
+
+
+def test_gpt_sovits_worker_accepts_generator_pipeline_output(tmp_path: Path, monkeypatch) -> None:
+    """Upstream GPT-SoVITS TTS.run returns a generator yielding audio chunks."""
+    import app.workers.gpt_sovits_worker as worker
+
+    writes: list[tuple[list[float], int, Path, str]] = []
+
+    class FakePipeline:
+        def run(self, inputs: dict) -> object:
+            assert inputs["text"] == "hello"
+
+            def chunks():
+                yield 32000, [0.0, 0.25, -0.25]
+
+            return chunks()
+
+    monkeypatch.setattr(worker, "_ensure_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(
+        worker,
+        "_write_audio",
+        lambda audio, sampling_rate, output_path, media_type: writes.append((list(audio), sampling_rate, output_path, media_type)),
+    )
+    client = TestClient(gpt_app)
+
+    response = client.post(
+        "/synthesize",
+        json={
+            "line": {"id": "l1", "character_id": "narrator", "text": "hello"},
+            "profile": "demo",
+            "output_path": str(tmp_path / "out.wav"),
+            "parameters": {"media_type": "wav"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert writes == [([0.0, 0.25, -0.25], 32000, tmp_path / "out.wav", "wav")]
 
 
 # --- discovery helpers ---------------------------------------------------------
@@ -151,6 +190,81 @@ def test_cosyvoice_worker_health_and_capabilities() -> None:
     caps = client.get("/capabilities").json()["capabilities"]
     assert "zero-shot-voice" in caps
     assert "style-instruction" in caps
+
+
+def test_cosyvoice_worker_defaults_to_cosyvoice_300m_model_dir() -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    assert worker.MODEL_DIR == "pretrained_models/CosyVoice-300M"
+
+
+def test_cosyvoice_bootstrap_adds_matcha_tts_to_python_path(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    repo = tmp_path / "CosyVoice"
+    matcha = repo / "third_party" / "Matcha-TTS"
+    matcha.mkdir(parents=True)
+    monkeypatch.setattr(worker, "REPO_DIR", repo)
+    monkeypatch.setattr(sys, "path", [])
+
+    worker._bootstrap_repo()
+
+    assert str(repo) in sys.path
+    assert str(matcha) in sys.path
+
+
+def test_cosyvoice_zero_shot_uses_upstream_positional_signature_and_prompt_audio_alias(monkeypatch) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    calls: list[tuple] = []
+
+    class FakePipeline:
+        sample_rate = 24000
+
+        def inference_zero_shot(self, text, prompt_text, prompt_wav, zero_shot_spk_id="", stream=False, speed=1.0):
+            calls.append((text, prompt_text, prompt_wav, stream, speed))
+            assert zero_shot_spk_id == ""
+            return [{"tts_speech": [0.0, 0.1], "sample_rate": 24000}]
+
+    monkeypatch.setattr(worker, "_load_audio", lambda path: f"audio:{path}")
+    monkeypatch.setattr(worker, "_chunk_to_wav", lambda chunk, sample_rate=None: b"RIFFdemo")
+
+    chunks = worker._run_cosyvoice(
+        FakePipeline(),
+        "zero_shot",
+        "target text",
+        {"prompt_audio_path": "ref.wav", "prompt_text": "reference text", "speed": 1.25},
+    )
+
+    assert calls == [("target text", "reference text", "audio:ref.wav", False, 1.25)]
+    assert chunks == [b"RIFFdemo"]
+
+
+def test_cosyvoice_ensure_pipeline_uses_auto_model(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    created: list[str] = []
+    fake_module = types.ModuleType("cosyvoice.cli.cosyvoice")
+
+    class FakePipeline:
+        pass
+
+    def fake_auto_model(**kwargs):
+        created.append(kwargs["model_dir"])
+        return FakePipeline()
+
+    fake_module.AutoModel = fake_auto_model
+    monkeypatch.setitem(sys.modules, "cosyvoice", types.ModuleType("cosyvoice"))
+    monkeypatch.setitem(sys.modules, "cosyvoice.cli", types.ModuleType("cosyvoice.cli"))
+    monkeypatch.setitem(sys.modules, "cosyvoice.cli.cosyvoice", fake_module)
+    monkeypatch.setattr(worker, "REPO_DIR", tmp_path)
+    monkeypatch.setattr(worker, "MODEL_DIR", "pretrained_models/CosyVoice-300M")
+    monkeypatch.setattr(worker, "_pipeline", None)
+
+    pipeline = worker._ensure_pipeline()
+
+    assert isinstance(pipeline, FakePipeline)
+    assert created == [str(tmp_path / "pretrained_models/CosyVoice-300M")]
 
 
 def test_cosyvoice_worker_status_reports_repo_state(tmp_path: Path, monkeypatch) -> None:

@@ -37,7 +37,7 @@ from pydantic import BaseModel
 from app.workers.contracts import LoadRequest, SynthesizeRequest
 
 REPO_DIR = Path(os.environ.get("TTS_MORE_COSYVOICE_REPO", "repo/CosyVoice")).resolve(strict=False)
-MODEL_DIR = os.environ.get("TTS_MORE_COSYVOICE_MODEL_DIR", "pretrained_models")
+MODEL_DIR = os.environ.get("TTS_MORE_COSYVOICE_MODEL_DIR", "pretrained_models/CosyVoice-300M")
 
 _pipeline: Any = None
 _loaded_mode: str | None = None
@@ -60,9 +60,10 @@ _MODE_MAP = {
 def _bootstrap_repo() -> None:
     if not REPO_DIR.exists():
         return
-    repo_str = str(REPO_DIR)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
+    for path in (REPO_DIR, REPO_DIR / "third_party" / "Matcha-TTS"):
+        path_str = str(path)
+        if path.exists() and path_str not in sys.path:
+            sys.path.insert(0, path_str)
     try:
         os.chdir(REPO_DIR)
     except OSError:
@@ -78,14 +79,11 @@ def _ensure_pipeline() -> Any:
         raise RuntimeError(f"CosyVoice repo not found at {REPO_DIR}")
     _bootstrap_repo()
     try:
-        # TODO(GPU-env): confirm the exact import path + class name for the
-        # deployed CosyVoice build (CosyVoice vs CosyVoice2). Upstream typically
-        # exposes cosyvoice.cli.cosyvoice.CosyVoice.
-        from cosyvoice.cli.cosyvoice import CosyVoice  # type: ignore
+        from cosyvoice.cli.cosyvoice import AutoModel  # type: ignore
     except Exception as exc:  # pragma: no cover - requires torch/GPU env
         raise RuntimeError(f"failed to import CosyVoice pipeline: {exc}") from exc
     model_path = REPO_DIR / MODEL_DIR if not Path(MODEL_DIR).is_absolute() else Path(MODEL_DIR)
-    _pipeline = CosyVoice(str(model_path))
+    _pipeline = AutoModel(model_dir=str(model_path))
     return _pipeline
 
 
@@ -108,9 +106,13 @@ def capabilities() -> dict[str, Any]:
         "capabilities": [
             "tts",
             "sft-voice",
+            "sft_voice",
             "zero-shot-voice",
+            "zero_shot_voice",
             "cross-lingual-voice",
+            "cross_lingual_voice",
             "style-instruction",
+            "style_instruction",
         ]
     }
 
@@ -190,19 +192,29 @@ def _run_cosyvoice(pipeline: Any, mode: str, text: str, params: dict[str, Any]) 
     speed = float(params.get("speed", 1.0))
     if mode == "sft":
         sft_voice = str(params.get("sft_voice") or "")
-        gen = pipeline.inference_sft(text, sft_voice, speed=speed)
+        gen = pipeline.inference_sft(text, sft_voice, stream=False, speed=speed)
     elif mode == "cross_lingual":
-        ref_audio = str(params.get("ref_audio_path") or "")
-        gen = pipeline.inference_cross_lingual(text, prompt_speech_16k=_load_audio(ref_audio), speed=speed)
+        ref_audio = _reference_audio_path(params)
+        gen = pipeline.inference_cross_lingual(text, _load_audio(ref_audio), stream=False, speed=speed)
     elif mode == "instruct":
         instruct_text = str(params.get("instruct_text") or "")
-        ref_audio = str(params.get("ref_audio_path") or "")
-        gen = pipeline.inference_instruct2(text, instruct_text, prompt_speech_16k=_load_audio(ref_audio), speed=speed)
+        ref_audio = _reference_audio_path(params)
+        gen = pipeline.inference_instruct2(text, instruct_text, _load_audio(ref_audio), stream=False, speed=speed)
     else:  # zero_shot
-        ref_audio = str(params.get("ref_audio_path") or "")
+        ref_audio = _reference_audio_path(params)
         prompt_text = str(params.get("prompt_text") or "")
-        gen = pipeline.inference_zero_shot(text, prompt_text, prompt_speech_16k=_load_audio(ref_audio), speed=speed)
-    return [_chunk_to_wav(chunk) for chunk in gen]
+        gen = pipeline.inference_zero_shot(text, prompt_text, _load_audio(ref_audio), stream=False, speed=speed)
+    sample_rate = int(getattr(pipeline, "sample_rate", 22050) or 22050)
+    return [_chunk_to_wav(chunk, sample_rate=sample_rate) for chunk in gen]
+
+
+def _reference_audio_path(params: dict[str, Any]) -> str:
+    return str(
+        params.get("prompt_audio_path")
+        or params.get("voice_reference_audio")
+        or params.get("ref_audio_path")
+        or ""
+    )
 
 
 def _load_audio(path: str) -> Any:
@@ -213,15 +225,15 @@ def _load_audio(path: str) -> Any:
     return speech
 
 
-def _chunk_to_wav(chunk: Any) -> bytes:
+def _chunk_to_wav(chunk: Any, sample_rate: int | None = None) -> bytes:
     import io
     import numpy as np
     from scipy.io import wavfile  # type: ignore
 
     data = np.asarray(chunk.get("tts_speech", chunk), dtype=np.float32)
     buf = io.BytesIO()
-    sample_rate = int(chunk.get("sample_rate", 22050)) if isinstance(chunk, dict) else 22050
-    wavfile.write(buf, sample_rate, data)
+    resolved_rate = int(chunk.get("sample_rate", sample_rate or 22050)) if isinstance(chunk, dict) else int(sample_rate or 22050)
+    wavfile.write(buf, resolved_rate, data)
     return buf.getvalue()
 
 

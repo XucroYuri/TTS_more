@@ -23,7 +23,7 @@
 - `backend/pyproject.toml` 依赖只有 `fastapi`/`uvicorn`/`pydantic`/`httpx`/`PyYAML`/`python-dotenv`/`python-multipart`，**无 torch/CUDA**。
 - `backend/app/hardware.py`：`nvidia-smi` 是**可选探测**（`shutil.which` 找不到就返回 `unavailable`），非硬依赖。`os.getloadavg()` 用 `hasattr` 守卫（Windows 无此函数）。
 - `backend/app/workers/indextts_line_launcher.py`：`--cuda-kernel`/`--fp16`/`--deepspeed` 是**透传给 IndexTTS 库的 CLI 参数**，只在子进程 worker 里 `from indextts.infer_v2 import IndexTTS2`，**不在 Web 应用进程内**。
-- `backend/app/main.py:1456`：`modules: ["numpy","torch"]` 是**子进程运行时探测**（检查 `repo/GPT-SoVITS` 的 venv 是否装了 torch），应用本体不 import torch。
+- `backend/app/main.py` 的 runtime checks 是**子进程运行时探测**（检查 GPT-SoVITS 分支 repo 的 venv 是否装了 torch），应用本体不 import torch。
 
 **CUDA/uv-Windows 专属逻辑只存在于**：(a) 可选硬件探测（优雅降级）；(b) 子 worker launcher（独立进程）；(c) `scripts/prepare-models.ps1`（Windows 模型准备脚本，非应用本体）。这些在文档层面已记录，待运行环境符合时验证。
 

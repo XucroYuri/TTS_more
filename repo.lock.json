@@ -1,25 +1,59 @@
 {
   "repositories": [
     {
-      "name": "GPT-SoVITS",
-      "path": "repo/GPT-SoVITS",
+      "name": "GPT-SoVITS-main",
+      "provider_type": "gpt-sovits",
+      "variant": "main",
+      "path": "repo/GPT-SoVITS-main",
+      "remote": "https://github.com/XucroYuri/GPT-SoVITS.git",
+      "branch": "main",
+      "commit": "bf81cdb14a38b674b6e9996dabc97340bc9978d2",
+      "service_id": "local-gpt-sovits-main",
+      "port": 9880
+    },
+    {
+      "name": "GPT-SoVITS-dev",
+      "provider_type": "gpt-sovits",
+      "variant": "dev",
+      "path": "repo/GPT-SoVITS-dev",
+      "remote": "https://github.com/XucroYuri/GPT-SoVITS.git",
+      "branch": "dev",
+      "commit": "6ae63b72bd3352356dcfd3961e44add7e04b1a1c",
+      "service_id": "local-gpt-sovits-dev",
+      "port": 9883
+    },
+    {
+      "name": "GPT-SoVITS-proplus-hc-dev",
+      "provider_type": "gpt-sovits",
+      "variant": "proplus-hc-dev",
+      "path": "repo/GPT-SoVITS-proplus-hc-dev",
       "remote": "https://github.com/XucroYuri/GPT-SoVITS.git",
       "branch": "xucroyuri/proplus-hc-dev",
-      "commit": "b6b2a9da2eade248cf03f89195c79f49d8cd8e22"
+      "commit": "b6b2a9da2eade248cf03f89195c79f49d8cd8e22",
+      "service_id": "local-gpt-sovits-proplus-hc-dev",
+      "port": 9884
     },
     {
       "name": "index-tts",
+      "provider_type": "indextts",
       "path": "repo/index-tts",
       "remote": "https://github.com/XucroYuri/index-tts.git",
       "branch": "main",
-      "commit": "7264ce2a9a0924becb6b8da3f60725f7663de089"
+      "commit": "7264ce2a9a0924becb6b8da3f60725f7663de089",
+      "service_id": "local-indextts",
+      "port": 9881
     },
     {
       "name": "CosyVoice",
+      "provider_type": "cosyvoice",
       "path": "repo/CosyVoice",
       "remote": "https://github.com/XucroYuri/CosyVoice.git",
       "branch": "main",
-      "commit": null
+      "commit": "074ca6dc9e80a2f424f1f74b48bdd7d3fea531cc",
+      "service_id": "local-cosyvoice",
+      "port": 9882,
+      "submodules": true,
+      "model_dir": "pretrained_models/CosyVoice-300M"
     }
   ]
 }

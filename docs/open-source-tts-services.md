@@ -30,25 +30,24 @@ flowchart TD
 git clone https://github.com/XucroYuri/TTS_more.git
 ```
 
-如果本机或局域网还没有可用 TTS 服务，可以按需部署以下项目，并启动它们各自的推理 WebUI。
+如果本机或局域网还没有可用 TTS 服务，推荐用部署脚本准备 repo 和 worker：
 
 ```bash
-git clone https://github.com/XucroYuri/GPT-SoVITS.git repo/GPT-SoVITS
-git clone https://github.com/XucroYuri/index-tts.git repo/index-tts
-git clone https://github.com/XucroYuri/CosyVoice.git repo/CosyVoice
+python scripts/tts_more_deploy.py sync-repos --clean
+python scripts/tts_more_deploy.py render-services --profile local-all --output data/local/services.json
 ```
 
-这些 fork 作为稳定镜像使用。TTS More 不再绑定本机 repo 路径，也不托管启动进程；只接入已经运行的 Gradio WebUI。
+`repo.lock.json` 会拉取 GPT-SoVITS `main`、`dev`、`xucroyuri/proplus-hc-dev` 三个分支，以及 IndexTTS、CosyVoice。详见 [部署方案](deployment.md)。
 
 ## 接入方式
 
-在工作台打开 `服务与资源 → 开源接入`，选择一个开源 provider 后只需要配置一个字段：
+首选接入方式是 TTS More worker 的 `tts-more-v1` 契约：
 
 ```text
-Gradio WebUI 地址，例如 http://tts-webui.local:9872
+Worker 地址，例如 http://tts-gpu.local:9880
 ```
 
-`127.0.0.1` 和 `localhost` 仍然兼容。TTS More 会根据 URL 自动标记为本机端点、局域网端点或公网端点，并固定使用对应 provider 的 Gradio contract：
+`127.0.0.1` 和 `localhost` 仍然兼容。已有上游 Gradio WebUI 时可以作为 fallback：
 
 - GPT-SoVITS：`gradio-gpt-sovits-webui`
 - IndexTTS：`gradio-indextts2-webui`
@@ -109,7 +108,7 @@ service_id + mode + speaker + prompt audio + prompt text + instruct + speed + se
 
 ## 进程边界
 
-GPT-SoVITS、IndexTTS、CosyVoice 的启动、停止和模型资源管理都由各自 WebUI 负责。TTS More 只保存 endpoint、检测 Gradio `/config`、调用对应 api_name，并把生成音频写回项目历史。
+GPT-SoVITS、IndexTTS、CosyVoice 的主路径是本仓 `backend/app/workers/` 下的非侵入式 worker。worker 在上游 repo 的 Python 环境里运行，直接 import 上游模型，并暴露 `/health`、`/capabilities`、`/load`、`/synthesize`、`/unload`。Gradio 只作为用户已有 WebUI 的兼容接入。
 
 ## 发布安全
 

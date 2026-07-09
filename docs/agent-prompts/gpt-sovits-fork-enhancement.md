@@ -1,6 +1,6 @@
 # GPT-SoVITS Fork 改造 Prompt
 
-> **作用域说明：** 本文档针对 GPT-SoVITS **子仓库**（`repo/GPT-SoVITS`，即 fork `https://github.com/XucroYuri/GPT-SoVITS`）的改造，**不是** TTS More 本仓库的代码。TTS More 通过 HTTP API 调用 GPT-SoVITS，本文档描述如何让 GPT-SoVITS 那一侧暴露 TTS More 需要的端点。
+> **作用域说明：** 本文档针对 GPT-SoVITS **子仓库的具体分支目录**（例如 `repo/GPT-SoVITS-proplus-hc-dev`，即 fork `https://github.com/XucroYuri/GPT-SoVITS`）的改造，**不是** TTS More 本仓库的代码。TTS More 通过 HTTP API 调用 GPT-SoVITS，本文档描述如何让 GPT-SoVITS 那一侧暴露 TTS More 需要的端点。
 
 ## 角色与目标
 

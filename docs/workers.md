@@ -12,7 +12,7 @@ flowchart TD
       W2["indextts_worker.py :9881<br/>import indextts.infer_v2"]
       W3["cosyvoice_worker.py :9882<br/>import cosyvoice.cli"]
     end
-    Workers -- "进程内 import<br/>常驻模型" --> Repos["repo/GPT-SoVITS<br/>repo/index-tts<br/>repo/CosyVoice"]
+    Workers -- "进程内 import<br/>常驻模型" --> Repos["repo/GPT-SoVITS-main/dev/proplus-hc-dev<br/>repo/index-tts<br/>repo/CosyVoice"]
     App -. "兜底（能力有限）" .-> Gradio["Gradio WebUI<br/>上游官方/fork"]
 ```
 
@@ -57,34 +57,33 @@ flowchart LR
 ```bash
 # macOS / Linux
 make workers
-# 或：scripts/start-service-workers.sh
+# 或：scripts/start-service-workers.sh --services local-gpt-sovits-main,local-indextts
 
 # Windows
-.\scripts\start-service-workers.ps1
+.\scripts\start-service-workers.ps1 -Services local-gpt-sovits-main,local-indextts
 ```
 
-每个 worker 在其 repo 的 venv 里运行（torch/CUDA 解析）。用环境变量指定各 repo 的解释器：
+worker 启动信息来自 `repo.lock.json`，由 `scripts/tts_more_deploy.py` 渲染。每个 worker 在其 repo 的 venv 里运行（torch/CUDA 解析）。如需生成本机服务配置：
 
 ```bash
-TTS_MORE_GPTSOVITS_PYTHON=repo/GPT-SoVITS/.venv/bin/python \
-TTS_MORE_INDEXTTS_PYTHON=repo/index-tts/.venv/bin/python \
-TTS_MORE_COSYVOICE_PYTHON=repo/CosyVoice/.venv/bin/python \
-make workers
+python scripts/tts_more_deploy.py render-services --profile local-all --output data/local/services.json
 ```
 
-未设置时回退到后端 `.venv/bin/python`（适用于 repo 共享后端 env 的场景）。
+普通验证建议一次启动一个 GPT-SoVITS 分支，避免同时加载多个大模型占满显存。
 
 ## 端口约定
 
 | 服务 | 端口 | worker 模块 |
 |---|---|---|
-| GPT-SoVITS | 9880 | `app.workers.gpt_sovits_worker:app` |
+| GPT-SoVITS main | 9880 | `app.workers.gpt_sovits_worker:app` |
+| GPT-SoVITS dev | 9883 | `app.workers.gpt_sovits_worker:app` |
+| GPT-SoVITS proplus-hc-dev | 9884 | `app.workers.gpt_sovits_worker:app` |
 | IndexTTS | 9881 | `app.workers.indextts_worker:app` |
 | CosyVoice | 9882 | `app.workers.cosyvoice_worker:app` |
 
 ## 服务注册
 
-`data/services.json` 三个本地服务已声明为 `api_contract: tts-more-v1`、`mode: local`、`managed: true`，带 `start_command`/`start_cwd`/`env`/`repo_path`。`ServiceSupervisor` 可启停。`HttpTTSServiceClient` 自动消费。
+`data/services.json` 的提交模板声明五个本地 worker（GPT-SoVITS 三分支、IndexTTS、CosyVoice），默认 `enabled:false`、`setup_state:not_configured`。部署脚本生成的 `data/local/services.json` 会启用目标服务，并写入 `start_command`/`start_cwd`/`env`/`repo_path`。`ServiceSupervisor` 可启停。`HttpTTSServiceClient` 自动消费。
 
 ## 分布式部署
 
