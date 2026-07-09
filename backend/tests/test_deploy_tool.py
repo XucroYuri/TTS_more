@@ -231,12 +231,23 @@ def test_resolve_network_profile_prefers_healthy_domestic_source(tmp_path: Path)
 def test_resolve_network_profile_reuses_valid_cached_profile_without_probe(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
+    cache_paths = deploy._cache_paths(tmp_path, {})
     cached_profile = {
         "schema_version": deploy.NETWORK_PROFILE_SCHEMA_VERSION,
         "mode": "auto",
         "source": "cached",
         "expires_at": "2099-01-01T00:00:00Z",
-        "cache_paths": {"pip_cache_dir": "data/cache/pip"},
+        "cache_root": cache_paths["cache_root"],
+        "cache_paths": cache_paths,
+        "request_context": {
+            "mode": "auto",
+            "source": "Auto",
+            "cache_root": cache_paths["cache_root"],
+            "model_source": "",
+            "pip_index_url": "",
+            "hf_endpoint": "",
+            "extra_pip_index_url": "",
+        },
     }
     deploy.write_json(tmp_path / "data" / "local" / "network-profile.json", cached_profile)
 
@@ -251,6 +262,48 @@ def test_resolve_network_profile_reuses_valid_cached_profile_without_probe(tmp_p
     )
 
     assert profile == cached_profile
+
+
+def test_resolve_network_profile_rebuilds_cache_when_cache_root_changes(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    cache_paths = deploy._cache_paths(tmp_path, {})
+    cached_profile = {
+        "schema_version": deploy.NETWORK_PROFILE_SCHEMA_VERSION,
+        "mode": "auto",
+        "source": "cached",
+        "expires_at": "2099-01-01T00:00:00Z",
+        "cache_root": cache_paths["cache_root"],
+        "cache_paths": cache_paths,
+        "request_context": {
+            "mode": "auto",
+            "source": "Auto",
+            "cache_root": cache_paths["cache_root"],
+            "model_source": "",
+            "pip_index_url": "",
+            "hf_endpoint": "",
+            "extra_pip_index_url": "",
+        },
+    }
+    deploy.write_json(tmp_path / "data" / "local" / "network-profile.json", cached_profile)
+
+    probe_calls: list[str] = []
+
+    def fake_probe(url: str, timeout_seconds: float) -> dict[str, object]:
+        probe_calls.append(url)
+        return {"url": url, "ok": True, "latency_ms": 10, "error": ""}
+
+    profile = deploy.resolve_network_profile(
+        tmp_path,
+        force=False,
+        probe_func=fake_probe,
+        environ={"TTS_MORE_CACHE_ROOT": "custom-cache"},
+    )
+
+    assert probe_calls
+    assert profile["cache_root"] == "custom-cache"
+    assert profile["cache_paths"]["cache_root"] == "custom-cache"
+    assert profile["cache_paths"]["pip_cache_dir"].endswith(os.path.join("custom-cache", "pip"))
 
 
 def test_probe_url_rejects_client_error_status(monkeypatch: pytest.MonkeyPatch) -> None:

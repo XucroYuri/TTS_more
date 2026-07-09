@@ -206,6 +206,32 @@ def _load_cached_network_profile(root: Path) -> dict[str, Any] | None:
     return payload
 
 
+def _network_profile_request_context(root: Path, mode: str, source: str, environ: Mapping[str, str]) -> dict[str, str]:
+    cache_paths = _cache_paths(root, environ)
+    return {
+        "mode": mode,
+        "source": source,
+        "cache_root": cache_paths["cache_root"],
+        "model_source": environ.get("TTS_MORE_MODEL_SOURCE", ""),
+        "pip_index_url": environ.get("TTS_MORE_PIP_INDEX_URL", ""),
+        "hf_endpoint": environ.get("TTS_MORE_HF_ENDPOINT", ""),
+        "extra_pip_index_url": environ.get("TTS_MORE_EXTRA_PIP_INDEX_URL", ""),
+    }
+
+
+def _cached_network_profile_matches_request(
+    profile: dict[str, Any],
+    request_context: dict[str, str],
+) -> bool:
+    cached_context = profile.get("request_context")
+    if not isinstance(cached_context, dict):
+        return False
+    for key, expected in request_context.items():
+        if str(cached_context.get(key, "")) != expected:
+            return False
+    return True
+
+
 def network_env_from_profile(profile: dict[str, Any]) -> dict[str, str]:
     cache_paths = profile.get("cache_paths") or {}
     env = {
@@ -255,6 +281,7 @@ def _profile_from_choices(
         "pytorch_index_strategy": "official",
         "cache_root": cache_paths["cache_root"],
         "cache_paths": cache_paths,
+        "request_context": _network_profile_request_context(root, mode, environ.get("TTS_MORE_MODEL_SOURCE", ""), environ),
         "created_at": _isoformat(now),
         "expires_at": _isoformat(now + timedelta(hours=ttl_hours)),
         "probes": list(probes.values()),
@@ -281,9 +308,10 @@ def resolve_network_profile(
         raise ValueError(f"unsupported network profile mode: {mode}")
     if source not in {"Auto", "ModelScope", "HF-Mirror", "HF"}:
         raise ValueError(f"unsupported model source: {source}")
+    request_context = _network_profile_request_context(root, mode, source, environ)
     if not force:
         cached_profile = _load_cached_network_profile(root)
-        if cached_profile is not None:
+        if cached_profile is not None and _cached_network_profile_matches_request(cached_profile, request_context):
             return cached_profile
     probes = _probe_all_candidates(timeout_seconds, probe_func)
     model_candidate = next((item for item in MODEL_SOURCE_CANDIDATES if item["name"] == source), None)
