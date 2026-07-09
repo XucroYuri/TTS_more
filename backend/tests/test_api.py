@@ -229,7 +229,7 @@ def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch
             captured["json"] = json
             return FakeResponse()
 
-    monkeypatch.setattr("app.main.httpx.Client", FakeClient)
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
     client = TestClient(create_app(data_root=tmp_path, env_path=tmp_path / ".env.local"))
 
     response = client.post(
@@ -244,6 +244,7 @@ def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch
                 "enabled": True,
                 "timeout_seconds": 45,
                 "priority": 10,
+                "adapter": "openai-compatible",
             }
         },
     )
@@ -258,6 +259,80 @@ def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch
     assert "**NARRATOR**" in messages[1]["content"]
     assert response.json()["message"] == "parser contract request succeeded"
     assert '"characters"' in response.json()["content_preview"]
+
+
+def test_parser_provider_test_uses_anthropic_adapter(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "emit_tts_parse",
+                        "input": {
+                            "characters": [{"id": "narrator", "name": "NARRATOR"}],
+                            "lines": [
+                                {
+                                    "id": "l001",
+                                    "character_id": "narrator",
+                                    "text": "Hello from the contract test.",
+                                    "note": "calm",
+                                    "language": "en",
+                                    "source_text": "Hello from the contract test.",
+                                    "source_excerpt": "**NARRATOR**\n(calm)\nHello from the contract test.",
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            captured["timeout"] = timeout
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
+    client = TestClient(create_app(data_root=tmp_path, env_path=tmp_path / ".env.local"))
+
+    response = client.post(
+        "/api/parser/providers/test",
+        json={
+            "provider": {
+                "name": "Anthropic",
+                "base_url": "https://api.anthropic.com",
+                "api_key_env": "ANTHROPIC_API_KEY",
+                "api_key": "anthropic-test-secret",
+                "model": "claude-fable-5",
+                "enabled": True,
+                "timeout_seconds": 60,
+                "priority": 20,
+                "adapter": "anthropic",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert captured["url"] == "https://api.anthropic.com/v1/messages"
+    assert captured["headers"]["x-api-key"] == "anthropic-test-secret"
+    assert captured["json"]["tool_choice"] == {"type": "tool", "name": "emit_tts_parse"}
 
 
 def test_parse_script_returns_422_when_parser_quality_gate_fails(tmp_path: Path) -> None:
