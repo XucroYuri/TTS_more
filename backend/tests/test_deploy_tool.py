@@ -327,3 +327,101 @@ def test_probe_url_rejects_client_error_status(monkeypatch: pytest.MonkeyPatch) 
     result = deploy._probe_url("https://example.invalid", 1.0)
 
     assert result["ok"] is False
+
+
+def test_resolve_network_profile_falls_back_to_global_when_domestic_fails(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+
+    def fake_probe(url: str, timeout_seconds: float) -> dict[str, object]:
+        if url in {"https://www.modelscope.cn", "https://hf-mirror.com", "https://mirrors.aliyun.com/pypi/simple"}:
+            return {"url": url, "ok": False, "latency_ms": 2000, "error": "timeout"}
+        return {"url": url, "ok": True, "latency_ms": 90, "error": ""}
+
+    profile = deploy.resolve_network_profile(
+        tmp_path,
+        mode="auto",
+        source="Auto",
+        force=True,
+        probe_func=fake_probe,
+        environ={},
+    )
+
+    assert profile["model_source"] == "HF"
+    assert profile["hf_endpoint"] == ""
+    assert profile["pip_index_url"] == "https://pypi.org/simple"
+
+
+def test_manual_source_keeps_cache_env_and_skips_auto_source_choice(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+
+    def fake_probe(url: str, timeout_seconds: float) -> dict[str, object]:
+        return {"url": url, "ok": True, "latency_ms": 10, "error": ""}
+
+    profile = deploy.resolve_network_profile(
+        tmp_path,
+        mode="auto",
+        source="HF-Mirror",
+        force=True,
+        probe_func=fake_probe,
+        environ={},
+    )
+
+    assert profile["model_source"] == "HF-Mirror"
+    assert profile["hf_endpoint"] == "https://hf-mirror.com"
+    env = deploy.network_env_from_profile(profile)
+    assert env["HF_ENDPOINT"] == "https://hf-mirror.com"
+    assert "PIP_CACHE_DIR" in env
+
+
+def test_probe_network_writes_profile_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+
+    def fake_resolve(root: Path, **kwargs: object) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "mode": "auto",
+            "model_source": "ModelScope",
+            "hf_endpoint": "",
+            "pip_index_url": "https://mirrors.aliyun.com/pypi/simple",
+            "cache_root": "data/cache",
+            "cache_paths": {"pip_cache_dir": str(root / "data/cache/pip")},
+            "env": {"PIP_CACHE_DIR": str(root / "data/cache/pip")},
+            "probes": [],
+        }
+
+    monkeypatch.setattr(deploy, "resolve_network_profile", fake_resolve)
+
+    profile = deploy.probe_network(tmp_path, write=True)
+
+    profile_path = tmp_path / "data" / "local" / "network-profile.json"
+    assert profile["model_source"] == "ModelScope"
+    assert json.loads(profile_path.read_text(encoding="utf-8"))["env"]["PIP_CACHE_DIR"].endswith("pip")
+
+
+def test_doctor_reports_network_profile_and_cache_paths(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    profile_path = tmp_path / "data" / "local" / "network-profile.json"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "mode": "auto",
+                "model_source": "HF-Mirror",
+                "cache_root": "data/cache",
+                "cache_paths": {"pip_cache_dir": str(tmp_path / "data/cache/pip")},
+                "env": {"HF_ENDPOINT": "https://hf-mirror.com"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = deploy.doctor(tmp_path)
+
+    assert report["network_profile"]["model_source"] == "HF-Mirror"
+    assert report["cache_paths"]["cache_root"] == "data/cache"

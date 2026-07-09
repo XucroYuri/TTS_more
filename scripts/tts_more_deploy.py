@@ -334,6 +334,47 @@ def resolve_network_profile(
     return profile
 
 
+def _network_profile_path(root: Path) -> Path:
+    return root / NETWORK_PROFILE_RELATIVE_PATH
+
+
+def _read_network_profile(root: Path) -> dict[str, Any] | None:
+    path = _network_profile_path(root)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def probe_network(
+    root: Path = PROJECT_ROOT,
+    *,
+    mode: str = "auto",
+    source: str = "Auto",
+    write: bool = False,
+    force: bool = False,
+    timeout_seconds: float = 2.0,
+    ttl_hours: float = 24.0,
+    output: str | None = None,
+) -> dict[str, Any]:
+    profile = resolve_network_profile(
+        root,
+        mode=mode,
+        source=source,
+        timeout_seconds=timeout_seconds,
+        ttl_hours=ttl_hours,
+        force=force,
+    )
+    if write:
+        write_json(_network_profile_path(root), profile)
+    if output:
+        write_json(root / output, profile)
+    return profile
+
+
 def render_services(
     root: Path = PROJECT_ROOT,
     *,
@@ -449,7 +490,12 @@ def doctor(root: Path = PROJECT_ROOT) -> dict[str, Any]:
             rel = child.relative_to(root).as_posix()
             if rel not in expected_paths:
                 extra_dirs.append({"path": rel, "empty": child.is_dir() and not any(child.iterdir())})
-    return {"repositories": reports, "extra_repo_dirs": extra_dirs}
+    return {
+        "repositories": reports,
+        "extra_repo_dirs": extra_dirs,
+        "network_profile": _read_network_profile(root) or {},
+        "cache_paths": _cache_paths(root),
+    }
 
 
 def start_workers(
@@ -695,6 +741,15 @@ def main(argv: list[str] | None = None) -> int:
     sync.add_argument("--clean", action="store_true")
     sync.add_argument("--dry-run", action="store_true")
 
+    probe = sub.add_parser("probe-network", help="Probe local network and choose install/download sources")
+    probe.add_argument("--mode", choices=("auto", "china", "global"), default="auto")
+    probe.add_argument("--source", choices=("Auto", "ModelScope", "HF", "HF-Mirror"), default="Auto")
+    probe.add_argument("--write", action="store_true")
+    probe.add_argument("--force", action="store_true")
+    probe.add_argument("--timeout-seconds", type=float, default=2.0)
+    probe.add_argument("--ttl-hours", type=float, default=24.0)
+    probe.add_argument("--output", default=None)
+
     doctor_parser = sub.add_parser("doctor", help="Inspect repository checkout state")
     doctor_parser.add_argument("--output", default=None)
 
@@ -723,6 +778,19 @@ def main(argv: list[str] | None = None) -> int:
         actions = sync_repos(root, clean=args.clean, dry_run=args.dry_run)
         for command in actions:
             print(" ".join(command))
+        return 0
+    if args.command == "probe-network":
+        profile = probe_network(
+            root,
+            mode=args.mode,
+            source=args.source,
+            write=args.write,
+            force=args.force,
+            timeout_seconds=args.timeout_seconds,
+            ttl_hours=args.ttl_hours,
+            output=args.output,
+        )
+        print(json.dumps(profile, ensure_ascii=False, indent=2))
         return 0
     if args.command == "doctor":
         payload = doctor(root)
