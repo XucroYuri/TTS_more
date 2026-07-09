@@ -37,7 +37,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       resourceQueue: "队列",
       services: "服务",
       ttsConfig: "接入",
-      llmConfig: "解析"
+      llmConfig: "LLM"
     },
     audioInput: {
       upload: "上传",
@@ -802,7 +802,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       resourceQueue: "Queue",
       services: "Services",
       ttsConfig: "Setup",
-      llmConfig: "Parser"
+      llmConfig: "LLM"
     },
     audioInput: {
       upload: "Upload",

@@ -32,7 +32,7 @@ describe("i18n configuration", () => {
 
   it("keeps production workstation labels fully localized", () => {
     expect(tText(resources["zh-CN"], "topbar.roleLibrary")).toBe("角色");
-    expect(tText(resources["zh-CN"], "topbar.llmConfig")).toBe("解析");
+    expect(tText(resources["zh-CN"], "topbar.llmConfig")).toBe("LLM");
     expect(tText(resources["zh-CN"], "characters.libraryManager")).toBe("角色与音色");
     expect(tText(resources["zh-CN"], "characters.bindToProjectRole")).toBe("用于当前项目");
     expect(tText(resources["zh-CN"], "services.ttsAccessTitle")).toBe("添加 TTS 服务");
