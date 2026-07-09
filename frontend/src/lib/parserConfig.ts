@@ -1,7 +1,10 @@
 import type { ParserProviderDraft, ParserProvidersSavePayload } from "../types";
 
 export type ParserProviderKeyState = "configured" | "missing";
-type ParserProviderDraftLike = Omit<ParserProviderDraft, "adapter"> & { adapter?: string | null };
+type ParserProviderDraftLike = Omit<ParserProviderDraft, "adapter" | "key_configured"> & {
+  adapter?: string | null;
+  key_configured?: boolean;
+};
 
 export const KWJM_BASE_URL = "https://kwjm.com";
 export const KWJM_BASE_URL_PLACEHOLDER = KWJM_BASE_URL;
@@ -64,8 +67,8 @@ export function upsertKwjmParserProvider(providers: ParserProviderDraft[], apiKe
 
 export function toParserProviderSavePayload(providers: ParserProviderDraft[]): ParserProvidersSavePayload {
   return {
-    providers: providers.map(({ key_configured: _keyConfigured, api_key, ...provider }) => {
-      const normalizedProvider = normalizeParserProviderDraft(provider);
+    providers: providers.map(({ api_key, ...provider }) => {
+      const { key_configured: _keyConfigured, ...normalizedProvider } = normalizeParserProviderDraft(provider);
       const trimmedKey = api_key?.trim();
       return trimmedKey ? { ...normalizedProvider, api_key: trimmedKey } : normalizedProvider;
     }),
@@ -75,6 +78,7 @@ export function toParserProviderSavePayload(providers: ParserProviderDraft[]): P
 export function normalizeParserProviderDraft<T extends ParserProviderDraftLike>(provider: T): ParserProviderDraft {
   return {
     ...provider,
+    key_configured: provider.key_configured ?? false,
     adapter: normalizeParserProviderAdapter(provider.adapter),
   };
 }

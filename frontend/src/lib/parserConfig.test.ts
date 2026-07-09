@@ -90,6 +90,7 @@ describe("parser provider config helpers", () => {
   it("activates the kwjm preset with a trimmed api key while preserving other providers", () => {
     const existingKwjm: ParserProviderDraft = {
       name: "开物基模",
+      adapter: "openai-compatible",
       base_url: "",
       api_key_env: "OLD_KWJM_KEY",
       model: "old-model",
