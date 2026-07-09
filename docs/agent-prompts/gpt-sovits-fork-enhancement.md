@@ -1,6 +1,6 @@
 # GPT-SoVITS 子仓维护 Prompt
 
-> 只在用户明确要求维护 GPT-SoVITS 子仓时使用。TTS More 本仓的默认路径是 `tts-more-v1` worker，不需要改上游仓库。
+> 只在用户明确要求维护 GPT-SoVITS 子仓时使用。TTS More 本仓默认通过 `tts-more-v1` worker 或兼容 HTTP 端点调用服务，不需要为了普通接入去改上游仓库。
 
 ## 目标
 

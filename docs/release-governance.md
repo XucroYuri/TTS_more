@@ -51,7 +51,7 @@ flowchart TD
 pnpm --dir frontend test
 pnpm --dir frontend build
 
-git check-ignore -v data/local/characters.json data/local/services.json .env.local repo/GPT-SoVITS/README.md
+git check-ignore -v data/local/characters.json data/local/services.json .env.local repo/GPT-SoVITS-main/README.md
 .venv/bin/python -m pytest backend/tests/test_release_governance.py -q
 ```
 

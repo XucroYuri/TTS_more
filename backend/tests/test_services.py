@@ -108,6 +108,74 @@ def test_health_timeout_is_short_and_configurable(monkeypatch) -> None:
     assert _health_timeout_seconds() == 0.75
 
 
+def test_gpt_sovits_tts_more_worker_uses_standard_worker_health_endpoint() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ready": True, "worker": "gpt-sovits-standard"})
+        return httpx.Response(404, json={"error": "wrong endpoint"})
+
+    endpoint = TTSServiceEndpoint(
+        service_id="local-gpt-sovits-main",
+        engine=EngineName.GPT_SOVITS,
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://127.0.0.1:9880",
+        mode="local",
+        network_scope="localhost",
+        capabilities=["tts", "tts-more-worker"],
+    )
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+    health = client.health()
+
+    assert health["ready"] is True
+    assert paths == ["/health"]
+
+
+def test_gpt_sovits_tts_more_worker_catalog_uses_models_endpoint() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "name": "demo-hero",
+                            "gpt_weights": ["GPT_weights/demo-hero-e50.ckpt"],
+                            "sovits_weights": ["SoVITS_weights/demo-hero_e24_s360.pth"],
+                            "sample_count": 2,
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": "wrong endpoint"})
+
+    endpoint = TTSServiceEndpoint(
+        service_id="local-gpt-sovits-main",
+        engine=EngineName.GPT_SOVITS,
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://127.0.0.1:9880",
+        mode="local",
+        network_scope="localhost",
+        capabilities=["tts", "tts-more-worker"],
+    )
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+    catalog = client.model_catalog()  # type: ignore[attr-defined]
+
+    assert paths == ["/models"]
+    assert catalog["service_id"] == "local-gpt-sovits-main"
+    assert catalog["candidates"][0]["name"] == "demo-hero"
+    assert catalog["candidates"][0]["recommended_gpt_weights_path"].endswith("demo-hero-e50.ckpt")
+
+
 def test_gradio_webui_endpoint_is_reachable_and_routable_with_bridge(tmp_path: Path) -> None:
     endpoint = TTSServiceEndpoint(
         service_id="lan-indextts2-gradio",

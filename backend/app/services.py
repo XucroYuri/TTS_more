@@ -329,9 +329,11 @@ class ServiceRouter:
 def build_service_client(endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> TTSServiceClient:
     if endpoint.base_url.startswith("mock://"):
         return MockServiceClient(endpoint)
+    if endpoint.api_contract == "tts-more-v1":
+        return HttpTTSServiceClient(endpoint, transport=transport)
     if endpoint.api_contract.startswith("gradio-"):
         return GradioWebUIServiceClient(endpoint, transport=transport)
-    if endpoint.provider_type == ProviderType.GPT_SOVITS or "gpt-sovits-api-v2" in endpoint.capabilities:
+    if endpoint.api_contract == "gpt-sovits-api-v2" or "gpt-sovits-api-v2" in endpoint.capabilities:
         return GPTSoVITSApiV2ServiceClient(endpoint, transport=transport)
     if endpoint.provider_type == ProviderType.OPENAI:
         return OpenAISpeechClient(endpoint, transport=transport)
@@ -473,6 +475,26 @@ class HttpTTSServiceClient:
         except Exception:
             return {"capabilities": self.endpoint.capabilities}
 
+    def model_catalog(self, limit: int = 120) -> dict[str, Any]:
+        with httpx.Client(timeout=self.endpoint.default_params.get("timeout_seconds", 30.0), transport=self.transport) as client:
+            response = client.get(self.endpoint.base_url.rstrip("/") + "/models", headers=self._headers())
+            response.raise_for_status()
+            payload = response.json()
+        return _gpt_sovits_models_payload_to_catalog(self.endpoint, payload, source="worker", limit=limit)
+
+    def model_samples(self, logs_name: str, limit: int = 120) -> dict[str, Any]:
+        encoded_name = quote(logs_name, safe="")
+        with httpx.Client(timeout=self.endpoint.default_params.get("timeout_seconds", 30.0), transport=self.transport) as client:
+            response = client.get(self.endpoint.base_url.rstrip("/") + f"/models/{encoded_name}/samples", headers=self._headers())
+            response.raise_for_status()
+            payload = response.json()
+        return {
+            "service_id": self.endpoint.service_id,
+            "logs_name": logs_name,
+            "samples": list(payload.get("samples") or [])[:limit],
+            "raw": payload,
+        }
+
     def load(self, profile: str, parameters: dict[str, Any] | None = None) -> None:
         payload = {"profile": profile, "parameters": parameters or {}}
         with httpx.Client(timeout=120.0, transport=self.transport) as client:
@@ -515,6 +537,43 @@ class HttpTTSServiceClient:
         if self.endpoint.auth_header_env:
             keys.append(self.endpoint.auth_header_env)
         return [key for key in keys if not os.environ.get(key)]
+
+
+def _gpt_sovits_models_payload_to_catalog(
+    endpoint: TTSServiceEndpoint,
+    payload: dict[str, Any],
+    *,
+    source: str,
+    limit: int,
+) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for item in (payload.get("models") or [])[:limit]:
+        name = str(item.get("name") or item.get("model_name") or "").strip()
+        if not name:
+            continue
+        candidate = _logs_candidate({}, endpoint.service_id, name, source=source)
+        candidate["sample_count"] = int(item.get("sample_count") or 0)
+        candidate["has_training_data"] = bool(item.get("has_training_data") or candidate["sample_count"] > 0)
+        for path in item.get("gpt_weights") or []:
+            option = {
+                "name": Path(str(path)).name or str(path),
+                "path": str(path),
+                "value": str(path),
+                "score": _weight_score_tuple(str(path)),
+            }
+            candidate.setdefault("gpt_weights", []).append(option)
+            _prefer_recommended(candidate, "gpt", option)
+        for path in item.get("sovits_weights") or []:
+            option = {
+                "name": Path(str(path)).name or str(path),
+                "path": str(path),
+                "value": str(path),
+                "score": _weight_score_tuple(str(path)),
+            }
+            candidate.setdefault("sovits_weights", []).append(option)
+            _prefer_recommended(candidate, "sovits", option)
+        candidates.append(candidate)
+    return {"service_id": endpoint.service_id, "candidates": candidates, "raw": payload}
 
 
 class GradioWebUIServiceClient(HttpTTSServiceClient):
@@ -1018,24 +1077,7 @@ class GPTSoVITSApiV2ServiceClient(HttpTTSServiceClient):
             response = client.get(self.endpoint.base_url.rstrip("/") + "/models", headers=self._headers())
             response.raise_for_status()
             payload = response.json()
-        candidates: list[dict[str, Any]] = []
-        for item in (payload.get("models") or [])[:limit]:
-            name = str(item.get("name") or item.get("model_name") or "").strip()
-            if not name:
-                continue
-            candidate = _logs_candidate({}, self.endpoint.service_id, name, source="api_v2")
-            candidate["sample_count"] = int(item.get("sample_count") or 0)
-            candidate["has_training_data"] = bool(item.get("has_training_data") or candidate["sample_count"] > 0)
-            for path in item.get("gpt_weights") or []:
-                option = {"name": Path(str(path)).name or str(path), "path": str(path), "value": str(path), "score": _weight_score_tuple(str(path))}
-                candidate.setdefault("gpt_weights", []).append(option)
-                _prefer_recommended(candidate, "gpt", option)
-            for path in item.get("sovits_weights") or []:
-                option = {"name": Path(str(path)).name or str(path), "path": str(path), "value": str(path), "score": _weight_score_tuple(str(path))}
-                candidate.setdefault("sovits_weights", []).append(option)
-                _prefer_recommended(candidate, "sovits", option)
-            candidates.append(candidate)
-        return {"service_id": self.endpoint.service_id, "candidates": candidates, "raw": payload}
+        return _gpt_sovits_models_payload_to_catalog(self.endpoint, payload, source="api_v2", limit=limit)
 
     def model_samples(self, logs_name: str, limit: int = 120) -> dict[str, Any]:
         encoded_name = quote(logs_name, safe="")

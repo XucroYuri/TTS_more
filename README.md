@@ -74,18 +74,27 @@ make dev        # 或 scripts/start-dev.sh
 
 ### 4. 接入 TTS 服务
 
-在工作台打开 `接入 → TTS 服务`，选择 GPT-SoVITS / IndexTTS / CosyVoice，粘贴服务地址并执行“检测并保存”。接入向导写入 `data/local/services.json`，不污染可提交模板。
+在工作台打开 `接入 → TTS 服务`，选择 GPT-SoVITS / IndexTTS / CosyVoice，粘贴服务地址并执行“检测并保存”。`127.0.0.1`、`localhost`、局域网或远端 worker 地址都可以接入；向导写入 `data/local/services.json`，不污染可提交模板。
 
 TTS More 推荐 worker-first 架构：优先接入 `tts-more-v1` worker；已有 Gradio 服务也可以作为兼容端点接入。
 
-如需克隆本地 TTS 仓库到 `repo/`：
+本地部署推荐使用 manifest 驱动脚本。它会按 `repo.lock.json` 拉取 GPT-SoVITS 三个分支，以及 IndexTTS、CosyVoice：
 
-```bash
-git clone https://github.com/XucroYuri/GPT-SoVITS.git repo/GPT-SoVITS
-git clone https://github.com/XucroYuri/index-tts.git repo/index-tts
+```powershell
+.\scripts\tts-more.ps1 sync-repos --clean
+.\scripts\prepare-tts-repos.ps1 -SyncRepos -CleanRepos -Device CU128
 ```
 
-> 模型准备脚本 `scripts/prepare-models.ps1` 是 Windows 专属（含 CUDA/uv 布局）。macOS/Linux 用户请按各 TTS 项目的说明手动准备模型，或在 `.env.local` 里指向已运行的服务地址。
+macOS/Linux：
+
+```bash
+./scripts/tts-more.sh sync-repos --clean
+bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --device CU128
+```
+
+准备脚本默认走 `Auto`：先跑 `probe-network`，优先选择中国大陆可达且健康的源，例如 ModelScope 或 HF Mirror，必要时再回退到全球 Hugging Face / PyPI 路线。默认安装只准备 full-quality baseline models，quantized、distilled、simplified、small、low-memory 这些都只是手动 manual 的高级选项。
+
+详细拓扑、远端 worker、离线缓存和模型下载策略见 [部署方案](docs/deployment.md)。
 
 ## 验证
 
@@ -155,7 +164,7 @@ flowchart TD
 提交前确认：`repo/`、`.env.local`、`data/local/`、生成音频、模型权重、本机路径/UNC/局域网 IP、真实角色库**均不提交**。
 
 ```bash
-git check-ignore -v data/local/services.json .env.local repo/GPT-SoVITS
+git check-ignore -v data/local/services.json .env.local repo/GPT-SoVITS-main
 .venv/bin/python -m pytest backend/tests/test_release_governance.py -q
 ```
 
@@ -164,6 +173,7 @@ git check-ignore -v data/local/services.json .env.local repo/GPT-SoVITS
 - [架构](docs/architecture.md)
 - [安全模型](docs/security.md)
 - [TTS Worker 架构](docs/workers.md)
+- [部署方案](docs/deployment.md)
 - [GPT-SoVITS 接入方案](docs/gpt-sovits-integration.md)
 - [CI 架构与真实 TTS 验收](docs/ci-architecture.md)
 - [开源 TTS 服务接入](docs/open-source-tts-services.md)

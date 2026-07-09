@@ -30,13 +30,16 @@ flowchart TD
 git clone https://github.com/XucroYuri/TTS_more.git
 ```
 
-如果还没有可用 TTS 服务，可以按需部署以下项目，并优先启动 TTS More worker；已有 Gradio 服务也可以作为兼容端点接入。
+如果还没有可用 TTS 服务，推荐先用部署脚本准备 repo 和 worker；已有 Gradio 服务也可以作为兼容端点接入。
 
 ```bash
-git clone https://github.com/XucroYuri/GPT-SoVITS.git repo/GPT-SoVITS
-git clone https://github.com/XucroYuri/index-tts.git repo/index-tts
-git clone https://github.com/XucroYuri/CosyVoice.git repo/CosyVoice
+python scripts/tts_more_deploy.py sync-repos --clean
+python scripts/tts_more_deploy.py render-services --profile local-all --output data/local/services.json
 ```
+
+`repo.lock.json` 会拉取 GPT-SoVITS `main`、`dev`、`xucroyuri/proplus-hc-dev` 三个分支，以及 IndexTTS、CosyVoice。详见 [部署方案](deployment.md)。
+
+本地 worker 部署 profile 和源选择彼此独立。`app-only`、`worker-node`、`local-all` 都可以复用同一份生成的 `data/local/network-profile.json`；也可以让每台机器各自运行一次 `probe-network`，让包索引和模型端点和它自己的网络环境对齐。
 
 这些 fork 作为稳定镜像使用。TTS More 不再要求在工作台里填写本机 repo 路径；工作台只保存可检测的服务端点。
 
@@ -109,7 +112,7 @@ service_id + mode + speaker + prompt audio + prompt text + instruct + speed + se
 
 ## 进程边界
 
-GPT-SoVITS、IndexTTS、CosyVoice 的启动、停止和模型资源管理由对应 worker 或上游服务负责。TTS More 只保存 endpoint、检测契约、调用合成接口，并把生成音频写回项目历史。
+GPT-SoVITS、IndexTTS、CosyVoice 的主路径是本仓 `backend/app/workers/` 下的非侵入式 worker。worker 在上游 repo 的 Python 环境里运行，直接 import 上游模型，并暴露 `/health`、`/capabilities`、`/load`、`/synthesize`、`/unload`。TTS More 只保存 endpoint、检测契约、调用合成接口，并把生成音频写回项目历史；Gradio 只作为用户已有 WebUI 的兼容接入。
 
 ## 发布安全
 

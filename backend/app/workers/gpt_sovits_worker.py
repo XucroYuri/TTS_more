@@ -230,7 +230,7 @@ def synthesize(request: SynthesizeRequest) -> dict[str, Any]:
             inputs[opt] = params[opt]
     output_path = Path(request.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    sampling_rate, audio = pipeline.run(inputs)
+    sampling_rate, audio = _normalize_tts_run_output(pipeline.run(inputs))
     _write_audio(audio, sampling_rate, output_path, inputs["media_type"])
     return {
         "audio_path": str(output_path),
@@ -358,6 +358,39 @@ def _count_training_samples(role_name: str) -> dict[str, int]:
         if logs_dir.exists():
             return {"count": len(read_name2text_records(logs_dir))}
     return {"count": 0}
+
+
+def _normalize_tts_run_output(result: Any) -> tuple[int, Any]:
+    """Accept GPT-SoVITS tuple output or the upstream generator form."""
+    if isinstance(result, tuple) and len(result) == 2:
+        return int(result[0]), result[1]
+
+    try:
+        iterator = iter(result)
+    except TypeError as exc:
+        raise RuntimeError("GPT-SoVITS TTS.run returned an unsupported result") from exc
+
+    chunks: list[tuple[int, Any]] = []
+    for chunk in iterator:
+        if isinstance(chunk, tuple) and len(chunk) >= 2:
+            chunks.append((int(chunk[0]), chunk[1]))
+            continue
+        raise RuntimeError("GPT-SoVITS TTS.run yielded an unsupported audio chunk")
+    if not chunks:
+        raise RuntimeError("GPT-SoVITS TTS.run yielded no audio")
+    if len(chunks) == 1:
+        return chunks[0]
+
+    sampling_rate = chunks[0][0]
+    try:
+        import numpy as np
+
+        return sampling_rate, np.concatenate([np.asarray(audio) for _, audio in chunks])
+    except Exception:
+        merged: list[Any] = []
+        for _, audio in chunks:
+            merged.extend(list(audio))
+        return sampling_rate, merged
 
 
 def _write_audio(audio: Any, sampling_rate: int, output_path: Path, media_type: str) -> None:
