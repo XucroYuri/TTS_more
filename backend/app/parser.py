@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
 
 import httpx
@@ -28,6 +28,9 @@ class ParserProvider(Protocol):
         ...
 
 
+ParserAdapterName = Literal["openai-compatible", "anthropic"]
+
+
 class ParserProviderConfig(BaseModel):
     name: str
     base_url: str
@@ -35,6 +38,7 @@ class ParserProviderConfig(BaseModel):
     model: str
     enabled: bool = True
     timeout_seconds: float = 45.0
+    adapter: ParserAdapterName = "openai-compatible"
 
 
 class ParserProviderUnavailable(RuntimeError):

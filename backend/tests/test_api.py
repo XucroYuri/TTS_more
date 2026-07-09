@@ -37,29 +37,31 @@ def test_parse_script_requires_enabled_llm_parser(tmp_path: Path) -> None:
     assert "no enabled parser providers" in response.text
 
 
-def test_default_parser_providers_list_mainstream_first_and_kwjm_last(tmp_path: Path) -> None:
+def test_default_parser_providers_list_agentic_presets_and_kwjm_last(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path, env_path=tmp_path / ".env.local"))
 
     response = client.get("/api/parser/providers")
 
     assert response.status_code == 200
     providers = response.json()["providers"]
-    # Mainstream providers come first; OpenAI has the lowest priority.
+    names = [provider["name"] for provider in providers]
     first = providers[0]
     assert first["name"] == "OpenAI"
+    assert first["adapter"] == "openai-compatible"
     assert first["base_url"] == "https://api.openai.com/v1"
     assert first["api_key_env"] == "OPENAI_API_KEY"
+    assert first["model"] == "gpt-5.5"
     assert first["enabled"] is False
-    assert first["priority"] == 10
-    # 开物基模 (KWJM) is kept last as a project-specific fallback.
+    assert "百度千帆" not in names
+    assert "Mistral" not in names
+    assert "Anthropic" in names
+    assert "Gemini" in names
+    assert "OpenRouter" in names
+    assert "Aihubmix" in names
     last = providers[-1]
     assert last["name"] == "开物基模"
-    assert last["base_url"] == "https://kwjm.com"
-    assert last["api_key_env"] == "KWJM_API_KEY"
-    assert last["model"] == "gpt-5.5"
+    assert last["adapter"] == "openai-compatible"
     assert last["priority"] == max(p["priority"] for p in providers)
-    # At least 12 providers total (11 mainstream + KWJM).
-    assert len(providers) >= 12
 
 
 def test_parser_provider_config_activates_kwjm_with_api_key_only_flow(tmp_path: Path) -> None:
