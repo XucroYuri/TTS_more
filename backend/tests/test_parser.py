@@ -11,6 +11,7 @@ from app.parser import (
     ParserProviderUnavailable,
     ParserQualityError,
     ScriptParseVerifier,
+    _draft_from_provider_payload,
     chat_completions_url,
     parser_contract_probe_messages,
 )
@@ -79,6 +80,62 @@ def test_script_parse_verifier_rejects_untraceable_text() -> None:
 
     with pytest.raises(ParserQualityError, match="l001 text is not traceable in source order"):
         ScriptParseVerifier().verify("**NARRATOR**\nHello.", draft)
+
+
+def test_script_parse_verifier_rejects_dialogue_punctuation_mutation() -> None:
+    draft = make_draft(
+        characters=[Character(id="pang-bai", name="旁白")],
+        lines=[ScriptLine(id="l001", character_id="pang-bai", text="不要动。", language="zh")],
+    )
+
+    with pytest.raises(ParserQualityError, match="l001 text is not an exact source match"):
+        ScriptParseVerifier().verify("旁白: 不要动！", draft)
+
+
+def test_script_parse_verifier_accepts_wrapping_quotes_removed_from_prose_dialogue() -> None:
+    draft = make_draft(
+        characters=[Character(id="lin-xia", name="林夏")],
+        lines=[ScriptLine(id="l001", character_id="lin-xia", text="我们马上出发。", language="zh")],
+    )
+
+    ScriptParseVerifier().verify("报道写道，林夏说：“我们马上出发。”随后离开。", draft)
+
+
+def test_provider_payload_rejects_source_text_that_differs_from_dialogue() -> None:
+    payload = {
+        "characters": [{"id": "narrator", "name": "NARRATOR"}],
+        "lines": [
+            {
+                "id": "l001",
+                "character_id": "narrator",
+                "text": "Hello.",
+                "source_text": "Hello!",
+            }
+        ],
+    }
+
+    with pytest.raises(ParserQualityError, match="source_text does not match text"):
+        _draft_from_provider_payload("llm-test", payload)
+
+
+def test_provider_payload_keeps_source_evidence_out_of_serialized_draft() -> None:
+    payload = {
+        "characters": [{"id": "narrator", "name": "NARRATOR"}],
+        "lines": [
+            {
+                "id": "l001",
+                "character_id": "narrator",
+                "text": "Hello.",
+                "source_text": "Hello.",
+                "source_excerpt": "NARRATOR: Hello.",
+            }
+        ],
+    }
+
+    draft = _draft_from_provider_payload("llm-test", payload)
+
+    assert draft.source_evidence["l001"].source_text == "Hello."
+    assert "source_evidence" not in draft.model_dump(mode="json")
 
 
 def test_script_parse_verifier_rejects_out_of_order_dialogue() -> None:

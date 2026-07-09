@@ -13,12 +13,20 @@ from app.models import Character, ScriptLine
 from app.net_guard import scrub_error
 from app.role_library import slugify_role_name
 
+_WRAPPING_DIALOGUE_QUOTES = "\"'“”‘’「」『』《》"
+
+
+class LineSourceEvidence(BaseModel):
+    source_text: str = ""
+    source_excerpt: str = ""
+
 
 class ParsedScriptDraft(BaseModel):
     provider: str
     characters: list[Character] = Field(default_factory=list)
     lines: list[ScriptLine] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    source_evidence: dict[str, LineSourceEvidence] = Field(default_factory=dict, exclude=True)
 
 
 class ParserProvider(Protocol):
@@ -196,6 +204,45 @@ def _source_match_text(value: str) -> str:
     return text
 
 
+def _strip_wrapping_dialogue_quotes(value: str) -> str:
+    text = value.strip()
+    quote_pairs = {
+        "\"": "\"",
+        "'": "'",
+        "“": "”",
+        "‘": "’",
+        "「": "」",
+        "『": "』",
+        "《": "》",
+    }
+    for left, right in quote_pairs.items():
+        if text.startswith(left) and text.endswith(right) and len(text) >= 2:
+            return text[1:-1].strip()
+    return text
+
+
+def _source_fidelity_text(value: Any) -> str:
+    text = _clean_markup(value)
+    leading_note = _LEADING_NOTE_RE.match(text)
+    if leading_note:
+        text = leading_note.group("text")
+    text = _strip_wrapping_dialogue_quotes(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _source_fidelity_source(value: str) -> str:
+    text = _clean_markup(value)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _find_exact_spoken_text(source_text: str, spoken_text: str, cursor: int = 0) -> int:
+    needle = _source_fidelity_text(spoken_text)
+    if not needle:
+        return -1
+    source = _source_fidelity_source(source_text)
+    return source.find(needle, cursor)
+
+
 def _finalize_lines(
     provider: str,
     records: list[dict[str, str]],
@@ -203,6 +250,7 @@ def _finalize_lines(
 ) -> ParsedScriptDraft:
     characters: dict[str, Character] = {}
     lines: list[ScriptLine] = []
+    source_evidence: dict[str, LineSourceEvidence] = {}
     for record in records:
         name = _clean_markup(record.get("speaker", ""))
         text = _clean_dialogue(record.get("text", ""))
@@ -213,17 +261,30 @@ def _finalize_lines(
         if leading_note and not note:
             note = _clean_note(leading_note.group("note"))
         character_id = slugify_name(name)
+        line_id = f"l{len(lines) + 1:03d}"
         characters.setdefault(character_id, Character(id=character_id, name=name))
         lines.append(
             ScriptLine(
-                id=f"l{len(lines) + 1:03d}",
+                id=line_id,
                 character_id=character_id,
                 note=note,
                 text=text,
                 language=record.get("language") or _infer_language(text),
             )
         )
-    return ParsedScriptDraft(provider=provider, characters=list(characters.values()), lines=lines, warnings=warnings or [])
+        evidence = LineSourceEvidence(
+            source_text=_clean_markup(record.get("source_text", "")),
+            source_excerpt=_clean_markup(record.get("source_excerpt", "")),
+        )
+        if evidence.source_text or evidence.source_excerpt:
+            source_evidence[line_id] = evidence
+    return ParsedScriptDraft(
+        provider=provider,
+        characters=list(characters.values()),
+        lines=lines,
+        warnings=warnings or [],
+        source_evidence=source_evidence,
+    )
 
 
 class ScriptParseVerifier:
@@ -385,6 +446,10 @@ def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> Pars
         if not isinstance(item, dict):
             continue
         text = _clean_dialogue(item.get("text") or item.get("dialogue"))
+        source_text = _clean_markup(item.get("source_text", ""))
+        source_excerpt = _clean_markup(item.get("source_excerpt", ""))
+        if source_text and _source_fidelity_text(source_text) != _source_fidelity_text(text):
+            raise ParserQualityError("source_text does not match text")
         raw_character = _clean_markup(
             item.get("character_id")
             or item.get("speaker_id")
@@ -401,6 +466,8 @@ def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> Pars
                 "note": _clean_note(item.get("note") or item.get("parenthetical")),
                 "text": text,
                 "language": str(item.get("language") or "") or _infer_language(text),
+                "source_text": source_text,
+                "source_excerpt": source_excerpt,
             }
         )
     draft = _finalize_lines(provider, records, warnings)
@@ -437,17 +504,25 @@ def _quality_reasons(draft: ParsedScriptDraft, source_text: str) -> list[str]:
     expected = _reference_dialogue_texts(source_text)
     if expected and len(draft.lines) < len(expected):
         reasons.append(f"missing dialogue lines: expected at least {len(expected)}, got {len(draft.lines)}")
-    source = _source_match_text(source_text)
-    cursor = 0
+    source_cursor = 0
+    source_for_cursor = _source_fidelity_source(source_text)
     for line in draft.lines:
-        needle = _source_match_text(line.text)
+        needle = _source_fidelity_text(line.text)
         if not needle:
             continue
-        position = source.find(needle, cursor)
+        position = source_for_cursor.find(needle, source_cursor)
         if position < 0:
-            reasons.append(f"{line.id} text is not traceable in source order")
+            reasons.append(f"{line.id} text is not an exact source match in source order")
         else:
-            cursor = position + len(needle)
+            source_cursor = position + len(needle)
+        evidence = draft.source_evidence.get(line.id)
+        if evidence and evidence.source_text:
+            if _source_fidelity_text(evidence.source_text) != needle:
+                reasons.append(f"{line.id} source_text does not match text")
+        if evidence and evidence.source_excerpt:
+            excerpt = _source_fidelity_source(evidence.source_excerpt)
+            if excerpt and source_for_cursor.find(excerpt) < 0 and source_for_cursor.find(needle) < 0:
+                reasons.append(f"{line.id} source_excerpt is not traceable in source")
     return list(dict.fromkeys(reasons))
 
 
