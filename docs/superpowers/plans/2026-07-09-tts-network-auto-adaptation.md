@@ -251,6 +251,7 @@ def _profile_from_choices(
     model_candidate: dict[str, str],
     pip_candidate: dict[str, str],
     probes: dict[str, dict[str, Any]],
+    ttl_hours: float,
     environ: Mapping[str, str],
 ) -> dict[str, Any]:
     now = _utc_now()
@@ -272,7 +273,7 @@ def _profile_from_choices(
         "cache_root": cache_paths["cache_root"],
         "cache_paths": cache_paths,
         "created_at": _isoformat(now),
-        "expires_at": _isoformat(now + timedelta(hours=24)),
+        "expires_at": _isoformat(now + timedelta(hours=ttl_hours)),
         "probes": list(probes.values()),
     }
     profile["env"] = network_env_from_profile(profile)
@@ -332,6 +333,7 @@ def resolve_network_profile(
         model_candidate=model_candidate,
         pip_candidate=pip_candidate,
         probes=probes,
+        ttl_hours=ttl_hours,
         environ={**environ, "TTS_MORE_MODEL_SOURCE": source},
     )
 ```
