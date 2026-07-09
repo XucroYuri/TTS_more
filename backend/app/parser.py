@@ -104,6 +104,23 @@ _NON_DIALOGUE_ROLE_RE = re.compile(
     r")(?:\b|[:：.-]|$)",
     re.IGNORECASE,
 )
+_ATTRIBUTED_QUOTE_PATTERNS = (
+    re.compile(
+        r'(?P<speaker>[\u4e00-\u9fffA-Za-z][^"\n“”]{0,40}?)'
+        r'(?:说|表示|称|提到|补充|问道|回应|强调|解释|写道|答道|喊道|提醒|指出|告诉记者|告诉大家)'
+        r'\s*[:：,，]?\s*[“"](?P<quote>[^“”"\n]{1,200})[”"]'
+    ),
+    re.compile(
+        r'(?P<speaker>[A-Z][A-Za-z][A-Za-z .\'-]{0,40})'
+        r'\s+(?:said|says|told|asked|replied|added|wrote|tweeted|explained|warned|noted)'
+        r'\s*[,:\-]?\s*"(?P<quote>[^"\n]{1,200})"'
+    ),
+    re.compile(
+        r'"(?P<quote>[^"\n]{1,200})"\s*[, -]?\s*'
+        r'(?P<speaker>[A-Z][A-Za-z][A-Za-z .\'-]{0,40})'
+        r'\s+(?:said|says|told|asked|replied|added|wrote|tweeted|explained|warned|noted)\b'
+    ),
+)
 _SYSTEM_PROMPT = """You extract line-level TTS dialogue from scripts, prose, interviews, news articles, Markdown, and mixed-format drafts.
 
 Return one JSON object only:
@@ -227,12 +244,6 @@ def _infer_language(text: str) -> str:
     return "zh" if re.search(r"[\u4e00-\u9fff]", text) else "en"
 
 
-def _source_match_text(value: str) -> str:
-    text = _clean_markup(value).casefold()
-    text = re.sub(r"[\s*_`\"'“”‘’（）()\[\]{}<>:：,，.。!！?？;；-]+", "", text)
-    return text
-
-
 def _strip_wrapping_dialogue_quotes(value: str) -> str:
     text = value.strip()
     quote_pairs = {
@@ -264,12 +275,34 @@ def _source_fidelity_source(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _find_exact_spoken_text(source_text: str, spoken_text: str, cursor: int = 0) -> int:
-    needle = _source_fidelity_text(spoken_text)
-    if not needle:
-        return -1
-    source = _source_fidelity_source(source_text)
-    return source.find(needle, cursor)
+def _quoted_dialogue_candidates(source_text: str) -> list[str]:
+    matches: list[tuple[int, str]] = []
+    for pattern in _ATTRIBUTED_QUOTE_PATTERNS:
+        for match in pattern.finditer(source_text):
+            quote = _source_fidelity_text(match.group("quote"))
+            if quote:
+                matches.append((match.start("quote"), quote))
+    ordered: list[str] = []
+    seen: set[tuple[int, str]] = set()
+    for item in sorted(matches):
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item[1])
+    return ordered
+
+
+def _ordered_coverage_count(expected: list[str], actual: list[str]) -> int:
+    actual_index = 0
+    matched = 0
+    for candidate in expected:
+        while actual_index < len(actual) and actual[actual_index] != candidate:
+            actual_index += 1
+        if actual_index >= len(actual):
+            continue
+        matched += 1
+        actual_index += 1
+    return matched
 
 
 def _finalize_lines(
@@ -606,12 +639,16 @@ def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> Pars
     raw_lines = payload.get("lines", [])
     if not isinstance(raw_lines, list):
         raise ParserQualityError("lines must be a list")
-    for item in raw_lines:
+    for index, item in enumerate(raw_lines, start=1):
         if not isinstance(item, dict):
             continue
         text = _clean_dialogue(item.get("text") or item.get("dialogue"))
         source_text = _clean_markup(item.get("source_text", ""))
         source_excerpt = _clean_markup(item.get("source_excerpt", ""))
+        if not source_text:
+            raise ParserQualityError(f"line {index} missing source_text")
+        if not source_excerpt:
+            raise ParserQualityError(f"line {index} missing source_excerpt")
         if source_text and _source_fidelity_text(source_text) != _source_fidelity_text(text):
             raise ParserQualityError("source_text does not match text")
         raw_character = _clean_markup(
@@ -668,6 +705,14 @@ def _quality_reasons(draft: ParsedScriptDraft, source_text: str) -> list[str]:
     expected = _reference_dialogue_texts(source_text)
     if expected and len(draft.lines) < len(expected):
         reasons.append(f"missing dialogue lines: expected at least {len(expected)}, got {len(draft.lines)}")
+    quoted_candidates = _quoted_dialogue_candidates(source_text)
+    quoted_line_texts = [
+        _source_fidelity_text((draft.source_evidence.get(line.id) or LineSourceEvidence()).source_text or line.text)
+        for line in draft.lines
+    ]
+    quoted_matches = _ordered_coverage_count(quoted_candidates, quoted_line_texts)
+    if quoted_candidates and quoted_matches < len(quoted_candidates):
+        reasons.append(f"missing quoted dialogue coverage: expected at least {len(quoted_candidates)}, got {quoted_matches}")
     source_cursor = 0
     source_for_cursor = _source_fidelity_source(source_text)
     for line in draft.lines:
@@ -685,8 +730,10 @@ def _quality_reasons(draft: ParsedScriptDraft, source_text: str) -> list[str]:
                 reasons.append(f"{line.id} source_text does not match text")
         if evidence and evidence.source_excerpt:
             excerpt = _source_fidelity_source(evidence.source_excerpt)
-            if excerpt and source_for_cursor.find(excerpt) < 0 and source_for_cursor.find(needle) < 0:
+            if excerpt and source_for_cursor.find(excerpt) < 0:
                 reasons.append(f"{line.id} source_excerpt is not traceable in source")
+            if excerpt and needle and excerpt.find(needle) < 0:
+                reasons.append(f"{line.id} source_excerpt does not contain source_text")
     return list(dict.fromkeys(reasons))
 
 

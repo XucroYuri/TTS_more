@@ -204,6 +204,8 @@ def test_parser_provider_test_posts_kwjm_root_to_v1_chat_completions(monkeypatch
                                             "text": "Hello from the contract test.",
                                             "note": "calm",
                                             "language": "en",
+                                            "source_text": "Hello from the contract test.",
+                                            "source_excerpt": "**NARRATOR**\n(calm)\nHello from the contract test.",
                                         }
                                     ],
                                 }

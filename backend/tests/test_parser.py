@@ -5,6 +5,7 @@ import pytest
 
 from app.parser import (
     AnthropicProvider,
+    LineSourceEvidence,
     MultiProviderParser,
     OpenAICompatibleProvider,
     ParsedScriptDraft,
@@ -24,12 +25,14 @@ def make_draft(
     *,
     characters: list[Character] | None = None,
     lines: list[ScriptLine] | None = None,
+    source_evidence: dict[str, LineSourceEvidence] | None = None,
     provider: str = "llm-test",
 ) -> ParsedScriptDraft:
     return ParsedScriptDraft(
         provider=provider,
         characters=characters or [Character(id="narrator", name="NARRATOR")],
         lines=lines or [ScriptLine(id="l001", character_id="narrator", text="Hello.", language="en")],
+        source_evidence=source_evidence or {},
     )
 
 
@@ -111,11 +114,46 @@ def test_provider_payload_rejects_source_text_that_differs_from_dialogue() -> No
                 "character_id": "narrator",
                 "text": "Hello.",
                 "source_text": "Hello!",
+                "source_excerpt": "NARRATOR: Hello!",
             }
         ],
     }
 
     with pytest.raises(ParserQualityError, match="source_text does not match text"):
+        _draft_from_provider_payload("llm-test", payload)
+
+
+def test_provider_payload_rejects_missing_source_text() -> None:
+    payload = {
+        "characters": [{"id": "narrator", "name": "NARRATOR"}],
+        "lines": [
+            {
+                "id": "l001",
+                "character_id": "narrator",
+                "text": "Hello.",
+                "source_excerpt": "NARRATOR: Hello.",
+            }
+        ],
+    }
+
+    with pytest.raises(ParserQualityError, match="line 1 missing source_text"):
+        _draft_from_provider_payload("llm-test", payload)
+
+
+def test_provider_payload_rejects_missing_source_excerpt() -> None:
+    payload = {
+        "characters": [{"id": "narrator", "name": "NARRATOR"}],
+        "lines": [
+            {
+                "id": "l001",
+                "character_id": "narrator",
+                "text": "Hello.",
+                "source_text": "Hello.",
+            }
+        ],
+    }
+
+    with pytest.raises(ParserQualityError, match="line 1 missing source_excerpt"):
         _draft_from_provider_payload("llm-test", payload)
 
 
@@ -157,6 +195,78 @@ def test_script_parse_verifier_rejects_missing_recognizable_dialogue() -> None:
 
     with pytest.raises(ParserQualityError, match="missing dialogue lines: expected at least 2, got 1"):
         ScriptParseVerifier().verify("NARRATOR: First line.\nNARRATOR: Second line.", draft)
+
+
+def test_script_parse_verifier_rejects_fabricated_source_excerpt_not_in_source() -> None:
+    draft = make_draft(
+        characters=[Character(id="alice", name="ALICE")],
+        lines=[ScriptLine(id="l001", character_id="alice", text="Hello.", language="en")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="Hello.",
+                source_excerpt="ALICE: A fabricated line.",
+            )
+        },
+    )
+
+    with pytest.raises(ParserQualityError, match="l001 source_excerpt is not traceable in source"):
+        ScriptParseVerifier().verify("ALICE: Hello.", draft)
+
+
+def test_script_parse_verifier_rejects_source_excerpt_that_omits_dialogue() -> None:
+    draft = make_draft(
+        characters=[Character(id="alice", name="ALICE")],
+        lines=[ScriptLine(id="l001", character_id="alice", text="Hello there.", language="en")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="Hello there.",
+                source_excerpt="ALICE:",
+            )
+        },
+    )
+
+    with pytest.raises(ParserQualityError, match="l001 source_excerpt does not contain source_text"):
+        ScriptParseVerifier().verify("ALICE: Hello there.", draft)
+
+
+def test_script_parse_verifier_rejects_missing_attributed_prose_quote() -> None:
+    source = '记者会上，林夏说：“先撤离。” 随后，周明补充：“别回头。”'
+    draft = make_draft(
+        characters=[Character(id="lin-xia", name="林夏")],
+        lines=[ScriptLine(id="l001", character_id="lin-xia", text="先撤离。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“先撤离。”",
+                source_excerpt="林夏说：“先撤离。”",
+            )
+        },
+    )
+
+    with pytest.raises(ParserQualityError, match="missing quoted dialogue coverage: expected at least 2, got 1"):
+        ScriptParseVerifier().verify(source, draft)
+
+
+def test_script_parse_verifier_accepts_complete_attributed_prose_quotes() -> None:
+    source = '记者会上，林夏说：“先撤离。” 随后，周明补充：“别回头。”'
+    draft = make_draft(
+        characters=[Character(id="lin-xia", name="林夏"), Character(id="zhou-ming", name="周明")],
+        lines=[
+            ScriptLine(id="l001", character_id="lin-xia", text="先撤离。", language="zh"),
+            ScriptLine(id="l002", character_id="zhou-ming", text="别回头。", language="zh"),
+        ],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“先撤离。”",
+                source_excerpt="林夏说：“先撤离。”",
+            ),
+            "l002": LineSourceEvidence(
+                source_text="“别回头。”",
+                source_excerpt="周明补充：“别回头。”",
+            ),
+        },
+    )
+
+    ScriptParseVerifier().verify(source, draft)
 
 
 def test_parser_contract_prompt_requires_agentic_source_fidelity_audit() -> None:
@@ -240,11 +350,20 @@ def test_openai_provider_accepts_valid_llm_output_without_repair(monkeypatch: py
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "characters": [{"id": "narrator", "name": "NARRATOR"}],
-                                    "lines": [{"id": "l001", "character_id": "narrator", "note": "calm", "text": "Hello."}],
-                                }
-                            )
-                        }
+                                        "characters": [{"id": "narrator", "name": "NARRATOR"}],
+                                        "lines": [
+                                            {
+                                                "id": "l001",
+                                                "character_id": "narrator",
+                                                "note": "calm",
+                                                "text": "Hello.",
+                                                "source_text": "Hello.",
+                                                "source_excerpt": "**NARRATOR**\n(calm)\nHello.",
+                                            }
+                                        ],
+                                    }
+                                )
+                            }
                     }
                 ]
             }
@@ -281,11 +400,28 @@ def test_openai_provider_repairs_invalid_quality_output_once(monkeypatch: pytest
     responses = [
         {
             "characters": [{"id": "sfx", "name": "SFX"}],
-            "lines": [{"id": "scene-1", "character_id": "sfx", "text": "Rain hits metal."}],
+            "lines": [
+                {
+                    "id": "scene-1",
+                    "character_id": "sfx",
+                    "text": "Rain hits metal.",
+                    "source_text": "Rain hits metal.",
+                    "source_excerpt": "SFX: Rain hits metal.",
+                }
+            ],
         },
         {
             "characters": [{"id": "narrator", "name": "NARRATOR"}],
-            "lines": [{"id": "bad-id", "character_id": "narrator", "note": "(calm)", "text": "**Hello.**"}],
+            "lines": [
+                {
+                    "id": "bad-id",
+                    "character_id": "narrator",
+                    "note": "(calm)",
+                    "text": "**Hello.**",
+                    "source_text": "Hello.",
+                    "source_excerpt": "**NARRATOR**\n(calm)\nHello.",
+                }
+            ],
         },
     ]
 
@@ -349,12 +485,20 @@ def test_openai_provider_raises_quality_error_when_repair_is_still_invalid(monke
                     {
                         "message": {
                             "content": json.dumps(
-                                {
-                                    "characters": [{"id": "sfx", "name": "SFX"}],
-                                    "lines": [{"id": "l001", "character_id": "sfx", "text": "Rain hits metal."}],
-                                }
-                            )
-                        }
+                                    {
+                                        "characters": [{"id": "sfx", "name": "SFX"}],
+                                        "lines": [
+                                            {
+                                                "id": "l001",
+                                                "character_id": "sfx",
+                                                "text": "Rain hits metal.",
+                                                "source_text": "Rain hits metal.",
+                                                "source_excerpt": "SFX: Rain hits metal.",
+                                            }
+                                        ],
+                                    }
+                                )
+                            }
                     }
                 ]
             }
