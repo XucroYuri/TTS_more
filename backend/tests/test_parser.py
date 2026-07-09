@@ -78,7 +78,7 @@ def test_script_parse_verifier_rejects_unknown_character_reference() -> None:
 def test_script_parse_verifier_rejects_untraceable_text() -> None:
     draft = make_draft(lines=[ScriptLine(id="l001", character_id="narrator", text="Invented line.", language="en")])
 
-    with pytest.raises(ParserQualityError, match="l001 text is not traceable in source order"):
+    with pytest.raises(ParserQualityError, match="l001 text is not an exact source match in source order"):
         ScriptParseVerifier().verify("**NARRATOR**\nHello.", draft)
 
 
@@ -147,7 +147,7 @@ def test_script_parse_verifier_rejects_out_of_order_dialogue() -> None:
         ],
     )
 
-    with pytest.raises(ParserQualityError, match="l002 text is not traceable in source order"):
+    with pytest.raises(ParserQualityError, match="l002 text is not an exact source match in source order"):
         ScriptParseVerifier().verify("ALICE: First line.\nBOB: Second line.", draft)
 
 
