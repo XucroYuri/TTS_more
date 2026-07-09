@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -188,3 +189,40 @@ def test_resolve_command_rejects_paths_outside_project(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="outside project root"):
         deploy._resolve_command(tmp_path, ["../outside/python", "-m", "uvicorn"])
+
+
+def test_resolve_network_profile_prefers_healthy_domestic_source(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+
+    timings = {
+        "https://www.modelscope.cn": {"ok": True, "latency_ms": 40},
+        "https://hf-mirror.com": {"ok": True, "latency_ms": 80},
+        "https://huggingface.co": {"ok": True, "latency_ms": 240},
+        "https://mirrors.aliyun.com/pypi/simple": {"ok": True, "latency_ms": 35},
+        "https://pypi.org/simple": {"ok": True, "latency_ms": 260},
+    }
+
+    def fake_probe(url: str, timeout_seconds: float) -> dict[str, object]:
+        result = timings[url]
+        return {"url": url, "ok": result["ok"], "latency_ms": result["latency_ms"], "error": ""}
+
+    profile = deploy.resolve_network_profile(
+        tmp_path,
+        mode="auto",
+        source="Auto",
+        force=True,
+        probe_func=fake_probe,
+        environ={},
+    )
+
+    assert profile["mode"] == "auto"
+    assert profile["model_source"] == "ModelScope"
+    assert profile["hf_endpoint"] == ""
+    assert profile["pip_index_url"] == "https://mirrors.aliyun.com/pypi/simple"
+    assert profile["cache_root"] == "data/cache"
+    env = deploy.network_env_from_profile(profile)
+    assert env["PIP_INDEX_URL"] == "https://mirrors.aliyun.com/pypi/simple"
+    assert env["PIP_CACHE_DIR"].endswith(os.path.join("data", "cache", "pip"))
+    assert env["HF_HOME"].endswith(os.path.join("data", "cache", "huggingface"))
+    assert env["MODELSCOPE_CACHE"].endswith(os.path.join("data", "cache", "modelscope"))

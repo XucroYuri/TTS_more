@@ -8,6 +8,10 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from collections.abc import Callable, Mapping
+from datetime import datetime, timedelta, timezone
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 from typing import Any
 
 
@@ -57,11 +61,217 @@ PROVIDER_CAPABILITIES = {
 
 PROVIDER_PRIORITY = {"gpt-sovits": 10, "indextts": 20, "cosyvoice": 30}
 
+NETWORK_PROFILE_RELATIVE_PATH = Path("data/local/network-profile.json")
+DEFAULT_CACHE_RELATIVE_PATH = Path("data/cache")
+NETWORK_PROFILE_SCHEMA_VERSION = 1
+
+MODEL_SOURCE_CANDIDATES = [
+    {"name": "ModelScope", "url": "https://www.modelscope.cn", "scope": "china", "hf_endpoint": ""},
+    {"name": "HF-Mirror", "url": "https://hf-mirror.com", "scope": "china", "hf_endpoint": "https://hf-mirror.com"},
+    {"name": "HF", "url": "https://huggingface.co", "scope": "global", "hf_endpoint": ""},
+]
+
+PIP_INDEX_CANDIDATES = [
+    {"name": "aliyun", "url": "https://mirrors.aliyun.com/pypi/simple", "scope": "china"},
+    {"name": "pypi", "url": "https://pypi.org/simple", "scope": "global"},
+]
+
 
 def load_repo_lock(root: Path = PROJECT_ROOT) -> list[dict[str, Any]]:
     path = root / "repo.lock.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     return list(payload.get("repositories") or [])
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _isoformat(value: datetime) -> str:
+    return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _cache_paths(root: Path, environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    environ = environ or os.environ
+    raw_root = environ.get("TTS_MORE_CACHE_ROOT", "")
+    cache_root = Path(raw_root) if raw_root else root / DEFAULT_CACHE_RELATIVE_PATH
+    if not cache_root.is_absolute():
+        cache_root = root / cache_root
+    cache_root = cache_root.resolve(strict=False)
+    root_resolved = root.resolve(strict=False)
+    try:
+        rel_cache_root = cache_root.relative_to(root_resolved).as_posix()
+    except ValueError:
+        rel_cache_root = str(cache_root)
+    return {
+        "cache_root": rel_cache_root,
+        "pip_cache_dir": str(cache_root / "pip"),
+        "uv_cache_dir": str(cache_root / "uv"),
+        "hf_home": str(cache_root / "huggingface"),
+        "huggingface_hub_cache": str(cache_root / "huggingface" / "hub"),
+        "transformers_cache": str(cache_root / "huggingface" / "transformers"),
+        "modelscope_cache": str(cache_root / "modelscope"),
+        "torch_cache_dir": str(cache_root / "torch"),
+        "downloads_dir": str(cache_root / "downloads"),
+    }
+
+
+def _probe_url(url: str, timeout_seconds: float) -> dict[str, Any]:
+    started = datetime.now(timezone.utc)
+    request = Request(url, method="HEAD", headers={"User-Agent": "tts-more-deploy/1"})
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            status = int(getattr(response, "status", 200))
+        latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+        return {"url": url, "ok": 200 <= status < 500, "latency_ms": latency_ms, "error": ""}
+    except Exception as exc:
+        latency_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+        message = str(exc.reason) if isinstance(exc, URLError) and getattr(exc, "reason", None) else str(exc)
+        return {"url": url, "ok": False, "latency_ms": latency_ms, "error": message}
+
+
+def _candidate_allowed(candidate: dict[str, str], mode: str) -> bool:
+    if mode == "china":
+        return candidate["scope"] == "china"
+    if mode == "global":
+        return candidate["scope"] == "global"
+    return True
+
+
+def _choose_candidate(
+    candidates: list[dict[str, str]],
+    probes: dict[str, dict[str, Any]],
+    mode: str,
+) -> dict[str, str] | None:
+    healthy = [
+        candidate
+        for candidate in candidates
+        if _candidate_allowed(candidate, mode) and probes[candidate["url"]].get("ok")
+    ]
+    if mode == "auto":
+        domestic = [item for item in healthy if item["scope"] == "china"]
+        if domestic:
+            return min(domestic, key=lambda item: int(probes[item["url"]]["latency_ms"]))
+    if healthy:
+        return min(healthy, key=lambda item: int(probes[item["url"]]["latency_ms"]))
+    if mode == "china":
+        global_healthy = [
+            candidate
+            for candidate in candidates
+            if candidate["scope"] == "global" and probes[candidate["url"]].get("ok")
+        ]
+        if global_healthy:
+            return min(global_healthy, key=lambda item: int(probes[item["url"]]["latency_ms"]))
+    return None
+
+
+def _probe_all_candidates(
+    timeout_seconds: float,
+    probe_func: Callable[[str, float], dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    probe = probe_func or _probe_url
+    probes: dict[str, dict[str, Any]] = {}
+    for candidate in [*MODEL_SOURCE_CANDIDATES, *PIP_INDEX_CANDIDATES]:
+        url = candidate["url"]
+        if url not in probes:
+            probes[url] = probe(url, timeout_seconds)
+    return probes
+
+
+def network_env_from_profile(profile: dict[str, Any]) -> dict[str, str]:
+    cache_paths = profile.get("cache_paths") or {}
+    env = {
+        "PIP_CACHE_DIR": str(cache_paths.get("pip_cache_dir", "")),
+        "UV_CACHE_DIR": str(cache_paths.get("uv_cache_dir", "")),
+        "HF_HOME": str(cache_paths.get("hf_home", "")),
+        "HUGGINGFACE_HUB_CACHE": str(cache_paths.get("huggingface_hub_cache", "")),
+        "TRANSFORMERS_CACHE": str(cache_paths.get("transformers_cache", "")),
+        "MODELSCOPE_CACHE": str(cache_paths.get("modelscope_cache", "")),
+        "TORCH_HOME": str(cache_paths.get("torch_cache_dir", "")),
+    }
+    if profile.get("pip_index_url"):
+        env["PIP_INDEX_URL"] = str(profile["pip_index_url"])
+        env["UV_INDEX_URL"] = str(profile["pip_index_url"])
+    if profile.get("extra_pip_index_url"):
+        env["PIP_EXTRA_INDEX_URL"] = str(profile["extra_pip_index_url"])
+    if profile.get("hf_endpoint"):
+        env["HF_ENDPOINT"] = str(profile["hf_endpoint"])
+    return {key: value for key, value in env.items() if value}
+
+
+def _profile_from_choices(
+    root: Path,
+    *,
+    mode: str,
+    model_candidate: dict[str, str],
+    pip_candidate: dict[str, str],
+    probes: dict[str, dict[str, Any]],
+    ttl_hours: float,
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    now = _utc_now()
+    cache_paths = _cache_paths(root, environ)
+    model_source_override = environ.get("TTS_MORE_MODEL_SOURCE", "")
+    pip_index_override = environ.get("TTS_MORE_PIP_INDEX_URL", "")
+    hf_endpoint_override = environ.get("TTS_MORE_HF_ENDPOINT", "")
+    model_source = model_source_override if model_source_override and model_source_override != "Auto" else model_candidate["name"]
+    hf_endpoint = hf_endpoint_override if hf_endpoint_override else (model_candidate.get("hf_endpoint") or "")
+    pip_index_url = pip_index_override if pip_index_override else pip_candidate["url"]
+    profile = {
+        "schema_version": NETWORK_PROFILE_SCHEMA_VERSION,
+        "mode": mode,
+        "model_source": model_source,
+        "hf_endpoint": hf_endpoint,
+        "pip_index_url": pip_index_url,
+        "extra_pip_index_url": environ.get("TTS_MORE_EXTRA_PIP_INDEX_URL", ""),
+        "pytorch_index_strategy": "official",
+        "cache_root": cache_paths["cache_root"],
+        "cache_paths": cache_paths,
+        "created_at": _isoformat(now),
+        "expires_at": _isoformat(now + timedelta(hours=ttl_hours)),
+        "probes": list(probes.values()),
+    }
+    profile["env"] = network_env_from_profile(profile)
+    return profile
+
+
+def resolve_network_profile(
+    root: Path = PROJECT_ROOT,
+    *,
+    mode: str = "auto",
+    source: str = "Auto",
+    timeout_seconds: float = 2.0,
+    ttl_hours: float = 24.0,
+    force: bool = False,
+    probe_func: Callable[[str, float], dict[str, Any]] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    environ = environ or os.environ
+    mode = environ.get("TTS_MORE_NETWORK_PROFILE", mode).lower()
+    source = environ.get("TTS_MORE_MODEL_SOURCE", source)
+    if mode not in {"auto", "china", "global"}:
+        raise ValueError(f"unsupported network profile mode: {mode}")
+    if source not in {"Auto", "ModelScope", "HF-Mirror", "HF"}:
+        raise ValueError(f"unsupported model source: {source}")
+    probes = _probe_all_candidates(timeout_seconds, probe_func)
+    model_candidate = next((item for item in MODEL_SOURCE_CANDIDATES if item["name"] == source), None)
+    if model_candidate is None:
+        model_candidate = _choose_candidate(MODEL_SOURCE_CANDIDATES, probes, mode)
+    pip_candidate = _choose_candidate(PIP_INDEX_CANDIDATES, probes, mode)
+    if model_candidate is None or pip_candidate is None:
+        failed = [f"{url}: {result.get('error') or 'unreachable'}" for url, result in probes.items() if not result.get("ok")]
+        raise RuntimeError("no usable network source found; " + "; ".join(failed))
+    profile = _profile_from_choices(
+        root,
+        mode=mode,
+        model_candidate=model_candidate,
+        pip_candidate=pip_candidate,
+        probes=probes,
+        ttl_hours=ttl_hours,
+        environ={**environ, "TTS_MORE_MODEL_SOURCE": source},
+    )
+    write_json(root / NETWORK_PROFILE_RELATIVE_PATH, profile)
+    return profile
 
 
 def render_services(
