@@ -166,3 +166,51 @@ def test_cosyvoice_worker_openapi_lists_standard_contract() -> None:
     paths = client.get("/openapi.json").json()["paths"]
     for endpoint in ("/health", "/capabilities", "/load", "/synthesize", "/unload", "/status", "/upload_ref"):
         assert endpoint in paths, f"missing {endpoint}"
+
+
+# --- reference-audio duration limit relaxation -------------------------------
+
+
+def test_relax_reference_duration_limit_replaces_check(monkeypatch) -> None:
+    """The worker monkey-patches TTS._set_prompt_semantic to drop the 3–10s
+    hard limit. Verify the replacement has no length check and preserves the
+    semantic-extraction structure (uses a fake TTS class; no torch needed for
+    the patch application itself)."""
+    import app.workers.gpt_sovits_worker as worker
+
+    # Stub the heavy deps the patcher imports so it can run without torch.
+    import sys, types
+    for mod in ("librosa", "torch", "numpy"):
+        if mod not in sys.modules:
+            monkeypatch.setitem(sys.modules, mod, types.ModuleType(mod))
+
+    class FakeTTS:
+        def _set_prompt_semantic(self, ref_wav_path: str) -> None:
+            raise OSError("参考音频在3~10秒范围外，请更换！")
+
+    monkeypatch.delenv("TTS_MORE_ENFORCE_REF_DURATION", raising=False)
+    worker._relax_reference_duration_limit(FakeTTS)
+
+    # The method should now be replaced with the no-limit version.
+    import inspect
+    src = inspect.getsource(FakeTTS._set_prompt_semantic)
+    # No hard limit raise remains.
+    assert "raise OSError" not in src
+    # The semantic-extraction call structure is preserved.
+    assert "prompt_semantic" in src
+    assert "prompt_cache" in src
+
+
+def test_relax_reference_duration_limit_respects_opt_in(monkeypatch) -> None:
+    """TTS_MORE_ENFORCE_REF_DURATION=1 keeps the original upstream behavior."""
+    import app.workers.gpt_sovits_worker as worker
+
+    class FakeTTS:
+        def _set_prompt_semantic(self, ref_wav_path: str) -> None:
+            raise OSError("参考音频在3~10秒范围外，请更换！")
+
+    original = FakeTTS._set_prompt_semantic
+    monkeypatch.setenv("TTS_MORE_ENFORCE_REF_DURATION", "1")
+    worker._relax_reference_duration_limit(FakeTTS)
+    # Method unchanged when opted in.
+    assert FakeTTS._set_prompt_semantic is original

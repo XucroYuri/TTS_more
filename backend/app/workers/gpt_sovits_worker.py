@@ -80,9 +80,63 @@ def _ensure_pipeline() -> Any:
         from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config  # type: ignore
     except Exception as exc:  # pragma: no cover - requires torch/GPU env
         raise RuntimeError(f"failed to import GPT-SoVITS pipeline: {exc}") from exc
+    _relax_reference_duration_limit(TTS)
     _config = TTS_Config(CONFIG_YAML)
     _pipeline = TTS(_config)
     return _pipeline
+
+
+def _relax_reference_duration_limit(tts_cls: Any) -> None:
+    """Remove the upstream 3–10s reference-audio hard limit.
+
+    GPT-SoVITS's ``_set_prompt_semantic`` raises ``OSError`` when the reference
+    audio is outside 3–10s (48000–160000 samples at 16kHz). TTS More does not
+    treat this as a hard constraint — longer/shorter references are legitimate
+    and the upstream limit would block valid inputs. We replace the method with
+    a copy that skips only the length check, preserving all the semantic-
+    extraction logic (librosa load, hubert feature, codes, prompt_semantic).
+
+    This is a process-local monkey-patch: it touches NO upstream file, so it
+    works against the official upstream build and the fork alike. Set
+    TTS_MORE_ENFORCE_REF_DURATION=1 to keep the original hard limit.
+    """
+    if os.environ.get("TTS_MORE_ENFORCE_REF_DURATION", "0") == "1":
+        return  # operator opted into the original upstream behavior
+
+    import types  # noqa: required for the bound method replacement
+
+    try:
+        import librosa  # type: ignore  # noqa: provided by the GPT-SoVITS env
+        import torch  # type: ignore  # noqa: provided by the GPT-SoVITS env
+        import numpy as np  # type: ignore  # noqa
+    except Exception:  # pragma: no cover - requires torch env
+        return  # cannot patch without the deps; upstream limit stays
+
+    def _set_prompt_semantic_nolimit(self: Any, ref_wav_path: str) -> None:
+        zero_wav = np.zeros(
+            int(self.configs.sampling_rate * 0.3),
+            dtype=np.float16 if self.configs.is_half else np.float32,
+        )
+        with torch.no_grad():
+            wav16k, sr = librosa.load(ref_wav_path, sr=16000)
+            # Upstream raises OSError here if wav16k.shape[0] is outside
+            # [48000, 160000] (3–10s). TTS More allows any duration; very
+            # short clips may still produce poor results, but that is a
+            # quality tradeoff the caller chooses, not a hard error.
+            wav16k = torch.from_numpy(wav16k)
+            zero_wav_torch = torch.from_numpy(zero_wav)
+            wav16k = wav16k.to(self.configs.device)
+            zero_wav_torch = zero_wav_torch.to(self.configs.device)
+            if self.configs.is_half:
+                wav16k = wav16k.half()
+                zero_wav_torch = zero_wav_torch.half()
+            wav16k = torch.cat([wav16k, zero_wav_torch])
+            hubert_feature = self.cnhuhbert_model.model(wav16k.unsqueeze(0))["last_hidden_state"].transpose(1, 2)
+            codes = self.vits_model.extract_latent(hubert_feature)
+            prompt_semantic = codes[0, 0].to(self.configs.device)
+            self.prompt_cache["prompt_semantic"] = prompt_semantic
+
+    tts_cls._set_prompt_semantic = _set_prompt_semantic_nolimit
 
 
 def _resolve_weight_roots() -> list[Path]:

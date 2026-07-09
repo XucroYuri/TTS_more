@@ -96,6 +96,14 @@ worker 可部署在 LAN/公网 GPU 机器上，本机 TTS More 通过 `services.
 
 参考音频跨机上传走 `POST /upload_ref`（GPT-SoVITS worker）或本地路径直传（同机）。
 
+## 参考音频时长限制解除（GPT-SoVITS）
+
+上游 GPT-SoVITS 在 `_set_prompt_semantic` 中硬限制参考音频 3–10 秒（16kHz 下 48000–160000 采样点），超限直接 `raise OSError`。TTS More 不认为这是需要硬限制的设计——更长/更短的参考音频是合法输入。
+
+worker 在 import `TTS` 类后、构造实例前，**进程内 monkey-patch** `_set_prompt_semantic`，仅去掉长度检查，保留全部语义提取逻辑（librosa 加载、hubert 特征、codes、prompt_semantic）。这是进程内补丁，**不改上游任何文件**，对上游官方和 fork 都生效。
+
+设 `TTS_MORE_ENFORCE_REF_DURATION=1` 可恢复上游原始硬限制（操作员可选）。
+
 ## 文件清单
 
 | 文件 | 作用 |
