@@ -239,6 +239,93 @@ def test_sync_repos_retries_clone_without_partial_filter(tmp_path: Path, monkeyp
     assert any(command[:2] == ["git", "clone"] and "--filter=blob:none" not in command for command in calls)
 
 
+def test_sync_repos_preserves_existing_non_git_target_on_clone_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "GPT-SoVITS-main"
+    target.mkdir(parents=True)
+    marker = target / "marker.txt"
+    marker.write_text("keep", encoding="utf-8")
+    (tmp_path / "repo.lock.json").write_text(
+        json.dumps(
+            {
+                "repositories": [
+                    {
+                        "name": "GPT-SoVITS-main",
+                        "provider_type": "gpt-sovits",
+                        "path": "repo/GPT-SoVITS-main",
+                        "remote": "https://github.com/XucroYuri/GPT-SoVITS.git",
+                        "branch": "main",
+                        "commit": "bf81cdb14a38b674b6e9996dabc97340bc9978d2",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_run(command: list[str], cwd: Path) -> None:
+        if command[:2] == ["git", "clone"] and "--filter=blob:none" in command:
+            raise deploy.subprocess.CalledProcessError(128, command)
+        if command[:2] == ["git", "clone"]:
+            (Path(command[-1]) / ".git").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(deploy, "_run_git_command", fake_run)
+    monkeypatch.setattr(deploy, "_git_output", lambda command: "bf81cdb14a38b674b6e9996dabc97340bc9978d2")
+
+    deploy.sync_repos(tmp_path, dry_run=False)
+
+    assert marker.exists()
+
+
+def test_sync_repos_fetches_locked_commit_before_checkout_when_head_differs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "GPT-SoVITS-main"
+    commit = "bf81cdb14a38b674b6e9996dabc97340bc9978d2"
+    (tmp_path / "repo.lock.json").write_text(
+        json.dumps(
+            {
+                "repositories": [
+                    {
+                        "name": "GPT-SoVITS-main",
+                        "provider_type": "gpt-sovits",
+                        "path": "repo/GPT-SoVITS-main",
+                        "remote": "https://github.com/XucroYuri/GPT-SoVITS.git",
+                        "branch": "main",
+                        "commit": commit,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], cwd: Path) -> None:
+        calls.append(command)
+        if command[:2] == ["git", "clone"]:
+            (target / ".git").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(deploy, "_run_git_command", fake_run)
+    monkeypatch.setattr(deploy, "_git_output", lambda command: "0000000000000000000000000000000000000000")
+
+    dry_actions = deploy.sync_repos(tmp_path, dry_run=True)
+    deploy.sync_repos(tmp_path, dry_run=False)
+
+    fetch_command = ["git", "-C", str(target), "fetch", "origin", commit]
+    checkout_command = ["git", "-C", str(target), "checkout", commit]
+
+    assert fetch_command in dry_actions
+    assert dry_actions.index(fetch_command) < dry_actions.index(checkout_command)
+    assert fetch_command in calls
+    assert calls.index(fetch_command) < calls.index(checkout_command)
+
+
 def test_resolve_command_rejects_paths_outside_project(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
