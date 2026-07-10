@@ -384,6 +384,7 @@ function Invoke-SingleNodeDeployment {
         $start = @{ Detach = $true }
         if ($TopologyPath) { $start.Topology = $TopologyPath }
         if ($Node) { $start.Node = $Node }
+        if ($RepoPaths) { $start.RepoPaths = $RepoPaths }
         Invoke-LocalScript (Join-Path $Root "scripts\start-service-workers.ps1") $start
     }
 }

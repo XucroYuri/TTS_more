@@ -119,6 +119,13 @@ def test_cuda_entrypoint_forwards_repo_paths_and_marks_skips_diagnostic() -> Non
     assert '[string]$RepoPaths = ""' in script
     assert 'if ($RepoPaths -and !(Test-Path -LiteralPath $RepoPathsPath))' in single_deploy
     assert "$deploy.RepoPaths = $RepoPaths" in single_deploy
+    assert 'if ($RepoPaths) { $start.RepoPaths = $RepoPaths }' in single_deploy
+    assert single_deploy.index("$deploy.RepoPaths = $RepoPaths") < single_deploy.index(
+        'Invoke-LocalScript (Join-Path $Root "scripts\\deploy-local-tts.ps1") $deploy'
+    )
+    assert single_deploy.index("$start.RepoPaths = $RepoPaths") < single_deploy.index(
+        'Invoke-LocalScript (Join-Path $Root "scripts\\start-service-workers.ps1") $start'
+    )
     assert "$isDiagnostic = $SkipDeploy -or $SkipStart" in script
     assert script.count('$validatorArgs += "--diagnostic"') == 2
     assert 'Write-Host "CUDA diagnostic core 通过（不可认证）：$Output"' in script

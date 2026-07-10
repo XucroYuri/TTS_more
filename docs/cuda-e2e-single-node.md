@@ -104,7 +104,7 @@ Invoke-RestMethod http://127.0.0.1:9882/capabilities
 Invoke-RestMethod http://127.0.0.1:9882/status
 ```
 
-启动应用工作台；只停止该命令打印的本次 PID，不按端口强杀未知进程。
+启动应用工作台前会检查固定端口。8000 或 5173 已被占用时立即阻塞；不得复用旧 checkout 的后端或前端。只停止该命令打印的本次 PID，不按端口强杀未知进程。
 
 ```powershell
 .\scripts\start-dev.ps1
@@ -175,4 +175,7 @@ $RunId = "single-release-$(Get-Date -Format yyyyMMdd-HHmmss)"
 
 ## 仅诊断
 
-`SkipDeploy` 或 `SkipStart` 只用于保留现有环境的 diagnostic 排障。任何带 Skip 开关的运行都必须是 `certifiable: false`、`diagnostic_core_passed`，不可认证，也不可建立或批准基线。
+- `SkipDeploy`：不部署，也不启动，只连接已经存在的 worker。
+- `SkipStart`：仍执行部署但不启动；在 `single-clean` 仍可能清理所选 repo。
+
+两种 Skip 都是 `certifiable:false` 的 diagnostic。只有核心通过时才是 `diagnostic_core_passed`；核心失败仍是 `core_failed`，输入或环境缺失仍是 `blocked`。诊断运行不可认证，也不可建立或批准基线。

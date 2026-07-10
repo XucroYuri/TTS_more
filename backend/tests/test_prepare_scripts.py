@@ -279,6 +279,21 @@ def test_windows_deploy_and_worker_scripts_forward_topology_selection() -> None:
     assert "Stop-ConfiguredWorkerListeners" in validator
 
 
+def test_start_dev_rejects_occupied_fixed_ports_before_starting_processes() -> None:
+    script = (REPO_ROOT / "scripts" / "start-dev.ps1").read_text(encoding="utf-8")
+    vite = (REPO_ROOT / "frontend" / "vite.config.ts").read_text(encoding="utf-8")
+
+    assert "function Assert-PortAvailable" in script
+    assert "Get-NetTCPConnection -State Listen -LocalPort $Port" in script
+    first_start = script.index("Start-Process")
+    for call in ('Assert-PortAvailable 8000 "Backend"', 'Assert-PortAvailable 5173 "Frontend"'):
+        assert call in script
+        assert script.index(call) < first_start
+    assert "is already in use; stop the existing process before starting this checkout" in script
+    assert "port: 5173" in vite
+    assert "strictPort: true" in vite
+
+
 def test_committed_topology_examples_are_sanitized_and_valid() -> None:
     import importlib.util
     import json
@@ -453,6 +468,19 @@ def test_single_node_runbook_documents_one_formal_path_and_separate_ui_gate() ->
     assert "展示所选服务 repo 的绝对路径" not in runbook
     assert "项目相对清理范围" in runbook
     assert "selected repo labels" in runbook
+    assert "8000 或 5173 已被占用时立即阻塞" in runbook
+    assert "不得复用旧 checkout" in runbook
+
+
+def test_single_node_runbook_distinguishes_skip_control_flow_and_outcomes() -> None:
+    runbook = _read_repo_text("docs/cuda-e2e-single-node.md")
+
+    assert "`SkipDeploy`：不部署，也不启动" in runbook
+    assert "`SkipStart`：仍执行部署" in runbook
+    assert "`single-clean` 仍可能清理" in runbook
+    assert "只有核心通过时才是 `diagnostic_core_passed`" in runbook
+    assert "核心失败仍是 `core_failed`" in runbook
+    assert "输入或环境缺失仍是 `blocked`" in runbook
 
 
 def test_cuda_docs_use_root_lock_and_current_repopaths_contract() -> None:
@@ -481,7 +509,10 @@ def test_provider_readmes_route_certification_through_top_level_wrapper() -> Non
         "cosyvoice": _read_repo_text("deployment/tts-repos/cosyvoice/README.md"),
     }
     for provider, text in provider_docs.items():
-        assert "deploy-local-tts.ps1" in text, f"{provider} must route formal certification to the top-level wrapper"
+        assert "run-cuda-validation.ps1" in text, f"{provider} must route formal certification to the total entrypoint"
+        assert "总入口内部调用 `deploy-local-tts.ps1`" in text
+        assert "直接运行 `deploy-local-tts.ps1` 仅用于通用部署或排障" in text
+        assert "不要在认证总入口前先运行" in text
         assert "不是完整认证路径" in text
         assert "CU128" in text
 
@@ -517,6 +548,12 @@ def test_acceptance_record_has_machine_states_human_conclusions_and_twelve_liste
         assert record.count(f"`{case_id}`") == 2, f"{case_id} needs one row per first-certification reviewer"
     assert "Playwright report URL" not in record
     assert "Playwright JUnit" in record
+
+
+def test_cuda_contract_requires_single_release_warm_p95_baseline_regression() -> None:
+    contract = _read_repo_text("docs/cuda-e2e-validation.md")
+    assert "single-release 必须使用已批准 baseline" in contract
+    assert "single-release warm p95 回归 <=30%" in contract
 
 
 def test_windows_cuda_handoff_contains_boundaries_not_a_second_runbook() -> None:
