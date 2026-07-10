@@ -14,6 +14,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "windows-gpu-validation.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 PLAYWRIGHT_SPEC = ROOT / "frontend" / "e2e" / "cuda-workstation.spec.ts"
 PLAYWRIGHT_FIXTURE_HELPER = ROOT / "frontend" / "e2e" / "cuda-fixture.ts"
 FRONTEND_PACKAGE = ROOT / "frontend" / "package.json"
@@ -96,7 +97,7 @@ def test_windows_gpu_workflow_uses_separate_protected_inputs_and_candidate_sha()
 
     for job_name in ("single-validation", "distributed-validation"):
         steps = jobs[job_name]["steps"]
-        checkout_index = next(index for index, step in enumerate(steps) if step.get("uses") == "actions/checkout@v4")
+        checkout_index = next(index for index, step in enumerate(steps) if step.get("uses") == "actions/checkout@v7")
         recover_index = next(index for index, step in enumerate(steps) if step.get("name") == "Recover prior owned processes")
         initialize_index = next(index for index, step in enumerate(steps) if step.get("name") == "Initialize controlled run directories")
         assert steps[checkout_index]["with"]["clean"] == "false"
@@ -133,7 +134,7 @@ def test_windows_gpu_workflow_uploads_only_fail_closed_sanitized_evidence() -> N
     ):
         steps = jobs[job_name]["steps"]
         finalizer_index = next(index for index, step in enumerate(steps) if step.get("id") == "finalize-evidence")
-        upload_index = next(index for index, step in enumerate(steps) if step.get("uses") == "actions/upload-artifact@v4")
+        upload_index = next(index for index, step in enumerate(steps) if step.get("uses") == "actions/upload-artifact@v7")
         cleanup_index = next(index for index, step in enumerate(steps) if step.get("id") == "cleanup-run-processes")
         finalizer = steps[finalizer_index]
         upload = steps[upload_index]
@@ -161,13 +162,33 @@ def test_windows_gpu_workflow_uploads_only_fail_closed_sanitized_evidence() -> N
         step["with"]["path"]
         for job in jobs.values()
         for step in job.get("steps", [])
-        if step.get("uses") == "actions/upload-artifact@v4"
+        if step.get("uses") == "actions/upload-artifact@v7"
     )
     for forbidden in ("wav", "logs", "worker-logs", "test-results", "trace", "video", "screenshot", "controller.log"):
         assert forbidden not in upload_blocks
     assert "stable-release-gate" not in workflow_text
     assert "automatic-gate.json" in workflow_text
     assert "manifest.json" in workflow_text
+
+
+def test_github_workflows_use_node24_action_majors() -> None:
+    combined = _read(WORKFLOW) + "\n" + _read(CI_WORKFLOW)
+    for expected in (
+        "actions/checkout@v7",
+        "actions/setup-python@v6",
+        "actions/setup-node@v6",
+        "pnpm/action-setup@v6",
+        "actions/upload-artifact@v7",
+    ):
+        assert expected in combined
+    for deprecated in (
+        "actions/checkout@v4",
+        "actions/setup-python@v5",
+        "actions/setup-node@v4",
+        "pnpm/action-setup@v4",
+        "actions/upload-artifact@v4",
+    ):
+        assert deprecated not in combined
 
 
 def test_windows_gpu_workflow_recovers_owned_processes_across_mode_switches() -> None:

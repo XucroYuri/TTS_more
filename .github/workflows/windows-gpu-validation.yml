@@ -71,7 +71,7 @@ jobs:
       TTS_MORE_VALIDATION_SSH_USER: ${{ vars.TTS_MORE_VALIDATION_SSH_USER }}
       TTS_MORE_VALIDATION_REMOTE_ROOT: ${{ vars.TTS_MORE_VALIDATION_REMOTE_ROOT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.candidate_sha }}
           # Preserve the prior run's ignored PID manifest until owned cleanup runs.
@@ -129,17 +129,17 @@ jobs:
             if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
           }
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "24"
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -304,7 +304,7 @@ jobs:
 
       - name: Upload sanitized single-node evidence
         if: ${{ always() && steps.finalize-evidence.outputs.verified == 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-gpu-single-sanitized-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
@@ -330,7 +330,7 @@ jobs:
       TTS_MORE_VALIDATION_SSH_USER: ${{ vars.TTS_MORE_VALIDATION_SSH_USER }}
       TTS_MORE_VALIDATION_REMOTE_ROOT: ${{ vars.TTS_MORE_VALIDATION_REMOTE_ROOT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.candidate_sha }}
           # Preserve the prior run's ignored PID manifest until owned cleanup runs.
@@ -388,17 +388,17 @@ jobs:
             if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
           }
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "24"
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -571,7 +571,7 @@ jobs:
 
       - name: Upload sanitized distributed evidence
         if: ${{ always() && steps.finalize-evidence.outputs.verified == 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-gpu-distributed-sanitized-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error

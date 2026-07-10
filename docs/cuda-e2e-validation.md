@@ -142,6 +142,8 @@ flowchart TD
 
 `cuda-validation` 保护环境提供运行输入：
 
+自托管 runner 必须为 Actions Runner `v2.327.1` 或更高版本，以运行 Node 24 action；低于该版本时先升级 runner，不回退到已弃用的 Node 20 action。
+
 - `TTS_MORE_SINGLE_TOPOLOGY`、`TTS_MORE_SINGLE_FIXTURE`、可选 `TTS_MORE_SINGLE_REPO_PATHS`；
 - `TTS_MORE_DISTRIBUTED_TOPOLOGY`、`TTS_MORE_DISTRIBUTED_FIXTURE`、可选 `TTS_MORE_DISTRIBUTED_REPO_PATHS`；
 - `TTS_MORE_VALIDATION_SSH_USER`、`TTS_MORE_VALIDATION_REMOTE_ROOT`；
