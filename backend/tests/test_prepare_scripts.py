@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import re
 import shutil
 import subprocess
@@ -428,22 +429,23 @@ def test_windows_cuda_copy_paste_powershell_parses() -> None:
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if powershell is None:
         pytest.skip("PowerShell parser is only available on Windows or pwsh-enabled runners")
-    parser_command = (
-        "$code = [Console]::In.ReadToEnd(); $tokens = $null; $errors = $null; "
-        "[System.Management.Automation.Language.Parser]::ParseInput($code, [ref]$tokens, [ref]$errors) | Out-Null; "
-        "if ($errors.Count) { $errors | ForEach-Object { $_.Message }; exit 1 }"
-    )
-
     for relative_path in CUDA_DOC_PATHS:
         for line, block in _powershell_blocks(relative_path):
+            encoded = base64.b64encode(block.encode("utf-8")).decode("ascii")
+            parser_command = (
+                "$code = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('"
+                + encoded
+                + "')); $tokens = $null; $errors = $null; "
+                "[System.Management.Automation.Language.Parser]::ParseInput($code, [ref]$tokens, [ref]$errors) | Out-Null; "
+                "if ($errors.Count) { $errors | ForEach-Object { $_.Message }; exit 1 }"
+            )
             completed = subprocess.run(
                 [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", parser_command],
-                input=block,
                 capture_output=True,
-                text=True,
                 check=False,
             )
-            assert completed.returncode == 0, f"{relative_path}:{line}: {completed.stdout}{completed.stderr}"
+            diagnostics = (completed.stdout + completed.stderr).decode("utf-8", errors="replace")
+            assert completed.returncode == 0, f"{relative_path}:{line}: {diagnostics}"
 
 
 def test_single_node_runbook_documents_one_formal_path_and_separate_ui_gate() -> None:
