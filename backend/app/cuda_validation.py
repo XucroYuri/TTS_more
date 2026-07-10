@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import hmac
+import importlib.util
 import json
 import math
 import os
@@ -159,6 +160,48 @@ def load_fixture(path: Path) -> ValidationFixture:
     raw = json.loads(path.read_text(encoding="utf-8"))
     expanded = _expand_environment(raw)
     return ValidationFixture.model_validate(expanded)
+
+
+def _append_required_file_failure(
+    failures: list[str], kind: str, label: str, raw_path: str
+) -> None:
+    if _contains_unresolved_environment(raw_path):
+        failures.append(f"{kind} {label} contains an unresolved environment variable")
+    elif not Path(raw_path).is_file():
+        failures.append(f"{kind} {label} not found")
+
+
+def validate_fixture_inputs(
+    fixture_path: Path,
+    *,
+    mode: str,
+    require_baseline: bool,
+) -> tuple[ValidationFixture | None, list[str]]:
+    try:
+        fixture = load_fixture(fixture_path)
+    except Exception as exc:
+        return None, [f"fixture validation failed: {exc}"]
+    failures: list[str] = []
+    for label, raw_path in fixture.references.model_dump().items():
+        _append_required_file_failure(failures, "reference", label, str(raw_path))
+    for version, pair in fixture.gpt_weights.model_dump(by_alias=True).items():
+        for kind, raw_path in pair.items():
+            raw_path = str(raw_path)
+            if mode == "distributed":
+                if _contains_unresolved_environment(raw_path):
+                    failures.append(
+                        f"weight {version}.{kind} contains an unresolved environment variable"
+                    )
+            else:
+                _append_required_file_failure(failures, "weight", f"{version}.{kind}", raw_path)
+    if require_baseline and mode != "single-clean" and fixture.performance_baseline is None:
+        failures.append("an approved performance baseline is required")
+    if importlib.util.find_spec("faster_whisper") is None:
+        failures.append("ASR gate requires faster-whisper with large-v3")
+    required_reviewers = 2 if mode == "single-clean" else 1
+    if len(fixture.reviewers) < required_reviewers:
+        failures.append(f"{mode} requires {required_reviewers} listening reviewers")
+    return fixture, failures
 
 
 def validation_cases(fixture: ValidationFixture) -> list[ValidationCase]:
@@ -514,6 +557,7 @@ class CUDAValidationRunner:
         monitor_factory: Callable[[Path], NvidiaSmiMonitor] = NvidiaSmiMonitor,
         expected_commit: str | None = None,
         require_baseline: bool = False,
+        diagnostic: bool = False,
         distributed_preflight_path: Path | None = None,
         distributed_orchestration_token: str | None = None,
     ) -> None:
@@ -533,6 +577,7 @@ class CUDAValidationRunner:
         self.monitor_factory = monitor_factory
         self.expected_commit = expected_commit or os.environ.get("TTS_MORE_EXPECTED_APP_COMMIT") or None
         self.require_baseline = require_baseline and mode != "single-clean"
+        self.diagnostic = diagnostic
         self.distributed_preflight_path = distributed_preflight_path
         self.distributed_orchestration_token = (
             distributed_orchestration_token
@@ -541,15 +586,11 @@ class CUDAValidationRunner:
         )
         self.distributed_orchestration_verified = False
 
-    def run(self) -> dict[str, Any]:
-        started_at = datetime.now(timezone.utc)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        (self.output_dir / "wav").mkdir(parents=True, exist_ok=True)
-        monitor = self.monitor_factory(self.output_dir / "nvidia-smi.csv")
-        monitor.start()
-        report: dict[str, Any] = {
+    def _new_report(self, *, stage: str) -> dict[str, Any]:
+        return {
             "schema_version": 1,
             "name": "cuda-e2e-validation",
+            "stage": stage,
             "mode": self.mode,
             "topology": str(self.topology_path) if self.topology_path else None,
             "node": self.node,
@@ -559,15 +600,55 @@ class CUDAValidationRunner:
             "distributed_preflight": (
                 str(self.distributed_preflight_path) if self.distributed_preflight_path else None
             ),
-            "started_at": started_at.isoformat(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
             "passed": False,
+            "certifiable": False if self.diagnostic else None,
+            "certification_status": "diagnostic" if self.diagnostic else "pending",
             "preflight": [],
             "services": [],
             "cases": [],
             "cer": {"required": False, "items": [], "aggregate_cer": None, "passed": True},
             "performance": {"passed": False, "checks": {}, "metrics": {}},
         }
+
+    def run_input_preflight(self) -> dict[str, Any]:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        fixture, failures = validate_fixture_inputs(
+            self.fixture_path,
+            mode=self.mode,
+            require_baseline=self.require_baseline,
+        )
+        report = self._new_report(stage="input-preflight")
+        report["preflight"] = [
+            {"passed": False, "message": message} for message in failures
+        ]
+        report["passed"] = not failures
+        report["blocker_count"] = len(failures)
+        report["next_action"] = (
+            "Fill the unresolved reference audio and GPT/SoVITS weight paths, then rerun the same command."
+        )
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        if not self.diagnostic:
+            report["certification_status"] = (
+                "input-preflight-passed" if report["passed"] else "blocked"
+            )
+        _write_report_files(self.output_dir, report, fixture, {})
+        with (self.output_dir / "nvidia-smi.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            csv.writer(handle).writerow(NvidiaSmiMonitor.HEADER)
+        return report
+
+    def run(self) -> dict[str, Any]:
+        input_report = self.run_input_preflight()
+        if not input_report["passed"]:
+            return input_report
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "wav").mkdir(parents=True, exist_ok=True)
+        monitor = self.monitor_factory(self.output_dir / "nvidia-smi.csv")
+        monitor.start()
+        report = self._new_report(stage="cuda-validation")
         fixture: ValidationFixture | None = None
         endpoints: dict[str, TTSServiceEndpoint] = {}
         try:
@@ -679,29 +760,6 @@ class CUDAValidationRunner:
                 report["preflight"].append(
                     {"passed": False, "message": f"{endpoint.service_id} lacks artifact-transfer capability"}
                 )
-        for label, raw_path in fixture.references.model_dump().items():
-            if _contains_unresolved_environment(raw_path):
-                report["preflight"].append(
-                    {"passed": False, "message": f"reference {label} contains an unresolved environment variable"}
-                )
-            elif not Path(raw_path).is_file():
-                report["preflight"].append({"passed": False, "message": f"reference {label} not found: {raw_path}"})
-        for version, pair in fixture.gpt_weights.model_dump(by_alias=True).items():
-            for kind, raw_path in pair.items():
-                if _contains_unresolved_environment(str(raw_path)):
-                    report["preflight"].append(
-                        {
-                            "passed": False,
-                            "message": f"weight {version}.{kind} contains an unresolved environment variable",
-                        }
-                    )
-        if self.require_baseline and fixture.performance_baseline is None:
-            report["preflight"].append(
-                {
-                    "passed": False,
-                    "message": "an approved performance baseline is required for release and distributed validation",
-                }
-            )
         if self.transcriber is None:
             self.transcriber, asr_error = create_transcriber(
                 required=fixture.asr.required,
@@ -923,6 +981,12 @@ class CUDAValidationRunner:
             and bool(report["cer"].get("passed"))
             and bool(report["performance"].get("passed"))
         )
+        if self.diagnostic:
+            report["certifiable"] = False
+            report["certification_status"] = "diagnostic"
+        else:
+            report["certifiable"] = report["passed"]
+            report["certification_status"] = "certified" if report["passed"] else "failed"
         _write_report_files(self.output_dir, report, fixture, endpoints)
         return report
 
@@ -1210,6 +1274,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--topology", type=Path)
     parser.add_argument("--node")
     parser.add_argument("--distributed-preflight", type=Path)
+    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument(
         "--require-baseline",
         action="store_true",
@@ -1225,9 +1291,15 @@ def main(argv: list[str] | None = None) -> int:
         node=args.node,
         distributed_preflight_path=args.distributed_preflight,
         require_baseline=args.require_baseline,
+        diagnostic=args.diagnostic,
     )
-    report = runner.run()
-    print(json.dumps({"passed": report["passed"], "summary": str(args.output / "summary.json")}, ensure_ascii=False))
+    report = runner.run_input_preflight() if args.preflight_only else runner.run()
+    if report.get("stage") == "input-preflight" and not report["passed"]:
+        print(
+            f"阻塞：input-preflight 有 {report['blocker_count']} 个未解决项；证据：summary.json"
+        )
+    else:
+        print(json.dumps({"passed": report["passed"], "summary": str(args.output / "summary.json")}, ensure_ascii=False))
     return 0 if report["passed"] else 1
 
 

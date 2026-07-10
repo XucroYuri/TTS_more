@@ -23,6 +23,7 @@ from app.cuda_validation import (
     evaluate_cer,
     evaluate_performance,
     load_fixture,
+    main,
     measure_wav,
     validation_cases,
     _sanitize_evidence,
@@ -58,15 +59,20 @@ def _fixture_payload(tmp_path: Path, *, asr_required: bool = True) -> dict:
         path = tmp_path / f"{name}.wav"
         _write_wav(path)
         references[name] = str(path)
+    weights = {}
+    for version in ("v2ProPlus", "v2Pro"):
+        pair = {}
+        for kind, suffix in (("gpt", ".ckpt"), ("sovits", ".pth")):
+            path = tmp_path / f"{version}{suffix}"
+            path.write_bytes(b"unit-test-weight")
+            pair[kind] = str(path)
+        weights[version] = pair
     return {
         "schema_version": 1,
         "name": "unit-cuda-validation",
         "service_ids": dict(FORMAL_SERVICE_IDS),
         "references": references,
-        "gpt_weights": {
-            "v2ProPlus": {"gpt": "worker:/weights/v2ProPlus.ckpt", "sovits": "worker:/weights/v2ProPlus.pth"},
-            "v2Pro": {"gpt": "worker:/weights/v2Pro.ckpt", "sovits": "worker:/weights/v2Pro.pth"},
-        },
+        "gpt_weights": weights,
         "prompts": {
             "gpt": {"text": "参考文本。", "language": "zh"},
             "cosyvoice": {"text": "参考提示。", "language": "zh"},
@@ -511,6 +517,198 @@ def test_runner_preflight_failure_is_reported_without_network(tmp_path: Path, mo
     assert report["passed"] is False
     assert "faster-whisper" in report["preflight"][0]["message"]
     assert (tmp_path / "failed-report" / "summary.json").is_file()
+
+
+@pytest.mark.parametrize("mode", ["single-clean", "single-release"])
+def test_input_preflight_rejects_missing_weight_files_without_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    payload = _fixture_payload(tmp_path)
+    payload["gpt_weights"]["v2Pro"]["gpt"] = str(tmp_path / "missing.ckpt")
+    fixture_path = tmp_path / f"{mode}-missing-weight.json"
+    fixture_path.write_text(json.dumps(payload), encoding="utf-8")
+    output_dir = tmp_path / f"{mode}-input-preflight"
+    output_dir.mkdir()
+    (output_dir / "nvidia-smi.csv").write_text("stale-gpu-evidence\n", encoding="utf-8")
+    network_calls: list[str] = []
+    monitor_starts = 0
+
+    def monitor_factory(_path: Path):
+        nonlocal monitor_starts
+        monitor_starts += 1
+        pytest.fail("nvidia-smi monitor must not start during input preflight")
+
+    monkeypatch.setattr(
+        "app.cuda_validation.create_transcriber",
+        lambda **_kwargs: pytest.fail("input preflight must not import or construct an ASR transcriber"),
+    )
+    runner = CUDAValidationRunner(
+        mode=mode,
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=output_dir,
+        client_factory=lambda _endpoint: network_calls.append("client"),
+        status_probe=lambda _endpoint: network_calls.append("status") or {},
+        monitor_factory=monitor_factory,
+    )
+
+    report = runner.run_input_preflight()
+
+    assert report["passed"] is False
+    assert report["stage"] == "input-preflight"
+    assert report["blocker_count"] == 1
+    assert "weight v2Pro.gpt not found" in report["preflight"][0]["message"]
+    assert report["next_action"] == (
+        "Fill the unresolved reference audio and GPT/SoVITS weight paths, then rerun the same command."
+    )
+    assert network_calls == []
+    assert monitor_starts == 0
+    for artifact in (
+        "summary.json",
+        "junit.xml",
+        "human-listening-review.md",
+        "worker-log-references.json",
+        "nvidia-smi.csv",
+    ):
+        assert (output_dir / artifact).is_file()
+    assert (output_dir / "nvidia-smi.csv").read_text(encoding="utf-8").splitlines() == [
+        ",".join(NvidiaSmiMonitor.HEADER)
+    ]
+
+
+def test_distributed_input_preflight_requires_controller_reference_but_not_remote_weights(tmp_path: Path) -> None:
+    payload = _fixture_payload(tmp_path)
+    payload["gpt_weights"] = {
+        "v2ProPlus": {"gpt": "D:/worker/weights/v2ProPlus.ckpt", "sovits": "D:/worker/weights/v2ProPlus.pth"},
+        "v2Pro": {"gpt": "D:/worker/weights/v2Pro.ckpt", "sovits": "D:/worker/weights/v2Pro.pth"},
+    }
+    fixture_path = tmp_path / "distributed-remote-weights.json"
+    fixture_path.write_text(json.dumps(payload), encoding="utf-8")
+    runner = CUDAValidationRunner(
+        mode="distributed",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "distributed-remote-weights",
+    )
+
+    report = runner.run_input_preflight()
+
+    assert report["passed"] is True
+    payload["references"]["gpt_sovits"] = str(tmp_path / "controller-reference-missing.wav")
+    fixture_path.write_text(json.dumps(payload), encoding="utf-8")
+    report = runner.run_input_preflight()
+    assert report["passed"] is False
+    assert "reference gpt_sovits not found" in report["preflight"][0]["message"]
+
+
+def test_distributed_input_preflight_rejects_unresolved_remote_weight(tmp_path: Path) -> None:
+    payload = _fixture_payload(tmp_path)
+    payload["gpt_weights"]["v2ProPlus"]["gpt"] = "${REMOTE_GPT_WEIGHT}"
+    fixture_path = tmp_path / "distributed-unresolved-weight.json"
+    fixture_path.write_text(json.dumps(payload), encoding="utf-8")
+    runner = CUDAValidationRunner(
+        mode="distributed",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "distributed-unresolved-weight",
+    )
+
+    report = runner.run_input_preflight()
+
+    assert report["passed"] is False
+    assert "weight v2ProPlus.gpt contains an unresolved environment variable" in report["preflight"][0]["message"]
+
+
+def test_preflight_only_cli_returns_zero_for_valid_local_inputs(tmp_path: Path) -> None:
+    output = tmp_path / "preflight-only"
+
+    exit_code = main(
+        [
+            "--mode",
+            "single-release",
+            "--services",
+            str(tmp_path / "services-must-not-be-read.json"),
+            "--fixture",
+            str(_write_fixture(tmp_path)),
+            "--output",
+            str(output),
+            "--preflight-only",
+        ]
+    )
+
+    assert exit_code == 0
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["passed"] is True
+    assert summary["stage"] == "input-preflight"
+
+
+def test_diagnostic_cli_marks_preflight_non_certifiable(tmp_path: Path) -> None:
+    output = tmp_path / "diagnostic-preflight"
+
+    exit_code = main(
+        [
+            "--mode",
+            "single-clean",
+            "--services",
+            str(tmp_path / "services-must-not-be-read.json"),
+            "--fixture",
+            str(_write_fixture(tmp_path)),
+            "--output",
+            str(output),
+            "--preflight-only",
+            "--diagnostic",
+        ]
+    )
+
+    assert exit_code == 0
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["certifiable"] is False
+    assert summary["certification_status"] == "diagnostic"
+
+
+def test_input_preflight_checks_asr_availability_without_loading_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.cuda_validation.importlib.util.find_spec", lambda _name: None)
+    monkeypatch.setattr(
+        "app.cuda_validation.create_transcriber",
+        lambda **_kwargs: pytest.fail("input preflight must not import or construct an ASR transcriber"),
+    )
+    runner = CUDAValidationRunner(
+        mode="single-release",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=_write_fixture(tmp_path),
+        output_dir=tmp_path / "missing-asr",
+    )
+
+    report = runner.run_input_preflight()
+
+    assert report["passed"] is False
+    assert "ASR gate requires faster-whisper with large-v3" in report["preflight"][0]["message"]
+
+
+def test_input_preflight_requires_two_reviewers_only_for_single_clean(tmp_path: Path) -> None:
+    payload = _fixture_payload(tmp_path)
+    payload["reviewers"] = payload["reviewers"][:1]
+    fixture_path = tmp_path / "one-reviewer.json"
+    fixture_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    clean_report = CUDAValidationRunner(
+        mode="single-clean",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "clean-one-reviewer",
+    ).run_input_preflight()
+    release_report = CUDAValidationRunner(
+        mode="single-release",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "release-one-reviewer",
+    ).run_input_preflight()
+
+    assert clean_report["passed"] is False
+    assert "single-clean requires 2 listening reviewers" in clean_report["preflight"][0]["message"]
+    assert release_report["passed"] is True
 
 
 def test_runner_preflight_rejects_unresolved_weight_environment_without_network(tmp_path: Path) -> None:

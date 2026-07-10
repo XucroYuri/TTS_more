@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "windows-gpu-validation.yml"
 PLAYWRIGHT_SPEC = ROOT / "frontend" / "e2e" / "cuda-workstation.spec.ts"
 PLAYWRIGHT_CONFIG = ROOT / "frontend" / "playwright.config.ts"
+CUDA_ENTRYPOINT = ROOT / "scripts" / "run-cuda-validation.ps1"
 
 
 def _read(path: Path) -> str:
@@ -66,6 +67,46 @@ def test_windows_gpu_workflow_runs_validation_ui_and_preserves_evidence() -> Non
     assert "needs.single-validation.result" in workflow
     assert "needs.distributed-validation.result" in workflow
     assert not re.search(r"(?im)^\s*(?:&\s*)?(?:ssh|scp)\b", workflow), "remote commands belong in the validator entrypoint"
+
+
+def test_cuda_entrypoint_runs_fixture_preflight_before_deploy_or_wait() -> None:
+    script = _read(CUDA_ENTRYPOINT)
+    main_marker = 'try {\n    $validatorArgs = @('
+    assert main_marker in script
+    entrypoint = script[script.index(main_marker) :]
+
+    preflight = entrypoint.index('"--preflight-only"')
+    single_deploy = entrypoint.index("Invoke-SingleNodeDeployment")
+    distributed_deploy = entrypoint.index("Invoke-DistributedDeployment")
+    worker_wait = entrypoint.index("Wait-ServiceReady $ServicesPath")
+
+    assert preflight < single_deploy
+    assert preflight < distributed_deploy
+    assert preflight < worker_wait
+    assert "& $Python @validatorArgs | Out-Null" in entrypoint[:single_deploy]
+    assert "阻塞：input-preflight 有 $blockerCount 个未解决项；证据：summary.json" in entrypoint
+    assert "$script:DistributedDeploymentStarted = $false" in script
+    assert (
+        'if ($Mode -eq "distributed" -and $script:DistributedDeploymentStarted -and '
+        '-not $script:DistributedEvidenceCollected)'
+    ) in entrypoint
+
+
+def test_cuda_entrypoint_forwards_repo_paths_and_marks_skips_diagnostic() -> None:
+    script = _read(CUDA_ENTRYPOINT)
+    single_deploy = script[
+        script.index("function Invoke-SingleNodeDeployment") : script.index("function Invoke-DistributedDeployment")
+    ]
+
+    assert '[string]$RepoPaths = ""' in script
+    assert "$deploy.RepoPaths = $RepoPaths" in single_deploy
+    assert "$isDiagnostic = $SkipDeploy -or $SkipStart" in script
+    assert script.count('$validatorArgs += "--diagnostic"') == 2
+    assert 'Write-Host "CUDA diagnostic completed: $Output"' in script
+    assert re.search(
+        r'if \(\$isDiagnostic\) \{\s*Write-Host "CUDA diagnostic completed: \$Output"[^}]*\}\s*else \{\s*Write-Host "CUDA validation passed: \$Output"',
+        script,
+    )
 
 
 def test_playwright_cuda_spec_is_a_real_three_service_closed_loop() -> None:

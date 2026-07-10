@@ -9,6 +9,7 @@ param(
     [string]$Output = "",
     [string]$SshUser = "",
     [string]$RemoteRoot = "",
+    [string]$RepoPaths = "",
     [switch]$SkipDeploy,
     [switch]$SkipStart,
     [switch]$SkipFaultRecovery,
@@ -33,6 +34,8 @@ if ($LASTEXITCODE -ne 0 -or $ControllerCommit -notmatch '^[0-9a-f]{40}$') { thro
 $env:TTS_MORE_EXPECTED_APP_COMMIT = $ControllerCommit
 Remove-Item Env:TTS_MORE_DISTRIBUTED_ORCHESTRATION_TOKEN -ErrorAction SilentlyContinue
 $script:DistributedPreflightPath = ""
+$script:DistributedDeploymentStarted = $false
+$isDiagnostic = $SkipDeploy -or $SkipStart
 
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 $TranscriptPath = Join-Path $Output "controller.log"
@@ -277,6 +280,7 @@ function Invoke-SingleNodeDeployment {
     }
     if ($TopologyPath) { $deploy.Topology = $TopologyPath }
     if ($Node) { $deploy.Node = $Node }
+    if ($RepoPaths) { $deploy.RepoPaths = $RepoPaths }
     if ($Mode -eq "single-clean") { $deploy.CleanRepos = $true }
     Invoke-LocalScript (Join-Path $Root "scripts\deploy-local-tts.ps1") $deploy
     if (-not $SkipStart) {
@@ -444,7 +448,29 @@ function Invoke-DistributedFaultRecovery {
 }
 
 try {
-    if (!(Test-Path -LiteralPath $FixturePath)) { throw "Fixture file not found: $FixturePath" }
+    $validatorArgs = @(
+        (Join-Path $Root "scripts\run-cuda-validation.py"),
+        "--mode", $Mode,
+        "--services", $ServicesPath,
+        "--fixture", $FixturePath,
+        "--output", $Output,
+        "--preflight-only"
+    )
+    if ($TopologyPath) { $validatorArgs += @("--topology", $TopologyPath) }
+    if ($Node) { $validatorArgs += @("--node", $Node) }
+    if ($RequireBaseline) { $validatorArgs += "--require-baseline" }
+    if ($isDiagnostic) { $validatorArgs += "--diagnostic" }
+    & $Python @validatorArgs | Out-Null
+    $preflightExitCode = $LASTEXITCODE
+    if ($preflightExitCode -ne 0) {
+        $blockerCount = 1
+        try {
+            $preflightSummary = Get-Content -LiteralPath (Join-Path $Output "summary.json") -Raw | ConvertFrom-Json
+            $blockerCount = [int]$preflightSummary.blocker_count
+        } catch { }
+        Write-Host "阻塞：input-preflight 有 $blockerCount 个未解决项；证据：summary.json" -ForegroundColor Red
+        exit $preflightExitCode
+    }
     if ($Mode -eq "distributed") {
         if ($SkipDeploy) { throw "distributed mode does not allow -SkipDeploy because deployment identity checks are mandatory" }
         if ($Node) { throw "distributed mode does not allow -Node because all four machines are mandatory" }
@@ -452,7 +478,12 @@ try {
         if ($SkipFaultRecovery) { throw "distributed mode does not allow -SkipFaultRecovery because recovery is mandatory" }
     }
     if (-not $SkipDeploy) {
-        if ($Mode -eq "distributed") { Invoke-DistributedDeployment } else { Invoke-SingleNodeDeployment }
+        if ($Mode -eq "distributed") {
+            $script:DistributedDeploymentStarted = $true
+            Invoke-DistributedDeployment
+        } else {
+            Invoke-SingleNodeDeployment
+        }
     }
     if ($Mode -eq "distributed") { New-DistributedOrchestrationPreflight }
     if (!(Test-Path -LiteralPath $ServicesPath)) { throw "Services file not found: $ServicesPath" }
@@ -469,6 +500,7 @@ try {
     if ($script:DistributedPreflightPath) { $validatorArgs += @("--distributed-preflight", $script:DistributedPreflightPath) }
     if ($Node) { $validatorArgs += @("--node", $Node) }
     if ($RequireBaseline) { $validatorArgs += "--require-baseline" }
+    if ($isDiagnostic) { $validatorArgs += "--diagnostic" }
     & $Python @validatorArgs
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) { throw "CUDA validation gate failed; see $(Join-Path $Output 'summary.json')" }
@@ -479,9 +511,13 @@ try {
         Collect-DistributedEvidence
         $script:DistributedEvidenceCollected = $true
     }
-    Write-Host "CUDA validation passed: $Output" -ForegroundColor Green
+    if ($isDiagnostic) {
+        Write-Host "CUDA diagnostic completed: $Output" -ForegroundColor Yellow
+    } else {
+        Write-Host "CUDA validation passed: $Output" -ForegroundColor Green
+    }
 } finally {
-    if ($Mode -eq "distributed" -and -not $script:DistributedEvidenceCollected) {
+    if ($Mode -eq "distributed" -and $script:DistributedDeploymentStarted -and -not $script:DistributedEvidenceCollected) {
         try { Collect-DistributedEvidence } catch { Write-Warning "Distributed evidence collection failed: $_" }
     }
     if ($script:ValidationControlPlane -and -not $script:ValidationControlPlane.HasExited) {
