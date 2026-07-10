@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import struct
 import subprocess
@@ -67,7 +68,12 @@ def _write_float_wav(path: Path, *, seconds: float = 1.0) -> None:
     path.write_bytes(b"RIFF" + struct.pack("<I", riff_size) + b"WAVEfmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", len(data)) + data)
 
 
-def _fixture_payload(tmp_path: Path, *, asr_required: bool = True) -> dict:
+def _fixture_payload(
+    tmp_path: Path,
+    *,
+    asr_required: bool = True,
+    distributed_weights: bool = False,
+) -> dict:
     references = {}
     for name in ("gpt_sovits", "indextts", "cosyvoice"):
         path = tmp_path / f"{name}.wav"
@@ -77,9 +83,12 @@ def _fixture_payload(tmp_path: Path, *, asr_required: bool = True) -> dict:
     for version in ("v2ProPlus", "v2Pro"):
         pair = {}
         for kind, suffix in (("gpt", ".ckpt"), ("sovits", ".pth")):
-            path = tmp_path / f"{version}{suffix}"
-            path.write_bytes(b"unit-test-weight")
-            pair[kind] = str(path)
+            if distributed_weights:
+                pair[kind] = f"D:/worker/weights/{version}-{kind}{suffix}"
+            else:
+                path = tmp_path / f"{version}{suffix}"
+                path.write_bytes(b"unit-test-weight")
+                pair[kind] = str(path)
         weights[version] = pair
     return {
         "schema_version": 1,
@@ -109,9 +118,23 @@ def _fixture_payload(tmp_path: Path, *, asr_required: bool = True) -> dict:
     }
 
 
-def _write_fixture(tmp_path: Path, *, asr_required: bool = True) -> Path:
+def _write_fixture(
+    tmp_path: Path,
+    *,
+    asr_required: bool = True,
+    distributed_weights: bool = False,
+) -> Path:
     path = tmp_path / "fixture.json"
-    path.write_text(json.dumps(_fixture_payload(tmp_path, asr_required=asr_required)), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            _fixture_payload(
+                tmp_path,
+                asr_required=asr_required,
+                distributed_weights=distributed_weights,
+            )
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -414,7 +437,7 @@ def test_runner_writes_full_artifacts_and_continues_after_case_failure(tmp_path:
     calls: list[tuple] = []
     state: dict[str, str | None] = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
     services_path = _write_services(tmp_path)
-    fixture_path = _write_fixture(tmp_path)
+    fixture_path = _write_fixture(tmp_path, distributed_weights=True)
     output_dir = tmp_path / "report"
 
     runner = CUDAValidationRunner(
@@ -626,7 +649,7 @@ def test_distributed_input_preflight_requires_controller_reference_but_not_remot
 def test_distributed_input_preflight_rejects_unresolved_remote_weight(
     tmp_path: Path, raw_path: str
 ) -> None:
-    payload = _fixture_payload(tmp_path)
+    payload = _fixture_payload(tmp_path, distributed_weights=True)
     payload["gpt_weights"]["v2ProPlus"]["gpt"] = raw_path
     fixture_path = tmp_path / "distributed-unresolved-weight.json"
     fixture_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -650,7 +673,7 @@ def test_distributed_input_preflight_rejects_unresolved_remote_weight(
 def test_distributed_input_preflight_rejects_empty_or_non_windows_absolute_weight(
     tmp_path: Path, raw_path: str
 ) -> None:
-    payload = _fixture_payload(tmp_path)
+    payload = _fixture_payload(tmp_path, distributed_weights=True)
     payload["gpt_weights"]["v2Pro"]["gpt"] = raw_path
     fixture_path = tmp_path / "distributed-invalid-weight-path.json"
     fixture_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -678,7 +701,7 @@ def test_distributed_input_preflight_rejects_empty_or_non_windows_absolute_weigh
 def test_distributed_input_preflight_accepts_windows_drive_and_unc_weight_paths(
     tmp_path: Path, raw_path: str
 ) -> None:
-    payload = _fixture_payload(tmp_path)
+    payload = _fixture_payload(tmp_path, distributed_weights=True)
     for pair in payload["gpt_weights"].values():
         pair["gpt"] = raw_path
         pair["sovits"] = raw_path
@@ -911,6 +934,16 @@ def test_powershell_rewrites_valid_preflight_pass_after_safe_stage_failure(
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     fixture_path = _write_fixture(tmp_path)
+    stub_root = tmp_path / "python-stubs"
+    stub_package = stub_root / "faster_whisper"
+    stub_package.mkdir(parents=True)
+    (stub_package / "__init__.py").write_text("", encoding="utf-8")
+    child_env = os.environ.copy()
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        part
+        for part in (str(stub_root), child_env.get("PYTHONPATH", ""))
+        if part
+    )
     services_path = tmp_path / "empty-services.json"
     services_path.write_text("[]", encoding="utf-8")
     output = tmp_path / f"powershell-{stage}"
@@ -938,6 +971,7 @@ def test_powershell_rewrites_valid_preflight_pass_after_safe_stage_failure(
     completed = subprocess.run(
         command,
         cwd=repo_root,
+        env=child_env,
         capture_output=True,
         timeout=30,
         check=False,
@@ -1100,7 +1134,10 @@ def test_release_runner_requires_approved_performance_baseline(tmp_path: Path) -
 def test_first_certification_can_establish_performance_baseline(
     tmp_path: Path, mode: str, require_baseline: bool
 ) -> None:
-    payload = _fixture_payload(tmp_path)
+    payload = _fixture_payload(
+        tmp_path,
+        distributed_weights=mode == "distributed",
+    )
     payload.pop("performance_baseline")
     fixture_path = tmp_path / f"{mode}-first-certification.json"
     fixture_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1128,7 +1165,7 @@ def test_runner_rejects_worker_from_stale_tts_more_commit(tmp_path: Path) -> Non
     runner = CUDAValidationRunner(
         mode="distributed",
         services_path=_write_services(tmp_path),
-        fixture_path=_write_fixture(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=True),
         output_dir=tmp_path / "stale",
         **_distributed_orchestration(tmp_path, commit="b" * 40),
         client_factory=lambda endpoint: _FakeClient(endpoint, calls, state),
@@ -1154,7 +1191,7 @@ def test_distributed_contract_rejects_workers_on_same_gpu(tmp_path: Path) -> Non
     runner = CUDAValidationRunner(
         mode="distributed",
         services_path=_write_services(tmp_path),
-        fixture_path=_write_fixture(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=True),
         output_dir=tmp_path / "duplicate-gpu",
         **_distributed_orchestration(tmp_path),
         client_factory=lambda endpoint: _FakeClient(endpoint, [], state),
@@ -1187,7 +1224,7 @@ def test_distributed_runner_requires_powershell_orchestration(tmp_path: Path) ->
     runner = CUDAValidationRunner(
         mode="distributed",
         services_path=_write_services(tmp_path),
-        fixture_path=_write_fixture(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=True),
         output_dir=tmp_path / "not-orchestrated",
         transcriber=_expected_transcriber,
     )
@@ -1204,7 +1241,7 @@ def test_distributed_preflight_is_bound_to_topology_hash(tmp_path: Path) -> None
     runner = CUDAValidationRunner(
         mode="distributed",
         services_path=_write_services(tmp_path),
-        fixture_path=_write_fixture(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=True),
         output_dir=tmp_path / "mismatched-topology",
         transcriber=_expected_transcriber,
         **orchestration,
