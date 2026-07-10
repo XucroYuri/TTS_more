@@ -99,7 +99,7 @@ scripts/tts-more.sh install-update-scripts
 
 剩余风险：
 - 真实服务 repo 尚未全部克隆，无法在本机验证服务 repo 内脚本实际执行。
-- Gitee 当前返回 403，需要可用 Gitee 凭据后才能做同步推送。
+- Gitee 镜像固定为 `https://gitee.com/chengdu-flower-food/TTS_more`；后续同步必须核对该组织仓库，不能推送到同名个人仓库。
 
 ## 任务分解
 
@@ -139,6 +139,6 @@ scripts/tts-more.sh install-update-scripts
 
 ## 待用户醒来处理
 
-- 提供或修复 Gitee 凭据：当前 `https://gitee.com/XucroYuri/TTS_more.git` 返回 403，无法推送。
+- 后续发布提交需同时核对 GitHub 与 Gitee 组织仓库的目标分支 SHA，保持双远端记录一致。
 - 在目标 GPU 上完成 GPT-SoVITS 收敛分支 CUDA 门禁；通过后合入 fork `main`，首个稳定版本发布后删除远端 proplus 分支并永久保留归档标签。
 - 在目标 GPU 设备上确认模型下载源、CUDA/conda/micromamba 路线和真实音频验收样本。
