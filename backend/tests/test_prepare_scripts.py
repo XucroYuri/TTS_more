@@ -299,6 +299,16 @@ def test_start_dev_rejects_occupied_fixed_ports_before_starting_processes() -> N
     assert "strictPort: true" in vite
 
 
+def test_test_client_dependency_and_frontend_vendor_chunks_avoid_known_warnings() -> None:
+    backend_project = (REPO_ROOT / "backend" / "pyproject.toml").read_text(encoding="utf-8")
+    vite = (REPO_ROOT / "frontend" / "vite.config.ts").read_text(encoding="utf-8")
+
+    assert '"httpx2>=2.5.0"' in backend_project
+    assert "manualChunks" in vite
+    for chunk in ("react-vendor", "i18n-vendor", "audio-vendor", "icons-vendor"):
+        assert chunk in vite
+
+
 def test_committed_topology_examples_are_sanitized_and_valid() -> None:
     import importlib.util
     import json
