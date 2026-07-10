@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+requires_make = pytest.mark.skipif(shutil.which("make") is None, reason="make executable is not available on PATH")
 
 
 def test_frontend_dev_defaults_to_loopback() -> None:
@@ -17,6 +19,7 @@ def test_frontend_dev_defaults_to_loopback() -> None:
     assert package["scripts"]["dev"] == "vite --host 127.0.0.1"
 
 
+@requires_make
 @pytest.mark.parametrize(
     ("target", "expected_command"),
     [
@@ -41,6 +44,7 @@ def test_make_posix_entrypoints_are_make_conditioned(target: str, expected_comma
     assert result.stdout == f"{expected_command}\n"
 
 
+@requires_make
 @pytest.mark.parametrize(
     ("target", "expected_command"),
     [

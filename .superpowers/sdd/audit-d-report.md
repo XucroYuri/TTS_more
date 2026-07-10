@@ -41,3 +41,18 @@ Verification results:
 - Make conditionals are parsed by make and are no longer shell recipe output.
 - Help text and unrelated targets were left unchanged.
 - The build emitted only the existing Vite chunk-size warning; it did not fail.
+
+## Hosted Windows CI Follow-Up
+
+- Fix base SHA: `afca8ad84d02bc9d14a5f52f01c3a0fcb65dbf8a`.
+- RED: with `PATH=/nonexistent`, the focused run produced `1 passed, 4 failed`; all four make cases raised `FileNotFoundError`, while the frontend loopback test still passed.
+- GREEN: both make test groups now use `pytest.mark.skipif(shutil.which("make") is None, reason="make executable is not available on PATH")`.
+- No-make verification: `1 passed, 4 skipped`; both skip summaries showed the explicit PATH reason.
+- Normal focused verification: `5 passed, 18 deselected`.
+- POSIX `make -n dev`: `scripts/start-dev.sh`.
+- POSIX `make -n workers`: `scripts/start-service-workers.sh`.
+- Simulated Windows `make -n dev`: `powershell -ExecutionPolicy Bypass -File scripts/start-dev.ps1`.
+- Simulated Windows `make -n workers`: `powershell -ExecutionPolicy Bypass -File scripts/start-service-workers.ps1`.
+- `git diff --check`: passed.
+- The skip applies only to make-dependent tests; the frontend loopback assertion always executes.
+- Concurrent changes outside the allowed file set were left untouched and excluded from the fix commit.
