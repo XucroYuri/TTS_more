@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from app.models import TTSServiceEndpoint
 from app.parser_config import set_env_value
-from app.services import ServiceRegistry
+from app.services import ServiceRegistry, validate_service_endpoint_egress
 
 
 class ServiceSettingsRecord(TTSServiceEndpoint):
@@ -32,13 +32,16 @@ def public_service_settings(registry: ServiceRegistry, env_path: Path) -> dict[s
 
 
 def save_service_settings(path: Path, env_path: Path, payload: ServiceSettingsUpdate) -> ServiceRegistry:
-    services: list[TTSServiceEndpoint] = []
+    services = [
+        TTSServiceEndpoint.model_validate(record.model_dump(mode="python", exclude={"secrets"}))
+        for record in payload.services
+    ]
+    for service in services:
+        validate_service_endpoint_egress(service)
     for record in payload.services:
         for key, value in record.secrets.items():
             if value:
                 set_env_value(env_path, key, value)
-        data = record.model_dump(mode="python", exclude={"secrets"})
-        services.append(TTSServiceEndpoint.model_validate(data))
     registry = ServiceRegistry(services)
     registry.save(path)
     return registry

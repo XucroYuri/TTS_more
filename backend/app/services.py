@@ -7,7 +7,7 @@ import hashlib
 import re
 import time
 import uuid
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +17,7 @@ import httpx
 
 from app.adapters.base import SynthesisRequest, SynthesisResult
 from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
-from app.net_guard import scrub_error
+from app.net_guard import scrub_error, validate_same_origin_url, validate_service_egress_url
 
 
 class TTSServiceClient(Protocol):
@@ -59,6 +59,8 @@ class ServiceRegistry:
         return cls([TTSServiceEndpoint.model_validate(item) for item in raw])
 
     def save(self, path: Path) -> None:
+        for service in self.services:
+            validate_service_endpoint_egress(service)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps([service.model_dump(mode="json") for service in self.services], ensure_ascii=False, indent=2),
@@ -136,6 +138,14 @@ class ServiceRegistry:
             [service for service in self.services if _is_generation_candidate(service) and service.provider_type == provider_type],
             key=lambda service: service.priority,
         )
+
+
+def validate_service_endpoint_egress(endpoint: TTSServiceEndpoint) -> None:
+    if endpoint.base_url.startswith("mock://"):
+        return
+    validate_service_egress_url(endpoint.base_url, endpoint.network_scope)
+    if endpoint.health_url:
+        validate_service_egress_url(endpoint.health_url, endpoint.network_scope)
 
 
 def build_load_signature(endpoint: TTSServiceEndpoint, parameters: dict[str, Any]) -> str:
@@ -469,7 +479,7 @@ class HttpTTSServiceClient:
         url = self.endpoint.health_url or self.endpoint.base_url.rstrip("/") + "/health"
         try:
             with httpx.Client(timeout=_health_timeout_seconds(), transport=self.transport) as client:
-                response = client.get(url, headers=self._headers())
+                response = client.get(self._validated_url(url), headers=self._headers())
                 response.raise_for_status()
                 payload = response.json()
         except Exception as exc:
@@ -479,7 +489,10 @@ class HttpTTSServiceClient:
     def capabilities(self) -> dict[str, Any]:
         try:
             with httpx.Client(timeout=5.0, transport=self.transport) as client:
-                response = client.get(self.endpoint.base_url.rstrip("/") + "/capabilities", headers=self._headers())
+                response = client.get(
+                    self._validated_url(self.endpoint.base_url.rstrip("/") + "/capabilities"),
+                    headers=self._headers(),
+                )
                 response.raise_for_status()
                 return response.json()
         except Exception:
@@ -487,7 +500,10 @@ class HttpTTSServiceClient:
 
     def model_catalog(self, limit: int = 120) -> dict[str, Any]:
         with httpx.Client(timeout=self.endpoint.default_params.get("timeout_seconds", 30.0), transport=self.transport) as client:
-            response = client.get(self.endpoint.base_url.rstrip("/") + "/models", headers=self._headers())
+            response = client.get(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + "/models"),
+                headers=self._headers(),
+            )
             response.raise_for_status()
             payload = response.json()
         return _gpt_sovits_models_payload_to_catalog(self.endpoint, payload, source="worker", limit=limit)
@@ -495,7 +511,10 @@ class HttpTTSServiceClient:
     def model_samples(self, logs_name: str, limit: int = 120) -> dict[str, Any]:
         encoded_name = quote(logs_name, safe="")
         with httpx.Client(timeout=self.endpoint.default_params.get("timeout_seconds", 30.0), transport=self.transport) as client:
-            response = client.get(self.endpoint.base_url.rstrip("/") + f"/models/{encoded_name}/samples", headers=self._headers())
+            response = client.get(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + f"/models/{encoded_name}/samples"),
+                headers=self._headers(),
+            )
             response.raise_for_status()
             payload = response.json()
         return {
@@ -511,7 +530,11 @@ class HttpTTSServiceClient:
         prepared = self._prepare_remote_parameters(parameters or {}) if self._uses_artifact_delivery() else (parameters or {})
         payload = {"profile": profile, "parameters": prepared}
         with httpx.Client(timeout=120.0, transport=self.transport) as client:
-            response = client.post(self.endpoint.base_url.rstrip("/") + "/load", json=payload, headers=self._headers())
+            response = client.post(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + "/load"),
+                json=payload,
+                headers=self._headers(),
+            )
             response.raise_for_status()
 
     def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
@@ -527,18 +550,36 @@ class HttpTTSServiceClient:
             "delivery": "artifact" if artifact_delivery else "path",
         }
         with httpx.Client(timeout=request.parameters.get("timeout_seconds", 600.0), transport=self.transport) as client:
-            response = client.post(self.endpoint.base_url.rstrip("/") + "/synthesize", json=payload, headers=self._headers())
+            response = client.post(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + "/synthesize"),
+                json=payload,
+                headers=self._headers(),
+            )
             response.raise_for_status()
             data = response.json()
             if artifact_delivery:
-                self._download_artifact(client, data, request.output_path)
-                return SynthesisResult(audio_path=request.output_path, metadata=data.get("metadata", {}))
+                cleanup = self._download_artifact(client, data, request.output_path)
+                metadata = dict(data.get("metadata") or {})
+                if cleanup:
+                    metadata["artifact_cleanup"] = cleanup
+                return SynthesisResult(audio_path=request.output_path, metadata=metadata)
         return SynthesisResult(audio_path=Path(data["audio_path"]), metadata=data.get("metadata", {}))
 
     def unload(self) -> None:
         with httpx.Client(timeout=120.0, transport=self.transport) as client:
-            response = client.post(self.endpoint.base_url.rstrip("/") + "/unload", headers=self._headers())
+            response = client.post(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + "/unload"),
+                headers=self._headers(),
+            )
             response.raise_for_status()
+
+    def _validated_url(self, url: str) -> str:
+        return validate_service_egress_url(
+            url,
+            self.endpoint.network_scope,
+            resolve_dns=not isinstance(self.transport, httpx.MockTransport),
+            allow_unresolved=False,
+        )
 
     def _headers(self) -> dict[str, str]:
         if not self.endpoint.auth_header_env:
@@ -615,7 +656,7 @@ class HttpTTSServiceClient:
         with httpx.Client(timeout=120.0, transport=self.transport) as client:
             with resolved.open("rb") as handle:
                 response = client.post(
-                    self.endpoint.base_url.rstrip("/") + "/upload_ref",
+                    self._validated_url(self.endpoint.base_url.rstrip("/") + "/upload_ref"),
                     files={"file": (resolved.name, handle, "application/octet-stream")},
                     headers=self._headers(),
                 )
@@ -626,7 +667,7 @@ class HttpTTSServiceClient:
         self._uploaded_references[cache_key] = (remote_path, time.monotonic())
         return remote_path
 
-    def _download_artifact(self, client: httpx.Client, data: dict[str, Any], output_path: Path) -> None:
+    def _download_artifact(self, client: httpx.Client, data: dict[str, Any], output_path: Path) -> dict[str, Any] | None:
         artifact_id = str(data.get("artifact_id") or "")
         download_url = str(data.get("download_url") or "")
         expected_hash = str(data.get("sha256") or "").casefold()
@@ -639,30 +680,59 @@ class HttpTTSServiceClient:
             raise RuntimeError("worker artifact response has an invalid download URL")
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise RuntimeError("worker artifact response has an invalid sha256")
-        max_bytes = 100 * 1024 * 1024
+        max_bytes = self._artifact_download_max_bytes()
         if expected_size < 1 or expected_size > max_bytes:
             raise RuntimeError("worker artifact exceeds download limit")
 
-        response = client.get(self.endpoint.base_url.rstrip("/") + download_url, headers=self._headers())
-        response.raise_for_status()
-        content = response.content
-        if len(content) != expected_size or len(content) > max_bytes:
-            raise RuntimeError("worker artifact size mismatch")
-        if hashlib.sha256(content).hexdigest() != expected_hash:
-            raise RuntimeError("worker artifact sha256 mismatch")
-
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.tmp")
+        actual_size = 0
+        actual_hash = hashlib.sha256()
         try:
-            temp_path.write_bytes(content)
+            with client.stream(
+                "GET",
+                self._validated_url(self.endpoint.base_url.rstrip("/") + download_url),
+                headers=self._headers(),
+            ) as response:
+                response.raise_for_status()
+                with temp_path.open("wb") as handle:
+                    for chunk in response.iter_bytes():
+                        actual_size += len(chunk)
+                        if actual_size > max_bytes:
+                            raise RuntimeError("worker artifact exceeds download limit")
+                        actual_hash.update(chunk)
+                        handle.write(chunk)
+            if actual_size != expected_size:
+                raise RuntimeError("worker artifact size mismatch")
+            if actual_hash.hexdigest() != expected_hash:
+                raise RuntimeError("worker artifact sha256 mismatch")
             os.replace(temp_path, output_path)
         finally:
             temp_path.unlink(missing_ok=True)
-        delete_response = client.delete(
-            self.endpoint.base_url.rstrip("/") + expected_path,
-            headers=self._headers(),
-        )
-        delete_response.raise_for_status()
+        try:
+            delete_response = client.delete(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + expected_path),
+                headers=self._headers(),
+            )
+            delete_response.raise_for_status()
+        except Exception as exc:
+            return {
+                "status": "deferred",
+                "artifact_id": artifact_id,
+                "warning": f"remote artifact cleanup failed; worker TTL cleanup remains active: {scrub_error(exc, self.endpoint.base_url)}",
+            }
+        return None
+
+    def _artifact_download_max_bytes(self) -> int:
+        configured = self.endpoint.default_params.get("artifact_download_max_bytes")
+        raw = configured if configured is not None else os.environ.get("TTS_MORE_MAX_ARTIFACT_DOWNLOAD_BYTES", 100 * 1024 * 1024)
+        try:
+            limit = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("worker artifact download limit is invalid") from exc
+        if limit < 1:
+            raise RuntimeError("worker artifact download limit is invalid")
+        return limit
 
 
 def _gpt_sovits_models_payload_to_catalog(
@@ -982,7 +1052,10 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         if self._config_cache is not None:
             return self._config_cache
         with httpx.Client(timeout=float(timeout or _health_timeout_seconds()), transport=self.transport) as client:
-            response = client.get(self.endpoint.base_url.rstrip("/") + "/config", headers=self._headers())
+            response = client.get(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + "/config"),
+                headers=self._headers(),
+            )
             response.raise_for_status()
             self._config_cache = response.json()
             return self._config_cache
@@ -1004,7 +1077,11 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         with httpx.Client(timeout=float(timeout or 900.0), transport=self.transport) as client:
             for path in path_candidates:
                 try:
-                    response = client.post(self.endpoint.base_url.rstrip("/") + path, json=payload, headers=self._headers())
+                    response = client.post(
+                        self._validated_url(self.endpoint.base_url.rstrip("/") + path),
+                        json=payload,
+                        headers=self._headers(),
+                    )
                     if response.status_code == 404:
                         continue
                     if response.status_code >= 400:
@@ -1038,7 +1115,11 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         for join_path in join_paths:
             try:
                 with httpx.Client(timeout=30.0, transport=self.transport) as join_client:
-                    response = join_client.post(self.endpoint.base_url.rstrip("/") + join_path, json=join_payload, headers=self._headers())
+                    response = join_client.post(
+                        self._validated_url(self.endpoint.base_url.rstrip("/") + join_path),
+                        json=join_payload,
+                        headers=self._headers(),
+                    )
                 if response.status_code == 404:
                     continue
                 response.raise_for_status()
@@ -1068,7 +1149,11 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         # This reader handles both formats.
         current_event = ""
         last_data: Any = None
-        with client.stream("GET", self.endpoint.base_url.rstrip("/") + stream_path, headers=self._headers()) as response:
+        with client.stream(
+            "GET",
+            self._validated_url(self.endpoint.base_url.rstrip("/") + stream_path),
+            headers=self._headers(),
+        ) as response:
             if response.status_code >= 400:
                 raise RuntimeError(f"{response.status_code} {scrub_error(response.text[:800], self.endpoint.base_url)}")
             response.raise_for_status()
@@ -1130,9 +1215,14 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         path = _audio_reference_path(audio_ref)
         if not path:
             raise RuntimeError("Gradio audio output path is empty")
-        url = path if path.startswith(("http://", "https://")) else self.endpoint.base_url.rstrip("/") + _gradio_file_path(path)
+        parsed = urlsplit(path)
+        is_windows_path = bool(re.match(r"^[A-Za-z]:[\\/]", path))
+        if (parsed.scheme and not is_windows_path) or parsed.netloc:
+            url = validate_same_origin_url(self.endpoint.base_url, path)
+        else:
+            url = self.endpoint.base_url.rstrip("/") + _gradio_file_path(path)
         with httpx.Client(timeout=120.0, transport=self.transport) as client:
-            response = client.get(url, headers=self._headers())
+            response = client.get(self._validated_url(url), headers=self._headers())
             response.raise_for_status()
             return response.content
 
@@ -1155,7 +1245,7 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
                 try:
                     with path.open("rb") as file_handle:
                         response = client.post(
-                            self.endpoint.base_url.rstrip("/") + upload_path,
+                            self._validated_url(self.endpoint.base_url.rstrip("/") + upload_path),
                             files={"files": (path.name, file_handle, "application/octet-stream")},
                             headers=self._headers(),
                         )
@@ -1192,7 +1282,10 @@ class GPTSoVITSApiV2ServiceClient(HttpTTSServiceClient):
     def health(self) -> dict[str, Any]:
         try:
             with httpx.Client(timeout=_health_timeout_seconds(), transport=self.transport) as client:
-                response = client.get(self.endpoint.base_url.rstrip("/") + "/docs", headers=self._headers())
+                response = client.get(
+                    self._validated_url(self.endpoint.base_url.rstrip("/") + "/docs"),
+                    headers=self._headers(),
+                )
                 response.raise_for_status()
         except Exception as exc:
             return {"engine": self.endpoint.engine.value, "ready": False, "error": scrub_error(exc, self.endpoint.base_url)}
@@ -1200,7 +1293,10 @@ class GPTSoVITSApiV2ServiceClient(HttpTTSServiceClient):
 
     def model_catalog(self, limit: int = 120) -> dict[str, Any]:
         with httpx.Client(timeout=self.endpoint.default_params.get("timeout_seconds", 30.0), transport=self.transport) as client:
-            response = client.get(self.endpoint.base_url.rstrip("/") + "/models", headers=self._headers())
+            response = client.get(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + "/models"),
+                headers=self._headers(),
+            )
             response.raise_for_status()
             payload = response.json()
         return _gpt_sovits_models_payload_to_catalog(self.endpoint, payload, source="api_v2", limit=limit)
@@ -1208,7 +1304,10 @@ class GPTSoVITSApiV2ServiceClient(HttpTTSServiceClient):
     def model_samples(self, logs_name: str, limit: int = 120) -> dict[str, Any]:
         encoded_name = quote(logs_name, safe="")
         with httpx.Client(timeout=self.endpoint.default_params.get("timeout_seconds", 30.0), transport=self.transport) as client:
-            response = client.get(self.endpoint.base_url.rstrip("/") + f"/models/{encoded_name}/samples", headers=self._headers())
+            response = client.get(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + f"/models/{encoded_name}/samples"),
+                headers=self._headers(),
+            )
             response.raise_for_status()
             payload = response.json()
         samples: list[dict[str, Any]] = []
@@ -1243,14 +1342,14 @@ class GPTSoVITSApiV2ServiceClient(HttpTTSServiceClient):
         with httpx.Client(timeout=300.0, transport=self.transport) as client:
             if parameters.get("gpt_weights_path"):
                 response = client.get(
-                    self.endpoint.base_url.rstrip("/") + "/set_gpt_weights",
+                    self._validated_url(self.endpoint.base_url.rstrip("/") + "/set_gpt_weights"),
                     params={"weights_path": parameters["gpt_weights_path"]},
                     headers=self._headers(),
                 )
                 response.raise_for_status()
             if parameters.get("sovits_weights_path"):
                 response = client.get(
-                    self.endpoint.base_url.rstrip("/") + "/set_sovits_weights",
+                    self._validated_url(self.endpoint.base_url.rstrip("/") + "/set_sovits_weights"),
                     params={"weights_path": parameters["sovits_weights_path"]},
                     headers=self._headers(),
                 )
@@ -1268,7 +1367,11 @@ class GPTSoVITSApiV2ServiceClient(HttpTTSServiceClient):
         }
         payload.update(request.parameters.get("gpt_sovits_payload", {}))
         with httpx.Client(timeout=request.parameters.get("timeout_seconds", 600.0), transport=self.transport) as client:
-            response = client.post(self.endpoint.base_url.rstrip("/") + "/tts", json=payload, headers=self._headers())
+            response = client.post(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + "/tts"),
+                json=payload,
+                headers=self._headers(),
+            )
             response.raise_for_status()
         request.output_path.parent.mkdir(parents=True, exist_ok=True)
         request.output_path.write_bytes(response.content)
@@ -1303,7 +1406,11 @@ class OpenAISpeechClient(CommercialSpeechClient):
         if params.get("instructions"):
             payload["instructions"] = params["instructions"]
         with httpx.Client(timeout=params.get("timeout_seconds", 600.0), transport=self.transport) as client:
-            response = client.post(self.endpoint.base_url.rstrip("/") + "/audio/speech", json=payload, headers=self._headers())
+            response = client.post(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + "/audio/speech"),
+                json=payload,
+                headers=self._headers(),
+            )
             response.raise_for_status()
         return self._write_response_bytes(request, response.content, {"provider_type": "openai"})
 
@@ -1318,7 +1425,11 @@ class XAISpeechClient(OpenAISpeechClient):
             "response_format": params.get("response_format", "wav"),
         }
         with httpx.Client(timeout=params.get("timeout_seconds", 600.0), transport=self.transport) as client:
-            response = client.post(self.endpoint.base_url.rstrip("/") + "/audio/speech", json=payload, headers=self._headers())
+            response = client.post(
+                self._validated_url(self.endpoint.base_url.rstrip("/") + "/audio/speech"),
+                json=payload,
+                headers=self._headers(),
+            )
             response.raise_for_status()
         return self._write_response_bytes(request, response.content, {"provider_type": "xai"})
 
@@ -1343,7 +1454,7 @@ class GeminiSpeechClient(CommercialSpeechClient):
         key = os.environ.get(self.endpoint.auth_profile.get("api_key_env", ""))
         with httpx.Client(timeout=params.get("timeout_seconds", 600.0), transport=self.transport) as client:
             response = client.post(
-                self.endpoint.base_url.rstrip("/") + f"/models/{model}:generateContent",
+                self._validated_url(self.endpoint.base_url.rstrip("/") + f"/models/{model}:generateContent"),
                 params={"key": key},
                 json=payload,
             )
@@ -1378,7 +1489,7 @@ class VolcengineSpeechClient(CommercialSpeechClient):
             payload["audio"]["emotion"] = params["emotion"]
         headers = {"Authorization": f"Bearer;{access_token}"}
         with httpx.Client(timeout=params.get("timeout_seconds", 600.0), transport=self.transport) as client:
-            response = client.post(self.endpoint.base_url, json=payload, headers=headers)
+            response = client.post(self._validated_url(self.endpoint.base_url), json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
         audio_data = base64.b64decode(data.get("data", ""))

@@ -25,9 +25,16 @@ import ipaddress
 import re
 import socket
 from typing import Any
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import SplitResult, urlsplit
 
-__all__ = ["EgressError", "validate_egress_url", "scrub_error", "scrub_url"]
+__all__ = [
+    "EgressError",
+    "validate_egress_url",
+    "validate_same_origin_url",
+    "validate_service_egress_url",
+    "scrub_error",
+    "scrub_url",
+]
 
 
 class EgressError(ValueError):
@@ -36,8 +43,15 @@ class EgressError(ValueError):
 
 # Hostnames that are commonly used to reach cloud metadata services.
 _FORBIDDEN_HOSTNAMES = {
+    "instance-data.ec2.internal",  # AWS legacy metadata hostname
     "metadata.google.internal",  # GCP metadata
     "metadata",  # GCP metadata short form
+}
+
+_FORBIDDEN_ADDRESSES = {
+    ipaddress.ip_address("100.100.100.200"),  # Alibaba Cloud metadata
+    ipaddress.ip_address("168.63.129.16"),  # Azure platform virtual IP
+    ipaddress.ip_address("fd00:ec2::254"),  # AWS IPv6 metadata
 }
 
 
@@ -46,20 +60,24 @@ def _is_blocked_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address, 
 
     Link-local is always blocked (covers 169.254.169.254 cloud metadata).
     """
-    if address.is_loopback:
-        return None if allow_loopback else "loopback address"
+    if address in _FORBIDDEN_ADDRESSES:
+        return "cloud metadata address"
     if address.is_link_local:
         # 169.254.0.0/16 — always block, this is the cloud metadata range.
         return "link-local address (cloud metadata range)"
     if address.is_unspecified:
         # 0.0.0.0 / :: — binding wildcard, never a safe egress target.
         return "unspecified address"
+    if address.is_loopback:
+        return None if allow_loopback else "loopback address"
+    if address.is_reserved:
+        return "reserved address"
+    if address.is_multicast:
+        return "multicast address"
     if address.is_private:
         # is_private also covers is_loopback/is_link-local on some Python
         # versions, but we already handled those above.
         return None if allow_private else "private address"
-    if address.is_reserved or address.is_multicast:
-        return "reserved/multicast address"
     return None
 
 
@@ -84,7 +102,14 @@ def _resolve_host_ips(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6A
     return ips
 
 
-def validate_egress_url(url: str, *, allow_loopback: bool = False, allow_private: bool = False, resolve_dns: bool = True) -> str:
+def validate_egress_url(
+    url: str,
+    *,
+    allow_loopback: bool = False,
+    allow_private: bool = False,
+    resolve_dns: bool = True,
+    allow_unresolved: bool = True,
+) -> str:
     """Validate that ``url`` is safe for the server to fetch.
 
     Parameters
@@ -98,6 +123,9 @@ def validate_egress_url(url: str, *, allow_loopback: bool = False, allow_private
     resolve_dns:
         Also resolve the hostname and block if any A/AAAA record is blocked.
         This is a basic DNS-rebinding guard; disable only for tests.
+    allow_unresolved:
+        Permit hostnames that return no DNS addresses. Service requests disable
+        this for real transports so DNS failure cannot become a validation race.
 
     Returns the (possibly normalized) URL string.
 
@@ -108,7 +136,13 @@ def validate_egress_url(url: str, *, allow_loopback: bool = False, allow_private
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"}:
         raise EgressError(f"scheme {parsed.scheme!r} is not allowed (http/https only)")
-    host = (parsed.hostname or "").strip().strip("[]").lower()
+    if parsed.username is not None or parsed.password is not None:
+        raise EgressError("url userinfo is not allowed")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise EgressError("url has an invalid port") from exc
+    host = (parsed.hostname or "").strip().strip("[]").rstrip(".").lower()
     if not host:
         raise EgressError("url has no host")
     if host in _FORBIDDEN_HOSTNAMES:
@@ -129,9 +163,8 @@ def validate_egress_url(url: str, *, allow_loopback: bool = False, allow_private
         # This also catches hostnames that point at metadata/private IPs.
         ips = _resolve_host_ips(host)
         if not ips:
-            # Could not resolve — let the caller's httpx attempt fail naturally.
-            # We do not block unresolvable hostnames (could be a race / mock).
-            pass
+            if not allow_unresolved:
+                raise EgressError("host did not resolve to an address")
         else:
             for ip in ips:
                 reason = _is_blocked_address(ip, allow_loopback=allow_loopback, allow_private=allow_private)
@@ -139,6 +172,56 @@ def validate_egress_url(url: str, *, allow_loopback: bool = False, allow_private
                     raise EgressError(f"host resolves to a {reason}: {ip}")
 
     return url
+
+
+def validate_service_egress_url(
+    url: str,
+    network_scope: str,
+    *,
+    resolve_dns: bool = True,
+    allow_unresolved: bool = True,
+) -> str:
+    """Validate a service URL according to its explicitly configured scope."""
+    if network_scope not in {"localhost", "lan", "public", "commercial"}:
+        raise EgressError(f"unknown network scope: {network_scope!r}")
+    return validate_egress_url(
+        url,
+        allow_loopback=network_scope == "localhost",
+        allow_private=network_scope == "lan",
+        resolve_dns=resolve_dns,
+        allow_unresolved=allow_unresolved,
+    )
+
+
+def validate_same_origin_url(base_url: str, candidate_url: str) -> str:
+    """Require an absolute HTTP(S) URL to use the configured service origin."""
+    base = _validated_origin_parts(base_url, label="service base URL")
+    candidate = _validated_origin_parts(candidate_url, label="response URL")
+    if base.scheme == "https" and candidate.scheme == "http":
+        raise EgressError("response URL scheme downgrade is not allowed")
+    if _origin(base) != _origin(candidate):
+        raise EgressError("response URL must use the configured service origin")
+    return candidate_url
+
+
+def _validated_origin_parts(url: str, *, label: str) -> SplitResult:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise EgressError(f"{label} scheme must be http or https")
+    if not parsed.hostname:
+        raise EgressError(f"{label} has no host")
+    if parsed.username is not None or parsed.password is not None:
+        raise EgressError(f"{label} userinfo is not allowed")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise EgressError(f"{label} has an invalid port") from exc
+    return parsed
+
+
+def _origin(parsed: SplitResult) -> tuple[str, str, int]:
+    default_port = 443 if parsed.scheme == "https" else 80
+    return parsed.scheme, (parsed.hostname or "").rstrip(".").casefold(), parsed.port or default_port
 
 
 # Patterns used to scrub secrets out of error strings before they reach a

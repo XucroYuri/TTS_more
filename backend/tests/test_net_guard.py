@@ -27,6 +27,11 @@ def test_accepts_http_and_https() -> None:
     assert validate_egress_url("https://example.com/x", resolve_dns=False) == "https://example.com/x"
 
 
+def test_rejects_url_userinfo() -> None:
+    with pytest.raises(EgressError, match="userinfo"):
+        validate_egress_url("https://operator:secret@example.com/x", resolve_dns=False)
+
+
 # --- validate_egress_url: literal IP addresses ----------------------------------
 
 
@@ -89,9 +94,69 @@ def test_blocks_metadata_hostname() -> None:
         validate_egress_url("http://metadata.google.internal/", resolve_dns=False)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://100.100.100.200/latest/meta-data/",  # Alibaba Cloud metadata
+        "http://168.63.129.16/metadata/instance",  # Azure platform virtual IP
+        "http://[fd00:ec2::254]/latest/meta-data/",  # AWS IPv6 metadata
+    ],
+)
+def test_always_blocks_cloud_metadata_addresses(url: str) -> None:
+    with pytest.raises(EgressError, match="metadata"):
+        validate_egress_url(url, allow_loopback=True, allow_private=True)
+
+
 def test_blocks_reserved_and_multicast() -> None:
     with pytest.raises(EgressError):
         validate_egress_url("http://224.0.0.1/x")  # multicast
+    with pytest.raises(EgressError, match="reserved"):
+        validate_egress_url("http://240.0.0.1/x", allow_private=True)
+
+
+def test_service_scope_allows_only_explicit_localhost_or_lan_ranges() -> None:
+    from app.net_guard import validate_service_egress_url
+
+    assert validate_service_egress_url("http://127.0.0.1:9872/health", "localhost")
+    assert validate_service_egress_url("http://192.168.20.12:9872/health", "lan")
+    with pytest.raises(EgressError, match="loopback"):
+        validate_service_egress_url("http://127.0.0.1:9872/health", "public")
+    with pytest.raises(EgressError, match="private"):
+        validate_service_egress_url("http://192.168.20.12:9872/health", "commercial")
+
+
+def test_service_egress_can_fail_closed_when_dns_does_not_resolve(monkeypatch) -> None:
+    from app.net_guard import validate_service_egress_url
+
+    monkeypatch.setattr("app.net_guard._resolve_host_ips", lambda _host: [])
+
+    with pytest.raises(EgressError, match="resolve"):
+        validate_service_egress_url("https://worker.example/health", "public", allow_unresolved=False)
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "https://evil.example/audio.wav",
+        "https://operator@gradio.example/audio.wav",
+        "http://gradio.example/audio.wav",
+        "file:///etc/passwd",
+    ],
+)
+def test_same_origin_url_rejects_cross_origin_userinfo_and_bad_schemes(candidate: str) -> None:
+    from app.net_guard import validate_same_origin_url
+
+    with pytest.raises(EgressError):
+        validate_same_origin_url("https://gradio.example", candidate)
+
+
+def test_same_origin_url_accepts_matching_https_origin() -> None:
+    from app.net_guard import validate_same_origin_url
+
+    assert (
+        validate_same_origin_url("https://gradio.example", "https://gradio.example/file=/tmp/audio.wav")
+        == "https://gradio.example/file=/tmp/audio.wav"
+    )
 
 
 # --- scrub_error ----------------------------------------------------------------

@@ -1,8 +1,10 @@
 import json
+import hashlib
 from threading import Barrier
 from pathlib import Path
 
 import httpx
+import pytest
 
 from app.adapters.base import SynthesisRequest
 from app.models import EngineName, ScriptLine, TTSServiceEndpoint
@@ -52,6 +54,76 @@ def test_registry_loads_services_json(tmp_path: Path) -> None:
     assert registry.get("remote-gpt").base_url == "http://192.0.2.20:9872"
     assert registry.get("remote-gpt").mode == "external"
     assert registry.get("remote-gpt").resource_group == "remote-a-gpu-0"
+
+
+def test_save_service_settings_rejects_dangerous_endpoint_before_writing_secrets(tmp_path: Path) -> None:
+    from app.net_guard import EgressError
+    from app.service_config import ServiceSettingsRecord, ServiceSettingsUpdate, save_service_settings
+
+    services_path = tmp_path / "services.json"
+    env_path = tmp_path / ".env"
+    payload = ServiceSettingsUpdate(
+        services=[
+            ServiceSettingsRecord(
+                service_id="metadata",
+                base_url="http://169.254.169.254/latest/meta-data/",
+                mode="external",
+                network_scope="lan",
+                secrets={"WORKER_TOKEN": "must-not-be-written"},
+            )
+        ]
+    )
+
+    with pytest.raises(EgressError, match="link-local"):
+        save_service_settings(services_path, env_path, payload)
+
+    assert not services_path.exists()
+    assert not env_path.exists()
+
+
+def test_save_service_settings_allows_explicit_localhost_and_lan_endpoints(tmp_path: Path) -> None:
+    from app.service_config import ServiceSettingsRecord, ServiceSettingsUpdate, save_service_settings
+
+    registry = save_service_settings(
+        tmp_path / "services.json",
+        tmp_path / ".env",
+        ServiceSettingsUpdate(
+            services=[
+                ServiceSettingsRecord(
+                    service_id="local-worker",
+                    base_url="http://127.0.0.1:9880",
+                    mode="local",
+                    network_scope="localhost",
+                ),
+                ServiceSettingsRecord(
+                    service_id="lan-worker",
+                    base_url="http://192.168.20.12:9880",
+                    mode="external",
+                    network_scope="lan",
+                ),
+            ]
+        ),
+    )
+
+    assert [service.service_id for service in registry.services] == ["local-worker", "lan-worker"]
+
+
+def test_common_http_request_rejects_endpoint_outside_configured_scope() -> None:
+    from app.net_guard import EgressError
+
+    endpoint = TTSServiceEndpoint(
+        service_id="unsafe-public-worker",
+        base_url="http://127.0.0.1:9880",
+        mode="local",
+        network_scope="public",
+    )
+    client = build_service_client(
+        endpoint,
+        transport=httpx.MockTransport(lambda _request: (_ for _ in ()).throw(AssertionError("network must not run"))),
+    )
+
+    with pytest.raises(EgressError, match="loopback"):
+        client.unload()
 
 
 def test_external_worker_uploads_references_and_downloads_artifact(tmp_path: Path) -> None:
@@ -196,6 +268,124 @@ def test_external_worker_hash_mismatch_preserves_local_file_and_remote_artifact(
 
     assert output.read_bytes() == b"existing-history"
     assert calls == [("POST", "/synthesize"), ("GET", f"/artifacts/{artifact_id}")]
+
+
+def test_artifact_stream_stops_when_actual_bytes_exceed_configured_limit(tmp_path: Path) -> None:
+    output = tmp_path / "result.wav"
+    output.write_bytes(b"existing-history")
+    artifact_id = "e" * 32
+    calls: list[tuple[str, str]] = []
+
+    class OversizedStream(httpx.SyncByteStream):
+        def __init__(self) -> None:
+            self.read_past_limit = False
+            self.closed = False
+
+        def __iter__(self):
+            yield b"1234"
+            yield b"56789"
+            self.read_past_limit = True
+            yield b"must-not-be-read"
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = OversizedStream()
+    endpoint = TTSServiceEndpoint(
+        service_id="remote-gpt",
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://worker-gpt.lan:9880",
+        mode="external",
+        network_scope="lan",
+        managed=False,
+        capabilities=["tts", "artifact-transfer"],
+        default_params={"artifact_download_max_bytes": 8},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "artifact_id": artifact_id,
+                    "download_url": f"/artifacts/{artifact_id}",
+                    "sha256": hashlib.sha256(b"1234").hexdigest(),
+                    "size_bytes": 4,
+                },
+            )
+        if request.method == "GET":
+            return httpx.Response(200, stream=stream)
+        raise AssertionError("oversized artifact must not be deleted")
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+
+    with pytest.raises(RuntimeError, match="download limit"):
+        client.synthesize(
+            SynthesisRequest(
+                line=ScriptLine(id="l1", character_id="hero", text="hello"),
+                profile="hero",
+                output_path=output,
+                parameters={},
+            )
+        )
+
+    assert output.read_bytes() == b"existing-history"
+    assert calls == [("POST", "/synthesize"), ("GET", f"/artifacts/{artifact_id}")]
+    assert stream.closed
+    assert not stream.read_past_limit
+    assert not list(tmp_path.glob(".result.wav.*.tmp"))
+
+
+def test_artifact_delete_failure_returns_success_with_cleanup_warning(tmp_path: Path) -> None:
+    output = tmp_path / "result.wav"
+    audio = b"RIFFgenerated-audio"
+    artifact_id = "f" * 32
+    endpoint = TTSServiceEndpoint(
+        service_id="remote-gpt",
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://worker-gpt.lan:9880",
+        mode="external",
+        network_scope="lan",
+        managed=False,
+        capabilities=["tts", "artifact-transfer"],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "artifact_id": artifact_id,
+                    "download_url": f"/artifacts/{artifact_id}",
+                    "sha256": hashlib.sha256(audio).hexdigest(),
+                    "size_bytes": len(audio),
+                    "metadata": {"service": "gpt"},
+                },
+            )
+        if request.method == "GET":
+            return httpx.Response(200, content=audio)
+        if request.method == "DELETE":
+            return httpx.Response(500, json={"detail": "cleanup unavailable"})
+        return httpx.Response(404)
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+    result = client.synthesize(
+        SynthesisRequest(
+            line=ScriptLine(id="l1", character_id="hero", text="hello"),
+            profile="hero",
+            output_path=output,
+            parameters={},
+        )
+    )
+
+    assert output.read_bytes() == audio
+    assert result.metadata["service"] == "gpt"
+    assert result.metadata["artifact_cleanup"]["status"] == "deferred"
+    assert result.metadata["artifact_cleanup"]["artifact_id"] == artifact_id
+    assert "TTL" in result.metadata["artifact_cleanup"]["warning"]
 
 
 def test_local_worker_can_explicitly_validate_artifact_delivery(tmp_path: Path) -> None:
@@ -827,6 +1017,50 @@ def test_gradio_upload_prefers_api_prefix_when_present(tmp_path: Path) -> None:
 
     assert calls == ["prefixed-upload"]
     assert result.audio_path.read_bytes() == b"RIFFprefixed"
+
+
+@pytest.mark.parametrize(
+    "audio_url",
+    [
+        "https://evil.example/audio.wav",
+        "https://operator@gradio.example/audio.wav",
+        "http://gradio.example/audio.wav",
+        "file:///etc/passwd",
+    ],
+)
+def test_gradio_rejects_unsafe_absolute_audio_url_before_download(audio_url: str) -> None:
+    from app.net_guard import EgressError
+
+    endpoint = TTSServiceEndpoint(
+        service_id="public-gradio",
+        api_contract="gradio-indextts2-webui",
+        base_url="https://gradio.example",
+        mode="external",
+        network_scope="public",
+    )
+    client = build_service_client(
+        endpoint,
+        transport=httpx.MockTransport(lambda _request: (_ for _ in ()).throw(AssertionError("network must not run"))),
+    )
+
+    with pytest.raises(EgressError):
+        client._download_gradio_audio({"url": audio_url})  # type: ignore[attr-defined]
+
+
+def test_gradio_allows_same_origin_absolute_audio_url() -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="public-gradio",
+        api_contract="gradio-indextts2-webui",
+        base_url="https://gradio.example",
+        mode="external",
+        network_scope="public",
+    )
+    client = build_service_client(
+        endpoint,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"RIFFsame-origin")),
+    )
+
+    assert client._download_gradio_audio({"url": "https://gradio.example/file=/tmp/audio.wav"}) == b"RIFFsame-origin"  # type: ignore[attr-defined]
 
 
 def test_gradio_synthesis_uses_operation_timeout_for_config_fetch(tmp_path: Path) -> None:
