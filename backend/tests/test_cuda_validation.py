@@ -1383,29 +1383,46 @@ def test_preserve_existing_blocker_rejects_non_post_core_stage(tmp_path: Path) -
         )
 
 
-def _write_post_host_entrypoint_copy(repo_root: Path, tmp_path: Path) -> Path:
-    """Create a test-only copy that starts at input preflight.
+def _write_blocker_cli_harness(tmp_path: Path) -> Path:
+    """Write a minimal PowerShell-to-Python blocker-report integration harness.
 
-    Host-preflight ordering is covered against the unmodified production script in
-    ``test_gpu_workflow.py``. This copy keeps later-stage integration tests
-    deterministic without exposing a production host-gate bypass.
+    Production stage ordering and catch behavior are asserted directly against the
+    unmodified entrypoint in ``test_gpu_workflow.py``. Keeping this integration
+    harness independent of the production script's text layout makes the test
+    deterministic on both developer machines and hosted Windows runners.
     """
 
-    source = (repo_root / "scripts" / "run-cuda-validation.ps1").read_text(
-        encoding="utf-8"
+    target = tmp_path / "write-cuda-blocker.ps1"
+    target.write_text(
+        """param(
+    [Parameter(Mandatory = $true)][string]$Python,
+    [Parameter(Mandatory = $true)][string]$Validator,
+    [Parameter(Mandatory = $true)][string]$Fixture,
+    [Parameter(Mandatory = $true)][string]$Services,
+    [Parameter(Mandatory = $true)][string]$Output,
+    [Parameter(Mandatory = $true)][string]$Stage,
+    [switch]$Diagnostic
+)
+$ErrorActionPreference = "Stop"
+$preflightArgs = @(
+    $Validator, "--mode", "single-release", "--services", $Services,
+    "--fixture", $Fixture, "--output", $Output, "--preflight-only"
+)
+if ($Diagnostic) { $preflightArgs += "--diagnostic" }
+& $Python @preflightArgs | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "test preflight did not pass" }
+$blockerArgs = @(
+    $Validator, "--mode", "single-release", "--services", $Services,
+    "--fixture", $Fixture, "--output", $Output,
+    "--write-blocker-stage", $Stage,
+    "--blocker-message", ("simulated safe " + $Stage + " failure")
+)
+if ($Diagnostic) { $blockerArgs += "--diagnostic" }
+& $Python @blockerArgs | Out-Null
+exit $LASTEXITCODE
+""",
+        encoding="utf-8",
     )
-    root_assignment = "$Root = Split-Path -Parent $PSScriptRoot"
-    escaped_root = str(repo_root).replace("'", "''")
-    assert root_assignment in source
-    source = source.replace(root_assignment, f"$Root = '{escaped_root}'", 1)
-
-    host_start = source.index("$environmentPreflightPath = Join-Path $Output")
-    input_marker = '    $currentStage = "input-preflight"\n'
-    host_end = source.index(input_marker, host_start) + len(input_marker)
-    source = source[:host_start] + "try {\n" + input_marker + source[host_end:]
-
-    target = tmp_path / "run-cuda-validation-post-host.ps1"
-    target.write_text(source, encoding="utf-8")
     return target
 
 
@@ -1414,11 +1431,12 @@ def _write_post_host_entrypoint_copy(repo_root: Path, tmp_path: Path) -> Path:
     ("stage", "diagnostic"),
     [("deployment", False), ("worker-wait", True)],
 )
-def test_powershell_rewrites_valid_preflight_pass_after_safe_stage_failure(
+def test_powershell_blocker_cli_rewrites_valid_preflight_pass_after_safe_stage_failure(
     tmp_path: Path, stage: str, diagnostic: bool
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    entrypoint = _write_post_host_entrypoint_copy(repo_root, tmp_path)
+    entrypoint = _write_blocker_cli_harness(tmp_path)
+    validator = repo_root / "scripts" / "run-cuda-validation.py"
     fixture_path = _write_fixture(tmp_path)
     stub_root = tmp_path / "python-stubs"
     stub_package = stub_root / "faster_whisper"
@@ -1440,19 +1458,21 @@ def test_powershell_rewrites_valid_preflight_pass_after_safe_stage_failure(
         "Bypass",
         "-File",
         str(entrypoint),
-        "-Mode",
-        "single-release",
+        "-Python",
+        sys.executable,
+        "-Validator",
+        str(validator),
         "-Fixture",
         str(fixture_path),
         "-Services",
         str(services_path),
         "-Output",
         str(output),
+        "-Stage",
+        stage,
     ]
-    if stage == "deployment":
-        command.extend(["-RepoPaths", str(tmp_path / "missing-repo-paths.json")])
-    else:
-        command.append("-SkipDeploy")
+    if diagnostic:
+        command.append("-Diagnostic")
 
     completed = subprocess.run(
         command,
