@@ -1349,7 +1349,7 @@ def _remove_selected_repo_paths(
     *,
     dry_run: bool,
 ) -> list[str]:
-    removed: list[str] = []
+    selected_paths: list[tuple[Path, str]] = []
     root_resolved = root.resolve(strict=False)
     repo_root = (root / "repo").resolve(strict=False)
     for repo in repositories:
@@ -1359,11 +1359,13 @@ def _remove_selected_repo_paths(
         if target in {root_resolved, repo_root}:
             raise RuntimeError(f"refusing to clean repository root: {target}")
         label = target.relative_to(root_resolved).as_posix()
+        selected_paths.append((target, label))
+
+    for target, label in selected_paths:
         print(f"clean repository: {label}")
         if target.exists() and not dry_run:
             _remove_path(target)
-        removed.append(label)
-    return removed
+    return [label for _, label in selected_paths]
 
 
 def _remove_path(path: Path) -> None:

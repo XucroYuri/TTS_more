@@ -537,6 +537,32 @@ def test_clean_sync_refuses_repository_root_paths(
         )
 
 
+@pytest.mark.parametrize("unsafe_path", [".", "repo"])
+def test_clean_sync_validates_all_selected_paths_before_deleting_any(
+    tmp_path: Path, unsafe_path: str
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    formal_repositories = _repository_fixture_with_three_formal_services()
+    repositories = [
+        formal_repositories[1],
+        {**formal_repositories[2], "path": unsafe_path},
+    ]
+    marker = tmp_path / "repo" / "index-tts" / "checkpoints" / "model.bin"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("model", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="refusing to clean repository root"):
+        deploy.sync_repos(
+            tmp_path,
+            clean=True,
+            service_ids={"local-indextts", "local-cosyvoice"},
+            repositories=repositories,
+        )
+
+    assert marker.read_text(encoding="utf-8") == "model"
+
+
 def test_sync_repos_rejects_paths_outside_project(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
