@@ -31,18 +31,18 @@ install-frontend: ## Install frontend dependencies with pnpm
 	cd frontend && pnpm install
 
 dev: ## Start backend and frontend (cross-platform)
-	@ifeq ($(OS),Windows_NT)
-		powershell -ExecutionPolicy Bypass -File scripts/start-dev.ps1
-	@else
-		scripts/start-dev.sh
-	@endif
+ifeq ($(OS),Windows_NT)
+	powershell -ExecutionPolicy Bypass -File scripts/start-dev.ps1
+else
+	scripts/start-dev.sh
+endif
 
 workers: ## Start the three non-invasive TTS workers (GPT-SoVITS/IndexTTS/CosyVoice)
-	@ifeq ($(OS),Windows_NT)
-		powershell -ExecutionPolicy Bypass -File scripts/start-service-workers.ps1
-	@else
-		scripts/start-service-workers.sh
-	@endif
+ifeq ($(OS),Windows_NT)
+	powershell -ExecutionPolicy Bypass -File scripts/start-service-workers.ps1
+else
+	scripts/start-service-workers.sh
+endif
 
 test: test-backend test-frontend ## Run all tests
 

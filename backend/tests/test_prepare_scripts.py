@@ -1,9 +1,68 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_frontend_dev_defaults_to_loopback() -> None:
+    package = json.loads((REPO_ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
+
+    assert package["scripts"]["dev"] == "vite --host 127.0.0.1"
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_command"),
+    [
+        ("dev", "scripts/start-dev.sh"),
+        ("workers", "scripts/start-service-workers.sh"),
+    ],
+)
+def test_make_posix_entrypoints_are_make_conditioned(target: str, expected_command: str) -> None:
+    env = os.environ.copy()
+    env.pop("OS", None)
+
+    result = subprocess.run(
+        ["make", "-n", target],
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{expected_command}\n"
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_command"),
+    [
+        ("dev", "powershell -ExecutionPolicy Bypass -File scripts/start-dev.ps1"),
+        ("workers", "powershell -ExecutionPolicy Bypass -File scripts/start-service-workers.ps1"),
+    ],
+)
+def test_make_windows_entrypoints_are_make_conditioned(target: str, expected_command: str) -> None:
+    env = os.environ.copy()
+    env["OS"] = "Windows_NT"
+
+    result = subprocess.run(
+        ["make", "-n", target],
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{expected_command}\n"
 
 
 def test_powershell_prepare_defaults_to_auto_and_calls_probe_network() -> None:
