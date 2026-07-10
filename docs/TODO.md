@@ -10,7 +10,7 @@
 | 2 | GPT-SoVITS 接入能力与上游兼容性 | ✅ 已解决（非侵入式 worker，见 `docs/workers.md`） |
 | 3 | 未合并 feature 分支 | ✅ dev-xu 已合并；两个死分支已删除 |
 | 4 | `frontend/design.md` 过时 | ✅ 已删除 |
-| 5 | 真实 TTS 端到端 CI | 📋 部署模型已定（本机应用 + 网络接入 GPU 机器），见 `docs/ci-architecture.md` |
+| 5 | Windows CUDA 全流程认证 | 🔬 自动化与文档已建立，待真实单机和四机首次认证 |
 
 ---
 
@@ -69,14 +69,16 @@ rebase 会让 28 个提交逐个撞安全代码（冲突分散），merge 更干
 
 ---
 
-## 5. 真实 TTS 端到端 CI 📋
+## 5. Windows CUDA 首次认证 🔬
 
-详见 `docs/ci-architecture.md`。核心探讨：当前 CI 在 GitHub-hosted ubuntu/windows runner 上跑单元测试（无 GPU）。真实 TTS 验收需要大模型 + GPU，三种部署架构的得失：
+代码侧的 topology、三 worker 工件协议、共享资源切换、CUDA 判定器、报告格式和 runbook 不再列为 TODO。剩余工作必须在真实硬件上完成：
 
-| 方案 | 得 | 失 |
-|---|---|---|
-| 自托管 GPU runner | 真验收、防回归 | 需维护 GPU 机器、runner 注册、成本 |
-| 手动验收（现状） | 零 CI 成本 | 回归风险、依赖人 |
-| 容器化 GPU + 模型缓存 | 可复现、可调度 | 镜像大、模型下载慢、复杂 |
+1. 准备 Windows 11/Server、CUDA 12.8、至少 16 GB VRAM 的单机 runner，并注册标签 `[self-hosted, Windows, X64, cuda, tts-more-gpu]`。
+2. 在 runner 本地创建被忽略的 topology、repo 路径确认文件和 validation fixture，准备三服务参考音频及 GPT `v2ProPlus`/`v2Pro` 权重。
+3. 完成第一次 `single-clean`，由两名审核者签核，建立 16 GB 冷加载、短句、warm p95 和显存恢复基线。
+4. 准备一台控制节点和三台独立 GPU worker，配置 Windows OpenSSH、DNS/时间同步、端口与防火墙。
+5. 在真实四机上完成第一次 `distributed` 认证，确认已实现的 30 条重叠检测、远端证据采集和 15 秒故障恢复脚本通过 Windows OpenSSH 实测。
+6. 审核私有 CI 工件的脱敏和访问控制，保存单机/分布式运行 URL 与人工听审记录。
+7. 首次两类认证均通过后，才将其启用为稳定发布的强制门禁。
 
-推荐：保持单元测试在 hosted runner，真实验收用**自托管 GPU runner + 模型缓存卷**，仅在 release 前触发（非每次 push）。
+执行说明见 [CUDA 验证总入口](cuda-e2e-validation.md)、[单机 runbook](cuda-e2e-single-node.md) 和 [四机 runbook](cuda-e2e-distributed.md)。

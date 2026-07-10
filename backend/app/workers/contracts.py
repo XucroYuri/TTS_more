@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -18,3 +18,4 @@ class SynthesizeRequest(BaseModel):
     profile: str
     output_path: Path
     parameters: dict[str, Any] = {}
+    delivery: Literal["path", "artifact"] = "path"

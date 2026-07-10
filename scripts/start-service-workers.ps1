@@ -1,6 +1,8 @@
 param(
     [string]$Services = "",
     [string]$RepoPaths = "",
+    [string]$Topology = "",
+    [string]$Node = "",
     [switch]$Detach
 )
 
@@ -18,6 +20,12 @@ if ($Services) {
 }
 if ($RepoPaths) {
     $argsList += @("--repo-paths", $RepoPaths)
+}
+if ($Topology) {
+    $argsList += @("--topology", $Topology)
+}
+if ($Node) {
+    $argsList += @("--node", $Node)
 }
 if ($Detach) {
     $argsList += "--detach"

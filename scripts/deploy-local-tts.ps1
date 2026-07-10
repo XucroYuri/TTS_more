@@ -1,6 +1,9 @@
 param(
     [ValidateSet("Auto", "ModelScope", "HF", "HF-Mirror")][string]$Source = "Auto",
     [ValidateSet("CU128", "CU126", "CPU", "ROCM", "MPS")][string]$Device = "CU128",
+    [ValidateSet("local-all", "app-only", "worker-node")][string]$Profile = "local-all",
+    [string]$Topology = "",
+    [string]$Node = "",
     [string[]]$Targets = @("default"),
     [string]$RepoPaths = "",
     [switch]$CleanRepos,
@@ -52,6 +55,33 @@ function Add-RepoPathsArg {
     return $Arguments
 }
 
+function Add-TopologyArgs {
+    param([string[]]$Arguments)
+    if ($Topology) {
+        $Arguments += @("--topology", $Topology)
+    }
+    if ($Node) {
+        $Arguments += @("--node", $Node)
+    }
+    return $Arguments
+}
+
+function Get-WorkerServiceIds {
+    if ($Profile -ne "worker-node") {
+        return @($Targets | ForEach-Object { $_ -split "," } | Where-Object { $_ } | ForEach-Object { $_.Trim() })
+    }
+    if (-not $Topology -or -not $Node) {
+        throw "worker-node profile requires -Topology and -Node"
+    }
+    $topologyPath = if ([IO.Path]::IsPathRooted($Topology)) { $Topology } else { Join-Path $Root $Topology }
+    if (!(Test-Path -LiteralPath $topologyPath)) { throw "Topology file not found: $topologyPath" }
+    $manifest = Get-Content -LiteralPath $topologyPath -Raw | ConvertFrom-Json
+    $nodeProperty = $manifest.nodes.PSObject.Properties[$Node]
+    if ($null -eq $nodeProperty) { throw "Topology node not found: $Node" }
+    if ($nodeProperty.Value.role -ne "worker") { throw "Topology node is not a worker: $Node" }
+    return @($nodeProperty.Value.services)
+}
+
 function Install-App {
     if ($SkipAppInstall) {
         Write-Host "[skip] app dependency install" -ForegroundColor Yellow
@@ -74,44 +104,53 @@ Refresh-Python
 Install-App
 Refresh-Python
 
-$targetList = $Targets -join ","
-$validateArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "validate-repo-paths", "--service-ids", $targetList)
-Invoke-Logged $Python $validateArgs
+$targetList = (Get-WorkerServiceIds) -join ","
+$isAppOnly = $Profile -eq "app-only"
+if (-not $isAppOnly) {
+    $validateArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "validate-repo-paths", "--service-ids", $targetList)
+    Invoke-Logged $Python $validateArgs
 
-if (-not $SkipRepoSync) {
-    $syncArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "sync-repos", "--service-ids", $targetList)
-    if ($CleanRepos) { $syncArgs += "--clean" }
-    if ($DryRun) { $syncArgs += "--dry-run" }
-    Invoke-Logged $Python $syncArgs
+    if (-not $SkipRepoSync) {
+        $syncArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "sync-repos", "--service-ids", $targetList)
+        if ($CleanRepos) { $syncArgs += "--clean" }
+        if ($DryRun) { $syncArgs += "--dry-run" }
+        Invoke-Logged $Python $syncArgs
+    } else {
+        Write-Host "[skip] repo sync" -ForegroundColor Yellow
+    }
+
+    $bundleArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "install-repo-bundles", "--service-ids", $targetList)
+    if ($DryRun) { $bundleArgs += "--dry-run" }
+    Invoke-Logged $Python $bundleArgs
+
+    $updateScriptArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "install-update-scripts", "--service-ids", $targetList)
+    if ($DryRun) { $updateScriptArgs += "--dry-run" }
+    Invoke-Logged $Python $updateScriptArgs
+
+    if (-not $SkipRepoPrepare) {
+        $prepareArgs = @("-Source", $Source, "-Device", $Device, "-Profile", $Profile, "-Targets", $targetList)
+        if ($Topology) { $prepareArgs += @("-Topology", $Topology) }
+        if ($Node) { $prepareArgs += @("-Node", $Node) }
+        if ($RepoPaths) { $prepareArgs += @("-RepoPaths", $RepoPaths) }
+        if ($SkipInstall) { $prepareArgs += "-SkipInstall" }
+        if ($SkipDownloads) { $prepareArgs += "-SkipDownloads" }
+        if ($DryRun) { $prepareArgs += "-DryRun" }
+        $prepareCommandArgs = @("-ExecutionPolicy", "Bypass", "-File", (Join-Path $Root "scripts\prepare-tts-repos.ps1"))
+        $prepareCommandArgs += $prepareArgs
+        Invoke-Logged "powershell" $prepareCommandArgs
+    } else {
+        Write-Host "[skip] repo dependency/model prepare" -ForegroundColor Yellow
+    }
 } else {
-    Write-Host "[skip] repo sync" -ForegroundColor Yellow
+    Write-Host "[skip] app-only profile does not prepare local TTS repositories" -ForegroundColor Yellow
 }
 
-$bundleArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "install-repo-bundles", "--service-ids", $targetList)
-if ($DryRun) { $bundleArgs += "--dry-run" }
-Invoke-Logged $Python $bundleArgs
-
-$updateScriptArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "install-update-scripts", "--service-ids", $targetList)
-if ($DryRun) { $updateScriptArgs += "--dry-run" }
-Invoke-Logged $Python $updateScriptArgs
-
-if (-not $SkipRepoPrepare) {
-    $prepareArgs = @("-Source", $Source, "-Device", $Device, "-Targets", $targetList)
-    if ($RepoPaths) { $prepareArgs += @("-RepoPaths", $RepoPaths) }
-    if ($SkipInstall) { $prepareArgs += "-SkipInstall" }
-    if ($SkipDownloads) { $prepareArgs += "-SkipDownloads" }
-    if ($DryRun) { $prepareArgs += "-DryRun" }
-    $prepareCommandArgs = @("-ExecutionPolicy", "Bypass", "-File", (Join-Path $Root "scripts\prepare-tts-repos.ps1"))
-    $prepareCommandArgs += $prepareArgs
-    Invoke-Logged "powershell" $prepareCommandArgs
-} else {
-    Write-Host "[skip] repo dependency/model prepare" -ForegroundColor Yellow
-}
-
-$renderArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "render-services", "--profile", "local-all", "--platform", "windows", "--service-ids", $targetList, "--output", "data\local\services.json")
+$renderArgs = Add-TopologyArgs (Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "render-services", "--profile", $Profile, "--platform", "windows", "--service-ids", $targetList, "--output", "data\local\services.json"))
 Invoke-Logged $Python $renderArgs
 
-$doctorArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "doctor", "--service-ids", $targetList)
-Invoke-Logged $Python $doctorArgs
+if (-not $isAppOnly) {
+    $doctorArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "doctor", "--service-ids", $targetList)
+    Invoke-Logged $Python $doctorArgs
+}
 
 Write-Host "Local TTS deployment workflow complete." -ForegroundColor Green

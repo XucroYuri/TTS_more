@@ -2,6 +2,9 @@ param(
     [string[]]$Targets = @("default"),
     [ValidateSet("Auto", "ModelScope", "HF", "HF-Mirror")][string]$Source = "Auto",
     [ValidateSet("CU128", "CU126", "CPU", "ROCM", "MPS")][string]$Device = "CU128",
+    [ValidateSet("local-all", "app-only", "worker-node")][string]$Profile = "local-all",
+    [string]$Topology = "",
+    [string]$Node = "",
     [string]$RepoPaths = "",
     [switch]$SyncRepos,
     [switch]$CleanRepos,
@@ -11,11 +14,28 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$TargetItems = @($Targets | ForEach-Object { $_ -split "," } | Where-Object { $_ } | ForEach-Object { $_.Trim() })
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
 if (!(Test-Path -LiteralPath $Python)) { $Python = "python" }
+
+function Get-WorkerServiceIds {
+    if ($Profile -ne "worker-node") {
+        return @($Targets | ForEach-Object { $_ -split "," } | Where-Object { $_ } | ForEach-Object { $_.Trim() })
+    }
+    if (-not $Topology -or -not $Node) {
+        throw "worker-node profile requires -Topology and -Node"
+    }
+    $topologyPath = if ([IO.Path]::IsPathRooted($Topology)) { $Topology } else { Join-Path $Root $Topology }
+    if (!(Test-Path -LiteralPath $topologyPath)) { throw "Topology file not found: $topologyPath" }
+    $manifest = Get-Content -LiteralPath $topologyPath -Raw | ConvertFrom-Json
+    $nodeProperty = $manifest.nodes.PSObject.Properties[$Node]
+    if ($null -eq $nodeProperty) { throw "Topology node not found: $Node" }
+    if ($nodeProperty.Value.role -ne "worker") { throw "Topology node is not a worker: $Node" }
+    return @($nodeProperty.Value.services)
+}
+
+$script:TargetItems = @(Get-WorkerServiceIds)
 
 function Invoke-Logged {
     param(
@@ -188,6 +208,25 @@ function Ensure-Venv {
     return $venvPython
 }
 
+function Install-WorkerRuntime {
+    param([string]$RepoPath)
+    if ($SkipInstall) { return }
+    $repoPython = Resolve-RepoPython $RepoPath
+    if (!(Test-Path -LiteralPath $repoPython) -and -not $DryRun) {
+        throw "Repository Python environment not found: $repoPython"
+    }
+    Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "TTS More worker runtime install" -Action {
+        param($IndexUrl)
+        Invoke-Logged $repoPython @(
+            "-m", "pip", "install",
+            "fastapi>=0.115.0",
+            "uvicorn[standard]>=0.30.0",
+            "pydantic>=2.8.0",
+            "python-multipart>=0.0.9"
+        ) $RepoPath
+    }
+}
+
 function Prepare-GPTSoVITS {
     param($Repo)
     $repoPath = Join-Path $Root $Repo.path
@@ -197,15 +236,21 @@ function Prepare-GPTSoVITS {
     }
     $installPs1 = Join-Path $repoPath "install.ps1"
     $installSh = Join-Path $repoPath "install.sh"
+    $repoPython = Ensure-Venv $repoPath
     if ($IsWindows -or $env:OS -eq "Windows_NT") {
         if (!(Test-Path -LiteralPath $installPs1)) { throw "Missing GPT-SoVITS installer: $installPs1" }
         if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
-            Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
-            return
+            throw "conda was not found; GPT-SoVITS official installer requires conda for $($Repo.name)."
         }
-        Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
-            param($CandidateSource)
-            Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", $installPs1, "-Device", $Device, "-Source", $CandidateSource) $repoPath
+        $previousPath = $env:PATH
+        $env:PATH = "$(Split-Path -Parent $repoPython);$previousPath"
+        try {
+            Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
+                param($CandidateSource)
+                Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", $installPs1, "-Device", $Device, "-Source", $CandidateSource) $repoPath
+            }
+        } finally {
+            $env:PATH = $previousPath
         }
     } else {
         if (!(Test-Path -LiteralPath $installSh)) { throw "Missing GPT-SoVITS installer: $installSh" }
@@ -321,14 +366,18 @@ if ($RepoPaths) {
 }
 foreach ($repo in $repositories) {
     if (-not (Test-Target $repo)) { continue }
+    $repoPath = Join-Path $Root $repo.path
     switch ($repo.provider_type) {
         "gpt-sovits" { Prepare-GPTSoVITS $repo }
         "indextts" { Prepare-IndexTTS $repo }
         "cosyvoice" { Prepare-CosyVoice $repo }
     }
+    Install-WorkerRuntime $repoPath
 }
 
-$renderArgs = @("scripts\tts_more_deploy.py", "render-services", "--profile", "local-all", "--platform", "windows", "--service-ids", ($TargetItems -join ","), "--output", "data\local\services.json")
+$renderArgs = @("scripts\tts_more_deploy.py", "render-services", "--profile", $Profile, "--platform", "windows", "--service-ids", ($TargetItems -join ","), "--output", "data\local\services.json")
 if ($RepoPaths) { $renderArgs += @("--repo-paths", $RepoPaths) }
+if ($Topology) { $renderArgs += @("--topology", $Topology) }
+if ($Node) { $renderArgs += @("--node", $Node) }
 Invoke-Logged $Python $renderArgs $Root
 Write-Host "Prepared selected TTS repositories. Rendered data\local\services.json." -ForegroundColor Green

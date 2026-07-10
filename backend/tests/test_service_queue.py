@@ -57,6 +57,12 @@ class SynthesisFailingServiceClient(RecordingServiceClient):
         raise RuntimeError("synthesis backend returned 500")
 
 
+class UnloadFailingServiceClient(RecordingServiceClient):
+    def unload(self) -> None:
+        self.calls.append("unload")
+        raise RuntimeError("old provider is still resident")
+
+
 class StaticRouter:
     def __init__(self, clients: dict[str, RecordingServiceClient]) -> None:
         self.clients = clients
@@ -167,10 +173,35 @@ def test_service_queue_serializes_services_in_same_resource_group(tmp_path: Path
         output_dir=tmp_path,
     )
 
-    assert first.calls == ["load:p1", "synthesize:l1"]
+    assert first.calls == ["load:p1", "synthesize:l1", "unload"]
     assert second.calls == ["load:p2", "synthesize:l2"]
+    assert queue.load_state("local-gpt")["loaded"] is False
+    assert queue.load_state("local-index")["loaded"] is True
     assert manifest.lines["l1"].versions[0].service_id == "local-gpt"
     assert manifest.lines["l2"].versions[0].resource_group == "local-gpu-0"
+
+
+def test_service_queue_preserves_old_load_state_when_resource_unload_fails(tmp_path: Path) -> None:
+    first = UnloadFailingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    second = RecordingServiceClient(endpoint("local-index", EngineName.INDEX_TTS, "local-gpu-0"))
+    queue = ServiceGenerationQueue(StaticRouter({"local-gpt": first, "local-index": second}))
+    manifest = GenerationManifest(project_id="demo")
+
+    with pytest.raises(RuntimeError, match="still resident"):
+        queue.run(
+            [
+                task("l1", EngineName.GPT_SOVITS, "p1", "local-gpt"),
+                task("l2", EngineName.INDEX_TTS, "p2", "local-index"),
+            ],
+            manifest,
+            output_dir=tmp_path,
+        )
+
+    assert queue.load_state("local-gpt")["loaded"] is True
+    assert queue.load_state("local-index")["loaded"] is False
+    assert second.calls == []
+    assert manifest.lines["l2"].versions[0].status == "failed"
+    assert manifest.lines["l2"].versions[0].metadata["failure_stage"] == "unloading"
 
 
 def test_service_queue_clusters_same_weights_and_reference_before_switching(tmp_path: Path) -> None:
@@ -582,4 +613,3 @@ def test_generation_job_cancel_stops_dispatching_remaining_lines(tmp_path: Path)
     # and should be cancelled, never synthesized.
     assert any("synthesize:l1" in c for c in client.calls)
     assert not any("synthesize:l2" in c for c in client.calls)
-

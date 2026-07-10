@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import shutil
@@ -18,6 +19,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_BUNDLE_RELATIVE_PATH = Path("deployment/tts-repos")
 DEFAULT_REPO_PATHS_RELATIVE_PATH = Path("deployment/app/repo-paths.local.json")
+TOPOLOGY_SCHEMA_VERSION = 1
 
 
 PROVIDER_MODULES = {
@@ -41,6 +43,7 @@ PROVIDER_CAPABILITIES = {
         "sovits-weights",
         "wav_output",
         "tts-more-worker",
+        "artifact-transfer",
     ],
     "indextts": [
         "tts",
@@ -49,6 +52,7 @@ PROVIDER_CAPABILITIES = {
         "emotion_audio",
         "wav_output",
         "tts-more-worker",
+        "artifact-transfer",
     ],
     "cosyvoice": [
         "tts",
@@ -58,6 +62,7 @@ PROVIDER_CAPABILITIES = {
         "style_instruction",
         "wav_output",
         "tts-more-worker",
+        "artifact-transfer",
     ],
 }
 
@@ -471,40 +476,74 @@ def render_services(
     service_ids: set[str] | None = None,
     template: bool = False,
     repositories: list[dict[str, Any]] | None = None,
+    topology: str | Path | None = None,
+    node: str | None = None,
 ) -> list[dict[str, Any]]:
     platform_name = platform_name or _platform_name()
     repositories = [repo for repo in (repositories or load_repo_lock(root)) if _is_tts_repo(repo)]
+    selected_repositories = [repo for repo in repositories if _repo_selected(repo, service_ids)]
+    topology_payload: dict[str, Any] | None = None
+    topology_worker: tuple[str, dict[str, Any]] | None = None
+    assignments: dict[str, tuple[str, dict[str, Any]]] = {}
+    if topology is not None:
+        selected_service_ids = {
+            str(repo.get("service_id") or _default_service_id(repo)) for repo in selected_repositories
+        }
+        topology_payload = load_topology(root, topology, selected_service_ids=selected_service_ids)
+        assignments = _topology_assignments(topology_payload)
+        topology_worker = _resolve_topology_worker(topology_payload, profile=profile, node=node)
+
     services: list[dict[str, Any]] = []
-    for repo in repositories:
+    for repo in selected_repositories:
         service_id = str(repo.get("service_id") or _default_service_id(repo))
-        if not _repo_selected(repo, service_ids):
+        assigned_node = assignments.get(service_id)
+        if topology_worker is not None and assigned_node is not None and assigned_node[0] != topology_worker[0]:
             continue
         provider = str(repo["provider_type"])
         port = int(repo.get("port") or _default_port(provider))
         is_external = profile == "app-only"
+        endpoint_host = host
+        bind_host = "127.0.0.1"
+        resource_group = str(repo.get("resource_group") or _resource_group(repo))
+        capacity = int(repo.get("capacity") or 1)
+        if assigned_node is not None:
+            node_config = assigned_node[1]
+            endpoint_host = str(node_config["host"])
+            bind_host = str(node_config["bind_host"])
+            resource_group = str(node_config["resource_group"])
+            capacity = int(node_config["capacity"])
+        if topology_payload is not None:
+            is_lan = is_external or endpoint_host not in {"127.0.0.1", "localhost", "::1"}
+        else:
+            is_lan = is_external and endpoint_host not in {"127.0.0.1", "localhost", "::1"}
+        worker_env = {} if is_external else _worker_env(repo, platform_name)
+        if not is_external:
+            worker_env["TTS_MORE_WORKER_ALLOW_PATH_DELIVERY"] = (
+                "1" if bind_host in {"127.0.0.1", "localhost", "::1"} else "0"
+            )
         service = {
             "service_id": service_id,
             "service_kind": "tts",
             "display_name": str(repo.get("display_name") or _display_name(repo)),
             "engine": PROVIDER_ENGINES[provider],
             "provider_type": provider,
-            "source_profile": "lan_endpoint" if is_external and host not in {"127.0.0.1", "localhost", "::1"} else "local_endpoint",
+            "source_profile": "lan_endpoint" if is_lan else "local_endpoint",
             "catalog_provider": provider,
             "setup_state": "not_configured" if template else ("endpoint_unreachable" if is_external else "repo_found"),
             "api_contract": "tts-more-v1",
-            "base_url": f"http://{host}:{port}",
+            "base_url": f"http://{endpoint_host}:{port}",
             "mode": "external" if is_external else "local",
-            "network_scope": "lan" if is_external and host not in {"127.0.0.1", "localhost", "::1"} else "localhost",
+            "network_scope": "lan" if is_lan else "localhost",
             "managed": not is_external,
             "enabled": not template,
             "poll_interval_seconds": 5,
             "repo_path": None if is_external else repo["path"],
-            "start_command": [] if is_external else _start_command(repo, platform_name, port),
+            "start_command": [] if is_external else _start_command(repo, platform_name, port, bind_host=bind_host),
             "start_cwd": None if is_external else ".",
-            "env": {} if is_external else _worker_env(repo, platform_name),
-            "health_url": f"http://{host}:{port}/health",
-            "resource_group": str(repo.get("resource_group") or _resource_group(repo)),
-            "capacity": int(repo.get("capacity") or 1),
+            "env": worker_env,
+            "health_url": f"http://{endpoint_host}:{port}/health",
+            "resource_group": resource_group,
+            "capacity": capacity,
             "priority": int(repo.get("priority") or PROVIDER_PRIORITY[provider]),
             "capabilities": list(repo.get("capabilities") or PROVIDER_CAPABILITIES[provider]),
         }
@@ -512,6 +551,157 @@ def render_services(
             service["default_params"] = {"mode": "zero_shot", "response_format": "wav"}
         services.append(service)
     return services
+
+
+def load_topology(
+    root: Path,
+    topology: str | Path,
+    *,
+    selected_service_ids: set[str],
+) -> dict[str, Any]:
+    path = Path(topology)
+    if not path.is_absolute():
+        path = root / path
+    if not path.exists():
+        raise FileNotFoundError(f"topology file not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    validate_topology(payload, selected_service_ids=selected_service_ids)
+    return payload
+
+
+def validate_topology(payload: Any, *, selected_service_ids: set[str]) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("topology must be a JSON object")
+    if payload.get("schema_version") != TOPOLOGY_SCHEMA_VERSION or isinstance(payload.get("schema_version"), bool):
+        raise ValueError(f"topology schema_version must be {TOPOLOGY_SCHEMA_VERSION}")
+    if not isinstance(payload.get("name"), str) or not payload["name"].strip():
+        raise ValueError("topology name must be a nonempty string")
+    app_node = payload.get("app_node")
+    if not isinstance(app_node, str) or not app_node.strip():
+        raise ValueError("topology app_node must be a nonempty string")
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, dict) or not nodes:
+        raise ValueError("topology nodes must be a nonempty object")
+
+    required_fields = {"role", "host", "bind_host", "services", "resource_group", "capacity"}
+    service_owners: dict[str, str] = {}
+    for node_name, node_config in nodes.items():
+        if not isinstance(node_name, str) or not node_name.strip() or not isinstance(node_config, dict):
+            raise ValueError("topology node names and values must be nonempty strings and objects")
+        missing = required_fields.difference(node_config)
+        if missing:
+            raise ValueError(f"topology node {node_name} is missing fields: {', '.join(sorted(missing))}")
+        if node_config["role"] not in {"app", "worker"}:
+            raise ValueError(f"topology node {node_name} role must be app or worker")
+        for field in ("host", "bind_host", "resource_group"):
+            value = node_config[field]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"topology node {node_name} {field} must be a nonempty string")
+        services = node_config["services"]
+        if not isinstance(services, list) or any(not isinstance(item, str) or not item.strip() for item in services):
+            raise ValueError(f"topology node {node_name} services must be a list of nonempty strings")
+        if node_config["role"] == "app" and services:
+            raise ValueError("topology app node services must be empty")
+        capacity = node_config["capacity"]
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError(f"topology node {node_name} capacity must be an integer >= 1")
+        if node_config["role"] == "worker":
+            for service_id in services:
+                previous_owner = service_owners.get(service_id)
+                if previous_owner is not None:
+                    raise ValueError(
+                        f"service {service_id} must be assigned to exactly one worker; "
+                        f"found {previous_owner} and {node_name}"
+                    )
+                service_owners[service_id] = node_name
+
+    if app_node not in nodes:
+        raise ValueError(f"topology app_node does not exist: {app_node}")
+    if nodes[app_node]["role"] != "app":
+        raise ValueError(f"topology app_node {app_node} must have role app")
+
+    assignments = _topology_assignments(payload)
+    for service_id in sorted(selected_service_ids):
+        assigned_workers = [
+            node_name
+            for node_name, node_config in nodes.items()
+            if node_config["role"] == "worker" and service_id in node_config["services"]
+        ]
+        if len(assigned_workers) != 1:
+            raise ValueError(
+                f"selected service {service_id} must be assigned to exactly one worker; "
+                f"found {len(assigned_workers)}"
+            )
+        if service_id not in assignments:
+            raise ValueError(f"selected service {service_id} must be assigned to exactly one worker")
+    worker_nodes = [
+        (node_name, node_config)
+        for node_name, node_config in nodes.items()
+        if node_config["role"] == "worker"
+    ]
+    if len(worker_nodes) > 1:
+        declared_hosts: dict[str, str] = {}
+        for node_name, node_config in nodes.items():
+            host = str(node_config["host"]).strip()
+            normalized_host = host.casefold().rstrip(".")
+            candidate_ip = normalized_host.strip("[]")
+            try:
+                address = ipaddress.ip_address(candidate_ip)
+            except ValueError:
+                address = None
+            if normalized_host in {"localhost", "ip6-localhost"} or (
+                address is not None and (address.is_loopback or address.is_unspecified)
+            ):
+                raise ValueError(f"distributed topology node {node_name} host must be non-loopback")
+            previous_node = declared_hosts.get(normalized_host)
+            if previous_node is not None:
+                raise ValueError(
+                    f"distributed topology nodes {previous_node} and {node_name} must use a distinct host"
+                )
+            declared_hosts[normalized_host] = node_name
+        for node_name, node_config in worker_nodes:
+            if len(node_config["services"]) != 1:
+                raise ValueError(f"distributed worker {node_name} must own exactly one service")
+
+
+def _topology_assignments(payload: dict[str, Any]) -> dict[str, tuple[str, dict[str, Any]]]:
+    assignments: dict[str, tuple[str, dict[str, Any]]] = {}
+    for node_name, node_config in payload["nodes"].items():
+        if node_config["role"] != "worker":
+            continue
+        for service_id in node_config["services"]:
+            assignments[service_id] = (node_name, node_config)
+    return assignments
+
+
+def _resolve_topology_worker(
+    payload: dict[str, Any],
+    *,
+    profile: str,
+    node: str | None,
+) -> tuple[str, dict[str, Any]] | None:
+    nodes = payload["nodes"]
+    if profile == "app-only":
+        selected_node = node or payload["app_node"]
+        if selected_node not in nodes:
+            raise ValueError(f"topology node does not exist: {selected_node}")
+        if nodes[selected_node]["role"] != "app":
+            raise ValueError(f"app-only node {selected_node} must have role app")
+        return None
+
+    if node is not None:
+        if node not in nodes:
+            raise ValueError(f"topology node does not exist: {node}")
+        if nodes[node]["role"] != "worker":
+            raise ValueError(f"{profile} node {node} must have role worker")
+        return node, nodes[node]
+
+    workers = [(node_name, node_config) for node_name, node_config in nodes.items() if node_config["role"] == "worker"]
+    if profile == "worker-node":
+        raise ValueError("worker-node profile requires --node")
+    if len(workers) != 1:
+        raise ValueError("local-all topology requires --node when multiple worker nodes are configured")
+    return workers[0]
 
 
 def _clone_command(remote: str, branch: str, path: Path, *, partial: bool = True) -> list[str]:
@@ -1006,20 +1196,26 @@ def start_workers(
     service_ids: set[str] | None = None,
     detach: bool = False,
     repositories: list[dict[str, Any]] | None = None,
+    topology: str | Path | None = None,
+    node: str | None = None,
 ) -> int:
     services = render_services(
         root,
-        profile="local-all",
+        profile="worker-node" if topology is not None and node is not None else "local-all",
         platform_name=platform_name,
         service_ids=service_ids,
         repositories=repositories,
+        topology=topology,
+        node=node,
     )
     processes: list[subprocess.Popen] = []
+    app_commit = _git_output(["git", "-C", str(root), "rev-parse", "HEAD"])
     logs_dir = root / "data" / ".runtime" / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     for service in services:
         command = _resolve_command(root, service["start_command"])
         env = {**os.environ, **_resolve_env(root, service.get("env") or {})}
+        env["TTS_MORE_APP_COMMIT"] = app_commit
         log_path = logs_dir / f"{service['service_id']}.log"
         log_file = log_path.open("ab")
         kwargs: dict[str, Any] = {
@@ -1093,7 +1289,13 @@ def _resource_group(repo: dict[str, Any]) -> str:
     return "local-gpu-0"
 
 
-def _start_command(repo: dict[str, Any], platform_name: str, port: int) -> list[str]:
+def _start_command(
+    repo: dict[str, Any],
+    platform_name: str,
+    port: int,
+    *,
+    bind_host: str = "127.0.0.1",
+) -> list[str]:
     return [
         _python_path(repo, platform_name),
         "-m",
@@ -1102,7 +1304,7 @@ def _start_command(repo: dict[str, Any], platform_name: str, port: int) -> list[
         "--app-dir",
         "backend",
         "--host",
-        "127.0.0.1",
+        bind_host,
         "--port",
         str(port),
     ]
@@ -1251,6 +1453,8 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--template", action="store_true", help="Render disabled committable defaults")
     render.add_argument("--output", default=None)
     render.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    render.add_argument("--topology", default=None, help="Optional deployment topology JSON")
+    render.add_argument("--node", default=None, help="Node name from --topology")
 
     sync = sub.add_parser("sync-repos", help="Clone/fetch repositories from repo.lock.json")
     sync.add_argument("--clean", action="store_true")
@@ -1284,6 +1488,8 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--service-ids", default=None)
     start.add_argument("--detach", action="store_true")
     start.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    start.add_argument("--topology", default=None, help="Optional deployment topology JSON")
+    start.add_argument("--node", default=None, help="Worker node name from --topology")
 
     install_scripts = sub.add_parser(
         "install-update-scripts",
@@ -1336,6 +1542,8 @@ def main(argv: list[str] | None = None) -> int:
             service_ids=_parse_service_ids(args.service_ids),
             template=args.template,
             repositories=repositories,
+            topology=args.topology,
+            node=args.node,
         )
         if args.output:
             write_json(root / args.output, services)
@@ -1395,6 +1603,8 @@ def main(argv: list[str] | None = None) -> int:
             service_ids=_parse_service_ids(args.service_ids),
             detach=args.detach,
             repositories=repositories,
+            topology=args.topology,
+            node=args.node,
         )
     if args.command == "install-update-scripts":
         repositories = _load_cli_repositories(root, args.repo_paths)

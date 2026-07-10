@@ -88,6 +88,69 @@ def _write_repo_lock(root: Path) -> None:
     )
 
 
+def _topology_payload(*, distributed: bool = True) -> dict:
+    worker_nodes = {
+        "gpt-worker": {
+            "role": "worker",
+            "host": "tts-gpt.lan" if distributed else "localhost",
+            "bind_host": "0.0.0.0" if distributed else "127.0.0.1",
+            "services": ["local-gpt-sovits-main"],
+            "resource_group": "gpt-worker:cuda-0" if distributed else "cuda-0",
+            "capacity": 1,
+        },
+        "index-worker": {
+            "role": "worker",
+            "host": "tts-index.lan" if distributed else "localhost",
+            "bind_host": "0.0.0.0" if distributed else "127.0.0.1",
+            "services": ["local-indextts"],
+            "resource_group": "index-worker:cuda-0" if distributed else "cuda-0",
+            "capacity": 2 if distributed else 1,
+        },
+        "cosy-worker": {
+            "role": "worker",
+            "host": "tts-cosy.lan" if distributed else "localhost",
+            "bind_host": "0.0.0.0" if distributed else "127.0.0.1",
+            "services": ["local-cosyvoice"],
+            "resource_group": "cosy-worker:cuda-0" if distributed else "cuda-0",
+            "capacity": 1,
+        },
+    }
+    if not distributed:
+        worker_nodes = {
+            "gpu-worker": {
+                "role": "worker",
+                "host": "localhost",
+                "bind_host": "127.0.0.1",
+                "services": ["local-gpt-sovits-main", "local-indextts", "local-cosyvoice"],
+                "resource_group": "cuda-0",
+                "capacity": 1,
+            }
+        }
+    return {
+        "schema_version": 1,
+        "name": "four-node-lan" if distributed else "single-windows",
+        "app_node": "app-controller",
+        "nodes": {
+            "app-controller": {
+                "role": "app",
+                "host": "tts-app.lan" if distributed else "localhost",
+                "bind_host": "127.0.0.1",
+                "services": [],
+                "resource_group": "app",
+                "capacity": 1,
+            },
+            **worker_nodes,
+        },
+    }
+
+
+def _write_topology(root: Path, payload: dict) -> Path:
+    path = root / "deployment" / "app" / "topology.local.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
 def test_render_local_all_services_from_repo_lock(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
@@ -108,6 +171,173 @@ def test_render_local_all_services_from_repo_lock(tmp_path: Path) -> None:
     assert gpt_main["start_command"][0] == "repo/GPT-SoVITS-main/.venv/Scripts/python.exe"
     assert services[1]["env"]["TTS_MORE_INDEXTTS_MODEL_DIR"] == "repo/index-tts/checkpoints"
     assert services[2]["env"]["TTS_MORE_COSYVOICE_MODEL_DIR"] == "pretrained_models/CosyVoice-300M"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda payload: payload.update(schema_version=2), "schema_version"),
+        (lambda payload: payload.update(app_node="missing"), "app_node"),
+        (lambda payload: payload["nodes"]["app-controller"].update(role="worker"), "role app"),
+        (lambda payload: payload["nodes"]["gpt-worker"].update(role="gpu"), "role"),
+        (lambda payload: payload["nodes"]["gpt-worker"].update(host=""), "host"),
+        (lambda payload: payload["nodes"]["gpt-worker"].update(bind_host=""), "bind_host"),
+        (lambda payload: payload["nodes"]["gpt-worker"].update(host="localhost"), "non-loopback"),
+        (
+            lambda payload: payload["nodes"]["index-worker"].update(host="tts-gpt.lan"),
+            "distinct host",
+        ),
+        (lambda payload: payload["nodes"]["gpt-worker"].update(capacity=0), "capacity"),
+        (lambda payload: payload["nodes"]["app-controller"].update(services=["local-gpt-sovits-main"]), "app node services must be empty"),
+        (lambda payload: payload["nodes"]["gpt-worker"].update(services=[]), "exactly one worker"),
+        (
+            lambda payload: (
+                payload["nodes"]["gpt-worker"]["services"].append("local-indextts"),
+                payload["nodes"]["index-worker"].update(services=[]),
+            ),
+            "distributed worker gpt-worker must own exactly one service",
+        ),
+        (
+            lambda payload: payload["nodes"]["index-worker"]["services"].append("local-gpt-sovits-main"),
+            "exactly one worker",
+        ),
+    ],
+)
+def test_topology_validation_rejects_invalid_manifests(tmp_path: Path, mutate, message: str) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    payload = _topology_payload()
+    mutate(payload)
+    topology_path = _write_topology(tmp_path, payload)
+
+    with pytest.raises(ValueError, match=message):
+        deploy.load_topology(
+            tmp_path,
+            topology_path,
+            selected_service_ids={"local-gpt-sovits-main", "local-indextts", "local-cosyvoice"},
+        )
+
+
+def test_render_app_only_uses_each_assigned_worker_endpoint(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    topology_path = _write_topology(tmp_path, _topology_payload())
+
+    services = deploy.render_services(
+        tmp_path,
+        profile="app-only",
+        platform_name="windows",
+        topology=topology_path,
+        node="app-controller",
+    )
+
+    by_id = {service["service_id"]: service for service in services}
+    assert by_id["local-gpt-sovits-main"]["base_url"] == "http://tts-gpt.lan:9880"
+    assert by_id["local-indextts"]["base_url"] == "http://tts-index.lan:9881"
+    assert by_id["local-cosyvoice"]["base_url"] == "http://tts-cosy.lan:9882"
+    assert all(service["mode"] == "external" for service in services)
+    assert all(service["managed"] is False for service in services)
+    assert all(service["network_scope"] == "lan" for service in services)
+    assert all(service["source_profile"] == "lan_endpoint" for service in services)
+    assert all("artifact-transfer" in service["capabilities"] for service in services)
+    assert by_id["local-indextts"]["resource_group"] == "index-worker:cuda-0"
+    assert by_id["local-indextts"]["capacity"] == 2
+
+
+def test_render_worker_node_selects_assignments_and_binds_node_host(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    topology_path = _write_topology(tmp_path, _topology_payload())
+
+    services = deploy.render_services(
+        tmp_path,
+        profile="worker-node",
+        platform_name="windows",
+        topology=topology_path,
+        node="index-worker",
+    )
+
+    assert [service["service_id"] for service in services] == ["local-indextts"]
+    service = services[0]
+    assert service["base_url"] == "http://tts-index.lan:9881"
+    assert service["mode"] == "local"
+    assert service["managed"] is True
+    assert service["resource_group"] == "index-worker:cuda-0"
+    assert service["capacity"] == 2
+    assert service["env"]["TTS_MORE_WORKER_ALLOW_PATH_DELIVERY"] == "0"
+    host_index = service["start_command"].index("--host")
+    assert service["start_command"][host_index + 1] == "0.0.0.0"
+
+
+def test_render_local_all_single_topology_shares_cuda_resource_group(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    topology_path = _write_topology(tmp_path, _topology_payload(distributed=False))
+
+    services = deploy.render_services(
+        tmp_path,
+        profile="local-all",
+        platform_name="windows",
+        topology=topology_path,
+    )
+
+    assert [service["service_id"] for service in services] == [
+        "local-gpt-sovits-main",
+        "local-indextts",
+        "local-cosyvoice",
+    ]
+    assert {service["resource_group"] for service in services} == {"cuda-0"}
+    assert {service["capacity"] for service in services} == {1}
+    assert {service["env"]["TTS_MORE_WORKER_ALLOW_PATH_DELIVERY"] for service in services} == {"1"}
+
+
+def test_start_workers_uses_local_profile_for_single_topology_without_node(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    profiles: list[str] = []
+
+    def fake_render_services(*_args, **kwargs):
+        profiles.append(kwargs["profile"])
+        return []
+
+    monkeypatch.setattr(deploy, "render_services", fake_render_services)
+
+    assert deploy.start_workers(tmp_path, topology="single.local.json", node=None) == 0
+    assert deploy.start_workers(tmp_path, topology="four.local.json", node="gpt-worker") == 0
+    assert profiles == ["local-all", "worker-node"]
+
+
+def test_render_services_cli_accepts_topology_and_node(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    topology_path = _write_topology(tmp_path, _topology_payload())
+    output = tmp_path / "services.json"
+
+    exit_code = deploy.main(
+        [
+            "--root",
+            str(tmp_path),
+            "render-services",
+            "--profile",
+            "worker-node",
+            "--platform",
+            "windows",
+            "--topology",
+            str(topology_path),
+            "--node",
+            "gpt-worker",
+            "--output",
+            str(output.relative_to(tmp_path)),
+        ]
+    )
+
+    assert exit_code == 0
+    services = json.loads(output.read_text(encoding="utf-8"))
+    assert [service["service_id"] for service in services] == ["local-gpt-sovits-main"]
 
 
 def test_render_explicit_all_includes_regression_branches(tmp_path: Path) -> None:
@@ -157,6 +387,22 @@ def test_render_app_only_services_are_external_and_unmanaged(tmp_path: Path) -> 
     assert all(item["start_command"] == [] for item in services)
     assert services[0]["base_url"] == "http://tts-gpu.local:9880"
     assert services[2]["base_url"] == "http://tts-gpu.local:9882"
+
+
+def test_render_without_topology_preserves_local_profile_network_markers(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+
+    services = deploy.render_services(
+        tmp_path,
+        profile="local-all",
+        platform_name="posix",
+        host="custom-host.lan",
+    )
+
+    assert all(item["source_profile"] == "local_endpoint" for item in services)
+    assert all(item["network_scope"] == "localhost" for item in services)
 
 
 def test_render_worker_node_keeps_selected_local_worker_manageable(tmp_path: Path) -> None:

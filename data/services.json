@@ -45,7 +45,8 @@
       "gpt-weights",
       "sovits-weights",
       "wav_output",
-      "tts-more-worker"
+      "tts-more-worker",
+      "artifact-transfer"
     ]
   },
   {
@@ -94,7 +95,8 @@
       "emotion_text",
       "emotion_audio",
       "wav_output",
-      "tts-more-worker"
+      "tts-more-worker",
+      "artifact-transfer"
     ]
   },
   {
@@ -143,7 +145,8 @@
       "cross_lingual_voice",
       "style_instruction",
       "wav_output",
-      "tts-more-worker"
+      "tts-more-worker",
+      "artifact-transfer"
     ],
     "default_params": {
       "mode": "zero_shot",

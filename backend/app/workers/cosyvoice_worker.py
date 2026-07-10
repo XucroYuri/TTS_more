@@ -31,10 +31,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, UploadFile
-from pydantic import BaseModel
+from fastapi import FastAPI
 
+from app.workers.artifacts import ArtifactStore, artifact_output, artifact_response, register_artifact_routes
 from app.workers.contracts import LoadRequest, SynthesizeRequest
+from app.workers.runtime import release_cuda_memory, worker_runtime_status
 
 REPO_DIR = Path(os.environ.get("TTS_MORE_COSYVOICE_REPO", "repo/CosyVoice")).resolve(strict=False)
 MODEL_DIR = os.environ.get("TTS_MORE_COSYVOICE_MODEL_DIR", "pretrained_models/CosyVoice-300M")
@@ -90,11 +91,19 @@ def _ensure_pipeline() -> Any:
 app = FastAPI(title="TTS More CosyVoice Worker", version="0.1.0")
 
 
+def _artifact_store() -> ArtifactStore:
+    return ArtifactStore(REPO_DIR / "uploaded_ref")
+
+
+register_artifact_routes(app, _artifact_store)
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
         "ready": _pipeline is not None or REPO_DIR.exists(),
         "worker": "cosyvoice-standard",
+        "tts_more_commit": os.environ.get("TTS_MORE_APP_COMMIT", ""),
         "repo_found": REPO_DIR.exists(),
         "pipeline_loaded": _pipeline is not None,
     }
@@ -113,6 +122,7 @@ def capabilities() -> dict[str, Any]:
             "cross_lingual_voice",
             "style-instruction",
             "style_instruction",
+            "artifact-transfer",
         ]
     }
 
@@ -135,7 +145,8 @@ def synthesize(request: SynthesizeRequest) -> dict[str, Any]:
     raw_mode = str(params.get("mode", "zero_shot"))
     mode = _MODE_MAP.get(raw_mode, "zero_shot")
     text = request.line.text
-    output_path = Path(request.output_path)
+    store = _artifact_store()
+    output_path, artifact_id = artifact_output(store, request.delivery, Path(request.output_path), ".wav")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     chunks = _run_cosyvoice(pipeline, mode, text, params)
@@ -143,6 +154,7 @@ def synthesize(request: SynthesizeRequest) -> dict[str, Any]:
     return {
         "audio_path": str(output_path),
         "metadata": {"service": "cosyvoice-worker", "mode": mode},
+        **artifact_response(store, artifact_id),
     }
 
 
@@ -151,30 +163,18 @@ def unload() -> dict[str, Any]:
     global _pipeline, _loaded_mode
     _pipeline = None
     _loaded_mode = None
+    release_cuda_memory()
     return {"status": "unloaded"}
 
 
 @app.get("/status")
 def status() -> dict[str, Any]:
     return {
+        **worker_runtime_status(loaded=_pipeline is not None, model=_loaded_mode or MODEL_DIR),
         "ready": _pipeline is not None,
         "mode": _loaded_mode,
         "repo_found": REPO_DIR.exists(),
     }
-
-
-class UploadRefResponse(BaseModel):
-    path: str
-
-
-@app.post("/upload_ref", response_model=UploadRefResponse)
-async def upload_ref(file: UploadFile) -> UploadRefResponse:
-    upload_dir = REPO_DIR / "uploaded_ref"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = (file.filename or "ref.wav").replace("/", "_").replace("\\", "_")
-    target = upload_dir / safe_name
-    target.write_bytes(await file.read())
-    return UploadRefResponse(path=str(target))
 
 
 # ---------------------------------------------------------------------------
@@ -238,19 +238,56 @@ def _chunk_to_wav(chunk: Any, sample_rate: int | None = None) -> bytes:
 
 
 def _write_chunks(chunks: list[bytes], output_path: Path) -> None:
-    """Concatenate wav byte chunks into one file (strip headers of all but first)."""
+    """Merge WAV chunks and rebuild RIFF sizes without changing sample encoding."""
     if not chunks:
         output_path.write_bytes(b"")
         return
-    output_path.write_bytes(chunks[0])
-    if len(chunks) > 1:
-        with output_path.open("ab") as handle:
-            for chunk in chunks[1:]:
-                # Naive concat: wav bodies after the first. Acceptable for the
-                # standard worker contract; a proper wav merger can refine this.
-                handle.write(_strip_wav_header(chunk))
+    if len(chunks) == 1:
+        output_path.write_bytes(chunks[0])
+        return
+    import struct
+
+    parsed = [_wav_format_and_data(chunk) for chunk in chunks]
+    fmt = parsed[0][0]
+    if any(candidate_fmt != fmt for candidate_fmt, _data in parsed[1:]):
+        raise RuntimeError("CosyVoice returned incompatible WAV chunks")
+    audio = b"".join(data for _candidate_fmt, data in parsed)
+    fmt_padding = b"\x00" if len(fmt) % 2 else b""
+    data_padding = b"\x00" if len(audio) % 2 else b""
+    body = (
+        b"WAVE"
+        + b"fmt "
+        + struct.pack("<I", len(fmt))
+        + fmt
+        + fmt_padding
+        + b"data"
+        + struct.pack("<I", len(audio))
+        + audio
+        + data_padding
+    )
+    output_path.write_bytes(b"RIFF" + struct.pack("<I", len(body)) + body)
 
 
-def _strip_wav_header(wav: bytes) -> bytes:
-    """Best-effort strip of a 44-byte wav header."""
-    return wav[44:] if len(wav) > 44 else wav
+def _wav_format_and_data(payload: bytes) -> tuple[bytes, bytes]:
+    import struct
+
+    if len(payload) < 12 or payload[:4] != b"RIFF" or payload[8:12] != b"WAVE":
+        raise RuntimeError("CosyVoice returned an invalid WAV chunk")
+    fmt: bytes | None = None
+    data: bytes | None = None
+    offset = 12
+    while offset + 8 <= len(payload):
+        chunk_id = payload[offset : offset + 4]
+        chunk_size = struct.unpack_from("<I", payload, offset + 4)[0]
+        start = offset + 8
+        end = start + chunk_size
+        if end > len(payload):
+            raise RuntimeError("CosyVoice returned a truncated WAV chunk")
+        if chunk_id == b"fmt ":
+            fmt = payload[start:end]
+        elif chunk_id == b"data":
+            data = payload[start:end]
+        offset = end + (chunk_size % 2)
+    if fmt is None or data is None:
+        raise RuntimeError("CosyVoice WAV chunk is missing fmt or data")
+    return fmt, data

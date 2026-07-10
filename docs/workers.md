@@ -8,7 +8,7 @@ TTS More 通过**非侵入式 worker** 接入三个开源 TTS 服务（GPT-SoVIT
 
 ```mermaid
 flowchart TD
-    App["TTS More 后端<br/>HttpTTSServiceClient"] -- "tts-more-v1 契约<br/>/health /capabilities /load /synthesize /unload" --> Workers
+    App["TTS More 后端<br/>HttpTTSServiceClient"] -- "tts-more-v1 契约<br/>状态、加载、合成、工件传输" --> Workers
     subgraph Workers["非侵入式 worker（本仓 backend/app/workers/）"]
       W1["gpt_sovits_worker.py :9880<br/>import GPT_SoVITS.TTS"]
       W2["indextts_worker.py :9881<br/>import indextts.infer_v2"]
@@ -38,6 +38,12 @@ flowchart TD
 | `POST /load` | 加载/切换模型配置（权重、参考音频）；常驻模式首次加载模型 |
 | `POST /synthesize` | 合成音频，写 wav 到 output_path |
 | `POST /unload` | 释放常驻模型（释放 GPU 显存）；下次 /load 重建 |
+| `GET /status` | 统一报告 `device`、`loaded`、模型和显存 |
+| `POST /upload_ref` | 安全上传参考音频，默认最大 25 MiB |
+| `GET /artifacts/{id}` | 下载 UUID 标识的输出，最大 100 MiB |
+| `DELETE /artifacts/{id}` | 应用校验并落盘后删除远端输出 |
+
+统一上传上限由 `TTS_MORE_MAX_UPLOAD_BYTES` 配置；GPT-SoVITS worker 额外兼容既定的 `GPT_SOVITS_MAX_UPLOAD_BYTES`，其值优先于统一变量。两者未设置时均为 25 MiB。
 
 GPT-SoVITS worker 额外暴露**发现端点**（替代 Gradio scrape + fork api_v2 改造）：
 
@@ -45,8 +51,7 @@ GPT-SoVITS worker 额外暴露**发现端点**（替代 Gradio scrape + fork api
 |---|---|
 | `GET /models` | 列出训练角色 + GPT/SoVITS 权重 + 样本数（按 logs 名前缀配对，按 epoch/step 排序） |
 | `GET /models/{name}/samples` | 训练音频 + 参考文本（解析 `2-name2text.txt` + 扫 `5-wav32k/`） |
-| `GET /status` | 当前权重/版本/设备 |
-| `POST /upload_ref` | 跨机上传参考音频 |
+| `GET /status` | 在统一状态字段之外报告当前权重/版本 |
 
 ## 模型加载策略：常驻 + 可 unload
 
@@ -60,6 +65,8 @@ flowchart LR
 ```
 
 模型在首次 `/load` 时在进程内构造一次并常驻，`/synthesize` 直接调用（低延迟）。`/unload` 释放显存，下次 `/load` 重建。IndexTTS 的每行子进程模式作为 fallback（`TTS_MORE_INDEXTTS_RESIDENT=0`）。
+
+多个服务共享同一 `resource_group` 时，队列在切换 provider 前先调用当前 worker 的 `/unload`，清除加载签名和 load state，再加载目标服务。worker 的 unload 会执行 Python GC，并在 CUDA 可用时调用 cache 释放。统一 `/status` 同时报告 `cuda_runtime` 和 `device_uuid`；正式 CUDA 门禁要求三个 worker 都实际运行在 `12.8`，分布式模式还要求 GPU UUID 互不相同。单机 16 GB 基线要求三个进程同时在线、模型按 `capacity:1` 顺序驻留；多模型并发不作为基础门禁。
 
 ## 启动
 
@@ -94,15 +101,18 @@ python scripts/tts_more_deploy.py render-services --profile local-all --output d
 
 `data/services.json` 的提交模板只声明三个正式 worker（GPT-SoVITS main、IndexTTS、CosyVoice），默认 `enabled:false`、`setup_state:not_configured`。`repo.lock.json` 仍保留 dev/proplus 回归条目；部署脚本只有在显式选择后才会把它们写入 `data/local/services.json`。生成配置会写入 `start_command`/`start_cwd`/`env`/`repo_path`，由 `ServiceSupervisor` 启停，`HttpTTSServiceClient` 自动消费。
 
-## 分布式部署
+## 分布式部署与工件传输
 
-worker 可部署在 LAN/公网 GPU 机器上，本机 TTS More 通过 `services.json` 的 `base_url` 远程调用（设为 `mode: external`、`managed: false`）。远端机器只需：
+worker 可部署在可信 LAN GPU 机器上，本机 TTS More 通过 `services.json` 的 `base_url` 远程调用（`mode: external`、`network_scope: lan`、`managed: false`）。当前 CUDA 发布门禁不覆盖公网、TLS 或反向代理。远端机器只需：
 
-1. 克隆上游 repo + 装 torch + 模型权重；
-2. 运行 `start-service-workers.sh`（或单独启动某个 worker）；
-3. 本机 `data/local/services.json` 指向远端 worker 端口。
+1. 保留轻量 TTS More checkout，获得锁文件、部署脚本和 worker；
+2. 只准备本节点负责的一个上游 repo、torch/CUDA 和模型；
+3. 以 `worker-node --topology ... --node ...` 启动服务；
+4. 应用节点以 `app-only` 渲染每个服务的独立 LAN 地址。
 
-参考音频跨机上传走 `POST /upload_ref`（GPT-SoVITS worker）或本地路径直传（同机）。
+`SynthesizeRequest.delivery` 支持 `path` 和 `artifact`。`path` 默认关闭，部署器仅在 loopback bind 的本机 worker 上设置 `TTS_MORE_WORKER_ALLOW_PATH_DELIVERY=1`；LAN worker 即使收到恶意绝对路径也拒绝写入。外部 worker 强制使用 `artifact`，并且必须声明 `artifact-transfer`。应用把本地参考音频上传到 worker，远端返回 `artifact_id`、`download_url`、`sha256`、`size_bytes`；应用校验大小和 SHA-256 后原子写入本地历史，再删除远端工件。worker 使用 UUID 文件名，未取走工件按 24 小时 TTL 清理；应用侧参考音频上传缓存会在 worker TTL 前失效并重新上传。缺少 capability 时预检失败，不假设共享文件系统。
+
+拓扑和完整协议验证见 [CUDA 全流程闭环验证](cuda-e2e-validation.md)。
 
 ## 参考音频时长限制解除（GPT-SoVITS）
 
@@ -123,6 +133,8 @@ worker 在 import `TTS` 类后、构造实例前，**进程内 monkey-patch** `_
 | `backend/app/workers/indextts_line_launcher.py` | IndexTTS 每行 CLI（子进程模式用） |
 | `backend/app/workers/discovery.py` | 共享发现助手（logs 名提取、权重扫描、name2text 解析） |
 | `backend/app/workers/contracts.py` | 标准请求 schema |
+| `backend/app/workers/artifacts.py` | 三 worker 共用的上传、下载、删除、限额和 TTL 模块 |
+| `backend/app/workers/runtime.py` | 统一 CUDA 状态与显存释放助手 |
 | `backend/app/workers/gpt_sovits_launcher.py` | **LEGACY** runpy 重执行上游 api_v2（被 worker 取代） |
 
 ## 待 GPU 环境验证
@@ -131,4 +143,4 @@ worker 在 import `TTS` 类后、构造实例前，**进程内 monkey-patch** `_
 - CosyVoice 上游 import 路径 + 推理方法签名（`cosyvoice.cli.cosyvoice.CosyVoice`）；
 - IndexTTS 常驻模式推理。
 
-这些在 macOS 上无法验证（无 GPU/torch）。契约与发现层通过后仍不能替代 CUDA 门禁；GPT-SoVITS 收敛代码在真实默认 `v2ProPlus`、显式 `v2Pro` 和 worker 联动通过前不得合入 `main`。
+这些在 macOS 上无法验证（无 GPU/torch）。契约、topology、工件和指标判定单测通过后仍不能替代 CUDA 门禁；GPT-SoVITS 收敛代码在真实默认 `v2ProPlus`、显式 `v2Pro` 和 worker 联动通过前不得合入 `main`。正式步骤见 [CUDA 验证总入口](cuda-e2e-validation.md)。

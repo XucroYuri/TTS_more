@@ -85,8 +85,38 @@ Windows：
 ## 部署 profile
 
 - `local-all`：应用本体和选中的 worker 在同一台机器上，生成 `data/local/services.json`，本机可托管启动。
-- `app-only`：只跑 TTS More 应用，`services.json` 指向局域网或云端 worker。
-- `worker-node`：只在某台 CPU/GPU 机器上准备 repo、模型和 worker，不要求启动前端；渲染出来仍是该机器本地可管理的 worker 配置，通常配合 `--service-ids` 只选择本节点负责的服务。
+- `app-only`：只跑 TTS More 应用；配合 topology 时为每个服务生成独立 LAN 地址，远端服务为 `managed:false`。
+- `worker-node`：只在某台 GPU 机器上准备该节点负责的 repo、模型和 worker，不要求启动前端；必须配合 topology 的节点选择使用。
+
+### Topology manifest
+
+Windows CUDA 验收使用 manifest 明确机器、服务和 GPU 资源归属：
+
+- `deployment/app/topology.single-windows.example.json`：单机应用 + 三个 worker，三服务共享 `cuda-0`、`capacity:1`；
+- `deployment/app/topology.four-node-lan.example.json`：一台应用控制节点 + 三台独立 GPU worker。
+
+复制示例为 `deployment/app/topology.<name>.local.json` 并填入真实 LAN hostname/IP；真实文件已被 git ignore。字段和校验规则见 [CUDA 验证总入口](cuda-e2e-validation.md#topology-manifest)。
+
+单机渲染：
+
+```powershell
+.\scripts\deploy-local-tts.ps1 `
+  -Profile local-all `
+  -Topology deployment\app\topology.single-windows.local.json `
+  -Node gpu-worker `
+  -Device CU128
+```
+
+四机控制节点渲染：
+
+```powershell
+.\scripts\deploy-local-tts.ps1 `
+  -Profile app-only `
+  -Topology deployment\app\topology.four-node-lan.local.json `
+  -Node app-controller
+```
+
+单个 worker 节点把 profile 改为 `worker-node`，并使用 `-Node gpt-worker|index-worker|cosy-worker`。底层 CLI 对应 `--topology` 和 `--node`。分布式基线只支持可信 LAN；公网、TLS 和反向代理不在当前发布门禁内。
 
 ## Network Auto Mode
 
@@ -269,13 +299,19 @@ curl http://127.0.0.1:9881/health
 curl http://127.0.0.1:9882/health
 ```
 
-GPU/真实合成验收需要模型、参考音频和对应硬件：
+聚焦真实合成的 pytest 需要模型、参考音频和对应硬件：
 
 ```bash
 export TTS_MORE_SERVICE_MODE=real
 export TTS_MORE_RUN_REAL_TTS=1
 .venv/bin/python -m pytest backend/tests/test_real_tts_validation.py -q
 ```
+
+正式 Windows CUDA 验收使用 `scripts/run-cuda-validation.ps1`，固定模式为 `single-clean`、`single-release`、`distributed`。它还要求 topology、被忽略的 validation fixture、三 worker 契约、工件传输、资源切换、音频/ASR/性能阈值、Playwright 和人工听审。完整操作见：
+
+- [CUDA 全流程闭环验证](cuda-e2e-validation.md)
+- [单机 runbook](cuda-e2e-single-node.md)
+- [四机 LAN runbook](cuda-e2e-distributed.md)
 
 ## 离线和缓存
 

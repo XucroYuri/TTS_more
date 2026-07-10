@@ -10,7 +10,9 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc && vite build",
-    "test": "vitest run"
+    "test": "vitest run --exclude e2e/**",
+    "cuda:e2e": "playwright test e2e/cuda-workstation.spec.ts",
+    "cuda:e2e:install": "playwright install chromium"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.2",
@@ -24,6 +26,7 @@
     "wavesurfer.js": "^7.12.8"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/react": "^19.2.8",
     "@types/react-dom": "^19.2.3",
     "typescript": "^5.9.3",

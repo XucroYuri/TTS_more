@@ -33,17 +33,16 @@ The pipeline is constructed once at startup and held resident for low latency;
 from __future__ import annotations
 
 import os
-import re
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, UploadFile
-from pydantic import BaseModel
+from fastapi import FastAPI
 
 # The standard worker request schemas.
+from app.workers.artifacts import ArtifactStore, artifact_output, artifact_response, register_artifact_routes
 from app.workers.contracts import LoadRequest, SynthesizeRequest
+from app.workers.runtime import release_cuda_memory, worker_runtime_status
 
 # --- repo bootstrap: put the upstream GPT-SoVITS repo on the path and chdir ---
 REPO_DIR = Path(os.environ.get("TTS_MORE_GPTSOVITS_REPO", "repo/GPT-SoVITS")).resolve(strict=False)
@@ -54,8 +53,8 @@ CONFIG_YAML = os.environ.get("TTS_MORE_GPTSOVITS_CONFIG", "GPT_SoVITS/configs/tt
 # torch/CUDA. _pipeline / _config are populated by _ensure_pipeline().
 _pipeline: Any = None
 _config: Any = None
+_loaded_profile: str | None = None
 _weight_roots: list[Path] = []
-UPLOAD_AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".webm"}
 
 
 def _bootstrap_repo() -> None:
@@ -162,6 +161,15 @@ def _resolve_weight_roots() -> list[Path]:
 app = FastAPI(title="TTS More GPT-SoVITS Worker", version="0.1.0")
 
 
+def _artifact_store() -> ArtifactStore:
+    configured_limit = os.environ.get("GPT_SOVITS_MAX_UPLOAD_BYTES")
+    max_upload_bytes = int(configured_limit) if configured_limit else None
+    return ArtifactStore(REPO_DIR / "uploaded_ref", max_upload_bytes=max_upload_bytes)
+
+
+register_artifact_routes(app, _artifact_store)
+
+
 # ---------------------------------------------------------------------------
 # Standard worker contract
 # ---------------------------------------------------------------------------
@@ -173,6 +181,7 @@ def health() -> dict[str, Any]:
     return {
         "ready": bool(ready),
         "worker": "gpt-sovits-standard",
+        "tts_more_commit": os.environ.get("TTS_MORE_APP_COMMIT", ""),
         "repo_found": REPO_DIR.exists(),
         "pipeline_loaded": _pipeline is not None,
     }
@@ -187,6 +196,7 @@ def capabilities() -> dict[str, Any]:
             "reference-audio-voice",
             "gpt-weights",
             "sovits-weights",
+            "artifact-transfer",
         ]
     }
 
@@ -196,6 +206,7 @@ def load(request: LoadRequest) -> dict[str, Any]:
     """Switch GPT/SoVITS weights. ``parameters`` may carry:
     gpt_weights_path, sovits_weights_path, ref_audio_path, prompt_text, prompt_lang.
     """
+    global _loaded_profile
     pipeline = _ensure_pipeline()
     params = request.parameters or {}
     gpt = params.get("gpt_weights_path")
@@ -207,6 +218,7 @@ def load(request: LoadRequest) -> dict[str, Any]:
     ref = params.get("ref_audio_path")
     if ref:
         pipeline.set_ref_audio(ref)
+    _loaded_profile = request.profile
     return {"status": "loaded", "profile": request.profile}
 
 
@@ -231,22 +243,31 @@ def synthesize(request: SynthesizeRequest) -> dict[str, Any]:
                 "repetition_penalty", "sample_steps", "super_sampling"):
         if opt in params:
             inputs[opt] = params[opt]
-    output_path = Path(request.output_path)
+    store = _artifact_store()
+    output_path, artifact_id = artifact_output(
+        store,
+        request.delivery,
+        Path(request.output_path),
+        str(inputs["media_type"]),
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sampling_rate, audio = _normalize_tts_run_output(pipeline.run(inputs))
     _write_audio(audio, sampling_rate, output_path, inputs["media_type"])
     return {
         "audio_path": str(output_path),
         "metadata": {"sampling_rate": int(sampling_rate), "service": "gpt-sovits-worker"},
+        **artifact_response(store, artifact_id),
     }
 
 
 @app.post("/unload")
 def unload() -> dict[str, Any]:
     """Release the resident pipeline to free GPU memory. Next /load rebuilds it."""
-    global _pipeline, _config
+    global _pipeline, _config, _loaded_profile
     _pipeline = None
     _config = None
+    _loaded_profile = None
+    release_cuda_memory()
     return {"status": "unloaded"}
 
 
@@ -319,43 +340,19 @@ def model_samples(model_name: str) -> dict[str, Any]:
 @app.get("/status")
 def status() -> dict[str, Any]:
     """Current loaded weights / version / device."""
-    _ensure_pipeline()
     cfg = _config
     return {
+        **worker_runtime_status(
+            loaded=_pipeline is not None,
+            model=_loaded_profile or getattr(cfg, "version", None),
+            device_hint=str(getattr(cfg, "device", "") or "") or None,
+        ),
         "ready": _pipeline is not None,
         "version": getattr(cfg, "version", None),
-        "device": str(getattr(cfg, "device", "")),
         "t2s_weights_path": getattr(cfg, "t2s_weights_path", None),
         "vits_weights_path": getattr(cfg, "vits_weights_path", None),
         "languages": list(getattr(cfg, "languages", []) or []),
     }
-
-
-class UploadRefResponse(BaseModel):
-    path: str
-
-
-@app.post("/upload_ref", response_model=UploadRefResponse)
-async def upload_ref(file: UploadFile) -> UploadRefResponse:
-    """Upload a reference audio for cross-machine deployment. Stored under
-    ``uploaded_ref/`` in the repo so it can be referenced by path on /load."""
-    raw_name = (file.filename or "").replace("\\", "/")
-    base_name = Path(raw_name).name
-    suffix = Path(base_name).suffix.lower()
-    if suffix not in UPLOAD_AUDIO_SUFFIXES:
-        raise HTTPException(status_code=400, detail="unsupported audio file")
-    max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
-    content = await file.read(max_upload_bytes + 1)
-    if not content:
-        raise HTTPException(status_code=400, detail="audio file is empty")
-    if len(content) > max_upload_bytes:
-        raise HTTPException(status_code=413, detail="audio file exceeds upload limit")
-    upload_dir = REPO_DIR / "uploaded_ref"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r"[^\w.\-]", "_", base_name) or f"reference{suffix}"
-    target = upload_dir / f"{uuid.uuid4().hex[:16]}_{safe_name}"
-    target.write_bytes(content)
-    return UploadRefResponse(path=str(target))
 
 
 # ---------------------------------------------------------------------------
