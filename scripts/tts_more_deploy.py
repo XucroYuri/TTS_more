@@ -960,7 +960,7 @@ def install_update_scripts(
             "name": repo.get("name"),
             "path": str(repo.get("path")),
             "exists": exists,
-            "scripts": [str(sh_path.relative_to(root)), str(ps1_path.relative_to(root))],
+            "scripts": [sh_path.relative_to(root).as_posix(), ps1_path.relative_to(root).as_posix()],
         }
         reports.append(report)
         if dry_run or not exists:
@@ -993,8 +993,8 @@ def install_repo_bundles(
             "provider_type": provider,
             "path": str(repo.get("path")),
             "exists": repo_path.exists(),
-            "bundle": str(bundle_path.relative_to(root)) if bundle_path.exists() else "",
-            "target": str(target_path.relative_to(root)),
+            "bundle": bundle_path.relative_to(root).as_posix() if bundle_path.exists() else "",
+            "target": target_path.relative_to(root).as_posix(),
             "installed": False,
         }
         reports.append(report)
@@ -1013,7 +1013,7 @@ def install_repo_bundles(
             "variant": repo.get("variant"),
             "branch": repo.get("branch"),
             "commit": repo.get("commit"),
-            "source_bundle": str(REPO_BUNDLE_RELATIVE_PATH / provider),
+            "source_bundle": (REPO_BUNDLE_RELATIVE_PATH / provider).as_posix(),
         }
         write_json(target_path / "tts-more-repo.json", manifest)
         _chmod_shell_scripts(target_path)

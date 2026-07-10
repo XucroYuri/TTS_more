@@ -1036,7 +1036,8 @@ def test_install_update_scripts_writes_repo_local_helpers(tmp_path: Path) -> Non
     ]
     assert "git pull --ff-only origin" in sh_path.read_text(encoding="utf-8")
     assert "git pull --ff-only origin" in ps1_path.read_text(encoding="utf-8")
-    assert sh_path.stat().st_mode & stat.S_IXUSR
+    if os.name != "nt":
+        assert sh_path.stat().st_mode & stat.S_IXUSR
     exclude = (target / ".git" / "info" / "exclude").read_text(encoding="utf-8")
     assert "tts-more-update.sh" in exclude
     assert "tts-more-update.ps1" in exclude
@@ -1105,8 +1106,12 @@ def test_install_repo_bundles_copies_provider_helpers_and_excludes_them(tmp_path
     copied = target / "tts-more" / "tts-more-prepare.sh"
     manifest = json.loads((target / "tts-more" / "tts-more-repo.json").read_text(encoding="utf-8"))
     assert reports[0]["installed"] is True
+    assert manifest["source_bundle"] == "deployment/tts-repos/indextts"
+    assert reports[0]["bundle"] == "deployment/tts-repos/indextts"
+    assert reports[0]["target"] == "repo/index-tts/tts-more"
     assert copied.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash")
-    assert copied.stat().st_mode & stat.S_IXUSR
+    if os.name != "nt":
+        assert copied.stat().st_mode & stat.S_IXUSR
     assert manifest["service_id"] == "local-indextts"
     exclude = (target / ".git" / "info" / "exclude").read_text(encoding="utf-8")
     assert "tts-more/" in exclude
