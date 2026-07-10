@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import struct
 import subprocess
 import sys
@@ -776,6 +777,115 @@ def test_blocker_cli_atomically_replaces_valid_preflight_evidence(
         ",".join(NvidiaSmiMonitor.HEADER)
     ]
     assert list(output.glob(".*.tmp")) == []
+
+
+@pytest.mark.parametrize("stage", ["fault-recovery", "evidence-collection"])
+def test_post_core_blocker_preserves_completed_core_evidence(
+    tmp_path: Path, stage: str
+) -> None:
+    output = tmp_path / f"post-core-{stage}"
+    output.mkdir()
+    fixture_path = _write_fixture(tmp_path)
+    core_report = {
+        "schema_version": 1,
+        "name": "cuda-e2e-validation",
+        "stage": "cuda-validation",
+        "mode": "single-release",
+        "started_at": "2026-07-10T00:00:00+00:00",
+        "finished_at": "2026-07-10T00:01:00+00:00",
+        "passed": True,
+        "certifiable": False,
+        "certification_status": "core_passed_ui_pending",
+        "preflight": [],
+        "services": [
+            {"service_id": service_id, "passed": True, "errors": []}
+            for service_id in FORMAL_SERVICE_IDS.values()
+        ],
+        "cases": [
+            {"name": "core-case-a", "service_id": "local-gpt-sovits-main", "passed": True, "errors": [], "output_path": "core-a.wav"},
+            {"name": "core-case-b", "service_id": "local-cosyvoice", "passed": True, "errors": [], "output_path": "core-b.wav"},
+        ],
+        "cer": {
+            "required": True,
+            "items": [{"name": "core-case-a", "cer": 0.0, "passed": True}],
+            "aggregate_cer": 0.0,
+            "passed": True,
+        },
+        "performance": {
+            "passed": True,
+            "checks": {"no_oom": True, "warm_p95_regression": True},
+            "metrics": {"warm_p95_seconds": 1.25},
+        },
+    }
+    (output / "summary.json").write_text(json.dumps(core_report), encoding="utf-8")
+    (output / "junit.xml").write_text("<old-core-junit />", encoding="utf-8")
+    (output / "human-listening-review.md").write_text("old listening", encoding="utf-8")
+    worker_references = json.dumps(
+        [{"service_id": "local-gpt-sovits-main", "configured_log": "core-worker.log", "status_path": "/status"}],
+        ensure_ascii=False,
+        indent=2,
+    ) + "\n"
+    (output / "worker-log-references.json").write_text(worker_references, encoding="utf-8")
+    gpu_evidence = ",".join(NvidiaSmiMonitor.HEADER) + "\n2026-07-10T00:00:30Z,2026/07/10,0,GPU-core,16384,12000,4384,42\n"
+    (output / "nvidia-smi.csv").write_text(gpu_evidence, encoding="utf-8")
+    common_args = [
+        "--mode",
+        "single-release",
+        "--services",
+        str(tmp_path / "services-not-required.json"),
+        "--fixture",
+        str(fixture_path),
+        "--output",
+        str(output),
+    ]
+
+    exit_code = main(
+        [
+            *common_args,
+            "--write-blocker-stage",
+            stage,
+            "--blocker-message",
+            f"simulated {stage} pipeline failure",
+            "--preserve-existing",
+        ]
+    )
+
+    assert exit_code == 1
+    report = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    for field in ("preflight", "services", "cases", "cer", "performance"):
+        assert report[field] == core_report[field]
+    assert report["passed"] is False
+    assert report["certifiable"] is False
+    assert report["certification_status"] == "post_core_failed"
+    assert report["stage"] == stage
+    assert report["pipeline_failures"] == [
+        {"stage": stage, "message": f"simulated {stage} pipeline failure", "passed": False}
+    ]
+    assert stage in report["next_action"]
+    junit = (output / "junit.xml").read_text(encoding="utf-8")
+    assert int(re.search(r'failures="(\d+)"', junit).group(1)) >= 1
+    assert "pipeline" in junit
+    listening = (output / "human-listening-review.md").read_text(encoding="utf-8")
+    assert "core-case-a" in listening
+    assert "core-case-b" in listening
+    assert (output / "worker-log-references.json").read_text(encoding="utf-8") == worker_references
+    assert (output / "nvidia-smi.csv").read_text(encoding="utf-8") == gpu_evidence
+
+
+def test_preserve_existing_blocker_rejects_non_post_core_stage(tmp_path: Path) -> None:
+    runner = CUDAValidationRunner(
+        mode="single-release",
+        services_path=tmp_path / "services.json",
+        fixture_path=_write_fixture(tmp_path),
+        output_dir=tmp_path / "invalid-preserve-stage",
+    )
+
+    with pytest.raises(ValueError, match="post-core"):
+        runner.write_blocker_report(
+            stage="deployment",
+            message="must not preserve stale preflight evidence",
+            preserve_existing=True,
+        )
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="PowerShell entrypoint is Windows-only")

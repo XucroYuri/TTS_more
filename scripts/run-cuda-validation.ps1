@@ -557,6 +557,7 @@ try {
         if ($TopologyPath) { $blockerArgs += @("--topology", $TopologyPath) }
         if ($Node) { $blockerArgs += @("--node", $Node) }
         if ($isDiagnostic) { $blockerArgs += "--diagnostic" }
+        if ($currentStage -in @("fault-recovery", "evidence-collection")) { $blockerArgs += "--preserve-existing" }
         & $Python @blockerArgs | Out-Null
         if ($LASTEXITCODE -ne 0) { Write-Warning "Unable to write blocker evidence for $currentStage" }
     }

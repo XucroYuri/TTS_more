@@ -33,6 +33,7 @@ from app.services import HttpTTSServiceClient, ServiceRegistry, TTSServiceClient
 
 
 VALIDATION_MODES = ("single-clean", "single-release", "distributed")
+POST_CORE_STAGES = frozenset({"fault-recovery", "evidence-collection"})
 FORMAL_SERVICE_IDS = {
     "gpt_sovits": "local-gpt-sovits-main",
     "indextts": "local-indextts",
@@ -673,7 +674,54 @@ class CUDAValidationRunner:
         _write_report_files(self.output_dir, report, fixture, {}, reset_nvidia=True)
         return report
 
-    def write_blocker_report(self, *, stage: str, message: str) -> dict[str, Any]:
+    def write_blocker_report(
+        self,
+        *,
+        stage: str,
+        message: str,
+        preserve_existing: bool = False,
+    ) -> dict[str, Any]:
+        if preserve_existing:
+            if stage not in POST_CORE_STAGES:
+                raise ValueError("preserve-existing is only allowed for post-core stages")
+            summary_path = self.output_dir / "summary.json"
+            try:
+                report = json.loads(summary_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise ValueError(f"post-core blocker requires an existing core summary: {exc}") from exc
+            required_core_fields = ("services", "cases", "cer", "performance")
+            if (
+                not isinstance(report, dict)
+                or report.get("stage") != "cuda-validation"
+                or report.get("passed") is not True
+                or any(field not in report for field in required_core_fields)
+            ):
+                raise ValueError("post-core blocker requires a completed passing core summary")
+            pipeline_failures = list(report.get("pipeline_failures") or [])
+            pipeline_failures.append(
+                {"stage": stage, "message": message, "passed": False}
+            )
+            report["stage"] = stage
+            report["finished_at"] = datetime.now(timezone.utc).isoformat()
+            report["passed"] = False
+            report["certifiable"] = False
+            report["certification_status"] = "post_core_failed"
+            report["pipeline_failures"] = pipeline_failures
+            report["post_core"] = {"passed": False, "failed_stage": stage}
+            report["blocker_count"] = len(pipeline_failures)
+            report["next_action"] = f"修复 {stage} 流水线阶段后重新运行完整 CUDA 验证。"
+            try:
+                fixture = load_fixture(self.fixture_path)
+            except Exception:
+                fixture = None
+            _write_report_files(
+                self.output_dir,
+                report,
+                fixture,
+                {},
+                preserve_worker_references=True,
+            )
+            return report
         try:
             fixture = load_fixture(self.fixture_path)
         except Exception:
@@ -1078,6 +1126,7 @@ def _write_report_files(
     endpoints: dict[str, TTSServiceEndpoint],
     *,
     reset_nvidia: bool = False,
+    preserve_worker_references: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     evidence_report = _sanitize_evidence(report)
@@ -1105,13 +1154,15 @@ def _write_report_files(
                 "status_path": "/status" if endpoint else None,
             }
         )
-    _atomic_write_report_file(
-        output_dir / "worker-log-references.json",
-        lambda path: path.write_text(
-            json.dumps(log_references, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        ),
-    )
+    worker_references_path = output_dir / "worker-log-references.json"
+    if not preserve_worker_references or not worker_references_path.exists():
+        _atomic_write_report_file(
+            worker_references_path,
+            lambda path: path.write_text(
+                json.dumps(log_references, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            ),
+        )
     nvidia_path = output_dir / "nvidia-smi.csv"
     if reset_nvidia or not nvidia_path.exists():
         _atomic_write_report_file(nvidia_path, _write_nvidia_header)
@@ -1187,6 +1238,10 @@ def _write_junit(path: Path, report: dict[str, Any]) -> None:
         testcases.append(("service-contract", str(service["service_id"]), [str(item) for item in service.get("errors") or []]))
     for case in report.get("cases") or []:
         testcases.append(("cuda-synthesis", str(case["name"]), [str(item) for item in case.get("errors") or []]))
+    for index, failure in enumerate(report.get("pipeline_failures") or []):
+        stage = str(failure.get("stage") or "post-core")
+        errors = [] if failure.get("passed") else [str(failure.get("message") or "pipeline failed")]
+        testcases.append(("pipeline", f"{stage}-{index + 1}", errors))
     if report.get("performance", {}).get("checks"):
         errors = [name for name, passed in report["performance"]["checks"].items() if not passed]
         testcases.append(("quality-gates", "performance", errors))
@@ -1364,6 +1419,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument("--write-blocker-stage")
     parser.add_argument("--blocker-message")
+    parser.add_argument("--preserve-existing", action="store_true")
     parser.add_argument(
         "--require-baseline",
         action="store_true",
@@ -1372,6 +1428,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if bool(args.write_blocker_stage) != bool(args.blocker_message):
         parser.error("--write-blocker-stage and --blocker-message must be provided together")
+    if args.preserve_existing and args.write_blocker_stage not in POST_CORE_STAGES:
+        parser.error("--preserve-existing is only allowed for post-core blocker stages")
     runner = CUDAValidationRunner(
         mode=args.mode,
         services_path=args.services,
@@ -1387,6 +1445,7 @@ def main(argv: list[str] | None = None) -> int:
         report = runner.write_blocker_report(
             stage=args.write_blocker_stage,
             message=args.blocker_message,
+            preserve_existing=args.preserve_existing,
         )
     else:
         report = runner.run_input_preflight() if args.preflight_only else runner.run()

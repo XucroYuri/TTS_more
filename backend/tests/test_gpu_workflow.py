@@ -128,6 +128,11 @@ def test_cuda_entrypoint_rewrites_stale_preflight_pass_on_later_stage_failure() 
     assert wait_stage < wait_call
     assert '"--write-blocker-stage", $currentStage' in entrypoint
     assert '"--blocker-message", $failureMessage' in entrypoint
+    assert (
+        'if ($currentStage -in @("fault-recovery", "evidence-collection")) '
+        '{ $blockerArgs += "--preserve-existing" }'
+    ) in entrypoint
+    assert entrypoint.count('"--preserve-existing"') == 1
     assert 'Write-Host "阻塞：$currentStage 失败；证据：summary.json"' in entrypoint
     catch_index = entrypoint.rindex("} catch {")
     finally_index = entrypoint.rindex("} finally {")
