@@ -79,6 +79,12 @@ HOST_LIMITS_GIB = {
     "single-release": {"repo": 15.0, "temp": 5.0},
     "distributed": {"repo": 15.0, "temp": 5.0},
 }
+
+FORMAL_WORKER_MODULES = {
+    "local-gpt-sovits-main": "app.workers.gpt_sovits_worker:app",
+    "local-indextts": "app.workers.indextts_worker:app",
+    "local-cosyvoice": "app.workers.cosyvoice_worker:app",
+}
 MIN_GPU_TOTAL_MIB = 16000
 MAX_INITIAL_GPU_USED_MIB = 1024
 # large-v3 may need to download before CUDA initialization; never let that child
@@ -1212,6 +1218,7 @@ def start_workers(
     repositories: list[dict[str, Any]] | None = None,
     topology: str | Path | None = None,
     node: str | None = None,
+    pid_manifest: str | Path | None = None,
 ) -> int:
     services = render_services(
         root,
@@ -1226,6 +1233,20 @@ def start_workers(
     app_commit = _git_output(["git", "-C", str(root), "rev-parse", "HEAD"])
     logs_dir = root / "data" / ".runtime" / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = _resolve_project_path(root, str(pid_manifest)) if pid_manifest else None
+    manifest_payload: dict[str, Any] = {"schema_version": 1, "processes": []}
+    if manifest_path is not None and manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("validation process manifest is invalid") from exc
+        if (
+            not isinstance(existing, dict)
+            or existing.get("schema_version") != 1
+            or not isinstance(existing.get("processes"), list)
+        ):
+            raise RuntimeError("validation process manifest is invalid")
+        manifest_payload = existing
     for service in services:
         command = _resolve_command(root, service["start_command"])
         env = {**os.environ, **_resolve_env(root, service.get("env") or {})}
@@ -1250,6 +1271,27 @@ def start_workers(
         process = subprocess.Popen(command, **kwargs)
         log_file.close()
         processes.append(process)
+        if manifest_path is not None:
+            try:
+                executable = _resolve_project_path(root, str(command[0]))
+                expected_module = FORMAL_WORKER_MODULES.get(str(service["service_id"]))
+                if expected_module is None or expected_module not in {str(item) for item in command}:
+                    raise RuntimeError("worker command is not eligible for validation cleanup")
+                creation_date = _windows_process_creation_date(process.pid)
+                manifest_payload["processes"].append(
+                    {
+                        "pid": process.pid,
+                        "creation_date": creation_date,
+                        "executable_path": str(executable),
+                        "project_root": str(root.resolve(strict=False)),
+                        "worker_module": expected_module,
+                        "service_id": str(service["service_id"]),
+                    }
+                )
+                _write_process_manifest(manifest_path, manifest_payload)
+            except Exception:
+                process.terminate()
+                raise RuntimeError("validation worker could not be recorded for owned cleanup") from None
         print(f"{service['service_id']} PID {process.pid} {service['health_url']} log={log_path}")
     if detach:
         return 0
@@ -1259,6 +1301,41 @@ def start_workers(
         for process in processes:
             process.terminate()
         return 130
+
+
+def _windows_process_creation_date(process_id: int) -> str:
+    if os.name != "nt":
+        raise RuntimeError("owned process manifests require Windows")
+    script = (
+        f"$p = $null; for ($i = 0; $i -lt 20 -and $null -eq $p; $i++) {{ "
+        f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {int(process_id)}' "
+        "-ErrorAction SilentlyContinue; if ($null -eq $p) { Start-Sleep -Milliseconds 50 } }; "
+        "if ($null -eq $p) { exit 1 }; [Console]::Write([string]$p.CreationDate)"
+    )
+    completed = subprocess.run(
+        ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    creation_date = completed.stdout.strip()
+    if completed.returncode != 0 or not creation_date:
+        raise RuntimeError("validation process creation identity is unavailable")
+    return creation_date
+
+
+def _write_process_manifest(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -2019,6 +2096,7 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
     start.add_argument("--topology", default=None, help="Optional deployment topology JSON")
     start.add_argument("--node", default=None, help="Worker node name from --topology")
+    start.add_argument("--pid-manifest", default=None, help="Run-local owned process manifest inside the project root")
 
     install_scripts = sub.add_parser(
         "install-update-scripts",
@@ -2149,6 +2227,7 @@ def main(argv: list[str] | None = None) -> int:
             repositories=repositories,
             topology=args.topology,
             node=args.node,
+            pid_manifest=args.pid_manifest,
         )
     if args.command == "install-update-scripts":
         repositories = _load_cli_repositories(root, args.repo_paths)

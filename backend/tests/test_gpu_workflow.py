@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,11 +20,21 @@ FRONTEND_PACKAGE = ROOT / "frontend" / "package.json"
 PLAYWRIGHT_CONFIG = ROOT / "frontend" / "playwright.config.ts"
 CUDA_ENTRYPOINT = ROOT / "scripts" / "run-cuda-validation.ps1"
 CUDA_VALIDATOR = ROOT / "backend" / "app" / "cuda_validation.py"
+CUDA_SANITIZER = ROOT / "scripts" / "sanitize-cuda-evidence.py"
+CUDA_CLEANUP = ROOT / "scripts" / "cleanup-cuda-validation-processes.ps1"
+CUDA_REGISTER = ROOT / "scripts" / "register-cuda-validation-process.ps1"
+CUDA_DISTRIBUTED_CLEANUP = ROOT / "scripts" / "cleanup-distributed-cuda-validation-processes.ps1"
+CUDA_GPU_MONITOR_START = ROOT / "scripts" / "start-cuda-gpu-monitor.ps1"
+CUDA_GPU_MONITOR_STOP = ROOT / "scripts" / "stop-cuda-gpu-monitor.ps1"
 
 
 def _read(path: Path) -> str:
     assert path.is_file(), f"missing required file: {path.relative_to(ROOT)}"
     return path.read_text(encoding="utf-8")
+
+
+def _workflow_payload() -> dict[str, object]:
+    return yaml.load(_read(WORKFLOW), Loader=yaml.BaseLoader)
 
 
 def _powershell_function(source: str, name: str) -> str:
@@ -35,56 +46,284 @@ def _powershell_function(source: str, name: str) -> str:
 
 
 def test_windows_gpu_workflow_declares_triggers_modes_and_runner_contract() -> None:
-    workflow = _read(WORKFLOW)
+    workflow = _workflow_payload()
+    triggers = workflow["on"]
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    jobs = workflow["jobs"]
 
-    assert re.search(r"^name:\s*Windows GPU validation\s*$", workflow, re.MULTILINE)
-    assert "workflow_dispatch:" in workflow
-    assert "release:" in workflow
-    assert "prereleased" in workflow
-    assert "published" in workflow
-    assert "single-clean" in workflow
-    assert "single-release" in workflow
-    assert "distributed" in workflow
-    assert "topology:" in workflow
-    assert "fixture:" in workflow
-    assert "require_baseline:" in workflow
-    runner_lines = re.findall(r"^\s*runs-on:\s*(.+)$", workflow, re.MULTILINE)
-    assert len(runner_lines) == 3
-    assert set(runner_lines) == {"[self-hosted, Windows, X64, cuda, tts-more-gpu]"}
-    assert "concurrency:" in workflow
-    assert "timeout-minutes:" in workflow
+    assert workflow["name"] == "Windows GPU validation"
+    assert set(inputs) == {"mode", "candidate_sha", "require_baseline"}
+    assert inputs["candidate_sha"]["required"] == "true"
+    assert set(inputs["mode"]["options"]) == {
+        "single-clean",
+        "single-release",
+        "distributed",
+    }
+    assert triggers["release"]["types"] == ["published"]
+    assert workflow["concurrency"] == {
+        "group": "windows-gpu-validation-tts-more-cluster",
+        "cancel-in-progress": "false",
+    }
+    assert jobs["single-validation"]["environment"] == "cuda-validation"
+    assert jobs["distributed-validation"]["environment"] == "cuda-validation"
+    candidate_gate = jobs["candidate-release-gate"]
+    assert candidate_gate["environment"] == "cuda-release-approval"
+    assert "needs.distributed-validation.result == 'success'" in candidate_gate["if"]
+    assert "inputs.require_baseline == true" in candidate_gate["if"]
+    assert "always()" not in candidate_gate["if"]
+    assert jobs["published-audit"]["if"] == "${{ github.event_name == 'release' && github.event.action == 'published' }}"
+    assert "release" not in jobs["single-validation"]["if"]
+    assert "release" not in jobs["distributed-validation"]["if"]
 
 
-def test_windows_gpu_workflow_runs_validation_ui_and_preserves_evidence() -> None:
-    workflow = _read(WORKFLOW)
+def test_windows_gpu_workflow_uses_separate_protected_inputs_and_candidate_sha() -> None:
+    workflow = _workflow_payload()
+    jobs = workflow["jobs"]
+    single = jobs["single-validation"]
+    distributed = jobs["distributed-validation"]
 
-    assert "scripts/run-cuda-validation.ps1" in workflow
-    assert "pnpm cuda:e2e" in workflow
-    assert "TTS_MORE_RUN_CUDA_E2E" in workflow
-    assert workflow.count("pip install faster-whisper") == 2
-    assert "TTS_MORE_REQUIRE_BASELINE" in workflow
-    assert workflow.count("$validationParameters = @{") == 2
-    assert workflow.count("$validationParameters.RequireBaseline = $true") == 2
-    assert '"-Mode",' not in workflow
-    assert "github.event_name == 'release' || inputs.require_baseline" in workflow
-    assert "actions/upload-artifact@v4" in workflow
-    assert re.search(r"if:\s*\$\{\{\s*always\(\)\s*\}\}", workflow)
-    for evidence in (
-        "summary.json",
-        "junit.xml",
-        "wav",
-        "logs",
-        "nvidia-smi",
-        "human-listening-review",
-        "orchestration-preflight.json",
+    assert single["env"]["TTS_MORE_CUDA_TOPOLOGY"] == "${{ vars.TTS_MORE_SINGLE_TOPOLOGY }}"
+    assert single["env"]["TTS_MORE_CUDA_FIXTURE"] == "${{ vars.TTS_MORE_SINGLE_FIXTURE }}"
+    assert distributed["env"]["TTS_MORE_CUDA_TOPOLOGY"] == "${{ vars.TTS_MORE_DISTRIBUTED_TOPOLOGY }}"
+    assert distributed["env"]["TTS_MORE_CUDA_FIXTURE"] == "${{ vars.TTS_MORE_DISTRIBUTED_FIXTURE }}"
+    serialized = json.dumps(workflow, ensure_ascii=False)
+    assert "vars.TTS_MORE_CUDA_TOPOLOGY" not in serialized
+    assert "vars.TTS_MORE_CUDA_FIXTURE" not in serialized
+    assert "inputs.topology" not in serialized
+    assert "inputs.fixture" not in serialized
+    assert serialized.count('"ref": "${{ inputs.candidate_sha }}"') == 2
+    assert serialized.count('"clean": "false"') == 2
+
+    for job_name in ("single-validation", "distributed-validation"):
+        steps = jobs[job_name]["steps"]
+        checkout_index = next(index for index, step in enumerate(steps) if step.get("uses") == "actions/checkout@v4")
+        recover_index = next(index for index, step in enumerate(steps) if step.get("name") == "Recover prior owned processes")
+        initialize_index = next(index for index, step in enumerate(steps) if step.get("name") == "Initialize controlled run directories")
+        assert steps[checkout_index]["with"]["clean"] == "false"
+        assert checkout_index < recover_index < initialize_index
+
+    preflight = jobs["candidate-input-preflight"]
+    assert preflight["runs-on"] == "ubuntu-latest"
+    assert set(preflight["env"]) == {"REQUESTED_CANDIDATE_SHA"}
+    assert "^[0-9a-fA-F]{40}$" in preflight["steps"][0]["run"]
+    assert jobs["single-validation"]["needs"] == "candidate-input-preflight"
+    assert jobs["distributed-validation"]["needs"] == "candidate-input-preflight"
+    for job in jobs.values():
+        for step in job.get("steps", []):
+            if "run" in step:
+                assert "${{ inputs." not in step["run"]
+    for protected_name in (
+        "TTS_MORE_API_TOKEN",
+        "TTS_MORE_VALIDATION_SSH_USER",
+        "TTS_MORE_VALIDATION_REMOTE_ROOT",
     ):
-        assert evidence in workflow
+        assert protected_name not in workflow["env"]
+        assert protected_name in single["env"]
+        assert protected_name in distributed["env"]
 
-    assert "stable-release-gate" in workflow
-    assert re.search(r"needs:\s*\[single-validation, distributed-validation\]", workflow)
-    assert "needs.single-validation.result" in workflow
-    assert "needs.distributed-validation.result" in workflow
-    assert not re.search(r"(?im)^\s*(?:&\s*)?(?:ssh|scp)\b", workflow), "remote commands belong in the validator entrypoint"
+
+def test_windows_gpu_workflow_uploads_only_fail_closed_sanitized_evidence() -> None:
+    workflow = _workflow_payload()
+    jobs = workflow["jobs"]
+    workflow_text = _read(WORKFLOW)
+
+    for job_name, raw_name in (
+        ("single-validation", "cuda-single"),
+        ("distributed-validation", "cuda-distributed"),
+    ):
+        steps = jobs[job_name]["steps"]
+        finalizer_index = next(index for index, step in enumerate(steps) if step.get("id") == "finalize-evidence")
+        upload_index = next(index for index, step in enumerate(steps) if step.get("uses") == "actions/upload-artifact@v4")
+        cleanup_index = next(index for index, step in enumerate(steps) if step.get("id") == "cleanup-run-processes")
+        finalizer = steps[finalizer_index]
+        upload = steps[upload_index]
+        cleanup = steps[cleanup_index]
+
+        assert finalizer["if"] == "${{ always() }}"
+        assert "scripts/sanitize-cuda-evidence.py" in finalizer["run"]
+        assert "sanitizer-fallback-raw" in finalizer["run"]
+        assert "Primary evidence sanitization failed" in finalizer["run"]
+        assert finalizer["run"].index("Automatic evidence must not claim final certification") < finalizer["run"].index(
+            "verified=true"
+        )
+        assert cleanup["if"] == "${{ always() }}"
+        assert "scripts/cleanup-cuda-validation-processes.ps1" in cleanup["run"]
+        if job_name == "distributed-validation":
+            assert "scripts/cleanup-distributed-cuda-validation-processes.ps1" in cleanup["run"]
+        assert finalizer_index < upload_index
+        assert cleanup_index < upload_index
+        assert upload["if"] == "${{ always() && steps.finalize-evidence.outputs.verified == 'true' }}"
+        assert "verified=true" in finalizer["run"]
+        assert upload["with"]["if-no-files-found"] == "error"
+        assert upload["with"]["path"] == f"artifacts/{raw_name}-sanitized"
+
+    upload_blocks = "\n".join(
+        step["with"]["path"]
+        for job in jobs.values()
+        for step in job.get("steps", [])
+        if step.get("uses") == "actions/upload-artifact@v4"
+    )
+    for forbidden in ("wav", "logs", "worker-logs", "test-results", "trace", "video", "screenshot", "controller.log"):
+        assert forbidden not in upload_blocks
+    assert "stable-release-gate" not in workflow_text
+    assert "automatic-gate.json" in workflow_text
+    assert "manifest.json" in workflow_text
+
+
+def test_windows_gpu_workflow_recovers_owned_processes_across_mode_switches() -> None:
+    workflow = _workflow_payload()
+    jobs = workflow["jobs"]
+
+    for job_name in ("single-validation", "distributed-validation"):
+        recover = next(
+            step for step in jobs[job_name]["steps"] if step.get("name") == "Recover prior owned processes"
+        )["run"]
+        assert "artifacts\\cuda-single\\process-manifest.json" in recover
+        assert "artifacts\\cuda-distributed\\process-manifest.json" in recover
+        assert "cleanup-distributed-cuda-validation-processes.ps1" in recover
+        assert "Distributed recovery settings must be either complete or empty" in recover
+
+    assert jobs["single-validation"]["env"]["TTS_MORE_DISTRIBUTED_RECOVERY_TOPOLOGY"] == (
+        "${{ vars.TTS_MORE_DISTRIBUTED_TOPOLOGY }}"
+    )
+
+
+def test_windows_gpu_workflow_uses_unique_playwright_projects_and_never_claims_overall_pass() -> None:
+    workflow = _workflow_payload()
+    jobs = workflow["jobs"]
+    single_id = jobs["single-validation"]["env"]["TTS_MORE_CUDA_E2E_PROJECT_ID"]
+    distributed_id = jobs["distributed-validation"]["env"]["TTS_MORE_CUDA_E2E_PROJECT_ID"]
+
+    assert single_id != distributed_id
+    for project_id, label in ((single_id, "single"), (distributed_id, "distributed")):
+        assert label in project_id
+        assert "github.run_id" in project_id
+        assert "github.run_attempt" in project_id
+    workflow_text = _read(WORKFLOW)
+    assert "automatic_passed_human_pending" in workflow_text
+    assert workflow_text.count('if ($gate.automatic_result -ne "通过")') == 2
+    assert "overall_status" not in workflow_text or 'overall_status = "通过"' not in workflow_text
+    assert not re.search(r"(?im)^\s*(?:&\s*)?(?:ssh|scp)\b", workflow_text), "remote commands belong in the validator entrypoint"
+
+
+def test_cuda_process_cleanup_revalidates_run_local_manifest_ownership() -> None:
+    cleanup = _read(CUDA_CLEANUP)
+
+    assert "[Parameter(Mandatory = $true)][string]$Manifest" in cleanup
+    assert "[switch]$Required" in cleanup
+    assert "cleanup blocked: required process manifest is missing" in cleanup
+    assert "Get-CimInstance Win32_Process" in cleanup
+    assert "CreationDate" in cleanup
+    assert "ExecutablePath" in cleanup
+    assert "ProjectRoot" in cleanup
+    assert "WorkerModule" in cleanup
+    assert "Test-PathInsideRoot" in cleanup
+    assert "Test-ExactCommandToken" in cleanup
+    assert cleanup.index("Get-CimInstance Win32_Process") < cleanup.index("Stop-Process")
+    assert "Get-NetTCPConnection" not in cleanup
+    assert "Get-Process" not in cleanup
+    assert "Win32_Process |" not in cleanup
+    assert "Select-Object -ExpandProperty OwningProcess" not in cleanup
+    assert "cleanup blocked: process ownership changed" in cleanup
+    assert "cleanup blocked: unable to stop an owned validation process" in cleanup
+    for module in (
+        "app.main:app",
+        "app.workers.gpt_sovits_worker:app",
+        "app.workers.indextts_worker:app",
+        "app.workers.cosyvoice_worker:app",
+    ):
+        assert module in cleanup
+
+
+def test_cuda_process_registration_records_only_owned_current_checkout_process() -> None:
+    register = _read(CUDA_REGISTER)
+
+    assert "Get-CimInstance Win32_Process" in register
+    assert "CreationDate" in register
+    assert "ExecutablePath" in register
+    assert "Test-PathInsideRoot" in register
+    assert "Test-ExactCommandToken" in register
+    assert "validation process registration blocked" in register
+    assert "Get-NetTCPConnection" not in register
+    assert "Stop-Process" not in register
+    assert "OwningProcess" not in register
+    assert '"frontend-vite"' in register
+    assert "$CommandToken" in register
+    assert "node.exe" in register
+
+
+def test_distributed_worker_replacement_and_cleanup_use_remote_owned_manifests() -> None:
+    entrypoint = _read(CUDA_ENTRYPOINT)
+    deployment = _powershell_function(entrypoint, "Invoke-DistributedDeployment")
+    recovery = _powershell_function(entrypoint, "Invoke-DistributedFaultRecovery")
+    cleanup = _read(CUDA_DISTRIBUTED_CLEANUP)
+
+    assert "cleanup-cuda-validation-processes.ps1" in deployment
+    assert "-PidManifest" in deployment
+    assert "cuda-validation-processes.json" in deployment
+    assert "Get-NetTCPConnection" in deployment
+    assert "Stop-Process" not in deployment
+    assert "-ServiceId" in recovery
+    assert "cleanup-cuda-validation-processes.ps1" in recovery
+    assert "Select-Object -ExpandProperty OwningProcess" not in recovery
+    kill_command = recovery[recovery.index("$killCommand =") : recovery.index("$stopwatch =")]
+    assert "Stop-Process" not in kill_command
+    assert "[Parameter(Mandatory = $true)][string]$Topology" in cleanup
+    assert "EncodedCommand" in cleanup
+    assert "cleanup-cuda-validation-processes.ps1" in cleanup
+    assert "Stop-Process" not in cleanup
+
+    control_plane = _powershell_function(entrypoint, "Start-ValidationControlPlane")
+    assert "register-cuda-validation-process.ps1" in control_plane
+    assert "TTS_MORE_CUDA_PID_MANIFEST" in control_plane
+    assert "Get-NetTCPConnection" in control_plane
+    assert control_plane.index("Start-Process") < control_plane.index("register-cuda-validation-process.ps1")
+
+
+def test_workflow_registers_explicit_vite_process_in_owned_manifest() -> None:
+    workflow = _workflow_payload()
+    for job_name in ("single-validation", "distributed-validation"):
+        playwright = next(
+            step for step in workflow["jobs"][job_name]["steps"] if step.get("id") == "playwright"
+        )["run"]
+        assert "frontend\\node_modules\\vite\\bin\\vite.js" in playwright
+        assert "frontend-vite" in playwright
+        assert "-CommandToken $vitePath" in playwright
+        assert "Start-Process" in playwright
+        assert "register-cuda-validation-process.ps1" in playwright
+
+    cleanup = _read(CUDA_CLEANUP)
+    assert '"frontend-vite"' in cleanup
+    assert "command_token" in cleanup
+    assert "vite.js" in cleanup
+
+
+def test_distributed_gpu_monitor_stop_revalidates_owned_process_identity() -> None:
+    entrypoint = _read(CUDA_ENTRYPOINT)
+    start = _read(CUDA_GPU_MONITOR_START)
+    stop = _read(CUDA_GPU_MONITOR_STOP)
+    distributed_cleanup = _read(CUDA_DISTRIBUTED_CLEANUP)
+
+    assert "start-cuda-gpu-monitor.ps1" in entrypoint
+    assert "stop-cuda-gpu-monitor.ps1" in entrypoint
+    assert "nvidia-smi.pid" not in entrypoint
+    assert "Get-CimInstance Win32_Process" in start
+    assert "CreationDate" in start
+    assert "ExecutablePath" in start
+    assert "ConvertTo-Json" in start
+    assert "Get-NetTCPConnection" not in start
+    assert stop.count("Get-CimInstance Win32_Process") == 2
+    assert "CreationDate" in stop
+    assert "ExecutablePath" in stop
+    assert "nvidia-smi.exe" in stop
+    assert "Get-Command nvidia-smi.exe" in stop
+    assert "CommandLine" in stop
+    assert "Test-ExactCommandToken" in stop
+    assert "--query-gpu=timestamp,index,uuid,memory.total,memory.free,memory.used,utilization.gpu" in stop
+    assert "--loop-ms=2000" in stop
+    assert stop.index("Get-CimInstance Win32_Process") < stop.index("Stop-Process")
+    assert "Get-NetTCPConnection" not in stop
+    assert "stop-cuda-gpu-monitor.ps1" in distributed_cleanup
 
 
 def test_cuda_entrypoint_runs_fixture_preflight_before_deploy_or_wait() -> None:
@@ -108,6 +347,15 @@ def test_cuda_entrypoint_runs_fixture_preflight_before_deploy_or_wait() -> None:
         'if ($Mode -eq "distributed" -and $script:DistributedDeploymentStarted -and '
         '-not $script:DistributedEvidenceCollected)'
     ) in entrypoint
+
+
+def test_cuda_entrypoint_gives_manual_runs_a_run_local_process_manifest() -> None:
+    script = _read(CUDA_ENTRYPOINT)
+
+    assert "$previousCudaPidManifest = $env:TTS_MORE_CUDA_PID_MANIFEST" in script
+    assert 'Join-Path $Output "process-manifest.json"' in script
+    assert "$env:TTS_MORE_CUDA_PID_MANIFEST = $runProcessManifest" in script
+    assert "$env:TTS_MORE_CUDA_PID_MANIFEST = $previousCudaPidManifest" in script
 
 
 def test_cuda_entrypoint_forwards_repo_paths_and_marks_skips_diagnostic() -> None:

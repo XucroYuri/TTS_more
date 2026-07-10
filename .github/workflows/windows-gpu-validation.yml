@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: CUDA validation mode
+        description: CUDA validation mode for this candidate SHA
         required: true
         default: single-release
         type: choice
@@ -12,51 +12,122 @@ on:
           - single-clean
           - single-release
           - distributed
-      topology:
-        description: Runner-local topology manifest path (or configure TTS_MORE_CUDA_TOPOLOGY as a repository variable)
-        required: false
-        type: string
-      fixture:
-        description: Runner-local validation fixture path (or configure TTS_MORE_CUDA_FIXTURE as a repository variable)
-        required: false
+      candidate_sha:
+        description: Exact 40-character candidate commit SHA
+        required: true
         type: string
       require_baseline:
-        description: Require an approved performance baseline; disable only for first certification
+        description: Require the approved warm-performance baseline
         required: true
         default: true
         type: boolean
   release:
-    types: [prereleased, published]
+    types: [published]
 
 concurrency:
-  group: windows-gpu-validation-${{ github.event.release.tag_name || github.ref }}
+  group: windows-gpu-validation-tts-more-cluster
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
-  TTS_MORE_CUDA_TOPOLOGY: ${{ inputs.topology || vars.TTS_MORE_CUDA_TOPOLOGY }}
-  TTS_MORE_CUDA_FIXTURE: ${{ inputs.fixture || vars.TTS_MORE_CUDA_FIXTURE }}
   TTS_MORE_E2E_BASE_URL: http://127.0.0.1:5173
   TTS_MORE_API_TARGET: http://127.0.0.1:8000
   TTS_MORE_SERVICE_MODE: real
-  TTS_MORE_API_TOKEN: ${{ secrets.TTS_MORE_API_TOKEN }}
-  TTS_MORE_VALIDATION_SSH_USER: ${{ vars.TTS_MORE_VALIDATION_SSH_USER }}
-  TTS_MORE_VALIDATION_REMOTE_ROOT: ${{ vars.TTS_MORE_VALIDATION_REMOTE_ROOT }}
-  TTS_MORE_REQUIRE_BASELINE: ${{ github.event_name == 'release' || inputs.require_baseline }}
+  TTS_MORE_AUTOMATIC_SUCCESS_STATUS: automatic_passed_human_pending
 
 jobs:
+  candidate-input-preflight:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    env:
+      REQUESTED_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+    steps:
+      - name: Validate candidate SHA before using a protected runner
+        shell: bash
+        run: |
+          [[ "$REQUESTED_CANDIDATE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo "Candidate SHA must be exactly 40 hexadecimal characters." >&2
+            exit 1
+          }
+
   single-validation:
-    if: >-
-      ${{
-        (github.event_name == 'workflow_dispatch' && inputs.mode != 'distributed') ||
-        github.event_name == 'release'
-      }}
+    needs: candidate-input-preflight
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode != 'distributed' }}
+    environment: cuda-validation
     runs-on: [self-hosted, Windows, X64, cuda, tts-more-gpu]
     timeout-minutes: 360
+    env:
+      TTS_MORE_CUDA_TOPOLOGY: ${{ vars.TTS_MORE_SINGLE_TOPOLOGY }}
+      TTS_MORE_CUDA_FIXTURE: ${{ vars.TTS_MORE_SINGLE_FIXTURE }}
+      TTS_MORE_REPO_PATHS: ${{ vars.TTS_MORE_SINGLE_REPO_PATHS }}
+      TTS_MORE_DISTRIBUTED_RECOVERY_TOPOLOGY: ${{ vars.TTS_MORE_DISTRIBUTED_TOPOLOGY }}
+      TTS_MORE_CUDA_E2E_PROJECT_ID: cuda-single-${{ github.run_id }}-${{ github.run_attempt }}
+      TTS_MORE_CUDA_PID_MANIFEST: artifacts/cuda-single/process-manifest.json
+      TTS_MORE_REQUIRE_BASELINE: ${{ inputs.require_baseline }}
+      REQUESTED_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      TTS_MORE_API_TOKEN: ${{ secrets.TTS_MORE_API_TOKEN }}
+      TTS_MORE_VALIDATION_SSH_USER: ${{ vars.TTS_MORE_VALIDATION_SSH_USER }}
+      TTS_MORE_VALIDATION_REMOTE_ROOT: ${{ vars.TTS_MORE_VALIDATION_REMOTE_ROOT }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          # Preserve the prior run's ignored PID manifest until owned cleanup runs.
+          clean: false
+
+      - name: Verify candidate identity
+        shell: pwsh
+        run: |
+          if ($env:REQUESTED_CANDIDATE_SHA -notmatch '^[0-9a-fA-F]{40}$') { throw "Candidate SHA is invalid" }
+          $actual = (& git rev-parse HEAD).Trim()
+          if (-not $actual.Equals($env:REQUESTED_CANDIDATE_SHA, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Checked-out candidate does not match the requested SHA"
+          }
+
+      - name: Recover prior owned processes
+        shell: pwsh
+        run: |
+          foreach ($manifest in @(
+            "artifacts\cuda-single\process-manifest.json",
+            "artifacts\cuda-distributed\process-manifest.json"
+          )) {
+            & scripts/cleanup-cuda-validation-processes.ps1 -Manifest $manifest
+          }
+          $remoteValues = @(
+            $env:TTS_MORE_DISTRIBUTED_RECOVERY_TOPOLOGY,
+            $env:TTS_MORE_VALIDATION_SSH_USER,
+            $env:TTS_MORE_VALIDATION_REMOTE_ROOT
+          )
+          $configured = @($remoteValues | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+          if ($configured -notin @(0, 3)) {
+            throw "Distributed recovery settings must be either complete or empty"
+          }
+          if ($configured -eq 3) {
+            & scripts/cleanup-distributed-cuda-validation-processes.ps1 `
+              -Topology $env:TTS_MORE_DISTRIBUTED_RECOVERY_TOPOLOGY `
+              -SshUser $env:TTS_MORE_VALIDATION_SSH_USER `
+              -RemoteRoot $env:TTS_MORE_VALIDATION_REMOTE_ROOT
+          }
+
+      - name: Initialize controlled run directories
+        shell: pwsh
+        run: |
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd([char[]]@('\', '/'))
+          $targets = @(
+            "artifacts\cuda-single",
+            "artifacts\cuda-single-sanitized",
+            "frontend\test-results",
+            ".venv"
+          )
+          foreach ($relative in $targets) {
+            $target = [IO.Path]::GetFullPath((Join-Path $workspace $relative))
+            if (-not $target.StartsWith($workspace + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Run directory escaped the current checkout"
+            }
+            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+          }
 
       - uses: pnpm/action-setup@v4
         with:
@@ -82,16 +153,18 @@ jobs:
           pnpm --dir frontend install --frozen-lockfile
           pnpm --dir frontend cuda:e2e:install
 
-      - name: Validate local runner inputs
+      - name: Validate protected runner inputs
+        id: runner-inputs
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TTS_MORE_CUDA_TOPOLOGY)) { throw "CUDA topology path is not configured" }
-          if ([string]::IsNullOrWhiteSpace($env:TTS_MORE_CUDA_FIXTURE)) { throw "CUDA fixture path is not configured" }
+          if ([string]::IsNullOrWhiteSpace($env:TTS_MORE_CUDA_TOPOLOGY)) { throw "Single-node topology is not configured" }
+          if ([string]::IsNullOrWhiteSpace($env:TTS_MORE_CUDA_FIXTURE)) { throw "Single-node fixture is not configured" }
 
       - name: Run CUDA validator
+        id: validator
         shell: pwsh
         env:
-          VALIDATION_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'single-release' }}
+          VALIDATION_MODE: ${{ inputs.mode }}
         run: |
           $validationParameters = @{
             Mode = $env:VALIDATION_MODE
@@ -99,75 +172,221 @@ jobs:
             Fixture = $env:TTS_MORE_CUDA_FIXTURE
             Output = "artifacts\cuda-single"
           }
+          if (-not [string]::IsNullOrWhiteSpace($env:TTS_MORE_REPO_PATHS)) {
+            $validationParameters.RepoPaths = $env:TTS_MORE_REPO_PATHS
+          }
           if ($env:TTS_MORE_REQUIRE_BASELINE -eq "true") { $validationParameters.RequireBaseline = $true }
-          & ./scripts/run-cuda-validation.ps1 @validationParameters
+          & scripts/run-cuda-validation.ps1 @validationParameters
 
       - name: Run CUDA workstation Playwright loop
+        id: playwright
         shell: pwsh
         env:
           TTS_MORE_RUN_CUDA_E2E: "1"
-          TTS_MORE_CUDA_VALIDATION_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'single-release' }}
+          TTS_MORE_CUDA_VALIDATION_MODE: ${{ inputs.mode }}
         run: |
+          foreach ($port in 8000, 5173) {
+            if (@(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue).Count -gt 0) {
+              throw "A required application port is already in use; confirm ownership before continuing"
+            }
+          }
           New-Item -ItemType Directory -Force artifacts\cuda-single\logs | Out-Null
           $backend = Start-Process `
             -FilePath .\.venv\Scripts\python.exe `
             -ArgumentList '-m','uvicorn','app.main:app','--app-dir','backend','--host','127.0.0.1','--port','8000' `
             -RedirectStandardOutput artifacts\cuda-single\logs\app-backend.stdout.log `
             -RedirectStandardError artifacts\cuda-single\logs\app-backend.stderr.log `
+            -WindowStyle Hidden `
             -PassThru
           try {
-            $ready = $false
-            $healthHeaders = @{}
-            if (![string]::IsNullOrWhiteSpace($env:TTS_MORE_API_TOKEN)) {
-              $healthHeaders.Authorization = "Bearer $env:TTS_MORE_API_TOKEN"
-            }
-            for ($attempt = 0; $attempt -lt 60; $attempt += 1) {
-              try {
-                $response = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health -Headers $healthHeaders -TimeoutSec 5
-                if ($response.StatusCode -eq 200) { $ready = $true; break }
-              } catch { Start-Sleep -Seconds 2 }
-            }
-            if (!$ready) { throw "TTS More backend did not become ready" }
-            Push-Location frontend
-            try {
-              pnpm cuda:e2e
-              if ($LASTEXITCODE -ne 0) { throw "Playwright CUDA E2E failed" }
-            } finally { Pop-Location }
-          } finally {
-            if ($backend -and !$backend.HasExited) { Stop-Process -Id $backend.Id -Force }
+            & scripts/register-cuda-validation-process.ps1 `
+              -Manifest $env:TTS_MORE_CUDA_PID_MANIFEST `
+              -ProcessId $backend.Id `
+              -ExecutablePath (Resolve-Path .\.venv\Scripts\python.exe).Path `
+              -WorkerModule 'app.main:app'
+          } catch {
+            if ($backend -and !$backend.HasExited) { Stop-Process -Id $backend.Id -Force -ErrorAction SilentlyContinue }
+            throw "Application process registration failed"
           }
+          $nodePath = (Get-Command node.exe -CommandType Application -ErrorAction Stop).Source
+          $vitePath = (Resolve-Path frontend\node_modules\vite\bin\vite.js).Path
+          $viteArgument = '"' + $vitePath + '"'
+          $frontend = Start-Process `
+            -FilePath $nodePath `
+            -ArgumentList @($viteArgument, "--host", "127.0.0.1", "--port", "5173", "--strictPort") `
+            -WorkingDirectory frontend `
+            -RedirectStandardOutput artifacts\cuda-single\logs\app-frontend.stdout.log `
+            -RedirectStandardError artifacts\cuda-single\logs\app-frontend.stderr.log `
+            -WindowStyle Hidden `
+            -PassThru
+          try {
+            & scripts/register-cuda-validation-process.ps1 `
+              -Manifest $env:TTS_MORE_CUDA_PID_MANIFEST `
+              -ProcessId $frontend.Id `
+              -ExecutablePath $nodePath `
+              -WorkerModule 'frontend-vite' `
+              -CommandToken $vitePath
+          } catch {
+            if ($frontend -and !$frontend.HasExited) { Stop-Process -Id $frontend.Id -Force -ErrorAction SilentlyContinue }
+            throw "Frontend process registration failed"
+          }
+          $ready = $false
+          $healthHeaders = @{}
+          if (![string]::IsNullOrWhiteSpace($env:TTS_MORE_API_TOKEN)) {
+            $healthHeaders.Authorization = "Bearer $env:TTS_MORE_API_TOKEN"
+          }
+          for ($attempt = 0; $attempt -lt 60; $attempt += 1) {
+            try {
+              $response = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health -Headers $healthHeaders -TimeoutSec 5
+              if ($response.StatusCode -eq 200) { $ready = $true; break }
+            } catch { Start-Sleep -Seconds 2 }
+          }
+          if (!$ready) { throw "TTS More backend did not become ready" }
+          Push-Location frontend
+          try {
+            pnpm cuda:e2e
+            if ($LASTEXITCODE -ne 0) { throw "Playwright CUDA E2E failed" }
+          } finally { Pop-Location }
 
-      - name: Upload single-node validation evidence
+      - name: Clean up run-owned processes
+        id: cleanup-run-processes
         if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $required = '${{ steps.validator.outcome }}' -ne 'skipped'
+          & scripts/cleanup-cuda-validation-processes.ps1 `
+            -Manifest $env:TTS_MORE_CUDA_PID_MANIFEST `
+            -Required:$required
+
+      - name: Finalize sanitized evidence
+        id: finalize-evidence
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          VALIDATION_MODE: ${{ inputs.mode }}
+        run: |
+          $raw = "artifacts\cuda-single"
+          New-Item -ItemType Directory -Force $raw | Out-Null
+          if (Test-Path -LiteralPath frontend\test-results\playwright-junit.xml) {
+            Copy-Item -LiteralPath frontend\test-results\playwright-junit.xml -Destination "$raw\playwright-junit.xml"
+          }
+          python scripts/sanitize-cuda-evidence.py `
+            --raw $raw `
+            --output artifacts\cuda-single-sanitized `
+            --mode $env:VALIDATION_MODE `
+            --core-outcome '${{ steps.validator.outcome }}' `
+            --playwright-outcome '${{ steps.playwright.outcome }}' `
+            --cleanup-outcome '${{ steps['cleanup-run-processes'].outcome }}'
+          $primarySanitizationFailed = $LASTEXITCODE -ne 0
+          if ($primarySanitizationFailed) {
+            $fallbackRaw = "artifacts\cuda-single-sanitizer-fallback-raw"
+            Remove-Item -LiteralPath $fallbackRaw -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force $fallbackRaw | Out-Null
+            python scripts/sanitize-cuda-evidence.py `
+              --raw $fallbackRaw `
+              --output artifacts\cuda-single-sanitized `
+              --mode $env:VALIDATION_MODE `
+              --core-outcome failure `
+              --playwright-outcome skipped `
+              --cleanup-outcome '${{ steps['cleanup-run-processes'].outcome }}'
+            if ($LASTEXITCODE -ne 0) { throw "Fallback evidence sanitization failed closed" }
+          }
+          python scripts/sanitize-cuda-evidence.py --output artifacts\cuda-single-sanitized --verify-only
+          if ($LASTEXITCODE -ne 0) { throw "Sanitized evidence verification failed" }
+          $gate = Get-Content artifacts\cuda-single-sanitized\automatic-gate.json -Raw | ConvertFrom-Json
+          if ($gate.overall_result -eq "通过") { throw "Automatic evidence must not claim final certification" }
+          if ($gate.automatic_result -eq "通过" -and $gate.certification_status -ne $env:TTS_MORE_AUTOMATIC_SUCCESS_STATUS) {
+            throw "Automatic success status is inconsistent"
+          }
+          "verified=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ($primarySanitizationFailed) { throw "Primary evidence sanitization failed; verified blocker evidence remains uploadable" }
+          if ($gate.automatic_result -ne "通过") { throw "Automatic CUDA gate did not pass; sanitized evidence remains uploadable" }
+
+      - name: Upload sanitized single-node evidence
+        if: ${{ always() && steps.finalize-evidence.outputs.verified == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: windows-gpu-single-${{ github.run_id }}
-          if-no-files-found: warn
+          name: windows-gpu-single-sanitized-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
           retention-days: 30
-          path: |
-            artifacts/cuda-single/summary.json
-            artifacts/cuda-single/junit.xml
-            artifacts/cuda-single/wav/**
-            artifacts/cuda-single/logs/**
-            artifacts/cuda-single/controller.log
-            artifacts/cuda-single/worker-log-references.json
-            artifacts/cuda-single/nvidia-smi.csv
-            artifacts/cuda-single/human-listening-review.md
-            artifacts/cuda-single/orchestration-preflight.json
-            frontend/test-results/**
+          path: artifacts/cuda-single-sanitized
 
   distributed-validation:
-    needs: single-validation
-    if: >-
-      ${{
-        always() &&
-        ((github.event_name == 'workflow_dispatch' && inputs.mode == 'distributed') ||
-          (github.event_name == 'release' && github.event.action == 'published' && github.event.release.prerelease == false))
-      }}
+    needs: candidate-input-preflight
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'distributed' }}
+    environment: cuda-validation
     runs-on: [self-hosted, Windows, X64, cuda, tts-more-gpu]
     timeout-minutes: 360
+    env:
+      TTS_MORE_CUDA_TOPOLOGY: ${{ vars.TTS_MORE_DISTRIBUTED_TOPOLOGY }}
+      TTS_MORE_CUDA_FIXTURE: ${{ vars.TTS_MORE_DISTRIBUTED_FIXTURE }}
+      TTS_MORE_REPO_PATHS: ${{ vars.TTS_MORE_DISTRIBUTED_REPO_PATHS }}
+      TTS_MORE_DISTRIBUTED_RECOVERY_TOPOLOGY: ${{ vars.TTS_MORE_DISTRIBUTED_TOPOLOGY }}
+      TTS_MORE_CUDA_E2E_PROJECT_ID: cuda-distributed-${{ github.run_id }}-${{ github.run_attempt }}
+      TTS_MORE_CUDA_PID_MANIFEST: artifacts/cuda-distributed/process-manifest.json
+      TTS_MORE_REQUIRE_BASELINE: ${{ inputs.require_baseline }}
+      REQUESTED_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      TTS_MORE_API_TOKEN: ${{ secrets.TTS_MORE_API_TOKEN }}
+      TTS_MORE_VALIDATION_SSH_USER: ${{ vars.TTS_MORE_VALIDATION_SSH_USER }}
+      TTS_MORE_VALIDATION_REMOTE_ROOT: ${{ vars.TTS_MORE_VALIDATION_REMOTE_ROOT }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          # Preserve the prior run's ignored PID manifest until owned cleanup runs.
+          clean: false
+
+      - name: Verify candidate identity
+        shell: pwsh
+        run: |
+          if ($env:REQUESTED_CANDIDATE_SHA -notmatch '^[0-9a-fA-F]{40}$') { throw "Candidate SHA is invalid" }
+          $actual = (& git rev-parse HEAD).Trim()
+          if (-not $actual.Equals($env:REQUESTED_CANDIDATE_SHA, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Checked-out candidate does not match the requested SHA"
+          }
+
+      - name: Recover prior owned processes
+        shell: pwsh
+        run: |
+          foreach ($manifest in @(
+            "artifacts\cuda-single\process-manifest.json",
+            "artifacts\cuda-distributed\process-manifest.json"
+          )) {
+            & scripts/cleanup-cuda-validation-processes.ps1 -Manifest $manifest
+          }
+          $remoteValues = @(
+            $env:TTS_MORE_DISTRIBUTED_RECOVERY_TOPOLOGY,
+            $env:TTS_MORE_VALIDATION_SSH_USER,
+            $env:TTS_MORE_VALIDATION_REMOTE_ROOT
+          )
+          $configured = @($remoteValues | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+          if ($configured -notin @(0, 3)) {
+            throw "Distributed recovery settings must be either complete or empty"
+          }
+          if ($configured -eq 3) {
+            & scripts/cleanup-distributed-cuda-validation-processes.ps1 `
+              -Topology $env:TTS_MORE_DISTRIBUTED_RECOVERY_TOPOLOGY `
+              -SshUser $env:TTS_MORE_VALIDATION_SSH_USER `
+              -RemoteRoot $env:TTS_MORE_VALIDATION_REMOTE_ROOT
+          }
+
+      - name: Initialize controlled run directories
+        shell: pwsh
+        run: |
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd([char[]]@('\', '/'))
+          $targets = @(
+            "artifacts\cuda-distributed",
+            "artifacts\cuda-distributed-sanitized",
+            "frontend\test-results",
+            ".venv"
+          )
+          foreach ($relative in $targets) {
+            $target = [IO.Path]::GetFullPath((Join-Path $workspace $relative))
+            if (-not $target.StartsWith($workspace + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Run directory escaped the current checkout"
+            }
+            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+          }
 
       - uses: pnpm/action-setup@v4
         with:
@@ -193,13 +412,15 @@ jobs:
           pnpm --dir frontend install --frozen-lockfile
           pnpm --dir frontend cuda:e2e:install
 
-      - name: Validate distributed runner inputs
+      - name: Validate protected runner inputs
+        id: runner-inputs
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TTS_MORE_CUDA_TOPOLOGY)) { throw "CUDA topology path is not configured" }
-          if ([string]::IsNullOrWhiteSpace($env:TTS_MORE_CUDA_FIXTURE)) { throw "CUDA fixture path is not configured" }
+          if ([string]::IsNullOrWhiteSpace($env:TTS_MORE_CUDA_TOPOLOGY)) { throw "Distributed topology is not configured" }
+          if ([string]::IsNullOrWhiteSpace($env:TTS_MORE_CUDA_FIXTURE)) { throw "Distributed fixture is not configured" }
 
       - name: Run distributed CUDA validator
+        id: validator
         shell: pwsh
         run: |
           $validationParameters = @{
@@ -208,75 +429,178 @@ jobs:
             Fixture = $env:TTS_MORE_CUDA_FIXTURE
             Output = "artifacts\cuda-distributed"
           }
+          if (-not [string]::IsNullOrWhiteSpace($env:TTS_MORE_REPO_PATHS)) {
+            $validationParameters.RepoPaths = $env:TTS_MORE_REPO_PATHS
+          }
           if ($env:TTS_MORE_REQUIRE_BASELINE -eq "true") { $validationParameters.RequireBaseline = $true }
-          & ./scripts/run-cuda-validation.ps1 @validationParameters
+          & scripts/run-cuda-validation.ps1 @validationParameters
 
       - name: Run distributed workstation Playwright loop
+        id: playwright
         shell: pwsh
         env:
           TTS_MORE_RUN_CUDA_E2E: "1"
           TTS_MORE_CUDA_VALIDATION_MODE: distributed
         run: |
+          foreach ($port in 8000, 5173) {
+            if (@(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue).Count -gt 0) {
+              throw "A required application port is already in use; confirm ownership before continuing"
+            }
+          }
           New-Item -ItemType Directory -Force artifacts\cuda-distributed\logs | Out-Null
           $backend = Start-Process `
             -FilePath .\.venv\Scripts\python.exe `
             -ArgumentList '-m','uvicorn','app.main:app','--app-dir','backend','--host','127.0.0.1','--port','8000' `
             -RedirectStandardOutput artifacts\cuda-distributed\logs\app-backend.stdout.log `
             -RedirectStandardError artifacts\cuda-distributed\logs\app-backend.stderr.log `
+            -WindowStyle Hidden `
             -PassThru
           try {
-            $ready = $false
-            $healthHeaders = @{}
-            if (![string]::IsNullOrWhiteSpace($env:TTS_MORE_API_TOKEN)) {
-              $healthHeaders.Authorization = "Bearer $env:TTS_MORE_API_TOKEN"
-            }
-            for ($attempt = 0; $attempt -lt 60; $attempt += 1) {
-              try {
-                $response = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health -Headers $healthHeaders -TimeoutSec 5
-                if ($response.StatusCode -eq 200) { $ready = $true; break }
-              } catch { Start-Sleep -Seconds 2 }
-            }
-            if (!$ready) { throw "TTS More backend did not become ready" }
-            Push-Location frontend
-            try {
-              pnpm cuda:e2e
-              if ($LASTEXITCODE -ne 0) { throw "Playwright CUDA E2E failed" }
-            } finally { Pop-Location }
-          } finally {
-            if ($backend -and !$backend.HasExited) { Stop-Process -Id $backend.Id -Force }
+            & scripts/register-cuda-validation-process.ps1 `
+              -Manifest $env:TTS_MORE_CUDA_PID_MANIFEST `
+              -ProcessId $backend.Id `
+              -ExecutablePath (Resolve-Path .\.venv\Scripts\python.exe).Path `
+              -WorkerModule 'app.main:app'
+          } catch {
+            if ($backend -and !$backend.HasExited) { Stop-Process -Id $backend.Id -Force -ErrorAction SilentlyContinue }
+            throw "Application process registration failed"
           }
+          $nodePath = (Get-Command node.exe -CommandType Application -ErrorAction Stop).Source
+          $vitePath = (Resolve-Path frontend\node_modules\vite\bin\vite.js).Path
+          $viteArgument = '"' + $vitePath + '"'
+          $frontend = Start-Process `
+            -FilePath $nodePath `
+            -ArgumentList @($viteArgument, "--host", "127.0.0.1", "--port", "5173", "--strictPort") `
+            -WorkingDirectory frontend `
+            -RedirectStandardOutput artifacts\cuda-distributed\logs\app-frontend.stdout.log `
+            -RedirectStandardError artifacts\cuda-distributed\logs\app-frontend.stderr.log `
+            -WindowStyle Hidden `
+            -PassThru
+          try {
+            & scripts/register-cuda-validation-process.ps1 `
+              -Manifest $env:TTS_MORE_CUDA_PID_MANIFEST `
+              -ProcessId $frontend.Id `
+              -ExecutablePath $nodePath `
+              -WorkerModule 'frontend-vite' `
+              -CommandToken $vitePath
+          } catch {
+            if ($frontend -and !$frontend.HasExited) { Stop-Process -Id $frontend.Id -Force -ErrorAction SilentlyContinue }
+            throw "Frontend process registration failed"
+          }
+          $ready = $false
+          $healthHeaders = @{}
+          if (![string]::IsNullOrWhiteSpace($env:TTS_MORE_API_TOKEN)) {
+            $healthHeaders.Authorization = "Bearer $env:TTS_MORE_API_TOKEN"
+          }
+          for ($attempt = 0; $attempt -lt 60; $attempt += 1) {
+            try {
+              $response = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health -Headers $healthHeaders -TimeoutSec 5
+              if ($response.StatusCode -eq 200) { $ready = $true; break }
+            } catch { Start-Sleep -Seconds 2 }
+          }
+          if (!$ready) { throw "TTS More backend did not become ready" }
+          Push-Location frontend
+          try {
+            pnpm cuda:e2e
+            if ($LASTEXITCODE -ne 0) { throw "Playwright CUDA E2E failed" }
+          } finally { Pop-Location }
 
-      - name: Upload distributed validation evidence
+      - name: Clean up run-owned processes
+        id: cleanup-run-processes
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-gpu-distributed-${{ github.run_id }}
-          if-no-files-found: warn
-          retention-days: 30
-          path: |
-            artifacts/cuda-distributed/summary.json
-            artifacts/cuda-distributed/junit.xml
-            artifacts/cuda-distributed/wav/**
-            artifacts/cuda-distributed/logs/**
-            artifacts/cuda-distributed/controller.log
-            artifacts/cuda-distributed/worker-log-references.json
-            artifacts/cuda-distributed/nvidia-smi.csv
-            artifacts/cuda-distributed/human-listening-review.md
-            artifacts/cuda-distributed/orchestration-preflight.json
-            artifacts/cuda-distributed/fault-recovery.json
-            artifacts/cuda-distributed/recovery/**
-            artifacts/cuda-distributed/worker-logs/**
-            artifacts/cuda-distributed/distributed-evidence.json
-            frontend/test-results/**
-
-  stable-release-gate:
-    needs: [single-validation, distributed-validation]
-    if: ${{ always() && github.event_name == 'release' && github.event.action == 'published' && github.event.release.prerelease == false }}
-    runs-on: [self-hosted, Windows, X64, cuda, tts-more-gpu]
-    timeout-minutes: 10
-    steps:
-      - name: Require both stable-release CUDA validations
         shell: pwsh
         run: |
-          if ('${{ needs.single-validation.result }}' -ne 'success') { throw "Single-node CUDA validation did not pass" }
-          if ('${{ needs.distributed-validation.result }}' -ne 'success') { throw "Distributed CUDA validation did not pass" }
+          $failed = $false
+          $localRequired = '${{ steps.playwright.outcome }}' -ne 'skipped'
+          $remoteRequired = '${{ steps.validator.outcome }}' -ne 'skipped'
+          try {
+            & scripts/cleanup-cuda-validation-processes.ps1 `
+              -Manifest $env:TTS_MORE_CUDA_PID_MANIFEST `
+              -Required:$localRequired
+          } catch { $failed = $true }
+          try {
+            & scripts/cleanup-distributed-cuda-validation-processes.ps1 `
+              -Topology $env:TTS_MORE_CUDA_TOPOLOGY `
+              -SshUser $env:TTS_MORE_VALIDATION_SSH_USER `
+              -RemoteRoot $env:TTS_MORE_VALIDATION_REMOTE_ROOT `
+              -Required:$remoteRequired
+          } catch { $failed = $true }
+          if ($failed) { throw "One or more owned-process cleanups failed" }
+
+      - name: Finalize sanitized evidence
+        id: finalize-evidence
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $raw = "artifacts\cuda-distributed"
+          New-Item -ItemType Directory -Force $raw | Out-Null
+          if (Test-Path -LiteralPath frontend\test-results\playwright-junit.xml) {
+            Copy-Item -LiteralPath frontend\test-results\playwright-junit.xml -Destination "$raw\playwright-junit.xml"
+          }
+          python scripts/sanitize-cuda-evidence.py `
+            --raw $raw `
+            --output artifacts\cuda-distributed-sanitized `
+            --mode distributed `
+            --core-outcome '${{ steps.validator.outcome }}' `
+            --playwright-outcome '${{ steps.playwright.outcome }}' `
+            --cleanup-outcome '${{ steps['cleanup-run-processes'].outcome }}'
+          $primarySanitizationFailed = $LASTEXITCODE -ne 0
+          if ($primarySanitizationFailed) {
+            $fallbackRaw = "artifacts\cuda-distributed-sanitizer-fallback-raw"
+            Remove-Item -LiteralPath $fallbackRaw -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force $fallbackRaw | Out-Null
+            python scripts/sanitize-cuda-evidence.py `
+              --raw $fallbackRaw `
+              --output artifacts\cuda-distributed-sanitized `
+              --mode distributed `
+              --core-outcome failure `
+              --playwright-outcome skipped `
+              --cleanup-outcome '${{ steps['cleanup-run-processes'].outcome }}'
+            if ($LASTEXITCODE -ne 0) { throw "Fallback evidence sanitization failed closed" }
+          }
+          python scripts/sanitize-cuda-evidence.py --output artifacts\cuda-distributed-sanitized --verify-only
+          if ($LASTEXITCODE -ne 0) { throw "Sanitized evidence verification failed" }
+          $gate = Get-Content artifacts\cuda-distributed-sanitized\automatic-gate.json -Raw | ConvertFrom-Json
+          if ($gate.overall_result -eq "通过") { throw "Automatic evidence must not claim final certification" }
+          if ($gate.automatic_result -eq "通过" -and $gate.certification_status -ne $env:TTS_MORE_AUTOMATIC_SUCCESS_STATUS) {
+            throw "Automatic success status is inconsistent"
+          }
+          "verified=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ($primarySanitizationFailed) { throw "Primary evidence sanitization failed; verified blocker evidence remains uploadable" }
+          if ($gate.automatic_result -ne "通过") { throw "Automatic CUDA gate did not pass; sanitized evidence remains uploadable" }
+
+      - name: Upload sanitized distributed evidence
+        if: ${{ always() && steps.finalize-evidence.outputs.verified == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-gpu-distributed-sanitized-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: artifacts/cuda-distributed-sanitized
+
+  candidate-release-gate:
+    needs: distributed-validation
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'distributed' && inputs.require_baseline == true && needs.distributed-validation.result == 'success' }}
+    environment: cuda-release-approval
+    runs-on: ubuntu-latest
+    env:
+      ACCEPTED_CANDIDATE_SHA: ${{ vars.TTS_MORE_ACCEPTED_CANDIDATE_SHA }}
+      ACCEPTANCE_RECORD_SHA256: ${{ vars.TTS_MORE_ACCEPTANCE_RECORD_SHA256 }}
+      REQUESTED_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+    steps:
+      - name: Bind protected acceptance to the candidate
+        shell: bash
+        run: |
+          test "${{ needs.distributed-validation.result }}" = "success"
+          test "${ACCEPTED_CANDIDATE_SHA}" = "${REQUESTED_CANDIDATE_SHA}"
+          [[ "${ACCEPTANCE_RECORD_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          echo "Protected candidate acceptance is bound; publication remains a separate authorized action."
+
+  published-audit:
+    if: ${{ github.event_name == 'release' && github.event.action == 'published' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark post-release audit scope
+        shell: bash
+        run: |
+          echo "Post-release audit only: this event never approves or blocks the already-published release."

@@ -12,7 +12,9 @@ import csv
 import hashlib
 import json
 import math
+import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
@@ -314,12 +316,26 @@ def _automatic_gate(
     *,
     source_present: bool,
     source_valid: bool,
+    source_core_passed: bool,
     source_status: str,
     core_outcome: str,
     playwright_outcome: str,
+    cleanup_outcome: str,
     shareable_evidence_complete: bool,
 ) -> dict[str, Any]:
     if not source_present or not source_valid or source_status == "blocked":
+        automatic_result = "阻塞"
+        overall_result = "阻塞"
+        status = "blocked"
+    elif source_status == "diagnostic_core_passed":
+        automatic_result = "阻塞"
+        overall_result = "阻塞"
+        status = "diagnostic_core_passed"
+    elif source_status == "core_failed" or not source_core_passed:
+        automatic_result = "失败"
+        overall_result = "失败"
+        status = "core_failed"
+    elif source_status not in {"core_passed_ui_pending", "automatic_passed_human_pending"}:
         automatic_result = "阻塞"
         overall_result = "阻塞"
         status = "blocked"
@@ -327,6 +343,14 @@ def _automatic_gate(
         automatic_result = "失败" if core_outcome == "failure" else "阻塞"
         overall_result = automatic_result
         status = "core_failed" if core_outcome == "failure" else "blocked"
+    elif cleanup_outcome == "failure":
+        automatic_result = "失败"
+        overall_result = "失败"
+        status = "core_failed"
+    elif cleanup_outcome != "success":
+        automatic_result = "阻塞"
+        overall_result = "阻塞"
+        status = "core_passed_ui_pending"
     elif playwright_outcome == "failure":
         automatic_result = "失败"
         overall_result = "失败"
@@ -346,6 +370,7 @@ def _automatic_gate(
         "certification_status": status,
         "core_outcome": core_outcome,
         "playwright_outcome": playwright_outcome,
+        "cleanup_outcome": cleanup_outcome,
     }
 
 
@@ -381,8 +406,9 @@ def _number_text(value: str) -> str:
     return str(int(number)) if number.is_integer() else format(number, ".12g")
 
 
-def _write_gpu_csv(raw_dir: Path, output_path: Path) -> int:
+def _write_gpu_csv(raw_dir: Path, output_path: Path, *, mode: str) -> tuple[int, int, int]:
     header = [
+        "source",
         "sample",
         "index",
         "memory_total_mib",
@@ -397,33 +423,71 @@ def _write_gpu_csv(raw_dir: Path, output_path: Path) -> int:
             with source.open("r", encoding="utf-8-sig", newline="") as handle:
                 reader = csv.DictReader(handle)
                 required = {
+                    "captured_at",
+                    "gpu_timestamp",
                     "index",
                     "uuid",
-                    "memory.total",
-                    "memory.free",
-                    "memory.used",
-                    "utilization.gpu",
+                    "memory_total_mib",
+                    "memory_free_mib",
+                    "memory_used_mib",
+                    "utilization_gpu_percent",
                 }
                 if not reader.fieldnames or not required.issubset(reader.fieldnames):
                     raise EvidenceSanitizationError("GPU evidence has an unexpected schema")
                 for sample, row in enumerate(reader, start=1):
                     rows.append(
                         [
+                            "controller",
                             str(sample),
                             _number_text(str(row["index"])),
-                            _number_text(str(row["memory.total"])),
-                            _number_text(str(row["memory.free"])),
-                            _number_text(str(row["memory.used"])),
-                            _number_text(str(row["utilization.gpu"])),
+                            _number_text(str(row["memory_total_mib"])),
+                            _number_text(str(row["memory_free_mib"])),
+                            _number_text(str(row["memory_used_mib"])),
+                            _number_text(str(row["utilization_gpu_percent"])),
                         ]
                     )
         except (OSError, UnicodeError, csv.Error, TypeError, ValueError) as exc:
             raise EvidenceSanitizationError("GPU evidence cannot be sanitized") from exc
+
+    controller_sample_count = len(rows)
+    remote_source_count = 0
+    if mode == "distributed":
+        worker_root = raw_dir / "worker-logs"
+        remote_paths = sorted(worker_root.glob("*/nvidia-smi.csv")) if worker_root.is_dir() else []
+        for source_index, remote_path in enumerate(remote_paths, start=1):
+            source = f"worker-{source_index}"
+            source_rows = 0
+            try:
+                with remote_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                    for sample, raw_row in enumerate(csv.reader(handle), start=1):
+                        if not raw_row or all(not item.strip() for item in raw_row):
+                            continue
+                        if len(raw_row) != 7:
+                            raise EvidenceSanitizationError("remote GPU evidence has an unexpected schema")
+                        _timestamp, index, _uuid, total, free, used, utilization = raw_row
+                        rows.append(
+                            [
+                                source,
+                                str(sample),
+                                _number_text(index.strip()),
+                                _number_text(total.strip()),
+                                _number_text(free.strip()),
+                                _number_text(used.strip()),
+                                _number_text(utilization.strip()),
+                            ]
+                        )
+                        source_rows += 1
+            except EvidenceSanitizationError:
+                raise
+            except (OSError, UnicodeError, csv.Error, TypeError, ValueError) as exc:
+                raise EvidenceSanitizationError("remote GPU evidence cannot be sanitized") from exc
+            if source_rows > 0:
+                remote_source_count += 1
     with output_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(header)
         writer.writerows(rows)
-    return len(rows)
+    return len(rows), controller_sample_count, remote_source_count
 
 
 def _write_worker_references(raw_dir: Path, output_path: Path) -> set[str]:
@@ -507,6 +571,40 @@ def verify_sanitized_bundle(output_dir: Path) -> dict[str, Any]:
             raise EvidenceSanitizationError(f"sanitized file size mismatch: {name}")
         _assert_no_sensitive_content(path)
     _assert_no_sensitive_content(output_dir / "manifest.json")
+
+    try:
+        gate = json.loads((output_dir / "automatic-gate.json").read_text(encoding="utf-8"))
+        summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+        human_state = json.loads(
+            (output_dir / "human-review-state.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise EvidenceSanitizationError("sanitized evidence semantics are invalid") from exc
+    valid_gate_states = {
+        "通过": ("自动门禁通过，人工待完成", {"automatic_passed_human_pending"}),
+        "失败": ("失败", {"core_failed"}),
+        "阻塞": ("阻塞", {"blocked", "core_passed_ui_pending", "diagnostic_core_passed"}),
+    }
+    if not isinstance(gate, dict) or not isinstance(summary, dict) or not isinstance(human_state, dict):
+        raise EvidenceSanitizationError("automatic gate semantics are invalid")
+    automatic_result = gate.get("automatic_result")
+    expected = valid_gate_states.get(automatic_result)
+    if (
+        gate.get("schema_version") != 1
+        or expected is None
+        or gate.get("overall_result") != expected[0]
+        or gate.get("certification_status") not in expected[1]
+        or gate.get("core_outcome") not in ALLOWED_OUTCOMES
+        or gate.get("playwright_outcome") not in ALLOWED_OUTCOMES
+        or gate.get("cleanup_outcome") not in ALLOWED_OUTCOMES
+        or summary.get("passed") is not (automatic_result == "通过")
+        or summary.get("pass_scope") != "automatic_only"
+        or summary.get("overall_result") != gate.get("overall_result")
+        or summary.get("certification_status") != gate.get("certification_status")
+        or human_state.get("state") != "pending"
+        or human_state.get("identities_included") is not False
+    ):
+        raise EvidenceSanitizationError("automatic gate semantics are invalid")
     return manifest
 
 
@@ -517,76 +615,106 @@ def sanitize_evidence(
     mode: str,
     core_outcome: str,
     playwright_outcome: str,
+    cleanup_outcome: str = "success",
 ) -> dict[str, Any]:
     raw_dir = Path(raw_dir)
     output_dir = Path(output_dir)
     if mode not in ALLOWED_MODES:
         raise EvidenceSanitizationError("unsupported CUDA validation mode")
-    if core_outcome not in ALLOWED_OUTCOMES or playwright_outcome not in ALLOWED_OUTCOMES:
+    if (
+        core_outcome not in ALLOWED_OUTCOMES
+        or playwright_outcome not in ALLOWED_OUTCOMES
+        or cleanup_outcome not in ALLOWED_OUTCOMES
+    ):
         raise EvidenceSanitizationError("unsupported workflow outcome")
     if output_dir.exists() and any(output_dir.iterdir()):
         raise EvidenceSanitizationError("sanitized output directory must be empty")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir.exists():
+        output_dir.rmdir()
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = output_dir.with_name(f".{output_dir.name}.{os.getpid()}.staging")
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir()
 
-    raw_summary, source_present, source_valid = _load_source_summary(raw_dir)
-    source_junit_present, source_junit_valid = _xml_evidence_state(raw_dir / "junit.xml")
-    source_playwright_junit_present, source_playwright_junit_valid = _xml_evidence_state(
-        raw_dir / "playwright-junit.xml"
-    )
-    gpu_sample_count = _write_gpu_csv(raw_dir, output_dir / "nvidia-smi.csv")
-    worker_reference_services = _write_worker_references(
-        raw_dir, output_dir / "worker-log-references.json"
-    )
-    shareable_evidence_complete = bool(
-        source_junit_valid
-        and source_playwright_junit_valid
-        and gpu_sample_count > 0
-        and worker_reference_services == FORMAL_SERVICE_IDS
-    )
-    summary = _safe_summary(
-        raw_summary,
-        mode=mode,
-        source_present=source_present,
-        source_valid=source_valid,
-        source_junit_present=source_junit_present,
-        source_junit_valid=source_junit_valid,
-        source_playwright_junit_present=source_playwright_junit_present,
-        source_playwright_junit_valid=source_playwright_junit_valid,
-        shareable_evidence_complete=shareable_evidence_complete,
-    )
-    source_status = str(raw_summary.get("certification_status") or "blocked")
-    gate = _automatic_gate(
-        source_present=source_present,
-        source_valid=source_valid,
-        source_status=source_status,
-        core_outcome=core_outcome,
-        playwright_outcome=playwright_outcome,
-        shareable_evidence_complete=shareable_evidence_complete,
-    )
+    try:
+        raw_summary, source_present, source_valid = _load_source_summary(raw_dir)
+        source_junit_present, source_junit_valid = _xml_evidence_state(raw_dir / "junit.xml")
+        source_playwright_junit_present, source_playwright_junit_valid = _xml_evidence_state(
+            raw_dir / "playwright-junit.xml"
+        )
+        gpu_sample_count, controller_gpu_sample_count, remote_gpu_source_count = _write_gpu_csv(
+            raw_dir, staging_dir / "nvidia-smi.csv", mode=mode
+        )
+        worker_reference_services = _write_worker_references(
+            raw_dir, staging_dir / "worker-log-references.json"
+        )
+        shareable_evidence_complete = bool(
+            source_junit_valid
+            and source_playwright_junit_valid
+            and controller_gpu_sample_count > 0
+            and (mode != "distributed" or remote_gpu_source_count == 3)
+            and worker_reference_services == FORMAL_SERVICE_IDS
+        )
+        summary = _safe_summary(
+            raw_summary,
+            mode=mode,
+            source_present=source_present,
+            source_valid=source_valid,
+            source_junit_present=source_junit_present,
+            source_junit_valid=source_junit_valid,
+            source_playwright_junit_present=source_playwright_junit_present,
+            source_playwright_junit_valid=source_playwright_junit_valid,
+            shareable_evidence_complete=shareable_evidence_complete,
+        )
+        source_status = str(raw_summary.get("certification_status") or "blocked")
+        summary["gpu_monitor"]["shareable_sample_count"] = gpu_sample_count
+        summary["gpu_monitor"]["controller_sample_count"] = controller_gpu_sample_count
+        summary["gpu_monitor"]["remote_source_count"] = remote_gpu_source_count
+        gate = _automatic_gate(
+            source_present=source_present,
+            source_valid=source_valid,
+            source_core_passed=bool(raw_summary.get("passed")),
+            source_status=source_status,
+            core_outcome=core_outcome,
+            playwright_outcome=playwright_outcome,
+            cleanup_outcome=cleanup_outcome,
+            shareable_evidence_complete=shareable_evidence_complete,
+        )
 
-    _write_json(output_dir / "summary.json", summary)
-    _write_junit(output_dir / "junit.xml", summary, gate)
-    _write_human_review_state(
-        output_dir / "human-review-state.json",
-        mode=mode,
-        case_count=len(summary["case_results"]),
-    )
-    _write_json(output_dir / "automatic-gate.json", gate)
+        summary["core_passed"] = bool(summary.pop("passed"))
+        summary["passed"] = gate["automatic_result"] == "通过"
+        summary["pass_scope"] = "automatic_only"
+        summary["overall_result"] = gate["overall_result"]
+        summary["certification_status"] = gate["certification_status"]
 
-    manifest = {
-        "schema_version": 1,
-        "bundle": "cuda-evidence-sanitized",
-        "files": {
-            name: {
-                "sha256": _sha256_file(output_dir / name),
-                "size": (output_dir / name).stat().st_size,
-            }
-            for name in sorted(MANIFEST_CONTENT_FILES)
-        },
-    }
-    _write_json(output_dir / "manifest.json", manifest)
-    verify_sanitized_bundle(output_dir)
-    return manifest
+        _write_json(staging_dir / "summary.json", summary)
+        _write_junit(staging_dir / "junit.xml", summary, gate)
+        _write_human_review_state(
+            staging_dir / "human-review-state.json",
+            mode=mode,
+            case_count=len(summary["case_results"]),
+        )
+        _write_json(staging_dir / "automatic-gate.json", gate)
+
+        manifest = {
+            "schema_version": 1,
+            "bundle": "cuda-evidence-sanitized",
+            "files": {
+                name: {
+                    "sha256": _sha256_file(staging_dir / name),
+                    "size": (staging_dir / name).stat().st_size,
+                }
+                for name in sorted(MANIFEST_CONTENT_FILES)
+            },
+        }
+        _write_json(staging_dir / "manifest.json", manifest)
+        verify_sanitized_bundle(staging_dir)
+        os.replace(staging_dir, output_dir)
+        return manifest
+    finally:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -596,6 +724,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", choices=sorted(ALLOWED_MODES))
     parser.add_argument("--core-outcome", choices=sorted(ALLOWED_OUTCOMES))
     parser.add_argument("--playwright-outcome", choices=sorted(ALLOWED_OUTCOMES))
+    parser.add_argument("--cleanup-outcome", choices=sorted(ALLOWED_OUTCOMES), default="success")
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -610,6 +739,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode=args.mode,
                 core_outcome=args.core_outcome,
                 playwright_outcome=args.playwright_outcome,
+                cleanup_outcome=args.cleanup_outcome,
             )
     except EvidenceSanitizationError as exc:
         parser.exit(2, f"evidence sanitization blocked: {exc}\n")

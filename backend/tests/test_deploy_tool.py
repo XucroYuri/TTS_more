@@ -343,6 +343,94 @@ def test_start_workers_uses_local_profile_for_single_topology_without_node(tmp_p
     assert profiles == ["local-all", "worker-node"]
 
 
+def test_start_workers_writes_run_local_owned_process_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    executable = tmp_path / ".venv" / "Scripts" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"")
+    services = [
+        {
+            "service_id": "local-gpt-sovits-main",
+            "health_url": "http://127.0.0.1:9880/health",
+            "start_command": [
+                str(executable),
+                "-m",
+                "uvicorn",
+                "app.workers.gpt_sovits_worker:app",
+            ],
+            "env": {},
+        }
+    ]
+
+    class FakeProcess:
+        pid = 4321
+
+        def terminate(self) -> None:
+            raise AssertionError("tracked process must not be terminated")
+
+    monkeypatch.setattr(deploy, "render_services", lambda *_args, **_kwargs: services)
+    monkeypatch.setattr(deploy, "_resolve_command", lambda _root, command: command)
+    monkeypatch.setattr(deploy.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    monkeypatch.setattr(deploy, "_windows_process_creation_date", lambda _pid: "20260711010000.000000+480")
+    monkeypatch.setattr(deploy, "_git_output", lambda _args: "a" * 40)
+    manifest_path = tmp_path / "artifacts" / "run-processes.json"
+
+    result = deploy.start_workers(
+        tmp_path,
+        platform_name="windows",
+        detach=True,
+        pid_manifest=manifest_path,
+    )
+
+    assert result == 0
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "schema_version": 1,
+        "processes": [
+            {
+                "pid": 4321,
+                "creation_date": "20260711010000.000000+480",
+                "executable_path": str(executable.resolve()),
+                "project_root": str(tmp_path.resolve()),
+                "worker_module": "app.workers.gpt_sovits_worker:app",
+                "service_id": "local-gpt-sovits-main",
+            }
+        ],
+    }
+
+
+def test_start_workers_cli_forwards_pid_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    observed: dict[str, object] = {}
+
+    def fake_start_workers(_root: Path, **kwargs) -> int:
+        observed.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(deploy, "start_workers", fake_start_workers)
+
+    exit_code = deploy.main(
+        [
+            "--root",
+            str(tmp_path),
+            "start-workers",
+            "--platform",
+            "windows",
+            "--detach",
+            "--pid-manifest",
+            "artifacts/run-processes.json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert observed["pid_manifest"] == "artifacts/run-processes.json"
+    assert observed["detach"] is True
+
+
 def test_render_services_cli_accepts_topology_and_node(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
