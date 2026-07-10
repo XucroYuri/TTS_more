@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import app.cuda_validation as cuda_validation
 from app.adapters.base import SynthesisResult
 from app.cuda_validation import (
     FORMAL_SERVICE_IDS,
@@ -32,6 +33,7 @@ from app.cuda_validation import (
     measure_wav,
     validation_cases,
     _sanitize_evidence,
+    _write_listening_template,
 )
 
 
@@ -628,7 +630,78 @@ def test_runner_defers_asr_until_every_tts_case_has_unloaded_and_recovered(
     report = runner.run()
 
     assert report["cases"][0]["asr"]["hypothesis"] == case.text
-    assert events == ["load", "synthesize", "unload", "memory-recovered", "asr"]
+    assert events == [
+        "load",
+        "synthesize",
+        "synthesize",
+        "synthesize",
+        "unload",
+        "memory-recovered",
+        "asr",
+    ]
+
+
+def test_runner_measures_two_warm_repeats_without_reloading_or_overwriting_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = FORMAL_SERVICE_IDS["gpt_sovits"]
+    case = ValidationCase(
+        name="gpt-v2ProPlus",
+        service_id=target,
+        profile="gpt-v2ProPlus",
+        text="默认模型验证。",
+        language="zh",
+        parameters={},
+    )
+    monkeypatch.setattr("app.cuda_validation.validation_cases", lambda _fixture: [case])
+    calls: list[tuple] = []
+    state: dict[str, str | None] = {
+        service_id: None for service_id in FORMAL_SERVICE_IDS.values()
+    }
+    timestamps = iter([0.0, 1.0, 10.0, 20.0, 30.0, 32.0, 40.0, 43.0, 50.0, 51.0])
+    transcribed: list[Path] = []
+
+    def transcribe(audio_path: Path, _language: str | None = None) -> str:
+        transcribed.append(audio_path)
+        return case.text
+
+    runner = CUDAValidationRunner(
+        mode="distributed",
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=True),
+        output_dir=tmp_path / "warm-repeats",
+        **_distributed_orchestration(tmp_path),
+        client_factory=lambda endpoint: _FakeClient(endpoint, calls, state),
+        status_probe=lambda endpoint: {
+            "device": "cuda:0",
+            "device_uuid": f"GPU-{endpoint.service_id}",
+            "cuda_runtime": "12.8",
+            "loaded": state[endpoint.service_id] is not None,
+            "model": state[endpoint.service_id],
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        },
+        transcriber=transcribe,
+        clock=lambda: next(timestamps),
+        sleeper=lambda _: None,
+        monitor_factory=_HealthyMonitor,
+        diagnostic=True,
+    )
+
+    report = runner.run()
+
+    lifecycle = [call[1] for call in calls if call[0] == target]
+    assert lifecycle == ["health", "capabilities", "load", "synthesize", "synthesize", "synthesize", "unload"]
+    assert report["cases"][0]["synthesis_seconds"] == pytest.approx(10.0)
+    assert report["cases"][0]["warm_synthesis_seconds"] == pytest.approx([2.0, 3.0])
+    assert report["performance"]["metrics"]["warm_p95_seconds"] == pytest.approx(2.95)
+    assert transcribed == [tmp_path / "warm-repeats" / "wav" / "gpt-v2ProPlus.wav"]
+    assert report["certifiable"] is False
+    assert report["certification_status"] == "diagnostic_core_passed"
 
 
 @pytest.mark.parametrize(
@@ -1201,6 +1274,49 @@ def test_preflight_only_cli_returns_zero_for_valid_local_inputs(tmp_path: Path) 
     assert summary["next_action"] == "继续部署和完整 CUDA 验证。"
 
 
+def test_summary_uses_hash_only_fixture_identity(tmp_path: Path) -> None:
+    fixture_path = _write_fixture(tmp_path)
+    expected_sha256 = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
+    output = tmp_path / "fixture-identity"
+
+    report = CUDAValidationRunner(
+        mode="single-release",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=output,
+    ).run_input_preflight()
+
+    summary_text = (output / "summary.json").read_text(encoding="utf-8")
+    summary = json.loads(summary_text)
+    assert report["fixture_sha256"] == expected_sha256
+    assert summary["fixture_sha256"] == expected_sha256
+    assert str(fixture_path) not in summary_text
+    assert str(tmp_path) not in summary_text
+
+
+def test_certification_status_vocabulary_is_closed_and_preflight_is_not_a_core_pass(
+    tmp_path: Path,
+) -> None:
+    assert cuda_validation.CERTIFICATION_STATUSES == frozenset(
+        {
+            "blocked",
+            "core_failed",
+            "diagnostic_core_passed",
+            "core_passed_ui_pending",
+            "automatic_passed_human_pending",
+        }
+    )
+    report = CUDAValidationRunner(
+        mode="single-release",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=_write_fixture(tmp_path),
+        output_dir=tmp_path / "preflight-status",
+    ).run_input_preflight()
+    assert report["passed"] is True
+    assert report["certifiable"] is False
+    assert report["certification_status"] == "blocked"
+
+
 def test_diagnostic_cli_marks_preflight_non_certifiable(tmp_path: Path) -> None:
     output = tmp_path / "diagnostic-preflight"
 
@@ -1222,7 +1338,7 @@ def test_diagnostic_cli_marks_preflight_non_certifiable(tmp_path: Path) -> None:
     assert exit_code == 0
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     assert summary["certifiable"] is False
-    assert summary["certification_status"] == "diagnostic"
+    assert summary["certification_status"] == "blocked"
 
 
 @pytest.mark.parametrize("stage", ["deployment", "worker-wait"])
@@ -1351,7 +1467,7 @@ def test_post_core_blocker_preserves_completed_core_evidence(
         assert report[field] == core_report[field]
     assert report["passed"] is False
     assert report["certifiable"] is False
-    assert report["certification_status"] == "post_core_failed"
+    assert report["certification_status"] == "core_failed"
     assert report["stage"] == stage
     assert report["pipeline_failures"] == [
         {"stage": stage, "message": f"simulated {stage} pipeline failure", "passed": False}
@@ -1488,7 +1604,7 @@ def test_powershell_blocker_cli_rewrites_valid_preflight_pass_after_safe_stage_f
     assert summary["passed"] is False
     assert summary["stage"] == stage
     assert summary["certifiable"] is False
-    assert summary["certification_status"] == ("diagnostic" if diagnostic else "blocked")
+    assert summary["certification_status"] == "blocked"
     assert stage in summary["preflight"][0]["message"]
     for artifact in (
         "summary.json",
@@ -1549,6 +1665,35 @@ def test_input_preflight_requires_two_reviewers_only_for_single_clean(tmp_path: 
     assert "single-clean requires 2 listening reviewers" in clean_report["preflight"][0]["message"]
     assert "补充当前模式所需的 listening reviewers" in clean_report["next_action"]
     assert release_report["passed"] is True
+
+
+def test_single_clean_listening_template_has_one_nine_column_row_per_reviewer_and_case(
+    tmp_path: Path,
+) -> None:
+    fixture_path = _write_fixture(tmp_path)
+    fixture = load_fixture(fixture_path)
+    output = tmp_path / "human-listening-review.md"
+    report = {
+        "mode": "single-clean",
+        "passed": True,
+        "cases": [
+            {"name": f"case-{index}", "output_path": f"wav/case-{index}.wav"}
+            for index in range(1, 7)
+        ],
+    }
+
+    _write_listening_template(output, report, fixture)
+
+    content = output.read_text(encoding="utf-8")
+    data_rows = [line for line in content.splitlines() if line.startswith("| case-")]
+    assert len(data_rows) == 12
+    assert all(len(line.strip("|").split("|")) == 9 for line in data_rows)
+    for reviewer in fixture.reviewers:
+        assert sum(
+            f"| {reviewer.id} |" in line or f"| `{reviewer.id}` |" in line
+            for line in data_rows
+        ) == 6
+        assert content.count(f"### Reviewer `{reviewer.id}`") == 1
 
 
 def test_input_preflight_next_action_identifies_fixture_schema_failure(tmp_path: Path) -> None:

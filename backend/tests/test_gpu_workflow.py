@@ -14,6 +14,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "windows-gpu-validation.yml"
 PLAYWRIGHT_SPEC = ROOT / "frontend" / "e2e" / "cuda-workstation.spec.ts"
+PLAYWRIGHT_FIXTURE_HELPER = ROOT / "frontend" / "e2e" / "cuda-fixture.ts"
+FRONTEND_PACKAGE = ROOT / "frontend" / "package.json"
 PLAYWRIGHT_CONFIG = ROOT / "frontend" / "playwright.config.ts"
 CUDA_ENTRYPOINT = ROOT / "scripts" / "run-cuda-validation.ps1"
 CUDA_VALIDATOR = ROOT / "backend" / "app" / "cuda_validation.py"
@@ -308,3 +310,25 @@ def test_playwright_cuda_spec_is_a_real_three_service_closed_loop() -> None:
     assert "audio/" in spec
     assert "byteLength" in spec
     assert "> 1024" in spec
+
+
+def test_playwright_fixture_expansion_precedes_every_validation_api_call() -> None:
+    spec = _read(PLAYWRIGHT_SPEC)
+    helper = _read(PLAYWRIGHT_FIXTURE_HELPER)
+    package = json.loads(_read(FRONTEND_PACKAGE))
+    test_body = spec[spec.index('test("imports a CUDA validation project') :]
+    load_start = spec.index("function loadFixture")
+    load_end = spec.index("function resolveFixturePath", load_start)
+    load_fixture = spec[load_start:load_end]
+
+    assert 'import { expandFixtureEnvironment } from "./cuda-fixture"' in spec
+    assert test_body.index("const fixture = loadFixture()") < test_body.index(
+        "resetValidationProject(request, project)"
+    )
+    assert load_fixture.index("JSON.parse") < load_fixture.index(
+        "expandFixtureEnvironment(rawFixture, process.env)"
+    )
+    assert "CUDA fixture has unresolved environment variables" in helper
+    assert package["scripts"]["test:cuda-fixture"] == (
+        "vitest run e2e/cuda-fixture.test.ts"
+    )

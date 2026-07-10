@@ -3,6 +3,8 @@ import { isAbsolute, resolve } from "node:path";
 
 import { expect, test, type APIRequestContext } from "@playwright/test";
 
+import { expandFixtureEnvironment } from "./cuda-fixture";
+
 const FORMAL_SERVICE_IDS = [
   "local-gpt-sovits-main",
   "local-indextts",
@@ -160,7 +162,8 @@ function loadFixture(): ValidationFixture {
   const rawPath = process.env.TTS_MORE_CUDA_FIXTURE;
   if (!rawPath) throw new Error("TTS_MORE_CUDA_FIXTURE must point to the local validation fixture");
   const fixturePath = resolveFixturePath(rawPath);
-  return JSON.parse(readFileSync(fixturePath, "utf8")) as ValidationFixture;
+  const rawFixture: unknown = JSON.parse(readFileSync(fixturePath, "utf8"));
+  return expandFixtureEnvironment(rawFixture, process.env) as ValidationFixture;
 }
 
 function resolveFixturePath(rawPath: string): string {

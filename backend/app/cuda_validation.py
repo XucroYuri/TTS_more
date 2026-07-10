@@ -33,6 +33,15 @@ from app.services import HttpTTSServiceClient, ServiceRegistry, TTSServiceClient
 
 
 VALIDATION_MODES = ("single-clean", "single-release", "distributed")
+CERTIFICATION_STATUSES = frozenset(
+    {
+        "blocked",
+        "core_failed",
+        "diagnostic_core_passed",
+        "core_passed_ui_pending",
+        "automatic_passed_human_pending",
+    }
+)
 POST_CORE_STAGES = frozenset({"fault-recovery", "evidence-collection"})
 FORMAL_SERVICE_IDS = {
     "gpt_sovits": "local-gpt-sovits-main",
@@ -56,6 +65,7 @@ MAX_UNLOAD_SECONDS = 30.0
 MAX_COLD_LOAD_SECONDS = 600.0
 MAX_SHORT_SYNTHESIS_SECONDS = 300.0
 MAX_WARM_P95_REGRESSION = 0.30
+WARM_SYNTHESIS_REPEATS = 2
 GPU_MONITOR_REQUIRED_ERROR = (
     "GPU monitor is unavailable; nvidia-smi evidence is required for certification"
 )
@@ -700,9 +710,10 @@ class CUDAValidationRunner:
             ),
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
+            "fixture_sha256": _fixture_sha256(self.fixture_path),
             "passed": False,
             "certifiable": False,
-            "certification_status": "diagnostic" if self.diagnostic else "pending",
+            "certification_status": "blocked",
             "preflight": [],
             "services": [],
             "cases": [],
@@ -727,10 +738,6 @@ class CUDAValidationRunner:
         report["blocker_count"] = len(failures)
         report["next_action"] = _preflight_next_action(failures)
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
-        if not self.diagnostic:
-            report["certification_status"] = (
-                "input-preflight-passed" if report["passed"] else "blocked"
-            )
         _write_report_files(self.output_dir, report, fixture, {}, reset_nvidia=True)
         return report
 
@@ -765,7 +772,8 @@ class CUDAValidationRunner:
             report["finished_at"] = datetime.now(timezone.utc).isoformat()
             report["passed"] = False
             report["certifiable"] = False
-            report["certification_status"] = "post_core_failed"
+            report["certification_status"] = "core_failed"
+            report["fixture_sha256"] = _fixture_sha256(self.fixture_path)
             report["pipeline_failures"] = pipeline_failures
             report["post_core"] = {"passed": False, "failed_stage": stage}
             report["blocker_count"] = len(pipeline_failures)
@@ -790,7 +798,7 @@ class CUDAValidationRunner:
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         report["passed"] = False
         report["certifiable"] = False
-        report["certification_status"] = "diagnostic" if self.diagnostic else "blocked"
+        report["certification_status"] = "blocked"
         report["preflight"] = [
             {"passed": False, "message": f"{stage} failed: {message}"}
         ]
@@ -837,6 +845,7 @@ class CUDAValidationRunner:
                 "unload_recovery_seconds": None,
                 "cold_load_seconds": None,
                 "short_synthesis_seconds": [],
+                "warm_synthesis_seconds": [],
                 "warm_p95_seconds": None,
             }
             cer_items: list[tuple[str, str, str]] = []
@@ -929,8 +938,10 @@ class CUDAValidationRunner:
                 if len(cer_items) != len(report["cases"]):
                     report["cer"]["passed"] = False
                     report["cer"]["missing_items"] = len(report["cases"]) - len(cer_items)
-            synthesis_times = list(perf_source["short_synthesis_seconds"])
-            perf_source["warm_p95_seconds"] = _p95(synthesis_times) if synthesis_times else None
+            warm_synthesis_times = list(perf_source["warm_synthesis_seconds"])
+            perf_source["warm_p95_seconds"] = (
+                _p95(warm_synthesis_times) if warm_synthesis_times else None
+            )
             baseline = fixture.performance_baseline.model_dump(exclude_none=True) if fixture.performance_baseline else None
             report["performance"] = evaluate_performance(perf_source, baseline=baseline)
             return self._finish(report, fixture, endpoints)
@@ -1185,6 +1196,31 @@ class CUDAValidationRunner:
             after_synthesis = self.status_probe(endpoint)
             case_report["synthesis_status"] = after_synthesis
             _record_memory(perf_source, after_synthesis)
+
+            warm_times: list[float] = []
+            warm_dir = self.output_dir / "wav" / "warm"
+            warm_dir.mkdir(parents=True, exist_ok=True)
+            for repeat_index in range(1, WARM_SYNTHESIS_REPEATS + 1):
+                warm_output_path = warm_dir / f"{case.name}-repeat-{repeat_index}.wav"
+                warm_started = self.clock()
+                warm_result = client.synthesize(
+                    SynthesisRequest(
+                        line=line,
+                        profile=case.profile,
+                        output_path=warm_output_path,
+                        parameters=case.parameters,
+                    )
+                )
+                warm_seconds = max(0.0, self.clock() - warm_started)
+                if warm_result.audio_path.resolve(strict=False) != warm_output_path.resolve(
+                    strict=False
+                ):
+                    raise RuntimeError(
+                        f"worker returned unexpected warm output path: {warm_result.audio_path}"
+                    )
+                warm_times.append(warm_seconds)
+                perf_source["warm_synthesis_seconds"].append(warm_seconds)
+            case_report["warm_synthesis_seconds"] = warm_times
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             case_report["errors"].append(message)
@@ -1247,7 +1283,9 @@ class CUDAValidationRunner:
         )
         if self.diagnostic:
             report["certifiable"] = False
-            report["certification_status"] = "diagnostic"
+            report["certification_status"] = (
+                "diagnostic_core_passed" if report["passed"] else "core_failed"
+            )
         else:
             report["certifiable"] = False
             report["certification_status"] = (
@@ -1434,13 +1472,31 @@ def _write_listening_template(
 ) -> None:
     reviewers = fixture.reviewers if fixture else []
     reviewer_lines = "\n".join(f"- `{reviewer.id}`: {reviewer.name}" for reviewer in reviewers) or "- Not configured"
-    rows = []
-    for case in report.get("cases") or []:
-        rows.append(
-            f"| {case['name']} | `{case.get('output_path', '')}` |  |  |  |  |  |  |"
-        )
+    rows: list[str] = []
+    for reviewer in reviewers:
+        for case in report.get("cases") or []:
+            columns = [
+                str(case["name"]),
+                f"`{case.get('output_path', '')}`",
+                f"`{reviewer.id}`",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ]
+            rows.append("| " + " | ".join(columns) + " |")
     if not rows:
-        rows.append("| No synthesis output |  |  |  |  |  |  |  |")
+        rows.append("| " + " | ".join(["No synthesis output", "", "", "", "", "", "", "", ""]) + " |")
+    signature_blocks = "\n\n".join(
+        f"""### Reviewer `{reviewer.id}` — {reviewer.name}
+
+- Decision: PASS / FAIL
+- Signature / timestamp:
+- Release or certification reference:"""
+        for reviewer in reviewers
+    ) or "- Reviewers are not configured."
     content = f"""# CUDA Human Listening Review
 
 Validation mode: `{report.get('mode')}`
@@ -1456,12 +1512,9 @@ Score clarity, timbre similarity, emotion/prosody, and artifacts from 1 to 5. Ea
 |---|---|---:|---:|---:|---:|---:|---:|---|
 {chr(10).join(rows)}
 
-## Decision
+## Independent decisions
 
-- Reviewer identity:
-- Decision: PASS / FAIL
-- Signature / timestamp:
-- Release or certification reference:
+{signature_blocks}
 """
     path.write_text(content, encoding="utf-8")
 
@@ -1562,6 +1615,13 @@ def _optional_float(value: Any) -> float | None:
     try:
         return None if value is None else float(value)
     except (TypeError, ValueError):
+        return None
+
+
+def _fixture_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
         return None
 
 
