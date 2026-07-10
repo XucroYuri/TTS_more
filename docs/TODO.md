@@ -11,7 +11,7 @@
 | 3 | 未合并 feature 分支 | ✅ dev-xu 已合并；两个死分支已删除 |
 | 4 | `frontend/design.md` 过时 | ✅ 已删除 |
 | 5 | Windows CUDA 全流程认证 | 🔬 自动化与文档已建立，待真实单机和四机首次认证 |
-| 6 | macOS 控制面 + LAN Windows CUDA | 📐 补充门禁方案已设计，待真实执行和跨平台编排实现 |
+| 6 | macOS 控制面 + LAN Windows CUDA | 🌿 专用分支已建立，待 V1 编排实现及 V2/V3 真实认证 |
 
 ---
 
@@ -89,6 +89,8 @@ rebase 会让 28 个提交逐个撞安全代码（冲突分散），merge 更干
 ## 6. macOS 控制面与 LAN Windows CUDA 📐
 
 已确定两级拓扑：当前 macOS 运行完整应用，一台 Windows GPU 主机承载三个服务用于共享资源组验证；随后使用三台 Windows GPU 主机各承载一个服务完成并行和故障隔离验证。远端控制固定使用密钥认证、host key 固定的 Windows OpenSSH，音频使用 `artifact-transfer`，不依赖共享文件系统。
+
+专用分支为 `dev-xu/macos-lan-cuda-validation`，基于 `dev-xu/cuda-e2e-validation@0457261`。该分支必须在独立 worktree 中工作，不处理主 worktree 的未提交文件；父分支合入前，审查目标保持为父分支。
 
 当前阶段只作为可审计补充门禁。升级为稳定发布门禁前仍需：
 

@@ -2,9 +2,55 @@
 
 本文定义第二套 CUDA 闭环测试方案：TTS More 应用本体运行在 macOS，本机通过可信局域网调用 Windows CUDA worker。方案覆盖一台远端 GPU 主机承载三个服务，以及三台远端 GPU 主机各承载一个服务。
 
-当前状态：**补充集成门禁设计已批准，正式发布门禁自动化尚未实现。** 在跨平台编排器完成前，本方案可以证明真实应用闭环和 LAN 工件传输，但不能替代 [Windows CUDA 正式认证](cuda-e2e-validation.md)。
+当前状态：**专用验证分支已建立，补充集成门禁设计已批准，正式发布门禁自动化尚未实现。** 在跨平台编排器完成前，本方案可以证明真实应用闭环和 LAN 工件传输，但不能替代 [Windows CUDA 正式认证](cuda-e2e-validation.md)。
 
 文中的 `<...>` 表示运行前必须由操作者填写的本地值，不是未决设计项；真实值不得提交到仓库。
+
+## 专用分支与工作区边界
+
+本方向固定使用：
+
+```text
+branch: dev-xu/macos-lan-cuda-validation
+parent: dev-xu/cuda-e2e-validation
+parent_commit: 045726165bf6a9a9a919188a3615bac998fecdc5
+```
+
+该分支依赖父分支已经实现的 topology、artifact 协议、CUDA validator、Playwright 和 Windows GPU runbook，不能直接从当前远端 `master` 独立重建。父分支合入产品主线前，本分支的代码审查目标应为 `dev-xu/cuda-e2e-validation`；父分支合入后，再把本分支更新到最新产品 `main` 并执行全量回归。
+
+工作区规则：
+
+- 主 worktree 保持在 `master`，其中任何未提交文件都不切换、不暂存、不复制到本分支；
+- 本分支只在独立 worktree 中编辑和测试；
+- topology、fixture、SSH config、repo 路径、模型和验收结果继续使用被忽略的本地文件；
+- 禁止使用 `git add -A` 从主 worktree 收集内容；提交必须按本分支文件清单显式暂存；
+- 发现主 worktree 有新修改时只记录存在性，不据此重置、清理或改变本分支历史。
+
+本分支允许修改：
+
+- 本测试方向的设计、runbook、验收和发布治理文档；
+- 后续计划中的 `lan_topology`、`windows_ssh`、`lan_evidence`、`lan_nodes`、`lan_orchestration`；
+- `run-lan-validation.*`、LAN Playwright 策略和手动 macOS workflow；
+- 为上述行为新增的测试。
+
+本分支禁止混入：
+
+- 与验证无关的工作台 UI 修改；
+- GPT-SoVITS、IndexTTS、CosyVoice 上游 repo 的功能开发；
+- 未经真实硬件认证就修改稳定发布触发器；
+- 真实机器标识、路径、密钥、模型、音频或审核者身份。
+
+### 测试活动与退出条件
+
+| 阶段 | 执行环境 | 目标 | 退出条件 | 主要证据 |
+|---|---|---|---|---|
+| `V0-docs` | macOS，无 GPU | 固定架构、边界和实施计划 | 链接、JSON topology、命令和分支职责审查通过 | 文档提交与双远端 SHA |
+| `V1-control` | macOS，无 GPU，mock SSH | 实现跨平台编排并保持 Windows 回归 | Python/前端全量测试、shell-free SSH、两种 policy 单测通过 | pytest、Vitest、build、静态 workflow 测试 |
+| `V2-shared` | macOS + 1 台 Windows CUDA | 三服务共享 GPU 的真实闭环 | 5 个核心样本、30 条队列、无加载重叠、显存恢复和两级故障通过 | JSON/JUnit/WAV/ASR/GPU/Playwright/听审 |
+| `V3-distributed` | macOS + 3 台 Windows CUDA | 并行、工件传输和节点故障隔离 | 三身份和 GPU 唯一、至少两个加载重叠、15 秒降级和恢复通过 | 三节点日志、GPU 时序、故障和听审记录 |
+| `V4-promotion` | 维护者评审 | 决定是否成为稳定发布门禁 | 与 Windows 四机结果无未解释差异，单独 promotion PR 获批 | 两类运行 URL、基线、签核和发布决策 |
+
+`V0`、`V1` 通过只允许声明“文档/控制面准备完成”；`V2` 通过允许声明“共享 GPU 补充门禁通过”；只有 `V3` 和人工签核完成后，才能申请 `V4`。任何阶段失败都保留证据并停止后续阶段。
 
 ## 1. 目标与结论等级
 
@@ -126,7 +172,7 @@ https://gitee.com/chengdu-flower-food/TTS_more.git
 macOS：
 
 ```bash
-git clone --branch dev-xu/cuda-e2e-validation --single-branch \
+git clone --branch dev-xu/macos-lan-cuda-validation --single-branch \
   https://gitee.com/chengdu-flower-food/TTS_more.git
 cd TTS_more
 git rev-parse HEAD
@@ -141,7 +187,7 @@ pnpm --dir frontend cuda:e2e:install
 Windows worker：
 
 ```powershell
-git clone --branch dev-xu/cuda-e2e-validation --single-branch `
+git clone --branch dev-xu/macos-lan-cuda-validation --single-branch `
   https://gitee.com/chengdu-flower-food/TTS_more.git C:\TTS\TTS_more
 Set-Location C:\TTS\TTS_more
 git checkout --detach <controller-commit-sha>
@@ -452,3 +498,12 @@ scripts/run-lan-validation.ps1
 8. 与 Windows 控制节点的正式分布式结果对比，没有未解释的功能或性能差异。
 
 升级前，Windows 单机和四机认证仍是稳定发布真相源。本方案不覆盖公网、TLS、反向代理、Linux GPU、商业 TTS 或不受信任网络。
+
+## 13. 合并与归档规则
+
+1. 文档和无 GPU 编排实现先在本分支完成审查，不直接提交到 `master`。
+2. 父分支未合入产品主线时，本分支 PR 以父分支为目标，避免把两个方向压成不可审查的大提交。
+3. 父分支合入后，将本分支同步到产品 `main`，重新运行 `V1`，再进行真实 `V2`、`V3`。
+4. 缺少 `V2` 或 `V3` 证据时，可以合入实验性代码和手动 workflow，但必须保持 release 触发器关闭，并在文档中标记为 supplemental。
+5. 启用稳定发布触发器必须使用独立 `V4-promotion` PR，不得与编排实现 PR 合并处理。
+6. promotion 完成后保留本分支的最终 tag 和验收记录；远端分支是否删除由维护者在发布后单独决定。

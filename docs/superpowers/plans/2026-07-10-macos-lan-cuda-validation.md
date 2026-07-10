@@ -10,6 +10,7 @@
 
 ## Global Constraints
 
+- Execute this plan on `dev-xu/macos-lan-cuda-validation`, based on `dev-xu/cuda-e2e-validation@0457261`; never stage files from the main worktree.
 - The macOS controller has no CUDA requirement; all GPU identity and `nvidia-smi` evidence comes from Windows workers.
 - Windows workers must use CUDA runtime `12.8` and expose at least `16,000 MiB` total VRAM through `/status`.
 - Formal service IDs remain `local-gpt-sovits-main`, `local-indextts`, and `local-cosyvoice`.

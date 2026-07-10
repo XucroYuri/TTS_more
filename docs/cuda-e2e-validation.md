@@ -37,6 +37,8 @@ flowchart LR
 
 macOS 控制面的混合 LAN 方案另行覆盖一台共享 GPU worker 和三台独立 GPU worker。当前 Windows PowerShell 总入口依赖控制节点注册表、Windows venv 路径和本地 `nvidia-smi`，不能在 macOS 上签发正式分布式通过结果；具体阶段划分和升级条件以 [macOS LAN 验证](cuda-e2e-macos-lan.md) 为准。
 
+混合 LAN 方向在专用分支 `dev-xu/macos-lan-cuda-validation` 验证，并依赖本 Windows CUDA 基础分支。主 worktree 的未提交内容不得进入该分支；分支流向、阶段结论和合并条件由混合 LAN runbook 单独约束。
+
 ## 配置接口
 
 ### Topology manifest

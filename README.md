@@ -156,7 +156,7 @@ bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --device CU128
 
 准备脚本默认走 `Auto`：先跑 `probe-network`，优先选择中国大陆可达且健康的源，例如 ModelScope 或 HF Mirror，必要时再回退到全球 Hugging Face / PyPI 路线。默认安装只准备 full-quality baseline models，quantized、distilled、simplified、small、low-memory 这些都只是手动 manual 的高级选项。
 
-详细拓扑、远端 worker、离线缓存和模型下载策略见 [部署方案](docs/deployment.md)。Windows CUDA 的单机与四机正式认证统一从 [CUDA 全流程闭环验证](docs/cuda-e2e-validation.md) 进入。
+详细拓扑、远端 worker、离线缓存和模型下载策略见 [部署方案](docs/deployment.md)。Windows CUDA 的单机与四机正式认证统一从 [CUDA 全流程闭环验证](docs/cuda-e2e-validation.md) 进入；当前 macOS 运行应用、局域网 Windows CUDA 运行三个 TTS 服务的第二套测试见 [macOS LAN CUDA 验证](docs/cuda-e2e-macos-lan.md)。
 GPT-SoVITS 三分支职责、收敛顺序和合并门禁见 [GPT-SoVITS 分支收敛](docs/gpt-sovits-branch-convergence.md)。
 当前阶段边界、设计不足和任务拆分见 [当前阶段说明与简化计划](docs/current-state-and-simplification-plan.md)。
 

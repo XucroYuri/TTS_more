@@ -11,6 +11,7 @@ The detailed test plan and operational constraints are defined in [macOS 应用�
 
 ## Decisions
 
+- Develop and validate this direction on `dev-xu/macos-lan-cuda-validation`, based on `dev-xu/cuda-e2e-validation@0457261`, without staging changes from the main worktree.
 - Cover both one Windows GPU host running all three services and three Windows GPU hosts running one service each.
 - Treat the three-host topology as the eventual formal distributed gate.
 - Use macOS OpenSSH with key-only authentication, pinned host keys and SCP evidence collection.
@@ -59,3 +60,7 @@ The three-host profile becomes a release gate only after the cross-platform entr
 ## Out Of Scope
 
 This design does not cover public networks, TLS, reverse proxies, Linux GPU workers, commercial TTS providers, shared network filesystems or replacing the existing Windows CUDA certification before the promotion criteria pass.
+
+## Branch Promotion
+
+Before the parent CUDA branch reaches the product mainline, review this branch against `dev-xu/cuda-e2e-validation`. After the parent merges, update this branch to product `main`, rerun control-plane regression, and require both shared and three-node hardware records before requesting release-gate promotion. Release triggers remain a separate change.
