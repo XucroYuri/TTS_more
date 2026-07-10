@@ -82,7 +82,7 @@ macOS 到 Windows 固定使用 OpenSSH：
 建议在 macOS 的 `~/.ssh/config` 使用脱敏别名：
 
 ```sshconfig
-Host tts-gpt
+Host gpt-worker
     HostName <gpt-worker-lan-host>
     User <validation-user>
     IdentityFile ~/.ssh/<validation-key>
@@ -91,7 +91,7 @@ Host tts-gpt
     UserKnownHostsFile ~/.ssh/known_hosts_tts_more
 ```
 
-IndexTTS、CosyVoice 节点使用独立 alias。共享 GPU 拓扑只需要一个 alias。首次写入 host key 必须由人类通过设备控制台或其他可信渠道核对指纹，不能使用 `StrictHostKeyChecking no`。
+SSH `Host` alias 必须与 topology 节点名一致。三 GPU 拓扑使用 `gpt-worker`、`index-worker`、`cosy-worker`，共享 GPU 拓扑使用 `shared-worker`。首次写入 host key 必须由人类通过设备控制台或其他可信渠道核对指纹，不能使用 `StrictHostKeyChecking no`。
 
 ## 4. 共同前提
 
@@ -229,8 +229,8 @@ git diff --check
 从 macOS 验证：
 
 ```bash
-ssh tts-gpt 'powershell.exe -NoLogo -NoProfile -Command "$PSVersionTable.PSVersion"'
-ssh tts-gpt 'powershell.exe -NoLogo -NoProfile -Command "nvidia-smi"'
+ssh gpt-worker 'powershell.exe -NoLogo -NoProfile -Command "$PSVersionTable.PSVersion"'
+ssh gpt-worker 'powershell.exe -NoLogo -NoProfile -Command "nvidia-smi"'
 ```
 
 同时记录 DNS 解析、TCP 22、worker 端口、时钟、Windows 版本、驱动、CUDA、GPU UUID 和 VRAM。三 GPU 拓扑要求三个 hostname/IP、Windows `MachineGuid` 和 GPU UUID 全部唯一；原始 `MachineGuid` 只在内存中比较，不写入公开证据。
@@ -412,6 +412,7 @@ scripts/run-lan-validation.sh
 scripts/run-lan-validation.ps1
 
 --mode lan-shared | lan-distributed
+--deployment clean | release
 --topology <path>
 --fixture <path>
 --ssh-config <path>
@@ -419,6 +420,10 @@ scripts/run-lan-validation.ps1
 --output <path>
 --require-baseline
 ```
+
+`clean` 删除并重建服务 repo/venv，用于首次认证；`release` 重新同步锁定提交、安装依赖和渲染配置，但保留已批准模型缓存。正式入口不提供跳过部署、启动、身份检查、GPU 监控或故障恢复的参数。
+
+正式自动化要求所有 Windows worker 使用同一个不含空格的绝对 `--remote-root`，例如 `C:\TTS\TTS_more`，以保证 SSH/SCP 路径解析一致。阶段一人工排障可以使用其他路径，但不能据此签发正式通过结果。
 
 实现应遵循以下边界：
 

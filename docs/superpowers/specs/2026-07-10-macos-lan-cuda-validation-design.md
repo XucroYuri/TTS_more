@@ -14,6 +14,8 @@ The detailed test plan and operational constraints are defined in [macOS 应用�
 - Cover both one Windows GPU host running all three services and three Windows GPU hosts running one service each.
 - Treat the three-host topology as the eventual formal distributed gate.
 - Use macOS OpenSSH with key-only authentication, pinned host keys and SCP evidence collection.
+- Require each SSH `Host` alias to match its topology worker node name.
+- Require one shared absolute Windows remote root without spaces for formal SSH/SCP orchestration.
 - Keep all remote services `managed:false`; the macOS supervisor never owns remote processes.
 - Use the existing `artifact-transfer` HTTP contract instead of a shared filesystem.
 - Introduce the validation in two phases: auditable supplemental testing first, formal release gating only after cross-platform orchestration is implemented.
@@ -33,6 +35,8 @@ The implementation phase will extract a cross-platform Python orchestrator with 
 
 - `lan-shared`: one worker owns all three services on one GPU, capacity is one, loaded models cannot overlap and unload recovery is mandatory;
 - `lan-distributed`: three workers own one service each, host identity and GPU UUID are unique, concurrent loading and single-node recovery are mandatory.
+
+The CLI also requires `--deployment clean|release`; it does not infer destructive cleanup from missing baselines and does not expose skip flags for deployment, startup, identity, monitoring or fault recovery.
 
 Remote Windows execution remains a bounded adapter that invokes repository PowerShell scripts through OpenSSH and retrieves only declared evidence paths.
 
