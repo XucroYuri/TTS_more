@@ -7,9 +7,10 @@ from pathlib import Path
 import pytest
 
 from app.adapters.base import SynthesisRequest, SynthesisResult
-from app.models import EngineName, GenerationManifest, GenerationTask, ProviderType, ScriptLine, TTSServiceEndpoint
+from app.models import EngineName, GenerationManifest, GenerationTask, GenerationVersion, ProviderType, ScriptLine, TTSServiceEndpoint
 from app.queue import GenerationJobManager, ServiceGenerationQueue
-from app.services import ServiceRoute
+from app.services import ServiceRoute, build_load_signature
+from app.storage import ProjectStore
 
 
 class RecordingServiceClient:
@@ -49,6 +50,35 @@ class LoadFailingServiceClient(RecordingServiceClient):
     def load(self, profile: str, parameters: dict | None = None) -> None:
         self.calls.append(f"load:{profile}")
         raise RuntimeError("load failed for target signature")
+
+
+class LoadAndUnloadFailingServiceClient(LoadFailingServiceClient):
+    def unload(self) -> None:
+        self.calls.append("unload")
+        raise RuntimeError("cleanup unload failed")
+
+
+class FailOnceLoadingServiceClient(RecordingServiceClient):
+    def __init__(self, endpoint: TTSServiceEndpoint) -> None:
+        super().__init__(endpoint)
+        self.remaining_load_failures = 1
+
+    def load(self, profile: str, parameters: dict | None = None) -> None:
+        self.calls.append(f"load:{profile}")
+        if self.remaining_load_failures:
+            self.remaining_load_failures -= 1
+            raise RuntimeError("load failed after changing resident resources")
+
+
+class OutputPathRecordingServiceClient(RecordingServiceClient):
+    def __init__(self, endpoint: TTSServiceEndpoint) -> None:
+        super().__init__(endpoint)
+        self.output_paths: list[Path] = []
+
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        self.calls.append(f"synthesize:{request.line.id}")
+        self.output_paths.append(request.output_path)
+        return SynthesisResult(audio_path=request.output_path, metadata={"service": self.endpoint.service_id})
 
 
 class SynthesisFailingServiceClient(RecordingServiceClient):
@@ -103,6 +133,70 @@ class MemoryStore:
     def save_manifest(self, manifest: GenerationManifest) -> None:
         self.save_calls += 1
         self.manifest = manifest
+
+
+class SnapshotMemoryStore:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._manifests: dict[str, GenerationManifest] = {}
+        self._lock = threading.Lock()
+
+    def load_manifest(self, project_id: str) -> GenerationManifest:
+        with self._lock:
+            manifest = self._manifests.get(project_id, GenerationManifest(project_id=project_id))
+            return manifest.model_copy(deep=True)
+
+    def project_audio_dir(self, project_id: str) -> Path:
+        path = self.root / project_id / "output" / "audio"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def save_manifest(self, manifest: GenerationManifest) -> None:
+        with self._lock:
+            self._manifests[manifest.project_id] = manifest.model_copy(deep=True)
+
+    def manifest(self, project_id: str) -> GenerationManifest:
+        with self._lock:
+            return self._manifests[project_id].model_copy(deep=True)
+
+
+class ManifestAppendingQueue:
+    def __init__(self, router: StaticRouter, blocking_line_id: str, release: threading.Event) -> None:
+        self.router = router
+        self.blocking_line_id = blocking_line_id
+        self.release = release
+        self._started: dict[str, threading.Event] = {}
+        self._lock = threading.Lock()
+
+    def started_event(self, line_id: str) -> threading.Event:
+        with self._lock:
+            return self._started.setdefault(line_id, threading.Event())
+
+    def run(self, tasks, manifest, output_dir, status_callback=None, cancel_check=None) -> GenerationManifest:
+        for current in tasks:
+            self.started_event(current.line.id).set()
+            if current.line.id == self.blocking_line_id and not self.release.wait(5):
+                raise TimeoutError("test timed out waiting to release transaction")
+            if cancel_check and cancel_check():
+                return manifest
+            version_id = "v001"
+            if status_callback:
+                status_callback(current, "running", 0.5, "test-cluster", version_id)
+            manifest.append_version(
+                current.line.id,
+                GenerationVersion(
+                    version_id=version_id,
+                    line_uid=current.line.line_uid or current.line.id,
+                    engine=current.engine,
+                    profile=current.profile,
+                    service_id=current.service_id,
+                    status="completed",
+                    audio_path=str(output_dir / f"{current.line.id}.wav"),
+                ),
+            )
+            if status_callback:
+                status_callback(current, "completed", 1.0, "test-cluster", version_id)
+        return manifest
 
 
 def endpoint(service_id: str, engine: EngineName, resource_group: str) -> TTSServiceEndpoint:
@@ -179,6 +273,58 @@ def test_service_queue_serializes_services_in_same_resource_group(tmp_path: Path
     assert queue.load_state("local-index")["loaded"] is True
     assert manifest.lines["l1"].versions[0].service_id == "local-gpt"
     assert manifest.lines["l2"].versions[0].resource_group == "local-gpu-0"
+
+
+@pytest.mark.parametrize(
+    ("service_id", "profile", "line_id"),
+    [
+        ("../escaped-service", "profile", "line/../unsafe"),
+        ("/absolute-service", "profile", "line/../unsafe"),
+        (r"C:\\temp\\service", r"..\\..\\escaped-profile", "line/../unsafe"),
+        ("service", "../../escaped-profile", "line/../unsafe"),
+        ("service", "profile", "../"),
+    ],
+)
+def test_service_queue_sanitizes_output_segments_and_contains_paths(
+    tmp_path: Path,
+    service_id: str,
+    profile: str,
+    line_id: str,
+) -> None:
+    output_dir = tmp_path / "audio"
+    client = OutputPathRecordingServiceClient(endpoint(service_id, EngineName.GPT_SOVITS, "local-gpu-0"))
+    queue = ServiceGenerationQueue(StaticRouter({service_id: client}))
+
+    queue.run(
+        [task(line_id, EngineName.GPT_SOVITS, profile, service_id)],
+        GenerationManifest(project_id="demo"),
+        output_dir=output_dir,
+    )
+
+    output_path = client.output_paths[0]
+    relative = output_path.resolve(strict=False).relative_to(output_dir.resolve(strict=False))
+    assert len(relative.parts) == 4
+    assert all(part not in {"", ".", ".."} for part in relative.parts)
+    assert all(not any(character in part for character in '/\\:') for part in relative.parts)
+
+
+def test_service_queue_rejects_output_path_resolving_through_symlink_outside_output_dir(tmp_path: Path) -> None:
+    output_dir = tmp_path / "audio"
+    outside_dir = tmp_path / "outside"
+    output_dir.mkdir()
+    outside_dir.mkdir()
+    (output_dir / EngineName.GPT_SOVITS.value).symlink_to(outside_dir, target_is_directory=True)
+    client = OutputPathRecordingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    queue = ServiceGenerationQueue(StaticRouter({"local-gpt": client}))
+
+    with pytest.raises(ValueError, match="outside output directory"):
+        queue.run(
+            [gpt_task("a1", "a.wav")],
+            GenerationManifest(project_id="demo"),
+            output_dir=output_dir,
+        )
+
+    assert client.output_paths == []
 
 
 def test_service_queue_preserves_old_load_state_when_resource_unload_fails(tmp_path: Path) -> None:
@@ -284,10 +430,11 @@ def test_service_queue_load_state_tracks_successful_signature(tmp_path: Path) ->
     assert state["updated_at"]
 
 
-def test_service_queue_failed_load_does_not_pollute_load_state(tmp_path: Path) -> None:
+def test_service_queue_failed_load_invalidates_old_signature_and_active_resource(tmp_path: Path) -> None:
     client = LoadFailingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
     queue = ServiceGenerationQueue(StaticRouter({"local-gpt": client}))
     queue._loaded_signatures["local-gpt"] = "service_id=local-gpt|logs_name=old"
+    queue._active_resource_services["local-gpu-0"] = ("local-gpt", client)
     manifest = GenerationManifest(project_id="demo")
 
     try:
@@ -298,14 +445,58 @@ def test_service_queue_failed_load_does_not_pollute_load_state(tmp_path: Path) -
         raise AssertionError("load failure should bubble out of the resource cluster")
 
     state = queue.load_state("local-gpt")
-    assert state["loaded_signature"] == "service_id=local-gpt|logs_name=old"
+    assert state["loaded"] is False
+    assert state["loaded_signature"] is None
     assert state["last_error"]
     assert "load failed" in state["last_error"]
+    assert "local-gpu-0" not in queue._active_resource_services
+    assert client.calls == ["load:gpt-role", "unload"]
     failed_version = manifest.lines["a1"].versions[0]
     assert failed_version.status == "failed"
     assert failed_version.error == "load failed for target signature"
     assert failed_version.metadata["failure_stage"] == "loading"
     assert failed_version.requested_load_signature is not None
+
+
+def test_service_queue_reloads_old_signature_after_partial_load_failure(tmp_path: Path) -> None:
+    client = FailOnceLoadingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    queue = ServiceGenerationQueue(StaticRouter({"local-gpt": client}))
+    old_task = gpt_task("old", "old.wav")
+    old_signature = build_load_signature(client.endpoint, old_task.parameters)
+    queue._loaded_signatures["local-gpt"] = old_signature
+    queue._active_resource_services["local-gpu-0"] = ("local-gpt", client)
+
+    with pytest.raises(RuntimeError, match="changing resident resources"):
+        queue.run(
+            [gpt_task("new", "new.wav")],
+            GenerationManifest(project_id="demo"),
+            output_dir=tmp_path,
+        )
+
+    retry_manifest = GenerationManifest(project_id="demo")
+    queue.run([old_task], retry_manifest, output_dir=tmp_path)
+
+    assert client.calls == ["load:gpt-role", "unload", "load:gpt-role", "synthesize:old"]
+    assert queue.load_state("local-gpt")["loaded_signature"] == old_signature
+    assert retry_manifest.lines["old"].versions[0].status == "completed"
+
+
+def test_service_queue_preserves_load_error_when_failed_load_cleanup_unload_also_fails(tmp_path: Path) -> None:
+    client = LoadAndUnloadFailingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    queue = ServiceGenerationQueue(StaticRouter({"local-gpt": client}))
+    queue._loaded_signatures["local-gpt"] = "old-signature"
+    queue._active_resource_services["local-gpu-0"] = ("local-gpt", client)
+
+    with pytest.raises(RuntimeError, match="load failed for target signature"):
+        queue.run(
+            [gpt_task("new", "new.wav")],
+            GenerationManifest(project_id="demo"),
+            output_dir=tmp_path,
+        )
+
+    assert client.calls == ["load:gpt-role", "unload"]
+    assert queue.load_state("local-gpt")["loaded"] is False
+    assert "local-gpu-0" not in queue._active_resource_services
 
 
 def test_service_queue_records_synthesis_failure_stage(tmp_path: Path) -> None:
@@ -510,6 +701,111 @@ def test_generation_job_manager_persists_load_failure_versions_when_worker_raise
     failed_version = store.manifest.lines["a1"].versions[0]
     assert failed_version.status == "failed"
     assert failed_version.metadata["failure_stage"] == "loading"
+
+
+def test_generation_job_manager_serializes_full_manifest_transaction_per_project(tmp_path: Path) -> None:
+    release = threading.Event()
+    client = RecordingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    queue = ManifestAppendingQueue(StaticRouter({"local-gpt": client}), "first", release)
+    store = SnapshotMemoryStore(tmp_path)
+    manager = GenerationJobManager(queue, store)
+    first_started = queue.started_event("first")
+    second_started = queue.started_event("second")
+
+    first = manager.submit("demo", [gpt_task("first", "a.wav")])
+    assert first_started.wait(2), "first project transaction did not start"
+    second = manager.submit("demo", [gpt_task("second", "b.wav")])
+    second_ran_before_release = second_started.wait(0.3)
+    release.set()
+
+    first_final = _wait_for_manager_job(manager, first.job_id)
+    second_final = _wait_for_manager_job(manager, second.job_id)
+    manifest = store.manifest("demo")
+
+    assert second_ran_before_release is False
+    assert first_final.status == "completed"
+    assert second_final.status == "completed"
+    assert set(manifest.lines) == {"first", "second"}
+
+
+def test_generation_job_manager_allows_different_project_transactions_in_parallel(tmp_path: Path) -> None:
+    release = threading.Event()
+    client = RecordingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    queue = ManifestAppendingQueue(StaticRouter({"local-gpt": client}), "blocked", release)
+    store = SnapshotMemoryStore(tmp_path)
+    manager = GenerationJobManager(queue, store)
+    blocked_started = queue.started_event("blocked")
+    other_started = queue.started_event("other")
+
+    blocked = manager.submit("project-a", [gpt_task("blocked", "a.wav")])
+    assert blocked_started.wait(2), "blocked project transaction did not start"
+    other = manager.submit("project-b", [gpt_task("other", "b.wav")])
+    other_ran_in_parallel = other_started.wait(1)
+    release.set()
+
+    blocked_final = _wait_for_manager_job(manager, blocked.job_id)
+    other_final = _wait_for_manager_job(manager, other.job_id)
+
+    assert other_ran_in_parallel is True
+    assert blocked_final.status == "completed"
+    assert other_final.status == "completed"
+    assert set(store.manifest("project-a").lines) == {"blocked"}
+    assert set(store.manifest("project-b").lines) == {"other"}
+
+
+def test_project_store_atomic_writes_use_unique_temp_paths_under_concurrency(tmp_path: Path, monkeypatch) -> None:
+    store = ProjectStore(tmp_path)
+    target = tmp_path / "state.json"
+    write_barrier = threading.Barrier(2)
+    temp_paths: list[Path] = []
+    errors: list[BaseException] = []
+    paths_lock = threading.Lock()
+    original_write_text = Path.write_text
+
+    def synchronized_write_text(path: Path, text: str, *args, **kwargs):
+        result = original_write_text(path, text, *args, **kwargs)
+        if path.parent == target.parent and path.name.startswith(f".{target.name}.") and path.name.endswith(".tmp"):
+            with paths_lock:
+                temp_paths.append(path)
+            write_barrier.wait(2)
+        return result
+
+    def write_payload(payload: str) -> None:
+        try:
+            store._write_text(target, payload)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(Path, "write_text", synchronized_write_text)
+    workers = [threading.Thread(target=write_payload, args=(payload,)) for payload in ("first", "second")]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(3)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    assert len(temp_paths) == 2
+    assert len(set(temp_paths)) == 2
+    assert target.read_text(encoding="utf-8") in {"first", "second"}
+
+
+def test_project_store_atomic_write_cleans_temp_file_when_replace_fails(tmp_path: Path, monkeypatch) -> None:
+    store = ProjectStore(tmp_path)
+    target = tmp_path / "payload.json"
+    original_replace = Path.replace
+
+    def failing_replace(path: Path, destination: Path):
+        if path.parent == target.parent and path.name.startswith(f".{target.name}."):
+            raise OSError("replace failed")
+        return original_replace(path, destination)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        store._write_json(target, {"value": 1})
+
+    assert list(tmp_path.glob(f".{target.name}.*.tmp")) == []
 
 
 def _wait_for_manager_job(manager: GenerationJobManager, job_id: str, timeout_seconds: float = 10.0):

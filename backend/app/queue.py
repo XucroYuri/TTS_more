@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import uuid
-import re
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -19,13 +19,53 @@ StatusCallback = Callable[[GenerationTask, GenerationStatus, float, str | None, 
 
 logger = logging.getLogger(__name__)
 
+WINDOWS_RESERVED_OUTPUT_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
 
 def _task_line_uid(task: GenerationTask) -> str:
     return task.line.line_uid or task.line.id
 
 
 def _safe_line_output_stem(task: GenerationTask) -> str:
-    return re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", _task_line_uid(task)).strip("._-") or task.line.id
+    return re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", _task_line_uid(task)).strip("._-") or "line"
+
+
+def _safe_output_segment(value: str, fallback: str) -> str:
+    segment = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value.strip())
+    segment = re.sub(r"_+", "_", segment).strip(" ._-")[:120].strip(" .")
+    if not segment:
+        segment = fallback
+    if segment.split(".", 1)[0].upper() in WINDOWS_RESERVED_OUTPUT_NAMES:
+        segment = f"{segment}_"
+    return segment
+
+
+def _generation_output_path(
+    output_dir: Path,
+    task: GenerationTask,
+    service_id: str,
+    version_id: str,
+) -> Path:
+    output_root = output_dir.resolve(strict=False)
+    output_path = (
+        output_root
+        / _safe_output_segment(task.engine.value, "engine")
+        / _safe_output_segment(service_id, "service")
+        / _safe_output_segment(task.profile, "profile")
+        / f"{_safe_line_output_stem(task)}_{version_id}.wav"
+    ).resolve(strict=False)
+    try:
+        output_path.relative_to(output_root)
+    except ValueError as exc:
+        raise ValueError("generation output path is outside output directory") from exc
+    return output_path
 
 
 class ServiceGenerationQueue:
@@ -128,7 +168,7 @@ class ServiceGenerationQueue:
                 try:
                     route.client.load(first_task.profile, first_task.parameters)
                 except Exception as exc:
-                    self._mark_load_failed(route.endpoint.service_id, exc)
+                    self._recover_failed_load(resource_group, route, exc)
                     for _failed_index, failed_task, failed_route, failed_cluster_key in group:
                         version_id = self._append_failed_version(
                             failed_route,
@@ -161,7 +201,7 @@ class ServiceGenerationQueue:
                     try:
                         task_route.client.load(task.profile, task.parameters)
                     except Exception as exc:
-                        self._mark_load_failed(task_route.endpoint.service_id, exc)
+                        self._recover_failed_load(resource_group, task_route, exc)
                         version_id = self._append_failed_version(
                             task_route,
                             task,
@@ -190,13 +230,7 @@ class ServiceGenerationQueue:
             history = manifest.history_for_line(task.line.id, _task_line_uid(task))
             version_number = len(history.versions) + 1 if history else 1
             version_id = f"v{version_number:03d}"
-        output_path = (
-            output_dir
-            / task.engine.value
-            / route.endpoint.service_id
-            / task.profile
-            / f"{_safe_line_output_stem(task)}_{version_id}.wav"
-        )
+        output_path = _generation_output_path(output_dir, task, route.endpoint.service_id, version_id)
         requested_load_signature = build_load_signature(route.endpoint, task.parameters)
         revision_context = _revision_context(task)
         binding_snapshot = route.binding.model_dump(mode="json") if route.binding else None
@@ -312,6 +346,23 @@ class ServiceGenerationQueue:
             "last_error": str(exc),
             "last_error_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    def _recover_failed_load(self, resource_group: str, route: ServiceRoute, exc: Exception) -> None:
+        service_id = route.endpoint.service_id
+        self._loaded_signatures.pop(service_id, None)
+        for active_group, active in list(self._active_resource_services.items()):
+            if active[0] == service_id:
+                self._active_resource_services.pop(active_group, None)
+        try:
+            route.client.unload()
+        except Exception:
+            logger.warning(
+                "Failed to unload service %s after load failure in resource group %s",
+                service_id,
+                resource_group,
+                exc_info=True,
+            )
+        self._mark_load_failed(service_id, exc)
 
     def _evict_other_service(self, resource_group: str, target_route: ServiceRoute) -> None:
         active = self._active_resource_services.get(resource_group)
@@ -436,6 +487,8 @@ class GenerationJobManager:
         self.store = store
         self._jobs: "OrderedDict[str, GenerationJob]" = OrderedDict()
         self._lock = threading.Lock()
+        self._project_locks: dict[str, threading.Lock] = {}
+        self._project_locks_guard = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=self.MAX_ACTIVE_JOBS, thread_name_prefix="tts-job")
 
     def submit(self, project_id: str, tasks: list[GenerationTask]) -> GenerationJob:
@@ -554,47 +607,53 @@ class GenerationJobManager:
             return bool(job and job.status == "cancelled")
 
     def _run_job(self, job_id: str, tasks: list[GenerationTask]) -> None:
-        manifest: GenerationManifest | None = None
-        try:
-            with self._lock:
-                job = self._jobs[job_id]
-                if job.status == "cancelled":
-                    return
-                job.status = "running"
-                job.updated_at = datetime.now(timezone.utc)
-            manifest = self.store.load_manifest(self.get(job_id).project_id)
-            output_dir = self.store.project_audio_dir(self.get(job_id).project_id)
-            self._record_prefailed_items(job_id, tasks, manifest)
-            runnable_tasks = self._runnable_tasks(job_id, tasks)
-            self.queue.run(
-                runnable_tasks,
-                manifest,
-                output_dir=output_dir,
-                status_callback=lambda task, status, progress, cluster_key, version_id: self._update_item(
-                    job_id, task, status, progress, cluster_key, version_id
-                ),
-                cancel_check=lambda: self._is_cancelled(job_id),
-            )
-            self._sync_item_errors_from_manifest(job_id, manifest)
-            self.store.save_manifest(manifest)
-            self._finish_job(job_id)
-        except Exception as exc:
-            if manifest is not None:
+        project_id = self.get(job_id).project_id
+        with self._project_lock(project_id):
+            manifest: GenerationManifest | None = None
+            try:
+                with self._lock:
+                    job = self._jobs[job_id]
+                    if job.status == "cancelled":
+                        return
+                    job.status = "running"
+                    job.updated_at = datetime.now(timezone.utc)
+                manifest = self.store.load_manifest(project_id)
+                output_dir = self.store.project_audio_dir(project_id)
+                self._record_prefailed_items(job_id, tasks, manifest)
+                runnable_tasks = self._runnable_tasks(job_id, tasks)
+                self.queue.run(
+                    runnable_tasks,
+                    manifest,
+                    output_dir=output_dir,
+                    status_callback=lambda task, status, progress, cluster_key, version_id: self._update_item(
+                        job_id, task, status, progress, cluster_key, version_id
+                    ),
+                    cancel_check=lambda: self._is_cancelled(job_id),
+                )
+                self._sync_item_errors_from_manifest(job_id, manifest)
                 self.store.save_manifest(manifest)
-            failed_at = datetime.now(timezone.utc)
-            with self._lock:
-                job = self._jobs[job_id]
-                if job.status == "cancelled":
-                    return
-                job.status = "failed"
-                job.error = str(exc)
-                job.updated_at = failed_at
-                for item in job.items:
-                    if item.status not in {"completed", "failed", "cancelled"}:
-                        item.status = "failed"
-                        item.progress = 1.0
-                        item.error = item.error or str(exc)
-                job.progress = sum(item.progress for item in job.items) / max(1, len(job.items))
+                self._finish_job(job_id)
+            except Exception as exc:
+                if manifest is not None:
+                    self.store.save_manifest(manifest)
+                failed_at = datetime.now(timezone.utc)
+                with self._lock:
+                    job = self._jobs[job_id]
+                    if job.status == "cancelled":
+                        return
+                    job.status = "failed"
+                    job.error = str(exc)
+                    job.updated_at = failed_at
+                    for item in job.items:
+                        if item.status not in {"completed", "failed", "cancelled"}:
+                            item.status = "failed"
+                            item.progress = 1.0
+                            item.error = item.error or str(exc)
+                    job.progress = sum(item.progress for item in job.items) / max(1, len(job.items))
+
+    def _project_lock(self, project_id: str) -> threading.Lock:
+        with self._project_locks_guard:
+            return self._project_locks.setdefault(project_id, threading.Lock())
 
     def _record_prefailed_items(self, job_id: str, tasks: list[GenerationTask], manifest: GenerationManifest) -> None:
         tasks_by_key = {(task.line.id, _task_line_uid(task)): task for task in tasks}

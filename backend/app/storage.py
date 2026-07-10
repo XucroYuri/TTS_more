@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeVar
@@ -186,16 +187,19 @@ class ProjectStore:
         self._write_json(path, model.model_dump(mode="json"))
 
     def _write_json(self, path: Path, payload: object) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp_path.replace(path)
+        self._write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def _write_text(self, path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temp_path.write_text(text, encoding="utf-8")
-        temp_path.replace(path)
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(text, encoding="utf-8")
+            temp_path.replace(path)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _read_model(self, path: Path, model_type: type[T]) -> T:
         return model_type.model_validate(self._read_structured(path))
