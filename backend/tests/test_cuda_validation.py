@@ -489,9 +489,38 @@ def test_faster_whisper_close_does_not_mask_cleanup_errors(monkeypatch: pytest.M
     )
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=fake_cuda))
 
-    transcriber.close()
+    with pytest.raises(ValueError, match="driver unavailable"):
+        transcriber.close()
 
     assert transcriber._model is None
+
+
+def test_runner_fails_when_faster_whisper_cuda_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_cuda = SimpleNamespace(
+        is_available=lambda: True,
+        empty_cache=lambda: (_ for _ in ()).throw(RuntimeError("cache release failed")),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=fake_cuda))
+    transcriber = FasterWhisperTranscriber(lambda *_args, **_kwargs: None, "large-v3", "zh")
+    runner = CUDAValidationRunner(
+        mode="single-release",
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path),
+        output_dir=tmp_path / "asr-cleanup-failure",
+        client_factory=lambda _endpoint: (_ for _ in ()).throw(RuntimeError("offline")),
+        transcriber=transcriber,
+        monitor_factory=_HealthyMonitor,
+    )
+
+    report = runner.run()
+
+    assert report["passed"] is False
+    assert any(
+        item["message"] == "ASR cleanup failed: RuntimeError: cache release failed"
+        for item in report["preflight"]
+    )
 
 
 class _FakeClient:
@@ -600,6 +629,98 @@ def test_runner_defers_asr_until_every_tts_case_has_unloaded_and_recovered(
 
     assert report["cases"][0]["asr"]["hypothesis"] == case.text
     assert events == ["load", "synthesize", "unload", "memory-recovered", "asr"]
+
+
+@pytest.mark.parametrize(
+    ("release_failure", "expected_unload", "expected_memory"),
+    [
+        ("unload-exception", False, False),
+        ("still-loaded", False, True),
+        ("memory-timeout", True, False),
+    ],
+)
+def test_asr_batch_requires_positive_release_proof_for_every_attempted_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_failure: str,
+    expected_unload: bool,
+    expected_memory: bool,
+) -> None:
+    target = FORMAL_SERVICE_IDS["gpt_sovits"]
+    case = ValidationCase(
+        name="gpt-v2ProPlus",
+        service_id=target,
+        profile="gpt-v2ProPlus",
+        text="默认模型验证。",
+        language="zh",
+        parameters={},
+    )
+    monkeypatch.setattr("app.cuda_validation.validation_cases", lambda _fixture: [case])
+    state: dict[str, str | None] = {
+        service_id: None for service_id in FORMAL_SERVICE_IDS.values()
+    }
+    lifecycle = {"unload_called": False}
+    asr_calls: list[str] = []
+
+    class ReleaseFailingClient(_FakeClient):
+        def unload(self) -> None:
+            if self.endpoint.service_id == target:
+                lifecycle["unload_called"] = True
+                if release_failure == "unload-exception":
+                    raise RuntimeError("intentional unload failure")
+            super().unload()
+
+    def status_probe(endpoint) -> dict:
+        after_unload = endpoint.service_id == target and lifecycle["unload_called"]
+        loaded = state[endpoint.service_id] is not None
+        reserved_bytes = 0
+        if after_unload and release_failure == "still-loaded":
+            loaded = True
+        if after_unload and release_failure == "memory-timeout":
+            reserved_bytes = 2 * 1024**3
+        return {
+            "device": "cuda:0",
+            "device_uuid": f"GPU-{endpoint.service_id}",
+            "cuda_runtime": "12.8",
+            "loaded": loaded,
+            "model": state[endpoint.service_id] if loaded else None,
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": reserved_bytes,
+                "allocated_bytes": 0,
+            },
+        }
+
+    def transcribe(audio_path: Path, _language: str | None = None) -> str:
+        asr_calls.append(audio_path.stem)
+        return case.text
+
+    runner = CUDAValidationRunner(
+        mode="distributed",
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=True),
+        output_dir=tmp_path / release_failure,
+        **_distributed_orchestration(tmp_path),
+        client_factory=lambda endpoint: ReleaseFailingClient(endpoint, [], state),
+        status_probe=status_probe,
+        transcriber=transcribe,
+        clock=lambda: 10.0,
+        sleeper=lambda _: None,
+        monitor_factory=_HealthyMonitor,
+    )
+
+    report = runner.run()
+
+    release_error = "ASR batch blocked: TTS unload and memory recovery were not confirmed"
+    case_report = report["cases"][0]
+    assert case_report["audio"]["passed"] is True
+    assert case_report["unload_confirmed"] is expected_unload
+    assert case_report["memory_recovered"] is expected_memory
+    assert release_error in case_report["errors"]
+    assert any(item["message"] == release_error for item in report["preflight"])
+    assert report["cer"]["missing_items"] == 1
+    assert asr_calls == []
 
 
 def test_asr_batch_continues_after_case_error_and_closes_in_finally(

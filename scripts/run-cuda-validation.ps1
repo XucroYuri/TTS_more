@@ -244,22 +244,21 @@ function Test-ConfiguredWorkerProcessOwnership {
     if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {
         try {
             $normalizedExecutable = [IO.Path]::GetFullPath($ExecutablePath)
-            $executableOwned =
-                $normalizedExecutable.Equals($normalizedRoot, [StringComparison]::OrdinalIgnoreCase) -or
-                $normalizedExecutable.StartsWith($rootWithSeparator, [StringComparison]::OrdinalIgnoreCase)
+            $executableOwned = $normalizedExecutable.StartsWith(
+                $rootWithSeparator, [StringComparison]::OrdinalIgnoreCase
+            )
         } catch {
             $executableOwned = $false
         }
     }
-    $normalizedCommand = $CommandLine.Replace('/', '\')
-    $normalizedCommandRoot = $normalizedRoot.Replace('/', '\') + '\'
-    $commandOwned = $normalizedCommand.IndexOf(
-        $normalizedCommandRoot, [StringComparison]::OrdinalIgnoreCase
-    ) -ge 0
-    $moduleOwned = $CommandLine.IndexOf(
-        $WorkerModule, [StringComparison]::OrdinalIgnoreCase
-    ) -ge 0
-    return [bool]($moduleOwned -and ($executableOwned -or $commandOwned))
+    $escapedModule = [regex]::Escape($WorkerModule)
+    $moduleArgumentPattern = '(?:^|\s)(?:"' + $escapedModule + '"|' + $escapedModule + ')(?=\s|$)'
+    $moduleOwned = [regex]::IsMatch(
+        $CommandLine,
+        $moduleArgumentPattern,
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    return [bool]($executableOwned -and $moduleOwned)
 }
 
 function Stop-ConfiguredWorkerListeners {
@@ -278,7 +277,8 @@ function Stop-ConfiguredWorkerListeners {
         $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
         foreach ($processId in @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
             $process = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$processId)" -ErrorAction SilentlyContinue
-            $owned = $null -ne $process -and (Test-ConfiguredWorkerProcessOwnership `
+            $creationDate = if ($null -ne $process) { [string]$process.CreationDate } else { "" }
+            $owned = -not [string]::IsNullOrWhiteSpace($creationDate) -and (Test-ConfiguredWorkerProcessOwnership `
                 -CommandLine ([string]$process.CommandLine) `
                 -ExecutablePath ([string]$process.ExecutablePath) `
                 -ProjectRoot $Root `
@@ -287,12 +287,40 @@ function Stop-ConfiguredWorkerListeners {
             if (-not $owned) {
                 throw "阻塞：端口 $port 被非本次验证进程占用"
             }
-            $ownedListeners += [pscustomobject]@{ Port = $port; ProcessId = [int]$processId }
+            $ownedListeners += [pscustomobject]@{
+                Port = $port
+                ProcessId = [int]$processId
+                CreationDate = $creationDate
+                WorkerModule = $workerModules[[string]$service.service_id]
+            }
         }
     }
+    $revalidatedListeners = @()
     foreach ($listener in $ownedListeners) {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$listener.ProcessId)" -ErrorAction SilentlyContinue
+        $sameCreation =
+            $null -ne $process -and
+            ([string]$process.CreationDate).Equals(
+                [string]$listener.CreationDate, [StringComparison]::Ordinal
+            )
+        $owned = $sameCreation -and (Test-ConfiguredWorkerProcessOwnership `
+            -CommandLine ([string]$process.CommandLine) `
+            -ExecutablePath ([string]$process.ExecutablePath) `
+            -ProjectRoot $Root `
+            -WorkerModule ([string]$listener.WorkerModule)
+        )
+        if (-not $owned) {
+            throw "阻塞：端口 $($listener.Port) 被非本次验证进程占用"
+        }
+        $revalidatedListeners += $listener
+    }
+    foreach ($listener in $revalidatedListeners) {
         Write-Host "[replace] stop owned worker listener on port $($listener.Port)" -ForegroundColor Yellow
-        Stop-Process -Id $listener.ProcessId -Force -ErrorAction Stop
+        try {
+            Stop-Process -Id $listener.ProcessId -Force -ErrorAction Stop
+        } catch {
+            throw "阻塞：端口 $($listener.Port) 的本次验证进程停止失败"
+        }
     }
 }
 

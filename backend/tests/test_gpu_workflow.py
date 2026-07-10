@@ -137,10 +137,19 @@ def test_worker_listener_cleanup_is_scoped_to_current_root_and_formal_module() -
     assert "$CommandLine" in predicate
     assert "$WorkerModule" in predicate
     assert "Stop-Process" not in predicate
+    assert "$commandOwned" not in predicate
     assert "Get-CimInstance Win32_Process" in cleanup
     assert "Test-ConfiguredWorkerProcessOwnership" in cleanup
     assert "阻塞：端口 $port 被非本次验证进程占用" in cleanup
     assert cleanup.index("Test-ConfiguredWorkerProcessOwnership") < cleanup.index("Stop-Process")
+    assert cleanup.count("Get-CimInstance Win32_Process") == 2
+    assert cleanup.count("Test-ConfiguredWorkerProcessOwnership") == 2
+    assert "CreationDate" in cleanup
+    assert "$revalidatedListeners = @()" in cleanup
+    assert cleanup.index("$revalidatedListeners = @()") < cleanup.index("Stop-Process")
+    assert "阻塞：端口 $($listener.Port) 的本次验证进程停止失败" in cleanup
+    stop_block = cleanup[cleanup.index("Stop-Process") :]
+    assert "catch {" in stop_block
     assert "Get-Process" not in cleanup
     for module in (
         "app.workers.gpt_sovits_worker:app",
@@ -164,11 +173,15 @@ $inside = Join-Path $root '.venv\\Scripts\\python.exe'
 $outside = 'C:\\external\\python.exe'
 $sibling = $root + '-other\\.venv\\Scripts\\python.exe'
 $module = 'app.workers.gpt_sovits_worker:app'
+$evilModule = $module + '_evil'
 @(
     (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$inside`\" -m uvicorn $module\" -ExecutablePath $inside -ProjectRoot $root -WorkerModule $module),
     (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$outside`\" -m uvicorn $module\" -ExecutablePath $outside -ProjectRoot $root -WorkerModule $module),
     (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$inside`\" -m uvicorn app.main:app\" -ExecutablePath $inside -ProjectRoot $root -WorkerModule $module),
-    (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$sibling`\" -m uvicorn $module\" -ExecutablePath $sibling -ProjectRoot $root -WorkerModule $module)
+    (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$sibling`\" -m uvicorn $module\" -ExecutablePath $sibling -ProjectRoot $root -WorkerModule $module),
+    (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$outside`\" --note `\"$root\\fake $module`\"\" -ExecutablePath $outside -ProjectRoot $root -WorkerModule $module),
+    (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$inside`\" -m uvicorn $evilModule\" -ExecutablePath $inside -ProjectRoot $root -WorkerModule $module),
+    (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$inside`\" -m uvicorn `\"$module`\"\" -ExecutablePath $inside -ProjectRoot $root -WorkerModule $module)
 ) | ConvertTo-Json -Compress
 """
     encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
@@ -182,7 +195,7 @@ $module = 'app.workers.gpt_sovits_worker:app'
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout) == [True, False, False, False]
+    assert json.loads(completed.stdout) == [True, False, False, False, False, False, True]
 
 
 def test_cuda_entrypoint_rewrites_stale_preflight_pass_on_later_stage_failure() -> None:

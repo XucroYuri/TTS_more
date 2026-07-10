@@ -59,6 +59,9 @@ MAX_WARM_P95_REGRESSION = 0.30
 GPU_MONITOR_REQUIRED_ERROR = (
     "GPU monitor is unavailable; nvidia-smi evidence is required for certification"
 )
+ASR_BATCH_RELEASE_ERROR = (
+    "ASR batch blocked: TTS unload and memory recovery were not confirmed"
+)
 
 
 class ServiceIds(BaseModel):
@@ -474,11 +477,10 @@ class FasterWhisperTranscriber:
         self._model = None
         try:
             import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        except ImportError:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def create_transcriber(*, required: bool, model_name: str, language: str) -> tuple[Transcriber | None, str]:
@@ -705,6 +707,7 @@ class CUDAValidationRunner:
             "services": [],
             "cases": [],
             "cer": {"required": False, "items": [], "aggregate_cer": None, "passed": True},
+            "asr_batch": {"required": False, "passed": True, "error": ""},
             "performance": {"passed": False, "checks": {}, "metrics": {}},
             "gpu_monitor": {"healthy": False, "sample_count": 0, "error": ""},
         }
@@ -878,28 +881,50 @@ class CUDAValidationRunner:
                             artifact_case.language,
                         )
                     )
+            release_failures = [
+                case_report
+                for case_report in report["cases"]
+                if case_report.get("tts_attempted")
+                and not (
+                    case_report.get("unload_confirmed")
+                    and case_report.get("memory_recovered")
+                )
+            ]
             if fixture.asr.required:
-                for case_report, wav_path, reference, language in asr_queue:
-                    try:
-                        assert self.transcriber is not None
-                        hypothesis = self.transcriber(wav_path, language)
-                        cer = character_error_rate(reference, hypothesis)
-                        case_report["asr"] = {
-                            "reference": reference,
-                            "hypothesis": hypothesis,
-                            "cer": cer,
-                            "passed": cer <= MAX_ITEM_CER,
-                        }
-                        cer_items.append((case_report["name"], reference, hypothesis))
-                        if cer > MAX_ITEM_CER:
+                report["asr_batch"]["required"] = True
+                if release_failures:
+                    report["asr_batch"].update(
+                        {"passed": False, "error": ASR_BATCH_RELEASE_ERROR}
+                    )
+                    report["preflight"].append(
+                        {"passed": False, "message": ASR_BATCH_RELEASE_ERROR}
+                    )
+                    for case_report in release_failures:
+                        if ASR_BATCH_RELEASE_ERROR not in case_report["errors"]:
+                            case_report["errors"].append(ASR_BATCH_RELEASE_ERROR)
+                        case_report["passed"] = False
+                else:
+                    for case_report, wav_path, reference, language in asr_queue:
+                        try:
+                            assert self.transcriber is not None
+                            hypothesis = self.transcriber(wav_path, language)
+                            cer = character_error_rate(reference, hypothesis)
+                            case_report["asr"] = {
+                                "reference": reference,
+                                "hypothesis": hypothesis,
+                                "cer": cer,
+                                "passed": cer <= MAX_ITEM_CER,
+                            }
+                            cer_items.append((case_report["name"], reference, hypothesis))
+                            if cer > MAX_ITEM_CER:
+                                case_report["errors"].append(
+                                    f"CER {cer:.4f} exceeds {MAX_ITEM_CER:.2f}"
+                                )
+                        except Exception as exc:
                             case_report["errors"].append(
-                                f"CER {cer:.4f} exceeds {MAX_ITEM_CER:.2f}"
+                                f"ASR failed: {type(exc).__name__}: {exc}"
                             )
-                    except Exception as exc:
-                        case_report["errors"].append(
-                            f"ASR failed: {type(exc).__name__}: {exc}"
-                        )
-                    case_report["passed"] = not case_report["errors"]
+                        case_report["passed"] = not case_report["errors"]
                 report["cer"] = evaluate_cer(cer_items)
                 if len(cer_items) != len(report["cases"]):
                     report["cer"]["passed"] = False
@@ -1111,6 +1136,9 @@ class CUDAValidationRunner:
             "service_id": case.service_id,
             "profile": case.profile,
             "output_path": f"wav/{output_path.name}",
+            "tts_attempted": True,
+            "unload_confirmed": False,
+            "memory_recovered": False,
             "passed": False,
             "errors": [],
         }
@@ -1170,11 +1198,16 @@ class CUDAValidationRunner:
                 unload_status, recovery_seconds = self._wait_for_unload(endpoint, baseline_reserved, unload_started)
                 case_report["unload_status"] = unload_status
                 case_report["unload_recovery_seconds"] = recovery_seconds
+                case_report["unload_confirmed"] = unload_status.get("loaded") is False
+                unload_reserved = _memory_mib(unload_status, "reserved_bytes")
+                case_report["memory_recovered"] = (
+                    unload_reserved is not None
+                    and unload_reserved <= baseline_reserved + MAX_UNLOAD_MEMORY_DELTA_MIB
+                )
                 case_report["errors"].extend(_status_errors(unload_status, expected_loaded=False))
                 perf_source["unload_recovery_seconds"] = max(
                     perf_source.get("unload_recovery_seconds") or 0.0, recovery_seconds
                 )
-                unload_reserved = _memory_mib(unload_status, "reserved_bytes")
                 if unload_reserved is not None:
                     perf_source["unload_memory_mib"] = max(perf_source.get("unload_memory_mib") or 0.0, unload_reserved)
             except Exception as exc:
