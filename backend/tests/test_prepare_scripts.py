@@ -123,6 +123,87 @@ def test_prepare_and_worker_scripts_accept_repo_paths_file() -> None:
     assert "list-repos" in combined
 
 
+def test_windows_prepare_flattens_list_repos_json_before_iteration() -> None:
+    script = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+
+    assert "$parsedRepositories = $reposJson | ConvertFrom-Json" in script
+    assert "$repositories = @($parsedRepositories)" in script
+    assert "$repositories = @($reposJson | ConvertFrom-Json)" not in script
+
+
+def test_windows_prepare_logged_commands_do_not_pollute_function_returns() -> None:
+    script = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+    invoke_logged = script.split("function Invoke-Logged", maxsplit=1)[1].split(
+        "function Invoke-Captured", maxsplit=1
+    )[0]
+
+    assert "& $FilePath @Arguments 2>&1 | Out-Host" in invoke_logged
+    assert "$exitCode = $LASTEXITCODE" in invoke_logged
+    assert "if ($exitCode -ne 0)" in invoke_logged
+
+
+def test_windows_prepare_bootstraps_torchcodec_before_upstream_cuda_install() -> None:
+    script = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+    prepare_gpt = script.split("function Prepare-GPTSoVITS", maxsplit=1)[1].split(
+        "function Prepare-IndexTTS", maxsplit=1
+    )[0]
+
+    assert '"GPT-SoVITS torchcodec bootstrap"' in prepare_gpt
+    assert '"--no-deps", "torchcodec==0.13"' in prepare_gpt
+    assert prepare_gpt.index("GPT-SoVITS torchcodec bootstrap") < prepare_gpt.index(
+        '-Description "GPT-SoVITS install for'
+    )
+
+
+def test_windows_prepare_installs_and_verifies_cu128_runtime_for_index_and_cosy() -> None:
+    script = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+
+    assert "function Install-CU128TorchRuntime" in script
+    assert '"torch==${TorchVersion}+cu128"' in script
+    assert '"torchaudio==${TorchVersion}+cu128"' in script
+    assert "torch.version.cuda == '12.8'" in script
+    assert 'Install-CU128TorchRuntime $repoPython $repoPath "2.8.0"' in script
+    assert 'Install-CU128TorchRuntime $repoPython $repoPath "2.7.1"' in script
+
+
+def test_windows_prepare_bootstraps_indextts_auxiliary_models_from_modelscope() -> None:
+    script = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+    prepare_index = script.split("function Prepare-IndexTTS", maxsplit=1)[1].split(
+        "function Prepare-CosyVoice", maxsplit=1
+    )[0]
+
+    assert "function Install-IndexTTSModelScopeAuxiliaryModels" in script
+    assert "AI-ModelScope/w2v-bert-2.0" in script
+    assert "nv-community/bigvgan_v2_22khz_80band_256x" in script
+    assert "semantic_codec/model.safetensors" in script
+    assert "iic/speech_campplus_sv_zh-cn_16k-common" in script
+    assert "eb890c9660ed6e3414b6812e27257b8ce5454365d5490d3ad581ea60b93be043" in script
+    assert "e95ba25972d3de0628d99cd156e9315a9c018899bf739988959ebe3544080ced" in script
+    assert "b'')" in script
+    assert 'b"")' not in script
+    assert "Install-IndexTTSModelScopeAuxiliaryModels $repoPython $repoPath" in prepare_index
+    assert prepare_index.index("Install-IndexTTSModelScopeAuxiliaryModels") < prepare_index.index(
+        'Invoke-Logged $repoPython @("indextts\\cli_v2.py", "download"'
+    )
+
+
+def test_windows_prepare_bootstraps_legacy_whisper_before_cosy_requirements() -> None:
+    script = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+    prepare_cosy = script.split("function Prepare-CosyVoice", maxsplit=1)[1].split(
+        "if ($SyncRepos)", maxsplit=1
+    )[0]
+
+    assert '"setuptools<81"' in prepare_cosy
+    assert '"--no-build-isolation", "--no-deps", "openai-whisper==20231117"' in prepare_cosy
+    assert "function Get-CosyVoiceRequirementsWithoutTorch" in script
+    assert "-notmatch '^(torch|torchaudio)=='" in script
+    assert '$Device -eq "CU128"' in prepare_cosy
+    assert "Get-CosyVoiceRequirementsWithoutTorch $repoPath" in prepare_cosy
+    assert prepare_cosy.index("openai-whisper==20231117") < prepare_cosy.index(
+        'Get-CosyVoiceRequirementsWithoutTorch $repoPath'
+    )
+
+
 def test_one_click_deploy_scripts_install_bundles_and_render_services() -> None:
     bash = (REPO_ROOT / "scripts" / "deploy-local-tts.sh").read_text(encoding="utf-8")
     powershell = (REPO_ROOT / "scripts" / "deploy-local-tts.ps1").read_text(encoding="utf-8")
