@@ -26,7 +26,7 @@ flowchart TD
 
 ```powershell
 $ErrorActionPreference = "Stop"
-python --version
+py -3.11 --version
 conda --version
 git --version
 node --version
@@ -36,7 +36,7 @@ nvidia-smi
 if (Test-Path -LiteralPath .venv) {
     throw "首次 single-clean 需要新的应用 .venv；请使用新 checkout，或经人类确认后删除旧环境再重跑。"
 }
-python -m venv .venv
+py -3.11 -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install --upgrade pip
 & .\.venv\Scripts\python.exe -m pip install -e 'backend[dev]'
 & .\.venv\Scripts\python.exe -m pip install faster-whisper

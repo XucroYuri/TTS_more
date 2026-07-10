@@ -452,6 +452,9 @@ def test_single_node_runbook_documents_one_formal_path_and_separate_ui_gate() ->
     runbook = _read_repo_text("docs/cuda-e2e-single-node.md")
 
     assert "Python 3.11" in runbook
+    assert "py -3.11 --version" in runbook
+    assert "py -3.11 -m venv .venv" in runbook
+    assert "python -m venv .venv" not in runbook
     assert "conda" in runbook.casefold()
     assert "host preflight" in runbook
     assert "input preflight" in runbook
