@@ -1,114 +1,113 @@
 # CUDA 验收记录模板
 
-复制本模板到访问受控的发布记录位置。不要把真实 hostname、IP、用户名、绝对资产路径、参考音频或 secret 提交到公开仓库。
+复制本模板到访问受控的位置填写，**不得提交到公开仓库**。执行步骤只使用 [单机 Runbook](cuda-e2e-single-node.md) 或 [分布式 Runbook](cuda-e2e-distributed.md)。
 
 ## 1. 基本信息
 
 | 字段 | 值 |
 |---|---|
-| Run ID | `<yyyyMMdd-HHmmss-mode>` |
+| Run ID | |
 | 模式 | `single-clean` / `single-release` / `distributed` |
-| 发布版本或 PR | `<version-or-url>` |
-| 执行开始/结束 | `<ISO-8601>` |
-| 执行人 | `<operator-id>` |
-| TTS More commit | `<sha>` |
-| `repo.lock.json` SHA-256 | `<sha256>` |
-| Topology 名称 | `<sanitized-name>` |
-| Topology SHA-256 | `<sha256>` |
-| Fixture SHA-256 | `<sha256>` |
-| 基线记录 | `<baseline-run-url>` |
-| 自动化运行 URL | `<actions-or-controlled-storage-url>` |
-| Playwright report URL | `<url>` |
-| 工件保留位置 | `<controlled-storage-url>` |
+| 分支与 TTS More commit | |
+| 仓库根 `repo.lock.json` SHA-256 | |
+| 执行开始/结束 | |
+| 执行人 | |
+| Topology 安全名称 / SHA-256 | |
+| Fixture 安全名称 / SHA-256 | |
+| 基线运行 ID | |
+| 受控原始证据位置 | |
+| 脱敏可共享证据位置 | |
+| Playwright JUnit | `frontend/test-results/playwright-junit.xml` |
+| 失败 trace/screenshot/video | 不适用或受控位置 |
 
-## 2. Repo 锁定状态
+受控原始证据可包含音频、日志、机器标识和签名；脱敏可共享证据不得包含这些内容。
 
-| Service ID | Repo/分支 | 锁定 commit | 实际 `HEAD` | 匹配 |
-|---|---|---|---|---|
-| `local-gpt-sovits-main` | `GPT-SoVITS main` | `<sha>` | `<sha>` | 是/否 |
-| `local-indextts` | `IndexTTS` | `<sha>` | `<sha>` | 是/否 |
-| `local-cosyvoice` | `CosyVoice` | `<sha>` | `<sha>` | 是/否 |
+## 2. 主机与锁定部署
 
-## 3. 机器与运行时
+应用控制面固定 Python 3.11；Windows GPT-SoVITS 正式准备必须有 conda。
 
-每个节点填写一行；单机也要分别说明 app/worker 角色共用同一机器。
-
-| 节点/角色 | Windows 版本/Build | CPU/RAM | GPU/VRAM | NVIDIA driver | CUDA | Python | 磁盘余量 | 时钟同步 |
-|---|---|---|---|---|---|---|---|---|
-| `<node>` | `<value>` | `<value>` | `<model>/<GiB>` | `<version>` | `12.8` | `<version>` | `<GiB>` | 通过/失败 |
-
-## 4. 部署与预检
-
-| 检查项 | 结果 | 证据/备注 |
+| 检查项 | 结果 | 证据 |
 |---|---|---|
-| 首次 repo/venv 洁净或发布缓存策略符合模式 | 通过/失败 | `<log-url>` |
-| 锁定 repo 重新同步 | 通过/失败 | `<log-url>` |
-| 依赖重新安装、附加脚本复制、配置重新渲染 | 通过/失败 | `<log-url>` |
-| CUDA 12.8、VRAM >=16 GB、磁盘 | 通过/失败 | `<evidence>` |
-| Topology schema 和 service 唯一归属 | 通过/失败 | `<evidence>` |
-| 分布式 DNS/端口/防火墙/OpenSSH | 通过/失败/不适用 | `<evidence>` |
-| 四节点 host/IP/MachineGuid 与三个 GPU UUID 唯一 | 通过/失败/不适用 | `<evidence>` |
-| 三 worker 同时在线 | 通过/失败 | `<evidence>` |
-| `/health`、`/capabilities`、`/status` | 通过/失败 | `<evidence>` |
-| `artifact-transfer` capability | 通过/失败 | `<evidence>` |
+| Windows、Python 3.11、conda | 通过 / 失败 / 阻塞 | |
+| CUDA 12.8、VRAM >=16 GB、磁盘 | 通过 / 失败 / 阻塞 | |
+| 非任务 GPU 进程与端口所有权 | 通过 / 失败 / 阻塞 | |
+| 根 `repo.lock.json` 与三个实际 HEAD | 通过 / 失败 | |
+| 三个 repo venv、模型和 CU128 runtime | 通过 / 失败 | |
+| Topology schema、服务唯一归属、capacity | 通过 / 失败 | |
+| Fixture、3 参考音频、4 权重 | 通过 / 失败 / 阻塞 | |
+| `/health`、`/capabilities`、`/status` | 通过 / 失败 | |
+| 应用 `/api/health`、`/api/services/status` | 通过 / 失败 | |
 
-## 5. 自动化结果
+分布式记录还要核对时间、DNS、SSH、四台机器身份和三个 GPU 的唯一性；只保存脱敏结论和 hash，不复制原始标识到可共享记录。
 
-| 门禁 | 单机结果/URL | 分布式结果/URL | 备注 |
+## 3. 自动门禁
+
+| 门禁 | 单机 | 分布式 | 证据 |
 |---|---|---|---|
-| 核心 5 用例 | `<result>` | `<result>` | GPT 两版本、Index 情绪、Cosy 两模式 |
-| 每服务 3 条短文本 | `<result>` | `<result>` | 9 条 |
-| 30 条混合队列 | `<result>` | `<result>` | `<manifest-url>` |
-| 分布式并行重叠 | 不适用 | `<result>` | 至少两个 GPU 节点 |
-| `path` 工件模式 | `<result>` | 不适用 | |
-| `artifact` 工件模式 | `<result>` | `<result>` | 上传、下载、hash、删除 |
-| WAV 自动指标 | `<result>` | `<result>` | `<summary-url>` |
-| ASR CER | `<result>` | `<result>` | 单条最大 `<x>`，整体 `<x>` |
-| 显存/卸载恢复 | `<result>` | `<result>` | `<nvidia-smi-url>` |
-| 性能基线比较 | `<result>` | `<result>` | warm p95 变化 `<x>%` |
-| 故障降级/恢复/重试 | `<result>` | `<result>` | `<log-url>` |
-| Playwright 工作台闭环 | `<result>` | `<result>` | `<report-url>` |
+| 核心 5 模型能力 | 通过 / 失败 | 通过 / 失败 | summary / JUnit |
+| GPT path 与 artifact | 通过 / 失败 | 不适用 | summary / JUnit |
+| WAV 与 ASR CER | 通过 / 失败 | 通过 / 失败 | summary / JUnit |
+| 显存、卸载和性能 | 通过 / 失败 | 通过 / 失败 | summary / 聚合 GPU 指标 |
+| Playwright 30 条队列 | 通过 / 失败 / 未运行 | 通过 / 失败 / 未运行 | Playwright JUnit |
+| 三条代表性历史音频 | 通过 / 失败 / 未运行 | 通过 / 失败 / 未运行 | JUnit |
+| 分布式并行重叠 | 不适用 | 通过 / 失败 | JUnit |
+| 故障降级、恢复和重试 | 不适用 | 通过 / 失败 | fault recovery summary |
 
-自动阈值：WAV >1 KiB、0.5-30 秒、RMS > -50 dBFS、削波率 <=1%、静音率 <90%；单条 CER <=0.40、整体 CER <=0.25；无 OOM、峰值空闲显存 >=512 MiB、卸载后 30 秒内回到基线 +1 GiB、冷加载 <=10 分钟、短句 <=5 分钟、warm p95 退化 <=30%。
+自动阈值以 [CUDA 验证契约](cuda-e2e-validation.md#必过矩阵) 为准，不在本记录中放宽。
 
-## 6. 样本听审
+## 4. 机器状态
 
-评分 1-5。`伪影控制` 分数越高表示伪影越少。每项必须 >=3，总均分必须 >=3.5。
+勾选且只选一个：
 
-| 样本/版本 ID | Service/模式 | 审核者 | 清晰度 | 音色相似度 | 情绪/韵律 | 伪影控制 | 均分 | 结论/备注 |
-|---|---|---|---:|---:|---:|---:|---:|---|
-| `<id>` | `GPT v2ProPlus` | `<reviewer>` |  |  |  |  |  |  |
-| `<id>` | `GPT v2Pro` | `<reviewer>` |  |  |  |  |  |  |
-| `<id>` | `Index emotion-text` | `<reviewer>` |  |  |  |  |  |  |
-| `<id>` | `Cosy zero-shot` | `<reviewer>` |  |  |  |  |  |  |
-| `<id>` | `Cosy cross-lingual` | `<reviewer>` |  |  |  |  |  |  |
+- [ ] `blocked`：环境、资产、凭据或人类输入缺失；
+- [ ] `core_failed`：核心 CUDA 门禁失败；
+- [ ] `diagnostic_core_passed`：Skip 诊断通过，不可认证；
+- [ ] `core_passed_ui_pending`：核心通过，Playwright 待完成；
+- [ ] `automatic_passed_human_pending`：自动门禁通过，人工待完成。
 
-汇总：
+## 5. 首次认证听审
 
-| 审核者 | 身份/角色 | 样本数 | 总均分 | 最低单项 | 结论 |
-|---|---|---:|---:|---:|---|
-| `<reviewer-1>` | `<role>` |  |  |  | 通过/失败 |
-| `<reviewer-2>` | `<role>` |  |  |  | 通过/失败/不适用 |
+首次 `single-clean` 必须填写以下 6 case × 2 reviewer 共 12 行。发布回归可保留一名审核者，但不得删除 case。
 
-首次 `single-clean` 和首次 `distributed` 认证各需要两名审核者；稳定发布至少一名审核者。
+| Case | Reviewer | 清晰度 | 音色 | 情绪/韵律 | 伪影控制 | 总均分 | 结论/备注 |
+|---|---|---:|---:|---:|---:|---:|---|
+| `gpt-v2ProPlus` | `reviewer-1` | | | | | | |
+| `gpt-v2ProPlus` | `reviewer-2` | | | | | | |
+| `gpt-v2Pro` | `reviewer-1` | | | | | | |
+| `gpt-v2Pro` | `reviewer-2` | | | | | | |
+| `gpt-v2ProPlus-artifact` | `reviewer-1` | | | | | | |
+| `gpt-v2ProPlus-artifact` | `reviewer-2` | | | | | | |
+| `index-emotion-text` | `reviewer-1` | | | | | | |
+| `index-emotion-text` | `reviewer-2` | | | | | | |
+| `cosyvoice-zero-shot` | `reviewer-1` | | | | | | |
+| `cosyvoice-zero-shot` | `reviewer-2` | | | | | | |
+| `cosyvoice-cross-lingual` | `reviewer-1` | | | | | | |
+| `cosyvoice-cross-lingual` | `reviewer-2` | | | | | | |
 
-## 7. 故障与例外
+每个单项至少 3/5，总均分至少 3.5。审核者身份和签名只写入受控原始证据，不进入脱敏可共享证据。
 
-| ID | 发现时间 | 节点/服务 | 症状 | 对任务/应用影响 | 恢复时间 | 根因/后续 issue | 是否阻塞 |
-|---|---|---|---|---|---|---|---|
-| `<id>` | `<time>` | `<service>` | `<description>` | `<impact>` | `<time>` | `<url>` | 是/否 |
+## 6. 故障与例外
 
-例外必须列出批准人、有效期和补测计划。任何自动门禁失败、阈值超限、证据缺失或人工评分不足都不能通过例外直接放行稳定发布。
+| ID | 阶段 | 症状 | 影响 | 根因 / issue | 是否阻塞 |
+|---|---|---|---|---|---|
+| | | | | | |
 
-## 8. 最终签核
+自动门禁失败、证据缺失、阈值超限或人工评分不足不能通过例外放行稳定发布。
 
-| 角色 | 姓名/ID | 决策 | 时间 | 签名或审查 URL |
+## 7. 人工签核
+
+| 角色 | 受控身份 | 决策 | 时间 | 签名或受控 URL |
 |---|---|---|---|---|
-| 执行人 | `<id>` | 通过/失败 | `<ISO-8601>` | `<url>` |
-| 听审核人 1 | `<id>` | 通过/失败 | `<ISO-8601>` | `<url>` |
-| 听审核人 2 | `<id>` | 通过/失败/不适用 | `<ISO-8601>` | `<url>` |
-| 发布负责人 | `<id>` | 发布/阻止 | `<ISO-8601>` | `<url>` |
+| 执行人 | | | | |
+| 审核者 1 | | | | |
+| 审核者 2 | | | | |
+| 发布负责人 | | | | |
 
-最终结论：`通过` / `失败`。
+最终人类结论，勾选且只选一个：
 
-阻塞原因或发布说明：`<text>`
+- [ ] **认证通过**：所有自动门禁和所需人工签核完成；
+- [ ] **自动门禁通过，人工待完成**；
+- [ ] **失败**：自动或人工门禁失败；
+- [ ] **阻塞**：缺少环境、资产、凭据或人类确认。
+
+阻塞原因或发布说明：

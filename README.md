@@ -156,7 +156,7 @@ bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --device CU128
 
 准备脚本默认走 `Auto`：先跑 `probe-network`，优先选择中国大陆可达且健康的源，例如 ModelScope 或 HF Mirror，必要时再回退到全球 Hugging Face / PyPI 路线。默认安装只准备 full-quality baseline models，quantized、distilled、simplified、small、low-memory 这些都只是手动 manual 的高级选项。
 
-详细拓扑、远端 worker、离线缓存和模型下载策略见 [部署方案](docs/deployment.md)。Windows CUDA 的单机与四机正式认证统一从 [CUDA 全流程闭环验证](docs/cuda-e2e-validation.md) 进入。
+详细拓扑、远端 worker、离线缓存和模型下载策略见 [部署方案](docs/deployment.md)。Windows 单机认证命令只见 [单机 CUDA Runbook](docs/cuda-e2e-single-node.md)；四机命令见 [分布式 Runbook](docs/cuda-e2e-distributed.md)；跨拓扑规则见 [CUDA 验证契约](docs/cuda-e2e-validation.md)。
 GPT-SoVITS 三分支职责、收敛顺序和合并门禁见 [GPT-SoVITS 分支收敛](docs/gpt-sovits-branch-convergence.md)。
 当前阶段边界、设计不足和任务拆分见 [当前阶段说明与简化计划](docs/current-state-and-simplification-plan.md)。
 
@@ -183,18 +183,7 @@ export TTS_MORE_RUN_REAL_TTS=1
 .venv/bin/python -m pytest backend/tests/test_real_tts_validation.py -q
 ```
 
-稳定发布使用 Windows CUDA 总入口，不能只以该 pytest 文件通过代替完整门禁：
-
-```powershell
-.\scripts\run-cuda-validation.ps1 `
-  -Mode single-release `
-  -Services data\local\services.json `
-  -Fixture data\validation\cuda-fixture.local.json `
-  -Output data\validation\runs\<run-id> `
-  -RequireBaseline
-```
-
-首次设备认证运行 `single-clean`；四机可信 LAN 运行 `distributed`。环境、topology、工件传输、音频/ASR/性能阈值、Playwright 和人工听审要求见 [CUDA 全流程闭环验证](docs/cuda-e2e-validation.md)。macOS 和普通 hosted CI 只能验证无 GPU 的契约与判定逻辑，不能签发 CUDA 认证。
+真实 TTS pytest 不能替代正式 CUDA 认证。Windows 单机只从 [单机 CUDA Runbook](docs/cuda-e2e-single-node.md) 复制命令；四机可信 LAN 见 [分布式 Runbook](docs/cuda-e2e-distributed.md)；门禁和证据语义见 [CUDA 验证契约](docs/cuda-e2e-validation.md)。macOS 和普通 hosted CI 不能签发 Windows CUDA 认证。
 
 ## 服务模式
 

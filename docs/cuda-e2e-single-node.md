@@ -1,179 +1,178 @@
 # 单机 Windows CUDA 验收 Runbook
 
-本 runbook 执行应用本体和三个正式 worker 在一台 Windows CUDA 设备上的完整闭环。门禁定义以 [CUDA 全流程闭环验证](cuda-e2e-validation.md) 为准。
+这是唯一可复制执行的 Windows 单机认证入口。跨拓扑契约见 [CUDA 验证契约](cuda-e2e-validation.md)，人工签核见 [验收记录模板](cuda-e2e-acceptance-record.md)。
 
-## 1. 机器准备
+## 完整路径
 
-确认：
+```mermaid
+flowchart TD
+    A["环境与磁盘"] --> B["创建被忽略的 topology / fixture"]
+    B --> C["总入口执行 host preflight + input preflight"]
+    C -->|"阻塞"| X["读取摘要，补齐输入后重跑"]
+    C -->|"通过"| D["锁定部署、启动 worker、核心 CUDA"]
+    D --> E["worker 与应用端点"]
+    E --> F["Playwright 30 条队列"]
+    F --> G["证据完整性"]
+    G --> H["人工听审"]
+    H --> I["批准基线"]
+    I --> J["single-release 回归"]
+```
 
-- Windows 11 或 Windows Server；
-- NVIDIA 驱动支持 CUDA 12.8，GPU 至少 16 GB VRAM；
-- Python 3.11、Git、Node.js、pnpm、PowerShell 可用；
-- 验证用 `.venv` 安装 `faster-whisper`，并能加载 `large-v3`；
-- `nvidia-smi` 可执行，系统盘、repo 盘和模型缓存盘有足够空间；
-- 防火墙允许本机访问 `127.0.0.1:8000`、`:5173`、`:9880`、`:9881`、`:9882`。
+正式运行只调用一次总入口。项目根内使用默认 repo 路径或可选 `RepoPaths` 都由总入口完成部署和启动；不要先手动部署或启动。
 
-记录以下输出到验收记录：
+## 1. 环境
+
+要求 Windows、Python 3.11、conda、Git、Node.js、pnpm、PowerShell、`nvidia-smi`。NVIDIA 驱动必须支持 CUDA 12.8，GPU 至少 16 GB VRAM。系统盘、repo 盘、模型缓存盘和输出盘都要有足够空间。
 
 ```powershell
-Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber
-nvidia-smi
+$ErrorActionPreference = "Stop"
 python --version
+conda --version
 git --version
 node --version
 pnpm --version
+nvidia-smi
+
+if (Test-Path -LiteralPath .venv) {
+    throw "首次 single-clean 需要新的应用 .venv；请使用新 checkout，或经人类确认后删除旧环境再重跑。"
+}
+python -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install --upgrade pip
+& .\.venv\Scripts\python.exe -m pip install -e 'backend[dev]'
+& .\.venv\Scripts\python.exe -m pip install faster-whisper
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend cuda:e2e:install
 ```
 
-## 2. 创建本机配置
+日常 `single-release` 复用已认证的应用 `.venv`，但仍要确认 Python 为 3.11、conda 可用且依赖安装成功。
+
+## 2. 被忽略的本机配置
 
 ```powershell
+New-Item -ItemType Directory -Force data\validation | Out-Null
 Copy-Item deployment\app\repo-paths.example.json deployment\app\repo-paths.local.json
 Copy-Item deployment\app\topology.single-windows.example.json deployment\app\topology.single-windows.local.json
-```
-
-在人类确认后编辑 `repo-paths.local.json`。单机 topology 保持三个正式服务归属 `gpu-worker`，并保持：
-
-```json
-{
-  "host": "localhost",
-  "bind_host": "127.0.0.1",
-  "resource_group": "cuda-0",
-  "capacity": 1
-}
-```
-
-从脱敏模板创建被忽略的 fixture，填写三份参考音频、GPT `v2ProPlus`/`v2Pro` 权重、prompt、测试文本、`faster-whisper large-v3` 和审核者：
-
-```powershell
 Copy-Item deployment\validation\fixture.example.json data\validation\cuda-fixture.local.json
-```
 
-可以保留模板中的 `${TTS_MORE_VALIDATION_*}` 并在 runner 环境设置对应变量。检查这些文件确实不会提交：
-
-```powershell
 git check-ignore -v deployment\app\repo-paths.local.json
 git check-ignore -v deployment\app\topology.single-windows.local.json
 git check-ignore -v data\validation\cuda-fixture.local.json
 ```
 
-## 3. 首次认证 `single-clean`
+由人类确认 `repo-paths.local.json`。fixture 必须提供三份参考音频、四个 GPT/SoVITS 权重、prompt、测试文本和审核者。可以设置模板中的 `TTS_MORE_VALIDATION_*` 环境变量，不要把真实路径或身份写入仓库。
 
-`single-clean` 必须证明空白设备能从锁定源完成部署。开始前保存必要的私有模型和 fixture 备份，然后移除应用 venv、三个服务 repo 和服务 repo 内 venv。第一次认证不复用旧 repo 或旧 Python 环境；模型也重新下载或从已批准的离线发布缓存恢复，并在记录中写明来源。
+锁定提交的唯一来源是仓库根 `repo.lock.json`。单机 topology 的三个正式服务必须属于 `gpu-worker`，共享 `resource_group: cuda-0`、`capacity: 1`。
 
-```powershell
-Remove-Item -Recurse -Force .venv -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force repo\GPT-SoVITS-main -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force repo\index-tts -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force repo\CosyVoice -ErrorAction SilentlyContinue
-```
+## 3. 首次 `single-clean`
 
-执行完整部署：
+下面是正式首次认证命令。总入口先运行 host preflight 和 input preflight；未满足 Python 3.11、conda、磁盘、GPU、Playwright 或 fixture 要求时，会在清理和 worker 等待前阻塞。
 
 ```powershell
-.\scripts\deploy-local-tts.ps1 `
-  -Device CU128 `
-  -Profile local-all `
-  -Topology deployment\app\topology.single-windows.local.json `
-  -Node gpu-worker `
-  -Targets default `
-  -RepoPaths deployment\app\repo-paths.local.json `
-  -CleanRepos
-```
-
-不得使用 `-SkipRepoSync`、`-SkipRepoPrepare`、`-SkipInstall` 或 `-SkipDownloads`。部署结束后确认：
-
-1. `repo.lock.json` 中三个正式 repo 的提交与本地 `HEAD` 一致；
-2. 应用 `.venv` 与三个服务环境存在；
-3. 模型和 fixture 中指定的 GPT 权重存在；
-4. `data/local/services.json` 只有三个正式服务，均为 `resource_group: cuda-0`、`capacity: 1`；
-5. `python scripts/tts_more_deploy.py doctor` 没有 repo、分支、提交或 venv 错误。
-
-`backend[dev]` 当前不包含 `faster-whisper`。fixture 的 `asr.required` 固定为 `true`；在执行验证器前将 `faster-whisper` 安装到本次验证的 `.venv`。缺失时预检会失败，不能通过 fixture 关闭 ASR 来绕过发布门禁。
-
-## 4. 日常发布 `single-release`
-
-`single-release` 保留已认证模型缓存，不删除模型目录；它仍必须重新同步锁定 repo、安装依赖、复制 `deployment/tts-repos/<provider>` 附加脚本，并重新渲染 `data/local/services.json`。
-
-```powershell
-.\scripts\deploy-local-tts.ps1 `
-  -Device CU128 `
-  -Profile local-all `
-  -Topology deployment\app\topology.single-windows.local.json `
-  -Node gpu-worker `
-  -Targets default `
-  -RepoPaths deployment\app\repo-paths.local.json
-```
-
-不要使用 `-SkipRepoSync` 或 `-SkipInstall`。允许下载器命中已批准缓存，但记录缓存位置和命中情况。若锁定提交、依赖锁或模型清单变化，重新执行受影响部分并在验收记录说明。
-
-## 5. 启动与静态预检
-
-让三个 worker 同时在线：
-
-```powershell
-.\scripts\start-service-workers.ps1 `
+$RunId = "single-clean-$(Get-Date -Format yyyyMMdd-HHmmss)"
+& .\scripts\run-cuda-validation.ps1 `
+  -Mode single-clean `
+  -Services data\local\services.json `
+  -Fixture data\validation\cuda-fixture.local.json `
   -Topology deployment\app\topology.single-windows.local.json `
   -Node gpu-worker `
   -RepoPaths deployment\app\repo-paths.local.json `
-  -Detach
+  -Output "data\validation\runs\$RunId"
 ```
 
-启动应用：
+`single-clean` 会先展示解析后的项目相对清理范围（selected repo labels），再清理这些 repo 内的模型和 venv。清理范围不包含应用 `.venv`、fixture 或 repo 清单以外的目录。看到的 label 与已确认配置不一致时立即停止。
 
-```powershell
-.\scripts\start-dev.ps1
-```
+阻塞时先读：
 
-分别检查 `/health`、`/capabilities`、`/status`。三个 `/capabilities` 都必须包含 `artifact-transfer`；`/status` 必须报告 `device`、`cuda_runtime:12.8`、`loaded`、`model` 和 `memory`。
+- `environment-preflight.json`：host preflight 的 Python、conda、磁盘、GPU、ASR 和 Playwright 结论；
+- `summary.json`：input preflight 的 fixture、参考音频、权重、审核者和基线结论。
+
+不要在输入阻塞时启动或等待 worker。
+
+## 4. Worker 与应用端点
+
+核心入口通过后，保存三个 worker 的端点证据。`/capabilities` 必须包含 `tts` 和 `artifact-transfer`；`/status` 必须报告 CUDA 12.8、加载状态、模型和显存字段。
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:9880/health
-Invoke-RestMethod http://127.0.0.1:9881/health
-Invoke-RestMethod http://127.0.0.1:9882/health
+Invoke-RestMethod http://127.0.0.1:9880/capabilities
 Invoke-RestMethod http://127.0.0.1:9880/status
+Invoke-RestMethod http://127.0.0.1:9881/health
+Invoke-RestMethod http://127.0.0.1:9881/capabilities
 Invoke-RestMethod http://127.0.0.1:9881/status
+Invoke-RestMethod http://127.0.0.1:9882/health
+Invoke-RestMethod http://127.0.0.1:9882/capabilities
 Invoke-RestMethod http://127.0.0.1:9882/status
 ```
 
-预检必须确认 CUDA 12.8、VRAM >=16 GB、磁盘余量、模型文件、三个进程和端口。三进程在线不代表三模型同时驻留。
+启动应用工作台；只停止该命令打印的本次 PID，不按端口强杀未知进程。
 
-## 6. 自动验证
+```powershell
+.\scripts\start-dev.ps1
+Invoke-RestMethod http://127.0.0.1:8000/api/health
+Invoke-RestMethod http://127.0.0.1:8000/api/services/status
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:5173
+```
 
-为每次运行使用新的输出目录：
+## 5. 独立 Playwright 门禁
+
+核心 CUDA 通过不等于 UI 通过。在同一运行中设置唯一项目 ID，再执行 30 条真实混合队列。
+
+```powershell
+$env:TTS_MORE_RUN_CUDA_E2E = "1"
+$env:TTS_MORE_CUDA_VALIDATION_MODE = "single-clean"
+$env:TTS_MORE_CUDA_E2E_PROJECT_ID = "cuda-$RunId"
+$env:TTS_MORE_CUDA_FIXTURE = (Resolve-Path data\validation\cuda-fixture.local.json).Path
+$env:TTS_MORE_E2E_BASE_URL = "http://127.0.0.1:5173"
+$env:TTS_MORE_API_TARGET = "http://127.0.0.1:8000"
+pnpm --dir frontend cuda:e2e
+```
+
+成功判据：30 条任务完成，每个正式服务 10 条；单机同时最多一个加载签名；三个服务各有一条历史音频可由 `/api/audio` 读取。证据是 `frontend/test-results/playwright-junit.xml`；失败时同时保留 trace、screenshot 和 video。
+
+## 6. 证据与状态
+
+证据分两类：
+
+- **受控原始证据**：`controller.log`、`wav/`、worker 原始日志、Playwright trace/video、真实 GPU UUID、审核者身份和签名。仅留在本机运行目录或受控存储。
+- **脱敏可共享证据**：脱敏 summary、JUnit、聚合 GPU 指标、hash-only 引用和无身份的审核状态。只有这一类可以进入 PR 或普通 GitHub artifact。
+
+核心报告使用五个机器状态：
+
+| 状态 | 含义 |
+|---|---|
+| `blocked` | 环境、fixture、凭据或人类输入缺失 |
+| `core_failed` | 核心 CUDA 自动门禁失败 |
+| `diagnostic_core_passed` | 使用 Skip 开关完成核心诊断，不可认证 |
+| `core_passed_ui_pending` | 核心通过，Playwright 未完成 |
+| `automatic_passed_human_pending` | 核心与 Playwright 通过，等待人工听审 |
+
+人类最终结论只有四个：认证通过、自动门禁通过，人工待完成、失败、阻塞。不要把任一机器中间状态写成认证通过。
+
+## 7. 人工听审与基线
+
+打开受控原始运行目录的 `human-listening-review.md`，并填写 [验收记录](cuda-e2e-acceptance-record.md)。首次 `single-clean` 有 6 个输出，每个输出由两名审核者独立评分，共 12 行。每个单项至少 3/5，总均分至少 3.5。
+
+人工签核完成后才批准首个 `performance_baseline.warm_p95_seconds`。把有限正数写入私有 fixture，记录批准人和基线运行 ID。
+
+## 8. `single-release` 回归
+
+发布回归仍只调用一次总入口，并强制批准基线。
 
 ```powershell
 $RunId = "single-release-$(Get-Date -Format yyyyMMdd-HHmmss)"
-.\scripts\run-cuda-validation.ps1 `
+& .\scripts\run-cuda-validation.ps1 `
   -Mode single-release `
   -Services data\local\services.json `
   -Fixture data\validation\cuda-fixture.local.json `
   -Topology deployment\app\topology.single-windows.local.json `
   -Node gpu-worker `
+  -RepoPaths deployment\app\repo-paths.local.json `
   -Output "data\validation\runs\$RunId" `
   -RequireBaseline
 ```
 
-首次认证将 `-Mode` 改为 `single-clean` 并可移除 `-RequireBaseline`；该模式会忽略已有基线要求并产出待批准的首个 warm p95。它把 `-CleanRepos` 传给同步工具，删除 `repo/` 下已有 checkout（包括 repo 内 venv）后重建；首次设备认证仍应按第 3 节先清理应用 `.venv`，CI 的全新 checkout 也必须重新创建它。验证期间持续采集 `nvidia-smi`。必须观察到 provider 切换前旧服务 `/unload`，随后显存回落，再加载新服务；不得用三个模型同时驻留绕过该路径。
+随后把 Playwright 模式改为 `single-release`，使用新的项目 ID 再运行第 5 节命令。自动门禁和人工听审都通过后，才可写“认证通过”。
 
-核心验证器自动执行 5 个模型用例、单机 GPT `path`/`artifact` 对照及音频、ASR、显存和耗时判定。GPU workflow 随后用 Playwright 提交 30 条真实混合队列，每服务 10 条，并断言共享资源组最多只有一个加载签名；三条代表性历史音频必须可由 `/api/audio` 读取。两部分都通过才算自动门禁通过。
+## 仅诊断
 
-若本机使用 `repo-paths.local.json` 的自定义路径，当前 CUDA 总入口不会转发 `-RepoPaths`。先按第 3/4 节手动部署，再给验证入口加 `-SkipDeploy`，避免它重新按默认路径部署。
-
-## 7. UI 与人工验收
-
-Playwright 门禁加载专用验证项目，等待三个服务 ready，执行 30 条真实混合队列，等待队列结束，并抽查三个服务各一条历史音频的 `/api/audio` 返回有效媒体。保留 Playwright report、trace 或失败截图 URL。
-
-打开运行目录的 `human-listening-review.md`，按 [验收记录模板](cuda-e2e-acceptance-record.md) 逐样本评分。首次 `single-clean` 需要两名审核者；后续发布至少一名。清晰度、音色相似度、情绪/韵律和伪影控制均不得低于 3/5，总均分不得低于 3.5。
-
-## 8. 建立与比较基线
-
-第一次完整通过的 16 GB `single-clean` 运行建立冷加载、短句耗时、warm p95、显存基线。后续 `single-release`：
-
-- 无 OOM；峰值空闲显存至少 512 MiB；
-- 卸载后 30 秒内回到基线 +1 GiB；
-- 冷加载不超过 10 分钟，短句不超过 5 分钟；
-- warm p95 不得比已批准基线退化超过 30%。
-
-从首个通过报告取 warm p95，经审核批准后写入受控 fixture 的 `performance_baseline.warm_p95_seconds`。后续 `single-release` 必须使用 `-RequireBaseline`，缺少该字段时预检直接失败。
-
-复制自动运行 URL、基线版本和人工记录链接到发布候选。任何失败或缺失结果都阻止发布。
+`SkipDeploy` 或 `SkipStart` 只用于保留现有环境的 diagnostic 排障。任何带 Skip 开关的运行都必须是 `certifiable: false`、`diagnostic_core_passed`，不可认证，也不可建立或批准基线。

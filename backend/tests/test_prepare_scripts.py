@@ -1,9 +1,40 @@
 from __future__ import annotations
 
+import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+CUDA_DOC_PATHS = (
+    "README.md",
+    "docs/cuda-e2e-single-node.md",
+    "docs/cuda-windows-codex-handoff-prompt.md",
+    "docs/cuda-e2e-validation.md",
+    "docs/cuda-e2e-acceptance-record.md",
+    "docs/ci-architecture.md",
+    "docs/deployment.md",
+    "deployment/app/README.md",
+    "deployment/tts-repos/gpt-sovits/README.md",
+    "deployment/tts-repos/indextts/README.md",
+    "deployment/tts-repos/cosyvoice/README.md",
+)
+
+
+def _read_repo_text(relative_path: str) -> str:
+    return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def _powershell_blocks(relative_path: str) -> list[tuple[int, str]]:
+    text = _read_repo_text(relative_path)
+    blocks = []
+    for match in re.finditer(r"```powershell\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE):
+        blocks.append((text.count("\n", 0, match.start()) + 1, match.group(1).strip()))
+    return blocks
 
 
 def test_powershell_prepare_defaults_to_auto_and_calls_probe_network() -> None:
@@ -337,3 +368,167 @@ def test_docs_explain_gpt_branch_convergence_and_explicit_regression_targets() -
     assert "upstream/main → dev" in docs
     assert "proplus-hc-dev" in docs
     assert "CUDA" in docs
+
+
+def test_windows_cuda_single_node_runbook_is_the_only_copy_paste_certification_entrypoint() -> None:
+    canonical = "docs/cuda-e2e-single-node.md"
+    for relative_path in CUDA_DOC_PATHS:
+        blocks = _powershell_blocks(relative_path)
+        containing_entrypoint = [block for _line, block in blocks if "run-cuda-validation.ps1" in block]
+        if relative_path == canonical:
+            assert containing_entrypoint, "single-node runbook must contain the executable CUDA entrypoint"
+        else:
+            assert containing_entrypoint == [], f"{relative_path} duplicates the single-node certification command"
+
+    for relative_path in (
+        "README.md",
+        "docs/cuda-windows-codex-handoff-prompt.md",
+        "docs/cuda-e2e-validation.md",
+        "docs/ci-architecture.md",
+        "docs/deployment.md",
+        "deployment/app/README.md",
+    ):
+        assert "cuda-e2e-single-node.md" in _read_repo_text(relative_path)
+
+
+def test_windows_cuda_copy_paste_powershell_has_no_pseudo_syntax() -> None:
+    forbidden_literals = (
+        "single-clean|single-release|distributed",
+        "local-all|app-only|worker-node",
+    )
+    placeholder = re.compile(r"<[^>\r\n]+>")
+
+    for relative_path in CUDA_DOC_PATHS:
+        for line, block in _powershell_blocks(relative_path):
+            assert not placeholder.search(block), f"{relative_path}:{line} contains an angle-bracket placeholder"
+            for token in forbidden_literals:
+                assert token not in block, f"{relative_path}:{line} contains pseudo-enum syntax {token!r}"
+
+
+def test_windows_cuda_copy_paste_powershell_parses() -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell parser is only available on Windows or pwsh-enabled runners")
+    parser_command = (
+        "$code = [Console]::In.ReadToEnd(); $tokens = $null; $errors = $null; "
+        "[System.Management.Automation.Language.Parser]::ParseInput($code, [ref]$tokens, [ref]$errors) | Out-Null; "
+        "if ($errors.Count) { $errors | ForEach-Object { $_.Message }; exit 1 }"
+    )
+
+    for relative_path in CUDA_DOC_PATHS:
+        for line, block in _powershell_blocks(relative_path):
+            completed = subprocess.run(
+                [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", parser_command],
+                input=block,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert completed.returncode == 0, f"{relative_path}:{line}: {completed.stdout}{completed.stderr}"
+
+
+def test_single_node_runbook_documents_one_formal_path_and_separate_ui_gate() -> None:
+    runbook = _read_repo_text("docs/cuda-e2e-single-node.md")
+
+    assert "Python 3.11" in runbook
+    assert "conda" in runbook.casefold()
+    assert "host preflight" in runbook
+    assert "input preflight" in runbook
+    assert "-RepoPaths deployment\\app\\repo-paths.local.json" in runbook
+    assert "deploy-local-tts.ps1" not in runbook
+    assert "start-service-workers.ps1" not in runbook
+    assert "SkipDeploy" in runbook and "SkipStart" in runbook
+    assert "diagnostic" in runbook and "不可认证" in runbook
+    for port in (9880, 9881, 9882):
+        for endpoint in ("health", "capabilities", "status"):
+            assert f"http://127.0.0.1:{port}/{endpoint}" in runbook
+    assert "http://127.0.0.1:8000/api/health" in runbook
+    assert "http://127.0.0.1:8000/api/services/status" in runbook
+    assert "http://127.0.0.1:5173" in runbook
+    assert "TTS_MORE_RUN_CUDA_E2E" in runbook
+    assert "TTS_MORE_CUDA_VALIDATION_MODE" in runbook
+    assert "TTS_MORE_CUDA_E2E_PROJECT_ID" in runbook
+    assert "TTS_MORE_CUDA_FIXTURE" in runbook
+    assert "pnpm --dir frontend cuda:e2e" in runbook
+    assert "展示所选服务 repo 的绝对路径" not in runbook
+    assert "项目相对清理范围" in runbook
+    assert "selected repo labels" in runbook
+
+
+def test_cuda_docs_use_root_lock_and_current_repopaths_contract() -> None:
+    combined = "\n".join(_read_repo_text(path) for path in CUDA_DOC_PATHS)
+    assert "deployment/app/repo.lock.json" not in combined
+    assert "deployment\\app\\repo.lock.json" not in combined
+    assert "总入口不会转发 `-RepoPaths`" not in combined
+    assert "总入口当前不转发 `-RepoPaths`" not in combined
+
+    for relative_path in (
+        "docs/cuda-e2e-single-node.md",
+        "docs/cuda-windows-codex-handoff-prompt.md",
+        "docs/cuda-e2e-validation.md",
+        "docs/cuda-e2e-acceptance-record.md",
+    ):
+        text = _read_repo_text(relative_path)
+        assert "repo.lock.json" in text
+        assert "Python 3.11" in text
+        assert "conda" in text.casefold()
+
+
+def test_provider_readmes_route_certification_through_top_level_wrapper() -> None:
+    provider_docs = {
+        "gpt-sovits": _read_repo_text("deployment/tts-repos/gpt-sovits/README.md"),
+        "indextts": _read_repo_text("deployment/tts-repos/indextts/README.md"),
+        "cosyvoice": _read_repo_text("deployment/tts-repos/cosyvoice/README.md"),
+    }
+    for provider, text in provider_docs.items():
+        assert "deploy-local-tts.ps1" in text, f"{provider} must route formal certification to the top-level wrapper"
+        assert "不是完整认证路径" in text
+        assert "CU128" in text
+
+    assert "conda" in provider_docs["gpt-sovits"].casefold()
+    assert "torchcodec" in provider_docs["gpt-sovits"]
+    assert "w2v-bert" in provider_docs["indextts"].casefold()
+    assert "BigVGAN" in provider_docs["indextts"]
+    assert "openai-whisper" in provider_docs["cosyvoice"]
+
+
+def test_acceptance_record_has_machine_states_human_conclusions_and_twelve_listening_rows() -> None:
+    record = _read_repo_text("docs/cuda-e2e-acceptance-record.md")
+    for status in (
+        "blocked",
+        "core_failed",
+        "diagnostic_core_passed",
+        "core_passed_ui_pending",
+        "automatic_passed_human_pending",
+    ):
+        assert status in record
+    for conclusion in ("认证通过", "自动门禁通过，人工待完成", "失败", "阻塞"):
+        assert conclusion in record
+
+    case_ids = (
+        "gpt-v2ProPlus",
+        "gpt-v2Pro",
+        "gpt-v2ProPlus-artifact",
+        "index-emotion-text",
+        "cosyvoice-zero-shot",
+        "cosyvoice-cross-lingual",
+    )
+    for case_id in case_ids:
+        assert record.count(f"`{case_id}`") == 2, f"{case_id} needs one row per first-certification reviewer"
+    assert "Playwright report URL" not in record
+    assert "Playwright JUnit" in record
+
+
+def test_windows_cuda_handoff_contains_boundaries_not_a_second_runbook() -> None:
+    handoff = _read_repo_text("docs/cuda-windows-codex-handoff-prompt.md")
+    assert len(handoff.splitlines()) <= 120
+    assert "docs/cuda-e2e-single-node.md" in handoff
+    for required in ("授权边界", "停止条件", "私有", "最终回复"):
+        assert required in handoff
+    for duplicated_command in (
+        "deploy-local-tts.ps1",
+        "start-service-workers.ps1",
+        "run-cuda-validation.ps1",
+        "pnpm --dir frontend cuda:e2e",
+    ):
+        assert duplicated_command not in handoff
