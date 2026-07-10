@@ -1,6 +1,6 @@
 # CUDA 全流程闭环验证
 
-本文是 TTS More Windows CUDA 验收的唯一总入口。单机操作见 [单机 runbook](cuda-e2e-single-node.md)，四机操作见 [分布式 runbook](cuda-e2e-distributed.md)，签核使用 [验收记录模板](cuda-e2e-acceptance-record.md)。在新 Windows 设备上通过 Codex 接续执行时，直接使用 [Windows CUDA Codex 验证交接 Prompt](cuda-windows-codex-handoff-prompt.md)。
+本文是 TTS More Windows CUDA 正式验收的唯一总入口。单机操作见 [单机 runbook](cuda-e2e-single-node.md)，四机操作见 [分布式 runbook](cuda-e2e-distributed.md)，签核使用 [验收记录模板](cuda-e2e-acceptance-record.md)。当前 macOS 运行应用、Windows CUDA 运行远端 worker 的第二套方案见 [macOS LAN 验证](cuda-e2e-macos-lan.md)；跨平台编排完成前，该方案属于补充门禁，不替代本文的正式门禁。在新 Windows 设备上通过 Codex 接续执行时，直接使用 [Windows CUDA Codex 验证交接 Prompt](cuda-windows-codex-handoff-prompt.md)。
 
 ## 目标与边界
 
@@ -34,6 +34,8 @@ flowchart LR
 单机必须让应用和三个 worker 同时在线，但三个服务共享 `cuda-0`，按队列顺序加载。切换 provider 前，编排器调用旧 worker 的 `/unload`，清除加载状态并触发 GC/CUDA cache 释放。高显存设备上的多模型并发只是扩展测试，不代替 `capacity: 1` 的必过路径。
 
 分布式基线是一台应用控制节点加三台独立 GPU worker。每个 worker 节点保留一份轻量 TTS More checkout，只准备自己负责的一个 TTS repo 和模型；不要求运行前端或应用后端。
+
+macOS 控制面的混合 LAN 方案另行覆盖一台共享 GPU worker 和三台独立 GPU worker。当前 Windows PowerShell 总入口依赖控制节点注册表、Windows venv 路径和本地 `nvidia-smi`，不能在 macOS 上签发正式分布式通过结果；具体阶段划分和升级条件以 [macOS LAN 验证](cuda-e2e-macos-lan.md) 为准。
 
 ## 配置接口
 

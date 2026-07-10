@@ -11,6 +11,7 @@
 | 3 | 未合并 feature 分支 | ✅ dev-xu 已合并；两个死分支已删除 |
 | 4 | `frontend/design.md` 过时 | ✅ 已删除 |
 | 5 | Windows CUDA 全流程认证 | 🔬 自动化与文档已建立，待真实单机和四机首次认证 |
+| 6 | macOS 控制面 + LAN Windows CUDA | 📐 补充门禁方案已设计，待真实执行和跨平台编排实现 |
 
 ---
 
@@ -82,3 +83,21 @@ rebase 会让 28 个提交逐个撞安全代码（冲突分散），merge 更干
 7. 首次两类认证均通过后，才将其启用为稳定发布的强制门禁。
 
 执行说明见 [CUDA 验证总入口](cuda-e2e-validation.md)、[单机 runbook](cuda-e2e-single-node.md) 和 [四机 runbook](cuda-e2e-distributed.md)。
+
+---
+
+## 6. macOS 控制面与 LAN Windows CUDA 📐
+
+已确定两级拓扑：当前 macOS 运行完整应用，一台 Windows GPU 主机承载三个服务用于共享资源组验证；随后使用三台 Windows GPU 主机各承载一个服务完成并行和故障隔离验证。远端控制固定使用密钥认证、host key 固定的 Windows OpenSSH，音频使用 `artifact-transfer`，不依赖共享文件系统。
+
+当前阶段只作为可审计补充门禁。升级为稳定发布门禁前仍需：
+
+1. 抽取跨平台 Python 编排核心，提供 POSIX 和 PowerShell 薄入口；
+2. 去除控制节点必须为 Windows、必须有本地 `nvidia-smi` 的假设；
+3. 为共享 GPU 和三 GPU topology 分别实现加载互斥、UUID 唯一性和性能规则；
+4. 自动完成远端 clean deploy、commit 核对、监控、故障注入和证据回收；
+5. 让一次性 preflight 同时绑定 topology、fixture、commit 和 SSH host key 哈希；
+6. 在真实 LAN 上先完成共享 GPU 补充认证，再完成三 GPU 首次认证和两名审核者签核；
+7. 与 Windows 控制节点的正式结果对比，确认没有未解释差异后再修改发布治理。
+
+完整设计和阶段一操作见 [macOS LAN CUDA 验证](cuda-e2e-macos-lan.md)。
