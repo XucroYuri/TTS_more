@@ -4,6 +4,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -20,6 +21,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_BUNDLE_RELATIVE_PATH = Path("deployment/tts-repos")
 DEFAULT_REPO_PATHS_RELATIVE_PATH = Path("deployment/app/repo-paths.local.json")
 TOPOLOGY_SCHEMA_VERSION = 1
+_HOSTNAME_PATTERN = re.compile(
+    r"(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
+)
 
 
 PROVIDER_MODULES = {
@@ -529,9 +534,9 @@ def render_services(
             "provider_type": provider,
             "source_profile": "lan_endpoint" if is_lan else "local_endpoint",
             "catalog_provider": provider,
-            "setup_state": "not_configured" if template else ("endpoint_unreachable" if is_external else "repo_found"),
+            "setup_state": "not_configured" if template else (None if is_external else "repo_found"),
             "api_contract": "tts-more-v1",
-            "base_url": f"http://{endpoint_host}:{port}",
+            "base_url": _service_base_url(endpoint_host, port),
             "mode": "external" if is_external else "local",
             "network_scope": "lan" if is_lan else "localhost",
             "managed": not is_external,
@@ -541,7 +546,7 @@ def render_services(
             "start_command": [] if is_external else _start_command(repo, platform_name, port, bind_host=bind_host),
             "start_cwd": None if is_external else ".",
             "env": worker_env,
-            "health_url": f"http://{endpoint_host}:{port}/health",
+            "health_url": f"{_service_base_url(endpoint_host, port)}/health",
             "resource_group": resource_group,
             "capacity": capacity,
             "priority": int(repo.get("priority") or PROVIDER_PRIORITY[provider]),
@@ -551,6 +556,16 @@ def render_services(
             service["default_params"] = {"mode": "zero_shot", "response_format": "wav"}
         services.append(service)
     return services
+
+
+def _service_base_url(host: str, port: int) -> str:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        url_host = host
+    else:
+        url_host = f"[{host}]" if address.version == 6 else host
+    return f"http://{url_host}:{port}"
 
 
 def load_topology(
@@ -597,6 +612,8 @@ def validate_topology(payload: Any, *, selected_service_ids: set[str]) -> None:
             value = node_config[field]
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"topology node {node_name} {field} must be a nonempty string")
+        for field in ("host", "bind_host"):
+            _validate_topology_host(node_name, field, node_config[field])
         services = node_config["services"]
         if not isinstance(services, list) or any(not isinstance(item, str) or not item.strip() for item in services):
             raise ValueError(f"topology node {node_name} services must be a list of nonempty strings")
@@ -662,6 +679,22 @@ def validate_topology(payload: Any, *, selected_service_ids: set[str]) -> None:
         for node_name, node_config in worker_nodes:
             if len(node_config["services"]) != 1:
                 raise ValueError(f"distributed worker {node_name} must own exactly one service")
+
+
+def _validate_topology_host(node_name: str, field: str, value: str) -> None:
+    if value != value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"topology node {node_name} {field} must be a valid host")
+    if any(char in value for char in ":/@\\?#[]%"):
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            raise ValueError(f"topology node {node_name} {field} must be a valid host") from None
+        return
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        if not _HOSTNAME_PATTERN.fullmatch(value):
+            raise ValueError(f"topology node {node_name} {field} must be a valid host") from None
 
 
 def _topology_assignments(payload: dict[str, Any]) -> dict[str, tuple[str, dict[str, Any]]]:
@@ -809,7 +842,7 @@ def sync_repos(
     latest: bool = False,
     write_lock: bool = False,
     service_ids: set[str] | None = None,
-    force_reset: bool = True,
+    force_reset: bool = False,
     repositories: list[dict[str, Any]] | None = None,
 ) -> list[list[str]]:
     save_lock_on_change = repositories is None
@@ -1461,6 +1494,7 @@ def main(argv: list[str] | None = None) -> int:
     sync.add_argument("--dry-run", action="store_true")
     sync.add_argument("--latest", action="store_true", help="Track each configured branch instead of checking out the pinned commit")
     sync.add_argument("--write-lock", action="store_true", help="After --latest, write current HEADs back to repo.lock.json")
+    sync.add_argument("--force-reset", action="store_true", help="Allow service repositories to be reset hard to the configured branch")
     sync.add_argument("--service-ids", default=None)
     sync.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
 
@@ -1559,6 +1593,7 @@ def main(argv: list[str] | None = None) -> int:
             latest=args.latest,
             write_lock=args.write_lock,
             service_ids=_parse_service_ids(args.service_ids),
+            force_reset=args.force_reset,
             repositories=repositories,
         )
         for command in actions:

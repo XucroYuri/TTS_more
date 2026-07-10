@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -245,6 +246,73 @@ def test_render_app_only_uses_each_assigned_worker_endpoint(tmp_path: Path) -> N
     assert by_id["local-indextts"]["capacity"] == 2
 
 
+def test_render_app_only_defers_endpoint_state_to_runtime_health_and_is_routable(tmp_path: Path) -> None:
+    from backend.app.models import ProviderType, TTSServiceEndpoint
+    from backend.app.services import ServiceRegistry
+
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    topology_path = _write_topology(tmp_path, _topology_payload())
+
+    rendered = deploy.render_services(
+        tmp_path,
+        profile="app-only",
+        platform_name="windows",
+        topology=topology_path,
+        node="app-controller",
+    )
+    services = [TTSServiceEndpoint.model_validate(service) for service in rendered]
+
+    assert all(service.setup_state is None for service in services)
+    assert [service.service_id for service in ServiceRegistry(services).by_provider(ProviderType.GPT_SOVITS)] == [
+        "local-gpt-sovits-main"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("host", "base_url"),
+    [
+        ("tts-gpt.lan", "http://tts-gpt.lan:9880"),
+        ("192.0.2.10", "http://192.0.2.10:9880"),
+        ("2001:db8::10", "http://[2001:db8::10]:9880"),
+    ],
+)
+def test_render_topology_host_preserves_hostname_and_ip_literals(tmp_path: Path, host: str, base_url: str) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    payload = _topology_payload()
+    payload["nodes"]["gpt-worker"]["host"] = host
+    topology_path = _write_topology(tmp_path, payload)
+
+    services = deploy.render_services(
+        tmp_path,
+        profile="app-only",
+        platform_name="windows",
+        topology=topology_path,
+        node="app-controller",
+    )
+
+    assert next(service for service in services if service["service_id"] == "local-gpt-sovits-main")["base_url"] == base_url
+
+
+@pytest.mark.parametrize("host", ["http://tts-gpt.lan", "user@tts-gpt.lan", "tts-gpt.lan/path", "tts-gpt.lan\n"])
+def test_topology_validation_rejects_non_host_values(tmp_path: Path, host: str) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    payload = _topology_payload()
+    payload["nodes"]["gpt-worker"]["host"] = host
+    topology_path = _write_topology(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="host"):
+        deploy.load_topology(
+            tmp_path,
+            topology_path,
+            selected_service_ids={"local-gpt-sovits-main", "local-indextts", "local-cosyvoice"},
+        )
+
+
 def test_render_worker_node_selects_assignments_and_binds_node_host(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
@@ -475,6 +543,65 @@ def test_sync_repos_dry_run_uses_shallow_partial_clone(tmp_path: Path) -> None:
     assert "--filter=blob:none" in clone
     assert "--single-branch" in clone
     assert "--branch" in clone
+
+
+def test_sync_repos_refuses_dirty_real_git_repository_by_default(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    source = tmp_path / "source"
+    remote = tmp_path / "remote.git"
+    target = tmp_path / "repo" / "service"
+
+    for command in (
+        ["git", "init", "--initial-branch=main", str(source)],
+        ["git", "-C", str(source), "config", "user.email", "test@example.invalid"],
+        ["git", "-C", str(source), "config", "user.name", "TTS More test"],
+    ):
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    (source / "README.md").write_text("initial\n", encoding="utf-8")
+    for command in (
+        ["git", "-C", str(source), "add", "README.md"],
+        ["git", "-C", str(source), "commit", "-m", "initial"],
+        ["git", "init", "--bare", str(remote)],
+        ["git", "-C", str(source), "remote", "add", "origin", str(remote)],
+        ["git", "-C", str(source), "push", "-u", "origin", "main"],
+        ["git", "clone", "--branch", "main", str(remote), str(target)],
+    ):
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    (target / "README.md").write_text("local change\n", encoding="utf-8")
+
+    repositories = [
+        {
+            "name": "service",
+            "provider_type": "indextts",
+            "path": "repo/service",
+            "remote": str(remote),
+            "branch": "main",
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="refusing to update dirty service repository"):
+        deploy.sync_repos(tmp_path, repositories=repositories)
+
+    assert (target / "README.md").read_text(encoding="utf-8") == "local change\n"
+
+
+def test_sync_repos_cli_requires_explicit_force_reset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    calls: list[dict[str, object]] = []
+
+    def fake_sync(root: Path, **kwargs: object) -> list[list[str]]:
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(deploy, "sync_repos", fake_sync)
+
+    assert deploy.main(["--root", str(tmp_path), "sync-repos"]) == 0
+    assert deploy.main(["--root", str(tmp_path), "sync-repos", "--force-reset"]) == 0
+
+    assert [call.get("force_reset") for call in calls] == [False, True]
 
 
 def test_sync_repos_retries_clone_without_partial_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
