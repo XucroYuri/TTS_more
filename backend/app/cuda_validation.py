@@ -174,10 +174,14 @@ class Transcriber(Protocol):
         ...
 
 
-def load_fixture(path: Path) -> ValidationFixture:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+def _load_fixture_bytes(raw_bytes: bytes) -> ValidationFixture:
+    raw = json.loads(raw_bytes.decode("utf-8"))
     expanded = _expand_environment(raw)
     return ValidationFixture.model_validate(expanded)
+
+
+def load_fixture(path: Path) -> ValidationFixture:
+    return _load_fixture_bytes(path.read_bytes())
 
 
 def _append_required_file_failure(
@@ -211,7 +215,7 @@ def _preflight_next_action(failures: list[str]) -> str:
             lambda message: message.startswith("an approved performance baseline is required"),
             "补充已批准的 performance baseline",
         ),
-        (lambda message: "listening reviewers" in message, "补充当前模式所需的 listening reviewers"),
+        (lambda message: "listening reviewer" in message, "补充当前模式所需的 listening reviewers"),
     )
     for matches, action in categories:
         if any(matches(message) for message in failures):
@@ -227,10 +231,29 @@ def validate_fixture_inputs(
     mode: str,
     require_baseline: bool,
 ) -> tuple[ValidationFixture | None, list[str]]:
+    fixture, _fixture_sha256_value, failures = _load_fixture_snapshot(
+        fixture_path,
+        mode=mode,
+        require_baseline=require_baseline,
+    )
+    return fixture, failures
+
+
+def _load_fixture_snapshot(
+    fixture_path: Path,
+    *,
+    mode: str,
+    require_baseline: bool,
+) -> tuple[ValidationFixture | None, str | None, list[str]]:
     try:
-        fixture = load_fixture(fixture_path)
+        raw_bytes = fixture_path.read_bytes()
     except Exception as exc:
-        return None, [f"fixture validation failed: {exc}"]
+        return None, None, [f"fixture validation failed: {exc}"]
+    fixture_sha256_value = hashlib.sha256(raw_bytes).hexdigest()
+    try:
+        fixture = _load_fixture_bytes(raw_bytes)
+    except Exception as exc:
+        return None, fixture_sha256_value, [f"fixture validation failed: {exc}"]
     failures: list[str] = []
     for label, raw_path in fixture.references.model_dump().items():
         _append_required_file_failure(failures, "reference", label, str(raw_path))
@@ -257,7 +280,15 @@ def validate_fixture_inputs(
     required_reviewers = 2 if mode == "single-clean" else 1
     if len(fixture.reviewers) < required_reviewers:
         failures.append(f"{mode} requires {required_reviewers} listening reviewers")
-    return fixture, failures
+    reviewer_ids = [reviewer.id.strip() for reviewer in fixture.reviewers]
+    reviewer_names = [reviewer.name.strip() for reviewer in fixture.reviewers]
+    if any(not value for value in [*reviewer_ids, *reviewer_names]):
+        failures.append("listening reviewers require non-empty IDs and names")
+    elif len({reviewer_id.casefold() for reviewer_id in reviewer_ids}) != len(
+        reviewer_ids
+    ):
+        failures.append("listening reviewer IDs must be unique")
+    return fixture, fixture_sha256_value, failures
 
 
 def validation_cases(fixture: ValidationFixture) -> list[ValidationCase]:
@@ -694,7 +725,9 @@ class CUDAValidationRunner:
         )
         self.distributed_orchestration_verified = False
 
-    def _new_report(self, *, stage: str) -> dict[str, Any]:
+    def _new_report(
+        self, *, stage: str, fixture_sha256: str | None = None
+    ) -> dict[str, Any]:
         return {
             "schema_version": 1,
             "name": "cuda-e2e-validation",
@@ -710,8 +743,9 @@ class CUDAValidationRunner:
             ),
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
-            "fixture_sha256": _fixture_sha256(self.fixture_path),
+            "fixture_sha256": fixture_sha256,
             "passed": False,
+            "core_started": False,
             "certifiable": False,
             "certification_status": "blocked",
             "preflight": [],
@@ -725,12 +759,22 @@ class CUDAValidationRunner:
 
     def run_input_preflight(self) -> dict[str, Any]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        fixture, failures = validate_fixture_inputs(
+        fixture, fixture_sha256, failures = _load_fixture_snapshot(
             self.fixture_path,
             mode=self.mode,
             require_baseline=self.require_baseline,
         )
-        report = self._new_report(stage="input-preflight")
+        return self._write_input_preflight(fixture, fixture_sha256, failures)
+
+    def _write_input_preflight(
+        self,
+        fixture: ValidationFixture | None,
+        fixture_sha256: str | None,
+        failures: list[str],
+    ) -> dict[str, Any]:
+        report = self._new_report(
+            stage="input-preflight", fixture_sha256=fixture_sha256
+        )
         report["preflight"] = [
             {"passed": False, "message": message} for message in failures
         ]
@@ -773,14 +817,17 @@ class CUDAValidationRunner:
             report["passed"] = False
             report["certifiable"] = False
             report["certification_status"] = "core_failed"
-            report["fixture_sha256"] = _fixture_sha256(self.fixture_path)
+            report.setdefault("fixture_sha256", None)
             report["pipeline_failures"] = pipeline_failures
             report["post_core"] = {"passed": False, "failed_stage": stage}
             report["blocker_count"] = len(pipeline_failures)
             report["next_action"] = f"修复 {stage} 流水线阶段后重新运行完整 CUDA 验证。"
-            try:
-                fixture = load_fixture(self.fixture_path)
-            except Exception:
+            fixture, current_fixture_sha256, _failures = _load_fixture_snapshot(
+                self.fixture_path,
+                mode=self.mode,
+                require_baseline=self.require_baseline,
+            )
+            if current_fixture_sha256 != report.get("fixture_sha256"):
                 fixture = None
             _write_report_files(
                 self.output_dir,
@@ -790,11 +837,12 @@ class CUDAValidationRunner:
                 preserve_worker_references=True,
             )
             return report
-        try:
-            fixture = load_fixture(self.fixture_path)
-        except Exception:
-            fixture = None
-        report = self._new_report(stage=stage)
+        fixture, fixture_sha256, _failures = _load_fixture_snapshot(
+            self.fixture_path,
+            mode=self.mode,
+            require_baseline=self.require_baseline,
+        )
+        report = self._new_report(stage=stage, fixture_sha256=fixture_sha256)
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         report["passed"] = False
         report["certifiable"] = False
@@ -808,13 +856,22 @@ class CUDAValidationRunner:
         return report
 
     def run(self) -> dict[str, Any]:
-        input_report = self.run_input_preflight()
+        fixture, fixture_sha256, input_failures = _load_fixture_snapshot(
+            self.fixture_path,
+            mode=self.mode,
+            require_baseline=self.require_baseline,
+        )
+        input_report = self._write_input_preflight(
+            fixture, fixture_sha256, input_failures
+        )
         if not input_report["passed"]:
             return input_report
+        assert fixture is not None
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "wav").mkdir(parents=True, exist_ok=True)
-        report = self._new_report(stage="cuda-validation")
-        fixture: ValidationFixture | None = None
+        report = self._new_report(
+            stage="cuda-validation", fixture_sha256=fixture_sha256
+        )
         endpoints: dict[str, TTSServiceEndpoint] = {}
         monitor: NvidiaSmiMonitor | None = None
         try:
@@ -832,14 +889,16 @@ class CUDAValidationRunner:
                     {"passed": False, "message": GPU_MONITOR_REQUIRED_ERROR}
                 )
                 return self._finish(report, fixture, endpoints)
-            fixture, endpoints = self._preflight(report)
+            fixture, endpoints = self._preflight(report, fixture)
             if report["preflight"]:
                 return self._finish(report, fixture, endpoints)
-            assert fixture is not None
+            report["core_started"] = True
             clients, ready_services = self._check_service_contracts(report, fixture, endpoints)
             perf_source: dict[str, Any] = {
                 "oom": False,
                 "minimum_free_mib": None,
+                "maximum_reserved_mib": None,
+                "maximum_allocated_mib": None,
                 "baseline_memory_mib": None,
                 "unload_memory_mib": None,
                 "unload_recovery_seconds": None,
@@ -988,13 +1047,18 @@ class CUDAValidationRunner:
         }
 
     def _preflight(
-        self, report: dict[str, Any]
+        self,
+        report: dict[str, Any],
+        fixture: ValidationFixture | None = None,
     ) -> tuple[ValidationFixture | None, dict[str, TTSServiceEndpoint]]:
-        try:
-            fixture = load_fixture(self.fixture_path)
-        except Exception as exc:
-            report["preflight"].append({"passed": False, "message": f"fixture validation failed: {exc}"})
-            return None, {}
+        if fixture is None:
+            try:
+                fixture = load_fixture(self.fixture_path)
+            except Exception as exc:
+                report["preflight"].append(
+                    {"passed": False, "message": f"fixture validation failed: {exc}"}
+                )
+                return None, {}
         if self.mode == "distributed":
             orchestration_error = self._verify_distributed_orchestration()
             if orchestration_error:
@@ -1150,6 +1214,8 @@ class CUDAValidationRunner:
             "tts_attempted": True,
             "unload_confirmed": False,
             "memory_recovered": False,
+            "warm_synthesis_seconds": [],
+            "warm_repeats": [],
             "passed": False,
             "errors": [],
         }
@@ -1167,6 +1233,7 @@ class CUDAValidationRunner:
             case_report["loaded_status"] = loaded_status
             case_report["errors"].extend(_status_errors(loaded_status, expected_loaded=True))
             _record_memory(perf_source, loaded_status)
+            loaded_model = loaded_status.get("model")
 
             synthesis_started = self.clock()
             line = ScriptLine(
@@ -1196,8 +1263,16 @@ class CUDAValidationRunner:
             after_synthesis = self.status_probe(endpoint)
             case_report["synthesis_status"] = after_synthesis
             _record_memory(perf_source, after_synthesis)
+            primary_residency_errors = _residency_errors(
+                after_synthesis, expected_model=loaded_model
+            )
+            if primary_residency_errors:
+                raise RuntimeError(
+                    "warm synthesis requires the original loaded model: "
+                    + "; ".join(primary_residency_errors)
+                )
 
-            warm_times: list[float] = []
+            warm_times: list[float] = case_report["warm_synthesis_seconds"]
             warm_dir = self.output_dir / "wav" / "warm"
             warm_dir.mkdir(parents=True, exist_ok=True)
             for repeat_index in range(1, WARM_SYNTHESIS_REPEATS + 1):
@@ -1218,9 +1293,43 @@ class CUDAValidationRunner:
                     raise RuntimeError(
                         f"worker returned unexpected warm output path: {warm_result.audio_path}"
                     )
+                warm_status = self.status_probe(endpoint)
+                _record_memory(perf_source, warm_status)
+                warm_residency_errors = _residency_errors(
+                    warm_status, expected_model=loaded_model
+                )
+                if warm_residency_errors:
+                    raise RuntimeError(
+                        "warm synthesis requires the original loaded model: "
+                        + "; ".join(warm_residency_errors)
+                    )
+                try:
+                    warm_audio = measure_wav(warm_output_path)
+                except (OSError, ValueError, wave.Error) as exc:
+                    raise RuntimeError(
+                        "warm WAV evidence is missing or invalid"
+                    ) from exc
+                if not warm_audio["passed"]:
+                    failed_checks = [
+                        name
+                        for name, passed in warm_audio["checks"].items()
+                        if not passed
+                    ]
+                    raise RuntimeError(
+                        "warm WAV evidence failed audio quality: "
+                        + ", ".join(failed_checks)
+                    )
                 warm_times.append(warm_seconds)
                 perf_source["warm_synthesis_seconds"].append(warm_seconds)
-            case_report["warm_synthesis_seconds"] = warm_times
+                case_report["warm_repeats"].append(
+                    {
+                        "repeat": repeat_index,
+                        "output_path": f"wav/warm/{warm_output_path.name}",
+                        "synthesis_seconds": warm_seconds,
+                        "audio": warm_audio,
+                        "status": warm_status,
+                    }
+                )
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             case_report["errors"].append(message)
@@ -1283,14 +1392,28 @@ class CUDAValidationRunner:
         )
         if self.diagnostic:
             report["certifiable"] = False
-            report["certification_status"] = (
-                "diagnostic_core_passed" if report["passed"] else "core_failed"
-            )
+            if report["passed"]:
+                report["certification_status"] = "diagnostic_core_passed"
+            else:
+                report["certification_status"] = (
+                    "core_failed"
+                    if report.get("core_started")
+                    or report["services"]
+                    or report["cases"]
+                    else "blocked"
+                )
         else:
             report["certifiable"] = False
-            report["certification_status"] = (
-                "core_passed_ui_pending" if report["passed"] else "core_failed"
-            )
+            if report["passed"]:
+                report["certification_status"] = "core_passed_ui_pending"
+            else:
+                report["certification_status"] = (
+                    "core_failed"
+                    if report.get("core_started")
+                    or report["services"]
+                    or report["cases"]
+                    else "blocked"
+                )
         _write_report_files(self.output_dir, report, fixture, endpoints)
         return report
 
@@ -1471,14 +1594,21 @@ def _write_listening_template(
     path: Path, report: dict[str, Any], fixture: ValidationFixture | None
 ) -> None:
     reviewers = fixture.reviewers if fixture else []
-    reviewer_lines = "\n".join(f"- `{reviewer.id}`: {reviewer.name}" for reviewer in reviewers) or "- Not configured"
+    reviewer_lines = (
+        "\n".join(
+            f"- `{_markdown_inline(reviewer.id)}`: {_markdown_inline(reviewer.name)}"
+            for reviewer in reviewers
+        )
+        or "- Not configured"
+    )
     rows: list[str] = []
-    for reviewer in reviewers:
+    row_reviewers: list[Reviewer | None] = list(reviewers) or [None]
+    for reviewer in row_reviewers:
         for case in report.get("cases") or []:
             columns = [
-                str(case["name"]),
-                f"`{case.get('output_path', '')}`",
-                f"`{reviewer.id}`",
+                _markdown_inline(case["name"]),
+                f"`{_markdown_inline(case.get('output_path', ''))}`",
+                f"`{_markdown_inline(reviewer.id)}`" if reviewer else "",
                 "",
                 "",
                 "",
@@ -1490,7 +1620,7 @@ def _write_listening_template(
     if not rows:
         rows.append("| " + " | ".join(["No synthesis output", "", "", "", "", "", "", "", ""]) + " |")
     signature_blocks = "\n\n".join(
-        f"""### Reviewer `{reviewer.id}` — {reviewer.name}
+        f"""### Reviewer `{_markdown_inline(reviewer.id)}` — {_markdown_inline(reviewer.name)}
 
 - Decision: PASS / FAIL
 - Signature / timestamp:
@@ -1519,6 +1649,18 @@ Score clarity, timbre similarity, emotion/prosody, and artifacts from 1 to 5. Ea
     path.write_text(content, encoding="utf-8")
 
 
+def _markdown_inline(value: Any) -> str:
+    normalized = " ".join(str(value).splitlines())
+    return (
+        normalized.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("|", "&#124;")
+        .replace("`", "&#96;")
+        .replace("#", "&#35;")
+    )
+
+
 def _status_errors(status: dict[str, Any], *, expected_loaded: bool) -> list[str]:
     errors = []
     if not str(status.get("device") or "").startswith("cuda"):
@@ -1544,11 +1686,27 @@ def _status_errors(status: dict[str, Any], *, expected_loaded: bool) -> list[str
     return errors
 
 
+def _residency_errors(
+    status: dict[str, Any], *, expected_model: Any
+) -> list[str]:
+    errors = _status_errors(status, expected_loaded=True)
+    if status.get("model") != expected_model:
+        errors.append("status model changed since the explicit load")
+    return errors
+
+
 def _record_memory(metrics: dict[str, Any], status: dict[str, Any], *, baseline: bool = False) -> None:
     free_mib = _memory_mib(status, "free_bytes")
     if free_mib is not None:
         current = metrics.get("minimum_free_mib")
         metrics["minimum_free_mib"] = free_mib if current is None else min(current, free_mib)
+    for field, metric_name in (
+        ("reserved_bytes", "maximum_reserved_mib"),
+        ("allocated_bytes", "maximum_allocated_mib"),
+    ):
+        value_mib = _memory_mib(status, field)
+        if value_mib is not None:
+            metrics[metric_name] = max(metrics.get(metric_name) or 0.0, value_mib)
     if baseline:
         reserved_mib = _memory_mib(status, "reserved_bytes")
         if reserved_mib is not None:
@@ -1615,13 +1773,6 @@ def _optional_float(value: Any) -> float | None:
     try:
         return None if value is None else float(value)
     except (TypeError, ValueError):
-        return None
-
-
-def _fixture_sha256(path: Path) -> str | None:
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
         return None
 
 

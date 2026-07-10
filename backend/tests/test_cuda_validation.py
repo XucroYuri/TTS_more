@@ -660,10 +660,30 @@ def test_runner_measures_two_warm_repeats_without_reloading_or_overwriting_prima
     }
     timestamps = iter([0.0, 1.0, 10.0, 20.0, 30.0, 32.0, 40.0, 43.0, 50.0, 51.0])
     transcribed: list[Path] = []
+    loaded_probe_count = 0
 
     def transcribe(audio_path: Path, _language: str | None = None) -> str:
         transcribed.append(audio_path)
         return case.text
+
+    def status_probe(endpoint) -> dict:
+        nonlocal loaded_probe_count
+        loaded = state[endpoint.service_id] is not None
+        if endpoint.service_id == target and loaded:
+            loaded_probe_count += 1
+        return {
+            "device": "cuda:0",
+            "device_uuid": f"GPU-{endpoint.service_id}",
+            "cuda_runtime": "12.8",
+            "loaded": loaded,
+            "model": state[endpoint.service_id],
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": loaded_probe_count * 50 * 1024**2 if loaded else 0,
+                "allocated_bytes": loaded_probe_count * 100 * 1024**2 if loaded else 0,
+            },
+        }
 
     runner = CUDAValidationRunner(
         mode="distributed",
@@ -672,19 +692,7 @@ def test_runner_measures_two_warm_repeats_without_reloading_or_overwriting_prima
         output_dir=tmp_path / "warm-repeats",
         **_distributed_orchestration(tmp_path),
         client_factory=lambda endpoint: _FakeClient(endpoint, calls, state),
-        status_probe=lambda endpoint: {
-            "device": "cuda:0",
-            "device_uuid": f"GPU-{endpoint.service_id}",
-            "cuda_runtime": "12.8",
-            "loaded": state[endpoint.service_id] is not None,
-            "model": state[endpoint.service_id],
-            "memory": {
-                "free_bytes": 2 * 1024**3,
-                "total_bytes": 16 * 1024**3,
-                "reserved_bytes": 0,
-                "allocated_bytes": 0,
-            },
-        },
+        status_probe=status_probe,
         transcriber=transcribe,
         clock=lambda: next(timestamps),
         sleeper=lambda _: None,
@@ -698,10 +706,91 @@ def test_runner_measures_two_warm_repeats_without_reloading_or_overwriting_prima
     assert lifecycle == ["health", "capabilities", "load", "synthesize", "synthesize", "synthesize", "unload"]
     assert report["cases"][0]["synthesis_seconds"] == pytest.approx(10.0)
     assert report["cases"][0]["warm_synthesis_seconds"] == pytest.approx([2.0, 3.0])
+    assert len(report["cases"][0]["warm_repeats"]) == 2
+    assert all(item["audio"]["passed"] for item in report["cases"][0]["warm_repeats"])
+    assert all(item["status"]["loaded"] for item in report["cases"][0]["warm_repeats"])
     assert report["performance"]["metrics"]["warm_p95_seconds"] == pytest.approx(2.95)
+    assert report["performance"]["metrics"]["maximum_reserved_mib"] == 200.0
+    assert report["performance"]["metrics"]["maximum_allocated_mib"] == 400.0
     assert transcribed == [tmp_path / "warm-repeats" / "wav" / "gpt-v2ProPlus.wav"]
+    assert len(list((tmp_path / "warm-repeats" / "wav" / "warm").glob("*.wav"))) == 2
     assert report["certifiable"] is False
     assert report["certification_status"] == "diagnostic_core_passed"
+
+
+@pytest.mark.parametrize("failure_mode", ["lost-residency", "missing-warm-wav"])
+def test_warm_repeats_require_continuous_residency_and_real_wav_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_mode: str
+) -> None:
+    target = FORMAL_SERVICE_IDS["gpt_sovits"]
+    case = ValidationCase(
+        name="gpt-v2ProPlus",
+        service_id=target,
+        profile="gpt-v2ProPlus",
+        text="默认模型验证。",
+        language="zh",
+        parameters={},
+    )
+    monkeypatch.setattr("app.cuda_validation.validation_cases", lambda _fixture: [case])
+    state: dict[str, str | None] = {
+        service_id: None for service_id in FORMAL_SERVICE_IDS.values()
+    }
+
+    class InvalidWarmClient(_FakeClient):
+        synthesis_count = 0
+
+        def synthesize(self, request) -> SynthesisResult:
+            self.synthesis_count += 1
+            if failure_mode == "missing-warm-wav" and self.synthesis_count > 1:
+                self.calls.append(
+                    (self.endpoint.service_id, "synthesize", request.profile, request.parameters)
+                )
+                return SynthesisResult(
+                    audio_path=request.output_path,
+                    metadata={"artifact_verified": True},
+                )
+            result = super().synthesize(request)
+            if failure_mode == "lost-residency" and self.synthesis_count == 1:
+                self.state[self.endpoint.service_id] = None
+            return result
+
+    runner = CUDAValidationRunner(
+        mode="distributed",
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=True),
+        output_dir=tmp_path / failure_mode,
+        **_distributed_orchestration(tmp_path),
+        client_factory=lambda endpoint: InvalidWarmClient(endpoint, [], state),
+        status_probe=lambda endpoint: {
+            "device": "cuda:0",
+            "device_uuid": f"GPU-{endpoint.service_id}",
+            "cuda_runtime": "12.8",
+            "loaded": state[endpoint.service_id] is not None,
+            "model": state[endpoint.service_id],
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        },
+        transcriber=lambda _path, _language=None: case.text,
+        clock=lambda: 10.0,
+        sleeper=lambda _: None,
+        monitor_factory=_HealthyMonitor,
+    )
+
+    report = runner.run()
+
+    assert report["passed"] is False
+    assert report["certification_status"] == "core_failed"
+    assert report["cases"][0]["warm_synthesis_seconds"] == []
+    assert report["performance"]["metrics"]["warm_p95_seconds"] is None
+    errors = " ".join(report["cases"][0]["errors"])
+    if failure_mode == "lost-residency":
+        assert "warm synthesis requires the original loaded model" in errors
+    else:
+        assert "warm WAV evidence" in errors
 
 
 @pytest.mark.parametrize(
@@ -1042,6 +1131,51 @@ def test_runner_blocks_before_service_clients_when_gpu_monitor_is_unhealthy(tmp_
     assert network_calls == []
     assert report["preflight"][0]["message"] == UnhealthyMonitor.error
     assert report["gpu_monitor"]["sample_count"] == 0
+    assert report["certification_status"] == "blocked"
+
+
+def test_service_contract_failure_after_core_start_is_core_failed_even_without_cases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.cuda_validation.validation_cases", lambda _fixture: [])
+    state: dict[str, str | None] = {
+        service_id: None for service_id in FORMAL_SERVICE_IDS.values()
+    }
+
+    class NotReadyClient(_FakeClient):
+        def health(self) -> dict:
+            return {"ready": False, "tts_more_commit": "a" * 40}
+
+    runner = CUDAValidationRunner(
+        mode="single-release",
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path),
+        output_dir=tmp_path / "service-contract-failed",
+        client_factory=lambda endpoint: NotReadyClient(endpoint, [], state),
+        status_probe=lambda endpoint: {
+            "device": "cuda:0",
+            "device_uuid": f"GPU-{endpoint.service_id}",
+            "cuda_runtime": "12.8",
+            "loaded": False,
+            "model": None,
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        },
+        transcriber=_expected_transcriber,
+        monitor_factory=_HealthyMonitor,
+    )
+
+    report = runner.run()
+
+    assert report["passed"] is False
+    assert report["core_started"] is True
+    assert report["cases"] == []
+    assert report["services"]
+    assert report["certification_status"] == "core_failed"
 
 
 @pytest.mark.parametrize("failure_mode", ["unhealthy", "stop-error"])
@@ -1294,6 +1428,72 @@ def test_summary_uses_hash_only_fixture_identity(tmp_path: Path) -> None:
     assert str(tmp_path) not in summary_text
 
 
+def test_runner_executes_the_same_fixture_snapshot_named_by_summary_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_path = _write_fixture(tmp_path, distributed_weights=True)
+    original_bytes = fixture_path.read_bytes()
+    changed_payload = json.loads(original_bytes)
+    changed_payload["name"] = "changed-after-snapshot"
+    changed_payload["test_texts"]["gpt_v2ProPlus"] = "变更后的文本。"
+    changed_bytes = json.dumps(changed_payload).encode("utf-8")
+    observed_fixture_names: list[str] = []
+    state: dict[str, str | None] = {
+        service_id: None for service_id in FORMAL_SERVICE_IDS.values()
+    }
+
+    def snapshot_case(fixture) -> list[ValidationCase]:
+        observed_fixture_names.append(fixture.name)
+        return [
+            ValidationCase(
+                name="gpt-v2ProPlus",
+                service_id=FORMAL_SERVICE_IDS["gpt_sovits"],
+                profile="gpt-v2ProPlus",
+                text=fixture.test_texts.gpt_v2_pro_plus,
+                language="zh",
+                parameters={},
+            )
+        ]
+
+    monkeypatch.setattr("app.cuda_validation.validation_cases", snapshot_case)
+
+    class MutatingMonitor(_HealthyMonitor):
+        def start(self) -> None:
+            super().start()
+            fixture_path.write_bytes(changed_bytes)
+
+    runner = CUDAValidationRunner(
+        mode="distributed",
+        services_path=_write_services(tmp_path),
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "fixture-snapshot",
+        **_distributed_orchestration(tmp_path),
+        client_factory=lambda endpoint: _FakeClient(endpoint, [], state),
+        status_probe=lambda endpoint: {
+            "device": "cuda:0",
+            "device_uuid": f"GPU-{endpoint.service_id}",
+            "cuda_runtime": "12.8",
+            "loaded": state[endpoint.service_id] is not None,
+            "model": state[endpoint.service_id],
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        },
+        transcriber=lambda _path, _language=None: "默认模型验证。",
+        clock=lambda: 10.0,
+        sleeper=lambda _: None,
+        monitor_factory=MutatingMonitor,
+    )
+
+    report = runner.run()
+
+    assert observed_fixture_names == ["unit-cuda-validation"]
+    assert report["fixture_sha256"] == hashlib.sha256(original_bytes).hexdigest()
+
+
 def test_certification_status_vocabulary_is_closed_and_preflight_is_not_a_core_pass(
     tmp_path: Path,
 ) -> None:
@@ -1397,6 +1597,7 @@ def test_post_core_blocker_preserves_completed_core_evidence(
     output = tmp_path / f"post-core-{stage}"
     output.mkdir()
     fixture_path = _write_fixture(tmp_path)
+    core_fixture_sha256 = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
     core_report = {
         "schema_version": 1,
         "name": "cuda-e2e-validation",
@@ -1404,6 +1605,7 @@ def test_post_core_blocker_preserves_completed_core_evidence(
         "mode": "single-release",
         "started_at": "2026-07-10T00:00:00+00:00",
         "finished_at": "2026-07-10T00:01:00+00:00",
+        "fixture_sha256": core_fixture_sha256,
         "passed": True,
         "certifiable": False,
         "certification_status": "core_passed_ui_pending",
@@ -1439,6 +1641,9 @@ def test_post_core_blocker_preserves_completed_core_evidence(
     (output / "worker-log-references.json").write_text(worker_references, encoding="utf-8")
     gpu_evidence = ",".join(NvidiaSmiMonitor.HEADER) + "\n2026-07-10T00:00:30Z,2026/07/10,0,GPU-core,16384,12000,4384,42\n"
     (output / "nvidia-smi.csv").write_text(gpu_evidence, encoding="utf-8")
+    changed_fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    changed_fixture["name"] = "changed-after-core"
+    fixture_path.write_text(json.dumps(changed_fixture), encoding="utf-8")
     common_args = [
         "--mode",
         "single-release",
@@ -1468,6 +1673,7 @@ def test_post_core_blocker_preserves_completed_core_evidence(
     assert report["passed"] is False
     assert report["certifiable"] is False
     assert report["certification_status"] == "core_failed"
+    assert report["fixture_sha256"] == core_fixture_sha256
     assert report["stage"] == stage
     assert report["pipeline_failures"] == [
         {"stage": stage, "message": f"simulated {stage} pipeline failure", "passed": False}
@@ -1667,6 +1873,44 @@ def test_input_preflight_requires_two_reviewers_only_for_single_clean(tmp_path: 
     assert release_report["passed"] is True
 
 
+@pytest.mark.parametrize(
+    ("reviewers", "expected_message"),
+    [
+        (
+            [
+                {"id": "reviewer-a", "name": "Reviewer A"},
+                {"id": "reviewer-a", "name": "Reviewer B"},
+            ],
+            "listening reviewer IDs must be unique",
+        ),
+        (
+            [
+                {"id": "reviewer-a", "name": "Reviewer A"},
+                {"id": "reviewer-b", "name": "   "},
+            ],
+            "listening reviewers require non-empty IDs and names",
+        ),
+    ],
+)
+def test_single_clean_rejects_non_independent_reviewer_records(
+    tmp_path: Path, reviewers: list[dict[str, str]], expected_message: str
+) -> None:
+    payload = _fixture_payload(tmp_path)
+    payload["reviewers"] = reviewers
+    fixture_path = tmp_path / "invalid-reviewers.json"
+    fixture_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = CUDAValidationRunner(
+        mode="single-clean",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "invalid-reviewers",
+    ).run_input_preflight()
+
+    assert report["passed"] is False
+    assert any(expected_message in item["message"] for item in report["preflight"])
+
+
 def test_single_clean_listening_template_has_one_nine_column_row_per_reviewer_and_case(
     tmp_path: Path,
 ) -> None:
@@ -1694,6 +1938,43 @@ def test_single_clean_listening_template_has_one_nine_column_row_per_reviewer_an
             for line in data_rows
         ) == 6
         assert content.count(f"### Reviewer `{reviewer.id}`") == 1
+
+
+def test_listening_template_escapes_reviewer_markdown_without_changing_table_shape(
+    tmp_path: Path,
+) -> None:
+    payload = _fixture_payload(tmp_path)
+    payload["reviewers"] = [
+        {"id": "reviewer|a\n### Reviewer `forged`", "name": "Reviewer | A\n## Injected"},
+        {
+            "id": "reviewer`b<script>",
+            "name": "Reviewer B\r\n- Decision: PASS<img src=x>",
+        },
+    ]
+    fixture_path = tmp_path / "markdown-reviewers.json"
+    fixture_path.write_text(json.dumps(payload), encoding="utf-8")
+    fixture = load_fixture(fixture_path)
+    output = tmp_path / "human-listening-review.md"
+    report = {
+        "mode": "single-clean",
+        "passed": True,
+        "cases": [
+            {"name": f"case-{index}", "output_path": f"wav/case-{index}.wav"}
+            for index in range(1, 7)
+        ],
+    }
+
+    _write_listening_template(output, report, fixture)
+
+    content = output.read_text(encoding="utf-8")
+    data_rows = [line for line in content.splitlines() if line.startswith("| case-")]
+    assert len(data_rows) == 12
+    assert all(len(line.strip("|").split("|")) == 9 for line in data_rows)
+    assert content.count("### Reviewer ") == 2
+    assert "### Reviewer `forged`" not in content
+    assert "\n## Injected" not in content
+    assert "<script>" not in content
+    assert "<img" not in content
 
 
 def test_input_preflight_next_action_identifies_fixture_schema_failure(tmp_path: Path) -> None:
