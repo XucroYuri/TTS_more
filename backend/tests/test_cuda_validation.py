@@ -31,6 +31,19 @@ from app.cuda_validation import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_faster_whisper_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep unit tests independent from the optional local ASR installation.
+
+    The dedicated missing-ASR test overrides this default with ``None``.
+    """
+
+    monkeypatch.setattr(
+        "app.cuda_validation.importlib.util.find_spec",
+        lambda name: object() if name == "faster_whisper" else None,
+    )
+
+
 def _write_wav(path: Path, *, seconds: float = 1.0, amplitude: int = 10_000) -> None:
     sample_rate = 16_000
     samples = [
