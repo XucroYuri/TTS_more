@@ -81,6 +81,8 @@ $RunId = "single-clean-$(Get-Date -Format yyyyMMdd-HHmmss)"
 
 `single-clean` 会先展示解析后的项目相对清理范围（selected repo labels），再清理这些 repo 内的模型和 venv。清理范围不包含应用 `.venv`、fixture 或 repo 清单以外的目录。看到的 label 与已确认配置不一致时立即停止。
 
+总入口把本次 worker 的归属记录在 `data\validation\runs\$RunId\process-manifest.json`；分布式故障恢复使用同一机制记录临时控制平面。这不是认证证据，而是安全清理依据；不要手工编辑或按其中 PID 直接停止进程。工作流会自动清理，手工运行完成 Playwright 后可调用 `scripts\cleanup-cuda-validation-processes.ps1 -Manifest <该文件> -Required`，脚本会再次核对创建时间、可执行文件和命令 token。
+
 阻塞时先读：
 
 - `environment-preflight.json`：host preflight 的 Python、conda、磁盘、GPU、ASR 和 Playwright 结论；

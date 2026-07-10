@@ -9,6 +9,9 @@
 | Run ID | |
 | 模式 | `single-clean` / `single-release` / `distributed` |
 | 分支与 TTS More commit | |
+| GitHub 候选 SHA（40 位） | |
+| `single-release` run URL / 脱敏 manifest SHA-256 | |
+| `distributed` run URL / 脱敏 manifest SHA-256 | |
 | 仓库根 `repo.lock.json` SHA-256 | |
 | 执行开始/结束 | |
 | 执行人 | |
@@ -19,8 +22,10 @@
 | 脱敏可共享证据位置 | |
 | Playwright JUnit | `frontend/test-results/playwright-junit.xml` |
 | 失败 trace/screenshot/video | 不适用或受控位置 |
+| 本验收记录 SHA-256 | |
 
 受控原始证据可包含音频、日志、机器标识和签名；脱敏可共享证据不得包含这些内容。
+同一发布候选的单机、分布式和人工结论必须绑定到同一个候选 SHA。完成签核后重新计算本记录 SHA-256；把候选 SHA 与记录哈希写入 `cuda-release-approval` 保护环境，记录正文仍留在受控位置。
 
 ## 2. 主机与锁定部署
 

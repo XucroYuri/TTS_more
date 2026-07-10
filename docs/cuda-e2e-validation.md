@@ -123,3 +123,34 @@ flowchart LR
 **脱敏可共享证据**只包含脱敏 summary、JUnit、聚合 GPU 指标、hash-only worker 引用和无身份审核状态。发布前必须由显式 sanitization manifest 证明没有私有字段。
 
 验收记录分别填写受控原始证据位置和脱敏可共享证据位置。Fixture/topology 只记录安全名称和 SHA-256，不记录绝对路径或展开后的资产路径。
+
+## GitHub 受保护门禁
+
+GitHub 工作流只接受一个明确的 40 位候选提交 SHA。SHA 先在 GitHub 托管 runner 上作为数据校验，不会直接拼进 PowerShell 或 Bash 源码；校验通过后才允许使用受保护的自托管 GPU runner。单机和分布式运行使用同一个固定并发组，因此同一套 GPU 集群不会被两个验证任务同时占用。每次 Playwright 运行还会使用由 run ID 和 attempt 组成的独立项目 ID，避免读取上一次运行的结果。
+
+```mermaid
+flowchart TD
+    C["候选提交 SHA"] --> S["single-release 自动门禁"]
+    C --> D["distributed 自动门禁"]
+    S --> R["受控验收记录：单机、分布式、Playwright、人工听审"]
+    D --> R
+    R --> E["cuda-release-approval 人工保护环境"]
+    E --> B["候选 SHA 与验收记录哈希绑定"]
+    B --> P["另行执行有权限的发布动作"]
+    P --> A["release.published 只做发布后审计"]
+```
+
+`cuda-validation` 保护环境提供运行输入：
+
+- `TTS_MORE_SINGLE_TOPOLOGY`、`TTS_MORE_SINGLE_FIXTURE`、可选 `TTS_MORE_SINGLE_REPO_PATHS`；
+- `TTS_MORE_DISTRIBUTED_TOPOLOGY`、`TTS_MORE_DISTRIBUTED_FIXTURE`、可选 `TTS_MORE_DISTRIBUTED_REPO_PATHS`；
+- `TTS_MORE_VALIDATION_SSH_USER`、`TTS_MORE_VALIDATION_REMOTE_ROOT`；
+- secret `TTS_MORE_API_TOKEN`（若应用启用 API 鉴权）。
+
+`cuda-release-approval` 保护环境提供 `TTS_MORE_ACCEPTED_CANDIDATE_SHA` 和 `TTS_MORE_ACCEPTANCE_RECORD_SHA256`。推荐顺序是：先完成同一候选 SHA 的 `single-release`，再运行带 baseline 的 `distributed`；分布式作业成功后，候选门禁会等待保护环境审核。审核者此时检查单机、分布式、Playwright 和人工听审记录，写入候选 SHA 与受控验收记录哈希，再批准环境。候选门禁只证明这次绑定成立，不创建 Release，也不把 `release.published` 误当成发布前批准。
+
+普通 GitHub artifact 的文件名固定为：`summary.json`、`junit.xml`、`nvidia-smi.csv`、`worker-log-references.json`、`human-review-state.json`、`automatic-gate.json`、`manifest.json`。脱敏器在临时目录重新构造这些文件，校验 allowlist、敏感模式、大小和 SHA-256 后才原子提升为可上传目录；它不复制原始 JUnit、日志或 WAV。上传步骤还要求 finalizer 明确写出 `verified=true`，因此拒绝的中间目录不会被 `always()` 发布。主脱敏失败时只生成并再次验证一个不读取原始证据的最小阻塞包。
+
+分布式 `nvidia-smi.csv` 包含控制节点和三个远端 worker 的匿名来源标签，不含节点名或 GPU UUID。三个远端来源必须各有至少一个可解析样本；缺少任一个来源、任一来源格式错误、清理失败或清单多出文件时，自动结论只能是失败或阻塞。
+
+自托管 runner 上的 worker、故障控制平面、Playwright 应用后端、直接启动的 Vite 进程和 GPU 采样器都有运行归属清单。清理前会两次核对 PID、创建时间、可执行文件路径和预期命令 token；远端 GPU 采样器还会重解析系统 `nvidia-smi.exe` 并核对固定查询参数。端口占用只用于阻塞判断，不作为终止任意进程的依据。checkout 会保留忽略的 PID 清单，先完成单机与分布式跨模式归属清理，再删除本 checkout 内的旧运行目录。
