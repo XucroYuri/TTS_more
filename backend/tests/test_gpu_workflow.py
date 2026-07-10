@@ -99,14 +99,40 @@ def test_cuda_entrypoint_forwards_repo_paths_and_marks_skips_diagnostic() -> Non
     ]
 
     assert '[string]$RepoPaths = ""' in script
+    assert 'if ($RepoPaths -and !(Test-Path -LiteralPath $RepoPathsPath))' in single_deploy
     assert "$deploy.RepoPaths = $RepoPaths" in single_deploy
     assert "$isDiagnostic = $SkipDeploy -or $SkipStart" in script
     assert script.count('$validatorArgs += "--diagnostic"') == 2
-    assert 'Write-Host "CUDA diagnostic completed: $Output"' in script
+    assert 'Write-Host "CUDA diagnostic core 通过（不可认证）：$Output"' in script
+    assert "CUDA validation passed" not in script
     assert re.search(
-        r'if \(\$isDiagnostic\) \{\s*Write-Host "CUDA diagnostic completed: \$Output"[^}]*\}\s*else \{\s*Write-Host "CUDA validation passed: \$Output"',
+        r'if \(\$isDiagnostic\) \{\s*Write-Host "CUDA diagnostic core 通过（不可认证）：\$Output"[^}]*\}\s*else \{\s*Write-Host "CUDA core 通过，Playwright/人工待完成：\$Output"',
         script,
     )
+
+
+def test_cuda_entrypoint_rewrites_stale_preflight_pass_on_later_stage_failure() -> None:
+    script = _read(CUDA_ENTRYPOINT)
+    main_marker = 'try {\n    $validatorArgs = @('
+    entrypoint = script[script.index(main_marker) :]
+
+    deployment_stage = entrypoint.index('$currentStage = "deployment"')
+    deployment_call = min(
+        entrypoint.index("Invoke-SingleNodeDeployment"),
+        entrypoint.index("Invoke-DistributedDeployment"),
+    )
+    wait_stage = entrypoint.index('$currentStage = "worker-wait"')
+    wait_call = entrypoint.index("Wait-ServiceReady $ServicesPath")
+
+    assert deployment_stage < deployment_call
+    assert wait_stage < wait_call
+    assert '"--write-blocker-stage", $currentStage' in entrypoint
+    assert '"--blocker-message", $failureMessage' in entrypoint
+    assert 'Write-Host "阻塞：$currentStage 失败；证据：summary.json"' in entrypoint
+    catch_index = entrypoint.rindex("} catch {")
+    finally_index = entrypoint.rindex("} finally {")
+    assert catch_index < finally_index
+    assert "--write-blocker-stage" not in entrypoint[finally_index:]
 
 
 def test_playwright_cuda_spec_is_a_real_three_service_closed_loop() -> None:

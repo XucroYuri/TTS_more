@@ -431,6 +431,8 @@ def test_runner_writes_full_artifacts_and_continues_after_case_failure(tmp_path:
     report = runner.run()
 
     assert report["passed"] is False
+    assert report["certifiable"] is False
+    assert report["certification_status"] == "core_failed"
     assert len(report["cases"]) == 5
     assert [case["name"] for case in report["cases"] if not case["passed"]] == ["cosyvoice-zero-shot"]
     assert any(call[1] == "synthesize" and call[2] == "cosyvoice-cross-lingual" for call in calls)
@@ -491,6 +493,8 @@ def test_single_runner_validates_explicit_local_artifact_delivery(tmp_path: Path
     report = runner.run()
 
     assert report["passed"] is True
+    assert report["certifiable"] is False
+    assert report["certification_status"] == "core_passed_ui_pending"
     assert any(case["name"] == "gpt-v2ProPlus-artifact" for case in report["cases"])
     assert any(endpoint.default_params.get("delivery") == "artifact" for endpoint in created_endpoints)
 
@@ -559,7 +563,7 @@ def test_input_preflight_rejects_missing_weight_files_without_network(
     assert report["blocker_count"] == 1
     assert "weight v2Pro.gpt not found" in report["preflight"][0]["message"]
     assert report["next_action"] == (
-        "Fill the unresolved reference audio and GPT/SoVITS weight paths, then rerun the same command."
+        "补齐或修正 reference audio 和 GPT/SoVITS weight 路径，然后重新运行相同命令。"
     )
     assert network_calls == []
     assert monitor_starts == 0
@@ -601,9 +605,15 @@ def test_distributed_input_preflight_requires_controller_reference_but_not_remot
     assert "reference gpt_sovits not found" in report["preflight"][0]["message"]
 
 
-def test_distributed_input_preflight_rejects_unresolved_remote_weight(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "raw_path",
+    ["${REMOTE_GPT_WEIGHT}", "$REMOTE_GPT_WEIGHT", "%REMOTE_GPT_WEIGHT%"],
+)
+def test_distributed_input_preflight_rejects_unresolved_remote_weight(
+    tmp_path: Path, raw_path: str
+) -> None:
     payload = _fixture_payload(tmp_path)
-    payload["gpt_weights"]["v2ProPlus"]["gpt"] = "${REMOTE_GPT_WEIGHT}"
+    payload["gpt_weights"]["v2ProPlus"]["gpt"] = raw_path
     fixture_path = tmp_path / "distributed-unresolved-weight.json"
     fixture_path.write_text(json.dumps(payload), encoding="utf-8")
     runner = CUDAValidationRunner(
@@ -617,6 +627,58 @@ def test_distributed_input_preflight_rejects_unresolved_remote_weight(tmp_path: 
 
     assert report["passed"] is False
     assert "weight v2ProPlus.gpt contains an unresolved environment variable" in report["preflight"][0]["message"]
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    ["", "   ", "weights/model.ckpt", "../weights/model.ckpt", "/weights/model.ckpt"],
+)
+def test_distributed_input_preflight_rejects_empty_or_non_windows_absolute_weight(
+    tmp_path: Path, raw_path: str
+) -> None:
+    payload = _fixture_payload(tmp_path)
+    payload["gpt_weights"]["v2Pro"]["gpt"] = raw_path
+    fixture_path = tmp_path / "distributed-invalid-weight-path.json"
+    fixture_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = CUDAValidationRunner(
+        mode="distributed",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "distributed-invalid-weight-path",
+    ).run_input_preflight()
+
+    assert report["passed"] is False
+    expected = "is empty" if not raw_path.strip() else "must be a Windows absolute path"
+    assert expected in report["preflight"][0]["message"]
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        r"D:\worker\weights\model.ckpt",
+        "D:/worker/weights/model.ckpt",
+        r"\\worker-host\models\model.ckpt",
+    ],
+)
+def test_distributed_input_preflight_accepts_windows_drive_and_unc_weight_paths(
+    tmp_path: Path, raw_path: str
+) -> None:
+    payload = _fixture_payload(tmp_path)
+    for pair in payload["gpt_weights"].values():
+        pair["gpt"] = raw_path
+        pair["sovits"] = raw_path
+    fixture_path = tmp_path / "distributed-valid-weight-path.json"
+    fixture_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = CUDAValidationRunner(
+        mode="distributed",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "distributed-valid-weight-path",
+    ).run_input_preflight()
+
+    assert report["passed"] is True
 
 
 def test_preflight_only_cli_returns_zero_for_valid_local_inputs(tmp_path: Path) -> None:
@@ -640,6 +702,7 @@ def test_preflight_only_cli_returns_zero_for_valid_local_inputs(tmp_path: Path) 
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     assert summary["passed"] is True
     assert summary["stage"] == "input-preflight"
+    assert summary["next_action"] == "继续部署和完整 CUDA 验证。"
 
 
 def test_diagnostic_cli_marks_preflight_non_certifiable(tmp_path: Path) -> None:
@@ -666,6 +729,118 @@ def test_diagnostic_cli_marks_preflight_non_certifiable(tmp_path: Path) -> None:
     assert summary["certification_status"] == "diagnostic"
 
 
+@pytest.mark.parametrize("stage", ["deployment", "worker-wait"])
+def test_blocker_cli_atomically_replaces_valid_preflight_evidence(
+    tmp_path: Path, stage: str
+) -> None:
+    output = tmp_path / f"{stage}-failure"
+    fixture_path = _write_fixture(tmp_path)
+    common_args = [
+        "--mode",
+        "single-release",
+        "--services",
+        str(tmp_path / "services-not-required.json"),
+        "--fixture",
+        str(fixture_path),
+        "--output",
+        str(output),
+    ]
+    assert main([*common_args, "--preflight-only"]) == 0
+    passing = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert passing["passed"] is True
+    (output / "nvidia-smi.csv").write_text("stale-gpu-evidence\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            *common_args,
+            "--write-blocker-stage",
+            stage,
+            "--blocker-message",
+            f"simulated safe {stage} failure",
+        ]
+    )
+
+    assert exit_code == 1
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["passed"] is False
+    assert summary["stage"] == stage
+    assert summary["certifiable"] is False
+    assert summary["certification_status"] == "blocked"
+    assert summary["blocker_count"] == 1
+    assert f"simulated safe {stage} failure" in summary["preflight"][0]["message"]
+    assert stage in summary["next_action"]
+    assert "simulated safe" in (output / "junit.xml").read_text(encoding="utf-8")
+    assert "Automated gate: `FAIL`" in (output / "human-listening-review.md").read_text(encoding="utf-8")
+    assert len(json.loads((output / "worker-log-references.json").read_text(encoding="utf-8"))) == 3
+    assert (output / "nvidia-smi.csv").read_text(encoding="utf-8").splitlines() == [
+        ",".join(NvidiaSmiMonitor.HEADER)
+    ]
+    assert list(output.glob(".*.tmp")) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell entrypoint is Windows-only")
+@pytest.mark.parametrize(
+    ("stage", "diagnostic"),
+    [("deployment", False), ("worker-wait", True)],
+)
+def test_powershell_rewrites_valid_preflight_pass_after_safe_stage_failure(
+    tmp_path: Path, stage: str, diagnostic: bool
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    fixture_path = _write_fixture(tmp_path)
+    services_path = tmp_path / "empty-services.json"
+    services_path.write_text("[]", encoding="utf-8")
+    output = tmp_path / f"powershell-{stage}"
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(repo_root / "scripts" / "run-cuda-validation.ps1"),
+        "-Mode",
+        "single-release",
+        "-Fixture",
+        str(fixture_path),
+        "-Services",
+        str(services_path),
+        "-Output",
+        str(output),
+    ]
+    if stage == "deployment":
+        command.extend(["-RepoPaths", str(tmp_path / "missing-repo-paths.json")])
+    else:
+        command.append("-SkipDeploy")
+
+    completed = subprocess.run(
+        command,
+        cwd=repo_root,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["passed"] is False
+    assert summary["stage"] == stage
+    assert summary["certifiable"] is False
+    assert summary["certification_status"] == ("diagnostic" if diagnostic else "blocked")
+    assert stage in summary["preflight"][0]["message"]
+    for artifact in (
+        "summary.json",
+        "junit.xml",
+        "human-listening-review.md",
+        "worker-log-references.json",
+        "nvidia-smi.csv",
+    ):
+        assert (output / artifact).is_file()
+    assert "failures=\"1\"" in (output / "junit.xml").read_text(encoding="utf-8")
+    assert (output / "nvidia-smi.csv").read_text(encoding="utf-8").splitlines() == [
+        ",".join(NvidiaSmiMonitor.HEADER)
+    ]
+
+
 def test_input_preflight_checks_asr_availability_without_loading_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -685,6 +860,7 @@ def test_input_preflight_checks_asr_availability_without_loading_model(
 
     assert report["passed"] is False
     assert "ASR gate requires faster-whisper with large-v3" in report["preflight"][0]["message"]
+    assert "安装 faster-whisper 并确保 large-v3 可用" in report["next_action"]
 
 
 def test_input_preflight_requires_two_reviewers_only_for_single_clean(tmp_path: Path) -> None:
@@ -708,7 +884,48 @@ def test_input_preflight_requires_two_reviewers_only_for_single_clean(tmp_path: 
 
     assert clean_report["passed"] is False
     assert "single-clean requires 2 listening reviewers" in clean_report["preflight"][0]["message"]
+    assert "补充当前模式所需的 listening reviewers" in clean_report["next_action"]
     assert release_report["passed"] is True
+
+
+def test_input_preflight_next_action_identifies_fixture_schema_failure(tmp_path: Path) -> None:
+    fixture_path = tmp_path / "invalid-schema.json"
+    fixture_path.write_text("{}", encoding="utf-8")
+
+    report = CUDAValidationRunner(
+        mode="single-release",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "invalid-schema",
+    ).run_input_preflight()
+
+    assert report["passed"] is False
+    assert "fixture validation failed" in report["preflight"][0]["message"]
+    assert "修复 fixture JSON 或 schema" in report["next_action"]
+
+
+def test_input_preflight_next_action_combines_multiple_blocker_types(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = _fixture_payload(tmp_path)
+    payload["gpt_weights"]["v2Pro"]["gpt"] = str(tmp_path / "missing.ckpt")
+    payload["reviewers"] = payload["reviewers"][:1]
+    fixture_path = tmp_path / "multiple-blockers.json"
+    fixture_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr("app.cuda_validation.importlib.util.find_spec", lambda _name: None)
+
+    report = CUDAValidationRunner(
+        mode="single-clean",
+        services_path=tmp_path / "services-must-not-be-read.json",
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "multiple-blockers",
+    ).run_input_preflight()
+
+    assert report["blocker_count"] == 3
+    assert "reference audio 和 GPT/SoVITS weight" in report["next_action"]
+    assert "faster-whisper" in report["next_action"]
+    assert "listening reviewers" in report["next_action"]
+    assert report["next_action"].count("重新运行相同命令") == 1
 
 
 def test_runner_preflight_rejects_unresolved_weight_environment_without_network(tmp_path: Path) -> None:
@@ -750,6 +967,7 @@ def test_release_runner_requires_approved_performance_baseline(tmp_path: Path) -
 
     assert report["passed"] is False
     assert "approved performance baseline" in report["preflight"][0]["message"]
+    assert "补充已批准的 performance baseline" in report["next_action"]
 
 
 @pytest.mark.parametrize(

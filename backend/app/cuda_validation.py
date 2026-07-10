@@ -12,6 +12,7 @@ import re
 import shutil
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import wave
@@ -171,6 +172,38 @@ def _append_required_file_failure(
         failures.append(f"{kind} {label} not found")
 
 
+def _is_windows_absolute_path(value: str) -> bool:
+    normalized = value.strip()
+    if re.match(r"^[A-Za-z]:[\\/].+", normalized):
+        return True
+    return bool(re.match(r"^(?:\\\\|//)[^\\/]+[\\/][^\\/]+(?:[\\/].+)?$", normalized))
+
+
+def _preflight_next_action(failures: list[str]) -> str:
+    if not failures:
+        return "继续部署和完整 CUDA 验证。"
+    actions: list[str] = []
+    categories = (
+        (lambda message: message.startswith("fixture validation failed:"), "修复 fixture JSON 或 schema"),
+        (
+            lambda message: message.startswith(("reference ", "weight ")),
+            "补齐或修正 reference audio 和 GPT/SoVITS weight 路径",
+        ),
+        (lambda message: message.startswith("ASR gate requires "), "安装 faster-whisper 并确保 large-v3 可用"),
+        (
+            lambda message: message.startswith("an approved performance baseline is required"),
+            "补充已批准的 performance baseline",
+        ),
+        (lambda message: "listening reviewers" in message, "补充当前模式所需的 listening reviewers"),
+    )
+    for matches, action in categories:
+        if any(matches(message) for message in failures):
+            actions.append(action)
+    if not actions:
+        actions.append("解决 preflight 列出的阻塞项")
+    return "；".join(actions) + "，然后重新运行相同命令。"
+
+
 def validate_fixture_inputs(
     fixture_path: Path,
     *,
@@ -188,9 +221,15 @@ def validate_fixture_inputs(
         for kind, raw_path in pair.items():
             raw_path = str(raw_path)
             if mode == "distributed":
-                if _contains_unresolved_environment(raw_path):
+                if not raw_path.strip():
+                    failures.append(f"weight {version}.{kind} is empty")
+                elif _contains_unresolved_environment(raw_path):
                     failures.append(
                         f"weight {version}.{kind} contains an unresolved environment variable"
+                    )
+                elif not _is_windows_absolute_path(raw_path):
+                    failures.append(
+                        f"weight {version}.{kind} must be a Windows absolute path"
                     )
             else:
                 _append_required_file_failure(failures, "weight", f"{version}.{kind}", raw_path)
@@ -603,7 +642,7 @@ class CUDAValidationRunner:
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
             "passed": False,
-            "certifiable": False if self.diagnostic else None,
+            "certifiable": False,
             "certification_status": "diagnostic" if self.diagnostic else "pending",
             "preflight": [],
             "services": [],
@@ -625,19 +664,31 @@ class CUDAValidationRunner:
         ]
         report["passed"] = not failures
         report["blocker_count"] = len(failures)
-        report["next_action"] = (
-            "Fill the unresolved reference audio and GPT/SoVITS weight paths, then rerun the same command."
-        )
+        report["next_action"] = _preflight_next_action(failures)
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
         if not self.diagnostic:
             report["certification_status"] = (
                 "input-preflight-passed" if report["passed"] else "blocked"
             )
-        _write_report_files(self.output_dir, report, fixture, {})
-        with (self.output_dir / "nvidia-smi.csv").open(
-            "w", encoding="utf-8", newline=""
-        ) as handle:
-            csv.writer(handle).writerow(NvidiaSmiMonitor.HEADER)
+        _write_report_files(self.output_dir, report, fixture, {}, reset_nvidia=True)
+        return report
+
+    def write_blocker_report(self, *, stage: str, message: str) -> dict[str, Any]:
+        try:
+            fixture = load_fixture(self.fixture_path)
+        except Exception:
+            fixture = None
+        report = self._new_report(stage=stage)
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report["passed"] = False
+        report["certifiable"] = False
+        report["certification_status"] = "diagnostic" if self.diagnostic else "blocked"
+        report["preflight"] = [
+            {"passed": False, "message": f"{stage} failed: {message}"}
+        ]
+        report["blocker_count"] = 1
+        report["next_action"] = f"修复 {stage} 阶段错误后重新运行完整 CUDA 验证。"
+        _write_report_files(self.output_dir, report, fixture, {}, reset_nvidia=True)
         return report
 
     def run(self) -> dict[str, Any]:
@@ -985,8 +1036,10 @@ class CUDAValidationRunner:
             report["certifiable"] = False
             report["certification_status"] = "diagnostic"
         else:
-            report["certifiable"] = report["passed"]
-            report["certification_status"] = "certified" if report["passed"] else "failed"
+            report["certifiable"] = False
+            report["certification_status"] = (
+                "core_passed_ui_pending" if report["passed"] else "core_failed"
+            )
         _write_report_files(self.output_dir, report, fixture, endpoints)
         return report
 
@@ -1023,14 +1076,25 @@ def _write_report_files(
     report: dict[str, Any],
     fixture: ValidationFixture | None,
     endpoints: dict[str, TTSServiceEndpoint],
+    *,
+    reset_nvidia: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     evidence_report = _sanitize_evidence(report)
-    (output_dir / "summary.json").write_text(
-        json.dumps(evidence_report, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    _atomic_write_report_file(
+        output_dir / "summary.json",
+        lambda path: path.write_text(
+            json.dumps(evidence_report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        ),
     )
-    _write_junit(output_dir / "junit.xml", evidence_report)
-    _write_listening_template(output_dir / "human-listening-review.md", evidence_report, fixture)
+    _atomic_write_report_file(
+        output_dir / "junit.xml", lambda path: _write_junit(path, evidence_report)
+    )
+    _atomic_write_report_file(
+        output_dir / "human-listening-review.md",
+        lambda path: _write_listening_template(path, evidence_report, fixture),
+    )
     log_references = []
     for service_id in FORMAL_SERVICE_IDS.values():
         endpoint = endpoints.get(service_id)
@@ -1041,13 +1105,35 @@ def _write_report_files(
                 "status_path": "/status" if endpoint else None,
             }
         )
-    (output_dir / "worker-log-references.json").write_text(
-        json.dumps(log_references, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    _atomic_write_report_file(
+        output_dir / "worker-log-references.json",
+        lambda path: path.write_text(
+            json.dumps(log_references, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        ),
     )
     nvidia_path = output_dir / "nvidia-smi.csv"
-    if not nvidia_path.exists():
-        with nvidia_path.open("w", encoding="utf-8", newline="") as handle:
-            csv.writer(handle).writerow(NvidiaSmiMonitor.HEADER)
+    if reset_nvidia or not nvidia_path.exists():
+        _atomic_write_report_file(nvidia_path, _write_nvidia_header)
+
+
+def _write_nvidia_header(path: Path) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerow(NvidiaSmiMonitor.HEADER)
+
+
+def _atomic_write_report_file(path: Path, writer: Callable[[Path], Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        writer(temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _sanitize_evidence(value: Any, key: str = "") -> Any:
@@ -1249,7 +1335,7 @@ def _expand_environment(value: Any) -> Any:
 
 
 def _contains_unresolved_environment(value: str) -> bool:
-    return bool(re.search(r"\$\{[^}]+\}|%[^%]+%", value))
+    return bool(re.search(r"\$\{[^}]+\}|%[^%]+%|\$[A-Za-z_][A-Za-z0-9_]*", value))
 
 
 def _optional_float(value: Any) -> float | None:
@@ -1276,12 +1362,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--distributed-preflight", type=Path)
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument("--write-blocker-stage")
+    parser.add_argument("--blocker-message")
     parser.add_argument(
         "--require-baseline",
         action="store_true",
         help="require an approved performance baseline (ignored for single-clean certification)",
     )
     args = parser.parse_args(argv)
+    if bool(args.write_blocker_stage) != bool(args.blocker_message):
+        parser.error("--write-blocker-stage and --blocker-message must be provided together")
     runner = CUDAValidationRunner(
         mode=args.mode,
         services_path=args.services,
@@ -1293,7 +1383,13 @@ def main(argv: list[str] | None = None) -> int:
         require_baseline=args.require_baseline,
         diagnostic=args.diagnostic,
     )
-    report = runner.run_input_preflight() if args.preflight_only else runner.run()
+    if args.write_blocker_stage:
+        report = runner.write_blocker_report(
+            stage=args.write_blocker_stage,
+            message=args.blocker_message,
+        )
+    else:
+        report = runner.run_input_preflight() if args.preflight_only else runner.run()
     if report.get("stage") == "input-preflight" and not report["passed"]:
         print(
             f"阻塞：input-preflight 有 {report['blocker_count']} 个未解决项；证据：summary.json"

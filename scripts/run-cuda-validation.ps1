@@ -29,6 +29,13 @@ if (-not $Output) {
 $FixturePath = if ([IO.Path]::IsPathRooted($Fixture)) { $Fixture } else { Join-Path $Root $Fixture }
 $ServicesPath = if ([IO.Path]::IsPathRooted($Services)) { $Services } else { Join-Path $Root $Services }
 $TopologyPath = if ($Topology -and [IO.Path]::IsPathRooted($Topology)) { $Topology } elseif ($Topology) { Join-Path $Root $Topology } else { "" }
+$RepoPathsPath = if ($RepoPaths -and [IO.Path]::IsPathRooted($RepoPaths)) {
+    $RepoPaths
+} elseif ($RepoPaths) {
+    Join-Path $Root $RepoPaths
+} else {
+    ""
+}
 $ControllerCommit = (& git -C $Root rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $ControllerCommit -notmatch '^[0-9a-f]{40}$') { throw "Unable to resolve TTS More HEAD" }
 $env:TTS_MORE_EXPECTED_APP_COMMIT = $ControllerCommit
@@ -36,6 +43,7 @@ Remove-Item Env:TTS_MORE_DISTRIBUTED_ORCHESTRATION_TOKEN -ErrorAction SilentlyCo
 $script:DistributedPreflightPath = ""
 $script:DistributedDeploymentStarted = $false
 $isDiagnostic = $SkipDeploy -or $SkipStart
+$currentStage = "input-preflight"
 
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 $TranscriptPath = Join-Path $Output "controller.log"
@@ -273,6 +281,9 @@ function Start-ValidationControlPlane {
 }
 
 function Invoke-SingleNodeDeployment {
+    if ($RepoPaths -and !(Test-Path -LiteralPath $RepoPathsPath)) {
+        throw "RepoPaths file not found: $RepoPathsPath"
+    }
     $deploy = @{
         Profile = "local-all"
         Device = "CU128"
@@ -471,12 +482,14 @@ try {
         Write-Host "阻塞：input-preflight 有 $blockerCount 个未解决项；证据：summary.json" -ForegroundColor Red
         exit $preflightExitCode
     }
+    $currentStage = "argument-validation"
     if ($Mode -eq "distributed") {
         if ($SkipDeploy) { throw "distributed mode does not allow -SkipDeploy because deployment identity checks are mandatory" }
         if ($Node) { throw "distributed mode does not allow -Node because all four machines are mandatory" }
         if ($SkipStart) { throw "distributed mode does not allow -SkipStart because worker restart is mandatory" }
         if ($SkipFaultRecovery) { throw "distributed mode does not allow -SkipFaultRecovery because recovery is mandatory" }
     }
+    $currentStage = "deployment"
     if (-not $SkipDeploy) {
         if ($Mode -eq "distributed") {
             $script:DistributedDeploymentStarted = $true
@@ -485,10 +498,13 @@ try {
             Invoke-SingleNodeDeployment
         }
     }
+    $currentStage = "orchestration-preflight"
     if ($Mode -eq "distributed") { New-DistributedOrchestrationPreflight }
+    $currentStage = "worker-wait"
     if (!(Test-Path -LiteralPath $ServicesPath)) { throw "Services file not found: $ServicesPath" }
     Wait-ServiceReady $ServicesPath
 
+    $currentStage = "core-validation"
     $validatorArgs = @(
         (Join-Path $Root "scripts\run-cuda-validation.py"),
         "--mode", $Mode,
@@ -505,21 +521,48 @@ try {
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) { throw "CUDA validation gate failed; see $(Join-Path $Output 'summary.json')" }
     if ($Mode -eq "distributed" -and -not $SkipFaultRecovery) {
+        $currentStage = "fault-recovery"
         Invoke-DistributedFaultRecovery
     }
     if ($Mode -eq "distributed") {
+        $currentStage = "evidence-collection"
         Collect-DistributedEvidence
         $script:DistributedEvidenceCollected = $true
     }
     if ($isDiagnostic) {
-        Write-Host "CUDA diagnostic completed: $Output" -ForegroundColor Yellow
+        Write-Host "CUDA diagnostic core 通过（不可认证）：$Output" -ForegroundColor Yellow
     } else {
-        Write-Host "CUDA validation passed: $Output" -ForegroundColor Green
+        Write-Host "CUDA core 通过，Playwright/人工待完成：$Output" -ForegroundColor Green
     }
-} finally {
+} catch {
+    $failureMessage = $_.Exception.Message
     if ($Mode -eq "distributed" -and $script:DistributedDeploymentStarted -and -not $script:DistributedEvidenceCollected) {
         try { Collect-DistributedEvidence } catch { Write-Warning "Distributed evidence collection failed: $_" }
     }
+    $writeBlocker = $true
+    try {
+        $existingSummary = Get-Content -LiteralPath (Join-Path $Output "summary.json") -Raw | ConvertFrom-Json
+        if ($existingSummary.passed -eq $false) { $writeBlocker = $false }
+    } catch { }
+    if ($writeBlocker) {
+        $blockerArgs = @(
+            (Join-Path $Root "scripts\run-cuda-validation.py"),
+            "--mode", $Mode,
+            "--services", $ServicesPath,
+            "--fixture", $FixturePath,
+            "--output", $Output,
+            "--write-blocker-stage", $currentStage,
+            "--blocker-message", $failureMessage
+        )
+        if ($TopologyPath) { $blockerArgs += @("--topology", $TopologyPath) }
+        if ($Node) { $blockerArgs += @("--node", $Node) }
+        if ($isDiagnostic) { $blockerArgs += "--diagnostic" }
+        & $Python @blockerArgs | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Unable to write blocker evidence for $currentStage" }
+    }
+    Write-Host "阻塞：$currentStage 失败；证据：summary.json" -ForegroundColor Red
+    throw
+} finally {
     if ($script:ValidationControlPlane -and -not $script:ValidationControlPlane.HasExited) {
         Stop-Process -Id $script:ValidationControlPlane.Id -Force
     }
