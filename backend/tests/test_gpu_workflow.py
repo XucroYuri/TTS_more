@@ -332,3 +332,4 @@ def test_playwright_fixture_expansion_precedes_every_validation_api_call() -> No
     assert package["scripts"]["test:cuda-fixture"] == (
         "vitest run e2e/cuda-fixture.test.ts"
     )
+    assert package["scripts"]["test"] == "vitest run --exclude=e2e/**"
