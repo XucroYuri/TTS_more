@@ -11,6 +11,7 @@ import sys
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,7 +20,9 @@ from app.cuda_validation import (
     FORMAL_SERVICE_IDS,
     VALIDATION_MODES,
     CUDAValidationRunner,
+    FasterWhisperTranscriber,
     NvidiaSmiMonitor,
+    ValidationCase,
     character_error_rate,
     create_transcriber,
     evaluate_cer,
@@ -148,6 +151,25 @@ def _expected_transcriber(audio_path: Path, _language: str | None = None) -> str
         "cosyvoice-cross-lingual": "Cross-lingual validation.",
     }
     return names[audio_path.stem]
+
+
+class _HealthyMonitor:
+    def __init__(self, output_path: Path) -> None:
+        self.output_path = output_path
+        self.health = True
+        self.sample_count = 1
+        self.error = ""
+
+    def start(self) -> None:
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.output_path.write_text(
+            ",".join(NvidiaSmiMonitor.HEADER)
+            + "\n2026-07-10T00:00:00Z,2026/07/10 08:00:00.000,0,GPU-test,16384,12000,4384,42\n",
+            encoding="utf-8",
+        )
+
+    def stop(self) -> None:
+        return None
 
 
 def _write_services(tmp_path: Path) -> Path:
@@ -381,7 +403,7 @@ def test_performance_gate_enforces_resource_and_regression_thresholds() -> None:
 def test_nvidia_smi_monitor_writes_time_series_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     csv_path = tmp_path / "nvidia-smi.csv"
     monitor = NvidiaSmiMonitor(csv_path)
-    monkeypatch.setattr("app.cuda_validation.shutil.which", lambda _: None)
+    monkeypatch.setattr("app.cuda_validation.shutil.which", lambda _: "nvidia-smi")
     monkeypatch.setattr(
         "app.cuda_validation.subprocess.run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
@@ -393,13 +415,83 @@ def test_nvidia_smi_monitor_writes_time_series_rows(tmp_path: Path, monkeypatch:
     )
 
     monitor.start()
-    monitor.capture_once()
     monitor.stop()
 
     rows = csv_path.read_text(encoding="utf-8").splitlines()
     assert len(rows) == 2
     assert "memory_free_mib" in rows[0]
     assert "GPU-test" in rows[1]
+
+
+@pytest.mark.parametrize("failure", ["missing", "query-error", "empty", "header"])
+def test_nvidia_smi_monitor_requires_a_valid_initial_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    csv_path = tmp_path / f"{failure}.csv"
+    monitor = NvidiaSmiMonitor(csv_path)
+    monkeypatch.setattr(
+        "app.cuda_validation.shutil.which",
+        lambda _: None if failure == "missing" else "nvidia-smi",
+    )
+
+    def query(*args, **kwargs):
+        if failure == "query-error":
+            raise subprocess.CalledProcessError(1, args[0], stderr="query failed")
+        stdout = ""
+        if failure == "header":
+            stdout = "timestamp,index,uuid,memory.total,memory.free,memory.used,utilization.gpu\n"
+        return subprocess.CompletedProcess(args[0], 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("app.cuda_validation.subprocess.run", query)
+
+    monitor.start()
+    monitor.stop()
+
+    assert monitor.health is False
+    assert monitor.sample_count == 0
+    assert monitor.error == (
+        "GPU monitor is unavailable; nvidia-smi evidence is required for certification"
+    )
+    assert csv_path.read_text(encoding="utf-8").splitlines() == [
+        ",".join(NvidiaSmiMonitor.HEADER)
+    ]
+
+
+def test_faster_whisper_close_releases_model_and_cuda_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_calls: list[str] = []
+    model = SimpleNamespace(
+        transcribe=lambda *_args, **_kwargs: ([SimpleNamespace(text="ok")], None)
+    )
+    transcriber = FasterWhisperTranscriber(lambda *_args, **_kwargs: model, "large-v3", "zh")
+    fake_cuda = SimpleNamespace(
+        is_available=lambda: True,
+        empty_cache=lambda: cache_calls.append("empty-cache"),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=fake_cuda))
+
+    assert transcriber(tmp_path / "sample.wav") == "ok"
+    assert transcriber._model is model
+
+    transcriber.close()
+
+    assert transcriber._model is None
+    assert cache_calls == ["empty-cache"]
+
+
+def test_faster_whisper_close_does_not_mask_cleanup_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    transcriber = FasterWhisperTranscriber(lambda *_args, **_kwargs: None, "large-v3", "zh")
+    transcriber._model = object()
+    fake_cuda = SimpleNamespace(
+        is_available=lambda: True,
+        empty_cache=lambda: (_ for _ in ()).throw(ValueError("driver unavailable")),
+    )
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=fake_cuda))
+
+    transcriber.close()
+
+    assert transcriber._model is None
 
 
 class _FakeClient:
@@ -433,6 +525,157 @@ class _FakeClient:
         self.state[self.endpoint.service_id] = None
 
 
+def test_runner_defers_asr_until_every_tts_case_has_unloaded_and_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = FORMAL_SERVICE_IDS["gpt_sovits"]
+    case = ValidationCase(
+        name="gpt-v2ProPlus",
+        service_id=target,
+        profile="gpt-v2ProPlus",
+        text="默认模型验证。",
+        language="zh",
+        parameters={},
+    )
+    monkeypatch.setattr("app.cuda_validation.validation_cases", lambda _fixture: [case])
+    events: list[str] = []
+    state: dict[str, str | None] = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
+    lifecycle = {"unloaded": False, "recovered": False}
+
+    class OrderingClient(_FakeClient):
+        def load(self, profile: str, parameters: dict | None = None) -> None:
+            if self.endpoint.service_id == target:
+                events.append("load")
+            super().load(profile, parameters)
+
+        def synthesize(self, request) -> SynthesisResult:
+            if self.endpoint.service_id == target:
+                events.append("synthesize")
+            return super().synthesize(request)
+
+        def unload(self) -> None:
+            if self.endpoint.service_id == target:
+                events.append("unload")
+                lifecycle["unloaded"] = True
+            super().unload()
+
+    def status_probe(endpoint) -> dict:
+        if endpoint.service_id == target and lifecycle["unloaded"] and not lifecycle["recovered"]:
+            events.append("memory-recovered")
+            lifecycle["recovered"] = True
+        return {
+            "device": "cuda:0",
+            "device_uuid": f"GPU-{endpoint.service_id}",
+            "cuda_runtime": "12.8",
+            "loaded": state[endpoint.service_id] is not None,
+            "model": state[endpoint.service_id],
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        }
+
+    def transcribe(_audio_path: Path, _language: str | None = None) -> str:
+        events.append("asr")
+        assert all(profile is None for profile in state.values())
+        return case.text
+
+    runner = CUDAValidationRunner(
+        mode="distributed",
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=True),
+        output_dir=tmp_path / "ordered-asr",
+        **_distributed_orchestration(tmp_path),
+        client_factory=lambda endpoint: OrderingClient(endpoint, [], state),
+        status_probe=status_probe,
+        transcriber=transcribe,
+        clock=lambda: 10.0,
+        sleeper=lambda _: None,
+        monitor_factory=_HealthyMonitor,
+    )
+
+    report = runner.run()
+
+    assert report["cases"][0]["asr"]["hypothesis"] == case.text
+    assert events == ["load", "synthesize", "unload", "memory-recovered", "asr"]
+
+
+def test_asr_batch_continues_after_case_error_and_closes_in_finally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cases = [
+        ValidationCase(
+            name="gpt-v2ProPlus",
+            service_id=FORMAL_SERVICE_IDS["gpt_sovits"],
+            profile="gpt-v2ProPlus",
+            text="默认模型验证。",
+            language="zh",
+            parameters={},
+        ),
+        ValidationCase(
+            name="index-emotion-text",
+            service_id=FORMAL_SERVICE_IDS["indextts"],
+            profile="index-emotion-text",
+            text="情绪文本验证。",
+            language="zh",
+            parameters={},
+        ),
+    ]
+    monkeypatch.setattr("app.cuda_validation.validation_cases", lambda _fixture: cases)
+    state: dict[str, str | None] = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
+
+    class BatchTranscriber:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.closed = False
+
+        def __call__(self, audio_path: Path, _language: str | None = None) -> str:
+            self.calls.append(audio_path.stem)
+            if audio_path.stem == cases[0].name:
+                raise RuntimeError("intentional ASR failure")
+            return cases[1].text
+
+        def close(self) -> None:
+            self.closed = True
+
+    transcriber = BatchTranscriber()
+    runner = CUDAValidationRunner(
+        mode="distributed",
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=True),
+        output_dir=tmp_path / "asr-error",
+        **_distributed_orchestration(tmp_path),
+        client_factory=lambda endpoint: _FakeClient(endpoint, [], state),
+        status_probe=lambda endpoint: {
+            "device": "cuda:0",
+            "device_uuid": f"GPU-{endpoint.service_id}",
+            "cuda_runtime": "12.8",
+            "loaded": state[endpoint.service_id] is not None,
+            "model": state[endpoint.service_id],
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        },
+        transcriber=transcriber,
+        clock=lambda: 10.0,
+        sleeper=lambda _: None,
+        monitor_factory=_HealthyMonitor,
+    )
+
+    report = runner.run()
+
+    assert transcriber.calls == [case.name for case in cases]
+    assert transcriber.closed is True
+    assert "intentional ASR failure" in " ".join(report["cases"][0]["errors"])
+    assert report["cases"][1]["asr"]["hypothesis"] == cases[1].text
+    assert report["cer"]["missing_items"] == 1
+
+
 def test_runner_writes_full_artifacts_and_continues_after_case_failure(tmp_path: Path) -> None:
     calls: list[tuple] = []
     state: dict[str, str | None] = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
@@ -463,6 +706,7 @@ def test_runner_writes_full_artifacts_and_continues_after_case_failure(tmp_path:
         clock=lambda: 10.0,
         sleeper=lambda _: None,
         transcriber=_expected_transcriber,
+        monitor_factory=_HealthyMonitor,
     )
 
     report = runner.run()
@@ -503,6 +747,10 @@ def test_single_runner_validates_explicit_local_artifact_delivery(tmp_path: Path
         created_endpoints.append(endpoint)
         return _FakeClient(endpoint, calls, state)
 
+    def transcribe(audio_path: Path, language: str | None = None) -> str:
+        calls.append(("asr", audio_path.stem))
+        return _expected_transcriber(audio_path, language)
+
     runner = CUDAValidationRunner(
         mode="single-release",
         services_path=services_path,
@@ -524,7 +772,8 @@ def test_single_runner_validates_explicit_local_artifact_delivery(tmp_path: Path
         },
         clock=lambda: 10.0,
         sleeper=lambda _: None,
-        transcriber=_expected_transcriber,
+        transcriber=transcribe,
+        monitor_factory=_HealthyMonitor,
     )
 
     report = runner.run()
@@ -534,6 +783,9 @@ def test_single_runner_validates_explicit_local_artifact_delivery(tmp_path: Path
     assert report["certification_status"] == "core_passed_ui_pending"
     assert any(case["name"] == "gpt-v2ProPlus-artifact" for case in report["cases"])
     assert any(endpoint.default_params.get("delivery") == "artifact" for endpoint in created_endpoints)
+    first_asr = next(index for index, call in enumerate(calls) if call[0] == "asr")
+    assert all(index < first_asr for index, call in enumerate(calls) if call[1] == "unload")
+    assert ("asr", "gpt-v2ProPlus-artifact") in calls
 
 
 def test_runner_preflight_failure_is_reported_without_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -551,6 +803,7 @@ def test_runner_preflight_failure_is_reported_without_network(tmp_path: Path, mo
         fixture_path=_write_fixture(tmp_path, asr_required=True),
         output_dir=tmp_path / "failed-report",
         client_factory=lambda endpoint: pytest.fail("network/client construction must not happen"),
+        monitor_factory=_HealthyMonitor,
     )
 
     report = runner.run()
@@ -558,6 +811,91 @@ def test_runner_preflight_failure_is_reported_without_network(tmp_path: Path, mo
     assert report["passed"] is False
     assert "faster-whisper" in report["preflight"][0]["message"]
     assert (tmp_path / "failed-report" / "summary.json").is_file()
+
+
+def test_runner_blocks_before_service_clients_when_gpu_monitor_is_unhealthy(tmp_path: Path) -> None:
+    network_calls: list[str] = []
+
+    class UnhealthyMonitor:
+        health = False
+        sample_count = 0
+        error = "GPU monitor is unavailable; nvidia-smi evidence is required for certification"
+
+        def __init__(self, output_path: Path) -> None:
+            self.output_path = output_path
+
+        def start(self) -> None:
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            self.output_path.write_text(",".join(NvidiaSmiMonitor.HEADER) + "\n", encoding="utf-8")
+
+        def stop(self) -> None:
+            return None
+
+    runner = CUDAValidationRunner(
+        mode="single-release",
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path),
+        output_dir=tmp_path / "monitor-blocked",
+        client_factory=lambda _endpoint: network_calls.append("client"),
+        status_probe=lambda _endpoint: network_calls.append("status") or {},
+        transcriber=_expected_transcriber,
+        monitor_factory=UnhealthyMonitor,
+    )
+
+    report = runner.run()
+
+    assert report["passed"] is False
+    assert network_calls == []
+    assert report["preflight"][0]["message"] == UnhealthyMonitor.error
+    assert report["gpu_monitor"]["sample_count"] == 0
+
+
+@pytest.mark.parametrize("failure_mode", ["unhealthy", "stop-error"])
+def test_runner_marks_runtime_gpu_monitor_failure_without_erasing_samples(
+    tmp_path: Path, failure_mode: str
+) -> None:
+    state: dict[str, str | None] = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
+    error_message = "GPU monitor is unavailable; nvidia-smi evidence is required for certification"
+
+    class FailingAfterStartMonitor(_HealthyMonitor):
+        def stop(self) -> None:
+            if failure_mode == "stop-error":
+                raise RuntimeError("monitor thread failed")
+            self.health = False
+            self.error = error_message
+
+    output_dir = tmp_path / "monitor-runtime-failure"
+    runner = CUDAValidationRunner(
+        mode="single-release",
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path),
+        output_dir=output_dir,
+        client_factory=lambda endpoint: _FakeClient(endpoint, [], state),
+        status_probe=lambda endpoint: {
+            "device": "cuda:0",
+            "device_uuid": "GPU-single",
+            "cuda_runtime": "12.8",
+            "loaded": state[endpoint.service_id] is not None,
+            "model": state[endpoint.service_id],
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        },
+        transcriber=_expected_transcriber,
+        clock=lambda: 10.0,
+        sleeper=lambda _: None,
+        monitor_factory=FailingAfterStartMonitor,
+    )
+
+    report = runner.run()
+
+    assert report["passed"] is False
+    assert error_message in {item["message"] for item in report["preflight"]}
+    assert report["gpu_monitor"]["sample_count"] == 1
+    assert len((output_dir / "nvidia-smi.csv").read_text(encoding="utf-8").splitlines()) == 2
 
 
 @pytest.mark.parametrize("mode", ["single-clean", "single-release"])
@@ -1186,6 +1524,121 @@ def test_first_certification_can_establish_performance_baseline(
     assert report["preflight"] == []
 
 
+@pytest.mark.parametrize("mode", VALIDATION_MODES)
+def test_all_modes_require_artifact_transfer_in_formal_endpoint_configuration(
+    tmp_path: Path, mode: str
+) -> None:
+    services_path = _write_services(tmp_path)
+    services = json.loads(services_path.read_text(encoding="utf-8"))
+    services[0]["capabilities"] = ["tts"]
+    services_path.write_text(json.dumps(services), encoding="utf-8")
+    runner = CUDAValidationRunner(
+        mode=mode,
+        services_path=services_path,
+        fixture_path=_write_fixture(tmp_path, distributed_weights=mode == "distributed"),
+        output_dir=tmp_path / f"missing-artifact-{mode}",
+        transcriber=_expected_transcriber,
+        **(_distributed_orchestration(tmp_path) if mode == "distributed" else {}),
+    )
+    report: dict = {"preflight": []}
+
+    runner._preflight(report)
+
+    assert any("lacks artifact-transfer capability" in item["message"] for item in report["preflight"])
+
+
+@pytest.mark.parametrize("mode", VALIDATION_MODES)
+def test_all_modes_require_normalized_live_artifact_transfer_capability(
+    tmp_path: Path, mode: str
+) -> None:
+    state: dict[str, str | None] = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
+
+    class MissingArtifactClient(_FakeClient):
+        def capabilities(self) -> dict:
+            return {"capabilities": ["tts"]}
+
+    runner = CUDAValidationRunner(
+        mode=mode,
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=mode == "distributed"),
+        output_dir=tmp_path / f"live-artifact-{mode}",
+        transcriber=_expected_transcriber,
+        client_factory=lambda endpoint: MissingArtifactClient(endpoint, [], state),
+        status_probe=lambda endpoint: {
+            "device": "cuda:0",
+            "device_uuid": f"GPU-{endpoint.service_id}",
+            "cuda_runtime": "12.8",
+            "loaded": False,
+            "model": None,
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        },
+        **(_distributed_orchestration(tmp_path) if mode == "distributed" else {}),
+    )
+    report: dict = {"preflight": [], "services": []}
+    fixture, endpoints = runner._preflight(report)
+    assert fixture is not None
+
+    _clients, ready = runner._check_service_contracts(report, fixture, endpoints)
+
+    assert ready == set()
+    assert all(
+        "worker does not advertise artifact-transfer capability" in service["errors"]
+        for service in report["services"]
+    )
+
+
+@pytest.mark.parametrize("mode", VALIDATION_MODES)
+def test_all_modes_accept_underscore_artifact_transfer_capability(
+    tmp_path: Path, mode: str
+) -> None:
+    services_path = _write_services(tmp_path)
+    services = json.loads(services_path.read_text(encoding="utf-8"))
+    for service in services:
+        service["capabilities"] = ["tts", "artifact_transfer"]
+    services_path.write_text(json.dumps(services), encoding="utf-8")
+    state: dict[str, str | None] = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
+
+    class UnderscoreArtifactClient(_FakeClient):
+        def capabilities(self) -> dict:
+            return {"capabilities": ["tts", "artifact_transfer"]}
+
+    runner = CUDAValidationRunner(
+        mode=mode,
+        services_path=services_path,
+        fixture_path=_write_fixture(tmp_path, distributed_weights=mode == "distributed"),
+        output_dir=tmp_path / f"underscore-artifact-{mode}",
+        transcriber=_expected_transcriber,
+        client_factory=lambda endpoint: UnderscoreArtifactClient(endpoint, [], state),
+        status_probe=lambda endpoint: {
+            "device": "cuda:0",
+            "device_uuid": f"GPU-{endpoint.service_id}",
+            "cuda_runtime": "12.8",
+            "loaded": False,
+            "model": None,
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        },
+        **(_distributed_orchestration(tmp_path) if mode == "distributed" else {}),
+    )
+    report: dict = {"preflight": [], "services": []}
+    fixture, endpoints = runner._preflight(report)
+    assert fixture is not None
+
+    _clients, ready = runner._check_service_contracts(report, fixture, endpoints)
+
+    assert report["preflight"] == []
+    assert ready == set(FORMAL_SERVICE_IDS.values())
+
+
 def test_runner_rejects_worker_from_stale_tts_more_commit(tmp_path: Path) -> None:
     calls: list[tuple] = []
     state: dict[str, str | None] = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
@@ -1205,6 +1658,7 @@ def test_runner_rejects_worker_from_stale_tts_more_commit(tmp_path: Path) -> Non
             "memory": {"free_bytes": 1, "total_bytes": 16 * 1024**3, "reserved_bytes": 0, "allocated_bytes": 0},
         },
         transcriber=_expected_transcriber,
+        monitor_factory=_HealthyMonitor,
     )
 
     report = runner.run()

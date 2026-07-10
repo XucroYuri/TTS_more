@@ -56,6 +56,9 @@ MAX_UNLOAD_SECONDS = 30.0
 MAX_COLD_LOAD_SECONDS = 600.0
 MAX_SHORT_SYNTHESIS_SECONDS = 300.0
 MAX_WARM_P95_REGRESSION = 0.30
+GPU_MONITOR_REQUIRED_ERROR = (
+    "GPU monitor is unavailable; nvidia-smi evidence is required for certification"
+)
 
 
 class ServiceIds(BaseModel):
@@ -467,6 +470,16 @@ class FasterWhisperTranscriber:
         )
         return "".join(str(segment.text) for segment in segments).strip()
 
+    def close(self) -> None:
+        self._model = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
 
 def create_transcriber(*, required: bool, model_name: str, language: str) -> tuple[Transcriber | None, str]:
     if not required:
@@ -538,12 +551,37 @@ class NvidiaSmiMonitor:
         self.interval_seconds = interval_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._sample_count = 0
+        self._error = ""
+
+    @property
+    def health(self) -> bool:
+        with self._lock:
+            return self._sample_count > 0 and not self._error
+
+    @property
+    def sample_count(self) -> int:
+        with self._lock:
+            return self._sample_count
+
+    @property
+    def error(self) -> str:
+        with self._lock:
+            return self._error
+
+    def _mark_failed(self) -> None:
+        with self._lock:
+            self._error = GPU_MONITOR_REQUIRED_ERROR
 
     def start(self) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         with self.output_path.open("w", encoding="utf-8", newline="") as handle:
             csv.writer(handle).writerow(self.HEADER)
         if shutil.which("nvidia-smi") is None:
+            self._mark_failed()
+            return
+        if not self.capture_once():
             return
         self._thread = threading.Thread(target=self._run, name="nvidia-smi-validation", daemon=True)
         self._thread.start()
@@ -552,13 +590,18 @@ class NvidiaSmiMonitor:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(5.0, self.interval_seconds * 2))
+            if self._thread.is_alive():
+                self._mark_failed()
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            self.capture_once()
-            self._stop.wait(self.interval_seconds)
+        try:
+            while not self._stop.wait(self.interval_seconds):
+                if not self.capture_once():
+                    return
+        except Exception:
+            self._mark_failed()
 
-    def capture_once(self) -> None:
+    def capture_once(self) -> bool:
         command = [
             "nvidia-smi",
             "--query-gpu=timestamp,index,uuid,memory.total,memory.free,memory.used,utilization.gpu",
@@ -567,16 +610,29 @@ class NvidiaSmiMonitor:
         try:
             completed = subprocess.run(command, capture_output=True, text=True, timeout=15, check=True)
         except (OSError, subprocess.SubprocessError):
-            return
+            self._mark_failed()
+            return False
         captured_at = datetime.now(timezone.utc).isoformat()
         rows = []
         for line in completed.stdout.splitlines():
             fields = [field.strip() for field in next(csv.reader([line]))]
-            if len(fields) == 7:
-                rows.append([captured_at, *fields])
+            if len(fields) != 7 or not fields[0] or not fields[2]:
+                continue
+            try:
+                int(fields[1])
+                for value in fields[3:]:
+                    float(value)
+            except ValueError:
+                continue
+            rows.append([captured_at, *fields])
         if rows:
             with self.output_path.open("a", encoding="utf-8", newline="") as handle:
                 csv.writer(handle).writerows(rows)
+            with self._lock:
+                self._sample_count += len(rows)
+            return True
+        self._mark_failed()
+        return False
 
 
 class CUDAValidationRunner:
@@ -650,6 +706,7 @@ class CUDAValidationRunner:
             "cases": [],
             "cer": {"required": False, "items": [], "aggregate_cer": None, "passed": True},
             "performance": {"passed": False, "checks": {}, "metrics": {}},
+            "gpu_monitor": {"healthy": False, "sample_count": 0, "error": ""},
         }
 
     def run_input_preflight(self) -> dict[str, Any]:
@@ -745,12 +802,25 @@ class CUDAValidationRunner:
             return input_report
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "wav").mkdir(parents=True, exist_ok=True)
-        monitor = self.monitor_factory(self.output_dir / "nvidia-smi.csv")
-        monitor.start()
         report = self._new_report(stage="cuda-validation")
         fixture: ValidationFixture | None = None
         endpoints: dict[str, TTSServiceEndpoint] = {}
+        monitor: NvidiaSmiMonitor | None = None
         try:
+            try:
+                monitor = self.monitor_factory(self.output_dir / "nvidia-smi.csv")
+                monitor.start()
+            except Exception:
+                report["preflight"].append(
+                    {"passed": False, "message": GPU_MONITOR_REQUIRED_ERROR}
+                )
+                return self._finish(report, fixture, endpoints)
+            self._record_gpu_monitor(report, monitor)
+            if not report["gpu_monitor"]["healthy"]:
+                report["preflight"].append(
+                    {"passed": False, "message": GPU_MONITOR_REQUIRED_ERROR}
+                )
+                return self._finish(report, fixture, endpoints)
             fixture, endpoints = self._preflight(report)
             if report["preflight"]:
                 return self._finish(report, fixture, endpoints)
@@ -767,6 +837,7 @@ class CUDAValidationRunner:
                 "warm_p95_seconds": None,
             }
             cer_items: list[tuple[str, str, str]] = []
+            asr_queue: list[tuple[dict[str, Any], Path, str, str]] = []
             for case in validation_cases(fixture):
                 client = clients.get(case.service_id)
                 endpoint = endpoints[case.service_id]
@@ -775,8 +846,10 @@ class CUDAValidationRunner:
                         {"name": case.name, "service_id": case.service_id, "passed": False, "errors": ["service contract preflight failed"]}
                     )
                     continue
-                case_report = self._run_case(case, endpoint, client, perf_source, cer_items)
+                case_report = self._run_case(case, endpoint, client, perf_source)
                 report["cases"].append(case_report)
+                if case_report.get("audio", {}).get("passed"):
+                    asr_queue.append((case_report, self.output_dir / case_report["output_path"], case.text, case.language))
             if self.mode != "distributed" and fixture.service_ids.gpt_sovits in ready_services:
                 base_case = validation_cases(fixture)[0]
                 artifact_case = ValidationCase(
@@ -792,10 +865,41 @@ class CUDAValidationRunner:
                     update={"default_params": {**base_endpoint.default_params, "delivery": "artifact"}}
                 )
                 artifact_client = self.client_factory(artifact_endpoint)
-                report["cases"].append(
-                    self._run_case(artifact_case, artifact_endpoint, artifact_client, perf_source, cer_items)
+                artifact_report = self._run_case(
+                    artifact_case, artifact_endpoint, artifact_client, perf_source
                 )
+                report["cases"].append(artifact_report)
+                if artifact_report.get("audio", {}).get("passed"):
+                    asr_queue.append(
+                        (
+                            artifact_report,
+                            self.output_dir / artifact_report["output_path"],
+                            artifact_case.text,
+                            artifact_case.language,
+                        )
+                    )
             if fixture.asr.required:
+                for case_report, wav_path, reference, language in asr_queue:
+                    try:
+                        assert self.transcriber is not None
+                        hypothesis = self.transcriber(wav_path, language)
+                        cer = character_error_rate(reference, hypothesis)
+                        case_report["asr"] = {
+                            "reference": reference,
+                            "hypothesis": hypothesis,
+                            "cer": cer,
+                            "passed": cer <= MAX_ITEM_CER,
+                        }
+                        cer_items.append((case_report["name"], reference, hypothesis))
+                        if cer > MAX_ITEM_CER:
+                            case_report["errors"].append(
+                                f"CER {cer:.4f} exceeds {MAX_ITEM_CER:.2f}"
+                            )
+                    except Exception as exc:
+                        case_report["errors"].append(
+                            f"ASR failed: {type(exc).__name__}: {exc}"
+                        )
+                    case_report["passed"] = not case_report["errors"]
                 report["cer"] = evaluate_cer(cer_items)
                 if len(cer_items) != len(report["cases"]):
                     report["cer"]["passed"] = False
@@ -809,7 +913,43 @@ class CUDAValidationRunner:
             report["preflight"].append({"passed": False, "message": f"validator error: {type(exc).__name__}: {exc}"})
             return self._finish(report, fixture, endpoints)
         finally:
-            monitor.stop()
+            close = getattr(self.transcriber, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    report["preflight"].append(
+                        {"passed": False, "message": f"ASR cleanup failed: {type(exc).__name__}: {exc}"}
+                    )
+            if monitor is not None:
+                monitor_stop_failed = False
+                try:
+                    monitor.stop()
+                except Exception:
+                    monitor_stop_failed = True
+                self._record_gpu_monitor(report, monitor)
+                if monitor_stop_failed:
+                    report["gpu_monitor"].update(
+                        {"healthy": False, "error": GPU_MONITOR_REQUIRED_ERROR}
+                    )
+                if not report["gpu_monitor"]["healthy"] and not any(
+                    item.get("message") == GPU_MONITOR_REQUIRED_ERROR
+                    for item in report["preflight"]
+                ):
+                    report["preflight"].append(
+                        {"passed": False, "message": GPU_MONITOR_REQUIRED_ERROR}
+                    )
+            self._finish(report, fixture, endpoints)
+
+    @staticmethod
+    def _record_gpu_monitor(report: dict[str, Any], monitor: Any) -> None:
+        sample_count = int(getattr(monitor, "sample_count", 0) or 0)
+        healthy = bool(getattr(monitor, "health", False)) and sample_count > 0
+        report["gpu_monitor"] = {
+            "healthy": healthy,
+            "sample_count": sample_count,
+            "error": str(getattr(monitor, "error", "") or ""),
+        }
 
     def _preflight(
         self, report: dict[str, Any]
@@ -853,7 +993,7 @@ class CUDAValidationRunner:
                 report["preflight"].append(
                     {"passed": False, "message": f"{endpoint.service_id} is not an unmanaged external LAN worker"}
                 )
-            if self.mode == "distributed" and "artifact-transfer" not in {
+            if "artifact-transfer" not in {
                 item.replace("_", "-").casefold() for item in endpoint.capabilities
             }:
                 report["preflight"].append(
@@ -928,7 +1068,7 @@ class CUDAValidationRunner:
                 live_caps = {str(item).replace("_", "-").casefold() for item in capabilities.get("capabilities", [])}
                 if "tts" not in live_caps:
                     service_report["errors"].append("worker does not advertise tts capability")
-                if self.mode == "distributed" and "artifact-transfer" not in live_caps:
+                if "artifact-transfer" not in live_caps:
                     service_report["errors"].append("worker does not advertise artifact-transfer capability")
                 service_report["errors"].extend(_status_errors(status, expected_loaded=False))
             except Exception as exc:
@@ -964,7 +1104,6 @@ class CUDAValidationRunner:
         endpoint: TTSServiceEndpoint,
         client: TTSServiceClient,
         perf_source: dict[str, Any],
-        cer_items: list[tuple[str, str, str]],
     ) -> dict[str, Any]:
         output_path = self.output_dir / "wav" / f"{case.name}.wav"
         case_report: dict[str, Any] = {
@@ -1015,13 +1154,6 @@ class CUDAValidationRunner:
             if not audio_metrics["passed"]:
                 failed_checks = [name for name, passed in audio_metrics["checks"].items() if not passed]
                 case_report["errors"].append(f"audio quality failed: {', '.join(failed_checks)}")
-            if self.transcriber is not None:
-                hypothesis = self.transcriber(output_path, case.language)
-                cer = character_error_rate(case.text, hypothesis)
-                case_report["asr"] = {"reference": case.text, "hypothesis": hypothesis, "cer": cer, "passed": cer <= MAX_ITEM_CER}
-                cer_items.append((case.name, case.text, hypothesis))
-                if cer > MAX_ITEM_CER:
-                    case_report["errors"].append(f"CER {cer:.4f} exceeds {MAX_ITEM_CER:.2f}")
             after_synthesis = self.status_probe(endpoint)
             case_report["synthesis_status"] = after_synthesis
             _record_memory(perf_source, after_synthesis)

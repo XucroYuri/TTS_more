@@ -224,18 +224,75 @@ function Wait-ServiceReady {
     throw "Workers did not become ready within $TimeoutSeconds seconds"
 }
 
+function Test-ConfiguredWorkerProcessOwnership {
+    param(
+        [AllowEmptyString()][string]$CommandLine,
+        [AllowEmptyString()][string]$ExecutablePath,
+        [string]$ProjectRoot,
+        [string]$WorkerModule
+    )
+    if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($WorkerModule)) {
+        return $false
+    }
+    try {
+        $normalizedRoot = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd([char[]]@('\', '/'))
+    } catch {
+        return $false
+    }
+    $rootWithSeparator = $normalizedRoot + [IO.Path]::DirectorySeparatorChar
+    $executableOwned = $false
+    if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {
+        try {
+            $normalizedExecutable = [IO.Path]::GetFullPath($ExecutablePath)
+            $executableOwned =
+                $normalizedExecutable.Equals($normalizedRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                $normalizedExecutable.StartsWith($rootWithSeparator, [StringComparison]::OrdinalIgnoreCase)
+        } catch {
+            $executableOwned = $false
+        }
+    }
+    $normalizedCommand = $CommandLine.Replace('/', '\')
+    $normalizedCommandRoot = $normalizedRoot.Replace('/', '\') + '\'
+    $commandOwned = $normalizedCommand.IndexOf(
+        $normalizedCommandRoot, [StringComparison]::OrdinalIgnoreCase
+    ) -ge 0
+    $moduleOwned = $CommandLine.IndexOf(
+        $WorkerModule, [StringComparison]::OrdinalIgnoreCase
+    ) -ge 0
+    return [bool]($moduleOwned -and ($executableOwned -or $commandOwned))
+}
+
 function Stop-ConfiguredWorkerListeners {
     param([string]$Path)
     if (!(Test-Path -LiteralPath $Path)) { return }
     $formal = @("local-gpt-sovits-main", "local-indextts", "local-cosyvoice")
+    $workerModules = @{
+        "local-gpt-sovits-main" = "app.workers.gpt_sovits_worker:app"
+        "local-indextts" = "app.workers.indextts_worker:app"
+        "local-cosyvoice" = "app.workers.cosyvoice_worker:app"
+    }
     $servicesPayload = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $ownedListeners = @()
     foreach ($service in @($servicesPayload | Where-Object { $_.service_id -in $formal })) {
         $port = ([Uri]$service.base_url).Port
         $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
-        $listeners | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object {
-            Write-Host "[replace] stop existing worker listener on port $port" -ForegroundColor Yellow
-            Stop-Process -Id $_ -Force -ErrorAction Stop
+        foreach ($processId in @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
+            $process = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$processId)" -ErrorAction SilentlyContinue
+            $owned = $null -ne $process -and (Test-ConfiguredWorkerProcessOwnership `
+                -CommandLine ([string]$process.CommandLine) `
+                -ExecutablePath ([string]$process.ExecutablePath) `
+                -ProjectRoot $Root `
+                -WorkerModule $workerModules[[string]$service.service_id]
+            )
+            if (-not $owned) {
+                throw "阻塞：端口 $port 被非本次验证进程占用"
+            }
+            $ownedListeners += [pscustomobject]@{ Port = $port; ProcessId = [int]$processId }
         }
+    }
+    foreach ($listener in $ownedListeners) {
+        Write-Host "[replace] stop owned worker listener on port $($listener.Port)" -ForegroundColor Yellow
+        Stop-Process -Id $listener.ProcessId -Force -ErrorAction Stop
     }
 }
 

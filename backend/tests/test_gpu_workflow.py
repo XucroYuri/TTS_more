@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import base64
+import json
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -15,6 +22,14 @@ CUDA_VALIDATOR = ROOT / "backend" / "app" / "cuda_validation.py"
 def _read(path: Path) -> str:
     assert path.is_file(), f"missing required file: {path.relative_to(ROOT)}"
     return path.read_text(encoding="utf-8")
+
+
+def _powershell_function(source: str, name: str) -> str:
+    marker = f"function {name} {{"
+    start = source.index(marker)
+    match = re.search(r"(?m)^function\s+[A-Za-z0-9-]+\s*\{", source[start + len(marker) :])
+    end = len(source) if match is None else start + len(marker) + match.start()
+    return source[start:end].rstrip()
 
 
 def test_windows_gpu_workflow_declares_triggers_modes_and_runner_contract() -> None:
@@ -110,6 +125,64 @@ def test_cuda_entrypoint_forwards_repo_paths_and_marks_skips_diagnostic() -> Non
         r'if \(\$isDiagnostic\) \{\s*Write-Host "CUDA diagnostic core 通过（不可认证）：\$Output"[^}]*\}\s*else \{\s*Write-Host "CUDA core 通过，Playwright/人工待完成：\$Output"',
         script,
     )
+
+
+def test_worker_listener_cleanup_is_scoped_to_current_root_and_formal_module() -> None:
+    script = _read(CUDA_ENTRYPOINT)
+    predicate = _powershell_function(script, "Test-ConfiguredWorkerProcessOwnership")
+    cleanup = _powershell_function(script, "Stop-ConfiguredWorkerListeners")
+
+    assert "GetFullPath" in predicate
+    assert "$ExecutablePath" in predicate
+    assert "$CommandLine" in predicate
+    assert "$WorkerModule" in predicate
+    assert "Stop-Process" not in predicate
+    assert "Get-CimInstance Win32_Process" in cleanup
+    assert "Test-ConfiguredWorkerProcessOwnership" in cleanup
+    assert "阻塞：端口 $port 被非本次验证进程占用" in cleanup
+    assert cleanup.index("Test-ConfiguredWorkerProcessOwnership") < cleanup.index("Stop-Process")
+    assert "Get-Process" not in cleanup
+    for module in (
+        "app.workers.gpt_sovits_worker:app",
+        "app.workers.indextts_worker:app",
+        "app.workers.cosyvoice_worker:app",
+    ):
+        assert module in cleanup
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell ownership predicate is Windows-only")
+def test_worker_process_ownership_predicate_is_pure_and_root_scoped() -> None:
+    executable = shutil.which("powershell.exe")
+    assert executable is not None
+    predicate = _powershell_function(
+        _read(CUDA_ENTRYPOINT), "Test-ConfiguredWorkerProcessOwnership"
+    )
+    root = str(ROOT).replace("'", "''")
+    command = predicate + f"""
+$root = '{root}'
+$inside = Join-Path $root '.venv\\Scripts\\python.exe'
+$outside = 'C:\\external\\python.exe'
+$sibling = $root + '-other\\.venv\\Scripts\\python.exe'
+$module = 'app.workers.gpt_sovits_worker:app'
+@(
+    (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$inside`\" -m uvicorn $module\" -ExecutablePath $inside -ProjectRoot $root -WorkerModule $module),
+    (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$outside`\" -m uvicorn $module\" -ExecutablePath $outside -ProjectRoot $root -WorkerModule $module),
+    (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$inside`\" -m uvicorn app.main:app\" -ExecutablePath $inside -ProjectRoot $root -WorkerModule $module),
+    (Test-ConfiguredWorkerProcessOwnership -CommandLine \"`\"$sibling`\" -m uvicorn $module\" -ExecutablePath $sibling -ProjectRoot $root -WorkerModule $module)
+) | ConvertTo-Json -Compress
+"""
+    encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+
+    completed = subprocess.run(
+        [executable, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == [True, False, False, False]
 
 
 def test_cuda_entrypoint_rewrites_stale_preflight_pass_on_later_stage_failure() -> None:
