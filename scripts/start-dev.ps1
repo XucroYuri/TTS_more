@@ -7,8 +7,7 @@ function Assert-PortAvailable {
   param([int]$Port, [string]$Label)
   $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
   if ($listeners.Count -gt 0) {
-    $owners = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique) -join ", "
-    throw "$Label port $Port is already in use; stop the existing process before starting this checkout. PID(s): $owners"
+    throw "$Label port $Port is already in use; confirm its ownership before taking any action."
   }
 }
 

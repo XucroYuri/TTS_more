@@ -285,11 +285,15 @@ def test_start_dev_rejects_occupied_fixed_ports_before_starting_processes() -> N
 
     assert "function Assert-PortAvailable" in script
     assert "Get-NetTCPConnection -State Listen -LocalPort $Port" in script
+    guard = script[script.index("function Assert-PortAvailable") : script.index("if (!(Test-Path")]
     first_start = script.index("Start-Process")
     for call in ('Assert-PortAvailable 8000 "Backend"', 'Assert-PortAvailable 5173 "Frontend"'):
         assert call in script
         assert script.index(call) < first_start
-    assert "is already in use; stop the existing process before starting this checkout" in script
+    assert "OwningProcess" not in guard
+    assert "Stop-Process" not in guard
+    assert "PID" not in guard
+    assert "is already in use; confirm its ownership before taking any action" in script
     assert "port: 5173" in vite
     assert "strictPort: true" in vite
 
