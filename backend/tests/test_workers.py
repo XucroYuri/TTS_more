@@ -87,6 +87,44 @@ def test_gpt_sovits_worker_accepts_generator_pipeline_output(tmp_path: Path, mon
     assert writes == [([0.0, 0.25, -0.25], 32000, tmp_path / "out.wav", "wav")]
 
 
+def test_gpt_worker_upload_randomizes_safe_audio_names(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    monkeypatch.setattr(worker, "REPO_DIR", tmp_path)
+    monkeypatch.setenv("TTS_MORE_MAX_UPLOAD_BYTES", "8")
+    client = TestClient(gpt_app)
+
+    first = client.post("/upload_ref", files={"file": ("../../ref.wav", b"123", "audio/wav")})
+    second = client.post("/upload_ref", files={"file": ("ref.wav", b"456", "audio/wav")})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_path = Path(first.json()["path"])
+    second_path = Path(second.json()["path"])
+    assert first_path.parent == tmp_path / "uploaded_ref"
+    assert second_path.parent == tmp_path / "uploaded_ref"
+    assert first_path != second_path
+    assert ".." not in first_path.name
+    assert first_path.read_bytes() == b"123"
+    assert second_path.read_bytes() == b"456"
+
+
+def test_gpt_worker_upload_rejects_invalid_empty_and_oversized_files(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    monkeypatch.setattr(worker, "REPO_DIR", tmp_path)
+    monkeypatch.setenv("TTS_MORE_MAX_UPLOAD_BYTES", "8")
+    client = TestClient(gpt_app)
+
+    invalid = client.post("/upload_ref", files={"file": ("ref.txt", b"123", "text/plain")})
+    empty = client.post("/upload_ref", files={"file": ("ref.wav", b"", "audio/wav")})
+    oversized = client.post("/upload_ref", files={"file": ("ref.wav", b"123456789", "audio/wav")})
+
+    assert invalid.status_code == 400
+    assert empty.status_code == 400
+    assert oversized.status_code == 413
+
+
 # --- discovery helpers ---------------------------------------------------------
 
 

@@ -1,7 +1,8 @@
 param(
-    [string[]]$Targets = @("all"),
+    [string[]]$Targets = @("default"),
     [ValidateSet("Auto", "ModelScope", "HF", "HF-Mirror")][string]$Source = "Auto",
     [ValidateSet("CU128", "CU126", "CPU", "ROCM", "MPS")][string]$Device = "CU128",
+    [string]$RepoPaths = "",
     [switch]$SyncRepos,
     [switch]$CleanRepos,
     [switch]$SkipInstall,
@@ -10,6 +11,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$TargetItems = @($Targets | ForEach-Object { $_ -split "," } | Where-Object { $_ } | ForEach-Object { $_.Trim() })
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
@@ -157,12 +159,13 @@ function Invoke-WithPackageIndexFallback {
 
 function Test-Target {
     param($Repo)
-    if ($Targets -contains "all") { return $true }
+    if ($TargetItems -contains "all") { return $true }
+    if ($TargetItems -contains "default" -and $Repo.default_selected -ne $false) { return $true }
     return (
-        $Targets -contains $Repo.name -or
-        $Targets -contains $Repo.provider_type -or
-        $Targets -contains $Repo.service_id -or
-        ($Repo.variant -and $Targets -contains $Repo.variant)
+        $TargetItems -contains $Repo.name -or
+        $TargetItems -contains $Repo.provider_type -or
+        $TargetItems -contains $Repo.service_id -or
+        ($Repo.variant -and $TargetItems -contains $Repo.variant)
     )
 }
 
@@ -292,7 +295,8 @@ function Prepare-CosyVoice {
 }
 
 if ($SyncRepos) {
-    $syncArgs = @("scripts\tts_more_deploy.py", "sync-repos")
+    $syncArgs = @("scripts\tts_more_deploy.py", "sync-repos", "--service-ids", ($TargetItems -join ","))
+    if ($RepoPaths) { $syncArgs += @("--repo-paths", $RepoPaths) }
     if ($CleanRepos) { $syncArgs += "--clean" }
     if ($DryRun) { $syncArgs += "--dry-run" }
     Invoke-Logged $Python $syncArgs $Root
@@ -306,8 +310,16 @@ $SourceFallbacks = Get-SourceFallbacks $ResolvedSource
 $PackageIndexFallbacks = Get-PackageIndexFallbacks ([string]$NetworkProfile.pip_index_url)
 Write-Host "[network] source=$ResolvedSource cache=$($NetworkProfile.cache_root)" -ForegroundColor Cyan
 
-$lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json
-foreach ($repo in $lock.repositories) {
+if ($RepoPaths) {
+    $repoArgs = @((Join-Path $Root "scripts\tts_more_deploy.py"), "--root", $Root, "list-repos", "--service-ids", ($TargetItems -join ","), "--repo-paths", $RepoPaths)
+    $reposJson = & $Python @repoArgs
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $repositories = @($reposJson | ConvertFrom-Json)
+} else {
+    $lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json
+    $repositories = @($lock.repositories)
+}
+foreach ($repo in $repositories) {
     if (-not (Test-Target $repo)) { continue }
     switch ($repo.provider_type) {
         "gpt-sovits" { Prepare-GPTSoVITS $repo }
@@ -316,5 +328,7 @@ foreach ($repo in $lock.repositories) {
     }
 }
 
-Invoke-Logged $Python @("scripts\tts_more_deploy.py", "render-services", "--profile", "local-all", "--platform", "windows", "--output", "data\local\services.json") $Root
+$renderArgs = @("scripts\tts_more_deploy.py", "render-services", "--profile", "local-all", "--platform", "windows", "--service-ids", ($TargetItems -join ","), "--output", "data\local\services.json")
+if ($RepoPaths) { $renderArgs += @("--repo-paths", $RepoPaths) }
+Invoke-Logged $Python $renderArgs $Root
 Write-Host "Prepared selected TTS repositories. Rendered data\local\services.json." -ForegroundColor Green

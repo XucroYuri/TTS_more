@@ -33,7 +33,9 @@ The pipeline is constructed once at startup and held resident for low latency;
 from __future__ import annotations
 
 import os
+import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +55,7 @@ CONFIG_YAML = os.environ.get("TTS_MORE_GPTSOVITS_CONFIG", "GPT_SoVITS/configs/tt
 _pipeline: Any = None
 _config: Any = None
 _weight_roots: list[Path] = []
+UPLOAD_AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".webm"}
 
 
 def _bootstrap_repo() -> None:
@@ -336,11 +339,21 @@ class UploadRefResponse(BaseModel):
 async def upload_ref(file: UploadFile) -> UploadRefResponse:
     """Upload a reference audio for cross-machine deployment. Stored under
     ``uploaded_ref/`` in the repo so it can be referenced by path on /load."""
+    raw_name = (file.filename or "").replace("\\", "/")
+    base_name = Path(raw_name).name
+    suffix = Path(base_name).suffix.lower()
+    if suffix not in UPLOAD_AUDIO_SUFFIXES:
+        raise HTTPException(status_code=400, detail="unsupported audio file")
+    max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+    content = await file.read(max_upload_bytes + 1)
+    if not content:
+        raise HTTPException(status_code=400, detail="audio file is empty")
+    if len(content) > max_upload_bytes:
+        raise HTTPException(status_code=413, detail="audio file exceeds upload limit")
     upload_dir = REPO_DIR / "uploaded_ref"
     upload_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = (file.filename or "ref.wav").replace("/", "_").replace("\\", "_")
-    target = upload_dir / safe_name
-    content = await file.read()
+    safe_name = re.sub(r"[^\w.\-]", "_", base_name) or f"reference{suffix}"
+    target = upload_dir / f"{uuid.uuid4().hex[:16]}_{safe_name}"
     target.write_bytes(content)
     return UploadRefResponse(path=str(target))
 

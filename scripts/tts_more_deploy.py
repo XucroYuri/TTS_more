@@ -16,6 +16,8 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+REPO_BUNDLE_RELATIVE_PATH = Path("deployment/tts-repos")
+DEFAULT_REPO_PATHS_RELATIVE_PATH = Path("deployment/app/repo-paths.local.json")
 
 
 PROVIDER_MODULES = {
@@ -83,8 +85,78 @@ def load_repo_lock(root: Path = PROJECT_ROOT) -> list[dict[str, Any]]:
     return list(payload.get("repositories") or [])
 
 
+def load_deployment_repositories(
+    root: Path = PROJECT_ROOT,
+    repo_paths: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    repositories = [dict(repo) for repo in load_repo_lock(root)]
+    overrides = load_repo_path_overrides(root, repo_paths)
+    if overrides:
+        apply_repo_path_overrides(repositories, overrides)
+    return repositories
+
+
 def save_repo_lock(repositories: list[dict[str, Any]], root: Path = PROJECT_ROOT) -> None:
     write_json(root / "repo.lock.json", {"repositories": repositories})
+
+
+def load_repo_path_overrides(root: Path = PROJECT_ROOT, repo_paths: str | Path | None = None) -> dict[str, str]:
+    path = _repo_paths_config_path(root, repo_paths)
+    if path is None:
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw = payload.get("repositories") if isinstance(payload, dict) else payload
+    overrides: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(key, str) and isinstance(value, str) and value.strip():
+                overrides[key] = value.strip()
+        return overrides
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            path_value = item.get("path")
+            if not isinstance(path_value, str) or not path_value.strip():
+                continue
+            for key_name in ("service_id", "name", "provider_type", "variant"):
+                key = item.get(key_name)
+                if isinstance(key, str) and key.strip():
+                    overrides[key.strip()] = path_value.strip()
+        return overrides
+    raise ValueError(f"unsupported repo paths format: {path}")
+
+
+def apply_repo_path_overrides(repositories: list[dict[str, Any]], overrides: Mapping[str, str]) -> None:
+    for repo in repositories:
+        for key in _repo_override_keys(repo):
+            if key in overrides:
+                repo["path"] = overrides[key]
+                repo["path_source"] = key
+                break
+
+
+def _repo_paths_config_path(root: Path, repo_paths: str | Path | None) -> Path | None:
+    if repo_paths is None:
+        default = root / DEFAULT_REPO_PATHS_RELATIVE_PATH
+        return default if default.exists() else None
+    path = Path(repo_paths)
+    if not path.is_absolute():
+        path = root / path
+    if not path.exists():
+        raise FileNotFoundError(f"repo paths file not found: {path}")
+    return path
+
+
+def _repo_override_keys(repo: Mapping[str, Any]) -> list[str]:
+    keys = [
+        str(repo.get("service_id") or ""),
+        str(repo.get("name") or ""),
+        str(repo.get("provider_type") or ""),
+        str(repo.get("variant") or ""),
+        str(repo.get("path") or ""),
+    ]
+    return [key for key in keys if key]
 
 
 def _utc_now() -> datetime:
@@ -398,13 +470,14 @@ def render_services(
     host: str = "127.0.0.1",
     service_ids: set[str] | None = None,
     template: bool = False,
+    repositories: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     platform_name = platform_name or _platform_name()
-    repositories = [repo for repo in load_repo_lock(root) if _is_tts_repo(repo)]
+    repositories = [repo for repo in (repositories or load_repo_lock(root)) if _is_tts_repo(repo)]
     services: list[dict[str, Any]] = []
     for repo in repositories:
         service_id = str(repo.get("service_id") or _default_service_id(repo))
-        if service_ids and service_id not in service_ids:
+        if not _repo_selected(repo, service_ids):
             continue
         provider = str(repo["provider_type"])
         port = int(repo.get("port") or _default_port(provider))
@@ -455,6 +528,10 @@ def _run_git_command(command: list[str], *, cwd: Path) -> None:
 
 def _repo_selected(repo: dict[str, Any], service_ids: set[str] | None) -> bool:
     if not service_ids:
+        return bool(repo.get("default_selected", True))
+    if "all" in service_ids:
+        return True
+    if "default" in service_ids and bool(repo.get("default_selected", True)):
         return True
     candidates = {
         str(repo.get("name") or ""),
@@ -494,12 +571,16 @@ def _git_exclude_path(repo_path: Path) -> Path | None:
 
 
 def _exclude_local_update_scripts(repo_path: Path) -> None:
+    _exclude_local_helper_paths(repo_path, ["tts-more-update.sh", "tts-more-update.ps1"])
+
+
+def _exclude_local_helper_paths(repo_path: Path, names: list[str]) -> None:
     exclude_path = _git_exclude_path(repo_path)
     if exclude_path is None:
         return
     exclude_path.parent.mkdir(parents=True, exist_ok=True)
     existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
-    additions = [name for name in ("tts-more-update.sh", "tts-more-update.ps1") if name not in existing.splitlines()]
+    additions = [name for name in names if name not in existing.splitlines()]
     if not additions:
         return
     prefix = "" if not existing or existing.endswith("\n") else "\n"
@@ -539,11 +620,13 @@ def sync_repos(
     write_lock: bool = False,
     service_ids: set[str] | None = None,
     force_reset: bool = True,
+    repositories: list[dict[str, Any]] | None = None,
 ) -> list[list[str]]:
+    save_lock_on_change = repositories is None
     if clean:
         _remove_repo_dir(root, dry_run=dry_run)
     actions: list[list[str]] = []
-    repositories = load_repo_lock(root)
+    repositories = [dict(repo) for repo in (repositories or load_repo_lock(root))]
     lock_changed = False
     for repo in repositories:
         if not _repo_selected(repo, service_ids):
@@ -609,7 +692,7 @@ def sync_repos(
                     _run_git_command(fetch_command, cwd=root)
                     actions.append(checkout_command)
                     _run_git_command(checkout_command, cwd=root)
-    if lock_changed and not dry_run:
+    if lock_changed and save_lock_on_change and not dry_run:
         save_repo_lock(repositories, root)
     return actions
 
@@ -673,9 +756,10 @@ def install_update_scripts(
     *,
     service_ids: set[str] | None = None,
     dry_run: bool = False,
+    repositories: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     reports = []
-    for repo in load_repo_lock(root):
+    for repo in repositories or load_repo_lock(root):
         if not _repo_selected(repo, service_ids):
             continue
         repo_path = _resolve_project_path(root, str(repo["path"]))
@@ -699,6 +783,108 @@ def install_update_scripts(
     return reports
 
 
+def install_repo_bundles(
+    root: Path = PROJECT_ROOT,
+    *,
+    service_ids: set[str] | None = None,
+    dry_run: bool = False,
+    repositories: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    reports = []
+    for repo in repositories or load_repo_lock(root):
+        if not _repo_selected(repo, service_ids):
+            continue
+        provider = str(repo.get("provider_type") or "")
+        bundle_path = root / REPO_BUNDLE_RELATIVE_PATH / provider
+        repo_path = _resolve_project_path(root, str(repo["path"]))
+        target_path = repo_path / "tts-more"
+        report = {
+            "name": repo.get("name"),
+            "provider_type": provider,
+            "path": str(repo.get("path")),
+            "exists": repo_path.exists(),
+            "bundle": str(bundle_path.relative_to(root)) if bundle_path.exists() else "",
+            "target": str(target_path.relative_to(root)),
+            "installed": False,
+        }
+        reports.append(report)
+        if not bundle_path.exists():
+            report["error"] = f"missing bundle for provider: {provider}"
+            continue
+        if dry_run or not repo_path.exists():
+            continue
+        _copy_tree_contents(bundle_path, target_path)
+        manifest = {
+            "schema_version": 1,
+            "installed_at": _isoformat(_utc_now()),
+            "service_id": repo.get("service_id"),
+            "name": repo.get("name"),
+            "provider_type": provider,
+            "variant": repo.get("variant"),
+            "branch": repo.get("branch"),
+            "commit": repo.get("commit"),
+            "source_bundle": str(REPO_BUNDLE_RELATIVE_PATH / provider),
+        }
+        write_json(target_path / "tts-more-repo.json", manifest)
+        _chmod_shell_scripts(target_path)
+        _exclude_local_helper_paths(repo_path, ["tts-more/"])
+        report["installed"] = True
+    return reports
+
+
+def _copy_tree_contents(source: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        destination = target / child.name
+        if child.is_dir():
+            shutil.copytree(child, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, destination)
+
+
+def _chmod_shell_scripts(root: Path) -> None:
+    for path in root.rglob("*.sh"):
+        current_mode = path.stat().st_mode
+        path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def validate_repo_paths(
+    root: Path = PROJECT_ROOT,
+    *,
+    service_ids: set[str] | None = None,
+    require_exists: bool = False,
+    repositories: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    reports = []
+    for repo in repositories or load_repo_lock(root):
+        if not _repo_selected(repo, service_ids):
+            continue
+        raw_path = str(repo.get("path") or "")
+        try:
+            resolved = _resolve_project_path(root, raw_path)
+            inside_project = True
+            error = ""
+        except ValueError as exc:
+            resolved = Path(raw_path).resolve(strict=False)
+            inside_project = False
+            error = str(exc)
+        exists = resolved.exists()
+        reports.append(
+            {
+                "name": repo.get("name"),
+                "service_id": repo.get("service_id"),
+                "provider_type": repo.get("provider_type"),
+                "path": raw_path,
+                "absolute_path": str(resolved),
+                "exists": exists,
+                "inside_project": inside_project,
+                "ok": inside_project and (exists or not require_exists),
+                "error": error or ("path does not exist" if require_exists and not exists else ""),
+            }
+        )
+    return reports
+
+
 def update_project(
     root: Path = PROJECT_ROOT,
     *,
@@ -714,6 +900,7 @@ def update_project(
     force_render: bool = False,
     force_reset_repos: bool = False,
     platform_name: str | None = None,
+    repositories: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     app_actions: list[list[str]] = []
     if not skip_app:
@@ -736,8 +923,13 @@ def update_project(
             write_lock=write_lock,
             service_ids=service_ids,
             force_reset=force_reset_repos,
+            repositories=repositories,
         )
-    update_scripts = install_update_scripts(root, service_ids=service_ids, dry_run=dry_run) if install_scripts else []
+    update_scripts = (
+        install_update_scripts(root, service_ids=service_ids, dry_run=dry_run, repositories=repositories)
+        if install_scripts
+        else []
+    )
     services_output = ""
     services_rendered = False
     if render:
@@ -751,6 +943,7 @@ def update_project(
                 profile="local-all",
                 platform_name=platform_name,
                 service_ids=service_ids,
+                repositories=repositories,
             )
             write_json(root / services_output, services)
     return {
@@ -763,11 +956,18 @@ def update_project(
     }
 
 
-def doctor(root: Path = PROJECT_ROOT) -> dict[str, Any]:
+def doctor(
+    root: Path = PROJECT_ROOT,
+    *,
+    service_ids: set[str] | None = None,
+    repositories: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     reports = []
-    repos = load_repo_lock(root)
-    expected_paths = {str(repo["path"]).replace("\\", "/").rstrip("/") for repo in repos}
-    for repo in repos:
+    all_repos = repositories or load_repo_lock(root)
+    expected_paths = {str(repo["path"]).replace("\\", "/").rstrip("/") for repo in all_repos}
+    for repo in all_repos:
+        if not _repo_selected(repo, service_ids):
+            continue
         path = root / str(repo["path"])
         branch = _git_output(["git", "-C", str(path), "branch", "--show-current"]) if (path / ".git").exists() else ""
         head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"]) if (path / ".git").exists() else ""
@@ -805,8 +1005,15 @@ def start_workers(
     platform_name: str | None = None,
     service_ids: set[str] | None = None,
     detach: bool = False,
+    repositories: list[dict[str, Any]] | None = None,
 ) -> int:
-    services = render_services(root, profile="local-all", platform_name=platform_name, service_ids=service_ids)
+    services = render_services(
+        root,
+        profile="local-all",
+        platform_name=platform_name,
+        service_ids=service_ids,
+        repositories=repositories,
+    )
     processes: list[subprocess.Popen] = []
     logs_dir = root / "data" / ".runtime" / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -1025,6 +1232,12 @@ def _parse_service_ids(raw: str | None) -> set[str] | None:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def _load_cli_repositories(root: Path, repo_paths: str | None) -> list[dict[str, Any]] | None:
+    if not repo_paths:
+        return None
+    return load_deployment_repositories(root, repo_paths)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TTS More deployment helper")
     parser.add_argument("--root", default=str(PROJECT_ROOT), help="Project root")
@@ -1037,6 +1250,7 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--service-ids", default=None)
     render.add_argument("--template", action="store_true", help="Render disabled committable defaults")
     render.add_argument("--output", default=None)
+    render.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
 
     sync = sub.add_parser("sync-repos", help="Clone/fetch repositories from repo.lock.json")
     sync.add_argument("--clean", action="store_true")
@@ -1044,6 +1258,12 @@ def main(argv: list[str] | None = None) -> int:
     sync.add_argument("--latest", action="store_true", help="Track each configured branch instead of checking out the pinned commit")
     sync.add_argument("--write-lock", action="store_true", help="After --latest, write current HEADs back to repo.lock.json")
     sync.add_argument("--service-ids", default=None)
+    sync.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+
+    list_repos = sub.add_parser("list-repos", help="Print repositories after applying optional local path overrides")
+    list_repos.add_argument("--service-ids", default=None)
+    list_repos.add_argument("--repo-paths", default=None)
+    list_repos.add_argument("--json-lines", action="store_true")
 
     probe = sub.add_parser("probe-network", help="Probe local network and choose install/download sources")
     probe.add_argument("--mode", choices=("auto", "china", "global"), default="auto")
@@ -1056,11 +1276,14 @@ def main(argv: list[str] | None = None) -> int:
 
     doctor_parser = sub.add_parser("doctor", help="Inspect repository checkout state")
     doctor_parser.add_argument("--output", default=None)
+    doctor_parser.add_argument("--service-ids", default=None)
+    doctor_parser.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
 
     start = sub.add_parser("start-workers", help="Start local worker processes from repo.lock.json")
     start.add_argument("--platform", choices=("windows", "posix"), default=None)
     start.add_argument("--service-ids", default=None)
     start.add_argument("--detach", action="store_true")
+    start.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
 
     install_scripts = sub.add_parser(
         "install-update-scripts",
@@ -1068,6 +1291,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     install_scripts.add_argument("--service-ids", default=None)
     install_scripts.add_argument("--dry-run", action="store_true")
+    install_scripts.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+
+    install_bundles = sub.add_parser(
+        "install-repo-bundles",
+        help="Copy provider-specific TTS More helper bundles into checked-out TTS repositories",
+    )
+    install_bundles.add_argument("--service-ids", default=None)
+    install_bundles.add_argument("--dry-run", action="store_true")
+    install_bundles.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+
+    validate_paths = sub.add_parser(
+        "validate-repo-paths",
+        help="Validate local TTS repo paths before one-click deployment",
+    )
+    validate_paths.add_argument("--service-ids", default=None)
+    validate_paths.add_argument("--require-exists", action="store_true")
+    validate_paths.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
 
     update = sub.add_parser("update", help="Fast-forward the app and service repositories")
     update.add_argument("--dry-run", action="store_true")
@@ -1082,10 +1322,12 @@ def main(argv: list[str] | None = None) -> int:
     update.add_argument("--no-render", action="store_true")
     update.add_argument("--force-render-services", action="store_true")
     update.add_argument("--platform", choices=("windows", "posix"), default=None)
+    update.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
 
     args = parser.parse_args(argv)
     root = Path(args.root).resolve(strict=False)
     if args.command == "render-services":
+        repositories = _load_cli_repositories(root, args.repo_paths)
         services = render_services(
             root,
             profile=args.profile,
@@ -1093,6 +1335,7 @@ def main(argv: list[str] | None = None) -> int:
             host=args.host,
             service_ids=_parse_service_ids(args.service_ids),
             template=args.template,
+            repositories=repositories,
         )
         if args.output:
             write_json(root / args.output, services)
@@ -1100,6 +1343,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(services, ensure_ascii=False, indent=2))
         return 0
     if args.command == "sync-repos":
+        repositories = _load_cli_repositories(root, args.repo_paths)
         actions = sync_repos(
             root,
             clean=args.clean,
@@ -1107,9 +1351,20 @@ def main(argv: list[str] | None = None) -> int:
             latest=args.latest,
             write_lock=args.write_lock,
             service_ids=_parse_service_ids(args.service_ids),
+            repositories=repositories,
         )
         for command in actions:
             print(" ".join(command))
+        return 0
+    if args.command == "list-repos":
+        repositories = load_deployment_repositories(root, args.repo_paths)
+        service_ids = _parse_service_ids(args.service_ids)
+        repositories = [repo for repo in repositories if _repo_selected(repo, service_ids)]
+        if args.json_lines:
+            for repo in repositories:
+                print(json.dumps(repo, ensure_ascii=False))
+        else:
+            print(json.dumps(repositories, ensure_ascii=False, indent=2))
         return 0
     if args.command == "probe-network":
         profile = probe_network(
@@ -1125,28 +1380,54 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(profile, ensure_ascii=False, indent=2))
         return 0
     if args.command == "doctor":
-        payload = doctor(root)
+        repositories = _load_cli_repositories(root, args.repo_paths)
+        payload = doctor(root, service_ids=_parse_service_ids(args.service_ids), repositories=repositories)
         if args.output:
             write_json(root / args.output, payload)
         else:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "start-workers":
+        repositories = _load_cli_repositories(root, args.repo_paths)
         return start_workers(
             root,
             platform_name=args.platform,
             service_ids=_parse_service_ids(args.service_ids),
             detach=args.detach,
+            repositories=repositories,
         )
     if args.command == "install-update-scripts":
+        repositories = _load_cli_repositories(root, args.repo_paths)
         reports = install_update_scripts(
             root,
             service_ids=_parse_service_ids(args.service_ids),
             dry_run=args.dry_run,
+            repositories=repositories,
         )
         print(json.dumps(reports, ensure_ascii=False, indent=2))
         return 0
+    if args.command == "install-repo-bundles":
+        repositories = _load_cli_repositories(root, args.repo_paths)
+        reports = install_repo_bundles(
+            root,
+            service_ids=_parse_service_ids(args.service_ids),
+            dry_run=args.dry_run,
+            repositories=repositories,
+        )
+        print(json.dumps(reports, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "validate-repo-paths":
+        repositories = _load_cli_repositories(root, args.repo_paths)
+        reports = validate_repo_paths(
+            root,
+            service_ids=_parse_service_ids(args.service_ids),
+            require_exists=args.require_exists,
+            repositories=repositories,
+        )
+        print(json.dumps(reports, ensure_ascii=False, indent=2))
+        return 0 if all(item["ok"] for item in reports) else 1
     if args.command == "update":
+        repositories = _load_cli_repositories(root, args.repo_paths)
         payload = update_project(
             root,
             dry_run=args.dry_run,
@@ -1161,6 +1442,7 @@ def main(argv: list[str] | None = None) -> int:
             force_render=args.force_render_services,
             force_reset_repos=args.force_reset_repos,
             platform_name=args.platform,
+            repositories=repositories,
         )
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
