@@ -88,6 +88,36 @@ def _write_repo_lock(root: Path) -> None:
     )
 
 
+def _repository_fixture_with_three_formal_services() -> list[dict[str, object]]:
+    return [
+        {
+            "name": "GPT-SoVITS-main",
+            "provider_type": "gpt-sovits",
+            "variant": "main",
+            "path": "repo/GPT-SoVITS-main",
+            "remote": "https://example.invalid/GPT-SoVITS.git",
+            "branch": "main",
+            "service_id": "local-gpt-sovits-main",
+        },
+        {
+            "name": "index-tts",
+            "provider_type": "indextts",
+            "path": "repo/index-tts",
+            "remote": "https://example.invalid/index-tts.git",
+            "branch": "main",
+            "service_id": "local-indextts",
+        },
+        {
+            "name": "CosyVoice",
+            "provider_type": "cosyvoice",
+            "path": "repo/CosyVoice",
+            "remote": "https://example.invalid/CosyVoice.git",
+            "branch": "main",
+            "service_id": "local-cosyvoice",
+        },
+    ]
+
+
 def _topology_payload(*, distributed: bool = True) -> dict:
     worker_nodes = {
         "gpt-worker": {
@@ -424,18 +454,87 @@ def test_render_worker_node_keeps_selected_local_worker_manageable(tmp_path: Pat
     assert services[0]["start_command"][0] == "repo/GPT-SoVITS-dev/.venv/Scripts/python.exe"
 
 
-def test_clean_repo_removes_readonly_files(tmp_path: Path) -> None:
+def test_clean_sync_removes_readonly_files_from_selected_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
     readonly = tmp_path / "repo" / "CosyVoice" / ".git" / "objects" / "pack" / "pack.idx"
     readonly.parent.mkdir(parents=True)
     readonly.write_text("pack", encoding="utf-8")
     readonly.chmod(stat.S_IREAD)
+    monkeypatch.setattr(deploy, "_run_clone_with_fallback", lambda *args, **kwargs: None)
 
-    deploy._remove_repo_dir(tmp_path, dry_run=False)
+    deploy.sync_repos(
+        tmp_path,
+        clean=True,
+        service_ids={"local-cosyvoice"},
+        repositories=_repository_fixture_with_three_formal_services(),
+    )
 
     assert (tmp_path / "repo").exists()
     assert not readonly.exists()
+
+
+def test_clean_sync_preserves_unselected_repo_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    repositories = _repository_fixture_with_three_formal_services()
+    selected = tmp_path / "repo" / "index-tts"
+    unrelated = tmp_path / "repo" / "research-checkout"
+    selected.mkdir(parents=True)
+    unrelated.mkdir(parents=True)
+    (unrelated / "keep.txt").write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(deploy, "_run_clone_with_fallback", lambda *args, **kwargs: None)
+
+    deploy.sync_repos(
+        tmp_path,
+        clean=True,
+        service_ids={"local-indextts"},
+        repositories=repositories,
+    )
+
+    assert not selected.exists()
+    assert (unrelated / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_clean_sync_dry_run_does_not_delete_selected_repository(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    marker = tmp_path / "repo" / "index-tts" / "checkpoints" / "model.bin"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("model", encoding="utf-8")
+
+    deploy.sync_repos(
+        tmp_path,
+        clean=True,
+        dry_run=True,
+        service_ids={"local-indextts"},
+        repositories=_repository_fixture_with_three_formal_services(),
+    )
+
+    assert marker.read_text(encoding="utf-8") == "model"
+
+
+@pytest.mark.parametrize("unsafe_path", [".", "repo"])
+def test_clean_sync_refuses_repository_root_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe_path: str
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    repositories = _repository_fixture_with_three_formal_services()
+    repositories[1] = {**repositories[1], "path": unsafe_path}
+    monkeypatch.setattr(deploy, "_run_clone_with_fallback", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="refusing to clean repository root"):
+        deploy.sync_repos(
+            tmp_path,
+            clean=True,
+            service_ids={"local-indextts"},
+            repositories=repositories,
+        )
 
 
 def test_sync_repos_rejects_paths_outside_project(tmp_path: Path) -> None:

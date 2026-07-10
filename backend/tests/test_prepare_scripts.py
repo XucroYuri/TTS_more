@@ -219,6 +219,17 @@ def test_one_click_deploy_scripts_install_bundles_and_render_services() -> None:
         assert "--service-ids" in script
 
 
+def test_windows_one_click_clean_preview_names_selected_repositories_and_removed_contents() -> None:
+    script = (REPO_ROOT / "scripts" / "deploy-local-tts.ps1").read_text(encoding="utf-8")
+
+    preview = '"list-repos", "--service-ids", $targetList, "--json-lines"'
+    clean_forward = '$syncArgs += "--clean"'
+    assert preview in script
+    assert "Selected repository paths to clean:" in script
+    assert "Models and repo-local venvs inside these selected paths will be removed." in script
+    assert script.index(preview) < script.index(clean_forward)
+
+
 def test_windows_deploy_and_worker_scripts_forward_topology_selection() -> None:
     deploy = (REPO_ROOT / "scripts" / "deploy-local-tts.ps1").read_text(encoding="utf-8")
     workers = (REPO_ROOT / "scripts" / "start-service-workers.ps1").read_text(encoding="utf-8")

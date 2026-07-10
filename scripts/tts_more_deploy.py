@@ -813,10 +813,10 @@ def sync_repos(
     repositories: list[dict[str, Any]] | None = None,
 ) -> list[list[str]]:
     save_lock_on_change = repositories is None
-    if clean:
-        _remove_repo_dir(root, dry_run=dry_run)
     actions: list[list[str]] = []
     repositories = [dict(repo) for repo in (repositories or load_repo_lock(root))]
+    if clean:
+        _remove_selected_repo_paths(root, repositories, service_ids, dry_run=dry_run)
     lock_changed = False
     for repo in repositories:
         if not _repo_selected(repo, service_ids):
@@ -1342,19 +1342,28 @@ def _platform_name() -> str:
     return "windows" if os.name == "nt" else "posix"
 
 
-def _remove_repo_dir(root: Path, *, dry_run: bool) -> None:
-    target = (root / "repo").resolve(strict=False)
+def _remove_selected_repo_paths(
+    root: Path,
+    repositories: list[dict[str, Any]],
+    service_ids: set[str] | None,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    removed: list[str] = []
     root_resolved = root.resolve(strict=False)
-    if target == root_resolved or root_resolved not in target.parents:
-        raise RuntimeError(f"refusing to remove repo directory outside project root: {target}")
-    if target.name != "repo":
-        raise RuntimeError(f"refusing to remove unexpected directory: {target}")
-    if dry_run:
-        return
-    if target.exists():
-        for child in list(target.iterdir()):
-            _remove_path(child)
-    target.mkdir(parents=True, exist_ok=True)
+    repo_root = (root / "repo").resolve(strict=False)
+    for repo in repositories:
+        if not _repo_selected(repo, service_ids):
+            continue
+        target = _resolve_project_path(root, str(repo["path"]))
+        if target in {root_resolved, repo_root}:
+            raise RuntimeError(f"refusing to clean repository root: {target}")
+        label = target.relative_to(root_resolved).as_posix()
+        print(f"clean repository: {label}")
+        if target.exists() and not dry_run:
+            _remove_path(target)
+        removed.append(label)
+    return removed
 
 
 def _remove_path(path: Path) -> None:
