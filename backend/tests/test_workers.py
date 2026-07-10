@@ -6,8 +6,12 @@ import io
 import wave
 from pathlib import Path
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from app.adapters.base import SynthesisRequest, SynthesisResult
+from app.models import ScriptLine
 from app.workers import discovery
 from app.workers.gpt_sovits_worker import app as gpt_app
 from app.workers.cosyvoice_worker import app as cosyvoice_app
@@ -42,6 +46,56 @@ def test_gpt_sovits_worker_samples_missing_role_returns_empty(tmp_path: Path, mo
     response = client.get("/models/nobody/samples")
     assert response.status_code == 200
     assert response.json() == {"samples": []}
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    ["", "   ", "..", "../outside", "/absolute", "nested/role", r"nested\role", r"C:\logs\role", "C:role"],
+)
+def test_gpt_sovits_worker_samples_rejects_non_single_segment_model_names(
+    tmp_path: Path,
+    monkeypatch,
+    model_name: str,
+) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    monkeypatch.setattr(worker, "REPO_DIR", tmp_path)
+
+    with pytest.raises(HTTPException, match="single directory name") as exc_info:
+        worker.model_samples(model_name)
+
+    assert exc_info.value.status_code == 400
+
+
+def test_gpt_sovits_worker_samples_rejects_symlink_escape(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    logs_root = tmp_path / "GPT_SoVITS" / "logs"
+    outside = tmp_path / "outside" / "role"
+    outside.mkdir(parents=True)
+    logs_root.mkdir(parents=True)
+    (logs_root / "role").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(worker, "REPO_DIR", tmp_path)
+
+    with pytest.raises(HTTPException, match="outside configured logs root") as exc_info:
+        worker.model_samples("role")
+
+    assert exc_info.value.status_code == 400
+
+
+def test_gpt_sovits_worker_samples_accepts_unicode_model_name(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    model_name = "小品-斯月学杨师版"
+    wav_dir = tmp_path / "GPT_SoVITS" / "logs" / model_name / "5-wav32k"
+    wav_dir.mkdir(parents=True)
+    (wav_dir / "001.wav").write_bytes(b"wav")
+    monkeypatch.setattr(worker, "REPO_DIR", tmp_path)
+
+    response = TestClient(gpt_app).get(f"/models/{model_name}/samples")
+
+    assert response.status_code == 200
+    assert response.json()["samples"][0]["audio_name"] == "001.wav"
 
 
 def test_gpt_sovits_worker_openapi_lists_discovery_endpoints() -> None:
@@ -294,6 +348,95 @@ def test_gpt_sovits_worker_accepts_generator_pipeline_output(tmp_path: Path, mon
 
     assert response.status_code == 200
     assert writes == [([0.0, 0.25, -0.25], 32000, tmp_path / "out.wav", "wav")]
+
+
+@pytest.mark.parametrize(
+    ("parameters", "expected_path"),
+    [
+        ({"reference_audio": "reference.wav"}, "reference.wav"),
+        ({"voice": "voice.wav"}, "voice.wav"),
+        (
+            {"ref_audio_path": "canonical.wav", "reference_audio": "reference.wav", "voice": "voice.wav"},
+            "canonical.wav",
+        ),
+    ],
+)
+def test_gpt_worker_normalizes_reference_audio_aliases(
+    tmp_path: Path,
+    monkeypatch,
+    parameters: dict[str, str],
+    expected_path: str,
+) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    captured: list[dict] = []
+
+    class FakePipeline:
+        def run(self, inputs: dict) -> object:
+            captured.append(inputs)
+            return 32000, [0.0]
+
+    monkeypatch.setattr(worker, "_ensure_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(worker, "_write_audio", lambda *_args: None)
+    monkeypatch.setenv("TTS_MORE_WORKER_ALLOW_PATH_DELIVERY", "1")
+
+    response = TestClient(gpt_app).post(
+        "/synthesize",
+        json={
+            "line": {"id": "l1", "character_id": "role", "text": "hello"},
+            "profile": "demo",
+            "output_path": str(tmp_path / "out.wav"),
+            "parameters": {**parameters, "temperature": 0.75},
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured[0]["ref_audio_path"] == expected_path
+    assert captured[0]["temperature"] == 0.75
+
+
+@pytest.mark.parametrize(
+    ("parameters", "expected_path"),
+    [
+        ({"ref_audio_path": "reference.wav"}, "reference.wav"),
+        ({"reference_audio": "reference.wav"}, "reference.wav"),
+        (
+            {"voice": "canonical.wav", "ref_audio_path": "ref.wav", "reference_audio": "reference.wav"},
+            "canonical.wav",
+        ),
+    ],
+)
+def test_indextts_adapter_normalizes_reference_audio_aliases(
+    tmp_path: Path,
+    monkeypatch,
+    parameters: dict[str, str],
+    expected_path: str,
+) -> None:
+    from app.workers.indextts_subprocess import IndexTTSSubprocessAdapter
+
+    adapter = IndexTTSSubprocessAdapter(tmp_path)
+    adapter.resident_mode = False
+    captured: list[tuple[str, dict]] = []
+
+    def capture(request: SynthesisRequest, voice: str, output_path: Path) -> SynthesisResult:
+        captured.append((voice, request.parameters))
+        return SynthesisResult(audio_path=output_path)
+
+    monkeypatch.setattr(adapter, "_synthesize_subprocess", capture)
+    original = {**parameters, "emotion_mode": "same_as_voice"}
+
+    adapter.synthesize(
+        SynthesisRequest(
+            line=ScriptLine(id="l1", character_id="role", text="hello"),
+            profile="demo",
+            output_path=tmp_path / "out.wav",
+            parameters=original,
+        )
+    )
+
+    voice, normalized = captured[0]
+    assert voice == expected_path
+    assert normalized == {**original, "voice": expected_path}
 
 
 def test_gpt_worker_upload_randomizes_safe_audio_names(tmp_path: Path, monkeypatch) -> None:

@@ -37,9 +37,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 # The standard worker request schemas.
+from app.role_library import resolve_logs_directory
 from app.workers.artifacts import ArtifactStore, artifact_output, artifact_response, register_artifact_routes
 from app.workers.contracts import LoadRequest, SynthesizeRequest
 from app.workers.runtime import release_cuda_memory, worker_runtime_status
@@ -167,6 +168,17 @@ def _artifact_store() -> ArtifactStore:
     return ArtifactStore(REPO_DIR / "uploaded_ref", max_upload_bytes=max_upload_bytes)
 
 
+def _normalize_reference_audio_parameters(parameters: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = dict(parameters or {})
+    reference_audio = next(
+        (normalized.get(key) for key in ("ref_audio_path", "reference_audio", "voice") if normalized.get(key)),
+        None,
+    )
+    if reference_audio is not None:
+        normalized["ref_audio_path"] = reference_audio
+    return normalized
+
+
 register_artifact_routes(app, _artifact_store)
 
 
@@ -208,7 +220,7 @@ def load(request: LoadRequest) -> dict[str, Any]:
     """
     global _loaded_profile
     pipeline = _ensure_pipeline()
-    params = request.parameters or {}
+    params = _normalize_reference_audio_parameters(request.parameters)
     gpt = params.get("gpt_weights_path")
     sovits = params.get("sovits_weights_path")
     if gpt:
@@ -225,7 +237,7 @@ def load(request: LoadRequest) -> dict[str, Any]:
 @app.post("/synthesize")
 def synthesize(request: SynthesizeRequest) -> dict[str, Any]:
     pipeline = _ensure_pipeline()
-    params = request.parameters or {}
+    params = _normalize_reference_audio_parameters(request.parameters)
     inputs: dict[str, Any] = {
         "text": request.line.text,
         "text_lang": params.get("text_lang", "zh"),
@@ -329,12 +341,14 @@ def model_samples(model_name: str) -> dict[str, Any]:
     """List training-audio samples + reference text for a role."""
     from app.workers.discovery import scan_training_samples
 
-    logs_dir = REPO_DIR / "GPT_SoVITS" / "logs" / model_name
-    if not logs_dir.exists():
-        logs_dir = REPO_DIR / "logs" / model_name
-    if not logs_dir.exists():
-        return {"samples": []}
-    return {"samples": scan_training_samples(logs_dir)}
+    for logs_root in (REPO_DIR / "GPT_SoVITS" / "logs", REPO_DIR / "logs"):
+        try:
+            logs_dir = resolve_logs_directory(logs_root, model_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if logs_dir.exists() and logs_dir.is_dir():
+            return {"samples": scan_training_samples(logs_dir)}
+    return {"samples": []}
 
 
 @app.get("/status")

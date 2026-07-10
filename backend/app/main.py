@@ -24,7 +24,7 @@ from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProv
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
 from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
-from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
+from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates, validate_logs_name
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
 from app.services import ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
 from app.storage import ProjectStore
@@ -427,11 +427,7 @@ def create_app(
         character = next((item for item in characters if item.id == character_id), None)
         if character is None:
             raise HTTPException(status_code=404, detail="character not found")
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="avatar image is empty")
-        if len(content) > app.state.max_upload_bytes:
-            raise HTTPException(status_code=413, detail=f"avatar image exceeds upload limit")
+        content = await _read_limited_upload(file, app.state.max_upload_bytes, "avatar image")
 
         output_dir = Path(app.state.store.root) / "character_avatars"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -456,11 +452,7 @@ def create_app(
         character = next((item for item in characters if item.id == character_id), None)
         if character is None:
             raise HTTPException(status_code=404, detail="character not found")
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="audio file is empty")
-        if len(content) > app.state.max_upload_bytes:
-            raise HTTPException(status_code=413, detail=f"audio file exceeds upload limit")
+        content = await _read_limited_upload(file, app.state.max_upload_bytes, "audio file")
 
         safe_character_id = _safe_upload_name(character_id).removesuffix(Path(_safe_upload_name(character_id)).suffix)
         output_dir = Path(app.state.store.root) / "character_reference_audio" / safe_character_id
@@ -599,6 +591,7 @@ def create_app(
 
     @app.get("/api/model-catalog/gpt-sovits/samples")
     def gpt_sovits_model_catalog_samples(service_id: str | None = None, logs_name: str = "", limit: int = 120) -> dict[str, Any]:
+        _require_valid_logs_name(logs_name)
         diagnostics: list[dict[str, str]] = []
         if service_id:
             client = app.state.service_router.clients.get(service_id)
@@ -634,6 +627,7 @@ def create_app(
         limit: int = 120,
     ) -> dict[str, Any]:
         del gpt_weights_path, sovits_weights_path
+        _require_valid_logs_name(logs_name)
         characters = store.load_characters()
         if service_id:
             logs_roots = [
@@ -856,6 +850,11 @@ def create_app(
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in AUDIO_UPLOAD_SUFFIXES:
             raise HTTPException(status_code=400, detail="unsupported audio file")
+        try:
+            store.load_project(project_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        content = await _read_limited_upload(file, app.state.max_upload_bytes, "audio file")
         output_dir = store.project_reference_audio_dir(project_id) / "temporary"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / _safe_upload_name(file.filename or f"reference{suffix}")
@@ -863,11 +862,6 @@ def create_app(
         while output_path.exists():
             output_path = output_dir / f"{output_path.stem}-{counter}{suffix}"
             counter += 1
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="audio file is empty")
-        if len(content) > app.state.max_upload_bytes:
-            raise HTTPException(status_code=413, detail=f"audio file exceeds upload limit")
         output_path.write_bytes(content)
         return {"sample": {"path": str(output_path), "text": "", "text_source": "manual"}}
 
@@ -1619,6 +1613,22 @@ def _safe_upload_name(filename: str) -> str:
     return f"{stem}{suffix}"
 
 
+async def _read_limited_upload(file: UploadFile, max_upload_bytes: int, label: str) -> bytes:
+    content = await file.read(max_upload_bytes + 1)
+    if not content:
+        raise HTTPException(status_code=400, detail=f"{label} is empty")
+    if len(content) > max_upload_bytes:
+        raise HTTPException(status_code=413, detail=f"{label} exceeds upload limit")
+    return content
+
+
+def _require_valid_logs_name(logs_name: str) -> None:
+    try:
+        validate_logs_name(logs_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _load_all_projects(store: ProjectStore) -> list[tuple[str, ScriptProject]]:
     projects: list[tuple[str, ScriptProject]] = []
     for item in store.list_projects():
@@ -1631,7 +1641,7 @@ def _enrich_tasks_for_project(store: ProjectStore, project_id: str, tasks: list[
     try:
         project = store.load_project(project_id)
     except FileNotFoundError:
-        return tasks
+        return [_normalize_task_reference_audio(task) for task in tasks]
     characters = resolve_project_characters(project, store.load_characters())
     by_id = {character.id: character for character in characters}
     project_lines = {line.id: line for line in project.lines}
@@ -1670,18 +1680,19 @@ def _enrich_tasks_for_project(store: ProjectStore, project_id: str, tasks: list[
                     "required_capabilities": task.required_capabilities or binding.capabilities,
                 }
             )
+            enriched = _normalize_task_reference_audio(enriched)
             _assert_generation_inputs(enriched)
             output.append(enriched)
             continue
         character = by_id.get(line.character_id)
         if character is None:
-            output.append(task)
+            output.append(_normalize_task_reference_audio(task))
             continue
         profile_id = line.profile_override or (task.profile if task.profile and task.profile != "default" else None) or character.default_profile
         profile = next((item for item in character.profiles if item.id == profile_id), None) or (character.profiles[0] if character.profiles else None)
         if profile is None:
             if task.provider_type and task.binding_id:
-                output.append(task)
+                output.append(_normalize_task_reference_audio(task))
                 continue
             raise ValueError(f"line {line.id} character {line.character_id!r} needs a voice binding before generation")
         binding = None
@@ -1704,6 +1715,7 @@ def _enrich_tasks_for_project(store: ProjectStore, project_id: str, tasks: list[
                 "required_capabilities": task.required_capabilities or (binding.capabilities if binding else []),
             }
         )
+        enriched = _normalize_task_reference_audio(enriched)
         _assert_generation_inputs(enriched)
         output.append(enriched)
     return output
@@ -1734,6 +1746,22 @@ def _prefailed_task(task: GenerationTask, error: str) -> GenerationTask:
 def _validate_generation_tasks(tasks: list[GenerationTask]) -> None:
     for task in tasks:
         _assert_generation_inputs(task)
+
+
+def _normalize_task_reference_audio(task: GenerationTask) -> GenerationTask:
+    provider = task.provider_type.value if task.provider_type is not None else task.engine.value
+    parameters = dict(task.parameters)
+    if provider == "gpt-sovits":
+        value = next((parameters.get(key) for key in ("ref_audio_path", "reference_audio", "voice") if _has_text(parameters.get(key))), None)
+        if value is not None:
+            parameters["ref_audio_path"] = value
+    elif provider == "indextts":
+        value = next((parameters.get(key) for key in ("voice", "ref_audio_path", "reference_audio") if _has_text(parameters.get(key))), None)
+        if value is not None:
+            parameters["voice"] = value
+    if parameters == task.parameters:
+        return task
+    return task.model_copy(update={"parameters": parameters})
 
 
 def _assert_generation_inputs(task: GenerationTask) -> None:

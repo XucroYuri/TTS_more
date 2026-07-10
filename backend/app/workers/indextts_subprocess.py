@@ -69,9 +69,21 @@ class IndexTTSSubprocessAdapter:
         return self._resident_tts
 
     def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
-        voice = request.parameters.get("voice")
+        parameters = dict(request.parameters)
+        voice = next(
+            (parameters.get(key) for key in ("voice", "ref_audio_path", "reference_audio") if parameters.get(key)),
+            None,
+        )
         if not voice:
             raise RuntimeError("IndexTTS voice reference path is required")
+        parameters["voice"] = voice
+        if parameters != request.parameters:
+            request = SynthesisRequest(
+                line=request.line,
+                profile=request.profile,
+                output_path=request.output_path,
+                parameters=parameters,
+            )
         output_path = request.output_path.resolve(strict=False)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if self.resident_mode:

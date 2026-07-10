@@ -2,7 +2,9 @@ import json
 from pathlib import Path
 import time
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from app.models import Character, ScriptLine
 from app.main import _layer_service_status, create_app
@@ -729,6 +731,21 @@ def test_logs_reference_audio_is_scoped_to_requested_service(tmp_path: Path) -> 
     assert payload["diagnostics"][0]["status"] == "service_logs_roots_missing"
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/api/character-library/logs-reference-audio",
+        "/api/model-catalog/gpt-sovits/samples",
+    ],
+)
+def test_logs_reference_audio_endpoints_reject_path_like_logs_name(tmp_path: Path, endpoint: str) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.get(endpoint, params={"logs_name": "../outside"})
+
+    assert response.status_code == 400
+
+
 def test_character_avatar_upload_updates_library_and_serves_image(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path))
     client.put(
@@ -787,6 +804,55 @@ def test_character_reference_audio_upload_accepts_recording_format_and_updates_l
     assert Path(sample_path).is_file()
     assert payload["character"]["reference_audio_groups"][0]["samples"][0]["path"] == sample_path
     assert client.get("/api/characters").json()[0]["reference_audio_groups"][0]["samples"][0]["path"] == sample_path
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "filename", "content_type"),
+    [
+        ("/api/characters/xiao-pin/avatar/upload", "avatar.png", "image/png"),
+        ("/api/characters/xiao-pin/reference-audio/upload", "reference.wav", "audio/wav"),
+        ("/api/projects/demo/reference-audio/upload", "reference.wav", "audio/wav"),
+    ],
+)
+def test_application_uploads_bound_the_initial_read(
+    tmp_path: Path,
+    monkeypatch,
+    endpoint: str,
+    filename: str,
+    content_type: str,
+) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    client.app.state.max_upload_bytes = 8
+    client.put(
+        "/api/characters",
+        json=[{"id": "xiao-pin", "name": "小品", "aliases": [], "fallback_profiles": []}],
+    )
+    client.put("/api/projects/demo", json={"title": "demo", "lines": []})
+    read_sizes: list[int] = []
+    original_read = StarletteUploadFile.read
+
+    async def tracked_read(upload: StarletteUploadFile, size: int = -1) -> bytes:
+        read_sizes.append(size)
+        return await original_read(upload, size)
+
+    monkeypatch.setattr(StarletteUploadFile, "read", tracked_read)
+
+    response = client.post(endpoint, files={"file": (filename, b"1234567890", content_type)})
+
+    assert response.status_code == 413
+    assert read_sizes == [9]
+
+
+def test_project_reference_audio_upload_rejects_missing_project_without_creating_directories(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.post(
+        "/api/projects/missing/reference-audio/upload",
+        files={"file": ("reference.wav", b"audio", "audio/wav")},
+    )
+
+    assert response.status_code == 404
+    assert not list(tmp_path.rglob("temporary"))
 
 
 def test_project_round_trip_via_api(tmp_path: Path) -> None:
@@ -1577,6 +1643,73 @@ def test_generate_routes_task_to_service_endpoint(tmp_path: Path) -> None:
     assert version["requested_load_signature"].endswith("ref_audio_path=sample.wav|prompt_text=参考文本|prompt_lang=|text_lang=")
     assert version["verified_load_signature"] == version["requested_load_signature"]
     assert version["metadata"]["load_verification_level"] == "assumed_after_success"
+
+
+@pytest.mark.parametrize(
+    ("engine", "provider_type", "parameters", "canonical_key", "expected_path"),
+    [
+        ("gpt-sovits", "gpt-sovits", {"reference_audio": "reference.wav"}, "ref_audio_path", "reference.wav"),
+        ("gpt-sovits", "gpt-sovits", {"voice": "voice.wav"}, "ref_audio_path", "voice.wav"),
+        (
+            "gpt-sovits",
+            "gpt-sovits",
+            {"ref_audio_path": "canonical.wav", "reference_audio": "reference.wav", "voice": "voice.wav"},
+            "ref_audio_path",
+            "canonical.wav",
+        ),
+        ("indextts", "indextts", {"ref_audio_path": "reference.wav"}, "voice", "reference.wav"),
+        ("indextts", "indextts", {"reference_audio": "reference.wav"}, "voice", "reference.wav"),
+        (
+            "indextts",
+            "indextts",
+            {"voice": "canonical.wav", "ref_audio_path": "ref.wav", "reference_audio": "reference.wav"},
+            "voice",
+            "canonical.wav",
+        ),
+    ],
+)
+def test_generate_normalizes_reference_audio_before_queue_dispatch(
+    tmp_path: Path,
+    engine: str,
+    provider_type: str,
+    parameters: dict[str, str],
+    canonical_key: str,
+    expected_path: str,
+) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    captured_tasks = []
+
+    def capture_run(tasks, manifest, output_dir) -> None:
+        del manifest, output_dir
+        captured_tasks.extend(tasks)
+
+    client.app.state.queue.run = capture_run
+    required = {
+        "gpt_weights_path": "model.ckpt",
+        "sovits_weights_path": "model.pth",
+        "prompt_text": "参考文本",
+    } if provider_type == "gpt-sovits" else {}
+    original = {**required, **parameters, "contract_marker": "preserved"}
+
+    response = client.post(
+        "/api/generate",
+        json={
+            "project_id": "missing-project",
+            "tasks": [
+                {
+                    "line": {"id": "l001", "character_id": "role", "text": "你好"},
+                    "engine": engine,
+                    "profile": "demo",
+                    "provider_type": provider_type,
+                    "parameters": original,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    dispatched = captured_tasks[0].parameters
+    assert dispatched == {**original, canonical_key: expected_path}
 
 
 def test_generation_preflight_suggests_local_fallback_without_auto_start(tmp_path: Path) -> None:

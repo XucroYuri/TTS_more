@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from app.models import (
@@ -94,6 +94,31 @@ def common_logs_presets() -> list[dict[str, Any]]:
     return [dict(item, nicknames=list(item.get("nicknames", [])), match_names=list(item.get("match_names", []))) for item in COMMON_LOGS_PRESETS]
 
 
+def validate_logs_name(logs_name: str) -> str:
+    windows_path = PureWindowsPath(logs_name)
+    if (
+        not logs_name.strip()
+        or logs_name in {".", ".."}
+        or "/" in logs_name
+        or "\\" in logs_name
+        or Path(logs_name).is_absolute()
+        or bool(windows_path.drive)
+    ):
+        raise ValueError("logs_name must be a single directory name")
+    return logs_name
+
+
+def resolve_logs_directory(logs_root: Path, logs_name: str) -> Path:
+    validated_name = validate_logs_name(logs_name)
+    resolved_root = logs_root.resolve()
+    resolved_directory = (resolved_root / validated_name).resolve()
+    try:
+        resolved_directory.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError("logs_name resolves outside configured logs root") from exc
+    return resolved_directory
+
+
 def scan_role_library_candidates(
     reference_audio_root: Path,
     gpt_weights_roots: list[Path],
@@ -160,8 +185,7 @@ def scan_gpt_sovits_model_catalog_candidates(
 def scan_logs_reference_audio_samples(logs_roots: list[Path], logs_name: str, limit: int = 120) -> dict[str, Any]:
     diagnostics: list[dict[str, str]] = []
     samples: list[dict[str, Any]] = []
-    if not logs_name.strip():
-        return {"logs_name": logs_name, "samples": samples, "diagnostics": [{"status": "missing_logs_name", "detail": "logs_name is required"}]}
+    validate_logs_name(logs_name)
 
     for logs_dir in _matching_logs_dirs(logs_roots, logs_name):
         wav_dir = logs_dir / "5-wav32k"
@@ -552,16 +576,22 @@ def _read_audio_metadata(path: Path) -> dict[str, Any]:
 
 def _matching_logs_dirs(logs_roots: list[Path], logs_name: str) -> list[Path]:
     output: list[Path] = []
+    validate_logs_name(logs_name)
     normalized = _normalize(logs_name)
     seen: set[str] = set()
     for root in logs_roots:
         if not root.exists() or not root.is_dir():
             continue
-        direct = root / logs_name
+        resolved_root = root.resolve()
+        direct = resolve_logs_directory(resolved_root, logs_name)
         candidates = [direct] if direct.is_dir() else []
-        candidates.extend(child for child in root.iterdir() if child.is_dir() and _normalize(child.name) == normalized)
+        candidates.extend(
+            resolve_logs_directory(resolved_root, child.name)
+            for child in resolved_root.iterdir()
+            if child.is_dir() and _normalize(child.name) == normalized
+        )
         for candidate in candidates:
-            marker = str(candidate.resolve())
+            marker = str(candidate)
             if marker in seen:
                 continue
             seen.add(marker)
