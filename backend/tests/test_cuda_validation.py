@@ -924,6 +924,32 @@ def test_preserve_existing_blocker_rejects_non_post_core_stage(tmp_path: Path) -
         )
 
 
+def _write_post_host_entrypoint_copy(repo_root: Path, tmp_path: Path) -> Path:
+    """Create a test-only copy that starts at input preflight.
+
+    Host-preflight ordering is covered against the unmodified production script in
+    ``test_gpu_workflow.py``. This copy keeps later-stage integration tests
+    deterministic without exposing a production host-gate bypass.
+    """
+
+    source = (repo_root / "scripts" / "run-cuda-validation.ps1").read_text(
+        encoding="utf-8"
+    )
+    root_assignment = "$Root = Split-Path -Parent $PSScriptRoot"
+    escaped_root = str(repo_root).replace("'", "''")
+    assert root_assignment in source
+    source = source.replace(root_assignment, f"$Root = '{escaped_root}'", 1)
+
+    host_start = source.index("$environmentPreflightPath = Join-Path $Output")
+    input_marker = '    $currentStage = "input-preflight"\n'
+    host_end = source.index(input_marker, host_start) + len(input_marker)
+    source = source[:host_start] + "try {\n" + input_marker + source[host_end:]
+
+    target = tmp_path / "run-cuda-validation-post-host.ps1"
+    target.write_text(source, encoding="utf-8")
+    return target
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="PowerShell entrypoint is Windows-only")
 @pytest.mark.parametrize(
     ("stage", "diagnostic"),
@@ -933,6 +959,7 @@ def test_powershell_rewrites_valid_preflight_pass_after_safe_stage_failure(
     tmp_path: Path, stage: str, diagnostic: bool
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
+    entrypoint = _write_post_host_entrypoint_copy(repo_root, tmp_path)
     fixture_path = _write_fixture(tmp_path)
     stub_root = tmp_path / "python-stubs"
     stub_package = stub_root / "faster_whisper"
@@ -953,7 +980,7 @@ def test_powershell_rewrites_valid_preflight_pass_after_safe_stage_failure(
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        str(repo_root / "scripts" / "run-cuda-validation.ps1"),
+        str(entrypoint),
         "-Mode",
         "single-release",
         "-Fixture",

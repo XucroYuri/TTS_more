@@ -43,7 +43,7 @@ Remove-Item Env:TTS_MORE_DISTRIBUTED_ORCHESTRATION_TOKEN -ErrorAction SilentlyCo
 $script:DistributedPreflightPath = ""
 $script:DistributedDeploymentStarted = $false
 $isDiagnostic = $SkipDeploy -or $SkipStart
-$currentStage = "input-preflight"
+$currentStage = "host-preflight"
 
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 $TranscriptPath = Join-Path $Output "controller.log"
@@ -458,7 +458,29 @@ function Invoke-DistributedFaultRecovery {
     if (-not $report.retry_passed) { throw "CUDA synthesis retry failed after worker restart" }
 }
 
+$environmentPreflightPath = Join-Path $Output "environment-preflight.json"
 try {
+    $hostPreflightArgs = @(
+        (Join-Path $Root "scripts\tts_more_deploy.py"),
+        "--root", $Root,
+        "preflight-cuda-host",
+        "--mode", $Mode,
+        "--output", $environmentPreflightPath
+    )
+    & $Python @hostPreflightArgs | Out-Null
+    $hostPreflightExitCode = $LASTEXITCODE
+    if ($hostPreflightExitCode -ne 0) {
+        $hostPreflightNextAction = "Resolve the failed CUDA host requirements, then rerun host preflight."
+        try {
+            $environmentPreflight = Get-Content -LiteralPath $environmentPreflightPath -Raw | ConvertFrom-Json
+            if ($environmentPreflight.next_action) {
+                $hostPreflightNextAction = [string]$environmentPreflight.next_action
+            }
+        } catch { }
+        throw $hostPreflightNextAction
+    }
+
+    $currentStage = "input-preflight"
     $validatorArgs = @(
         (Join-Path $Root "scripts\run-cuda-validation.py"),
         "--mode", $Mode,
@@ -539,11 +561,14 @@ try {
     if ($Mode -eq "distributed" -and $script:DistributedDeploymentStarted -and -not $script:DistributedEvidenceCollected) {
         try { Collect-DistributedEvidence } catch { Write-Warning "Distributed evidence collection failed: $_" }
     }
-    $writeBlocker = $true
-    try {
-        $existingSummary = Get-Content -LiteralPath (Join-Path $Output "summary.json") -Raw | ConvertFrom-Json
-        if ($existingSummary.passed -eq $false) { $writeBlocker = $false }
-    } catch { }
+    $writeBlocker = $currentStage -eq "host-preflight"
+    if (-not $writeBlocker) {
+        $writeBlocker = $true
+        try {
+            $existingSummary = Get-Content -LiteralPath (Join-Path $Output "summary.json") -Raw | ConvertFrom-Json
+            if ($existingSummary.passed -eq $false) { $writeBlocker = $false }
+        } catch { }
+    }
     if ($writeBlocker) {
         $blockerArgs = @(
             (Join-Path $Root "scripts\run-cuda-validation.py"),
@@ -559,9 +584,13 @@ try {
         if ($isDiagnostic) { $blockerArgs += "--diagnostic" }
         if ($currentStage -in @("fault-recovery", "evidence-collection")) { $blockerArgs += "--preserve-existing" }
         & $Python @blockerArgs | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Warning "Unable to write blocker evidence for $currentStage" }
+        if ($LASTEXITCODE -notin @(0, 1)) { Write-Warning "Unable to write blocker evidence for $currentStage" }
     }
-    Write-Host "阻塞：$currentStage 失败；证据：summary.json" -ForegroundColor Red
+    if ($currentStage -eq "host-preflight") {
+        Write-Host "阻塞：CUDA 主机预检未通过；证据：environment-preflight.json、summary.json" -ForegroundColor Red
+    } else {
+        Write-Host "阻塞：$currentStage 失败；证据：summary.json" -ForegroundColor Red
+    }
     throw
 } finally {
     if ($script:ValidationControlPlane -and -not $script:ValidationControlPlane.HasExited) {

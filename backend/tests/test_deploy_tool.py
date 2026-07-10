@@ -3,8 +3,11 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import posixpath
 import stat
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1348,3 +1351,304 @@ def test_update_project_force_reset_repos_allows_reset_actions_for_dirty_repo(
     )
 
     assert ["git", "-C", str(target), "reset", "--hard", "origin/main"] in payload["repo_actions"]
+
+
+class _FakeCudaHost:
+    def __init__(self) -> None:
+        self.failures: set[str] = set()
+        self.commands: list[list[str]] = []
+        self.disk_calls: list[str] = []
+        self.free_gib = {"repo": 80.0, "temp": 20.0}
+        self.repo_path = Path("C:/workspace/tts-more")
+        self.temp_path = Path("D:/temp")
+
+    def fail(self, check: str) -> None:
+        self.failures.add(check)
+
+    def which(self, name: str) -> str | None:
+        if name in self.failures:
+            return None
+        return f"C:/private/tools/{name}.exe"
+
+    def disk_usage(self, path: str | os.PathLike[str]):
+        raw = str(path)
+        self.disk_calls.append(raw)
+        label = "temp" if "temp" in raw.lower() else "repo"
+        free = int(self.free_gib[label] * 1024**3)
+        return SimpleNamespace(total=100 * 1024**3, used=100 * 1024**3 - free, free=free)
+
+    def path_exists(self, path: str | os.PathLike[str]) -> bool:
+        return "playwright" not in self.failures and bool(path)
+
+    def run(self, command: list[str], **_kwargs):
+        self.commands.append([str(item) for item in command])
+        rendered = " ".join(str(item) for item in command)
+        executable = Path(str(command[0])).stem.lower()
+        if "WhisperModel" in rendered:
+            if "asr_timeout" in self.failures:
+                raise subprocess.TimeoutExpired(command, _kwargs.get("timeout", 0))
+            if "asr_smoke" in self.failures:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout=json.dumps(
+                        {
+                            "ok": False,
+                            "error_type": "RuntimeError",
+                            "message": (
+                                r"C:\private\models\large-v3\model.bin failed in "
+                                "secret-worker.exe 123e4567-e89b-12d3-a456-426614174000 "
+                                "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                            ),
+                        }
+                    ),
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=0, stdout='{"ok": true}', stderr="")
+        if "get_supported_compute_types" in rendered:
+            compute_types = ["int8"] if "ctranslate2" in self.failures else ["float16", "int8_float16"]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(compute_types), stderr="")
+        if "chromium.executablePath" in rendered:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="C:/private/playwright/chromium.exe\n",
+                stderr="",
+            )
+        if "--query-gpu=memory.total,memory.used,driver_version" in rendered:
+            if "nvidia_query" in self.failures:
+                return SimpleNamespace(returncode=1, stdout="", stderr="driver query failed")
+            total = 12000 if "gpu_total" in self.failures else 24576
+            used = 2048 if "gpu_idle" in self.failures else 512
+            return SimpleNamespace(returncode=0, stdout=f"{total}, {used}, 555.42\n", stderr="")
+        versions = {
+            "conda": "conda 24.1.0",
+            "git": "git version 2.45.0.windows.1",
+            "node": "v20.15.0",
+            "pnpm": "9.12.0",
+        }
+        return SimpleNamespace(returncode=0, stdout=versions.get(executable, ""), stderr="")
+
+    def providers(self) -> dict[str, object]:
+        version = (3, 10, 14) if "python" in self.failures else (3, 11, 9)
+        return {
+            "command_runner": self.run,
+            "which": self.which,
+            "disk_usage": self.disk_usage,
+            "python_version": version,
+            "repo_path": self.repo_path,
+            "temp_path": self.temp_path,
+            "path_exists": self.path_exists,
+            "smoke_timeout_seconds": 5.0,
+        }
+
+
+def test_cuda_host_volume_keys_preserve_windows_drive_identity_on_posix_controller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    monkeypatch.setattr(deploy.os, "path", posixpath)
+
+    assert deploy._host_volume_key("C:/workspace/tts-more") == "c:"
+    assert deploy._host_volume_key(r"C:\temp") == "c:"
+    assert deploy._host_volume_key("D:/temp") == "d:"
+    assert deploy._host_volume_key(r"\\server\share\models") == "//server/share"
+
+
+@pytest.mark.parametrize(
+    ("check", "message"),
+    [
+        ("python", "Python 3.11 is required"),
+        ("conda", "conda is required for GPT-SoVITS on Windows"),
+        ("git", "git is required"),
+        ("node", "node is required"),
+        ("pnpm", "pnpm is required"),
+        ("nvidia-smi", "nvidia-smi is required"),
+        ("gpu_total", "GPU memory must be at least 16000 MiB"),
+        ("gpu_idle", "GPU must use no more than 1024 MiB before certification"),
+        ("ctranslate2", "CTranslate2 CUDA float16 support is required"),
+        ("playwright", "Playwright Chromium is required"),
+    ],
+)
+def test_cuda_host_preflight_reports_actionable_cheap_blockers(check: str, message: str) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    fake_host = _FakeCudaHost()
+    fake_host.fail(check)
+
+    report = deploy.inspect_cuda_host("single-clean", **fake_host.providers())
+
+    assert report["passed"] is False
+    assert any(message in item["message"] for item in report["checks"] if not item["passed"])
+
+
+@pytest.mark.parametrize(
+    ("mode", "volume", "free_gib", "required_gib"),
+    [
+        ("single-clean", "repo", 39.0, 40.0),
+        ("single-clean", "temp", 9.0, 10.0),
+        ("single-release", "repo", 14.0, 15.0),
+        ("single-release", "temp", 4.0, 5.0),
+        ("distributed", "repo", 14.0, 15.0),
+        ("distributed", "temp", 4.0, 5.0),
+    ],
+)
+def test_cuda_host_preflight_enforces_mode_disk_thresholds(
+    mode: str, volume: str, free_gib: float, required_gib: float
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    fake_host = _FakeCudaHost()
+    fake_host.free_gib[volume] = free_gib
+
+    report = deploy.inspect_cuda_host(mode, **fake_host.providers())
+
+    assert report["passed"] is False
+    failed_disk = [item for item in report["checks"] if item["id"].startswith("disk_") and not item["passed"]]
+    assert len(failed_disk) == 1
+    assert failed_disk[0]["required_gib"] == required_gib
+
+
+def test_cuda_host_preflight_checks_shared_repo_temp_volume_once_at_stricter_threshold() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    fake_host = _FakeCudaHost()
+    fake_host.repo_path = Path("C:/workspace/tts-more")
+    fake_host.temp_path = Path("C:/temp")
+    fake_host.free_gib["repo"] = 20.0
+
+    report = deploy.inspect_cuda_host("single-clean", **fake_host.providers())
+
+    disk_checks = [item for item in report["checks"] if item["id"].startswith("disk_")]
+    assert len(fake_host.disk_calls) == 1
+    assert len(disk_checks) == 1
+    assert disk_checks[0]["required_gib"] == 40.0
+    assert disk_checks[0]["passed"] is False
+    assert report["disk"]["volumes"] == [
+        {"label": "repository-and-temp", "free_gib": 20.0, "required_gib": 40.0}
+    ]
+
+
+def test_cuda_host_preflight_skips_large_v3_smoke_when_any_cheap_check_fails() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    fake_host = _FakeCudaHost()
+    fake_host.fail("python")
+
+    report = deploy.inspect_cuda_host("single-clean", **fake_host.providers())
+
+    assert report["asr_smoke"] == {"attempted": False, "passed": False, "status": "skipped"}
+    assert not any("WhisperModel" in " ".join(command) for command in fake_host.commands)
+
+
+def test_cuda_host_preflight_runs_bounded_large_v3_smoke_after_cheap_checks_pass() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    fake_host = _FakeCudaHost()
+
+    report = deploy.inspect_cuda_host("single-clean", **fake_host.providers())
+
+    smoke_commands = [command for command in fake_host.commands if "WhisperModel" in " ".join(command)]
+    assert report["passed"] is True
+    assert report["asr_smoke"] == {"attempted": True, "passed": True, "status": "passed"}
+    assert len(smoke_commands) == 1
+    assert "large-v3" in " ".join(smoke_commands[0])
+    assert "device='cuda'" in " ".join(smoke_commands[0])
+    assert "compute_type='float16'" in " ".join(smoke_commands[0])
+
+
+def test_cuda_host_preflight_sanitizes_smoke_error_paths_processes_and_uuids() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    fake_host = _FakeCudaHost()
+    fake_host.fail("asr_smoke")
+
+    report = deploy.inspect_cuda_host("single-release", **fake_host.providers())
+    serialized = json.dumps(report, ensure_ascii=False)
+
+    assert report["passed"] is False
+    assert report["asr_smoke"]["error_type"] == "RuntimeError"
+    assert "C:\\private" not in serialized
+    assert "secret-worker.exe" not in serialized
+    assert "123e4567-e89b-12d3-a456-426614174000" not in serialized
+    assert "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" not in serialized
+    assert len(report["asr_smoke"]["message"]) <= 200
+
+
+def test_cuda_host_preflight_marks_nvidia_query_failure_without_corrupting_disk_checks() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    fake_host = _FakeCudaHost()
+    fake_host.fail("nvidia_query")
+
+    report = deploy.inspect_cuda_host("single-clean", **fake_host.providers())
+
+    nvidia_check = next(item for item in report["checks"] if item["id"] == "nvidia-smi")
+    disk_checks = [item for item in report["checks"] if item["id"].startswith("disk_")]
+    assert nvidia_check["passed"] is False
+    assert all(item["passed"] for item in disk_checks)
+    assert report["asr_smoke"]["status"] == "skipped"
+
+
+def test_cuda_host_preflight_records_sanitized_large_v3_timeout() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    fake_host = _FakeCudaHost()
+    fake_host.fail("asr_timeout")
+
+    report = deploy.inspect_cuda_host("single-release", **fake_host.providers())
+
+    assert report["passed"] is False
+    assert report["asr_smoke"]["error_type"] == "TimeoutExpired"
+    assert report["asr_smoke"]["message"] == "large-v3 CUDA float16 smoke exceeded 5 seconds"
+    assert len(report["asr_smoke"]["message"]) <= 200
+
+
+def test_cuda_host_preflight_next_action_combines_independent_cheap_blockers() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    fake_host = _FakeCudaHost()
+    fake_host.fail("conda")
+    fake_host.fail("gpu_idle")
+
+    report = deploy.inspect_cuda_host("single-clean", **fake_host.providers())
+
+    assert "Install or repair required tools: conda." in report["next_action"]
+    assert "Wait for unrelated GPU work to finish" in report["next_action"]
+    assert "never stops GPU processes" in report["next_action"]
+
+
+@pytest.mark.parametrize(("passed", "expected_exit"), [(True, 0), (False, 1)])
+def test_cuda_host_preflight_cli_writes_environment_report_and_returns_gate_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passed: bool, expected_exit: int
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    report = {
+        "schema_version": 1,
+        "stage": "host-preflight",
+        "mode": "single-release",
+        "passed": passed,
+        "checks": [],
+        "versions": {"python": "3.11.9"},
+        "disk": {"volumes": []},
+        "gpu": {"count": 1, "aggregate_total_mib": 24576, "aggregate_used_mib": 512},
+        "asr_smoke": {"attempted": True, "passed": passed, "status": "passed" if passed else "failed"},
+        "next_action": "Continue to input preflight and deployment." if passed else "Resolve the failed host checks, then rerun.",
+    }
+    monkeypatch.setattr(deploy, "inspect_cuda_host", lambda mode, **_kwargs: {**report, "mode": mode})
+    output = tmp_path / "environment-preflight.json"
+
+    exit_code = deploy.main(
+        [
+            "--root",
+            str(tmp_path),
+            "preflight-cuda-host",
+            "--mode",
+            "single-release",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert exit_code == expected_exit
+    assert json.loads(output.read_text(encoding="utf-8")) == report

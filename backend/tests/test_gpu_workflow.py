@@ -9,6 +9,7 @@ WORKFLOW = ROOT / ".github" / "workflows" / "windows-gpu-validation.yml"
 PLAYWRIGHT_SPEC = ROOT / "frontend" / "e2e" / "cuda-workstation.spec.ts"
 PLAYWRIGHT_CONFIG = ROOT / "frontend" / "playwright.config.ts"
 CUDA_ENTRYPOINT = ROOT / "scripts" / "run-cuda-validation.ps1"
+CUDA_VALIDATOR = ROOT / "backend" / "app" / "cuda_validation.py"
 
 
 def _read(path: Path) -> str:
@@ -71,7 +72,7 @@ def test_windows_gpu_workflow_runs_validation_ui_and_preserves_evidence() -> Non
 
 def test_cuda_entrypoint_runs_fixture_preflight_before_deploy_or_wait() -> None:
     script = _read(CUDA_ENTRYPOINT)
-    main_marker = 'try {\n    $validatorArgs = @('
+    main_marker = 'try {\n    $hostPreflightArgs = @('
     assert main_marker in script
     entrypoint = script[script.index(main_marker) :]
 
@@ -113,7 +114,7 @@ def test_cuda_entrypoint_forwards_repo_paths_and_marks_skips_diagnostic() -> Non
 
 def test_cuda_entrypoint_rewrites_stale_preflight_pass_on_later_stage_failure() -> None:
     script = _read(CUDA_ENTRYPOINT)
-    main_marker = 'try {\n    $validatorArgs = @('
+    main_marker = 'try {\n    $hostPreflightArgs = @('
     entrypoint = script[script.index(main_marker) :]
 
     deployment_stage = entrypoint.index('$currentStage = "deployment"')
@@ -138,6 +139,61 @@ def test_cuda_entrypoint_rewrites_stale_preflight_pass_on_later_stage_failure() 
     finally_index = entrypoint.rindex("} finally {")
     assert catch_index < finally_index
     assert "--write-blocker-stage" not in entrypoint[finally_index:]
+
+
+def test_cuda_entrypoint_runs_host_preflight_before_input_and_destructive_work() -> None:
+    script = _read(CUDA_ENTRYPOINT)
+    main_marker = 'try {\n    $hostPreflightArgs = @('
+    assert main_marker in script
+    entrypoint = script[script.index(main_marker) :]
+
+    host_preflight = entrypoint.index('"preflight-cuda-host"')
+    input_preflight = entrypoint.index('"--preflight-only"')
+    single_deploy = entrypoint.index("Invoke-SingleNodeDeployment")
+    distributed_deploy = entrypoint.index("Invoke-DistributedDeployment")
+    worker_wait = entrypoint.index("Wait-ServiceReady $ServicesPath")
+
+    assert host_preflight < input_preflight < single_deploy
+    assert host_preflight < input_preflight < distributed_deploy
+    assert host_preflight < input_preflight < worker_wait
+    host_failure_gate = entrypoint[host_preflight:input_preflight]
+    assert "$hostPreflightExitCode = $LASTEXITCODE" in host_failure_gate
+    assert "if ($hostPreflightExitCode -ne 0)" in host_failure_gate
+    assert "throw $hostPreflightNextAction" in host_failure_gate
+    assert "Invoke-SingleNodeDeployment" not in host_failure_gate
+    assert "Invoke-DistributedDeployment" not in host_failure_gate
+    assert "CleanRepos" not in host_failure_gate
+    assert "Stop-Process" not in host_failure_gate
+
+
+def test_cuda_host_failure_uses_shared_blocker_writer_for_five_evidence_artifacts() -> None:
+    entrypoint = _read(CUDA_ENTRYPOINT)
+    validator = _read(CUDA_VALIDATOR)
+    host_stage = entrypoint.index('$currentStage = "host-preflight"')
+    host_command = entrypoint.index('"preflight-cuda-host"', host_stage)
+    input_stage = entrypoint.index('$currentStage = "input-preflight"', host_command)
+    catch_marker = '} catch {\n    $failureMessage = $_.Exception.Message'
+    catch_block = entrypoint[entrypoint.index(catch_marker) : entrypoint.rindex("} finally {")]
+
+    assert host_stage < host_command < input_stage
+    assert '"--write-blocker-stage", $currentStage' in catch_block
+    assert '"--blocker-message", $failureMessage' in catch_block
+    assert "scripts\\run-cuda-validation.py" in catch_block
+    assert '$LASTEXITCODE -notin @(0, 1)' in catch_block
+    assert '$writeBlocker = $currentStage -eq "host-preflight"' in catch_block
+    assert 'if (-not $writeBlocker) {' in catch_block
+    assert (
+        'Write-Host "阻塞：CUDA 主机预检未通过；证据：environment-preflight.json、summary.json"'
+        in catch_block
+    )
+    for artifact in (
+        "summary.json",
+        "junit.xml",
+        "human-listening-review.md",
+        "worker-log-references.json",
+        "nvidia-smi.csv",
+    ):
+        assert artifact in validator
 
 
 def test_playwright_cuda_spec_is_a_real_three_service_closed_loop() -> None:
