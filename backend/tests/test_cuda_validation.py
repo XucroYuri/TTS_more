@@ -718,7 +718,9 @@ def test_runner_measures_two_warm_repeats_without_reloading_or_overwriting_prima
     assert report["certification_status"] == "diagnostic_core_passed"
 
 
-@pytest.mark.parametrize("failure_mode", ["lost-residency", "missing-warm-wav"])
+@pytest.mark.parametrize(
+    "failure_mode", ["lost-residency", "missing-primary-wav", "missing-warm-wav"]
+)
 def test_warm_repeats_require_continuous_residency_and_real_wav_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_mode: str
 ) -> None:
@@ -741,7 +743,10 @@ def test_warm_repeats_require_continuous_residency_and_real_wav_evidence(
 
         def synthesize(self, request) -> SynthesisResult:
             self.synthesis_count += 1
-            if failure_mode == "missing-warm-wav" and self.synthesis_count > 1:
+            suppress_current_output = (
+                failure_mode == "missing-primary-wav" and self.synthesis_count == 1
+            ) or (failure_mode == "missing-warm-wav" and self.synthesis_count > 1)
+            if suppress_current_output:
                 self.calls.append(
                     (self.endpoint.service_id, "synthesize", request.profile, request.parameters)
                 )
@@ -754,11 +759,23 @@ def test_warm_repeats_require_continuous_residency_and_real_wav_evidence(
                 self.state[self.endpoint.service_id] = None
             return result
 
+    output_dir = tmp_path / failure_mode
+    if failure_mode == "missing-primary-wav":
+        _write_wav(output_dir / "wav" / "gpt-v2ProPlus.wav")
+    if failure_mode == "missing-warm-wav":
+        for repeat_index in (1, 2):
+            _write_wav(
+                output_dir
+                / "wav"
+                / "warm"
+                / f"gpt-v2ProPlus-repeat-{repeat_index}.wav"
+            )
+
     runner = CUDAValidationRunner(
         mode="distributed",
         services_path=_write_services(tmp_path),
         fixture_path=_write_fixture(tmp_path, distributed_weights=True),
-        output_dir=tmp_path / failure_mode,
+        output_dir=output_dir,
         **_distributed_orchestration(tmp_path),
         client_factory=lambda endpoint: InvalidWarmClient(endpoint, [], state),
         status_probe=lambda endpoint: {
@@ -789,6 +806,8 @@ def test_warm_repeats_require_continuous_residency_and_real_wav_evidence(
     errors = " ".join(report["cases"][0]["errors"])
     if failure_mode == "lost-residency":
         assert "warm synthesis requires the original loaded model" in errors
+    elif failure_mode == "missing-primary-wav":
+        assert "primary WAV evidence" in errors
     else:
         assert "warm WAV evidence" in errors
 
@@ -1947,8 +1966,12 @@ def test_listening_template_escapes_reviewer_markdown_without_changing_table_sha
     payload["reviewers"] = [
         {"id": "reviewer|a\n### Reviewer `forged`", "name": "Reviewer | A\n## Injected"},
         {
-            "id": "reviewer`b<script>",
-            "name": "Reviewer B\r\n- Decision: PASS<img src=x>",
+            "id": "reviewer`b<script>[link](javascript:alert(1))*_~\\",
+            "name": (
+                "Reviewer B\r\n- Decision: PASS<img src=x> "
+                "![pixel](https://tracker.example/pixel) "
+                "[link](https://example.test) *bold* _em_ ~strike~"
+            ),
         },
     ]
     fixture_path = tmp_path / "markdown-reviewers.json"
@@ -1975,6 +1998,16 @@ def test_listening_template_escapes_reviewer_markdown_without_changing_table_sha
     assert "\n## Injected" not in content
     assert "<script>" not in content
     assert "<img" not in content
+    for active_markdown in (
+        "![pixel]",
+        "[link](",
+        "javascript:",
+        "https://",
+        "*bold*",
+        "_em_",
+        "~strike~",
+    ):
+        assert active_markdown not in content
 
 
 def test_input_preflight_next_action_identifies_fixture_schema_failure(tmp_path: Path) -> None:

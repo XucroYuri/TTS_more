@@ -1242,6 +1242,7 @@ class CUDAValidationRunner:
                 text=case.text,
                 language=case.language,
             )
+            output_path.unlink(missing_ok=True)
             result = client.synthesize(
                 SynthesisRequest(
                     line=line,
@@ -1255,7 +1256,12 @@ class CUDAValidationRunner:
             perf_source["short_synthesis_seconds"].append(synthesis_seconds)
             if result.audio_path.resolve(strict=False) != output_path.resolve(strict=False):
                 raise RuntimeError(f"worker returned unexpected output path: {result.audio_path}")
-            audio_metrics = measure_wav(output_path)
+            try:
+                audio_metrics = measure_wav(output_path)
+            except (OSError, ValueError, wave.Error) as exc:
+                raise RuntimeError(
+                    "primary WAV evidence is missing or invalid"
+                ) from exc
             case_report["audio"] = audio_metrics
             if not audio_metrics["passed"]:
                 failed_checks = [name for name, passed in audio_metrics["checks"].items() if not passed]
@@ -1277,6 +1283,7 @@ class CUDAValidationRunner:
             warm_dir.mkdir(parents=True, exist_ok=True)
             for repeat_index in range(1, WARM_SYNTHESIS_REPEATS + 1):
                 warm_output_path = warm_dir / f"{case.name}-repeat-{repeat_index}.wav"
+                warm_output_path.unlink(missing_ok=True)
                 warm_started = self.clock()
                 warm_result = client.synthesize(
                     SynthesisRequest(
@@ -1596,7 +1603,7 @@ def _write_listening_template(
     reviewers = fixture.reviewers if fixture else []
     reviewer_lines = (
         "\n".join(
-            f"- `{_markdown_inline(reviewer.id)}`: {_markdown_inline(reviewer.name)}"
+            f"- `{_markdown_reviewer(reviewer.id)}`: {_markdown_reviewer(reviewer.name)}"
             for reviewer in reviewers
         )
         or "- Not configured"
@@ -1608,7 +1615,7 @@ def _write_listening_template(
             columns = [
                 _markdown_inline(case["name"]),
                 f"`{_markdown_inline(case.get('output_path', ''))}`",
-                f"`{_markdown_inline(reviewer.id)}`" if reviewer else "",
+                f"`{_markdown_reviewer(reviewer.id)}`" if reviewer else "",
                 "",
                 "",
                 "",
@@ -1620,7 +1627,7 @@ def _write_listening_template(
     if not rows:
         rows.append("| " + " | ".join(["No synthesis output", "", "", "", "", "", "", "", ""]) + " |")
     signature_blocks = "\n\n".join(
-        f"""### Reviewer `{_markdown_inline(reviewer.id)}` — {_markdown_inline(reviewer.name)}
+        f"""### Reviewer `{_markdown_reviewer(reviewer.id)}` — {_markdown_reviewer(reviewer.name)}
 
 - Decision: PASS / FAIL
 - Signature / timestamp:
@@ -1659,6 +1666,13 @@ def _markdown_inline(value: Any) -> str:
         .replace("`", "&#96;")
         .replace("#", "&#35;")
     )
+
+
+def _markdown_reviewer(value: Any) -> str:
+    sanitized = _markdown_inline(value)
+    for character in "\\![]()*_~:/@.":
+        sanitized = sanitized.replace(character, f"&#{ord(character)};")
+    return sanitized
 
 
 def _status_errors(status: dict[str, Any], *, expected_loaded: bool) -> list[str]:
