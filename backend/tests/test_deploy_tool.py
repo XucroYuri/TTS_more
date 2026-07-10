@@ -33,6 +33,7 @@ def _write_repo_lock(root: Path) -> None:
                         "commit": "bf81cdb14a38b674b6e9996dabc97340bc9978d2",
                         "service_id": "local-gpt-sovits-main",
                         "port": 9880,
+                        "default_selected": True,
                     },
                     {
                         "name": "GPT-SoVITS-dev",
@@ -44,6 +45,7 @@ def _write_repo_lock(root: Path) -> None:
                         "commit": "6ae63b72bd3352356dcfd3961e44add7e04b1a1c",
                         "service_id": "local-gpt-sovits-dev",
                         "port": 9883,
+                        "default_selected": False,
                     },
                     {
                         "name": "GPT-SoVITS-proplus-hc-dev",
@@ -55,6 +57,7 @@ def _write_repo_lock(root: Path) -> None:
                         "commit": "b6b2a9da2eade248cf03f89195c79f49d8cd8e22",
                         "service_id": "local-gpt-sovits-proplus-hc-dev",
                         "port": 9884,
+                        "default_selected": False,
                     },
                     {
                         "name": "index-tts",
@@ -93,18 +96,48 @@ def test_render_local_all_services_from_repo_lock(tmp_path: Path) -> None:
     services = deploy.render_services(tmp_path, profile="local-all", platform_name="windows")
 
     service_ids = [item["service_id"] for item in services]
-    assert service_ids[:3] == [
+    assert service_ids == [
         "local-gpt-sovits-main",
-        "local-gpt-sovits-dev",
-        "local-gpt-sovits-proplus-hc-dev",
+        "local-indextts",
+        "local-cosyvoice",
     ]
     gpt_main = services[0]
     assert gpt_main["repo_path"] == "repo/GPT-SoVITS-main"
     assert gpt_main["base_url"] == "http://127.0.0.1:9880"
     assert gpt_main["env"]["TTS_MORE_GPTSOVITS_REPO"] == "repo/GPT-SoVITS-main"
     assert gpt_main["start_command"][0] == "repo/GPT-SoVITS-main/.venv/Scripts/python.exe"
-    assert services[3]["env"]["TTS_MORE_INDEXTTS_MODEL_DIR"] == "repo/index-tts/checkpoints"
-    assert services[4]["env"]["TTS_MORE_COSYVOICE_MODEL_DIR"] == "pretrained_models/CosyVoice-300M"
+    assert services[1]["env"]["TTS_MORE_INDEXTTS_MODEL_DIR"] == "repo/index-tts/checkpoints"
+    assert services[2]["env"]["TTS_MORE_COSYVOICE_MODEL_DIR"] == "pretrained_models/CosyVoice-300M"
+
+
+def test_render_explicit_all_includes_regression_branches(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+
+    services = deploy.render_services(
+        tmp_path,
+        profile="local-all",
+        platform_name="posix",
+        service_ids={"all"},
+    )
+
+    assert [item["service_id"] for item in services[:3]] == [
+        "local-gpt-sovits-main",
+        "local-gpt-sovits-dev",
+        "local-gpt-sovits-proplus-hc-dev",
+    ]
+
+
+def test_repo_selection_defaults_to_release_entries_but_accepts_variant_aliases(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    repositories = deploy.load_repo_lock(tmp_path)
+
+    assert [repo["variant"] for repo in repositories[:3] if deploy._repo_selected(repo, None)] == ["main"]
+    assert [repo["variant"] for repo in repositories[:3] if deploy._repo_selected(repo, {"dev"})] == ["dev"]
+    assert all(deploy._repo_selected(repo, {"all"}) for repo in repositories)
 
 
 def test_render_app_only_services_are_external_and_unmanaged(tmp_path: Path) -> None:
@@ -123,7 +156,7 @@ def test_render_app_only_services_are_external_and_unmanaged(tmp_path: Path) -> 
     assert all(item["managed"] is False for item in services)
     assert all(item["start_command"] == [] for item in services)
     assert services[0]["base_url"] == "http://tts-gpu.local:9880"
-    assert services[2]["base_url"] == "http://tts-gpu.local:9884"
+    assert services[2]["base_url"] == "http://tts-gpu.local:9882"
 
 
 def test_render_worker_node_keeps_selected_local_worker_manageable(tmp_path: Path) -> None:
@@ -762,6 +795,76 @@ def test_install_update_scripts_writes_repo_local_helpers(tmp_path: Path) -> Non
     exclude = (target / ".git" / "info" / "exclude").read_text(encoding="utf-8")
     assert "tts-more-update.sh" in exclude
     assert "tts-more-update.ps1" in exclude
+
+
+def test_repo_path_overrides_apply_to_rendered_local_services(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    repo_paths = tmp_path / "deployment" / "app" / "repo-paths.local.json"
+    repo_paths.parent.mkdir(parents=True)
+    repo_paths.write_text(
+        json.dumps({"repositories": {"local-indextts": "repo/custom-index-tts"}}),
+        encoding="utf-8",
+    )
+
+    repositories = deploy.load_deployment_repositories(tmp_path, repo_paths)
+    services = deploy.render_services(
+        tmp_path,
+        platform_name="posix",
+        service_ids={"local-indextts"},
+        repositories=repositories,
+    )
+
+    assert services[0]["repo_path"] == "repo/custom-index-tts"
+    assert services[0]["start_command"][0] == "repo/custom-index-tts/.venv/bin/python"
+    assert services[0]["env"]["TTS_MORE_INDEXTTS_MODEL_DIR"] == "repo/custom-index-tts/checkpoints"
+
+
+def test_validate_repo_paths_rejects_paths_outside_project(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    repo_paths = tmp_path / "deployment" / "app" / "repo-paths.local.json"
+    repo_paths.parent.mkdir(parents=True)
+    repo_paths.write_text(
+        json.dumps({"repositories": {"local-indextts": "../outside-index-tts"}}),
+        encoding="utf-8",
+    )
+
+    repositories = deploy.load_deployment_repositories(tmp_path, repo_paths=repo_paths)
+    report = deploy.validate_repo_paths(
+        tmp_path,
+        service_ids={"local-indextts"},
+        repositories=repositories,
+    )
+
+    assert report[0]["ok"] is False
+    assert report[0]["inside_project"] is False
+    assert "outside project root" in report[0]["error"]
+
+
+def test_install_repo_bundles_copies_provider_helpers_and_excludes_them(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    (bundle / "tts-more-prepare.sh").write_text("#!/usr/bin/env bash\necho prepare\n", encoding="utf-8")
+    (bundle / "README.md").write_text("IndexTTS helper\n", encoding="utf-8")
+    target = tmp_path / "repo" / "index-tts"
+    (target / ".git").mkdir(parents=True)
+
+    reports = deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+    copied = target / "tts-more" / "tts-more-prepare.sh"
+    manifest = json.loads((target / "tts-more" / "tts-more-repo.json").read_text(encoding="utf-8"))
+    assert reports[0]["installed"] is True
+    assert copied.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash")
+    assert copied.stat().st_mode & stat.S_IXUSR
+    assert manifest["service_id"] == "local-indextts"
+    exclude = (target / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert "tts-more/" in exclude
 
 
 def test_update_project_dry_run_reports_app_and_repo_actions_without_writes(

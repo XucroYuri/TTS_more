@@ -8,11 +8,16 @@ if [[ ! -x "$PYTHON" ]]; then
 fi
 
 SERVICES=""
+REPO_PATHS=""
 DETACH=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --services)
       SERVICES="$2"
+      shift 2
+      ;;
+    --repo-paths)
+      REPO_PATHS="$2"
       shift 2
       ;;
     --detach)
@@ -29,6 +34,9 @@ done
 ARGS=(start-workers --platform posix)
 if [[ -n "$SERVICES" ]]; then
   ARGS+=(--service-ids "$SERVICES")
+fi
+if [[ -n "$REPO_PATHS" ]]; then
+  ARGS+=(--repo-paths "$REPO_PATHS")
 fi
 ARGS+=("${DETACH[@]}")
 

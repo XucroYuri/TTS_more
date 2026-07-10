@@ -37,11 +37,11 @@ python scripts/tts_more_deploy.py sync-repos --clean
 python scripts/tts_more_deploy.py render-services --profile local-all --output data/local/services.json
 ```
 
-`repo.lock.json` 会拉取 GPT-SoVITS `main`、`dev`、`xucroyuri/proplus-hc-dev` 三个分支，以及 IndexTTS、CosyVoice。详见 [部署方案](deployment.md)。
+`repo.lock.json` 会保留 GPT-SoVITS `main`、`dev`、`xucroyuri/proplus-hc-dev` 三个分支，以及 IndexTTS、CosyVoice。默认只拉取标记为 `default_selected` 的 GPT-SoVITS `main`、IndexTTS、CosyVoice；`dev` 与 `proplus-hc-dev` 需要显式选择。详见 [部署方案](deployment.md)。
 
 本地 worker 部署 profile 和源选择彼此独立。`app-only`、`worker-node`、`local-all` 都可以复用同一份生成的 `data/local/network-profile.json`；也可以让每台机器各自运行一次 `probe-network`，让包索引和模型端点和它自己的网络环境对齐。
 
-这些 fork 作为稳定镜像使用。TTS More 不再要求在工作台里填写本机 repo 路径；工作台只保存可检测的服务端点。
+GPT-SoVITS `main` 是产品目标，`dev` 是回归目标，`proplus-hc-dev` 是待归档旧分支。TTS More 不再要求在工作台里填写本机 repo 路径；工作台只保存可检测的服务端点。
 
 ## 接入方式
 

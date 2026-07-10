@@ -1,5 +1,6 @@
 param(
     [string]$Services = "",
+    [string]$RepoPaths = "",
     [switch]$Detach
 )
 
@@ -14,6 +15,9 @@ if (!(Test-Path -LiteralPath $Python)) {
 $argsList = @((Join-Path $Root "scripts\tts_more_deploy.py"), "start-workers", "--platform", "windows")
 if ($Services) {
     $argsList += @("--service-ids", $Services)
+}
+if ($RepoPaths) {
+    $argsList += @("--repo-paths", $RepoPaths)
 }
 if ($Detach) {
     $argsList += "--detach"
