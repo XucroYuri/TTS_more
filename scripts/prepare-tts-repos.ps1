@@ -242,6 +242,10 @@ function Prepare-GPTSoVITS {
         if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
             throw "conda was not found; GPT-SoVITS official installer requires conda for $($Repo.name)."
         }
+        Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "GPT-SoVITS torchcodec install" -Action {
+            param($IndexUrl)
+            Invoke-Logged $repoPython @("-m", "pip", "install", "torchcodec") $repoPath
+        }
         $previousPath = $env:PATH
         $env:PATH = "$(Split-Path -Parent $repoPython);$previousPath"
         try {

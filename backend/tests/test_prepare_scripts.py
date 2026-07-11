@@ -204,6 +204,17 @@ def test_windows_prepare_installs_worker_runtime_into_each_repo_environment() ->
     assert '"--service-ids", ($TargetItems -join ",")' in powershell
 
 
+def test_windows_prepare_installs_torchcodec_before_upstream_cuda_index_install() -> None:
+    powershell = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+
+    torchcodec_install = 'Invoke-Logged $repoPython @("-m", "pip", "install", "torchcodec") $repoPath'
+    upstream_install = 'Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", $installPs1'
+
+    assert "GPT-SoVITS torchcodec install" in powershell
+    assert torchcodec_install in powershell
+    assert powershell.index(torchcodec_install) < powershell.index(upstream_install)
+
+
 def test_windows_prepare_parenthesizes_repo_path_properties_for_join_path() -> None:
     powershell = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
 
