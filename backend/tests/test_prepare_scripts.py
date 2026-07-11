@@ -207,6 +207,7 @@ def test_windows_prepare_installs_worker_runtime_into_each_repo_environment() ->
 def test_windows_prepare_parenthesizes_repo_path_properties_for_join_path() -> None:
     powershell = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
 
+    assert "& $FilePath @Arguments | Out-Host" in powershell
     assert "$reposJsonText = $reposJson -join [Environment]::NewLine" in powershell
     assert "$repositories = $reposJsonText | ConvertFrom-Json" in powershell
     assert "$repositories = @($repositories)" in powershell

@@ -48,7 +48,7 @@ function Invoke-Logged {
     if ($DryRun) { return }
     Push-Location $WorkingDirectory
     try {
-        & $FilePath @Arguments
+        & $FilePath @Arguments | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "Command failed: $line" }
     } finally {
         Pop-Location
