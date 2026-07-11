@@ -204,6 +204,18 @@ def test_windows_prepare_installs_worker_runtime_into_each_repo_environment() ->
     assert '"--service-ids", ($TargetItems -join ",")' in powershell
 
 
+def test_windows_prepare_parenthesizes_repo_path_properties_for_join_path() -> None:
+    powershell = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+
+    assert "$reposJsonText = $reposJson -join [Environment]::NewLine" in powershell
+    assert "$repositories = $reposJsonText | ConvertFrom-Json" in powershell
+    assert "$repositories = @($repositories)" in powershell
+    assert "Join-Path $Root $Repo.path" not in powershell
+    assert "Join-Path $Root $repo.path" not in powershell
+    assert powershell.count("Join-Path $Root ([string]$Repo.path)") == 3
+    assert powershell.count("Join-Path $Root ([string]$repo.path)") == 1
+
+
 def test_deployment_assets_separate_app_and_provider_repo_scripts() -> None:
     assert (REPO_ROOT / "deployment" / "app" / "repo-paths.example.json").exists()
     for provider in ("gpt-sovits", "indextts", "cosyvoice"):

@@ -229,7 +229,7 @@ function Install-WorkerRuntime {
 
 function Prepare-GPTSoVITS {
     param($Repo)
-    $repoPath = Join-Path $Root $Repo.path
+    $repoPath = Join-Path $Root ([string]$Repo.path)
     if ($SkipInstall) {
         Write-Host "[skip] GPT-SoVITS install for $($Repo.name)"
         return
@@ -267,7 +267,7 @@ function Prepare-GPTSoVITS {
 
 function Prepare-IndexTTS {
     param($Repo)
-    $repoPath = Join-Path $Root $Repo.path
+    $repoPath = Join-Path $Root ([string]$Repo.path)
     $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
     $repoUv = Join-Path $repoPath ".uv-bootstrap\Scripts\uv.exe"
     if (-not $uv -and (Test-Path -LiteralPath $repoUv)) { $uv = $repoUv }
@@ -309,7 +309,7 @@ function Prepare-IndexTTS {
 
 function Prepare-CosyVoice {
     param($Repo)
-    $repoPath = Join-Path $Root $Repo.path
+    $repoPath = Join-Path $Root ([string]$Repo.path)
     Invoke-Logged "git" @("-C", $repoPath, "submodule", "update", "--init", "--recursive") $Root
     $repoPython = Resolve-RepoPython $repoPath
     if (-not $SkipInstall) {
@@ -359,14 +359,16 @@ if ($RepoPaths) {
     $repoArgs = @((Join-Path $Root "scripts\tts_more_deploy.py"), "--root", $Root, "list-repos", "--service-ids", ($TargetItems -join ","), "--repo-paths", $RepoPaths)
     $reposJson = & $Python @repoArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    $repositories = @($reposJson | ConvertFrom-Json)
+    $reposJsonText = $reposJson -join [Environment]::NewLine
+    $repositories = $reposJsonText | ConvertFrom-Json
+    $repositories = @($repositories)
 } else {
     $lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json
     $repositories = @($lock.repositories)
 }
 foreach ($repo in $repositories) {
     if (-not (Test-Target $repo)) { continue }
-    $repoPath = Join-Path $Root $repo.path
+    $repoPath = Join-Path $Root ([string]$repo.path)
     switch ($repo.provider_type) {
         "gpt-sovits" { Prepare-GPTSoVITS $repo }
         "indextts" { Prepare-IndexTTS $repo }
