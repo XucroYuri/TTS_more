@@ -112,7 +112,19 @@ if (-not $isAppOnly) {
 
     if (-not $SkipRepoSync) {
         $syncArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "sync-repos", "--service-ids", $targetList)
-        if ($CleanRepos) { $syncArgs += "--clean" }
+        if ($CleanRepos) {
+            $previewArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "list-repos", "--service-ids", $targetList, "--json-lines")
+            Write-Host "Selected repository paths to clean:" -ForegroundColor Yellow
+            $selectedRepositoryLines = @(& $Python @previewArgs)
+            if ($LASTEXITCODE -ne 0) { throw "Unable to list selected repository paths before cleaning." }
+            foreach ($repositoryLine in $selectedRepositoryLines) {
+                if (-not $repositoryLine) { continue }
+                $repository = $repositoryLine | ConvertFrom-Json
+                Write-Host "  - $($repository.path)" -ForegroundColor Yellow
+            }
+            Write-Host "Models and repo-local venvs inside these selected paths will be removed." -ForegroundColor Yellow
+            $syncArgs += "--clean"
+        }
         if ($DryRun) { $syncArgs += "--dry-run" }
         Invoke-Logged $Python $syncArgs
     } else {

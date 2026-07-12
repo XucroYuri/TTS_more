@@ -4,10 +4,12 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
@@ -71,6 +73,24 @@ PROVIDER_PRIORITY = {"gpt-sovits": 10, "indextts": 20, "cosyvoice": 30}
 NETWORK_PROFILE_RELATIVE_PATH = Path("data/local/network-profile.json")
 DEFAULT_CACHE_RELATIVE_PATH = Path("data/cache")
 NETWORK_PROFILE_SCHEMA_VERSION = 1
+
+HOST_LIMITS_GIB = {
+    "single-clean": {"repo": 40.0, "temp": 10.0},
+    "single-release": {"repo": 15.0, "temp": 5.0},
+    "distributed": {"repo": 15.0, "temp": 5.0},
+}
+
+FORMAL_WORKER_MODULES = {
+    "local-gpt-sovits-main": "app.workers.gpt_sovits_worker:app",
+    "local-indextts": "app.workers.indextts_worker:app",
+    "local-cosyvoice": "app.workers.cosyvoice_worker:app",
+}
+MIN_GPU_TOTAL_MIB = 16000
+MAX_INITIAL_GPU_USED_MIB = 1024
+# large-v3 may need to download before CUDA initialization; never let that child
+# process outlive this bounded ten-minute certification probe.
+ASR_SMOKE_TIMEOUT_SECONDS = 600.0
+HOST_COMMAND_TIMEOUT_SECONDS = 30.0
 
 MODEL_SOURCE_CANDIDATES = [
     {"name": "ModelScope", "url": "https://www.modelscope.cn", "scope": "china", "hf_endpoint": ""},
@@ -813,10 +833,10 @@ def sync_repos(
     repositories: list[dict[str, Any]] | None = None,
 ) -> list[list[str]]:
     save_lock_on_change = repositories is None
-    if clean:
-        _remove_repo_dir(root, dry_run=dry_run)
     actions: list[list[str]] = []
     repositories = [dict(repo) for repo in (repositories or load_repo_lock(root))]
+    if clean:
+        _remove_selected_repo_paths(root, repositories, service_ids, dry_run=dry_run)
     lock_changed = False
     for repo in repositories:
         if not _repo_selected(repo, service_ids):
@@ -1198,6 +1218,7 @@ def start_workers(
     repositories: list[dict[str, Any]] | None = None,
     topology: str | Path | None = None,
     node: str | None = None,
+    pid_manifest: str | Path | None = None,
 ) -> int:
     services = render_services(
         root,
@@ -1212,6 +1233,20 @@ def start_workers(
     app_commit = _git_output(["git", "-C", str(root), "rev-parse", "HEAD"])
     logs_dir = root / "data" / ".runtime" / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = _resolve_project_path(root, str(pid_manifest)) if pid_manifest else None
+    manifest_payload: dict[str, Any] = {"schema_version": 1, "processes": []}
+    if manifest_path is not None and manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("validation process manifest is invalid") from exc
+        if (
+            not isinstance(existing, dict)
+            or existing.get("schema_version") != 1
+            or not isinstance(existing.get("processes"), list)
+        ):
+            raise RuntimeError("validation process manifest is invalid")
+        manifest_payload = existing
     for service in services:
         command = _resolve_command(root, service["start_command"])
         env = {**os.environ, **_resolve_env(root, service.get("env") or {})}
@@ -1236,6 +1271,27 @@ def start_workers(
         process = subprocess.Popen(command, **kwargs)
         log_file.close()
         processes.append(process)
+        if manifest_path is not None:
+            try:
+                executable = _resolve_project_path(root, str(command[0]))
+                expected_module = FORMAL_WORKER_MODULES.get(str(service["service_id"]))
+                if expected_module is None or expected_module not in {str(item) for item in command}:
+                    raise RuntimeError("worker command is not eligible for validation cleanup")
+                creation_date = _windows_process_creation_date(process.pid)
+                manifest_payload["processes"].append(
+                    {
+                        "pid": process.pid,
+                        "creation_date": creation_date,
+                        "executable_path": str(executable),
+                        "project_root": str(root.resolve(strict=False)),
+                        "worker_module": expected_module,
+                        "service_id": str(service["service_id"]),
+                    }
+                )
+                _write_process_manifest(manifest_path, manifest_payload)
+            except Exception:
+                process.terminate()
+                raise RuntimeError("validation worker could not be recorded for owned cleanup") from None
         print(f"{service['service_id']} PID {process.pid} {service['health_url']} log={log_path}")
     if detach:
         return 0
@@ -1245,6 +1301,41 @@ def start_workers(
         for process in processes:
             process.terminate()
         return 130
+
+
+def _windows_process_creation_date(process_id: int) -> str:
+    if os.name != "nt":
+        raise RuntimeError("owned process manifests require Windows")
+    script = (
+        f"$p = $null; for ($i = 0; $i -lt 20 -and $null -eq $p; $i++) {{ "
+        f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {int(process_id)}' "
+        "-ErrorAction SilentlyContinue; if ($null -eq $p) { Start-Sleep -Milliseconds 50 } }; "
+        "if ($null -eq $p) { exit 1 }; [Console]::Write([string]$p.CreationDate)"
+    )
+    completed = subprocess.run(
+        ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    creation_date = completed.stdout.strip()
+    if completed.returncode != 0 or not creation_date:
+        raise RuntimeError("validation process creation identity is unavailable")
+    return creation_date
+
+
+def _write_process_manifest(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -1342,19 +1433,30 @@ def _platform_name() -> str:
     return "windows" if os.name == "nt" else "posix"
 
 
-def _remove_repo_dir(root: Path, *, dry_run: bool) -> None:
-    target = (root / "repo").resolve(strict=False)
+def _remove_selected_repo_paths(
+    root: Path,
+    repositories: list[dict[str, Any]],
+    service_ids: set[str] | None,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    selected_paths: list[tuple[Path, str]] = []
     root_resolved = root.resolve(strict=False)
-    if target == root_resolved or root_resolved not in target.parents:
-        raise RuntimeError(f"refusing to remove repo directory outside project root: {target}")
-    if target.name != "repo":
-        raise RuntimeError(f"refusing to remove unexpected directory: {target}")
-    if dry_run:
-        return
-    if target.exists():
-        for child in list(target.iterdir()):
-            _remove_path(child)
-    target.mkdir(parents=True, exist_ok=True)
+    repo_root = (root / "repo").resolve(strict=False)
+    for repo in repositories:
+        if not _repo_selected(repo, service_ids):
+            continue
+        target = _resolve_project_path(root, str(repo["path"]))
+        if target in {root_resolved, repo_root}:
+            raise RuntimeError(f"refusing to clean repository root: {target}")
+        label = target.relative_to(root_resolved).as_posix()
+        selected_paths.append((target, label))
+
+    for target, label in selected_paths:
+        print(f"clean repository: {label}")
+        if target.exists() and not dry_run:
+            _remove_path(target)
+    return [label for _, label in selected_paths]
 
 
 def _remove_path(path: Path) -> None:
@@ -1406,6 +1508,510 @@ def _resolve_env(root: Path, env: dict[str, str]) -> dict[str, str]:
         else:
             resolved[key] = value
     return resolved
+
+
+def _host_volume_key(path: str | os.PathLike[str]) -> str:
+    raw = os.fspath(path).replace("\\", "/")
+    drive_match = re.match(r"^([A-Za-z]:)(?:/|$)", raw)
+    if drive_match:
+        return drive_match.group(1).casefold()
+    if raw.startswith("//"):
+        unc_parts = [part for part in raw[2:].split("/") if part]
+        if len(unc_parts) >= 2:
+            return f"//{unc_parts[0]}/{unc_parts[1]}".casefold()
+    absolute = os.path.abspath(raw)
+    drive, _tail = os.path.splitdrive(absolute)
+    return (drive or Path(absolute).anchor or absolute).casefold()
+
+
+def _sanitize_host_message(message: object, *, limit: int = 200) -> str:
+    text = " ".join(str(message or "").split())
+    text = re.sub(
+        r"(?i)\b[a-z]:[\\/](?:[^\s,;]+)",
+        "<path>",
+        text,
+    )
+    text = re.sub(r"\\\\[^\\\s]+\\[^\s,;]+", "<path>", text)
+    text = re.sub(r"(?i)\b[\w.-]+\.exe\b", "<process>", text)
+    text = re.sub(r"(?i)\bGPU-[0-9a-f-]{32,}\b", "<uuid>", text)
+    text = re.sub(
+        r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        "<uuid>",
+        text,
+    )
+    return (text or "no diagnostic message")[:limit]
+
+
+def _append_host_check(
+    checks: list[dict[str, Any]],
+    check_id: str,
+    passed: bool,
+    message: str,
+    **details: Any,
+) -> None:
+    checks.append({"id": check_id, "passed": bool(passed), "message": message, **details})
+
+
+def _run_host_command(
+    command_runner: Callable[..., Any],
+    command: list[str],
+    *,
+    timeout: float,
+    cwd: Path | None = None,
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "timeout": timeout,
+    }
+    if cwd is not None:
+        kwargs["cwd"] = str(cwd)
+    return command_runner(command, **kwargs)
+
+
+def _python_version_string(version: Any) -> str:
+    parts = [int(version[index]) for index in range(min(3, len(version)))]
+    while len(parts) < 3:
+        parts.append(0)
+    return ".".join(str(item) for item in parts)
+
+
+def _tool_version(
+    executable: str,
+    tool: str,
+    command_runner: Callable[..., Any],
+) -> str:
+    arguments = [executable, "--version"]
+    try:
+        result = _run_host_command(
+            command_runner,
+            arguments,
+            timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return "unknown"
+    if int(getattr(result, "returncode", 1)) != 0:
+        return "unknown"
+    first_line = str(getattr(result, "stdout", "") or "").strip().splitlines()
+    return _sanitize_host_message(first_line[0] if first_line else f"{tool} version unknown")
+
+
+def _inspect_host_disks(
+    mode: str,
+    *,
+    repo_path: Path,
+    temp_path: Path,
+    disk_usage: Callable[[str | os.PathLike[str]], Any],
+    checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    limits = HOST_LIMITS_GIB[mode]
+    shared = _host_volume_key(repo_path) == _host_volume_key(temp_path)
+    specifications = (
+        [("repository-and-temp", repo_path, max(limits.values()))]
+        if shared
+        else [
+            ("repository", repo_path, limits["repo"]),
+            ("temp", temp_path, limits["temp"]),
+        ]
+    )
+    volumes: list[dict[str, Any]] = []
+    for label, path, required_gib in specifications:
+        check_id = f"disk_{label.replace('-', '_')}"
+        try:
+            usage = disk_usage(path)
+            free_gib = round(int(usage.free) / 1024**3, 2)
+            passed = free_gib >= required_gib
+            message = (
+                f"{label} volume has {free_gib:.2f} GiB free"
+                if passed
+                else f"{mode} requires at least {required_gib:g} GiB free on the {label} volume"
+            )
+            _append_host_check(
+                checks,
+                check_id,
+                passed,
+                message,
+                free_gib=free_gib,
+                required_gib=required_gib,
+            )
+            volumes.append(
+                {"label": label, "free_gib": free_gib, "required_gib": required_gib}
+            )
+        except Exception:
+            _append_host_check(
+                checks,
+                check_id,
+                False,
+                f"Unable to inspect free space on the {label} volume",
+                required_gib=required_gib,
+            )
+            volumes.append({"label": label, "free_gib": None, "required_gib": required_gib})
+    return {"volumes": volumes}
+
+
+def _inspect_host_gpu(
+    executable: str | None,
+    *,
+    command_runner: Callable[..., Any],
+    checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    empty = {
+        "count": 0,
+        "aggregate_total_mib": 0,
+        "aggregate_used_mib": 0,
+        "max_total_mib": 0,
+        "driver_versions": [],
+    }
+    if executable is None:
+        return empty
+    command = [
+        executable,
+        "--query-gpu=memory.total,memory.used,driver_version",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        result = _run_host_command(
+            command_runner,
+            command,
+            timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+        )
+        if int(getattr(result, "returncode", 1)) != 0:
+            raise RuntimeError("GPU query failed")
+        rows: list[tuple[int, int, str]] = []
+        for raw_line in str(getattr(result, "stdout", "") or "").splitlines():
+            if not raw_line.strip():
+                continue
+            fields = [field.strip() for field in raw_line.split(",")]
+            if len(fields) != 3:
+                raise ValueError("unexpected GPU query columns")
+            rows.append((int(fields[0]), int(fields[1]), fields[2]))
+        if not rows:
+            raise ValueError("no NVIDIA GPU returned")
+    except Exception:
+        nvidia_check = next(item for item in checks if item["id"] == "nvidia-smi")
+        nvidia_check.update(
+            passed=False,
+            message="nvidia-smi is required and must return GPU memory data",
+        )
+        return empty
+
+    total_mib = sum(row[0] for row in rows)
+    used_mib = sum(row[1] for row in rows)
+    max_total_mib = max(row[0] for row in rows)
+    driver_versions = sorted({_sanitize_host_message(row[2], limit=40) for row in rows})
+    _append_host_check(
+        checks,
+        "gpu_total",
+        max_total_mib >= MIN_GPU_TOTAL_MIB,
+        (
+            f"At least one GPU has {max_total_mib} MiB total memory"
+            if max_total_mib >= MIN_GPU_TOTAL_MIB
+            else f"GPU memory must be at least {MIN_GPU_TOTAL_MIB} MiB"
+        ),
+        observed_mib=max_total_mib,
+        required_mib=MIN_GPU_TOTAL_MIB,
+    )
+    _append_host_check(
+        checks,
+        "gpu_idle",
+        used_mib <= MAX_INITIAL_GPU_USED_MIB,
+        (
+            f"Aggregate initial GPU use is {used_mib} MiB"
+            if used_mib <= MAX_INITIAL_GPU_USED_MIB
+            else f"GPU must use no more than {MAX_INITIAL_GPU_USED_MIB} MiB before certification"
+        ),
+        observed_mib=used_mib,
+        maximum_mib=MAX_INITIAL_GPU_USED_MIB,
+    )
+    return {
+        "count": len(rows),
+        "aggregate_total_mib": total_mib,
+        "aggregate_used_mib": used_mib,
+        "max_total_mib": max_total_mib,
+        "driver_versions": driver_versions,
+    }
+
+
+def _inspect_ctranslate2(
+    command_runner: Callable[..., Any],
+    *,
+    checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    probe = (
+        "import json, ctranslate2; "
+        "print(json.dumps(sorted(ctranslate2.get_supported_compute_types('cuda'))))"
+    )
+    compute_types: list[str] = []
+    try:
+        result = _run_host_command(
+            command_runner,
+            [sys.executable, "-c", probe],
+            timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+        )
+        if int(getattr(result, "returncode", 1)) == 0:
+            payload = json.loads(str(getattr(result, "stdout", "") or "[]"))
+            if isinstance(payload, list):
+                compute_types = sorted(str(item) for item in payload)
+    except Exception:
+        compute_types = []
+    passed = "float16" in compute_types
+    _append_host_check(
+        checks,
+        "ctranslate2_cuda_float16",
+        passed,
+        (
+            "CTranslate2 reports CUDA float16 support"
+            if passed
+            else "CTranslate2 CUDA float16 support is required"
+        ),
+    )
+    return {"cuda_compute_types": compute_types}
+
+
+def _inspect_playwright_chromium(
+    node_executable: str | None,
+    *,
+    repo_path: Path,
+    command_runner: Callable[..., Any],
+    path_exists: Callable[[str | os.PathLike[str]], bool],
+    checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    chromium_path = ""
+    if node_executable is not None:
+        probe = (
+            "const { chromium } = require('@playwright/test'); "
+            "process.stdout.write(chromium.executablePath());"
+        )
+        try:
+            result = _run_host_command(
+                command_runner,
+                [node_executable, "-e", probe],
+                timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+                cwd=repo_path / "frontend",
+            )
+            if int(getattr(result, "returncode", 1)) == 0:
+                chromium_path = str(getattr(result, "stdout", "") or "").strip()
+        except Exception:
+            chromium_path = ""
+    passed = bool(chromium_path and path_exists(chromium_path))
+    _append_host_check(
+        checks,
+        "playwright_chromium",
+        passed,
+        (
+            "Playwright Chromium is installed"
+            if passed
+            else "Playwright Chromium is required; run pnpm --dir frontend cuda:e2e:install"
+        ),
+    )
+    return {"chromium_present": passed}
+
+
+def _run_large_v3_cuda_smoke(
+    command_runner: Callable[..., Any],
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    probe = """
+import gc
+import json
+try:
+    from faster_whisper import WhisperModel
+    model = WhisperModel('large-v3', device='cuda', compute_type='float16')
+    del model
+    gc.collect()
+    print(json.dumps({'ok': True}))
+except BaseException as exc:
+    print(json.dumps({'ok': False, 'error_type': type(exc).__name__, 'message': str(exc)}))
+    raise SystemExit(1)
+""".strip()
+    try:
+        result = _run_host_command(
+            command_runner,
+            [sys.executable, "-c", probe],
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "attempted": True,
+            "passed": False,
+            "status": "failed",
+            "error_type": "TimeoutExpired",
+            "message": _sanitize_host_message(
+                f"large-v3 CUDA float16 smoke exceeded {timeout_seconds:g} seconds"
+            ),
+        }
+    except Exception as exc:
+        return {
+            "attempted": True,
+            "passed": False,
+            "status": "failed",
+            "error_type": re.sub(r"[^A-Za-z0-9_.]", "", type(exc).__name__)[:64],
+            "message": _sanitize_host_message(exc),
+        }
+    stdout = str(getattr(result, "stdout", "") or "").strip()
+    try:
+        payload = json.loads(stdout.splitlines()[-1])
+    except (IndexError, json.JSONDecodeError, TypeError):
+        payload = {}
+    if int(getattr(result, "returncode", 1)) == 0 and payload.get("ok") is True:
+        return {"attempted": True, "passed": True, "status": "passed"}
+    error_type = re.sub(r"[^A-Za-z0-9_.]", "", str(payload.get("error_type") or "ChildProcessError"))[:64]
+    raw_message = payload.get("message") or getattr(result, "stderr", "") or "large-v3 CUDA float16 smoke failed"
+    return {
+        "attempted": True,
+        "passed": False,
+        "status": "failed",
+        "error_type": error_type,
+        "message": _sanitize_host_message(raw_message),
+    }
+
+
+def inspect_cuda_host(
+    mode: str,
+    *,
+    command_runner: Callable[..., Any] = subprocess.run,
+    which: Callable[[str], str | None] = shutil.which,
+    disk_usage: Callable[[str | os.PathLike[str]], Any] = shutil.disk_usage,
+    python_version: Any = None,
+    repo_path: str | os.PathLike[str] = PROJECT_ROOT,
+    temp_path: str | os.PathLike[str] | None = None,
+    path_exists: Callable[[str | os.PathLike[str]], bool] = os.path.isfile,
+    smoke_timeout_seconds: float = ASR_SMOKE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    if mode not in HOST_LIMITS_GIB:
+        raise ValueError(f"unsupported CUDA host preflight mode: {mode}")
+    if smoke_timeout_seconds <= 0:
+        raise ValueError("smoke_timeout_seconds must be positive")
+    repo = Path(repo_path)
+    temp = Path(temp_path or tempfile.gettempdir())
+    version = python_version if python_version is not None else sys.version_info
+    checks: list[dict[str, Any]] = []
+    versions: dict[str, str | None] = {"python": _python_version_string(version)}
+
+    python_passed = int(version[0]) == 3 and int(version[1]) == 11
+    _append_host_check(
+        checks,
+        "python",
+        python_passed,
+        (
+            f"Python {versions['python']} is supported"
+            if python_passed
+            else f"Python 3.11 is required; detected {versions['python']}"
+        ),
+    )
+
+    executables: dict[str, str | None] = {}
+    required_tools = {
+        "conda": "conda is required for GPT-SoVITS on Windows",
+        "git": "git is required",
+        "node": "node is required",
+        "pnpm": "pnpm is required",
+        "nvidia-smi": "nvidia-smi is required",
+    }
+    for tool, failure_message in required_tools.items():
+        executable = which(tool)
+        executables[tool] = executable
+        passed = executable is not None
+        _append_host_check(
+            checks,
+            tool,
+            passed,
+            f"{tool} is available" if passed else failure_message,
+        )
+        versions[tool] = (
+            _tool_version(executable, tool, command_runner)
+            if executable is not None and tool != "nvidia-smi"
+            else None
+        )
+
+    disk = _inspect_host_disks(
+        mode,
+        repo_path=repo,
+        temp_path=temp,
+        disk_usage=disk_usage,
+        checks=checks,
+    )
+    gpu = _inspect_host_gpu(
+        executables["nvidia-smi"],
+        command_runner=command_runner,
+        checks=checks,
+    )
+    versions["nvidia_driver"] = ", ".join(gpu["driver_versions"]) or None
+    ctranslate2 = _inspect_ctranslate2(command_runner, checks=checks)
+    playwright = _inspect_playwright_chromium(
+        executables["node"],
+        repo_path=repo,
+        command_runner=command_runner,
+        path_exists=path_exists,
+        checks=checks,
+    )
+
+    cheap_passed = all(item["passed"] for item in checks)
+    if cheap_passed:
+        asr_smoke = _run_large_v3_cuda_smoke(
+            command_runner,
+            timeout_seconds=smoke_timeout_seconds,
+        )
+        _append_host_check(
+            checks,
+            "large_v3_cuda_smoke",
+            asr_smoke["passed"],
+            (
+                "large-v3 CUDA float16 smoke passed"
+                if asr_smoke["passed"]
+                else (
+                    "large-v3 CUDA float16 smoke failed "
+                    f"({asr_smoke['error_type']}): {asr_smoke['message']}"
+                )
+            ),
+        )
+    else:
+        asr_smoke = {"attempted": False, "passed": False, "status": "skipped"}
+
+    passed = cheap_passed and asr_smoke["passed"]
+    failed_ids = {item["id"] for item in checks if not item["passed"]}
+    if passed:
+        next_action = "Continue to input preflight and deployment."
+    else:
+        actions: list[str] = []
+        if "python" in failed_ids:
+            actions.append("Run host preflight with Python 3.11.")
+        failed_tools = [tool for tool in required_tools if tool in failed_ids]
+        if failed_tools:
+            actions.append(f"Install or repair required tools: {', '.join(failed_tools)}.")
+        if any(item.startswith("disk_") for item in failed_ids):
+            actions.append("Free the required repository or temp volume space.")
+        if "gpu_total" in failed_ids:
+            actions.append(f"Use an NVIDIA GPU with at least {MIN_GPU_TOTAL_MIB} MiB total memory.")
+        if "gpu_idle" in failed_ids:
+            actions.append(
+                "Wait for unrelated GPU work to finish, then rerun; "
+                "this preflight never stops GPU processes."
+            )
+        if "ctranslate2_cuda_float16" in failed_ids:
+            actions.append("Install a CTranslate2 build with CUDA float16 support.")
+        if "playwright_chromium" in failed_ids:
+            actions.append("Install Playwright Chromium from the frontend workspace.")
+        if "large_v3_cuda_smoke" in failed_ids:
+            actions.append("Repair the large-v3 cache, network, or CUDA runtime.")
+        actions.append("Then rerun host preflight.")
+        next_action = " ".join(actions)
+    return {
+        "schema_version": 1,
+        "stage": "host-preflight",
+        "mode": mode,
+        "passed": passed,
+        "checks": checks,
+        "versions": versions,
+        "disk": disk,
+        "gpu": gpu,
+        "ctranslate2": ctranslate2,
+        "playwright": playwright,
+        "asr_smoke": asr_smoke,
+        "next_action": next_action,
+    }
 
 
 def _resolve_project_path(root: Path, raw: str) -> Path:
@@ -1490,6 +2096,7 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
     start.add_argument("--topology", default=None, help="Optional deployment topology JSON")
     start.add_argument("--node", default=None, help="Worker node name from --topology")
+    start.add_argument("--pid-manifest", default=None, help="Run-local owned process manifest inside the project root")
 
     install_scripts = sub.add_parser(
         "install-update-scripts",
@@ -1514,6 +2121,21 @@ def main(argv: list[str] | None = None) -> int:
     validate_paths.add_argument("--service-ids", default=None)
     validate_paths.add_argument("--require-exists", action="store_true")
     validate_paths.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+
+    host_preflight = sub.add_parser(
+        "preflight-cuda-host",
+        help="Validate the Windows CUDA host before deployment or repository cleanup",
+    )
+    host_preflight.add_argument(
+        "--mode",
+        choices=tuple(HOST_LIMITS_GIB),
+        required=True,
+    )
+    host_preflight.add_argument(
+        "--output",
+        required=True,
+        help="environment-preflight.json output path",
+    )
 
     update = sub.add_parser("update", help="Fast-forward the app and service repositories")
     update.add_argument("--dry-run", action="store_true")
@@ -1605,6 +2227,7 @@ def main(argv: list[str] | None = None) -> int:
             repositories=repositories,
             topology=args.topology,
             node=args.node,
+            pid_manifest=args.pid_manifest,
         )
     if args.command == "install-update-scripts":
         repositories = _load_cli_repositories(root, args.repo_paths)
@@ -1636,6 +2259,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(reports, ensure_ascii=False, indent=2))
         return 0 if all(item["ok"] for item in reports) else 1
+    if args.command == "preflight-cuda-host":
+        report = inspect_cuda_host(args.mode, repo_path=root)
+        output = Path(args.output)
+        if not output.is_absolute():
+            output = root / output
+        write_json(output, report)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report["passed"] else 1
     if args.command == "update":
         repositories = _load_cli_repositories(root, args.repo_paths)
         payload = update_project(

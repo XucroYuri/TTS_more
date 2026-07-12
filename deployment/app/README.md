@@ -44,4 +44,4 @@ Windows profile：
 
 首次 `single-clean` 和首次 `distributed` 用于建立基线，可省略 `-RequireBaseline`；首轮通过并批准后，所有 `single-release`、分布式回归和 release workflow 都必须要求正数 `performance_baseline.warm_p95_seconds`。
 
-字段、唯一服务归属、工件传输和正式 CUDA 验收见 [`docs/cuda-e2e-validation.md`](../../docs/cuda-e2e-validation.md)。
+本页只说明部署资料，不提供认证命令。Windows 单机正式路径见 [单机 Runbook](../../docs/cuda-e2e-single-node.md)；字段、唯一服务归属和证据语义见 [CUDA 验证契约](../../docs/cuda-e2e-validation.md)。
