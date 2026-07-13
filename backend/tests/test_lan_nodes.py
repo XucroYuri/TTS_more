@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -112,6 +113,48 @@ class FakeExecutor:
 
     def pinned_host_key_sha256(self, alias: str) -> str:
         return "b" * 64
+
+
+class FailStartOnceExecutor(FakeExecutor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    def run_powershell(
+        self, alias: str, script: str, *, timeout: int = 1800
+    ) -> SshCommandResult:
+        self.scripts.append((alias, script, timeout))
+        if "start-service-workers.ps1" in script and not self.failed:
+            self.failed = True
+            raise RuntimeError("injected ambiguous start failure")
+        return SshCommandResult("", "")
+
+
+class ReplaceStagingExecutor(FakeExecutor):
+    def __init__(self, outside: Path) -> None:
+        super().__init__()
+        self.outside = outside
+
+    def copy_from(self, alias: str, remote_path: str, destination: Path) -> None:
+        self.copies_from.append((alias, remote_path, destination))
+        assert destination.parent.name.startswith(".lan-evidence-")
+        assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+        destination.unlink()
+        destination.symlink_to(self.outside)
+        destination.write_bytes(self.evidence_bytes)
+
+
+class ReplaceDestinationParentExecutor(FakeExecutor):
+    def __init__(self, destination_parent: Path, outside: Path) -> None:
+        super().__init__()
+        self.destination_parent = destination_parent
+        self.outside = outside
+
+    def copy_from(self, alias: str, remote_path: str, destination: Path) -> None:
+        super().copy_from(alias, remote_path, destination)
+        moved = self.destination_parent.with_name(self.destination_parent.name + "-moved")
+        self.destination_parent.rename(moved)
+        self.destination_parent.symlink_to(self.outside, target_is_directory=True)
 
 
 @pytest.fixture
@@ -274,8 +317,60 @@ def test_start_uses_real_worker_cli_and_controlled_pid_manifest() -> None:
         script,
     )
     assert "-Detach" in script
-    assert "fresh manifest" in script.casefold()
+    assert "Reconcile-ExactServiceProcessSet" in script
     assert "Generated validation service PID manifest is invalid" in script
+
+
+def test_start_rollback_uses_only_strict_snapshot_and_owned_handles() -> None:
+    executor = FakeExecutor()
+    manager = WindowsLanNodeManager(executor, salt=b"salt")
+
+    manager.start("gpt-worker", r"C:\TTS\TTS_more")
+
+    script = executor.scripts[-1][1]
+    assert "cleanup-cuda-validation-processes.ps1" not in script
+    assert "Stop-Process" not in script
+    assert "Invoke-OwnedServiceRollback" in script
+    assert "$validatedSnapshot" in script
+    assert "Test-ExactCommandToken" in script
+    assert "Test-ExactPortTokens" in script
+    assert "Get-NetTCPConnection" in script
+    assert script.count("Get-CimInstance Win32_Process") >= 2
+    assert ".Handle" in script
+    assert ".Kill()" in script
+    assert "rollback termination failed; ownership manifest retained" in script
+    snapshot_assignment = script.index("$validatedSnapshot =")
+    assert snapshot_assignment < script.index(
+        "Invoke-OwnedServiceRollback", snapshot_assignment
+    )
+
+
+def test_start_failure_retains_pending_manifest_and_retry_reuses_exact_path() -> None:
+    executor = FailStartOnceExecutor()
+    manager = WindowsLanNodeManager(executor, salt=b"salt")
+
+    with pytest.raises(RuntimeError, match="ambiguous start failure"):
+        manager.start("gpt-worker", r"C:\TTS\TTS_more")
+
+    assert "gpt-worker" in manager._pending_service_starts
+    first_script = executor.scripts[-1][1]
+    first_manifest = re.search(
+        r"-PidManifest '([^']+service-processes-[0-9a-f]{16}\.json)'",
+        first_script,
+    )
+    assert first_manifest is not None
+
+    manager.start("gpt-worker", r"C:\TTS\TTS_more")
+
+    second_script = executor.scripts[-1][1]
+    second_manifest = re.search(
+        r"-PidManifest '([^']+service-processes-[0-9a-f]{16}\.json)'",
+        second_script,
+    )
+    assert second_manifest is not None
+    assert second_manifest.group(1) == first_manifest.group(1)
+    assert "Reconcile-ExactServiceProcessSet" in second_script
+    assert "gpt-worker" not in manager._pending_service_starts
 
 
 def test_gpu_monitor_manifest_records_process_identity_and_stop_verifies_it() -> None:
@@ -395,6 +490,24 @@ def test_monitor_is_bounded_failure_atomic_and_retry_reconciled() -> None:
     assert "Move-Item" in launch
 
 
+def test_monitor_launch_rollback_failure_retains_reconcilable_ownership() -> None:
+    executor = FakeExecutor()
+    manager = WindowsLanNodeManager(executor, salt=b"salt")
+
+    manager.start_gpu_monitor("gpt-worker", r"C:\TTS\TTS_more", "run-20260713")
+
+    script = executor.scripts[-1][1]
+    catch_block = script[script.index("$launchFailure = $_") - 20 :]
+    assert "WaitForExit(10000)" in catch_block
+    assert "monitor rollback termination failed; ownership artifacts retained" in catch_block
+    assert "Publish-MonitorOwnership" in catch_block
+    assert "$rollbackConfirmed" in catch_block
+    assert "catch { }" not in catch_block
+    removal = catch_block.index("Remove-Item")
+    assert catch_block.index("$rollbackConfirmed") < removal
+    assert "retry reconciliation confirmed exited process" in script
+
+
 def test_monitor_stop_uses_exact_identity_and_second_snapshot_immediately_before_kill() -> None:
     executor = FakeExecutor()
     manager = WindowsLanNodeManager(executor, salt=b"salt")
@@ -422,7 +535,7 @@ def test_manifest_validators_use_bounded_single_snapshots_and_exact_numeric_type
     assert "type(payload[\"schema_version\"]) is not int" in start_script
     assert "read(MAX_BYTES + 1)" in start_script
     assert "sha256" in start_script
-    assert "fresh manifest" in start_script.casefold()
+    assert "Reconcile-ExactServiceProcessSet" in start_script
 
     manager.stop_gpu_monitor("gpt-worker", r"C:\TTS\TTS_more", "run-20260713")
     monitor_stop = executor.scripts[-1][1]
@@ -678,3 +791,74 @@ def test_collect_evidence_rejects_digest_mismatch_without_publishing(tmp_path: P
     destination = output / "worker-logs" / "gpt-worker"
     assert not (destination / "nvidia-smi.csv").exists()
     assert not list(destination.glob("*.tmp"))
+
+
+def test_collect_evidence_detects_same_principal_staging_replacement(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "run-20260713"
+    output.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"before")
+    executor = ReplaceStagingExecutor(outside)
+
+    with pytest.raises(ValueError, match="temporary|staging"):
+        WindowsLanNodeManager(executor, salt=b"salt").collect_evidence(
+            "gpt-worker",
+            r"C:\TTS\TTS_more",
+            output,
+            ("local-gpt-sovits-main",),
+        )
+
+    assert not (output / "worker-logs" / "gpt-worker" / "nvidia-smi.csv").exists()
+    assert not list(output.glob(".lan-evidence-*"))
+    assert outside.read_bytes() == b"evidence"
+
+
+def test_collect_evidence_rejects_destination_parent_replacement_before_publish(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "run-20260713"
+    output.mkdir()
+    destination_parent = output / "worker-logs" / "gpt-worker"
+    destination_parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    executor = ReplaceDestinationParentExecutor(destination_parent, outside)
+
+    with pytest.raises(ValueError, match="symlink|directory|containment|publication"):
+        WindowsLanNodeManager(executor, salt=b"salt").collect_evidence(
+            "gpt-worker",
+            r"C:\TTS\TTS_more",
+            output,
+            ("local-gpt-sovits-main",),
+        )
+
+    assert not list(outside.iterdir())
+    assert not list(output.glob(".lan-evidence-*"))
+
+
+def test_remote_evidence_snapshot_checks_and_reads_the_same_open_handle(
+    tmp_path: Path,
+) -> None:
+    executor = FakeExecutor()
+    output = tmp_path / "run-20260713"
+    output.mkdir()
+
+    WindowsLanNodeManager(executor, salt=b"salt").collect_evidence(
+        "gpt-worker",
+        r"C:\TTS\TTS_more",
+        output,
+        ("local-gpt-sovits-main",),
+    )
+
+    snapshot_scripts = [
+        script
+        for _, script, _ in executor.scripts
+        if "TTS_MORE_EVIDENCE_SNAPSHOT" in script
+    ]
+    assert snapshot_scripts
+    assert all("SafeFileHandle" in script for script in snapshot_scripts)
+    assert all("GetFinalPathNameByHandle" in script for script in snapshot_scripts)
+    assert all("FileAttributeTagInfo" in script for script in snapshot_scripts)
+    assert all("$input.Read" in script for script in snapshot_scripts)

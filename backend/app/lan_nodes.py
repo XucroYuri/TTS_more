@@ -5,8 +5,8 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -260,6 +260,7 @@ class WindowsLanNodeManager:
         self._service_manifests: dict[str, list[PureWindowsPath]] = {}
         self._service_roots: dict[str, PureWindowsPath] = {}
         self._start_generations: dict[str, int] = {}
+        self._pending_service_starts: dict[str, PureWindowsPath] = {}
 
     def inspect(self, node: str, remote_root: str, expected_commit: str) -> NodeProbe:
         node = _validate_node(node)
@@ -429,13 +430,12 @@ if ($LASTEXITCODE -ne 0) {{ throw 'Remote deployment failed' }}
             + b"\0"
             + str(generation).encode("ascii")
         ).hexdigest()[:16]
-        pid_manifest = (
+        pid_manifest = self._pending_service_starts.get(node) or (
             root
             / "data/validation/lan-controller"
             / f"service-processes-{manifest_token}.json"
         )
         start_script = root / "scripts/start-service-workers.ps1"
-        cleanup_script = root / "scripts/cleanup-cuda-validation-processes.ps1"
         remote_python = root / ".venv/Scripts/python.exe"
         manifest_validator = r"""
 import hashlib, json, os, pathlib, stat, sys
@@ -489,43 +489,182 @@ for process in payload["processes"]:
     if type(process["executable_path"]) is not str:
         raise ValueError("invalid executable path")
     pathlib.Path(process["executable_path"]).resolve().relative_to(root)
-print(json.dumps({"snapshot_sha256": hashlib.sha256(raw).hexdigest()}, separators=(",", ":")))
+if len(sys.argv) == 5:
+    topology_path = pathlib.Path(sys.argv[3])
+    topology_raw = topology_path.read_bytes()
+    if len(topology_raw) < 1 or len(topology_raw) > MAX_BYTES:
+        raise ValueError("invalid topology size")
+    topology = json.loads(topology_raw.decode("utf-8"), object_pairs_hook=pairs)
+    if not isinstance(topology, dict) or set(topology) != {"schema_version", "name", "app_node", "nodes"}:
+        raise ValueError("invalid topology")
+    nodes = topology["nodes"]
+    if not isinstance(nodes, dict) or sys.argv[4] not in nodes:
+        raise ValueError("invalid topology node")
+    selected = nodes[sys.argv[4]]
+    if not isinstance(selected, dict) or selected.get("role") != "worker":
+        raise ValueError("invalid topology worker")
+    expected_services = selected.get("services")
+    if not isinstance(expected_services, list) or any(type(item) is not str for item in expected_services):
+        raise ValueError("invalid topology services")
+    if set(expected_services) != seen or len(expected_services) != len(seen):
+        raise ValueError("manifest service identities do not match topology")
+result = {
+    "snapshot_sha256": hashlib.sha256(raw).hexdigest(),
+    "processes": payload["processes"],
+}
+print(json.dumps(result, separators=(",", ":")))
 """.strip()
         script = f"""
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force -Path {_powershell_literal(str(pid_manifest.parent))} | Out-Null
-if (Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))}) {{
-  throw 'Remote start requires a fresh manifest path'
-}}
 $python = if (Test-Path -LiteralPath {_powershell_literal(str(remote_python))} -PathType Leaf) {{
   {_powershell_literal(str(remote_python))}
 }} else {{ 'python' }}
 $manifestValidator = @'
 {manifest_validator}
 '@
+function Test-ExactCommandToken {{
+  param([string]$CommandLine, [string]$Token)
+  if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Token)) {{ return $false }}
+  $escaped = [regex]::Escape($Token)
+  return [regex]::IsMatch($CommandLine, '(?:^|\\s)(?:"' + $escaped + '"|' + $escaped + ')(?=\\s|$)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}}
+function Test-ExactPortTokens {{
+  param([string]$CommandLine, [int]$Port)
+  if ([string]::IsNullOrWhiteSpace($CommandLine)) {{ return $false }}
+  $escapedPort = [regex]::Escape([string]$Port)
+  $pattern = '(?:^|\\s)(?:"--port"|--port)\\s+(?:"' + $escapedPort + '"|' + $escapedPort + ')(?=\\s|$)'
+  return [regex]::IsMatch($CommandLine, $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}}
+function Get-ServicePort {{
+  param([string]$ServiceId)
+  return @{{
+    'local-gpt-sovits-main' = 9880
+    'local-indextts' = 9881
+    'local-cosyvoice' = 9882
+  }}[$ServiceId]
+}}
+function Test-OwnedServiceSnapshot {{
+  param($Entry, $Snapshot, [int]$Port)
+  if ($null -eq $Snapshot) {{ return $false }}
+  $actualExecutable = ''
+  try {{ $actualExecutable = [IO.Path]::GetFullPath([string]$Snapshot.ExecutablePath) }} catch {{ return $false }}
+  return (
+    ([string]$Snapshot.CreationDate).Equals([string]$Entry.creation_date, [StringComparison]::Ordinal) -and
+    $actualExecutable.Equals([IO.Path]::GetFullPath([string]$Entry.executable_path), [StringComparison]::OrdinalIgnoreCase) -and
+    ([IO.Path]::GetFullPath([string]$Entry.project_root)).Equals({_powershell_literal(str(root))}, [StringComparison]::OrdinalIgnoreCase) -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) ([string]$Entry.worker_module)) -and
+    (Test-ExactPortTokens ([string]$Snapshot.CommandLine) $Port)
+  )
+}}
+function Test-OwnedServiceListener {{
+  param($Entry, [int]$Port)
+  $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+  $owners = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
+  return $owners.Count -eq 1 -and [int]$owners[0] -eq [int]$Entry.pid
+}}
+function Get-StrictServiceSnapshot {{
+  $raw = @(& $python -c $manifestValidator {_powershell_literal(str(root))} {_powershell_literal(str(pid_manifest))} {_powershell_literal(str(topology))} {_powershell_literal(node)}) -join "`n"
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($raw)) {{
+    throw 'strict service manifest rejected; ownership manifest retained'
+  }}
+  try {{ return $raw | ConvertFrom-Json }} catch {{
+    throw 'strict service manifest rejected; ownership manifest retained'
+  }}
+}}
+function Get-ReconciledServiceProcessSet {{
+  param($Snapshot)
+  $live = 0
+  $missing = 0
+  foreach ($entry in @($Snapshot.processes)) {{
+    $port = Get-ServicePort ([string]$entry.service_id)
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$entry.pid)" -ErrorAction SilentlyContinue
+    if ($null -eq $process) {{ $missing++; continue }}
+    if (-not (Test-OwnedServiceSnapshot $entry $process $port) -or
+        -not (Test-OwnedServiceListener $entry $port)) {{
+      throw 'service retry reconciliation found ownership mismatch'
+    }}
+    $live++
+  }}
+  return [pscustomobject]@{{ Live = $live; Missing = $missing; Total = @($Snapshot.processes).Count }}
+}}
+function Invoke-OwnedServiceRollback {{
+  param($Snapshot)
+  foreach ($entry in @($Snapshot.processes)) {{
+    $processId = [int]$entry.pid
+    $port = Get-ServicePort ([string]$entry.service_id)
+    $first = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+    if ($null -eq $first) {{ continue }}
+    if (-not (Test-OwnedServiceSnapshot $entry $first $port) -or
+        -not (Test-OwnedServiceListener $entry $port)) {{
+      throw 'rollback termination failed; ownership manifest retained'
+    }}
+    $ownedProcess = Get-Process -Id $processId -ErrorAction Stop
+    $null = $ownedProcess.Handle
+    $second = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+    if (-not (Test-OwnedServiceSnapshot $entry $second $port) -or
+        -not (Test-OwnedServiceListener $entry $port)) {{
+      throw 'rollback termination failed; ownership manifest retained'
+    }}
+    try {{
+      $ownedProcess.Kill()
+      if (-not $ownedProcess.WaitForExit(10000)) {{
+        throw 'rollback process did not exit'
+      }}
+    }} catch {{ throw 'rollback termination failed; ownership manifest retained' }}
+  }}
+}}
+$validatedSnapshot = $null
+if (Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Leaf) {{
+  $validatedSnapshot = Get-StrictServiceSnapshot
+  $state = Get-ReconciledServiceProcessSet $validatedSnapshot
+  if ($state.Live -eq $state.Total) {{
+    Write-Output 'Reconcile-ExactServiceProcessSet: existing process set is owned and live'
+    return
+  }}
+  try {{
+    Invoke-OwnedServiceRollback $validatedSnapshot
+  }} catch {{
+    throw 'rollback termination failed; ownership manifest retained'
+  }}
+  Remove-Item -LiteralPath {_powershell_literal(str(pid_manifest))} -Force
+  $validatedSnapshot = $null
+}}
+$startFailure = $null
 try {{
   & {_powershell_literal(str(start_script))} -Topology {_powershell_literal(str(topology))} -Node {_powershell_literal(node)} -RepoPaths {_powershell_literal(str(repo_paths))} -PidManifest {_powershell_literal(str(pid_manifest))} -Detach
   if ($LASTEXITCODE -ne 0) {{ throw 'Remote start failed' }}
-  if (!(Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Leaf)) {{
-    throw 'Remote start did not create the owned PID manifest'
+}} catch {{ $startFailure = $_ }}
+if (!(Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Leaf)) {{
+  if ($null -ne $startFailure) {{ throw $startFailure }}
+  throw 'Remote start did not create the owned PID manifest'
+}}
+$validatedSnapshot = Get-StrictServiceSnapshot
+if ($null -ne $startFailure) {{
+  try {{
+    Invoke-OwnedServiceRollback $validatedSnapshot
+  }} catch {{
+    throw 'rollback termination failed; ownership manifest retained'
   }}
-  $validated = @(& $python -c $manifestValidator {_powershell_literal(str(root))} {_powershell_literal(str(pid_manifest))}) -join "`n"
-  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($validated)) {{
-    throw 'Generated validation service PID manifest is invalid'
-  }}
-}} catch {{
-  $startFailure = $_
-  if (Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Leaf) {{
-    try {{
-      & {_powershell_literal(str(cleanup_script))} -Manifest {_powershell_literal(str(pid_manifest))} -Required
-    }} catch {{ }}
-  }}
+  Remove-Item -LiteralPath {_powershell_literal(str(pid_manifest))} -Force
   throw $startFailure
 }}
+$startedState = Get-ReconciledServiceProcessSet $validatedSnapshot
+if ($startedState.Live -ne $startedState.Total) {{
+  throw 'Generated validation service PID manifest is invalid; ownership manifest retained'
+}}
 """
-        self.executor.run_powershell(node, script, timeout=1800)
+        try:
+            self.executor.run_powershell(node, script, timeout=1800)
+        except Exception:
+            self._service_roots[node] = root
+            self._pending_service_starts[node] = pid_manifest
+            raise
+        self._pending_service_starts.pop(node, None)
         self._service_roots[node] = root
-        self._service_manifests.setdefault(node, []).append(pid_manifest)
+        manifests = self._service_manifests.setdefault(node, [])
+        if pid_manifest not in manifests:
+            manifests.append(pid_manifest)
         self._start_generations[node] = generation + 1
 
     def _gpu_monitor_script(self, csv_path: PureWindowsPath) -> str:
@@ -670,10 +809,24 @@ function Test-MonitorIdentity {{
     (Test-ExactCommandToken ([string]$Snapshot.CommandLine) {_powershell_literal(encoded)})
   )
 }}
+function Publish-MonitorOwnership {{
+  param($Ownership)
+  if ($null -eq $Ownership) {{
+    throw 'monitor rollback termination failed; ownership artifacts retained'
+  }}
+  if (Test-Path -LiteralPath {_powershell_literal(str(manifest_path))} -PathType Leaf) {{ return }}
+  Remove-Item -LiteralPath {_powershell_literal(str(manifest_temp))} -Force -ErrorAction SilentlyContinue
+  $json = $Ownership | ConvertTo-Json
+  $stream = [IO.FileStream]::new({_powershell_literal(str(manifest_temp))}, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  try {{
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  }} finally {{ $stream.Dispose() }}
+  Move-Item -LiteralPath {_powershell_literal(str(manifest_temp))} -Destination {_powershell_literal(str(manifest_path))}
+}}
 if (Test-Path -LiteralPath {_powershell_literal(str(manifest_path))} -PathType Leaf) {{
-  if (!(Test-Path -LiteralPath {_powershell_literal(str(csv_path))} -PathType Leaf) -or
-      !(Test-Path -LiteralPath {_powershell_literal(str(stderr_path))} -PathType Leaf) -or
-      (Test-Path -LiteralPath {_powershell_literal(str(manifest_temp))})) {{
+  if (Test-Path -LiteralPath {_powershell_literal(str(manifest_temp))}) {{
     throw 'GPU monitor retry reconciliation found ambiguous artifacts'
   }}
   $validated = @(& $python -c $manifestValidator {_powershell_literal(str(manifest_path))} {_powershell_literal(command_sha256)} {_powershell_literal(str(root))}) -join "`n"
@@ -686,8 +839,17 @@ if (Test-Path -LiteralPath {_powershell_literal(str(manifest_path))} -PathType L
     throw 'GPU monitor retry reconciliation failed'
   }}
   $snapshot = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$reconciled.pid)" -ErrorAction SilentlyContinue
-  if (-not (Test-MonitorIdentity $snapshot $reconciled)) {{ throw 'GPU monitor retry reconciliation failed' }}
-  return
+  if ($null -eq $snapshot) {{
+    foreach ($artifact in @(
+      {_powershell_literal(str(manifest_path))},
+      {_powershell_literal(str(csv_path))},
+      {_powershell_literal(str(stderr_path))}
+    )) {{ Remove-Item -LiteralPath $artifact -Force -ErrorAction SilentlyContinue }}
+    Write-Output 'retry reconciliation confirmed exited process'
+  }} else {{
+    if (-not (Test-MonitorIdentity $snapshot $reconciled)) {{ throw 'GPU monitor retry reconciliation failed' }}
+    return
+  }}
 }}
 foreach ($artifact in @(
   {_powershell_literal(str(csv_path))},
@@ -698,6 +860,7 @@ foreach ($artifact in @(
 }}
 $process = $null
 $published = $false
+$manifest = $null
 try {{
   $process = Start-Process -FilePath $canonicalExecutable -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',{_powershell_literal(encoded)}) -RedirectStandardError {_powershell_literal(str(stderr_path))} -PassThru
   $null = $process.Handle
@@ -706,11 +869,7 @@ try {{
     $identity = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue
     if ($null -eq $identity) {{ Start-Sleep -Milliseconds 50 }}
   }}
-  $expected = [pscustomobject]@{{
-    creation_date = [string]$identity.CreationDate
-    executable_path = $canonicalExecutable
-  }}
-  if (-not (Test-MonitorIdentity $identity $expected)) {{ throw 'GPU monitor process identity is unavailable' }}
+  if ($null -eq $identity) {{ throw 'GPU monitor process identity is unavailable' }}
   $manifest = [ordered]@{{
     schema_version = 1
     pid = [int]$process.Id
@@ -719,6 +878,11 @@ try {{
     project_root = {_powershell_literal(str(root))}
     command_sha256 = {_powershell_literal(command_sha256)}
   }}
+  $expected = [pscustomobject]@{{
+    creation_date = [string]$identity.CreationDate
+    executable_path = $canonicalExecutable
+  }}
+  if (-not (Test-MonitorIdentity $identity $expected)) {{ throw 'GPU monitor process identity is unavailable' }}
   $json = $manifest | ConvertTo-Json
   $manifestStream = [IO.FileStream]::new({_powershell_literal(str(manifest_temp))}, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
   try {{
@@ -729,8 +893,38 @@ try {{
   Move-Item -LiteralPath {_powershell_literal(str(manifest_temp))} -Destination {_powershell_literal(str(manifest_path))}
   $published = $true
 }} catch {{
+  $launchFailure = $_
+  $rollbackConfirmed = $null -eq $process
   if ($null -ne $process) {{
-    try {{ $process.Kill(); $process.WaitForExit(10000) | Out-Null }} catch {{ }}
+    try {{
+      $process.Kill()
+      $rollbackConfirmed = $process.WaitForExit(10000)
+    }} catch {{
+      try {{ $rollbackConfirmed = $process.HasExited }} catch {{ $rollbackConfirmed = $false }}
+    }}
+  }}
+  if (-not $rollbackConfirmed) {{
+    if ($null -eq $manifest -and $null -ne $process) {{
+      $recovery = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue
+      if ($null -ne $recovery) {{
+        $recoveryExpected = [pscustomobject]@{{
+          creation_date = [string]$recovery.CreationDate
+          executable_path = $canonicalExecutable
+        }}
+        if (Test-MonitorIdentity $recovery $recoveryExpected) {{
+          $manifest = [ordered]@{{
+            schema_version = 1
+            pid = [int]$process.Id
+            creation_date = [string]$recovery.CreationDate
+            executable_path = $canonicalExecutable
+            project_root = {_powershell_literal(str(root))}
+            command_sha256 = {_powershell_literal(command_sha256)}
+          }}
+        }}
+      }}
+    }}
+    Publish-MonitorOwnership $manifest
+    throw 'monitor rollback termination failed; ownership artifacts retained'
   }}
   foreach ($artifact in @(
     {_powershell_literal(str(manifest_temp))},
@@ -738,7 +932,7 @@ try {{
     {_powershell_literal(str(csv_path))},
     {_powershell_literal(str(stderr_path))}
   )) {{ Remove-Item -LiteralPath $artifact -Force -ErrorAction SilentlyContinue }}
-  throw
+  throw $launchFailure
 }}
 """
         self.executor.run_powershell(node, script)
@@ -1034,10 +1228,54 @@ if ($sourceItem.PSIsContainer -or
 New-Item -ItemType Directory -Force -Path {_powershell_literal(str(snapshot.parent))} | Out-Null
 Assert-ContainedNoReparsePath $source
 Assert-ContainedNoReparsePath $snapshot
+if ($null -eq ('LanEvidenceNative' -as [type])) {{
+  Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class LanEvidenceNative {{
+  [StructLayout(LayoutKind.Sequential)]
+  public struct FILE_ATTRIBUTE_TAG_INFO {{
+    public UInt32 FileAttributes;
+    public UInt32 ReparseTag;
+  }}
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  private static extern UInt32 GetFinalPathNameByHandle(
+    SafeFileHandle handle, StringBuilder path, UInt32 length, UInt32 flags);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  private static extern bool GetFileInformationByHandleEx(
+    SafeFileHandle handle, int FileAttributeTagInfo,
+    out FILE_ATTRIBUTE_TAG_INFO info, UInt32 size);
+  public static string FinalPath(SafeFileHandle handle) {{
+    StringBuilder path = new StringBuilder(32768);
+    UInt32 length = GetFinalPathNameByHandle(handle, path, (UInt32)path.Capacity, 0);
+    if (length == 0 || length >= path.Capacity) throw new Win32Exception();
+    return path.ToString();
+  }}
+  public static UInt32 Attributes(SafeFileHandle handle) {{
+    FILE_ATTRIBUTE_TAG_INFO info;
+    if (!GetFileInformationByHandleEx(
+      handle, 9, out info, (UInt32)Marshal.SizeOf(typeof(FILE_ATTRIBUTE_TAG_INFO)))) {{
+      throw new Win32Exception();
+    }}
+    return info.FileAttributes;
+  }}
+}}
+'@
+}}
 $input = $null
 $output = $null
 try {{
   $input = [IO.FileStream]::new($source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+  $openedPath = [LanEvidenceNative]::FinalPath($input.SafeFileHandle)
+  if ($openedPath.StartsWith('\\\\?\\')) {{ $openedPath = $openedPath.Substring(4) }}
+  $openedPath = [IO.Path]::GetFullPath($openedPath)
+  if (-not $openedPath.Equals([IO.Path]::GetFullPath($source), [StringComparison]::OrdinalIgnoreCase) -or
+      (([LanEvidenceNative]::Attributes($input.SafeFileHandle) -band [uint32][IO.FileAttributes]::ReparsePoint) -ne 0)) {{
+    throw 'Remote evidence opened handle identity changed'
+  }}
   if ($input.Length -gt $maxBytes) {{ throw 'Remote evidence source exceeds the byte limit' }}
   $output = [IO.FileStream]::new($snapshot, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
   $buffer = [byte[]]::new(65536)
@@ -1106,79 +1344,145 @@ if ($snapshotItem.PSIsContainer -or
                 raise ValueError("evidence destination is unavailable") from None
             if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
                 raise ValueError("evidence destination is not a regular file")
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
-        )
-        temporary = Path(temporary_name)
-        os.close(descriptor)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor = -1
+        staging_descriptor = -1
+        destination_descriptor = -1
+        staging_name = f".lan-evidence-{secrets.token_hex(16)}"
+        temporary_name = "payload.tmp"
         try:
-            self.executor.copy_from(node, remote_snapshot.as_posix(), temporary)
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            root_descriptor = os.open(evidence_root, directory_flags)
+            root_metadata = os.fstat(root_descriptor)
+            if not stat.S_ISDIR(root_metadata.st_mode):
+                raise ValueError("evidence root identity is invalid")
+            os.mkdir(staging_name, mode=0o700, dir_fd=root_descriptor)
+            staging_descriptor = os.open(
+                staging_name, directory_flags, dir_fd=root_descriptor
+            )
+            staging_metadata = os.fstat(staging_descriptor)
+            if (
+                not stat.S_ISDIR(staging_metadata.st_mode)
+                or stat.S_IMODE(staging_metadata.st_mode) != 0o700
+                or (
+                    hasattr(os, "getuid")
+                    and staging_metadata.st_uid != os.getuid()
+                )
+            ):
+                raise ValueError("private evidence staging identity is invalid")
+            create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            create_flags |= getattr(os, "O_NOFOLLOW", 0)
+            temporary_descriptor = os.open(
+                temporary_name,
+                create_flags,
+                0o600,
+                dir_fd=staging_descriptor,
+            )
+            initial_temp = os.fstat(temporary_descriptor)
+            os.close(temporary_descriptor)
+            staging_path = evidence_root / staging_name / temporary_name
+            self.executor.copy_from(node, remote_snapshot.as_posix(), staging_path)
+            read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             try:
-                descriptor = os.open(temporary, flags)
+                descriptor = os.open(
+                    temporary_name, read_flags, dir_fd=staging_descriptor
+                )
                 with os.fdopen(descriptor, "rb") as stream:
                     metadata = os.fstat(stream.fileno())
-                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                        raise ValueError("local evidence temporary is not a regular file")
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_nlink != 1
+                        or metadata.st_dev != initial_temp.st_dev
+                        or metadata.st_ino != initial_temp.st_ino
+                    ):
+                        raise ValueError(
+                            "private evidence staging temporary was replaced"
+                        )
                     raw = stream.read(_MAX_EVIDENCE_FILE_BYTES + 1)
             except OSError:
-                raise ValueError("local evidence temporary is unavailable") from None
+                raise ValueError(
+                    "private evidence staging temporary was replaced"
+                ) from None
             if len(raw) != expected_size or len(raw) > _MAX_EVIDENCE_FILE_BYTES:
                 raise ValueError("local evidence size does not match remote snapshot")
             if hashlib.sha256(raw).hexdigest() != expected_digest:
                 raise ValueError("local evidence digest does not match remote snapshot")
-            _reject_symlink_components(destination.parent)
-            _contained_path(evidence_root, destination.parent)
-            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+            relative_parent = destination.parent.relative_to(evidence_root)
+            destination_descriptor = os.dup(root_descriptor)
+            for part in relative_parent.parts:
+                next_descriptor = os.open(
+                    part,
+                    directory_flags,
+                    dir_fd=destination_descriptor,
+                )
+                os.close(destination_descriptor)
+                destination_descriptor = next_descriptor
+            opened_directory = os.fstat(destination_descriptor)
+            if not stat.S_ISDIR(opened_directory.st_mode):
+                raise ValueError("evidence destination parent changed")
+            current_temp = os.stat(
+                temporary_name,
+                dir_fd=staging_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                current_temp.st_dev != initial_temp.st_dev
+                or current_temp.st_ino != initial_temp.st_ino
+                or not stat.S_ISREG(current_temp.st_mode)
+            ):
+                raise ValueError("private evidence staging temporary was replaced")
             try:
-                directory_descriptor = os.open(destination.parent, directory_flags)
-                try:
-                    opened_directory = os.fstat(directory_descriptor)
-                    if not stat.S_ISDIR(opened_directory.st_mode):
-                        raise ValueError("evidence destination parent changed")
-                    current_temp = os.stat(
-                        temporary.name,
-                        dir_fd=directory_descriptor,
-                        follow_symlinks=False,
-                    )
-                    if (
-                        current_temp.st_dev != metadata.st_dev
-                        or current_temp.st_ino != metadata.st_ino
-                        or not stat.S_ISREG(current_temp.st_mode)
-                    ):
-                        raise ValueError("local evidence temporary changed before publication")
-                    try:
-                        final_metadata = os.stat(
-                            destination.name,
-                            dir_fd=directory_descriptor,
-                            follow_symlinks=False,
-                        )
-                    except FileNotFoundError:
-                        pass
-                    else:
-                        if not stat.S_ISREG(final_metadata.st_mode):
-                            raise ValueError(
-                                "evidence destination changed before publication"
-                            )
-                    os.replace(
-                        temporary.name,
-                        destination.name,
-                        src_dir_fd=directory_descriptor,
-                        dst_dir_fd=directory_descriptor,
-                    )
-                finally:
-                    os.close(directory_descriptor)
-            except OSError:
-                raise ValueError("atomic evidence publication failed") from None
-            _contained_path(evidence_root, destination)
-        finally:
-            try:
-                temporary.unlink()
+                final_metadata = os.stat(
+                    destination.name,
+                    dir_fd=destination_descriptor,
+                    follow_symlinks=False,
+                )
             except FileNotFoundError:
                 pass
-            except OSError:
-                raise ValueError("local evidence temporary cleanup failed") from None
+            else:
+                if not stat.S_ISREG(final_metadata.st_mode):
+                    raise ValueError("evidence destination changed before publication")
+            os.replace(
+                temporary_name,
+                destination.name,
+                src_dir_fd=staging_descriptor,
+                dst_dir_fd=destination_descriptor,
+            )
+            current_root = os.stat(evidence_root, follow_symlinks=False)
+            if (
+                current_root.st_dev != root_metadata.st_dev
+                or current_root.st_ino != root_metadata.st_ino
+                or not stat.S_ISDIR(current_root.st_mode)
+            ):
+                raise ValueError("evidence root changed during publication")
+            _contained_path(evidence_root, destination)
+        except OSError:
+            raise ValueError("atomic evidence publication failed") from None
+        finally:
+            if destination_descriptor >= 0:
+                os.close(destination_descriptor)
+            if staging_descriptor >= 0:
+                try:
+                    os.unlink(
+                        temporary_name,
+                        dir_fd=staging_descriptor,
+                    )
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+                os.close(staging_descriptor)
+            if root_descriptor >= 0:
+                try:
+                    os.rmdir(staging_name, dir_fd=root_descriptor)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    raise ValueError(
+                        "private evidence staging cleanup failed"
+                    ) from None
+                finally:
+                    os.close(root_descriptor)
 
     def collect_evidence(
         self,

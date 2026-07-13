@@ -110,3 +110,64 @@ Review-focused verification:
   available. Generated PowerShell ordering and predicates are covered by tests, including
   the second-snapshot-before-handle-kill requirement, but execution against real CIM,
   reparse points, and NVIDIA output remains part of LAN end-to-end validation.
+
+## Re-review Remediation: High 1 / Medium 2 / Medium 1 Narrowing
+
+### RED
+
+The re-review tests initially reported `6 failed, 48 passed`:
+
+- service-start rollback still referenced the legacy bare-PID cleanup script;
+- failed starts did not retain manager pending state or reuse the same manifest on retry;
+- monitor launch rollback swallowed `Kill` / `WaitForExit` failures;
+- SCP staging was not private and destination-parent replacement was not fd-anchored;
+- the remote snapshot checked a pathname and then reopened it without final-handle proof.
+
+### High 1 And Medium 2 Closure
+
+- `start()` no longer references `cleanup-cuda-validation-processes.ps1` or emits
+  `Stop-Process`. The strict bounded validator returns the exact process byte snapshot,
+  including a digest and the complete topology-matched formal service set.
+- Rollback consumes only that snapshot. Each live entry must match PID, creation time,
+  canonical executable below the project root, exact worker-module token, adjacent exact
+  `--port <port>` tokens, and the formal listener owner. It then opens a `Process` handle,
+  performs a second CIM/listener snapshot, and immediately calls `.Kill()` on the retained
+  handle. Entries are never validated as a batch and later killed by bare PID.
+- A rejected manifest is never passed to a weaker consumer. It is retained and reported
+  as a strict rejection.
+- Rollback termination failure retains the ownership manifest, stores the same path in
+  manager pending state, and reports an explicit rollback error. Retry reuses that path:
+  an exact fully live process set is reconciled as success; a partial exact set is rolled
+  back handle-by-handle before a fresh start; any ownership mismatch remains fail-closed.
+- Monitor launch rollback now tests both `.Kill()` and `WaitForExit(10000)`. Confirmed
+  termination is required before artifacts are removed. Failure republishes or retains
+  the exact ownership manifest and all artifacts. Retry reconciles an exact live monitor,
+  or cleans a strictly identified manifest whose process is confirmed absent.
+
+### Medium 1 Narrowing And Residual
+
+- SCP downloads now target a controller-created random private directory with mode 0700
+  and a pre-created 0600 file. The retained staging directory fd and original file inode
+  must still match after SCP; replacements are rejected before evidence publication.
+- Destination publication starts from a retained evidence-root fd, opens every parent
+  component relative to the previous fd with `O_DIRECTORY | O_NOFOLLOW`, and uses
+  dirfd-relative `os.replace`. Root identity is rechecked after publication.
+- Remote evidence opens the source once, obtains final path and reparse attributes through
+  `SafeFileHandle` (`GetFinalPathNameByHandle` / `FileAttributeTagInfo`), and reads that same
+  handle into the bounded snapshot.
+- Cross-principal staging replacement is blocked by the random 0700 directory. A process
+  running as the same controller principal can still replace the SCP pathname after it is
+  handed to `scp`; the inode/no-follow checks detect this and prevent final publication,
+  but cannot prevent the attempted SCP write from following that same-principal link.
+  The race test intentionally demonstrates this pre-detection write. Fully closing it
+  requires changing the owned `WindowsSshExecutor.copy_from` interface to an fd/stream
+  sink or an equivalent descriptor-preserving transport, outside Task 4 ownership.
+
+### GREEN
+
+- `.venv/bin/python -m pytest backend/tests/test_lan_nodes.py backend/tests/test_windows_ssh.py -q`
+  -> `188 passed`.
+- `.venv/bin/python -m pytest backend -q`
+  -> `934 passed, 6 skipped`.
+- `.venv/bin/python -W error::DeprecationWarning -m compileall -q -f backend`
+  -> exit 0.
