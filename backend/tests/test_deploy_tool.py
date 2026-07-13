@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -249,7 +250,7 @@ def test_sync_repos_rejects_paths_outside_project(tmp_path: Path) -> None:
         deploy.sync_repos(tmp_path, dry_run=True)
 
 
-def test_sync_repos_dry_run_uses_shallow_partial_clone(tmp_path: Path) -> None:
+def test_sync_repos_dry_run_uses_shallow_full_clone(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
     _write_repo_lock(tmp_path)
@@ -259,7 +260,7 @@ def test_sync_repos_dry_run_uses_shallow_partial_clone(tmp_path: Path) -> None:
     clone = actions[0]["argv"]
     assert clone[:3] == ["git", "clone", "--depth"]
     assert "1" in clone
-    assert "--filter=blob:none" in clone
+    assert not any(argument.startswith("--filter") for argument in clone)
     assert "--single-branch" in clone
     assert "--branch" in clone
 
@@ -301,7 +302,9 @@ def test_sync_repos_refuses_dirty_existing_repo_by_default(
         )
 
 
-def test_sync_repos_retries_clone_without_partial_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sync_repos_uses_one_full_clone_before_pinned_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
     _write_repo_lock(tmp_path)
@@ -309,8 +312,6 @@ def test_sync_repos_retries_clone_without_partial_filter(tmp_path: Path, monkeyp
 
     def fake_run(command: list[str], cwd: Path) -> None:
         calls.append(command)
-        if command[:2] == ["git", "clone"] and "--filter=blob:none" in command:
-            raise deploy.subprocess.CalledProcessError(128, command)
         clone_path = Path(command[-1]) if command[:2] == ["git", "clone"] else None
         if clone_path:
             (clone_path / ".git").mkdir(parents=True)
@@ -340,11 +341,13 @@ def test_sync_repos_retries_clone_without_partial_filter(tmp_path: Path, monkeyp
 
     deploy.sync_repos(tmp_path, dry_run=False)
 
-    assert any("--filter=blob:none" in command for command in calls)
-    assert any(command[:2] == ["git", "clone"] and "--filter=blob:none" not in command for command in calls)
+    clone_calls = [command for command in calls if command[:2] == ["git", "clone"]]
+    assert len(clone_calls) == 1
+    assert not any(argument.startswith("--filter") for argument in clone_calls[0])
+    assert any(command[:4] == ["git", "-C", str(tmp_path / "repo" / "GPT-SoVITS-main"), "fetch"] for command in calls)
 
 
-def test_run_clone_with_fallback_accepts_positional_helper_interface(
+def test_run_clone_records_one_portable_full_clone_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
@@ -354,7 +357,7 @@ def test_run_clone_with_fallback_accepts_positional_helper_interface(
 
     monkeypatch.setattr(deploy, "_run_git_command", lambda command, *, cwd: None)
 
-    deploy._run_clone_with_fallback(
+    deploy._run_clone(
         tmp_path,
         "https://github.com/XucroYuri/GPT-SoVITS.git",
         "main",
@@ -371,7 +374,6 @@ def test_run_clone_with_fallback_accepts_positional_helper_interface(
             "clone",
             "--depth",
             "1",
-            "--filter=blob:none",
             "--branch",
             "main",
             "--single-branch",
@@ -1622,6 +1624,9 @@ def _set_local_git_config(path: Path, key: str, value: str) -> None:
         ("filter.attack.clean", "marker-command"),
         ("submodule.attack.url", "https://github.com/attacker/repo.git"),
         ("remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/attacker"),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.partialCloneFilter", "blob:none"),
+        ("extensions.partialClone", "origin"),
         ("unknown.setting", "value"),
     ],
 )
@@ -1713,7 +1718,7 @@ def test_windows_trusted_candidates_use_system_api_without_path_or_cwd_lookup() 
         assert 'os.environ.get("PATH")' not in content
 
 
-def test_update_sidecar_binds_validated_absolute_git_and_ssh_paths(tmp_path: Path) -> None:
+def test_update_sidecar_uses_exact_portable_https_policy_without_host_paths(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
     target = tmp_path / "repo" / "index-tts"
@@ -1724,16 +1729,19 @@ def test_update_sidecar_binds_validated_absolute_git_and_ssh_paths(tmp_path: Pat
     deploy.install_update_scripts(tmp_path, repositories=repositories)
 
     sidecar = json.loads((target / "tts-more-update.json").read_text(encoding="utf-8"))
-    assert sidecar["schema_version"] == 2
-    for key in ("git_executable", "ssh_executable"):
-        executable = Path(sidecar[key])
-        assert executable.is_absolute()
-        assert executable.is_file()
-        assert not executable.is_symlink()
-        assert not executable.resolve(strict=True).is_relative_to(tmp_path.resolve(strict=True))
+    assert sidecar == {
+        "schema_version": 3,
+        "executable_policy": "fixed-dirs-or-explicit-env-v1",
+        "requires_ssh": False,
+        "service_id": "local-indextts",
+        "name": "index-tts",
+        "remote": "https://github.com/XucroYuri/index-tts.git",
+        "branch": "main",
+        "commit": "7264ce2a9a0924becb6b8da3f60725f7663de089",
+    }
 
 
-def test_generated_updater_revalidates_bound_git_path_before_execution(tmp_path: Path) -> None:
+def test_generated_updater_rejects_tampered_portable_policy_before_git(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
     target = tmp_path / "repo" / "index-tts"
@@ -1742,17 +1750,40 @@ def test_generated_updater_revalidates_bound_git_path_before_execution(tmp_path:
     repositories[0]["path"] = "repo/index-tts"
     deploy.install_update_scripts(tmp_path, repositories=repositories)
     marker = tmp_path / "fake-git-marker"
-    fake_bin = tmp_path / "untrusted-bin"
-    fake_bin.mkdir()
-    fake_git = fake_bin / ("git.exe" if os.name == "nt" else "git")
-    if os.name == "nt":
-        fake_git.write_bytes(b"not a trusted executable\r\n")
-    else:
-        fake_git.write_text(f"#!/bin/sh\nprintf executed > {marker!s}\nexit 1\n", encoding="utf-8")
-        fake_git.chmod(0o755)
+    fake_git = target / ("git.exe" if os.name == "nt" else "git")
+    fake_git.write_text("checkout-controlled executable\n", encoding="utf-8")
     sidecar_path = target / "tts-more-update.json"
     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
-    sidecar["git_executable"] = str(fake_git)
+    sidecar["executable_policy"] = "trust-sidecar-path-v0"
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    (target / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+    env = {**os.environ, "PATH": f"{target}{os.pathsep}{os.pathsep}relative-bin"}
+
+    result = subprocess.run(
+        [sys.executable, str(target / "tts-more-update.py")],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "updater executable policy" in result.stderr
+    assert not marker.exists()
+
+
+def test_generated_updater_rejects_requires_ssh_mismatch_before_git(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+    sidecar_path = target / "tts-more-update.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["requires_ssh"] = True
     sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
     (target / "tracked.txt").write_text("dirty\n", encoding="utf-8")
 
@@ -1765,8 +1796,139 @@ def test_generated_updater_revalidates_bound_git_path_before_execution(tmp_path:
     )
 
     assert result.returncode != 0
-    assert "trusted Git executable" in result.stderr
-    assert not marker.exists()
+    assert "requires_ssh does not match remote" in result.stderr
+
+
+def test_install_https_updater_does_not_resolve_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+    monkeypatch.setattr(
+        deploy,
+        "_trusted_ssh_executable",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("HTTPS resolved SSH")),
+    )
+
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+
+    sidecar = json.loads((target / "tts-more-update.json").read_text(encoding="utf-8"))
+    assert sidecar["requires_ssh"] is False
+
+
+def test_generated_https_updater_resolves_only_current_host_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+    (target / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+    source = (target / "tts-more-update.py").read_text(encoding="utf-8")
+    namespace = {"__name__": "portable_https_test", "__file__": str(target / "tts-more-update.py")}
+    exec(compile(source, str(target / "tts-more-update.py"), "exec"), namespace)
+    calls: list[str] = []
+    trusted_git = deploy._trusted_git_executable(managed_roots=(target,))
+
+    def resolve(name: str, *, root: Path, git_executable: Path | None = None) -> str:
+        calls.append(name)
+        if name == "ssh":
+            raise AssertionError("HTTPS updater resolved SSH")
+        return trusted_git
+
+    monkeypatch.setitem(namespace, "resolve_trusted_executable", resolve)
+
+    with pytest.raises(RuntimeError, match="dirty repository"):
+        namespace["main"]([])
+
+    assert calls == ["git"]
+
+
+def test_generated_ssh_updater_requires_current_host_ssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    ssh_remote = "git@github.com:XucroYuri/index-tts.git"
+    _init_git_checkout(target, ssh_remote)
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+    repositories[0]["remote"] = ssh_remote
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+    sidecar = json.loads((target / "tts-more-update.json").read_text(encoding="utf-8"))
+    assert sidecar["requires_ssh"] is True
+    source = (target / "tts-more-update.py").read_text(encoding="utf-8")
+    namespace = {"__name__": "portable_ssh_test", "__file__": str(target / "tts-more-update.py")}
+    exec(compile(source, str(target / "tts-more-update.py"), "exec"), namespace)
+    calls: list[str] = []
+    trusted_git = deploy._trusted_git_executable(managed_roots=(target,))
+
+    def resolve(name: str, *, root: Path, git_executable: Path | None = None) -> str:
+        calls.append(name)
+        if name == "ssh":
+            raise RuntimeError("trusted SSH executable is required")
+        return trusted_git
+
+    monkeypatch.setitem(namespace, "resolve_trusted_executable", resolve)
+
+    with pytest.raises(RuntimeError, match="trusted SSH executable is required"):
+        namespace["main"]([])
+
+    assert calls == ["git", "ssh"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX destination-prefix executable fixture")
+def test_copied_updater_resolves_git_from_destination_prefix(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    source_target = tmp_path / "repo" / "source-index-tts"
+    destination = tmp_path / "repo" / "destination-index-tts"
+    remote = "https://github.com/XucroYuri/index-tts.git"
+    _init_git_checkout(source_target, remote)
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/source-index-tts"
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+    _init_git_checkout(destination, remote)
+    for name in ("tts-more-update.sh", "tts-more-update.ps1", "tts-more-update.py", "tts-more-update.json"):
+        shutil.copy2(source_target / name, destination / name)
+    tools = tmp_path / "destination-tools"
+    tools.mkdir()
+    marker = tmp_path / "destination-git-marker"
+    real_git = deploy._trusted_git_executable(managed_roots=(tmp_path,))
+    destination_git = tools / "git"
+    destination_git.write_text(
+        f"#!/bin/sh\nprintf used > {marker!s}\nexec {shlex.quote(real_git)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    destination_git.chmod(0o755)
+    (destination / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "TTS_MORE_TRUSTED_GIT": str(destination_git),
+        "PATH": f"{destination}{os.pathsep}{os.pathsep}relative-bin",
+    }
+    env.pop("TTS_MORE_TRUSTED_SSH", None)
+
+    result = subprocess.run(
+        [sys.executable, str(destination / "tts-more-update.py")],
+        cwd=destination,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "dirty repository" in result.stderr
+    assert marker.read_text(encoding="utf-8") == "used"
 
 
 def test_git_runner_removes_config_environment_injection_before_status(
@@ -1902,8 +2064,12 @@ def test_generated_updater_rejects_unknown_config_and_checkout_fake_git_before_e
 
 
 @pytest.mark.parametrize("verb", ["status", "config", "fetch", "checkout", "pull"])
+@pytest.mark.parametrize("requires_ssh", [False, True])
 def test_app_and_generated_updater_use_identical_hardened_git_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verb: str,
+    requires_ssh: bool,
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
@@ -1932,10 +2098,15 @@ def test_app_and_generated_updater_use_identical_hardened_git_policy(
         logical,
         trusted_file=generated_path,
         git_executable=git_executable,
-        ssh_executable=ssh_executable,
+        ssh_executable=ssh_executable if requires_ssh else None,
         managed_roots=(tmp_path,),
+        requires_ssh=requires_ssh,
     )
-    updater_command = namespace["harden_git_command"](logical, git_executable, ssh_executable)
+    updater_command = namespace["harden_git_command"](
+        logical,
+        git_executable,
+        ssh_executable if requires_ssh else None,
+    )
     app_environment = deploy._git_environment()
     updater_environment = namespace["git_environment"]()
 
@@ -1970,8 +2141,11 @@ def test_app_and_generated_updater_use_identical_hardened_git_policy(
     assert "protocol.https.allow=always" in app_command
     assert "protocol.ssh.allow=always" in app_command
     ssh_override = next(item for item in app_command if item.startswith("core.sshCommand="))
-    assert "ProxyCommand=none" in ssh_override
-    assert "PermitLocalCommand=no" in ssh_override
+    if requires_ssh:
+        assert "ProxyCommand=none" in ssh_override
+        assert "PermitLocalCommand=no" in ssh_override
+    else:
+        assert ssh_override == "core.sshCommand=tts-more-ssh-disabled"
     assert app_environment["GIT_ALLOW_PROTOCOL"] == "https:ssh"
 
 

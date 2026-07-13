@@ -61,6 +61,7 @@ GIT_BLOCKED_ENV_PREFIXES = ("GIT_CONFIG_",)
 TRUSTED_GIT_ENV = "TTS_MORE_TRUSTED_GIT"
 TRUSTED_SSH_ENV = "TTS_MORE_TRUSTED_SSH"
 MAX_LOCAL_GIT_CONFIG_BYTES = 1024 * 1024
+UPDATER_EXECUTABLE_POLICY = "fixed-dirs-or-explicit-env-v1"
 
 
 PROVIDER_MODULES = {
@@ -307,6 +308,11 @@ def _parse_github_remote(remote: str) -> tuple[str, str, str]:
         raise ValueError(f"unsupported GitHub remote: {remote!r}")
     owner, repository = (part.lower() for part in parts)
     return ("github.com", owner, repository)
+
+
+def _github_remote_requires_ssh(remote: str) -> bool:
+    _parse_github_remote(remote)
+    return "://" not in remote or urlparse(remote).scheme.lower() == "ssh"
 
 
 def _utc_now() -> datetime:
@@ -667,11 +673,9 @@ def render_services(
     return services
 
 
-def _clone_command(remote: str, branch: str, path: Path, *, partial: bool = True) -> list[str]:
+def _clone_command(remote: str, branch: str, path: Path) -> list[str]:
     _parse_github_remote(remote)
     command = ["git", "clone", "--depth", "1"]
-    if partial:
-        command.append("--filter=blob:none")
     command.extend(["--branch", branch, "--single-branch", "--", remote, str(path)])
     return command
 
@@ -964,6 +968,7 @@ def _harden_git_command(
     git_executable: str | None = None,
     ssh_executable: str | None = None,
     managed_roots: tuple[Path, ...] = (),
+    requires_ssh: bool = False,
 ) -> list[str]:
     if not command or Path(command[0]).name.lower() not in {"git", "git.exe"}:
         raise ValueError(f"hardened Git runner requires a git command: {command!r}")
@@ -972,22 +977,24 @@ def _harden_git_command(
         if git_executable is not None
         else _trusted_git_executable(managed_roots=managed_roots)
     )
-    trusted_ssh = (
-        _validate_trusted_executable(
-            ssh_executable,
-            name="ssh",
-            managed_roots=managed_roots,
-            git_executable=Path(trusted_git),
+    trusted_ssh = None
+    if requires_ssh or ssh_executable is not None:
+        trusted_ssh = (
+            _validate_trusted_executable(
+                ssh_executable,
+                name="ssh",
+                managed_roots=managed_roots,
+                git_executable=Path(trusted_git),
+            )
+            if ssh_executable is not None
+            else _trusted_ssh_executable(managed_roots=managed_roots, git_executable=trusted_git)
         )
-        if ssh_executable is not None
-        else _trusted_ssh_executable(managed_roots=managed_roots, git_executable=trusted_git)
-    )
     hook_sink = str((trusted_file or Path(__file__)).resolve(strict=False))
     overrides = [
         ("core.hooksPath", hook_sink),
         ("core.fsmonitor", "false"),
         ("credential.helper", ""),
-        ("core.sshCommand", _trusted_ssh_command(trusted_ssh)),
+        ("core.sshCommand", _trusted_ssh_command(trusted_ssh) if trusted_ssh else "tts-more-ssh-disabled"),
         ("protocol.allow", "never"),
         ("protocol.https.allow", "always"),
         ("protocol.ssh.allow", "always"),
@@ -1042,10 +1049,6 @@ def _validate_local_git_config_value(section: str, option: str, value: str) -> N
                 value,
             )
             valid = bool(refspec and refspec.group(1) == refspec.group(2))
-        elif normalized_option == "promisor":
-            valid = value.lower() == "true"
-        elif normalized_option == "partialclonefilter":
-            valid = value == "blob:none"
         else:
             valid = False
     else:
@@ -1065,12 +1068,16 @@ def _validate_local_git_config_value(section: str, option: str, value: str) -> N
         raise RuntimeError(f"local Git config key is not allowlisted or has an unsafe value: {display_key}")
 
 
-def _audit_local_git_config(repo_path: Path, *, environment: Mapping[str, str] | None = None) -> None:
+def _audit_local_git_config(
+    repo_path: Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     config_path = repo_path / ".git" / "config"
     if _is_link_or_reparse(config_path):
         raise RuntimeError(f"local Git config must not be a symlink or reparse point: {config_path}")
     if not config_path.exists():
-        return
+        return {}
     try:
         payload = config_path.read_bytes()
     except OSError as exc:
@@ -1094,6 +1101,7 @@ def _audit_local_git_config(repo_path: Path, *, environment: Mapping[str, str] |
     if parser.defaults():
         raise RuntimeError("local Git config key is not allowlisted: DEFAULT")
     seen: set[str] = set()
+    values: dict[str, str] = {}
     for section in parser.sections():
         for option, value in parser.items(section, raw=True):
             normalized_key = f"{section}.{option}".lower()
@@ -1101,6 +1109,33 @@ def _audit_local_git_config(repo_path: Path, *, environment: Mapping[str, str] |
                 raise RuntimeError(f"duplicate local Git config key: {section}.{option}")
             seen.add(normalized_key)
             _validate_local_git_config_value(section, option, value)
+            values[normalized_key] = value
+    return values
+
+
+def _git_command_verb(command: list[str]) -> str:
+    index = 1
+    while index < len(command):
+        if command[index] == "-C" and index + 1 < len(command):
+            index += 2
+            continue
+        return command[index].lower()
+    return ""
+
+
+def _git_command_requires_ssh(
+    command: list[str],
+    *,
+    local_config: Mapping[str, str],
+) -> bool:
+    verb = _git_command_verb(command)
+    if verb == "clone" and "--" in command:
+        separator = command.index("--")
+        return separator + 1 < len(command) and _github_remote_requires_ssh(command[separator + 1])
+    if verb in {"fetch", "pull"}:
+        remote = local_config.get('remote "origin".url')
+        return bool(remote and _github_remote_requires_ssh(remote))
+    return verb == "submodule"
 
 
 def _run_git_process(
@@ -1113,11 +1148,17 @@ def _run_git_process(
 ) -> subprocess.CompletedProcess[Any]:
     environment = _git_environment()
     repo_path = _git_command_repo_path(command, cwd)
+    local_config: dict[str, str] = {}
     if repo_path is not None:
-        _audit_local_git_config(repo_path.resolve(strict=False), environment=environment)
+        local_config = _audit_local_git_config(repo_path.resolve(strict=False), environment=environment)
     managed_roots = tuple(path for path in (cwd, repo_path) if path is not None)
+    requires_ssh = _git_command_requires_ssh(command, local_config=local_config)
     return subprocess.run(
-        _harden_git_command(command, managed_roots=managed_roots),
+        _harden_git_command(
+            command,
+            managed_roots=managed_roots,
+            requires_ssh=requires_ssh,
+        ),
         cwd=cwd,
         env=environment,
         capture_output=capture_output,
@@ -1184,7 +1225,7 @@ def _exclude_local_helper_paths(repo_path: Path, names: list[str]) -> None:
     )
 
 
-def _run_clone_with_fallback(
+def _run_clone(
     root: Path,
     remote: str,
     branch: str,
@@ -1192,20 +1233,11 @@ def _run_clone_with_fallback(
     dry_run: bool,
     actions: list[dict[str, Any]],
 ) -> None:
-    path_existed_before = path.exists()
-    primary = _clone_command(remote, branch, path, partial=True)
-    actions.append({"action": "git", "argv": primary})
+    command = _clone_command(remote, branch, path)
+    actions.append({"action": "git", "argv": command})
     if dry_run:
         return
-    try:
-        _run_git_command(primary, cwd=root)
-        return
-    except subprocess.CalledProcessError:
-        if not path_existed_before and path.exists():
-            _remove_path(path)
-    fallback = _clone_command(remote, branch, path, partial=False)
-    actions.append({"action": "git", "argv": fallback})
-    _run_git_command(fallback, cwd=root)
+    _run_git_command(command, cwd=root)
 
 
 def sync_repos(
@@ -1268,7 +1300,7 @@ def sync_repos(
         else:
             if not dry_run:
                 _safe_mkdir(path.parent, root)
-            _run_clone_with_fallback(
+            _run_clone(
                 root,
                 remote=remote,
                 branch=branch,
@@ -1390,6 +1422,7 @@ BLOCKED_GIT_ENV = {
 MAX_LOCAL_GIT_CONFIG_BYTES = 1024 * 1024
 TRUSTED_GIT_ENV = "TTS_MORE_TRUSTED_GIT"
 TRUSTED_SSH_ENV = "TTS_MORE_TRUSTED_SSH"
+UPDATER_EXECUTABLE_POLICY = "fixed-dirs-or-explicit-env-v1"
 
 
 def validate_branch(value: str) -> str:
@@ -1447,6 +1480,11 @@ def parse_github_remote(value: str) -> tuple[str, str, str]:
     ):
         raise ValueError(f"unsupported GitHub remote: {value!r}")
     return ("github.com", parts[0].lower(), parts[1].lower())
+
+
+def remote_requires_ssh(value: str) -> bool:
+    parse_github_remote(value)
+    return "://" not in value or urlparse(value).scheme.lower() == "ssh"
 
 
 def git_environment() -> dict[str, str]:
@@ -1547,6 +1585,38 @@ def validate_trusted_executable(
     return str(resolved)
 
 
+def resolve_trusted_executable(
+    name: str,
+    *,
+    root: Path,
+    git_executable: Path | None = None,
+) -> str:
+    environment_variable = TRUSTED_GIT_ENV if name == "git" else TRUSTED_SSH_ENV
+    explicit = os.environ.get(environment_variable)
+    if explicit:
+        return validate_trusted_executable(
+            explicit,
+            name=name,
+            root=root,
+            git_executable=git_executable,
+        )
+    for candidate in trusted_executable_candidates(name, git_executable=git_executable):
+        try:
+            return validate_trusted_executable(
+                str(candidate),
+                name=name,
+                root=root,
+                git_executable=git_executable,
+            )
+        except RuntimeError:
+            continue
+    label = "Git" if name == "git" else "SSH"
+    raise RuntimeError(
+        f"trusted {label} executable was not found in fixed installation directories; "
+        f"set {environment_variable} to an absolute trusted path"
+    )
+
+
 def trusted_ssh_command(executable: str) -> str:
     arguments = [
         executable,
@@ -1559,12 +1629,16 @@ def trusted_ssh_command(executable: str) -> str:
     return subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
 
 
-def harden_git_command(args: list[str], git_executable: str, ssh_executable: str) -> list[str]:
+def harden_git_command(
+    args: list[str],
+    git_executable: str,
+    ssh_executable: str | None,
+) -> list[str]:
     overrides = [
         ("core.hooksPath", str(Path(__file__).resolve(strict=False))),
         ("core.fsmonitor", "false"),
         ("credential.helper", ""),
-        ("core.sshCommand", trusted_ssh_command(ssh_executable)),
+        ("core.sshCommand", trusted_ssh_command(ssh_executable) if ssh_executable else "tts-more-ssh-disabled"),
         ("protocol.allow", "never"),
         ("protocol.https.allow", "always"),
         ("protocol.ssh.allow", "always"),
@@ -1611,10 +1685,6 @@ def validate_local_git_config_value(section: str, option: str, value: str) -> No
                 value,
             )
             valid = bool(refspec and refspec.group(1) == refspec.group(2))
-        elif normalized_option == "promisor":
-            valid = value.lower() == "true"
-        elif normalized_option == "partialclonefilter":
-            valid = value == "blob:none"
         else:
             valid = False
     else:
@@ -1683,7 +1753,7 @@ def is_link_or_reparse(path: Path) -> bool:
     return bool(is_junction and is_junction(path))
 
 
-def output(args: list[str], root: Path, git_executable: str, ssh_executable: str) -> str:
+def output(args: list[str], root: Path, git_executable: str, ssh_executable: str | None) -> str:
     audit_local_git_config(root)
     result = subprocess.run(
         harden_git_command(args, git_executable, ssh_executable),
@@ -1698,7 +1768,7 @@ def output(args: list[str], root: Path, git_executable: str, ssh_executable: str
     return result.stdout.strip()
 
 
-def run(args: list[str], root: Path, git_executable: str, ssh_executable: str) -> None:
+def run(args: list[str], root: Path, git_executable: str, ssh_executable: str | None) -> None:
     audit_local_git_config(root)
     subprocess.run(
         harden_git_command(args, git_executable, ssh_executable),
@@ -1708,7 +1778,7 @@ def run(args: list[str], root: Path, git_executable: str, ssh_executable: str) -
     )
 
 
-def validate_git_checkout(root: Path, git_executable: str, ssh_executable: str) -> None:
+def validate_git_checkout(root: Path, git_executable: str, ssh_executable: str | None) -> None:
     dot_git = root / ".git"
     if is_link_or_reparse(dot_git):
         raise ValueError(f"Git metadata must not be a symlink or reparse point: {dot_git}")
@@ -1726,32 +1796,52 @@ def validate_git_checkout(root: Path, git_executable: str, ssh_executable: str) 
 def main(argv: list[str]) -> int:
     root = Path(__file__).resolve().parent
     config = json.loads((root / "tts-more-update.json").read_text(encoding="utf-8"))
-    if not isinstance(config, dict) or config.get("schema_version") != 2:
+    expected_keys = {
+        "schema_version",
+        "executable_policy",
+        "requires_ssh",
+        "service_id",
+        "name",
+        "remote",
+        "branch",
+        "commit",
+    }
+    if not isinstance(config, dict) or set(config) != expected_keys or config.get("schema_version") != 3:
         raise ValueError("unsupported updater sidecar schema")
-    branch = validate_branch(os.environ.get("TTS_MORE_UPDATE_BRANCH") or str(config["branch"]))
-    commit = os.environ.get("TTS_MORE_PINNED_COMMIT") or str(config.get("commit") or "")
+    if config.get("executable_policy") != UPDATER_EXECUTABLE_POLICY:
+        raise ValueError("unsupported updater executable policy")
+    remote = config.get("remote")
+    if not isinstance(remote, str):
+        raise ValueError("updater remote must be a string")
+    expected_identity = parse_github_remote(remote)
+    requires_ssh = remote_requires_ssh(remote)
+    if not isinstance(config.get("requires_ssh"), bool) or config["requires_ssh"] != requires_ssh:
+        raise ValueError("updater requires_ssh does not match remote")
+    configured_branch = config.get("branch")
+    configured_commit = config.get("commit")
+    if not isinstance(configured_branch, str) or not isinstance(configured_commit, str):
+        raise ValueError("updater branch and commit must be strings")
+    branch = validate_branch(os.environ.get("TTS_MORE_UPDATE_BRANCH") or configured_branch)
+    commit = os.environ.get("TTS_MORE_PINNED_COMMIT") or configured_commit
     if commit and not COMMIT_RE.fullmatch(commit):
         raise ValueError(f"invalid pinned commit: {commit!r}")
-    expected_remote = str(config["remote"])
-    expected_identity = parse_github_remote(expected_remote)
-    git_executable = validate_trusted_executable(config.get("git_executable"), name="git", root=root)
-    ssh_executable = validate_trusted_executable(
-        config.get("ssh_executable"),
-        name="ssh",
-        root=root,
-        git_executable=Path(git_executable),
+    git_executable = resolve_trusted_executable("git", root=root)
+    ssh_executable = (
+        resolve_trusted_executable("ssh", root=root, git_executable=Path(git_executable))
+        if requires_ssh
+        else None
     )
     validate_git_checkout(root, git_executable, ssh_executable)
     actual_remote = output(["git", "remote", "get-url", "origin"], root, git_executable, ssh_executable)
     if parse_github_remote(actual_remote) != expected_identity:
         raise RuntimeError(
-            f"repository origin mismatch: expected {expected_remote!r}, found {actual_remote!r}"
+            f"repository origin mismatch: expected {remote!r}, found {actual_remote!r}"
         )
     dirty = output(["git", "status", "--porcelain"], root, git_executable, ssh_executable)
     if dirty:
         raise RuntimeError("refusing to update a dirty repository; commit, stash, or clean local changes first")
     print(f"[update] {config.get('name') or config.get('service_id') or branch}")
-    print(f"[remote] {expected_remote}")
+    print(f"[remote] {remote}")
     run(["git", "fetch", "--prune", "origin", branch], root, git_executable, ssh_executable)
     run(["git", "checkout", branch], root, git_executable, ssh_executable)
     run(["git", "pull", "--ff-only", "origin", branch], root, git_executable, ssh_executable)
@@ -1812,20 +1902,16 @@ def install_update_scripts(
                 _assert_safe_path(destination, repo_path)
         if dry_run or not exists:
             continue
-        git_executable = _trusted_git_executable(managed_roots=(root,))
-        ssh_executable = _trusted_ssh_executable(
-            managed_roots=(root,),
-            git_executable=git_executable,
-        )
+        remote = str(repo["remote"])
         sidecar = {
-            "schema_version": 2,
+            "schema_version": 3,
+            "executable_policy": UPDATER_EXECUTABLE_POLICY,
+            "requires_ssh": _github_remote_requires_ssh(remote),
             "service_id": service_id,
             "name": repo.get("name"),
-            "remote": repo["remote"],
+            "remote": remote,
             "branch": branch,
             "commit": commit,
-            "git_executable": git_executable,
-            "ssh_executable": ssh_executable,
         }
         executable_mode = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
         _atomic_write_text(
