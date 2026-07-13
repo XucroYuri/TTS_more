@@ -904,16 +904,8 @@ def test_validate_repo_paths_rejects_paths_outside_project(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    repositories = deploy.load_deployment_repositories(tmp_path, repo_paths=repo_paths)
-    report = deploy.validate_repo_paths(
-        tmp_path,
-        service_ids={"local-indextts"},
-        repositories=repositories,
-    )
-
-    assert report[0]["ok"] is False
-    assert report[0]["inside_project"] is False
-    assert "outside project root" in report[0]["error"]
+    with pytest.raises(ValueError, match="outside project root"):
+        deploy.load_deployment_repositories(tmp_path, repo_paths=repo_paths)
 
 
 def test_install_repo_bundles_copies_provider_helpers_and_excludes_them(tmp_path: Path) -> None:
@@ -1128,20 +1120,13 @@ def test_repo_paths_are_limited_to_dedicated_repo_area(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    repositories = deploy.load_deployment_repositories(
-        tmp_path,
-        repo_paths,
-        service_ids={"local-indextts"},
-        require_complete=True,
-    )
-    report = deploy.validate_repo_paths(
-        tmp_path,
-        service_ids={"local-indextts"},
-        repositories=repositories,
-    )
-
-    assert report[0]["ok"] is False
-    assert "dedicated repository area" in report[0]["error"]
+    with pytest.raises(ValueError, match="dedicated repository area"):
+        deploy.load_deployment_repositories(
+            tmp_path,
+            repo_paths,
+            service_ids={"local-indextts"},
+            require_complete=True,
+        )
 
 
 def test_existing_repo_origin_must_match_manifest_before_sync(
@@ -1596,6 +1581,178 @@ def test_generated_updater_rejects_gitdir_file_before_invoking_git(tmp_path: Pat
     assert not marker.exists()
 
 
+def _write_marker_command(path: Path, marker: Path) -> str:
+    path.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed\\n', encoding='utf-8')\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{path}"'
+
+
+def test_git_runner_removes_config_environment_injection_before_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    marker = tmp_path / "fsmonitor-marker"
+    command = _write_marker_command(tmp_path / "fsmonitor.py", marker)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", command)
+    monkeypatch.setenv("GIT_SSH_COMMAND", command)
+    monkeypatch.setenv("GIT_ASKPASS", command)
+
+    assert deploy._repo_status(target) == ""
+    assert not marker.exists()
+    environment = deploy._git_environment()
+    assert "GIT_CONFIG_COUNT" not in environment
+    assert "GIT_CONFIG_KEY_0" not in environment
+    assert "GIT_CONFIG_VALUE_0" not in environment
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert "GIT_SSH_COMMAND" not in environment
+    assert "GIT_ASKPASS" not in environment
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable hook fixture")
+def test_git_runner_disables_default_checkout_hooks(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    subprocess.run(["git", "-C", str(target), "branch", "next"], check=True)
+    marker = tmp_path / "post-checkout-marker"
+    hook = target / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f"#!/bin/sh\nprintf executed > {marker!s}\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    deploy._run_git_command(["git", "-C", str(target), "checkout", "next"], cwd=tmp_path)
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("core.fsmonitor", "marker-command"),
+        ("core.hooksPath", "custom-hooks"),
+        ("core.sshCommand", "marker-command"),
+        ("credential.helper", "!marker-command"),
+        ("url.https://evil.example/.insteadOf", "https://github.com/"),
+        ("filter.attack.process", "marker-command"),
+        ("submodule.attack.update", "!marker-command"),
+        ("include.path", "../attacker.gitconfig"),
+        ("http.sslVerify", "false"),
+        ("core.askPass", "marker-command"),
+        ("extensions.worktreeConfig", "true"),
+    ],
+)
+def test_git_checkout_rejects_executable_or_rewriting_local_config(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    subprocess.run(["git", "-C", str(target), "config", "--local", key, value], check=True)
+
+    with pytest.raises(RuntimeError, match="unsafe local Git config"):
+        deploy._validate_git_checkout(target)
+
+
+def test_generated_updater_rejects_executable_local_config_before_status(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+    marker = tmp_path / "updater-fsmonitor-marker"
+    command = _write_marker_command(tmp_path / "updater-fsmonitor.py", marker)
+    subprocess.run(["git", "-C", str(target), "config", "--local", "core.fsmonitor", command], check=True)
+
+    result = subprocess.run(
+        [sys.executable, str(target / "tts-more-update.py")],
+        cwd=target,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe local Git config" in result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("verb", ["status", "config", "fetch", "checkout", "pull"])
+def test_app_and_generated_updater_use_identical_hardened_git_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    generated_path = tmp_path / "tts-more-update.py"
+    source = deploy._service_update_script_py()
+    generated_path.write_text(source, encoding="utf-8")
+    namespace = {"__name__": "policy_test", "__file__": str(generated_path)}
+    exec(compile(source, str(generated_path), "exec"), namespace)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "marker-command")
+    monkeypatch.setenv("GIT_SSH_COMMAND", "marker-command")
+    monkeypatch.setenv("GIT_EXEC_PATH", str(tmp_path / "attacker-exec"))
+    monkeypatch.setenv("GIT_TEMPLATE_DIR", str(tmp_path / "attacker-template"))
+    monkeypatch.setenv("GIT_EXTERNAL_DIFF", "marker-command")
+    monkeypatch.setenv("GIT_SSL_NO_VERIFY", "1")
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file:ext")
+    logical = ["git", verb]
+
+    app_command = deploy._harden_git_command(logical, trusted_file=generated_path)
+    updater_command = namespace["harden_git_command"](logical)
+    app_environment = deploy._git_environment()
+    updater_environment = namespace["git_environment"]()
+
+    assert Path(app_command[0]).is_absolute()
+    assert Path(updater_command[0]).is_absolute()
+    assert app_command[1:] == updater_command[1:]
+    for key in (
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_ATTR_NOSYSTEM",
+        "GIT_TERMINAL_PROMPT",
+        "GIT_PROTOCOL_FROM_USER",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_ALLOW_PROTOCOL",
+    ):
+        assert app_environment[key] == updater_environment[key]
+    for key in (
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_SSH_COMMAND",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_SSL_NO_VERIFY",
+    ):
+        assert key not in app_environment
+        assert key not in updater_environment
+    assert "protocol.allow=never" in app_command
+    assert "protocol.https.allow=always" in app_command
+    assert "protocol.ssh.allow=always" in app_command
+    ssh_override = next(item for item in app_command if item.startswith("core.sshCommand="))
+    assert "ProxyCommand=none" in ssh_override
+    assert "PermitLocalCommand=no" in ssh_override
+    assert app_environment["GIT_ALLOW_PROTOCOL"] == "https:ssh"
+
+
 def test_clean_is_selection_scoped_and_dry_run_matches_real_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1691,6 +1848,127 @@ def test_clean_rejects_unrecognized_selected_path_without_deleting(
     assert marker.read_text(encoding="utf-8") == "preserve\n"
 
 
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_selected_repository_set_rejects_duplicate_canonical_paths_before_git_or_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    repositories = deploy.load_repo_lock(tmp_path)
+    for repo in repositories[:3]:
+        repo["path"] = "repo/shared-gpt"
+    monkeypatch.setattr(
+        deploy,
+        "_git_output",
+        lambda command: (_ for _ in ()).throw(AssertionError("Git ran before selected-set validation")),
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_run_git_command",
+        lambda command, *, cwd: (_ for _ in ()).throw(AssertionError("Git mutated before selected-set validation")),
+    )
+
+    with pytest.raises(ValueError, match="same canonical repository path"):
+        deploy.sync_repos(
+            tmp_path,
+            clean=True,
+            dry_run=dry_run,
+            service_ids={"local-gpt-sovits-main", "local-gpt-sovits-dev", "local-gpt-sovits-proplus-hc-dev"},
+            repositories=repositories,
+        )
+
+    assert not (tmp_path / "repo").exists()
+
+
+def test_selected_repository_set_rejects_nested_paths_before_git(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    repositories = deploy.load_repo_lock(tmp_path)
+    repositories[3]["path"] = "repo/shared"
+    repositories[4]["path"] = "repo/shared/nested"
+
+    with pytest.raises(ValueError, match="nested repository paths"):
+        deploy.sync_repos(
+            tmp_path,
+            dry_run=True,
+            service_ids={"local-indextts", "local-cosyvoice"},
+            repositories=repositories,
+        )
+
+
+def test_selected_repository_set_uses_platform_normcase_for_equivalent_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    repositories = deploy.load_repo_lock(tmp_path)
+    repositories[3]["path"] = "repo/Index-TTS"
+    repositories[4]["path"] = "repo/index-tts"
+    original_normcase = deploy.os.path.normcase
+    monkeypatch.setattr(deploy.os.path, "normcase", lambda value: original_normcase(value).casefold())
+
+    with pytest.raises(ValueError, match="same canonical repository path"):
+        deploy.sync_repos(
+            tmp_path,
+            dry_run=True,
+            service_ids={"local-indextts", "local-cosyvoice"},
+            repositories=repositories,
+        )
+
+
+def test_update_rejects_selected_path_conflicts_before_app_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    repositories = deploy.load_repo_lock(tmp_path)
+    repositories[3]["path"] = "repo/shared"
+    repositories[4]["path"] = "repo/shared"
+    monkeypatch.setattr(
+        deploy,
+        "_git_output",
+        lambda command: (_ for _ in ()).throw(AssertionError("app Git ran before selected-set validation")),
+    )
+
+    with pytest.raises(ValueError, match="same canonical repository path"):
+        deploy.update_project(
+            tmp_path,
+            dry_run=False,
+            service_ids={"local-indextts", "local-cosyvoice"},
+            repositories=repositories,
+        )
+
+
+def test_complete_confirmation_rejects_duplicate_selected_paths(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    confirmation = tmp_path / "repo-paths.json"
+    confirmation.write_text(
+        json.dumps(
+            {
+                "repositories": {
+                    "local-indextts": "repo/shared",
+                    "local-cosyvoice": "repo/shared",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="same canonical repository path"):
+        deploy.load_deployment_repositories(
+            tmp_path,
+            confirmation,
+            service_ids={"local-indextts", "local-cosyvoice"},
+            require_complete=True,
+        )
+
+
 @pytest.mark.parametrize("metadata_kind", ["symlink", "gitdir-file", "corrupt-directory"])
 def test_git_metadata_policy_rejects_redirected_worktree_or_corrupt_metadata_before_git(
     tmp_path: Path,
@@ -1767,6 +2045,34 @@ def test_worker_log_open_is_strictly_bounded_to_logs_directory(tmp_path: Path) -
         deploy._open_worker_log(logs_dir, "../../../outside")
 
     assert outside.read_text(encoding="utf-8") == "keep\n"
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY") or os.open not in os.supports_dir_fd,
+    reason="POSIX directory-relative no-follow open is unavailable",
+)
+def test_worker_log_opens_logs_directory_with_no_follow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    logs_dir = tmp_path / "data" / ".runtime" / "logs"
+    logs_dir.mkdir(parents=True)
+    original_open = deploy.os.open
+    directory_flags: list[int] = []
+
+    def tracking_open(path, flags, *args, **kwargs):
+        if Path(path) == logs_dir:
+            directory_flags.append(flags)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(deploy.os, "open", tracking_open)
+    monkeypatch.setattr(deploy.os, "supports_dir_fd", {*deploy.os.supports_dir_fd, tracking_open})
+    with deploy._open_worker_log(logs_dir, "local-indextts") as handle:
+        handle.write(b"test\n")
+
+    assert directory_flags
+    assert directory_flags[0] & os.O_NOFOLLOW
 
 
 @pytest.mark.parametrize(
@@ -1919,10 +2225,131 @@ def test_forged_pending_bundle_manifest_cannot_claim_user_files(tmp_path: Path) 
     }
     (installed / "tts-more-install-pending.json").write_text(json.dumps(forged), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="pending bundle ownership does not match"):
+    with pytest.raises(RuntimeError, match="unanchored bundle ownership"):
         deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
 
     assert user_file.read_text(encoding="utf-8") == "preserve\n"
+
+
+def test_same_identity_schema3_manifest_without_app_anchor_cannot_delete_user_file(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    (bundle / "current.sh").write_text("current\n", encoding="utf-8")
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    installed = target / "tts-more"
+    installed.mkdir()
+    user_file = installed / "user-notes.txt"
+    user_file.write_text("preserve\n", encoding="utf-8")
+    forged_owned = {"user-notes.txt": hashlib.sha256(b"preserve\n").hexdigest()}
+    forged_manifest = {
+        "schema_version": 3,
+        "service_id": "local-indextts",
+        "provider_type": "indextts",
+        "source_bundle": "deployment/tts-repos/indextts",
+        "source_hash": deploy._bundle_source_hash(forged_owned),
+        "owned_files": forged_owned,
+    }
+    (installed / "tts-more-repo.json").write_text(json.dumps(forged_manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="unanchored bundle ownership"):
+        deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+    assert user_file.read_text(encoding="utf-8") == "preserve\n"
+    assert not (installed / "current.sh").exists()
+
+
+def test_first_bundle_install_creates_app_owned_anchor_outside_checkout(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    (bundle / "helper.sh").write_text("managed\n", encoding="utf-8")
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+
+    deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+    manifest_path = target / "tts-more" / "tts-more-repo.json"
+    anchor_path = tmp_path / "data" / "local" / "deployment-ownership" / "local-indextts.json"
+    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+    assert anchor_path.resolve(strict=False).is_relative_to(tmp_path.resolve(strict=False))
+    assert target.resolve(strict=False) not in anchor_path.resolve(strict=False).parents
+    assert anchor == {
+        "schema_version": 1,
+        "state": "installed",
+        "service_id": "local-indextts",
+        "provider_type": "indextts",
+        "source_bundle": "deployment/tts-repos/indextts",
+        "repo_path": "repo/index-tts",
+        "manifest_hash": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    }
+
+
+def test_lost_bundle_anchor_fails_closed_without_deleting_owned_files(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    old_source = bundle / "old.sh"
+    old_source.write_text("old\n", encoding="utf-8")
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+    anchor = tmp_path / "data" / "local" / "deployment-ownership" / "local-indextts.json"
+    anchor.unlink()
+    old_source.unlink()
+    (bundle / "new.sh").write_text("new\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="unanchored bundle ownership"):
+        deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+    assert (target / "tts-more" / "old.sh").read_text(encoding="utf-8") == "old\n"
+    assert not (target / "tts-more" / "new.sh").exists()
+
+
+def test_explicit_bundle_adoption_only_anchors_existing_manifest_then_requires_rerun(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    (bundle / "new.sh").write_text("new\n", encoding="utf-8")
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    installed = target / "tts-more"
+    installed.mkdir()
+    old_file = installed / "old.sh"
+    old_file.write_text("old\n", encoding="utf-8")
+    old_owned = {"old.sh": hashlib.sha256(b"old\n").hexdigest()}
+    old_manifest = {
+        "schema_version": 3,
+        "service_id": "local-indextts",
+        "provider_type": "indextts",
+        "source_bundle": "deployment/tts-repos/indextts",
+        "source_hash": deploy._bundle_source_hash(old_owned),
+        "owned_files": old_owned,
+    }
+    manifest_path = installed / "tts-more-repo.json"
+    manifest_path.write_text(json.dumps(old_manifest, indent=2) + "\n", encoding="utf-8")
+
+    reports = deploy.install_repo_bundles(
+        tmp_path,
+        service_ids={"local-indextts"},
+        adopt_existing=True,
+    )
+
+    assert reports[0]["adopted"] is True
+    assert old_file.read_text(encoding="utf-8") == "old\n"
+    assert not (installed / "new.sh").exists()
+    deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+    assert not old_file.exists()
+    assert (installed / "new.sh").read_text(encoding="utf-8") == "new\n"
 
 
 def test_interrupted_bundle_rerun_rejects_locally_modified_new_file(
