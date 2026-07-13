@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
+import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -13,7 +16,7 @@ from app.windows_ssh import WindowsSshExecutor
 
 
 _SAFE_NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
-_SAFE_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_SAFE_RUN_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _SAFE_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_WINDOWS_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]*\Z")
 _SAFE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -31,6 +34,11 @@ _FORMAL_PORT_MODULES = {
     9882: "app.workers.cosyvoice_worker:app",
 }
 _MAX_JSON_BYTES = 1024 * 1024
+_MAX_MANIFEST_BYTES = 1024 * 1024
+_MAX_EVIDENCE_FILE_BYTES = 64 * 1024 * 1024
+_MONITOR_MAX_SECONDS = 6 * 60 * 60
+_MONITOR_MAX_ROWS = 200_000
+_MONITOR_MAX_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -81,9 +89,54 @@ def _validate_run_id(run_id: str) -> str:
         not isinstance(run_id, str)
         or not _SAFE_RUN_ID.fullmatch(run_id)
         or run_id in {".", ".."}
+        or run_id[-1] in {" ", "."}
+        or run_id.split(".", 1)[0].casefold() in _WINDOWS_RESERVED_NAMES
     ):
         raise ValueError("validation run ID is invalid")
     return run_id
+
+
+def _reject_symlink_components(path: Path) -> None:
+    absolute = path.absolute()
+    for component in reversed((absolute, *absolute.parents)):
+        try:
+            metadata = component.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise ValueError("evidence path component is unavailable") from None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("evidence path contains a symlink component")
+
+
+def _contained_path(root: Path, candidate: Path) -> Path:
+    try:
+        canonical = candidate.resolve(strict=False)
+        canonical.relative_to(root)
+    except (OSError, ValueError):
+        raise ValueError("evidence destination containment check failed") from None
+    return canonical
+
+
+def _secure_directory(root: Path, relative: Path) -> Path:
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.exists() or current.is_symlink():
+            _reject_symlink_components(current)
+            try:
+                metadata = current.lstat()
+            except OSError:
+                raise ValueError("evidence directory is unavailable") from None
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError("evidence path component is not a directory")
+        else:
+            try:
+                current.mkdir(mode=0o700)
+            except OSError:
+                raise ValueError("evidence directory could not be created") from None
+        _contained_path(root, current)
+    return current
 
 
 def _validate_remote_root(remote_root: str) -> PureWindowsPath:
@@ -204,6 +257,9 @@ class WindowsLanNodeManager:
             raise ValueError("identity hash salt must be nonempty bytes")
         self.executor = executor
         self.salt = salt
+        self._service_manifests: dict[str, list[PureWindowsPath]] = {}
+        self._service_roots: dict[str, PureWindowsPath] = {}
+        self._start_generations: dict[str, int] = {}
 
     def inspect(self, node: str, remote_root: str, expected_commit: str) -> NodeProbe:
         node = _validate_node(node)
@@ -363,11 +419,27 @@ if ($LASTEXITCODE -ne 0) {{ throw 'Remote deployment failed' }}
         root = _validate_remote_root(remote_root)
         topology = root / "data/local/topology.validation.json"
         repo_paths = root / "deployment/app/repo-paths.local.json"
-        pid_manifest = root / "data/validation/lan-controller/service-processes.json"
+        generation = self._start_generations.get(node, 0)
+        manifest_token = hashlib.sha256(
+            self.salt
+            + b"\0service-manifest\0"
+            + node.encode("ascii")
+            + b"\0"
+            + str(root).casefold().encode("utf-8")
+            + b"\0"
+            + str(generation).encode("ascii")
+        ).hexdigest()[:16]
+        pid_manifest = (
+            root
+            / "data/validation/lan-controller"
+            / f"service-processes-{manifest_token}.json"
+        )
         start_script = root / "scripts/start-service-workers.ps1"
+        cleanup_script = root / "scripts/cleanup-cuda-validation-processes.ps1"
         remote_python = root / ".venv/Scripts/python.exe"
         manifest_validator = r"""
-import json, pathlib, sys
+import hashlib, json, os, pathlib, stat, sys
+MAX_BYTES = 1024 * 1024
 def pairs(items):
     value = {}
     for key, item in items:
@@ -376,11 +448,20 @@ def pairs(items):
         value[key] = item
     return value
 root = pathlib.Path(sys.argv[1]).resolve()
-with open(sys.argv[2], "r", encoding="utf-8") as stream:
-    payload = json.load(stream, object_pairs_hook=pairs)
+path = pathlib.Path(sys.argv[2])
+metadata = os.lstat(path)
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_size < 1 or metadata.st_size > MAX_BYTES:
+    raise ValueError("invalid manifest file")
+with open(path, "rb") as stream:
+    raw = stream.read(MAX_BYTES + 1)
+if len(raw) < 1 or len(raw) > MAX_BYTES:
+    raise ValueError("invalid manifest size")
+payload = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=pairs)
 if not isinstance(payload, dict) or set(payload) != {"schema_version", "processes"}:
     raise ValueError("invalid manifest")
-if payload["schema_version"] != 1 or not isinstance(payload["processes"], list):
+if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+    raise ValueError("invalid schema version")
+if not isinstance(payload["processes"], list) or not payload["processes"]:
     raise ValueError("invalid manifest")
 modules = {
     "local-gpt-sovits-main": "app.workers.gpt_sovits_worker:app",
@@ -388,41 +469,64 @@ modules = {
     "local-cosyvoice": "app.workers.cosyvoice_worker:app",
 }
 fields = {"pid", "creation_date", "executable_path", "project_root", "worker_module", "service_id"}
+seen = set()
 for process in payload["processes"]:
     if not isinstance(process, dict) or set(process) != fields:
         raise ValueError("invalid process")
     service_id = process["service_id"]
     pid = process["pid"]
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
+    if type(pid) is not int or pid < 1:
         raise ValueError("invalid pid")
-    if service_id not in modules or process["worker_module"] != modules[service_id]:
+    if not isinstance(service_id, str) or service_id not in modules or service_id in seen:
+        raise ValueError("invalid service identity")
+    seen.add(service_id)
+    if type(process["worker_module"]) is not str or process["worker_module"] != modules[service_id]:
         raise ValueError("invalid worker identity")
-    if not isinstance(process["creation_date"], str) or not process["creation_date"].strip():
+    if type(process["creation_date"]) is not str or not process["creation_date"].strip():
         raise ValueError("invalid creation date")
-    if pathlib.Path(process["project_root"]).resolve() != root:
+    if type(process["project_root"]) is not str or pathlib.Path(process["project_root"]).resolve() != root:
         raise ValueError("invalid project root")
+    if type(process["executable_path"]) is not str:
+        raise ValueError("invalid executable path")
     pathlib.Path(process["executable_path"]).resolve().relative_to(root)
+print(json.dumps({"snapshot_sha256": hashlib.sha256(raw).hexdigest()}, separators=(",", ":")))
 """.strip()
         script = f"""
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force -Path {_powershell_literal(str(pid_manifest.parent))} | Out-Null
-if (Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Leaf) {{
-  $python = if (Test-Path -LiteralPath {_powershell_literal(str(remote_python))} -PathType Leaf) {{
-    {_powershell_literal(str(remote_python))}
-  }} else {{ 'python' }}
-  $manifestValidator = @'
+if (Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))}) {{
+  throw 'Remote start requires a fresh manifest path'
+}}
+$python = if (Test-Path -LiteralPath {_powershell_literal(str(remote_python))} -PathType Leaf) {{
+  {_powershell_literal(str(remote_python))}
+}} else {{ 'python' }}
+$manifestValidator = @'
 {manifest_validator}
 '@
-  & $python -c $manifestValidator {_powershell_literal(str(root))} {_powershell_literal(str(pid_manifest))}
-  if ($LASTEXITCODE -ne 0) {{ throw 'Existing validation service PID manifest is invalid' }}
-}}
-& {_powershell_literal(str(start_script))} -Topology {_powershell_literal(str(topology))} -Node {_powershell_literal(node)} -RepoPaths {_powershell_literal(str(repo_paths))} -PidManifest {_powershell_literal(str(pid_manifest))} -Detach
-if ($LASTEXITCODE -ne 0) {{ throw 'Remote start failed' }}
-if (!(Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Leaf)) {{
-  throw 'Remote start did not create the owned PID manifest'
+try {{
+  & {_powershell_literal(str(start_script))} -Topology {_powershell_literal(str(topology))} -Node {_powershell_literal(node)} -RepoPaths {_powershell_literal(str(repo_paths))} -PidManifest {_powershell_literal(str(pid_manifest))} -Detach
+  if ($LASTEXITCODE -ne 0) {{ throw 'Remote start failed' }}
+  if (!(Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Leaf)) {{
+    throw 'Remote start did not create the owned PID manifest'
+  }}
+  $validated = @(& $python -c $manifestValidator {_powershell_literal(str(root))} {_powershell_literal(str(pid_manifest))}) -join "`n"
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($validated)) {{
+    throw 'Generated validation service PID manifest is invalid'
+  }}
+}} catch {{
+  $startFailure = $_
+  if (Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Leaf) {{
+    try {{
+      & {_powershell_literal(str(cleanup_script))} -Manifest {_powershell_literal(str(pid_manifest))} -Required
+    }} catch {{ }}
+  }}
+  throw $startFailure
 }}
 """
         self.executor.run_powershell(node, script, timeout=1800)
+        self._service_roots[node] = root
+        self._service_manifests.setdefault(node, []).append(pid_manifest)
+        self._start_generations[node] = generation + 1
 
     def _gpu_monitor_script(self, csv_path: PureWindowsPath) -> str:
         salt = base64.b64encode(self.salt).decode("ascii")
@@ -430,8 +534,22 @@ if (!(Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType 
 $ErrorActionPreference = 'Stop'
 $salt = [Convert]::FromBase64String({_powershell_literal(salt)})
 $sha = [Security.Cryptography.SHA256]::Create()
+$maxSeconds = {_MONITOR_MAX_SECONDS}
+$maxRows = {_MONITOR_MAX_ROWS}
+$maxBytes = {_MONITOR_MAX_BYTES}
+$rowCount = 0
+$byteCount = 0
+$deadline = [DateTime]::UtcNow.AddSeconds($maxSeconds)
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$stream = [IO.FileStream]::new(
+  {_powershell_literal(str(csv_path))},
+  [IO.FileMode]::CreateNew,
+  [IO.FileAccess]::Write,
+  [IO.FileShare]::Read
+)
+$writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false))
 try {{
-  while ($true) {{
+  :monitor while ($clock.Elapsed.TotalSeconds -lt $maxSeconds -and [DateTime]::UtcNow -lt $deadline) {{
     $rows = @(& nvidia-smi.exe --query-gpu=timestamp,index,uuid,memory.total,memory.free,memory.used,utilization.gpu --format=csv,noheader,nounits)
     if ($LASTEXITCODE -ne 0) {{ throw 'nvidia-smi query failed' }}
     foreach ($row in $rows) {{
@@ -443,13 +561,64 @@ try {{
       [Array]::Copy($identity, 0, $digestInput, $salt.Length + 1, $identity.Length)
       $gpu_uuid_sha256 = ([BitConverter]::ToString($sha.ComputeHash($digestInput))).Replace('-', '').ToLowerInvariant()
       $parts[2] = $gpu_uuid_sha256
-      Add-Content -LiteralPath {_powershell_literal(str(csv_path))} -Value ($parts -join ',') -Encoding UTF8
+      $line = $parts -join ','
+      $lineBytes = [Text.Encoding]::UTF8.GetByteCount($line + [Environment]::NewLine)
+      if ($rowCount + 1 -gt $maxRows -or $byteCount + $lineBytes -gt $maxBytes) {{
+        break monitor
+      }}
+      $writer.WriteLine($line)
+      $writer.Flush()
+      $rowCount++
+      $byteCount += $lineBytes
     }}
     Start-Sleep -Milliseconds 2000
   }}
 }} finally {{
+  $writer.Dispose()
+  $stream.Dispose()
+  $clock.Stop()
   $sha.Dispose()
 }}
+""".strip()
+
+    @staticmethod
+    def _monitor_manifest_validator() -> str:
+        return r"""
+import hashlib, json, os, pathlib, stat, sys
+MAX_BYTES = 1024 * 1024
+def pairs(items):
+    value = {}
+    for key, item in items:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+path = pathlib.Path(sys.argv[1])
+metadata = os.lstat(path)
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_size < 1 or metadata.st_size > MAX_BYTES:
+    raise ValueError("invalid manifest file")
+with open(path, "rb") as stream:
+    raw = stream.read(MAX_BYTES + 1)
+if len(raw) < 1 or len(raw) > MAX_BYTES:
+    raise ValueError("invalid manifest size")
+payload = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=pairs)
+fields = {"schema_version", "pid", "creation_date", "executable_path", "project_root", "command_sha256"}
+if not isinstance(payload, dict) or set(payload) != fields:
+    raise ValueError("invalid manifest")
+pid = payload["pid"]
+if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+    raise ValueError("invalid schema version")
+if type(pid) is not int or pid < 1:
+    raise ValueError("invalid pid")
+for field in ("creation_date", "executable_path", "project_root", "command_sha256"):
+    if type(payload[field]) is not str or not payload[field].strip():
+        raise ValueError("invalid process identity")
+if payload["command_sha256"] != sys.argv[2]:
+    raise ValueError("invalid command identity")
+if pathlib.Path(payload["project_root"]).resolve() != pathlib.Path(sys.argv[3]).resolve():
+    raise ValueError("invalid project root")
+result = {"snapshot_sha256": hashlib.sha256(raw).hexdigest(), "process": payload}
+print(json.dumps(result, separators=(",", ":")))
 """.strip()
 
     def start_gpu_monitor(self, node: str, remote_root: str, run_id: str) -> None:
@@ -460,37 +629,117 @@ try {{
         csv_path = evidence / "nvidia-smi.csv"
         stderr_path = evidence / "nvidia-smi.stderr.log"
         manifest_path = evidence / "nvidia-smi.process.json"
+        manifest_temp = evidence / "nvidia-smi.process.json.tmp"
         encoded = base64.b64encode(
             self._gpu_monitor_script(csv_path).encode("utf-16-le")
         ).decode("ascii")
         command_sha256 = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+        remote_python = root / ".venv/Scripts/python.exe"
+        manifest_validator = self._monitor_manifest_validator()
         script = f"""
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force -Path {_powershell_literal(str(evidence))} | Out-Null
-if (Test-Path -LiteralPath {_powershell_literal(str(manifest_path))}) {{
-  throw 'GPU monitor PID manifest already exists'
+$canonicalExecutable = [IO.Path]::GetFullPath(
+  [string](Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source
+
+)
+$python = if (Test-Path -LiteralPath {_powershell_literal(str(remote_python))} -PathType Leaf) {{
+  {_powershell_literal(str(remote_python))}
+}} else {{ 'python' }}
+$manifestValidator = @'
+{manifest_validator}
+'@
+function Test-ExactCommandToken {{
+  param([string]$CommandLine, [string]$Token)
+  if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Token)) {{ return $false }}
+  $escaped = [regex]::Escape($Token)
+  return [regex]::IsMatch($CommandLine, '(?:^|\\s)(?:"' + $escaped + '"|' + $escaped + ')(?=\\s|$)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
 }}
-if (Test-Path -LiteralPath {_powershell_literal(str(csv_path))}) {{
-  throw 'GPU monitor evidence already exists'
+function Test-MonitorIdentity {{
+  param($Snapshot, $Expected)
+  if ($null -eq $Snapshot) {{ return $false }}
+  $actualExecutable = ''
+  try {{ $actualExecutable = [IO.Path]::GetFullPath([string]$Snapshot.ExecutablePath) }} catch {{ return $false }}
+  return (
+    ([string]$Snapshot.CreationDate).Equals([string]$Expected.creation_date, [StringComparison]::Ordinal) -and
+    $actualExecutable.Equals([string]$Expected.executable_path, [StringComparison]::OrdinalIgnoreCase) -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) '-NoLogo') -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) '-NoProfile') -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) '-NonInteractive') -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) '-EncodedCommand') -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) {_powershell_literal(encoded)})
+  )
 }}
-$process = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',{_powershell_literal(encoded)}) -RedirectStandardError {_powershell_literal(str(stderr_path))} -PassThru
-$identity = $null
-for ($attempt = 0; $attempt -lt 20 -and $null -eq $identity; $attempt++) {{
-  $identity = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue
-  if ($null -eq $identity) {{ Start-Sleep -Milliseconds 50 }}
+if (Test-Path -LiteralPath {_powershell_literal(str(manifest_path))} -PathType Leaf) {{
+  if (!(Test-Path -LiteralPath {_powershell_literal(str(csv_path))} -PathType Leaf) -or
+      !(Test-Path -LiteralPath {_powershell_literal(str(stderr_path))} -PathType Leaf) -or
+      (Test-Path -LiteralPath {_powershell_literal(str(manifest_temp))})) {{
+    throw 'GPU monitor retry reconciliation found ambiguous artifacts'
+  }}
+  $validated = @(& $python -c $manifestValidator {_powershell_literal(str(manifest_path))} {_powershell_literal(command_sha256)} {_powershell_literal(str(root))}) -join "`n"
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($validated)) {{
+    throw 'GPU monitor retry reconciliation failed'
+  }}
+  $reconciled = ($validated | ConvertFrom-Json).process
+  if (-not ([IO.Path]::GetFullPath([string]$reconciled.executable_path)).Equals($canonicalExecutable, [StringComparison]::OrdinalIgnoreCase) -or
+      -not ([IO.Path]::GetFullPath([string]$reconciled.project_root)).Equals({_powershell_literal(str(root))}, [StringComparison]::OrdinalIgnoreCase)) {{
+    throw 'GPU monitor retry reconciliation failed'
+  }}
+  $snapshot = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$reconciled.pid)" -ErrorAction SilentlyContinue
+  if (-not (Test-MonitorIdentity $snapshot $reconciled)) {{ throw 'GPU monitor retry reconciliation failed' }}
+  return
 }}
-if ($null -eq $identity -or [IO.Path]::GetFileName($identity.ExecutablePath) -ine 'powershell.exe') {{
-  Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-  throw 'GPU monitor process identity is unavailable'
+foreach ($artifact in @(
+  {_powershell_literal(str(csv_path))},
+  {_powershell_literal(str(stderr_path))},
+  {_powershell_literal(str(manifest_temp))}
+)) {{
+  if (Test-Path -LiteralPath $artifact) {{ throw 'GPU monitor preexisting artifact is not owned' }}
 }}
-$manifest = [ordered]@{{
-  schema_version = 1
-  pid = [int]$process.Id
-  creation_date = [string]$identity.CreationDate
-  executable_name = 'powershell.exe'
-  command_sha256 = {_powershell_literal(command_sha256)}
+$process = $null
+$published = $false
+try {{
+  $process = Start-Process -FilePath $canonicalExecutable -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',{_powershell_literal(encoded)}) -RedirectStandardError {_powershell_literal(str(stderr_path))} -PassThru
+  $null = $process.Handle
+  $identity = $null
+  for ($attempt = 0; $attempt -lt 20 -and $null -eq $identity; $attempt++) {{
+    $identity = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue
+    if ($null -eq $identity) {{ Start-Sleep -Milliseconds 50 }}
+  }}
+  $expected = [pscustomobject]@{{
+    creation_date = [string]$identity.CreationDate
+    executable_path = $canonicalExecutable
+  }}
+  if (-not (Test-MonitorIdentity $identity $expected)) {{ throw 'GPU monitor process identity is unavailable' }}
+  $manifest = [ordered]@{{
+    schema_version = 1
+    pid = [int]$process.Id
+    creation_date = [string]$identity.CreationDate
+    executable_path = $canonicalExecutable
+    project_root = {_powershell_literal(str(root))}
+    command_sha256 = {_powershell_literal(command_sha256)}
+  }}
+  $json = $manifest | ConvertTo-Json
+  $manifestStream = [IO.FileStream]::new({_powershell_literal(str(manifest_temp))}, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  try {{
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    $manifestStream.Write($bytes, 0, $bytes.Length)
+    $manifestStream.Flush($true)
+  }} finally {{ $manifestStream.Dispose() }}
+  Move-Item -LiteralPath {_powershell_literal(str(manifest_temp))} -Destination {_powershell_literal(str(manifest_path))}
+  $published = $true
+}} catch {{
+  if ($null -ne $process) {{
+    try {{ $process.Kill(); $process.WaitForExit(10000) | Out-Null }} catch {{ }}
+  }}
+  foreach ($artifact in @(
+    {_powershell_literal(str(manifest_temp))},
+    {_powershell_literal(str(manifest_path))},
+    {_powershell_literal(str(csv_path))},
+    {_powershell_literal(str(stderr_path))}
+  )) {{ Remove-Item -LiteralPath $artifact -Force -ErrorAction SilentlyContinue }}
+  throw
 }}
-$manifest | ConvertTo-Json | Set-Content -LiteralPath {_powershell_literal(str(manifest_path))} -Encoding UTF8
 """
         self.executor.run_powershell(node, script)
 
@@ -505,29 +754,7 @@ $manifest | ConvertTo-Json | Set-Content -LiteralPath {_powershell_literal(str(m
         ).decode("ascii")
         command_sha256 = hashlib.sha256(encoded.encode("ascii")).hexdigest()
         remote_python = root / ".venv/Scripts/python.exe"
-        manifest_validator = r"""
-import json, sys
-def pairs(items):
-    value = {}
-    for key, item in items:
-        if key in value:
-            raise ValueError("duplicate key")
-        value[key] = item
-    return value
-with open(sys.argv[1], "r", encoding="utf-8-sig") as stream:
-    payload = json.load(stream, object_pairs_hook=pairs)
-fields = {"schema_version", "pid", "creation_date", "executable_name", "command_sha256"}
-if not isinstance(payload, dict) or set(payload) != fields:
-    raise ValueError("invalid manifest")
-pid = payload["pid"]
-if payload["schema_version"] != 1 or isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
-    raise ValueError("invalid manifest")
-if payload["executable_name"] != "powershell.exe" or payload["command_sha256"] != sys.argv[2]:
-    raise ValueError("invalid process identity")
-if not isinstance(payload["creation_date"], str) or not payload["creation_date"].strip():
-    raise ValueError("invalid creation date")
-print(json.dumps(payload, separators=(",", ":")))
-""".strip()
+        manifest_validator = self._monitor_manifest_validator()
         script = f"""
 $ErrorActionPreference = 'Stop'
 if (!(Test-Path -LiteralPath {_powershell_literal(str(manifest_path))} -PathType Leaf)) {{ return }}
@@ -537,33 +764,65 @@ $python = if (Test-Path -LiteralPath {_powershell_literal(str(remote_python))} -
 $manifestValidator = @'
 {manifest_validator}
 '@
-$validatedManifest = @(& $python -c $manifestValidator {_powershell_literal(str(manifest_path))} {_powershell_literal(command_sha256)}) -join "`n"
+$validatedManifest = @(& $python -c $manifestValidator {_powershell_literal(str(manifest_path))} {_powershell_literal(command_sha256)} {_powershell_literal(str(root))}) -join "`n"
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($validatedManifest)) {{
   throw 'GPU monitor PID manifest is invalid'
 }}
-try {{ $manifest = $validatedManifest | ConvertFrom-Json }} catch {{
+try {{ $manifest = ($validatedManifest | ConvertFrom-Json).process }} catch {{
   throw 'GPU monitor PID manifest is invalid'
 }}
 $fields = @($manifest.PSObject.Properties.Name)
-$expectedFields = @('schema_version','pid','creation_date','executable_name','command_sha256')
+$expectedFields = @('schema_version','pid','creation_date','executable_path','project_root','command_sha256')
 if ($fields.Count -ne $expectedFields.Count -or @($fields | Where-Object {{ $_ -notin $expectedFields }}).Count -ne 0) {{
   throw 'GPU monitor PID manifest is invalid'
 }}
 $monitorPid = $manifest.pid -as [int]
 if ($manifest.schema_version -ne 1 -or $null -eq $monitorPid -or $monitorPid -lt 1 -or
-    $manifest.executable_name -cne 'powershell.exe' -or
     $manifest.command_sha256 -cne {_powershell_literal(command_sha256)} -or
     [string]::IsNullOrWhiteSpace([string]$manifest.creation_date)) {{
   throw 'GPU monitor PID manifest is invalid'
 }}
-$process = Get-CimInstance Win32_Process -Filter "ProcessId = $monitorPid" -ErrorAction SilentlyContinue
-if ($null -ne $process) {{
-  if ([string]$process.CreationDate -cne [string]$manifest.creation_date -or
-      [IO.Path]::GetFileName([string]$process.ExecutablePath) -ine 'powershell.exe' -or
-      [string]$process.CommandLine -notlike '*{encoded}*') {{
-    throw 'GPU monitor process identity mismatch'
-  }}
-  Stop-Process -Id $monitorPid -Force -ErrorAction Stop
+$canonicalExecutable = [IO.Path]::GetFullPath([string](Get-Command powershell.exe -CommandType Application -ErrorAction Stop).Source)
+if (-not ([IO.Path]::GetFullPath([string]$manifest.executable_path)).Equals($canonicalExecutable, [StringComparison]::OrdinalIgnoreCase) -or
+    -not ([IO.Path]::GetFullPath([string]$manifest.project_root)).Equals({_powershell_literal(str(root))}, [StringComparison]::OrdinalIgnoreCase)) {{
+  throw 'GPU monitor process identity mismatch'
+}}
+function Test-ExactCommandToken {{
+  param([string]$CommandLine, [string]$Token)
+  if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Token)) {{ return $false }}
+  $escaped = [regex]::Escape($Token)
+  return [regex]::IsMatch($CommandLine, '(?:^|\\s)(?:"' + $escaped + '"|' + $escaped + ')(?=\\s|$)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}}
+function Test-MonitorSnapshot {{
+  param($Snapshot)
+  if ($null -eq $Snapshot) {{ return $false }}
+  $executable = ''
+  try {{ $executable = [IO.Path]::GetFullPath([string]$Snapshot.ExecutablePath) }} catch {{ return $false }}
+  return (
+    ([string]$Snapshot.CreationDate).Equals([string]$manifest.creation_date, [StringComparison]::Ordinal) -and
+    $executable.Equals($canonicalExecutable, [StringComparison]::OrdinalIgnoreCase) -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) '-NoLogo') -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) '-NoProfile') -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) '-NonInteractive') -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) '-EncodedCommand') -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) {_powershell_literal(encoded)})
+  )
+}}
+$first = Get-CimInstance Win32_Process -Filter "ProcessId = $monitorPid" -ErrorAction SilentlyContinue
+if ($null -eq $first) {{
+  Remove-Item -LiteralPath {_powershell_literal(str(manifest_path))} -Force
+  return
+}}
+if (-not (Test-MonitorSnapshot $first)) {{ throw 'GPU monitor process identity mismatch' }}
+$ownedProcess = Get-Process -Id $monitorPid -ErrorAction Stop
+$null = $ownedProcess.Handle
+$second = Get-CimInstance Win32_Process -Filter "ProcessId = $monitorPid" -ErrorAction SilentlyContinue
+if (-not (Test-MonitorSnapshot $second)) {{ throw 'GPU monitor process identity changed' }}
+try {{
+  $ownedProcess.Kill()
+  if (-not $ownedProcess.WaitForExit(10000)) {{ throw 'GPU monitor did not exit' }}
+}} catch {{
+  throw 'GPU monitor cleanup blocked after ownership verification'
 }}
 Remove-Item -LiteralPath {_powershell_literal(str(manifest_path))} -Force
 """
@@ -573,21 +832,131 @@ Remove-Item -LiteralPath {_powershell_literal(str(manifest_path))} -Force
         node = _validate_node(node)
         if isinstance(port, bool) or not isinstance(port, int) or port not in _FORMAL_PORT_MODULES:
             raise ValueError("fault injection port is not a formal worker port")
+        root = self._service_roots.get(node)
+        manifests = self._service_manifests.get(node, [])
+        if root is None or not manifests:
+            raise ValueError("worker node has no manager-owned service manifest")
+        manifest = manifests[-1]
         module = _FORMAL_PORT_MODULES[port]
-        port_pattern = rf"(?:^|\s)--port(?:\s+|=){port}(?:\s|$)"
+        service_id = {
+            9880: "local-gpt-sovits-main",
+            9881: "local-indextts",
+            9882: "local-cosyvoice",
+        }[port]
+        remote_python = root / ".venv/Scripts/python.exe"
+        validator = r"""
+import hashlib, json, os, pathlib, stat, sys
+MAX_BYTES = 1024 * 1024
+def pairs(items):
+    value = {}
+    for key, item in items:
+        if key in value:
+            raise ValueError("duplicate key")
+        value[key] = item
+    return value
+path = pathlib.Path(sys.argv[1])
+metadata = os.lstat(path)
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_size < 1 or metadata.st_size > MAX_BYTES:
+    raise ValueError("invalid manifest file")
+with open(path, "rb") as stream:
+    raw = stream.read(MAX_BYTES + 1)
+if len(raw) < 1 or len(raw) > MAX_BYTES:
+    raise ValueError("invalid manifest size")
+payload = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=pairs)
+if not isinstance(payload, dict) or set(payload) != {"schema_version", "processes"}:
+    raise ValueError("invalid manifest")
+if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+    raise ValueError("invalid schema version")
+if not isinstance(payload["processes"], list):
+    raise ValueError("invalid processes")
+fields = {"pid", "creation_date", "executable_path", "project_root", "worker_module", "service_id"}
+modules = {
+    "local-gpt-sovits-main": "app.workers.gpt_sovits_worker:app",
+    "local-indextts": "app.workers.indextts_worker:app",
+    "local-cosyvoice": "app.workers.cosyvoice_worker:app",
+}
+matches = []
+seen = set()
+for process in payload["processes"]:
+    if not isinstance(process, dict) or set(process) != fields:
+        raise ValueError("invalid process")
+    pid = process["pid"]
+    if type(pid) is not int or pid < 1:
+        raise ValueError("invalid pid")
+    for field in ("creation_date", "executable_path", "project_root", "worker_module", "service_id"):
+        if type(process[field]) is not str or not process[field].strip():
+            raise ValueError("invalid process identity")
+    service_id = process["service_id"]
+    if service_id not in modules or service_id in seen or process["worker_module"] != modules[service_id]:
+        raise ValueError("invalid worker identity")
+    seen.add(service_id)
+    if pathlib.Path(process["project_root"]).resolve() != pathlib.Path(sys.argv[2]).resolve():
+        raise ValueError("invalid project root")
+    pathlib.Path(process["executable_path"]).resolve().relative_to(pathlib.Path(sys.argv[2]).resolve())
+    if service_id == sys.argv[3]:
+        matches.append(process)
+if len(matches) != 1 or matches[0]["worker_module"] != sys.argv[4]:
+    raise ValueError("owned service identity is ambiguous")
+result = {"snapshot_sha256": hashlib.sha256(raw).hexdigest(), "process": matches[0]}
+print(json.dumps(result, separators=(",", ":")))
+""".strip()
         script = f"""
 $ErrorActionPreference = 'Stop'
+$python = if (Test-Path -LiteralPath {_powershell_literal(str(remote_python))} -PathType Leaf) {{
+  {_powershell_literal(str(remote_python))}
+}} else {{ 'python' }}
+$manifestValidator = @'
+{validator}
+'@
+$validated = @(& $python -c $manifestValidator {_powershell_literal(str(manifest))} {_powershell_literal(str(root))} {_powershell_literal(service_id)} {_powershell_literal(module)}) -join "`n"
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($validated)) {{
+  throw 'Worker process identity mismatch'
+}}
+$entry = ($validated | ConvertFrom-Json).process
+function Test-ExactCommandToken {{
+  param([string]$CommandLine, [string]$Token)
+  if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Token)) {{ return $false }}
+  $escaped = [regex]::Escape($Token)
+  return [regex]::IsMatch($CommandLine, '(?:^|\\s)(?:"' + $escaped + '"|' + $escaped + ')(?=\\s|$)', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}}
+function Test-ExactPortTokens {{
+  param([string]$CommandLine, [int]$Port)
+  if ([string]::IsNullOrWhiteSpace($CommandLine)) {{ return $false }}
+  $escapedPort = [regex]::Escape([string]$Port)
+  $pattern = '(?:^|\\s)(?:"--port"|--port)\\s+(?:"' + $escapedPort + '"|' + $escapedPort + ')(?=\\s|$)'
+  return [regex]::IsMatch($CommandLine, $pattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}}
+function Test-ServiceSnapshot {{
+  param($Snapshot)
+  if ($null -eq $Snapshot) {{ return $false }}
+  $actualExecutable = ''
+  try {{ $actualExecutable = [IO.Path]::GetFullPath([string]$Snapshot.ExecutablePath) }} catch {{ return $false }}
+  return (
+    ([string]$Snapshot.CreationDate).Equals([string]$entry.creation_date, [StringComparison]::Ordinal) -and
+    $actualExecutable.Equals([IO.Path]::GetFullPath([string]$entry.executable_path), [StringComparison]::OrdinalIgnoreCase) -and
+    ([IO.Path]::GetFullPath([string]$entry.project_root)).Equals({_powershell_literal(str(root))}, [StringComparison]::OrdinalIgnoreCase) -and
+    (Test-ExactCommandToken ([string]$Snapshot.CommandLine) {_powershell_literal(module)}) -and
+    (Test-ExactPortTokens ([string]$Snapshot.CommandLine) {port})
+  )
+}}
 $listeners = @(Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction Stop)
 if ($listeners.Count -eq 0) {{ throw 'No listener on validation port' }}
 $processIds = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
-foreach ($processId in $processIds) {{
-  $process = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction Stop
-  if ([string]$process.CommandLine -notlike '*{module}*' -or
-      -not [regex]::IsMatch([string]$process.CommandLine, {_powershell_literal(port_pattern)})) {{
-    throw 'Worker process identity mismatch'
-  }}
+if ($processIds.Count -ne 1 -or [int]$processIds[0] -ne [int]$entry.pid) {{
+  throw 'Worker process identity mismatch'
 }}
-foreach ($processId in $processIds) {{ Stop-Process -Id $processId -Force -ErrorAction Stop }}
+foreach ($processId in $processIds) {{
+  $first = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+  if (-not (Test-ServiceSnapshot $first)) {{ throw 'Worker process identity mismatch' }}
+  $ownedProcess = Get-Process -Id $processId -ErrorAction Stop
+  $null = $ownedProcess.Handle
+  $second = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+  if (-not (Test-ServiceSnapshot $second)) {{ throw 'Worker process identity changed' }}
+  try {{
+    $ownedProcess.Kill()
+    if (-not $ownedProcess.WaitForExit(10000)) {{ throw 'Worker process did not exit' }}
+  }} catch {{ throw 'Worker process termination failed after ownership verification' }}
+}}
 """
         self.executor.run_powershell(node, script)
 
@@ -608,6 +977,209 @@ foreach ($processId in $processIds) {{ Stop-Process -Id $processId -Force -Error
         for port in ports:
             self.stop_service(node, port)
 
+    def _prepare_remote_evidence_snapshot(
+        self,
+        node: str,
+        root: PureWindowsPath,
+        source: PureWindowsPath,
+    ) -> tuple[PureWindowsPath, int, str]:
+        token = hashlib.sha256(
+            self.salt
+            + b"\0evidence-snapshot\0"
+            + node.encode("ascii")
+            + b"\0"
+            + str(source).casefold().encode("utf-8")
+        ).hexdigest()[:24]
+        snapshot = (
+            root
+            / "data/validation/lan-controller"
+            / f".evidence-snapshot-{token}.tmp"
+        )
+        script = f"""
+# TTS_MORE_EVIDENCE_SNAPSHOT
+$ErrorActionPreference = 'Stop'
+$root = {_powershell_literal(str(root))}
+$source = {_powershell_literal(str(source))}
+$snapshot = {_powershell_literal(str(snapshot))}
+$maxBytes = {_MAX_EVIDENCE_FILE_BYTES}
+function Assert-ContainedNoReparsePath {{
+  param([string]$Candidate)
+  $canonicalRoot = [IO.Path]::GetFullPath($root).TrimEnd([char[]]@('\\','/'))
+  $canonicalCandidate = [IO.Path]::GetFullPath($Candidate)
+  $prefix = $canonicalRoot + [IO.Path]::DirectorySeparatorChar
+  if (-not $canonicalCandidate.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {{
+    throw 'Remote evidence path escaped the project root'
+  }}
+  $pathRoot = [IO.Path]::GetPathRoot($canonicalCandidate)
+  $current = $pathRoot
+  foreach ($segment in $canonicalCandidate.Substring($pathRoot.Length) -split '[\\/]') {{
+    $current = Join-Path $current $segment
+    if (Test-Path -LiteralPath $current) {{
+      $item = Get-Item -LiteralPath $current -Force
+      if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {{
+        throw 'Remote evidence path contains a ReparsePoint'
+      }}
+    }}
+  }}
+}}
+Assert-ContainedNoReparsePath $source
+Assert-ContainedNoReparsePath $snapshot
+if (Test-Path -LiteralPath $snapshot) {{ throw 'Remote evidence snapshot already exists' }}
+$sourceItem = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+if ($sourceItem.PSIsContainer -or
+    ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+    [int64]$sourceItem.Length -lt 0 -or [int64]$sourceItem.Length -gt $maxBytes) {{
+  throw 'Remote evidence source is not a bounded regular file'
+}}
+New-Item -ItemType Directory -Force -Path {_powershell_literal(str(snapshot.parent))} | Out-Null
+Assert-ContainedNoReparsePath $source
+Assert-ContainedNoReparsePath $snapshot
+$input = $null
+$output = $null
+try {{
+  $input = [IO.FileStream]::new($source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+  if ($input.Length -gt $maxBytes) {{ throw 'Remote evidence source exceeds the byte limit' }}
+  $output = [IO.FileStream]::new($snapshot, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  $buffer = [byte[]]::new(65536)
+  [int64]$total = 0
+  while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {{
+    $total += $read
+    if ($total -gt $maxBytes) {{ throw 'Remote evidence source exceeds the byte limit' }}
+    $output.Write($buffer, 0, $read)
+  }}
+  $output.Flush($true)
+}} catch {{
+  if ($null -ne $output) {{ $output.Dispose(); $output = $null }}
+  Remove-Item -LiteralPath $snapshot -Force -ErrorAction SilentlyContinue
+  throw
+}} finally {{
+  if ($null -ne $output) {{ $output.Dispose() }}
+  if ($null -ne $input) {{ $input.Dispose() }}
+}}
+$snapshotItem = Get-Item -LiteralPath $snapshot -Force
+if ($snapshotItem.PSIsContainer -or
+    ($snapshotItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+    [int64]$snapshotItem.Length -gt $maxBytes) {{
+  Remove-Item -LiteralPath $snapshot -Force -ErrorAction SilentlyContinue
+  throw 'Remote evidence snapshot is invalid'
+}}
+[ordered]@{{
+  snapshot_path = $snapshot.Replace('\\','/')
+  size = [int64]$snapshotItem.Length
+  sha256 = (Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash.ToLowerInvariant()
+}} | ConvertTo-Json -Compress
+"""
+        result = self.executor.run_powershell(node, script, timeout=600)
+        payload = _strict_json(result.stdout, "remote evidence snapshot")
+        if not isinstance(payload, dict) or set(payload) != {
+            "snapshot_path",
+            "size",
+            "sha256",
+        }:
+            raise ValueError("remote evidence snapshot JSON is invalid")
+        if (
+            type(payload["snapshot_path"]) is not str
+            or payload["snapshot_path"] != snapshot.as_posix()
+            or type(payload["size"]) is not int
+            or not 0 <= payload["size"] <= _MAX_EVIDENCE_FILE_BYTES
+            or type(payload["sha256"]) is not str
+            or not _SAFE_SHA256.fullmatch(payload["sha256"])
+        ):
+            raise ValueError("remote evidence snapshot JSON is invalid")
+        return snapshot, payload["size"], payload["sha256"]
+
+    def _copy_evidence_atomically(
+        self,
+        node: str,
+        remote_snapshot: PureWindowsPath,
+        destination: Path,
+        evidence_root: Path,
+        expected_size: int,
+        expected_digest: str,
+    ) -> None:
+        _reject_symlink_components(destination.parent)
+        _contained_path(evidence_root, destination.parent)
+        if destination.exists() or destination.is_symlink():
+            try:
+                existing = destination.lstat()
+            except OSError:
+                raise ValueError("evidence destination is unavailable") from None
+            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                raise ValueError("evidence destination is not a regular file")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        temporary = Path(temporary_name)
+        os.close(descriptor)
+        try:
+            self.executor.copy_from(node, remote_snapshot.as_posix(), temporary)
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(temporary, flags)
+                with os.fdopen(descriptor, "rb") as stream:
+                    metadata = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise ValueError("local evidence temporary is not a regular file")
+                    raw = stream.read(_MAX_EVIDENCE_FILE_BYTES + 1)
+            except OSError:
+                raise ValueError("local evidence temporary is unavailable") from None
+            if len(raw) != expected_size or len(raw) > _MAX_EVIDENCE_FILE_BYTES:
+                raise ValueError("local evidence size does not match remote snapshot")
+            if hashlib.sha256(raw).hexdigest() != expected_digest:
+                raise ValueError("local evidence digest does not match remote snapshot")
+            _reject_symlink_components(destination.parent)
+            _contained_path(evidence_root, destination.parent)
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                directory_descriptor = os.open(destination.parent, directory_flags)
+                try:
+                    opened_directory = os.fstat(directory_descriptor)
+                    if not stat.S_ISDIR(opened_directory.st_mode):
+                        raise ValueError("evidence destination parent changed")
+                    current_temp = os.stat(
+                        temporary.name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        current_temp.st_dev != metadata.st_dev
+                        or current_temp.st_ino != metadata.st_ino
+                        or not stat.S_ISREG(current_temp.st_mode)
+                    ):
+                        raise ValueError("local evidence temporary changed before publication")
+                    try:
+                        final_metadata = os.stat(
+                            destination.name,
+                            dir_fd=directory_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if not stat.S_ISREG(final_metadata.st_mode):
+                            raise ValueError(
+                                "evidence destination changed before publication"
+                            )
+                    os.replace(
+                        temporary.name,
+                        destination.name,
+                        src_dir_fd=directory_descriptor,
+                        dst_dir_fd=directory_descriptor,
+                    )
+                finally:
+                    os.close(directory_descriptor)
+            except OSError:
+                raise ValueError("atomic evidence publication failed") from None
+            _contained_path(evidence_root, destination)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise ValueError("local evidence temporary cleanup failed") from None
+
     def collect_evidence(
         self,
         node: str,
@@ -618,8 +1190,17 @@ foreach ($processId in $processIds) {{ Stop-Process -Id $processId -Force -Error
         node = _validate_node(node)
         root = _validate_remote_root(remote_root)
         output = Path(output)
-        if not output.is_absolute() or output.is_symlink() or not output.is_dir():
+        if not output.is_absolute():
             raise ValueError("evidence output must be an absolute directory")
+        _reject_symlink_components(output)
+        try:
+            output_metadata = output.lstat()
+            canonical_output = output.resolve(strict=True)
+        except OSError:
+            raise ValueError("evidence output must be an absolute directory") from None
+        if not stat.S_ISDIR(output_metadata.st_mode):
+            raise ValueError("evidence output must be an absolute directory")
+        _reject_symlink_components(canonical_output)
         run_id = _validate_run_id(output.name)
         if (
             not isinstance(service_ids, tuple)
@@ -629,7 +1210,9 @@ foreach ($processId in $processIds) {{ Stop-Process -Id $processId -Force -Error
         ):
             raise ValueError("worker log service is not a unique formal service ID")
         remote = root / "data/validation/lan-controller" / run_id
-        destination = output / "worker-logs" / node
+        destination = _secure_directory(
+            canonical_output, Path("worker-logs") / node
+        )
         sources = [
             (remote / "nvidia-smi.csv", destination / "nvidia-smi.csv"),
             (remote / "nvidia-smi.stderr.log", destination / "nvidia-smi.stderr.log"),
@@ -642,4 +1225,24 @@ foreach ($processId in $processIds) {{ Stop-Process -Id $processId -Force -Error
             ),
         ]
         for remote_path, local_path in sources:
-            self.executor.copy_from(node, remote_path.as_posix(), local_path)
+            remote_snapshot: PureWindowsPath | None = None
+            try:
+                remote_snapshot, size, digest = self._prepare_remote_evidence_snapshot(
+                    node, root, remote_path
+                )
+                self._copy_evidence_atomically(
+                    node,
+                    remote_snapshot,
+                    local_path,
+                    canonical_output,
+                    size,
+                    digest,
+                )
+            finally:
+                if remote_snapshot is not None:
+                    self.executor.run_powershell(
+                        node,
+                        "Remove-Item -LiteralPath "
+                        f"{_powershell_literal(str(remote_snapshot))} "
+                        "-Force -ErrorAction SilentlyContinue",
+                    )

@@ -57,3 +57,56 @@ collection in `backend/app/lan_nodes.py`. Added focused lifecycle and security t
 - `ruff` and `black` are not installed in the project virtual environment, so those
   optional formatter/linter commands could not be run. Compilation, pytest, and diff
   whitespace checks are the available repository gates used here.
+
+## Review Remediation: High 2 / Medium 3
+
+### RED
+
+1. The expanded review suite initially reported `15 failed, 30 passed`. Failures covered
+   reserved/case-aliased Windows run IDs, one-snapshot PID termination, unowned service
+   stopping, unbounded monitor output, weak manifest typing, and symlink/digest evidence
+   escapes.
+2. A focused adjacent-port-token test then failed because separate exact matches for
+   `--port` and `9880` did not prove that they were one argument pair.
+
+### GREEN
+
+- Run IDs now require lowercase canonical spelling and reject reserved device basenames,
+  reserved names with extensions, trailing dot/space aliases, and case aliases.
+- Service starts use a fresh bounded manifest path for every generation. Service stops
+  require the same manager's canonical remote root and manifest, consume one strict byte
+  snapshot, and bind PID, creation time, canonical executable, project root, exact module,
+  and adjacent exact `--port <port>` tokens.
+- Monitor launch resolves the canonical PowerShell executable, rejects partial artifacts,
+  atomically publishes a strict manifest, cleans the child through its owned `Process`
+  object on failure, and reconciles only an exact pre-existing manifest/process after an
+  ambiguous retry.
+- The monitor child independently enforces a six-hour deadline, 200,000-row limit, and
+  64 MiB CSV limit. GPU UUIDs remain salted hashes before persistence.
+- Monitor and service termination open an owned process handle, validate a first CIM
+  snapshot, validate a second snapshot immediately before `.Kill()`, and reject changes
+  in creation time, executable, command/module, or port. No batch bare-PID termination is
+  emitted by `lan_nodes.py`.
+- Service and monitor manifest validators reject bool/float numeric substitutions,
+  duplicate keys, extra fields, oversized files, and invalid exact field types. Consumers
+  use the validated snapshot/digest output rather than reopening the mutable pathname.
+- Evidence collection rejects symlink components, canonicalizes the output root, stages
+  bounded regular non-reparse remote files under a fixed controlled snapshot path, checks
+  size and SHA-256 after SCP, and publishes via a same-directory no-follow temporary plus
+  directory-fd atomic replace and final containment check.
+
+Review-focused verification:
+
+- `.venv/bin/python -m pytest backend/tests/test_lan_nodes.py backend/tests/test_windows_ssh.py -q`
+  -> `182 passed`.
+- `.venv/bin/python -m pytest backend/tests -q`
+  -> `928 passed, 6 skipped`.
+- `.venv/bin/python -m compileall -q backend`
+  -> exit 0.
+
+### Remaining Concerns
+
+- The controller has no `pwsh` executable and no live Windows/OpenSSH/CUDA worker was
+  available. Generated PowerShell ordering and predicates are covered by tests, including
+  the second-snapshot-before-handle-kill requirement, but execution against real CIM,
+  reparse points, and NVIDIA output remains part of LAN end-to-end validation.
