@@ -2,7 +2,8 @@
 param(
     [string]$CacheRoot = "data/cache/portable/conda",
     [string]$LockPath = "packaging/portable/toolchain.lock.json",
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$PassThru
 )
 
 Set-StrictMode -Version Latest
@@ -105,3 +106,6 @@ function Ensure-BuildConda {
 
 $privateConda = Ensure-BuildConda -CacheRoot $CacheRoot -LockPath $LockPath -DryRun:$DryRun
 Write-Host "[portable-conda] conda command: $privateConda"
+if ($PassThru) {
+    Write-Output $privateConda
+}

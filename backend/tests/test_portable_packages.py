@@ -154,3 +154,65 @@ def test_worker_launch_scripts_use_package_relative_runtime_paths() -> None:
     assert "runtime.zip" in start
     assert "%~dp0" in stop
     assert "worker.pid.json" in stop
+
+
+def test_gpt_portable_builder_requires_dev_lock_and_offline_payloads() -> None:
+    builder_path = REPO_ROOT / "scripts" / "build-portable-gpt-dev.ps1"
+    assert builder_path.is_file(), "GPT portable builder script is missing"
+    script = builder_path.read_text(encoding="utf-8")
+    requirements = (REPO_ROOT / "packaging" / "portable" / "gpt-dev-requirements.lock.txt").read_text(encoding="utf-8")
+    manifest = json.loads(
+        (REPO_ROOT / "deployment" / "portable" / "gpt-sovits-dev" / "package" / "tts-more-package.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert '"variant": "dev"' in script
+    assert "bootstrap-conda.ps1" in script
+    assert "conda-pack" in script
+    assert "onnxruntime-gpu==1.26.0" in script
+    assert "runtime.zip" in script
+    assert "TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)" in script
+    assert "Install-GptModelPayloads" in script
+    assert "Invoke-GptDownloadWithFallback" in script
+    assert "Test-ZipArchive" in script
+    assert "curl.exe" in script
+    assert "--range" in script
+    assert "--speed-time" in script
+    assert "--speed-limit" in script
+    assert "--proxy" in script
+    assert "reuse validated GPT payload" in script
+    assert "PIP_CACHE_DIR" in script
+    assert "install.ps1" not in script
+    assert "[switch]$ReuseRuntime" in script
+    assert "reuse existing private GPT runtime" in script
+    assert "setuptools=80.9.0" in script
+    assert "gpt-dev-requirements.pip.txt" in script
+    assert "& $Command | Out-Host" in script
+    assert "TrimStart([char]'\\', [char]'/')" in script
+    assert '"bin\\7z.exe"' in script
+    assert 'add worker launcher to runtime.zip' in script
+    for dependency in ("numpy==1.26.4", "MarkupSafe==2.0.1", "websockets==12.0", "starlette==0.46.2", "setuptools==80.9.0"):
+        assert dependency in requirements
+    assert manifest["component"] == "gpt-sovits-dev"
+    assert manifest["port"] == 9883
+
+
+def test_every_local_tts_component_has_a_path_relative_start_and_stop_launcher() -> None:
+    launchers = (
+        (REPO_ROOT, "8000", "scripts\\start-dev.ps1"),
+        (REPO_ROOT / "deployment" / "portable" / "gpt-sovits-dev", "9883", "runtime\\runtime.zip"),
+        (REPO_ROOT / "repo" / "index-tts", "7860", ".venv\\Scripts\\python.exe"),
+        (REPO_ROOT / "repo" / "CosyVoice", "9882", ".venv\\Scripts\\python.exe"),
+    )
+
+    for root, port, entrypoint in launchers:
+        start = root / "Start.cmd"
+        stop = root / "Stop.cmd"
+        assert start.is_file(), f"missing Start.cmd: {start}"
+        assert stop.is_file(), f"missing Stop.cmd: {stop}"
+        contents = start.read_text(encoding="utf-8")
+        assert "%~dp0" in contents
+        assert port in contents
+        assert entrypoint in contents
+        assert "pid.json" in stop.read_text(encoding="utf-8")

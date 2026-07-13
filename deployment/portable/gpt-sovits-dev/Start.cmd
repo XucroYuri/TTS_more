@@ -1,6 +1,7 @@
 @echo off
 setlocal EnableExtensions
 set "PACKAGE_ROOT=%~dp0"
+rem GPT-SoVITS worker endpoint: http://127.0.0.1:9883
 set "RUNTIME_ARCHIVE=%~dp0runtime\runtime.zip"
 set "RUNTIME_ROOT=%~dp0runtime\live"
 set "TTS_MORE_ARTIFACT_ROOT=%~dp0data\local\artifacts"

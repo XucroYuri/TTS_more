@@ -30,6 +30,16 @@ $Frontend = Start-Process -FilePath "pnpm" `
   -WindowStyle Hidden `
   -PassThru
 
+$RunDirectory = Join-Path $Root "data\local\run"
+New-Item -ItemType Directory -Path $RunDirectory -Force | Out-Null
+@{
+  backend_pid = [int]$Backend.Id
+  frontend_pid = [int]$Frontend.Id
+  backend_port = 8000
+  frontend_port = 5173
+  started_at = [DateTime]::UtcNow.ToString("o")
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $RunDirectory "tts-more.pid.json") -Encoding UTF8
+
 Write-Host "Backend PID: $($Backend.Id)  http://127.0.0.1:8000"
 Write-Host "Frontend PID: $($Frontend.Id) http://127.0.0.1:5173"
 
