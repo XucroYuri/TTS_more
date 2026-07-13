@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import types
 from pathlib import Path
 
 
@@ -156,7 +158,8 @@ def test_stop_worker_accepts_windows_powershell_utf8_bom_pid_record(tmp_path: Pa
     def fake_run(command, **_kwargs):
         calls.append(command)
 
-    monkeypatch.setattr(launcher.os, "name", "nt")
+    monkeypatch.setattr(launcher, "os", types.SimpleNamespace(name="nt"))
+    assert launcher.os is not os
     monkeypatch.setattr(launcher.subprocess, "run", fake_run)
 
     assert launcher.stop_worker(package_root) == 0
