@@ -24,8 +24,27 @@ function Invoke-Logged {
         [string]$WorkingDirectory
     )
     $line = "$FilePath $($Arguments -join ' ')"
-    Write-Host "[run] $line" -ForegroundColor Cyan
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[run] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
     if ($DryRun) { return }
+    Push-Location $WorkingDirectory
+    try {
+        & $FilePath @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "Command failed: $line" }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-Plan {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory
+    )
+    $line = "$FilePath $($Arguments -join ' ')"
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[plan] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
     Push-Location $WorkingDirectory
     try {
         & $FilePath @Arguments
@@ -42,7 +61,8 @@ function Invoke-Captured {
         [string]$WorkingDirectory
     )
     $line = "$FilePath $($Arguments -join ' ')"
-    Write-Host "[run] $line" -ForegroundColor Cyan
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[run] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
     if ($DryRun) { return "{}" }
     Push-Location $WorkingDirectory
     try {
@@ -190,9 +210,23 @@ function Ensure-Venv {
 
 function Prepare-GPTSoVITS {
     param($Repo)
-    $repoPath = Join-Path $Root $Repo.path
+    $repoPath = [string]$Repo.absolute_path
     if ($SkipInstall) {
         Write-Host "[skip] GPT-SoVITS install for $($Repo.name)"
+        return
+    }
+    if ($DryRun) {
+        if ($IsWindows -or $env:OS -eq "Windows_NT") {
+            Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
+                param($CandidateSource)
+                Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", (Join-Path $repoPath "install.ps1"), "-Device", $Device, "-Source", $CandidateSource) $repoPath
+            }
+        } else {
+            Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
+                param($CandidateSource)
+                Invoke-Logged "bash" @((Join-Path $repoPath "install.sh"), "--device", $Device, "--source", $CandidateSource) $repoPath
+            }
+        }
         return
     }
     $installPs1 = Join-Path $repoPath "install.ps1"
@@ -222,7 +256,7 @@ function Prepare-GPTSoVITS {
 
 function Prepare-IndexTTS {
     param($Repo)
-    $repoPath = Join-Path $Root $Repo.path
+    $repoPath = [string]$Repo.absolute_path
     $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
     $repoUv = Join-Path $repoPath ".uv-bootstrap\Scripts\uv.exe"
     if (-not $uv -and (Test-Path -LiteralPath $repoUv)) { $uv = $repoUv }
@@ -264,7 +298,7 @@ function Prepare-IndexTTS {
 
 function Prepare-CosyVoice {
     param($Repo)
-    $repoPath = Join-Path $Root $Repo.path
+    $repoPath = [string]$Repo.absolute_path
     Invoke-Logged "git" @("-C", $repoPath, "submodule", "update", "--init", "--recursive") $Root
     $repoPython = Resolve-RepoPython $repoPath
     if (-not $SkipInstall) {
@@ -299,7 +333,7 @@ if ($SyncRepos) {
     if ($RepoPaths) { $syncArgs += @("--repo-paths", $RepoPaths) }
     if ($CleanRepos) { $syncArgs += "--clean" }
     if ($DryRun) { $syncArgs += "--dry-run" }
-    Invoke-Logged $Python $syncArgs $Root
+    Invoke-Plan $Python $syncArgs $Root
 }
 
 $NetworkProfile = Resolve-NetworkProfile
@@ -310,15 +344,11 @@ $SourceFallbacks = Get-SourceFallbacks $ResolvedSource
 $PackageIndexFallbacks = Get-PackageIndexFallbacks ([string]$NetworkProfile.pip_index_url)
 Write-Host "[network] source=$ResolvedSource cache=$($NetworkProfile.cache_root)" -ForegroundColor Cyan
 
-if ($RepoPaths) {
-    $repoArgs = @((Join-Path $Root "scripts\tts_more_deploy.py"), "--root", $Root, "list-repos", "--service-ids", ($TargetItems -join ","), "--repo-paths", $RepoPaths)
-    $reposJson = & $Python @repoArgs
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    $repositories = @($reposJson | ConvertFrom-Json)
-} else {
-    $lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json
-    $repositories = @($lock.repositories)
-}
+$repoArgs = @((Join-Path $Root "scripts\tts_more_deploy.py"), "--root", $Root, "list-repos", "--service-ids", ($TargetItems -join ","))
+if ($RepoPaths) { $repoArgs += @("--repo-paths", $RepoPaths) }
+$reposJson = & $Python @repoArgs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$repositories = @($reposJson | ConvertFrom-Json)
 foreach ($repo in $repositories) {
     if (-not (Test-Target $repo)) { continue }
     switch ($repo.provider_type) {
@@ -328,7 +358,8 @@ foreach ($repo in $repositories) {
     }
 }
 
-$renderArgs = @("scripts\tts_more_deploy.py", "render-services", "--profile", "local-all", "--platform", "windows", "--service-ids", ($TargetItems -join ","), "--output", "data\local\services.json")
+$renderArgs = @("scripts\tts_more_deploy.py", "render-services", "--profile", "local-all", "--platform", "windows", "--service-ids", ($TargetItems -join ","))
 if ($RepoPaths) { $renderArgs += @("--repo-paths", $RepoPaths) }
-Invoke-Logged $Python $renderArgs $Root
+if (-not $DryRun) { $renderArgs += @("--output", "data\local\services.json") }
+Invoke-Plan $Python $renderArgs $Root
 Write-Host "Prepared selected TTS repositories. Rendered data\local\services.json." -ForegroundColor Green

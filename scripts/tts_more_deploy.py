@@ -3,14 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from urllib.error import URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from typing import Any
 
@@ -18,6 +21,10 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_BUNDLE_RELATIVE_PATH = Path("deployment/tts-repos")
 DEFAULT_REPO_PATHS_RELATIVE_PATH = Path("deployment/app/repo-paths.local.json")
+MANAGED_REPO_RELATIVE_PATH = Path("repo")
+
+SAFE_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+PINNED_COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 
 PROVIDER_MODULES = {
@@ -82,58 +89,73 @@ PIP_INDEX_CANDIDATES = [
 def load_repo_lock(root: Path = PROJECT_ROOT) -> list[dict[str, Any]]:
     path = root / "repo.lock.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    return list(payload.get("repositories") or [])
+    raw_repositories = payload.get("repositories") if isinstance(payload, dict) else None
+    if not isinstance(raw_repositories, list) or not raw_repositories:
+        raise ValueError(f"repo lock must contain a non-empty repositories list: {path}")
+    repositories = [dict(repo) for repo in raw_repositories if isinstance(repo, dict)]
+    if len(repositories) != len(raw_repositories):
+        raise ValueError(f"every repo lock entry must be an object: {path}")
+    _validate_repo_manifest(repositories)
+    return repositories
 
 
 def load_deployment_repositories(
     root: Path = PROJECT_ROOT,
     repo_paths: str | Path | None = None,
+    *,
+    service_ids: set[str] | None = None,
+    require_complete: bool = False,
 ) -> list[dict[str, Any]]:
     repositories = [dict(repo) for repo in load_repo_lock(root)]
     overrides = load_repo_path_overrides(root, repo_paths)
     if overrides:
         apply_repo_path_overrides(repositories, overrides)
+    selected = _select_repositories(repositories, service_ids)
+    if require_complete:
+        confirmed = set(overrides)
+        missing = [str(repo["service_id"]) for repo in selected if str(repo["service_id"]) not in confirmed]
+        if missing:
+            source = _repo_paths_config_path(root, repo_paths)
+            detail = str(source) if source else "no confirmation file"
+            raise ValueError(
+                "missing confirmed repository paths for service_id(s): "
+                f"{', '.join(missing)} ({detail})"
+            )
     return repositories
 
 
 def save_repo_lock(repositories: list[dict[str, Any]], root: Path = PROJECT_ROOT) -> None:
-    write_json(root / "repo.lock.json", {"repositories": repositories})
+    write_json(root / "repo.lock.json", {"repositories": repositories}, boundary=root)
 
 
 def load_repo_path_overrides(root: Path = PROJECT_ROOT, repo_paths: str | Path | None = None) -> dict[str, str]:
     path = _repo_paths_config_path(root, repo_paths)
     if path is None:
         return {}
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object)
     raw = payload.get("repositories") if isinstance(payload, dict) else payload
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"repo paths must be a non-empty service-id keyed object: {path}")
     overrides: dict[str, str] = {}
-    if isinstance(raw, dict):
-        for key, value in raw.items():
-            if isinstance(key, str) and isinstance(value, str) and value.strip():
-                overrides[key] = value.strip()
-        return overrides
-    if isinstance(raw, list):
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            path_value = item.get("path")
-            if not isinstance(path_value, str) or not path_value.strip():
-                continue
-            for key_name in ("service_id", "name", "provider_type", "variant"):
-                key = item.get(key_name)
-                if isinstance(key, str) and key.strip():
-                    overrides[key.strip()] = path_value.strip()
-        return overrides
-    raise ValueError(f"unsupported repo paths format: {path}")
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"repository service_id keys must be non-empty strings: {path}")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"repository path for {key!r} must be a non-empty string: {path}")
+        overrides[key.strip()] = value.strip()
+    return overrides
 
 
 def apply_repo_path_overrides(repositories: list[dict[str, Any]], overrides: Mapping[str, str]) -> None:
-    for repo in repositories:
-        for key in _repo_override_keys(repo):
-            if key in overrides:
-                repo["path"] = overrides[key]
-                repo["path_source"] = key
-                break
+    by_service_id = {str(repo["service_id"]): repo for repo in repositories}
+    unknown = sorted(set(overrides) - set(by_service_id))
+    if unknown:
+        raise ValueError(f"unknown repository service_id(s): {', '.join(unknown)}")
+    for service_id, path in overrides.items():
+        repo = by_service_id[service_id]
+        repo["path"] = path
+        repo["path_source"] = service_id
+        repo["path_confirmed"] = True
 
 
 def _repo_paths_config_path(root: Path, repo_paths: str | Path | None) -> Path | None:
@@ -148,15 +170,46 @@ def _repo_paths_config_path(root: Path, repo_paths: str | Path | None) -> Path |
     return path
 
 
-def _repo_override_keys(repo: Mapping[str, Any]) -> list[str]:
-    keys = [
-        str(repo.get("service_id") or ""),
-        str(repo.get("name") or ""),
-        str(repo.get("provider_type") or ""),
-        str(repo.get("variant") or ""),
-        str(repo.get("path") or ""),
-    ]
-    return [key for key in keys if key]
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key in repository confirmation: {key}")
+        result[key] = value
+    return result
+
+
+def _validate_repo_manifest(repositories: list[dict[str, Any]]) -> None:
+    seen_service_ids: set[str] = set()
+    for index, repo in enumerate(repositories):
+        service_id = repo.get("service_id")
+        if not isinstance(service_id, str) or not service_id.strip():
+            raise ValueError(f"repository entry {index} requires a non-empty service_id")
+        if service_id in seen_service_ids:
+            raise ValueError(f"duplicate service_id in repo lock: {service_id}")
+        seen_service_ids.add(service_id)
+        if type(repo.get("default_selected")) is not bool:
+            raise ValueError(f"repository {service_id} requires explicit boolean default_selected")
+        for field in ("name", "provider_type", "path", "remote", "branch"):
+            if not isinstance(repo.get(field), str) or not str(repo[field]).strip():
+                raise ValueError(f"repository {service_id} requires non-empty {field}")
+        _validate_branch(str(repo["branch"]), service_id=service_id)
+        commit = repo.get("commit")
+        if commit is not None and (not isinstance(commit, str) or not PINNED_COMMIT_RE.fullmatch(commit)):
+            raise ValueError(f"repository {service_id} has invalid pinned commit")
+
+
+def _validate_branch(branch: str, *, service_id: str = "repository") -> None:
+    invalid = (
+        not SAFE_BRANCH_RE.fullmatch(branch)
+        or ".." in branch
+        or "@{" in branch
+        or "//" in branch
+        or branch.endswith(("/", ".", ".lock"))
+        or any(part.startswith(".") for part in branch.split("/"))
+    )
+    if invalid:
+        raise ValueError(f"repository {service_id} has invalid branch: {branch!r}")
 
 
 def _utc_now() -> datetime:
@@ -456,9 +509,9 @@ def probe_network(
         force=force,
     )
     if write:
-        write_json(_network_profile_path(root), profile)
+        write_json(_network_profile_path(root), profile, boundary=root)
     if output:
-        write_json(root / output, profile)
+        write_json(root / output, profile, boundary=root)
     return profile
 
 
@@ -473,12 +526,13 @@ def render_services(
     repositories: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     platform_name = platform_name or _platform_name()
-    repositories = [repo for repo in (repositories or load_repo_lock(root)) if _is_tts_repo(repo)]
+    repositories = _select_repositories(
+        [repo for repo in (repositories or load_repo_lock(root)) if _is_tts_repo(repo)],
+        service_ids,
+    )
     services: list[dict[str, Any]] = []
     for repo in repositories:
         service_id = str(repo.get("service_id") or _default_service_id(repo))
-        if not _repo_selected(repo, service_ids):
-            continue
         provider = str(repo["provider_type"])
         port = int(repo.get("port") or _default_port(provider))
         is_external = profile == "app-only"
@@ -527,13 +581,19 @@ def _run_git_command(command: list[str], *, cwd: Path) -> None:
 
 
 def _repo_selected(repo: dict[str, Any], service_ids: set[str] | None) -> bool:
+    if service_ids is None:
+        return repo.get("default_selected") is True
     if not service_ids:
-        return bool(repo.get("default_selected", True))
+        return False
     if "all" in service_ids:
         return True
-    if "default" in service_ids and bool(repo.get("default_selected", True)):
+    if "default" in service_ids and repo.get("default_selected") is True:
         return True
-    candidates = {
+    return bool(_repo_selector_candidates(repo) & service_ids)
+
+
+def _repo_selector_candidates(repo: Mapping[str, Any]) -> set[str]:
+    return {
         str(repo.get("name") or ""),
         str(repo.get("provider_type") or ""),
         str(repo.get("service_id") or _default_service_id(repo)),
@@ -541,7 +601,35 @@ def _repo_selected(repo: dict[str, Any], service_ids: set[str] | None) -> bool:
         str(repo.get("branch") or ""),
         str(repo.get("path") or ""),
     }
-    return any(item in candidates for item in service_ids)
+
+
+def _select_repositories(
+    repositories: list[dict[str, Any]],
+    service_ids: set[str] | None,
+) -> list[dict[str, Any]]:
+    if service_ids is not None and not service_ids:
+        raise ValueError("empty target selector set")
+    if service_ids is None:
+        selected = [repo for repo in repositories if repo.get("default_selected") is True]
+    else:
+        matched: set[str] = set()
+        selected = []
+        for repo in repositories:
+            candidates = _repo_selector_candidates(repo)
+            repo_matches = candidates & service_ids
+            if "all" in service_ids:
+                repo_matches.add("all")
+            if "default" in service_ids and repo.get("default_selected") is True:
+                repo_matches.add("default")
+            matched.update(repo_matches)
+            if repo_matches:
+                selected.append(repo)
+        unknown = sorted(service_ids - matched)
+        if unknown:
+            raise ValueError(f"unknown target selector(s): {', '.join(unknown)}")
+    if not selected:
+        raise ValueError("target selectors resolved to no repositories")
+    return selected
 
 
 def _repo_status(path: Path) -> str:
@@ -557,34 +645,70 @@ def _ensure_clean_repo(path: Path, name: str) -> None:
         )
 
 
+def _canonical_remote_identity(remote: str) -> str:
+    value = remote.strip()
+    scp_match = re.fullmatch(r"(?:[^@/]+@)?([^:/]+):(.+)", value)
+    if scp_match and "://" not in value:
+        host = scp_match.group(1).lower()
+        path = scp_match.group(2)
+    else:
+        parsed = urlparse(value)
+        if not parsed.scheme or not parsed.hostname:
+            return value.rstrip("/").removesuffix(".git")
+        host = parsed.hostname.lower()
+        path = parsed.path
+    normalized_path = path.strip("/").removesuffix(".git")
+    return f"{host}/{normalized_path}"
+
+
+def _ensure_repo_origin(path: Path, expected_remote: str) -> None:
+    actual_remote = _git_output(["git", "-C", str(path), "remote", "get-url", "origin"])
+    if not actual_remote or _canonical_remote_identity(actual_remote) != _canonical_remote_identity(expected_remote):
+        raise RuntimeError(
+            f"repository origin mismatch at {path}: expected {expected_remote!r}, "
+            f"found {actual_remote or '<missing>'!r}"
+        )
+
+
 def _git_exclude_path(repo_path: Path) -> Path | None:
     dot_git = repo_path / ".git"
-    if dot_git.is_dir():
-        return dot_git / "info" / "exclude"
-    git_dir = _git_output(["git", "-C", str(repo_path), "rev-parse", "--git-dir"])
-    if not git_dir:
+    if not dot_git.exists():
         return None
-    candidate = Path(git_dir)
-    if not candidate.is_absolute():
-        candidate = repo_path / candidate
-    return candidate / "info" / "exclude"
+    _assert_safe_path(dot_git, repo_path)
+    if not dot_git.is_dir():
+        return None
+    candidate = dot_git / "info" / "exclude"
+    _assert_safe_path(candidate, repo_path)
+    return candidate
 
 
 def _exclude_local_update_scripts(repo_path: Path) -> None:
-    _exclude_local_helper_paths(repo_path, ["tts-more-update.sh", "tts-more-update.ps1"])
+    _exclude_local_helper_paths(
+        repo_path,
+        [
+            "tts-more-update.sh",
+            "tts-more-update.ps1",
+            "tts-more-update.py",
+            "tts-more-update.json",
+        ],
+    )
 
 
 def _exclude_local_helper_paths(repo_path: Path, names: list[str]) -> None:
     exclude_path = _git_exclude_path(repo_path)
     if exclude_path is None:
         return
-    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    _safe_mkdir(exclude_path.parent, repo_path)
     existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
     additions = [name for name in names if name not in existing.splitlines()]
     if not additions:
         return
     prefix = "" if not existing or existing.endswith("\n") else "\n"
-    exclude_path.write_text(existing + prefix + "\n".join(additions) + "\n", encoding="utf-8")
+    _atomic_write_text(
+        exclude_path,
+        existing + prefix + "\n".join(additions) + "\n",
+        boundary=repo_path,
+    )
 
 
 def _run_clone_with_fallback(
@@ -626,16 +750,20 @@ def sync_repos(
     if clean:
         _remove_repo_dir(root, dry_run=dry_run)
     actions: list[list[str]] = []
-    repositories = [dict(repo) for repo in (repositories or load_repo_lock(root))]
+    repositories = _select_repositories(
+        [dict(repo) for repo in (repositories or load_repo_lock(root))],
+        service_ids,
+    )
     lock_changed = False
     for repo in repositories:
-        if not _repo_selected(repo, service_ids):
-            continue
-        path = _resolve_project_path(root, str(repo["path"]))
+        path = _resolve_repo_path(root, str(repo["path"]))
         remote = str(repo["remote"])
         branch = str(repo["branch"])
         commit = repo.get("commit")
         if path.exists() and (path / ".git").exists():
+            if not force_reset:
+                _ensure_clean_repo(path, str(repo.get("name") or repo.get("service_id") or path.name))
+            _ensure_repo_origin(path, remote)
             if force_reset:
                 commands = [
                     ["git", "-C", str(path), "fetch", "--prune", "origin", branch],
@@ -643,14 +771,14 @@ def sync_repos(
                     ["git", "-C", str(path), "reset", "--hard", f"origin/{branch}"],
                 ]
             else:
-                _ensure_clean_repo(path, str(repo.get("name") or repo.get("service_id") or path.name))
                 commands = [
                     ["git", "-C", str(path), "fetch", "--prune", "origin", branch],
                     ["git", "-C", str(path), "checkout", branch],
                     ["git", "-C", str(path), "pull", "--ff-only", "origin", branch],
                 ]
         else:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            if not dry_run:
+                _safe_mkdir(path.parent, root)
             _run_clone_with_fallback(
                 root,
                 remote=remote,
@@ -697,58 +825,122 @@ def sync_repos(
     return actions
 
 
-def _service_update_script_sh(repo: dict[str, Any]) -> str:
-    branch = str(repo.get("branch") or "main")
-    commit = str(repo.get("commit") or "")
-    remote = str(repo.get("remote") or "")
-    return f"""#!/usr/bin/env bash
+def _service_update_script_sh() -> str:
+    return """#!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
-BRANCH="${{TTS_MORE_UPDATE_BRANCH:-{branch}}}"
-PINNED_COMMIT="${{TTS_MORE_PINNED_COMMIT:-{commit}}}"
-
-cd "$ROOT"
-echo "[update] {repo.get('name') or repo.get('service_id') or branch}"
-echo "[remote] {remote}"
-git fetch --prune origin "$BRANCH"
-git checkout "$BRANCH"
-git pull --ff-only origin "$BRANCH"
-
-if [[ "${{1:-}}" == "--pinned" && -n "$PINNED_COMMIT" ]]; then
-  git fetch origin "$PINNED_COMMIT"
-  git checkout "$PINNED_COMMIT"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${TTS_MORE_UPDATE_PYTHON:-}" ]]; then
+  PYTHON="$TTS_MORE_UPDATE_PYTHON"
+elif [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PYTHON="$ROOT/.venv/bin/python"
+else
+  PYTHON="python3"
 fi
-
-git status --short --branch
+exec "$PYTHON" "$ROOT/tts-more-update.py" "$@"
 """
 
 
-def _service_update_script_ps1(repo: dict[str, Any]) -> str:
-    branch = str(repo.get("branch") or "main")
-    commit = str(repo.get("commit") or "")
-    remote = str(repo.get("remote") or "")
-    return f"""$ErrorActionPreference = "Stop"
+def _service_update_script_ps1() -> str:
+    return r"""$ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Branch = if ($env:TTS_MORE_UPDATE_BRANCH) {{ $env:TTS_MORE_UPDATE_BRANCH }} else {{ "{branch}" }}
-$PinnedCommit = if ($env:TTS_MORE_PINNED_COMMIT) {{ $env:TTS_MORE_PINNED_COMMIT }} else {{ "{commit}" }}
-
-Set-Location $Root
-Write-Host "[update] {repo.get('name') or repo.get('service_id') or branch}" -ForegroundColor Cyan
-Write-Host "[remote] {remote}" -ForegroundColor DarkCyan
-git fetch --prune origin $Branch
-git checkout $Branch
-git pull --ff-only origin $Branch
-
-if ($args.Count -gt 0 -and $args[0] -eq "--pinned" -and $PinnedCommit) {{
-  git fetch origin $PinnedCommit
-  git checkout $PinnedCommit
-}}
-
-git status --short --branch
+if ($env:TTS_MORE_UPDATE_PYTHON) {
+  $Python = $env:TTS_MORE_UPDATE_PYTHON
+} elseif (Test-Path -LiteralPath (Join-Path $Root ".venv\Scripts\python.exe")) {
+  $Python = Join-Path $Root ".venv\Scripts\python.exe"
+} else {
+  $Python = "python"
+}
+& $Python (Join-Path $Root "tts-more-update.py") @args
 exit $LASTEXITCODE
 """
+
+
+def _service_update_script_py() -> str:
+    return r'''from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
+COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
+
+
+def validate_branch(value: str) -> str:
+    invalid = (
+        not BRANCH_RE.fullmatch(value)
+        or ".." in value
+        or "@{" in value
+        or "//" in value
+        or value.endswith(("/", ".", ".lock"))
+        or any(part.startswith(".") for part in value.split("/"))
+    )
+    if invalid:
+        raise ValueError(f"invalid update branch: {value!r}")
+    return value
+
+
+def canonical_remote(value: str) -> str:
+    value = value.strip()
+    scp_match = re.fullmatch(r"(?:[^@/]+@)?([^:/]+):(.+)", value)
+    if scp_match and "://" not in value:
+        host, path = scp_match.group(1).lower(), scp_match.group(2)
+    else:
+        parsed = urlparse(value)
+        if not parsed.scheme or not parsed.hostname:
+            return value.rstrip("/").removesuffix(".git")
+        host, path = parsed.hostname.lower(), parsed.path
+    return f"{host}/{path.strip('/').removesuffix('.git')}"
+
+
+def output(args: list[str], root: Path) -> str:
+    result = subprocess.run(args, cwd=root, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"command failed: {args!r}")
+    return result.stdout.strip()
+
+
+def run(args: list[str], root: Path) -> None:
+    subprocess.run(args, cwd=root, check=True)
+
+
+def main(argv: list[str]) -> int:
+    root = Path(__file__).resolve().parent
+    config = json.loads((root / "tts-more-update.json").read_text(encoding="utf-8"))
+    branch = validate_branch(os.environ.get("TTS_MORE_UPDATE_BRANCH") or str(config["branch"]))
+    commit = os.environ.get("TTS_MORE_PINNED_COMMIT") or str(config.get("commit") or "")
+    if commit and not COMMIT_RE.fullmatch(commit):
+        raise ValueError(f"invalid pinned commit: {commit!r}")
+    expected_remote = str(config["remote"])
+    actual_remote = output(["git", "remote", "get-url", "origin"], root)
+    if canonical_remote(actual_remote) != canonical_remote(expected_remote):
+        raise RuntimeError(
+            f"repository origin mismatch: expected {expected_remote!r}, found {actual_remote!r}"
+        )
+    dirty = output(["git", "status", "--porcelain"], root)
+    if dirty:
+        raise RuntimeError("refusing to update a dirty repository; commit, stash, or clean local changes first")
+    print(f"[update] {config.get('name') or config.get('service_id') or branch}")
+    print(f"[remote] {expected_remote}")
+    run(["git", "fetch", "--prune", "origin", branch], root)
+    run(["git", "checkout", branch], root)
+    run(["git", "pull", "--ff-only", "origin", branch], root)
+    if argv and argv[0] == "--pinned" and commit:
+        run(["git", "fetch", "origin", commit], root)
+        run(["git", "checkout", commit], root)
+    run(["git", "status", "--short", "--branch"], root)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+'''
 
 
 def install_update_scripts(
@@ -759,26 +951,64 @@ def install_update_scripts(
     repositories: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     reports = []
-    for repo in repositories or load_repo_lock(root):
-        if not _repo_selected(repo, service_ids):
-            continue
-        repo_path = _resolve_project_path(root, str(repo["path"]))
-        sh_path = repo_path / "tts-more-update.sh"
-        ps1_path = repo_path / "tts-more-update.ps1"
+    selected = _select_repositories(repositories or load_repo_lock(root), service_ids)
+    for repo in selected:
+        service_id = str(repo["service_id"])
+        branch = str(repo["branch"])
+        commit = str(repo.get("commit") or "")
+        _validate_branch(branch, service_id=service_id)
+        if commit and not PINNED_COMMIT_RE.fullmatch(commit):
+            raise ValueError(f"repository {service_id} has invalid pinned commit")
+        repo_path = _resolve_repo_path(root, str(repo["path"]))
+        destinations = {
+            "tts-more-update.sh": repo_path / "tts-more-update.sh",
+            "tts-more-update.ps1": repo_path / "tts-more-update.ps1",
+            "tts-more-update.py": repo_path / "tts-more-update.py",
+            "tts-more-update.json": repo_path / "tts-more-update.json",
+        }
         exists = repo_path.exists()
         report = {
             "name": repo.get("name"),
             "path": str(repo.get("path")),
             "exists": exists,
-            "scripts": [sh_path.relative_to(root).as_posix(), ps1_path.relative_to(root).as_posix()],
+            "scripts": [path.relative_to(root).as_posix() for path in destinations.values()],
+            "actions": [
+                {"action": "write", "path": path.relative_to(root).as_posix()}
+                for path in destinations.values()
+            ],
         }
         reports.append(report)
+        if exists:
+            for destination in destinations.values():
+                _assert_safe_path(destination, repo_path)
         if dry_run or not exists:
             continue
-        sh_path.write_text(_service_update_script_sh(repo), encoding="utf-8")
-        ps1_path.write_text(_service_update_script_ps1(repo), encoding="utf-8")
-        current_mode = sh_path.stat().st_mode
-        sh_path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        sidecar = {
+            "schema_version": 1,
+            "service_id": service_id,
+            "name": repo.get("name"),
+            "remote": repo["remote"],
+            "branch": branch,
+            "commit": commit,
+        }
+        executable_mode = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+        _atomic_write_text(
+            destinations["tts-more-update.sh"],
+            _service_update_script_sh(),
+            boundary=repo_path,
+            mode=executable_mode,
+        )
+        _atomic_write_text(
+            destinations["tts-more-update.ps1"],
+            _service_update_script_ps1(),
+            boundary=repo_path,
+        )
+        _atomic_write_text(
+            destinations["tts-more-update.py"],
+            _service_update_script_py(),
+            boundary=repo_path,
+        )
+        write_json(destinations["tts-more-update.json"], sidecar, boundary=repo_path)
         _exclude_local_update_scripts(repo_path)
     return reports
 
@@ -791,13 +1021,13 @@ def install_repo_bundles(
     repositories: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     reports = []
-    for repo in repositories or load_repo_lock(root):
-        if not _repo_selected(repo, service_ids):
-            continue
+    selected = _select_repositories(repositories or load_repo_lock(root), service_ids)
+    for repo in selected:
         provider = str(repo.get("provider_type") or "")
         bundle_path = root / REPO_BUNDLE_RELATIVE_PATH / provider
-        repo_path = _resolve_project_path(root, str(repo["path"]))
+        repo_path = _resolve_repo_path(root, str(repo["path"]))
         target_path = repo_path / "tts-more"
+        manifest_path = target_path / "tts-more-repo.json"
         report = {
             "name": repo.get("name"),
             "provider_type": provider,
@@ -806,46 +1036,105 @@ def install_repo_bundles(
             "bundle": str(bundle_path.relative_to(root)) if bundle_path.exists() else "",
             "target": str(target_path.relative_to(root)),
             "installed": False,
+            "actions": [],
         }
         reports.append(report)
         if not bundle_path.exists():
             report["error"] = f"missing bundle for provider: {provider}"
             continue
-        if dry_run or not repo_path.exists():
-            continue
-        _copy_tree_contents(bundle_path, target_path)
+        _assert_safe_path(bundle_path, root)
+        source_files = _bundle_inventory(bundle_path)
+        current_owned = sorted(source_files)
+        _assert_safe_path(target_path, repo_path)
+        _assert_safe_path(manifest_path, repo_path)
+        previous_owned = _read_previous_owned_files(manifest_path, target_path) if target_path.exists() else []
+        stale_owned = sorted(set(previous_owned) - set(current_owned))
+        for relative in stale_owned:
+            destination = target_path / relative
+            _assert_safe_path(destination, target_path)
+            report["actions"].append({"action": "remove", "path": destination.relative_to(root).as_posix()})
+        for relative in current_owned:
+            destination = target_path / relative
+            _assert_safe_path(destination, target_path)
+            report["actions"].append({"action": "copy", "path": destination.relative_to(root).as_posix()})
+        report["actions"].append(
+            {"action": "write-manifest", "path": manifest_path.relative_to(root).as_posix()}
+        )
         manifest = {
-            "schema_version": 1,
-            "installed_at": _isoformat(_utc_now()),
+            "schema_version": 2,
             "service_id": repo.get("service_id"),
             "name": repo.get("name"),
             "provider_type": provider,
             "variant": repo.get("variant"),
             "branch": repo.get("branch"),
             "commit": repo.get("commit"),
-            "source_bundle": str(REPO_BUNDLE_RELATIVE_PATH / provider),
+            "source_bundle": (REPO_BUNDLE_RELATIVE_PATH / provider).as_posix(),
+            "owned_files": current_owned,
         }
-        write_json(target_path / "tts-more-repo.json", manifest)
-        _chmod_shell_scripts(target_path)
+        if dry_run or not repo_path.exists():
+            continue
+        _git_exclude_path(repo_path)
+        _safe_mkdir(target_path, repo_path)
+        for relative in stale_owned:
+            _remove_owned_bundle_file(target_path / relative, target_path)
+        for relative in current_owned:
+            source = source_files[relative]
+            destination = target_path / relative
+            source_mode = source.stat().st_mode & 0o777
+            if destination.suffix == ".sh":
+                source_mode |= stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+            _atomic_write_bytes(destination, source.read_bytes(), boundary=target_path, mode=source_mode)
+        write_json(manifest_path, manifest, boundary=repo_path)
         _exclude_local_helper_paths(repo_path, ["tts-more/"])
         report["installed"] = True
     return reports
 
 
-def _copy_tree_contents(source: Path, target: Path) -> None:
-    target.mkdir(parents=True, exist_ok=True)
-    for child in source.iterdir():
-        destination = target / child.name
-        if child.is_dir():
-            shutil.copytree(child, destination, dirs_exist_ok=True)
-        else:
-            shutil.copy2(child, destination)
+def _bundle_inventory(source: Path) -> dict[str, Path]:
+    inventory: dict[str, Path] = {}
+    for directory, directory_names, file_names in os.walk(source, followlinks=False):
+        directory_path = Path(directory)
+        for name in [*directory_names, *file_names]:
+            candidate = directory_path / name
+            if _is_link_or_reparse(candidate):
+                raise ValueError(f"bundle source contains a symlink or reparse point: {candidate}")
+        for name in file_names:
+            candidate = directory_path / name
+            if not candidate.is_file():
+                raise ValueError(f"bundle source contains a non-regular file: {candidate}")
+            inventory[candidate.relative_to(source).as_posix()] = candidate
+    return dict(sorted(inventory.items()))
 
 
-def _chmod_shell_scripts(root: Path) -> None:
-    for path in root.rglob("*.sh"):
-        current_mode = path.stat().st_mode
-        path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+def _read_previous_owned_files(manifest_path: Path, target_path: Path) -> list[str]:
+    _assert_safe_path(manifest_path, target_path)
+    if not manifest_path.exists():
+        return []
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_owned = payload.get("owned_files") if isinstance(payload, dict) else None
+    if not isinstance(raw_owned, list):
+        return []
+    owned: list[str] = []
+    for raw in raw_owned:
+        if not isinstance(raw, str) or not raw:
+            raise ValueError(f"invalid owned file entry in {manifest_path}")
+        relative = Path(raw)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"owned file escapes bundle target: {raw}")
+        owned.append(relative.as_posix())
+    return sorted(set(owned))
+
+
+def _remove_owned_bundle_file(path: Path, target_path: Path) -> None:
+    _assert_safe_path(path, target_path)
+    if path.exists():
+        if not path.is_file():
+            raise ValueError(f"owned bundle path is not a regular file: {path}")
+        path.unlink()
+    parent = path.parent
+    while parent != target_path and parent.exists() and not any(parent.iterdir()):
+        parent.rmdir()
+        parent = parent.parent
 
 
 def validate_repo_paths(
@@ -856,12 +1145,11 @@ def validate_repo_paths(
     repositories: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     reports = []
-    for repo in repositories or load_repo_lock(root):
-        if not _repo_selected(repo, service_ids):
-            continue
+    selected = _select_repositories(repositories or load_repo_lock(root), service_ids)
+    for repo in selected:
         raw_path = str(repo.get("path") or "")
         try:
-            resolved = _resolve_project_path(root, raw_path)
+            resolved = _resolve_repo_path(root, raw_path)
             inside_project = True
             error = ""
         except ValueError as exc:
@@ -869,6 +1157,21 @@ def validate_repo_paths(
             inside_project = False
             error = str(exc)
         exists = resolved.exists()
+        git_repo = exists and (resolved / ".git").exists()
+        origin_matches = False
+        if git_repo:
+            actual_remote = _git_output(["git", "-C", str(resolved), "remote", "get-url", "origin"])
+            origin_matches = bool(actual_remote) and _canonical_remote_identity(actual_remote) == _canonical_remote_identity(
+                str(repo["remote"])
+            )
+            if not origin_matches and not error:
+                error = (
+                    f"repository origin mismatch: expected {repo['remote']!r}, "
+                    f"found {actual_remote or '<missing>'!r}"
+                )
+        elif exists and not error:
+            error = "path exists but is not a Git repository"
+        ok = inside_project and (exists or not require_exists) and (not exists or (git_repo and origin_matches))
         reports.append(
             {
                 "name": repo.get("name"),
@@ -878,7 +1181,9 @@ def validate_repo_paths(
                 "absolute_path": str(resolved),
                 "exists": exists,
                 "inside_project": inside_project,
-                "ok": inside_project and (exists or not require_exists),
+                "git_repository": git_repo,
+                "origin_matches": origin_matches,
+                "ok": ok,
                 "error": error or ("path does not exist" if require_exists and not exists else ""),
             }
         )
@@ -945,7 +1250,7 @@ def update_project(
                 service_ids=service_ids,
                 repositories=repositories,
             )
-            write_json(root / services_output, services)
+            write_json(root / services_output, services, boundary=root)
     return {
         "app_actions": app_actions,
         "repo_actions": repo_actions,
@@ -965,10 +1270,8 @@ def doctor(
     reports = []
     all_repos = repositories or load_repo_lock(root)
     expected_paths = {str(repo["path"]).replace("\\", "/").rstrip("/") for repo in all_repos}
-    for repo in all_repos:
-        if not _repo_selected(repo, service_ids):
-            continue
-        path = root / str(repo["path"])
+    for repo in _select_repositories(all_repos, service_ids):
+        path = _resolve_repo_path(root, str(repo["path"]))
         branch = _git_output(["git", "-C", str(path), "branch", "--show-current"]) if (path / ".git").exists() else ""
         head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"]) if (path / ".git").exists() else ""
         reports.append(
@@ -1016,12 +1319,16 @@ def start_workers(
     )
     processes: list[subprocess.Popen] = []
     logs_dir = root / "data" / ".runtime" / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    _safe_mkdir(logs_dir, root)
     for service in services:
         command = _resolve_command(root, service["start_command"])
         env = {**os.environ, **_resolve_env(root, service.get("env") or {})}
         log_path = logs_dir / f"{service['service_id']}.log"
-        log_file = log_path.open("ab")
+        _assert_safe_path(log_path, root)
+        open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        open_flags |= getattr(os, "O_BINARY", 0)
+        open_flags |= getattr(os, "O_NOFOLLOW", 0)
+        log_file = os.fdopen(os.open(log_path, open_flags, 0o600), "ab")
         kwargs: dict[str, Any] = {
             "cwd": root,
             "env": env,
@@ -1051,9 +1358,91 @@ def start_workers(
         return 130
 
 
-def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(metadata, "st_file_attributes", 0) & reparse_flag:
+        return True
+    is_junction = getattr(os.path, "isjunction", None)
+    return bool(is_junction and is_junction(path))
+
+
+def _assert_safe_path(path: Path, boundary: Path) -> None:
+    boundary_absolute = Path(os.path.abspath(boundary))
+    path_absolute = Path(os.path.abspath(path))
+    try:
+        relative = path_absolute.relative_to(boundary_absolute)
+    except ValueError as exc:
+        raise ValueError(f"write path is outside owned boundary {boundary_absolute}: {path}") from exc
+    current = boundary_absolute
+    if _is_link_or_reparse(current):
+        raise ValueError(f"owned boundary is a symlink or reparse point: {current}")
+    for part in relative.parts:
+        current = current / part
+        if _is_link_or_reparse(current):
+            raise ValueError(f"refusing symlink or reparse-point destination: {current}")
+    resolved_boundary = boundary_absolute.resolve(strict=False)
+    resolved_path = path_absolute.resolve(strict=False)
+    try:
+        resolved_path.relative_to(resolved_boundary)
+    except ValueError as exc:
+        raise ValueError(f"resolved write path escapes owned boundary {resolved_boundary}: {path}") from exc
+
+
+def _safe_mkdir(path: Path, boundary: Path) -> None:
+    _assert_safe_path(path, boundary)
+    boundary_absolute = Path(os.path.abspath(boundary))
+    current = boundary_absolute
+    if not current.exists():
+        current.mkdir()
+    for part in Path(os.path.abspath(path)).relative_to(boundary_absolute).parts:
+        current = current / part
+        if current.exists():
+            if _is_link_or_reparse(current) or not current.is_dir():
+                raise ValueError(f"refusing non-directory or redirected destination: {current}")
+            continue
+        current.mkdir()
+
+
+def _atomic_write_bytes(path: Path, payload: bytes, *, boundary: Path, mode: int | None = None) -> None:
+    _safe_mkdir(path.parent, boundary)
+    _assert_safe_path(path, boundary)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".tts-more-write-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            temporary.chmod(mode)
+        _assert_safe_path(path, boundary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _atomic_write_text(path: Path, payload: str, *, boundary: Path, mode: int | None = None) -> None:
+    _atomic_write_bytes(path, payload.encode("utf-8"), boundary=boundary, mode=mode)
+
+
+def write_json(path: Path, payload: Any, *, boundary: Path | None = None) -> None:
+    owned_boundary = boundary
+    if owned_boundary is None:
+        owned_boundary = path.parent
+        while not owned_boundary.exists() and owned_boundary != owned_boundary.parent:
+            owned_boundary = owned_boundary.parent
+    _atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        boundary=owned_boundary,
+    )
 
 
 def _is_tts_repo(repo: dict[str, Any]) -> bool:
@@ -1125,7 +1514,9 @@ def _worker_env(repo: dict[str, Any], platform_name: str) -> dict[str, str]:
     elif provider == "cosyvoice":
         env["TTS_MORE_COSYVOICE_REPO"] = path
         env["TTS_MORE_COSYVOICE_PYTHON"] = _python_path(repo, platform_name)
-        env["TTS_MORE_COSYVOICE_MODEL_DIR"] = str(repo.get("model_dir") or "pretrained_models/CosyVoice-300M")
+        model_dir = str(repo.get("model_dir") or "pretrained_models/CosyVoice-300M").lstrip("/\\")
+        repo_root = path.rstrip("/\\")
+        env["TTS_MORE_COSYVOICE_MODEL_DIR"] = f"{repo_root}/{model_dir}"
     return env
 
 
@@ -1152,7 +1543,7 @@ def _remove_repo_dir(root: Path, *, dry_run: bool) -> None:
     if target.exists():
         for child in list(target.iterdir()):
             _remove_path(child)
-    target.mkdir(parents=True, exist_ok=True)
+    _safe_mkdir(target, root)
 
 
 def _remove_path(path: Path) -> None:
@@ -1218,6 +1609,24 @@ def _resolve_project_path(root: Path, raw: str) -> Path:
     return resolved
 
 
+def _resolve_repo_path(root: Path, raw: str) -> Path:
+    resolved = _resolve_project_path(root, raw)
+    lexical = Path(raw.replace("\\", "/"))
+    if not lexical.is_absolute():
+        lexical = root / lexical
+    _assert_safe_path(lexical, root)
+    managed_root = (root / MANAGED_REPO_RELATIVE_PATH).resolve(strict=False)
+    try:
+        relative = resolved.relative_to(managed_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"path is outside dedicated repository area {managed_root}: {raw}"
+        ) from exc
+    if not relative.parts:
+        raise ValueError(f"repository path must be below dedicated repository area: {raw}")
+    return resolved
+
+
 def _git_output(command: list[str]) -> str:
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -1227,15 +1636,41 @@ def _git_output(command: list[str]) -> str:
 
 
 def _parse_service_ids(raw: str | None) -> set[str] | None:
-    if not raw:
+    if raw is None:
         return None
-    return {item.strip() for item in raw.split(",") if item.strip()}
+    if not raw.strip():
+        raise ValueError("empty target selector")
+    items = [item.strip() for item in raw.split(",")]
+    if any(not item for item in items):
+        raise ValueError("empty target selector")
+    if len(items) != len(set(items)):
+        raise ValueError("duplicate target selector")
+    return set(items)
 
 
-def _load_cli_repositories(root: Path, repo_paths: str | None) -> list[dict[str, Any]] | None:
-    if not repo_paths:
-        return None
-    return load_deployment_repositories(root, repo_paths)
+def _load_cli_repositories(
+    root: Path,
+    repo_paths: str | None,
+    service_ids: set[str] | None,
+    *,
+    require_complete: bool = True,
+    verify_existing: bool = True,
+) -> list[dict[str, Any]]:
+    repositories = load_deployment_repositories(
+        root,
+        repo_paths,
+        service_ids=service_ids,
+        require_complete=require_complete,
+    )
+    if verify_existing:
+        for repo in _select_repositories(repositories, service_ids):
+            path = _resolve_repo_path(root, str(repo["path"]))
+            if not path.exists():
+                continue
+            if not (path / ".git").exists():
+                raise RuntimeError(f"confirmed repository path is not a Git checkout: {path}")
+            _ensure_repo_origin(path, str(repo["remote"]))
+    return repositories
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1250,7 +1685,7 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--service-ids", default=None)
     render.add_argument("--template", action="store_true", help="Render disabled committable defaults")
     render.add_argument("--output", default=None)
-    render.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    render.add_argument("--repo-paths", default=None, help="Complete service-id keyed repo path confirmation JSON")
 
     sync = sub.add_parser("sync-repos", help="Clone/fetch repositories from repo.lock.json")
     sync.add_argument("--clean", action="store_true")
@@ -1258,7 +1693,7 @@ def main(argv: list[str] | None = None) -> int:
     sync.add_argument("--latest", action="store_true", help="Track each configured branch instead of checking out the pinned commit")
     sync.add_argument("--write-lock", action="store_true", help="After --latest, write current HEADs back to repo.lock.json")
     sync.add_argument("--service-ids", default=None)
-    sync.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    sync.add_argument("--repo-paths", default=None, help="Complete service-id keyed repo path confirmation JSON")
 
     list_repos = sub.add_parser("list-repos", help="Print repositories after applying optional local path overrides")
     list_repos.add_argument("--service-ids", default=None)
@@ -1277,13 +1712,13 @@ def main(argv: list[str] | None = None) -> int:
     doctor_parser = sub.add_parser("doctor", help="Inspect repository checkout state")
     doctor_parser.add_argument("--output", default=None)
     doctor_parser.add_argument("--service-ids", default=None)
-    doctor_parser.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    doctor_parser.add_argument("--repo-paths", default=None, help="Complete service-id keyed repo path confirmation JSON")
 
     start = sub.add_parser("start-workers", help="Start local worker processes from repo.lock.json")
     start.add_argument("--platform", choices=("windows", "posix"), default=None)
     start.add_argument("--service-ids", default=None)
     start.add_argument("--detach", action="store_true")
-    start.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    start.add_argument("--repo-paths", default=None, help="Complete service-id keyed repo path confirmation JSON")
 
     install_scripts = sub.add_parser(
         "install-update-scripts",
@@ -1291,7 +1726,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     install_scripts.add_argument("--service-ids", default=None)
     install_scripts.add_argument("--dry-run", action="store_true")
-    install_scripts.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    install_scripts.add_argument("--repo-paths", default=None, help="Complete service-id keyed repo path confirmation JSON")
 
     install_bundles = sub.add_parser(
         "install-repo-bundles",
@@ -1299,7 +1734,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     install_bundles.add_argument("--service-ids", default=None)
     install_bundles.add_argument("--dry-run", action="store_true")
-    install_bundles.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    install_bundles.add_argument("--repo-paths", default=None, help="Complete service-id keyed repo path confirmation JSON")
 
     validate_paths = sub.add_parser(
         "validate-repo-paths",
@@ -1307,7 +1742,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     validate_paths.add_argument("--service-ids", default=None)
     validate_paths.add_argument("--require-exists", action="store_true")
-    validate_paths.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    validate_paths.add_argument("--repo-paths", default=None, help="Complete service-id keyed repo path confirmation JSON")
 
     update = sub.add_parser("update", help="Fast-forward the app and service repositories")
     update.add_argument("--dry-run", action="store_true")
@@ -1322,44 +1757,64 @@ def main(argv: list[str] | None = None) -> int:
     update.add_argument("--no-render", action="store_true")
     update.add_argument("--force-render-services", action="store_true")
     update.add_argument("--platform", choices=("windows", "posix"), default=None)
-    update.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    update.add_argument("--repo-paths", default=None, help="Complete service-id keyed repo path confirmation JSON")
 
     args = parser.parse_args(argv)
     root = Path(args.root).resolve(strict=False)
     if args.command == "render-services":
-        repositories = _load_cli_repositories(root, args.repo_paths)
+        service_ids = _parse_service_ids(args.service_ids)
+        repositories = _load_cli_repositories(
+            root,
+            args.repo_paths,
+            service_ids,
+            require_complete=args.profile != "app-only",
+            verify_existing=args.profile != "app-only",
+        )
         services = render_services(
             root,
             profile=args.profile,
             platform_name=args.platform,
             host=args.host,
-            service_ids=_parse_service_ids(args.service_ids),
+            service_ids=service_ids,
             template=args.template,
             repositories=repositories,
         )
         if args.output:
-            write_json(root / args.output, services)
+            write_json(root / args.output, services, boundary=root)
         else:
             print(json.dumps(services, ensure_ascii=False, indent=2))
         return 0
     if args.command == "sync-repos":
-        repositories = _load_cli_repositories(root, args.repo_paths)
+        service_ids = _parse_service_ids(args.service_ids)
+        repositories = _load_cli_repositories(
+            root,
+            args.repo_paths,
+            service_ids,
+            verify_existing=False,
+        )
         actions = sync_repos(
             root,
             clean=args.clean,
             dry_run=args.dry_run,
             latest=args.latest,
             write_lock=args.write_lock,
-            service_ids=_parse_service_ids(args.service_ids),
+            service_ids=service_ids,
             repositories=repositories,
         )
-        for command in actions:
-            print(" ".join(command))
+        print(
+            json.dumps(
+                {"actions": [{"argv": command} for command in actions]},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     if args.command == "list-repos":
-        repositories = load_deployment_repositories(root, args.repo_paths)
         service_ids = _parse_service_ids(args.service_ids)
-        repositories = [repo for repo in repositories if _repo_selected(repo, service_ids)]
+        repositories = _load_cli_repositories(root, args.repo_paths, service_ids)
+        repositories = _select_repositories(repositories, service_ids)
+        for repo in repositories:
+            repo["absolute_path"] = str(_resolve_repo_path(root, str(repo["path"])))
         if args.json_lines:
             for repo in repositories:
                 print(json.dumps(repo, ensure_ascii=False))
@@ -1380,54 +1835,65 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(profile, ensure_ascii=False, indent=2))
         return 0
     if args.command == "doctor":
-        repositories = _load_cli_repositories(root, args.repo_paths)
-        payload = doctor(root, service_ids=_parse_service_ids(args.service_ids), repositories=repositories)
+        service_ids = _parse_service_ids(args.service_ids)
+        repositories = _load_cli_repositories(root, args.repo_paths, service_ids)
+        payload = doctor(root, service_ids=service_ids, repositories=repositories)
         if args.output:
-            write_json(root / args.output, payload)
+            write_json(root / args.output, payload, boundary=root)
         else:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "start-workers":
-        repositories = _load_cli_repositories(root, args.repo_paths)
+        service_ids = _parse_service_ids(args.service_ids)
+        repositories = _load_cli_repositories(root, args.repo_paths, service_ids)
         return start_workers(
             root,
             platform_name=args.platform,
-            service_ids=_parse_service_ids(args.service_ids),
+            service_ids=service_ids,
             detach=args.detach,
             repositories=repositories,
         )
     if args.command == "install-update-scripts":
-        repositories = _load_cli_repositories(root, args.repo_paths)
+        service_ids = _parse_service_ids(args.service_ids)
+        repositories = _load_cli_repositories(root, args.repo_paths, service_ids)
         reports = install_update_scripts(
             root,
-            service_ids=_parse_service_ids(args.service_ids),
+            service_ids=service_ids,
             dry_run=args.dry_run,
             repositories=repositories,
         )
         print(json.dumps(reports, ensure_ascii=False, indent=2))
         return 0
     if args.command == "install-repo-bundles":
-        repositories = _load_cli_repositories(root, args.repo_paths)
+        service_ids = _parse_service_ids(args.service_ids)
+        repositories = _load_cli_repositories(root, args.repo_paths, service_ids)
         reports = install_repo_bundles(
             root,
-            service_ids=_parse_service_ids(args.service_ids),
+            service_ids=service_ids,
             dry_run=args.dry_run,
             repositories=repositories,
         )
         print(json.dumps(reports, ensure_ascii=False, indent=2))
         return 0
     if args.command == "validate-repo-paths":
-        repositories = _load_cli_repositories(root, args.repo_paths)
+        service_ids = _parse_service_ids(args.service_ids)
+        repositories = _load_cli_repositories(
+            root,
+            args.repo_paths,
+            service_ids,
+            verify_existing=False,
+        )
         reports = validate_repo_paths(
             root,
-            service_ids=_parse_service_ids(args.service_ids),
+            service_ids=service_ids,
             require_exists=args.require_exists,
             repositories=repositories,
         )
         print(json.dumps(reports, ensure_ascii=False, indent=2))
         return 0 if all(item["ok"] for item in reports) else 1
     if args.command == "update":
-        repositories = _load_cli_repositories(root, args.repo_paths)
+        service_ids = _parse_service_ids(args.service_ids)
+        repositories = _load_cli_repositories(root, args.repo_paths, service_ids)
         payload = update_project(
             root,
             dry_run=args.dry_run,
@@ -1436,7 +1902,7 @@ def main(argv: list[str] | None = None) -> int:
             clean=args.clean,
             latest_repos=args.latest_repos,
             write_lock=args.write_lock,
-            service_ids=_parse_service_ids(args.service_ids),
+            service_ids=service_ids,
             install_scripts=not args.no_install_scripts,
             render=not args.no_render,
             force_render=args.force_render_services,

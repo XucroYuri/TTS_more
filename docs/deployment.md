@@ -29,13 +29,15 @@
 macOS/Linux：
 
 ```bash
-scripts/deploy-local-tts.sh --device CU128
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
+scripts/deploy-local-tts.sh --device CU128 --repo-paths deployment/app/repo-paths.local.json
 ```
 
 Windows：
 
 ```powershell
-.\scripts\deploy-local-tts.ps1 -Device CU128
+Copy-Item deployment\app\repo-paths.example.json deployment\app\repo-paths.local.json
+.\scripts\deploy-local-tts.ps1 -Device CU128 -RepoPaths deployment\app\repo-paths.local.json
 ```
 
 默认步骤：
@@ -48,7 +50,8 @@ Windows：
 6. 渲染 `data/local/services.json`，让应用本体直接接入当前设备上的 worker。
 7. 执行 `doctor` 输出路径、分支、提交和 venv 诊断。
 
-只预览命令：
+只预览命令。该模式仍会解析 selector、校验完整路径确认和现有 Git
+origin/dirty 状态，并输出 clone/fetch、bundle、依赖、模型与服务配置计划，但不会写文件：
 
 ```bash
 scripts/deploy-local-tts.sh --dry-run
@@ -62,13 +65,15 @@ scripts/deploy-local-tts.sh --skip-repo-prepare
 
 ## 本机 repo 路径确认
 
-人类用户需要确保每个服务 repo 在当前设备上的部署路径。默认路径来自 `repo.lock.json`；如果本机路径不同：
+人类用户需要通过 service-id keyed JSON 确认每个选中服务 repo 在当前设备上的部署路径。
+即使采用 `repo.lock.json` 中的默认路径，也必须提供完整确认文件：
 
 ```bash
 cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
 ```
 
-编辑 `deployment/app/repo-paths.local.json` 后运行：
+编辑 `deployment/app/repo-paths.local.json` 后运行。只允许唯一的正式 `service_id` key；
+未知 key、provider/name/variant 别名、缺少任一选中服务或重复 JSON key 都会失败：
 
 ```bash
 scripts/deploy-local-tts.sh --repo-paths deployment/app/repo-paths.local.json
@@ -80,7 +85,11 @@ Windows：
 .\scripts\deploy-local-tts.ps1 -RepoPaths deployment\app\repo-paths.local.json
 ```
 
-当前应用内置的 managed local worker 启动安全策略要求 repo 路径位于 TTS More 项目根目录内。若 TTS repo 部署在项目外部目录，请把 `deployment/tts-repos/<provider>/` 复制到对应 repo 手动执行，并在应用里按 `app-only`/外部 endpoint 接入。
+当前应用内置的 managed local worker 只接受 `<TTS More>/repo/` 专用区域内的路径。
+现有 checkout 还必须是 Git repo，且 `origin` 身份与 lock 中的 remote 一致；SSH 与 HTTPS
+形式会规范化后比较。若 TTS repo 部署在该区域外，请按各 provider README 的 POSIX/PowerShell
+命令把 `deployment/tts-repos/<provider>/` 内容复制到 `<repo>/tts-more/`，并在应用里按
+`app-only`/外部 endpoint 接入。
 
 ## 部署 profile
 

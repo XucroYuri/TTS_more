@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -190,3 +194,177 @@ def test_docs_explain_gpt_branch_convergence_and_explicit_regression_targets() -
     assert "upstream/main → dev" in docs
     assert "proplus-hc-dev" in docs
     assert "CUDA" in docs
+
+
+def test_one_click_and_prepare_dry_run_check_dirty_repositories_without_resetting() -> None:
+    root = Path(__file__).resolve().parents[2]
+    managed_root = root / "repo"
+    managed_root.mkdir(exist_ok=True)
+    commands = []
+    with tempfile.TemporaryDirectory(prefix="dirty index ", dir=managed_root) as temp_dir:
+        target = Path(temp_dir)
+        subprocess.run(["git", "init", "-q", str(target)], check=True)
+        subprocess.run(
+            ["git", "-C", str(target), "remote", "add", "origin", "git@github.com:XucroYuri/index-tts.git"],
+            check=True,
+        )
+        dirty_file = target / "local_patch.py"
+        dirty_file.write_text("local work\n", encoding="utf-8")
+        confirmation = target / "repo-paths.json"
+        confirmation.write_text(
+            json.dumps({"repositories": {"local-indextts": str(target)}}),
+            encoding="utf-8",
+        )
+        commands.extend(
+            [
+                [
+                    "bash",
+                    str(root / "scripts" / "deploy-local-tts.sh"),
+                    "--skip-app-install",
+                    "--skip-repo-prepare",
+                    "--targets",
+                    "local-indextts",
+                    "--repo-paths",
+                    str(confirmation),
+                    "--dry-run",
+                ],
+                [
+                    "bash",
+                    str(root / "scripts" / "prepare-tts-repos.sh"),
+                    "--sync-repos",
+                    "--skip-install",
+                    "--skip-downloads",
+                    "--targets",
+                    "local-indextts",
+                    "--repo-paths",
+                    str(confirmation),
+                    "--dry-run",
+                ],
+            ]
+        )
+        for command in commands:
+            result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
+            assert result.returncode != 0
+            assert "refusing to update dirty service repository" in result.stderr
+            assert dirty_file.read_text(encoding="utf-8") == "local work\n"
+
+
+def test_one_click_dry_run_executes_real_plan_without_writes(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    confirmation = tmp_path / "repo-paths.json"
+    confirmation.write_text(
+        json.dumps({"repositories": {"local-indextts": "repo/index-tts"}}),
+        encoding="utf-8",
+    )
+    services_path = root / "data" / "local" / "services.json"
+    before = services_path.read_bytes() if services_path.exists() else None
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(root / "scripts" / "deploy-local-tts.sh"),
+            "--skip-app-install",
+            "--skip-repo-prepare",
+            "--targets",
+            "local-indextts",
+            "--repo-paths",
+            str(confirmation),
+            "--dry-run",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert '"argv": [' in result.stdout
+    assert '"git"' in result.stdout
+    assert '"clone"' in result.stdout
+    assert '"actions"' in result.stdout
+    assert '"service_id": "local-indextts"' in result.stdout
+    after = services_path.read_bytes() if services_path.exists() else None
+    assert after == before
+
+
+def test_one_click_dry_run_includes_dependency_and_model_plan_without_writes(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    plan_root = root / "repo" / f"dry-plan-{tmp_path.name}"
+    confirmation = tmp_path / "repo-paths-all.json"
+    confirmation.write_text(
+        json.dumps(
+            {
+                "repositories": {
+                    "local-gpt-sovits-main": str(plan_root / "GPT-SoVITS-main"),
+                    "local-indextts": str(plan_root / "index-tts"),
+                    "local-cosyvoice": str(plan_root / "CosyVoice"),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(root / "scripts" / "deploy-local-tts.sh"),
+            "--skip-app-install",
+            "--repo-paths",
+            str(confirmation),
+            "--dry-run",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    created_plan_root = plan_root.exists()
+    if created_plan_root:
+        shutil.rmtree(plan_root)
+
+    assert result.returncode == 0, result.stderr
+    assert "GPT-SoVITS install" in result.stdout
+    assert "IndexTTS dependency install" in result.stdout
+    assert "IndexTTS model download" in result.stdout
+    assert "CosyVoice dependency install" in result.stdout
+    assert "CosyVoice model download" in result.stdout
+    assert '"write-manifest"' in result.stdout
+    assert created_plan_root is False
+
+
+def test_prepare_scripts_consume_canonical_absolute_repo_path() -> None:
+    root = Path(__file__).resolve().parents[2]
+    bash = (root / "scripts" / "prepare-tts-repos.sh").read_text(encoding="utf-8")
+    powershell = (root / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+
+    assert 'repo_path="$(field "$repo" absolute_path)"' in bash
+    assert 'repo_path="$ROOT/$rel_path"' not in bash
+    assert "$Repo.absolute_path" in powershell
+    assert "Join-Path $Root $Repo.path" not in powershell
+
+
+def test_powershell_wrappers_execute_dry_run_aware_children() -> None:
+    root = Path(__file__).resolve().parents[2]
+    deploy = (root / "scripts" / "deploy-local-tts.ps1").read_text(encoding="utf-8")
+    prepare = (root / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+
+    assert "function Invoke-Plan" in deploy
+    assert "Invoke-Plan $Python $syncArgs" in deploy
+    assert "Invoke-Plan \"powershell\" $prepareCommandArgs" in deploy
+    assert "function Invoke-Plan" in prepare
+    assert "Invoke-Plan $Python $syncArgs" in prepare
+    assert "ConvertTo-Json -Compress" in deploy
+    assert "ConvertTo-Json -Compress" in prepare
+    assert "--force-reset" not in deploy
+    assert "--force-reset" not in prepare
+
+
+def test_manual_copy_docs_have_executable_posix_and_powershell_layout() -> None:
+    root = Path(__file__).resolve().parents[2]
+    for provider in ("gpt-sovits", "indextts", "cosyvoice"):
+        readme = (root / "deployment" / "tts-repos" / provider / "README.md").read_text(encoding="utf-8")
+        assert 'mkdir -p "$TTS_REPO/tts-more"' in readme
+        assert "Copy-Item" in readme
+        assert "tts-more/tts-more-prepare.sh" in readme
+        assert "tts-more\\tts-more-prepare.ps1" in readme
+        assert "replaces files owned by the TTS More bundle" in readme

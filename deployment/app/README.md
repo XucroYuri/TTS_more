@@ -6,8 +6,8 @@ the scripts copied into upstream TTS repositories.
 
 ## Repo path confirmation
 
-Copy `repo-paths.example.json` to `repo-paths.local.json` when the local checkout
-paths differ from `repo.lock.json`, then edit the paths for this machine:
+Copy `repo-paths.example.json` to `repo-paths.local.json` and confirm every
+selected service path, including paths that are unchanged from `repo.lock.json`:
 
 ```bash
 cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
@@ -25,6 +25,8 @@ regression checkout or `--targets all` for every locked repository. The example
 path file contains all entries so the same file can also support explicit
 regression deployments.
 
-For managed local workers, paths must stay inside the TTS More project root.
+The confirmation object accepts only unique formal `service_id` keys and must
+contain every selected service. Managed local worker paths must stay inside the
+dedicated `<TTS More>/repo/` area, and existing Git origins must match the lock.
 Use the per-repo scripts under `deployment/tts-repos/` for manual deployments in
 external TTS repo directories.

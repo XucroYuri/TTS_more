@@ -1,19 +1,31 @@
 # CosyVoice repo scripts
 
-Copy this directory into a CosyVoice checkout when deploying that repo manually,
-or let `scripts/deploy-local-tts.*` copy it into `<repo>/tts-more/`.
-
-Run from the copied `tts-more` directory:
+Use the app-side installer, or copy the bundle contents into a CosyVoice
+checkout explicitly. POSIX:
 
 ```bash
-bash tts-more-prepare.sh
+TTS_MORE_ROOT=/path/to/TTS_more
+TTS_REPO=/path/to/CosyVoice
+mkdir -p "$TTS_REPO/tts-more"
+cp -R "$TTS_MORE_ROOT/deployment/tts-repos/cosyvoice/." "$TTS_REPO/tts-more/"
+bash "$TTS_REPO/tts-more/tts-more-prepare.sh"
 ```
 
 PowerShell:
 
 ```powershell
-.\tts-more-prepare.ps1
+$TtsMoreRoot = "C:\path\to\TTS_more"
+$TtsRepo = "C:\path\to\CosyVoice"
+New-Item -ItemType Directory -Force (Join-Path $TtsRepo "tts-more") | Out-Null
+Copy-Item -Recurse -Force (Join-Path $TtsMoreRoot "deployment\tts-repos\cosyvoice\*") (Join-Path $TtsRepo "tts-more")
+& (Join-Path $TtsRepo "tts-more\tts-more-prepare.ps1")
 ```
+
+The resulting entry points are `tts-more/tts-more-prepare.sh` and
+`tts-more\tts-more-prepare.ps1`. These manual commands overwrite same-named
+helper files and leave unrelated files in place. The automated installer
+replaces files owned by the TTS More bundle and removes stale owned files while
+preserving user-owned files.
 
 Environment knobs:
 
