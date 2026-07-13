@@ -47,7 +47,7 @@ cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
 scripts/tts-more.sh install-update-scripts --repo-paths deployment/app/repo-paths.local.json
 ```
 
-生成的 `tts-more-update.sh` / `tts-more-update.ps1` 可以复制到单独的 TTS 服务部署设备上。它只做一件事：从 GitHub fast-forward 当前服务 repo 到对应分支最新版；如需回到锁定提交，可加 `--pinned`。
+生成的 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 必须作为一个 portable updater bundle 一起复制到单独的 TTS 服务部署设备上。sidecar **does not store installer-host absolute executable paths**；运行时 **resolves Git independently on the destination device**，使用固定安装目录或目标机显式 `TTS_MORE_TRUSTED_GIT`。**HTTPS remotes do not require SSH**；**SSH remotes require a trusted SSH executable**，可由目标机 `TTS_MORE_TRUSTED_SSH` 指定。updater 从 GitHub fast-forward 当前服务 repo 到对应分支最新版；如需回到锁定提交，可加 `--pinned`。
 
 ## 当前已具备的能力
 

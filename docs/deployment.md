@@ -36,7 +36,7 @@ python scripts/tts_more_deploy.py install-repo-bundles --adopt-existing --repo-p
 
 **adoption does not upgrade, overwrite, or delete files**；它只校验现有 owned hashes 并建立 anchor，之后必须再次运行不带 `--adopt-existing` 的安装命令。已有损坏 anchor、pending install、缺失或修改过的 owned 文件均拒绝 adoption。
 
-所有 app-side Git 和复制到服务 repo 的 updater Git 都使用同一 hardened runner：忽略 system/global config 与 `GIT_CONFIG_*`/SSH/askpass 注入，禁用 hooks/fsmonitor/credential helper，固定 SSH command，并把协议限制为 allowlisted GitHub HTTPS/SSH。checkout-local 的 hooksPath、fsmonitor、sshCommand、credential helper、URL rewrite、filter/process、include 和 executable submodule update 配置会在 `status/config/fetch/checkout/pull` 前拒绝。
+所有 app-side Git 和复制到服务 repo 的 updater Git 都使用同一 hardened runner：忽略 system/global config 与 `GIT_CONFIG_*`/SSH/askpass 注入，禁用 hooks/fsmonitor/credential helper，并把协议限制为 allowlisted GitHub HTTPS/SSH。Git executable 只从平台固定安装目录或显式 `TTS_MORE_TRUSTED_GIT` 解析；只有 SSH remote 才同样从固定目录或 `TTS_MORE_TRUSTED_SSH` 解析 SSH 并固定 SSH command，HTTPS 使用不可执行 sentinel 且不要求安装 SSH。checkout-local 的 hooksPath、fsmonitor、sshCommand、credential helper、URL rewrite、filter/process、include 和 executable submodule update 配置会在 `status/config/fetch/checkout/pull` 前拒绝。
 
 并发攻击者仍可能在最终 pathname 检查与替换之间交换一般输出目录；**concurrent parent-swap remains a residual threat**。POSIX worker logs 会以 `O_DIRECTORY | O_NOFOLLOW` 打开 `logs_dir` 并通过 dirfd 创建日志，但一般 bundle/output rename 尚未改成完整 `openat`/`renameat` 链，且 **Windows handle-based parent protection is not implemented**。因此当前保证覆盖静态 symlink/reparse 与单文件替换，不宣称跨平台 race-free。
 
@@ -188,7 +188,9 @@ scripts/update.sh --force-reset-repos --repo-paths deployment/app/repo-paths.loc
 
 `--force-reset-repos` 会允许服务 repo 执行硬重置，只适合确认没有要保留的本地改动时使用。
 
-服务 repo 内的轻量更新脚本用于分布式部署设备。复制过去后，在服务 repo 根目录运行：
+服务 repo 内的轻量更新脚本用于分布式部署设备。复制时必须把 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 四个文件一起放到目标 service repo 根目录。schema 3 sidecar 只记录 portable executable policy 和 `requires_ssh`，**does not store installer-host absolute executable paths**；updater **resolves Git independently on the destination device**，从目标机固定安装目录或显式 `TTS_MORE_TRUSTED_GIT` 解析。**HTTPS remotes do not require SSH**；**SSH remotes require a trusted SSH executable**，非标准安装位置通过目标机的 `TTS_MORE_TRUSTED_SSH` 指定。
+
+复制完成后，在服务 repo 根目录运行：
 
 ```bash
 ./tts-more-update.sh

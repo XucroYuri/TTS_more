@@ -456,6 +456,28 @@ def test_bundle_docs_describe_per_file_atomicity_and_interruption_recovery() -> 
     assert "Windows handle-based parent protection is not implemented" in docs
 
 
+def test_update_script_docs_describe_portable_runtime_executable_policy() -> None:
+    root = Path(__file__).resolve().parents[2]
+    deployment = (root / "docs" / "deployment.md").read_text(encoding="utf-8")
+    current_state = (root / "docs" / "current-state-and-simplification-plan.md").read_text(encoding="utf-8")
+    combined = deployment + "\n" + current_state
+
+    for name in (
+        "tts-more-update.sh",
+        "tts-more-update.ps1",
+        "tts-more-update.py",
+        "tts-more-update.json",
+    ):
+        assert name in deployment
+    assert "does not store installer-host absolute executable paths" in combined
+    assert "resolves Git independently on the destination device" in combined
+    assert "HTTPS remotes do not require SSH" in combined
+    assert "SSH remotes require a trusted SSH executable" in combined
+    assert "TTS_MORE_TRUSTED_GIT" in combined
+    assert "TTS_MORE_TRUSTED_SSH" in combined
+    assert "concurrent parent-swap remains a residual threat" in deployment
+
+
 def test_windows_ci_executes_native_deployment_validation_without_capability_skip() -> None:
     root = Path(__file__).resolve().parents[2]
     workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
