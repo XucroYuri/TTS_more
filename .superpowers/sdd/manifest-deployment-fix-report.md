@@ -110,3 +110,59 @@ Supplemental GREEN: the three trust-chain/identity tests passed (`3 passed in 0.
 ### Round 2 concerns
 
 - M2 native execution evidence is pending an actual GitHub `windows-latest` run. No macOS-based PowerShell or Windows path success is claimed.
+
+## Round 3 re-review
+
+### Result
+
+`DONE_WITH_CONCERNS`
+
+C1, I1, I2, and documentation M2 are closed in implementation and regression coverage. M1 is materially improved on POSIX logs and explicitly retained as a residual cross-platform concurrent parent-swap threat rather than overstated as race-free. The existing non-skipping Windows gate is unchanged; native success still requires a pushed GitHub Windows run.
+
+### Round 3 RED log
+
+- Baseline focused suite: `126 passed, 4 skipped in 4.98s`.
+- C1 app runner RED: `10 failed, 108 deselected in 1.70s`. `GIT_CONFIG_COUNT` fsmonitor and the default `post-checkout` hook created marker files; checkout-local fsmonitor/hooksPath/sshCommand/credential helper/URL rewrite/filter/submodule/include config was accepted.
+- C1 updater RED: generated updater executed the configured fsmonitor and reached real GitHub fetch/pull before failing (`1 failed in 10.49s`); the temporary test checkout was discarded. Subsequent RED tests hard-failed before network mutation.
+- C1 policy consistency RED: all five `status/config/fetch/checkout/pull` cases retained a PATH-resolved `git` token instead of an absolute trusted executable (`5 failed`). Supplemental REDs covered `GIT_EXEC_PATH`/template/external-diff/SSL/protocol injection, `http.sslVerify`, `core.askPass`, and `extensions.worktreeConfig`.
+- I1 RED: same-identity schema-3 manifest deleted a matching user file; no app-owned anchor existed; lost-anchor and explicit adoption APIs were absent (`4 failed, 118 deselected in 0.80s`).
+- I2 RED: duplicate, nested, and case-equivalent selected paths were accepted; real clean reached the Git mutation sentinel; complete confirmation accepted aliases (`5 failed, 122 deselected in 0.29s`).
+- M2 RED: expanded maintained-doc test found bare secondary `sync-repos`, update, prepare, render, worker, and doctor commands outside the three previously checked guides (`1 failed`).
+- M1 RED: POSIX `logs_dir` was opened with `O_DIRECTORY` but not `O_NOFOLLOW`, and docs omitted the concurrent parent-swap/Windows-handle residual threat (`2 failed`).
+
+### Round 3 closure mapping
+
+| ID | GREEN closure |
+|---|---|
+| C1 | Every app-side Git path and generated updater path now uses the same hardened runner. It resolves trusted Git/SSH executables, strips repository/config/SSH/askpass/exec/template/diff/SSL/protocol injection variables, ignores system/global config, disables prompts/hooks/fsmonitor/credential helpers, fixes SSH to null config with ProxyCommand/LocalCommand disabled, and allowlists HTTPS/SSH protocols. Before Git reads a checkout, local config rejects executable or rewriting hooks/fsmonitor/askpass/ssh/credential/url/filter/diff/include/submodule/HTTP/remote/worktree-config keys. Marker execution tests and identical policy tests cover status, config, fetch, checkout, and pull. |
+| I1 | Bundle deletion authority is anchored outside the target checkout at ignored app-owned `data/local/deployment-ownership/<service_id>.json`. Pending anchors are written before target mutation and completed anchors bind exact manifest bytes. Same-identity forged schema-3 manifests, forged pending state, missing/mismatched anchors, and modified files fail closed. `--adopt-existing` validates hashes and only creates an anchor; it performs no upgrade/delete/overwrite until a separate rerun. |
+| I2 | The complete selected set is resolved before any Git/app/file mutation. Platform `normcase` canonical duplicates and ancestor/descendant paths are rejected with both service IDs. The gate runs during complete confirmation loading, sync, render, updater/bundle installation, and before `update_project` app fetch/pull. Dry and real clean both fail before mutation for conflicting sets. |
+| M2 | The consistency test now enumerates nine maintained deployment documents, including `docs/deployment.md`, `docs/current-state-and-simplification-plan.md`, app deployment docs, and provider READMEs. Every standalone managed-local update/sync/prepare/render/install/start/doctor/one-click command explicitly passes the complete confirmation file; `app-only` and network-only commands remain separate. |
+| M1 | POSIX worker logs now open `logs_dir` itself with `O_DIRECTORY | O_NOFOLLOW` and retain the dirfd for final no-follow creation. Documentation explicitly states that general pathname-based bundle/output replacements and Windows parent handles are not race-free. Full cross-platform handle-based parent protection remains open as a residual hardening concern. |
+
+### Round 3 verification
+
+- C1 focused policy group: `17 passed, 117 deselected in 1.30s`; later askpass/worktree-config additions: `2 passed`.
+- I1 anchor/adoption group: `4 passed, 118 deselected in 0.70s`; complete bundle group: `12 passed` after updating the stronger unanchored-pending expectation.
+- I2 selected-set group: `5 passed, 122 deselected in 0.11s`; update-before-app-Git coverage is included in final focused.
+- M2 maintained-doc consistency and M1 docs/log tests: passed.
+- Final focused deployment/docs: `156 passed, 4 skipped in 8.76s`.
+- Final full backend (Python 3.11): `438 passed, 6 skipped, 1 warning in 27.62s`.
+- `python -m compileall -q scripts backend`: exit 0.
+- `bash -n` for both app wrappers and all provider prepare scripts: exit 0.
+- Deployment/app JSON parse: 2 files validated.
+- `git diff --check` and staged diff-checks: exit 0.
+- Existing warning: FastAPI/Starlette `httpx` deprecation, unrelated to deployment.
+- Native Windows/PowerShell was not executed on this macOS host. `.github/workflows/ci.yml` and its mandatory `windows-latest` deployment step were not weakened or bypassed.
+
+### Round 3 commits
+
+- `50ae51e` - hardened Git runner, app-owned bundle trust anchor, selected-set path gate, POSIX log hardening, and deployment regressions.
+- `b0bc5fa` - maintained-doc confirmation contract, adoption/race documentation, and consistency tests.
+- Report-only finalization commit is recorded in the final task response because a commit cannot contain its own SHA.
+
+### Round 3 concerns
+
+- General bundle/output parent replacement remains pathname-based; concurrent parent-swap resistance is not complete, and no Windows handle-based equivalent is implemented.
+- Hardened Git intentionally ignores system/global Git config and rejects executable/rewrite-sensitive local config. Environments that depend on custom Git credential helpers, SSH config, or Git-configured CA/proxy settings must provide an explicitly supported trusted deployment configuration rather than relaxing this fail-closed policy.
+- Native Windows evidence remains pending a pushed GitHub Actions run; no macOS skip is reported as Windows success.
