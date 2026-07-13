@@ -105,7 +105,7 @@ worker 可部署在 LAN/公网 GPU 机器上，本机 TTS More 通过 `services.
 
 1. 克隆上游 repo + 装 torch + 模型权重；
 2. 运行 `cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json` 并核对完整 service-id/path 映射；
-3. 运行 `start-service-workers.sh --repo-paths deployment/app/repo-paths.local.json`（或单独启动某个 worker）；
+3. 运行 `scripts/start-service-workers.sh --repo-paths deployment/app/repo-paths.local.json`（或单独启动某个 worker）；
 4. 本机 `data/local/services.json` 指向远端 worker 端口。
 
 参考音频跨机上传走 `POST /upload_ref`（GPT-SoVITS worker）或本地路径直传（同机）。

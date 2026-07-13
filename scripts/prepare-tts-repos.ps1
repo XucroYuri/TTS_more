@@ -189,6 +189,25 @@ function Test-Target {
     )
 }
 
+function Assert-SupportedCondaForSelectedGPT {
+    param([object[]]$Repositories)
+    if ($SkipInstall -or $DryRun) { return }
+    $requiresConda = $false
+    foreach ($repo in $Repositories) {
+        if ($repo.provider_type -ne "gpt-sovits") { continue }
+        if (Test-Target $repo) {
+            $requiresConda = $true
+            break
+        }
+    }
+    if (-not $requiresConda) { return }
+    if (Get-Command conda -ErrorAction SilentlyContinue) { return }
+    if (Get-Command micromamba -ErrorAction SilentlyContinue) {
+        throw "micromamba is installed but is not currently supported by the TTS More GPT-SoVITS prepare workflow; install conda or use -SkipInstall."
+    }
+    throw "supported conda executable was not found; GPT-SoVITS dependency preparation cannot continue. Install conda or use -SkipInstall."
+}
+
 function Resolve-RepoPython {
     param([string]$RepoPath)
     return Join-Path $RepoPath ".venv\Scripts\python.exe"
@@ -233,20 +252,12 @@ function Prepare-GPTSoVITS {
     $installSh = Join-Path $repoPath "install.sh"
     if ($IsWindows -or $env:OS -eq "Windows_NT") {
         if (!(Test-Path -LiteralPath $installPs1)) { throw "Missing GPT-SoVITS installer: $installPs1" }
-        if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
-            Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
-            return
-        }
         Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
             param($CandidateSource)
             Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", $installPs1, "-Device", $Device, "-Source", $CandidateSource) $repoPath
         }
     } else {
         if (!(Test-Path -LiteralPath $installSh)) { throw "Missing GPT-SoVITS installer: $installSh" }
-        if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
-            Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
-            return
-        }
         Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
             param($CandidateSource)
             Invoke-Logged "bash" @($installSh, "--device", $Device, "--source", $CandidateSource) $repoPath
@@ -348,6 +359,7 @@ if ($RepoPaths) { $repoArgs += @("--repo-paths", $RepoPaths) }
 $reposJson = & $Python @repoArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $repositories = @($reposJson | ConvertFrom-Json)
+Assert-SupportedCondaForSelectedGPT $repositories
 foreach ($repo in $repositories) {
     if (-not (Test-Target $repo)) { continue }
     switch ($repo.provider_type) {

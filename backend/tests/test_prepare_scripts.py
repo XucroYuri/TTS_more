@@ -1,14 +1,127 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _write_prepare_failure_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    root = tmp_path / "fixture"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("prepare-tts-repos.sh", "prepare-tts-repos.ps1", "deploy-local-tts.sh", "deploy-local-tts.ps1"):
+        shutil.copy2(REPO_ROOT / "scripts" / name, scripts / name)
+    repo = root / "repo" / "GPT-SoVITS-main"
+    repo.mkdir(parents=True)
+    prepare_marker = root / "prepare-ran"
+    render_marker = root / "render-ran"
+    (repo / "install.sh").write_text(
+        '#!/usr/bin/env bash\nprintf prepare > "$TTS_MORE_TEST_PREPARE_MARKER"\n',
+        encoding="utf-8",
+    )
+    (repo / "install.sh").chmod(0o755)
+    (repo / "install.ps1").write_text(
+        "Set-Content -LiteralPath $env:TTS_MORE_TEST_PREPARE_MARKER -Value prepare\n",
+        encoding="utf-8",
+    )
+    deploy_stub = scripts / "tts_more_deploy.py"
+    deploy_stub.write_text(
+        """import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+repo = {
+    "name": "GPT-SoVITS-main",
+    "provider_type": "gpt-sovits",
+    "variant": "main",
+    "service_id": "local-gpt-sovits-main",
+    "default_selected": True,
+    "absolute_path": os.environ["TTS_MORE_TEST_REPO"],
+}
+if "probe-network" in args:
+    print(json.dumps({"model_source": "ModelScope", "cache_root": "data/cache", "env": {}}))
+elif "list-repos" in args:
+    print(json.dumps(repo if "--json-lines" in args else [repo]))
+elif "render-services" in args:
+    Path(os.environ["TTS_MORE_TEST_RENDER_MARKER"]).write_text("render", encoding="utf-8")
+    print("[]")
+elif "doctor" in args:
+    print("{}")
+else:
+    print("[]")
+""",
+        encoding="utf-8",
+    )
+    repo_paths = root / "repo-paths.json"
+    repo_paths.write_text(
+        json.dumps({"repositories": {"local-gpt-sovits-main": str(repo)}}),
+        encoding="utf-8",
+    )
+    return root, repo_paths, prepare_marker, render_marker
+
+
+def _prepare_command(root: Path, repo_paths: Path, entrypoint: str, powershell: bool) -> list[str]:
+    if powershell:
+        if entrypoint == "prepare":
+            return [
+                str(root / "scripts" / "prepare-tts-repos.ps1"),
+                "-Source",
+                "ModelScope",
+                "-Targets",
+                "local-gpt-sovits-main",
+                "-RepoPaths",
+                str(repo_paths),
+                "-SkipDownloads",
+            ]
+        return [
+            str(root / "scripts" / "deploy-local-tts.ps1"),
+            "-SkipAppInstall",
+            "-SkipRepoSync",
+            "-Source",
+            "ModelScope",
+            "-Targets",
+            "local-gpt-sovits-main",
+            "-RepoPaths",
+            str(repo_paths),
+            "-SkipDownloads",
+        ]
+    if entrypoint == "prepare":
+        return [
+            "bash",
+            str(root / "scripts" / "prepare-tts-repos.sh"),
+            "--source",
+            "ModelScope",
+            "--targets",
+            "local-gpt-sovits-main",
+            "--repo-paths",
+            str(repo_paths),
+            "--skip-downloads",
+        ]
+    return [
+        "bash",
+        str(root / "scripts" / "deploy-local-tts.sh"),
+        "--skip-app-install",
+        "--skip-repo-sync",
+        "--source",
+        "ModelScope",
+        "--targets",
+        "local-gpt-sovits-main",
+        "--repo-paths",
+        str(repo_paths),
+        "--skip-downloads",
+    ]
 
 
 def test_powershell_prepare_defaults_to_auto_and_calls_probe_network() -> None:
@@ -152,6 +265,79 @@ def test_prepare_scripts_default_to_release_repositories_and_forward_selection()
     assert '--service-ids "$TARGETS"' in bash
     assert '$TargetItems = @($Targets | ForEach-Object' in powershell
     assert '"--service-ids", ($TargetItems -join ",")' in powershell
+
+
+@pytest.mark.parametrize("entrypoint", ["prepare", "deploy"])
+@pytest.mark.parametrize("micromamba_only", [False, True], ids=("missing-conda", "micromamba-only"))
+def test_posix_prepare_and_wrapper_fail_before_gpt_preparation_without_supported_conda(
+    tmp_path: Path,
+    entrypoint: str,
+    micromamba_only: bool,
+) -> None:
+    root, repo_paths, prepare_marker, render_marker = _write_prepare_failure_fixture(tmp_path)
+    fake_bin = root / "test-bin"
+    fake_bin.mkdir()
+    if micromamba_only:
+        micromamba = fake_bin / "micromamba"
+        micromamba.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        micromamba.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": os.pathsep.join((str(fake_bin), "/usr/bin", "/bin")),
+        "TTS_MORE_BASE_PYTHON": sys.executable,
+        "TTS_MORE_TEST_REPO": str(root / "repo" / "GPT-SoVITS-main"),
+        "TTS_MORE_TEST_PREPARE_MARKER": str(prepare_marker),
+        "TTS_MORE_TEST_RENDER_MARKER": str(render_marker),
+    }
+
+    result = subprocess.run(
+        _prepare_command(root, repo_paths, entrypoint, powershell=False),
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    expected = (
+        "micromamba is installed but is not currently supported"
+        if micromamba_only
+        else "supported conda executable was not found"
+    )
+    assert expected in result.stderr
+    assert "Prepared selected TTS repositories" not in result.stdout
+    assert "Local TTS deployment workflow complete" not in result.stdout
+    assert not prepare_marker.exists()
+    assert not render_marker.exists()
+
+
+def test_prepare_scripts_preflight_conda_and_wrappers_propagate_failure_statically() -> None:
+    bash_prepare = (REPO_ROOT / "scripts" / "prepare-tts-repos.sh").read_text(encoding="utf-8")
+    ps_prepare = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+    bash_deploy = (REPO_ROOT / "scripts" / "deploy-local-tts.sh").read_text(encoding="utf-8")
+    ps_deploy = (REPO_ROOT / "scripts" / "deploy-local-tts.ps1").read_text(encoding="utf-8")
+    provider_bash = (
+        REPO_ROOT / "deployment" / "tts-repos" / "gpt-sovits" / "tts-more-prepare.sh"
+    ).read_text(encoding="utf-8")
+    provider_ps = (
+        REPO_ROOT / "deployment" / "tts-repos" / "gpt-sovits" / "tts-more-prepare.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert bash_prepare.rindex("\npreflight_gpt_conda\n") < bash_prepare.rindex("while IFS= read -r repo")
+    assert ps_prepare.rindex("Assert-SupportedCondaForSelectedGPT $repositories") < ps_prepare.index(
+        "foreach ($repo in $repositories)"
+    )
+    for script in (bash_prepare, ps_prepare, provider_bash, provider_ps):
+        assert "micromamba is installed but is not currently supported" in script
+        assert "supported conda executable was not found" in script
+    assert bash_deploy.index('run_plan bash "$ROOT/scripts/prepare-tts-repos.sh"') < bash_deploy.index(
+        "Local TTS deployment workflow complete"
+    )
+    assert 'if ($LASTEXITCODE -ne 0) { throw "Command failed:' in ps_deploy
+    assert ps_deploy.index('Invoke-Plan "powershell" $prepareCommandArgs') < ps_deploy.index(
+        "Local TTS deployment workflow complete"
+    )
 
 
 def test_deployment_assets_separate_app_and_provider_repo_scripts() -> None:
@@ -478,6 +664,30 @@ def test_update_script_docs_describe_portable_runtime_executable_policy() -> Non
     assert "concurrent parent-swap remains a residual threat" in deployment
 
 
+def test_deployment_docs_use_prefixed_worker_command_and_exact_updater_limits() -> None:
+    workers = (REPO_ROOT / "docs" / "workers.md").read_text(encoding="utf-8")
+    deployment = (REPO_ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
+    current_state = (REPO_ROOT / "docs" / "current-state-and-simplification-plan.md").read_text(
+        encoding="utf-8"
+    )
+    update_steps = deployment.split("它会按顺序做四件事：", 1)[1].split("常用变体：", 1)[0]
+
+    assert "scripts/start-service-workers.sh --repo-paths" in workers
+    assert "`start-service-workers.sh --repo-paths" not in workers
+    for name in (
+        "tts-more-update.sh",
+        "tts-more-update.ps1",
+        "tts-more-update.py",
+        "tts-more-update.json",
+    ):
+        assert name in update_steps
+    for maintained in (deployment, current_state):
+        assert "repositories with submodules do not receive the standalone updater" in maintained
+        assert "must be updated from TTS More managed sync-repos" in maintained
+    assert "micromamba is not currently supported" in deployment
+    assert "conda/micromamba" not in deployment
+
+
 def test_deployment_docs_describe_final_tree_and_actual_transport_policy() -> None:
     root = Path(__file__).resolve().parents[2]
     deployment = (root / "docs" / "deployment.md").read_text(encoding="utf-8")
@@ -517,6 +727,70 @@ def test_prepare_scripts_do_not_bypass_validated_submodule_sync() -> None:
     assert "does not run Git submodule commands" in readme
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows prepare validation")
+@pytest.mark.parametrize("powershell", ["powershell.exe", "pwsh.exe"])
+@pytest.mark.parametrize("entrypoint", ["prepare", "deploy"])
+@pytest.mark.parametrize("micromamba_only", [False, True], ids=("missing-conda", "micromamba-only"))
+def test_windows_native_prepare_and_wrapper_fail_without_supported_conda(
+    tmp_path: Path,
+    powershell: str,
+    entrypoint: str,
+    micromamba_only: bool,
+) -> None:
+    executable = shutil.which(powershell)
+    assert executable is not None, f"required Windows CI shell is missing: {powershell}"
+    root, repo_paths, prepare_marker, render_marker = _write_prepare_failure_fixture(tmp_path)
+    fake_bin = root / "test-bin"
+    fake_bin.mkdir()
+    if micromamba_only:
+        (fake_bin / "micromamba.cmd").write_text("@exit /b 0\n", encoding="utf-8")
+    path_dirs = [fake_bin, Path(sys.executable).parent]
+    system_root = Path(os.environ["SystemRoot"])
+    path_dirs.append(system_root / "System32")
+    for required_shell in ("powershell.exe", "pwsh.exe"):
+        resolved = shutil.which(required_shell)
+        assert resolved is not None, f"required Windows CI shell is missing: {required_shell}"
+        path_dirs.append(Path(resolved).parent)
+    env = {
+        **os.environ,
+        "PATH": os.pathsep.join(dict.fromkeys(str(path) for path in path_dirs)),
+        "TTS_MORE_BASE_PYTHON": sys.executable,
+        "TTS_MORE_TEST_REPO": str(root / "repo" / "GPT-SoVITS-main"),
+        "TTS_MORE_TEST_PREPARE_MARKER": str(prepare_marker),
+        "TTS_MORE_TEST_RENDER_MARKER": str(render_marker),
+    }
+    script_command = _prepare_command(root, repo_paths, entrypoint, powershell=True)
+
+    result = subprocess.run(
+        [
+            executable,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            *script_command,
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    output = result.stdout + "\n" + result.stderr
+    assert result.returncode != 0
+    expected = (
+        "micromamba is installed but is not currently supported"
+        if micromamba_only
+        else "supported conda executable was not found"
+    )
+    assert expected in output
+    assert "Prepared selected TTS repositories" not in output
+    assert "Local TTS deployment workflow complete" not in output
+    assert not prepare_marker.exists()
+    assert not render_marker.exists()
+
+
 def test_windows_ci_executes_native_deployment_validation_without_capability_skip() -> None:
     root = Path(__file__).resolve().parents[2]
     workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -525,5 +799,6 @@ def test_windows_ci_executes_native_deployment_validation_without_capability_ski
     assert "if: runner.os == 'Windows'" in workflow
     assert "test_windows_native_powershell_launchers_reject_unsafe_remote" in workflow
     assert "test_windows_native_drive_junction_and_gitdir_policy" in workflow
+    assert "test_windows_native_prepare_and_wrapper_fail_without_supported_conda" in workflow
     assert "powershell.exe" in workflow
     assert "pwsh.exe" in workflow

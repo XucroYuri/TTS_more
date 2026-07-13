@@ -12,6 +12,10 @@ That sync selects the final locked/latest superproject state, validates every
 resolved `.gitmodules` URL, and updates submodules. The prepare bundle **does not run Git submodule commands**;
 it only installs dependencies and models.
 
+CosyVoice does not receive the four-file standalone updater. Run all repository
+updates through the TTS More managed `sync-repos` workflow so the superproject
+and its validated submodules move together.
+
 Use the app-side installer, or copy the bundle contents into a CosyVoice
 checkout explicitly. POSIX:
 

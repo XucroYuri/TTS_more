@@ -173,7 +173,7 @@ Windows：
 
 1. `git fetch --prune` + `git pull --ff-only` 更新应用本体当前分支。
 2. 安全更新 `repo.lock.json` 中的服务 repo：先检查是否有本地改动，再执行 fetch / checkout / fast-forward pull。
-3. 向已存在的服务 repo 写入 `tts-more-update.sh` 和 `tts-more-update.ps1`。
+3. 向支持 standalone updater 的服务 repo 写入 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py` 和 `tts-more-update.json` 四个文件；submodule repo 会明确报告 managed-sync-only 且不写入其中任何文件。
 4. 如果 `data/local/services.json` 不存在，生成本机服务配置；已有本机配置默认保留。
 
 常用变体：
@@ -190,7 +190,7 @@ scripts/update.sh --force-reset-repos --repo-paths deployment/app/repo-paths.loc
 
 `--force-reset-repos` 会允许服务 repo 执行硬重置，只适合确认没有要保留的本地改动时使用。
 
-服务 repo 内的轻量更新脚本用于分布式部署设备。复制时必须把 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 四个文件一起放到目标 service repo 根目录。schema 3 sidecar 只记录 portable executable policy 和 `requires_ssh`，**does not store installer-host absolute executable paths**；updater **resolves Git independently on the destination device**，从目标机固定安装目录或显式 `TTS_MORE_TRUSTED_GIT` 解析。它先仅用 trusted Git 审计 checkout、读取 actual origin 并验证 GitHub identity，再按 actual origin transport 决定是否解析 `TTS_MORE_TRUSTED_SSH`；**sidecar transport does not override the actual origin transport**。对 actual transport 而言，**HTTPS remotes do not require SSH**，而 **SSH remotes require a trusted SSH executable**；sidecar 的 `requires_ssh` 仍必须与 sidecar remote 一致以检测篡改。
+服务 repo 内的轻量更新脚本用于分布式部署设备。复制时必须把 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 四个文件一起放到目标 service repo 根目录。**repositories with submodules do not receive the standalone updater**，因为该 updater 不更新 submodule；它们 **must be updated from TTS More managed sync-repos**，工具会报告限制且不会部分写入四个 updater 文件。schema 3 sidecar 只记录 portable executable policy 和 `requires_ssh`，**does not store installer-host absolute executable paths**；updater **resolves Git independently on the destination device**，从目标机固定安装目录或显式 `TTS_MORE_TRUSTED_GIT` 解析。它先仅用 trusted Git 审计 checkout、读取 actual origin 并验证 GitHub identity，再按 actual origin transport 决定是否解析 `TTS_MORE_TRUSTED_SSH`；**sidecar transport does not override the actual origin transport**。对 actual transport 而言，**HTTPS remotes do not require SSH**，而 **SSH remotes require a trusted SSH executable**；sidecar 的 `requires_ssh` 仍必须与 sidecar remote 一致以检测篡改。
 
 复制完成后，在服务 repo 根目录运行：
 
@@ -227,7 +227,7 @@ bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --source ModelScope
 
 上游要求：
 
-- GPT-SoVITS：优先使用每个分支自带的 `install.ps1`/`install.sh`，官方脚本依赖 conda/micromamba 环境。
+- GPT-SoVITS：优先使用每个分支自带的 `install.ps1`/`install.sh`，当前 managed prepare 只支持 conda；**micromamba is not currently supported**。选中 GPT-SoVITS 且未跳过依赖安装时，缺少 conda（包括仅安装 micromamba）会在任何 repo preparation 前以非零状态退出。
 - IndexTTS：优先 `uv sync --all-extras`，下载 `IndexTeam/IndexTTS-2`，并准备 BigVGAN 辅助模型。
 - CosyVoice：`sync-repos` 在最终 superproject commit/branch 确定后结构化校验 `.gitmodules`，逐层更新 allowlisted submodule；随后准备 Python 3.10 venv、`requirements.txt`，默认下载 `CosyVoice-300M`。
 

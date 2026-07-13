@@ -47,7 +47,7 @@ cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
 scripts/tts-more.sh install-update-scripts --repo-paths deployment/app/repo-paths.local.json
 ```
 
-生成的 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 必须作为一个 portable updater bundle 一起复制到单独的 TTS 服务部署设备上。sidecar **does not store installer-host absolute executable paths**；运行时 **resolves Git independently on the destination device**，使用固定安装目录或目标机显式 `TTS_MORE_TRUSTED_GIT`。updater 先验证 actual origin identity，再由 actual transport 决定 SSH；**sidecar transport does not override the actual origin transport**。因此实际 HTTPS origin 不要求 SSH，实际 SSH/scp origin 需要目标机 trusted SSH，可由 `TTS_MORE_TRUSTED_SSH` 指定。updater 从 GitHub fast-forward 当前服务 repo 到对应分支最新版；如需回到锁定提交，可加 `--pinned`。
+生成的 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 必须作为一个 portable updater bundle 一起复制到单独的 TTS 服务部署设备上。**repositories with submodules do not receive the standalone updater**；它们 **must be updated from TTS More managed sync-repos**，因为 standalone updater 不处理 submodule，安装命令会报告 managed-sync-only 且不写入四个文件。sidecar **does not store installer-host absolute executable paths**；运行时 **resolves Git independently on the destination device**，使用固定安装目录或目标机显式 `TTS_MORE_TRUSTED_GIT`。updater 先验证 actual origin identity，再由 actual transport 决定 SSH；**sidecar transport does not override the actual origin transport**。因此实际 HTTPS origin 不要求 SSH，实际 SSH/scp origin 需要目标机 trusted SSH，可由 `TTS_MORE_TRUSTED_SSH` 指定。updater 从 GitHub fast-forward 当前服务 repo 到对应分支最新版；如需回到锁定提交，可加 `--pinned`。
 
 ## 当前已具备的能力
 
@@ -101,7 +101,7 @@ scripts/tts-more.sh install-update-scripts --repo-paths deployment/app/repo-path
 已改进：
 - 新增 `tts_more_deploy.py update`，默认保护已有 `data/local/services.json`，并拒绝更新有本地改动的服务 repo；需要重写服务配置时显式加 `--force-render-services`，需要硬重置服务 repo 时显式加 `--force-reset-repos`。
 - 新增 `scripts/update.sh` 和 `scripts/update.ps1`。
-- 新增 `install-update-scripts`，向服务 repo 写入轻量更新脚本。
+- 新增 `install-update-scripts`，向不含 submodule 的服务 repo 写入四文件轻量 updater；含 submodule 的 repo 只报告必须走 managed `sync-repos`，不安装 standalone updater。
 
 剩余风险：
 - 真实服务 repo 尚未全部克隆，无法在本机验证服务 repo 内脚本实际执行。
@@ -147,4 +147,4 @@ scripts/tts-more.sh install-update-scripts --repo-paths deployment/app/repo-path
 
 - 提供或修复 Gitee 凭据：当前 `https://gitee.com/XucroYuri/TTS_more.git` 返回 403，无法推送。
 - 在目标 GPU 上完成 GPT-SoVITS 收敛分支 CUDA 门禁；通过后合入 fork `main`，首个稳定版本发布后删除远端 proplus 分支并永久保留归档标签。
-- 在目标 GPU 设备上确认模型下载源、CUDA/conda/micromamba 路线和真实音频验收样本。
+- 在目标 GPU 设备上确认模型下载源、CUDA/conda 路线和真实音频验收样本；micromamba 当前不受 managed prepare 支持。

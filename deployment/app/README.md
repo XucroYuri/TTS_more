@@ -32,3 +32,8 @@ Managed checkouts must use a checkout-local `.git` directory; symlink/reparse
 metadata and `gitdir:` files used by worktrees/submodules are rejected.
 Use the per-repo scripts under `deployment/tts-repos/` for manual deployments in
 external TTS repo directories.
+
+The standalone updater is a four-file bundle: `tts-more-update.sh`,
+`tts-more-update.ps1`, `tts-more-update.py`, and `tts-more-update.json`.
+Repositories with submodules do not receive it and must be updated through the
+TTS More managed `sync-repos` workflow.

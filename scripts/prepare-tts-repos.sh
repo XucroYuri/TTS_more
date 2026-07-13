@@ -223,10 +223,6 @@ prepare_gpt() {
     run_with_source_fallback "GPT-SoVITS install for $name" run_gpt_install "$repo_path"
     return
   fi
-  if ! command -v conda >/dev/null 2>&1; then
-    echo "[warn] conda was not found; GPT-SoVITS official installer requires conda for $name" >&2
-    return
-  fi
   if [[ ! -f "$repo_path/install.sh" ]]; then
     echo "Missing GPT-SoVITS installer: $repo_path/install.sh" >&2
     exit 1
@@ -322,6 +318,29 @@ run_cosy_download() {
   fi
 }
 
+preflight_gpt_conda() {
+  local repo name provider service_id variant
+  [[ "$SKIP_INSTALL" == "1" || "$DRY_RUN" == "1" ]] && return 0
+  while IFS= read -r repo; do
+    [[ -z "$repo" ]] && continue
+    name="$(field "$repo" name)"
+    provider="$(field "$repo" provider_type)"
+    service_id="$(field "$repo" service_id)"
+    variant="$(field "$repo" variant)"
+    target_enabled "$name" "$provider" "$service_id" "$variant" || continue
+    [[ "$provider" == "gpt-sovits" ]] || continue
+    if command -v conda >/dev/null 2>&1; then
+      return 0
+    fi
+    if command -v micromamba >/dev/null 2>&1; then
+      echo "[error] micromamba is installed but is not currently supported by the TTS More GPT-SoVITS prepare workflow; install conda or use --skip-install." >&2
+    else
+      echo "[error] supported conda executable was not found; GPT-SoVITS dependency preparation cannot continue. Install conda or use --skip-install." >&2
+    fi
+    return 1
+  done <<< "$REPOSITORIES_JSON"
+}
+
 resolve_network_profile
 
 if [[ "$SYNC_REPOS" == "1" ]]; then
@@ -332,7 +351,11 @@ if [[ "$SYNC_REPOS" == "1" ]]; then
   run_plan "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" "${args[@]}"
 fi
 
+REPOSITORIES_JSON="$(repo_json)"
+preflight_gpt_conda
+
 while IFS= read -r repo; do
+  [[ -z "$repo" ]] && continue
   name="$(field "$repo" name)"
   provider="$(field "$repo" provider_type)"
   service_id="$(field "$repo" service_id)"
@@ -344,7 +367,7 @@ while IFS= read -r repo; do
     indextts) prepare_index "$repo_path" ;;
     cosyvoice) prepare_cosy "$repo_path" ;;
   esac
-done < <(repo_json)
+done <<< "$REPOSITORIES_JSON"
 
 render_args=(render-services --profile local-all --platform posix --service-ids "$TARGETS")
 [[ -n "$REPO_PATHS" ]] && render_args+=(--repo-paths "$REPO_PATHS")
