@@ -36,3 +36,36 @@
 ## Concerns
 
 - None within Task 3 scope. The PowerShell/workflow schema-v2 producer and LAN launch path remain intentionally deferred to the later orchestration task.
+
+## Review Remediation
+
+### RED
+
+- Baseline before review fixes: `140 passed, 2 skipped` for the CUDA runner and protected sanitizer suites.
+- Review regression suite: `15 failed, 140 passed, 2 skipped`.
+- Failures reproduced all requested findings: malformed HMAC prefix bypass, missing runner worker manifest, validation-error sentinel leakage, non-boolean/missing orchestration verification, arbitrary worker directory substitution, and copied remote GPU evidence.
+- A separate mode-binding test failed because a `lan-shared` source summary could be presented to the `lan-distributed` sanitizer path.
+- The strengthened anonymity assertion then exposed a label collision where generated `worker-N` labels could equal real topology node names.
+
+### GREEN
+
+- LAN raw summaries now receive `orchestration_workers` only after successful schema-v2 and strict topology-policy verification.
+- The protected sanitizer requires source `orchestration_verified is True`, exact source/CLI mode agreement, a valid expected worker manifest, an exact one-to-one directory set, required GPU CSV files, policy cardinality, and non-duplicated distributed source content before anonymization.
+- Sanitized output retains only boolean verification state and `remote-N` labels; raw worker node names and GPU UUIDs are excluded.
+- Legacy `distributed` retains its schema-v1 fields and its existing remote-source collection/count path without a new v2 requirement.
+- LAN topology, controller-identity provider, and schema-v2 validation failures now emit fixed bounded errors without exception details or Pydantic `input_value` content.
+- HMAC idempotence now requires the full canonical form `hmac-sha256:[0-9a-f]{64}`; all malformed variants are re-HMACed recursively.
+- Targeted verification: `160 passed, 3 skipped`.
+- Full backend verification: `880 passed, 6 skipped`.
+- `.venv/bin/python -m compileall -q backend/app backend/tests scripts/sanitize-cuda-evidence.py`: passed.
+- `git diff --check`: passed.
+
+### Review Commit
+
+- Parent: `2f4d1f9e7be0da66ccfdc17cc975cde980dd3646`.
+- Atomic commit message: `fix: bind LAN evidence to verified topology`.
+- Final SHA is reported with completion because this report is included in the commit.
+
+### Review Concerns
+
+- None within Task 3 review scope. PowerShell/workflow integration remains intentionally deferred and unchanged.

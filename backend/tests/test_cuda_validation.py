@@ -2679,6 +2679,34 @@ def test_recursive_evidence_hmac_uses_per_run_key_without_raw_identity() -> None
     assert first != second
 
 
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "hmac-sha256:raw-identity",
+        "hmac-sha256:" + "a" * 63,
+        "hmac-sha256:" + "A" * 64,
+        "prefix-hmac-sha256:" + "a" * 64,
+    ],
+)
+def test_evidence_hmac_rehashes_malformed_prefixed_identity(malformed: str) -> None:
+    sanitized = _sanitize_evidence(
+        {"machine_id": malformed}, hash_key=hashlib.sha256(b"run-token").digest()
+    )
+
+    assert sanitized["machine_id"] != malformed
+    assert re.fullmatch(r"hmac-sha256:[0-9a-f]{64}", sanitized["machine_id"])
+
+
+def test_evidence_hmac_preserves_only_canonical_generated_identity() -> None:
+    canonical = "hmac-sha256:" + "a" * 64
+
+    sanitized = _sanitize_evidence(
+        {"machine_id": canonical}, hash_key=hashlib.sha256(b"run-token").digest()
+    )
+
+    assert sanitized["machine_id"] == canonical
+
+
 def test_verified_lan_runner_artifacts_never_persist_raw_token_or_identity(tmp_path: Path) -> None:
     raw_token = "private-orchestration-token"
     raw_controller_id = "private-controller-identity"
@@ -2775,11 +2803,70 @@ def test_lan_modes_do_not_run_the_single_only_gpt_artifact_comparison(
     report = runner.run()
 
     assert [item["name"] for item in report["cases"]] == ["gpt-v2ProPlus"]
+    expected_workers = (
+        ["shared-worker"] if mode == "lan-shared" else ["worker-0", "worker-1", "worker-2"]
+    )
+    assert report["orchestration_workers"] == expected_workers
+    raw_summary = json.loads(
+        (runner.output_dir / "summary.json").read_text(encoding="utf-8")
+    )
+    assert raw_summary["orchestration_workers"] == expected_workers
     assert not any(
         call[1] == "synthesize" and call[2].endswith("-artifact")
         for call in calls
         if len(call) > 2
     )
+
+
+@pytest.mark.parametrize("invalid_source", ["preflight", "topology"])
+def test_failed_lan_validation_errors_never_persist_input_values_or_sentinels(
+    tmp_path: Path, invalid_source: str
+) -> None:
+    token_sentinel = "SENTINEL-RAW-TOKEN-9d86"
+    identity_sentinel = "SENTINEL-CONTROLLER-IDENTITY-4b21"
+    host_sentinel = "SENTINEL-WORKER-HOST-7f10"
+    fixture_path = _write_fixture(tmp_path, distributed_weights=True)
+    orchestration = _lan_orchestration(
+        tmp_path,
+        mode="lan-shared",
+        fixture_path=fixture_path,
+        token=token_sentinel,
+        controller_identity=identity_sentinel,
+    )
+    services_path = orchestration.pop("services_path")
+    if invalid_source == "preflight":
+        preflight_path = orchestration["orchestration_preflight_path"]
+        payload = json.loads(preflight_path.read_text(encoding="utf-8"))
+        payload["token_sha256"] = token_sentinel
+        payload["controller_id_sha256"] = identity_sentinel
+        payload["nodes"]["shared-worker"]["machine_id_sha256"] = host_sentinel
+        preflight_path.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        topology_path = orchestration["topology_path"]
+        payload = json.loads(topology_path.read_text(encoding="utf-8"))
+        payload["nodes"]["shared-worker"]["host"] = host_sentinel
+        payload["nodes"]["shared-worker"]["capacity"] = identity_sentinel
+        topology_path.write_text(json.dumps(payload), encoding="utf-8")
+    runner = CUDAValidationRunner(
+        mode="lan-shared",
+        services_path=services_path,
+        fixture_path=fixture_path,
+        output_dir=tmp_path / f"invalid-{invalid_source}",
+        transcriber=_expected_transcriber,
+        monitor_factory=_HealthyMonitor,
+        **orchestration,
+    )
+
+    report = runner.run()
+
+    combined = b"\n".join(
+        path.read_bytes() for path in runner.output_dir.rglob("*") if path.is_file()
+    ).decode("utf-8", errors="replace")
+    assert report["passed"] is False
+    assert "input_value" not in combined
+    assert "validation failed" not in combined
+    for sentinel in (token_sentinel, identity_sentinel, host_sentinel):
+        assert sentinel not in combined
 
 
 @pytest.mark.parametrize("alias", ["--orchestration-preflight", "--distributed-preflight"])

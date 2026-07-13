@@ -775,6 +775,9 @@ class CUDAValidationRunner:
             "orchestration_verified": (
                 self.orchestration_verified if self.mode in STRICT_LAN_MODES else None
             ),
+            "orchestration_workers": (
+                [] if self.mode in STRICT_LAN_MODES else None
+            ),
             "orchestration_preflight": (
                 str(self.orchestration_preflight_path)
                 if self.mode in STRICT_LAN_MODES and self.orchestration_preflight_path
@@ -1129,6 +1132,8 @@ class CUDAValidationRunner:
                 return fixture, {}
             self.orchestration_verified = True
             report["orchestration_verified"] = True
+            assert self._lan_policy is not None
+            report["orchestration_workers"] = sorted(self._lan_policy.workers)
             assert self.orchestration_token is not None
             self._evidence_hash_key = hashlib.sha256(
                 self.orchestration_token.encode("utf-8")
@@ -1235,20 +1240,20 @@ class CUDAValidationRunner:
             return "LAN validation requires the controller commit identity"
         try:
             controller_identity = self.controller_identity_provider().strip()
-        except Exception as exc:
-            return f"LAN controller identity is unavailable: {type(exc).__name__}"
+        except Exception:
+            return "LAN controller identity is unavailable"
         if not controller_identity:
             return "LAN validation requires the controller identity"
         try:
             topology, policy = load_lan_policy(self.topology_path, self.mode)
-        except Exception as exc:
-            return f"LAN topology policy is invalid: {exc}"
+        except Exception:
+            return "LAN topology policy is invalid"
         try:
             payload = LanOrchestrationPreflight.model_validate_json(
                 self.orchestration_preflight_path.read_text(encoding="utf-8-sig")
             )
-        except Exception as exc:
-            return f"LAN orchestration preflight schema-v2 is invalid: {exc}"
+        except Exception:
+            return "LAN orchestration preflight schema-v2 is invalid"
         if payload.mode != self.mode:
             return "LAN orchestration mode does not match"
         bindings = (
@@ -1710,7 +1715,7 @@ def _sanitize_evidence(
         return value
     lowered = key.casefold()
     if lowered in {"device_uuid", "machine_id", "controller_id"}:
-        if value.startswith("hmac-sha256:"):
+        if re.fullmatch(r"hmac-sha256:[0-9a-f]{64}", value):
             return value
         key_bytes = hash_key or b"tts-more-local-evidence"
         digest = hmac.new(key_bytes, value.encode("utf-8"), hashlib.sha256).hexdigest()

@@ -32,6 +32,7 @@ REMOTE_GPU_SOURCE_COUNTS = {
     "lan-shared": 1,
     "lan-distributed": 3,
 }
+LAN_MODES = frozenset({"lan-shared", "lan-distributed"})
 ALLOWED_OUTCOMES = {"success", "failure", "skipped", "cancelled"}
 BUNDLE_FILES = {
     "summary.json",
@@ -231,6 +232,7 @@ def _safe_summary(
     source_playwright_junit_present: bool,
     source_playwright_junit_valid: bool,
     shareable_evidence_complete: bool,
+    source_orchestration_verified: bool,
 ) -> dict[str, Any]:
     stage = _safe_identifier(
         raw.get("stage") or "workflow-finalizer",
@@ -320,6 +322,8 @@ def _safe_summary(
             "sample_count": int(monitor_raw.get("sample_count") or 0),
         },
     }
+    if mode in LAN_MODES:
+        summary["source_orchestration_verified"] = source_orchestration_verified
     return summary
 
 
@@ -417,7 +421,13 @@ def _number_text(value: str) -> str:
     return str(int(number)) if number.is_integer() else format(number, ".12g")
 
 
-def _write_gpu_csv(raw_dir: Path, output_path: Path, *, mode: str) -> tuple[int, int, int]:
+def _write_gpu_csv(
+    raw_dir: Path,
+    output_path: Path,
+    *,
+    mode: str,
+    expected_remote_nodes: tuple[str, ...] | None = None,
+) -> tuple[int, int, int, bool]:
     header = [
         "source",
         "sample",
@@ -462,11 +472,52 @@ def _write_gpu_csv(raw_dir: Path, output_path: Path, *, mode: str) -> tuple[int,
 
     controller_sample_count = len(rows)
     remote_source_count = 0
+    remote_node_set_verified = mode not in LAN_MODES
     if mode in REMOTE_GPU_SOURCE_COUNTS:
         worker_root = raw_dir / "worker-logs"
-        remote_paths = sorted(worker_root.glob("*/nvidia-smi.csv")) if worker_root.is_dir() else []
+        if mode in LAN_MODES:
+            worker_dirs = (
+                sorted(
+                    (path for path in worker_root.iterdir() if path.is_dir()),
+                    key=lambda path: path.name,
+                )
+                if worker_root.is_dir()
+                else []
+            )
+            expected = set(expected_remote_nodes or ())
+            actual = {path.name for path in worker_dirs}
+            remote_node_set_verified = bool(
+                expected_remote_nodes
+                and len(expected) == len(expected_remote_nodes)
+                and actual == expected
+                and len(actual) == REMOTE_GPU_SOURCE_COUNTS[mode]
+            )
+            remote_paths = [path / "nvidia-smi.csv" for path in worker_dirs]
+            if remote_node_set_verified and any(
+                not path.is_file() for path in remote_paths
+            ):
+                remote_node_set_verified = False
+            if remote_node_set_verified and len(remote_paths) > 1:
+                try:
+                    evidence_hashes = {
+                        hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in remote_paths
+                    }
+                except OSError:
+                    remote_node_set_verified = False
+                else:
+                    if len(evidence_hashes) != len(remote_paths):
+                        remote_node_set_verified = False
+            if not remote_node_set_verified:
+                remote_paths = []
+        else:
+            remote_paths = (
+                sorted(worker_root.glob("*/nvidia-smi.csv"))
+                if worker_root.is_dir()
+                else []
+            )
         for source_index, remote_path in enumerate(remote_paths, start=1):
-            source = f"worker-{source_index}"
+            source = f"remote-{source_index}"
             source_rows = 0
             try:
                 with remote_path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -498,7 +549,33 @@ def _write_gpu_csv(raw_dir: Path, output_path: Path, *, mode: str) -> tuple[int,
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(header)
         writer.writerows(rows)
-    return len(rows), controller_sample_count, remote_source_count
+    return (
+        len(rows),
+        controller_sample_count,
+        remote_source_count,
+        remote_node_set_verified,
+    )
+
+
+def _lan_orchestration_source_state(
+    raw_summary: dict[str, Any], mode: str
+) -> tuple[bool, tuple[str, ...] | None]:
+    if mode not in LAN_MODES:
+        return True, None
+    verified = (
+        raw_summary.get("mode") == mode
+        and raw_summary.get("orchestration_verified") is True
+    )
+    workers = raw_summary.get("orchestration_workers")
+    if not verified or not isinstance(workers, list):
+        return False, None
+    if (
+        len(workers) != REMOTE_GPU_SOURCE_COUNTS[mode]
+        or any(not isinstance(node, str) or not node.strip() for node in workers)
+        or len(set(workers)) != len(workers)
+    ):
+        return verified, None
+    return verified, tuple(workers)
 
 
 def _write_worker_references(raw_dir: Path, output_path: Path) -> set[str]:
@@ -650,12 +727,23 @@ def sanitize_evidence(
 
     try:
         raw_summary, source_present, source_valid = _load_source_summary(raw_dir)
+        source_orchestration_verified, expected_remote_nodes = (
+            _lan_orchestration_source_state(raw_summary, mode)
+        )
         source_junit_present, source_junit_valid = _xml_evidence_state(raw_dir / "junit.xml")
         source_playwright_junit_present, source_playwright_junit_valid = _xml_evidence_state(
             raw_dir / "playwright-junit.xml"
         )
-        gpu_sample_count, controller_gpu_sample_count, remote_gpu_source_count = _write_gpu_csv(
-            raw_dir, staging_dir / "nvidia-smi.csv", mode=mode
+        (
+            gpu_sample_count,
+            controller_gpu_sample_count,
+            remote_gpu_source_count,
+            remote_node_set_verified,
+        ) = _write_gpu_csv(
+            raw_dir,
+            staging_dir / "nvidia-smi.csv",
+            mode=mode,
+            expected_remote_nodes=expected_remote_nodes,
         )
         worker_reference_services = _write_worker_references(
             raw_dir, staging_dir / "worker-log-references.json"
@@ -665,6 +753,8 @@ def sanitize_evidence(
             and source_playwright_junit_valid
             and controller_gpu_sample_count > 0
             and remote_gpu_source_count == REMOTE_GPU_SOURCE_COUNTS.get(mode, 0)
+            and (mode not in LAN_MODES or source_orchestration_verified)
+            and (mode not in LAN_MODES or remote_node_set_verified)
             and worker_reference_services == FORMAL_SERVICE_IDS
         )
         summary = _safe_summary(
@@ -677,11 +767,16 @@ def sanitize_evidence(
             source_playwright_junit_present=source_playwright_junit_present,
             source_playwright_junit_valid=source_playwright_junit_valid,
             shareable_evidence_complete=shareable_evidence_complete,
+            source_orchestration_verified=source_orchestration_verified,
         )
         source_status = str(raw_summary.get("certification_status") or "blocked")
         summary["gpu_monitor"]["shareable_sample_count"] = gpu_sample_count
         summary["gpu_monitor"]["controller_sample_count"] = controller_gpu_sample_count
         summary["gpu_monitor"]["remote_source_count"] = remote_gpu_source_count
+        if mode in LAN_MODES:
+            summary["gpu_monitor"][
+                "remote_node_set_verified"
+            ] = remote_node_set_verified
         gate = _automatic_gate(
             source_present=source_present,
             source_valid=source_valid,
