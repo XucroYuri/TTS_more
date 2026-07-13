@@ -680,8 +680,18 @@ def _clone_command(remote: str, branch: str, path: Path) -> list[str]:
     return command
 
 
-def _run_git_command(command: list[str], *, cwd: Path) -> None:
-    _run_git_process(command, cwd=cwd, check=True)
+def _run_git_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    validated_submodule_remotes: tuple[str, ...] | None = None,
+) -> None:
+    _run_git_process(
+        command,
+        cwd=cwd,
+        check=True,
+        validated_submodule_remotes=validated_submodule_remotes,
+    )
 
 
 def _repo_selected(repo: dict[str, Any], service_ids: set[str] | None) -> bool:
@@ -782,7 +792,7 @@ def _canonical_remote_identity(remote: str) -> str:
     return f"{host}/{owner}/{repository}"
 
 
-def _ensure_repo_origin(path: Path, expected_remote: str) -> None:
+def _ensure_repo_origin(path: Path, expected_remote: str) -> str:
     actual_remote = _git_output(["git", "-C", str(path), "remote", "get-url", "origin"])
     try:
         expected_identity = _canonical_remote_identity(expected_remote)
@@ -794,6 +804,117 @@ def _ensure_repo_origin(path: Path, expected_remote: str) -> None:
             f"repository origin mismatch at {path}: expected {expected_remote!r}, "
             f"found {actual_remote or '<missing>'!r}"
         )
+    return actual_remote
+
+
+def _resolve_submodule_remote(origin: str, remote: str) -> str:
+    _parse_github_remote(origin)
+    if not remote.startswith(("./", "../")):
+        _parse_github_remote(remote)
+        return remote
+    if not remote or "\\" in remote or any(ord(character) < 32 for character in remote):
+        raise ValueError(f"unsupported GitHub remote: {remote!r}")
+    if "://" in origin:
+        parsed = urlparse(origin)
+        prefix = None
+        origin_path = parsed.path.lstrip("/")
+    else:
+        prefix, origin_path = origin.split(":", 1)
+        parsed = None
+    components = origin_path.split("/")
+    for component in remote.split("/"):
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            if not components:
+                raise ValueError(f"unsupported GitHub remote: {remote!r}")
+            components.pop()
+        else:
+            components.append(component)
+    resolved_path = "/".join(components)
+    if parsed is not None:
+        resolved = parsed._replace(path=f"/{resolved_path}", params="", query="", fragment="").geturl()
+    else:
+        resolved = f"{prefix}:{resolved_path}"
+    _parse_github_remote(resolved)
+    return resolved
+
+
+def _load_validated_submodules(repo_path: Path, origin: str) -> list[dict[str, str]]:
+    _parse_github_remote(origin)
+    gitmodules_path = repo_path / ".gitmodules"
+    if _is_link_or_reparse(gitmodules_path):
+        raise RuntimeError(f".gitmodules must not be a symlink or reparse point: {gitmodules_path}")
+    if not gitmodules_path.exists():
+        return []
+    _assert_safe_path(gitmodules_path, repo_path)
+    try:
+        payload = gitmodules_path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"unable to read .gitmodules safely: {gitmodules_path}") from exc
+    if len(payload) > MAX_LOCAL_GIT_CONFIG_BYTES or b"\0" in payload:
+        raise RuntimeError(f".gitmodules is oversized or contains NUL bytes: {gitmodules_path}")
+    try:
+        text = payload.decode("utf-8", errors="strict")
+        parser = configparser.RawConfigParser(
+            interpolation=None,
+            strict=True,
+            delimiters=("=",),
+            comment_prefixes=("#", ";"),
+            inline_comment_prefixes=None,
+            empty_lines_in_values=False,
+        )
+        parser.optionxform = str
+        parser.read_string(text, source=str(gitmodules_path))
+    except (UnicodeDecodeError, configparser.Error) as exc:
+        raise RuntimeError(f"unable to parse .gitmodules safely: {gitmodules_path}") from exc
+    if parser.defaults():
+        raise RuntimeError("unknown .gitmodules key: DEFAULT")
+    submodules: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+    seen_paths: list[str] = []
+    safe_component = re.compile(r"[A-Za-z0-9_.-]+\Z")
+    for section in parser.sections():
+        match = re.fullmatch(r'submodule "([^"\\]+)"', section, flags=re.IGNORECASE)
+        if not match:
+            raise RuntimeError(f"unknown .gitmodules section: {section}")
+        name = match.group(1)
+        name_key = name.casefold()
+        if name_key in seen_names:
+            raise RuntimeError(f"duplicate submodule name: {name}")
+        seen_names.add(name_key)
+        name_parts = name.split("/")
+        if any(not safe_component.fullmatch(part) or part in {".", "..", ".git"} for part in name_parts):
+            raise RuntimeError(f"unsafe submodule name: {name}")
+        options: dict[str, str] = {}
+        for option, value in parser.items(section, raw=True):
+            normalized_option = option.casefold()
+            if normalized_option in options:
+                raise RuntimeError(f"duplicate .gitmodules key: {section}.{option}")
+            if normalized_option not in {"path", "url"}:
+                raise RuntimeError(f"unknown .gitmodules key: {section}.{option}")
+            options[normalized_option] = value
+        if set(options) != {"path", "url"}:
+            raise RuntimeError(f"submodule must define exactly path and url: {name}")
+        submodule_path = options["path"]
+        path_parts = submodule_path.split("/")
+        if (
+            not submodule_path
+            or "\\" in submodule_path
+            or any(not safe_component.fullmatch(part) or part in {".", "..", ".git"} for part in path_parts)
+        ):
+            raise RuntimeError(f"unsafe submodule path: {submodule_path}")
+        path_key = submodule_path.casefold()
+        for existing in seen_paths:
+            if path_key == existing:
+                raise RuntimeError(f"duplicate submodule path: {submodule_path}")
+            if path_key.startswith(f"{existing}/") or existing.startswith(f"{path_key}/"):
+                raise RuntimeError(f"overlapping submodule path: {submodule_path}")
+        seen_paths.append(path_key)
+        _assert_safe_path(repo_path.joinpath(*path_parts), repo_path)
+        resolved_remote = _resolve_submodule_remote(origin, options["url"])
+        submodules.append({"name": name, "path": submodule_path, "url": resolved_remote})
+    return submodules
 
 
 def _git_environment() -> dict[str, str]:
@@ -1015,7 +1136,14 @@ def _git_command_repo_path(command: list[str], cwd: Path) -> Path | None:
     return cwd if (cwd / ".git" / "config").is_file() else None
 
 
-def _validate_local_git_config_value(section: str, option: str, value: str) -> None:
+def _validate_local_git_config_value(
+    section: str,
+    option: str,
+    value: str,
+    *,
+    config_path: Path | None = None,
+    expected_worktree: Path | None = None,
+) -> None:
     normalized_section = section.lower()
     normalized_option = option.lower()
     subsection = re.fullmatch(r'([^" ]+) "([^"\\]+)"', section)
@@ -1036,6 +1164,15 @@ def _validate_local_git_config_value(section: str, option: str, value: str) -> N
     }
     if normalized_section == "core" and normalized_option in core_validators:
         valid = core_validators[normalized_option](value)
+    elif normalized_section == "core" and normalized_option == "worktree":
+        candidate = Path(value)
+        valid = bool(
+            config_path is not None
+            and expected_worktree is not None
+            and not candidate.is_absolute()
+            and os.path.normcase(str((config_path.parent / candidate).resolve(strict=False)))
+            == os.path.normcase(str(expected_worktree.resolve(strict=False)))
+        )
     elif normalized_section == 'remote "origin"':
         if normalized_option == "url":
             try:
@@ -1072,8 +1209,10 @@ def _audit_local_git_config(
     repo_path: Path,
     *,
     environment: Mapping[str, str] | None = None,
+    config_path: Path | None = None,
+    expected_worktree: Path | None = None,
 ) -> dict[str, str]:
-    config_path = repo_path / ".git" / "config"
+    config_path = config_path or repo_path / ".git" / "config"
     if _is_link_or_reparse(config_path):
         raise RuntimeError(f"local Git config must not be a symlink or reparse point: {config_path}")
     if not config_path.exists():
@@ -1108,15 +1247,72 @@ def _audit_local_git_config(
             if normalized_key in seen:
                 raise RuntimeError(f"duplicate local Git config key: {section}.{option}")
             seen.add(normalized_key)
-            _validate_local_git_config_value(section, option, value)
+            _validate_local_git_config_value(
+                section,
+                option,
+                value,
+                config_path=config_path,
+                expected_worktree=expected_worktree,
+            )
             values[normalized_key] = value
     return values
+
+
+def _audit_nested_submodule_config(
+    repo_path: Path,
+    superproject_path: Path,
+    expected_remote: str,
+) -> str:
+    _parse_github_remote(expected_remote)
+    dot_git = repo_path / ".git"
+    _assert_safe_path(dot_git, superproject_path)
+    if _is_link_or_reparse(dot_git) or not dot_git.is_file():
+        raise RuntimeError(f"nested submodule .git must be a regular gitdir file: {dot_git}")
+    try:
+        payload = dot_git.read_bytes()
+        text = payload.decode("utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"unable to read nested submodule gitdir safely: {dot_git}") from exc
+    lines = text.splitlines()
+    if len(payload) > 4096 or b"\0" in payload or len(lines) != 1 or not lines[0].startswith("gitdir: "):
+        raise RuntimeError(f"invalid nested submodule gitdir file: {dot_git}")
+    raw_git_dir = lines[0][len("gitdir: ") :]
+    git_dir_reference = Path(raw_git_dir)
+    if (
+        not raw_git_dir
+        or git_dir_reference.is_absolute()
+        or any(ord(character) < 32 for character in raw_git_dir)
+    ):
+        raise RuntimeError(f"invalid nested submodule gitdir file: {dot_git}")
+    try:
+        git_dir = (repo_path / git_dir_reference).resolve(strict=True)
+        modules_boundary = (superproject_path / ".git" / "modules").resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"invalid nested submodule gitdir target: {dot_git}") from exc
+    if git_dir == modules_boundary or not git_dir.is_relative_to(modules_boundary):
+        raise RuntimeError(f"nested submodule gitdir escapes superproject metadata: {git_dir}")
+    _assert_safe_path(git_dir, superproject_path)
+    config_path = git_dir / "config"
+    values = _audit_local_git_config(
+        repo_path,
+        config_path=config_path,
+        expected_worktree=repo_path,
+    )
+    actual_remote = values.get('remote "origin".url')
+    if not actual_remote:
+        raise RuntimeError(f"nested submodule origin is missing: {repo_path}")
+    if _canonical_remote_identity(actual_remote) != _canonical_remote_identity(expected_remote):
+        raise RuntimeError(
+            f"nested submodule origin mismatch at {repo_path}: expected {expected_remote!r}, "
+            f"found {actual_remote!r}"
+        )
+    return actual_remote
 
 
 def _git_command_verb(command: list[str]) -> str:
     index = 1
     while index < len(command):
-        if command[index] == "-C" and index + 1 < len(command):
+        if command[index] in {"-C", "-c"} and index + 1 < len(command):
             index += 2
             continue
         return command[index].lower()
@@ -1127,6 +1323,7 @@ def _git_command_requires_ssh(
     command: list[str],
     *,
     local_config: Mapping[str, str],
+    validated_submodule_remotes: tuple[str, ...] | None = None,
 ) -> bool:
     verb = _git_command_verb(command)
     if verb == "clone" and "--" in command:
@@ -1135,7 +1332,11 @@ def _git_command_requires_ssh(
     if verb in {"fetch", "pull"}:
         remote = local_config.get('remote "origin".url')
         return bool(remote and _github_remote_requires_ssh(remote))
-    return verb == "submodule"
+    if verb == "submodule":
+        if validated_submodule_remotes is None:
+            raise RuntimeError("submodule Git commands require prevalidated remotes")
+        return any(_github_remote_requires_ssh(remote) for remote in validated_submodule_remotes)
+    return False
 
 
 def _run_git_process(
@@ -1145,6 +1346,7 @@ def _run_git_process(
     check: bool,
     capture_output: bool = False,
     text: bool = False,
+    validated_submodule_remotes: tuple[str, ...] | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     environment = _git_environment()
     repo_path = _git_command_repo_path(command, cwd)
@@ -1152,7 +1354,11 @@ def _run_git_process(
     if repo_path is not None:
         local_config = _audit_local_git_config(repo_path.resolve(strict=False), environment=environment)
     managed_roots = tuple(path for path in (cwd, repo_path) if path is not None)
-    requires_ssh = _git_command_requires_ssh(command, local_config=local_config)
+    requires_ssh = _git_command_requires_ssh(
+        command,
+        local_config=local_config,
+        validated_submodule_remotes=validated_submodule_remotes,
+    )
     return subprocess.run(
         _harden_git_command(
             command,
@@ -1240,6 +1446,85 @@ def _run_clone(
     _run_git_command(command, cwd=root)
 
 
+def _validated_submodule_update_command(
+    repo_path: Path,
+    submodules: list[dict[str, str]],
+) -> list[str]:
+    command = ["git"]
+    for submodule in submodules:
+        name = submodule["name"]
+        command.extend(
+            [
+                "-c",
+                f"submodule.{name}.url={submodule['url']}",
+                "-c",
+                f"submodule.{name}.active=true",
+            ]
+        )
+    command.extend(
+        [
+            "-C",
+            str(repo_path),
+            "submodule",
+            "update",
+            "--",
+            *(submodule["path"] for submodule in submodules),
+        ]
+    )
+    return command
+
+
+def _sync_validated_submodules(
+    root: Path,
+    repo_path: Path,
+    origin: str,
+    actions: list[dict[str, Any]],
+    *,
+    depth: int = 0,
+    metadata_root: Path | None = None,
+) -> None:
+    if depth > 32:
+        raise RuntimeError(f"submodule nesting exceeds supported depth at {repo_path}")
+    submodules = _load_validated_submodules(repo_path, origin)
+    if not submodules:
+        return
+    metadata_root = metadata_root or repo_path
+    command = _validated_submodule_update_command(repo_path, submodules)
+    remotes = tuple(submodule["url"] for submodule in submodules)
+    actions.append(
+        {
+            "action": "git",
+            "argv": command,
+            "validated_submodule_remotes": list(remotes),
+        }
+    )
+    _run_git_command(
+        command,
+        cwd=root,
+        validated_submodule_remotes=remotes,
+    )
+    for submodule in submodules:
+        child_path = repo_path.joinpath(*submodule["path"].split("/"))
+        if _is_link_or_reparse(child_path):
+            raise RuntimeError(f"submodule path must not be a symlink or reparse point: {child_path}")
+        if not child_path.is_dir():
+            raise RuntimeError(f"submodule update did not create a directory: {child_path}")
+        _assert_safe_path(child_path, repo_path)
+        actual_child_origin = _audit_nested_submodule_config(
+            child_path,
+            metadata_root,
+            submodule["url"],
+        )
+        _sync_validated_submodules(
+            root,
+            child_path,
+            actual_child_origin,
+            actions,
+            depth=depth + 1,
+            metadata_root=metadata_root,
+        )
+
+
 def sync_repos(
     root: Path = PROJECT_ROOT,
     *,
@@ -1277,6 +1562,7 @@ def sync_repos(
     lock_changed = False
     for repo, path in resolved_repositories:
         remote = str(repo["remote"])
+        actual_origin = remote
         branch = str(repo["branch"])
         commit = repo.get("commit")
         will_clone = clean or not path.exists()
@@ -1284,7 +1570,7 @@ def sync_repos(
             _validate_git_checkout(path)
             if not force_reset:
                 _ensure_clean_repo(path, str(repo.get("name") or repo.get("service_id") or path.name))
-            _ensure_repo_origin(path, remote)
+            actual_origin = _ensure_repo_origin(path, remote)
             if force_reset:
                 commands = [
                     ["git", "-C", str(path), "fetch", "--prune", "origin", branch],
@@ -1309,8 +1595,6 @@ def sync_repos(
                 actions=actions,
             )
             commands = []
-        if repo.get("submodules"):
-            commands.append(["git", "-C", str(path), "submodule", "update", "--init", "--recursive"])
         for command in commands:
             actions.append({"action": "git", "argv": command})
             if not dry_run:
@@ -1321,6 +1605,18 @@ def sync_repos(
                 if head and repo.get("commit") != head:
                     repo["commit"] = head
                     lock_changed = True
+            if repo.get("submodules"):
+                if dry_run:
+                    actions.append(
+                        {
+                            "action": "validate-and-update-submodules",
+                            "path": str(path),
+                            "origin": actual_origin,
+                            "after": "final-superproject-selection",
+                        }
+                    )
+                else:
+                    _sync_validated_submodules(root, path, actual_origin, actions)
             continue
         if commit:
             checkout_command = ["git", "-C", str(path), "checkout", str(commit)]
@@ -1343,6 +1639,18 @@ def sync_repos(
                     _run_git_command(fetch_command, cwd=root)
                     actions.append({"action": "git", "argv": checkout_command})
                     _run_git_command(checkout_command, cwd=root)
+        if repo.get("submodules"):
+            if dry_run:
+                actions.append(
+                    {
+                        "action": "validate-and-update-submodules",
+                        "path": str(path),
+                        "origin": actual_origin,
+                        "after": "final-superproject-selection",
+                    }
+                )
+            else:
+                _sync_validated_submodules(root, path, actual_origin, actions)
     if lock_changed and save_lock_on_change and not dry_run:
         save_repo_lock(repositories, root)
     return actions
@@ -1814,8 +2122,8 @@ def main(argv: list[str]) -> int:
     if not isinstance(remote, str):
         raise ValueError("updater remote must be a string")
     expected_identity = parse_github_remote(remote)
-    requires_ssh = remote_requires_ssh(remote)
-    if not isinstance(config.get("requires_ssh"), bool) or config["requires_ssh"] != requires_ssh:
+    expected_requires_ssh = remote_requires_ssh(remote)
+    if not isinstance(config.get("requires_ssh"), bool) or config["requires_ssh"] != expected_requires_ssh:
         raise ValueError("updater requires_ssh does not match remote")
     configured_branch = config.get("branch")
     configured_commit = config.get("commit")
@@ -1826,17 +2134,18 @@ def main(argv: list[str]) -> int:
     if commit and not COMMIT_RE.fullmatch(commit):
         raise ValueError(f"invalid pinned commit: {commit!r}")
     git_executable = resolve_trusted_executable("git", root=root)
-    ssh_executable = (
-        resolve_trusted_executable("ssh", root=root, git_executable=Path(git_executable))
-        if requires_ssh
-        else None
-    )
-    validate_git_checkout(root, git_executable, ssh_executable)
-    actual_remote = output(["git", "remote", "get-url", "origin"], root, git_executable, ssh_executable)
+    validate_git_checkout(root, git_executable, None)
+    actual_remote = output(["git", "remote", "get-url", "origin"], root, git_executable, None)
     if parse_github_remote(actual_remote) != expected_identity:
         raise RuntimeError(
             f"repository origin mismatch: expected {remote!r}, found {actual_remote!r}"
         )
+    actual_requires_ssh = remote_requires_ssh(actual_remote)
+    ssh_executable = (
+        resolve_trusted_executable("ssh", root=root, git_executable=Path(git_executable))
+        if actual_requires_ssh
+        else None
+    )
     dirty = output(["git", "status", "--porcelain"], root, git_executable, ssh_executable)
     if dirty:
         raise RuntimeError("refusing to update a dirty repository; commit, stash, or clean local changes first")

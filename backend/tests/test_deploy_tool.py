@@ -120,6 +120,30 @@ def _init_git_checkout(path: Path, remote: str) -> None:
     subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True)
 
 
+def _commit_index(path: Path, message: str) -> str:
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "-c",
+            "user.email=tests@example.invalid",
+            "-c",
+            "user.name=Deployment Tests",
+            "commit",
+            "-qm",
+            message,
+        ],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def test_render_local_all_services_from_repo_lock(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
@@ -508,6 +532,320 @@ def test_sync_repos_dry_run_skips_locked_commit_actions_when_head_matches(
     commands = [action["argv"] for action in actions if action["action"] == "git"]
     assert fetch_command not in commands
     assert checkout_command not in commands
+
+
+def test_gitmodules_parser_resolves_relative_urls_from_validated_origin(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "superproject"
+    target.mkdir()
+    (target / ".gitmodules").write_text(
+        """[submodule "https-child"]
+\tpath = deps/https-child
+\turl = ../https-child.git
+[submodule "third_party/Matcha-TTS"]
+\tpath = third_party/Matcha-TTS
+\turl = git@github.com:example/ssh-child.git
+""",
+        encoding="utf-8",
+    )
+
+    assert deploy._load_validated_submodules(
+        target,
+        "https://github.com/example/superproject.git",
+    ) == [
+        {
+            "name": "https-child",
+            "path": "deps/https-child",
+            "url": "https://github.com/example/https-child.git",
+        },
+        {
+            "name": "third_party/Matcha-TTS",
+            "path": "third_party/Matcha-TTS",
+            "url": "git@github.com:example/ssh-child.git",
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("contents", "error"),
+    [
+        (
+            """[submodule "child"]
+path = deps/one
+url = https://github.com/example/one.git
+[submodule "CHILD"]
+path = deps/two
+url = https://github.com/example/two.git
+""",
+            "duplicate submodule name",
+        ),
+        (
+            """[submodule "child"]
+path = deps/child
+url = https://github.com/example/child.git
+update = !marker-command
+""",
+            "unknown .gitmodules key",
+        ),
+        (
+            """[submodule "child"]
+path = ../outside
+url = https://github.com/example/child.git
+""",
+            "unsafe submodule path",
+        ),
+        (
+            """[submodule "child"]
+path = deps/child
+url = file:///tmp/child.git
+""",
+            "unsupported GitHub remote",
+        ),
+        (
+            """[submodule "one"]
+path = deps/child
+url = https://github.com/example/one.git
+[submodule "two"]
+path = DEPS/CHILD
+url = https://github.com/example/two.git
+""",
+            "duplicate submodule path",
+        ),
+    ],
+)
+def test_gitmodules_parser_rejects_duplicate_unknown_or_unsafe_metadata(
+    tmp_path: Path,
+    contents: str,
+    error: str,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "superproject"
+    target.mkdir()
+    (target / ".gitmodules").write_text(contents, encoding="utf-8")
+
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        deploy._load_validated_submodules(
+            target,
+            "https://github.com/example/superproject.git",
+        )
+
+
+def _write_nested_submodule_config(
+    superproject: Path,
+    child: Path,
+    remote: str,
+    extra: str = "",
+) -> None:
+    git_dir = superproject / ".git" / "modules" / "deps" / "child"
+    git_dir.mkdir(parents=True)
+    child.mkdir(parents=True)
+    (child / ".git").write_text(
+        f"gitdir: {os.path.relpath(git_dir, child)}\n",
+        encoding="utf-8",
+    )
+    worktree = os.path.relpath(child, git_dir)
+    (git_dir / "config").write_text(
+        f"""[core]
+repositoryformatversion = 0
+filemode = true
+bare = false
+logallrefupdates = true
+worktree = {worktree}
+[remote "origin"]
+url = {remote}
+fetch = +refs/heads/*:refs/remotes/origin/*
+{extra}""",
+        encoding="utf-8",
+    )
+
+
+def test_nested_submodule_gitdir_audit_returns_validated_actual_origin(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    superproject = tmp_path / "superproject"
+    child = superproject / "deps" / "child"
+    actual_remote = "git@github.com:example/child.git"
+    _write_nested_submodule_config(superproject, child, actual_remote)
+
+    assert deploy._audit_nested_submodule_config(
+        child,
+        superproject,
+        "https://github.com/example/child.git",
+    ) == actual_remote
+
+
+def test_nested_submodule_gitdir_audit_rejects_url_rewrite(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    superproject = tmp_path / "superproject"
+    child = superproject / "deps" / "child"
+    marker_remote = "https://github.com/example/child.git"
+    _write_nested_submodule_config(
+        superproject,
+        child,
+        marker_remote,
+        """[url "https://attacker.invalid/"]
+insteadOf = https://github.com/
+""",
+    )
+
+    with pytest.raises(RuntimeError, match="not allowlisted"):
+        deploy._audit_nested_submodule_config(child, superproject, marker_remote)
+
+
+@pytest.mark.parametrize(
+    ("latest", "expected_remote"),
+    [
+        (False, "https://github.com/example/locked-child.git"),
+        (True, "git@github.com:example/tip-child.git"),
+    ],
+)
+def test_sync_repos_updates_submodules_only_after_final_superproject_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    latest: bool,
+    expected_remote: str,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "superproject"
+    child_source = tmp_path / "child-source"
+    super_remote = "https://github.com/example/superproject.git"
+    _init_git_checkout(child_source, "https://github.com/example/child-source.git")
+    locked_child = subprocess.run(
+        ["git", "-C", str(child_source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (child_source / "tracked.txt").write_text("tip\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(child_source), "add", "tracked.txt"], check=True)
+    tip_child = _commit_index(child_source, "tip child")
+
+    _init_git_checkout(target, super_remote)
+    subprocess.run(["git", "-C", str(target), "branch", "-M", "main"], check=True)
+    (target / ".gitmodules").write_text(
+        """[submodule "child"]
+\tpath = deps/child
+\turl = ../locked-child.git
+""",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(target), "add", ".gitmodules"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(target),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{locked_child},deps/child",
+        ],
+        check=True,
+    )
+    locked_super = _commit_index(target, "locked superproject")
+    (target / ".gitmodules").write_text(
+        """[submodule "child"]
+\tpath = deps/child
+\turl = git@github.com:example/tip-child.git
+""",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(target), "add", ".gitmodules"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(target),
+            "update-index",
+            "--cacheinfo",
+            f"160000,{tip_child},deps/child",
+        ],
+        check=True,
+    )
+    tip_super = _commit_index(target, "tip superproject")
+    calls: list[tuple[list[str], tuple[str, ...] | None]] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path,
+        validated_submodule_remotes: tuple[str, ...] | None = None,
+    ) -> None:
+        calls.append((command, validated_submodule_remotes))
+        if "submodule" in command:
+            gitlink = subprocess.run(
+                ["git", "-C", str(target), "ls-tree", "HEAD", "deps/child"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.split()[2]
+            child_target = target / "deps" / "child"
+            if child_target.exists():
+                shutil.rmtree(child_target)
+            child_target.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "clone", "-q", str(child_source), str(child_target)], check=True)
+            subprocess.run(["git", "-C", str(child_target), "checkout", "-q", gitlink], check=True)
+            assert validated_submodule_remotes is not None
+            subprocess.run(
+                ["git", "-C", str(child_target), "remote", "set-url", "origin", validated_submodule_remotes[0]],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(target), "submodule", "absorbgitdirs", "--", "deps/child"],
+                check=True,
+            )
+        elif "checkout" in command:
+            subprocess.run(command, cwd=cwd, check=True, capture_output=True)
+
+    monkeypatch.setattr(deploy, "_run_git_command", fake_run)
+    repositories = [
+        {
+            "name": "superproject",
+            "provider_type": "cosyvoice",
+            "path": "repo/superproject",
+            "remote": super_remote,
+            "branch": "main",
+            "commit": locked_super,
+            "service_id": "local-superproject",
+            "default_selected": True,
+            "submodules": True,
+        }
+    ]
+
+    deploy.sync_repos(
+        tmp_path,
+        latest=latest,
+        force_reset=True,
+        repositories=repositories,
+    )
+
+    expected_super = tip_super if latest else locked_super
+    expected_child = tip_child if latest else locked_child
+    assert subprocess.run(
+        ["git", "-C", str(target), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == expected_super
+    assert subprocess.run(
+        ["git", "-C", str(target / "deps" / "child"), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == expected_child
+    submodule_call = next(item for item in calls if "submodule" in item[0])
+    assert submodule_call[1] == (expected_remote,)
+    final_selection = (
+        ["git", "-C", str(target), "reset", "--hard", "origin/main"]
+        if latest
+        else ["git", "-C", str(target), "checkout", expected_super]
+    )
+    command_calls = [item[0] for item in calls]
+    assert command_calls.index(final_selection) < command_calls.index(submodule_call[0])
 
 
 def test_resolve_command_rejects_paths_outside_project(tmp_path: Path) -> None:
@@ -1885,6 +2223,142 @@ def test_generated_ssh_updater_requires_current_host_ssh(
     assert calls == ["git", "ssh"]
 
 
+@pytest.mark.parametrize(
+    ("expected_remote", "actual_remote", "expected_resolvers"),
+    [
+        (
+            "https://github.com/XucroYuri/index-tts.git",
+            "git@github.com:XucroYuri/index-tts.git",
+            ["git", "ssh"],
+        ),
+        (
+            "git@github.com:XucroYuri/index-tts.git",
+            "https://github.com/XucroYuri/index-tts.git",
+            ["git"],
+        ),
+    ],
+)
+def test_generated_updater_selects_ssh_from_actual_origin_after_identity_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_remote: str,
+    actual_remote: str,
+    expected_resolvers: list[str],
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "index-tts"
+    target.mkdir()
+    updater_path = target / "tts-more-update.py"
+    source = deploy._service_update_script_py()
+    updater_path.write_text(source, encoding="utf-8")
+    (target / "tts-more-update.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "executable_policy": "fixed-dirs-or-explicit-env-v1",
+                "requires_ssh": deploy._github_remote_requires_ssh(expected_remote),
+                "service_id": "local-indextts",
+                "name": "index-tts",
+                "remote": expected_remote,
+                "branch": "main",
+                "commit": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    namespace = {"__name__": "actual_transport_test", "__file__": str(updater_path)}
+    exec(compile(source, str(updater_path), "exec"), namespace)
+    events: list[tuple[object, ...]] = []
+
+    def resolve(name: str, *, root: Path, git_executable: Path | None = None) -> str:
+        events.append(("resolve", name))
+        return f"/trusted/{name}"
+
+    def validate(root: Path, git_executable: str, ssh_executable: str | None) -> None:
+        events.append(("validate", ssh_executable))
+
+    def output(
+        args: list[str],
+        root: Path,
+        git_executable: str,
+        ssh_executable: str | None,
+    ) -> str:
+        events.append(("output", tuple(args[1:]), ssh_executable))
+        if args[1:] == ["remote", "get-url", "origin"]:
+            return actual_remote
+        if args[1:] == ["status", "--porcelain"]:
+            return "dirty"
+        raise AssertionError(f"unexpected updater output command: {args!r}")
+
+    monkeypatch.setitem(namespace, "resolve_trusted_executable", resolve)
+    monkeypatch.setitem(namespace, "validate_git_checkout", validate)
+    monkeypatch.setitem(namespace, "output", output)
+
+    with pytest.raises(RuntimeError, match="dirty repository"):
+        namespace["main"]([])
+
+    expected_ssh = "/trusted/ssh" if expected_resolvers[-1] == "ssh" else None
+    assert [event[1] for event in events if event[0] == "resolve"] == expected_resolvers
+    assert events == [
+        ("resolve", "git"),
+        ("validate", None),
+        ("output", ("remote", "get-url", "origin"), None),
+        *([("resolve", "ssh")] if expected_ssh else []),
+        ("output", ("status", "--porcelain"), expected_ssh),
+    ]
+
+
+def test_generated_updater_rejects_origin_identity_before_resolving_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "index-tts"
+    target.mkdir()
+    updater_path = target / "tts-more-update.py"
+    source = deploy._service_update_script_py()
+    updater_path.write_text(source, encoding="utf-8")
+    (target / "tts-more-update.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "executable_policy": "fixed-dirs-or-explicit-env-v1",
+                "requires_ssh": False,
+                "service_id": "local-indextts",
+                "name": "index-tts",
+                "remote": "https://github.com/XucroYuri/index-tts.git",
+                "branch": "main",
+                "commit": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    namespace = {"__name__": "identity_before_transport_test", "__file__": str(updater_path)}
+    exec(compile(source, str(updater_path), "exec"), namespace)
+    resolvers: list[str] = []
+
+    def resolve(name: str, *, root: Path, git_executable: Path | None = None) -> str:
+        resolvers.append(name)
+        if name == "ssh":
+            raise AssertionError("SSH resolved before origin identity validation")
+        return "/trusted/git"
+
+    monkeypatch.setitem(namespace, "resolve_trusted_executable", resolve)
+    monkeypatch.setitem(namespace, "validate_git_checkout", lambda root, git, ssh: None)
+    monkeypatch.setitem(
+        namespace,
+        "output",
+        lambda args, root, git, ssh: "git@github.com:attacker/other.git",
+    )
+
+    with pytest.raises(RuntimeError, match="origin mismatch"):
+        namespace["main"]([])
+
+    assert resolvers == ["git"]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX destination-prefix executable fixture")
 def test_copied_updater_resolves_git_from_destination_prefix(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
@@ -2063,7 +2537,153 @@ def test_generated_updater_rejects_unknown_config_and_checkout_fake_git_before_e
     assert not marker.exists()
 
 
-@pytest.mark.parametrize("verb", ["status", "config", "fetch", "checkout", "pull"])
+@pytest.mark.parametrize(
+    ("remotes", "expected"),
+    [
+        (("https://github.com/example/one.git",), False),
+        (("git@github.com:example/one.git",), True),
+        (
+            (
+                "https://github.com/example/one.git",
+                "ssh://git@github.com/example/two.git",
+            ),
+            True,
+        ),
+    ],
+)
+def test_submodule_classifier_uses_all_prevalidated_transports(
+    remotes: tuple[str, ...],
+    expected: bool,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+
+    assert deploy._git_command_requires_ssh(
+        ["git", "-C", "repo/superproject", "submodule", "update"],
+        local_config={},
+        validated_submodule_remotes=remotes,
+    ) is expected
+
+
+def test_submodule_classifier_fails_closed_without_prevalidated_remotes() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+
+    with pytest.raises(RuntimeError, match="prevalidated remotes"):
+        deploy._git_command_requires_ssh(
+            ["git", "-C", "repo/superproject", "submodule", "update"],
+            local_config={},
+        )
+
+
+def test_https_only_submodule_update_does_not_resolve_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "superproject"
+    target.mkdir(parents=True)
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        deploy,
+        "_trusted_ssh_executable",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("HTTPS submodule resolved SSH")),
+    )
+    monkeypatch.setattr(
+        deploy.subprocess,
+        "run",
+        lambda command, **kwargs: captured.append(command) or subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    deploy._run_git_process(
+        ["git", "-C", str(target), "submodule", "update"],
+        cwd=tmp_path,
+        check=True,
+        validated_submodule_remotes=("https://github.com/example/child.git",),
+    )
+
+    assert captured
+    assert "core.sshCommand=tts-more-ssh-disabled" in captured[0]
+
+
+def test_any_ssh_submodule_resolves_trusted_ssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "superproject"
+    target.mkdir(parents=True)
+    trusted_ssh = deploy._trusted_ssh_executable(managed_roots=(tmp_path,))
+    ssh_calls: list[dict[str, object]] = []
+    captured: list[list[str]] = []
+
+    def resolve_ssh(**kwargs: object) -> str:
+        ssh_calls.append(kwargs)
+        return trusted_ssh
+
+    monkeypatch.setattr(deploy, "_trusted_ssh_executable", resolve_ssh)
+    monkeypatch.setattr(
+        deploy.subprocess,
+        "run",
+        lambda command, **kwargs: captured.append(command) or subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    deploy._run_git_process(
+        ["git", "-C", str(target), "submodule", "update"],
+        cwd=tmp_path,
+        check=True,
+        validated_submodule_remotes=(
+            "https://github.com/example/https-child.git",
+            "git@github.com:example/ssh-child.git",
+        ),
+    )
+
+    assert len(ssh_calls) == 1
+    ssh_override = next(item for item in captured[0] if item.startswith("core.sshCommand="))
+    assert trusted_ssh in ssh_override
+
+
+@pytest.mark.parametrize(
+    "remotes",
+    [
+        ("https://github.com/example/one.git",),
+        ("ssh://git@github.com:22/example/one.git",),
+        (
+            "https://github.com/example/one.git",
+            "git@github.com:example/two.git",
+        ),
+    ],
+)
+def test_app_and_generated_updater_transport_classifiers_match_for_submodules(
+    tmp_path: Path,
+    remotes: tuple[str, ...],
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    generated_path = tmp_path / "tts-more-update.py"
+    source = deploy._service_update_script_py()
+    generated_path.write_text(source, encoding="utf-8")
+    namespace = {"__name__": "transport_parity_test", "__file__": str(generated_path)}
+    exec(compile(source, str(generated_path), "exec"), namespace)
+
+    for remote in remotes:
+        generated_requires_ssh = namespace["remote_requires_ssh"](remote)
+        assert deploy._github_remote_requires_ssh(remote) is generated_requires_ssh
+        for verb in ("fetch", "pull"):
+            assert deploy._git_command_requires_ssh(
+                ["git", verb, "origin", "main"],
+                local_config={'remote "origin".url': remote},
+            ) is generated_requires_ssh
+    assert deploy._git_command_requires_ssh(
+        ["git", "-C", "repo/superproject", "submodule", "update"],
+        local_config={},
+        validated_submodule_remotes=remotes,
+    ) is any(namespace["remote_requires_ssh"](remote) for remote in remotes)
+
+
+@pytest.mark.parametrize("verb", ["status", "config", "fetch", "checkout", "pull", "submodule"])
 @pytest.mark.parametrize("requires_ssh", [False, True])
 def test_app_and_generated_updater_use_identical_hardened_git_policy(
     tmp_path: Path,
