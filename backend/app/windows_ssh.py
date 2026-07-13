@@ -4,13 +4,17 @@ import base64
 import hashlib
 import ipaddress
 import re
+import socket
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 
-_SAFE_ALIAS = re.compile(r"[A-Za-z0-9._-]+\Z")
+_SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_SAFE_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_SAFE_HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _LEGACY_NUMERIC_IP = re.compile(r"(?:0[x][0-9a-f]+|[0-9]+)(?:\.(?:0[x][0-9a-f]+|[0-9]+))*", re.I)
 _SAFE_REMOTE_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]*\Z")
 
@@ -19,6 +23,7 @@ _SAFE_REMOTE_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]*\Z")
 class SshResolvedTarget:
     alias: str
     hostname: str
+    address: str
     user: str
     known_hosts_file: Path
 
@@ -35,10 +40,19 @@ class WindowsSshExecutor:
         config_path: Path,
         *,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        resolver: Callable[[str], list[str]] | None = None,
     ) -> None:
         self.config_path = config_path.resolve()
         self.runner = runner
-        self._resolved_targets: dict[str, SshResolvedTarget] = {}
+        self.resolver = resolver or self._resolve_addresses
+
+    @staticmethod
+    def _resolve_addresses(hostname: str) -> list[str]:
+        try:
+            records = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        except OSError:
+            raise ValueError("SSH target DNS resolution failed") from None
+        return [record[4][0] for record in records]
 
     def _run(
         self,
@@ -48,21 +62,26 @@ class WindowsSshExecutor:
         alias: str,
         timeout: int,
     ) -> subprocess.CompletedProcess[str]:
-        result = self.runner(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            shell=False,
-        )
+        try:
+            result = self.runner(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"{operation} for {alias} timed out") from None
+        except OSError:
+            raise RuntimeError(f"{operation} for {alias} could not start") from None
         if result.returncode != 0:
             raise RuntimeError(f"{operation} for {alias} failed with exit code {result.returncode}")
         return result
 
     @staticmethod
     def _validate_alias(alias: str) -> None:
-        if not alias or not _SAFE_ALIAS.fullmatch(alias):
+        if not alias or alias in {".", ".."} or not _SAFE_ALIAS.fullmatch(alias):
             raise ValueError("SSH alias contains unsupported characters")
 
     @staticmethod
@@ -70,6 +89,8 @@ class WindowsSshExecutor:
         settings: dict[str, str] = {}
         for line in output.splitlines():
             key, separator, value = line.partition(" ")
+            if line and not separator:
+                raise ValueError("SSH configuration output is malformed")
             if separator and key and value:
                 settings[key.casefold()] = value.strip()
         return settings
@@ -85,10 +106,36 @@ class WindowsSshExecutor:
         except ValueError:
             if _LEGACY_NUMERIC_IP.fullmatch(candidate):
                 raise ValueError("SSH target must use a canonical numeric IP address") from None
+            labels = normalized.split(".")
+            if len(normalized) > 253 or any(
+                not _SAFE_HOST_LABEL.fullmatch(label) for label in labels
+            ):
+                raise ValueError("SSH target must use a valid DNS hostname") from None
             return normalized
         if address.is_loopback or address.is_unspecified:
             raise ValueError("SSH target must use a non-loopback, specified hostname")
         return address.compressed
+
+    def _validated_address(self, hostname: str) -> str:
+        try:
+            literal = ipaddress.ip_address(hostname.strip("[]"))
+        except ValueError:
+            answers = self.resolver(hostname)
+        else:
+            answers = [literal.compressed]
+        if not answers:
+            raise ValueError("SSH target DNS resolution returned no addresses")
+
+        validated: list[str] = []
+        for answer in answers:
+            try:
+                address = ipaddress.ip_address(answer)
+            except ValueError:
+                raise ValueError("SSH target DNS returned an invalid address") from None
+            if address.is_loopback or address.is_unspecified or address.is_multicast:
+                raise ValueError("SSH target DNS returned a prohibited address")
+            validated.append(address.compressed)
+        return validated[0]
 
     @staticmethod
     def _validate_known_hosts(value: str) -> Path:
@@ -96,9 +143,18 @@ class WindowsSshExecutor:
         if len(paths) != 1:
             raise ValueError("SSH target must use a pinned UserKnownHostsFile")
         path = Path(paths[0]).expanduser()
-        if not path.name or path == Path("/dev/null"):
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.name or any(component.is_symlink() for component in (path, *path.parents)):
             raise ValueError("SSH target must use a pinned UserKnownHostsFile")
-        return path
+        try:
+            canonical = path.resolve(strict=True)
+            mode = canonical.stat().st_mode
+        except OSError:
+            raise ValueError("SSH target must use a pinned UserKnownHostsFile") from None
+        if not stat.S_ISREG(mode):
+            raise ValueError("SSH target must use a pinned UserKnownHostsFile")
+        return canonical
 
     @staticmethod
     def _validate_remote_path(remote_path: str) -> str:
@@ -120,10 +176,6 @@ class WindowsSshExecutor:
 
     def resolve(self, alias: str) -> SshResolvedTarget:
         self._validate_alias(alias)
-        cached = self._resolved_targets.get(alias)
-        if cached is not None:
-            return cached
-
         result = self._run(
             ["ssh", "-F", str(self.config_path), "-G", alias],
             operation="SSH resolution",
@@ -137,29 +189,57 @@ class WindowsSshExecutor:
             raise ValueError("SSH target must set IdentitiesOnly yes")
         if settings.get("stricthostkeychecking") not in {"yes", "true"}:
             raise ValueError("SSH target must set StrictHostKeyChecking yes")
+        if settings.get("proxycommand", "none").casefold() != "none":
+            raise ValueError("SSH target must not set a proxy route")
+        if settings.get("proxyjump", "none").casefold() != "none":
+            raise ValueError("SSH target must not set a proxy route")
+        if settings.get("permitlocalcommand", "no").casefold() != "no":
+            raise ValueError("SSH target must disable local command execution")
+        if settings.get("localcommand", "none").casefold() != "none":
+            raise ValueError("SSH target must not set a local command")
 
         hostname = self._validate_hostname(settings.get("hostname", ""))
         user = settings.get("user", "").strip()
-        if not user:
-            raise ValueError("SSH target must set a nonempty user")
+        if not _SAFE_USER.fullmatch(user):
+            raise ValueError("SSH target must set a valid user")
         known_hosts_file = self._validate_known_hosts(settings.get("userknownhostsfile", ""))
-        target = SshResolvedTarget(alias, hostname, user, known_hosts_file)
-        self._resolved_targets[alias] = target
-        return target
+        address = self._validated_address(hostname)
+        return SshResolvedTarget(alias, hostname, address, user, known_hosts_file)
+
+    @staticmethod
+    def _connection_options(target: SshResolvedTarget) -> list[str]:
+        options = [
+            f"HostName={target.address}",
+            f"HostKeyAlias={target.hostname}",
+            f"User={target.user}",
+            "BatchMode=yes",
+            "IdentitiesOnly=yes",
+            "StrictHostKeyChecking=yes",
+            f"UserKnownHostsFile={target.known_hosts_file}",
+            "GlobalKnownHostsFile=none",
+            "ProxyCommand=none",
+            "ProxyJump=none",
+            "PermitLocalCommand=no",
+            "LocalCommand=none",
+        ]
+        return [argument for option in options for argument in ("-o", option)]
+
+    @staticmethod
+    def _scp_host(address: str) -> str:
+        return f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
 
     def run_powershell(
         self, alias: str, script: str, *, timeout: int = 1800
     ) -> SshCommandResult:
-        self.resolve(alias)
+        target = self.resolve(alias)
         encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
         result = self._run(
             [
                 "ssh",
                 "-F",
                 str(self.config_path),
-                "-o",
-                "BatchMode=yes",
-                alias,
+                *self._connection_options(target),
+                target.address,
                 "powershell.exe",
                 "-NoLogo",
                 "-NoProfile",
@@ -176,9 +256,18 @@ class WindowsSshExecutor:
     def copy_to(self, alias: str, source: Path, remote_path: str) -> None:
         self._validate_alias(alias)
         safe_remote_path = self._validate_remote_path(remote_path)
-        self.resolve(alias)
+        local_source = source.expanduser().resolve()
+        target = self.resolve(alias)
         self._run(
-            ["scp", "-F", str(self.config_path), str(source), f"{alias}:{safe_remote_path}"],
+            [
+                "scp",
+                "-s",
+                "-F",
+                str(self.config_path),
+                *self._connection_options(target),
+                str(local_source),
+                f"{self._scp_host(target.address)}:{safe_remote_path}",
+            ],
             operation="SCP upload",
             alias=alias,
             timeout=600,
@@ -187,10 +276,19 @@ class WindowsSshExecutor:
     def copy_from(self, alias: str, remote_path: str, destination: Path) -> None:
         self._validate_alias(alias)
         safe_remote_path = self._validate_remote_path(remote_path)
-        self.resolve(alias)
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        local_destination = destination.expanduser().resolve()
+        target = self.resolve(alias)
+        local_destination.parent.mkdir(parents=True, exist_ok=True)
         self._run(
-            ["scp", "-F", str(self.config_path), f"{alias}:{safe_remote_path}", str(destination)],
+            [
+                "scp",
+                "-s",
+                "-F",
+                str(self.config_path),
+                *self._connection_options(target),
+                f"{self._scp_host(target.address)}:{safe_remote_path}",
+                str(local_destination),
+            ],
             operation="SCP download",
             alias=alias,
             timeout=600,
