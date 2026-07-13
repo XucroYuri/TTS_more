@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "name": "windows-cuda-certification",
+  "service_ids": {
+    "gpt_sovits": "local-gpt-sovits-main",
+    "indextts": "local-indextts",
+    "cosyvoice": "local-cosyvoice"
+  },
+  "references": {
+    "gpt_sovits": "${TTS_MORE_VALIDATION_GPT_REF}",
+    "indextts": "${TTS_MORE_VALIDATION_INDEX_REF}",
+    "cosyvoice": "${TTS_MORE_VALIDATION_COSY_REF}"
+  },
+  "gpt_weights": {
+    "v2ProPlus": {
+      "gpt": "${TTS_MORE_VALIDATION_GPT_V2PROPLUS_WEIGHT}",
+      "sovits": "${TTS_MORE_VALIDATION_SOVITS_V2PROPLUS_WEIGHT}"
+    },
+    "v2Pro": {
+      "gpt": "${TTS_MORE_VALIDATION_GPT_V2PRO_WEIGHT}",
+      "sovits": "${TTS_MORE_VALIDATION_SOVITS_V2PRO_WEIGHT}"
+    }
+  },
+  "prompts": {
+    "gpt": {
+      "text": "这是一段用于验证音色一致性的参考文本。",
+      "language": "zh"
+    },
+    "cosyvoice": {
+      "text": "这是一段用于零样本复刻的参考文本。",
+      "language": "zh"
+    },
+    "index_emotion": "克制、清晰并且坚定"
+  },
+  "test_texts": {
+    "gpt_v2ProPlus": "默认模型正在执行 CUDA 合成验证。",
+    "gpt_v2Pro": "兼容模型正在执行 CUDA 合成验证。",
+    "index_emotion": "请用克制但坚定的语气完成这次验证。",
+    "cosyvoice_zero_shot": "零样本音色复刻验证已经开始。",
+    "cosyvoice_cross_lingual": "Cross-lingual speech validation is now running."
+  },
+  "reviewers": [
+    {
+      "id": "certification-reviewer-1",
+      "name": "Certification Reviewer 1"
+    },
+    {
+      "id": "certification-reviewer-2",
+      "name": "Certification Reviewer 2"
+    }
+  ],
+  "asr": {
+    "required": true,
+    "model": "large-v3",
+    "language": "zh"
+  },
+  "worker_logs": {
+    "local-gpt-sovits-main": "worker-supervisor:gpt-sovits",
+    "local-indextts": "worker-supervisor:indextts",
+    "local-cosyvoice": "worker-supervisor:cosyvoice"
+  }
+}

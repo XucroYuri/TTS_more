@@ -1,137 +1,80 @@
-# CI 架构与真实 TTS 验收探讨
+# CI 架构与 CUDA 发布门禁
 
-本文档探讨 TTS More 的 CI 部署架构，特别是"真实 TTS 端到端验收"在不同方案下的得失。
+CI 分为无 GPU 快反馈和 Windows CUDA 发布认证两层。完整测试矩阵、runbook 与签核以 [CUDA 全流程闭环验证](cuda-e2e-validation.md) 为准。
 
-## 现状
-
-当前 CI（`.github/workflows/ci.yml`）：
-
-```mermaid
-flowchart LR
-    Push["push/PR to master"] --> B["后端 pytest<br/>ubuntu + windows 矩阵"]
-    Push --> F["前端 vitest + build<br/>ubuntu"]
-    B -.->|"无 GPU"| Skip["真实 TTS 验收 skip"]
-    F -.->|"无 GPU"| Skip
-```
-
-- 后端：`pytest backend -q`，矩阵 `ubuntu-latest` + `windows-latest`。单元测试 + 安全测试 + 跨平台测试 + worker 契约测试，**无 GPU**。
-- 前端：`vitest` + `vite build`，`ubuntu-latest`。
-- worker 契约层（`test_workers.py`）验证 `/health` `/capabilities` `/models` 发现等**不需要 GPU** 的端点；`/load` `/synthesize` 真实推理需 GPU，标 TODO。
-- `test_real_tts_validation.py` 默认 skip（需 `TTS_MORE_RUN_REAL_TTS=1` + 真实模型 + GPU）。
-
-**这个 CI 验证的是"应用本体代码正确性"与"跨平台可跑性"，不验证"真实推理质量"。**
-
-## 部署模型：本机应用 + 网络接入 GPU 机器
-
-```mermaid
-flowchart LR
-    subgraph Local["本机（任意平台）"]
-        App["TTS More 应用本体<br/>后端 + 前端 + 编排"]
-    end
-    subgraph GPU["GPU 机器（LAN/公网）"]
-        W1["GPT-SoVITS worker :9880"]
-        W2["IndexTTS worker :9881"]
-        W3["CosyVoice worker :9882"]
-        Models["模型权重<br/>（常驻显存）"]
-    end
-    App -- "HTTP tts-more-v1" --> W1
-    App -- "HTTP tts-more-v1" --> W2
-    App -- "HTTP tts-more-v1" --> W3
-    W1 --> Models
-    W2 --> Models
-    W3 --> Models
-```
-
-应用本体（`backend/app` + `frontend`）不含 CUDA/torch 硬依赖，可在任意平台本机运行。真实 TTS 推理跑在 GPU 机器上的 worker 里，本机通过 `services.json` 的 `base_url` 网络接入。验证流程：
-
-1. **CI（hosted runner）**：应用本体单元/安全/跨平台/worker 契约测试——每次 push。
-2. **本机验收**：开发者本机起 TTS More，`services.json` 指向 GPU 机器上的 worker 端点，手动跑 `test_real_tts_validation.py`。
-3. **GPU 机器**：只需克隆上游 repo + torch + 模型 + `make workers`（或单独启动某个 worker）。
-
-## 为什么真实验收难
-
-真实 TTS 验收需要：
-
-1. **大模型**：GPT-SoVITS 预训练权重（GB 级）、IndexTTS checkpoints、CosyVoice 模型。
-2. **GPU**：torch + CUDA（或 MPS），CPU 推理慢到不可用。
-3. **运行中的服务**：GPT-SoVITS Gradio/api-v2 WebUI、IndexTTS worker，各自监听端口。
-4. **测试数据**：参考音频、prompt 文本、预期输出比对。
-
-GitHub-hosted runner 无 GPU，且单次作业限时 6h、磁盘有限。模型下载动辄几十分钟，无法每次 push 跑。
-
-## 三种部署架构
-
-### 方案 1：自托管 GPU runner（推荐用于 release 门禁）
+## 两层门禁
 
 ```mermaid
 flowchart TD
-    GH["GitHub Actions"] --> Hosted["hosted runner<br/>单元测试（无 GPU）"]
-    GH --> SelfHosted["自托管 GPU runner<br/>真实验收（仅 release）"]
-    SelfHosted --> GPU["本机 GPU + torch"]
-    SelfHosted --> Cache["模型缓存卷<br/>避免重复下载"]
-    SelfHosted --> Svc["启动 GPT-SoVITS/IndexTTS"]
-    Svc --> Test["test_real_tts_validation.py"]
+    Change["push / pull request"] --> Hosted["GitHub-hosted CI\nUbuntu + Windows pytest\nVitest + build"]
+    Candidate["workflow_dispatch / prerelease"] --> GPU["Windows 自托管 CUDA runner"]
+    GPU --> Single["single-clean 或 single-release"]
+    GPU --> Distributed["控制 runner 通过 OpenSSH\n编排三个 GPU worker"]
+    Single & Distributed --> Human["人工听审签核"]
+    Human --> Stable{"稳定发布门禁"}
 ```
 
-**得**：
-- 真实推理回归保护（权重/参考音频/合成质量）。
-- 可在 release/nightly 触发，不堵每次 push。
-- 模型缓存卷避免重复下载。
+`.github/workflows/ci.yml` 在普通 hosted runner 上执行：
 
-**失**：
-- 需维护一台 GPU 机器（电费/折旧/运维）。
-- runner 注册与 token 管理。
-- 机器故障会卡 release。
+- 后端 `pytest backend -q`，Ubuntu 与 Windows；
+- 前端 Vitest 与生产 build，Ubuntu；
+- topology、worker 契约、工件传输、资源切换、指标判定和报告生成的无 GPU 测试。
 
-**触发策略**：`on: workflow_dispatch` + `schedule`（nightly）+ `release` 事件，不在 push/PR 上跑。
+这些测试不 import 真实 TTS 模型，也不证明 CUDA 显存、音质或 LAN 恢复行为。macOS 本地执行同样只能验证硬件无关部分。
 
-### 方案 2：纯手动验收（现状延续）
+`.github/workflows/windows-gpu-validation.yml` 使用：
 
-```mermaid
-flowchart LR
-    Dev["开发者本机<br/>有 GPU"] --> Run["手动跑 test_real_tts_validation.py"]
-    Run --> Merge["确认后合并"]
+```yaml
+runs-on: [self-hosted, Windows, X64, cuda, tts-more-gpu]
 ```
 
-**得**：零 CI 成本，灵活。
-**失**：回归靠人，易漏；新人/外部贡献者的 PR 无法自动验证真实路径。
+它支持 `workflow_dispatch`，并监听 release 的 `prereleased`、`published`。稳定版 `published` 的 workflow 要求单机与分布式 job 都成功。人工听审仍由发布记录门禁，不能只看 workflow 绿灯。GPU 门禁不在每次 push/PR 下载模型。
 
-### 方案 3：容器化 GPU + 模型缓存（高级）
+## Runner 角色
 
-```mermaid
-flowchart TD
-    Trigger["release 触发"] --> Runner["GPU runner"]
-    Runner --> Pull["拉取 GPT-SoVITS/IndexTTS 镜像"]
-    Pull --> Mount["挂载模型缓存卷"]
-    Mount --> Up["docker compose up 服务"]
-    Up --> Validate["pytest 真实验收"]
-```
+### 单机 runner
 
-**得**：可复现环境，镜像是版本化产物，可迁移。
-**失**：镜像构建复杂（torch+CUDA+模型），镜像大（10GB+），模型下载仍慢（除非预热缓存），维护成本高。
+同一台机器运行应用、三个 worker、CUDA 验证器和 Playwright。三 worker 同时在线，三模型按共享 `cuda-0`、`capacity:1` 顺序加载和卸载。
 
-## 推荐策略
+### 分布式控制 runner
 
-```mermaid
-flowchart TD
-    Change["代码变更"] --> L1{"单元/安全/跨平台测试"}
-    L1 -- hosted runner --> Fast["快反馈（~3min）"]
-    Change --> L2{"release / nightly?"}
-    L2 -- 是 --> GPU["自托管 GPU runner<br/>真实验收"]
-    L2 -- 否 --> Skip2["跳过"]
-    GPU --> Gate["通过才发版"]
-```
+控制 runner 运行应用、验证器和 Playwright，并通过 Windows OpenSSH 登录三个独立 GPU worker。每台 worker 保留轻量 TTS More checkout，只准备一个 TTS repo。控制 runner 使用 `app-only` 配置，远端服务为 `managed:false`，不能由本地 supervisor 管理。
 
-- **每次 push/PR**：hosted runner 跑单元 + 安全 + 跨平台（现状，快）。
-- **release / nightly**：自托管 GPU runner 跑 `test_real_tts_validation.py`，作为发版门禁。
-- **模型缓存**：runner 机器上常驻模型目录，CI 只拉代码不拉模型。
+OpenSSH 用户、私钥、远端 checkout 路径和真实 topology 不提交到仓库。host key 必须固定，不能通过关闭校验规避首次连接。
 
-## 落地清单（需维护者决策与资源）
+fixture 的 ASR 门禁固定使用 `faster-whisper large-v3`。`backend[dev]` 当前不安装该包，GPU workflow 会在控制环境显式安装 `faster-whisper`；runner 仍需提供可复用的 `large-v3` 模型缓存，否则首次下载时间计入认证准备。
 
-1. 准备一台 GPU 机器（本机或团队服务器），装 torch + CUDA + 模型。
-2. 注册为 GitHub self-hosted runner（`Settings → Actions → Runners → New self-hosted runner`），打 `gpu` label。
-3. 新增 `.github/workflows/real-tts.yml`，`runs-on: [self-hosted, gpu]`，`on: workflow_dispatch + schedule + release`。
-4. runner 机器上预设 `TTS_MORE_RUN_REAL_TTS=1` + 模型路径 env，启动 GPT-SoVITS/IndexTTS 服务。
-5. CI 步骤：拉代码 → 启服务 → pytest → 收集产物。
+## 执行与工件
 
-**此项需维护者提供 GPU 资源与 runner 注册**，Agent 无法独立完成。当前保持手动验收 + hosted 单元测试。
+本页不复制认证命令。Windows 单机只使用 [单机 Runbook](cuda-e2e-single-node.md)，四机只使用 [分布式 Runbook](cuda-e2e-distributed.md)，状态与证据字段以 [CUDA 验证契约](cuda-e2e-validation.md) 为准。
+
+受控原始证据保存 controller transcript、WAV、远端 worker 日志、GPU UUID、Playwright trace/video 和人工身份，只能留在 runner 本地或受控存储。普通 GitHub artifact 只包含脱敏可共享证据：脱敏 summary、JUnit、聚合 GPU 指标和 hash-only 引用。
+
+## 触发规则
+
+| 事件 | Hosted CI | 单机 CUDA | 分布式 CUDA | 人工听审 |
+|---|---:|---:|---:|---:|
+| 普通 push/PR | 必须 | 不触发 | 不触发 | 不需要 |
+| 手动调试 | 可选 | `workflow_dispatch` | `workflow_dispatch` | 视目标而定 |
+| prerelease | 必须 | workflow 自动运行单机 | 需要显式运行或稳定版运行 | 至少一名；首次认证两名 |
+| stable release | 必须 | 必须引用通过运行 | 必须引用通过运行 | 至少一名 |
+
+第一次设备认证必须执行 `single-clean`，清除 repo/venv 后完整部署并建立 16 GB 性能基线。后续 `single-release` 可以复用模型缓存，但仍重新同步锁定 repo、安装依赖并渲染服务配置。第一次分布式认证通过后，才能把分布式结果设为稳定发布门禁。
+
+## Secrets 与本地配置
+
+以下内容只能来自 runner 本地或受保护 secrets：
+
+- `deployment/app/topology*.local.json`；
+- `deployment/app/repo-paths.local.json`；
+- `data/validation/*.local.json`；
+- SSH 用户、私钥和远端 checkout 路径；
+- 参考音频、GPT 权重路径、模型缓存和审核者身份。
+
+仓库只提交脱敏 topology 示例和代码/测试。运行前使用 `git check-ignore -v` 确认真实文件被忽略，运行后检查日志脱敏。
+
+## 发布判定
+
+自动门禁包括服务契约、真实模型能力、每服务 3 条短文本、30 条混合队列、工件传输、音频/ASR 指标、资源与性能、故障恢复和 Playwright。人工门禁按清晰度、音色相似度、情绪/韵律、伪影控制评分。
+
+每个稳定版本必须提供单机运行 URL、分布式运行 URL 和人工记录。任一门禁失败、结果缺失或阈值超限都阻止发布；prerelease 触发本身不代表认证通过。

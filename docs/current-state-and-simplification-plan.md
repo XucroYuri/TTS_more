@@ -25,7 +25,7 @@ flowchart TD
     Workers --> Cosy
 ```
 
-这里有一个容易混淆的点：用户侧说“三个 TTS 服务”，指的是三类引擎：GPT-SoVITS、IndexTTS、CosyVoice。部署侧当前有五个目标，因为 GPT-SoVITS 同时锁定了 main、dev、proplus-hc-dev 三个分支，用于验证和选择不同能力。
+这里有一个容易混淆的点：用户侧说“三个 TTS 服务”，指的是三类引擎：GPT-SoVITS、IndexTTS、CosyVoice。锁文件有五个可选目标，但默认部署只有三个：GPT-SoVITS main、IndexTTS、CosyVoice。GPT-SoVITS dev 和 proplus-hc-dev 只用于显式回归与旧功能审计。
 
 ## 推荐部署路径
 
@@ -45,7 +45,7 @@ scripts/tts-more.sh install-update-scripts
 
 ## 当前已具备的能力
 
-- `repo.lock.json` 锁定五个本地部署目标的远端、分支、提交、端口和服务 id。
+- `repo.lock.json` 锁定五个可选部署目标的远端、分支、提交、端口、服务 id 和 `default_selected`；默认只选择三个正式服务。
 - `scripts/tts_more_deploy.py sync-repos` 可以拉取或重置服务 repo。
 - `probe-network` 会选择 ModelScope、HF Mirror、Hugging Face、PyPI 镜像等下载源，并把缓存路径集中到 `data/cache`。
 - `render-services` 会从 repo 清单生成 `data/local/services.json`，避免手写服务配置。
@@ -99,7 +99,7 @@ scripts/tts-more.sh install-update-scripts
 
 剩余风险：
 - 真实服务 repo 尚未全部克隆，无法在本机验证服务 repo 内脚本实际执行。
-- Gitee 当前返回 403，需要可用 Gitee 凭据后才能做同步推送。
+- Gitee 镜像固定为 `https://gitee.com/chengdu-flower-food/TTS_more`；后续同步必须核对该组织仓库，不能推送到同名个人仓库。
 
 ## 任务分解
 
@@ -139,6 +139,6 @@ scripts/tts-more.sh install-update-scripts
 
 ## 待用户醒来处理
 
-- 提供或修复 Gitee 凭据：当前 `https://gitee.com/XucroYuri/TTS_more.git` 返回 403，无法推送。
-- 决定 GPT-SoVITS 三个分支是否都长期保留，还是把 proplus/dev 作为高级目标隐藏到部署文档。
+- 后续发布提交需同时核对 GitHub 与 Gitee 组织仓库的目标分支 SHA，保持双远端记录一致。
+- 在目标 GPU 上完成 GPT-SoVITS 收敛分支 CUDA 门禁；通过后合入 fork `main`，首个稳定版本发布后删除远端 proplus 分支并永久保留归档标签。
 - 在目标 GPU 设备上确认模型下载源、CUDA/conda/micromamba 路线和真实音频验收样本。

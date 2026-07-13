@@ -9,7 +9,8 @@
       "branch": "main",
       "commit": "bf81cdb14a38b674b6e9996dabc97340bc9978d2",
       "service_id": "local-gpt-sovits-main",
-      "port": 9880
+      "port": 9880,
+      "default_selected": true
     },
     {
       "name": "GPT-SoVITS-dev",
@@ -20,7 +21,8 @@
       "branch": "dev",
       "commit": "6ae63b72bd3352356dcfd3961e44add7e04b1a1c",
       "service_id": "local-gpt-sovits-dev",
-      "port": 9883
+      "port": 9883,
+      "default_selected": false
     },
     {
       "name": "GPT-SoVITS-proplus-hc-dev",
@@ -31,7 +33,8 @@
       "branch": "xucroyuri/proplus-hc-dev",
       "commit": "b6b2a9da2eade248cf03f89195c79f49d8cd8e22",
       "service_id": "local-gpt-sovits-proplus-hc-dev",
-      "port": 9884
+      "port": 9884,
+      "default_selected": false
     },
     {
       "name": "index-tts",

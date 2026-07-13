@@ -112,7 +112,35 @@ scripts/update.sh --force-reset-repos
 
 TTS More 推荐 worker-first 架构：优先接入 `tts-more-v1` worker；已有 Gradio 服务也可以作为兼容端点接入。
 
-本地部署推荐使用 manifest 驱动脚本。它会按 `repo.lock.json` 拉取 GPT-SoVITS 三个分支，以及 IndexTTS、CosyVoice：
+本地完整部署推荐使用一键脚本。它会安装应用本体依赖，按 `repo.lock.json` 中的 `default_selected` 同步 GPT-SoVITS `main`、IndexTTS、CosyVoice，把 `deployment/tts-repos/<provider>` 下的附加脚本复制到对应服务 repo 的 `tts-more/` 目录，准备依赖/模型，并渲染 `data/local/services.json`：
+
+```bash
+scripts/deploy-local-tts.sh --device CU128
+```
+
+Windows：
+
+```powershell
+.\scripts\deploy-local-tts.ps1 -Device CU128
+```
+
+GPT-SoVITS `dev` 只用于显式回归，旧 `proplus-hc-dev` 只用于收敛审计。需要时使用：
+
+```bash
+scripts/deploy-local-tts.sh --targets dev
+scripts/deploy-local-tts.sh --targets all
+```
+
+如果本机 repo 路径不同，先复制并编辑路径确认文件：
+
+```bash
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
+scripts/deploy-local-tts.sh --repo-paths deployment/app/repo-paths.local.json
+```
+
+应用本体部署资料位于 `deployment/app/`；可复制到上游 TTS repo 的附加脚本位于 `deployment/tts-repos/gpt-sovits/`、`deployment/tts-repos/indextts/`、`deployment/tts-repos/cosyvoice/`。
+
+也可以只运行 manifest 驱动的 repo 准备脚本。默认同样只拉取正式服务；通过 `--targets dev` 或 `--targets all` 才包含回归分支：
 
 ```powershell
 .\scripts\tts-more.ps1 sync-repos --clean
@@ -128,7 +156,8 @@ bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --device CU128
 
 准备脚本默认走 `Auto`：先跑 `probe-network`，优先选择中国大陆可达且健康的源，例如 ModelScope 或 HF Mirror，必要时再回退到全球 Hugging Face / PyPI 路线。默认安装只准备 full-quality baseline models，quantized、distilled、simplified、small、low-memory 这些都只是手动 manual 的高级选项。
 
-详细拓扑、远端 worker、离线缓存和模型下载策略见 [部署方案](docs/deployment.md)。
+详细拓扑、远端 worker、离线缓存和模型下载策略见 [部署方案](docs/deployment.md)。Windows 单机认证命令只见 [单机 CUDA Runbook](docs/cuda-e2e-single-node.md)；四机命令见 [分布式 Runbook](docs/cuda-e2e-distributed.md)；跨拓扑规则见 [CUDA 验证契约](docs/cuda-e2e-validation.md)。
+GPT-SoVITS 三分支职责、收敛顺序和合并门禁见 [GPT-SoVITS 分支收敛](docs/gpt-sovits-branch-convergence.md)。
 当前阶段边界、设计不足和任务拆分见 [当前阶段说明与简化计划](docs/current-state-and-simplification-plan.md)。
 
 ## 验证
@@ -146,13 +175,15 @@ make build         # 前端生产构建
 cd frontend && pnpm test && pnpm build
 ```
 
-真实 TTS 验收（需要本机/网络 endpoint、模型、GPU）：
+聚焦真实 TTS 用例的 pytest 验证（需要本机/网络 endpoint、模型、GPU）：
 
 ```bash
 export TTS_MORE_SERVICE_MODE=real
 export TTS_MORE_RUN_REAL_TTS=1
 .venv/bin/python -m pytest backend/tests/test_real_tts_validation.py -q
 ```
+
+真实 TTS pytest 不能替代正式 CUDA 认证。Windows 单机只从 [单机 CUDA Runbook](docs/cuda-e2e-single-node.md) 复制命令；四机可信 LAN 见 [分布式 Runbook](docs/cuda-e2e-distributed.md)；门禁和证据语义见 [CUDA 验证契约](docs/cuda-e2e-validation.md)。macOS 和普通 hosted CI 不能签发 Windows CUDA 认证。
 
 ## 服务模式
 
@@ -211,5 +242,6 @@ git check-ignore -v data/local/services.json .env.local repo/GPT-SoVITS-main
 - [部署方案](docs/deployment.md)
 - [GPT-SoVITS 接入方案](docs/gpt-sovits-integration.md)
 - [CI 架构与真实 TTS 验收](docs/ci-architecture.md)
+- [CUDA 全流程闭环验证](docs/cuda-e2e-validation.md)
 - [开源 TTS 服务接入](docs/open-source-tts-services.md)
 - [发布治理](docs/release-governance.md)

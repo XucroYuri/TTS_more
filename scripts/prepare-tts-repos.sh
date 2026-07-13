@@ -12,7 +12,8 @@ NETWORK_PROFILE_JSON=""
 SOURCE_FALLBACKS=()
 PACKAGE_INDEX_FALLBACKS=()
 DEVICE="CU128"
-TARGETS="all"
+TARGETS="default"
+REPO_PATHS=""
 SYNC_REPOS=0
 CLEAN_REPOS=0
 SKIP_INSTALL=0
@@ -24,6 +25,7 @@ while [[ $# -gt 0 ]]; do
     --source) SOURCE="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --targets) TARGETS="$2"; shift 2 ;;
+    --repo-paths) REPO_PATHS="$2"; shift 2 ;;
     --sync-repos) SYNC_REPOS=1; shift ;;
     --clean-repos) CLEAN_REPOS=1; shift ;;
     --skip-install) SKIP_INSTALL=1; shift ;;
@@ -53,6 +55,7 @@ run_capture() {
 target_enabled() {
   local name="$1" provider="$2" service_id="$3" variant="$4"
   [[ "$TARGETS" == "all" ]] && return 0
+  [[ "$TARGETS" == "default" ]] && return 0
   IFS=',' read -ra parts <<< "$TARGETS"
   for item in "${parts[@]}"; do
     [[ "$item" == "$name" || "$item" == "$provider" || "$item" == "$service_id" || "$item" == "$variant" ]] && return 0
@@ -61,11 +64,9 @@ target_enabled() {
 }
 
 repo_json() {
-  "$APP_PY" - "$ROOT/repo.lock.json" <<'PY'
-import json, sys
-for repo in json.load(open(sys.argv[1], encoding="utf-8"))["repositories"]:
-    print(json.dumps(repo, ensure_ascii=False))
-PY
+  local args=(list-repos --json-lines --service-ids "$TARGETS")
+  [[ -n "$REPO_PATHS" ]] && args+=(--repo-paths "$REPO_PATHS")
+  "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" --root "$ROOT" "${args[@]}"
 }
 
 field() {
@@ -113,12 +114,10 @@ source_fallbacks() {
   for item in "${ordered[@]}"; do
     [[ -z "$item" ]] && continue
     local exists=0
-    for seen in "${result[@]}"; do
-      [[ "$seen" == "$item" ]] && exists=1
-    done
+    [[ " ${result[*]-} " == *" $item "* ]] && exists=1
     [[ "$exists" == "0" ]] && result+=("$item")
   done
-  printf '%s ' "${result[@]}"
+  [[ -n "${result[*]-}" ]] && printf '%s ' "${result[@]}"
 }
 
 run_with_source_fallback() {
@@ -146,12 +145,10 @@ package_index_fallbacks() {
   for item in "${ordered[@]}"; do
     [[ -z "$item" ]] && continue
     local exists=0
-    for seen in "${result[@]}"; do
-      [[ "$seen" == "$item" ]] && exists=1
-    done
+    [[ " ${result[*]-} " == *" $item "* ]] && exists=1
     [[ "$exists" == "0" ]] && result+=("$item")
   done
-  printf '%s ' "${result[@]}"
+  [[ -n "${result[*]-}" ]] && printf '%s ' "${result[@]}"
 }
 
 set_package_index_env() {
@@ -304,7 +301,8 @@ run_cosy_download() {
 resolve_network_profile
 
 if [[ "$SYNC_REPOS" == "1" ]]; then
-  args=(sync-repos)
+  args=(sync-repos --service-ids "$TARGETS")
+  [[ -n "$REPO_PATHS" ]] && args+=(--repo-paths "$REPO_PATHS")
   [[ "$CLEAN_REPOS" == "1" ]] && args+=(--clean)
   [[ "$DRY_RUN" == "1" ]] && args+=(--dry-run)
   run "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" "${args[@]}"
@@ -325,5 +323,7 @@ while IFS= read -r repo; do
   esac
 done < <(repo_json)
 
-run "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" render-services --profile local-all --platform posix --output data/local/services.json
+render_args=(render-services --profile local-all --platform posix --service-ids "$TARGETS" --output data/local/services.json)
+[[ -n "$REPO_PATHS" ]] && render_args+=(--repo-paths "$REPO_PATHS")
+run "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" "${render_args[@]}"
 echo "Prepared selected TTS repositories. Rendered data/local/services.json."

@@ -1,0 +1,9 @@
+{
+  "repositories": {
+    "local-gpt-sovits-main": "repo/GPT-SoVITS-main",
+    "local-gpt-sovits-dev": "repo/GPT-SoVITS-dev",
+    "local-gpt-sovits-proplus-hc-dev": "repo/GPT-SoVITS-proplus-hc-dev",
+    "local-indextts": "repo/index-tts",
+    "local-cosyvoice": "repo/CosyVoice"
+  }
+}

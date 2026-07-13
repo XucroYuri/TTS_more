@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "name": "four-node-windows-lan",
+  "app_node": "app-controller",
+  "nodes": {
+    "app-controller": {
+      "role": "app",
+      "host": "tts-app.lan",
+      "bind_host": "127.0.0.1",
+      "services": [],
+      "resource_group": "app",
+      "capacity": 1
+    },
+    "gpt-worker": {
+      "role": "worker",
+      "host": "tts-gpt.lan",
+      "bind_host": "0.0.0.0",
+      "services": [
+        "local-gpt-sovits-main"
+      ],
+      "resource_group": "gpt-worker:cuda-0",
+      "capacity": 1
+    },
+    "index-worker": {
+      "role": "worker",
+      "host": "tts-index.lan",
+      "bind_host": "0.0.0.0",
+      "services": [
+        "local-indextts"
+      ],
+      "resource_group": "index-worker:cuda-0",
+      "capacity": 1
+    },
+    "cosy-worker": {
+      "role": "worker",
+      "host": "tts-cosy.lan",
+      "bind_host": "0.0.0.0",
+      "services": [
+        "local-cosyvoice"
+      ],
+      "resource_group": "cosy-worker:cuda-0",
+      "capacity": 1
+    }
+  }
+}

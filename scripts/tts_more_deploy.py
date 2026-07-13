@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import sys
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from urllib.error import URLError
@@ -16,6 +19,9 @@ from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+REPO_BUNDLE_RELATIVE_PATH = Path("deployment/tts-repos")
+DEFAULT_REPO_PATHS_RELATIVE_PATH = Path("deployment/app/repo-paths.local.json")
+TOPOLOGY_SCHEMA_VERSION = 1
 
 
 PROVIDER_MODULES = {
@@ -39,6 +45,7 @@ PROVIDER_CAPABILITIES = {
         "sovits-weights",
         "wav_output",
         "tts-more-worker",
+        "artifact-transfer",
     ],
     "indextts": [
         "tts",
@@ -47,6 +54,7 @@ PROVIDER_CAPABILITIES = {
         "emotion_audio",
         "wav_output",
         "tts-more-worker",
+        "artifact-transfer",
     ],
     "cosyvoice": [
         "tts",
@@ -56,6 +64,7 @@ PROVIDER_CAPABILITIES = {
         "style_instruction",
         "wav_output",
         "tts-more-worker",
+        "artifact-transfer",
     ],
 }
 
@@ -64,6 +73,24 @@ PROVIDER_PRIORITY = {"gpt-sovits": 10, "indextts": 20, "cosyvoice": 30}
 NETWORK_PROFILE_RELATIVE_PATH = Path("data/local/network-profile.json")
 DEFAULT_CACHE_RELATIVE_PATH = Path("data/cache")
 NETWORK_PROFILE_SCHEMA_VERSION = 1
+
+HOST_LIMITS_GIB = {
+    "single-clean": {"repo": 40.0, "temp": 10.0},
+    "single-release": {"repo": 15.0, "temp": 5.0},
+    "distributed": {"repo": 15.0, "temp": 5.0},
+}
+
+FORMAL_WORKER_MODULES = {
+    "local-gpt-sovits-main": "app.workers.gpt_sovits_worker:app",
+    "local-indextts": "app.workers.indextts_worker:app",
+    "local-cosyvoice": "app.workers.cosyvoice_worker:app",
+}
+MIN_GPU_TOTAL_MIB = 16000
+MAX_INITIAL_GPU_USED_MIB = 1024
+# large-v3 may need to download before CUDA initialization; never let that child
+# process outlive this bounded ten-minute certification probe.
+ASR_SMOKE_TIMEOUT_SECONDS = 600.0
+HOST_COMMAND_TIMEOUT_SECONDS = 30.0
 
 MODEL_SOURCE_CANDIDATES = [
     {"name": "ModelScope", "url": "https://www.modelscope.cn", "scope": "china", "hf_endpoint": ""},
@@ -83,8 +110,78 @@ def load_repo_lock(root: Path = PROJECT_ROOT) -> list[dict[str, Any]]:
     return list(payload.get("repositories") or [])
 
 
+def load_deployment_repositories(
+    root: Path = PROJECT_ROOT,
+    repo_paths: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    repositories = [dict(repo) for repo in load_repo_lock(root)]
+    overrides = load_repo_path_overrides(root, repo_paths)
+    if overrides:
+        apply_repo_path_overrides(repositories, overrides)
+    return repositories
+
+
 def save_repo_lock(repositories: list[dict[str, Any]], root: Path = PROJECT_ROOT) -> None:
     write_json(root / "repo.lock.json", {"repositories": repositories})
+
+
+def load_repo_path_overrides(root: Path = PROJECT_ROOT, repo_paths: str | Path | None = None) -> dict[str, str]:
+    path = _repo_paths_config_path(root, repo_paths)
+    if path is None:
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw = payload.get("repositories") if isinstance(payload, dict) else payload
+    overrides: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if isinstance(key, str) and isinstance(value, str) and value.strip():
+                overrides[key] = value.strip()
+        return overrides
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            path_value = item.get("path")
+            if not isinstance(path_value, str) or not path_value.strip():
+                continue
+            for key_name in ("service_id", "name", "provider_type", "variant"):
+                key = item.get(key_name)
+                if isinstance(key, str) and key.strip():
+                    overrides[key.strip()] = path_value.strip()
+        return overrides
+    raise ValueError(f"unsupported repo paths format: {path}")
+
+
+def apply_repo_path_overrides(repositories: list[dict[str, Any]], overrides: Mapping[str, str]) -> None:
+    for repo in repositories:
+        for key in _repo_override_keys(repo):
+            if key in overrides:
+                repo["path"] = overrides[key]
+                repo["path_source"] = key
+                break
+
+
+def _repo_paths_config_path(root: Path, repo_paths: str | Path | None) -> Path | None:
+    if repo_paths is None:
+        default = root / DEFAULT_REPO_PATHS_RELATIVE_PATH
+        return default if default.exists() else None
+    path = Path(repo_paths)
+    if not path.is_absolute():
+        path = root / path
+    if not path.exists():
+        raise FileNotFoundError(f"repo paths file not found: {path}")
+    return path
+
+
+def _repo_override_keys(repo: Mapping[str, Any]) -> list[str]:
+    keys = [
+        str(repo.get("service_id") or ""),
+        str(repo.get("name") or ""),
+        str(repo.get("provider_type") or ""),
+        str(repo.get("variant") or ""),
+        str(repo.get("path") or ""),
+    ]
+    return [key for key in keys if key]
 
 
 def _utc_now() -> datetime:
@@ -398,40 +495,75 @@ def render_services(
     host: str = "127.0.0.1",
     service_ids: set[str] | None = None,
     template: bool = False,
+    repositories: list[dict[str, Any]] | None = None,
+    topology: str | Path | None = None,
+    node: str | None = None,
 ) -> list[dict[str, Any]]:
     platform_name = platform_name or _platform_name()
-    repositories = [repo for repo in load_repo_lock(root) if _is_tts_repo(repo)]
+    repositories = [repo for repo in (repositories or load_repo_lock(root)) if _is_tts_repo(repo)]
+    selected_repositories = [repo for repo in repositories if _repo_selected(repo, service_ids)]
+    topology_payload: dict[str, Any] | None = None
+    topology_worker: tuple[str, dict[str, Any]] | None = None
+    assignments: dict[str, tuple[str, dict[str, Any]]] = {}
+    if topology is not None:
+        selected_service_ids = {
+            str(repo.get("service_id") or _default_service_id(repo)) for repo in selected_repositories
+        }
+        topology_payload = load_topology(root, topology, selected_service_ids=selected_service_ids)
+        assignments = _topology_assignments(topology_payload)
+        topology_worker = _resolve_topology_worker(topology_payload, profile=profile, node=node)
+
     services: list[dict[str, Any]] = []
-    for repo in repositories:
+    for repo in selected_repositories:
         service_id = str(repo.get("service_id") or _default_service_id(repo))
-        if service_ids and service_id not in service_ids:
+        assigned_node = assignments.get(service_id)
+        if topology_worker is not None and assigned_node is not None and assigned_node[0] != topology_worker[0]:
             continue
         provider = str(repo["provider_type"])
         port = int(repo.get("port") or _default_port(provider))
         is_external = profile == "app-only"
+        endpoint_host = host
+        bind_host = "127.0.0.1"
+        resource_group = str(repo.get("resource_group") or _resource_group(repo))
+        capacity = int(repo.get("capacity") or 1)
+        if assigned_node is not None:
+            node_config = assigned_node[1]
+            endpoint_host = str(node_config["host"])
+            bind_host = str(node_config["bind_host"])
+            resource_group = str(node_config["resource_group"])
+            capacity = int(node_config["capacity"])
+        if topology_payload is not None:
+            is_lan = is_external or endpoint_host not in {"127.0.0.1", "localhost", "::1"}
+        else:
+            is_lan = is_external and endpoint_host not in {"127.0.0.1", "localhost", "::1"}
+        worker_env = {} if is_external else _worker_env(repo, platform_name)
+        if not is_external:
+            worker_env["TTS_MORE_WORKER_ALLOW_PATH_DELIVERY"] = (
+                "1" if bind_host in {"127.0.0.1", "localhost", "::1"} else "0"
+            )
         service = {
             "service_id": service_id,
             "service_kind": "tts",
             "display_name": str(repo.get("display_name") or _display_name(repo)),
             "engine": PROVIDER_ENGINES[provider],
             "provider_type": provider,
-            "source_profile": "lan_endpoint" if is_external and host not in {"127.0.0.1", "localhost", "::1"} else "local_endpoint",
+            "source_profile": "lan_endpoint" if is_lan else "local_endpoint",
             "catalog_provider": provider,
             "setup_state": "not_configured" if template else ("endpoint_unreachable" if is_external else "repo_found"),
             "api_contract": "tts-more-v1",
-            "base_url": f"http://{host}:{port}",
+            "base_url": f"http://{endpoint_host}:{port}",
             "mode": "external" if is_external else "local",
-            "network_scope": "lan" if is_external and host not in {"127.0.0.1", "localhost", "::1"} else "localhost",
+            "network_scope": "lan" if is_lan else "localhost",
             "managed": not is_external,
             "enabled": not template,
             "poll_interval_seconds": 5,
             "repo_path": None if is_external else repo["path"],
-            "start_command": [] if is_external else _start_command(repo, platform_name, port),
+            "start_command": [] if is_external else _start_command(repo, platform_name, port, bind_host=bind_host),
             "start_cwd": None if is_external else ".",
-            "env": {} if is_external else _worker_env(repo, platform_name),
-            "health_url": f"http://{host}:{port}/health",
-            "resource_group": str(repo.get("resource_group") or _resource_group(repo)),
-            "capacity": int(repo.get("capacity") or 1),
+            "env": worker_env,
+            "health_url": f"http://{endpoint_host}:{port}/health",
+            "resource_group": resource_group,
+            "capacity": capacity,
             "priority": int(repo.get("priority") or PROVIDER_PRIORITY[provider]),
             "capabilities": list(repo.get("capabilities") or PROVIDER_CAPABILITIES[provider]),
         }
@@ -439,6 +571,157 @@ def render_services(
             service["default_params"] = {"mode": "zero_shot", "response_format": "wav"}
         services.append(service)
     return services
+
+
+def load_topology(
+    root: Path,
+    topology: str | Path,
+    *,
+    selected_service_ids: set[str],
+) -> dict[str, Any]:
+    path = Path(topology)
+    if not path.is_absolute():
+        path = root / path
+    if not path.exists():
+        raise FileNotFoundError(f"topology file not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    validate_topology(payload, selected_service_ids=selected_service_ids)
+    return payload
+
+
+def validate_topology(payload: Any, *, selected_service_ids: set[str]) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("topology must be a JSON object")
+    if payload.get("schema_version") != TOPOLOGY_SCHEMA_VERSION or isinstance(payload.get("schema_version"), bool):
+        raise ValueError(f"topology schema_version must be {TOPOLOGY_SCHEMA_VERSION}")
+    if not isinstance(payload.get("name"), str) or not payload["name"].strip():
+        raise ValueError("topology name must be a nonempty string")
+    app_node = payload.get("app_node")
+    if not isinstance(app_node, str) or not app_node.strip():
+        raise ValueError("topology app_node must be a nonempty string")
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, dict) or not nodes:
+        raise ValueError("topology nodes must be a nonempty object")
+
+    required_fields = {"role", "host", "bind_host", "services", "resource_group", "capacity"}
+    service_owners: dict[str, str] = {}
+    for node_name, node_config in nodes.items():
+        if not isinstance(node_name, str) or not node_name.strip() or not isinstance(node_config, dict):
+            raise ValueError("topology node names and values must be nonempty strings and objects")
+        missing = required_fields.difference(node_config)
+        if missing:
+            raise ValueError(f"topology node {node_name} is missing fields: {', '.join(sorted(missing))}")
+        if node_config["role"] not in {"app", "worker"}:
+            raise ValueError(f"topology node {node_name} role must be app or worker")
+        for field in ("host", "bind_host", "resource_group"):
+            value = node_config[field]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"topology node {node_name} {field} must be a nonempty string")
+        services = node_config["services"]
+        if not isinstance(services, list) or any(not isinstance(item, str) or not item.strip() for item in services):
+            raise ValueError(f"topology node {node_name} services must be a list of nonempty strings")
+        if node_config["role"] == "app" and services:
+            raise ValueError("topology app node services must be empty")
+        capacity = node_config["capacity"]
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError(f"topology node {node_name} capacity must be an integer >= 1")
+        if node_config["role"] == "worker":
+            for service_id in services:
+                previous_owner = service_owners.get(service_id)
+                if previous_owner is not None:
+                    raise ValueError(
+                        f"service {service_id} must be assigned to exactly one worker; "
+                        f"found {previous_owner} and {node_name}"
+                    )
+                service_owners[service_id] = node_name
+
+    if app_node not in nodes:
+        raise ValueError(f"topology app_node does not exist: {app_node}")
+    if nodes[app_node]["role"] != "app":
+        raise ValueError(f"topology app_node {app_node} must have role app")
+
+    assignments = _topology_assignments(payload)
+    for service_id in sorted(selected_service_ids):
+        assigned_workers = [
+            node_name
+            for node_name, node_config in nodes.items()
+            if node_config["role"] == "worker" and service_id in node_config["services"]
+        ]
+        if len(assigned_workers) != 1:
+            raise ValueError(
+                f"selected service {service_id} must be assigned to exactly one worker; "
+                f"found {len(assigned_workers)}"
+            )
+        if service_id not in assignments:
+            raise ValueError(f"selected service {service_id} must be assigned to exactly one worker")
+    worker_nodes = [
+        (node_name, node_config)
+        for node_name, node_config in nodes.items()
+        if node_config["role"] == "worker"
+    ]
+    if len(worker_nodes) > 1:
+        declared_hosts: dict[str, str] = {}
+        for node_name, node_config in nodes.items():
+            host = str(node_config["host"]).strip()
+            normalized_host = host.casefold().rstrip(".")
+            candidate_ip = normalized_host.strip("[]")
+            try:
+                address = ipaddress.ip_address(candidate_ip)
+            except ValueError:
+                address = None
+            if normalized_host in {"localhost", "ip6-localhost"} or (
+                address is not None and (address.is_loopback or address.is_unspecified)
+            ):
+                raise ValueError(f"distributed topology node {node_name} host must be non-loopback")
+            previous_node = declared_hosts.get(normalized_host)
+            if previous_node is not None:
+                raise ValueError(
+                    f"distributed topology nodes {previous_node} and {node_name} must use a distinct host"
+                )
+            declared_hosts[normalized_host] = node_name
+        for node_name, node_config in worker_nodes:
+            if len(node_config["services"]) != 1:
+                raise ValueError(f"distributed worker {node_name} must own exactly one service")
+
+
+def _topology_assignments(payload: dict[str, Any]) -> dict[str, tuple[str, dict[str, Any]]]:
+    assignments: dict[str, tuple[str, dict[str, Any]]] = {}
+    for node_name, node_config in payload["nodes"].items():
+        if node_config["role"] != "worker":
+            continue
+        for service_id in node_config["services"]:
+            assignments[service_id] = (node_name, node_config)
+    return assignments
+
+
+def _resolve_topology_worker(
+    payload: dict[str, Any],
+    *,
+    profile: str,
+    node: str | None,
+) -> tuple[str, dict[str, Any]] | None:
+    nodes = payload["nodes"]
+    if profile == "app-only":
+        selected_node = node or payload["app_node"]
+        if selected_node not in nodes:
+            raise ValueError(f"topology node does not exist: {selected_node}")
+        if nodes[selected_node]["role"] != "app":
+            raise ValueError(f"app-only node {selected_node} must have role app")
+        return None
+
+    if node is not None:
+        if node not in nodes:
+            raise ValueError(f"topology node does not exist: {node}")
+        if nodes[node]["role"] != "worker":
+            raise ValueError(f"{profile} node {node} must have role worker")
+        return node, nodes[node]
+
+    workers = [(node_name, node_config) for node_name, node_config in nodes.items() if node_config["role"] == "worker"]
+    if profile == "worker-node":
+        raise ValueError("worker-node profile requires --node")
+    if len(workers) != 1:
+        raise ValueError("local-all topology requires --node when multiple worker nodes are configured")
+    return workers[0]
 
 
 def _clone_command(remote: str, branch: str, path: Path, *, partial: bool = True) -> list[str]:
@@ -455,6 +738,10 @@ def _run_git_command(command: list[str], *, cwd: Path) -> None:
 
 def _repo_selected(repo: dict[str, Any], service_ids: set[str] | None) -> bool:
     if not service_ids:
+        return bool(repo.get("default_selected", True))
+    if "all" in service_ids:
+        return True
+    if "default" in service_ids and bool(repo.get("default_selected", True)):
         return True
     candidates = {
         str(repo.get("name") or ""),
@@ -494,12 +781,16 @@ def _git_exclude_path(repo_path: Path) -> Path | None:
 
 
 def _exclude_local_update_scripts(repo_path: Path) -> None:
+    _exclude_local_helper_paths(repo_path, ["tts-more-update.sh", "tts-more-update.ps1"])
+
+
+def _exclude_local_helper_paths(repo_path: Path, names: list[str]) -> None:
     exclude_path = _git_exclude_path(repo_path)
     if exclude_path is None:
         return
     exclude_path.parent.mkdir(parents=True, exist_ok=True)
     existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
-    additions = [name for name in ("tts-more-update.sh", "tts-more-update.ps1") if name not in existing.splitlines()]
+    additions = [name for name in names if name not in existing.splitlines()]
     if not additions:
         return
     prefix = "" if not existing or existing.endswith("\n") else "\n"
@@ -539,11 +830,13 @@ def sync_repos(
     write_lock: bool = False,
     service_ids: set[str] | None = None,
     force_reset: bool = True,
+    repositories: list[dict[str, Any]] | None = None,
 ) -> list[list[str]]:
-    if clean:
-        _remove_repo_dir(root, dry_run=dry_run)
+    save_lock_on_change = repositories is None
     actions: list[list[str]] = []
-    repositories = load_repo_lock(root)
+    repositories = [dict(repo) for repo in (repositories or load_repo_lock(root))]
+    if clean:
+        _remove_selected_repo_paths(root, repositories, service_ids, dry_run=dry_run)
     lock_changed = False
     for repo in repositories:
         if not _repo_selected(repo, service_ids):
@@ -609,7 +902,7 @@ def sync_repos(
                     _run_git_command(fetch_command, cwd=root)
                     actions.append(checkout_command)
                     _run_git_command(checkout_command, cwd=root)
-    if lock_changed and not dry_run:
+    if lock_changed and save_lock_on_change and not dry_run:
         save_repo_lock(repositories, root)
     return actions
 
@@ -673,9 +966,10 @@ def install_update_scripts(
     *,
     service_ids: set[str] | None = None,
     dry_run: bool = False,
+    repositories: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     reports = []
-    for repo in load_repo_lock(root):
+    for repo in repositories or load_repo_lock(root):
         if not _repo_selected(repo, service_ids):
             continue
         repo_path = _resolve_project_path(root, str(repo["path"]))
@@ -699,6 +993,122 @@ def install_update_scripts(
     return reports
 
 
+def install_repo_bundles(
+    root: Path = PROJECT_ROOT,
+    *,
+    service_ids: set[str] | None = None,
+    dry_run: bool = False,
+    repositories: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    reports = []
+    for repo in repositories or load_repo_lock(root):
+        if not _repo_selected(repo, service_ids):
+            continue
+        provider = str(repo.get("provider_type") or "")
+        bundle_path = root / REPO_BUNDLE_RELATIVE_PATH / provider
+        repo_path = _resolve_project_path(root, str(repo["path"]))
+        target_path = repo_path / "tts-more"
+        report = {
+            "name": repo.get("name"),
+            "provider_type": provider,
+            "path": str(repo.get("path")),
+            "exists": repo_path.exists(),
+            "bundle": str(bundle_path.relative_to(root)) if bundle_path.exists() else "",
+            "target": str(target_path.relative_to(root)),
+            "launchers": [],
+            "installed": False,
+        }
+        reports.append(report)
+        if not bundle_path.exists():
+            report["error"] = f"missing bundle for provider: {provider}"
+            continue
+        if dry_run or not repo_path.exists():
+            continue
+        _copy_tree_contents(bundle_path, target_path)
+        installed_launchers: list[str] = []
+        launcher_templates = bundle_path / "launchers"
+        for launcher_name in ("Start.cmd", "Stop.cmd"):
+            source = launcher_templates / launcher_name
+            if not source.is_file():
+                continue
+            destination = repo_path / launcher_name
+            shutil.copy2(source, destination)
+            installed_launchers.append(destination.relative_to(root).as_posix())
+        report["launchers"] = installed_launchers
+        manifest = {
+            "schema_version": 1,
+            "installed_at": _isoformat(_utc_now()),
+            "service_id": repo.get("service_id"),
+            "name": repo.get("name"),
+            "provider_type": provider,
+            "variant": repo.get("variant"),
+            "branch": repo.get("branch"),
+            "commit": repo.get("commit"),
+            "source_bundle": str(REPO_BUNDLE_RELATIVE_PATH / provider),
+        }
+        write_json(target_path / "tts-more-repo.json", manifest)
+        _chmod_shell_scripts(target_path)
+        _exclude_local_helper_paths(
+            repo_path,
+            ["tts-more/", *[Path(path).name for path in installed_launchers]],
+        )
+        report["installed"] = True
+    return reports
+
+
+def _copy_tree_contents(source: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        destination = target / child.name
+        if child.is_dir():
+            shutil.copytree(child, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, destination)
+
+
+def _chmod_shell_scripts(root: Path) -> None:
+    for path in root.rglob("*.sh"):
+        current_mode = path.stat().st_mode
+        path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def validate_repo_paths(
+    root: Path = PROJECT_ROOT,
+    *,
+    service_ids: set[str] | None = None,
+    require_exists: bool = False,
+    repositories: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    reports = []
+    for repo in repositories or load_repo_lock(root):
+        if not _repo_selected(repo, service_ids):
+            continue
+        raw_path = str(repo.get("path") or "")
+        try:
+            resolved = _resolve_project_path(root, raw_path)
+            inside_project = True
+            error = ""
+        except ValueError as exc:
+            resolved = Path(raw_path).resolve(strict=False)
+            inside_project = False
+            error = str(exc)
+        exists = resolved.exists()
+        reports.append(
+            {
+                "name": repo.get("name"),
+                "service_id": repo.get("service_id"),
+                "provider_type": repo.get("provider_type"),
+                "path": raw_path,
+                "absolute_path": str(resolved),
+                "exists": exists,
+                "inside_project": inside_project,
+                "ok": inside_project and (exists or not require_exists),
+                "error": error or ("path does not exist" if require_exists and not exists else ""),
+            }
+        )
+    return reports
+
+
 def update_project(
     root: Path = PROJECT_ROOT,
     *,
@@ -714,6 +1124,7 @@ def update_project(
     force_render: bool = False,
     force_reset_repos: bool = False,
     platform_name: str | None = None,
+    repositories: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     app_actions: list[list[str]] = []
     if not skip_app:
@@ -736,8 +1147,13 @@ def update_project(
             write_lock=write_lock,
             service_ids=service_ids,
             force_reset=force_reset_repos,
+            repositories=repositories,
         )
-    update_scripts = install_update_scripts(root, service_ids=service_ids, dry_run=dry_run) if install_scripts else []
+    update_scripts = (
+        install_update_scripts(root, service_ids=service_ids, dry_run=dry_run, repositories=repositories)
+        if install_scripts
+        else []
+    )
     services_output = ""
     services_rendered = False
     if render:
@@ -751,6 +1167,7 @@ def update_project(
                 profile="local-all",
                 platform_name=platform_name,
                 service_ids=service_ids,
+                repositories=repositories,
             )
             write_json(root / services_output, services)
     return {
@@ -763,11 +1180,18 @@ def update_project(
     }
 
 
-def doctor(root: Path = PROJECT_ROOT) -> dict[str, Any]:
+def doctor(
+    root: Path = PROJECT_ROOT,
+    *,
+    service_ids: set[str] | None = None,
+    repositories: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     reports = []
-    repos = load_repo_lock(root)
-    expected_paths = {str(repo["path"]).replace("\\", "/").rstrip("/") for repo in repos}
-    for repo in repos:
+    all_repos = repositories or load_repo_lock(root)
+    expected_paths = {str(repo["path"]).replace("\\", "/").rstrip("/") for repo in all_repos}
+    for repo in all_repos:
+        if not _repo_selected(repo, service_ids):
+            continue
         path = root / str(repo["path"])
         branch = _git_output(["git", "-C", str(path), "branch", "--show-current"]) if (path / ".git").exists() else ""
         head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"]) if (path / ".git").exists() else ""
@@ -805,14 +1229,42 @@ def start_workers(
     platform_name: str | None = None,
     service_ids: set[str] | None = None,
     detach: bool = False,
+    repositories: list[dict[str, Any]] | None = None,
+    topology: str | Path | None = None,
+    node: str | None = None,
+    pid_manifest: str | Path | None = None,
 ) -> int:
-    services = render_services(root, profile="local-all", platform_name=platform_name, service_ids=service_ids)
+    services = render_services(
+        root,
+        profile="worker-node" if topology is not None and node is not None else "local-all",
+        platform_name=platform_name,
+        service_ids=service_ids,
+        repositories=repositories,
+        topology=topology,
+        node=node,
+    )
     processes: list[subprocess.Popen] = []
+    app_commit = _git_output(["git", "-C", str(root), "rev-parse", "HEAD"])
     logs_dir = root / "data" / ".runtime" / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = _resolve_project_path(root, str(pid_manifest)) if pid_manifest else None
+    manifest_payload: dict[str, Any] = {"schema_version": 1, "processes": []}
+    if manifest_path is not None and manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("validation process manifest is invalid") from exc
+        if (
+            not isinstance(existing, dict)
+            or existing.get("schema_version") != 1
+            or not isinstance(existing.get("processes"), list)
+        ):
+            raise RuntimeError("validation process manifest is invalid")
+        manifest_payload = existing
     for service in services:
         command = _resolve_command(root, service["start_command"])
         env = {**os.environ, **_resolve_env(root, service.get("env") or {})}
+        env["TTS_MORE_APP_COMMIT"] = app_commit
         log_path = logs_dir / f"{service['service_id']}.log"
         log_file = log_path.open("ab")
         kwargs: dict[str, Any] = {
@@ -833,6 +1285,27 @@ def start_workers(
         process = subprocess.Popen(command, **kwargs)
         log_file.close()
         processes.append(process)
+        if manifest_path is not None:
+            try:
+                executable = _resolve_project_path(root, str(command[0]))
+                expected_module = FORMAL_WORKER_MODULES.get(str(service["service_id"]))
+                if expected_module is None or expected_module not in {str(item) for item in command}:
+                    raise RuntimeError("worker command is not eligible for validation cleanup")
+                creation_date = _windows_process_creation_date(process.pid)
+                manifest_payload["processes"].append(
+                    {
+                        "pid": process.pid,
+                        "creation_date": creation_date,
+                        "executable_path": str(executable),
+                        "project_root": str(root.resolve(strict=False)),
+                        "worker_module": expected_module,
+                        "service_id": str(service["service_id"]),
+                    }
+                )
+                _write_process_manifest(manifest_path, manifest_payload)
+            except Exception:
+                process.terminate()
+                raise RuntimeError("validation worker could not be recorded for owned cleanup") from None
         print(f"{service['service_id']} PID {process.pid} {service['health_url']} log={log_path}")
     if detach:
         return 0
@@ -842,6 +1315,41 @@ def start_workers(
         for process in processes:
             process.terminate()
         return 130
+
+
+def _windows_process_creation_date(process_id: int) -> str:
+    if os.name != "nt":
+        raise RuntimeError("owned process manifests require Windows")
+    script = (
+        f"$p = $null; for ($i = 0; $i -lt 20 -and $null -eq $p; $i++) {{ "
+        f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {int(process_id)}' "
+        "-ErrorAction SilentlyContinue; if ($null -eq $p) { Start-Sleep -Milliseconds 50 } }; "
+        "if ($null -eq $p) { exit 1 }; [Console]::Write([string]$p.CreationDate)"
+    )
+    completed = subprocess.run(
+        ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    creation_date = completed.stdout.strip()
+    if completed.returncode != 0 or not creation_date:
+        raise RuntimeError("validation process creation identity is unavailable")
+    return creation_date
+
+
+def _write_process_manifest(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -886,7 +1394,13 @@ def _resource_group(repo: dict[str, Any]) -> str:
     return "local-gpu-0"
 
 
-def _start_command(repo: dict[str, Any], platform_name: str, port: int) -> list[str]:
+def _start_command(
+    repo: dict[str, Any],
+    platform_name: str,
+    port: int,
+    *,
+    bind_host: str = "127.0.0.1",
+) -> list[str]:
     return [
         _python_path(repo, platform_name),
         "-m",
@@ -895,10 +1409,18 @@ def _start_command(repo: dict[str, Any], platform_name: str, port: int) -> list[
         "--app-dir",
         "backend",
         "--host",
-        "127.0.0.1",
+        bind_host,
         "--port",
         str(port),
     ]
+
+
+def _repo_scoped_model_dir(repo_path: str, model_dir: str, platform_name: str) -> str:
+    path_type = PureWindowsPath if platform_name == "windows" else PurePosixPath
+    target_model_dir = path_type(model_dir)
+    if target_model_dir.is_absolute():
+        return model_dir
+    return (path_type(repo_path) / target_model_dir).as_posix()
 
 
 def _worker_env(repo: dict[str, Any], platform_name: str) -> dict[str, str]:
@@ -918,7 +1440,8 @@ def _worker_env(repo: dict[str, Any], platform_name: str) -> dict[str, str]:
     elif provider == "cosyvoice":
         env["TTS_MORE_COSYVOICE_REPO"] = path
         env["TTS_MORE_COSYVOICE_PYTHON"] = _python_path(repo, platform_name)
-        env["TTS_MORE_COSYVOICE_MODEL_DIR"] = str(repo.get("model_dir") or "pretrained_models/CosyVoice-300M")
+        model_dir = str(repo.get("model_dir") or "pretrained_models/CosyVoice-300M")
+        env["TTS_MORE_COSYVOICE_MODEL_DIR"] = _repo_scoped_model_dir(path, model_dir, platform_name)
     return env
 
 
@@ -933,19 +1456,30 @@ def _platform_name() -> str:
     return "windows" if os.name == "nt" else "posix"
 
 
-def _remove_repo_dir(root: Path, *, dry_run: bool) -> None:
-    target = (root / "repo").resolve(strict=False)
+def _remove_selected_repo_paths(
+    root: Path,
+    repositories: list[dict[str, Any]],
+    service_ids: set[str] | None,
+    *,
+    dry_run: bool,
+) -> list[str]:
+    selected_paths: list[tuple[Path, str]] = []
     root_resolved = root.resolve(strict=False)
-    if target == root_resolved or root_resolved not in target.parents:
-        raise RuntimeError(f"refusing to remove repo directory outside project root: {target}")
-    if target.name != "repo":
-        raise RuntimeError(f"refusing to remove unexpected directory: {target}")
-    if dry_run:
-        return
-    if target.exists():
-        for child in list(target.iterdir()):
-            _remove_path(child)
-    target.mkdir(parents=True, exist_ok=True)
+    repo_root = (root / "repo").resolve(strict=False)
+    for repo in repositories:
+        if not _repo_selected(repo, service_ids):
+            continue
+        target = _resolve_project_path(root, str(repo["path"]))
+        if target in {root_resolved, repo_root}:
+            raise RuntimeError(f"refusing to clean repository root: {target}")
+        label = target.relative_to(root_resolved).as_posix()
+        selected_paths.append((target, label))
+
+    for target, label in selected_paths:
+        print(f"clean repository: {label}")
+        if target.exists() and not dry_run:
+            _remove_path(target)
+    return [label for _, label in selected_paths]
 
 
 def _remove_path(path: Path) -> None:
@@ -999,6 +1533,510 @@ def _resolve_env(root: Path, env: dict[str, str]) -> dict[str, str]:
     return resolved
 
 
+def _host_volume_key(path: str | os.PathLike[str]) -> str:
+    raw = os.fspath(path).replace("\\", "/")
+    drive_match = re.match(r"^([A-Za-z]:)(?:/|$)", raw)
+    if drive_match:
+        return drive_match.group(1).casefold()
+    if raw.startswith("//"):
+        unc_parts = [part for part in raw[2:].split("/") if part]
+        if len(unc_parts) >= 2:
+            return f"//{unc_parts[0]}/{unc_parts[1]}".casefold()
+    absolute = os.path.abspath(raw)
+    drive, _tail = os.path.splitdrive(absolute)
+    return (drive or Path(absolute).anchor or absolute).casefold()
+
+
+def _sanitize_host_message(message: object, *, limit: int = 200) -> str:
+    text = " ".join(str(message or "").split())
+    text = re.sub(
+        r"(?i)\b[a-z]:[\\/](?:[^\s,;]+)",
+        "<path>",
+        text,
+    )
+    text = re.sub(r"\\\\[^\\\s]+\\[^\s,;]+", "<path>", text)
+    text = re.sub(r"(?i)\b[\w.-]+\.exe\b", "<process>", text)
+    text = re.sub(r"(?i)\bGPU-[0-9a-f-]{32,}\b", "<uuid>", text)
+    text = re.sub(
+        r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        "<uuid>",
+        text,
+    )
+    return (text or "no diagnostic message")[:limit]
+
+
+def _append_host_check(
+    checks: list[dict[str, Any]],
+    check_id: str,
+    passed: bool,
+    message: str,
+    **details: Any,
+) -> None:
+    checks.append({"id": check_id, "passed": bool(passed), "message": message, **details})
+
+
+def _run_host_command(
+    command_runner: Callable[..., Any],
+    command: list[str],
+    *,
+    timeout: float,
+    cwd: Path | None = None,
+) -> Any:
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "timeout": timeout,
+    }
+    if cwd is not None:
+        kwargs["cwd"] = str(cwd)
+    return command_runner(command, **kwargs)
+
+
+def _python_version_string(version: Any) -> str:
+    parts = [int(version[index]) for index in range(min(3, len(version)))]
+    while len(parts) < 3:
+        parts.append(0)
+    return ".".join(str(item) for item in parts)
+
+
+def _tool_version(
+    executable: str,
+    tool: str,
+    command_runner: Callable[..., Any],
+) -> str:
+    arguments = [executable, "--version"]
+    try:
+        result = _run_host_command(
+            command_runner,
+            arguments,
+            timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return "unknown"
+    if int(getattr(result, "returncode", 1)) != 0:
+        return "unknown"
+    first_line = str(getattr(result, "stdout", "") or "").strip().splitlines()
+    return _sanitize_host_message(first_line[0] if first_line else f"{tool} version unknown")
+
+
+def _inspect_host_disks(
+    mode: str,
+    *,
+    repo_path: Path,
+    temp_path: Path,
+    disk_usage: Callable[[str | os.PathLike[str]], Any],
+    checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    limits = HOST_LIMITS_GIB[mode]
+    shared = _host_volume_key(repo_path) == _host_volume_key(temp_path)
+    specifications = (
+        [("repository-and-temp", repo_path, max(limits.values()))]
+        if shared
+        else [
+            ("repository", repo_path, limits["repo"]),
+            ("temp", temp_path, limits["temp"]),
+        ]
+    )
+    volumes: list[dict[str, Any]] = []
+    for label, path, required_gib in specifications:
+        check_id = f"disk_{label.replace('-', '_')}"
+        try:
+            usage = disk_usage(path)
+            free_gib = round(int(usage.free) / 1024**3, 2)
+            passed = free_gib >= required_gib
+            message = (
+                f"{label} volume has {free_gib:.2f} GiB free"
+                if passed
+                else f"{mode} requires at least {required_gib:g} GiB free on the {label} volume"
+            )
+            _append_host_check(
+                checks,
+                check_id,
+                passed,
+                message,
+                free_gib=free_gib,
+                required_gib=required_gib,
+            )
+            volumes.append(
+                {"label": label, "free_gib": free_gib, "required_gib": required_gib}
+            )
+        except Exception:
+            _append_host_check(
+                checks,
+                check_id,
+                False,
+                f"Unable to inspect free space on the {label} volume",
+                required_gib=required_gib,
+            )
+            volumes.append({"label": label, "free_gib": None, "required_gib": required_gib})
+    return {"volumes": volumes}
+
+
+def _inspect_host_gpu(
+    executable: str | None,
+    *,
+    command_runner: Callable[..., Any],
+    checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    empty = {
+        "count": 0,
+        "aggregate_total_mib": 0,
+        "aggregate_used_mib": 0,
+        "max_total_mib": 0,
+        "driver_versions": [],
+    }
+    if executable is None:
+        return empty
+    command = [
+        executable,
+        "--query-gpu=memory.total,memory.used,driver_version",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        result = _run_host_command(
+            command_runner,
+            command,
+            timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+        )
+        if int(getattr(result, "returncode", 1)) != 0:
+            raise RuntimeError("GPU query failed")
+        rows: list[tuple[int, int, str]] = []
+        for raw_line in str(getattr(result, "stdout", "") or "").splitlines():
+            if not raw_line.strip():
+                continue
+            fields = [field.strip() for field in raw_line.split(",")]
+            if len(fields) != 3:
+                raise ValueError("unexpected GPU query columns")
+            rows.append((int(fields[0]), int(fields[1]), fields[2]))
+        if not rows:
+            raise ValueError("no NVIDIA GPU returned")
+    except Exception:
+        nvidia_check = next(item for item in checks if item["id"] == "nvidia-smi")
+        nvidia_check.update(
+            passed=False,
+            message="nvidia-smi is required and must return GPU memory data",
+        )
+        return empty
+
+    total_mib = sum(row[0] for row in rows)
+    used_mib = sum(row[1] for row in rows)
+    max_total_mib = max(row[0] for row in rows)
+    driver_versions = sorted({_sanitize_host_message(row[2], limit=40) for row in rows})
+    _append_host_check(
+        checks,
+        "gpu_total",
+        max_total_mib >= MIN_GPU_TOTAL_MIB,
+        (
+            f"At least one GPU has {max_total_mib} MiB total memory"
+            if max_total_mib >= MIN_GPU_TOTAL_MIB
+            else f"GPU memory must be at least {MIN_GPU_TOTAL_MIB} MiB"
+        ),
+        observed_mib=max_total_mib,
+        required_mib=MIN_GPU_TOTAL_MIB,
+    )
+    _append_host_check(
+        checks,
+        "gpu_idle",
+        used_mib <= MAX_INITIAL_GPU_USED_MIB,
+        (
+            f"Aggregate initial GPU use is {used_mib} MiB"
+            if used_mib <= MAX_INITIAL_GPU_USED_MIB
+            else f"GPU must use no more than {MAX_INITIAL_GPU_USED_MIB} MiB before certification"
+        ),
+        observed_mib=used_mib,
+        maximum_mib=MAX_INITIAL_GPU_USED_MIB,
+    )
+    return {
+        "count": len(rows),
+        "aggregate_total_mib": total_mib,
+        "aggregate_used_mib": used_mib,
+        "max_total_mib": max_total_mib,
+        "driver_versions": driver_versions,
+    }
+
+
+def _inspect_ctranslate2(
+    command_runner: Callable[..., Any],
+    *,
+    checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    probe = (
+        "import json, ctranslate2; "
+        "print(json.dumps(sorted(ctranslate2.get_supported_compute_types('cuda'))))"
+    )
+    compute_types: list[str] = []
+    try:
+        result = _run_host_command(
+            command_runner,
+            [sys.executable, "-c", probe],
+            timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+        )
+        if int(getattr(result, "returncode", 1)) == 0:
+            payload = json.loads(str(getattr(result, "stdout", "") or "[]"))
+            if isinstance(payload, list):
+                compute_types = sorted(str(item) for item in payload)
+    except Exception:
+        compute_types = []
+    passed = "float16" in compute_types
+    _append_host_check(
+        checks,
+        "ctranslate2_cuda_float16",
+        passed,
+        (
+            "CTranslate2 reports CUDA float16 support"
+            if passed
+            else "CTranslate2 CUDA float16 support is required"
+        ),
+    )
+    return {"cuda_compute_types": compute_types}
+
+
+def _inspect_playwright_chromium(
+    node_executable: str | None,
+    *,
+    repo_path: Path,
+    command_runner: Callable[..., Any],
+    path_exists: Callable[[str | os.PathLike[str]], bool],
+    checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    chromium_path = ""
+    if node_executable is not None:
+        probe = (
+            "const { chromium } = require('@playwright/test'); "
+            "process.stdout.write(chromium.executablePath());"
+        )
+        try:
+            result = _run_host_command(
+                command_runner,
+                [node_executable, "-e", probe],
+                timeout=HOST_COMMAND_TIMEOUT_SECONDS,
+                cwd=repo_path / "frontend",
+            )
+            if int(getattr(result, "returncode", 1)) == 0:
+                chromium_path = str(getattr(result, "stdout", "") or "").strip()
+        except Exception:
+            chromium_path = ""
+    passed = bool(chromium_path and path_exists(chromium_path))
+    _append_host_check(
+        checks,
+        "playwright_chromium",
+        passed,
+        (
+            "Playwright Chromium is installed"
+            if passed
+            else "Playwright Chromium is required; run pnpm --dir frontend cuda:e2e:install"
+        ),
+    )
+    return {"chromium_present": passed}
+
+
+def _run_large_v3_cuda_smoke(
+    command_runner: Callable[..., Any],
+    *,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    probe = """
+import gc
+import json
+try:
+    from faster_whisper import WhisperModel
+    model = WhisperModel('large-v3', device='cuda', compute_type='float16')
+    del model
+    gc.collect()
+    print(json.dumps({'ok': True}))
+except BaseException as exc:
+    print(json.dumps({'ok': False, 'error_type': type(exc).__name__, 'message': str(exc)}))
+    raise SystemExit(1)
+""".strip()
+    try:
+        result = _run_host_command(
+            command_runner,
+            [sys.executable, "-c", probe],
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "attempted": True,
+            "passed": False,
+            "status": "failed",
+            "error_type": "TimeoutExpired",
+            "message": _sanitize_host_message(
+                f"large-v3 CUDA float16 smoke exceeded {timeout_seconds:g} seconds"
+            ),
+        }
+    except Exception as exc:
+        return {
+            "attempted": True,
+            "passed": False,
+            "status": "failed",
+            "error_type": re.sub(r"[^A-Za-z0-9_.]", "", type(exc).__name__)[:64],
+            "message": _sanitize_host_message(exc),
+        }
+    stdout = str(getattr(result, "stdout", "") or "").strip()
+    try:
+        payload = json.loads(stdout.splitlines()[-1])
+    except (IndexError, json.JSONDecodeError, TypeError):
+        payload = {}
+    if int(getattr(result, "returncode", 1)) == 0 and payload.get("ok") is True:
+        return {"attempted": True, "passed": True, "status": "passed"}
+    error_type = re.sub(r"[^A-Za-z0-9_.]", "", str(payload.get("error_type") or "ChildProcessError"))[:64]
+    raw_message = payload.get("message") or getattr(result, "stderr", "") or "large-v3 CUDA float16 smoke failed"
+    return {
+        "attempted": True,
+        "passed": False,
+        "status": "failed",
+        "error_type": error_type,
+        "message": _sanitize_host_message(raw_message),
+    }
+
+
+def inspect_cuda_host(
+    mode: str,
+    *,
+    command_runner: Callable[..., Any] = subprocess.run,
+    which: Callable[[str], str | None] = shutil.which,
+    disk_usage: Callable[[str | os.PathLike[str]], Any] = shutil.disk_usage,
+    python_version: Any = None,
+    repo_path: str | os.PathLike[str] = PROJECT_ROOT,
+    temp_path: str | os.PathLike[str] | None = None,
+    path_exists: Callable[[str | os.PathLike[str]], bool] = os.path.isfile,
+    smoke_timeout_seconds: float = ASR_SMOKE_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    if mode not in HOST_LIMITS_GIB:
+        raise ValueError(f"unsupported CUDA host preflight mode: {mode}")
+    if smoke_timeout_seconds <= 0:
+        raise ValueError("smoke_timeout_seconds must be positive")
+    repo = Path(repo_path)
+    temp = Path(temp_path or tempfile.gettempdir())
+    version = python_version if python_version is not None else sys.version_info
+    checks: list[dict[str, Any]] = []
+    versions: dict[str, str | None] = {"python": _python_version_string(version)}
+
+    python_passed = int(version[0]) == 3 and int(version[1]) == 11
+    _append_host_check(
+        checks,
+        "python",
+        python_passed,
+        (
+            f"Python {versions['python']} is supported"
+            if python_passed
+            else f"Python 3.11 is required; detected {versions['python']}"
+        ),
+    )
+
+    executables: dict[str, str | None] = {}
+    required_tools = {
+        "conda": "conda is required for GPT-SoVITS on Windows",
+        "git": "git is required",
+        "node": "node is required",
+        "pnpm": "pnpm is required",
+        "nvidia-smi": "nvidia-smi is required",
+    }
+    for tool, failure_message in required_tools.items():
+        executable = which(tool)
+        executables[tool] = executable
+        passed = executable is not None
+        _append_host_check(
+            checks,
+            tool,
+            passed,
+            f"{tool} is available" if passed else failure_message,
+        )
+        versions[tool] = (
+            _tool_version(executable, tool, command_runner)
+            if executable is not None and tool != "nvidia-smi"
+            else None
+        )
+
+    disk = _inspect_host_disks(
+        mode,
+        repo_path=repo,
+        temp_path=temp,
+        disk_usage=disk_usage,
+        checks=checks,
+    )
+    gpu = _inspect_host_gpu(
+        executables["nvidia-smi"],
+        command_runner=command_runner,
+        checks=checks,
+    )
+    versions["nvidia_driver"] = ", ".join(gpu["driver_versions"]) or None
+    ctranslate2 = _inspect_ctranslate2(command_runner, checks=checks)
+    playwright = _inspect_playwright_chromium(
+        executables["node"],
+        repo_path=repo,
+        command_runner=command_runner,
+        path_exists=path_exists,
+        checks=checks,
+    )
+
+    cheap_passed = all(item["passed"] for item in checks)
+    if cheap_passed:
+        asr_smoke = _run_large_v3_cuda_smoke(
+            command_runner,
+            timeout_seconds=smoke_timeout_seconds,
+        )
+        _append_host_check(
+            checks,
+            "large_v3_cuda_smoke",
+            asr_smoke["passed"],
+            (
+                "large-v3 CUDA float16 smoke passed"
+                if asr_smoke["passed"]
+                else (
+                    "large-v3 CUDA float16 smoke failed "
+                    f"({asr_smoke['error_type']}): {asr_smoke['message']}"
+                )
+            ),
+        )
+    else:
+        asr_smoke = {"attempted": False, "passed": False, "status": "skipped"}
+
+    passed = cheap_passed and asr_smoke["passed"]
+    failed_ids = {item["id"] for item in checks if not item["passed"]}
+    if passed:
+        next_action = "Continue to input preflight and deployment."
+    else:
+        actions: list[str] = []
+        if "python" in failed_ids:
+            actions.append("Run host preflight with Python 3.11.")
+        failed_tools = [tool for tool in required_tools if tool in failed_ids]
+        if failed_tools:
+            actions.append(f"Install or repair required tools: {', '.join(failed_tools)}.")
+        if any(item.startswith("disk_") for item in failed_ids):
+            actions.append("Free the required repository or temp volume space.")
+        if "gpu_total" in failed_ids:
+            actions.append(f"Use an NVIDIA GPU with at least {MIN_GPU_TOTAL_MIB} MiB total memory.")
+        if "gpu_idle" in failed_ids:
+            actions.append(
+                "Wait for unrelated GPU work to finish, then rerun; "
+                "this preflight never stops GPU processes."
+            )
+        if "ctranslate2_cuda_float16" in failed_ids:
+            actions.append("Install a CTranslate2 build with CUDA float16 support.")
+        if "playwright_chromium" in failed_ids:
+            actions.append("Install Playwright Chromium from the frontend workspace.")
+        if "large_v3_cuda_smoke" in failed_ids:
+            actions.append("Repair the large-v3 cache, network, or CUDA runtime.")
+        actions.append("Then rerun host preflight.")
+        next_action = " ".join(actions)
+    return {
+        "schema_version": 1,
+        "stage": "host-preflight",
+        "mode": mode,
+        "passed": passed,
+        "checks": checks,
+        "versions": versions,
+        "disk": disk,
+        "gpu": gpu,
+        "ctranslate2": ctranslate2,
+        "playwright": playwright,
+        "asr_smoke": asr_smoke,
+        "next_action": next_action,
+    }
+
+
 def _resolve_project_path(root: Path, raw: str) -> Path:
     candidate = Path(raw.replace("\\", "/"))
     if not candidate.is_absolute():
@@ -1025,6 +2063,12 @@ def _parse_service_ids(raw: str | None) -> set[str] | None:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def _load_cli_repositories(root: Path, repo_paths: str | None) -> list[dict[str, Any]] | None:
+    if not repo_paths:
+        return None
+    return load_deployment_repositories(root, repo_paths)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TTS More deployment helper")
     parser.add_argument("--root", default=str(PROJECT_ROOT), help="Project root")
@@ -1037,6 +2081,9 @@ def main(argv: list[str] | None = None) -> int:
     render.add_argument("--service-ids", default=None)
     render.add_argument("--template", action="store_true", help="Render disabled committable defaults")
     render.add_argument("--output", default=None)
+    render.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    render.add_argument("--topology", default=None, help="Optional deployment topology JSON")
+    render.add_argument("--node", default=None, help="Node name from --topology")
 
     sync = sub.add_parser("sync-repos", help="Clone/fetch repositories from repo.lock.json")
     sync.add_argument("--clean", action="store_true")
@@ -1044,6 +2091,12 @@ def main(argv: list[str] | None = None) -> int:
     sync.add_argument("--latest", action="store_true", help="Track each configured branch instead of checking out the pinned commit")
     sync.add_argument("--write-lock", action="store_true", help="After --latest, write current HEADs back to repo.lock.json")
     sync.add_argument("--service-ids", default=None)
+    sync.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+
+    list_repos = sub.add_parser("list-repos", help="Print repositories after applying optional local path overrides")
+    list_repos.add_argument("--service-ids", default=None)
+    list_repos.add_argument("--repo-paths", default=None)
+    list_repos.add_argument("--json-lines", action="store_true")
 
     probe = sub.add_parser("probe-network", help="Probe local network and choose install/download sources")
     probe.add_argument("--mode", choices=("auto", "china", "global"), default="auto")
@@ -1056,11 +2109,17 @@ def main(argv: list[str] | None = None) -> int:
 
     doctor_parser = sub.add_parser("doctor", help="Inspect repository checkout state")
     doctor_parser.add_argument("--output", default=None)
+    doctor_parser.add_argument("--service-ids", default=None)
+    doctor_parser.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
 
     start = sub.add_parser("start-workers", help="Start local worker processes from repo.lock.json")
     start.add_argument("--platform", choices=("windows", "posix"), default=None)
     start.add_argument("--service-ids", default=None)
     start.add_argument("--detach", action="store_true")
+    start.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+    start.add_argument("--topology", default=None, help="Optional deployment topology JSON")
+    start.add_argument("--node", default=None, help="Worker node name from --topology")
+    start.add_argument("--pid-manifest", default=None, help="Run-local owned process manifest inside the project root")
 
     install_scripts = sub.add_parser(
         "install-update-scripts",
@@ -1068,6 +2127,38 @@ def main(argv: list[str] | None = None) -> int:
     )
     install_scripts.add_argument("--service-ids", default=None)
     install_scripts.add_argument("--dry-run", action="store_true")
+    install_scripts.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+
+    install_bundles = sub.add_parser(
+        "install-repo-bundles",
+        help="Copy provider-specific TTS More helper bundles into checked-out TTS repositories",
+    )
+    install_bundles.add_argument("--service-ids", default=None)
+    install_bundles.add_argument("--dry-run", action="store_true")
+    install_bundles.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+
+    validate_paths = sub.add_parser(
+        "validate-repo-paths",
+        help="Validate local TTS repo paths before one-click deployment",
+    )
+    validate_paths.add_argument("--service-ids", default=None)
+    validate_paths.add_argument("--require-exists", action="store_true")
+    validate_paths.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
+
+    host_preflight = sub.add_parser(
+        "preflight-cuda-host",
+        help="Validate the Windows CUDA host before deployment or repository cleanup",
+    )
+    host_preflight.add_argument(
+        "--mode",
+        choices=tuple(HOST_LIMITS_GIB),
+        required=True,
+    )
+    host_preflight.add_argument(
+        "--output",
+        required=True,
+        help="environment-preflight.json output path",
+    )
 
     update = sub.add_parser("update", help="Fast-forward the app and service repositories")
     update.add_argument("--dry-run", action="store_true")
@@ -1082,10 +2173,12 @@ def main(argv: list[str] | None = None) -> int:
     update.add_argument("--no-render", action="store_true")
     update.add_argument("--force-render-services", action="store_true")
     update.add_argument("--platform", choices=("windows", "posix"), default=None)
+    update.add_argument("--repo-paths", default=None, help="Optional local repo path confirmation JSON")
 
     args = parser.parse_args(argv)
     root = Path(args.root).resolve(strict=False)
     if args.command == "render-services":
+        repositories = _load_cli_repositories(root, args.repo_paths)
         services = render_services(
             root,
             profile=args.profile,
@@ -1093,6 +2186,9 @@ def main(argv: list[str] | None = None) -> int:
             host=args.host,
             service_ids=_parse_service_ids(args.service_ids),
             template=args.template,
+            repositories=repositories,
+            topology=args.topology,
+            node=args.node,
         )
         if args.output:
             write_json(root / args.output, services)
@@ -1100,6 +2196,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(services, ensure_ascii=False, indent=2))
         return 0
     if args.command == "sync-repos":
+        repositories = _load_cli_repositories(root, args.repo_paths)
         actions = sync_repos(
             root,
             clean=args.clean,
@@ -1107,9 +2204,20 @@ def main(argv: list[str] | None = None) -> int:
             latest=args.latest,
             write_lock=args.write_lock,
             service_ids=_parse_service_ids(args.service_ids),
+            repositories=repositories,
         )
         for command in actions:
             print(" ".join(command))
+        return 0
+    if args.command == "list-repos":
+        repositories = load_deployment_repositories(root, args.repo_paths)
+        service_ids = _parse_service_ids(args.service_ids)
+        repositories = [repo for repo in repositories if _repo_selected(repo, service_ids)]
+        if args.json_lines:
+            for repo in repositories:
+                print(json.dumps(repo, ensure_ascii=False))
+        else:
+            print(json.dumps(repositories, ensure_ascii=False, indent=2))
         return 0
     if args.command == "probe-network":
         profile = probe_network(
@@ -1125,28 +2233,65 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(profile, ensure_ascii=False, indent=2))
         return 0
     if args.command == "doctor":
-        payload = doctor(root)
+        repositories = _load_cli_repositories(root, args.repo_paths)
+        payload = doctor(root, service_ids=_parse_service_ids(args.service_ids), repositories=repositories)
         if args.output:
             write_json(root / args.output, payload)
         else:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if args.command == "start-workers":
+        repositories = _load_cli_repositories(root, args.repo_paths)
         return start_workers(
             root,
             platform_name=args.platform,
             service_ids=_parse_service_ids(args.service_ids),
             detach=args.detach,
+            repositories=repositories,
+            topology=args.topology,
+            node=args.node,
+            pid_manifest=args.pid_manifest,
         )
     if args.command == "install-update-scripts":
+        repositories = _load_cli_repositories(root, args.repo_paths)
         reports = install_update_scripts(
             root,
             service_ids=_parse_service_ids(args.service_ids),
             dry_run=args.dry_run,
+            repositories=repositories,
         )
         print(json.dumps(reports, ensure_ascii=False, indent=2))
         return 0
+    if args.command == "install-repo-bundles":
+        repositories = _load_cli_repositories(root, args.repo_paths)
+        reports = install_repo_bundles(
+            root,
+            service_ids=_parse_service_ids(args.service_ids),
+            dry_run=args.dry_run,
+            repositories=repositories,
+        )
+        print(json.dumps(reports, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "validate-repo-paths":
+        repositories = _load_cli_repositories(root, args.repo_paths)
+        reports = validate_repo_paths(
+            root,
+            service_ids=_parse_service_ids(args.service_ids),
+            require_exists=args.require_exists,
+            repositories=repositories,
+        )
+        print(json.dumps(reports, ensure_ascii=False, indent=2))
+        return 0 if all(item["ok"] for item in reports) else 1
+    if args.command == "preflight-cuda-host":
+        report = inspect_cuda_host(args.mode, repo_path=root)
+        output = Path(args.output)
+        if not output.is_absolute():
+            output = root / output
+        write_json(output, report)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report["passed"] else 1
     if args.command == "update":
+        repositories = _load_cli_repositories(root, args.repo_paths)
         payload = update_project(
             root,
             dry_run=args.dry_run,
@@ -1161,6 +2306,7 @@ def main(argv: list[str] | None = None) -> int:
             force_render=args.force_render_services,
             force_reset_repos=args.force_reset_repos,
             platform_name=args.platform,
+            repositories=repositories,
         )
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0

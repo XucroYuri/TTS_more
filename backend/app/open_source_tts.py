@@ -152,7 +152,7 @@ def configure_open_source_tts(
         resource_group=request.resource_group,
         capacity=request.capacity,
         priority=int(catalog_item["priority"]),
-        capabilities=list(catalog_item["capabilities"]),
+        capabilities=_capabilities_for_contract(catalog_item, api_contract),
         source_profile=source_profile,
         catalog_provider=request.provider_type,
         setup_state=detect_payload["setup_state"],
@@ -171,6 +171,16 @@ def _catalog_item(provider_type: OpenSourceProvider) -> dict[str, Any]:
         if item["provider_type"] == provider_type:
             return item
     raise ValueError(f"unsupported open-source TTS provider: {provider_type}")
+
+
+def _capabilities_for_contract(catalog_item: dict[str, Any], api_contract: str) -> list[str]:
+    markers = {"gradio_webui", "tts-more-worker", "artifact-transfer"}
+    capabilities = [item for item in catalog_item["capabilities"] if item not in markers]
+    if api_contract == "tts-more-v1":
+        return [*capabilities, "tts-more-worker", "artifact-transfer"]
+    if api_contract.startswith("gradio-"):
+        return [*capabilities, "gradio_webui"]
+    return capabilities
 
 
 def _gradio_contract(catalog_item: dict[str, Any], requested_contract: str | None = None) -> str:
