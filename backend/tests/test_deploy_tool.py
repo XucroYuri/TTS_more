@@ -4,6 +4,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -97,12 +98,24 @@ def _write_repo_lock(root: Path) -> None:
 def _init_git_checkout(path: Path, remote: str) -> None:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", str(path)], check=True)
-    subprocess.run(["git", "-C", str(path), "config", "user.email", "tests@example.invalid"], check=True)
-    subprocess.run(["git", "-C", str(path), "config", "user.name", "Deployment Tests"], check=True)
     tracked = path / "tracked.txt"
     tracked.write_text("tracked\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(path), "add", "tracked.txt"], check=True)
-    subprocess.run(["git", "-C", str(path), "commit", "-qm", "initial"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "-c",
+            "user.email=tests@example.invalid",
+            "-c",
+            "user.name=Deployment Tests",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        check=True,
+    )
     subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True)
 
 
@@ -1591,6 +1604,171 @@ def _write_marker_command(path: Path, marker: Path) -> str:
     return f'"{sys.executable}" "{path}"'
 
 
+def _set_local_git_config(path: Path, key: str, value: str) -> None:
+    subprocess.run(["git", "-C", str(path), "config", "--local", key, value], check=True)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("core.alternateRefsCommand", "marker-command"),
+        ("http.curloptResolve", "+github.com:443:127.0.0.1"),
+        ("http.sslCAInfo", "attacker-ca.pem"),
+        ("http.sslCAPath", "attacker-ca"),
+        ("diff.external", "marker-command"),
+        ("gc.recentObjectsHook", "marker-command"),
+        ("maintenance.strategy", "incremental"),
+        ("merge.tool", "marker-command"),
+        ("filter.attack.clean", "marker-command"),
+        ("submodule.attack.url", "https://github.com/attacker/repo.git"),
+        ("remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/attacker"),
+        ("unknown.setting", "value"),
+    ],
+)
+def test_local_git_config_audit_rejects_every_non_allowlisted_key_without_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    value: str,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    _set_local_git_config(target, key, value)
+    monkeypatch.setattr(
+        deploy.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Git executed during config audit")),
+    )
+
+    with pytest.raises(RuntimeError, match=r"local Git config key is not allowlisted.*" + re.escape(key)):
+        deploy._audit_local_git_config(target, environment={})
+
+
+def test_app_rejects_alternate_refs_command_without_executing_marker(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    marker = tmp_path / "app-alternate-refs-marker"
+    command = _write_marker_command(tmp_path / "app-alternate-refs.py", marker)
+    _set_local_git_config(target, "core.alternateRefsCommand", command)
+
+    with pytest.raises(RuntimeError, match="core.alternateRefsCommand"):
+        deploy._validate_git_checkout(target)
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX marker executable fixture")
+def test_app_git_resolution_ignores_checkout_and_relative_path_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    marker = tmp_path / "checkout-git-marker"
+    fake_git = target / "git"
+    fake_git.write_text(f"#!/bin/sh\nprintf executed > {marker!s}\nexit 1\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{target}{os.pathsep}{os.pathsep}relative-bin")
+
+    deploy._validate_git_checkout(target)
+
+    assert not marker.exists()
+
+
+def test_trusted_git_resolution_never_searches_cwd_on_any_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    fake_git = tmp_path / ("git.exe" if os.name == "nt" else "git")
+    fake_git.write_text("checkout-controlled executable\n", encoding="utf-8")
+    if os.name != "nt":
+        fake_git.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", f".{os.pathsep}{os.pathsep}relative-bin")
+
+    executable = Path(deploy._trusted_git_executable(managed_roots=(tmp_path,)))
+
+    assert executable.is_absolute()
+    assert executable != fake_git
+    assert not executable.resolve(strict=True).is_relative_to(tmp_path.resolve(strict=True))
+
+
+def test_windows_trusted_candidates_use_system_api_without_path_or_cwd_lookup() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    source = (repo_root / "scripts" / "tts_more_deploy.py").read_text(encoding="utf-8")
+    updater = deploy._service_update_script_py()
+
+    assert source.count("GetWindowsDirectoryW") >= 2
+    assert "GetWindowsDirectoryW" in updater
+    for content in (source, updater):
+        assert 'shutil.which("git")' not in content
+        assert 'shutil.which("ssh")' not in content
+        assert 'os.environ.get("PATH")' not in content
+
+
+def test_update_sidecar_binds_validated_absolute_git_and_ssh_paths(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+
+    sidecar = json.loads((target / "tts-more-update.json").read_text(encoding="utf-8"))
+    assert sidecar["schema_version"] == 2
+    for key in ("git_executable", "ssh_executable"):
+        executable = Path(sidecar[key])
+        assert executable.is_absolute()
+        assert executable.is_file()
+        assert not executable.is_symlink()
+        assert not executable.resolve(strict=True).is_relative_to(tmp_path.resolve(strict=True))
+
+
+def test_generated_updater_revalidates_bound_git_path_before_execution(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+    marker = tmp_path / "fake-git-marker"
+    fake_bin = tmp_path / "untrusted-bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / ("git.exe" if os.name == "nt" else "git")
+    if os.name == "nt":
+        fake_git.write_bytes(b"not a trusted executable\r\n")
+    else:
+        fake_git.write_text(f"#!/bin/sh\nprintf executed > {marker!s}\nexit 1\n", encoding="utf-8")
+        fake_git.chmod(0o755)
+    sidecar_path = target / "tts-more-update.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar["git_executable"] = str(fake_git)
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    (target / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(target / "tts-more-update.py")],
+        cwd=target,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "trusted Git executable" in result.stderr
+    assert not marker.exists()
+
+
 def test_git_runner_removes_config_environment_injection_before_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1661,7 +1839,7 @@ def test_git_checkout_rejects_executable_or_rewriting_local_config(
     _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
     subprocess.run(["git", "-C", str(target), "config", "--local", key, value], check=True)
 
-    with pytest.raises(RuntimeError, match="unsafe local Git config"):
+    with pytest.raises(RuntimeError, match="local Git config key is not allowlisted"):
         deploy._validate_git_checkout(target)
 
 
@@ -1686,7 +1864,40 @@ def test_generated_updater_rejects_executable_local_config_before_status(tmp_pat
     )
 
     assert result.returncode != 0
-    assert "unsafe local Git config" in result.stderr
+    assert "local Git config key is not allowlisted" in result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("key", ["core.alternateRefsCommand", "unknown.setting"])
+def test_generated_updater_rejects_unknown_config_and_checkout_fake_git_before_execution(
+    tmp_path: Path, key: str,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+    marker = tmp_path / "alternate-refs-marker"
+    command = _write_marker_command(tmp_path / "alternate-refs.py", marker)
+    _set_local_git_config(target, key, command)
+    fake_git = target / ("git.exe" if os.name == "nt" else "git")
+    fake_git.write_text("not executable by the updater\n", encoding="utf-8")
+    env = {**os.environ, "PATH": f"{target}{os.pathsep}{os.pathsep}relative-bin"}
+
+    result = subprocess.run(
+        [sys.executable, str(target / "tts-more-update.py")],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "local Git config key is not allowlisted" in result.stderr
+    assert key in result.stderr
     assert not marker.exists()
 
 
@@ -1711,9 +1922,20 @@ def test_app_and_generated_updater_use_identical_hardened_git_policy(
     monkeypatch.setenv("GIT_SSL_NO_VERIFY", "1")
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file:ext")
     logical = ["git", verb]
+    git_executable = deploy._trusted_git_executable(managed_roots=(tmp_path,))
+    ssh_executable = deploy._trusted_ssh_executable(
+        managed_roots=(tmp_path,),
+        git_executable=git_executable,
+    )
 
-    app_command = deploy._harden_git_command(logical, trusted_file=generated_path)
-    updater_command = namespace["harden_git_command"](logical)
+    app_command = deploy._harden_git_command(
+        logical,
+        trusted_file=generated_path,
+        git_executable=git_executable,
+        ssh_executable=ssh_executable,
+        managed_roots=(tmp_path,),
+    )
+    updater_command = namespace["harden_git_command"](logical, git_executable, ssh_executable)
     app_environment = deploy._git_environment()
     updater_environment = namespace["git_environment"]()
 

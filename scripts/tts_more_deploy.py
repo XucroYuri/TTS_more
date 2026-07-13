@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import hashlib
 import json
 import os
@@ -57,6 +58,9 @@ GIT_BLOCKED_ENV_EXACT = {
     "GIT_ALLOW_PROTOCOL",
 }
 GIT_BLOCKED_ENV_PREFIXES = ("GIT_CONFIG_",)
+TRUSTED_GIT_ENV = "TTS_MORE_TRUSTED_GIT"
+TRUSTED_SSH_ENV = "TTS_MORE_TRUSTED_SSH"
+MAX_LOCAL_GIT_CONFIG_BYTES = 1024 * 1024
 
 
 PROVIDER_MODULES = {
@@ -811,12 +815,139 @@ def _git_environment() -> dict[str, str]:
     return environment
 
 
-def _trusted_ssh_command() -> str:
-    executable = shutil.which("ssh")
-    if not executable:
-        return "tts-more-ssh-unavailable"
+def _windows_directory() -> Path:
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetWindowsDirectoryW(buffer, len(buffer))
+    if length <= 0 or length >= len(buffer):
+        raise RuntimeError("unable to resolve the trusted Windows system directory")
+    directory = Path(buffer.value)
+    if not directory.is_absolute():
+        raise RuntimeError("Windows system directory is not absolute")
+    return directory
+
+
+def _trusted_executable_candidates(name: str, *, git_executable: Path | None = None) -> list[Path]:
+    executable_name = f"{name}.exe" if os.name == "nt" else name
+    if os.name != "nt":
+        return [Path(directory) / executable_name for directory in ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/opt/local/bin")]
+    candidates: list[Path] = []
+    windows_directory = _windows_directory()
+    drive_root = Path(windows_directory.anchor)
+    if name == "git":
+        for directory in ("Program Files", "Program Files (x86)"):
+            root = drive_root / directory / "Git"
+            candidates.extend((root / "cmd" / executable_name, root / "bin" / executable_name))
+    else:
+        candidates.append(windows_directory / "System32" / "OpenSSH" / executable_name)
+        if git_executable is not None:
+            git_root = git_executable.parent.parent
+            candidates.extend((git_root / "usr" / "bin" / executable_name, git_root / "bin" / executable_name))
+    return candidates
+
+
+def _validate_trusted_executable(
+    value: str | Path,
+    *,
+    name: str,
+    managed_roots: tuple[Path, ...] = (),
+    git_executable: Path | None = None,
+) -> str:
+    label = "Git" if name == "git" else "SSH"
+    candidate = Path(value)
+    expected_names = {name, f"{name}.exe"}
+    if not candidate.is_absolute() or candidate.name.lower() not in expected_names:
+        raise RuntimeError(f"trusted {label} executable must be an absolute {name} path: {value!s}")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"trusted {label} executable does not exist: {candidate}") from exc
+    if os.path.normcase(str(candidate)) != os.path.normcase(str(resolved)):
+        raise RuntimeError(f"trusted {label} executable must not use symlink or reparse paths: {candidate}")
+    for component in (candidate, *candidate.parents):
+        if _is_link_or_reparse(component):
+            raise RuntimeError(f"trusted {label} executable must not use symlink or reparse paths: {candidate}")
+    if not resolved.is_file() or (os.name != "nt" and not os.access(resolved, os.X_OK)):
+        raise RuntimeError(f"trusted {label} executable is not executable: {resolved}")
+    environment_variable = TRUSTED_GIT_ENV if name == "git" else TRUSTED_SSH_ENV
+    configured_paths = _trusted_executable_candidates(name, git_executable=git_executable)
+    explicit = os.environ.get(environment_variable)
+    if explicit:
+        configured_paths.append(Path(explicit))
+    if not any(
+        path.is_absolute()
+        and os.path.normcase(str(path)) == os.path.normcase(str(resolved))
+        for path in configured_paths
+    ):
+        raise RuntimeError(
+            f"trusted {label} executable is not in a fixed installation directory and does not match "
+            f"{environment_variable}: {resolved}"
+        )
+    for root in managed_roots:
+        canonical_root = root.resolve(strict=False)
+        if resolved == canonical_root or resolved.is_relative_to(canonical_root):
+            raise RuntimeError(f"trusted {label} executable must be outside managed root: {resolved}")
+    return str(resolved)
+
+
+def _resolve_trusted_executable(
+    name: str,
+    *,
+    environment_variable: str,
+    managed_roots: tuple[Path, ...] = (),
+    git_executable: Path | None = None,
+) -> str:
+    explicit = os.environ.get(environment_variable)
+    if explicit:
+        return _validate_trusted_executable(
+            explicit,
+            name=name,
+            managed_roots=managed_roots,
+            git_executable=git_executable,
+        )
+    for candidate in _trusted_executable_candidates(name, git_executable=git_executable):
+        try:
+            return _validate_trusted_executable(
+                candidate,
+                name=name,
+                managed_roots=managed_roots,
+                git_executable=git_executable,
+            )
+        except RuntimeError:
+            continue
+    label = "Git" if name == "git" else "SSH"
+    raise RuntimeError(
+        f"trusted {label} executable was not found in fixed installation directories; "
+        f"set {environment_variable} to an absolute trusted path"
+    )
+
+
+def _trusted_git_executable(*, managed_roots: tuple[Path, ...] = ()) -> str:
+    return _resolve_trusted_executable(
+        "git",
+        environment_variable=TRUSTED_GIT_ENV,
+        managed_roots=managed_roots,
+    )
+
+
+def _trusted_ssh_executable(
+    *,
+    managed_roots: tuple[Path, ...] = (),
+    git_executable: str | Path | None = None,
+) -> str:
+    git_path = Path(git_executable) if git_executable is not None else None
+    return _resolve_trusted_executable(
+        "ssh",
+        environment_variable=TRUSTED_SSH_ENV,
+        managed_roots=managed_roots,
+        git_executable=git_path,
+    )
+
+
+def _trusted_ssh_command(executable: str) -> str:
     arguments = [
-        str(Path(executable).resolve(strict=False)),
+        executable,
         "-F",
         os.devnull,
         "-oBatchMode=yes",
@@ -826,29 +957,44 @@ def _trusted_ssh_command() -> str:
     return subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
 
 
-def _trusted_git_executable() -> str:
-    executable = shutil.which("git")
-    if not executable:
-        raise RuntimeError("trusted git executable was not found")
-    return str(Path(executable).resolve(strict=False))
-
-
-def _harden_git_command(command: list[str], *, trusted_file: Path | None = None) -> list[str]:
+def _harden_git_command(
+    command: list[str],
+    *,
+    trusted_file: Path | None = None,
+    git_executable: str | None = None,
+    ssh_executable: str | None = None,
+    managed_roots: tuple[Path, ...] = (),
+) -> list[str]:
     if not command or Path(command[0]).name.lower() not in {"git", "git.exe"}:
         raise ValueError(f"hardened Git runner requires a git command: {command!r}")
+    trusted_git = (
+        _validate_trusted_executable(git_executable, name="git", managed_roots=managed_roots)
+        if git_executable is not None
+        else _trusted_git_executable(managed_roots=managed_roots)
+    )
+    trusted_ssh = (
+        _validate_trusted_executable(
+            ssh_executable,
+            name="ssh",
+            managed_roots=managed_roots,
+            git_executable=Path(trusted_git),
+        )
+        if ssh_executable is not None
+        else _trusted_ssh_executable(managed_roots=managed_roots, git_executable=trusted_git)
+    )
     hook_sink = str((trusted_file or Path(__file__)).resolve(strict=False))
     overrides = [
         ("core.hooksPath", hook_sink),
         ("core.fsmonitor", "false"),
         ("credential.helper", ""),
-        ("core.sshCommand", _trusted_ssh_command()),
+        ("core.sshCommand", _trusted_ssh_command(trusted_ssh)),
         ("protocol.allow", "never"),
         ("protocol.https.allow", "always"),
         ("protocol.ssh.allow", "always"),
         ("protocol.file.allow", "never"),
         ("protocol.ext.allow", "never"),
     ]
-    prefix = [_trusted_git_executable()]
+    prefix = [trusted_git]
     for key, value in overrides:
         prefix.extend(["-c", f"{key}={value}"])
     return [*prefix, *command[1:]]
@@ -862,61 +1008,99 @@ def _git_command_repo_path(command: list[str], cwd: Path) -> Path | None:
     return cwd if (cwd / ".git" / "config").is_file() else None
 
 
-def _unsafe_local_git_config_key(key: str) -> bool:
-    normalized = key.lower()
-    exact = {
-        "core.fsmonitor",
-        "core.hookspath",
-        "core.sshcommand",
-        "core.gitproxy",
-        "core.worktree",
-        "core.askpass",
-        "extensions.worktreeconfig",
-        "credential.helper",
-        "include.path",
-        "interactive.difffilter",
+def _validate_local_git_config_value(section: str, option: str, value: str) -> None:
+    normalized_section = section.lower()
+    normalized_option = option.lower()
+    subsection = re.fullmatch(r'([^" ]+) "([^"\\]+)"', section)
+    display_key = (
+        f"{subsection.group(1)}.{subsection.group(2)}.{option}"
+        if subsection
+        else f"{section}.{option}"
+    )
+    boolean_values = {"true", "false", "yes", "no", "on", "off", "1", "0"}
+    core_validators: dict[str, Callable[[str], bool]] = {
+        "repositoryformatversion": lambda item: item == "0",
+        "filemode": lambda item: item.lower() in boolean_values,
+        "bare": lambda item: item.lower() == "false",
+        "logallrefupdates": lambda item: item.lower() in boolean_values,
+        "ignorecase": lambda item: item.lower() in boolean_values,
+        "precomposeunicode": lambda item: item.lower() in boolean_values,
+        "symlinks": lambda item: item.lower() in boolean_values,
     }
-    return (
-        normalized in exact
-        or normalized.startswith("includeif.")
-        or (normalized.startswith("url.") and normalized.endswith((".insteadof", ".pushinsteadof")))
-        or (normalized.startswith("filter.") and normalized.endswith((".clean", ".smudge", ".process")))
-        or (normalized.startswith("diff.") and normalized.endswith((".command", ".textconv")))
-        or (normalized.startswith("submodule.") and normalized.endswith(".update"))
-        or (normalized.startswith("credential.") and normalized.endswith(".helper"))
-        or (
-            normalized.startswith("http.")
-            and normalized.endswith(
-                (".extraheader", ".proxy", ".sslverify", ".sslcert", ".sslkey", ".cookiefile")
+    if normalized_section == "core" and normalized_option in core_validators:
+        valid = core_validators[normalized_option](value)
+    elif normalized_section == 'remote "origin"':
+        if normalized_option == "url":
+            try:
+                _parse_github_remote(value)
+                valid = True
+            except ValueError:
+                valid = False
+        elif normalized_option == "fetch":
+            refspec = re.fullmatch(
+                r"\+?refs/heads/(\*|[A-Za-z0-9][A-Za-z0-9._/-]*):refs/remotes/origin/(\*|[A-Za-z0-9][A-Za-z0-9._/-]*)",
+                value,
             )
-        )
-        or (normalized.startswith("remote.") and normalized.endswith((".proxy", ".uploadpack", ".receivepack")))
-    )
+            valid = bool(refspec and refspec.group(1) == refspec.group(2))
+        elif normalized_option == "promisor":
+            valid = value.lower() == "true"
+        elif normalized_option == "partialclonefilter":
+            valid = value == "blob:none"
+        else:
+            valid = False
+    else:
+        branch_match = re.fullmatch(r'branch "([^"\\]+)"', section, flags=re.IGNORECASE)
+        valid = False
+        if branch_match:
+            branch = branch_match.group(1)
+            try:
+                _validate_branch(branch)
+            except ValueError:
+                pass
+            else:
+                valid = (normalized_option == "remote" and value == "origin") or (
+                    normalized_option == "merge" and value == f"refs/heads/{branch}"
+                )
+    if not valid:
+        raise RuntimeError(f"local Git config key is not allowlisted or has an unsafe value: {display_key}")
 
 
-def _audit_local_git_config(repo_path: Path, *, environment: Mapping[str, str]) -> None:
+def _audit_local_git_config(repo_path: Path, *, environment: Mapping[str, str] | None = None) -> None:
     config_path = repo_path / ".git" / "config"
-    if not config_path.is_file():
+    if _is_link_or_reparse(config_path):
+        raise RuntimeError(f"local Git config must not be a symlink or reparse point: {config_path}")
+    if not config_path.exists():
         return
-    command = _harden_git_command(
-        [
-            "git",
-            "config",
-            "--file",
-            str(config_path),
-            "--no-includes",
-            "--null",
-            "--name-only",
-            "--list",
-        ]
-    )
-    result = subprocess.run(command, env=dict(environment), capture_output=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"unable to audit local Git config: {config_path}")
-    keys = [item.decode("utf-8", errors="strict") for item in result.stdout.split(b"\0") if item]
-    unsafe = sorted(key for key in keys if _unsafe_local_git_config_key(key))
-    if unsafe:
-        raise RuntimeError(f"unsafe local Git config at {config_path}: {', '.join(unsafe)}")
+    try:
+        payload = config_path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"unable to read local Git config: {config_path}") from exc
+    if len(payload) > MAX_LOCAL_GIT_CONFIG_BYTES or b"\0" in payload:
+        raise RuntimeError(f"local Git config is oversized or contains NUL bytes: {config_path}")
+    try:
+        text = payload.decode("utf-8", errors="strict")
+        parser = configparser.RawConfigParser(
+            interpolation=None,
+            strict=True,
+            delimiters=("=",),
+            comment_prefixes=("#", ";"),
+            inline_comment_prefixes=None,
+            empty_lines_in_values=False,
+        )
+        parser.optionxform = str
+        parser.read_string(text, source=str(config_path))
+    except (UnicodeDecodeError, configparser.Error) as exc:
+        raise RuntimeError(f"unable to parse local Git config safely: {config_path}") from exc
+    if parser.defaults():
+        raise RuntimeError("local Git config key is not allowlisted: DEFAULT")
+    seen: set[str] = set()
+    for section in parser.sections():
+        for option, value in parser.items(section, raw=True):
+            normalized_key = f"{section}.{option}".lower()
+            if normalized_key in seen:
+                raise RuntimeError(f"duplicate local Git config key: {section}.{option}")
+            seen.add(normalized_key)
+            _validate_local_git_config_value(section, option, value)
 
 
 def _run_git_process(
@@ -931,8 +1115,9 @@ def _run_git_process(
     repo_path = _git_command_repo_path(command, cwd)
     if repo_path is not None:
         _audit_local_git_config(repo_path.resolve(strict=False), environment=environment)
+    managed_roots = tuple(path for path in (cwd, repo_path) if path is not None)
     return subprocess.run(
-        _harden_git_command(command),
+        _harden_git_command(command, managed_roots=managed_roots),
         cwd=cwd,
         env=environment,
         capture_output=capture_output,
@@ -1166,11 +1351,11 @@ exit $LASTEXITCODE
 def _service_update_script_py() -> str:
     return r'''from __future__ import annotations
 
+import configparser
 import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1202,6 +1387,9 @@ BLOCKED_GIT_ENV = {
     "GIT_SSL_CAPATH",
     "GIT_ALLOW_PROTOCOL",
 }
+MAX_LOCAL_GIT_CONFIG_BYTES = 1024 * 1024
+TRUSTED_GIT_ENV = "TTS_MORE_TRUSTED_GIT"
+TRUSTED_SSH_ENV = "TTS_MORE_TRUSTED_SSH"
 
 
 def validate_branch(value: str) -> str:
@@ -1283,12 +1471,85 @@ def git_environment() -> dict[str, str]:
     return environment
 
 
-def trusted_ssh_command() -> str:
-    executable = shutil.which("ssh")
-    if not executable:
-        return "tts-more-ssh-unavailable"
+def windows_directory() -> Path:
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetWindowsDirectoryW(buffer, len(buffer))
+    if length <= 0 or length >= len(buffer):
+        raise RuntimeError("unable to resolve the trusted Windows system directory")
+    directory = Path(buffer.value)
+    if not directory.is_absolute():
+        raise RuntimeError("Windows system directory is not absolute")
+    return directory
+
+
+def trusted_executable_candidates(name: str, *, git_executable: Path | None = None) -> list[Path]:
+    executable_name = f"{name}.exe" if os.name == "nt" else name
+    if os.name != "nt":
+        return [Path(directory) / executable_name for directory in ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/opt/local/bin")]
+    system_directory = windows_directory()
+    drive_root = Path(system_directory.anchor)
+    candidates = []
+    if name == "git":
+        for directory in ("Program Files", "Program Files (x86)"):
+            root = drive_root / directory / "Git"
+            candidates.extend((root / "cmd" / executable_name, root / "bin" / executable_name))
+    else:
+        candidates.append(system_directory / "System32" / "OpenSSH" / executable_name)
+        if git_executable is not None:
+            git_root = git_executable.parent.parent
+            candidates.extend((git_root / "usr" / "bin" / executable_name, git_root / "bin" / executable_name))
+    return candidates
+
+
+def validate_trusted_executable(
+    value: object,
+    *,
+    name: str,
+    root: Path,
+    git_executable: Path | None = None,
+) -> str:
+    label = "Git" if name == "git" else "SSH"
+    if not isinstance(value, str):
+        raise RuntimeError(f"trusted {label} executable is missing from updater sidecar")
+    candidate = Path(value)
+    if not candidate.is_absolute() or candidate.name.lower() not in {name, f"{name}.exe"}:
+        raise RuntimeError(f"trusted {label} executable must be an absolute {name} path: {value!s}")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"trusted {label} executable does not exist: {candidate}") from exc
+    if os.path.normcase(str(candidate)) != os.path.normcase(str(resolved)):
+        raise RuntimeError(f"trusted {label} executable must not use symlink or reparse paths: {candidate}")
+    for component in (candidate, *candidate.parents):
+        if is_link_or_reparse(component):
+            raise RuntimeError(f"trusted {label} executable must not use symlink or reparse paths: {candidate}")
+    if not resolved.is_file() or (os.name != "nt" and not os.access(resolved, os.X_OK)):
+        raise RuntimeError(f"trusted {label} executable is not executable: {resolved}")
+    environment_variable = TRUSTED_GIT_ENV if name == "git" else TRUSTED_SSH_ENV
+    configured_paths = trusted_executable_candidates(name, git_executable=git_executable)
+    explicit = os.environ.get(environment_variable)
+    if explicit:
+        configured_paths.append(Path(explicit))
+    if not any(
+        path.is_absolute()
+        and os.path.normcase(str(path)) == os.path.normcase(str(resolved))
+        for path in configured_paths
+    ):
+        raise RuntimeError(
+            f"trusted {label} executable is not in a fixed installation directory and does not match "
+            f"{environment_variable}: {resolved}"
+        )
+    canonical_root = root.resolve(strict=False)
+    if resolved == canonical_root or resolved.is_relative_to(canonical_root):
+        raise RuntimeError(f"trusted {label} executable must be outside managed root: {resolved}")
+    return str(resolved)
+
+
+def trusted_ssh_command(executable: str) -> str:
     arguments = [
-        str(Path(executable).resolve(strict=False)),
+        executable,
         "-F",
         os.devnull,
         "-oBatchMode=yes",
@@ -1298,86 +1559,117 @@ def trusted_ssh_command() -> str:
     return subprocess.list2cmdline(arguments) if os.name == "nt" else shlex.join(arguments)
 
 
-def trusted_git_executable() -> str:
-    executable = shutil.which("git")
-    if not executable:
-        raise RuntimeError("trusted git executable was not found")
-    return str(Path(executable).resolve(strict=False))
-
-
-def harden_git_command(args: list[str]) -> list[str]:
+def harden_git_command(args: list[str], git_executable: str, ssh_executable: str) -> list[str]:
     overrides = [
         ("core.hooksPath", str(Path(__file__).resolve(strict=False))),
         ("core.fsmonitor", "false"),
         ("credential.helper", ""),
-        ("core.sshCommand", trusted_ssh_command()),
+        ("core.sshCommand", trusted_ssh_command(ssh_executable)),
         ("protocol.allow", "never"),
         ("protocol.https.allow", "always"),
         ("protocol.ssh.allow", "always"),
         ("protocol.file.allow", "never"),
         ("protocol.ext.allow", "never"),
     ]
-    command = [trusted_git_executable()]
+    command = [git_executable]
     for key, value in overrides:
         command.extend(["-c", f"{key}={value}"])
     return [*command, *args[1:]]
 
 
-def unsafe_local_config_key(key: str) -> bool:
-    normalized = key.lower()
-    exact = {
-        "core.fsmonitor",
-        "core.hookspath",
-        "core.sshcommand",
-        "core.gitproxy",
-        "core.worktree",
-        "core.askpass",
-        "extensions.worktreeconfig",
-        "credential.helper",
-        "include.path",
-        "interactive.difffilter",
-    }
-    return (
-        normalized in exact
-        or normalized.startswith("includeif.")
-        or (normalized.startswith("url.") and normalized.endswith((".insteadof", ".pushinsteadof")))
-        or (normalized.startswith("filter.") and normalized.endswith((".clean", ".smudge", ".process")))
-        or (normalized.startswith("diff.") and normalized.endswith((".command", ".textconv")))
-        or (normalized.startswith("submodule.") and normalized.endswith(".update"))
-        or (normalized.startswith("credential.") and normalized.endswith(".helper"))
-        or (
-            normalized.startswith("http.")
-            and normalized.endswith(
-                (".extraheader", ".proxy", ".sslverify", ".sslcert", ".sslkey", ".cookiefile")
-            )
-        )
-        or (normalized.startswith("remote.") and normalized.endswith((".proxy", ".uploadpack", ".receivepack")))
+def validate_local_git_config_value(section: str, option: str, value: str) -> None:
+    normalized_section = section.lower()
+    normalized_option = option.lower()
+    subsection = re.fullmatch(r'([^" ]+) "([^"\\]+)"', section)
+    display_key = (
+        f"{subsection.group(1)}.{subsection.group(2)}.{option}"
+        if subsection
+        else f"{section}.{option}"
     )
+    boolean_values = {"true", "false", "yes", "no", "on", "off", "1", "0"}
+    core_validators = {
+        "repositoryformatversion": lambda item: item == "0",
+        "filemode": lambda item: item.lower() in boolean_values,
+        "bare": lambda item: item.lower() == "false",
+        "logallrefupdates": lambda item: item.lower() in boolean_values,
+        "ignorecase": lambda item: item.lower() in boolean_values,
+        "precomposeunicode": lambda item: item.lower() in boolean_values,
+        "symlinks": lambda item: item.lower() in boolean_values,
+    }
+    if normalized_section == "core" and normalized_option in core_validators:
+        valid = core_validators[normalized_option](value)
+    elif normalized_section == 'remote "origin"':
+        if normalized_option == "url":
+            try:
+                parse_github_remote(value)
+                valid = True
+            except ValueError:
+                valid = False
+        elif normalized_option == "fetch":
+            refspec = re.fullmatch(
+                r"\+?refs/heads/(\*|[A-Za-z0-9][A-Za-z0-9._/-]*):refs/remotes/origin/(\*|[A-Za-z0-9][A-Za-z0-9._/-]*)",
+                value,
+            )
+            valid = bool(refspec and refspec.group(1) == refspec.group(2))
+        elif normalized_option == "promisor":
+            valid = value.lower() == "true"
+        elif normalized_option == "partialclonefilter":
+            valid = value == "blob:none"
+        else:
+            valid = False
+    else:
+        branch_match = re.fullmatch(r'branch "([^"\\]+)"', section, flags=re.IGNORECASE)
+        valid = False
+        if branch_match:
+            branch = branch_match.group(1)
+            try:
+                validate_branch(branch)
+            except ValueError:
+                pass
+            else:
+                valid = (normalized_option == "remote" and value == "origin") or (
+                    normalized_option == "merge" and value == f"refs/heads/{branch}"
+                )
+    if not valid:
+        raise RuntimeError(f"local Git config key is not allowlisted or has an unsafe value: {display_key}")
 
 
 def audit_local_git_config(root: Path) -> None:
     config_path = root / ".git" / "config"
-    if not config_path.is_file():
+    if is_link_or_reparse(config_path):
+        raise RuntimeError(f"local Git config must not be a symlink or reparse point: {config_path}")
+    if not config_path.exists():
         return
-    command = harden_git_command(
-        [
-            "git",
-            "config",
-            "--file",
-            str(config_path),
-            "--no-includes",
-            "--null",
-            "--name-only",
-            "--list",
-        ]
-    )
-    result = subprocess.run(command, env=git_environment(), capture_output=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"unable to audit local Git config: {config_path}")
-    keys = [item.decode("utf-8", errors="strict") for item in result.stdout.split(b"\0") if item]
-    unsafe = sorted(key for key in keys if unsafe_local_config_key(key))
-    if unsafe:
-        raise RuntimeError(f"unsafe local Git config at {config_path}: {', '.join(unsafe)}")
+    try:
+        payload = config_path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"unable to read local Git config: {config_path}") from exc
+    if len(payload) > MAX_LOCAL_GIT_CONFIG_BYTES or b"\0" in payload:
+        raise RuntimeError(f"local Git config is oversized or contains NUL bytes: {config_path}")
+    try:
+        text = payload.decode("utf-8", errors="strict")
+        parser = configparser.RawConfigParser(
+            interpolation=None,
+            strict=True,
+            delimiters=("=",),
+            comment_prefixes=("#", ";"),
+            inline_comment_prefixes=None,
+            empty_lines_in_values=False,
+        )
+        parser.optionxform = str
+        parser.read_string(text, source=str(config_path))
+    except (UnicodeDecodeError, configparser.Error) as exc:
+        raise RuntimeError(f"unable to parse local Git config safely: {config_path}") from exc
+    if parser.defaults():
+        raise RuntimeError("local Git config key is not allowlisted: DEFAULT")
+    seen = set()
+    for section in parser.sections():
+        for option, value in parser.items(section, raw=True):
+            normalized_key = f"{section}.{option}".lower()
+            if normalized_key in seen:
+                raise RuntimeError(f"duplicate local Git config key: {section}.{option}")
+            seen.add(normalized_key)
+            validate_local_git_config_value(section, option, value)
 
 
 def is_link_or_reparse(path: Path) -> bool:
@@ -1391,10 +1683,10 @@ def is_link_or_reparse(path: Path) -> bool:
     return bool(is_junction and is_junction(path))
 
 
-def output(args: list[str], root: Path) -> str:
+def output(args: list[str], root: Path, git_executable: str, ssh_executable: str) -> str:
     audit_local_git_config(root)
     result = subprocess.run(
-        harden_git_command(args),
+        harden_git_command(args, git_executable, ssh_executable),
         cwd=root,
         env=git_environment(),
         capture_output=True,
@@ -1406,12 +1698,17 @@ def output(args: list[str], root: Path) -> str:
     return result.stdout.strip()
 
 
-def run(args: list[str], root: Path) -> None:
+def run(args: list[str], root: Path, git_executable: str, ssh_executable: str) -> None:
     audit_local_git_config(root)
-    subprocess.run(harden_git_command(args), cwd=root, env=git_environment(), check=True)
+    subprocess.run(
+        harden_git_command(args, git_executable, ssh_executable),
+        cwd=root,
+        env=git_environment(),
+        check=True,
+    )
 
 
-def validate_git_checkout(root: Path) -> None:
+def validate_git_checkout(root: Path, git_executable: str, ssh_executable: str) -> None:
     dot_git = root / ".git"
     if is_link_or_reparse(dot_git):
         raise ValueError(f"Git metadata must not be a symlink or reparse point: {dot_git}")
@@ -1419,8 +1716,9 @@ def validate_git_checkout(root: Path) -> None:
         raise RuntimeError(f"path is not a supported Git checkout: {root}")
     if not dot_git.is_dir():
         raise RuntimeError(f"Git worktree/submodule gitdir files are not supported: {dot_git}")
-    inside = output(["git", "rev-parse", "--is-inside-work-tree"], root)
-    absolute_git_dir = output(["git", "rev-parse", "--absolute-git-dir"], root)
+    audit_local_git_config(root)
+    inside = output(["git", "rev-parse", "--is-inside-work-tree"], root, git_executable, ssh_executable)
+    absolute_git_dir = output(["git", "rev-parse", "--absolute-git-dir"], root, git_executable, ssh_executable)
     if inside != "true" or Path(absolute_git_dir).resolve(strict=False) != dot_git.resolve(strict=False):
         raise RuntimeError(f"corrupt or redirected Git metadata: {dot_git}")
 
@@ -1428,30 +1726,39 @@ def validate_git_checkout(root: Path) -> None:
 def main(argv: list[str]) -> int:
     root = Path(__file__).resolve().parent
     config = json.loads((root / "tts-more-update.json").read_text(encoding="utf-8"))
+    if not isinstance(config, dict) or config.get("schema_version") != 2:
+        raise ValueError("unsupported updater sidecar schema")
     branch = validate_branch(os.environ.get("TTS_MORE_UPDATE_BRANCH") or str(config["branch"]))
     commit = os.environ.get("TTS_MORE_PINNED_COMMIT") or str(config.get("commit") or "")
     if commit and not COMMIT_RE.fullmatch(commit):
         raise ValueError(f"invalid pinned commit: {commit!r}")
     expected_remote = str(config["remote"])
     expected_identity = parse_github_remote(expected_remote)
-    validate_git_checkout(root)
-    actual_remote = output(["git", "remote", "get-url", "origin"], root)
+    git_executable = validate_trusted_executable(config.get("git_executable"), name="git", root=root)
+    ssh_executable = validate_trusted_executable(
+        config.get("ssh_executable"),
+        name="ssh",
+        root=root,
+        git_executable=Path(git_executable),
+    )
+    validate_git_checkout(root, git_executable, ssh_executable)
+    actual_remote = output(["git", "remote", "get-url", "origin"], root, git_executable, ssh_executable)
     if parse_github_remote(actual_remote) != expected_identity:
         raise RuntimeError(
             f"repository origin mismatch: expected {expected_remote!r}, found {actual_remote!r}"
         )
-    dirty = output(["git", "status", "--porcelain"], root)
+    dirty = output(["git", "status", "--porcelain"], root, git_executable, ssh_executable)
     if dirty:
         raise RuntimeError("refusing to update a dirty repository; commit, stash, or clean local changes first")
     print(f"[update] {config.get('name') or config.get('service_id') or branch}")
     print(f"[remote] {expected_remote}")
-    run(["git", "fetch", "--prune", "origin", branch], root)
-    run(["git", "checkout", branch], root)
-    run(["git", "pull", "--ff-only", "origin", branch], root)
+    run(["git", "fetch", "--prune", "origin", branch], root, git_executable, ssh_executable)
+    run(["git", "checkout", branch], root, git_executable, ssh_executable)
+    run(["git", "pull", "--ff-only", "origin", branch], root, git_executable, ssh_executable)
     if argv and argv[0] == "--pinned" and commit:
-        run(["git", "fetch", "origin", commit], root)
-        run(["git", "checkout", commit], root)
-    run(["git", "status", "--short", "--branch"], root)
+        run(["git", "fetch", "origin", commit], root, git_executable, ssh_executable)
+        run(["git", "checkout", commit], root, git_executable, ssh_executable)
+    run(["git", "status", "--short", "--branch"], root, git_executable, ssh_executable)
     return 0
 
 
@@ -1505,13 +1812,20 @@ def install_update_scripts(
                 _assert_safe_path(destination, repo_path)
         if dry_run or not exists:
             continue
+        git_executable = _trusted_git_executable(managed_roots=(root,))
+        ssh_executable = _trusted_ssh_executable(
+            managed_roots=(root,),
+            git_executable=git_executable,
+        )
         sidecar = {
-            "schema_version": 1,
+            "schema_version": 2,
             "service_id": service_id,
             "name": repo.get("name"),
             "remote": repo["remote"],
             "branch": branch,
             "commit": commit,
+            "git_executable": git_executable,
+            "ssh_executable": ssh_executable,
         }
         executable_mode = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
         _atomic_write_text(
