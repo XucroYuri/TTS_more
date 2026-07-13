@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import base64
+import glob
 import hashlib
 import ipaddress
+import os
 import re
+import shlex
 import socket
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -25,7 +29,10 @@ class SshResolvedTarget:
     hostname: str
     address: str
     user: str
+    port: int
     known_hosts_file: Path
+    identity_files: tuple[Path, ...]
+    certificate_files: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -80,20 +87,112 @@ class WindowsSshExecutor:
         return result
 
     @staticmethod
+    def _directive(line: str) -> tuple[str, list[str]] | None:
+        try:
+            tokens = shlex.split(line, comments=True, posix=True)
+        except ValueError:
+            raise ValueError("SSH configuration is malformed") from None
+        if not tokens:
+            return None
+        if "=" in tokens[0]:
+            key, value = tokens[0].split("=", 1)
+            arguments = [value, *tokens[1:]]
+        elif len(tokens) > 1 and tokens[1] == "=":
+            key = tokens[0]
+            arguments = tokens[2:]
+        else:
+            key = tokens[0]
+            arguments = tokens[1:]
+        return key.casefold(), arguments
+
+    def _expand_config_file(self, path: Path, stack: tuple[Path, ...]) -> str:
+        path = path.expanduser()
+        if not path.is_absolute():
+            path = path.absolute()
+        try:
+            canonical = path.resolve(strict=True)
+        except OSError:
+            raise ValueError("SSH Include file is unavailable") from None
+        if canonical in stack or len(stack) >= 32:
+            raise ValueError("SSH Include graph is recursive or too deep")
+        if any(component.is_symlink() for component in (path, *path.parents)):
+            raise ValueError("SSH configuration must not use symlinks")
+        try:
+            with canonical.open("r", encoding="utf-8") as config_file:
+                if not stat.S_ISREG(os.fstat(config_file.fileno()).st_mode):
+                    raise ValueError("SSH configuration must be a regular file")
+                content = config_file.read()
+        except (OSError, UnicodeError):
+            raise ValueError("SSH configuration is unreadable") from None
+
+        expanded: list[str] = []
+        for line in content.splitlines(keepends=True):
+            directive = self._directive(line)
+            if directive is None:
+                expanded.append(line)
+                continue
+            key, arguments = directive
+            if key == "match" and any(
+                argument.lstrip("!").partition("=")[0].casefold() == "exec"
+                for argument in arguments
+            ):
+                raise ValueError("SSH configuration must not use Match exec")
+            if key != "include":
+                expanded.append(line)
+                continue
+            if not arguments:
+                raise ValueError("SSH Include directive is malformed")
+            for pattern_text in arguments:
+                if "%" in pattern_text or "${" in pattern_text:
+                    raise ValueError("SSH Include pattern uses unsupported expansion")
+                pattern = Path(pattern_text).expanduser()
+                if not pattern.is_absolute():
+                    pattern = Path.home() / ".ssh" / pattern
+                for included_name in sorted(glob.glob(str(pattern))):
+                    expanded.append(
+                        self._expand_config_file(Path(included_name), (*stack, canonical))
+                    )
+        return "".join(expanded)
+
+    def _resolved_config_output(self, alias: str) -> str:
+        snapshot = self._expand_config_file(self.config_path, ())
+        with tempfile.TemporaryDirectory(prefix="tts-more-ssh-") as directory:
+            snapshot_path = Path(directory) / "ssh_config"
+            snapshot_path.write_text(snapshot, encoding="utf-8")
+            snapshot_path.chmod(0o600)
+            return self._run(
+                ["ssh", "-F", str(snapshot_path), "-G", alias],
+                operation="SSH resolution",
+                alias=alias,
+                timeout=30,
+            ).stdout
+
+    @staticmethod
     def _validate_alias(alias: str) -> None:
         if not alias or alias in {".", ".."} or not _SAFE_ALIAS.fullmatch(alias):
             raise ValueError("SSH alias contains unsupported characters")
 
     @staticmethod
-    def _parse_settings(output: str) -> dict[str, str]:
-        settings: dict[str, str] = {}
+    def _parse_settings(output: str) -> dict[str, list[str]]:
+        settings: dict[str, list[str]] = {}
         for line in output.splitlines():
             key, separator, value = line.partition(" ")
             if line and not separator:
                 raise ValueError("SSH configuration output is malformed")
             if separator and key and value:
-                settings[key.casefold()] = value.strip()
+                settings.setdefault(key.casefold(), []).append(value.strip())
         return settings
+
+    @staticmethod
+    def _setting(
+        settings: dict[str, list[str]], key: str, *, default: str = ""
+    ) -> str:
+        values = settings.get(key, [])
+        if not values:
+            return default
+        if len(values) != 1:
+            raise ValueError(f"SSH configuration has duplicate {key}")
+        return values[0]
 
     @staticmethod
     def _validate_hostname(hostname: str) -> str:
@@ -157,6 +256,40 @@ class WindowsSshExecutor:
         return canonical
 
     @staticmethod
+    def _validate_auth_files(
+        values: list[str], setting: str, *, require_exists: bool
+    ) -> tuple[Path, ...]:
+        validated: list[Path] = []
+        for value in values:
+            if value.casefold() == "none":
+                continue
+            if (
+                not value
+                or "%" in value
+                or "${" in value
+                or any(character in value for character in "\r\n\x00")
+            ):
+                raise ValueError(f"SSH target has an invalid {setting}")
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            if not path.name or any(
+                component.is_symlink() for component in (path, *path.parents)
+            ):
+                raise ValueError(f"SSH target has an invalid {setting}")
+            canonical = path.resolve(strict=False)
+            try:
+                exists = canonical.exists()
+                if require_exists and not exists:
+                    raise ValueError(f"SSH target has an invalid {setting}")
+                if exists and not stat.S_ISREG(canonical.stat().st_mode):
+                    raise ValueError(f"SSH target has an invalid {setting}")
+            except OSError:
+                raise ValueError(f"SSH target has an invalid {setting}") from None
+            validated.append(canonical)
+        return tuple(validated)
+
+    @staticmethod
     def _validate_remote_path(remote_path: str) -> str:
         if not remote_path or remote_path != remote_path.strip():
             raise ValueError("remote path is unsafe")
@@ -176,35 +309,71 @@ class WindowsSshExecutor:
 
     def resolve(self, alias: str) -> SshResolvedTarget:
         self._validate_alias(alias)
-        result = self._run(
-            ["ssh", "-F", str(self.config_path), "-G", alias],
-            operation="SSH resolution",
-            alias=alias,
-            timeout=30,
-        )
-        settings = self._parse_settings(result.stdout)
-        if settings.get("batchmode") != "yes":
+        settings = self._parse_settings(self._resolved_config_output(alias))
+        if self._setting(settings, "batchmode") != "yes":
             raise ValueError("SSH target must set BatchMode yes")
-        if settings.get("identitiesonly") != "yes":
+        if self._setting(settings, "identitiesonly") != "yes":
             raise ValueError("SSH target must set IdentitiesOnly yes")
-        if settings.get("stricthostkeychecking") not in {"yes", "true"}:
+        if self._setting(settings, "stricthostkeychecking") not in {"yes", "true"}:
             raise ValueError("SSH target must set StrictHostKeyChecking yes")
-        if settings.get("proxycommand", "none").casefold() != "none":
+        if self._setting(settings, "proxycommand", default="none").casefold() != "none":
             raise ValueError("SSH target must not set a proxy route")
-        if settings.get("proxyjump", "none").casefold() != "none":
+        if self._setting(settings, "proxyjump", default="none").casefold() != "none":
             raise ValueError("SSH target must not set a proxy route")
-        if settings.get("permitlocalcommand", "no").casefold() != "no":
+        if self._setting(settings, "permitlocalcommand", default="no").casefold() != "no":
             raise ValueError("SSH target must disable local command execution")
-        if settings.get("localcommand", "none").casefold() != "none":
+        if self._setting(settings, "localcommand", default="none").casefold() != "none":
             raise ValueError("SSH target must not set a local command")
+        if self._setting(settings, "controlpath", default="none").casefold() != "none":
+            raise ValueError("SSH target must disable connection sharing")
+        if self._setting(settings, "controlmaster", default="no").casefold() not in {
+            "no",
+            "false",
+        }:
+            raise ValueError("SSH target must disable connection sharing")
+        if self._setting(settings, "controlpersist", default="no").casefold() not in {
+            "no",
+            "0",
+        }:
+            raise ValueError("SSH target must disable connection sharing")
+        if self._setting(settings, "knownhostscommand", default="none").casefold() != "none":
+            raise ValueError("SSH target must not use an alternative host-key source")
+        if self._setting(settings, "verifyhostkeydns", default="no").casefold() not in {
+            "no",
+            "false",
+        }:
+            raise ValueError("SSH target must not use an alternative host-key source")
 
-        hostname = self._validate_hostname(settings.get("hostname", ""))
-        user = settings.get("user", "").strip()
+        hostname = self._validate_hostname(self._setting(settings, "hostname"))
+        user = self._setting(settings, "user").strip()
         if not _SAFE_USER.fullmatch(user):
             raise ValueError("SSH target must set a valid user")
-        known_hosts_file = self._validate_known_hosts(settings.get("userknownhostsfile", ""))
+        port_text = self._setting(settings, "port", default="22")
+        if not port_text.isascii() or not port_text.isdecimal():
+            raise ValueError("SSH target must set a valid port")
+        port = int(port_text)
+        if not 1 <= port <= 65535:
+            raise ValueError("SSH target must set a valid port")
+        known_hosts_file = self._validate_known_hosts(
+            self._setting(settings, "userknownhostsfile")
+        )
+        identity_files = self._validate_auth_files(
+            settings.get("identityfile", []), "IdentityFile", require_exists=False
+        )
+        certificate_files = self._validate_auth_files(
+            settings.get("certificatefile", []), "CertificateFile", require_exists=True
+        )
         address = self._validated_address(hostname)
-        return SshResolvedTarget(alias, hostname, address, user, known_hosts_file)
+        return SshResolvedTarget(
+            alias,
+            hostname,
+            address,
+            user,
+            port,
+            known_hosts_file,
+            identity_files,
+            certificate_files,
+        )
 
     @staticmethod
     def _connection_options(target: SshResolvedTarget) -> list[str]:
@@ -212,6 +381,7 @@ class WindowsSshExecutor:
             f"HostName={target.address}",
             f"HostKeyAlias={target.hostname}",
             f"User={target.user}",
+            f"Port={target.port}",
             "BatchMode=yes",
             "IdentitiesOnly=yes",
             "StrictHostKeyChecking=yes",
@@ -221,12 +391,15 @@ class WindowsSshExecutor:
             "ProxyJump=none",
             "PermitLocalCommand=no",
             "LocalCommand=none",
+            "ControlPath=none",
+            "ControlMaster=no",
+            "ControlPersist=no",
+            "KnownHostsCommand=none",
+            "VerifyHostKeyDNS=no",
+            *(f"IdentityFile={path}" for path in target.identity_files),
+            *(f"CertificateFile={path}" for path in target.certificate_files),
         ]
         return [argument for option in options for argument in ("-o", option)]
-
-    @staticmethod
-    def _scp_host(address: str) -> str:
-        return f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
 
     def run_powershell(
         self, alias: str, script: str, *, timeout: int = 1800
@@ -237,9 +410,9 @@ class WindowsSshExecutor:
             [
                 "ssh",
                 "-F",
-                str(self.config_path),
+                os.devnull,
                 *self._connection_options(target),
-                target.address,
+                target.alias,
                 "powershell.exe",
                 "-NoLogo",
                 "-NoProfile",
@@ -263,10 +436,10 @@ class WindowsSshExecutor:
                 "scp",
                 "-s",
                 "-F",
-                str(self.config_path),
+                os.devnull,
                 *self._connection_options(target),
                 str(local_source),
-                f"{self._scp_host(target.address)}:{safe_remote_path}",
+                f"{target.alias}:{safe_remote_path}",
             ],
             operation="SCP upload",
             alias=alias,
@@ -284,9 +457,9 @@ class WindowsSshExecutor:
                 "scp",
                 "-s",
                 "-F",
-                str(self.config_path),
+                os.devnull,
                 *self._connection_options(target),
-                f"{self._scp_host(target.address)}:{safe_remote_path}",
+                f"{target.alias}:{safe_remote_path}",
                 str(local_destination),
             ],
             operation="SCP download",
@@ -296,12 +469,17 @@ class WindowsSshExecutor:
 
     def pinned_host_key_sha256(self, alias: str) -> str:
         target = self.resolve(alias)
-        try:
-            address = ipaddress.ip_address(target.hostname)
-        except ValueError:
-            lookup_host = target.hostname
+        if target.port != 22:
+            lookup_host = f"[{target.hostname}]:{target.port}"
         else:
-            lookup_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+            try:
+                address = ipaddress.ip_address(target.hostname)
+            except ValueError:
+                lookup_host = target.hostname
+            else:
+                lookup_host = (
+                    f"[{address.compressed}]" if address.version == 6 else address.compressed
+                )
         result = self._run(
             ["ssh-keygen", "-F", lookup_host, "-f", str(target.known_hosts_file)],
             operation="SSH host key lookup",

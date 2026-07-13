@@ -104,3 +104,82 @@
 - The known-hosts file is validated immediately before command construction;
   OpenSSH still opens the canonical path itself, so filesystem mutation by a
   separately privileged actor remains outside this adapter's process boundary.
+
+## Second Review Fixes (2026-07-13)
+
+### RED
+
+- Config graph/TOCTOU group:
+  `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q -k
+  'match_exec or never_reuse_mutable'` -> `5 failed, 67 deselected`. Direct and
+  recursively included `Match exec` reached the runner, and `ssh -G` received
+  the mutable original config path.
+- Multiplexing/host-key/authentication group:
+  `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q -k
+  'multiplexing or alternative_host_key or sharing_and_alternative or
+  authentication_semantics'` -> `10 failed, 72 deselected`.
+- `Match exec=...` syntax variant:
+  `.venv/bin/python -m pytest
+  backend/tests/test_windows_ssh.py::test_match_exec_in_root_config_is_rejected_before_runner
+  -q` -> `1 failed, 3 passed` before criterion normalization was expanded.
+- Relative Include semantics:
+  `.venv/bin/python -m pytest
+  backend/tests/test_windows_ssh.py::test_relative_include_uses_user_ssh_directory_like_openssh
+  -q` -> `1 failed`; the parser incorrectly used the containing directory
+  instead of OpenSSH's `~/.ssh` base.
+- Authentication path validation:
+  `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q -k
+  'unresolved_or_missing_auth_files'` -> `3 failed, 88 deselected` for residual
+  percent tokens and missing certificate files.
+
+### GREEN
+
+- `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q` ->
+  `91 passed in 0.14s`.
+- `.venv/bin/python -m pytest backend/tests/test_lan_topology.py -q` ->
+  `44 passed in 0.08s`.
+- `.venv/bin/python -m compileall -q backend/app/windows_ssh.py
+  backend/tests/test_windows_ssh.py` -> passed.
+- `git diff --check` -> passed.
+- Local `ssh -G -F /dev/null` parse check with the complete forced policy,
+  non-default port, IdentityFile, and CertificateFile options -> exit 0.
+
+### Second Review Checklist Closure
+
+1. Critical, pre-validation `Match exec`: closed. Python now reads the root
+   config and recursively expands every Include without invoking OpenSSH,
+   rejecting direct, negated, `key=value`, and nested `Match exec` forms before
+   the runner is called. Include globs are snapshotted, cycles/depth and unsafe
+   files are rejected, and relative includes use OpenSSH's `~/.ssh` base. Only
+   the fully expanded in-memory snapshot is written to a private temporary file
+   for `ssh -G`; actual SSH/SCP commands use `-F os.devnull`, so mutations to the
+   original graph after the read cannot affect parsing or execution.
+2. Critical, multiplexed transport bypass: closed. Non-default ControlPath,
+   ControlMaster, and ControlPersist settings are rejected. Every SSH/SCP argv
+   forces `ControlPath=none`, `ControlMaster=no`, and `ControlPersist=no`.
+3. Important, alternative host-key sources: closed. KnownHostsCommand and
+   VerifyHostKeyDNS are rejected unless disabled, then explicitly forced to
+   `none`/`no` alongside the canonical user known-hosts file and disabled global
+   file.
+4. Important, alias authentication semantics: closed. The frozen target retains
+   a validated port, all IdentityFile entries, and all CertificateFile entries.
+   SSH and both SCP directions use the safe alias operand with `-F os.devnull`
+   while explicitly pinning numeric HostName, HostKeyAlias, User, Port, policy,
+   and authentication files. Host-key lookup uses the same hostname and emits
+   `[hostname]:port` for non-default ports.
+
+### Concerns
+
+- Tests use fake process/DNS adapters; no live Windows host, authentication, or
+  file transfer was exercised.
+- Include token/environment expansion is rejected rather than reimplemented;
+  absolute paths, `~`, relative `~/.ssh` paths, and globs are supported. This is
+  intentionally fail-closed for config syntax the non-executing parser cannot
+  reproduce exactly.
+- Residual percent/environment tokens in IdentityFile and CertificateFile are
+  rejected to avoid changing their meaning when converted to explicit options.
+  Missing IdentityFile candidates remain allowed because OpenSSH emits missing
+  default key paths; configured CertificateFile entries must exist.
+- Authentication and known-host files are opened later by OpenSSH. A separate
+  actor with permission to replace canonical files after validation remains
+  outside this adapter's process boundary.

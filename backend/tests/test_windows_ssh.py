@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 
@@ -68,7 +69,7 @@ def test_run_powershell_uses_encoded_command_without_shell(tmp_path: Path) -> No
     ).run_powershell("gpt-worker", "Get-Date")
 
     assert result.stdout == "ok"
-    assert runner.calls[1][:4] == ["ssh", "-F", str(config), "-o"]
+    assert runner.calls[1][:4] == ["ssh", "-F", os.devnull, "-o"]
     assert "powershell.exe" in runner.calls[1]
     assert "-EncodedCommand" in runner.calls[1]
     assert all(kwargs["shell"] is False for kwargs in runner.kwargs)
@@ -159,12 +160,12 @@ def test_copy_uses_configured_scp_argv_and_safe_windows_path(tmp_path: Path) -> 
         config, runner=runner, resolver=FakeResolver([["192.0.2.10"]])
     ).copy_to("gpt-worker", source, r"C:\TTS More\artifacts\model.pt")
 
-    assert runner.calls[1][:4] == ["scp", "-s", "-F", str(config)]
+    assert runner.calls[1][:4] == ["scp", "-s", "-F", os.devnull]
     assert "HostName=192.0.2.10" in runner.calls[1]
     assert "GlobalKnownHostsFile=none" in runner.calls[1]
     assert runner.calls[1][-2:] == [
         str(source.resolve()),
-        r"192.0.2.10:C:\TTS More\artifacts\model.pt",
+        r"gpt-worker:C:\TTS More\artifacts\model.pt",
     ]
     assert runner.kwargs[1]["shell"] is False
 
@@ -238,7 +239,8 @@ def test_execution_binds_validated_target_and_policy_in_argv(tmp_path: Path) -> 
     assert "StrictHostKeyChecking=yes" in argv
     assert f"UserKnownHostsFile={known_hosts}" in argv
     assert "GlobalKnownHostsFile=none" in argv
-    assert "gpt-worker" not in argv
+    assert "gpt-worker" in argv
+    assert str(config) not in argv
 
 
 @pytest.mark.parametrize(
@@ -495,7 +497,7 @@ def test_scp_download_uses_absolute_local_destination(
     assert str((tmp_path / "-downloads/result.txt").resolve()) in runner.calls[1]
 
 
-def test_scp_brackets_validated_ipv6_remote_operand(tmp_path: Path) -> None:
+def test_scp_binds_ipv6_address_while_using_safe_alias_operand(tmp_path: Path) -> None:
     config = write_config(tmp_path)
     source = tmp_path / "payload.txt"
     source.write_text("payload", encoding="utf-8")
@@ -507,4 +509,259 @@ def test_scp_brackets_validated_ipv6_remote_operand(tmp_path: Path) -> None:
         "gpt-worker", source, r"C:\work\payload.txt"
     )
 
-    assert runner.calls[1][-1] == r"[2001:db8::10]:C:\work\payload.txt"
+    assert "HostName=2001:db8::10" in runner.calls[1]
+    assert runner.calls[1][-1] == r"gpt-worker:C:\work\payload.txt"
+
+
+@pytest.mark.parametrize(
+    "match_line",
+    [
+        'Match exec "touch /tmp/pwned"',
+        'Match host gpt-worker exec "touch /tmp/pwned"',
+        'Match !exec "touch /tmp/pwned"',
+        'Match exec="touch /tmp/pwned"',
+    ],
+)
+def test_match_exec_in_root_config_is_rejected_before_runner(
+    tmp_path: Path, match_line: str
+) -> None:
+    config = tmp_path / "ssh_config"
+    config.write_text(f"Host gpt-worker\n{match_line}\n", encoding="utf-8")
+    runner = FakeRunner([])
+
+    with pytest.raises(ValueError, match="Match exec"):
+        WindowsSshExecutor(config, runner=runner).resolve("gpt-worker")
+
+    assert runner.calls == []
+
+
+def test_match_exec_in_recursive_include_is_rejected_before_runner(tmp_path: Path) -> None:
+    nested = tmp_path / "nested.conf"
+    nested.write_text('Match exec "touch /tmp/pwned"\n', encoding="utf-8")
+    included = tmp_path / "included.conf"
+    included.write_text(f'Include "{nested}"\n', encoding="utf-8")
+    config = tmp_path / "ssh_config"
+    config.write_text(f'Include "{included}"\nHost gpt-worker\n', encoding="utf-8")
+    runner = FakeRunner([])
+
+    with pytest.raises(ValueError, match="Match exec"):
+        WindowsSshExecutor(config, runner=runner).resolve("gpt-worker")
+
+    assert runner.calls == []
+
+
+def test_relative_include_uses_user_ssh_directory_like_openssh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    ssh_directory = home / ".ssh"
+    ssh_directory.mkdir(parents=True)
+    (ssh_directory / "included.conf").write_text(
+        "Host gpt-worker\n  User tester\n", encoding="utf-8"
+    )
+    config_directory = tmp_path / "config"
+    config_directory.mkdir()
+    (config_directory / "included.conf").write_text(
+        'Match exec "touch /tmp/pwned"\n', encoding="utf-8"
+    )
+    config = config_directory / "ssh_config"
+    config.write_text("Include included.conf\nHost gpt-worker\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    class SnapshotRunner(FakeRunner):
+        def __call__(self, argv: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+            snapshot = Path(argv[2]).read_text(encoding="utf-8")
+            assert "User tester" in snapshot
+            assert "Match exec" not in snapshot
+            return super().__call__(argv, **kwargs)
+
+    runner = SnapshotRunner([completed(resolved_settings())])
+
+    WindowsSshExecutor(
+        config, runner=runner, resolver=FakeResolver([["192.0.2.10"]])
+    ).resolve("gpt-worker")
+
+    assert len(runner.calls) == 1
+
+
+def test_resolution_and_execution_never_reuse_mutable_original_config(tmp_path: Path) -> None:
+    config = write_config(tmp_path)
+
+    class MutatingRunner(FakeRunner):
+        def __call__(self, argv: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+            if not self.calls:
+                snapshot = Path(argv[2])
+                assert snapshot != config
+                assert snapshot.read_text(encoding="utf-8") == config.read_text(encoding="utf-8")
+                config.write_text(
+                    'Match exec "touch /tmp/pwned"\nHost gpt-worker\n'
+                    "  StrictHostKeyChecking no\n",
+                    encoding="utf-8",
+                )
+            return super().__call__(argv, **kwargs)
+
+    runner = MutatingRunner([completed(resolved_settings()), completed("ok")])
+
+    result = WindowsSshExecutor(
+        config, runner=runner, resolver=FakeResolver([["192.0.2.10"]])
+    ).run_powershell("gpt-worker", "Get-Date")
+
+    assert result.stdout == "ok"
+    assert runner.calls[1][1:3] == ["-F", os.devnull]
+    assert str(config) not in runner.calls[1]
+
+
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    [
+        ("controlpath", "/tmp/unsafe-control"),
+        ("controlmaster", "auto"),
+        ("controlmaster", "yes"),
+        ("controlpersist", "yes"),
+        ("controlpersist", "60"),
+    ],
+)
+def test_resolve_rejects_connection_multiplexing(
+    tmp_path: Path, setting: str, value: str
+) -> None:
+    runner = FakeRunner([completed(resolved_settings() + f"{setting} {value}\n")])
+
+    with pytest.raises(ValueError, match="connection sharing"):
+        WindowsSshExecutor(
+            write_config(tmp_path),
+            runner=runner,
+            resolver=FakeResolver([["192.0.2.10"]]),
+        ).resolve("gpt-worker")
+
+
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    [
+        ("knownhostscommand", "touch /tmp/pwned"),
+        ("verifyhostkeydns", "yes"),
+        ("verifyhostkeydns", "ask"),
+    ],
+)
+def test_resolve_rejects_alternative_host_key_sources(
+    tmp_path: Path, setting: str, value: str
+) -> None:
+    runner = FakeRunner([completed(resolved_settings() + f"{setting} {value}\n")])
+
+    with pytest.raises(ValueError, match="host-key source"):
+        WindowsSshExecutor(
+            write_config(tmp_path),
+            runner=runner,
+            resolver=FakeResolver([["192.0.2.10"]]),
+        ).resolve("gpt-worker")
+
+
+def test_execution_forces_sharing_and_alternative_host_key_sources_off(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([completed(resolved_settings()), completed()])
+
+    WindowsSshExecutor(
+        write_config(tmp_path),
+        runner=runner,
+        resolver=FakeResolver([["192.0.2.10"]]),
+    ).run_powershell("gpt-worker", "Get-Date")
+
+    argv = runner.calls[1]
+    assert "ControlPath=none" in argv
+    assert "ControlMaster=no" in argv
+    assert "ControlPersist=no" in argv
+    assert "KnownHostsCommand=none" in argv
+    assert "VerifyHostKeyDNS=no" in argv
+
+
+def test_alias_authentication_semantics_are_bound_across_all_operations(
+    tmp_path: Path,
+) -> None:
+    config = write_config(tmp_path)
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("[tts-gpt.lan]:2222 ssh-ed25519 AAAA\n", encoding="utf-8")
+    identity_one = tmp_path / "identity_one"
+    identity_one.write_text("PRIVATE KEY\n", encoding="utf-8")
+    identity_two = tmp_path / "identity_two"
+    identity_two.write_text("PRIVATE KEY\n", encoding="utf-8")
+    certificate = tmp_path / "identity-cert.pub"
+    certificate.write_text("ssh-ed25519-cert-v01@openssh.com AAAA\n", encoding="utf-8")
+    settings = resolved_settings(known_hosts=str(known_hosts)) + (
+        f"port 2222\nidentityfile {identity_one}\nidentityfile {identity_two}\n"
+        f"certificatefile {certificate}\n"
+    )
+    runner = FakeRunner(
+        [
+            completed(settings),
+            completed("ok"),
+            completed(settings),
+            completed(),
+            completed(settings),
+            completed(),
+            completed(settings),
+            completed("[tts-gpt.lan]:2222 ssh-ed25519 AAAA"),
+        ]
+    )
+    resolver = FakeResolver([["192.0.2.10"] for _ in range(4)])
+    executor = WindowsSshExecutor(config, runner=runner, resolver=resolver)
+    source = tmp_path / "source.txt"
+    source.write_text("payload", encoding="utf-8")
+
+    executor.run_powershell("gpt-worker", "Get-Date")
+    executor.copy_to("gpt-worker", source, r"C:\work\source.txt")
+    executor.copy_from("gpt-worker", r"C:\work\result.txt", tmp_path / "result.txt")
+    executor.pinned_host_key_sha256("gpt-worker")
+
+    for call_index in (1, 3, 5):
+        argv = runner.calls[call_index]
+        assert argv[1:3] == ["-F", os.devnull] or argv[1:4] == ["-s", "-F", os.devnull]
+        assert "Port=2222" in argv
+        assert f"IdentityFile={identity_one}" in argv
+        assert f"IdentityFile={identity_two}" in argv
+        assert f"CertificateFile={certificate}" in argv
+        assert any(
+            argument == "gpt-worker" or argument.startswith("gpt-worker:")
+            for argument in argv
+        )
+    assert runner.calls[3][-1] == r"gpt-worker:C:\work\source.txt"
+    assert runner.calls[5][-2] == r"gpt-worker:C:\work\result.txt"
+    assert runner.calls[7] == [
+        "ssh-keygen",
+        "-F",
+        "[tts-gpt.lan]:2222",
+        "-f",
+        str(known_hosts),
+    ]
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "-1", "22x"])
+def test_resolve_rejects_invalid_port(tmp_path: Path, port: str) -> None:
+    runner = FakeRunner([completed(resolved_settings() + f"port {port}\n")])
+
+    with pytest.raises(ValueError, match="valid port"):
+        WindowsSshExecutor(
+            write_config(tmp_path),
+            runner=runner,
+            resolver=FakeResolver([["192.0.2.10"]]),
+        ).resolve("gpt-worker")
+
+
+@pytest.mark.parametrize(
+    "auth_setting",
+    [
+        "identityfile %d/.ssh/worker_key",
+        "certificatefile %d/.ssh/worker-cert.pub",
+        "certificatefile /definitely/missing/worker-cert.pub",
+    ],
+)
+def test_resolve_rejects_unresolved_or_missing_auth_files(
+    tmp_path: Path, auth_setting: str
+) -> None:
+    runner = FakeRunner([completed(resolved_settings() + auth_setting + "\n")])
+
+    with pytest.raises(ValueError, match="IdentityFile|CertificateFile"):
+        WindowsSshExecutor(
+            write_config(tmp_path),
+            runner=runner,
+            resolver=FakeResolver([["192.0.2.10"]]),
+        ).resolve("gpt-worker")
