@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -25,6 +26,11 @@ MANAGED_REPO_RELATIVE_PATH = Path("repo")
 
 SAFE_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 PINNED_COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
+SERVICE_ID_RE = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?\Z")
+GITHUB_REPOSITORY_COMPONENT_RE = re.compile(r"[A-Za-z0-9_.-]+\Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+BUNDLE_MANIFEST_SCHEMA_VERSION = 3
+BUNDLE_PENDING_MANIFEST = "tts-more-install-pending.json"
 
 
 PROVIDER_MODULES = {
@@ -185,6 +191,7 @@ def _validate_repo_manifest(repositories: list[dict[str, Any]]) -> None:
         service_id = repo.get("service_id")
         if not isinstance(service_id, str) or not service_id.strip():
             raise ValueError(f"repository entry {index} requires a non-empty service_id")
+        _validate_service_id(service_id)
         if service_id in seen_service_ids:
             raise ValueError(f"duplicate service_id in repo lock: {service_id}")
         seen_service_ids.add(service_id)
@@ -194,6 +201,7 @@ def _validate_repo_manifest(repositories: list[dict[str, Any]]) -> None:
             if not isinstance(repo.get(field), str) or not str(repo[field]).strip():
                 raise ValueError(f"repository {service_id} requires non-empty {field}")
         _validate_branch(str(repo["branch"]), service_id=service_id)
+        _parse_github_remote(str(repo["remote"]))
         commit = repo.get("commit")
         if commit is not None and (not isinstance(commit, str) or not PINNED_COMMIT_RE.fullmatch(commit)):
             raise ValueError(f"repository {service_id} has invalid pinned commit")
@@ -210,6 +218,64 @@ def _validate_branch(branch: str, *, service_id: str = "repository") -> None:
     )
     if invalid:
         raise ValueError(f"repository {service_id} has invalid branch: {branch!r}")
+
+
+def _validate_service_id(service_id: str) -> str:
+    if not SERVICE_ID_RE.fullmatch(service_id):
+        raise ValueError(
+            "service_id must be 1-64 lowercase ASCII letters, digits, dots, underscores, or hyphens "
+            f"and must start/end alphanumeric: {service_id!r}"
+        )
+    return service_id
+
+
+def _parse_github_remote(remote: str) -> tuple[str, str, str]:
+    if not isinstance(remote, str) or not remote or remote != remote.strip():
+        raise ValueError(f"unsupported GitHub remote: {remote!r}")
+    if remote.startswith("-") or any(ord(character) < 32 or ord(character) == 127 for character in remote):
+        raise ValueError(f"unsupported GitHub remote: {remote!r}")
+    if "%" in remote or "::" in remote:
+        raise ValueError(f"unsupported GitHub remote: {remote!r}")
+
+    path: str
+    if "://" not in remote:
+        match = re.fullmatch(r"git@github\.com:(.+)", remote, flags=re.IGNORECASE)
+        if not match:
+            raise ValueError(f"unsupported GitHub remote: {remote!r}")
+        path = match.group(1)
+    else:
+        try:
+            parsed = urlparse(remote)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"unsupported GitHub remote: {remote!r}") from exc
+        scheme = parsed.scheme.lower()
+        if parsed.query or parsed.fragment or parsed.params:
+            raise ValueError(f"unsupported GitHub remote: {remote!r}")
+        if parsed.hostname != "github.com" or parsed.hostname is None:
+            raise ValueError(f"unsupported GitHub remote: {remote!r}")
+        if scheme == "https":
+            if parsed.username is not None or parsed.password is not None or port not in (None, 443):
+                raise ValueError(f"unsupported GitHub remote: {remote!r}")
+        elif scheme == "ssh":
+            if parsed.username != "git" or parsed.password is not None or port not in (None, 22):
+                raise ValueError(f"unsupported GitHub remote: {remote!r}")
+        else:
+            raise ValueError(f"unsupported GitHub remote: {remote!r}")
+        path = parsed.path.lstrip("/")
+
+    normalized_path = path.rstrip("/")
+    if normalized_path.endswith(".git"):
+        normalized_path = normalized_path[:-4]
+    parts = normalized_path.split("/")
+    if (
+        len(parts) != 2
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(not GITHUB_REPOSITORY_COMPONENT_RE.fullmatch(part) for part in parts)
+    ):
+        raise ValueError(f"unsupported GitHub remote: {remote!r}")
+    owner, repository = (part.lower() for part in parts)
+    return ("github.com", owner, repository)
 
 
 def _utc_now() -> datetime:
@@ -533,6 +599,7 @@ def render_services(
     services: list[dict[str, Any]] = []
     for repo in repositories:
         service_id = str(repo.get("service_id") or _default_service_id(repo))
+        _validate_service_id(service_id)
         provider = str(repo["provider_type"])
         port = int(repo.get("port") or _default_port(provider))
         is_external = profile == "app-only"
@@ -569,15 +636,16 @@ def render_services(
 
 
 def _clone_command(remote: str, branch: str, path: Path, *, partial: bool = True) -> list[str]:
+    _parse_github_remote(remote)
     command = ["git", "clone", "--depth", "1"]
     if partial:
         command.append("--filter=blob:none")
-    command.extend(["--branch", branch, "--single-branch", remote, str(path)])
+    command.extend(["--branch", branch, "--single-branch", "--", remote, str(path)])
     return command
 
 
 def _run_git_command(command: list[str], *, cwd: Path) -> None:
-    subprocess.run(command, cwd=cwd, check=True)
+    subprocess.run(command, cwd=cwd, env=_git_environment(), check=True)
 
 
 def _repo_selected(repo: dict[str, Any], service_ids: set[str] | None) -> bool:
@@ -646,37 +714,60 @@ def _ensure_clean_repo(path: Path, name: str) -> None:
 
 
 def _canonical_remote_identity(remote: str) -> str:
-    value = remote.strip()
-    scp_match = re.fullmatch(r"(?:[^@/]+@)?([^:/]+):(.+)", value)
-    if scp_match and "://" not in value:
-        host = scp_match.group(1).lower()
-        path = scp_match.group(2)
-    else:
-        parsed = urlparse(value)
-        if not parsed.scheme or not parsed.hostname:
-            return value.rstrip("/").removesuffix(".git")
-        host = parsed.hostname.lower()
-        path = parsed.path
-    normalized_path = path.strip("/").removesuffix(".git")
-    return f"{host}/{normalized_path}"
+    host, owner, repository = _parse_github_remote(remote)
+    return f"{host}/{owner}/{repository}"
 
 
 def _ensure_repo_origin(path: Path, expected_remote: str) -> None:
     actual_remote = _git_output(["git", "-C", str(path), "remote", "get-url", "origin"])
-    if not actual_remote or _canonical_remote_identity(actual_remote) != _canonical_remote_identity(expected_remote):
+    try:
+        expected_identity = _canonical_remote_identity(expected_remote)
+        actual_identity = _canonical_remote_identity(actual_remote)
+    except ValueError as exc:
+        raise RuntimeError(f"repository origin is not a supported GitHub remote at {path}: {actual_remote!r}") from exc
+    if actual_identity != expected_identity:
         raise RuntimeError(
             f"repository origin mismatch at {path}: expected {expected_remote!r}, "
             f"found {actual_remote or '<missing>'!r}"
         )
 
 
-def _git_exclude_path(repo_path: Path) -> Path | None:
+def _git_environment() -> dict[str, str]:
+    blocked = {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    }
+    return {key: value for key, value in os.environ.items() if key not in blocked}
+
+
+def _validate_git_checkout(repo_path: Path) -> Path:
     dot_git = repo_path / ".git"
+    if _is_link_or_reparse(dot_git):
+        raise ValueError(f"Git metadata must not be a symlink or reparse point: {dot_git}")
     if not dot_git.exists():
-        return None
-    _assert_safe_path(dot_git, repo_path)
+        raise RuntimeError(f"path is not a supported Git checkout: {repo_path}")
     if not dot_git.is_dir():
-        return None
+        raise RuntimeError(
+            f"Git worktree/submodule gitdir files are not supported; .git must be a directory: {dot_git}"
+        )
+    _assert_safe_path(dot_git, repo_path)
+    inside = _git_output(["git", "-C", str(repo_path), "rev-parse", "--is-inside-work-tree"])
+    absolute_git_dir = _git_output(["git", "-C", str(repo_path), "rev-parse", "--absolute-git-dir"])
+    if inside != "true" or not absolute_git_dir:
+        raise RuntimeError(f"corrupt Git metadata directory: {dot_git}")
+    if Path(absolute_git_dir).resolve(strict=False) != dot_git.resolve(strict=False):
+        raise RuntimeError(
+            f"Git metadata resolves outside the supported checkout-local .git directory: {absolute_git_dir}"
+        )
+    return dot_git
+
+
+def _git_exclude_path(repo_path: Path) -> Path | None:
+    dot_git = _validate_git_checkout(repo_path)
     candidate = dot_git / "info" / "exclude"
     _assert_safe_path(candidate, repo_path)
     return candidate
@@ -717,11 +808,11 @@ def _run_clone_with_fallback(
     branch: str,
     path: Path,
     dry_run: bool,
-    actions: list[list[str]],
+    actions: list[dict[str, Any]],
 ) -> None:
     path_existed_before = path.exists()
     primary = _clone_command(remote, branch, path, partial=True)
-    actions.append(primary)
+    actions.append({"action": "git", "argv": primary})
     if dry_run:
         return
     try:
@@ -731,7 +822,7 @@ def _run_clone_with_fallback(
         if not path_existed_before and path.exists():
             _remove_path(path)
     fallback = _clone_command(remote, branch, path, partial=False)
-    actions.append(fallback)
+    actions.append({"action": "git", "argv": fallback})
     _run_git_command(fallback, cwd=root)
 
 
@@ -745,22 +836,40 @@ def sync_repos(
     service_ids: set[str] | None = None,
     force_reset: bool = False,
     repositories: list[dict[str, Any]] | None = None,
-) -> list[list[str]]:
+) -> list[dict[str, Any]]:
     save_lock_on_change = repositories is None
-    if clean:
-        _remove_repo_dir(root, dry_run=dry_run)
-    actions: list[list[str]] = []
     repositories = _select_repositories(
         [dict(repo) for repo in (repositories or load_repo_lock(root))],
         service_ids,
     )
-    lock_changed = False
+    actions: list[dict[str, Any]] = []
+    resolved_repositories: list[tuple[dict[str, Any], Path]] = []
     for repo in repositories:
         path = _resolve_repo_path(root, str(repo["path"]))
+        _validate_service_id(str(repo["service_id"]))
+        _parse_github_remote(str(repo["remote"]))
+        resolved_repositories.append((repo, path))
+
+    if clean:
+        for repo, path in resolved_repositories:
+            if not path.exists():
+                continue
+            _validate_git_checkout(path)
+            _ensure_clean_repo(path, str(repo.get("name") or repo["service_id"]))
+            _ensure_repo_origin(path, str(repo["remote"]))
+            actions.append({"action": "remove-repository", "path": str(path)})
+        if not dry_run:
+            for action in actions:
+                _remove_path(Path(str(action["path"])))
+
+    lock_changed = False
+    for repo, path in resolved_repositories:
         remote = str(repo["remote"])
         branch = str(repo["branch"])
         commit = repo.get("commit")
-        if path.exists() and (path / ".git").exists():
+        will_clone = clean or not path.exists()
+        if not will_clone:
+            _validate_git_checkout(path)
             if not force_reset:
                 _ensure_clean_repo(path, str(repo.get("name") or repo.get("service_id") or path.name))
             _ensure_repo_origin(path, remote)
@@ -791,7 +900,7 @@ def sync_repos(
         if repo.get("submodules"):
             commands.append(["git", "-C", str(path), "submodule", "update", "--init", "--recursive"])
         for command in commands:
-            actions.append(command)
+            actions.append({"action": "git", "argv": command})
             if not dry_run:
                 _run_git_command(command, cwd=root)
         if latest:
@@ -804,21 +913,23 @@ def sync_repos(
         if commit:
             checkout_command = ["git", "-C", str(path), "checkout", str(commit)]
             fetch_command = ["git", "-C", str(path), "fetch", "origin", str(commit)]
-            if dry_run:
-                if not (path.exists() and (path / ".git").exists()):
-                    actions.append(fetch_command)
-                    actions.append(checkout_command)
-                else:
-                    head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"])
-                    if head != str(commit):
-                        actions.append(fetch_command)
-                        actions.append(checkout_command)
+            if will_clone:
+                actions.append({"action": "git", "argv": fetch_command})
+                actions.append({"action": "git", "argv": checkout_command})
+                if not dry_run:
+                    _run_git_command(fetch_command, cwd=root)
+                    _run_git_command(checkout_command, cwd=root)
+            elif dry_run:
+                head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"])
+                if head != str(commit):
+                    actions.append({"action": "git", "argv": fetch_command})
+                    actions.append({"action": "git", "argv": checkout_command})
             else:
                 head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"])
                 if head != str(commit):
-                    actions.append(fetch_command)
+                    actions.append({"action": "git", "argv": fetch_command})
                     _run_git_command(fetch_command, cwd=root)
-                    actions.append(checkout_command)
+                    actions.append({"action": "git", "argv": checkout_command})
                     _run_git_command(checkout_command, cwd=root)
     if lock_changed and save_lock_on_change and not dry_run:
         save_repo_lock(repositories, root)
@@ -870,6 +981,15 @@ from urllib.parse import urlparse
 
 BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
+GITHUB_COMPONENT_RE = re.compile(r"[A-Za-z0-9_.-]+\Z")
+BLOCKED_GIT_ENV = {
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+}
 
 
 def validate_branch(value: str) -> str:
@@ -886,28 +1006,94 @@ def validate_branch(value: str) -> str:
     return value
 
 
-def canonical_remote(value: str) -> str:
-    value = value.strip()
-    scp_match = re.fullmatch(r"(?:[^@/]+@)?([^:/]+):(.+)", value)
-    if scp_match and "://" not in value:
-        host, path = scp_match.group(1).lower(), scp_match.group(2)
+def parse_github_remote(value: str) -> tuple[str, str, str]:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"unsupported GitHub remote: {value!r}")
+    if value.startswith("-") or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"unsupported GitHub remote: {value!r}")
+    if "%" in value or "::" in value:
+        raise ValueError(f"unsupported GitHub remote: {value!r}")
+    if "://" not in value:
+        match = re.fullmatch(r"git@github\.com:(.+)", value, flags=re.IGNORECASE)
+        if not match:
+            raise ValueError(f"unsupported GitHub remote: {value!r}")
+        path = match.group(1)
     else:
-        parsed = urlparse(value)
-        if not parsed.scheme or not parsed.hostname:
-            return value.rstrip("/").removesuffix(".git")
-        host, path = parsed.hostname.lower(), parsed.path
-    return f"{host}/{path.strip('/').removesuffix('.git')}"
+        try:
+            parsed = urlparse(value)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"unsupported GitHub remote: {value!r}") from exc
+        scheme = parsed.scheme.lower()
+        if parsed.query or parsed.fragment or parsed.params or parsed.hostname != "github.com":
+            raise ValueError(f"unsupported GitHub remote: {value!r}")
+        if scheme == "https":
+            if parsed.username is not None or parsed.password is not None or port not in (None, 443):
+                raise ValueError(f"unsupported GitHub remote: {value!r}")
+        elif scheme == "ssh":
+            if parsed.username != "git" or parsed.password is not None or port not in (None, 22):
+                raise ValueError(f"unsupported GitHub remote: {value!r}")
+        else:
+            raise ValueError(f"unsupported GitHub remote: {value!r}")
+        path = parsed.path.lstrip("/")
+    normalized = path.rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    parts = normalized.split("/")
+    if (
+        len(parts) != 2
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(not GITHUB_COMPONENT_RE.fullmatch(part) for part in parts)
+    ):
+        raise ValueError(f"unsupported GitHub remote: {value!r}")
+    return ("github.com", parts[0].lower(), parts[1].lower())
+
+
+def git_environment() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items() if key not in BLOCKED_GIT_ENV}
+
+
+def is_link_or_reparse(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if path.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:
+        return True
+    is_junction = getattr(os.path, "isjunction", None)
+    return bool(is_junction and is_junction(path))
 
 
 def output(args: list[str], root: Path) -> str:
-    result = subprocess.run(args, cwd=root, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        args,
+        cwd=root,
+        env=git_environment(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"command failed: {args!r}")
     return result.stdout.strip()
 
 
 def run(args: list[str], root: Path) -> None:
-    subprocess.run(args, cwd=root, check=True)
+    subprocess.run(args, cwd=root, env=git_environment(), check=True)
+
+
+def validate_git_checkout(root: Path) -> None:
+    dot_git = root / ".git"
+    if is_link_or_reparse(dot_git):
+        raise ValueError(f"Git metadata must not be a symlink or reparse point: {dot_git}")
+    if not dot_git.exists():
+        raise RuntimeError(f"path is not a supported Git checkout: {root}")
+    if not dot_git.is_dir():
+        raise RuntimeError(f"Git worktree/submodule gitdir files are not supported: {dot_git}")
+    inside = output(["git", "rev-parse", "--is-inside-work-tree"], root)
+    absolute_git_dir = output(["git", "rev-parse", "--absolute-git-dir"], root)
+    if inside != "true" or Path(absolute_git_dir).resolve(strict=False) != dot_git.resolve(strict=False):
+        raise RuntimeError(f"corrupt or redirected Git metadata: {dot_git}")
 
 
 def main(argv: list[str]) -> int:
@@ -918,8 +1104,10 @@ def main(argv: list[str]) -> int:
     if commit and not COMMIT_RE.fullmatch(commit):
         raise ValueError(f"invalid pinned commit: {commit!r}")
     expected_remote = str(config["remote"])
+    expected_identity = parse_github_remote(expected_remote)
+    validate_git_checkout(root)
     actual_remote = output(["git", "remote", "get-url", "origin"], root)
-    if canonical_remote(actual_remote) != canonical_remote(expected_remote):
+    if parse_github_remote(actual_remote) != expected_identity:
         raise RuntimeError(
             f"repository origin mismatch: expected {expected_remote!r}, found {actual_remote!r}"
         )
@@ -954,8 +1142,10 @@ def install_update_scripts(
     selected = _select_repositories(repositories or load_repo_lock(root), service_ids)
     for repo in selected:
         service_id = str(repo["service_id"])
+        _validate_service_id(service_id)
         branch = str(repo["branch"])
         commit = str(repo.get("commit") or "")
+        _parse_github_remote(str(repo["remote"]))
         _validate_branch(branch, service_id=service_id)
         if commit and not PINNED_COMMIT_RE.fullmatch(commit):
             raise ValueError(f"repository {service_id} has invalid pinned commit")
@@ -967,6 +1157,8 @@ def install_update_scripts(
             "tts-more-update.json": repo_path / "tts-more-update.json",
         }
         exists = repo_path.exists()
+        if exists:
+            _validate_git_checkout(repo_path)
         report = {
             "name": repo.get("name"),
             "path": str(repo.get("path")),
@@ -1023,11 +1215,15 @@ def install_repo_bundles(
     reports = []
     selected = _select_repositories(repositories or load_repo_lock(root), service_ids)
     for repo in selected:
+        service_id = _validate_service_id(str(repo["service_id"]))
+        _parse_github_remote(str(repo["remote"]))
         provider = str(repo.get("provider_type") or "")
         bundle_path = root / REPO_BUNDLE_RELATIVE_PATH / provider
+        source_bundle = (REPO_BUNDLE_RELATIVE_PATH / provider).as_posix()
         repo_path = _resolve_repo_path(root, str(repo["path"]))
         target_path = repo_path / "tts-more"
         manifest_path = target_path / "tts-more-repo.json"
+        pending_path = target_path / BUNDLE_PENDING_MANIFEST
         report = {
             "name": repo.get("name"),
             "provider_type": provider,
@@ -1039,52 +1235,98 @@ def install_repo_bundles(
             "actions": [],
         }
         reports.append(report)
+        if repo_path.exists():
+            _validate_git_checkout(repo_path)
         if not bundle_path.exists():
             report["error"] = f"missing bundle for provider: {provider}"
             continue
         _assert_safe_path(bundle_path, root)
         source_files = _bundle_inventory(bundle_path)
-        current_owned = sorted(source_files)
+        current_owned = {
+            relative: hashlib.sha256(source.read_bytes()).hexdigest()
+            for relative, source in source_files.items()
+        }
+        source_hash = _bundle_source_hash(current_owned)
+        manifest = {
+            "schema_version": BUNDLE_MANIFEST_SCHEMA_VERSION,
+            "service_id": service_id,
+            "provider_type": provider,
+            "source_bundle": source_bundle,
+            "source_hash": source_hash,
+            "owned_files": current_owned,
+        }
         _assert_safe_path(target_path, repo_path)
         _assert_safe_path(manifest_path, repo_path)
-        previous_owned = _read_previous_owned_files(manifest_path, target_path) if target_path.exists() else []
+        _assert_safe_path(pending_path, repo_path)
+        trusted_previous = _read_previous_owned_files(
+            manifest_path,
+            target_path,
+            service_id=service_id,
+            provider=provider,
+            source_bundle=source_bundle,
+        ) if manifest_path.exists() else {}
+        resuming = pending_path.exists()
+        if resuming:
+            pending_previous = _read_pending_bundle_install(
+                pending_path,
+                target_path,
+                desired_manifest=manifest,
+            )
+            if trusted_previous == current_owned:
+                previous_owned = trusted_previous
+            elif pending_previous != trusted_previous:
+                raise ValueError(
+                    "pending bundle ownership does not match the current trusted manifest: "
+                    f"{pending_path}"
+                )
+            else:
+                previous_owned = pending_previous
+        else:
+            previous_owned = trusted_previous
+        _validate_owned_bundle_files(
+            target_path,
+            previous_owned,
+            desired_owned=current_owned,
+            resuming=resuming,
+        )
         stale_owned = sorted(set(previous_owned) - set(current_owned))
         for relative in stale_owned:
             destination = target_path / relative
             _assert_safe_path(destination, target_path)
             report["actions"].append({"action": "remove", "path": destination.relative_to(root).as_posix()})
-        for relative in current_owned:
+        for relative in sorted(current_owned):
             destination = target_path / relative
             _assert_safe_path(destination, target_path)
             report["actions"].append({"action": "copy", "path": destination.relative_to(root).as_posix()})
-        report["actions"].append(
-            {"action": "write-manifest", "path": manifest_path.relative_to(root).as_posix()}
-        )
-        manifest = {
-            "schema_version": 2,
-            "service_id": repo.get("service_id"),
-            "name": repo.get("name"),
-            "provider_type": provider,
-            "variant": repo.get("variant"),
-            "branch": repo.get("branch"),
-            "commit": repo.get("commit"),
-            "source_bundle": (REPO_BUNDLE_RELATIVE_PATH / provider).as_posix(),
-            "owned_files": current_owned,
-        }
+        report["actions"] = [
+            {"action": "write-pending", "path": pending_path.relative_to(root).as_posix()},
+            *report["actions"],
+            {"action": "write-manifest", "path": manifest_path.relative_to(root).as_posix()},
+            {"action": "remove-pending", "path": pending_path.relative_to(root).as_posix()},
+        ]
         if dry_run or not repo_path.exists():
             continue
         _git_exclude_path(repo_path)
         _safe_mkdir(target_path, repo_path)
-        for relative in stale_owned:
-            _remove_owned_bundle_file(target_path / relative, target_path)
-        for relative in current_owned:
+        pending_payload = {
+            "schema_version": 1,
+            "desired_manifest": manifest,
+            "previous_owned_files": previous_owned,
+        }
+        if not resuming:
+            write_json(pending_path, pending_payload, boundary=repo_path)
+        for relative in sorted(current_owned):
             source = source_files[relative]
             destination = target_path / relative
             source_mode = source.stat().st_mode & 0o777
             if destination.suffix == ".sh":
                 source_mode |= stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
             _atomic_write_bytes(destination, source.read_bytes(), boundary=target_path, mode=source_mode)
+        for relative in stale_owned:
+            _remove_owned_bundle_file(target_path / relative, target_path)
         write_json(manifest_path, manifest, boundary=repo_path)
+        _assert_safe_path(pending_path, target_path)
+        pending_path.unlink()
         _exclude_local_helper_paths(repo_path, ["tts-more/"])
         report["installed"] = True
     return reports
@@ -1106,23 +1348,122 @@ def _bundle_inventory(source: Path) -> dict[str, Path]:
     return dict(sorted(inventory.items()))
 
 
-def _read_previous_owned_files(manifest_path: Path, target_path: Path) -> list[str]:
+def _bundle_source_hash(owned_files: Mapping[str, str]) -> str:
+    encoded = json.dumps(dict(owned_files), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_owned_files_mapping(raw_owned: Any, *, context: Path) -> dict[str, str]:
+    if not isinstance(raw_owned, dict):
+        raise ValueError(f"invalid bundle ownership manifest owned_files: {context}")
+    owned: dict[str, str] = {}
+    for raw_path, raw_hash in raw_owned.items():
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError(f"invalid bundle ownership manifest path: {context}")
+        relative = Path(raw_path)
+        if relative.is_absolute() or ".." in relative.parts or relative.as_posix() != raw_path:
+            raise ValueError(f"bundle ownership manifest path escapes target: {raw_path}")
+        if not isinstance(raw_hash, str) or not SHA256_RE.fullmatch(raw_hash):
+            raise ValueError(f"invalid bundle ownership manifest hash for {raw_path}: {context}")
+        owned[raw_path] = raw_hash
+    return dict(sorted(owned.items()))
+
+
+def _read_previous_owned_files(
+    manifest_path: Path,
+    target_path: Path,
+    *,
+    service_id: str,
+    provider: str,
+    source_bundle: str,
+) -> dict[str, str]:
     _assert_safe_path(manifest_path, target_path)
     if not manifest_path.exists():
-        return []
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    raw_owned = payload.get("owned_files") if isinstance(payload, dict) else None
-    if not isinstance(raw_owned, list):
-        return []
-    owned: list[str] = []
-    for raw in raw_owned:
-        if not isinstance(raw, str) or not raw:
-            raise ValueError(f"invalid owned file entry in {manifest_path}")
-        relative = Path(raw)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError(f"owned file escapes bundle target: {raw}")
-        owned.append(relative.as_posix())
-    return sorted(set(owned))
+        return {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid bundle ownership manifest JSON: {manifest_path}") from exc
+    required_keys = {
+        "schema_version",
+        "service_id",
+        "provider_type",
+        "source_bundle",
+        "source_hash",
+        "owned_files",
+    }
+    if not isinstance(payload, dict) or set(payload) != required_keys:
+        raise ValueError(f"invalid bundle ownership manifest schema: {manifest_path}")
+    if payload.get("schema_version") != BUNDLE_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"invalid bundle ownership manifest schema version: {manifest_path}")
+    if (
+        payload.get("service_id") != service_id
+        or payload.get("provider_type") != provider
+        or payload.get("source_bundle") != source_bundle
+    ):
+        raise ValueError(f"bundle ownership manifest identity mismatch: {manifest_path}")
+    owned = _validate_owned_files_mapping(payload.get("owned_files"), context=manifest_path)
+    if payload.get("source_hash") != _bundle_source_hash(owned):
+        raise ValueError(f"bundle ownership manifest source hash mismatch: {manifest_path}")
+    return owned
+
+
+def _read_pending_bundle_install(
+    pending_path: Path,
+    target_path: Path,
+    *,
+    desired_manifest: Mapping[str, Any],
+) -> dict[str, str]:
+    _assert_safe_path(pending_path, target_path)
+    try:
+        payload = json.loads(pending_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid pending bundle ownership manifest: {pending_path}") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema_version", "desired_manifest", "previous_owned_files"}
+        or payload.get("schema_version") != 1
+        or payload.get("desired_manifest") != dict(desired_manifest)
+    ):
+        raise ValueError(
+            "pending bundle install does not match current inputs; rerun the original command or audit/remove "
+            f"{pending_path}"
+        )
+    return _validate_owned_files_mapping(payload.get("previous_owned_files"), context=pending_path)
+
+
+def _validate_owned_bundle_files(
+    target_path: Path,
+    previous_owned: Mapping[str, str],
+    *,
+    desired_owned: Mapping[str, str],
+    resuming: bool,
+) -> None:
+    paths_to_validate = set(previous_owned)
+    if resuming:
+        paths_to_validate.update(desired_owned)
+    for relative in sorted(paths_to_validate):
+        path = target_path / relative
+        _assert_safe_path(path, target_path)
+        if not path.exists():
+            continue
+        if not path.is_file():
+            raise RuntimeError(f"locally modified owned file is not regular: {path}")
+        current_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        allowed_hashes: set[str] = set()
+        previous_hash = previous_owned.get(relative)
+        if previous_hash is not None:
+            allowed_hashes.add(previous_hash)
+        if resuming and relative in desired_owned:
+            allowed_hashes.add(desired_owned[relative])
+        if current_hash not in allowed_hashes:
+            raise RuntimeError(f"locally modified owned file will not be overwritten or deleted: {path}")
+    if not resuming:
+        for relative in sorted(set(desired_owned) - set(previous_owned)):
+            path = target_path / relative
+            _assert_safe_path(path, target_path)
+            if path.exists():
+                raise RuntimeError(f"unowned bundle file will not be overwritten: {path}")
 
 
 def _remove_owned_bundle_file(path: Path, target_path: Path) -> None:
@@ -1157,20 +1498,16 @@ def validate_repo_paths(
             inside_project = False
             error = str(exc)
         exists = resolved.exists()
-        git_repo = exists and (resolved / ".git").exists()
+        git_repo = False
         origin_matches = False
-        if git_repo:
-            actual_remote = _git_output(["git", "-C", str(resolved), "remote", "get-url", "origin"])
-            origin_matches = bool(actual_remote) and _canonical_remote_identity(actual_remote) == _canonical_remote_identity(
-                str(repo["remote"])
-            )
-            if not origin_matches and not error:
-                error = (
-                    f"repository origin mismatch: expected {repo['remote']!r}, "
-                    f"found {actual_remote or '<missing>'!r}"
-                )
-        elif exists and not error:
-            error = "path exists but is not a Git repository"
+        if exists and not error:
+            try:
+                _validate_git_checkout(resolved)
+                git_repo = True
+                _ensure_repo_origin(resolved, str(repo["remote"]))
+                origin_matches = True
+            except (ValueError, RuntimeError) as exc:
+                error = str(exc)
         ok = inside_project and (exists or not require_exists) and (not exists or (git_repo and origin_matches))
         reports.append(
             {
@@ -1218,7 +1555,7 @@ def update_project(
             if not dry_run:
                 for command in app_actions:
                     _run_git_command(command, cwd=root)
-    repo_actions: list[list[str]] = []
+    repo_actions: list[dict[str, Any]] = []
     if not skip_repos:
         repo_actions = sync_repos(
             root,
@@ -1272,8 +1609,12 @@ def doctor(
     expected_paths = {str(repo["path"]).replace("\\", "/").rstrip("/") for repo in all_repos}
     for repo in _select_repositories(all_repos, service_ids):
         path = _resolve_repo_path(root, str(repo["path"]))
-        branch = _git_output(["git", "-C", str(path), "branch", "--show-current"]) if (path / ".git").exists() else ""
-        head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"]) if (path / ".git").exists() else ""
+        valid_git = False
+        if path.exists():
+            _validate_git_checkout(path)
+            valid_git = True
+        branch = _git_output(["git", "-C", str(path), "branch", "--show-current"]) if valid_git else ""
+        head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"]) if valid_git else ""
         reports.append(
             {
                 "name": repo.get("name"),
@@ -1323,12 +1664,9 @@ def start_workers(
     for service in services:
         command = _resolve_command(root, service["start_command"])
         env = {**os.environ, **_resolve_env(root, service.get("env") or {})}
-        log_path = logs_dir / f"{service['service_id']}.log"
-        _assert_safe_path(log_path, root)
-        open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        open_flags |= getattr(os, "O_BINARY", 0)
-        open_flags |= getattr(os, "O_NOFOLLOW", 0)
-        log_file = os.fdopen(os.open(log_path, open_flags, 0o600), "ab")
+        service_id = _validate_service_id(str(service["service_id"]))
+        log_path = logs_dir / f"{service_id}.log"
+        log_file = _open_worker_log(logs_dir, service_id)
         kwargs: dict[str, Any] = {
             "cwd": root,
             "env": env,
@@ -1356,6 +1694,28 @@ def start_workers(
         for process in processes:
             process.terminate()
         return 130
+
+
+def _open_worker_log(logs_dir: Path, service_id: str):
+    _validate_service_id(service_id)
+    _assert_safe_path(logs_dir, logs_dir)
+    if not logs_dir.is_dir():
+        raise ValueError(f"worker logs directory does not exist: {logs_dir}")
+    filename = f"{service_id}.log"
+    log_path = logs_dir / filename
+    _assert_safe_path(log_path, logs_dir)
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    open_flags |= getattr(os, "O_BINARY", 0)
+    open_flags |= getattr(os, "O_NOFOLLOW", 0)
+    if os.open in os.supports_dir_fd and hasattr(os, "O_DIRECTORY"):
+        directory_fd = os.open(logs_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            descriptor = os.open(filename, open_flags, 0o600, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+    else:
+        descriptor = os.open(log_path, open_flags, 0o600)
+    return os.fdopen(descriptor, "ab")
 
 
 def _is_link_or_reparse(path: Path) -> bool:
@@ -1629,7 +1989,13 @@ def _resolve_repo_path(root: Path, raw: str) -> Path:
 
 def _git_output(command: list[str]) -> str:
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            command,
+            env=_git_environment(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     except OSError:
         return ""
     return result.stdout.strip() if result.returncode == 0 else ""
@@ -1667,8 +2033,7 @@ def _load_cli_repositories(
             path = _resolve_repo_path(root, str(repo["path"]))
             if not path.exists():
                 continue
-            if not (path / ".git").exists():
-                raise RuntimeError(f"confirmed repository path is not a Git checkout: {path}")
+            _validate_git_checkout(path)
             _ensure_repo_origin(path, str(repo["remote"]))
     return repositories
 
@@ -1803,7 +2168,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(
             json.dumps(
-                {"actions": [{"argv": command} for command in actions]},
+                {"actions": actions},
                 ensure_ascii=False,
                 indent=2,
             )

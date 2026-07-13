@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -90,6 +92,18 @@ def _write_repo_lock(root: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _init_git_checkout(path: Path, remote: str) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "tests@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Deployment Tests"], check=True)
+    tracked = path / "tracked.txt"
+    tracked.write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", "initial"], check=True)
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True)
 
 
 def test_render_local_all_services_from_repo_lock(tmp_path: Path) -> None:
@@ -207,7 +221,7 @@ def test_sync_repos_rejects_paths_outside_project(tmp_path: Path) -> None:
                         "name": "bad",
                         "provider_type": "indextts",
                         "path": "../outside",
-                        "remote": "https://example.invalid/repo.git",
+                        "remote": "https://github.com/example/repo.git",
                         "branch": "main",
                         "service_id": "local-bad",
                         "default_selected": True,
@@ -229,7 +243,7 @@ def test_sync_repos_dry_run_uses_shallow_partial_clone(tmp_path: Path) -> None:
 
     actions = deploy.sync_repos(tmp_path, dry_run=True)
 
-    clone = actions[0]
+    clone = actions[0]["argv"]
     assert clone[:3] == ["git", "clone", "--depth"]
     assert "1" in clone
     assert "--filter=blob:none" in clone
@@ -252,7 +266,7 @@ def test_sync_repos_dry_run_does_not_create_nested_repo_parents(tmp_path: Path) 
         repositories=repositories,
     )
 
-    assert any(command[:2] == ["git", "clone"] for command in actions)
+    assert any(action.get("argv", [])[:2] == ["git", "clone"] for action in actions)
     assert not (tmp_path / "repo").exists()
 
 
@@ -263,15 +277,8 @@ def test_sync_repos_refuses_dirty_existing_repo_by_default(
     deploy = _load_deploy_module(repo_root)
     _write_repo_lock(tmp_path)
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git").mkdir(parents=True)
-
-    monkeypatch.setattr(
-        deploy,
-        "_git_output",
-        lambda command: " M local_patch.py"
-        if command[-2:] == ["status", "--porcelain"]
-        else "",
-    )
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    (target / "tracked.txt").write_text("local patch\n", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="refusing to update dirty service repository"):
         deploy.sync_repos(
@@ -329,7 +336,7 @@ def test_run_clone_with_fallback_accepts_positional_helper_interface(
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
-    actions: list[list[str]] = []
+    actions: list[dict[str, object]] = []
     target = tmp_path / "repo" / "GPT-SoVITS-main"
 
     monkeypatch.setattr(deploy, "_run_git_command", lambda command, *, cwd: None)
@@ -344,7 +351,9 @@ def test_run_clone_with_fallback_accepts_positional_helper_interface(
     )
 
     assert actions == [
-        [
+        {
+            "action": "git",
+            "argv": [
             "git",
             "clone",
             "--depth",
@@ -353,15 +362,15 @@ def test_run_clone_with_fallback_accepts_positional_helper_interface(
             "--branch",
             "main",
             "--single-branch",
+            "--",
             "https://github.com/XucroYuri/GPT-SoVITS.git",
             str(target),
-        ]
+            ],
+        }
     ]
 
 
-def test_sync_repos_preserves_existing_non_git_target_on_clone_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_sync_repos_rejects_existing_non_git_target_without_modifying_it(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
     target = tmp_path / "repo" / "GPT-SoVITS-main"
@@ -388,16 +397,8 @@ def test_sync_repos_preserves_existing_non_git_target_on_clone_failure(
         encoding="utf-8",
     )
 
-    def fake_run(command: list[str], cwd: Path) -> None:
-        if command[:2] == ["git", "clone"] and "--filter=blob:none" in command:
-            raise deploy.subprocess.CalledProcessError(128, command)
-        if command[:2] == ["git", "clone"]:
-            (Path(command[-1]) / ".git").mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setattr(deploy, "_run_git_command", fake_run)
-    monkeypatch.setattr(deploy, "_git_output", lambda command: "bf81cdb14a38b674b6e9996dabc97340bc9978d2")
-
-    deploy.sync_repos(tmp_path, dry_run=False)
+    with pytest.raises(RuntimeError, match="not a supported Git checkout"):
+        deploy.sync_repos(tmp_path, dry_run=False)
 
     assert marker.exists()
 
@@ -444,8 +445,9 @@ def test_sync_repos_fetches_locked_commit_before_checkout_when_head_differs(
     fetch_command = ["git", "-C", str(target), "fetch", "origin", commit]
     checkout_command = ["git", "-C", str(target), "checkout", commit]
 
-    assert fetch_command in dry_actions
-    assert dry_actions.index(fetch_command) < dry_actions.index(checkout_command)
+    dry_commands = [action["argv"] for action in dry_actions if action["action"] == "git"]
+    assert fetch_command in dry_commands
+    assert dry_commands.index(fetch_command) < dry_commands.index(checkout_command)
     assert fetch_command in calls
     assert calls.index(fetch_command) < calls.index(checkout_command)
 
@@ -457,7 +459,13 @@ def test_sync_repos_dry_run_skips_locked_commit_actions_when_head_matches(
     deploy = _load_deploy_module(repo_root)
     target = tmp_path / "repo" / "GPT-SoVITS-main"
     commit = "bf81cdb14a38b674b6e9996dabc97340bc9978d2"
-    (target / ".git").mkdir(parents=True)
+    _init_git_checkout(target, "git@github.com:XucroYuri/GPT-SoVITS.git")
+    commit = subprocess.run(
+        ["git", "-C", str(target), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     (tmp_path / "repo.lock.json").write_text(
         json.dumps(
             {
@@ -477,23 +485,14 @@ def test_sync_repos_dry_run_skips_locked_commit_actions_when_head_matches(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(
-        deploy,
-        "_git_output",
-        lambda command: (
-            "git@github.com:XucroYuri/GPT-SoVITS.git"
-            if command[-3:] == ["remote", "get-url", "origin"]
-            else (commit if command[-2:] == ["rev-parse", "HEAD"] else "")
-        ),
-    )
-
     actions = deploy.sync_repos(tmp_path, dry_run=True)
 
     fetch_command = ["git", "-C", str(target), "fetch", "origin", commit]
     checkout_command = ["git", "-C", str(target), "checkout", commit]
 
-    assert fetch_command not in actions
-    assert checkout_command not in actions
+    commands = [action["argv"] for action in actions if action["action"] == "git"]
+    assert fetch_command not in commands
+    assert checkout_command not in commands
 
 
 def test_resolve_command_rejects_paths_outside_project(tmp_path: Path) -> None:
@@ -830,9 +829,9 @@ def test_sync_repos_latest_dry_run_skips_locked_commit_checkout(tmp_path: Path) 
     )
 
     assert len(actions) == 1
-    assert actions[0][:2] == ["git", "clone"]
-    assert "index-tts" in actions[0][-1]
-    assert not any(command[-2:-1] == ["fetch"] for command in actions)
+    assert actions[0]["argv"][:2] == ["git", "clone"]
+    assert "index-tts" in actions[0]["argv"][-1]
+    assert not any(action.get("argv", [])[-2:-1] == ["fetch"] for action in actions)
 
 
 def test_install_update_scripts_writes_repo_local_helpers(tmp_path: Path) -> None:
@@ -840,7 +839,7 @@ def test_install_update_scripts_writes_repo_local_helpers(tmp_path: Path) -> Non
     deploy = _load_deploy_module(repo_root)
     _write_repo_lock(tmp_path)
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git").mkdir(parents=True)
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
 
     reports = deploy.install_update_scripts(tmp_path, service_ids={"local-indextts"})
 
@@ -926,7 +925,7 @@ def test_install_repo_bundles_copies_provider_helpers_and_excludes_them(tmp_path
     (bundle / "tts-more-prepare.sh").write_text("#!/usr/bin/env bash\necho prepare\n", encoding="utf-8")
     (bundle / "README.md").write_text("IndexTTS helper\n", encoding="utf-8")
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git").mkdir(parents=True)
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
 
     reports = deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
 
@@ -960,7 +959,11 @@ def test_update_project_dry_run_reports_app_and_repo_actions_without_writes(
         ["git", "-C", str(tmp_path), "fetch", "--prune", "origin", "master"],
         ["git", "-C", str(tmp_path), "pull", "--ff-only", "origin", "master"],
     ]
-    assert any("CosyVoice" in command[-1] for command in payload["repo_actions"] if command[:2] == ["git", "clone"])
+    assert any(
+        "CosyVoice" in action["argv"][-1]
+        for action in payload["repo_actions"]
+        if action.get("argv", [])[:2] == ["git", "clone"]
+    )
     assert payload["update_scripts"][0]["exists"] is False
     assert payload["services_output"] == "data/local/services.json"
     assert payload["services_rendered"] is False
@@ -1011,16 +1014,8 @@ def test_update_project_refuses_dirty_service_repo_by_default(
     deploy = _load_deploy_module(repo_root)
     _write_repo_lock(tmp_path)
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git").mkdir(parents=True)
-
-    def fake_git_output(command: list[str]) -> str:
-        if command[-2:] == ["status", "--porcelain"]:
-            return " M local_patch.py"
-        if command[-2:] == ["branch", "--show-current"]:
-            return "master"
-        return ""
-
-    monkeypatch.setattr(deploy, "_git_output", fake_git_output)
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    (target / "tracked.txt").write_text("local patch\n", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="refusing to update dirty service repository"):
         deploy.update_project(
@@ -1038,20 +1033,8 @@ def test_update_project_force_reset_repos_allows_reset_actions_for_dirty_repo(
     deploy = _load_deploy_module(repo_root)
     _write_repo_lock(tmp_path)
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git").mkdir(parents=True)
-    monkeypatch.setattr(
-        deploy,
-        "_git_output",
-        lambda command: (
-            " M local_patch.py"
-            if command[-2:] == ["status", "--porcelain"]
-            else (
-                "git@github.com:XucroYuri/index-tts.git"
-                if command[-3:] == ["remote", "get-url", "origin"]
-                else ""
-            )
-        ),
-    )
+    _init_git_checkout(target, "git@github.com:XucroYuri/index-tts.git")
+    (target / "tracked.txt").write_text("local patch\n", encoding="utf-8")
 
     payload = deploy.update_project(
         tmp_path,
@@ -1061,7 +1044,9 @@ def test_update_project_force_reset_repos_allows_reset_actions_for_dirty_repo(
         force_reset_repos=True,
     )
 
-    assert ["git", "-C", str(target), "reset", "--hard", "origin/main"] in payload["repo_actions"]
+    assert ["git", "-C", str(target), "reset", "--hard", "origin/main"] in [
+        action["argv"] for action in payload["repo_actions"] if action["action"] == "git"
+    ]
 
 
 def test_repo_path_confirmation_requires_exact_complete_service_id_map(tmp_path: Path) -> None:
@@ -1160,23 +1145,15 @@ def test_repo_paths_are_limited_to_dedicated_repo_area(tmp_path: Path) -> None:
 
 
 def test_existing_repo_origin_must_match_manifest_before_sync(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
     _write_repo_lock(tmp_path)
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git").mkdir(parents=True)
+    _init_git_checkout(target, "https://github.com/example/unrelated.git")
     repositories = deploy.load_repo_lock(tmp_path)
 
-    def mismatched_origin(command: list[str]) -> str:
-        if command[-3:] == ["remote", "get-url", "origin"]:
-            return "https://github.com/example/unrelated.git"
-        if command[-2:] == ["status", "--porcelain"]:
-            return ""
-        return "7264ce2a9a0924becb6b8da3f60725f7663de089"
-
-    monkeypatch.setattr(deploy, "_git_output", mismatched_origin)
     with pytest.raises(RuntimeError, match="origin mismatch"):
         deploy.sync_repos(
             tmp_path,
@@ -1185,14 +1162,9 @@ def test_existing_repo_origin_must_match_manifest_before_sync(
             repositories=repositories,
         )
 
-    monkeypatch.setattr(
-        deploy,
-        "_git_output",
-        lambda command: (
-            "git@github.com:XucroYuri/index-tts.git"
-            if command[-3:] == ["remote", "get-url", "origin"]
-            else ("" if command[-2:] == ["status", "--porcelain"] else "7264ce2a9a0924becb6b8da3f60725f7663de089")
-        ),
+    subprocess.run(
+        ["git", "-C", str(target), "remote", "set-url", "origin", "git@github.com:XucroYuri/index-tts.git"],
+        check=True,
     )
     actions = deploy.sync_repos(
         tmp_path,
@@ -1200,14 +1172,14 @@ def test_existing_repo_origin_must_match_manifest_before_sync(
         service_ids={"local-indextts"},
         repositories=repositories,
     )
-    assert any(command[-2:] == ["origin", "main"] for command in actions)
+    assert any(action.get("argv", [])[-2:] == ["origin", "main"] for action in actions)
 
 
 def test_update_sidecar_rejects_manifest_code_injection_without_execution(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git" / "info").mkdir(parents=True)
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
     marker = tmp_path / "manifest-injection-marker"
     repositories = [
         {
@@ -1243,12 +1215,12 @@ def test_update_sidecar_rejects_manifest_code_injection_without_execution(tmp_pa
     assert not marker.exists()
 
 
-@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not installed")
+@pytest.mark.skipif(os.name != "nt", reason="native PowerShell validation runs in Windows CI")
 def test_powershell_update_launcher_rejects_manifest_code_injection(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git" / "info").mkdir(parents=True)
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
     marker = tmp_path / "powershell-injection-marker"
     repositories = [
         {
@@ -1300,7 +1272,7 @@ def test_helper_install_rejects_symlinked_destinations_and_sources(tmp_path: Pat
     bundle.mkdir(parents=True)
     (bundle / "tts-more-prepare.sh").write_text("echo safe\n", encoding="utf-8")
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git" / "info").mkdir(parents=True)
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
     outside = tmp_path / "outside"
     outside.mkdir()
     (target / "tts-more").symlink_to(outside, target_is_directory=True)
@@ -1335,7 +1307,7 @@ def test_helper_install_rejects_junction_or_reparse_points(
     bundle.mkdir(parents=True)
     (bundle / "README.md").write_text("safe\n", encoding="utf-8")
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git" / "info").mkdir(parents=True)
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
     redirected = target / "tts-more"
     redirected.mkdir()
     original = deploy._is_link_or_reparse
@@ -1460,7 +1432,7 @@ def test_bundle_upgrade_removes_stale_owned_files_and_is_stable(tmp_path: Path) 
     old_source = bundle / "old-helper.sh"
     old_source.write_text("old\n", encoding="utf-8")
     target = tmp_path / "repo" / "index-tts"
-    (target / ".git" / "info").mkdir(parents=True)
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
 
     deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
     user_file = target / "tts-more" / "user-notes.txt"
@@ -1486,3 +1458,582 @@ def test_committed_repo_lock_marks_every_default_explicitly() -> None:
     repositories = json.loads((repo_root / "repo.lock.json").read_text(encoding="utf-8"))["repositories"]
 
     assert all(type(repo.get("default_selected")) is bool for repo in repositories)
+
+
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "ext::sh -c touch marker",
+        "helper::payload",
+        "-uploader",
+        "../local/repo",
+        "/tmp/local-repo",
+        "file:///tmp/local-repo",
+        "https://user@github.com/XucroYuri/index-tts.git",
+        "https://user:secret@github.com/XucroYuri/index-tts.git",
+        "https://github.com:444/XucroYuri/index-tts.git",
+        "ssh://git@github.com:2222/XucroYuri/index-tts.git",
+        "ssh://root@github.com/XucroYuri/index-tts.git",
+        "git@example.com:XucroYuri/index-tts.git",
+        "https://github.com./XucroYuri/index-tts.git",
+        "https://github.com/XucroYuri/index-tts.git?x=1",
+        "https://github.com/XucroYuri/index-tts.git#fragment",
+        "https://github.com/XucroYuri/index%2dtts.git",
+        "https://github.com/XucroYuri/index-tts.git\nhelper::payload",
+        "https://github.com/XucroYuri/index-tts.git\x00",
+    ],
+)
+def test_remote_policy_rejects_non_github_or_unsafe_transports(remote: str) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+
+    with pytest.raises(ValueError, match="GitHub remote"):
+        deploy._parse_github_remote(remote)
+
+
+def test_remote_policy_accepts_only_equivalent_default_github_endpoints() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    accepted = [
+        "https://github.com/XucroYuri/index-tts.git",
+        "https://github.com:443/XucroYuri/index-tts",
+        "ssh://git@github.com/XucroYuri/index-tts.git",
+        "ssh://git@github.com:22/XucroYuri/index-tts.git",
+        "git@github.com:XucroYuri/index-tts.git",
+        "https://GITHUB.COM/xucroyuri/INDEX-TTS.git",
+    ]
+
+    identities = {deploy._parse_github_remote(remote) for remote in accepted}
+
+    assert identities == {("github.com", "xucroyuri", "index-tts")}
+
+
+def test_repo_lock_rejects_remote_helper_before_clone(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    payload = json.loads((tmp_path / "repo.lock.json").read_text(encoding="utf-8"))
+    payload["repositories"][0]["remote"] = "ext::sh -c touch marker"
+    (tmp_path / "repo.lock.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="GitHub remote"):
+        deploy.load_repo_lock(tmp_path)
+
+
+def test_clone_command_terminates_options_before_remote(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    remote = "https://github.com/XucroYuri/index-tts.git"
+
+    command = deploy._clone_command(remote, "main", tmp_path / "repo" / "index-tts")
+
+    assert command[command.index(remote) - 1] == "--"
+
+
+def test_generated_updater_rejects_unsafe_remote_before_invoking_git(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+    sidecar = target / "tts-more-update.json"
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    payload["remote"] = "ext::sh -c touch marker"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "git-invoked"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(f"#!/usr/bin/env bash\ntouch {marker!s}\nexit 1\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+    result = subprocess.run(
+        [sys.executable, str(target / "tts-more-update.py")],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "GitHub remote" in result.stderr
+    assert not marker.exists()
+
+
+def test_generated_updater_rejects_gitdir_file_before_invoking_git(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+    shutil.rmtree(target / ".git")
+    (target / ".git").write_text("gitdir: ../../outside\n", encoding="utf-8")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "git-invoked"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(f"#!/usr/bin/env bash\ntouch {marker!s}\nexit 1\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+    result = subprocess.run(
+        [sys.executable, str(target / "tts-more-update.py")],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "gitdir files are not supported" in result.stderr
+    assert not marker.exists()
+
+
+def test_clean_is_selection_scoped_and_dry_run_matches_real_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    selected = tmp_path / "repo" / "index-tts"
+    unselected = tmp_path / "repo" / "CosyVoice"
+    extra = tmp_path / "repo" / "user-extra"
+    _init_git_checkout(selected, "https://github.com/XucroYuri/index-tts.git")
+    _init_git_checkout(unselected, "https://github.com/XucroYuri/CosyVoice.git")
+    extra.mkdir()
+    (extra / "keep.txt").write_text("keep\n", encoding="utf-8")
+    repositories = deploy.load_repo_lock(tmp_path)
+
+    dry_actions = deploy.sync_repos(
+        tmp_path,
+        clean=True,
+        dry_run=True,
+        service_ids={"local-indextts"},
+        repositories=repositories,
+    )
+    monkeypatch.setattr(deploy, "_run_git_command", lambda command, *, cwd: None)
+    real_actions = deploy.sync_repos(
+        tmp_path,
+        clean=True,
+        dry_run=False,
+        service_ids={"local-indextts"},
+        repositories=repositories,
+    )
+
+    assert dry_actions == real_actions
+    assert dry_actions[0] == {"action": "remove-repository", "path": str(selected)}
+    assert any(action.get("argv", [])[:2] == ["git", "clone"] for action in dry_actions)
+    assert not selected.exists()
+    assert unselected.exists()
+    assert (extra / "keep.txt").read_text(encoding="utf-8") == "keep\n"
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_clean_rejects_dirty_selected_repository_without_deleting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    selected = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(selected, "https://github.com/XucroYuri/index-tts.git")
+    dirty = selected / "tracked.txt"
+    dirty.write_text("local modification\n", encoding="utf-8")
+    monkeypatch.setattr(
+        deploy,
+        "_run_git_command",
+        lambda command, *, cwd: (_ for _ in ()).throw(AssertionError("clean reached Git mutation")),
+    )
+
+    with pytest.raises(RuntimeError, match="dirty service repository"):
+        deploy.sync_repos(
+            tmp_path,
+            clean=True,
+            dry_run=dry_run,
+            service_ids={"local-indextts"},
+        )
+
+    assert dirty.read_text(encoding="utf-8") == "local modification\n"
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_clean_rejects_unrecognized_selected_path_without_deleting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    selected = tmp_path / "repo" / "index-tts"
+    selected.mkdir(parents=True)
+    marker = selected / "user-data.txt"
+    marker.write_text("preserve\n", encoding="utf-8")
+    monkeypatch.setattr(
+        deploy,
+        "_run_git_command",
+        lambda command, *, cwd: (_ for _ in ()).throw(AssertionError("clean reached Git mutation")),
+    )
+
+    with pytest.raises(RuntimeError, match="not a supported Git checkout|unrecognized"):
+        deploy.sync_repos(
+            tmp_path,
+            clean=True,
+            dry_run=dry_run,
+            service_ids={"local-indextts"},
+        )
+
+    assert marker.read_text(encoding="utf-8") == "preserve\n"
+
+
+@pytest.mark.parametrize("metadata_kind", ["symlink", "gitdir-file", "corrupt-directory"])
+def test_git_metadata_policy_rejects_redirected_worktree_or_corrupt_metadata_before_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_kind: str,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    target = tmp_path / "repo" / "index-tts"
+    target.mkdir(parents=True)
+    dot_git = target / ".git"
+    if metadata_kind == "symlink":
+        outside = tmp_path / "outside-git"
+        outside.mkdir()
+        dot_git.symlink_to(outside, target_is_directory=True)
+        monkeypatch.setattr(
+            deploy,
+            "_git_output",
+            lambda command: (_ for _ in ()).throw(AssertionError("Git ran before metadata validation")),
+        )
+    elif metadata_kind == "gitdir-file":
+        dot_git.write_text("gitdir: ../../outside-git\n", encoding="utf-8")
+        monkeypatch.setattr(
+            deploy,
+            "_git_output",
+            lambda command: (_ for _ in ()).throw(AssertionError("Git ran before metadata validation")),
+        )
+    else:
+        dot_git.mkdir()
+
+    with pytest.raises((ValueError, RuntimeError), match="Git metadata|worktree|corrupt"):
+        deploy.sync_repos(tmp_path, dry_run=True, service_ids={"local-indextts"})
+
+
+@pytest.mark.parametrize(
+    "service_id",
+    [
+        "../escape",
+        "nested/service",
+        r"nested\service",
+        "/absolute",
+        r"C:\absolute",
+        "line\nbreak",
+        ".hidden",
+        "trailing-",
+        "a" * 65,
+    ],
+)
+def test_manifest_rejects_unsafe_service_ids(tmp_path: Path, service_id: str) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    payload = json.loads((tmp_path / "repo.lock.json").read_text(encoding="utf-8"))
+    payload["repositories"][0]["service_id"] = service_id
+    (tmp_path / "repo.lock.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="service_id"):
+        deploy.load_repo_lock(tmp_path)
+
+
+def test_worker_log_open_is_strictly_bounded_to_logs_directory(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    logs_dir = tmp_path / "data" / ".runtime" / "logs"
+    logs_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.log"
+    outside.write_text("keep\n", encoding="utf-8")
+    (logs_dir / "local-indextts.log").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        deploy._open_worker_log(logs_dir, "local-indextts")
+    with pytest.raises(ValueError, match="service_id"):
+        deploy._open_worker_log(logs_dir, "../../../outside")
+
+    assert outside.read_text(encoding="utf-8") == "keep\n"
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"owned_files": ["user-notes.txt"]},
+        {
+            "schema_version": 3,
+            "service_id": "local-cosyvoice",
+            "provider_type": "cosyvoice",
+            "source_bundle": "deployment/tts-repos/cosyvoice",
+            "source_hash": "0" * 64,
+            "owned_files": {"user-notes.txt": "0" * 64},
+        },
+    ],
+)
+def test_bundle_rejects_untrusted_or_cross_provider_ownership_manifest(
+    tmp_path: Path, manifest: dict[str, object]
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    (bundle / "current.sh").write_text("current\n", encoding="utf-8")
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    installed = target / "tts-more"
+    installed.mkdir()
+    user_file = installed / "user-notes.txt"
+    user_file.write_text("preserve\n", encoding="utf-8")
+    (installed / "tts-more-repo.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ownership manifest"):
+        deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+    assert user_file.read_text(encoding="utf-8") == "preserve\n"
+
+
+def test_bundle_refuses_to_delete_or_overwrite_modified_owned_file(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    source = bundle / "owned.sh"
+    source.write_text("version one\n", encoding="utf-8")
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+    owned = target / "tts-more" / "owned.sh"
+    owned.write_text("local modification\n", encoding="utf-8")
+    source.unlink()
+
+    with pytest.raises(RuntimeError, match="locally modified owned file"):
+        deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+    assert owned.read_text(encoding="utf-8") == "local modification\n"
+
+
+def test_bundle_manifest_records_strong_identity_and_content_hashes(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    payload = b"helper content\n"
+    (bundle / "helper.sh").write_bytes(payload)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+
+    deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+    manifest = json.loads((target / "tts-more" / "tts-more-repo.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 3
+    assert manifest["service_id"] == "local-indextts"
+    assert manifest["provider_type"] == "indextts"
+    assert manifest["source_bundle"] == "deployment/tts-repos/indextts"
+    assert manifest["owned_files"] == {"helper.sh": hashlib.sha256(payload).hexdigest()}
+    assert len(manifest["source_hash"]) == 64
+
+
+def test_interrupted_bundle_upgrade_recovers_on_identical_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    (bundle / "a.sh").write_text("a1\n", encoding="utf-8")
+    (bundle / "b.sh").write_text("b1\n", encoding="utf-8")
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+    (bundle / "a.sh").write_text("a2\n", encoding="utf-8")
+    (bundle / "b.sh").write_text("b2\n", encoding="utf-8")
+    original = deploy._atomic_write_bytes
+    failed = False
+
+    def fail_after_first_bundle_copy(path: Path, payload: bytes, *, boundary: Path, mode: int | None = None) -> None:
+        nonlocal failed
+        original(path, payload, boundary=boundary, mode=mode)
+        if path.name == "a.sh" and not failed:
+            failed = True
+            raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(deploy, "_atomic_write_bytes", fail_after_first_bundle_copy)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+    pending = target / "tts-more" / "tts-more-install-pending.json"
+    assert pending.exists()
+    monkeypatch.setattr(deploy, "_atomic_write_bytes", original)
+
+    deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+    assert not pending.exists()
+    assert (target / "tts-more" / "a.sh").read_text(encoding="utf-8") == "a2\n"
+    assert (target / "tts-more" / "b.sh").read_text(encoding="utf-8") == "b2\n"
+
+
+def test_forged_pending_bundle_manifest_cannot_claim_user_files(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    (bundle / "current.sh").write_text("current\n", encoding="utf-8")
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    installed = target / "tts-more"
+    installed.mkdir()
+    user_file = installed / "user-notes.txt"
+    user_file.write_text("preserve\n", encoding="utf-8")
+    current_hash = hashlib.sha256(b"current\n").hexdigest()
+    desired_manifest = {
+        "schema_version": 3,
+        "service_id": "local-indextts",
+        "provider_type": "indextts",
+        "source_bundle": "deployment/tts-repos/indextts",
+        "source_hash": deploy._bundle_source_hash({"current.sh": current_hash}),
+        "owned_files": {"current.sh": current_hash},
+    }
+    forged = {
+        "schema_version": 1,
+        "desired_manifest": desired_manifest,
+        "previous_owned_files": {
+            "user-notes.txt": hashlib.sha256(b"preserve\n").hexdigest(),
+        },
+    }
+    (installed / "tts-more-install-pending.json").write_text(json.dumps(forged), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="pending bundle ownership does not match"):
+        deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+    assert user_file.read_text(encoding="utf-8") == "preserve\n"
+
+
+def test_interrupted_bundle_rerun_rejects_locally_modified_new_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    (bundle / "new.sh").write_text("managed\n", encoding="utf-8")
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    original = deploy._atomic_write_bytes
+
+    def fail_after_copy(path: Path, payload: bytes, *, boundary: Path, mode: int | None = None) -> None:
+        original(path, payload, boundary=boundary, mode=mode)
+        if path.name == "new.sh":
+            raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(deploy, "_atomic_write_bytes", fail_after_copy)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+    (target / "tts-more" / "new.sh").write_text("local edit\n", encoding="utf-8")
+    monkeypatch.setattr(deploy, "_atomic_write_bytes", original)
+
+    with pytest.raises(RuntimeError, match="locally modified owned file"):
+        deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows deployment validation")
+@pytest.mark.parametrize("powershell", ["powershell.exe", "pwsh.exe"])
+def test_windows_native_powershell_launchers_reject_unsafe_remote(
+    tmp_path: Path, powershell: str
+) -> None:
+    executable = shutil.which(powershell)
+    assert executable is not None, f"required Windows CI shell is missing: {powershell}"
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    repositories[0]["path"] = "repo/index-tts"
+    deploy.install_update_scripts(tmp_path, repositories=repositories)
+    sidecar = target / "tts-more-update.json"
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    payload["remote"] = "ext::cmd /c echo unsafe"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    env = {**os.environ, "TTS_MORE_UPDATE_PYTHON": sys.executable}
+
+    result = subprocess.run(
+        [executable, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(target / "tts-more-update.ps1")],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "GitHub remote" in result.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows deployment validation")
+def test_windows_native_drive_junction_and_gitdir_policy(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    absolute = (tmp_path / "repo" / "index-tts").resolve(strict=False)
+    assert absolute.drive
+    assert deploy._resolve_repo_path(tmp_path, str(absolute)) == absolute
+    share_name = f"tts-more-{os.getpid()}"
+    share = subprocess.run(
+        ["net.exe", "share", f"{share_name}={tmp_path}", "/GRANT:Everyone,FULL"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert share.returncode == 0, share.stderr or share.stdout
+    try:
+        unc_root = Path(f"\\\\localhost\\{share_name}")
+        unc_repo = unc_root / "repo" / "unc-index-tts"
+        assert deploy._resolve_repo_path(unc_root, str(unc_repo)) == unc_repo.resolve(strict=False)
+    finally:
+        removed_share = subprocess.run(
+            ["net.exe", "share", share_name, "/delete", "/y"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert removed_share.returncode == 0, removed_share.stderr or removed_share.stdout
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    junction = target / "tts-more"
+    result = subprocess.run(
+        ["cmd.exe", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    bundle = tmp_path / "deployment" / "tts-repos" / "indextts"
+    bundle.mkdir(parents=True)
+    (bundle / "helper.ps1").write_text("Write-Host safe\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
+
+    os.rmdir(junction)
+    shutil.rmtree(target / ".git")
+    (target / ".git").write_text("gitdir: C:\\outside\\worktree\n", encoding="utf-8")
+    with pytest.raises((ValueError, RuntimeError), match="worktree|Git metadata"):
+        deploy.sync_repos(tmp_path, dry_run=True, service_ids={"local-indextts"})
