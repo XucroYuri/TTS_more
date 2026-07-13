@@ -15,6 +15,6 @@
     "artifact-transfer"
   ],
   "model_profile": "full-quality-default",
-  "runtime": "runtime/runtime.7z",
+  "runtime": "runtime/runtime.zip",
   "sha256_manifest": "SHA256SUMS.txt"
 }
