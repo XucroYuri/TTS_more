@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from urllib.error import URLError
@@ -1401,6 +1401,14 @@ def _start_command(
     ]
 
 
+def _repo_scoped_model_dir(repo_path: str, model_dir: str, platform_name: str) -> str:
+    path_type = PureWindowsPath if platform_name == "windows" else PurePosixPath
+    target_model_dir = path_type(model_dir)
+    if target_model_dir.is_absolute():
+        return model_dir
+    return (path_type(repo_path) / target_model_dir).as_posix()
+
+
 def _worker_env(repo: dict[str, Any], platform_name: str) -> dict[str, str]:
     provider = str(repo["provider_type"])
     path = str(repo["path"])
@@ -1418,7 +1426,8 @@ def _worker_env(repo: dict[str, Any], platform_name: str) -> dict[str, str]:
     elif provider == "cosyvoice":
         env["TTS_MORE_COSYVOICE_REPO"] = path
         env["TTS_MORE_COSYVOICE_PYTHON"] = _python_path(repo, platform_name)
-        env["TTS_MORE_COSYVOICE_MODEL_DIR"] = str(repo.get("model_dir") or "pretrained_models/CosyVoice-300M")
+        model_dir = str(repo.get("model_dir") or "pretrained_models/CosyVoice-300M")
+        env["TTS_MORE_COSYVOICE_MODEL_DIR"] = _repo_scoped_model_dir(path, model_dir, platform_name)
     return env
 
 

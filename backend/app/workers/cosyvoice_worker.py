@@ -217,12 +217,9 @@ def _reference_audio_path(params: dict[str, Any]) -> str:
     )
 
 
-def _load_audio(path: str) -> Any:
-    """Load a 16kHz reference audio as the upstream expects. TODO(GPU-env):
-    confirm the exact loader (torchaudio vs load_wav)."""
-    import torchaudio  # type: ignore  # provided by the CosyVoice env
-    speech, sample_rate = torchaudio.load(path)
-    return speech
+def _load_audio(path: str) -> str:
+    """Let the upstream CosyVoice frontend load and resample reference audio."""
+    return path
 
 
 def _chunk_to_wav(chunk: Any, sample_rate: int | None = None) -> bytes:
@@ -230,7 +227,7 @@ def _chunk_to_wav(chunk: Any, sample_rate: int | None = None) -> bytes:
     import numpy as np
     from scipy.io import wavfile  # type: ignore
 
-    data = np.asarray(chunk.get("tts_speech", chunk), dtype=np.float32)
+    data = np.asarray(chunk.get("tts_speech", chunk), dtype=np.float32).reshape(-1)
     buf = io.BytesIO()
     resolved_rate = int(chunk.get("sample_rate", sample_rate or 22050)) if isinstance(chunk, dict) else int(sample_rate or 22050)
     wavfile.write(buf, resolved_rate, data)

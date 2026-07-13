@@ -520,6 +520,41 @@ def test_cosyvoice_zero_shot_uses_upstream_positional_signature_and_prompt_audio
     assert chunks == [b"RIFFdemo"]
 
 
+def test_cosyvoice_load_audio_defers_to_upstream(monkeypatch) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    def fail_load(_path: str):
+        raise AssertionError("the upstream CosyVoice frontend must load the reference audio")
+
+    monkeypatch.setitem(sys.modules, "torchaudio", types.SimpleNamespace(load=fail_load))
+
+    assert worker._load_audio("ref.wav") == "ref.wav"
+
+
+def test_cosyvoice_chunk_to_wav_flattens_single_batch_dimension(monkeypatch) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    observed: dict[str, object] = {}
+
+    def fake_write(buffer, sample_rate: int, data) -> None:
+        observed.update(sample_rate=sample_rate, shape=data.shape)
+        buffer.write(b"RIFFdemo")
+
+    scipy_module = types.ModuleType("scipy")
+    scipy_io_module = types.ModuleType("scipy.io")
+    scipy_io_module.wavfile = types.SimpleNamespace(write=fake_write)
+    scipy_module.io = scipy_io_module
+    monkeypatch.setitem(sys.modules, "scipy", scipy_module)
+    monkeypatch.setitem(sys.modules, "scipy.io", scipy_io_module)
+
+    encoded = worker._chunk_to_wav(
+        {"tts_speech": [[0.0, 0.25, -0.25]], "sample_rate": 24_000}
+    )
+
+    assert encoded == b"RIFFdemo"
+    assert observed == {"sample_rate": 24_000, "shape": (3,)}
+
+
 def test_cosyvoice_ensure_pipeline_uses_auto_model(tmp_path: Path, monkeypatch) -> None:
     import app.workers.cosyvoice_worker as worker
 

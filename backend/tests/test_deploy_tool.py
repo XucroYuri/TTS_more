@@ -203,7 +203,50 @@ def test_render_local_all_services_from_repo_lock(tmp_path: Path) -> None:
     assert gpt_main["env"]["TTS_MORE_GPTSOVITS_REPO"] == "repo/GPT-SoVITS-main"
     assert gpt_main["start_command"][0] == "repo/GPT-SoVITS-main/.venv/Scripts/python.exe"
     assert services[1]["env"]["TTS_MORE_INDEXTTS_MODEL_DIR"] == "repo/index-tts/checkpoints"
-    assert services[2]["env"]["TTS_MORE_COSYVOICE_MODEL_DIR"] == "pretrained_models/CosyVoice-300M"
+    assert (
+        services[2]["env"]["TTS_MORE_COSYVOICE_MODEL_DIR"]
+        == "repo/CosyVoice/pretrained_models/CosyVoice-300M"
+    )
+
+
+def test_cosyvoice_worker_env_qualifies_repo_relative_model_dir() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    repo = {
+        "provider_type": "cosyvoice",
+        "path": "vendors/custom-cosyvoice",
+        "model_dir": "models/CosyVoice-300M",
+    }
+
+    env = deploy._worker_env(repo, "windows")
+
+    assert (
+        env["TTS_MORE_COSYVOICE_MODEL_DIR"]
+        == "vendors/custom-cosyvoice/models/CosyVoice-300M"
+    )
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "model_dir"),
+    [
+        ("windows", r"D:\Models\CosyVoice-300M"),
+        ("posix", "/srv/models/CosyVoice-300M"),
+    ],
+)
+def test_cosyvoice_worker_env_preserves_target_absolute_model_dir(
+    platform_name: str, model_dir: str
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    repo = {
+        "provider_type": "cosyvoice",
+        "path": "repo/CosyVoice",
+        "model_dir": model_dir,
+    }
+
+    env = deploy._worker_env(repo, platform_name)
+
+    assert env["TTS_MORE_COSYVOICE_MODEL_DIR"] == model_dir
 
 
 @pytest.mark.parametrize(
