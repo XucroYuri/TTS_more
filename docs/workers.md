@@ -104,8 +104,9 @@ python scripts/tts_more_deploy.py render-services --profile local-all --output d
 worker 可部署在 LAN/公网 GPU 机器上，本机 TTS More 通过 `services.json` 的 `base_url` 远程调用（设为 `mode: external`、`managed: false`）。远端机器只需：
 
 1. 克隆上游 repo + 装 torch + 模型权重；
-2. 运行 `start-service-workers.sh`（或单独启动某个 worker）；
-3. 本机 `data/local/services.json` 指向远端 worker 端口。
+2. 运行 `cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json` 并核对完整 service-id/path 映射；
+3. 运行 `start-service-workers.sh --repo-paths deployment/app/repo-paths.local.json`（或单独启动某个 worker）；
+4. 本机 `data/local/services.json` 指向远端 worker 端口。
 
 参考音频跨机上传走 `POST /upload_ref`（GPT-SoVITS worker）或本地路径直传（同机）。
 

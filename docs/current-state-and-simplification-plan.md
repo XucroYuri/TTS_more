@@ -114,7 +114,7 @@ scripts/tts-more.sh install-update-scripts --repo-paths deployment/app/repo-path
 - 保留 `scripts/update.* --repo-paths deployment/app/repo-paths.local.json` 作为应用本体更新入口。
 - 保留 `scripts/tts-more.* --repo-paths deployment/app/repo-paths.local.json` 作为部署工具入口。
 - 所有服务 repo 同步继续从 `repo.lock.json` 读取，不新增第二份清单。
-- 验收：`tts_more_deploy.py update --dry-run`、`sync-repos --dry-run`、`doctor` 均可运行。
+- 验收：`tts_more_deploy.py update --dry-run --repo-paths deployment/app/repo-paths.local.json`、`sync-repos --dry-run --repo-paths deployment/app/repo-paths.local.json`、`doctor --repo-paths deployment/app/repo-paths.local.json` 均可运行。
 
 ### P1：压缩默认 UI 文案和入口
 

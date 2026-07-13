@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -405,10 +406,29 @@ def test_all_managed_local_docs_require_complete_repo_confirmation() -> None:
         "scripts\\tts-more.ps1",
         "scripts/tts_more_deploy.py",
     )
+    bare_managed = re.compile(
+        r"^\s*(?:python(?:3)?\s+)?"
+        r"(?:tts_more_deploy\.py\s+)?"
+        r"(?:sync-repos|render-services|install-update-scripts|install-repo-bundles|"
+        r"start-workers|doctor|update|prepare-tts-repos|deploy-local-tts|start-service-workers)"
+        r"(?:\.sh|\.ps1)?"
+        r"(?=$|[\s`])"
+    )
+    violations = []
     for path, content in contents.items():
         for line_number, line in enumerate(content.splitlines(), start=1):
             normalized = line.replace(".\\", "").replace("./", "")
-            if not any(token in normalized for token in managed_tokens):
+            code_spans = re.findall(r"`([^`]+)`", line)
+            bare_invocation = any(
+                bare_managed.search(segment)
+                and (
+                    re.search(r"(?:^|\s)-{1,2}[A-Za-z]", segment)
+                    or re.search(r"(?:start-service-workers|prepare-tts-repos|deploy-local-tts)\.(?:sh|ps1)", segment)
+                    or "验收" in line
+                )
+                for segment in [normalized, *code_spans]
+            )
+            if not any(token in normalized for token in managed_tokens) and not bare_invocation:
                 continue
             if "probe-network" in line or "--profile app-only" in line:
                 continue
@@ -416,7 +436,9 @@ def test_all_managed_local_docs_require_complete_repo_confirmation() -> None:
                 continue
             if not any(command in line for command in ("sync-repos", "render-services", "install-update-scripts", "install-repo-bundles", "start-workers", "doctor", "update", "prepare-tts-repos", "deploy-local-tts", "start-service-workers")):
                 continue
-            assert "repo-paths" in line.lower() or "RepoPaths" in line, f"{path}:{line_number}: {line}"
+            if "repo-paths" not in line.lower() and "RepoPaths" not in line:
+                violations.append(f"{path}:{line_number}: {line}")
+    assert not violations, "\n".join(violations)
 
 
 def test_bundle_docs_describe_per_file_atomicity_and_interruption_recovery() -> None:
