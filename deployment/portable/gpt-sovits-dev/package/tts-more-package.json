@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "component": "gpt-sovits-dev",
+  "version": "0.1.0",
+  "build_id": "development",
+  "api_contract": "tts-more-v1",
+  "default_endpoint": "http://127.0.0.1:9883",
+  "port": 9883,
+  "launcher": "Start.cmd",
+  "health_path": "/health",
+  "capabilities": [
+    "tts",
+    "trained_weights_voice",
+    "reference_audio_voice",
+    "artifact-transfer"
+  ],
+  "model_profile": "full-quality-default",
+  "runtime": "runtime/runtime.7z",
+  "sha256_manifest": "SHA256SUMS.txt"
+}
