@@ -517,7 +517,8 @@ def _write_gpu_csv(
                 else []
             )
         for source_index, remote_path in enumerate(remote_paths, start=1):
-            source = f"remote-{source_index}"
+            label = "remote" if mode in LAN_MODES else "worker"
+            source = f"{label}-{source_index}"
             source_rows = 0
             try:
                 with remote_path.open("r", encoding="utf-8-sig", newline="") as handle:

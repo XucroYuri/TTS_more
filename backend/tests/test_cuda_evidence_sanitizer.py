@@ -284,7 +284,11 @@ def test_distributed_bundle_requires_and_anonymizes_three_remote_gpu_sources(tmp
     )
 
     rows = list(csv.DictReader((output / "nvidia-smi.csv").read_text(encoding="utf-8").splitlines()))
-    assert len({row["source"] for row in rows if row["source"] != "controller"}) == 3
+    assert {row["source"] for row in rows if row["source"] != "controller"} == {
+        "worker-1",
+        "worker-2",
+        "worker-3",
+    }
     combined = (output / "nvidia-smi.csv").read_text(encoding="utf-8")
     for node in private_nodes:
         assert node not in combined
@@ -416,6 +420,12 @@ def test_lan_bundle_accepts_exact_policy_remote_gpu_cardinality(
     assert summary["source_orchestration_verified"] is True
     assert summary["gpu_monitor"]["remote_node_set_verified"] is True
     assert summary["gpu_monitor"]["remote_source_count"] == remote_count
+    rows = list(
+        csv.DictReader((output / "nvidia-smi.csv").read_text(encoding="utf-8").splitlines())
+    )
+    assert {row["source"] for row in rows if row["source"] != "controller"} == {
+        f"remote-{index}" for index in range(1, remote_count + 1)
+    }
     assert all(node not in combined for node in LAN_WORKERS[mode])
     assert "GPU-private" not in combined
 

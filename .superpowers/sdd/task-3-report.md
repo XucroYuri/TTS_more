@@ -69,3 +69,27 @@
 ### Review Concerns
 
 - None within Task 3 review scope. PowerShell/workflow integration remains intentionally deferred and unchanged.
+
+## Medium 1 Re-review
+
+### RED
+
+- The legacy distributed regression failed because protected CSV sources were emitted as `remote-1`, `remote-2`, and `remote-3` instead of the deployed `worker-N` labels.
+
+### GREEN
+
+- Source labels now branch only on strict LAN membership: `lan-shared` and `lan-distributed` use collision-resistant `remote-N`; legacy `distributed` retains `worker-N`.
+- Legacy distributed received no schema-v2, `orchestration_verified`, or worker-manifest requirement.
+- Protected sanitizer targeted verification: `31 passed`.
+- `.venv/bin/python -m compileall -q backend/tests/test_cuda_evidence_sanitizer.py scripts/sanitize-cuda-evidence.py`: passed.
+- `git diff --check`: passed.
+
+### Commit
+
+- Parent: `962e4074198053289c9d5d8dc0826e51fb3f18de`.
+- Atomic commit message: `fix: preserve legacy distributed evidence labels`.
+- Final SHA is reported with completion because this report is included in the commit.
+
+### Concerns
+
+- None.
