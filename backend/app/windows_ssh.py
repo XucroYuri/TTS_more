@@ -12,6 +12,7 @@ import socket
 import stat
 import subprocess
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -115,12 +116,17 @@ class WindowsSshExecutor:
             arguments = tokens[1:]
         return key.casefold(), arguments
 
-    def _validate_config_text(self, content: str, *, assembled: bool) -> None:
+    @staticmethod
+    def _normalize_config_text(content: str) -> str:
+        normalized = content.replace("\r\n", "\n")
         if any(
-            (ord(character) < 32 and character != "\n") or ord(character) == 127
-            for character in content
+            unicodedata.category(character) == "Cc" and character not in {"\n", "\t"}
+            for character in normalized
         ):
             raise ValueError("SSH configuration contains an unsupported control character")
+        return normalized
+
+    def _validate_config_text(self, content: str, *, assembled: bool) -> None:
         for line in content.split("\n"):
             directive = self._directive(line)
             if directive is None:
@@ -180,6 +186,7 @@ class WindowsSshExecutor:
         except UnicodeError:
             raise ValueError("SSH configuration is unreadable") from None
 
+        content = self._normalize_config_text(content)
         self._validate_config_text(content, assembled=False)
 
         expanded: list[str] = []
@@ -221,6 +228,7 @@ class WindowsSshExecutor:
 
     def _resolved_config_output(self, alias: str) -> str:
         snapshot = self._expand_config_file(self.config_path, (), _ConfigBudget())
+        snapshot = self._normalize_config_text(snapshot)
         if len(snapshot.encode("utf-8")) > _MAX_CONFIG_TOTAL_BYTES:
             raise ValueError("SSH configuration snapshot exceeds the total byte limit")
         self._validate_config_text(snapshot, assembled=True)
@@ -306,6 +314,7 @@ class WindowsSshExecutor:
 
     @staticmethod
     def _validate_known_hosts(value: str) -> Path:
+        WindowsSshExecutor._validate_literal_path(value, "UserKnownHostsFile")
         paths = value.split()
         if len(paths) != 1:
             raise ValueError("SSH target must use a pinned UserKnownHostsFile")
@@ -321,7 +330,22 @@ class WindowsSshExecutor:
             raise ValueError("SSH target must use a pinned UserKnownHostsFile") from None
         if not stat.S_ISREG(mode):
             raise ValueError("SSH target must use a pinned UserKnownHostsFile")
+        WindowsSshExecutor._validate_literal_path(
+            str(canonical), "UserKnownHostsFile"
+        )
         return canonical
+
+    @staticmethod
+    def _validate_literal_path(value: str, setting: str) -> None:
+        if (
+            not value
+            or "%" in value
+            or "${" in value
+            or any(character.isspace() for character in value)
+            or any(character in "\"'\\" for character in value)
+            or any(unicodedata.category(character) == "Cc" for character in value)
+        ):
+            raise ValueError(f"SSH target has an invalid {setting}")
 
     @staticmethod
     def _validate_auth_files(
@@ -331,14 +355,7 @@ class WindowsSshExecutor:
         for value in values:
             if value.casefold() == "none":
                 continue
-            if (
-                not value
-                or "%" in value
-                or "${" in value
-                or any(character.isspace() or character in "\"'\\" for character in value)
-                or any(character in value for character in "\r\n\x00")
-            ):
-                raise ValueError(f"SSH target has an invalid {setting}")
+            WindowsSshExecutor._validate_literal_path(value, setting)
             path = Path(value).expanduser()
             if not path.is_absolute():
                 path = Path.cwd() / path
@@ -355,6 +372,7 @@ class WindowsSshExecutor:
                     raise ValueError(f"SSH target has an invalid {setting}")
             except OSError:
                 raise ValueError(f"SSH target has an invalid {setting}") from None
+            WindowsSshExecutor._validate_literal_path(str(canonical), setting)
             validated.append(canonical)
         return tuple(validated)
 

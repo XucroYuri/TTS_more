@@ -942,3 +942,144 @@ def test_generated_auth_arguments_parse_with_real_openssh(tmp_path: Path) -> Non
     assert parsed.returncode == 0, parsed.stderr
     assert f"identityfile {identity}" in parsed.stdout
     assert f"certificatefile {certificate}" in parsed.stdout
+
+
+def test_known_hosts_rejects_percent_token_after_first_openssh_expansion(
+    tmp_path: Path,
+) -> None:
+    literal_directory = tmp_path / "%h"
+    literal_directory.mkdir()
+    literal_known_hosts = literal_directory / "known_hosts"
+    literal_known_hosts.write_text("tts-gpt.lan ssh-ed25519 AAAA\n", encoding="utf-8")
+    config = tmp_path / "ssh_config"
+    config.write_text(
+        "Host gpt-worker\n"
+        f"  UserKnownHostsFile {tmp_path}/%%h/known_hosts\n",
+        encoding="utf-8",
+    )
+    runner = FakeRunner(
+        [completed(resolved_settings(known_hosts=str(literal_known_hosts)))]
+    )
+
+    with pytest.raises(ValueError, match="UserKnownHostsFile"):
+        WindowsSshExecutor(
+            config,
+            runner=runner,
+            resolver=FakeResolver([["192.0.2.10"]]),
+        ).resolve("gpt-worker")
+
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "parent_name", ["parent%h", "parent${HOME}", "parent space", 'parent"quote', "parent\\slash"]
+)
+@pytest.mark.parametrize(
+    ("setting", "error"),
+    [
+        ("userknownhostsfile", "UserKnownHostsFile"),
+        ("identityfile", "IdentityFile"),
+        ("certificatefile", "CertificateFile"),
+    ],
+)
+def test_canonical_parent_cannot_introduce_unsafe_path_characters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_name: str,
+    setting: str,
+    error: str,
+) -> None:
+    unsafe_parent = tmp_path / parent_name
+    unsafe_parent.mkdir()
+    filename = "known_hosts" if setting == "userknownhostsfile" else "worker_key"
+    (unsafe_parent / filename).write_text("key material\n", encoding="utf-8")
+    monkeypatch.chdir(unsafe_parent)
+    output = (
+        resolved_settings(known_hosts=filename)
+        if setting == "userknownhostsfile"
+        else resolved_settings() + f"{setting} {filename}\n"
+    )
+    runner = FakeRunner([completed(output)])
+
+    with pytest.raises(ValueError, match=error):
+        WindowsSshExecutor(
+            write_config(tmp_path),
+            runner=runner,
+            resolver=FakeResolver([["192.0.2.10"]]),
+        ).resolve("gpt-worker")
+
+
+def test_safe_known_hosts_literal_matches_ssh_and_keygen_argv(tmp_path: Path) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("tts-gpt.lan ssh-ed25519 AAAA\n", encoding="utf-8")
+    settings = resolved_settings(known_hosts=str(known_hosts))
+    runner = FakeRunner(
+        [
+            completed(settings),
+            completed(),
+            completed(settings),
+            completed("tts-gpt.lan ssh-ed25519 AAAA"),
+        ]
+    )
+    executor = WindowsSshExecutor(
+        write_config(tmp_path),
+        runner=runner,
+        resolver=FakeResolver([["192.0.2.10"], ["192.0.2.10"]]),
+    )
+
+    executor.run_powershell("gpt-worker", "Get-Date")
+    executor.pinned_host_key_sha256("gpt-worker")
+
+    canonical = str(known_hosts.resolve())
+    assert f"UserKnownHostsFile={canonical}" in runner.calls[1]
+    assert runner.calls[3][-1] == canonical
+
+
+def test_tab_indentation_is_accepted(tmp_path: Path) -> None:
+    config = tmp_path / "ssh_config"
+    config.write_bytes(b"Host gpt-worker\n\tUser tester\n")
+    runner = FakeRunner([completed(resolved_settings())])
+
+    target = WindowsSshExecutor(
+        config,
+        runner=runner,
+        resolver=FakeResolver([["192.0.2.10"]]),
+    ).resolve("gpt-worker")
+
+    assert target.user == "tester"
+
+
+def test_crlf_is_normalized_to_lf_before_snapshot(tmp_path: Path) -> None:
+    config = tmp_path / "ssh_config"
+    config.write_bytes(b"Host gpt-worker\r\n\tUser tester\r\n")
+
+    class LfSnapshotRunner(FakeRunner):
+        def __call__(self, argv: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+            snapshot = Path(argv[2]).read_bytes()
+            assert b"\r" not in snapshot
+            assert snapshot == b"Host gpt-worker\n\tUser tester\n"
+            return super().__call__(argv, **kwargs)
+
+    runner = LfSnapshotRunner([completed(resolved_settings())])
+
+    WindowsSshExecutor(
+        config,
+        runner=runner,
+        resolver=FakeResolver([["192.0.2.10"]]),
+    ).resolve("gpt-worker")
+
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("control", [b"\x00", b"\x01", b"\x0b", b"\x7f"])
+def test_non_whitespace_config_controls_remain_rejected(
+    tmp_path: Path, control: bytes
+) -> None:
+    config = tmp_path / "ssh_config"
+    config.write_bytes(b"Host gpt-worker\n" + control + b"User tester\n")
+    runner = FakeRunner([])
+
+    with pytest.raises(ValueError, match="control character"):
+        WindowsSshExecutor(config, runner=runner).resolve("gpt-worker")
+
+    assert runner.calls == []

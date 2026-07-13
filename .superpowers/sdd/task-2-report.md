@@ -253,3 +253,53 @@
   Include token/environment expansion remains unsupported and fails closed.
 - Authentication paths with whitespace, quotes, backslashes, or unresolved
   tokens are intentionally rejected rather than escaped.
+
+## Fourth Review Fixes (2026-07-13)
+
+### RED
+
+- Final canonical path group:
+  `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q -k
+  'percent_token_after or canonical_parent or safe_known_hosts_literal'` ->
+  `16 failed, 1 passed, 111 deselected`. `%%h` became a residual `%h`, and
+  canonical parents reintroduced `%`, `${...}`, whitespace, quotes, or
+  backslashes for known_hosts, IdentityFile, and CertificateFile. The safe
+  literal SSH/keygen consistency baseline already passed.
+- Config whitespace/newline group:
+  `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q -k
+  'tab_indentation or crlf_is_normalized or non_whitespace_config_controls'` ->
+  `2 failed, 4 passed, 128 deselected`. Tab and CRLF were rejected while the
+  other control-character cases remained correctly blocked.
+
+### GREEN
+
+- `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q` ->
+  `134 passed in 0.23s`.
+- `.venv/bin/python -m pytest backend/tests/test_lan_topology.py -q` ->
+  `44 passed in 0.09s`.
+- `.venv/bin/python -m compileall -q backend/app/windows_ssh.py
+  backend/tests/test_windows_ssh.py` -> passed.
+- `git diff --check` -> passed.
+
+### Fourth Review Checklist Closure
+
+1. Critical, second expansion of validated file paths: closed. A shared literal
+   path validator now runs on both the resolved source value and the final
+   expanded/absolute/canonical string for UserKnownHostsFile, IdentityFile, and
+   CertificateFile. Residual `%`, `${...}`, all whitespace, quotes, backslashes,
+   and control characters fail closed after canonicalization. Regression tests
+   cover `%%h -> %h` and canonical parents introducing each unsafe class. For a
+   safe path, SSH receives `UserKnownHostsFile=<canonical literal>` and
+   `ssh-keygen -f` receives the exact same string.
+2. Minor, Tab and CRLF compatibility: closed. UTF-8 config text normalizes CRLF
+   to LF before scanning and assembly, permits Tab as OpenSSH whitespace, and
+   writes an LF-only snapshot. Bare CR and all other Unicode control characters
+   remain rejected before runner invocation.
+
+### Concerns
+
+- No live Windows host, authentication, or transfer was exercised; focused tests
+  continue to use fake process/DNS adapters except for the real local OpenSSH
+  option-parse regression.
+- Canonical trust/authentication paths containing any rejected character class
+  are intentionally unsupported rather than escaped.
