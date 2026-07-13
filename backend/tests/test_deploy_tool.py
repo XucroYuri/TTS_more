@@ -861,7 +861,8 @@ def test_install_repo_bundles_copies_provider_helpers_and_excludes_them(tmp_path
     manifest = json.loads((target / "tts-more" / "tts-more-repo.json").read_text(encoding="utf-8"))
     assert reports[0]["installed"] is True
     assert copied.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash")
-    assert copied.stat().st_mode & stat.S_IXUSR
+    if os.name != "nt":
+        assert copied.stat().st_mode & stat.S_IXUSR
     assert manifest["service_id"] == "local-indextts"
     exclude = (target / ".git" / "info" / "exclude").read_text(encoding="utf-8")
     assert "tts-more/" in exclude
