@@ -65,11 +65,13 @@ flowchart LR
 
 ```bash
 # macOS / Linux
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
 make workers
-# 或：scripts/start-service-workers.sh --services local-gpt-sovits-main,local-indextts
+# 或：scripts/start-service-workers.sh --services local-gpt-sovits-main,local-indextts --repo-paths deployment/app/repo-paths.local.json
 
 # Windows
-.\scripts\start-service-workers.ps1 -Services local-gpt-sovits-main,local-indextts
+Copy-Item deployment\app\repo-paths.example.json deployment\app\repo-paths.local.json
+.\scripts\start-service-workers.ps1 -Services local-gpt-sovits-main,local-indextts -RepoPaths deployment\app\repo-paths.local.json
 ```
 
 worker 启动信息来自 `repo.lock.json`，由 `scripts/tts_more_deploy.py` 渲染。每个 worker 在其 repo 的 venv 里运行（torch/CUDA 解析）。如需生成本机服务配置：

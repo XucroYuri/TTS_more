@@ -77,13 +77,15 @@ make dev        # 或 scripts/start-dev.sh
 应用本体和服务 repo 都以 GitHub 为更新来源。普通更新：
 
 ```bash
-scripts/update.sh
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
+scripts/update.sh --repo-paths deployment/app/repo-paths.local.json
 ```
 
 Windows：
 
 ```powershell
-.\scripts\update.ps1
+Copy-Item deployment\app\repo-paths.example.json deployment\app\repo-paths.local.json
+.\scripts\update.ps1 --repo-paths deployment\app\repo-paths.local.json
 ```
 
 这会快进应用本体当前分支，安全更新 `repo.lock.json` 中的 TTS 服务 repo，并在已存在的服务 repo 内写入可复制的 `tts-more-update.sh` / `tts-more-update.ps1`。如果某个服务 repo 有本地未提交改动，普通更新会拒绝继续，避免丢改动。若 `data/local/services.json` 不存在，它会生成一份本机服务配置；已有本机配置默认保留。
@@ -91,19 +93,19 @@ Windows：
 只预览不写入：
 
 ```bash
-scripts/update.sh --dry-run
+scripts/update.sh --dry-run --repo-paths deployment/app/repo-paths.local.json
 ```
 
 确实要重写本机服务配置时，再显式加：
 
 ```bash
-scripts/update.sh --force-render-services
+scripts/update.sh --force-render-services --repo-paths deployment/app/repo-paths.local.json
 ```
 
 确实要把服务 repo 硬重置到远端分支时，再显式加：
 
 ```bash
-scripts/update.sh --force-reset-repos
+scripts/update.sh --force-reset-repos --repo-paths deployment/app/repo-paths.local.json
 ```
 
 ### 5. 接入 TTS 服务

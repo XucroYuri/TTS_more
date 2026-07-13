@@ -372,32 +372,51 @@ def test_manual_copy_docs_have_executable_posix_and_powershell_layout() -> None:
 
 def test_all_managed_local_docs_require_complete_repo_confirmation() -> None:
     root = Path(__file__).resolve().parents[2]
-    readme = (root / "README.md").read_text(encoding="utf-8")
-    open_source = (root / "docs" / "open-source-tts-services.md").read_text(encoding="utf-8")
-    workers = (root / "docs" / "workers.md").read_text(encoding="utf-8")
-    combined = "\n".join([readme, open_source, workers])
+    maintained = [
+        root / "README.md",
+        root / "docs" / "deployment.md",
+        root / "docs" / "open-source-tts-services.md",
+        root / "docs" / "workers.md",
+        root / "docs" / "current-state-and-simplification-plan.md",
+        root / "deployment" / "app" / "README.md",
+        *(root / "deployment" / "tts-repos").glob("*/README.md"),
+    ]
+    contents = {path: path.read_text(encoding="utf-8") for path in maintained}
+    readme = contents[root / "README.md"]
+    combined = "\n".join(contents.values())
 
-    assert combined.count("repo-paths.example.json") >= 3
+    assert len(maintained) == 9
+    assert combined.count("repo-paths.example.json") >= 6
     assert "mandatory even when the lock paths are unchanged" in combined
     assert "scripts/deploy-local-tts.sh --device CU128\n" not in readme
     assert ".\\scripts\\deploy-local-tts.ps1 -Device CU128\n" not in readme
     assert "sync-repos --clean\n" not in combined
     assert "render-services --profile local-all --output data/local/services.json\n" not in combined
-    for line in combined.splitlines():
-        stripped = line.strip()
-        managed_command = stripped.startswith(
-            (
-                "python scripts/tts_more_deploy.py",
-                "scripts/deploy-local-tts.sh",
-                ".\\scripts\\deploy-local-tts.ps1",
-                "bash scripts/prepare-tts-repos.sh",
-                "./scripts/tts-more.sh sync-repos",
-                ".\\scripts\\tts-more.ps1 sync-repos",
-                ".\\scripts\\prepare-tts-repos.ps1",
-            )
-        )
-        if managed_command:
-            assert "repo-paths" in line.lower() or "RepoPaths" in line, line
+    managed_tokens = (
+        "scripts/update.sh",
+        "scripts\\update.ps1",
+        "scripts/deploy-local-tts.sh",
+        "scripts\\deploy-local-tts.ps1",
+        "scripts/prepare-tts-repos.sh",
+        "scripts\\prepare-tts-repos.ps1",
+        "scripts/start-service-workers.sh",
+        "scripts\\start-service-workers.ps1",
+        "scripts/tts-more.sh",
+        "scripts\\tts-more.ps1",
+        "scripts/tts_more_deploy.py",
+    )
+    for path, content in contents.items():
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            normalized = line.replace(".\\", "").replace("./", "")
+            if not any(token in normalized for token in managed_tokens):
+                continue
+            if "probe-network" in line or "--profile app-only" in line:
+                continue
+            if line.strip().startswith("- 新增"):
+                continue
+            if not any(command in line for command in ("sync-repos", "render-services", "install-update-scripts", "install-repo-bundles", "start-workers", "doctor", "update", "prepare-tts-repos", "deploy-local-tts", "start-service-workers")):
+                continue
+            assert "repo-paths" in line.lower() or "RepoPaths" in line, f"{path}:{line_number}: {line}"
 
 
 def test_bundle_docs_describe_per_file_atomicity_and_interruption_recovery() -> None:
@@ -407,6 +426,12 @@ def test_bundle_docs_describe_per_file_atomicity_and_interruption_recovery() -> 
     assert "not atomic as a whole bundle" in docs
     assert "rerun the identical install command" in docs
     assert "tts-more-install-pending.json" in docs
+    assert "data/local/deployment-ownership" in docs
+    assert "--adopt-existing --repo-paths deployment/app/repo-paths.local.json" in docs
+    assert "adoption does not upgrade, overwrite, or delete files" in docs
+    assert "lost anchor fails closed" in docs
+    assert "concurrent parent-swap remains a residual threat" in docs
+    assert "Windows handle-based parent protection is not implemented" in docs
 
 
 def test_windows_ci_executes_native_deployment_validation_without_capability_skip() -> None:
