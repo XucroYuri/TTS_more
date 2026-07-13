@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -89,6 +90,11 @@ def _normalize_host(host: str) -> str:
     return host.strip().casefold().rstrip(".")
 
 
+_LEGACY_NUMERIC_IP = re.compile(
+    r"(?:0[x][0-9a-f]+|[0-9]+)(?:\.(?:0[x][0-9a-f]+|[0-9]+))*"
+)
+
+
 def _validate_worker_host(name: str, host: str) -> str:
     normalized = _normalize_host(host)
     if not normalized:
@@ -99,11 +105,12 @@ def _validate_worker_host(name: str, host: str) -> str:
     try:
         address = ipaddress.ip_address(candidate_ip)
     except ValueError:
-        if "." in candidate_ip and candidate_ip.replace(".", "").isdigit():
+        if _LEGACY_NUMERIC_IP.fullmatch(candidate_ip):
             raise ValueError(f"worker {name} must use a canonical numeric IP address") from None
     else:
         if address.is_loopback or address.is_unspecified:
             raise ValueError(f"worker {name} must use a non-loopback, specified host")
+        return address.compressed
     return normalized
 
 

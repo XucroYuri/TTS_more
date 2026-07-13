@@ -120,11 +120,18 @@ def test_shared_policy_requires_one_capacity_one_worker(tmp_path: Path) -> None:
         "LOCALHOST. ",
         "127.0.0.1",
         "127.1",
+        "127.0.1",
+        "192.0.2.1.5",
         "0.0.0.0",
         "::1",
         "[::1]",
         "::",
         "[::]",
+        "2130706433",
+        "017700000001",
+        "0x7f000001",
+        "0",
+        "0x0",
     ],
 )
 def test_worker_host_rejects_loopback_unspecified_and_noncanonical_ipv4(
@@ -143,6 +150,26 @@ def test_distributed_host_normalization_prevents_duplicate_bypass(
     tmp_path: Path, duplicate: str
 ) -> None:
     workers = distributed_workers()
+    workers["worker-1"]["host"] = duplicate
+    path = write_topology(tmp_path, workers)
+
+    with pytest.raises(ValueError, match="distinct worker hosts"):
+        load_lan_policy(path, LanMode.DISTRIBUTED)
+
+
+@pytest.mark.parametrize(
+    ("first", "duplicate"),
+    [
+        ("2001:db8::10", "2001:0db8:0:0:0:0:0:10"),
+        ("2001:DB8::10", "2001:db8::10"),
+        ("[2001:db8::10]", "2001:db8::10"),
+    ],
+)
+def test_distributed_host_normalization_prevents_equivalent_ipv6_duplicate_bypass(
+    tmp_path: Path, first: str, duplicate: str
+) -> None:
+    workers = distributed_workers()
+    workers["worker-0"]["host"] = first
     workers["worker-1"]["host"] = duplicate
     path = write_topology(tmp_path, workers)
 
