@@ -686,7 +686,7 @@ def install_update_scripts(
             "name": repo.get("name"),
             "path": str(repo.get("path")),
             "exists": exists,
-            "scripts": [str(sh_path.relative_to(root)), str(ps1_path.relative_to(root))],
+            "scripts": [sh_path.relative_to(root).as_posix(), ps1_path.relative_to(root).as_posix()],
         }
         reports.append(report)
         if dry_run or not exists:
