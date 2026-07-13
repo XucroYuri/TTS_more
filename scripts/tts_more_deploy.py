@@ -166,6 +166,25 @@ def save_repo_lock(repositories: list[dict[str, Any]], root: Path = PROJECT_ROOT
     write_json(root / "repo.lock.json", {"repositories": repositories}, boundary=root)
 
 
+def _save_repo_lock_commit_updates(root: Path, commits_by_service_id: Mapping[str, str]) -> bool:
+    repositories = load_repo_lock(root)
+    by_service_id = {str(repo["service_id"]): repo for repo in repositories}
+    unknown = sorted(set(commits_by_service_id) - set(by_service_id))
+    if unknown:
+        raise ValueError(f"cannot update unknown repository service_id(s): {', '.join(unknown)}")
+    changed = False
+    for service_id, commit in commits_by_service_id.items():
+        if not PINNED_COMMIT_RE.fullmatch(commit):
+            raise ValueError(f"repository {service_id} has invalid pinned commit")
+        repo = by_service_id[service_id]
+        if repo.get("commit") != commit:
+            repo["commit"] = commit
+            changed = True
+    if changed:
+        save_repo_lock(repositories, root)
+    return changed
+
+
 def load_repo_path_overrides(root: Path = PROJECT_ROOT, repo_paths: str | Path | None = None) -> dict[str, str]:
     path = _repo_paths_config_path(root, repo_paths)
     if path is None:
@@ -1536,7 +1555,6 @@ def sync_repos(
     force_reset: bool = False,
     repositories: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    save_lock_on_change = repositories is None
     repositories = _select_repositories(
         [dict(repo) for repo in (repositories or load_repo_lock(root))],
         service_ids,
@@ -1559,7 +1577,7 @@ def sync_repos(
             for action in actions:
                 _remove_path(Path(str(action["path"])))
 
-    lock_changed = False
+    lock_updates: dict[str, str] = {}
     for repo, path in resolved_repositories:
         remote = str(repo["remote"])
         actual_origin = remote
@@ -1602,9 +1620,10 @@ def sync_repos(
         if latest:
             if not dry_run and write_lock:
                 head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"])
-                if head and repo.get("commit") != head:
-                    repo["commit"] = head
-                    lock_changed = True
+                if not PINNED_COMMIT_RE.fullmatch(head):
+                    raise RuntimeError(f"unable to resolve final HEAD for repository {repo['service_id']}")
+                repo["commit"] = head
+                lock_updates[str(repo["service_id"])] = head
             if repo.get("submodules"):
                 if dry_run:
                     actions.append(
@@ -1651,8 +1670,8 @@ def sync_repos(
                 )
             else:
                 _sync_validated_submodules(root, path, actual_origin, actions)
-    if lock_changed and save_lock_on_change and not dry_run:
-        save_repo_lock(repositories, root)
+    if lock_updates and not dry_run:
+        _save_repo_lock_commit_updates(root, lock_updates)
     return actions
 
 
@@ -2179,6 +2198,24 @@ def install_update_scripts(
     for repo in selected:
         service_id = str(repo["service_id"])
         _validate_service_id(service_id)
+        if repo.get("submodules"):
+            repo_path = _resolve_repo_path(root, str(repo["path"]))
+            reports.append(
+                {
+                    "name": repo.get("name"),
+                    "path": str(repo.get("path")),
+                    "exists": repo_path.exists(),
+                    "standalone_updater": False,
+                    "managed_sync_required": True,
+                    "message": (
+                        "submodule repositories must be updated from TTS More managed sync-repos; "
+                        "the standalone updater is not installed"
+                    ),
+                    "scripts": [],
+                    "actions": [],
+                }
+            )
+            continue
         branch = str(repo["branch"])
         commit = str(repo.get("commit") or "")
         _parse_github_remote(str(repo["remote"]))

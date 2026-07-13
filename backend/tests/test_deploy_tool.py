@@ -1222,6 +1222,59 @@ def test_install_update_scripts_writes_repo_local_helpers(tmp_path: Path) -> Non
     assert "tts-more-update.json" in exclude
 
 
+def test_install_update_scripts_reports_submodule_repo_as_managed_sync_only(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    target = tmp_path / "repo" / "CosyVoice"
+    _init_git_checkout(target, "https://github.com/XucroYuri/CosyVoice.git")
+    repo_paths = tmp_path / "repo-paths.json"
+    repo_paths.write_text(
+        json.dumps({"repositories": {"local-cosyvoice": "repo/CosyVoice"}}),
+        encoding="utf-8",
+    )
+
+    result = deploy.main(
+        [
+            "--root",
+            str(tmp_path),
+            "install-update-scripts",
+            "--service-ids",
+            "local-cosyvoice",
+            "--repo-paths",
+            str(repo_paths),
+        ]
+    )
+
+    reports = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert reports == [
+        {
+            "name": "CosyVoice",
+            "path": "repo/CosyVoice",
+            "exists": True,
+            "standalone_updater": False,
+            "managed_sync_required": True,
+            "message": (
+                "submodule repositories must be updated from TTS More managed sync-repos; "
+                "the standalone updater is not installed"
+            ),
+            "scripts": [],
+            "actions": [],
+        }
+    ]
+    for name in (
+        "tts-more-update.sh",
+        "tts-more-update.ps1",
+        "tts-more-update.py",
+        "tts-more-update.json",
+    ):
+        assert not (target / name).exists()
+
+
 def test_repo_path_overrides_apply_to_rendered_local_services(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
@@ -1759,6 +1812,74 @@ def test_list_repos_emits_canonical_absolute_paths(tmp_path: Path, capsys: pytes
     payload = json.loads(capsys.readouterr().out)
     assert result == 0
     assert payload[0]["absolute_path"] == str(absolute)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["sync-repos", "--latest", "--write-lock"],
+        [
+            "update",
+            "--skip-app",
+            "--latest-repos",
+            "--write-lock",
+            "--no-install-scripts",
+            "--no-render",
+        ],
+    ],
+    ids=("sync-repos", "update"),
+)
+def test_cli_write_lock_updates_only_pristine_manifest_commit_with_confirmed_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    lock_path = tmp_path / "repo.lock.json"
+    before = json.loads(lock_path.read_text(encoding="utf-8"))
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    repo_paths = tmp_path / "repo-paths.json"
+    repo_paths.write_text(
+        json.dumps({"repositories": {"local-indextts": str(target)}}),
+        encoding="utf-8",
+    )
+    new_commit = "1" * 40
+    original_git_output = deploy._git_output
+
+    def fake_git_output(argv: list[str]) -> str:
+        if argv[-2:] == ["rev-parse", "HEAD"]:
+            return new_commit
+        return original_git_output(argv)
+
+    monkeypatch.setattr(deploy, "_git_output", fake_git_output)
+    monkeypatch.setattr(deploy, "_run_git_command", lambda *args, **kwargs: None)
+
+    result = deploy.main(
+        [
+            "--root",
+            str(tmp_path),
+            *command,
+            "--service-ids",
+            "local-indextts",
+            "--repo-paths",
+            str(repo_paths),
+        ]
+    )
+
+    after = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert result == 0
+    expected = json.loads(json.dumps(before))
+    selected = next(
+        repo for repo in expected["repositories"] if repo["service_id"] == "local-indextts"
+    )
+    selected["commit"] = new_commit
+    assert after == expected
+    serialized = lock_path.read_text(encoding="utf-8")
+    for forbidden in ("path_source", "path_confirmed", str(target)):
+        assert forbidden not in serialized
 
 
 def test_bundle_upgrade_removes_stale_owned_files_and_is_stable(tmp_path: Path) -> None:
