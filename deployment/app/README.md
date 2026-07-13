@@ -28,5 +28,7 @@ regression deployments.
 The confirmation object accepts only unique formal `service_id` keys and must
 contain every selected service. Managed local worker paths must stay inside the
 dedicated `<TTS More>/repo/` area, and existing Git origins must match the lock.
+Managed checkouts must use a checkout-local `.git` directory; symlink/reparse
+metadata and `gitdir:` files used by worktrees/submodules are rejected.
 Use the per-repo scripts under `deployment/tts-repos/` for manual deployments in
 external TTS repo directories.

@@ -24,6 +24,10 @@
 
 一键脚本会把对应 provider 的脚本包复制到服务 repo 的 `tts-more/` 目录，并写入该 repo 的本地 `.git/info/exclude`，避免误提交到上游 TTS repo。
 
+Managed checkout 的 `.git` 必须是 checkout 内的真实目录。为保证所有 Git 读写都使用同一 metadata boundary，当前版本明确拒绝 `.git` symlink/reparse point、损坏目录，以及 worktree/submodule 使用的 `gitdir:` 文件；这些布局请改用独立 clone。
+
+Bundle 文件逐个通过临时文件替换，单文件写入具备原子性，但安装 **not atomic as a whole bundle**。安装开始前会写入无时间戳的 `tts-more-install-pending.json`，其中记录旧 ownership hashes 与目标 manifest；正常完成后删除。若进程中断，保留目录原状并 **rerun the identical install command**，安装器只接受旧哈希或本次目标哈希并继续；其它本地修改会中止，不会删除或覆盖。不要手工编辑 `tts-more-repo.json` 或 pending journal。
+
 ## 一键本机部署
 
 macOS/Linux：

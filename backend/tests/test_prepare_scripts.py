@@ -368,3 +368,54 @@ def test_manual_copy_docs_have_executable_posix_and_powershell_layout() -> None:
         assert "tts-more/tts-more-prepare.sh" in readme
         assert "tts-more\\tts-more-prepare.ps1" in readme
         assert "replaces files owned by the TTS More bundle" in readme
+
+
+def test_all_managed_local_docs_require_complete_repo_confirmation() -> None:
+    root = Path(__file__).resolve().parents[2]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    open_source = (root / "docs" / "open-source-tts-services.md").read_text(encoding="utf-8")
+    workers = (root / "docs" / "workers.md").read_text(encoding="utf-8")
+    combined = "\n".join([readme, open_source, workers])
+
+    assert combined.count("repo-paths.example.json") >= 3
+    assert "mandatory even when the lock paths are unchanged" in combined
+    assert "scripts/deploy-local-tts.sh --device CU128\n" not in readme
+    assert ".\\scripts\\deploy-local-tts.ps1 -Device CU128\n" not in readme
+    assert "sync-repos --clean\n" not in combined
+    assert "render-services --profile local-all --output data/local/services.json\n" not in combined
+    for line in combined.splitlines():
+        stripped = line.strip()
+        managed_command = stripped.startswith(
+            (
+                "python scripts/tts_more_deploy.py",
+                "scripts/deploy-local-tts.sh",
+                ".\\scripts\\deploy-local-tts.ps1",
+                "bash scripts/prepare-tts-repos.sh",
+                "./scripts/tts-more.sh sync-repos",
+                ".\\scripts\\tts-more.ps1 sync-repos",
+                ".\\scripts\\prepare-tts-repos.ps1",
+            )
+        )
+        if managed_command:
+            assert "repo-paths" in line.lower() or "RepoPaths" in line, line
+
+
+def test_bundle_docs_describe_per_file_atomicity_and_interruption_recovery() -> None:
+    root = Path(__file__).resolve().parents[2]
+    docs = (root / "docs" / "deployment.md").read_text(encoding="utf-8")
+
+    assert "not atomic as a whole bundle" in docs
+    assert "rerun the identical install command" in docs
+    assert "tts-more-install-pending.json" in docs
+
+
+def test_windows_ci_executes_native_deployment_validation_without_capability_skip() -> None:
+    root = Path(__file__).resolve().parents[2]
+    workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "Native Windows deployment validation" in workflow
+    assert "if: runner.os == 'Windows'" in workflow
+    assert "test_windows_native_powershell_launchers_reject_unsafe_remote" in workflow
+    assert "test_windows_native_drive_junction_and_gitdir_policy" in workflow
+    assert "powershell.exe" in workflow
+    assert "pwsh.exe" in workflow

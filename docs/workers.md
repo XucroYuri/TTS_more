@@ -74,8 +74,11 @@ make workers
 
 worker 启动信息来自 `repo.lock.json`，由 `scripts/tts_more_deploy.py` 渲染。每个 worker 在其 repo 的 venv 里运行（torch/CUDA 解析）。如需生成本机服务配置：
 
+完整 repo 确认文件是 mandatory even when the lock paths are unchanged：
+
 ```bash
-python scripts/tts_more_deploy.py render-services --profile local-all --output data/local/services.json
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
+python scripts/tts_more_deploy.py render-services --profile local-all --output data/local/services.json --repo-paths deployment/app/repo-paths.local.json
 ```
 
 普通验证使用默认 GPT-SoVITS `main`。分支回归时通过 `--service-ids dev` 或 `--service-ids all` 显式生成配置，并且一次只启动一个 GPT-SoVITS 分支，避免同时加载多个大模型占满显存。
