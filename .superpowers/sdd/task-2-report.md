@@ -183,3 +183,73 @@
 - Authentication and known-host files are opened later by OpenSSH. A separate
   actor with permission to replace canonical files after validation remains
   outside this adapter's process boundary.
+
+## Third Review Fixes (2026-07-13)
+
+### RED
+
+- Snapshot boundary/Match group:
+  `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q -k
+  'bare_carriage or synthesize_match or all_match_directives'` ->
+  `5 failed, 1 passed, 91 deselected`. Bare CR reached snapshot generation,
+  no-final-LF Include fragments could concatenate, and non-exec Match forms were
+  retained. The one early pass was an accidental overbroad `exec` token check,
+  confirming criterion parsing was not reliable.
+- Include resource bounds group:
+  `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q -k
+  'fifo_include or config_single_file or config_total_byte or
+  config_file_count'` -> `4 failed, 97 deselected`. FIFO open occurred before
+  type validation and no size/count budgets existed.
+- Authentication serialization/ControlPersist group:
+  `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q -k
+  'unsafe_config_characters or generated_auth_arguments or
+  authentication_semantics or multiplexing'` ->
+  `10 failed, 6 passed, 95 deselected`. Unsafe path characters and
+  `ControlPersist=0` were accepted, and IdentityFile was not emitted with `-i`.
+
+### GREEN
+
+- `.venv/bin/python -m pytest backend/tests/test_windows_ssh.py -q` ->
+  `111 passed in 0.16s`. This includes a real local
+  `ssh -G -F os.devnull` parse of the generated IdentityFile and
+  CertificateFile arguments.
+- `.venv/bin/python -m pytest backend/tests/test_lan_topology.py -q` ->
+  `44 passed in 0.09s`.
+- `.venv/bin/python -m compileall -q backend/app/windows_ssh.py
+  backend/tests/test_windows_ssh.py` -> passed.
+- `git diff --check` -> passed.
+
+### Third Review Checklist Closure
+
+1. Critical, scanner/snapshot line-boundary disagreement: closed. Config bytes
+   preserve physical newlines, every control character except LF is rejected,
+   every nonempty expanded fragment ends with LF, and the final assembled
+   snapshot is validated again before it is written as unchanged UTF-8 bytes.
+   Directives cannot be synthesized across Include EOF boundaries.
+2. Important, authentication option serialization: closed fail-closed.
+   IdentityFile and CertificateFile paths reject whitespace, quotes,
+   backslashes, residual tokens, control characters, and symlinks. IdentityFile
+   uses the dedicated repeated `-i <path>` argv form; safe certificate options
+   remain explicit `-o` values. A real OpenSSH parse test validates generated
+   safe arguments.
+3. Important, operation-dependent Match semantics: closed fail-closed. All Match
+   directives are rejected before runner invocation, including `all`, `command`,
+   `sessiontype`, and `exec`; the brief does not require Match support.
+4. Important, unsafe/unbounded Include nodes: closed. Each node is checked with
+   `lstat` before open, must be regular and non-symlinked, is opened with available
+   no-follow/nonblocking flags, and is rechecked with `fstat` on the same file
+   descriptor. Per-file bytes, aggregate bytes, assembled snapshot bytes, file
+   count, recursion depth, and glob match materialization are bounded.
+5. Minor, `ControlPersist=0`: closed. Only `no` and `false` are accepted as
+   disabled resolved values; execution still forces `ControlPersist=no`.
+
+### Concerns
+
+- Tests do not contact a live Windows host or perform authentication/transfers;
+  only local OpenSSH option parsing is exercised with the real executable.
+- Match is intentionally unsupported in all forms. Configs requiring Match must
+  be flattened into unconditional alias-specific settings before use.
+- Config graphs are limited to 64 files, 1 MiB per source file, and 4 MiB total.
+  Include token/environment expansion remains unsupported and fails closed.
+- Authentication paths with whitespace, quotes, backslashes, or unresolved
+  tokens are intentionally rejected rather than escaped.

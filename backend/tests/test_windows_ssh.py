@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import app.windows_ssh as windows_ssh_module
 from app.windows_ssh import WindowsSshExecutor
 
 
@@ -619,6 +620,7 @@ def test_resolution_and_execution_never_reuse_mutable_original_config(tmp_path: 
         ("controlmaster", "yes"),
         ("controlpersist", "yes"),
         ("controlpersist", "60"),
+        ("controlpersist", "0"),
     ],
 )
 def test_resolve_rejects_connection_multiplexing(
@@ -716,8 +718,12 @@ def test_alias_authentication_semantics_are_bound_across_all_operations(
         argv = runner.calls[call_index]
         assert argv[1:3] == ["-F", os.devnull] or argv[1:4] == ["-s", "-F", os.devnull]
         assert "Port=2222" in argv
-        assert f"IdentityFile={identity_one}" in argv
-        assert f"IdentityFile={identity_two}" in argv
+        assert ["-i", str(identity_one)] == argv[
+            argv.index(str(identity_one)) - 1 : argv.index(str(identity_one)) + 1
+        ]
+        assert ["-i", str(identity_two)] == argv[
+            argv.index(str(identity_two)) - 1 : argv.index(str(identity_two)) + 1
+        ]
         assert f"CertificateFile={certificate}" in argv
         assert any(
             argument == "gpt-worker" or argument.startswith("gpt-worker:")
@@ -765,3 +771,174 @@ def test_resolve_rejects_unresolved_or_missing_auth_files(
             runner=runner,
             resolver=FakeResolver([["192.0.2.10"]]),
         ).resolve("gpt-worker")
+
+
+def test_bare_carriage_return_is_rejected_before_runner(tmp_path: Path) -> None:
+    config = tmp_path / "ssh_config"
+    config.write_bytes(b'Host gpt-worker\nMatch\r exec "touch /tmp/pwned"\n')
+    runner = FakeRunner([])
+
+    with pytest.raises(ValueError, match="control character"):
+        WindowsSshExecutor(config, runner=runner).resolve("gpt-worker")
+
+    assert runner.calls == []
+
+
+def test_include_fragments_cannot_synthesize_match_across_eof(tmp_path: Path) -> None:
+    first = tmp_path / "first.conf"
+    first.write_text("Match", encoding="utf-8")
+    second = tmp_path / "second.conf"
+    second.write_text(' exec "touch /tmp/pwned"\n', encoding="utf-8")
+    config = tmp_path / "ssh_config"
+    config.write_text(f'Include "{first}" "{second}"\n', encoding="utf-8")
+    runner = FakeRunner([])
+
+    with pytest.raises(ValueError, match="Match"):
+        WindowsSshExecutor(config, runner=runner).resolve("gpt-worker")
+
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "match_line",
+    [
+        "Match all",
+        "Match command powershell.exe",
+        "Match sessiontype exec",
+        "Match sessiontype subsystem",
+    ],
+)
+def test_all_match_directives_are_rejected_before_runner(
+    tmp_path: Path, match_line: str
+) -> None:
+    config = tmp_path / "ssh_config"
+    config.write_text(f"Host gpt-worker\n{match_line}\n", encoding="utf-8")
+    runner = FakeRunner([])
+
+    with pytest.raises(ValueError, match="Match"):
+        WindowsSshExecutor(config, runner=runner).resolve("gpt-worker")
+
+    assert runner.calls == []
+
+
+def test_fifo_include_is_rejected_before_open_or_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fifo = tmp_path / "unsafe.conf"
+    os.mkfifo(fifo)
+    config = tmp_path / "ssh_config"
+    config.write_text(f'Include "{fifo}"\nHost gpt-worker\n', encoding="utf-8")
+    runner = FakeRunner([])
+    original_open = Path.open
+
+    def guarded_open(path: Path, *args, **kwargs):
+        if path == fifo:
+            raise AssertionError("FIFO was opened before type validation")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    with pytest.raises(ValueError, match="regular file"):
+        WindowsSshExecutor(config, runner=runner).resolve("gpt-worker")
+
+    assert runner.calls == []
+
+
+def test_config_single_file_size_limit_is_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(windows_ssh_module, "_MAX_CONFIG_FILE_BYTES", 32, raising=False)
+    config = tmp_path / "ssh_config"
+    config.write_text("Host gpt-worker\n" + "#" * 64 + "\n", encoding="utf-8")
+    runner = FakeRunner([])
+
+    with pytest.raises(ValueError, match="size limit"):
+        WindowsSshExecutor(config, runner=runner).resolve("gpt-worker")
+
+    assert runner.calls == []
+
+
+def test_config_total_byte_limit_is_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(windows_ssh_module, "_MAX_CONFIG_FILE_BYTES", 256, raising=False)
+    monkeypatch.setattr(windows_ssh_module, "_MAX_CONFIG_TOTAL_BYTES", 100, raising=False)
+    included = tmp_path / "included.conf"
+    included.write_text("#" * 80 + "\n", encoding="utf-8")
+    config = tmp_path / "ssh_config"
+    config.write_text(f'Include "{included}"\nHost gpt-worker\n', encoding="utf-8")
+    runner = FakeRunner([])
+
+    with pytest.raises(ValueError, match="total byte limit"):
+        WindowsSshExecutor(config, runner=runner).resolve("gpt-worker")
+
+    assert runner.calls == []
+
+
+def test_config_file_count_limit_is_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(windows_ssh_module, "_MAX_CONFIG_FILES", 2, raising=False)
+    first = tmp_path / "first.conf"
+    first.write_text("# first\n", encoding="utf-8")
+    second = tmp_path / "second.conf"
+    second.write_text("# second\n", encoding="utf-8")
+    config = tmp_path / "ssh_config"
+    config.write_text(f'Include "{first}" "{second}"\n', encoding="utf-8")
+    runner = FakeRunner([])
+
+    with pytest.raises(ValueError, match="file count limit"):
+        WindowsSshExecutor(config, runner=runner).resolve("gpt-worker")
+
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("setting", ["identityfile", "certificatefile"])
+@pytest.mark.parametrize(
+    "filename",
+    ["worker key", "worker\tkey", 'worker"key', "worker\\key"],
+)
+def test_auth_paths_with_unsafe_config_characters_are_rejected(
+    tmp_path: Path, setting: str, filename: str
+) -> None:
+    auth_file = tmp_path / filename
+    auth_file.write_text("key material\n", encoding="utf-8")
+    runner = FakeRunner([completed(resolved_settings() + f"{setting} {auth_file}\n")])
+
+    with pytest.raises(ValueError, match="IdentityFile|CertificateFile"):
+        WindowsSshExecutor(
+            write_config(tmp_path),
+            runner=runner,
+            resolver=FakeResolver([["192.0.2.10"]]),
+        ).resolve("gpt-worker")
+
+
+def test_generated_auth_arguments_parse_with_real_openssh(tmp_path: Path) -> None:
+    identity = tmp_path / "worker_key"
+    identity.write_text("PRIVATE KEY\n", encoding="utf-8")
+    certificate = tmp_path / "worker-cert.pub"
+    certificate.write_text("CERTIFICATE\n", encoding="utf-8")
+    settings = resolved_settings() + (
+        f"identityfile {identity}\ncertificatefile {certificate}\n"
+    )
+    runner = FakeRunner([completed(settings), completed()])
+
+    WindowsSshExecutor(
+        write_config(tmp_path),
+        runner=runner,
+        resolver=FakeResolver([["192.0.2.10"]]),
+    ).run_powershell("gpt-worker", "Get-Date")
+
+    generated = runner.calls[1]
+    alias_index = generated.index("gpt-worker")
+    parse_argv = [*generated[:alias_index], "-G", "gpt-worker"]
+    parsed = subprocess.run(
+        parse_argv,
+        capture_output=True,
+        text=True,
+        check=False,
+        shell=False,
+    )
+    assert parsed.returncode == 0, parsed.stderr
+    assert f"identityfile {identity}" in parsed.stdout
+    assert f"certificatefile {certificate}" in parsed.stdout

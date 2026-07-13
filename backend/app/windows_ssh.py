@@ -4,6 +4,7 @@ import base64
 import glob
 import hashlib
 import ipaddress
+import itertools
 import os
 import re
 import shlex
@@ -21,6 +22,15 @@ _SAFE_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SAFE_HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _LEGACY_NUMERIC_IP = re.compile(r"(?:0[x][0-9a-f]+|[0-9]+)(?:\.(?:0[x][0-9a-f]+|[0-9]+))*", re.I)
 _SAFE_REMOTE_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]*\Z")
+_MAX_CONFIG_FILE_BYTES = 1024 * 1024
+_MAX_CONFIG_TOTAL_BYTES = 4 * 1024 * 1024
+_MAX_CONFIG_FILES = 64
+
+
+@dataclass
+class _ConfigBudget:
+    files: int = 0
+    total_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -49,7 +59,7 @@ class WindowsSshExecutor:
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         resolver: Callable[[str], list[str]] | None = None,
     ) -> None:
-        self.config_path = config_path.resolve()
+        self.config_path = Path(os.path.abspath(config_path.expanduser()))
         self.runner = runner
         self.resolver = resolver or self._resolve_addresses
 
@@ -105,25 +115,72 @@ class WindowsSshExecutor:
             arguments = tokens[1:]
         return key.casefold(), arguments
 
-    def _expand_config_file(self, path: Path, stack: tuple[Path, ...]) -> str:
+    def _validate_config_text(self, content: str, *, assembled: bool) -> None:
+        if any(
+            (ord(character) < 32 and character != "\n") or ord(character) == 127
+            for character in content
+        ):
+            raise ValueError("SSH configuration contains an unsupported control character")
+        for line in content.split("\n"):
+            directive = self._directive(line)
+            if directive is None:
+                continue
+            key, _ = directive
+            if key == "match":
+                raise ValueError(
+                    "SSH configuration must not use Match directives (including Match exec)"
+                )
+            if assembled and key == "include":
+                raise ValueError("SSH configuration snapshot contains an unexpanded Include")
+
+    def _expand_config_file(
+        self, path: Path, stack: tuple[Path, ...], budget: _ConfigBudget
+    ) -> str:
         path = path.expanduser()
-        if not path.is_absolute():
-            path = path.absolute()
-        try:
-            canonical = path.resolve(strict=True)
-        except OSError:
-            raise ValueError("SSH Include file is unavailable") from None
-        if canonical in stack or len(stack) >= 32:
+        path = Path(os.path.abspath(path))
+        if path in stack or len(stack) >= 32:
             raise ValueError("SSH Include graph is recursive or too deep")
         if any(component.is_symlink() for component in (path, *path.parents)):
             raise ValueError("SSH configuration must not use symlinks")
         try:
-            with canonical.open("r", encoding="utf-8") as config_file:
-                if not stat.S_ISREG(os.fstat(config_file.fileno()).st_mode):
+            metadata = path.lstat()
+        except OSError:
+            raise ValueError("SSH Include file is unavailable") from None
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("SSH configuration must be a regular file")
+        if metadata.st_size > _MAX_CONFIG_FILE_BYTES:
+            raise ValueError("SSH configuration exceeds the per-file size limit")
+        budget.files += 1
+        if budget.files > _MAX_CONFIG_FILES:
+            raise ValueError("SSH configuration exceeds the file count limit")
+
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        try:
+            descriptor = os.open(path, flags)
+            with os.fdopen(descriptor, "rb") as config_file:
+                opened_metadata = os.fstat(config_file.fileno())
+                if (
+                    not stat.S_ISREG(opened_metadata.st_mode)
+                    or opened_metadata.st_dev != metadata.st_dev
+                    or opened_metadata.st_ino != metadata.st_ino
+                ):
                     raise ValueError("SSH configuration must be a regular file")
-                content = config_file.read()
-        except (OSError, UnicodeError):
+                raw_content = config_file.read(_MAX_CONFIG_FILE_BYTES + 1)
+        except OSError:
             raise ValueError("SSH configuration is unreadable") from None
+        if len(raw_content) > _MAX_CONFIG_FILE_BYTES:
+            raise ValueError("SSH configuration exceeds the per-file size limit")
+        budget.total_bytes += len(raw_content)
+        if budget.total_bytes > _MAX_CONFIG_TOTAL_BYTES:
+            raise ValueError("SSH configuration exceeds the total byte limit")
+        try:
+            content = raw_content.decode("utf-8")
+        except UnicodeError:
+            raise ValueError("SSH configuration is unreadable") from None
+
+        self._validate_config_text(content, assembled=False)
 
         expanded: list[str] = []
         for line in content.splitlines(keepends=True):
@@ -132,11 +189,6 @@ class WindowsSshExecutor:
                 expanded.append(line)
                 continue
             key, arguments = directive
-            if key == "match" and any(
-                argument.lstrip("!").partition("=")[0].casefold() == "exec"
-                for argument in arguments
-            ):
-                raise ValueError("SSH configuration must not use Match exec")
             if key != "include":
                 expanded.append(line)
                 continue
@@ -148,17 +200,33 @@ class WindowsSshExecutor:
                 pattern = Path(pattern_text).expanduser()
                 if not pattern.is_absolute():
                     pattern = Path.home() / ".ssh" / pattern
-                for included_name in sorted(glob.glob(str(pattern))):
-                    expanded.append(
-                        self._expand_config_file(Path(included_name), (*stack, canonical))
+                remaining_files = _MAX_CONFIG_FILES - budget.files
+                included_names = list(
+                    itertools.islice(
+                        glob.iglob(str(pattern)), remaining_files + 1
                     )
-        return "".join(expanded)
+                )
+                if len(included_names) > remaining_files:
+                    raise ValueError("SSH configuration exceeds the file count limit")
+                for included_name in sorted(included_names):
+                    expanded.append(
+                        self._expand_config_file(
+                            Path(included_name), (*stack, path), budget
+                        )
+                    )
+        fragment = "".join(expanded)
+        if fragment and not fragment.endswith("\n"):
+            fragment += "\n"
+        return fragment
 
     def _resolved_config_output(self, alias: str) -> str:
-        snapshot = self._expand_config_file(self.config_path, ())
+        snapshot = self._expand_config_file(self.config_path, (), _ConfigBudget())
+        if len(snapshot.encode("utf-8")) > _MAX_CONFIG_TOTAL_BYTES:
+            raise ValueError("SSH configuration snapshot exceeds the total byte limit")
+        self._validate_config_text(snapshot, assembled=True)
         with tempfile.TemporaryDirectory(prefix="tts-more-ssh-") as directory:
             snapshot_path = Path(directory) / "ssh_config"
-            snapshot_path.write_text(snapshot, encoding="utf-8")
+            snapshot_path.write_bytes(snapshot.encode("utf-8"))
             snapshot_path.chmod(0o600)
             return self._run(
                 ["ssh", "-F", str(snapshot_path), "-G", alias],
@@ -267,6 +335,7 @@ class WindowsSshExecutor:
                 not value
                 or "%" in value
                 or "${" in value
+                or any(character.isspace() or character in "\"'\\" for character in value)
                 or any(character in value for character in "\r\n\x00")
             ):
                 raise ValueError(f"SSH target has an invalid {setting}")
@@ -333,7 +402,7 @@ class WindowsSshExecutor:
             raise ValueError("SSH target must disable connection sharing")
         if self._setting(settings, "controlpersist", default="no").casefold() not in {
             "no",
-            "0",
+            "false",
         }:
             raise ValueError("SSH target must disable connection sharing")
         if self._setting(settings, "knownhostscommand", default="none").casefold() != "none":
@@ -376,7 +445,7 @@ class WindowsSshExecutor:
         )
 
     @staticmethod
-    def _connection_options(target: SshResolvedTarget) -> list[str]:
+    def _connection_arguments(target: SshResolvedTarget) -> list[str]:
         options = [
             f"HostName={target.address}",
             f"HostKeyAlias={target.hostname}",
@@ -396,10 +465,15 @@ class WindowsSshExecutor:
             "ControlPersist=no",
             "KnownHostsCommand=none",
             "VerifyHostKeyDNS=no",
-            *(f"IdentityFile={path}" for path in target.identity_files),
             *(f"CertificateFile={path}" for path in target.certificate_files),
         ]
-        return [argument for option in options for argument in ("-o", option)]
+        arguments = [argument for option in options for argument in ("-o", option)]
+        arguments.extend(
+            argument
+            for path in target.identity_files
+            for argument in ("-i", str(path))
+        )
+        return arguments
 
     def run_powershell(
         self, alias: str, script: str, *, timeout: int = 1800
@@ -411,7 +485,7 @@ class WindowsSshExecutor:
                 "ssh",
                 "-F",
                 os.devnull,
-                *self._connection_options(target),
+                *self._connection_arguments(target),
                 target.alias,
                 "powershell.exe",
                 "-NoLogo",
@@ -437,7 +511,7 @@ class WindowsSshExecutor:
                 "-s",
                 "-F",
                 os.devnull,
-                *self._connection_options(target),
+                *self._connection_arguments(target),
                 str(local_source),
                 f"{target.alias}:{safe_remote_path}",
             ],
@@ -458,7 +532,7 @@ class WindowsSshExecutor:
                 "-s",
                 "-F",
                 os.devnull,
-                *self._connection_options(target),
+                *self._connection_arguments(target),
                 f"{target.alias}:{safe_remote_path}",
                 str(local_destination),
             ],
