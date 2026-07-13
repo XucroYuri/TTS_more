@@ -2135,7 +2135,6 @@ export default function App() {
                                   </button>
                                 </div>
                               </div>
-                              <p className="llm-preset-line">{t("parser.kwjmPresetMeta", { model: KWJM_MODEL, baseUrl: KWJM_BASE_URL })}</p>
                               <div className="llm-api-key-row">
                                 <label className="llm-api-key-field">
                                   <span>{t("parser.apiKey")}</span>

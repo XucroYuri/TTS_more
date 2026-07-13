@@ -2169,16 +2169,11 @@ h3 {
   gap: var(--space-2);
 }
 
-.llm-preset-line,
 .llm-advanced-hint {
   margin: 0;
   color: var(--geist-gray-900);
   font-size: 12px;
   line-height: 18px;
-}
-
-.llm-preset-line {
-  color: var(--geist-gray-900);
 }
 
 .llm-preset-grid {
@@ -2556,16 +2551,20 @@ h3 {
 }
 
 .llm-simple-form {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .llm-simple-form .wide {
-  grid-column: span 2;
+  grid-column: 1 / -1;
 }
 
-.llm-switch-field {
+.llm-form-grid .llm-switch-field {
+  grid-column: 1 / -1;
+  display: inline-flex;
+  align-items: center;
   justify-content: start;
-  align-self: end;
+  gap: 6px;
+  align-self: start;
   height: 32px;
   padding: 0 8px;
   border: 1px solid var(--geist-gray-200);
