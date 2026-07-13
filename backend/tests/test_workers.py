@@ -536,6 +536,25 @@ def test_cosyvoice_chunk_to_wav_flattens_single_batch_dimension(monkeypatch) -> 
 
     observed: dict[str, object] = {}
 
+    class FakeArray:
+        shape = (1, 3)
+
+        def reshape(self, *shape: int):
+            assert shape == (-1,)
+            self.shape = (3,)
+            return self
+
+    numpy_module = types.ModuleType("numpy")
+    numpy_module.float32 = object()
+
+    def fake_asarray(value, dtype):
+        assert value == [[0.0, 0.25, -0.25]]
+        assert dtype is numpy_module.float32
+        return FakeArray()
+
+    numpy_module.asarray = fake_asarray
+    monkeypatch.setitem(sys.modules, "numpy", numpy_module)
+
     def fake_write(buffer, sample_rate: int, data) -> None:
         observed.update(sample_rate=sample_rate, shape=data.shape)
         buffer.write(b"RIFFdemo")

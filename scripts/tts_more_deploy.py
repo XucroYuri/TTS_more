@@ -1015,6 +1015,7 @@ def install_repo_bundles(
             "exists": repo_path.exists(),
             "bundle": str(bundle_path.relative_to(root)) if bundle_path.exists() else "",
             "target": str(target_path.relative_to(root)),
+            "launchers": [],
             "installed": False,
         }
         reports.append(report)
@@ -1024,6 +1025,16 @@ def install_repo_bundles(
         if dry_run or not repo_path.exists():
             continue
         _copy_tree_contents(bundle_path, target_path)
+        installed_launchers: list[str] = []
+        launcher_templates = bundle_path / "launchers"
+        for launcher_name in ("Start.cmd", "Stop.cmd"):
+            source = launcher_templates / launcher_name
+            if not source.is_file():
+                continue
+            destination = repo_path / launcher_name
+            shutil.copy2(source, destination)
+            installed_launchers.append(destination.relative_to(root).as_posix())
+        report["launchers"] = installed_launchers
         manifest = {
             "schema_version": 1,
             "installed_at": _isoformat(_utc_now()),
@@ -1037,7 +1048,10 @@ def install_repo_bundles(
         }
         write_json(target_path / "tts-more-repo.json", manifest)
         _chmod_shell_scripts(target_path)
-        _exclude_local_helper_paths(repo_path, ["tts-more/"])
+        _exclude_local_helper_paths(
+            repo_path,
+            ["tts-more/", *[Path(path).name for path in installed_launchers]],
+        )
         report["installed"] = True
     return reports
 

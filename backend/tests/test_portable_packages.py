@@ -156,6 +156,7 @@ def test_stop_worker_accepts_windows_powershell_utf8_bom_pid_record(tmp_path: Pa
     def fake_run(command, **_kwargs):
         calls.append(command)
 
+    monkeypatch.setattr(launcher.os, "name", "nt")
     monkeypatch.setattr(launcher.subprocess, "run", fake_run)
 
     assert launcher.stop_worker(package_root) == 0
@@ -241,8 +242,8 @@ def test_every_local_tts_component_has_a_path_relative_start_and_stop_launcher()
     launchers = (
         (REPO_ROOT, "8000", "scripts\\start-dev.ps1"),
         (REPO_ROOT / "deployment" / "portable" / "gpt-sovits-dev", "9883", "runtime\\runtime.zip"),
-        (REPO_ROOT / "repo" / "index-tts", "7860", ".venv\\Scripts\\python.exe"),
-        (REPO_ROOT / "repo" / "CosyVoice", "9882", ".venv\\Scripts\\python.exe"),
+        (REPO_ROOT / "deployment" / "tts-repos" / "indextts" / "launchers", "7860", ".venv\\Scripts\\python.exe"),
+        (REPO_ROOT / "deployment" / "tts-repos" / "cosyvoice" / "launchers", "9882", ".venv\\Scripts\\python.exe"),
     )
 
     for root, port, entrypoint in launchers:
@@ -270,8 +271,8 @@ def test_local_start_launchers_allow_non_destructive_port_overrides() -> None:
     assert "$pid = $payload.$name" not in app_stop.lower()
 
     worker_launchers = (
-        (REPO_ROOT / "repo" / "index-tts" / "Start.cmd", "7860"),
-        (REPO_ROOT / "repo" / "CosyVoice" / "Start.cmd", "9882"),
+        (REPO_ROOT / "deployment" / "tts-repos" / "indextts" / "launchers" / "Start.cmd", "7860"),
+        (REPO_ROOT / "deployment" / "tts-repos" / "cosyvoice" / "launchers" / "Start.cmd", "9882"),
     )
     for launcher_path, default_port in worker_launchers:
         launcher = launcher_path.read_text(encoding="utf-8")
@@ -281,7 +282,9 @@ def test_local_start_launchers_allow_non_destructive_port_overrides() -> None:
         assert "port {0} is already in use" in launcher
         assert "-f $env:TTS_MORE_PORT" in launcher
 
-    cosy_launcher = (REPO_ROOT / "repo" / "CosyVoice" / "Start.cmd").read_text(encoding="utf-8")
+    cosy_launcher = (
+        REPO_ROOT / "deployment" / "tts-repos" / "cosyvoice" / "launchers" / "Start.cmd"
+    ).read_text(encoding="utf-8")
     assert "$model = Join-Path $root 'pretrained_models\\CosyVoice-300M'" in cosy_launcher
     assert "CosyVoice-300M model directory is missing" in cosy_launcher
     assert "'--model_dir', $model" in cosy_launcher

@@ -1357,6 +1357,10 @@ def test_install_repo_bundles_copies_provider_helpers_and_excludes_them(tmp_path
     bundle.mkdir(parents=True)
     (bundle / "tts-more-prepare.sh").write_text("#!/usr/bin/env bash\necho prepare\n", encoding="utf-8")
     (bundle / "README.md").write_text("IndexTTS helper\n", encoding="utf-8")
+    launchers = bundle / "launchers"
+    launchers.mkdir()
+    (launchers / "Start.cmd").write_text("@echo off\nstart\n", encoding="utf-8")
+    (launchers / "Stop.cmd").write_text("@echo off\nstop\n", encoding="utf-8")
     target = tmp_path / "repo" / "index-tts"
     (target / ".git").mkdir(parents=True)
 
@@ -1365,12 +1369,17 @@ def test_install_repo_bundles_copies_provider_helpers_and_excludes_them(tmp_path
     copied = target / "tts-more" / "tts-more-prepare.sh"
     manifest = json.loads((target / "tts-more" / "tts-more-repo.json").read_text(encoding="utf-8"))
     assert reports[0]["installed"] is True
+    assert reports[0]["launchers"] == ["repo/index-tts/Start.cmd", "repo/index-tts/Stop.cmd"]
     assert copied.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash")
+    assert (target / "Start.cmd").read_text(encoding="utf-8").splitlines() == ["@echo off", "start"]
+    assert (target / "Stop.cmd").read_text(encoding="utf-8").splitlines() == ["@echo off", "stop"]
     if os.name != "nt":
         assert copied.stat().st_mode & stat.S_IXUSR
     assert manifest["service_id"] == "local-indextts"
     exclude = (target / ".git" / "info" / "exclude").read_text(encoding="utf-8")
     assert "tts-more/" in exclude
+    assert "Start.cmd" in exclude
+    assert "Stop.cmd" in exclude
 
 
 def test_update_project_dry_run_reports_app_and_repo_actions_without_writes(
