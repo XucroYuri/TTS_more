@@ -64,7 +64,7 @@ def stop_worker(package_root: Path) -> int:
     record = root / "data" / "local" / "run" / "worker.pid.json"
     if not record.is_file():
         return 0
-    payload = json.loads(record.read_text(encoding="utf-8"))
+    payload = json.loads(record.read_text(encoding="utf-8-sig"))
     executable = Path(str(payload.get("executable_path") or "")).resolve(strict=False)
     _ensure_within(root, executable)
     pid = int(payload["pid"])

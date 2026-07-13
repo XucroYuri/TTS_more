@@ -295,15 +295,19 @@ def test_windows_deploy_and_worker_scripts_forward_topology_selection() -> None:
     assert "Stop-ConfiguredWorkerListeners" in validator
 
 
-def test_start_dev_rejects_occupied_fixed_ports_before_starting_processes() -> None:
+def test_start_dev_rejects_occupied_configured_ports_before_starting_processes() -> None:
     script = (REPO_ROOT / "scripts" / "start-dev.ps1").read_text(encoding="utf-8")
     vite = (REPO_ROOT / "frontend" / "vite.config.ts").read_text(encoding="utf-8")
 
     assert "function Assert-PortAvailable" in script
     assert "Get-NetTCPConnection -State Listen -LocalPort $Port" in script
+    assert "$BackendPort = if ($env:TTS_MORE_BACKEND_PORT)" in script
+    assert "else { 8000 }" in script
+    assert "$FrontendPort = if ($env:TTS_MORE_FRONTEND_PORT)" in script
+    assert "else { 5173 }" in script
     guard = script[script.index("function Assert-PortAvailable") : script.index("if (!(Test-Path")]
     first_start = script.index("Start-Process")
-    for call in ('Assert-PortAvailable 8000 "Backend"', 'Assert-PortAvailable 5173 "Frontend"'):
+    for call in ('Assert-PortAvailable $BackendPort "Backend"', 'Assert-PortAvailable $FrontendPort "Frontend"'):
         assert call in script
         assert script.index(call) < first_start
     assert "OwningProcess" not in guard

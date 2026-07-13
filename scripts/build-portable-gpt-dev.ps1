@@ -384,11 +384,12 @@ function Write-GptRuntimeLauncher {
     $content = @'
 @echo off
 setlocal EnableExtensions
-set "PACKAGE_ROOT=%~dp0..\.."
+for %%I in ("%~dp0..\..") do set "PACKAGE_ROOT=%%~fI"
 set "TTS_MORE_GPTSOVITS_REPO=%PACKAGE_ROOT%\upstream\GPT-SoVITS"
 set "TTS_MORE_GPTSOVITS_CONFIG=GPT_SoVITS\configs\tts_infer.yaml"
 set "TTS_MORE_ARTIFACT_ROOT=%PACKAGE_ROOT%\data\local\artifacts"
-powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$root = $args[0]; $python = Join-Path $root 'runtime\live\python.exe'; $appDir = Join-Path $root 'app'; $runDir = Join-Path $root 'data\local\run'; New-Item -ItemType Directory -Path $runDir -Force | Out-Null; $arguments = @('-m', 'uvicorn', 'app.workers.gpt_sovits_worker:app', '--app-dir', $appDir, '--host', '127.0.0.1', '--port', '__PORT__'); $process = Start-Process -FilePath $python -ArgumentList $arguments -WorkingDirectory $root -PassThru -WindowStyle Hidden; @{ pid = [int]$process.Id; executable_path = $python; port = __PORT__; started_at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDir 'worker.pid.json') -Encoding UTF8" "%PACKAGE_ROOT%"
+set "TTS_MORE_PACKAGE_ROOT=%PACKAGE_ROOT%"
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$root = $env:TTS_MORE_PACKAGE_ROOT; $python = Join-Path $root 'runtime\live\python.exe'; $appDir = Join-Path $root 'app'; $runDir = Join-Path $root 'data\local\run'; New-Item -ItemType Directory -Path $runDir -Force | Out-Null; $arguments = @('-m', 'uvicorn', 'app.workers.gpt_sovits_worker:app', '--app-dir', $appDir, '--host', '127.0.0.1', '--port', '__PORT__'); $process = Start-Process -FilePath $python -ArgumentList $arguments -WorkingDirectory $root -PassThru -WindowStyle Hidden; @{ pid = [int]$process.Id; executable_path = $python; port = __PORT__; started_at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDir 'worker.pid.json') -Encoding UTF8"
 exit /b %errorlevel%
 '@
     Write-Utf8File -Path $Path -Content $content.Replace("__PORT__", [string]$Port)

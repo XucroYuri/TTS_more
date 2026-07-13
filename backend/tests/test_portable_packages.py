@@ -139,21 +139,56 @@ def test_prepare_runtime_finalizes_start_cmd_extraction_without_extracting_twice
     }
 
 
-def test_worker_launch_scripts_use_package_relative_runtime_paths() -> None:
-    start_path = REPO_ROOT / "deployment" / "portable" / "common" / "Start-Worker.cmd"
-    stop_path = REPO_ROOT / "deployment" / "portable" / "common" / "Stop-Worker.cmd"
-    assert start_path.is_file(), "portable Start-Worker.cmd is missing"
-    assert stop_path.is_file(), "portable Stop-Worker.cmd is missing"
-    start = start_path.read_text(encoding="utf-8")
-    stop = stop_path.read_text(encoding="utf-8")
+def test_stop_worker_accepts_windows_powershell_utf8_bom_pid_record(tmp_path: Path, monkeypatch) -> None:
+    launcher = _load_portable_launcher()
+    package_root = tmp_path / "GPT-SoVITS-dev"
+    executable = package_root / "runtime" / "live" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"portable-python")
+    record = package_root / "data" / "local" / "run" / "worker.pid.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(
+        json.dumps({"pid": 1234, "executable_path": str(executable), "port": 9883}),
+        encoding="utf-8-sig",
+    )
+    calls: list[list[str]] = []
 
-    assert "%~dp0" in start
-    assert "portable_launcher.py" in start
-    assert "TTS_MORE_ARTIFACT_ROOT=%~dp0data\\local\\artifacts" in start
-    assert "Expand-Archive" in start
-    assert "runtime.zip" in start
-    assert "%~dp0" in stop
-    assert "worker.pid.json" in stop
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+    assert launcher.stop_worker(package_root) == 0
+    assert calls == [["taskkill", "/PID", "1234", "/T", "/F"]]
+    assert not record.exists()
+
+
+def test_worker_launch_scripts_use_package_relative_runtime_paths() -> None:
+    launcher_roots = (
+        REPO_ROOT / "deployment" / "portable" / "common",
+        REPO_ROOT / "deployment" / "portable" / "gpt-sovits-dev",
+    )
+
+    for launcher_root in launcher_roots:
+        start_path = launcher_root / ("Start-Worker.cmd" if launcher_root.name == "common" else "Start.cmd")
+        stop_path = launcher_root / ("Stop-Worker.cmd" if launcher_root.name == "common" else "Stop.cmd")
+        assert start_path.is_file(), f"portable start launcher is missing: {start_path}"
+        assert stop_path.is_file(), f"portable stop launcher is missing: {stop_path}"
+        start = start_path.read_text(encoding="utf-8")
+        stop = stop_path.read_text(encoding="utf-8")
+
+        normalization = 'for %%I in ("%~dp0.") do set "PACKAGE_ROOT=%%~fI"'
+        assert normalization in start
+        assert normalization in stop
+        assert "portable_launcher.py" in start
+        assert "TTS_MORE_ARTIFACT_ROOT=%PACKAGE_ROOT%\\data\\local\\artifacts" in start
+        assert "Expand-Archive" in start
+        assert "runtime.zip" in start
+        assert 'if not exist "%RUNTIME_ROOT%\\python.exe" (' in start
+        assert '.portable-build.json" (' not in start
+        assert '"%PACKAGE_ROOT%\\app\\scripts\\portable_launcher.py"' in start
+        assert "worker.pid.json" in stop
+        assert '"%PACKAGE_ROOT%\\app\\scripts\\portable_launcher.py"' in stop
 
 
 def test_gpt_portable_builder_requires_dev_lock_and_offline_payloads() -> None:
@@ -192,6 +227,10 @@ def test_gpt_portable_builder_requires_dev_lock_and_offline_payloads() -> None:
     assert "TrimStart([char]'\\', [char]'/')" in script
     assert '"bin\\7z.exe"' in script
     assert 'add worker launcher to runtime.zip' in script
+    assert 'for %%I in ("%~dp0..\\..") do set "PACKAGE_ROOT=%%~fI"' in script
+    assert 'set "TTS_MORE_PACKAGE_ROOT=%PACKAGE_ROOT%"' in script
+    assert "$root = $env:TTS_MORE_PACKAGE_ROOT" in script
+    assert "$root = $args[0]" not in script
     for dependency in ("numpy==1.26.4", "MarkupSafe==2.0.1", "websockets==12.0", "starlette==0.46.2", "setuptools==80.9.0"):
         assert dependency in requirements
     assert manifest["component"] == "gpt-sovits-dev"
@@ -216,3 +255,33 @@ def test_every_local_tts_component_has_a_path_relative_start_and_stop_launcher()
         assert port in contents
         assert entrypoint in contents
         assert "pid.json" in stop.read_text(encoding="utf-8")
+
+
+def test_local_start_launchers_allow_non_destructive_port_overrides() -> None:
+    app_launcher = (REPO_ROOT / "scripts" / "start-dev.ps1").read_text(encoding="utf-8")
+    app_stop = (REPO_ROOT / "Stop.cmd").read_text(encoding="utf-8")
+    assert "$env:TTS_MORE_BACKEND_PORT" in app_launcher
+    assert "$env:TTS_MORE_FRONTEND_PORT" in app_launcher
+    assert 'backend_port = $BackendPort' in app_launcher
+    assert 'frontend_port = $FrontendPort' in app_launcher
+    assert '-ArgumentList "dev", "--host", "127.0.0.1", "--port", ([string]$FrontendPort)' in app_launcher
+    assert '-ArgumentList "dev", "--", "--host"' not in app_launcher
+    assert "$processId = $payload.$name" in app_stop
+    assert "$pid = $payload.$name" not in app_stop.lower()
+
+    worker_launchers = (
+        (REPO_ROOT / "repo" / "index-tts" / "Start.cmd", "7860"),
+        (REPO_ROOT / "repo" / "CosyVoice" / "Start.cmd", "9882"),
+    )
+    for launcher_path, default_port in worker_launchers:
+        launcher = launcher_path.read_text(encoding="utf-8")
+        assert f'if not defined TTS_MORE_PORT set "TTS_MORE_PORT={default_port}"' in launcher
+        assert 'set "NO_PROXY=127.0.0.1,localhost,%NO_PROXY%"' in launcher
+        assert 'set "no_proxy=%NO_PROXY%"' in launcher
+        assert "port {0} is already in use" in launcher
+        assert "-f $env:TTS_MORE_PORT" in launcher
+
+    cosy_launcher = (REPO_ROOT / "repo" / "CosyVoice" / "Start.cmd").read_text(encoding="utf-8")
+    assert "$model = Join-Path $root 'pretrained_models\\CosyVoice-300M'" in cosy_launcher
+    assert "CosyVoice-300M model directory is missing" in cosy_launcher
+    assert "'--model_dir', $model" in cosy_launcher
