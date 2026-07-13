@@ -48,8 +48,15 @@ function Invoke-Logged {
     if ($DryRun) { return }
     Push-Location $WorkingDirectory
     try {
-        & $FilePath @Arguments
-        if ($LASTEXITCODE -ne 0) { throw "Command failed: $line" }
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            & $FilePath @Arguments 2>&1 | Out-Host
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if ($exitCode -ne 0) { throw "Command failed: $line" }
     } finally {
         Pop-Location
     }
@@ -227,6 +234,24 @@ function Install-WorkerRuntime {
     }
 }
 
+function Install-CU128TorchRuntime {
+    param(
+        [string]$RepoPython,
+        [string]$RepoPath,
+        [string]$TorchVersion
+    )
+    if ($Device -ne "CU128") { return }
+    $indexUrl = "https://download.pytorch.org/whl/cu128"
+    Invoke-Logged $RepoPython @(
+        "-m", "pip", "install", "--upgrade",
+        "torch==${TorchVersion}+cu128",
+        "torchaudio==${TorchVersion}+cu128",
+        "--index-url", $indexUrl
+    ) $RepoPath
+    $probe = "import torch; assert torch.version.cuda == '12.8', torch.version.cuda; assert torch.cuda.is_available()"
+    Invoke-Logged $RepoPython @("-c", $probe) $RepoPath
+}
+
 function Prepare-GPTSoVITS {
     param($Repo)
     $repoPath = Join-Path $Root $Repo.path
@@ -241,6 +266,10 @@ function Prepare-GPTSoVITS {
         if (!(Test-Path -LiteralPath $installPs1)) { throw "Missing GPT-SoVITS installer: $installPs1" }
         if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
             throw "conda was not found; GPT-SoVITS official installer requires conda for $($Repo.name)."
+        }
+        Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "GPT-SoVITS torchcodec bootstrap" -Action {
+            param($IndexUrl)
+            Invoke-Logged $repoPython @("-m", "pip", "install", "--no-deps", "torchcodec==0.13") $repoPath
         }
         $previousPath = $env:PATH
         $env:PATH = "$(Split-Path -Parent $repoPython);$previousPath"
@@ -265,6 +294,57 @@ function Prepare-GPTSoVITS {
     }
 }
 
+function Install-IndexTTSModelScopeAuxiliaryModels {
+    param(
+        [string]$RepoPython,
+        [string]$RepoPath
+    )
+    $code = @'
+from hashlib import sha256
+from pathlib import Path
+from shutil import copy2
+
+from modelscope.hub.file_download import model_file_download
+
+resources = (
+    ('AI-ModelScope/w2v-bert-2.0', 'config.json', 'checkpoints/hf_cache/w2v-bert-2.0/config.json', None),
+    ('AI-ModelScope/w2v-bert-2.0', 'preprocessor_config.json', 'checkpoints/hf_cache/w2v-bert-2.0/preprocessor_config.json', None),
+    ('AI-ModelScope/w2v-bert-2.0', 'model.safetensors', 'checkpoints/hf_cache/w2v-bert-2.0/model.safetensors', 'eb890c9660ed6e3414b6812e27257b8ce5454365d5490d3ad581ea60b93be043'),
+    ('amphion/MaskGCT', 'semantic_codec/model.safetensors', 'checkpoints/hf_cache/semantic_codec_model.safetensors', None),
+    ('iic/speech_campplus_sv_zh-cn_16k-common', 'campplus_cn_common.bin', 'checkpoints/hf_cache/campplus_cn_common.bin', None),
+    ('nv-community/bigvgan_v2_22khz_80band_256x', 'config.json', 'checkpoints/hf_cache/bigvgan/config.json', None),
+    ('nv-community/bigvgan_v2_22khz_80band_256x', 'bigvgan_generator.pt', 'checkpoints/hf_cache/bigvgan/bigvgan_generator.pt', 'e95ba25972d3de0628d99cd156e9315a9c018899bf739988959ebe3544080ced'),
+)
+
+
+def file_hash(path):
+    digest = sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+for repo_id, remote_file, destination, expected_hash in resources:
+    target = Path(destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_file() and target.stat().st_size > 0:
+        if expected_hash is None or file_hash(target) == expected_hash:
+            print(f'[skip] verified IndexTTS auxiliary resource: {target}', flush=True)
+            continue
+        target.unlink()
+    print(f'[download] {repo_id}/{remote_file}', flush=True)
+    downloaded = Path(model_file_download(model_id=repo_id, file_path=remote_file, local_dir=str(target.parent)))
+    if downloaded.resolve() != target.resolve():
+        copy2(downloaded, target)
+    if not target.is_file() or target.stat().st_size <= 0:
+        raise RuntimeError(f'IndexTTS auxiliary resource is missing after download: {target}')
+    if expected_hash is not None and file_hash(target) != expected_hash:
+        raise RuntimeError(f'IndexTTS auxiliary resource hash mismatch: {target}')
+'@
+    Invoke-Logged $RepoPython @("-c", $code) $RepoPath
+}
+
 function Prepare-IndexTTS {
     param($Repo)
     $repoPath = Join-Path $Root $Repo.path
@@ -284,6 +364,8 @@ function Prepare-IndexTTS {
                 Invoke-Logged $repoPython @("-m", "pip", "install", "-e", ".") $repoPath
             }
         }
+        $repoPython = Resolve-RepoPython $repoPath
+        Install-CU128TorchRuntime $repoPython $repoPath "2.8.0"
     }
     if (-not $SkipDownloads) {
         $repoPython = Resolve-RepoPython $repoPath
@@ -296,6 +378,9 @@ function Prepare-IndexTTS {
         Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "IndexTTS model download" -Action {
             param($CandidateSource)
             $sourceArg = if ($CandidateSource -eq "ModelScope") { "modelscope" } else { "huggingface" }
+            if ($CandidateSource -eq "ModelScope") {
+                Install-IndexTTSModelScopeAuxiliaryModels $repoPython $repoPath
+            }
             if ($CandidateSource -eq "HF-Mirror") {
                 $env:HF_ENDPOINT = "https://hf-mirror.com"
             } else {
@@ -307,6 +392,21 @@ function Prepare-IndexTTS {
     }
 }
 
+function Get-CosyVoiceRequirementsWithoutTorch {
+    param([string]$RepoPath)
+    $requirementsPath = Join-Path $RepoPath "requirements.txt"
+    return @(
+        Get-Content -LiteralPath $requirementsPath |
+            ForEach-Object { $_.Trim() } |
+            Where-Object {
+                $_ -and
+                -not $_.StartsWith("#") -and
+                -not $_.StartsWith("--") -and
+                $_ -notmatch '^(torch|torchaudio)=='
+            }
+    )
+}
+
 function Prepare-CosyVoice {
     param($Repo)
     $repoPath = Join-Path $Root $Repo.path
@@ -314,10 +414,24 @@ function Prepare-CosyVoice {
     $repoPython = Resolve-RepoPython $repoPath
     if (-not $SkipInstall) {
         $repoPython = Ensure-Venv $repoPath
+        Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "CosyVoice legacy Whisper bootstrap" -Action {
+            param($IndexUrl)
+            Invoke-Logged $repoPython @("-m", "pip", "install", "setuptools<81") $repoPath
+            Invoke-Logged $repoPython @(
+                "-m", "pip", "install",
+                "--no-build-isolation", "--no-deps", "openai-whisper==20231117"
+            ) $repoPath
+        }
         Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "CosyVoice dependency install" -Action {
             param($IndexUrl)
-            Invoke-Logged $repoPython @("-m", "pip", "install", "-r", "requirements.txt") $repoPath
+            if ($Device -eq "CU128") {
+                $cosyRequirements = @(Get-CosyVoiceRequirementsWithoutTorch $repoPath)
+                Invoke-Logged $repoPython (@("-m", "pip", "install") + $cosyRequirements) $repoPath
+            } else {
+                Invoke-Logged $repoPython @("-m", "pip", "install", "-r", "requirements.txt") $repoPath
+            }
         }
+        Install-CU128TorchRuntime $repoPython $repoPath "2.7.1"
     }
     if (-not $SkipDownloads) {
         $repoPython = Resolve-RepoPython $repoPath
@@ -359,7 +473,8 @@ if ($RepoPaths) {
     $repoArgs = @((Join-Path $Root "scripts\tts_more_deploy.py"), "--root", $Root, "list-repos", "--service-ids", ($TargetItems -join ","), "--repo-paths", $RepoPaths)
     $reposJson = & $Python @repoArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    $repositories = @($reposJson | ConvertFrom-Json)
+    $parsedRepositories = $reposJson | ConvertFrom-Json
+    $repositories = @($parsedRepositories)
 } else {
     $lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json
     $repositories = @($lock.repositories)

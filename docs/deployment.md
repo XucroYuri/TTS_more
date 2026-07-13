@@ -95,7 +95,7 @@ Windows CUDA 验收使用 manifest 明确机器、服务和 GPU 资源归属：
 - `deployment/app/topology.single-windows.example.json`：单机应用 + 三个 worker，三服务共享 `cuda-0`、`capacity:1`；
 - `deployment/app/topology.four-node-lan.example.json`：一台应用控制节点 + 三台独立 GPU worker。
 
-复制示例为 `deployment/app/topology.<name>.local.json` 并填入真实 LAN hostname/IP；真实文件已被 git ignore。字段和校验规则见 [CUDA 验证总入口](cuda-e2e-validation.md#topology-manifest)。
+复制示例为 `deployment/app/topology.<name>.local.json` 并填入真实 LAN hostname/IP；真实文件已被 git ignore。字段和校验规则见 [CUDA 验证契约](cuda-e2e-validation.md#拓扑)。
 
 单机渲染：
 
@@ -228,7 +228,7 @@ bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --source ModelScope
 
 上游要求：
 
-- GPT-SoVITS：优先使用每个分支自带的 `install.ps1`/`install.sh`，官方脚本依赖 conda/micromamba 环境。
+- GPT-SoVITS：优先使用每个分支自带的 `install.ps1`/`install.sh`。正式 Windows CUDA 包装器要求可执行的 `conda` 命令；仅安装 `micromamba` 但没有 conda 兼容入口不满足认证前提。
 - IndexTTS：优先 `uv sync --all-extras`，下载 `IndexTeam/IndexTTS-2`，并准备 BigVGAN 辅助模型。
 - CosyVoice：需要 `git submodule update --init --recursive`，Python 3.10 venv，`requirements.txt`，默认下载 `CosyVoice-300M`。
 
@@ -307,11 +307,7 @@ export TTS_MORE_RUN_REAL_TTS=1
 .venv/bin/python -m pytest backend/tests/test_real_tts_validation.py -q
 ```
 
-正式 Windows CUDA 验收使用 `scripts/run-cuda-validation.ps1`，固定模式为 `single-clean`、`single-release`、`distributed`。它还要求 topology、被忽略的 validation fixture、三 worker 契约、工件传输、资源切换、音频/ASR/性能阈值、Playwright 和人工听审。完整操作见：
-
-- [CUDA 全流程闭环验证](cuda-e2e-validation.md)
-- [单机 runbook](cuda-e2e-single-node.md)
-- [四机 LAN runbook](cuda-e2e-distributed.md)
+本页只解释通用部署接口，不是认证 runbook。Windows 单机的唯一可复制路径见 [单机 Runbook](cuda-e2e-single-node.md)；四机见 [分布式 Runbook](cuda-e2e-distributed.md)；协议和阈值见 [CUDA 验证契约](cuda-e2e-validation.md)。
 
 ## 离线和缓存
 

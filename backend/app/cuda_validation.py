@@ -4,6 +4,7 @@ import argparse
 import csv
 import hashlib
 import hmac
+import importlib.util
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import re
 import shutil
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import wave
@@ -31,6 +33,16 @@ from app.services import HttpTTSServiceClient, ServiceRegistry, TTSServiceClient
 
 
 VALIDATION_MODES = ("single-clean", "single-release", "distributed")
+CERTIFICATION_STATUSES = frozenset(
+    {
+        "blocked",
+        "core_failed",
+        "diagnostic_core_passed",
+        "core_passed_ui_pending",
+        "automatic_passed_human_pending",
+    }
+)
+POST_CORE_STAGES = frozenset({"fault-recovery", "evidence-collection"})
 FORMAL_SERVICE_IDS = {
     "gpt_sovits": "local-gpt-sovits-main",
     "indextts": "local-indextts",
@@ -53,6 +65,13 @@ MAX_UNLOAD_SECONDS = 30.0
 MAX_COLD_LOAD_SECONDS = 600.0
 MAX_SHORT_SYNTHESIS_SECONDS = 300.0
 MAX_WARM_P95_REGRESSION = 0.30
+WARM_SYNTHESIS_REPEATS = 2
+GPU_MONITOR_REQUIRED_ERROR = (
+    "GPU monitor is unavailable; nvidia-smi evidence is required for certification"
+)
+ASR_BATCH_RELEASE_ERROR = (
+    "ASR batch blocked: TTS unload and memory recovery were not confirmed"
+)
 
 
 class ServiceIds(BaseModel):
@@ -155,10 +174,121 @@ class Transcriber(Protocol):
         ...
 
 
-def load_fixture(path: Path) -> ValidationFixture:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+def _load_fixture_bytes(raw_bytes: bytes) -> ValidationFixture:
+    raw = json.loads(raw_bytes.decode("utf-8"))
     expanded = _expand_environment(raw)
     return ValidationFixture.model_validate(expanded)
+
+
+def load_fixture(path: Path) -> ValidationFixture:
+    return _load_fixture_bytes(path.read_bytes())
+
+
+def _append_required_file_failure(
+    failures: list[str], kind: str, label: str, raw_path: str
+) -> None:
+    if _contains_unresolved_environment(raw_path):
+        failures.append(f"{kind} {label} contains an unresolved environment variable")
+    elif not Path(raw_path).is_file():
+        failures.append(f"{kind} {label} not found")
+
+
+def _is_windows_absolute_path(value: str) -> bool:
+    normalized = value.strip()
+    if re.match(r"^[A-Za-z]:[\\/].+", normalized):
+        return True
+    return bool(re.match(r"^(?:\\\\|//)[^\\/]+[\\/][^\\/]+(?:[\\/].+)?$", normalized))
+
+
+def _preflight_next_action(failures: list[str]) -> str:
+    if not failures:
+        return "继续部署和完整 CUDA 验证。"
+    actions: list[str] = []
+    categories = (
+        (lambda message: message.startswith("fixture validation failed:"), "修复 fixture JSON 或 schema"),
+        (
+            lambda message: message.startswith(("reference ", "weight ")),
+            "补齐或修正 reference audio 和 GPT/SoVITS weight 路径",
+        ),
+        (lambda message: message.startswith("ASR gate requires "), "安装 faster-whisper 并确保 large-v3 可用"),
+        (
+            lambda message: message.startswith("an approved performance baseline is required"),
+            "补充已批准的 performance baseline",
+        ),
+        (lambda message: "listening reviewer" in message, "补充当前模式所需的 listening reviewers"),
+    )
+    for matches, action in categories:
+        if any(matches(message) for message in failures):
+            actions.append(action)
+    if not actions:
+        actions.append("解决 preflight 列出的阻塞项")
+    return "；".join(actions) + "，然后重新运行相同命令。"
+
+
+def validate_fixture_inputs(
+    fixture_path: Path,
+    *,
+    mode: str,
+    require_baseline: bool,
+) -> tuple[ValidationFixture | None, list[str]]:
+    fixture, _fixture_sha256_value, failures = _load_fixture_snapshot(
+        fixture_path,
+        mode=mode,
+        require_baseline=require_baseline,
+    )
+    return fixture, failures
+
+
+def _load_fixture_snapshot(
+    fixture_path: Path,
+    *,
+    mode: str,
+    require_baseline: bool,
+) -> tuple[ValidationFixture | None, str | None, list[str]]:
+    try:
+        raw_bytes = fixture_path.read_bytes()
+    except Exception as exc:
+        return None, None, [f"fixture validation failed: {exc}"]
+    fixture_sha256_value = hashlib.sha256(raw_bytes).hexdigest()
+    try:
+        fixture = _load_fixture_bytes(raw_bytes)
+    except Exception as exc:
+        return None, fixture_sha256_value, [f"fixture validation failed: {exc}"]
+    failures: list[str] = []
+    for label, raw_path in fixture.references.model_dump().items():
+        _append_required_file_failure(failures, "reference", label, str(raw_path))
+    for version, pair in fixture.gpt_weights.model_dump(by_alias=True).items():
+        for kind, raw_path in pair.items():
+            raw_path = str(raw_path)
+            if mode == "distributed":
+                if not raw_path.strip():
+                    failures.append(f"weight {version}.{kind} is empty")
+                elif _contains_unresolved_environment(raw_path):
+                    failures.append(
+                        f"weight {version}.{kind} contains an unresolved environment variable"
+                    )
+                elif not _is_windows_absolute_path(raw_path):
+                    failures.append(
+                        f"weight {version}.{kind} must be a Windows absolute path"
+                    )
+            else:
+                _append_required_file_failure(failures, "weight", f"{version}.{kind}", raw_path)
+    if require_baseline and mode != "single-clean" and fixture.performance_baseline is None:
+        failures.append("an approved performance baseline is required")
+    if importlib.util.find_spec("faster_whisper") is None:
+        failures.append("ASR gate requires faster-whisper with large-v3")
+    required_reviewers = 2 if mode == "single-clean" else 1
+    if len(fixture.reviewers) < required_reviewers:
+        failures.append(f"{mode} requires {required_reviewers} listening reviewers")
+    reviewer_ids = [reviewer.id.strip() for reviewer in fixture.reviewers]
+    reviewer_names = [reviewer.name.strip() for reviewer in fixture.reviewers]
+    if any(not value for value in [*reviewer_ids, *reviewer_names]):
+        failures.append("listening reviewers require non-empty IDs and names")
+    elif len({reviewer_id.casefold() for reviewer_id in reviewer_ids}) != len(
+        reviewer_ids
+    ):
+        failures.append("listening reviewer IDs must be unique")
+    return fixture, fixture_sha256_value, failures
 
 
 def validation_cases(fixture: ValidationFixture) -> list[ValidationCase]:
@@ -384,6 +514,15 @@ class FasterWhisperTranscriber:
         )
         return "".join(str(segment.text) for segment in segments).strip()
 
+    def close(self) -> None:
+        self._model = None
+        try:
+            import torch
+        except ImportError:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
 
 def create_transcriber(*, required: bool, model_name: str, language: str) -> tuple[Transcriber | None, str]:
     if not required:
@@ -455,12 +594,37 @@ class NvidiaSmiMonitor:
         self.interval_seconds = interval_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._sample_count = 0
+        self._error = ""
+
+    @property
+    def health(self) -> bool:
+        with self._lock:
+            return self._sample_count > 0 and not self._error
+
+    @property
+    def sample_count(self) -> int:
+        with self._lock:
+            return self._sample_count
+
+    @property
+    def error(self) -> str:
+        with self._lock:
+            return self._error
+
+    def _mark_failed(self) -> None:
+        with self._lock:
+            self._error = GPU_MONITOR_REQUIRED_ERROR
 
     def start(self) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         with self.output_path.open("w", encoding="utf-8", newline="") as handle:
             csv.writer(handle).writerow(self.HEADER)
         if shutil.which("nvidia-smi") is None:
+            self._mark_failed()
+            return
+        if not self.capture_once():
             return
         self._thread = threading.Thread(target=self._run, name="nvidia-smi-validation", daemon=True)
         self._thread.start()
@@ -469,13 +633,18 @@ class NvidiaSmiMonitor:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(5.0, self.interval_seconds * 2))
+            if self._thread.is_alive():
+                self._mark_failed()
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            self.capture_once()
-            self._stop.wait(self.interval_seconds)
+        try:
+            while not self._stop.wait(self.interval_seconds):
+                if not self.capture_once():
+                    return
+        except Exception:
+            self._mark_failed()
 
-    def capture_once(self) -> None:
+    def capture_once(self) -> bool:
         command = [
             "nvidia-smi",
             "--query-gpu=timestamp,index,uuid,memory.total,memory.free,memory.used,utilization.gpu",
@@ -484,16 +653,29 @@ class NvidiaSmiMonitor:
         try:
             completed = subprocess.run(command, capture_output=True, text=True, timeout=15, check=True)
         except (OSError, subprocess.SubprocessError):
-            return
+            self._mark_failed()
+            return False
         captured_at = datetime.now(timezone.utc).isoformat()
         rows = []
         for line in completed.stdout.splitlines():
             fields = [field.strip() for field in next(csv.reader([line]))]
-            if len(fields) == 7:
-                rows.append([captured_at, *fields])
+            if len(fields) != 7 or not fields[0] or not fields[2]:
+                continue
+            try:
+                int(fields[1])
+                for value in fields[3:]:
+                    float(value)
+            except ValueError:
+                continue
+            rows.append([captured_at, *fields])
         if rows:
             with self.output_path.open("a", encoding="utf-8", newline="") as handle:
                 csv.writer(handle).writerows(rows)
+            with self._lock:
+                self._sample_count += len(rows)
+            return True
+        self._mark_failed()
+        return False
 
 
 class CUDAValidationRunner:
@@ -514,6 +696,7 @@ class CUDAValidationRunner:
         monitor_factory: Callable[[Path], NvidiaSmiMonitor] = NvidiaSmiMonitor,
         expected_commit: str | None = None,
         require_baseline: bool = False,
+        diagnostic: bool = False,
         distributed_preflight_path: Path | None = None,
         distributed_orchestration_token: str | None = None,
     ) -> None:
@@ -533,6 +716,7 @@ class CUDAValidationRunner:
         self.monitor_factory = monitor_factory
         self.expected_commit = expected_commit or os.environ.get("TTS_MORE_EXPECTED_APP_COMMIT") or None
         self.require_baseline = require_baseline and mode != "single-clean"
+        self.diagnostic = diagnostic
         self.distributed_preflight_path = distributed_preflight_path
         self.distributed_orchestration_token = (
             distributed_orchestration_token
@@ -541,15 +725,13 @@ class CUDAValidationRunner:
         )
         self.distributed_orchestration_verified = False
 
-    def run(self) -> dict[str, Any]:
-        started_at = datetime.now(timezone.utc)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        (self.output_dir / "wav").mkdir(parents=True, exist_ok=True)
-        monitor = self.monitor_factory(self.output_dir / "nvidia-smi.csv")
-        monitor.start()
-        report: dict[str, Any] = {
+    def _new_report(
+        self, *, stage: str, fixture_sha256: str | None = None
+    ) -> dict[str, Any]:
+        return {
             "schema_version": 1,
             "name": "cuda-e2e-validation",
+            "stage": stage,
             "mode": self.mode,
             "topology": str(self.topology_path) if self.topology_path else None,
             "node": self.node,
@@ -559,34 +741,174 @@ class CUDAValidationRunner:
             "distributed_preflight": (
                 str(self.distributed_preflight_path) if self.distributed_preflight_path else None
             ),
-            "started_at": started_at.isoformat(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
+            "fixture_sha256": fixture_sha256,
             "passed": False,
+            "core_started": False,
+            "certifiable": False,
+            "certification_status": "blocked",
             "preflight": [],
             "services": [],
             "cases": [],
             "cer": {"required": False, "items": [], "aggregate_cer": None, "passed": True},
+            "asr_batch": {"required": False, "passed": True, "error": ""},
             "performance": {"passed": False, "checks": {}, "metrics": {}},
+            "gpu_monitor": {"healthy": False, "sample_count": 0, "error": ""},
         }
-        fixture: ValidationFixture | None = None
+
+    def run_input_preflight(self) -> dict[str, Any]:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        fixture, fixture_sha256, failures = _load_fixture_snapshot(
+            self.fixture_path,
+            mode=self.mode,
+            require_baseline=self.require_baseline,
+        )
+        return self._write_input_preflight(fixture, fixture_sha256, failures)
+
+    def _write_input_preflight(
+        self,
+        fixture: ValidationFixture | None,
+        fixture_sha256: str | None,
+        failures: list[str],
+    ) -> dict[str, Any]:
+        report = self._new_report(
+            stage="input-preflight", fixture_sha256=fixture_sha256
+        )
+        report["preflight"] = [
+            {"passed": False, "message": message} for message in failures
+        ]
+        report["passed"] = not failures
+        report["blocker_count"] = len(failures)
+        report["next_action"] = _preflight_next_action(failures)
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _write_report_files(self.output_dir, report, fixture, {}, reset_nvidia=True)
+        return report
+
+    def write_blocker_report(
+        self,
+        *,
+        stage: str,
+        message: str,
+        preserve_existing: bool = False,
+    ) -> dict[str, Any]:
+        if preserve_existing:
+            if stage not in POST_CORE_STAGES:
+                raise ValueError("preserve-existing is only allowed for post-core stages")
+            summary_path = self.output_dir / "summary.json"
+            try:
+                report = json.loads(summary_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise ValueError(f"post-core blocker requires an existing core summary: {exc}") from exc
+            required_core_fields = ("services", "cases", "cer", "performance")
+            if (
+                not isinstance(report, dict)
+                or report.get("stage") != "cuda-validation"
+                or report.get("passed") is not True
+                or any(field not in report for field in required_core_fields)
+            ):
+                raise ValueError("post-core blocker requires a completed passing core summary")
+            pipeline_failures = list(report.get("pipeline_failures") or [])
+            pipeline_failures.append(
+                {"stage": stage, "message": message, "passed": False}
+            )
+            report["stage"] = stage
+            report["finished_at"] = datetime.now(timezone.utc).isoformat()
+            report["passed"] = False
+            report["certifiable"] = False
+            report["certification_status"] = "core_failed"
+            report.setdefault("fixture_sha256", None)
+            report["pipeline_failures"] = pipeline_failures
+            report["post_core"] = {"passed": False, "failed_stage": stage}
+            report["blocker_count"] = len(pipeline_failures)
+            report["next_action"] = f"修复 {stage} 流水线阶段后重新运行完整 CUDA 验证。"
+            fixture, current_fixture_sha256, _failures = _load_fixture_snapshot(
+                self.fixture_path,
+                mode=self.mode,
+                require_baseline=self.require_baseline,
+            )
+            if current_fixture_sha256 != report.get("fixture_sha256"):
+                fixture = None
+            _write_report_files(
+                self.output_dir,
+                report,
+                fixture,
+                {},
+                preserve_worker_references=True,
+            )
+            return report
+        fixture, fixture_sha256, _failures = _load_fixture_snapshot(
+            self.fixture_path,
+            mode=self.mode,
+            require_baseline=self.require_baseline,
+        )
+        report = self._new_report(stage=stage, fixture_sha256=fixture_sha256)
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report["passed"] = False
+        report["certifiable"] = False
+        report["certification_status"] = "blocked"
+        report["preflight"] = [
+            {"passed": False, "message": f"{stage} failed: {message}"}
+        ]
+        report["blocker_count"] = 1
+        report["next_action"] = f"修复 {stage} 阶段错误后重新运行完整 CUDA 验证。"
+        _write_report_files(self.output_dir, report, fixture, {}, reset_nvidia=True)
+        return report
+
+    def run(self) -> dict[str, Any]:
+        fixture, fixture_sha256, input_failures = _load_fixture_snapshot(
+            self.fixture_path,
+            mode=self.mode,
+            require_baseline=self.require_baseline,
+        )
+        input_report = self._write_input_preflight(
+            fixture, fixture_sha256, input_failures
+        )
+        if not input_report["passed"]:
+            return input_report
+        assert fixture is not None
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "wav").mkdir(parents=True, exist_ok=True)
+        report = self._new_report(
+            stage="cuda-validation", fixture_sha256=fixture_sha256
+        )
         endpoints: dict[str, TTSServiceEndpoint] = {}
+        monitor: NvidiaSmiMonitor | None = None
         try:
-            fixture, endpoints = self._preflight(report)
+            try:
+                monitor = self.monitor_factory(self.output_dir / "nvidia-smi.csv")
+                monitor.start()
+            except Exception:
+                report["preflight"].append(
+                    {"passed": False, "message": GPU_MONITOR_REQUIRED_ERROR}
+                )
+                return self._finish(report, fixture, endpoints)
+            self._record_gpu_monitor(report, monitor)
+            if not report["gpu_monitor"]["healthy"]:
+                report["preflight"].append(
+                    {"passed": False, "message": GPU_MONITOR_REQUIRED_ERROR}
+                )
+                return self._finish(report, fixture, endpoints)
+            fixture, endpoints = self._preflight(report, fixture)
             if report["preflight"]:
                 return self._finish(report, fixture, endpoints)
-            assert fixture is not None
+            report["core_started"] = True
             clients, ready_services = self._check_service_contracts(report, fixture, endpoints)
             perf_source: dict[str, Any] = {
                 "oom": False,
                 "minimum_free_mib": None,
+                "maximum_reserved_mib": None,
+                "maximum_allocated_mib": None,
                 "baseline_memory_mib": None,
                 "unload_memory_mib": None,
                 "unload_recovery_seconds": None,
                 "cold_load_seconds": None,
                 "short_synthesis_seconds": [],
+                "warm_synthesis_seconds": [],
                 "warm_p95_seconds": None,
             }
             cer_items: list[tuple[str, str, str]] = []
+            asr_queue: list[tuple[dict[str, Any], Path, str, str]] = []
             for case in validation_cases(fixture):
                 client = clients.get(case.service_id)
                 endpoint = endpoints[case.service_id]
@@ -595,8 +917,10 @@ class CUDAValidationRunner:
                         {"name": case.name, "service_id": case.service_id, "passed": False, "errors": ["service contract preflight failed"]}
                     )
                     continue
-                case_report = self._run_case(case, endpoint, client, perf_source, cer_items)
+                case_report = self._run_case(case, endpoint, client, perf_source)
                 report["cases"].append(case_report)
+                if case_report.get("audio", {}).get("passed"):
+                    asr_queue.append((case_report, self.output_dir / case_report["output_path"], case.text, case.language))
             if self.mode != "distributed" and fixture.service_ids.gpt_sovits in ready_services:
                 base_case = validation_cases(fixture)[0]
                 artifact_case = ValidationCase(
@@ -612,16 +936,71 @@ class CUDAValidationRunner:
                     update={"default_params": {**base_endpoint.default_params, "delivery": "artifact"}}
                 )
                 artifact_client = self.client_factory(artifact_endpoint)
-                report["cases"].append(
-                    self._run_case(artifact_case, artifact_endpoint, artifact_client, perf_source, cer_items)
+                artifact_report = self._run_case(
+                    artifact_case, artifact_endpoint, artifact_client, perf_source
                 )
+                report["cases"].append(artifact_report)
+                if artifact_report.get("audio", {}).get("passed"):
+                    asr_queue.append(
+                        (
+                            artifact_report,
+                            self.output_dir / artifact_report["output_path"],
+                            artifact_case.text,
+                            artifact_case.language,
+                        )
+                    )
+            release_failures = [
+                case_report
+                for case_report in report["cases"]
+                if case_report.get("tts_attempted")
+                and not (
+                    case_report.get("unload_confirmed")
+                    and case_report.get("memory_recovered")
+                )
+            ]
             if fixture.asr.required:
+                report["asr_batch"]["required"] = True
+                if release_failures:
+                    report["asr_batch"].update(
+                        {"passed": False, "error": ASR_BATCH_RELEASE_ERROR}
+                    )
+                    report["preflight"].append(
+                        {"passed": False, "message": ASR_BATCH_RELEASE_ERROR}
+                    )
+                    for case_report in release_failures:
+                        if ASR_BATCH_RELEASE_ERROR not in case_report["errors"]:
+                            case_report["errors"].append(ASR_BATCH_RELEASE_ERROR)
+                        case_report["passed"] = False
+                else:
+                    for case_report, wav_path, reference, language in asr_queue:
+                        try:
+                            assert self.transcriber is not None
+                            hypothesis = self.transcriber(wav_path, language)
+                            cer = character_error_rate(reference, hypothesis)
+                            case_report["asr"] = {
+                                "reference": reference,
+                                "hypothesis": hypothesis,
+                                "cer": cer,
+                                "passed": cer <= MAX_ITEM_CER,
+                            }
+                            cer_items.append((case_report["name"], reference, hypothesis))
+                            if cer > MAX_ITEM_CER:
+                                case_report["errors"].append(
+                                    f"CER {cer:.4f} exceeds {MAX_ITEM_CER:.2f}"
+                                )
+                        except Exception as exc:
+                            case_report["errors"].append(
+                                f"ASR failed: {type(exc).__name__}: {exc}"
+                            )
+                        case_report["passed"] = not case_report["errors"]
                 report["cer"] = evaluate_cer(cer_items)
                 if len(cer_items) != len(report["cases"]):
                     report["cer"]["passed"] = False
                     report["cer"]["missing_items"] = len(report["cases"]) - len(cer_items)
-            synthesis_times = list(perf_source["short_synthesis_seconds"])
-            perf_source["warm_p95_seconds"] = _p95(synthesis_times) if synthesis_times else None
+            warm_synthesis_times = list(perf_source["warm_synthesis_seconds"])
+            perf_source["warm_p95_seconds"] = (
+                _p95(warm_synthesis_times) if warm_synthesis_times else None
+            )
             baseline = fixture.performance_baseline.model_dump(exclude_none=True) if fixture.performance_baseline else None
             report["performance"] = evaluate_performance(perf_source, baseline=baseline)
             return self._finish(report, fixture, endpoints)
@@ -629,16 +1008,57 @@ class CUDAValidationRunner:
             report["preflight"].append({"passed": False, "message": f"validator error: {type(exc).__name__}: {exc}"})
             return self._finish(report, fixture, endpoints)
         finally:
-            monitor.stop()
+            close = getattr(self.transcriber, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    report["preflight"].append(
+                        {"passed": False, "message": f"ASR cleanup failed: {type(exc).__name__}: {exc}"}
+                    )
+            if monitor is not None:
+                monitor_stop_failed = False
+                try:
+                    monitor.stop()
+                except Exception:
+                    monitor_stop_failed = True
+                self._record_gpu_monitor(report, monitor)
+                if monitor_stop_failed:
+                    report["gpu_monitor"].update(
+                        {"healthy": False, "error": GPU_MONITOR_REQUIRED_ERROR}
+                    )
+                if not report["gpu_monitor"]["healthy"] and not any(
+                    item.get("message") == GPU_MONITOR_REQUIRED_ERROR
+                    for item in report["preflight"]
+                ):
+                    report["preflight"].append(
+                        {"passed": False, "message": GPU_MONITOR_REQUIRED_ERROR}
+                    )
+            self._finish(report, fixture, endpoints)
+
+    @staticmethod
+    def _record_gpu_monitor(report: dict[str, Any], monitor: Any) -> None:
+        sample_count = int(getattr(monitor, "sample_count", 0) or 0)
+        healthy = bool(getattr(monitor, "health", False)) and sample_count > 0
+        report["gpu_monitor"] = {
+            "healthy": healthy,
+            "sample_count": sample_count,
+            "error": str(getattr(monitor, "error", "") or ""),
+        }
 
     def _preflight(
-        self, report: dict[str, Any]
+        self,
+        report: dict[str, Any],
+        fixture: ValidationFixture | None = None,
     ) -> tuple[ValidationFixture | None, dict[str, TTSServiceEndpoint]]:
-        try:
-            fixture = load_fixture(self.fixture_path)
-        except Exception as exc:
-            report["preflight"].append({"passed": False, "message": f"fixture validation failed: {exc}"})
-            return None, {}
+        if fixture is None:
+            try:
+                fixture = load_fixture(self.fixture_path)
+            except Exception as exc:
+                report["preflight"].append(
+                    {"passed": False, "message": f"fixture validation failed: {exc}"}
+                )
+                return None, {}
         if self.mode == "distributed":
             orchestration_error = self._verify_distributed_orchestration()
             if orchestration_error:
@@ -673,35 +1093,12 @@ class CUDAValidationRunner:
                 report["preflight"].append(
                     {"passed": False, "message": f"{endpoint.service_id} is not an unmanaged external LAN worker"}
                 )
-            if self.mode == "distributed" and "artifact-transfer" not in {
+            if "artifact-transfer" not in {
                 item.replace("_", "-").casefold() for item in endpoint.capabilities
             }:
                 report["preflight"].append(
                     {"passed": False, "message": f"{endpoint.service_id} lacks artifact-transfer capability"}
                 )
-        for label, raw_path in fixture.references.model_dump().items():
-            if _contains_unresolved_environment(raw_path):
-                report["preflight"].append(
-                    {"passed": False, "message": f"reference {label} contains an unresolved environment variable"}
-                )
-            elif not Path(raw_path).is_file():
-                report["preflight"].append({"passed": False, "message": f"reference {label} not found: {raw_path}"})
-        for version, pair in fixture.gpt_weights.model_dump(by_alias=True).items():
-            for kind, raw_path in pair.items():
-                if _contains_unresolved_environment(str(raw_path)):
-                    report["preflight"].append(
-                        {
-                            "passed": False,
-                            "message": f"weight {version}.{kind} contains an unresolved environment variable",
-                        }
-                    )
-        if self.require_baseline and fixture.performance_baseline is None:
-            report["preflight"].append(
-                {
-                    "passed": False,
-                    "message": "an approved performance baseline is required for release and distributed validation",
-                }
-            )
         if self.transcriber is None:
             self.transcriber, asr_error = create_transcriber(
                 required=fixture.asr.required,
@@ -771,7 +1168,7 @@ class CUDAValidationRunner:
                 live_caps = {str(item).replace("_", "-").casefold() for item in capabilities.get("capabilities", [])}
                 if "tts" not in live_caps:
                     service_report["errors"].append("worker does not advertise tts capability")
-                if self.mode == "distributed" and "artifact-transfer" not in live_caps:
+                if "artifact-transfer" not in live_caps:
                     service_report["errors"].append("worker does not advertise artifact-transfer capability")
                 service_report["errors"].extend(_status_errors(status, expected_loaded=False))
             except Exception as exc:
@@ -807,7 +1204,6 @@ class CUDAValidationRunner:
         endpoint: TTSServiceEndpoint,
         client: TTSServiceClient,
         perf_source: dict[str, Any],
-        cer_items: list[tuple[str, str, str]],
     ) -> dict[str, Any]:
         output_path = self.output_dir / "wav" / f"{case.name}.wav"
         case_report: dict[str, Any] = {
@@ -815,6 +1211,11 @@ class CUDAValidationRunner:
             "service_id": case.service_id,
             "profile": case.profile,
             "output_path": f"wav/{output_path.name}",
+            "tts_attempted": True,
+            "unload_confirmed": False,
+            "memory_recovered": False,
+            "warm_synthesis_seconds": [],
+            "warm_repeats": [],
             "passed": False,
             "errors": [],
         }
@@ -832,6 +1233,7 @@ class CUDAValidationRunner:
             case_report["loaded_status"] = loaded_status
             case_report["errors"].extend(_status_errors(loaded_status, expected_loaded=True))
             _record_memory(perf_source, loaded_status)
+            loaded_model = loaded_status.get("model")
 
             synthesis_started = self.clock()
             line = ScriptLine(
@@ -840,6 +1242,7 @@ class CUDAValidationRunner:
                 text=case.text,
                 language=case.language,
             )
+            output_path.unlink(missing_ok=True)
             result = client.synthesize(
                 SynthesisRequest(
                     line=line,
@@ -853,21 +1256,87 @@ class CUDAValidationRunner:
             perf_source["short_synthesis_seconds"].append(synthesis_seconds)
             if result.audio_path.resolve(strict=False) != output_path.resolve(strict=False):
                 raise RuntimeError(f"worker returned unexpected output path: {result.audio_path}")
-            audio_metrics = measure_wav(output_path)
+            try:
+                audio_metrics = measure_wav(output_path)
+            except (OSError, ValueError, wave.Error) as exc:
+                raise RuntimeError(
+                    "primary WAV evidence is missing or invalid"
+                ) from exc
             case_report["audio"] = audio_metrics
             if not audio_metrics["passed"]:
                 failed_checks = [name for name, passed in audio_metrics["checks"].items() if not passed]
                 case_report["errors"].append(f"audio quality failed: {', '.join(failed_checks)}")
-            if self.transcriber is not None:
-                hypothesis = self.transcriber(output_path, case.language)
-                cer = character_error_rate(case.text, hypothesis)
-                case_report["asr"] = {"reference": case.text, "hypothesis": hypothesis, "cer": cer, "passed": cer <= MAX_ITEM_CER}
-                cer_items.append((case.name, case.text, hypothesis))
-                if cer > MAX_ITEM_CER:
-                    case_report["errors"].append(f"CER {cer:.4f} exceeds {MAX_ITEM_CER:.2f}")
             after_synthesis = self.status_probe(endpoint)
             case_report["synthesis_status"] = after_synthesis
             _record_memory(perf_source, after_synthesis)
+            primary_residency_errors = _residency_errors(
+                after_synthesis, expected_model=loaded_model
+            )
+            if primary_residency_errors:
+                raise RuntimeError(
+                    "warm synthesis requires the original loaded model: "
+                    + "; ".join(primary_residency_errors)
+                )
+
+            warm_times: list[float] = case_report["warm_synthesis_seconds"]
+            warm_dir = self.output_dir / "wav" / "warm"
+            warm_dir.mkdir(parents=True, exist_ok=True)
+            for repeat_index in range(1, WARM_SYNTHESIS_REPEATS + 1):
+                warm_output_path = warm_dir / f"{case.name}-repeat-{repeat_index}.wav"
+                warm_output_path.unlink(missing_ok=True)
+                warm_started = self.clock()
+                warm_result = client.synthesize(
+                    SynthesisRequest(
+                        line=line,
+                        profile=case.profile,
+                        output_path=warm_output_path,
+                        parameters=case.parameters,
+                    )
+                )
+                warm_seconds = max(0.0, self.clock() - warm_started)
+                if warm_result.audio_path.resolve(strict=False) != warm_output_path.resolve(
+                    strict=False
+                ):
+                    raise RuntimeError(
+                        f"worker returned unexpected warm output path: {warm_result.audio_path}"
+                    )
+                warm_status = self.status_probe(endpoint)
+                _record_memory(perf_source, warm_status)
+                warm_residency_errors = _residency_errors(
+                    warm_status, expected_model=loaded_model
+                )
+                if warm_residency_errors:
+                    raise RuntimeError(
+                        "warm synthesis requires the original loaded model: "
+                        + "; ".join(warm_residency_errors)
+                    )
+                try:
+                    warm_audio = measure_wav(warm_output_path)
+                except (OSError, ValueError, wave.Error) as exc:
+                    raise RuntimeError(
+                        "warm WAV evidence is missing or invalid"
+                    ) from exc
+                if not warm_audio["passed"]:
+                    failed_checks = [
+                        name
+                        for name, passed in warm_audio["checks"].items()
+                        if not passed
+                    ]
+                    raise RuntimeError(
+                        "warm WAV evidence failed audio quality: "
+                        + ", ".join(failed_checks)
+                    )
+                warm_times.append(warm_seconds)
+                perf_source["warm_synthesis_seconds"].append(warm_seconds)
+                case_report["warm_repeats"].append(
+                    {
+                        "repeat": repeat_index,
+                        "output_path": f"wav/warm/{warm_output_path.name}",
+                        "synthesis_seconds": warm_seconds,
+                        "audio": warm_audio,
+                        "status": warm_status,
+                    }
+                )
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             case_report["errors"].append(message)
@@ -881,11 +1350,16 @@ class CUDAValidationRunner:
                 unload_status, recovery_seconds = self._wait_for_unload(endpoint, baseline_reserved, unload_started)
                 case_report["unload_status"] = unload_status
                 case_report["unload_recovery_seconds"] = recovery_seconds
+                case_report["unload_confirmed"] = unload_status.get("loaded") is False
+                unload_reserved = _memory_mib(unload_status, "reserved_bytes")
+                case_report["memory_recovered"] = (
+                    unload_reserved is not None
+                    and unload_reserved <= baseline_reserved + MAX_UNLOAD_MEMORY_DELTA_MIB
+                )
                 case_report["errors"].extend(_status_errors(unload_status, expected_loaded=False))
                 perf_source["unload_recovery_seconds"] = max(
                     perf_source.get("unload_recovery_seconds") or 0.0, recovery_seconds
                 )
-                unload_reserved = _memory_mib(unload_status, "reserved_bytes")
                 if unload_reserved is not None:
                     perf_source["unload_memory_mib"] = max(perf_source.get("unload_memory_mib") or 0.0, unload_reserved)
             except Exception as exc:
@@ -923,6 +1397,30 @@ class CUDAValidationRunner:
             and bool(report["cer"].get("passed"))
             and bool(report["performance"].get("passed"))
         )
+        if self.diagnostic:
+            report["certifiable"] = False
+            if report["passed"]:
+                report["certification_status"] = "diagnostic_core_passed"
+            else:
+                report["certification_status"] = (
+                    "core_failed"
+                    if report.get("core_started")
+                    or report["services"]
+                    or report["cases"]
+                    else "blocked"
+                )
+        else:
+            report["certifiable"] = False
+            if report["passed"]:
+                report["certification_status"] = "core_passed_ui_pending"
+            else:
+                report["certification_status"] = (
+                    "core_failed"
+                    if report.get("core_started")
+                    or report["services"]
+                    or report["cases"]
+                    else "blocked"
+                )
         _write_report_files(self.output_dir, report, fixture, endpoints)
         return report
 
@@ -959,14 +1457,26 @@ def _write_report_files(
     report: dict[str, Any],
     fixture: ValidationFixture | None,
     endpoints: dict[str, TTSServiceEndpoint],
+    *,
+    reset_nvidia: bool = False,
+    preserve_worker_references: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     evidence_report = _sanitize_evidence(report)
-    (output_dir / "summary.json").write_text(
-        json.dumps(evidence_report, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    _atomic_write_report_file(
+        output_dir / "summary.json",
+        lambda path: path.write_text(
+            json.dumps(evidence_report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        ),
     )
-    _write_junit(output_dir / "junit.xml", evidence_report)
-    _write_listening_template(output_dir / "human-listening-review.md", evidence_report, fixture)
+    _atomic_write_report_file(
+        output_dir / "junit.xml", lambda path: _write_junit(path, evidence_report)
+    )
+    _atomic_write_report_file(
+        output_dir / "human-listening-review.md",
+        lambda path: _write_listening_template(path, evidence_report, fixture),
+    )
     log_references = []
     for service_id in FORMAL_SERVICE_IDS.values():
         endpoint = endpoints.get(service_id)
@@ -977,13 +1487,37 @@ def _write_report_files(
                 "status_path": "/status" if endpoint else None,
             }
         )
-    (output_dir / "worker-log-references.json").write_text(
-        json.dumps(log_references, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    worker_references_path = output_dir / "worker-log-references.json"
+    if not preserve_worker_references or not worker_references_path.exists():
+        _atomic_write_report_file(
+            worker_references_path,
+            lambda path: path.write_text(
+                json.dumps(log_references, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            ),
+        )
     nvidia_path = output_dir / "nvidia-smi.csv"
-    if not nvidia_path.exists():
-        with nvidia_path.open("w", encoding="utf-8", newline="") as handle:
-            csv.writer(handle).writerow(NvidiaSmiMonitor.HEADER)
+    if reset_nvidia or not nvidia_path.exists():
+        _atomic_write_report_file(nvidia_path, _write_nvidia_header)
+
+
+def _write_nvidia_header(path: Path) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerow(NvidiaSmiMonitor.HEADER)
+
+
+def _atomic_write_report_file(path: Path, writer: Callable[[Path], Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        writer(temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _sanitize_evidence(value: Any, key: str = "") -> Any:
@@ -1037,6 +1571,10 @@ def _write_junit(path: Path, report: dict[str, Any]) -> None:
         testcases.append(("service-contract", str(service["service_id"]), [str(item) for item in service.get("errors") or []]))
     for case in report.get("cases") or []:
         testcases.append(("cuda-synthesis", str(case["name"]), [str(item) for item in case.get("errors") or []]))
+    for index, failure in enumerate(report.get("pipeline_failures") or []):
+        stage = str(failure.get("stage") or "post-core")
+        errors = [] if failure.get("passed") else [str(failure.get("message") or "pipeline failed")]
+        testcases.append(("pipeline", f"{stage}-{index + 1}", errors))
     if report.get("performance", {}).get("checks"):
         errors = [name for name, passed in report["performance"]["checks"].items() if not passed]
         testcases.append(("quality-gates", "performance", errors))
@@ -1063,14 +1601,39 @@ def _write_listening_template(
     path: Path, report: dict[str, Any], fixture: ValidationFixture | None
 ) -> None:
     reviewers = fixture.reviewers if fixture else []
-    reviewer_lines = "\n".join(f"- `{reviewer.id}`: {reviewer.name}" for reviewer in reviewers) or "- Not configured"
-    rows = []
-    for case in report.get("cases") or []:
-        rows.append(
-            f"| {case['name']} | `{case.get('output_path', '')}` |  |  |  |  |  |  |"
+    reviewer_lines = (
+        "\n".join(
+            f"- `{_markdown_reviewer(reviewer.id)}`: {_markdown_reviewer(reviewer.name)}"
+            for reviewer in reviewers
         )
+        or "- Not configured"
+    )
+    rows: list[str] = []
+    row_reviewers: list[Reviewer | None] = list(reviewers) or [None]
+    for reviewer in row_reviewers:
+        for case in report.get("cases") or []:
+            columns = [
+                _markdown_inline(case["name"]),
+                f"`{_markdown_inline(case.get('output_path', ''))}`",
+                f"`{_markdown_reviewer(reviewer.id)}`" if reviewer else "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ]
+            rows.append("| " + " | ".join(columns) + " |")
     if not rows:
-        rows.append("| No synthesis output |  |  |  |  |  |  |  |")
+        rows.append("| " + " | ".join(["No synthesis output", "", "", "", "", "", "", "", ""]) + " |")
+    signature_blocks = "\n\n".join(
+        f"""### Reviewer `{_markdown_reviewer(reviewer.id)}` — {_markdown_reviewer(reviewer.name)}
+
+- Decision: PASS / FAIL
+- Signature / timestamp:
+- Release or certification reference:"""
+        for reviewer in reviewers
+    ) or "- Reviewers are not configured."
     content = f"""# CUDA Human Listening Review
 
 Validation mode: `{report.get('mode')}`
@@ -1086,14 +1649,30 @@ Score clarity, timbre similarity, emotion/prosody, and artifacts from 1 to 5. Ea
 |---|---|---:|---:|---:|---:|---:|---:|---|
 {chr(10).join(rows)}
 
-## Decision
+## Independent decisions
 
-- Reviewer identity:
-- Decision: PASS / FAIL
-- Signature / timestamp:
-- Release or certification reference:
+{signature_blocks}
 """
     path.write_text(content, encoding="utf-8")
+
+
+def _markdown_inline(value: Any) -> str:
+    normalized = " ".join(str(value).splitlines())
+    return (
+        normalized.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("|", "&#124;")
+        .replace("`", "&#96;")
+        .replace("#", "&#35;")
+    )
+
+
+def _markdown_reviewer(value: Any) -> str:
+    sanitized = _markdown_inline(value)
+    for character in "\\![]()*_~:/@.":
+        sanitized = sanitized.replace(character, f"&#{ord(character)};")
+    return sanitized
 
 
 def _status_errors(status: dict[str, Any], *, expected_loaded: bool) -> list[str]:
@@ -1121,11 +1700,27 @@ def _status_errors(status: dict[str, Any], *, expected_loaded: bool) -> list[str
     return errors
 
 
+def _residency_errors(
+    status: dict[str, Any], *, expected_model: Any
+) -> list[str]:
+    errors = _status_errors(status, expected_loaded=True)
+    if status.get("model") != expected_model:
+        errors.append("status model changed since the explicit load")
+    return errors
+
+
 def _record_memory(metrics: dict[str, Any], status: dict[str, Any], *, baseline: bool = False) -> None:
     free_mib = _memory_mib(status, "free_bytes")
     if free_mib is not None:
         current = metrics.get("minimum_free_mib")
         metrics["minimum_free_mib"] = free_mib if current is None else min(current, free_mib)
+    for field, metric_name in (
+        ("reserved_bytes", "maximum_reserved_mib"),
+        ("allocated_bytes", "maximum_allocated_mib"),
+    ):
+        value_mib = _memory_mib(status, field)
+        if value_mib is not None:
+            metrics[metric_name] = max(metrics.get(metric_name) or 0.0, value_mib)
     if baseline:
         reserved_mib = _memory_mib(status, "reserved_bytes")
         if reserved_mib is not None:
@@ -1185,7 +1780,7 @@ def _expand_environment(value: Any) -> Any:
 
 
 def _contains_unresolved_environment(value: str) -> bool:
-    return bool(re.search(r"\$\{[^}]+\}|%[^%]+%", value))
+    return bool(re.search(r"\$\{[^}]+\}|%[^%]+%|\$[A-Za-z_][A-Za-z0-9_]*", value))
 
 
 def _optional_float(value: Any) -> float | None:
@@ -1210,12 +1805,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--topology", type=Path)
     parser.add_argument("--node")
     parser.add_argument("--distributed-preflight", type=Path)
+    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument("--write-blocker-stage")
+    parser.add_argument("--blocker-message")
+    parser.add_argument("--preserve-existing", action="store_true")
     parser.add_argument(
         "--require-baseline",
         action="store_true",
         help="require an approved performance baseline (ignored for single-clean certification)",
     )
     args = parser.parse_args(argv)
+    if bool(args.write_blocker_stage) != bool(args.blocker_message):
+        parser.error("--write-blocker-stage and --blocker-message must be provided together")
+    if args.preserve_existing and args.write_blocker_stage not in POST_CORE_STAGES:
+        parser.error("--preserve-existing is only allowed for post-core blocker stages")
     runner = CUDAValidationRunner(
         mode=args.mode,
         services_path=args.services,
@@ -1225,9 +1829,22 @@ def main(argv: list[str] | None = None) -> int:
         node=args.node,
         distributed_preflight_path=args.distributed_preflight,
         require_baseline=args.require_baseline,
+        diagnostic=args.diagnostic,
     )
-    report = runner.run()
-    print(json.dumps({"passed": report["passed"], "summary": str(args.output / "summary.json")}, ensure_ascii=False))
+    if args.write_blocker_stage:
+        report = runner.write_blocker_report(
+            stage=args.write_blocker_stage,
+            message=args.blocker_message,
+            preserve_existing=args.preserve_existing,
+        )
+    else:
+        report = runner.run_input_preflight() if args.preflight_only else runner.run()
+    if report.get("stage") == "input-preflight" and not report["passed"]:
+        print(
+            f"阻塞：input-preflight 有 {report['blocker_count']} 个未解决项；证据：summary.json"
+        )
+    else:
+        print(json.dumps({"passed": report["passed"], "summary": str(args.output / "summary.json")}, ensure_ascii=False))
     return 0 if report["passed"] else 1
 
 

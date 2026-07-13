@@ -508,7 +508,8 @@ def test_layered_status_does_not_mark_stopped_managed_service_ready() -> None:
     assert status["supervisor_state"] == "stopped"
 
 
-def test_generation_preflight_offers_local_fallback_when_primary_is_unavailable(tmp_path: Path) -> None:
+def test_generation_preflight_offers_local_fallback_when_primary_is_unavailable(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("app.services.ServiceRouter._client_ready", lambda *_args: False)
     services_path = tmp_path / "services.json"
     services_path.write_text(
         """
@@ -1712,7 +1713,8 @@ def test_generate_normalizes_reference_audio_before_queue_dispatch(
     assert dispatched == {**original, canonical_key: expected_path}
 
 
-def test_generation_preflight_suggests_local_fallback_without_auto_start(tmp_path: Path) -> None:
+def test_generation_preflight_suggests_local_fallback_without_auto_start(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("app.services.ServiceRouter._client_ready", lambda *_args: False)
     services_path = tmp_path / "services.json"
     services_path.write_text(
         """

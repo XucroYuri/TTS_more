@@ -3,6 +3,7 @@ param(
     [string]$RepoPaths = "",
     [string]$Topology = "",
     [string]$Node = "",
+    [string]$PidManifest = "",
     [switch]$Detach
 )
 
@@ -26,6 +27,12 @@ if ($Topology) {
 }
 if ($Node) {
     $argsList += @("--node", $Node)
+}
+if (-not $PidManifest) {
+    $PidManifest = $env:TTS_MORE_CUDA_PID_MANIFEST
+}
+if ($PidManifest) {
+    $argsList += @("--pid-manifest", $PidManifest)
 }
 if ($Detach) {
     $argsList += "--detach"

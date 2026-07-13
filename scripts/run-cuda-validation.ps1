@@ -9,6 +9,7 @@ param(
     [string]$Output = "",
     [string]$SshUser = "",
     [string]$RemoteRoot = "",
+    [string]$RepoPaths = "",
     [switch]$SkipDeploy,
     [switch]$SkipStart,
     [switch]$SkipFaultRecovery,
@@ -28,11 +29,28 @@ if (-not $Output) {
 $FixturePath = if ([IO.Path]::IsPathRooted($Fixture)) { $Fixture } else { Join-Path $Root $Fixture }
 $ServicesPath = if ([IO.Path]::IsPathRooted($Services)) { $Services } else { Join-Path $Root $Services }
 $TopologyPath = if ($Topology -and [IO.Path]::IsPathRooted($Topology)) { $Topology } elseif ($Topology) { Join-Path $Root $Topology } else { "" }
+$RepoPathsPath = if ($RepoPaths -and [IO.Path]::IsPathRooted($RepoPaths)) {
+    $RepoPaths
+} elseif ($RepoPaths) {
+    Join-Path $Root $RepoPaths
+} else {
+    ""
+}
 $ControllerCommit = (& git -C $Root rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $ControllerCommit -notmatch '^[0-9a-f]{40}$') { throw "Unable to resolve TTS More HEAD" }
 $env:TTS_MORE_EXPECTED_APP_COMMIT = $ControllerCommit
 Remove-Item Env:TTS_MORE_DISTRIBUTED_ORCHESTRATION_TOKEN -ErrorAction SilentlyContinue
 $script:DistributedPreflightPath = ""
+$script:DistributedDeploymentStarted = $false
+$isDiagnostic = $SkipDeploy -or $SkipStart
+$currentStage = "host-preflight"
+$previousCudaPidManifest = $env:TTS_MORE_CUDA_PID_MANIFEST
+$runProcessManifest = if ([string]::IsNullOrWhiteSpace($previousCudaPidManifest)) {
+    Join-Path $Output "process-manifest.json"
+} else {
+    $previousCudaPidManifest
+}
+$env:TTS_MORE_CUDA_PID_MANIFEST = $runProcessManifest
 
 New-Item -ItemType Directory -Force -Path $Output | Out-Null
 $TranscriptPath = Join-Path $Output "controller.log"
@@ -146,17 +164,14 @@ function New-DistributedOrchestrationPreflight {
 
 function Start-RemoteGpuMonitor {
     param([string]$Target, [string]$RemoteEvidenceRoot)
-    $monitorCommand = "New-Item -ItemType Directory -Force -Path " + (Quote-PowerShellLiteral $RemoteEvidenceRoot) +
-        " | Out-Null; Remove-Item -Force -ErrorAction SilentlyContinue " +
-        (Quote-PowerShellLiteral (Join-Path $RemoteEvidenceRoot "nvidia-smi.csv")) + "," +
-        (Quote-PowerShellLiteral (Join-Path $RemoteEvidenceRoot "nvidia-smi.pid")) +
-        "; `$args = @('--query-gpu=timestamp,index,uuid,memory.total,memory.free,memory.used,utilization.gpu','--format=csv,noheader,nounits','--loop-ms=2000'); " +
-        "`$process = Start-Process -FilePath 'nvidia-smi.exe' -ArgumentList `$args -RedirectStandardOutput " +
-        (Quote-PowerShellLiteral (Join-Path $RemoteEvidenceRoot "nvidia-smi.csv")) +
-        " -RedirectStandardError " + (Quote-PowerShellLiteral (Join-Path $RemoteEvidenceRoot "nvidia-smi.stderr.log")) +
-        " -WindowStyle Hidden -PassThru; Set-Content -LiteralPath " +
-        (Quote-PowerShellLiteral (Join-Path $RemoteEvidenceRoot "nvidia-smi.pid")) + " -Value `$process.Id"
-    Invoke-RemotePowerShell $Target $monitorCommand
+    $stopScript = Join-Path $script:RemoteRoot "scripts\stop-cuda-gpu-monitor.ps1"
+    $startScript = Join-Path $script:RemoteRoot "scripts\start-cuda-gpu-monitor.ps1"
+    $stopCommand = "& " + (Quote-PowerShellLiteral $stopScript) +
+        " -EvidenceRoot " + (Quote-PowerShellLiteral $RemoteEvidenceRoot)
+    $startCommand = "& " + (Quote-PowerShellLiteral $startScript) +
+        " -EvidenceRoot " + (Quote-PowerShellLiteral $RemoteEvidenceRoot)
+    Invoke-RemotePowerShell $Target $stopCommand
+    Invoke-RemotePowerShell $Target $startCommand
 }
 
 function Copy-RemoteEvidenceFile {
@@ -175,8 +190,9 @@ function Collect-DistributedEvidence {
         $nodeName = [string]$worker.Name
         $target = "$script:SshUser@$([string]$worker.Value.host)"
         $remoteEvidenceRoot = Join-Path $script:RemoteRoot "data\validation\cuda-controller"
-        $stopMonitor = "`$pidPath = " + (Quote-PowerShellLiteral (Join-Path $remoteEvidenceRoot "nvidia-smi.pid")) +
-            "; if (Test-Path -LiteralPath `$pidPath) { `$monitorPid = [int](Get-Content -LiteralPath `$pidPath -Raw); Stop-Process -Id `$monitorPid -Force -ErrorAction SilentlyContinue }"
+        $stopScript = Join-Path $script:RemoteRoot "scripts\stop-cuda-gpu-monitor.ps1"
+        $stopMonitor = "& " + (Quote-PowerShellLiteral $stopScript) +
+            " -EvidenceRoot " + (Quote-PowerShellLiteral $remoteEvidenceRoot) + " -Required"
         Invoke-RemotePowerShell $target $stopMonitor
         $nodeOutput = Join-Path $Output ("worker-logs\" + $nodeName)
         Copy-RemoteEvidenceFile $target (Join-Path $remoteEvidenceRoot "nvidia-smi.csv") (Join-Path $nodeOutput "nvidia-smi.csv")
@@ -213,17 +229,102 @@ function Wait-ServiceReady {
     throw "Workers did not become ready within $TimeoutSeconds seconds"
 }
 
+function Test-ConfiguredWorkerProcessOwnership {
+    param(
+        [AllowEmptyString()][string]$CommandLine,
+        [AllowEmptyString()][string]$ExecutablePath,
+        [string]$ProjectRoot,
+        [string]$WorkerModule
+    )
+    if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($WorkerModule)) {
+        return $false
+    }
+    try {
+        $normalizedRoot = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd([char[]]@('\', '/'))
+    } catch {
+        return $false
+    }
+    $rootWithSeparator = $normalizedRoot + [IO.Path]::DirectorySeparatorChar
+    $executableOwned = $false
+    if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {
+        try {
+            $normalizedExecutable = [IO.Path]::GetFullPath($ExecutablePath)
+            $executableOwned = $normalizedExecutable.StartsWith(
+                $rootWithSeparator, [StringComparison]::OrdinalIgnoreCase
+            )
+        } catch {
+            $executableOwned = $false
+        }
+    }
+    $escapedModule = [regex]::Escape($WorkerModule)
+    $moduleArgumentPattern = '(?:^|\s)(?:"' + $escapedModule + '"|' + $escapedModule + ')(?=\s|$)'
+    $moduleOwned = [regex]::IsMatch(
+        $CommandLine,
+        $moduleArgumentPattern,
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    return [bool]($executableOwned -and $moduleOwned)
+}
+
 function Stop-ConfiguredWorkerListeners {
     param([string]$Path)
     if (!(Test-Path -LiteralPath $Path)) { return }
     $formal = @("local-gpt-sovits-main", "local-indextts", "local-cosyvoice")
+    $workerModules = @{
+        "local-gpt-sovits-main" = "app.workers.gpt_sovits_worker:app"
+        "local-indextts" = "app.workers.indextts_worker:app"
+        "local-cosyvoice" = "app.workers.cosyvoice_worker:app"
+    }
     $servicesPayload = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $ownedListeners = @()
     foreach ($service in @($servicesPayload | Where-Object { $_.service_id -in $formal })) {
         $port = ([Uri]$service.base_url).Port
         $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
-        $listeners | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object {
-            Write-Host "[replace] stop existing worker listener on port $port" -ForegroundColor Yellow
-            Stop-Process -Id $_ -Force -ErrorAction Stop
+        foreach ($processId in @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)) {
+            $process = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$processId)" -ErrorAction SilentlyContinue
+            $creationDate = if ($null -ne $process) { [string]$process.CreationDate } else { "" }
+            $owned = -not [string]::IsNullOrWhiteSpace($creationDate) -and (Test-ConfiguredWorkerProcessOwnership `
+                -CommandLine ([string]$process.CommandLine) `
+                -ExecutablePath ([string]$process.ExecutablePath) `
+                -ProjectRoot $Root `
+                -WorkerModule $workerModules[[string]$service.service_id]
+            )
+            if (-not $owned) {
+                throw "阻塞：端口 $port 被非本次验证进程占用"
+            }
+            $ownedListeners += [pscustomobject]@{
+                Port = $port
+                ProcessId = [int]$processId
+                CreationDate = $creationDate
+                WorkerModule = $workerModules[[string]$service.service_id]
+            }
+        }
+    }
+    $revalidatedListeners = @()
+    foreach ($listener in $ownedListeners) {
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$listener.ProcessId)" -ErrorAction SilentlyContinue
+        $sameCreation =
+            $null -ne $process -and
+            ([string]$process.CreationDate).Equals(
+                [string]$listener.CreationDate, [StringComparison]::Ordinal
+            )
+        $owned = $sameCreation -and (Test-ConfiguredWorkerProcessOwnership `
+            -CommandLine ([string]$process.CommandLine) `
+            -ExecutablePath ([string]$process.ExecutablePath) `
+            -ProjectRoot $Root `
+            -WorkerModule ([string]$listener.WorkerModule)
+        )
+        if (-not $owned) {
+            throw "阻塞：端口 $($listener.Port) 被非本次验证进程占用"
+        }
+        $revalidatedListeners += $listener
+    }
+    foreach ($listener in $revalidatedListeners) {
+        Write-Host "[replace] stop owned worker listener on port $($listener.Port)" -ForegroundColor Yellow
+        try {
+            Stop-Process -Id $listener.ProcessId -Force -ErrorAction Stop
+        } catch {
+            throw "阻塞：端口 $($listener.Port) 的本次验证进程停止失败"
         }
     }
 }
@@ -238,10 +339,9 @@ function Get-ControlPlaneHeaders {
 
 function Start-ValidationControlPlane {
     $headers = Get-ControlPlaneHeaders
-    try {
-        $health = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health -Headers $headers -TimeoutSec 5
-        if ($health.StatusCode -eq 200) { return }
-    } catch {}
+    if (@(Get-NetTCPConnection -State Listen -LocalPort 8000 -ErrorAction SilentlyContinue).Count -gt 0) {
+        throw "Validation control-plane port is already in use; confirm ownership before continuing"
+    }
     $logs = Join-Path $Output "logs"
     New-Item -ItemType Directory -Force -Path $logs | Out-Null
     $previousServicesPath = $env:TTS_MORE_SERVICES_PATH
@@ -260,6 +360,19 @@ function Start-ValidationControlPlane {
         $env:TTS_MORE_SERVICES_PATH = $previousServicesPath
         $env:TTS_MORE_SERVICE_MODE = $previousServiceMode
     }
+    try {
+        & (Join-Path $Root "scripts\register-cuda-validation-process.ps1") `
+            -Manifest $env:TTS_MORE_CUDA_PID_MANIFEST `
+            -ProcessId $script:ValidationControlPlane.Id `
+            -ExecutablePath (Resolve-Path $Python).Path `
+            -WorkerModule "app.main:app"
+    } catch {
+        if ($script:ValidationControlPlane -and -not $script:ValidationControlPlane.HasExited) {
+            Stop-Process -Id $script:ValidationControlPlane.Id -Force -ErrorAction SilentlyContinue
+        }
+        $script:ValidationControlPlane = $null
+        throw "Validation control plane registration failed"
+    }
     for ($attempt = 0; $attempt -lt 60; $attempt += 1) {
         try {
             $health = Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/api/health -Headers $headers -TimeoutSec 5
@@ -270,6 +383,9 @@ function Start-ValidationControlPlane {
 }
 
 function Invoke-SingleNodeDeployment {
+    if ($RepoPaths -and !(Test-Path -LiteralPath $RepoPathsPath)) {
+        throw "RepoPaths file not found: $RepoPathsPath"
+    }
     $deploy = @{
         Profile = "local-all"
         Device = "CU128"
@@ -277,6 +393,7 @@ function Invoke-SingleNodeDeployment {
     }
     if ($TopologyPath) { $deploy.Topology = $TopologyPath }
     if ($Node) { $deploy.Node = $Node }
+    if ($RepoPaths) { $deploy.RepoPaths = $RepoPaths }
     if ($Mode -eq "single-clean") { $deploy.CleanRepos = $true }
     Invoke-LocalScript (Join-Path $Root "scripts\deploy-local-tts.ps1") $deploy
     if (-not $SkipStart) {
@@ -284,6 +401,7 @@ function Invoke-SingleNodeDeployment {
         $start = @{ Detach = $true }
         if ($TopologyPath) { $start.Topology = $TopologyPath }
         if ($Node) { $start.Node = $Node }
+        if ($RepoPaths) { $start.RepoPaths = $RepoPaths }
         Invoke-LocalScript (Join-Path $Root "scripts\start-service-workers.ps1") $start
     }
 }
@@ -334,6 +452,21 @@ function Invoke-DistributedDeployment {
         & scp $TopologyPath "${target}:$remoteTopology"
         if ($LASTEXITCODE -ne 0) { throw "Failed to copy topology to $target" }
 
+        $remoteProcessManifest = Join-Path $script:RemoteRoot "data\.runtime\cuda-validation-processes.json"
+        $remoteCleanupScript = Join-Path $script:RemoteRoot "scripts\cleanup-cuda-validation-processes.ps1"
+        $remoteCleanup = "& " + (Quote-PowerShellLiteral $remoteCleanupScript) +
+            " -Manifest " + (Quote-PowerShellLiteral $remoteProcessManifest)
+        Invoke-RemotePowerShell $target $remoteCleanup
+        $appServices = Get-Content -LiteralPath $ServicesPath -Raw | ConvertFrom-Json
+        foreach ($serviceId in @($worker.Value.services)) {
+            $workerService = @($appServices | Where-Object { $_.service_id -eq $serviceId })[0]
+            if ($null -eq $workerService) { throw "Worker service missing from controller config: $serviceId" }
+            $workerPort = ([Uri]$workerService.base_url).Port
+            $remoteAssertFree = "`$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $workerPort -ErrorAction SilentlyContinue); " +
+                "if (`$listeners.Count -gt 0) { throw 'Configured worker port is already in use; confirm ownership before continuing' }"
+            Invoke-RemotePowerShell $target $remoteAssertFree
+        }
+
         $deployScript = Join-Path $script:RemoteRoot "scripts\deploy-local-tts.ps1"
         $remoteDeploy = "& " + (Quote-PowerShellLiteral $deployScript) +
             " -Profile worker-node -Device CU128 -Targets default -Topology " + (Quote-PowerShellLiteral $remoteTopology) +
@@ -341,19 +474,11 @@ function Invoke-DistributedDeployment {
         if (-not $RequireBaseline) { $remoteDeploy += " -CleanRepos" }
         Invoke-RemotePowerShell $target $remoteDeploy
         if (-not $SkipStart) {
-            $appServices = Get-Content -LiteralPath $ServicesPath -Raw | ConvertFrom-Json
-            foreach ($serviceId in @($worker.Value.services)) {
-                $workerService = @($appServices | Where-Object { $_.service_id -eq $serviceId })[0]
-                if ($null -eq $workerService) { throw "Worker service missing from controller config: $serviceId" }
-                $workerPort = ([Uri]$workerService.base_url).Port
-                $remoteStop = "`$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $workerPort -ErrorAction SilentlyContinue); " +
-                    "`$listeners | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id `$_ -Force -ErrorAction Stop }"
-                Invoke-RemotePowerShell $target $remoteStop
-            }
             $startScript = Join-Path $script:RemoteRoot "scripts\start-service-workers.ps1"
             $remoteStart = "& " + (Quote-PowerShellLiteral $startScript) +
                 " -Topology " + (Quote-PowerShellLiteral $remoteTopology) +
-                " -Node " + (Quote-PowerShellLiteral $nodeName) + " -Detach"
+                " -Node " + (Quote-PowerShellLiteral $nodeName) +
+                " -PidManifest " + (Quote-PowerShellLiteral $remoteProcessManifest) + " -Detach"
             Invoke-RemotePowerShell $target $remoteStart
         }
         Start-RemoteGpuMonitor $target (Join-Path $script:RemoteRoot "data\validation\cuda-controller")
@@ -379,13 +504,15 @@ function Invoke-DistributedFaultRecovery {
     $servicesPayload = Get-Content -LiteralPath $ServicesPath -Raw | ConvertFrom-Json
     $service = @($servicesPayload | Where-Object { $_.service_id -eq $serviceId })[0]
     if ($null -eq $service) { throw "Fault-injection service is missing from services file: $serviceId" }
-    $port = ([Uri]$service.base_url).Port
     $target = "$script:SshUser@$([string]$faultWorker.Value.host)"
     $remoteTopology = Join-Path $script:RemoteRoot "data\local\topology.validation.json"
+    $remoteProcessManifest = Join-Path $script:RemoteRoot "data\.runtime\cuda-validation-processes.json"
+    $remoteCleanupScript = Join-Path $script:RemoteRoot "scripts\cleanup-cuda-validation-processes.ps1"
     $startScript = Join-Path $script:RemoteRoot "scripts\start-service-workers.ps1"
     $remoteStart = "& " + (Quote-PowerShellLiteral $startScript) +
         " -Topology " + (Quote-PowerShellLiteral $remoteTopology) +
-        " -Node " + (Quote-PowerShellLiteral ([string]$faultWorker.Name)) + " -Detach"
+        " -Node " + (Quote-PowerShellLiteral ([string]$faultWorker.Name)) +
+        " -PidManifest " + (Quote-PowerShellLiteral $remoteProcessManifest) + " -Detach"
     $report = [ordered]@{
         node = [string]$faultWorker.Name
         service_id = $serviceId
@@ -399,10 +526,12 @@ function Invoke-DistributedFaultRecovery {
     $headers = Get-ControlPlaneHeaders
     $workerStopped = $false
     try {
-        $killCommand = '$connections = @(Get-NetTCPConnection -State Listen -LocalPort {0} -ErrorAction Stop); if ($connections.Count -eq 0) {{ throw ''No listener on validation port'' }}; $connections | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object {{ Stop-Process -Id $_ -Force }}' -f $port
+        $killCommand = "& " + (Quote-PowerShellLiteral $remoteCleanupScript) +
+            " -Manifest " + (Quote-PowerShellLiteral $remoteProcessManifest) +
+            " -ServiceId " + (Quote-PowerShellLiteral $serviceId) + " -Required"
         $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-        $workerStopped = $true
         Invoke-RemotePowerShell $target $killCommand
+        $workerStopped = $true
         while ($stopwatch.Elapsed.TotalSeconds -le 15) {
             $status = Invoke-RestMethod -Uri http://127.0.0.1:8000/api/services/status -Headers $headers -TimeoutSec 10
             $faultStatus = @($status.services | Where-Object { $_.service_id -eq $serviceId })[0]
@@ -443,21 +572,75 @@ function Invoke-DistributedFaultRecovery {
     if (-not $report.retry_passed) { throw "CUDA synthesis retry failed after worker restart" }
 }
 
+$environmentPreflightPath = Join-Path $Output "environment-preflight.json"
 try {
-    if (!(Test-Path -LiteralPath $FixturePath)) { throw "Fixture file not found: $FixturePath" }
+    $hostPreflightArgs = @(
+        (Join-Path $Root "scripts\tts_more_deploy.py"),
+        "--root", $Root,
+        "preflight-cuda-host",
+        "--mode", $Mode,
+        "--output", $environmentPreflightPath
+    )
+    & $Python @hostPreflightArgs | Out-Null
+    $hostPreflightExitCode = $LASTEXITCODE
+    if ($hostPreflightExitCode -ne 0) {
+        $hostPreflightNextAction = "Resolve the failed CUDA host requirements, then rerun host preflight."
+        try {
+            $environmentPreflight = Get-Content -LiteralPath $environmentPreflightPath -Raw | ConvertFrom-Json
+            if ($environmentPreflight.next_action) {
+                $hostPreflightNextAction = [string]$environmentPreflight.next_action
+            }
+        } catch { }
+        throw $hostPreflightNextAction
+    }
+
+    $currentStage = "input-preflight"
+    $validatorArgs = @(
+        (Join-Path $Root "scripts\run-cuda-validation.py"),
+        "--mode", $Mode,
+        "--services", $ServicesPath,
+        "--fixture", $FixturePath,
+        "--output", $Output,
+        "--preflight-only"
+    )
+    if ($TopologyPath) { $validatorArgs += @("--topology", $TopologyPath) }
+    if ($Node) { $validatorArgs += @("--node", $Node) }
+    if ($RequireBaseline) { $validatorArgs += "--require-baseline" }
+    if ($isDiagnostic) { $validatorArgs += "--diagnostic" }
+    & $Python @validatorArgs | Out-Null
+    $preflightExitCode = $LASTEXITCODE
+    if ($preflightExitCode -ne 0) {
+        $blockerCount = 1
+        try {
+            $preflightSummary = Get-Content -LiteralPath (Join-Path $Output "summary.json") -Raw | ConvertFrom-Json
+            $blockerCount = [int]$preflightSummary.blocker_count
+        } catch { }
+        Write-Host "阻塞：input-preflight 有 $blockerCount 个未解决项；证据：summary.json" -ForegroundColor Red
+        exit $preflightExitCode
+    }
+    $currentStage = "argument-validation"
     if ($Mode -eq "distributed") {
         if ($SkipDeploy) { throw "distributed mode does not allow -SkipDeploy because deployment identity checks are mandatory" }
         if ($Node) { throw "distributed mode does not allow -Node because all four machines are mandatory" }
         if ($SkipStart) { throw "distributed mode does not allow -SkipStart because worker restart is mandatory" }
         if ($SkipFaultRecovery) { throw "distributed mode does not allow -SkipFaultRecovery because recovery is mandatory" }
     }
+    $currentStage = "deployment"
     if (-not $SkipDeploy) {
-        if ($Mode -eq "distributed") { Invoke-DistributedDeployment } else { Invoke-SingleNodeDeployment }
+        if ($Mode -eq "distributed") {
+            $script:DistributedDeploymentStarted = $true
+            Invoke-DistributedDeployment
+        } else {
+            Invoke-SingleNodeDeployment
+        }
     }
+    $currentStage = "orchestration-preflight"
     if ($Mode -eq "distributed") { New-DistributedOrchestrationPreflight }
+    $currentStage = "worker-wait"
     if (!(Test-Path -LiteralPath $ServicesPath)) { throw "Services file not found: $ServicesPath" }
     Wait-ServiceReady $ServicesPath
 
+    $currentStage = "core-validation"
     $validatorArgs = @(
         (Join-Path $Root "scripts\run-cuda-validation.py"),
         "--mode", $Mode,
@@ -469,24 +652,69 @@ try {
     if ($script:DistributedPreflightPath) { $validatorArgs += @("--distributed-preflight", $script:DistributedPreflightPath) }
     if ($Node) { $validatorArgs += @("--node", $Node) }
     if ($RequireBaseline) { $validatorArgs += "--require-baseline" }
+    if ($isDiagnostic) { $validatorArgs += "--diagnostic" }
     & $Python @validatorArgs
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) { throw "CUDA validation gate failed; see $(Join-Path $Output 'summary.json')" }
     if ($Mode -eq "distributed" -and -not $SkipFaultRecovery) {
+        $currentStage = "fault-recovery"
         Invoke-DistributedFaultRecovery
     }
     if ($Mode -eq "distributed") {
+        $currentStage = "evidence-collection"
         Collect-DistributedEvidence
         $script:DistributedEvidenceCollected = $true
     }
-    Write-Host "CUDA validation passed: $Output" -ForegroundColor Green
-} finally {
-    if ($Mode -eq "distributed" -and -not $script:DistributedEvidenceCollected) {
+    if ($isDiagnostic) {
+        Write-Host "CUDA diagnostic core 通过（不可认证）：$Output" -ForegroundColor Yellow
+    } else {
+        Write-Host "CUDA core 通过，Playwright/人工待完成：$Output" -ForegroundColor Green
+    }
+} catch {
+    $failureMessage = $_.Exception.Message
+    if ($Mode -eq "distributed" -and $script:DistributedDeploymentStarted -and -not $script:DistributedEvidenceCollected) {
         try { Collect-DistributedEvidence } catch { Write-Warning "Distributed evidence collection failed: $_" }
     }
+    $writeBlocker = $currentStage -eq "host-preflight"
+    if (-not $writeBlocker) {
+        $writeBlocker = $true
+        try {
+            $existingSummary = Get-Content -LiteralPath (Join-Path $Output "summary.json") -Raw | ConvertFrom-Json
+            if ($existingSummary.passed -eq $false) { $writeBlocker = $false }
+        } catch { }
+    }
+    if ($writeBlocker) {
+        $blockerArgs = @(
+            (Join-Path $Root "scripts\run-cuda-validation.py"),
+            "--mode", $Mode,
+            "--services", $ServicesPath,
+            "--fixture", $FixturePath,
+            "--output", $Output,
+            "--write-blocker-stage", $currentStage,
+            "--blocker-message", $failureMessage
+        )
+        if ($TopologyPath) { $blockerArgs += @("--topology", $TopologyPath) }
+        if ($Node) { $blockerArgs += @("--node", $Node) }
+        if ($isDiagnostic) { $blockerArgs += "--diagnostic" }
+        if ($currentStage -in @("fault-recovery", "evidence-collection")) { $blockerArgs += "--preserve-existing" }
+        & $Python @blockerArgs | Out-Null
+        if ($LASTEXITCODE -notin @(0, 1)) { Write-Warning "Unable to write blocker evidence for $currentStage" }
+    }
+    if ($currentStage -eq "host-preflight") {
+        Write-Host "阻塞：CUDA 主机预检未通过；证据：environment-preflight.json、summary.json" -ForegroundColor Red
+    } else {
+        Write-Host "阻塞：$currentStage 失败；证据：summary.json" -ForegroundColor Red
+    }
+    throw
+} finally {
     if ($script:ValidationControlPlane -and -not $script:ValidationControlPlane.HasExited) {
         Stop-Process -Id $script:ValidationControlPlane.Id -Force
     }
     Remove-Item Env:TTS_MORE_DISTRIBUTED_ORCHESTRATION_TOKEN -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($previousCudaPidManifest)) {
+        Remove-Item Env:TTS_MORE_CUDA_PID_MANIFEST -ErrorAction SilentlyContinue
+    } else {
+        $env:TTS_MORE_CUDA_PID_MANIFEST = $previousCudaPidManifest
+    }
     Stop-Transcript | Out-Null
 }
