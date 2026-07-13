@@ -232,6 +232,18 @@ bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --source ModelScope
 - IndexTTS：优先 `uv sync --all-extras`，下载 `IndexTeam/IndexTTS-2`，并准备 BigVGAN 辅助模型。
 - CosyVoice：需要 `git submodule update --init --recursive`，Python 3.10 venv，`requirements.txt`，默认下载 `CosyVoice-300M`。
 
+### 便携包构建用私有 Conda
+
+四个离线绿色包的构建不依赖电脑中已安装的 Conda。Windows 构建入口会从 `packaging/portable/toolchain.lock.json` 读取锁定的 Miniforge 下载地址与 SHA-256，将其仅安装到项目的 `data/cache/portable/conda/`，并把包缓存设为该目录下的 `conda-pkgs/`；不会写入用户 PATH、注册表或全局 Conda 环境。
+
+可先预览，不会下载或安装：
+
+```powershell
+.\scripts\bootstrap-conda.ps1 -DryRun
+```
+
+首次构建时运行同一脚本（或由对应 `build-portable-*.ps1` 自动调用）即可创建私有构建工具链。最终 ZIP 已包含可重定位运行环境，解压后启动完全不需要 Conda、Python 或网络。
+
 ## 渲染服务配置
 
 本机默认正式 worker：

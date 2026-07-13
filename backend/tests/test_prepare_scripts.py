@@ -187,6 +187,21 @@ def test_windows_prepare_bootstraps_torchcodec_before_upstream_cuda_install() ->
     )
 
 
+def test_portable_conda_bootstrap_uses_locked_archive_and_never_requires_system_conda() -> None:
+    script_path = REPO_ROOT / "scripts" / "bootstrap-conda.ps1"
+    lock_path = REPO_ROOT / "packaging" / "portable" / "toolchain.lock.json"
+
+    assert script_path.is_file(), "portable Conda bootstrap script is missing"
+    assert lock_path.is_file(), "portable Conda toolchain lock is missing"
+    script = script_path.read_text(encoding="utf-8")
+
+    assert "function Ensure-BuildConda" in script
+    assert "Get-FileHash" in script
+    assert "toolchain.lock.json" in script
+    assert "CONDA_PKGS_DIRS" in script
+    assert "Get-Command conda" not in script
+
+
 def test_windows_prepare_installs_and_verifies_cu128_runtime_for_index_and_cosy() -> None:
     script = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
 
