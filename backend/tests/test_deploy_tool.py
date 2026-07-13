@@ -1256,6 +1256,38 @@ def test_doctor_reports_network_profile_and_cache_paths(tmp_path: Path) -> None:
     assert report["cache_paths"]["cache_root"] == "data/cache"
 
 
+def test_doctor_reports_missing_gpt_worker_prerequisites(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    monkeypatch.setattr(deploy, "_platform_name", lambda: "windows")
+    monkeypatch.setattr(deploy.shutil, "which", lambda _name: None)
+    _write_repo_lock(tmp_path)
+    gpt_repo = tmp_path / "repo" / "GPT-SoVITS-main"
+    (gpt_repo / "GPT_SoVITS").mkdir(parents=True)
+    metadata = gpt_repo / ".venv" / "Lib" / "site-packages" / "onnxruntime_gpu-1.27.0.dist-info"
+    metadata.mkdir(parents=True)
+    (metadata / "METADATA").write_text("Metadata-Version: 2.1\nVersion: 1.27.0\n", encoding="utf-8")
+
+    report = deploy.doctor(tmp_path)
+    gpt_report = next(item for item in report["repositories"] if item["name"] == "GPT-SoVITS-main")
+
+    prerequisites = gpt_report["worker_prerequisites"]
+    assert prerequisites["ready"] is False
+    assert {check["id"] for check in prerequisites["checks"]} >= {
+        "gpt_package_dir",
+        "ffmpeg_shared_dll",
+        "conda_executable",
+        "onnxruntime_cuda12_compatible",
+    }
+    onnxruntime_check = next(
+        check for check in prerequisites["checks"] if check["id"] == "onnxruntime_cuda12_compatible"
+    )
+    assert onnxruntime_check["passed"] is False
+    assert "1.27.0" in onnxruntime_check["message"]
+    assert "prepare-tts-repos.ps1" in prerequisites["next_action"]
+    assert "Install Conda" in prerequisites["next_action"]
+
+
 def test_sync_repos_latest_dry_run_skips_locked_commit_checkout(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)

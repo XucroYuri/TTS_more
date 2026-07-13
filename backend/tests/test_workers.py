@@ -27,6 +27,44 @@ def test_gpt_sovits_worker_health_and_capabilities() -> None:
     assert "gpt-weights" in caps
 
 
+def test_gpt_sovits_bootstrap_derives_upstream_package_and_ffmpeg_paths(tmp_path: Path, monkeypatch) -> None:
+    """A configured checkout must be importable without machine-specific PYTHONPATH."""
+    import app.workers.gpt_sovits_worker as worker
+
+    repo = tmp_path / "custom-gpt-sovits"
+    package = repo / "GPT_SoVITS"
+    ffmpeg_bin = repo / "ffmpeg-shared" / "bin"
+    package.mkdir(parents=True)
+    ffmpeg_bin.mkdir(parents=True)
+    monkeypatch.setattr(worker, "REPO_DIR", repo)
+    monkeypatch.setattr(sys, "path", [str(tmp_path)])
+    monkeypatch.setenv("PATH", "system-path")
+    monkeypatch.chdir(tmp_path)
+
+    worker._bootstrap_repo()
+
+    assert sys.path[:2] == [str(package), str(repo)]
+    assert worker.os.environ["PATH"].split(worker.os.pathsep)[0] == str(ffmpeg_bin)
+
+
+def test_gpt_worker_artifact_store_uses_configured_tts_more_data_root(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    artifact_root = tmp_path / "runtime-artifacts"
+    monkeypatch.setenv("TTS_MORE_ARTIFACT_ROOT", str(artifact_root))
+
+    assert worker._artifact_store().root == artifact_root.resolve()
+
+
+def test_gpt_worker_artifact_store_defaults_outside_upstream_repo(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    monkeypatch.delenv("TTS_MORE_ARTIFACT_ROOT", raising=False)
+    monkeypatch.setattr(worker, "PROJECT_ROOT", tmp_path / "tts-more")
+
+    assert worker._artifact_store().root == (tmp_path / "tts-more" / "data" / "runtime" / "worker-artifacts" / "gpt-sovits").resolve()
+
+
 def test_gpt_sovits_worker_models_empty_without_repo(tmp_path: Path, monkeypatch) -> None:
     """Discovery must not require the resident pipeline or torch."""
     monkeypatch.setattr("app.workers.gpt_sovits_worker.REPO_DIR", tmp_path)
@@ -331,8 +369,10 @@ def test_gpt_sovits_worker_accepts_generator_pipeline_output(tmp_path: Path, mon
 def test_gpt_worker_upload_randomizes_safe_audio_names(tmp_path: Path, monkeypatch) -> None:
     import app.workers.gpt_sovits_worker as worker
 
+    artifact_root = tmp_path / "worker-artifacts"
     monkeypatch.setattr(worker, "REPO_DIR", tmp_path)
     monkeypatch.setenv("TTS_MORE_MAX_UPLOAD_BYTES", "8")
+    monkeypatch.setenv("TTS_MORE_ARTIFACT_ROOT", str(artifact_root))
     client = TestClient(gpt_app)
 
     first = client.post("/upload_ref", files={"file": ("../../ref.wav", b"123", "audio/wav")})
@@ -342,8 +382,8 @@ def test_gpt_worker_upload_randomizes_safe_audio_names(tmp_path: Path, monkeypat
     assert second.status_code == 200
     first_path = Path(first.json()["path"])
     second_path = Path(second.json()["path"])
-    assert first_path.parent == tmp_path / "uploaded_ref"
-    assert second_path.parent == tmp_path / "uploaded_ref"
+    assert first_path.parent == artifact_root
+    assert second_path.parent == artifact_root
     assert first_path != second_path
     assert ".." not in first_path.name
     assert first_path.read_bytes() == b"123"

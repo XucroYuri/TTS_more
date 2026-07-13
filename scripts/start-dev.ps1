@@ -4,6 +4,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 $BackendPython = Join-Path $Root ".venv\Scripts\python.exe"
 $BackendPort = if ($env:TTS_MORE_BACKEND_PORT) { [int]$env:TTS_MORE_BACKEND_PORT } else { 8000 }
 $FrontendPort = if ($env:TTS_MORE_FRONTEND_PORT) { [int]$env:TTS_MORE_FRONTEND_PORT } else { 5173 }
+$FrontendApiTarget = if ($env:TTS_MORE_API_TARGET) { $env:TTS_MORE_API_TARGET } else { "http://127.0.0.1:$BackendPort" }
 
 function Assert-PortAvailable {
   param([int]$Port, [string]$Label)
@@ -26,6 +27,7 @@ $Backend = Start-Process -FilePath $BackendPython `
   -WindowStyle Hidden `
   -PassThru
 
+$env:TTS_MORE_API_TARGET = $FrontendApiTarget
 $Frontend = Start-Process -FilePath "pnpm" `
   -ArgumentList "dev", "--host", "127.0.0.1", "--port", ([string]$FrontendPort) `
   -WorkingDirectory (Join-Path $Root "frontend") `
