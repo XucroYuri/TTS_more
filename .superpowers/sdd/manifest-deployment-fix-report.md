@@ -271,3 +271,60 @@ I1 and I2 are closed in implementation, regression coverage, and maintained depl
 - General concurrent ancestor replacement remains the documented M1 residual; no Windows handle-based parent-chain protection is claimed.
 - Native Windows/PowerShell execution evidence remains pending the existing GitHub Actions Windows job. The different-prefix portability fixture and platform-neutral policy tests pass locally, but macOS is not treated as native Windows evidence.
 - Custom Git/SSH installations on a destination must use that destination's exact absolute `TTS_MORE_TRUSTED_GIT`/`TTS_MORE_TRUSTED_SSH`; PATH and cwd lookup intentionally remain disabled.
+
+## Round 6 re-review
+
+### Result
+
+`DONE_WITH_CONCERNS`
+
+R5-I1, R5-I2, and R5-I3 are closed in implementation, regression coverage, and maintained deployment documentation. M1 remains the explicitly documented concurrent ancestor-replacement residual. Native Windows evidence still belongs to the existing mandatory GitHub `windows-latest` gate; this macOS run does not claim Windows success.
+
+### Round 6 RED log
+
+- Review source: the latest `.superpowers/sdd/manifest-deployment-review.md` (`Critical 0 / Important 3 / Minor 1`).
+- R5-I1 valid RED: after correcting a fixture that was stopped early by the dirty-check gate, final-tree parser/order coverage produced `8 failed, 170 deselected in 1.39s`. Six failures showed the missing structured `.gitmodules` parser; the pinned fixture left the child at the branch-tip gitlink after the superproject moved to the locked commit; the latest fixture passed no validated remote set to the submodule command.
+- R5-I1 real Cosy metadata RED: the locked CosyVoice submodule name `third_party/Matcha-TTS` was rejected by the initial conservative name grammar (`1 failed in 0.16s`). The grammar was then limited to safe slash-separated components.
+- R5-I1 nested metadata RED: standard nested submodule gitdir config and a malicious URL-rewrite config both reached a missing nested-gitdir audit (`2 failed, 192 deselected in 0.29s`).
+- R5-I2 RED: `5 failed, 1 passed, 178 deselected in 0.61s`. HTTPS-only submodules still invoked the SSH resolver; the classifier did not accept a validated remote set and did not fail closed when that set was absent. The one passing SSH case only demonstrated that the old unconditional behavior happened to require SSH.
+- R5-I3 RED: `2 failed, 1 passed, 184 deselected in 0.17s`. HTTPS sidecar plus same-identity SSH actual origin omitted SSH, while SSH sidecar plus HTTPS actual origin resolved SSH before reading the origin. The identity-mismatch case already failed before SSH for an HTTPS sidecar.
+- Documentation RED: `1 failed in 0.05s`; maintained docs omitted the final-tree, relative URL, resolved-URL allowlist, submodule transport, and actual-origin updater contracts.
+- Prepare bypass RED: `1 failed in 0.05s`; the root POSIX prepare script still contained a bare `git submodule update`, with equivalent duplicate mutations statically present in the root PowerShell and both Cosy bundle prepare scripts.
+
+### Round 6 closure mapping
+
+| ID | GREEN closure |
+|---|---|
+| R5-I1 | `sync_repos` now completes the final branch fast-forward/reset for latest mode or locked fetch/checkout for pinned mode before reading `.gitmodules`. A strict non-interpolating parser accepts only unique safe `submodule "name"` sections with exact `path`/`url`, rejects duplicate/case-equivalent/overlapping paths, unknown keys/sections, unsafe paths, malformed/NUL/oversized files, symlink/reparse files, and non-GitHub endpoints. Relative URLs inherit the validated actual parent origin transport and every resolved URL re-enters the GitHub allowlist. Updates use process-only validated URL/active overrides, do not persist `submodule.*` config, and recurse one validated level at a time instead of using unvalidated `--recursive`. Nested gitdir files must resolve inside the top-level `.git/modules`; their strict config permits only an exact `core.worktree`, validates same-identity actual origin, and rejects URL rewrites/unknown config before the next nested operation. Real Git fixtures prove branch tip and locked commits with different `.gitmodules`, gitlinks, and transports finish at the requested superproject and child commits, with the final reset/checkout before submodule mutation. Root and bundle prepare scripts no longer repeat a bare submodule update. |
+| R5-I2 | Submodule SSH selection is derived from the complete tuple of already resolved and allowlisted submodule transports. HTTPS-only tuples use the disabled-SSH sentinel and never resolve SSH; any SSH/scp member resolves and binds trusted SSH. A submodule Git command without a prevalidated tuple fails before Git. The classifier and hardened command policy are covered for app/generated HTTPS, SSH, mixed, fetch, pull, and submodule paths. |
+| R5-I3 | The generated updater still validates exact schema 3 and checks sidecar `requires_ssh` against the sidecar remote for tamper consistency. It then resolves only trusted Git, audits/validates the checkout with SSH disabled, reads and allowlists the actual origin without network access, verifies identity, and only then selects SSH from the actual origin transport. Both HTTPS-sidecar/SSH-origin and SSH-sidecar/HTTPS-origin directions are covered, and identity mismatch fails before SSH resolution. |
+| M1 | The documented general concurrent ancestor-swap and missing Windows parent-handle protection remain unchanged. POSIX final log-directory/log-entry no-follow protection remains in place; no broader race-free claim is made. |
+
+### Round 6 GREEN and verification
+
+- R5-I1 parser/order GREEN: `8 passed, 170 deselected in 0.87s`; nested gitdir plus parser/order GREEN: `10 passed, 184 deselected in 1.26s`.
+- R5-I2 plus R5-I1 regression GREEN: `14 passed, 170 deselected in 0.97s`.
+- R5-I3 homogeneous/cross-transport GREEN: `5 passed, 182 deselected in 0.34s`.
+- Combined classifier/submodule/hardened parity group: `32 passed, 160 deselected in 1.22s`.
+- Prepare/documentation suite: `26 passed in 1.94s`.
+- Final focused deployment/docs: `216 passed, 4 skipped in 11.73s`.
+- Final full backend (Python 3.11): `498 passed, 6 skipped, 1 warning in 30.91s`.
+- `python -m compileall -q scripts backend`: exit 0.
+- Generated `tts-more-update.py` source compilation: exit 0.
+- `bash -n` for the five maintained POSIX deployment wrappers plus the changed Cosy bundle prepare script: exit 0.
+- `repo.lock.json` and deployment JSON parse: 2 files validated.
+- `git diff --check` and both functional staged diff-checks: exit 0.
+- Existing warning: FastAPI/Starlette `httpx` deprecation, unrelated to deployment.
+- Native PowerShell was unavailable (`pwsh` is not installed on this macOS host). `.github/workflows/ci.yml` retains the `ubuntu-latest`/`windows-latest` matrix and mandatory native Windows deployment step requiring both Windows PowerShell and pwsh; its result is not inferred from local skips.
+
+### Round 6 commits
+
+- `babd2a6d42f51cdb2af50aae40a420f1ccda1487` - final-tree structured submodule validation, nested gitdir audit, transport-aware app runner, actual-origin updater selection, and R5-I1/I2/I3 regressions.
+- `f632ef501bea2bcc79360264deb2a3edc28bec69` - remove prepare-script submodule bypasses and document/test the managed sync and actual transport contracts.
+- Report-only finalization commit is recorded in the final task response because a commit cannot contain its own SHA.
+
+### Round 6 concerns
+
+- General concurrent ancestor replacement remains the documented M1 residual; no Windows handle-based parent-chain protection is claimed.
+- Native Windows/PowerShell execution evidence remains pending the existing GitHub Actions Windows job. macOS platform skips are not treated as Windows success.
+- The fail-closed `.gitmodules` schema intentionally permits only `path` and `url`. Upstreams that add `branch`, `update`, `shallow`, or other keys must be reviewed and explicitly supported rather than silently accepted.
