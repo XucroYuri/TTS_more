@@ -619,7 +619,7 @@ def sync_repos(
     latest: bool = False,
     write_lock: bool = False,
     service_ids: set[str] | None = None,
-    force_reset: bool = True,
+    force_reset: bool = False,
     repositories: list[dict[str, Any]] | None = None,
 ) -> list[list[str]]:
     save_lock_on_change = repositories is None

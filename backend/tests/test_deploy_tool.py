@@ -231,6 +231,31 @@ def test_sync_repos_dry_run_uses_shallow_partial_clone(tmp_path: Path) -> None:
     assert "--branch" in clone
 
 
+def test_sync_repos_refuses_dirty_existing_repo_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    _write_repo_lock(tmp_path)
+    target = tmp_path / "repo" / "index-tts"
+    (target / ".git").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        deploy,
+        "_git_output",
+        lambda command: " M local_patch.py"
+        if command[-2:] == ["status", "--porcelain"]
+        else "",
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to update dirty service repository"):
+        deploy.sync_repos(
+            tmp_path,
+            dry_run=True,
+            service_ids={"local-indextts"},
+        )
+
+
 def test_sync_repos_retries_clone_without_partial_filter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
