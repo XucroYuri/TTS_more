@@ -447,6 +447,8 @@ def pairs(items):
             raise ValueError("duplicate key")
         value[key] = item
     return value
+if len(sys.argv) != 5:
+    raise ValueError("topology-bound manifest validation required")
 root = pathlib.Path(sys.argv[1]).resolve()
 path = pathlib.Path(sys.argv[2])
 metadata = os.lstat(path)
@@ -489,28 +491,32 @@ for process in payload["processes"]:
     if type(process["executable_path"]) is not str:
         raise ValueError("invalid executable path")
     pathlib.Path(process["executable_path"]).resolve().relative_to(root)
-if len(sys.argv) == 5:
-    topology_path = pathlib.Path(sys.argv[3])
-    topology_raw = topology_path.read_bytes()
-    if len(topology_raw) < 1 or len(topology_raw) > MAX_BYTES:
-        raise ValueError("invalid topology size")
-    topology = json.loads(topology_raw.decode("utf-8"), object_pairs_hook=pairs)
-    if not isinstance(topology, dict) or set(topology) != {"schema_version", "name", "app_node", "nodes"}:
-        raise ValueError("invalid topology")
-    nodes = topology["nodes"]
-    if not isinstance(nodes, dict) or sys.argv[4] not in nodes:
-        raise ValueError("invalid topology node")
-    selected = nodes[sys.argv[4]]
-    if not isinstance(selected, dict) or selected.get("role") != "worker":
-        raise ValueError("invalid topology worker")
-    expected_services = selected.get("services")
-    if not isinstance(expected_services, list) or any(type(item) is not str for item in expected_services):
-        raise ValueError("invalid topology services")
-    if set(expected_services) != seen or len(expected_services) != len(seen):
-        raise ValueError("manifest service identities do not match topology")
+topology_path = pathlib.Path(sys.argv[3])
+topology_raw = topology_path.read_bytes()
+if len(topology_raw) < 1 or len(topology_raw) > MAX_BYTES:
+    raise ValueError("invalid topology size")
+topology = json.loads(topology_raw.decode("utf-8"), object_pairs_hook=pairs)
+if not isinstance(topology, dict) or set(topology) != {"schema_version", "name", "app_node", "nodes"}:
+    raise ValueError("invalid topology")
+nodes = topology["nodes"]
+if not isinstance(nodes, dict) or sys.argv[4] not in nodes:
+    raise ValueError("invalid topology node")
+selected = nodes[sys.argv[4]]
+if not isinstance(selected, dict) or selected.get("role") != "worker":
+    raise ValueError("invalid topology worker")
+expected_services = selected.get("services")
+if not isinstance(expected_services, list) or any(type(item) is not str for item in expected_services):
+    raise ValueError("invalid topology services")
+expected = set(expected_services)
+if not expected or len(expected) != len(expected_services) or not expected.issubset(modules):
+    raise ValueError("invalid topology services")
+if not seen.issubset(expected):
+    raise ValueError("manifest service identities do not match topology")
 result = {
     "snapshot_sha256": hashlib.sha256(raw).hexdigest(),
     "processes": payload["processes"],
+    "complete": seen == expected,
+    "expected_service_count": len(expected),
 }
 print(json.dumps(result, separators=(",", ":")))
 """.strip()
@@ -618,7 +624,8 @@ $validatedSnapshot = $null
 if (Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Leaf) {{
   $validatedSnapshot = Get-StrictServiceSnapshot
   $state = Get-ReconciledServiceProcessSet $validatedSnapshot
-  if ($state.Live -eq $state.Total) {{
+  if ([bool]$validatedSnapshot.complete -and $state.Live -eq $state.Total -and
+      $state.Total -eq [int]$validatedSnapshot.expected_service_count) {{
     Write-Output 'Reconcile-ExactServiceProcessSet: existing process set is owned and live'
     return
   }}
@@ -650,8 +657,15 @@ if ($null -ne $startFailure) {{
   throw $startFailure
 }}
 $startedState = Get-ReconciledServiceProcessSet $validatedSnapshot
-if ($startedState.Live -ne $startedState.Total) {{
-  throw 'Generated validation service PID manifest is invalid; ownership manifest retained'
+if (-not [bool]$validatedSnapshot.complete -or $startedState.Live -ne $startedState.Total -or
+    $startedState.Total -ne [int]$validatedSnapshot.expected_service_count) {{
+  try {{
+    Invoke-OwnedServiceRollback $validatedSnapshot
+  }} catch {{
+    throw 'rollback termination failed; ownership manifest retained'
+  }}
+  Remove-Item -LiteralPath {_powershell_literal(str(pid_manifest))} -Force
+  throw 'Generated validation service process set is incomplete; rollback completed; retry required'
 }}
 """
         try:

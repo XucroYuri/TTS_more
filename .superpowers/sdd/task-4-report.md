@@ -171,3 +171,47 @@ The re-review tests initially reported `6 failed, 48 passed`:
   -> `934 passed, 6 skipped`.
 - `.venv/bin/python -W error::DeprecationWarning -m compileall -q -f backend`
   -> exit 0.
+
+## Second Re-review Medium 1: Incremental Service Manifest Recovery
+
+### RED
+
+- The incremental-manifest test modeled service one succeeding and service two failing,
+  leaving one exact owned process in the manifest. The validator-focused run reported
+  `1 failed, 1 passed`: the strict validator rejected the valid nonempty topology subset
+  before retry reconciliation could reach rollback.
+- A separate post-launch recovery test then reported `1 failed`: an incomplete snapshot
+  returned after the launcher path did not yet enter handle-bound rollback.
+
+### GREEN
+
+- The start validator is now topology-bound and accepts only a nonempty, unique set of
+  formal service identities that is a subset of the selected worker's nonempty, unique
+  expected services. Empty, duplicate, unknown, and formal-but-not-expected identities
+  remain fail-closed.
+- The validated byte snapshot reports a validator-derived `complete` boolean and exact
+  expected-service count. Existing-process reconciliation succeeds only when the snapshot
+  is complete, every recorded process is exact and live, and both counts match.
+- A valid partial snapshot always reaches the existing per-process owned-handle rollback.
+  Successful rollback removes the partial manifest and proceeds to a fresh start on the
+  pending retry. Rollback failure removes nothing; Python retains the same manifest path
+  in pending manager state so the exact process set can be reconciled again.
+- A launcher result that is incomplete without an explicit launch exception is treated
+  the same way: handle-bound rollback is mandatory, successful cleanup requests a bounded
+  retry, and failed cleanup retains ownership state.
+
+Verification:
+
+- `.venv/bin/python -m pytest backend/tests/test_lan_nodes.py -q`
+  -> `56 passed`.
+- `.venv/bin/python -m pytest backend/tests/test_lan_nodes.py backend/tests/test_windows_ssh.py -q`
+  -> `190 passed`.
+- `.venv/bin/python -W error::DeprecationWarning -m compileall -q -f backend`
+  -> exit 0.
+
+### Remaining Concern
+
+- The controller still has no `pwsh` executable and no live Windows worker was available.
+  The embedded validator is executed directly in tests and generated PowerShell control
+  flow is checked for complete-only success and rollback ordering; live CIM/listener/
+  process-handle execution remains part of LAN end-to-end validation.

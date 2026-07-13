@@ -21,6 +21,11 @@ FORMAL_SERVICES = (
     "local-indextts",
     "local-cosyvoice",
 )
+SERVICE_MODULES = {
+    "local-gpt-sovits-main": "app.workers.gpt_sovits_worker:app",
+    "local-indextts": "app.workers.indextts_worker:app",
+    "local-cosyvoice": "app.workers.cosyvoice_worker:app",
+}
 
 
 def _topology_payload(node: str = "gpt-worker") -> dict[str, object]:
@@ -58,6 +63,39 @@ def _embedded_python(script: str, variable: str = "manifestValidator") -> str:
     match = re.search(rf"\${variable} = @'\n(.*?)\n'@", script, re.DOTALL)
     assert match is not None
     return match.group(1)
+
+
+def _service_process(root: Path, service_id: str, pid: int) -> dict[str, object]:
+    return {
+        "pid": pid,
+        "creation_date": f"202607130101{pid:02d}.000000+480",
+        "executable_path": str(root / ".venv" / "Scripts" / "python.exe"),
+        "project_root": str(root),
+        "worker_module": SERVICE_MODULES.get(service_id, "app.workers.unknown:app"),
+        "service_id": service_id,
+    }
+
+
+def _run_start_manifest_validator(
+    validator: str,
+    root: Path,
+    manifest: Path,
+    topology: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            validator,
+            str(root),
+            str(manifest),
+            str(topology),
+            "gpt-worker",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 class FakeExecutor:
@@ -318,7 +356,7 @@ def test_start_uses_real_worker_cli_and_controlled_pid_manifest() -> None:
     )
     assert "-Detach" in script
     assert "Reconcile-ExactServiceProcessSet" in script
-    assert "Generated validation service PID manifest is invalid" in script
+    assert "rollback completed; retry required" in script
 
 
 def test_start_rollback_uses_only_strict_snapshot_and_owned_handles() -> None:
@@ -371,6 +409,134 @@ def test_start_failure_retains_pending_manifest_and_retry_reuses_exact_path() ->
     assert second_manifest.group(1) == first_manifest.group(1)
     assert "Reconcile-ExactServiceProcessSet" in second_script
     assert "gpt-worker" not in manager._pending_service_starts
+
+
+def test_incremental_service_manifest_rolls_back_before_retry_fresh_start(
+    tmp_path: Path,
+) -> None:
+    executor = FailStartOnceExecutor()
+    manager = WindowsLanNodeManager(executor, salt=b"salt")
+    root = tmp_path / "root"
+    root.mkdir()
+    topology = _write_topology(tmp_path / "topology.json")
+    manifest = tmp_path / "service-processes.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "processes": [
+                    _service_process(root, "local-gpt-sovits-main", 11),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous start failure"):
+        manager.start("gpt-worker", r"C:\TTS\TTS_more")
+
+    first_script = executor.scripts[-1][1]
+    partial_result = _run_start_manifest_validator(
+        _embedded_python(first_script), root, manifest, topology
+    )
+    assert partial_result.returncode == 0, partial_result.stderr
+    partial_snapshot = json.loads(partial_result.stdout)
+    assert partial_snapshot["complete"] is False
+    assert partial_snapshot["expected_service_count"] == len(FORMAL_SERVICES)
+    assert [entry["service_id"] for entry in partial_snapshot["processes"]] == [
+        "local-gpt-sovits-main"
+    ]
+
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "processes": [
+                    _service_process(root, service_id, 21 + index)
+                    for index, service_id in enumerate(FORMAL_SERVICES)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    complete_result = _run_start_manifest_validator(
+        _embedded_python(first_script), root, manifest, topology
+    )
+    assert complete_result.returncode == 0, complete_result.stderr
+    complete_snapshot = json.loads(complete_result.stdout)
+    assert complete_snapshot["complete"] is True
+    assert complete_snapshot["expected_service_count"] == len(FORMAL_SERVICES)
+
+    manager.start("gpt-worker", r"C:\TTS\TTS_more")
+
+    retry_script = executor.scripts[-1][1]
+    retry_start = retry_script.index("$validatedSnapshot = $null")
+    fresh_start = retry_script.index("$startFailure = $null", retry_start)
+    retry_block = retry_script[retry_start:fresh_start]
+    assert (
+        "[bool]$validatedSnapshot.complete -and $state.Live -eq $state.Total"
+        in retry_block
+    )
+    assert retry_block.index("Invoke-OwnedServiceRollback $validatedSnapshot") < (
+        retry_block.index("Remove-Item -LiteralPath")
+    )
+    assert (
+        "-not [bool]$validatedSnapshot.complete -or "
+        "$startedState.Live -ne $startedState.Total"
+    ) in retry_script
+    post_launch = retry_script[retry_script.index("$startedState =") :]
+    assert post_launch.index("Invoke-OwnedServiceRollback $validatedSnapshot") < (
+        post_launch.index("Remove-Item -LiteralPath")
+    )
+    assert "rollback termination failed; ownership manifest retained" in post_launch
+    assert "rollback completed; retry required" in post_launch
+
+
+def test_service_manifest_validator_keeps_invalid_subsets_fail_closed(
+    tmp_path: Path,
+) -> None:
+    executor = FakeExecutor()
+    manager = WindowsLanNodeManager(executor, salt=b"salt")
+    manager.start("gpt-worker", r"C:\TTS\TTS_more")
+    validator = _embedded_python(executor.scripts[-1][1])
+    root = tmp_path / "root"
+    root.mkdir()
+    topology = _write_topology(tmp_path / "topology.json")
+    manifest = tmp_path / "manifest.json"
+    first = _service_process(root, "local-gpt-sovits-main", 11)
+    invalid_process_sets = [
+        [],
+        [first, {**first, "pid": 12}],
+        [_service_process(root, "unknown-service", 13)],
+    ]
+    for processes in invalid_process_sets:
+        manifest.write_text(
+            json.dumps({"schema_version": 1, "processes": processes}),
+            encoding="utf-8",
+        )
+        completed = _run_start_manifest_validator(
+            validator, root, manifest, topology
+        )
+        assert completed.returncode != 0
+
+    limited_topology = _topology_payload()
+    worker = limited_topology["nodes"]["gpt-worker"]
+    assert isinstance(worker, dict)
+    worker["services"] = ["local-gpt-sovits-main"]
+    topology.write_text(json.dumps(limited_topology), encoding="utf-8")
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "processes": [
+                    _service_process(root, "local-indextts", 14),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    completed = _run_start_manifest_validator(validator, root, manifest, topology)
+    assert completed.returncode != 0
 
 
 def test_gpu_monitor_manifest_records_process_identity_and_stop_verifies_it() -> None:
@@ -555,6 +721,7 @@ def test_service_manifest_validator_rejects_bool_float_duplicate_and_extra(
     manifest = tmp_path / "manifest.json"
     root = tmp_path / "root"
     root.mkdir()
+    topology = _write_topology(tmp_path / "topology.json")
     process = {
         "pid": 123,
         "creation_date": "20260713010101.000000+480",
@@ -573,11 +740,8 @@ def test_service_manifest_validator_rejects_bool_float_duplicate_and_extra(
     ]
     for payload in invalid_payloads:
         manifest.write_text(json.dumps(payload), encoding="utf-8")
-        completed = subprocess.run(
-            [sys.executable, "-c", validator, str(root), str(manifest)],
-            capture_output=True,
-            text=True,
-            check=False,
+        completed = _run_start_manifest_validator(
+            validator, root, manifest, topology
         )
         assert completed.returncode != 0
 
@@ -585,11 +749,8 @@ def test_service_manifest_validator_rejects_bool_float_duplicate_and_extra(
         '{"schema_version":1,"schema_version":1,"processes":[]}',
         encoding="utf-8",
     )
-    completed = subprocess.run(
-        [sys.executable, "-c", validator, str(root), str(manifest)],
-        capture_output=True,
-        text=True,
-        check=False,
+    completed = _run_start_manifest_validator(
+        validator, root, manifest, topology
     )
     assert completed.returncode != 0
 
