@@ -169,6 +169,38 @@ def test_worker_runtime_reports_and_releases_cuda_memory(monkeypatch) -> None:
     assert calls == ["gc", "empty_cache", "ipc_collect"]
 
 
+def test_worker_uuid_probe_uses_noninteractive_subprocess_kwargs(monkeypatch) -> None:
+    from app.workers import runtime
+
+    captured: dict[str, object] = {}
+
+    class FakeCuda:
+        is_available = staticmethod(lambda: True)
+        current_device = staticmethod(lambda: 0)
+        memory_allocated = staticmethod(lambda _index: 0)
+        memory_reserved = staticmethod(lambda _index: 0)
+        mem_get_info = staticmethod(lambda _index: (1024, 2048))
+
+    def fake_run(command, **kwargs):
+        captured.update(kwargs)
+        return __import__("subprocess").CompletedProcess(command, 0, stdout="0, GPU-test\n", stderr="")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(cuda=FakeCuda(), version=types.SimpleNamespace(cuda="12.8")),
+    )
+    monkeypatch.setattr(runtime, "noninteractive_subprocess_kwargs", lambda: {"creationflags": 0x08000000})
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    runtime._DEVICE_UUID_CACHE.clear()
+
+    status = runtime.worker_runtime_status(loaded=False, model=None)
+
+    assert captured["creationflags"] == 0x08000000
+    assert status["device_uuid"] == "GPU-test"
+
+
 def test_worker_runtime_maps_visible_and_explicit_cuda_devices_to_physical_uuid(monkeypatch) -> None:
     from app.workers import runtime
 
