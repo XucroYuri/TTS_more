@@ -9,8 +9,6 @@ if ($Source -eq "Auto") {
 $BasePython = if ($env:TTS_MORE_BASE_PYTHON) { $env:TTS_MORE_BASE_PYTHON } else { "python" }
 
 Set-Location $RepoRoot
-git submodule update --init --recursive
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 if (!(Test-Path -LiteralPath $Python)) {

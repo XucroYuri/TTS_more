@@ -47,12 +47,12 @@ cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
 scripts/tts-more.sh install-update-scripts --repo-paths deployment/app/repo-paths.local.json
 ```
 
-生成的 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 必须作为一个 portable updater bundle 一起复制到单独的 TTS 服务部署设备上。sidecar **does not store installer-host absolute executable paths**；运行时 **resolves Git independently on the destination device**，使用固定安装目录或目标机显式 `TTS_MORE_TRUSTED_GIT`。**HTTPS remotes do not require SSH**；**SSH remotes require a trusted SSH executable**，可由目标机 `TTS_MORE_TRUSTED_SSH` 指定。updater 从 GitHub fast-forward 当前服务 repo 到对应分支最新版；如需回到锁定提交，可加 `--pinned`。
+生成的 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 必须作为一个 portable updater bundle 一起复制到单独的 TTS 服务部署设备上。sidecar **does not store installer-host absolute executable paths**；运行时 **resolves Git independently on the destination device**，使用固定安装目录或目标机显式 `TTS_MORE_TRUSTED_GIT`。updater 先验证 actual origin identity，再由 actual transport 决定 SSH；**sidecar transport does not override the actual origin transport**。因此实际 HTTPS origin 不要求 SSH，实际 SSH/scp origin 需要目标机 trusted SSH，可由 `TTS_MORE_TRUSTED_SSH` 指定。updater 从 GitHub fast-forward 当前服务 repo 到对应分支最新版；如需回到锁定提交，可加 `--pinned`。
 
 ## 当前已具备的能力
 
 - `repo.lock.json` 锁定五个可选部署目标的远端、分支、提交、端口、服务 id 和 `default_selected`；默认只选择三个正式服务。
-- `scripts/tts_more_deploy.py sync-repos --repo-paths deployment/app/repo-paths.local.json` 可以拉取或重置服务 repo。
+- `scripts/tts_more_deploy.py sync-repos --repo-paths deployment/app/repo-paths.local.json` 可以拉取或重置服务 repo；submodule 只在最终 superproject state 后解析，relative URL 基于 validated actual origin，并逐个通过 GitHub allowlist 后更新。HTTPS-only submodules 不需要 SSH，任一 SSH submodule 都需要 trusted SSH。
 - `probe-network` 会选择 ModelScope、HF Mirror、Hugging Face、PyPI 镜像等下载源，并把缓存路径集中到 `data/cache`。
 - `render-services` 会从 repo 清单生成 `data/local/services.json`，避免手写服务配置。
 - worker 统一暴露 `tts-more-v1`，应用本体只需要看统一 API，而不是每个模型仓库的内部调用细节。

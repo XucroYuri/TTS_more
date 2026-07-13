@@ -1,5 +1,17 @@
 # CosyVoice repo scripts
 
+Before running either prepare helper, use the app's managed sync-repos path with
+the complete repository confirmation file:
+
+```bash
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
+scripts/tts-more.sh sync-repos --service-ids local-cosyvoice --repo-paths deployment/app/repo-paths.local.json
+```
+
+That sync selects the final locked/latest superproject state, validates every
+resolved `.gitmodules` URL, and updates submodules. The prepare bundle **does not run Git submodule commands**;
+it only installs dependencies and models.
+
 Use the app-side installer, or copy the bundle contents into a CosyVoice
 checkout explicitly. POSIX:
 

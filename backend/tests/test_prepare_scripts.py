@@ -478,6 +478,45 @@ def test_update_script_docs_describe_portable_runtime_executable_policy() -> Non
     assert "concurrent parent-swap remains a residual threat" in deployment
 
 
+def test_deployment_docs_describe_final_tree_and_actual_transport_policy() -> None:
+    root = Path(__file__).resolve().parents[2]
+    deployment = (root / "docs" / "deployment.md").read_text(encoding="utf-8")
+    current_state = (root / "docs" / "current-state-and-simplification-plan.md").read_text(
+        encoding="utf-8"
+    )
+    combined = deployment + "\n" + current_state
+
+    for contract in (
+        "after the final superproject checkout",
+        "relative submodule URLs are resolved against the validated actual origin",
+        "every resolved submodule URL must pass the GitHub allowlist",
+        "HTTPS-only submodules do not require SSH",
+        "any SSH submodule requires trusted SSH",
+        "sidecar transport does not override the actual origin transport",
+    ):
+        assert contract in combined
+    assert "concurrent parent-swap remains a residual threat" in deployment
+
+
+def test_prepare_scripts_do_not_bypass_validated_submodule_sync() -> None:
+    root = Path(__file__).resolve().parents[2]
+    scripts = (
+        root / "scripts" / "prepare-tts-repos.sh",
+        root / "scripts" / "prepare-tts-repos.ps1",
+        root / "deployment" / "tts-repos" / "cosyvoice" / "tts-more-prepare.sh",
+        root / "deployment" / "tts-repos" / "cosyvoice" / "tts-more-prepare.ps1",
+    )
+
+    for path in scripts:
+        content = path.read_text(encoding="utf-8")
+        assert not re.search(r"(?i)\bgit\b[^\n]*\bsubmodule\b[^\n]*\bupdate\b", content), path
+    readme = (root / "deployment" / "tts-repos" / "cosyvoice" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "managed sync-repos" in readme
+    assert "does not run Git submodule commands" in readme
+
+
 def test_windows_ci_executes_native_deployment_validation_without_capability_skip() -> None:
     root = Path(__file__).resolve().parents[2]
     workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

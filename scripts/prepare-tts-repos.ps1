@@ -299,7 +299,6 @@ function Prepare-IndexTTS {
 function Prepare-CosyVoice {
     param($Repo)
     $repoPath = [string]$Repo.absolute_path
-    Invoke-Logged "git" @("-C", $repoPath, "submodule", "update", "--init", "--recursive") $Root
     $repoPython = Resolve-RepoPython $repoPath
     if (-not $SkipInstall) {
         $repoPython = Ensure-Venv $repoPath

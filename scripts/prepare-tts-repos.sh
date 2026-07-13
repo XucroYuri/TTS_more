@@ -291,7 +291,6 @@ run_index_download() {
 
 prepare_cosy() {
   local repo_path="$1"
-  run git -C "$repo_path" submodule update --init --recursive
   local repo_python="$repo_path/.venv/bin/python"
   if [[ "$SKIP_INSTALL" != "1" ]]; then
     ensure_venv "$repo_path"

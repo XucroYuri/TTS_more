@@ -36,7 +36,9 @@ python scripts/tts_more_deploy.py install-repo-bundles --adopt-existing --repo-p
 
 **adoption does not upgrade, overwrite, or delete files**；它只校验现有 owned hashes 并建立 anchor，之后必须再次运行不带 `--adopt-existing` 的安装命令。已有损坏 anchor、pending install、缺失或修改过的 owned 文件均拒绝 adoption。
 
-所有 app-side Git 和复制到服务 repo 的 updater Git 都使用同一 hardened runner：忽略 system/global config 与 `GIT_CONFIG_*`/SSH/askpass 注入，禁用 hooks/fsmonitor/credential helper，并把协议限制为 allowlisted GitHub HTTPS/SSH。Git executable 只从平台固定安装目录或显式 `TTS_MORE_TRUSTED_GIT` 解析；只有 SSH remote 才同样从固定目录或 `TTS_MORE_TRUSTED_SSH` 解析 SSH 并固定 SSH command，HTTPS 使用不可执行 sentinel 且不要求安装 SSH。checkout-local 的 hooksPath、fsmonitor、sshCommand、credential helper、URL rewrite、filter/process、include 和 executable submodule update 配置会在 `status/config/fetch/checkout/pull` 前拒绝。
+所有 app-side Git 和复制到服务 repo 的 updater Git 都使用同一 hardened runner：忽略 system/global config 与 `GIT_CONFIG_*`/SSH/askpass 注入，禁用 hooks/fsmonitor/credential helper，并把协议限制为 allowlisted GitHub HTTPS/SSH。Git executable 只从平台固定安装目录或显式 `TTS_MORE_TRUSTED_GIT` 解析；只有实际将访问的 SSH transport 才同样从固定目录或 `TTS_MORE_TRUSTED_SSH` 解析 SSH 并固定 SSH command，纯 HTTPS 使用不可执行 sentinel 且不要求安装 SSH。checkout-local 的 hooksPath、fsmonitor、sshCommand、credential helper、URL rewrite、filter/process、include 和 executable submodule update 配置会在 `status/config/fetch/checkout/pull` 前拒绝。
+
+Submodule 同步发生 **after the final superproject checkout**：latest 模式先完成 branch fast-forward/reset，locked 模式先完成锁定 commit 的 fetch/checkout，之后才读取最终 tree 的 `.gitmodules`。解析器只接受不重复的 `submodule "<name>"`、`path` 和 `url`；unknown/duplicate/unsafe metadata 会 fail closed。**relative submodule URLs are resolved against the validated actual origin**，并且 **every resolved submodule URL must pass the GitHub allowlist**。更新命令使用进程级、已验证 URL override，不把 submodule URL 写入 local config；嵌套 submodule 逐层验证后再更新。**HTTPS-only submodules do not require SSH**；**any SSH submodule requires trusted SSH**。
 
 并发攻击者仍可能在最终 pathname 检查与替换之间交换一般输出目录；**concurrent parent-swap remains a residual threat**。POSIX worker logs 会以 `O_DIRECTORY | O_NOFOLLOW` 打开 `logs_dir` 并通过 dirfd 创建日志，但一般 bundle/output rename 尚未改成完整 `openat`/`renameat` 链，且 **Windows handle-based parent protection is not implemented**。因此当前保证覆盖静态 symlink/reparse 与单文件替换，不宣称跨平台 race-free。
 
@@ -188,7 +190,7 @@ scripts/update.sh --force-reset-repos --repo-paths deployment/app/repo-paths.loc
 
 `--force-reset-repos` 会允许服务 repo 执行硬重置，只适合确认没有要保留的本地改动时使用。
 
-服务 repo 内的轻量更新脚本用于分布式部署设备。复制时必须把 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 四个文件一起放到目标 service repo 根目录。schema 3 sidecar 只记录 portable executable policy 和 `requires_ssh`，**does not store installer-host absolute executable paths**；updater **resolves Git independently on the destination device**，从目标机固定安装目录或显式 `TTS_MORE_TRUSTED_GIT` 解析。**HTTPS remotes do not require SSH**；**SSH remotes require a trusted SSH executable**，非标准安装位置通过目标机的 `TTS_MORE_TRUSTED_SSH` 指定。
+服务 repo 内的轻量更新脚本用于分布式部署设备。复制时必须把 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 四个文件一起放到目标 service repo 根目录。schema 3 sidecar 只记录 portable executable policy 和 `requires_ssh`，**does not store installer-host absolute executable paths**；updater **resolves Git independently on the destination device**，从目标机固定安装目录或显式 `TTS_MORE_TRUSTED_GIT` 解析。它先仅用 trusted Git 审计 checkout、读取 actual origin 并验证 GitHub identity，再按 actual origin transport 决定是否解析 `TTS_MORE_TRUSTED_SSH`；**sidecar transport does not override the actual origin transport**。对 actual transport 而言，**HTTPS remotes do not require SSH**，而 **SSH remotes require a trusted SSH executable**；sidecar 的 `requires_ssh` 仍必须与 sidecar remote 一致以检测篡改。
 
 复制完成后，在服务 repo 根目录运行：
 
@@ -227,7 +229,7 @@ bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --source ModelScope
 
 - GPT-SoVITS：优先使用每个分支自带的 `install.ps1`/`install.sh`，官方脚本依赖 conda/micromamba 环境。
 - IndexTTS：优先 `uv sync --all-extras`，下载 `IndexTeam/IndexTTS-2`，并准备 BigVGAN 辅助模型。
-- CosyVoice：需要 `git submodule update --init --recursive`，Python 3.10 venv，`requirements.txt`，默认下载 `CosyVoice-300M`。
+- CosyVoice：`sync-repos` 在最终 superproject commit/branch 确定后结构化校验 `.gitmodules`，逐层更新 allowlisted submodule；随后准备 Python 3.10 venv、`requirements.txt`，默认下载 `CosyVoice-300M`。
 
 ## 渲染服务配置
 
