@@ -5,6 +5,7 @@ import csv
 import hashlib
 import hmac
 import importlib.util
+import ipaddress
 import json
 import math
 import os
@@ -28,11 +29,23 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.adapters.base import SynthesisRequest
+from app.lan_evidence import LanOrchestrationPreflight
+from app.lan_topology import LanPolicy, LanTopology, load_lan_policy
 from app.models import ScriptLine, TTSServiceEndpoint
 from app.services import HttpTTSServiceClient, ServiceRegistry, TTSServiceClient, build_service_client
 
 
-VALIDATION_MODES = ("single-clean", "single-release", "distributed")
+VALIDATION_MODES = (
+    "single-clean",
+    "single-release",
+    "distributed",
+    "lan-shared",
+    "lan-distributed",
+)
+LOCAL_SINGLE_MODES = frozenset({"single-clean", "single-release"})
+STRICT_LAN_MODES = frozenset({"lan-shared", "lan-distributed"})
+EXTERNAL_LAN_MODES = frozenset({"distributed", *STRICT_LAN_MODES})
+DISTINCT_GPU_MODES = frozenset({"distributed", "lan-distributed"})
 CERTIFICATION_STATUSES = frozenset(
     {
         "blocked",
@@ -260,7 +273,7 @@ def _load_fixture_snapshot(
     for version, pair in fixture.gpt_weights.model_dump(by_alias=True).items():
         for kind, raw_path in pair.items():
             raw_path = str(raw_path)
-            if mode == "distributed":
+            if mode in EXTERNAL_LAN_MODES:
                 if not raw_path.strip():
                     failures.append(f"weight {version}.{kind} is empty")
                 elif _contains_unresolved_environment(raw_path):
@@ -699,6 +712,9 @@ class CUDAValidationRunner:
         diagnostic: bool = False,
         distributed_preflight_path: Path | None = None,
         distributed_orchestration_token: str | None = None,
+        orchestration_preflight_path: Path | None = None,
+        orchestration_token: str | None = None,
+        controller_identity_provider: Callable[[], str] | None = None,
     ) -> None:
         if mode not in VALIDATION_MODES:
             raise ValueError(f"mode must be one of: {', '.join(VALIDATION_MODES)}")
@@ -717,13 +733,26 @@ class CUDAValidationRunner:
         self.expected_commit = expected_commit or os.environ.get("TTS_MORE_EXPECTED_APP_COMMIT") or None
         self.require_baseline = require_baseline and mode != "single-clean"
         self.diagnostic = diagnostic
-        self.distributed_preflight_path = distributed_preflight_path
-        self.distributed_orchestration_token = (
-            distributed_orchestration_token
+        self.orchestration_preflight_path = (
+            orchestration_preflight_path or distributed_preflight_path
+        )
+        self.orchestration_token = (
+            orchestration_token
+            or distributed_orchestration_token
+            or os.environ.get("TTS_MORE_ORCHESTRATION_TOKEN")
             or os.environ.get("TTS_MORE_DISTRIBUTED_ORCHESTRATION_TOKEN")
             or None
         )
+        self.distributed_preflight_path = self.orchestration_preflight_path
+        self.distributed_orchestration_token = self.orchestration_token
+        self.controller_identity_provider = controller_identity_provider or (
+            lambda: os.environ.get("TTS_MORE_CONTROLLER_IDENTITY", "")
+        )
         self.distributed_orchestration_verified = False
+        self.orchestration_verified = False
+        self._evidence_hash_key: bytes | None = None
+        self._lan_topology: LanTopology | None = None
+        self._lan_policy: LanPolicy | None = None
 
     def _new_report(
         self, *, stage: str, fixture_sha256: str | None = None
@@ -739,7 +768,17 @@ class CUDAValidationRunner:
                 self.distributed_orchestration_verified if self.mode == "distributed" else None
             ),
             "distributed_preflight": (
-                str(self.distributed_preflight_path) if self.distributed_preflight_path else None
+                str(self.distributed_preflight_path)
+                if self.mode == "distributed" and self.distributed_preflight_path
+                else None
+            ),
+            "orchestration_verified": (
+                self.orchestration_verified if self.mode in STRICT_LAN_MODES else None
+            ),
+            "orchestration_preflight": (
+                str(self.orchestration_preflight_path)
+                if self.mode in STRICT_LAN_MODES and self.orchestration_preflight_path
+                else None
             ),
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
@@ -782,7 +821,14 @@ class CUDAValidationRunner:
         report["blocker_count"] = len(failures)
         report["next_action"] = _preflight_next_action(failures)
         report["finished_at"] = datetime.now(timezone.utc).isoformat()
-        _write_report_files(self.output_dir, report, fixture, {}, reset_nvidia=True)
+        _write_report_files(
+            self.output_dir,
+            report,
+            fixture,
+            {},
+            reset_nvidia=True,
+            hash_key=self._evidence_hash_key,
+        )
         return report
 
     def write_blocker_report(
@@ -835,6 +881,7 @@ class CUDAValidationRunner:
                 fixture,
                 {},
                 preserve_worker_references=True,
+                hash_key=self._evidence_hash_key,
             )
             return report
         fixture, fixture_sha256, _failures = _load_fixture_snapshot(
@@ -852,7 +899,14 @@ class CUDAValidationRunner:
         ]
         report["blocker_count"] = 1
         report["next_action"] = f"修复 {stage} 阶段错误后重新运行完整 CUDA 验证。"
-        _write_report_files(self.output_dir, report, fixture, {}, reset_nvidia=True)
+        _write_report_files(
+            self.output_dir,
+            report,
+            fixture,
+            {},
+            reset_nvidia=True,
+            hash_key=self._evidence_hash_key,
+        )
         return report
 
     def run(self) -> dict[str, Any]:
@@ -921,7 +975,7 @@ class CUDAValidationRunner:
                 report["cases"].append(case_report)
                 if case_report.get("audio", {}).get("passed"):
                     asr_queue.append((case_report, self.output_dir / case_report["output_path"], case.text, case.language))
-            if self.mode != "distributed" and fixture.service_ids.gpt_sovits in ready_services:
+            if self.mode in LOCAL_SINGLE_MODES and fixture.service_ids.gpt_sovits in ready_services:
                 base_case = validation_cases(fixture)[0]
                 artifact_case = ValidationCase(
                     name=f"{base_case.name}-artifact",
@@ -1066,6 +1120,19 @@ class CUDAValidationRunner:
                 return fixture, {}
             self.distributed_orchestration_verified = True
             report["distributed_orchestration_verified"] = True
+        elif self.mode in STRICT_LAN_MODES:
+            orchestration_error = self._verify_orchestration()
+            if orchestration_error:
+                report["preflight"].append(
+                    {"passed": False, "message": orchestration_error}
+                )
+                return fixture, {}
+            self.orchestration_verified = True
+            report["orchestration_verified"] = True
+            assert self.orchestration_token is not None
+            self._evidence_hash_key = hashlib.sha256(
+                self.orchestration_token.encode("utf-8")
+            ).digest()
         if not self.services_path.is_file():
             report["preflight"].append({"passed": False, "message": f"services file not found: {self.services_path}"})
             return fixture, {}
@@ -1087,12 +1154,27 @@ class CUDAValidationRunner:
                 report["preflight"].append(
                     {"passed": False, "message": f"{endpoint.service_id} must use tts-more-v1 for CUDA validation"}
                 )
-            if self.mode == "distributed" and (
+            if self.mode in EXTERNAL_LAN_MODES and (
                 endpoint.mode != "external" or endpoint.network_scope != "lan" or endpoint.managed
             ):
                 report["preflight"].append(
                     {"passed": False, "message": f"{endpoint.service_id} is not an unmanaged external LAN worker"}
                 )
+            if self.mode in STRICT_LAN_MODES:
+                assert self._lan_topology is not None and self._lan_policy is not None
+                owner = self._lan_policy.service_owners[endpoint.service_id]
+                owner_node = self._lan_topology.nodes[owner]
+                endpoint_host = urlsplit(endpoint.base_url).hostname or ""
+                if (
+                    _canonical_host(endpoint_host) != _canonical_host(owner_node.host)
+                    or endpoint.resource_group != owner_node.resource_group
+                ):
+                    report["preflight"].append(
+                        {
+                            "passed": False,
+                            "message": f"{endpoint.service_id} does not match its topology owner",
+                        }
+                    )
             if "artifact-transfer" not in {
                 item.replace("_", "-").casefold() for item in endpoint.capabilities
             }:
@@ -1139,6 +1221,72 @@ class CUDAValidationRunner:
             return "distributed orchestration preflight is outside the allowed execution window"
         return ""
 
+    def _verify_orchestration(self) -> str:
+        if (
+            self.orchestration_preflight_path is None
+            or not self.orchestration_preflight_path.is_file()
+        ):
+            return "LAN validation requires the orchestration preflight"
+        if self.topology_path is None or not self.topology_path.is_file():
+            return "LAN validation requires an existing topology file"
+        if not self.orchestration_token:
+            return "LAN validation requires the current orchestration token"
+        if not self.expected_commit:
+            return "LAN validation requires the controller commit identity"
+        try:
+            controller_identity = self.controller_identity_provider().strip()
+        except Exception as exc:
+            return f"LAN controller identity is unavailable: {type(exc).__name__}"
+        if not controller_identity:
+            return "LAN validation requires the controller identity"
+        try:
+            topology, policy = load_lan_policy(self.topology_path, self.mode)
+        except Exception as exc:
+            return f"LAN topology policy is invalid: {exc}"
+        try:
+            payload = LanOrchestrationPreflight.model_validate_json(
+                self.orchestration_preflight_path.read_text(encoding="utf-8-sig")
+            )
+        except Exception as exc:
+            return f"LAN orchestration preflight schema-v2 is invalid: {exc}"
+        if payload.mode != self.mode:
+            return "LAN orchestration mode does not match"
+        bindings = (
+            (payload.topology_sha256, hashlib.sha256(self.topology_path.read_bytes()).hexdigest(), "topology"),
+            (payload.fixture_sha256, hashlib.sha256(self.fixture_path.read_bytes()).hexdigest(), "fixture"),
+            (payload.controller_commit, self.expected_commit, "controller commit"),
+            (
+                payload.controller_id_sha256,
+                hashlib.sha256(controller_identity.encode("utf-8")).hexdigest(),
+                "controller identity",
+            ),
+            (
+                payload.token_sha256,
+                hashlib.sha256(self.orchestration_token.encode("utf-8")).hexdigest(),
+                "token",
+            ),
+        )
+        for supplied, actual, label in bindings:
+            if not hmac.compare_digest(supplied, actual):
+                return f"LAN orchestration {label} hash does not match"
+        if set(payload.nodes) != set(policy.workers):
+            return "LAN orchestration node set does not match topology policy"
+        if any(
+            not hmac.compare_digest(node.commit, self.expected_commit)
+            for node in payload.nodes.values()
+        ):
+            return "LAN orchestration worker commit does not match the controller"
+        if payload.created_at.tzinfo is None:
+            return "LAN orchestration preflight timestamp must include a timezone"
+        age_seconds = (
+            datetime.now(timezone.utc) - payload.created_at.astimezone(timezone.utc)
+        ).total_seconds()
+        if age_seconds < -300 or age_seconds > 12 * 60 * 60:
+            return "LAN orchestration preflight is outside the allowed execution window"
+        self._lan_topology = topology
+        self._lan_policy = policy
+        return ""
+
     def _check_service_contracts(
         self,
         report: dict[str, Any],
@@ -1177,7 +1325,7 @@ class CUDAValidationRunner:
             if service_report["passed"]:
                 ready.add(service_id)
             report["services"].append(service_report)
-        if self.mode == "distributed":
+        if self.mode in DISTINCT_GPU_MODES:
             uuid_owners: dict[str, list[dict[str, Any]]] = {}
             for service_report in report["services"]:
                 device_uuid = str((service_report.get("status") or {}).get("device_uuid") or "").strip()
@@ -1191,6 +1339,27 @@ class CUDAValidationRunner:
                 for service_report in owners:
                     service_report["errors"].append(
                         "distributed workers must report a distinct CUDA device UUID"
+                        if self.mode == "distributed"
+                        else "lan-distributed workers must report a distinct CUDA device UUID"
+                    )
+            for service_report in report["services"]:
+                service_report["passed"] = not service_report["errors"]
+                if not service_report["passed"]:
+                    ready.discard(str(service_report["service_id"]))
+        elif self.mode == "lan-shared":
+            uuids: set[str] = set()
+            for service_report in report["services"]:
+                device_uuid = str(
+                    (service_report.get("status") or {}).get("device_uuid") or ""
+                ).strip()
+                if not device_uuid:
+                    service_report["errors"].append("status is missing CUDA device UUID")
+                else:
+                    uuids.add(device_uuid)
+            if len(uuids) != 1:
+                for service_report in report["services"]:
+                    service_report["errors"].append(
+                        "lan-shared workers must report one shared CUDA device UUID"
                     )
             for service_report in report["services"]:
                 service_report["passed"] = not service_report["errors"]
@@ -1421,7 +1590,13 @@ class CUDAValidationRunner:
                     or report["cases"]
                     else "blocked"
                 )
-        _write_report_files(self.output_dir, report, fixture, endpoints)
+        _write_report_files(
+            self.output_dir,
+            report,
+            fixture,
+            endpoints,
+            hash_key=self._evidence_hash_key,
+        )
         return report
 
 
@@ -1460,9 +1635,10 @@ def _write_report_files(
     *,
     reset_nvidia: bool = False,
     preserve_worker_references: bool = False,
+    hash_key: bytes | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    evidence_report = _sanitize_evidence(report)
+    evidence_report = _sanitize_evidence(report, hash_key=hash_key)
     _atomic_write_report_file(
         output_dir / "summary.json",
         lambda path: path.write_text(
@@ -1520,18 +1696,34 @@ def _atomic_write_report_file(path: Path, writer: Callable[[Path], Any]) -> None
         temporary_path.unlink(missing_ok=True)
 
 
-def _sanitize_evidence(value: Any, key: str = "") -> Any:
+def _sanitize_evidence(
+    value: Any, key: str = "", hash_key: bytes | None = None
+) -> Any:
     if isinstance(value, dict):
-        return {item_key: _sanitize_evidence(item, item_key) for item_key, item in value.items()}
+        return {
+            item_key: _sanitize_evidence(item, item_key, hash_key)
+            for item_key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_sanitize_evidence(item, key) for item in value]
+        return [_sanitize_evidence(item, key, hash_key) for item in value]
     if not isinstance(value, str):
         return value
     lowered = key.casefold()
+    if lowered in {"device_uuid", "machine_id", "controller_id"}:
+        if value.startswith("hmac-sha256:"):
+            return value
+        key_bytes = hash_key or b"tts-more-local-evidence"
+        digest = hmac.new(key_bytes, value.encode("utf-8"), hashlib.sha256).hexdigest()
+        return "hmac-sha256:" + digest
     if "url" in lowered or lowered == "host":
         parsed = urlsplit(value)
         return parsed.path or "<redacted>"
-    if lowered in {"topology", "fixture", "distributed_preflight"} or any(
+    if lowered in {
+        "topology",
+        "fixture",
+        "distributed_preflight",
+        "orchestration_preflight",
+    } or any(
         token in lowered for token in ("path", "root", "cli")
     ):
         return _path_label(value)
@@ -1561,6 +1753,14 @@ def _path_label(value: str | None) -> str | None:
         return value
     normalized = str(value).replace("\\", "/").rstrip("/")
     return normalized.rsplit("/", 1)[-1] or "<redacted>"
+
+
+def _canonical_host(value: str) -> str:
+    normalized = value.strip().casefold().rstrip(".").strip("[]")
+    try:
+        return ipaddress.ip_address(normalized).compressed
+    except ValueError:
+        return normalized
 
 
 def _write_junit(path: Path, report: dict[str, Any]) -> None:
@@ -1804,7 +2004,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--topology", type=Path)
     parser.add_argument("--node")
-    parser.add_argument("--distributed-preflight", type=Path)
+    parser.add_argument(
+        "--orchestration-preflight",
+        "--distributed-preflight",
+        dest="orchestration_preflight",
+        type=Path,
+    )
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--diagnostic", action="store_true")
     parser.add_argument("--write-blocker-stage")
@@ -1827,7 +2032,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=args.output,
         topology_path=args.topology,
         node=args.node,
-        distributed_preflight_path=args.distributed_preflight,
+        orchestration_preflight_path=args.orchestration_preflight,
         require_baseline=args.require_baseline,
         diagnostic=args.diagnostic,
     )

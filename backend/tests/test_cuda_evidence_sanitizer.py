@@ -349,6 +349,72 @@ def test_distributed_bundle_blocks_when_controller_gpu_source_is_missing(tmp_pat
     assert summary["gpu_monitor"]["controller_sample_count"] == 0
 
 
+def _write_remote_gpu_sources(raw: Path, count: int) -> None:
+    for index in range(count):
+        node_dir = raw / "worker-logs" / f"private-node-{index}"
+        node_dir.mkdir(parents=True)
+        (node_dir / "nvidia-smi.csv").write_text(
+            f"2026/07/10 01:00:0{index}, {index}, GPU-private-{index}, 24576, 22000, 2576, 31\n",
+            encoding="utf-8",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "remote_count"),
+    [("lan-shared", 1), ("lan-distributed", 3)],
+)
+def test_lan_bundle_accepts_exact_policy_remote_gpu_cardinality(
+    tmp_path: Path, mode: str, remote_count: int
+) -> None:
+    module = _load_module()
+    raw = tmp_path / "raw"
+    _write_malicious_raw_run(raw)
+    _write_remote_gpu_sources(raw, remote_count)
+    output = tmp_path / "sanitized"
+
+    module.sanitize_evidence(
+        raw,
+        output,
+        mode=mode,
+        core_outcome="success",
+        playwright_outcome="success",
+    )
+
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    gpu_csv = (output / "nvidia-smi.csv").read_text(encoding="utf-8")
+    assert summary["shareable_evidence_complete"] is True
+    assert summary["gpu_monitor"]["remote_source_count"] == remote_count
+    assert "private-node" not in gpu_csv
+    assert "GPU-private" not in gpu_csv
+
+
+@pytest.mark.parametrize(
+    ("mode", "remote_count"),
+    [("lan-shared", 0), ("lan-shared", 2), ("lan-distributed", 2), ("lan-distributed", 4)],
+)
+def test_lan_bundle_fails_closed_on_remote_gpu_cardinality_mismatch(
+    tmp_path: Path, mode: str, remote_count: int
+) -> None:
+    module = _load_module()
+    raw = tmp_path / "raw"
+    _write_malicious_raw_run(raw)
+    _write_remote_gpu_sources(raw, remote_count)
+    output = tmp_path / "sanitized"
+
+    module.sanitize_evidence(
+        raw,
+        output,
+        mode=mode,
+        core_outcome="success",
+        playwright_outcome="success",
+    )
+
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    gate = json.loads((output / "automatic-gate.json").read_text(encoding="utf-8"))
+    assert summary["shareable_evidence_complete"] is False
+    assert gate["automatic_result"] == "阻塞"
+
+
 def test_sanitizer_accepts_the_production_gpu_monitor_schema(tmp_path: Path) -> None:
     module = _load_module()
     assert NvidiaSmiMonitor.HEADER == [

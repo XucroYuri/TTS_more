@@ -20,7 +20,18 @@ from typing import Any
 from xml.etree import ElementTree
 
 
-ALLOWED_MODES = {"single-clean", "single-release", "distributed"}
+ALLOWED_MODES = {
+    "single-clean",
+    "single-release",
+    "distributed",
+    "lan-shared",
+    "lan-distributed",
+}
+REMOTE_GPU_SOURCE_COUNTS = {
+    "distributed": 3,
+    "lan-shared": 1,
+    "lan-distributed": 3,
+}
 ALLOWED_OUTCOMES = {"success", "failure", "skipped", "cancelled"}
 BUNDLE_FILES = {
     "summary.json",
@@ -451,7 +462,7 @@ def _write_gpu_csv(raw_dir: Path, output_path: Path, *, mode: str) -> tuple[int,
 
     controller_sample_count = len(rows)
     remote_source_count = 0
-    if mode == "distributed":
+    if mode in REMOTE_GPU_SOURCE_COUNTS:
         worker_root = raw_dir / "worker-logs"
         remote_paths = sorted(worker_root.glob("*/nvidia-smi.csv")) if worker_root.is_dir() else []
         for source_index, remote_path in enumerate(remote_paths, start=1):
@@ -653,7 +664,7 @@ def sanitize_evidence(
             source_junit_valid
             and source_playwright_junit_valid
             and controller_gpu_sample_count > 0
-            and (mode != "distributed" or remote_gpu_source_count == 3)
+            and remote_gpu_source_count == REMOTE_GPU_SOURCE_COUNTS.get(mode, 0)
             and worker_reference_services == FORMAL_SERVICE_IDS
         )
         summary = _safe_summary(

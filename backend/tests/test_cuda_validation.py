@@ -35,6 +35,7 @@ from app.cuda_validation import (
     _sanitize_evidence,
     _write_listening_template,
 )
+from app.lan_topology import LanMode
 
 
 @pytest.fixture(autouse=True)
@@ -234,8 +235,142 @@ def _distributed_orchestration(tmp_path: Path, *, commit: str = "a" * 40) -> dic
     }
 
 
+def _write_lan_topology(tmp_path: Path, mode: str) -> tuple[Path, dict[str, str]]:
+    service_ids = list(FORMAL_SERVICE_IDS.values())
+    if mode == "lan-shared":
+        owners = {service_id: "shared-worker" for service_id in service_ids}
+        workers = {
+            "shared-worker": {
+                "role": "worker",
+                "host": "tts-shared.lan",
+                "bind_host": "0.0.0.0",
+                "services": service_ids,
+                "resource_group": "shared-worker:cuda-0",
+                "capacity": 1,
+            }
+        }
+    else:
+        owners = {service_id: f"worker-{index}" for index, service_id in enumerate(service_ids)}
+        workers = {
+            owner: {
+                "role": "worker",
+                "host": f"tts-{index}.lan",
+                "bind_host": "0.0.0.0",
+                "services": [service_id],
+                "resource_group": f"worker-{index}:cuda-0",
+                "capacity": 1,
+            }
+            for index, (service_id, owner) in enumerate(owners.items())
+        }
+    payload = {
+        "schema_version": 1,
+        "name": f"unit-{mode}",
+        "app_node": "app-controller",
+        "nodes": {
+            "app-controller": {
+                "role": "app",
+                "host": "controller.lan",
+                "bind_host": "127.0.0.1",
+                "services": [],
+                "resource_group": "app",
+                "capacity": 1,
+            },
+            **workers,
+        },
+    }
+    path = tmp_path / f"{mode}-topology.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path, owners
+
+
+def _write_lan_services(tmp_path: Path, mode: str, owners: dict[str, str]) -> Path:
+    path = _write_services(tmp_path)
+    services = json.loads(path.read_text(encoding="utf-8"))
+    for service in services:
+        owner = owners[service["service_id"]]
+        index = 0 if owner == "shared-worker" else int(owner.rsplit("-", 1)[1])
+        service["base_url"] = (
+            "http://tts-shared.lan:9880"
+            if owner == "shared-worker"
+            else f"http://tts-{index}.lan:988{index}"
+        )
+        service["resource_group"] = (
+            "shared-worker:cuda-0" if owner == "shared-worker" else f"worker-{index}:cuda-0"
+        )
+    path.write_text(json.dumps(services), encoding="utf-8")
+    return path
+
+
+def _lan_orchestration(
+    tmp_path: Path,
+    *,
+    mode: str,
+    fixture_path: Path,
+    commit: str = "a" * 40,
+    token: str = "unit-lan-token",
+    controller_identity: str = "controller-machine-guid",
+) -> dict:
+    topology_path, owners = _write_lan_topology(tmp_path, mode)
+    preflight_path = tmp_path / f"{mode}-preflight.json"
+    preflight_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "mode": mode,
+                "topology_sha256": hashlib.sha256(topology_path.read_bytes()).hexdigest(),
+                "fixture_sha256": hashlib.sha256(fixture_path.read_bytes()).hexdigest(),
+                "controller_commit": commit,
+                "controller_id_sha256": hashlib.sha256(controller_identity.encode()).hexdigest(),
+                "nodes": {
+                    owner: {
+                        "commit": commit,
+                        "host_key_sha256": hashlib.sha256(f"host-{owner}".encode()).hexdigest(),
+                        "machine_id_sha256": hashlib.sha256(f"machine-{owner}".encode()).hexdigest(),
+                    }
+                    for owner in set(owners.values())
+                },
+                "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "topology_path": topology_path,
+        "services_path": _write_lan_services(tmp_path, mode, owners),
+        "orchestration_preflight_path": preflight_path,
+        "orchestration_token": token,
+        "controller_identity_provider": lambda: controller_identity,
+        "expected_commit": commit,
+    }
+
+
+def _mode_paths(tmp_path: Path, mode: str) -> tuple[Path, Path, dict]:
+    fixture_path = _write_fixture(
+        tmp_path, distributed_weights=mode in {"distributed", "lan-shared", "lan-distributed"}
+    )
+    if mode in {"lan-shared", "lan-distributed"}:
+        orchestration = _lan_orchestration(
+            tmp_path, mode=mode, fixture_path=fixture_path
+        )
+        services_path = orchestration.pop("services_path")
+        return fixture_path, services_path, orchestration
+    return (
+        fixture_path,
+        _write_services(tmp_path),
+        _distributed_orchestration(tmp_path) if mode == "distributed" else {},
+    )
+
+
 def test_validation_modes_and_fixture_expand_exact_required_cases(tmp_path: Path) -> None:
-    assert VALIDATION_MODES == ("single-clean", "single-release", "distributed")
+    assert VALIDATION_MODES == (
+        "single-clean",
+        "single-release",
+        "distributed",
+        "lan-shared",
+        "lan-distributed",
+    )
+    assert tuple(mode.value for mode in LanMode) == ("lan-shared", "lan-distributed")
     fixture = load_fixture(_write_fixture(tmp_path))
 
     cases = validation_cases(fixture)
@@ -2128,17 +2263,17 @@ def test_first_certification_can_establish_performance_baseline(
 def test_all_modes_require_artifact_transfer_in_formal_endpoint_configuration(
     tmp_path: Path, mode: str
 ) -> None:
-    services_path = _write_services(tmp_path)
+    fixture_path, services_path, orchestration = _mode_paths(tmp_path, mode)
     services = json.loads(services_path.read_text(encoding="utf-8"))
     services[0]["capabilities"] = ["tts"]
     services_path.write_text(json.dumps(services), encoding="utf-8")
     runner = CUDAValidationRunner(
         mode=mode,
         services_path=services_path,
-        fixture_path=_write_fixture(tmp_path, distributed_weights=mode == "distributed"),
+        fixture_path=fixture_path,
         output_dir=tmp_path / f"missing-artifact-{mode}",
         transcriber=_expected_transcriber,
-        **(_distributed_orchestration(tmp_path) if mode == "distributed" else {}),
+        **orchestration,
     )
     report: dict = {"preflight": []}
 
@@ -2151,6 +2286,7 @@ def test_all_modes_require_artifact_transfer_in_formal_endpoint_configuration(
 def test_all_modes_require_normalized_live_artifact_transfer_capability(
     tmp_path: Path, mode: str
 ) -> None:
+    fixture_path, services_path, orchestration = _mode_paths(tmp_path, mode)
     state: dict[str, str | None] = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
 
     class MissingArtifactClient(_FakeClient):
@@ -2159,8 +2295,8 @@ def test_all_modes_require_normalized_live_artifact_transfer_capability(
 
     runner = CUDAValidationRunner(
         mode=mode,
-        services_path=_write_services(tmp_path),
-        fixture_path=_write_fixture(tmp_path, distributed_weights=mode == "distributed"),
+        services_path=services_path,
+        fixture_path=fixture_path,
         output_dir=tmp_path / f"live-artifact-{mode}",
         transcriber=_expected_transcriber,
         client_factory=lambda endpoint: MissingArtifactClient(endpoint, [], state),
@@ -2177,7 +2313,7 @@ def test_all_modes_require_normalized_live_artifact_transfer_capability(
                 "allocated_bytes": 0,
             },
         },
-        **(_distributed_orchestration(tmp_path) if mode == "distributed" else {}),
+        **orchestration,
     )
     report: dict = {"preflight": [], "services": []}
     fixture, endpoints = runner._preflight(report)
@@ -2196,7 +2332,7 @@ def test_all_modes_require_normalized_live_artifact_transfer_capability(
 def test_all_modes_accept_underscore_artifact_transfer_capability(
     tmp_path: Path, mode: str
 ) -> None:
-    services_path = _write_services(tmp_path)
+    fixture_path, services_path, orchestration = _mode_paths(tmp_path, mode)
     services = json.loads(services_path.read_text(encoding="utf-8"))
     for service in services:
         service["capabilities"] = ["tts", "artifact_transfer"]
@@ -2210,13 +2346,15 @@ def test_all_modes_accept_underscore_artifact_transfer_capability(
     runner = CUDAValidationRunner(
         mode=mode,
         services_path=services_path,
-        fixture_path=_write_fixture(tmp_path, distributed_weights=mode == "distributed"),
+        fixture_path=fixture_path,
         output_dir=tmp_path / f"underscore-artifact-{mode}",
         transcriber=_expected_transcriber,
         client_factory=lambda endpoint: UnderscoreArtifactClient(endpoint, [], state),
         status_probe=lambda endpoint: {
             "device": "cuda:0",
-            "device_uuid": f"GPU-{endpoint.service_id}",
+            "device_uuid": (
+                "GPU-SHARED" if mode == "lan-shared" else f"GPU-{endpoint.service_id}"
+            ),
             "cuda_runtime": "12.8",
             "loaded": False,
             "model": None,
@@ -2227,7 +2365,7 @@ def test_all_modes_accept_underscore_artifact_transfer_capability(
                 "allocated_bytes": 0,
             },
         },
-        **(_distributed_orchestration(tmp_path) if mode == "distributed" else {}),
+        **orchestration,
     )
     report: dict = {"preflight": [], "services": []}
     fixture, endpoints = runner._preflight(report)
@@ -2332,6 +2470,350 @@ def test_distributed_preflight_is_bound_to_topology_hash(tmp_path: Path) -> None
     runner._preflight(report)
 
     assert "topology hash" in report["preflight"][0]["message"]
+
+
+@pytest.mark.parametrize("mode", ["lan-shared", "lan-distributed"])
+def test_lan_input_preflight_accepts_remote_windows_fixture_paths(
+    tmp_path: Path, mode: str
+) -> None:
+    fixture_path = _write_fixture(tmp_path, distributed_weights=True)
+    runner = CUDAValidationRunner(
+        mode=mode,
+        services_path=_write_services(tmp_path),
+        fixture_path=fixture_path,
+        output_dir=tmp_path / mode,
+        transcriber=_expected_transcriber,
+    )
+
+    report = runner.run_input_preflight()
+
+    assert report["passed"] is True
+
+
+@pytest.mark.parametrize("mode", ["single-clean", "single-release"])
+def test_single_modes_still_reject_remote_windows_fixture_paths(tmp_path: Path, mode: str) -> None:
+    runner = CUDAValidationRunner(
+        mode=mode,
+        services_path=_write_services(tmp_path),
+        fixture_path=_write_fixture(tmp_path, distributed_weights=True),
+        output_dir=tmp_path / mode,
+        transcriber=_expected_transcriber,
+    )
+
+    report = runner.run_input_preflight()
+
+    assert report["passed"] is False
+    assert any("weight " in item["message"] for item in report["preflight"])
+
+
+@pytest.mark.parametrize(
+    ("mode", "device_uuids", "expected_ready"),
+    [
+        ("lan-shared", ["GPU-SHARED"] * 3, True),
+        ("lan-shared", ["GPU-0", "GPU-1", "GPU-2"], False),
+        ("lan-distributed", ["GPU-DUPLICATE"] * 3, False),
+        ("lan-distributed", ["GPU-0", "GPU-1", "GPU-2"], True),
+    ],
+)
+def test_lan_gpu_uuid_policy(
+    tmp_path: Path, mode: str, device_uuids: list[str], expected_ready: bool
+) -> None:
+    fixture_path = _write_fixture(tmp_path, distributed_weights=True)
+    orchestration = _lan_orchestration(tmp_path, mode=mode, fixture_path=fixture_path)
+    services_path = orchestration.pop("services_path")
+    state = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
+    uuid_by_service = dict(zip(FORMAL_SERVICE_IDS.values(), device_uuids, strict=True))
+    runner = CUDAValidationRunner(
+        mode=mode,
+        services_path=services_path,
+        fixture_path=fixture_path,
+        output_dir=tmp_path / f"uuid-{mode}-{expected_ready}",
+        transcriber=_expected_transcriber,
+        client_factory=lambda endpoint: _FakeClient(endpoint, [], state),
+        status_probe=lambda endpoint: {
+            "device": "cuda:0",
+            "device_uuid": uuid_by_service[endpoint.service_id],
+            "cuda_runtime": "12.8",
+            "loaded": False,
+            "model": None,
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        },
+        **orchestration,
+    )
+    report: dict = {"preflight": [], "services": []}
+
+    fixture, endpoints = runner._preflight(report)
+    assert fixture is not None
+    _clients, ready = runner._check_service_contracts(report, fixture, endpoints)
+
+    assert (ready == set(FORMAL_SERVICE_IDS.values())) is expected_ready
+    if not expected_ready:
+        assert any("CUDA device UUID" in str(service["errors"]) for service in report["services"])
+
+
+def test_lan_v2_preflight_binds_fixture_controller_identity_and_exact_node_set(
+    tmp_path: Path,
+) -> None:
+    fixture_path = _write_fixture(tmp_path, distributed_weights=True)
+    orchestration = _lan_orchestration(tmp_path, mode="lan-shared", fixture_path=fixture_path)
+    services_path = orchestration.pop("services_path")
+    preflight_path = orchestration["orchestration_preflight_path"]
+    payload = json.loads(preflight_path.read_text(encoding="utf-8"))
+    payload["nodes"]["extra-worker"] = payload["nodes"]["shared-worker"]
+    preflight_path.write_text(json.dumps(payload), encoding="utf-8")
+    runner = CUDAValidationRunner(
+        mode="lan-shared",
+        services_path=services_path,
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "extra-node",
+        transcriber=_expected_transcriber,
+        **orchestration,
+    )
+    report: dict = {"preflight": []}
+
+    runner._preflight(report)
+
+    assert "node set" in report["preflight"][0]["message"]
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("mode", "lan-distributed", "mode"),
+        ("topology_sha256", "1" * 64, "topology"),
+        ("fixture_sha256", "2" * 64, "fixture"),
+        ("controller_commit", "3" * 40, "controller commit"),
+        ("controller_id_sha256", "4" * 64, "controller identity"),
+        ("token_sha256", "5" * 64, "token"),
+    ],
+)
+def test_lan_v2_preflight_rejects_each_mismatched_run_binding(
+    tmp_path: Path, field: str, replacement: str, message: str
+) -> None:
+    fixture_path = _write_fixture(tmp_path, distributed_weights=True)
+    orchestration = _lan_orchestration(tmp_path, mode="lan-shared", fixture_path=fixture_path)
+    services_path = orchestration.pop("services_path")
+    preflight_path = orchestration["orchestration_preflight_path"]
+    payload = json.loads(preflight_path.read_text(encoding="utf-8"))
+    payload[field] = replacement
+    preflight_path.write_text(json.dumps(payload), encoding="utf-8")
+    runner = CUDAValidationRunner(
+        mode="lan-shared",
+        services_path=services_path,
+        fixture_path=fixture_path,
+        output_dir=tmp_path / f"mismatch-{field}",
+        transcriber=_expected_transcriber,
+        **orchestration,
+    )
+    report: dict = {"preflight": []}
+
+    runner._preflight(report)
+
+    assert message in report["preflight"][0]["message"]
+
+
+def test_lan_rejects_schema_v1_without_distributed_downgrade(tmp_path: Path) -> None:
+    fixture_path = _write_fixture(tmp_path, distributed_weights=True)
+    orchestration = _lan_orchestration(tmp_path, mode="lan-shared", fixture_path=fixture_path)
+    services_path = orchestration.pop("services_path")
+    legacy = _distributed_orchestration(tmp_path)
+    orchestration["orchestration_preflight_path"] = legacy["distributed_preflight_path"]
+    runner = CUDAValidationRunner(
+        mode="lan-shared",
+        services_path=services_path,
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "no-downgrade",
+        transcriber=_expected_transcriber,
+        **orchestration,
+    )
+    report: dict = {"preflight": []}
+
+    runner._preflight(report)
+
+    assert "schema" in report["preflight"][0]["message"].casefold() or "invalid" in report["preflight"][0]["message"].casefold()
+
+
+def test_lan_preflight_rejects_endpoint_not_bound_to_topology_owner(tmp_path: Path) -> None:
+    fixture_path = _write_fixture(tmp_path, distributed_weights=True)
+    orchestration = _lan_orchestration(tmp_path, mode="lan-distributed", fixture_path=fixture_path)
+    services_path = orchestration.pop("services_path")
+    services = json.loads(services_path.read_text(encoding="utf-8"))
+    services[0]["base_url"] = services[1]["base_url"]
+    services_path.write_text(json.dumps(services), encoding="utf-8")
+    runner = CUDAValidationRunner(
+        mode="lan-distributed",
+        services_path=services_path,
+        fixture_path=fixture_path,
+        output_dir=tmp_path / "wrong-owner",
+        transcriber=_expected_transcriber,
+        **orchestration,
+    )
+    report: dict = {"preflight": []}
+
+    runner._preflight(report)
+
+    assert any("topology owner" in item["message"] for item in report["preflight"])
+
+
+def test_recursive_evidence_hmac_uses_per_run_key_without_raw_identity() -> None:
+    payload = {
+        "status": {"device_uuid": "GPU-private", "nested": [{"machine_id": "machine-private"}]},
+        "controller_id": "controller-private",
+    }
+
+    first = _sanitize_evidence(payload, hash_key=hashlib.sha256(b"token-one").digest())
+    second = _sanitize_evidence(payload, hash_key=hashlib.sha256(b"token-two").digest())
+
+    first_text = json.dumps(first)
+    assert "GPU-private" not in first_text
+    assert "machine-private" not in first_text
+    assert "controller-private" not in first_text
+    assert first["status"]["device_uuid"].startswith("hmac-sha256:")
+    assert first["status"]["nested"][0]["machine_id"].startswith("hmac-sha256:")
+    assert first["controller_id"].startswith("hmac-sha256:")
+    assert first != second
+
+
+def test_verified_lan_runner_artifacts_never_persist_raw_token_or_identity(tmp_path: Path) -> None:
+    raw_token = "private-orchestration-token"
+    raw_controller_id = "private-controller-identity"
+    fixture_path = _write_fixture(tmp_path, distributed_weights=True)
+    orchestration = _lan_orchestration(
+        tmp_path,
+        mode="lan-shared",
+        fixture_path=fixture_path,
+        token=raw_token,
+        controller_identity=raw_controller_id,
+    )
+    services_path = orchestration.pop("services_path")
+    output_dir = tmp_path / "identity-output"
+    runner = CUDAValidationRunner(
+        mode="lan-shared",
+        services_path=services_path,
+        fixture_path=fixture_path,
+        output_dir=output_dir,
+        transcriber=_expected_transcriber,
+        **orchestration,
+    )
+    preflight_report: dict = {"preflight": []}
+    fixture, endpoints = runner._preflight(preflight_report)
+    assert fixture is not None
+    assert preflight_report["preflight"] == []
+    report = runner._new_report(stage="cuda-validation")
+    report["controller_id"] = raw_controller_id
+    report["services"] = [
+        {
+            "service_id": FORMAL_SERVICE_IDS["gpt_sovits"],
+            "passed": False,
+            "errors": [],
+            "status": {"device_uuid": "GPU-private", "machine_id": "machine-private"},
+        }
+    ]
+
+    runner._finish(report, fixture, endpoints)
+
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in output_dir.iterdir()
+        if path.suffix != ".csv"
+    )
+    for secret in (raw_token, raw_controller_id, "GPU-private", "machine-private"):
+        assert secret not in combined
+    assert "hmac-sha256:" in (output_dir / "summary.json").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("mode", ["lan-shared", "lan-distributed"])
+def test_lan_modes_do_not_run_the_single_only_gpt_artifact_comparison(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    target = FORMAL_SERVICE_IDS["gpt_sovits"]
+    case = ValidationCase(
+        name="gpt-v2ProPlus",
+        service_id=target,
+        profile="gpt-v2ProPlus",
+        text="默认模型验证。",
+        language="zh",
+        parameters={},
+    )
+    monkeypatch.setattr("app.cuda_validation.validation_cases", lambda _fixture: [case])
+    fixture_path, services_path, orchestration = _mode_paths(tmp_path, mode)
+    calls: list[tuple] = []
+    state = {service_id: None for service_id in FORMAL_SERVICE_IDS.values()}
+    runner = CUDAValidationRunner(
+        mode=mode,
+        services_path=services_path,
+        fixture_path=fixture_path,
+        output_dir=tmp_path / f"no-artifact-{mode}",
+        client_factory=lambda endpoint: _FakeClient(endpoint, calls, state),
+        status_probe=lambda endpoint: {
+            "device": "cuda:0",
+            "device_uuid": (
+                "GPU-SHARED" if mode == "lan-shared" else f"GPU-{endpoint.service_id}"
+            ),
+            "cuda_runtime": "12.8",
+            "loaded": state[endpoint.service_id] is not None,
+            "model": state[endpoint.service_id],
+            "memory": {
+                "free_bytes": 2 * 1024**3,
+                "total_bytes": 16 * 1024**3,
+                "reserved_bytes": 0,
+                "allocated_bytes": 0,
+            },
+        },
+        transcriber=_expected_transcriber,
+        clock=lambda: 10.0,
+        sleeper=lambda _: None,
+        monitor_factory=_HealthyMonitor,
+        **orchestration,
+    )
+
+    report = runner.run()
+
+    assert [item["name"] for item in report["cases"]] == ["gpt-v2ProPlus"]
+    assert not any(
+        call[1] == "synthesize" and call[2].endswith("-artifact")
+        for call in calls
+        if len(call) > 2
+    )
+
+
+@pytest.mark.parametrize("alias", ["--orchestration-preflight", "--distributed-preflight"])
+def test_cli_preflight_aliases_use_the_same_constructor_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: str
+) -> None:
+    captured: dict = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def run_input_preflight(self) -> dict:
+            return {"stage": "input-preflight", "passed": True}
+
+    monkeypatch.setattr(cuda_validation, "CUDAValidationRunner", FakeRunner)
+    preflight = tmp_path / "preflight.json"
+
+    assert main(
+        [
+            "--mode",
+            "single-release",
+            "--services",
+            str(tmp_path / "services.json"),
+            "--fixture",
+            str(tmp_path / "fixture.json"),
+            "--output",
+            str(tmp_path / "output"),
+            alias,
+            str(preflight),
+            "--preflight-only",
+        ]
+    ) == 0
+    assert captured["orchestration_preflight_path"] == preflight
 
 
 def test_cli_and_powershell_entrypoints_declare_required_arguments() -> None:
