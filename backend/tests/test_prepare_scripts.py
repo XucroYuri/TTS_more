@@ -202,6 +202,38 @@ def test_portable_conda_bootstrap_uses_locked_archive_and_never_requires_system_
     assert "Get-Command conda" not in script
 
 
+def test_portable_conda_bootstrap_can_return_its_private_conda_path_to_a_builder() -> None:
+    script = (REPO_ROOT / "scripts" / "bootstrap-conda.ps1").read_text(encoding="utf-8")
+
+    assert "[switch]$PassThru" in script
+    assert "Write-Output $privateConda" in script
+
+
+def test_windows_prepare_provisions_shared_ffmpeg_and_verifies_gpt_worker_runtime() -> None:
+    script = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+    prepare_gpt = script.split("function Prepare-GPTSoVITS", maxsplit=1)[1].split(
+        "function Prepare-IndexTTS", maxsplit=1
+    )[0]
+
+    assert "function Ensure-GPTSharedFFmpeg" in script
+    assert "ffmpeg-8.1.2-full_build-shared.zip" in script
+    assert "function Test-GPTWorkerRuntime" in script
+    assert "torchaudio.load" in script
+    assert "GPT_SoVITS.TTS_infer_pack.TTS" in script
+    assert '"onnxruntime-gpu==1.26.0"' in prepare_gpt
+    assert "Ensure-GPTSharedFFmpeg $repoPath" in prepare_gpt
+    assert "Test-GPTWorkerRuntime $repoPython $repoPath" in prepare_gpt
+
+
+def test_windows_prepare_dry_run_does_not_require_conda_for_gpt_preflight() -> None:
+    script = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
+    prepare_gpt = script.split("function Prepare-GPTSoVITS", maxsplit=1)[1].split(
+        "function Prepare-IndexTTS", maxsplit=1
+    )[0]
+
+    assert "if (!$DryRun -and !(Get-Command conda -ErrorAction SilentlyContinue))" in prepare_gpt
+
+
 def test_windows_prepare_installs_and_verifies_cu128_runtime_for_index_and_cosy() -> None:
     script = (REPO_ROOT / "scripts" / "prepare-tts-repos.ps1").read_text(encoding="utf-8")
 
@@ -305,6 +337,9 @@ def test_start_dev_rejects_occupied_configured_ports_before_starting_processes()
     assert "else { 8000 }" in script
     assert "$FrontendPort = if ($env:TTS_MORE_FRONTEND_PORT)" in script
     assert "else { 5173 }" in script
+    assert "$FrontendApiTarget = if ($env:TTS_MORE_API_TARGET)" in script
+    assert 'else { "http://127.0.0.1:$BackendPort" }' in script
+    assert "$env:TTS_MORE_API_TARGET = $FrontendApiTarget" in script
     guard = script[script.index("function Assert-PortAvailable") : script.index("if (!(Test-Path")]
     first_start = script.index("Start-Process")
     for call in ('Assert-PortAvailable $BackendPort "Backend"', 'Assert-PortAvailable $FrontendPort "Frontend"'):

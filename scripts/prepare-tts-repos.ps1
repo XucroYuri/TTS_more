@@ -252,6 +252,92 @@ function Install-CU128TorchRuntime {
     Invoke-Logged $RepoPython @("-c", $probe) $RepoPath
 }
 
+function Ensure-GPTSharedFFmpeg {
+    param([string]$RepoPath)
+    $sharedBin = Join-Path $RepoPath "ffmpeg-shared\bin"
+    $ffmpeg = Join-Path $sharedBin "ffmpeg.exe"
+    $ffprobe = Join-Path $sharedBin "ffprobe.exe"
+    $sharedDll = Get-ChildItem -Path $sharedBin -Filter "avcodec-*.dll" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ((Test-Path -LiteralPath $ffmpeg) -and (Test-Path -LiteralPath $ffprobe) -and $sharedDll) {
+        return
+    }
+    if ($DryRun) {
+        Write-Host "[run] provision full-shared FFmpeg in $sharedBin" -ForegroundColor Cyan
+        return
+    }
+
+    $archive = Join-Path $RepoPath "ffmpeg-full-shared.zip"
+    $extractDir = Join-Path $RepoPath ".tts-more-ffmpeg-tmp"
+    try {
+        Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "[download] GPT-SoVITS full-shared FFmpeg runtime" -ForegroundColor Cyan
+        Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/GyanD/codexffmpeg/releases/download/8.1.2/ffmpeg-8.1.2-full_build-shared.zip" -OutFile $archive -TimeoutSec 900
+        Expand-Archive -LiteralPath $archive -DestinationPath $extractDir -Force
+        $sourceBin = Get-ChildItem -LiteralPath $extractDir -Directory -Recurse |
+            Where-Object { $_.Name -eq "bin" -and (Test-Path -LiteralPath (Join-Path $_.FullName "ffmpeg.exe")) } |
+            Select-Object -First 1
+        if ($null -eq $sourceBin) {
+            throw "full-shared FFmpeg archive does not contain a bin directory"
+        }
+        New-Item -ItemType Directory -Path $sharedBin -Force | Out-Null
+        Copy-Item -Path (Join-Path $sourceBin.FullName "*") -Destination $sharedBin -Recurse -Force
+        foreach ($tool in @("ffmpeg.exe", "ffprobe.exe")) {
+            Copy-Item -LiteralPath (Join-Path $sharedBin $tool) -Destination (Join-Path $RepoPath $tool) -Force
+        }
+        $sharedDll = Get-ChildItem -Path $sharedBin -Filter "avcodec-*.dll" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $sharedDll) {
+            throw "full-shared FFmpeg DLLs were not found in $sharedBin"
+        }
+    } finally {
+        Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-GPTWorkerRuntime {
+    param(
+        [string]$RepoPython,
+        [string]$RepoPath
+    )
+    $probe = @'
+import os
+import sys
+import tempfile
+import wave
+from importlib.metadata import version as package_version
+from pathlib import Path
+
+repo = Path(sys.argv[1]).resolve()
+package = repo / "GPT_SoVITS"
+ffmpeg_bin = repo / "ffmpeg-shared" / "bin"
+if not package.is_dir():
+    raise RuntimeError(f"missing GPT_SoVITS package: {package}")
+if not any(ffmpeg_bin.glob("avcodec-*.dll")):
+    raise RuntimeError(f"missing full-shared FFmpeg DLLs: {ffmpeg_bin}")
+if package_version("onnxruntime-gpu") != "1.26.0":
+    raise RuntimeError("onnxruntime-gpu must be pinned to 1.26.0 for CUDA 12")
+os.environ["PATH"] = str(ffmpeg_bin) + os.pathsep + os.environ.get("PATH", "")
+if hasattr(os, "add_dll_directory"):
+    dll_directory = os.add_dll_directory(str(ffmpeg_bin))
+sys.path[:0] = [str(package), str(repo)]
+
+from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
+import torchaudio
+
+with tempfile.TemporaryDirectory(prefix="tts-more-gpt-probe-") as temporary:
+    sample = Path(temporary) / "probe.wav"
+    with wave.open(str(sample), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(16000)
+        stream.writeframes(b"\x00\x00" * 1600)
+    waveform, sample_rate = torchaudio.load(str(sample))
+    assert sample_rate == 16000 and waveform.numel() > 0
+print("GPT-SoVITS worker import and media runtime probe passed")
+'@
+    Invoke-Logged $RepoPython @("-c", $probe, $RepoPath) $RepoPath
+}
+
 function Prepare-GPTSoVITS {
     param($Repo)
     $repoPath = Join-Path $Root $Repo.path
@@ -264,7 +350,10 @@ function Prepare-GPTSoVITS {
     $repoPython = Ensure-Venv $repoPath
     if ($IsWindows -or $env:OS -eq "Windows_NT") {
         if (!(Test-Path -LiteralPath $installPs1)) { throw "Missing GPT-SoVITS installer: $installPs1" }
-        if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
+        if ($DryRun -and !(Get-Command conda -ErrorAction SilentlyContinue)) {
+            Write-Host "[prerequisite] GPT-SoVITS official installer requires conda; install conda before running without -DryRun." -ForegroundColor Yellow
+        }
+        if (!$DryRun -and !(Get-Command conda -ErrorAction SilentlyContinue)) {
             throw "conda was not found; GPT-SoVITS official installer requires conda for $($Repo.name)."
         }
         Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "GPT-SoVITS torchcodec bootstrap" -Action {
@@ -281,6 +370,10 @@ function Prepare-GPTSoVITS {
         } finally {
             $env:PATH = $previousPath
         }
+        Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "GPT-SoVITS ONNX Runtime CUDA 12 pin" -Action {
+            param($IndexUrl)
+            Invoke-Logged $repoPython @("-m", "pip", "install", "--upgrade", "--force-reinstall", "--no-deps", "onnxruntime-gpu==1.26.0") $repoPath
+        }
     } else {
         if (!(Test-Path -LiteralPath $installSh)) { throw "Missing GPT-SoVITS installer: $installSh" }
         if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
@@ -291,6 +384,10 @@ function Prepare-GPTSoVITS {
             param($CandidateSource)
             Invoke-Logged "bash" @($installSh, "--device", $Device, "--source", $CandidateSource) $repoPath
         }
+    }
+    if ($IsWindows -or $env:OS -eq "Windows_NT") {
+        Ensure-GPTSharedFFmpeg $repoPath
+        Test-GPTWorkerRuntime $repoPython $repoPath
     }
 }
 
