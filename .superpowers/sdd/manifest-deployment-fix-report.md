@@ -217,3 +217,57 @@ C1 and documentation M2 are closed in implementation and regression coverage. M1
 - Native Windows/PowerShell execution evidence is pending the existing GitHub Actions Windows job. The cross-platform test is non-skipping, but this macOS run is not native evidence.
 - Strict local config intentionally rejects otherwise common checkout-local customizations such as `user.*`, custom CA/proxy settings, maintenance, filters, merge/diff tools, submodules, includes, and extra remotes. Operators must remove them from managed checkouts rather than weakening the allowlist.
 - When Git/SSH are installed outside fixed platform locations, the same explicit absolute `TTS_MORE_TRUSTED_GIT`/`TTS_MORE_TRUSTED_SSH` values used to install the updater must also be present when the generated updater runs; updater-side revalidation fails closed otherwise.
+
+## Round 5 re-review
+
+### Result
+
+`DONE_WITH_CONCERNS`
+
+I1 and I2 are closed in implementation, regression coverage, and maintained deployment documentation. M1 remains the explicitly documented residual concurrent ancestor-replacement threat. Native Windows execution remains delegated to the existing mandatory GitHub `windows-latest` gate; this macOS run does not claim Windows success.
+
+### Round 5 RED log
+
+- Review source: the latest `.superpowers/sdd/manifest-deployment-review.md` (`Critical 0 / Important 2 / Minor 1`), with Round 5 scoped to I1 and I2 while retaining the M1 caveat.
+- I1 initial RED: the new full-clone planning/execution tests produced `3 failed, 154 deselected in 0.38s`. Both dry-run and real plans still contained `--filter=blob:none`, and the single full-clone helper did not exist.
+- I1 strict-policy supplemental RED: after removing the clone filter, `remote.origin.promisor` and `remote.origin.partialCloneFilter` were still accepted (`2 failed, 13 passed, 150 deselected in 1.24s`). `extensions.partialClone` was already rejected. This demonstrated that removal of partial clone also required removal of its no-longer-needed allowlist entries.
+- I2 core RED: the selected schema/policy/HTTPS/SSH tests initially reported `7 failed, 155 deselected in 1.22s`; six were direct production failures and one different-prefix fixture was corrected because its first path was outside the temporary repository. The corrected different-prefix test then failed for the intended reason: the copied updater ignored the destination-only trusted Git marker because schema 2 retained the installer path. Together these are seven valid behavior RED observations.
+- I2 failures showed schema 2 host paths, no portable executable policy, no typed `requires_ssh` binding, unconditional SSH resolution for HTTPS, no destination runtime resolution, and no portable different-prefix copy behavior.
+- Documentation RED: `test_update_script_docs_describe_portable_runtime_executable_policy` failed (`1 failed, 23 deselected in 0.05s`) because the maintained deployment docs did not require the Python/JSON updater files or state the destination executable policy and HTTPS/SSH split.
+
+### Round 5 closure mapping
+
+| ID | GREEN closure |
+|---|---|
+| I1 | The deployer no longer requests partial clone. New repositories use one shallow, single-branch full clone followed by the existing pinned fetch/checkout path; dry-run and real action plans agree and contain no `--filter`. The fallback/retry path was removed. The strict local-config allowlist was not broadened: `extensions.partialClone`, `remote.origin.promisor`, and `remote.origin.partialCloneFilter` all fail closed as unknown/unneeded metadata. |
+| I2 | Generated sidecars use an exact schema 3 containing the portable `fixed-dirs-or-explicit-env-v1` policy and a typed `requires_ssh` value derived from the validated GitHub remote. They contain no installer-host Git/SSH paths. At runtime the destination independently resolves and revalidates Git from fixed directories or exact absolute `TTS_MORE_TRUSTED_GIT`, never PATH/cwd; it resolves SSH under the same policy only for validated SSH/scp remotes. HTTPS uses the hardened disabled-SSH sentinel and runs without SSH. Policy tampering and `requires_ssh`/remote mismatch fail before Git. Tests cover exact sidecar schema, a copied updater under a different installation prefix, HTTPS without SSH, SSH with missing/present SSH, tampered policy, and app/generated hardened-command parity. |
+| M1 | No cross-platform parent-handle expansion was attempted. Documentation continues to state that general bundle/output ancestor replacement and Windows parent handles remain raceable; POSIX final `logs_dir`/log entry no-follow protection remains in place. |
+
+### Round 5 GREEN and verification
+
+- I1 clone GREEN: `4 passed, 153 deselected in 0.30s`.
+- I2 core GREEN: `7 passed, 155 deselected in 2.16s`.
+- Strict rejection of old partial-clone metadata: `15 passed, 150 deselected in 1.34s`.
+- App/generated hardened policy parity for HTTPS/no-SSH and SSH paths across status/config/fetch/checkout/pull: `10 passed, 160 deselected in 0.18s`.
+- Documentation policy GREEN: `1 passed, 23 deselected in 0.01s`.
+- Final focused deployment/docs: `190 passed, 4 skipped in 9.82s`.
+- Final full backend (Python 3.11): `472 passed, 6 skipped, 1 warning in 29.44s`.
+- `python -m compileall -q scripts backend`: exit 0.
+- Generated `tts-more-update.py` source compilation: exit 0.
+- `bash -n` for the five maintained POSIX deployment wrappers: exit 0.
+- `repo.lock.json` and deployment JSON parse: 2 files validated.
+- `git diff --check` and both functional staged diff-checks: exit 0.
+- Existing warning: FastAPI/Starlette `httpx` deprecation, unrelated to deployment.
+- Native PowerShell was unavailable (`pwsh` is not installed on this macOS host). `.github/workflows/ci.yml` still has the `ubuntu-latest`/`windows-latest` matrix and mandatory Windows-native PowerShell deployment tests; their result requires a pushed CI run and is not inferred from local skips.
+
+### Round 5 commits
+
+- `bcb1b4a424154364e1bf75303fe160942cbf9470` - remove partial clone, add portable runtime updater policy, conditionally resolve SSH, and add I1/I2 regressions.
+- `b80466967fc2c2c1235148d15c58d1c817f50fcd` - document the four-file portable updater contract and destination executable policy, with a maintained-doc regression test.
+- Report-only finalization commit is recorded in the final task response because a commit cannot contain its own SHA.
+
+### Round 5 concerns
+
+- General concurrent ancestor replacement remains the documented M1 residual; no Windows handle-based parent-chain protection is claimed.
+- Native Windows/PowerShell execution evidence remains pending the existing GitHub Actions Windows job. The different-prefix portability fixture and platform-neutral policy tests pass locally, but macOS is not treated as native Windows evidence.
+- Custom Git/SSH installations on a destination must use that destination's exact absolute `TTS_MORE_TRUSTED_GIT`/`TTS_MORE_TRUSTED_SSH`; PATH and cwd lookup intentionally remain disabled.
