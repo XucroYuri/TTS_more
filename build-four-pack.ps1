@@ -25,19 +25,26 @@ function Resolve-ComponentRoot {
 }
 
 $repoLock = Get-Content -LiteralPath (Join-Path $Root "repo.lock.json") -Raw | ConvertFrom-Json
-$gptLocked = [string](@($repoLock.repositories | Where-Object { $_.name -eq "GPT-SoVITS-main" })[0].path)
-$indexLocked = [string](@($repoLock.repositories | Where-Object { $_.provider_type -eq "indextts" })[0].path)
-$cosyLocked = [string](@($repoLock.repositories | Where-Object { $_.provider_type -eq "cosyvoice" })[0].path)
+$gptLock = @($repoLock.repositories | Where-Object { $_.name -eq "GPT-SoVITS-main" })[0]
+$indexLock = @($repoLock.repositories | Where-Object { $_.provider_type -eq "indextts" })[0]
+$cosyLock = @($repoLock.repositories | Where-Object { $_.provider_type -eq "cosyvoice" })[0]
 $targets = @(
-    [pscustomobject]@{ component="tts-more"; root=$Root },
-    [pscustomobject]@{ component="gpt-sovits"; root=(Resolve-ComponentRoot $GptRoot "TTS_MORE_GPT_ROOT" $gptLocked) },
-    [pscustomobject]@{ component="indextts"; root=(Resolve-ComponentRoot $IndexRoot "TTS_MORE_INDEX_ROOT" $indexLocked) },
-    [pscustomobject]@{ component="cosyvoice"; root=(Resolve-ComponentRoot $CosyVoiceRoot "TTS_MORE_COSYVOICE_ROOT" $cosyLocked) }
+    [pscustomobject]@{ component="tts-more"; root=$Root; expected_revision="" },
+    [pscustomobject]@{ component="gpt-sovits"; root=(Resolve-ComponentRoot $GptRoot "TTS_MORE_GPT_ROOT" ([string]$gptLock.path)); expected_revision=[string]$gptLock.commit },
+    [pscustomobject]@{ component="indextts"; root=(Resolve-ComponentRoot $IndexRoot "TTS_MORE_INDEX_ROOT" ([string]$indexLock.path)); expected_revision=[string]$indexLock.commit },
+    [pscustomobject]@{ component="cosyvoice"; root=(Resolve-ComponentRoot $CosyVoiceRoot "TTS_MORE_COSYVOICE_ROOT" ([string]$cosyLock.path)); expected_revision=[string]$cosyLock.commit }
 )
 $componentOrder = @("tts-more", "gpt-sovits", "indextts", "cosyvoice")
 if (($targets.component -join ',') -ne ($componentOrder -join ',')) { throw "four-pack component order drifted" }
+foreach ($target in $targets) {
+    if (!$target.expected_revision) { continue }
+    $actualRevision = (& git -C $target.root rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $actualRevision -ne $target.expected_revision) {
+        throw "$($target.component) source revision drift: expected $($target.expected_revision), found $actualRevision"
+    }
+}
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
-$plan = [ordered]@{ schema_version=1; version=$Version; profile="full"; device=$Device.ToLowerInvariant(); output_root=$OutputRoot; components=@($targets | ForEach-Object { @{component=$_.component;root=$_.root} }) }
+$plan = [ordered]@{ schema_version=1; version=$Version; profile="full"; device=$Device.ToLowerInvariant(); output_root=$OutputRoot; components=@($targets | ForEach-Object { @{component=$_.component;root=$_.root;expected_revision=$_.expected_revision} }) }
 $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputRoot "four-pack.plan.json") -Encoding UTF8
 if ($PlanOnly) { Write-Host "Validated four-pack plan: $OutputRoot"; exit 0 }
 

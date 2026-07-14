@@ -224,6 +224,7 @@ def test_four_pack_builder_is_full_only_and_refuses_github_actions() -> None:
     assert '$env:GITHUB_ACTIONS -eq "true"' in builder
     assert '-Profile Full' in builder
     assert '"tts-more", "gpt-sovits", "indextts", "cosyvoice"' in builder
+    assert "source revision drift" in builder
     assert "compatibility-matrix.json" in builder
     assert "four-pack.provenance.json" in builder
 
