@@ -106,6 +106,7 @@ def _copy_controller_builder_fixture(root: Path) -> None:
         "Invoke-PortableStart.ps1",
         "Show-PortableProgress.ps1",
         "Portable-Validation.ps1",
+        "export-portable-diagnostics.py",
         "portable_install.py",
         "portable_launcher.py",
         "portable_operations.py",
@@ -656,7 +657,9 @@ def test_prepare_runtime_finalizes_start_cmd_extraction_without_extracting_twice
     }
 
 
-def test_stop_worker_accepts_windows_powershell_utf8_bom_pid_record(tmp_path: Path, monkeypatch) -> None:
+def test_stop_worker_reads_bom_but_rejects_legacy_record_without_safe_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
     launcher = _load_portable_launcher()
     package_root = tmp_path / "GPT-SoVITS-dev"
     executable = package_root / "runtime" / "live" / "python.exe"
@@ -677,9 +680,10 @@ def test_stop_worker_accepts_windows_powershell_utf8_bom_pid_record(tmp_path: Pa
     assert launcher.os is not os
     monkeypatch.setattr(launcher.subprocess, "run", fake_run)
 
-    assert launcher.stop_worker(package_root) == 0
-    assert calls == [["taskkill", "/PID", "1234", "/T", "/F"]]
-    assert not record.exists()
+    with pytest.raises(RuntimeError, match="legacy PID record"):
+        launcher.stop_worker(package_root)
+    assert calls == []
+    assert record.exists()
 
 
 def test_worker_launch_scripts_use_package_relative_runtime_paths() -> None:

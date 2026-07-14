@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import shutil
-import socket
 import subprocess
 import time
 from datetime import UTC, datetime
@@ -17,6 +16,7 @@ BUILD_MARKER = ".portable-build.json"
 ProcessInspector = Callable[[int], dict[str, object] | None]
 Terminator = Callable[[int], None]
 PortInspector = Callable[[int], bool]
+PortOwnerInspector = Callable[[int], set[int]]
 
 
 def run(command: list[str], **kwargs: Any) -> None:
@@ -158,6 +158,7 @@ def stop_worker(
     inspector: ProcessInspector | None = None,
     terminator: Terminator | None = None,
     port_is_listening: PortInspector | None = None,
+    port_owner_inspector: PortOwnerInspector | None = None,
     sleep: Callable[[float], None] = time.sleep,
     timeout_seconds: float = 15,
 ) -> int:
@@ -168,52 +169,76 @@ def stop_worker(
         return 0
     payload = json.loads(record.read_text(encoding="utf-8-sig"))
     if int(payload.get("schema_version") or 0) != 2:
-        return _stop_legacy_worker(root, record, payload)
+        raise RuntimeError("legacy PID record lacks the ownership identity required for safe stop")
     recorded_root = Path(str(payload.get("package_root") or "")).resolve(strict=False)
     if recorded_root != root:
         raise ValueError("PID record belongs to a different package root")
     executable = Path(str(payload.get("executable_path") or "")).resolve(strict=False)
     _ensure_within(root, executable)
+    expected_executable = (root / "runtime" / "live" / "python.exe").resolve(strict=False)
+    if executable != expected_executable:
+        raise RuntimeError("recorded executable is not the package runtime")
     pid = int(payload["pid"])
     port = int(payload["port"])
+    # A bare child PID has no creation-time or command identity and could have been reused.
+    # Only the fully identified primary process may authorize a listener owner.
+    owned_pids = {pid}
+    manifest_path = root / "package" / "tts-more-package.json"
+    expected_build_id = "source-checkout"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        expected_build_id = str(manifest.get("build_id") or "")
+    if not expected_build_id or str(payload.get("build_id") or "") != expected_build_id:
+        raise RuntimeError("recorded build identity does not match this package")
+    command_digest = str(payload.get("command_sha256") or "")
+    if len(command_digest) != 64 or any(character not in "0123456789abcdefABCDEF" for character in command_digest):
+        raise RuntimeError("recorded command identity is invalid")
     inspect = inspector or _inspect_process
     terminate = terminator or _terminate_process_tree
-    is_listening = port_is_listening or _port_is_listening
+    if port_owner_inspector is not None:
+        inspect_port_owners = port_owner_inspector
+    elif port_is_listening is not None:
+        inspect_port_owners = lambda current_port: {pid} if port_is_listening(current_port) else set()
+    else:
+        inspect_port_owners = _listener_pids_for_port
     process = inspect(pid)
-    listening = is_listening(port)
+    port_owners = inspect_port_owners(port)
+    if port_owners - owned_pids:
+        raise RuntimeError("recorded port ownership does not match the owned process tree")
     if process is not None:
+        if int(process.get("pid") or 0) != pid:
+            raise RuntimeError("recorded PID identity does not match the running process")
         actual_executable = Path(str(process.get("executable_path") or "")).resolve(strict=False)
         created_at = str(process.get("created_at") or "")
         if actual_executable != executable or created_at != str(payload.get("process_created_at") or ""):
             raise RuntimeError("recorded PID identity does not match the running process")
+        actual_parent = process.get("parent_pid")
+        if actual_parent is not None and int(actual_parent) != int(payload.get("parent_pid") or 0):
+            raise RuntimeError("recorded parent process identity does not match the running process")
+        command_args = process.get("command_args")
+        actual_digest = (
+            hashlib.sha256("\0".join(str(item) for item in command_args).encode("utf-8")).hexdigest()
+            if isinstance(command_args, list)
+            else ""
+        )
+        if actual_digest != command_digest.lower():
+            raise RuntimeError("recorded command identity does not match the running process")
         terminate(pid)
-    elif not listening:
+    elif not port_owners:
         record.unlink(missing_ok=True)
         return 0
 
     deadline = time.monotonic() + max(0, timeout_seconds)
     while time.monotonic() <= deadline:
         process = inspect(pid)
-        listening = is_listening(port)
-        if process is None and not listening:
+        port_owners = inspect_port_owners(port)
+        if process is None and not port_owners:
             record.unlink(missing_ok=True)
             return 0
         if timeout_seconds <= 0:
             break
         sleep(min(0.2, timeout_seconds))
     return 2
-
-
-def _stop_legacy_worker(root: Path, record: Path, payload: dict[str, object]) -> int:
-    """Compatibility path for schema-v1 packages; all newly built packages use v2."""
-    executable = Path(str(payload.get("executable_path") or "")).resolve(strict=False)
-    _ensure_within(root, executable)
-    pid = int(payload["pid"])
-    if os.name != "nt":
-        raise RuntimeError("portable process termination is supported only on Windows")
-    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False, capture_output=True)
-    record.unlink(missing_ok=True)
-    return 0
 
 
 def _inspect_process(pid: int) -> dict[str, object] | None:
@@ -226,8 +251,9 @@ def _inspect_process(pid: int) -> dict[str, object] | None:
         "-Command",
         "$p=Get-Process -Id $args[0] -ErrorAction SilentlyContinue; "
         "$c=Get-CimInstance Win32_Process -Filter ('ProcessId='+$args[0]) -ErrorAction SilentlyContinue; "
-        "if($p){@{pid=$p.Id;created_at=$p.StartTime.ToUniversalTime().ToString('o');"
-        "executable_path=$p.Path;command_line=if($c){$c.CommandLine}else{''}}|ConvertTo-Json -Compress}",
+        "if($p){@{pid=$p.Id;parent_pid=if($c){$c.ParentProcessId}else{$null};"
+        "created_at=$p.StartTime.ToUniversalTime().ToString('o');executable_path=$p.Path;"
+        "command_line=if($c){$c.CommandLine}else{''}}|ConvertTo-Json -Compress}",
         str(pid),
     ]
     completed = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -271,10 +297,28 @@ def _terminate_process_tree(pid: int) -> None:
         raise RuntimeError(f"failed to terminate owned process {pid}: {completed.stderr.strip()}")
 
 
-def _port_is_listening(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
-        client.settimeout(0.2)
-        return client.connect_ex(("127.0.0.1", port)) == 0
+def _listener_pids_for_port(port: int) -> set[int]:
+    """Return all Windows listener PIDs so unknown owners can never be terminated."""
+    if os.name != "nt":
+        return set()
+    command = [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "@(Get-NetTCPConnection -State Listen -LocalPort $args[0] -ErrorAction SilentlyContinue | "
+        "Select-Object -ExpandProperty OwningProcess -Unique) | ConvertTo-Json -Compress",
+        str(port),
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError("unable to verify port ownership")
+    output = completed.stdout.strip()
+    if not output:
+        return set()
+    payload = json.loads(output)
+    values = payload if isinstance(payload, list) else [payload]
+    return {int(value) for value in values}
 
 
 def _run_conda_unpack(live: Path) -> None:

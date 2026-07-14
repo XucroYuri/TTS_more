@@ -9,6 +9,7 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_COMMAND = ["-m", "uvicorn", "worker:app", "--port", "9880"]
 
 
 def _load_launcher():
@@ -29,10 +30,10 @@ def _record(root: Path) -> dict[str, object]:
         "process_created_at": "2026-07-14T01:02:03.000000+00:00",
         "recorded_at": "2026-07-14T01:02:04.000000+00:00",
         "executable_path": str(root / "runtime" / "live" / "python.exe"),
-        "command_sha256": "a" * 64,
+        "command_sha256": hashlib.sha256("\0".join(DEFAULT_COMMAND).encode()).hexdigest(),
         "port": 9880,
         "package_root": str(root),
-        "build_id": "gpt-sovits-2.0.0-deadbeef",
+        "build_id": "source-checkout",
     }
 
 
@@ -78,7 +79,13 @@ def test_stop_worker_deletes_record_only_after_process_and_port_are_gone(tmp_pat
     record_path.write_text(json.dumps(_record(root)), encoding="utf-8")
     inspections = iter(
         [
-            {"pid": 4242, "created_at": "2026-07-14T01:02:03.000000+00:00", "executable_path": str(root / "runtime/live/python.exe")},
+            {
+                "pid": 4242,
+                "parent_pid": 100,
+                "created_at": "2026-07-14T01:02:03.000000+00:00",
+                "executable_path": str(root / "runtime/live/python.exe"),
+                "command_args": DEFAULT_COMMAND,
+            },
             None,
         ]
     )
@@ -116,6 +123,107 @@ def test_stop_worker_preserves_record_when_port_does_not_release(tmp_path: Path)
     )
 
     assert result == 2
+    assert record_path.exists()
+
+
+def test_stop_worker_never_terminates_when_port_has_unknown_owner(tmp_path: Path) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    record_path = root / "data" / "local" / "run" / "worker.pid.json"
+    record_path.parent.mkdir(parents=True)
+    record_path.write_text(json.dumps(_record(root)), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="port ownership"):
+        launcher.stop_worker(
+            root,
+            inspector=lambda _pid: {
+                "pid": 4242,
+                "parent_pid": 100,
+                "created_at": "2026-07-14T01:02:03.000000+00:00",
+                "executable_path": str(root / "runtime/live/python.exe"),
+                "command_args": ["-m", "uvicorn", "worker:app", "--port", "9880"],
+            },
+            terminator=lambda _pid: pytest.fail("unknown port owner must prevent termination"),
+            port_owner_inspector=lambda _port: {4243},
+        )
+    assert record_path.exists()
+
+
+def test_stop_worker_validates_build_and_command_identity_before_termination(tmp_path: Path) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    executable = root / "runtime" / "live" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python")
+    manifest = root / "package" / "tts-more-package.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"build_id": "gpt-sovits-2.0.0-deadbeef"}), encoding="utf-8")
+    record_path = root / "data" / "local" / "run" / "worker.pid.json"
+    record_path.parent.mkdir(parents=True)
+    payload = _record(root)
+    payload["build_id"] = "gpt-sovits-2.0.0-deadbeef"
+    command = ["-m", "uvicorn", "worker:app", "--port", "9880"]
+    payload["command_sha256"] = hashlib.sha256("\0".join(command).encode()).hexdigest()
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    process = {
+        "pid": 4242,
+        "parent_pid": 100,
+        "created_at": payload["process_created_at"],
+        "executable_path": str(executable),
+        "command_args": [*command, "--forged"],
+    }
+    with pytest.raises(RuntimeError, match="command identity"):
+        launcher.stop_worker(
+            root,
+            inspector=lambda _pid: process,
+            terminator=lambda _pid: pytest.fail("forged command must not be terminated"),
+            port_owner_inspector=lambda _port: {4242},
+        )
+    assert record_path.exists()
+
+    payload["build_id"] = "forged-build"
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="build identity"):
+        launcher.stop_worker(
+            root,
+            inspector=lambda _pid: {**process, "command_args": command},
+            terminator=lambda _pid: pytest.fail("foreign build must not be terminated"),
+            port_owner_inspector=lambda _port: {4242},
+        )
+
+
+def test_stop_worker_removes_stale_record_only_when_process_and_port_are_absent(tmp_path: Path) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    record_path = root / "data" / "local" / "run" / "worker.pid.json"
+    record_path.parent.mkdir(parents=True)
+    record_path.write_text(json.dumps(_record(root)), encoding="utf-8")
+
+    assert launcher.stop_worker(
+        root,
+        inspector=lambda _pid: None,
+        port_owner_inspector=lambda _port: set(),
+    ) == 0
+    assert not record_path.exists()
+    assert launcher.stop_worker(root) == 0
+
+
+def test_stop_worker_rejects_foreign_build_identity_in_source_checkout(tmp_path: Path) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    record_path = root / "data" / "local" / "run" / "worker.pid.json"
+    record_path.parent.mkdir(parents=True)
+    payload = _record(root)
+    payload["build_id"] = "foreign-build"
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="build identity"):
+        launcher.stop_worker(
+            root,
+            inspector=lambda _pid: None,
+            port_owner_inspector=lambda _port: set(),
+        )
     assert record_path.exists()
 
 
@@ -193,7 +301,7 @@ def test_existing_listener_requires_record_build_command_and_process_identity(tm
             record_path,
             package_root=root,
             port=9880,
-            build_id="gpt-sovits-2.0.0-deadbeef",
+            build_id="source-checkout",
             executable_path=executable,
             command=command,
             listener_pids={4242},

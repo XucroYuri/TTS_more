@@ -28,7 +28,7 @@ New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "app\backend
 Copy-Item -LiteralPath (Join-Path $Root "backend\app") -Destination (Join-Path $stage "app\backend\app") -Recurse
 foreach ($file in @("pyproject.toml", "uv.lock", ".python-version")) { Copy-Item -LiteralPath (Join-Path $Root "backend\$file") -Destination (Join-Path $stage "app\backend\$file") }
 Copy-Item -LiteralPath (Join-Path $Root "frontend\dist") -Destination (Join-Path $stage "app\frontend") -Recurse
-foreach ($file in @("bootstrap-conda.ps1", "initialize-portable.ps1", "repair-portable.ps1", "start-production.ps1", "stop-production.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1", "portable_install.py", "portable_launcher.py", "portable_operations.py", "portable_packages.py", "portable_package_runner.py")) { Copy-Item -LiteralPath (Join-Path $Root "scripts\$file") -Destination (Join-Path $stage "scripts\$file") }
+foreach ($file in @("bootstrap-conda.ps1", "initialize-portable.ps1", "repair-portable.ps1", "start-production.ps1", "stop-production.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1", "export-portable-diagnostics.py", "portable_install.py", "portable_launcher.py", "portable_operations.py", "portable_packages.py", "portable_package_runner.py")) { Copy-Item -LiteralPath (Join-Path $Root "scripts\$file") -Destination (Join-Path $stage "scripts\$file") }
 foreach ($file in @("toolchain.lock.json", "runtime.lock.json", "models.lock.json", "tts-more-package.schema.json", "error-catalog.zh-CN.json")) { Copy-Item -LiteralPath (Join-Path $Root "packaging\portable\$file") -Destination (Join-Path $stage "packaging\portable\$file") }
 @(Get-ChildItem -LiteralPath $stage -Directory -Recurse -Force | Where-Object { $_.Name -in @("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache") } | Sort-Object FullName -Descending) | ForEach-Object {
     $resolved = [System.IO.Path]::GetFullPath($_.FullName)
@@ -81,8 +81,19 @@ if ($Profile -eq "Bootstrap") {
     })
     if ($forbidden.Count -gt 0) { throw "bootstrap package contains forbidden local/full assets: $($forbidden.FullName -join ', ')" }
 }
-$machinePathLeak = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Length -lt 5MB } | Select-String -SimpleMatch -Pattern $Root -ErrorAction SilentlyContinue)
-if ($machinePathLeak.Count -gt 0) { throw "package contains a build-machine absolute path: $($machinePathLeak[0].Path)" }
+$machinePaths = @(
+    $Root,
+    $env:USERPROFILE,
+    "$($env:HOMEDRIVE)$($env:HOMEPATH)"
+) | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) -and ([string]$_).Length -ge 4 } | Select-Object -Unique
+$machineNames = @($env:USERNAME, $env:COMPUTERNAME) | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) -and ([string]$_).Length -ge 4 } | Select-Object -Unique
+$machinePathLeak = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Length -lt 5MB } | Select-String -SimpleMatch -Pattern $machinePaths -ErrorAction SilentlyContinue)
+$generatedMetadata = @((Join-Path $stage "package\tts-more-package.json"), (Join-Path $stage "THIRD_PARTY_NOTICES.json"))
+$generatedMetadata = @($generatedMetadata | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+$machineNameLeak = @()
+if (@($machineNames).Count -gt 0 -and $generatedMetadata.Count -gt 0) { $machineNameLeak = @(Select-String -LiteralPath $generatedMetadata -SimpleMatch -Pattern $machineNames -ErrorAction SilentlyContinue) }
+if ($machinePathLeak.Count -gt 0) { throw "package contains build-machine identity or path data: $($machinePathLeak[0].Path)" }
+if ($machineNameLeak.Count -gt 0) { throw "package metadata contains build-machine identity data: $($machineNameLeak[0].Path)" }
 
 $python = if ($env:TTS_MORE_BUILD_PYTHON) {
     $env:TTS_MORE_BUILD_PYTHON
