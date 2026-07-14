@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,54 @@ V2_REQUIRED_FIELDS = (
 
 V2_LAUNCHERS = ("initialize", "start", "stop", "repair", "build")
 DEVICE_PROFILES = {"auto", "cu128", "cu126", "cpu"}
+RELEASE_FORBIDDEN_PATH = re.compile(
+    r"(^|/)(?:\.venv|runtime/live|data/(?:cache|local|models)|__pycache__)(?:/|$)|"
+    r"\.(?:safetensors|ckpt|pth|pt|onnx|bin)$",
+    re.IGNORECASE,
+)
+
+
+def create_zip(package_root: Path, output: Path) -> None:
+    """Create a deterministic-order ZIP64 archive with one package root."""
+    package_root = package_root.resolve(strict=True)
+    output = output.resolve(strict=False)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    temporary.unlink(missing_ok=True)
+    with zipfile.ZipFile(
+        temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True
+    ) as archive:
+        for path in sorted(candidate for candidate in package_root.rglob("*") if candidate.is_file()):
+            relative = path.relative_to(package_root).as_posix()
+            archive.write(path, f"{package_root.name}/{relative}")
+    temporary.replace(output)
+
+
+def audit_release_zip(path: Path) -> dict[str, object]:
+    """Fail closed unless a ZIP is a bootstrap package without local/full assets."""
+    errors: list[str] = []
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            manifests = [name for name in names if name.endswith("/package/tts-more-package.json")]
+            if len(manifests) != 1:
+                errors.append("release ZIP must contain exactly one package manifest")
+            else:
+                payload = json.loads(archive.read(manifests[0]).decode("utf-8-sig"))
+                if payload.get("package_profile") != "bootstrap":
+                    errors.append(f"GitHub release upload refused for profile={payload.get('package_profile')}")
+            for name in names:
+                normalized = name.replace("\\", "/").lstrip("/")
+                if ".." in normalized.split("/"):
+                    errors.append(f"unsafe ZIP entry: {name}")
+                    break
+                relative = normalized.split("/", 1)[1] if "/" in normalized else normalized
+                if RELEASE_FORBIDDEN_PATH.search(relative):
+                    errors.append(f"forbidden release asset: {relative}")
+                    break
+    except (OSError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        errors.append(f"invalid release ZIP: {exc}")
+    return {"valid": not errors, "errors": errors, "path": str(path)}
 
 
 def validate_manifest(manifest_path: Path, package_root: Path) -> dict[str, object]:
@@ -184,11 +233,23 @@ def main(argv: list[str] | None = None) -> int:
     validate = subcommands.add_parser("validate-manifest")
     validate.add_argument("--manifest", required=True, type=Path)
     validate.add_argument("--package-root", required=True, type=Path)
+    create = subcommands.add_parser("create-zip")
+    create.add_argument("--package-root", required=True, type=Path)
+    create.add_argument("--output", required=True, type=Path)
+    audit = subcommands.add_parser("audit-release")
+    audit.add_argument("--zip", required=True, action="append", type=Path)
     args = parser.parse_args(argv)
     if args.command == "validate-manifest":
         report = validate_manifest(args.manifest, args.package_root)
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0 if report["valid"] else 1
+    if args.command == "create-zip":
+        create_zip(args.package_root, args.output)
+        return 0
+    if args.command == "audit-release":
+        reports = [audit_release_zip(path) for path in args.zip]
+        print(json.dumps({"valid": all(report["valid"] for report in reports), "reports": reports}, ensure_ascii=False, sort_keys=True))
+        return 0 if all(report["valid"] for report in reports) else 1
     raise AssertionError(f"unsupported command: {args.command}")
 
 

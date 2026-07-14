@@ -42,12 +42,14 @@ $BootstrapPython = Join-Path $CondaRoot "python.exe"
 if (!(Test-Path -LiteralPath $BootstrapPython)) { throw "private bootstrap Python is missing" }
 $controllers = Join-Path $Root "data\cache\portable\video-controllers.json"
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $controllers) | Out-Null
-@(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{name=[string]$_.Name;driver_version=[string]$_.DriverVersion} }) | ConvertTo-Json | Set-Content -LiteralPath $controllers -Encoding UTF8
+$videoControllers = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{name=[string]$_.Name;driver_version=[string]$_.DriverVersion} })
+ConvertTo-Json -InputObject $videoControllers | Set-Content -LiteralPath $controllers -Encoding UTF8
 $selected = (& $BootstrapPython (Join-Path $Bundle "portable_install.py") select-device --runtime-lock $runtimeLockPath --requested $Device.ToLowerInvariant() --controllers $controllers).Trim()
 if ($LASTEXITCODE -ne 0) { throw "device profile selection failed" }
 $profile = $runtimeLock.profiles.$selected
 
-foreach ($asset in @($runtimeLock.payloads)) {
+$payloads = if ($null -ne $runtimeLock.PSObject.Properties['payloads']) { @($runtimeLock.payloads) } else { @() }
+foreach ($asset in $payloads) {
     $assetLock = Join-Path $Root "data\cache\portable\locks\$($asset.id).json"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $assetLock) | Out-Null
     $asset | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $assetLock -Encoding UTF8
@@ -95,9 +97,11 @@ $uv | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $uvLock -Encoding UTF8
 if ($LASTEXITCODE -ne 0) { throw "locked uv download failed" }
 & $StagePython -m pip install --no-deps $uvWheel
 $UvExe = Join-Path $staging "Scripts\uv.exe"
-if ($runtimeLock.dependency_mode -eq "uv-project") {
+if ($runtimeLock.dependency_mode -in @("uv-project", "uv-check-requirements")) {
     & $UvExe lock --check --project $Root
     if ($LASTEXITCODE -ne 0) { throw "upstream uv.lock drift detected" }
+}
+if ($runtimeLock.dependency_mode -eq "uv-project") {
     $requirements = Join-Path $staging "frozen-requirements.txt"
     & $UvExe export --frozen --no-dev --no-emit-project --project $Root --output-file $requirements
     & $UvExe pip install --python $StagePython --requirement $requirements

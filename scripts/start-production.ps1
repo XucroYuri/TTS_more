@@ -30,6 +30,7 @@ if ($listeners.Count -gt 0) {
 }
 
 $env:TTS_MORE_STATIC_ROOT = $StaticRoot
+$env:PATH = "$(Split-Path -Parent $Python);$env:PATH"
 $arguments = @("-m", "uvicorn", "app.main:app", "--app-dir", $BackendRoot, "--host", "127.0.0.1", "--port", [string]$Port)
 $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru
 $processCreatedAt = $process.StartTime.ToUniversalTime().ToString("o")

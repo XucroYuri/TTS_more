@@ -67,3 +67,16 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
         native = (target / "Start-WebUI.cmd").read_text(encoding="utf-8")
         assert "tts_more\\Start-Worker.ps1" in start
         assert native_entry in native
+
+
+def test_windows_templates_are_safe_for_cpu_only_hosts_and_optional_lock_fields() -> None:
+    initializer = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(encoding="utf-8")
+    builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(encoding="utf-8")
+
+    assert "ConvertTo-Json -InputObject $videoControllers" in initializer
+    assert "$runtimeLock.PSObject.Properties['payloads']" in initializer
+    assert "$config.PSObject.Properties['submodules']" in builder
+    assert "create-zip --package-root" in builder
+    assert '$env:GITHUB_ACTIONS -eq "true"' in builder
+    assert "audit-release --zip" in builder
+    assert "SoVITS_weights" in builder and "pretrained_models" in builder and "checkpoints" in builder

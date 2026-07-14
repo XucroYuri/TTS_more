@@ -38,9 +38,10 @@ if ($Repair) { Write-Host "Repairing only the missing or failed runtime transact
 
 $controllersPath = Join-Path $Root "data\cache\portable\video-controllers.json"
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $controllersPath) | Out-Null
-@(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object {
+$videoControllers = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | ForEach-Object {
     [pscustomobject]@{ name = [string]$_.Name; driver_version = [string]$_.DriverVersion }
-}) | ConvertTo-Json | Set-Content -LiteralPath $controllersPath -Encoding UTF8
+})
+ConvertTo-Json -InputObject $videoControllers | Set-Content -LiteralPath $controllersPath -Encoding UTF8
 
 $bootstrap = Join-Path $Root "scripts\bootstrap-conda.ps1"
 $Conda = (& $bootstrap -CacheRoot "data/cache/portable/conda" -LockPath "packaging/portable/toolchain.lock.json" -PassThru | Select-Object -Last 1)

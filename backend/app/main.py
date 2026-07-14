@@ -21,6 +21,7 @@ from app.auth import auth_status_endpoint, install_token_middleware
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
+from app.portable_discovery import PortablePackageDiscoverRequest, PortablePackageRegisterRequest, discover_portable_packages, endpoint_from_portable_package, read_portable_package
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
@@ -195,6 +196,31 @@ def create_app(
         return {
             "service": endpoint.model_dump(mode="json"),
             "detect": detect_payload,
+            "settings": public_service_settings(registry, env_file),
+        }
+
+    @app.post("/api/portable-packages/discover")
+    def portable_packages_discover(request: PortablePackageDiscoverRequest) -> dict[str, Any]:
+        packages = discover_portable_packages(project_root, request.roots, include_siblings=request.include_siblings)
+        return {"packages": [package.model_dump(mode="json") for package in packages]}
+
+    @app.post("/api/portable-packages/register")
+    def portable_package_register(request: PortablePackageRegisterRequest) -> dict[str, Any]:
+        try:
+            descriptor = read_portable_package(Path(request.package_root))
+            endpoint = endpoint_from_portable_package(descriptor, request)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        services = [service for service in app.state.service_registry.services if service.service_id != endpoint.service_id]
+        services.append(endpoint)
+        services.sort(key=lambda service: (service.priority, service.service_id))
+        registry = ServiceRegistry(services)
+        registry.save(app.state.writable_services_path)
+        _apply_registry(app, registry, store)
+        app.state.services_path = app.state.writable_services_path
+        return {
+            "package": descriptor.model_dump(mode="json"),
+            "service": endpoint.model_dump(mode="json"),
             "settings": public_service_settings(registry, env_file),
         }
 

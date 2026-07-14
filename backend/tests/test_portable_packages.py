@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import types
+import zipfile
 from pathlib import Path
 
 
@@ -161,6 +162,70 @@ def test_validate_manifest_accepts_windows_powershell_utf8_bom(tmp_path: Path) -
     manifest.write_text(json.dumps(_valid_gpt_manifest()), encoding="utf-8-sig")
 
     assert packages.validate_manifest(manifest, tmp_path)["valid"] is True
+
+
+def test_create_zip_uses_a_single_package_root_and_zip64(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    stage = tmp_path / "Component 目录"
+    (stage / "nested").mkdir(parents=True)
+    (stage / "Start.cmd").write_text("@echo off\n", encoding="utf-8")
+    (stage / "nested" / "asset.txt").write_text("locked", encoding="utf-8")
+    output = tmp_path / "component.zip"
+
+    packages.create_zip(stage, output)
+
+    with zipfile.ZipFile(output) as archive:
+        assert archive._allowZip64 is True
+        assert sorted(archive.namelist()) == ["Component 目录/Start.cmd", "Component 目录/nested/asset.txt"]
+
+
+def test_release_audit_accepts_bootstrap_and_rejects_full_or_runtime_assets(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+
+    def make_zip(name: str, profile: str, extra: dict[str, bytes] | None = None) -> Path:
+        path = tmp_path / name
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(
+                "Component/package/tts-more-package.json",
+                json.dumps({"schema_version": 2, "component": "gpt-sovits", "package_profile": profile}),
+            )
+            for relative, payload in (extra or {}).items():
+                archive.writestr(f"Component/{relative}", payload)
+        return path
+
+    bootstrap = make_zip("bootstrap.zip", "bootstrap")
+    full = make_zip("full.zip", "full")
+    contaminated = make_zip("bad.zip", "bootstrap", {"runtime/live/python.exe": b"runtime"})
+
+    assert packages.audit_release_zip(bootstrap)["valid"] is True
+    assert "profile=full" in packages.audit_release_zip(full)["errors"][0]
+    assert "forbidden release asset" in packages.audit_release_zip(contaminated)["errors"][0]
+
+
+def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
+    builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+
+    assert "create-zip --package-root" in builder
+    assert "Compress-Archive" not in builder
+    assert '"$zip.spdx.json"' in builder
+    assert '"$zip.licenses.json"' in builder
+    assert '"$zip.acceptance.json"' in builder
+
+
+def test_tts_more_initializer_serializes_an_empty_controller_list_as_json() -> None:
+    initializer = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(encoding="utf-8")
+
+    assert "ConvertTo-Json -InputObject $videoControllers" in initializer
+
+
+def test_four_pack_builder_is_full_only_and_refuses_github_actions() -> None:
+    builder = (REPO_ROOT / "build-four-pack.ps1").read_text(encoding="utf-8")
+
+    assert '$env:GITHUB_ACTIONS -eq "true"' in builder
+    assert '-Profile Full' in builder
+    assert '"tts-more", "gpt-sovits", "indextts", "cosyvoice"' in builder
+    assert "compatibility-matrix.json" in builder
+    assert "four-pack.provenance.json" in builder
 
 
 def test_validate_manifest_rejects_invalid_v2_profile_and_nested_absolute_paths(tmp_path: Path) -> None:
