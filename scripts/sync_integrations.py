@@ -45,11 +45,13 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
     _copy_file(source_root / "backend" / "app" / "adapters" / "__init__.py", controlled / "app" / "adapters" / "__init__.py")
     for name in ("portable_install.py", "portable_launcher.py", "portable_operations.py", "portable_packages.py"):
         _copy_file(source_root / "scripts" / name, controlled / name)
-    _copy_file(source_root / "scripts" / "bootstrap-conda.ps1", controlled / "bootstrap-conda.ps1")
+    for name in ("bootstrap-conda.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1"):
+        _copy_file(source_root / "scripts" / name, controlled / name)
     for name in ("Initialize.ps1", "Start-Worker.ps1", "Stop-Worker.ps1", "Repair.ps1", "Build-Package.ps1"):
         _copy_file(source_root / "integrations" / "windows" / name, controlled / name)
     _copy_file(source_root / "packaging" / "portable" / "toolchain.lock.json", controlled / "locks" / "toolchain.lock.json")
     _copy_file(source_root / "packaging" / "portable" / "tts-more-package.schema.json", controlled / "tts-more-package.schema.json")
+    _copy_file(source_root / "packaging" / "portable" / "error-catalog.zh-CN.json", controlled / "error-catalog.zh-CN.json")
     _copy_file(source_root / "LICENSE", controlled / "LICENSE.integration")
     _copy_file(source_root / "NOTICE", controlled / "NOTICE.integration")
     _copy_tree(source_root / "integrations" / "components" / component, controlled / "locks")
@@ -110,7 +112,7 @@ def _root_entry_payloads(component: str) -> dict[str, str]:
     }[component]
     return {
         "Initialize.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Initialize.ps1" %*\nexit /b %errorlevel%\n',
-        "Start.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Start-Worker.ps1" %*\nexit /b %errorlevel%\n',
+        "Start.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*\nexit /b %errorlevel%\n',
         "Stop.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Stop-Worker.ps1" %*\nexit /b %errorlevel%\n',
         "Repair.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Repair.ps1" %*\nexit /b %errorlevel%\n',
         "Build-Package.ps1": '& "$PSScriptRoot\\tts_more\\Build-Package.ps1" @args\nexit $LASTEXITCODE\n',

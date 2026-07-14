@@ -1,10 +1,14 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$PackageRoot = "",
+    [string]$OperationRoot = "",
+    [ValidateRange(1, 65535)][Nullable[int]]$PortOverride = $null
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-$Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-$Port = if ($env:TTS_MORE_PORT) { [int]$env:TTS_MORE_PORT } else { 8000 }
+$Root = if ([string]::IsNullOrWhiteSpace($PackageRoot)) { [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)) } else { [System.IO.Path]::GetFullPath($PackageRoot) }
+$Port = if ($null -ne $PortOverride) { [int]$PortOverride } elseif ($env:TTS_MORE_PORT) { [int]$env:TTS_MORE_PORT } else { 8000 }
 
 function Resolve-ExistingPath {
     param([string[]]$Candidates, [string]$Label)
@@ -26,7 +30,21 @@ if ($listeners.Count -gt 0) {
         $process = Get-Process -Id $_ -ErrorAction SilentlyContinue
         [pscustomobject]@{ pid = $_; name = if ($process) { $process.ProcessName } else { "unknown" }; path = if ($process) { $process.Path } else { "unknown" } }
     })
-    throw "TTS More port $Port is already in use. Owner: $($owners | ConvertTo-Json -Compress). No process was terminated."
+    $recordPath = Join-Path $Root "data\local\run\worker.pid.json"
+    $owned = $false
+    if (Test-Path -LiteralPath $recordPath -PathType Leaf) {
+        try {
+            $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+            $owned = [int]$record.port -eq $Port -and [int]$record.pid -in @($listeners | Select-Object -ExpandProperty OwningProcess) -and [string]::Equals([IO.Path]::GetFullPath([string]$record.package_root), $Root, [StringComparison]::OrdinalIgnoreCase)
+        } catch { $owned = $false }
+    }
+    if ($owned) {
+        try {
+            $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2
+            if ($health.status -eq "ok") { Write-Host "TTS More ready: http://127.0.0.1:$Port"; exit 0 }
+        } catch { }
+    }
+    throw "PORT_IN_USE: TTS More port $Port is already in use. Owner: $($owners | ConvertTo-Json -Compress). No process was terminated."
 }
 
 $env:TTS_MORE_STATIC_ROOT = $StaticRoot

@@ -76,7 +76,8 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
         sync.sync_integration(REPO_ROOT, target, component, "c" * 40)
         start = (target / "Start.cmd").read_text(encoding="utf-8")
         native = (target / "Start-WebUI.cmd").read_text(encoding="utf-8")
-        assert "tts_more\\Start-Worker.ps1" in start
+        assert "tts_more\\Invoke-PortableStart.ps1" in start
+        assert (target / "tts_more" / "Start-Worker.ps1").is_file()
         assert native_entry in native
 
 

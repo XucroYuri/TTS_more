@@ -29,6 +29,25 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+def resolve_operations_root(package_root: Path) -> Path:
+    root = package_root.resolve(strict=False)
+    relative = "data/local/operations"
+    manifest_path = root / "package" / "tts-more-package.json"
+    if manifest_path.is_file():
+        manifest = load_json(manifest_path)
+        if manifest.get("schema_version") == 2:
+            relative = str((manifest.get("data") or {}).get("operations") or "")
+            candidate = Path(relative.replace("\\", "/"))
+            if not relative or candidate.is_absolute() or ":" in relative or ".." in candidate.parts:
+                raise ValueError("manifest data.operations must be a package-relative path")
+    operations_root = (root / Path(relative.replace("\\", "/"))).resolve(strict=False)
+    try:
+        operations_root.relative_to(root)
+    except ValueError as error:
+        raise ValueError("manifest data.operations resolves outside the package") from error
+    return operations_root
+
+
 def validate_operation_paths(
     package_root: Path,
     operation_root: Path | None,
@@ -40,10 +59,10 @@ def validate_operation_paths(
         return None, None
 
     package_root = package_root.resolve(strict=False)
-    operations_root = (package_root / "data" / "local" / "operations").resolve(strict=False)
+    operations_root = resolve_operations_root(package_root)
     operation_root = operation_root.resolve(strict=False)
     if operation_root.parent != operations_root:
-        raise ValueError("operation-root must be a UUID-named direct child of package data/local/operations")
+        raise ValueError("operation-root must be a UUID-named direct child of the package operations root")
     try:
         UUID(operation_root.name)
     except (AttributeError, TypeError, ValueError) as error:

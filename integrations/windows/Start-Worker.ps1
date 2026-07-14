@@ -1,18 +1,36 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$PackageRoot = "",
+    [string]$OperationRoot = "",
+    [ValidateRange(1, 65535)][Nullable[int]]$PortOverride = $null
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $Bundle = [System.IO.Path]::GetFullPath($PSScriptRoot)
-$Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $Bundle))
+$Root = if ([string]::IsNullOrWhiteSpace($PackageRoot)) { [System.IO.Path]::GetFullPath((Split-Path -Parent $Bundle)) } else { [System.IO.Path]::GetFullPath($PackageRoot) }
 $config = Get-Content -LiteralPath (Join-Path $Bundle "component.json") -Raw | ConvertFrom-Json
-$Port = if ($env:TTS_MORE_PORT) { [int]$env:TTS_MORE_PORT } else { [int]$config.port }
+$Port = if ($null -ne $PortOverride) { [int]$PortOverride } elseif ($env:TTS_MORE_PORT) { [int]$env:TTS_MORE_PORT } else { [int]$config.port }
 $Python = if ($env:TTS_MORE_PYTHON_EXE) { $env:TTS_MORE_PYTHON_EXE } elseif (Test-Path -LiteralPath (Join-Path $Root "runtime\live\python.exe")) { Join-Path $Root "runtime\live\python.exe" } else { Join-Path $Root ".venv\Scripts\python.exe" }
 if (!(Test-Path -LiteralPath $Python -PathType Leaf)) { throw "package runtime is missing; run Initialize.cmd" }
 $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
 if ($listeners.Count -gt 0) {
     $owners = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, Path })
-    throw "worker port $Port is occupied by $($owners | ConvertTo-Json -Compress). No process was terminated."
+    $recordPath = Join-Path $Root "data\local\run\worker.pid.json"
+    $owned = $false
+    if (Test-Path -LiteralPath $recordPath -PathType Leaf) {
+        try {
+            $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+            $owned = [int]$record.port -eq $Port -and [int]$record.pid -in @($listeners | Select-Object -ExpandProperty OwningProcess) -and [string]::Equals([IO.Path]::GetFullPath([string]$record.package_root), $Root, [StringComparison]::OrdinalIgnoreCase)
+        } catch { $owned = $false }
+    }
+    if ($owned) {
+        try {
+            $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 2
+            if ($health) { Write-Host "$($config.component) ready: http://127.0.0.1:$Port"; exit 0 }
+        } catch { }
+    }
+    throw "PORT_IN_USE: worker port $Port is occupied by $($owners | ConvertTo-Json -Compress). No process was terminated."
 }
 switch ([string]$config.component) {
     "gpt-sovits" { $env:TTS_MORE_GPTSOVITS_REPO = $Root }

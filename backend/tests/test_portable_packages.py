@@ -533,7 +533,7 @@ def test_gpt_portable_builder_requires_dev_lock_and_offline_payloads() -> None:
 
 def test_every_local_tts_component_has_a_path_relative_start_and_stop_launcher() -> None:
     launchers = (
-        (REPO_ROOT, None, "scripts\\start-production.ps1"),
+        (REPO_ROOT, None, "scripts\\Invoke-PortableStart.ps1"),
         (REPO_ROOT / "deployment" / "portable" / "gpt-sovits-dev", "9883", "runtime\\runtime.zip"),
         (REPO_ROOT / "deployment" / "tts-repos" / "indextts" / "launchers", "7860", ".venv\\Scripts\\python.exe"),
         (REPO_ROOT / "deployment" / "tts-repos" / "cosyvoice" / "launchers", "9882", ".venv\\Scripts\\python.exe"),

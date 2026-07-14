@@ -2,13 +2,18 @@
 param(
     [ValidateSet("Auto", "CU128", "CU126", "CPU")][string]$Device = "Auto",
     [switch]$Repair,
+    [string]$PackageRoot = "",
     [string]$OperationRoot = "",
     [string]$CancelFile = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-$Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$Root = if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
+    [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+} else {
+    [System.IO.Path]::GetFullPath($PackageRoot)
+}
 $RuntimeLock = Join-Path $Root "packaging\portable\runtime.lock.json"
 $ModelLock = Join-Path $Root "packaging\portable\models.lock.json"
 $StatePath = Join-Path $Root "data\local\install-state.json"
@@ -24,11 +29,33 @@ function Resolve-OperationContract {
     if ($hasOperation -ne $hasCancel) { throw "OperationRoot and CancelFile must be provided together" }
     $resolvedPackage = [System.IO.Path]::GetFullPath($PackageRoot)
     if (!$hasOperation) { return [pscustomobject]@{ OperationRoot = ""; CancelFile = "" } }
-    $operations = [System.IO.Path]::GetFullPath((Join-Path $resolvedPackage "data\local\operations"))
+    $operationsRelative = "data\local\operations"
+    $manifestPath = Join-Path $resolvedPackage "package\tts-more-package.json"
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        if ([int]$manifest.schema_version -eq 2) {
+            $operationsRelative = [string]$manifest.data.operations
+            $segments = @($operationsRelative -split '[\\/]')
+            if ([string]::IsNullOrWhiteSpace($operationsRelative) -or [IO.Path]::IsPathRooted($operationsRelative) -or $operationsRelative.Contains(":") -or $segments -contains "..") {
+                throw "manifest data.operations must be a package-relative path"
+            }
+        }
+    }
+    $operations = [System.IO.Path]::GetFullPath((Join-Path $resolvedPackage $operationsRelative))
+    $packagePrefix = $resolvedPackage.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (!$operations.StartsWith($packagePrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "manifest data.operations resolves outside the package" }
+    $current = $resolvedPackage
+    foreach ($segment in @($operationsRelative -split '[\\/]')) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq ".") { continue }
+        $current = Join-Path $current $segment
+        if ((Test-Path -LiteralPath $current) -and (([IO.File]::GetAttributes($current) -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "manifest data.operations traverses a reparse point"
+        }
+    }
     $resolvedOperation = [System.IO.Path]::GetFullPath($OperationRoot)
     $operationParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $resolvedOperation))
     if (![string]::Equals($operationParent, $operations, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "OperationRoot must be a UUID-named direct child of package data/local/operations"
+        throw "OperationRoot must be a UUID-named direct child of the package operations root"
     }
     $parsedId = [guid]::Empty
     if (![guid]::TryParse((Split-Path -Leaf $resolvedOperation), [ref]$parsedId)) {
