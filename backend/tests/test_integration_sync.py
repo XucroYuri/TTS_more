@@ -80,4 +80,5 @@ def test_windows_templates_are_safe_for_cpu_only_hosts_and_optional_lock_fields(
     assert "create-zip --package-root" in builder
     assert '$env:GITHUB_ACTIONS -eq "true"' in builder
     assert "audit-release --zip" in builder
+    assert "device_profiles = @($deviceProfiles)" in builder
     assert "SoVITS_weights" in builder and "pretrained_models" in builder and "checkpoints" in builder
