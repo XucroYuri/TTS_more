@@ -9,6 +9,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$ValidationScript = Join-Path $PSScriptRoot "Portable-Validation.ps1"
+if (!(Test-Path -LiteralPath $ValidationScript -PathType Leaf)) { throw "Portable-Validation.ps1 is missing" }
+. $ValidationScript
 $Root = if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
     [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 } else {
@@ -66,7 +69,7 @@ function Resolve-OperationContract {
     if (![string]::Equals($resolvedCancel, $expectedCancel, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "CancelFile must resolve exactly to OperationRoot/cancel.requested"
     }
-    return [pscustomobject]@{ OperationRoot = $resolvedOperation; CancelFile = $resolvedCancel }
+    return Assert-PortableExactOperationContract -OperationsRoot $operations -OperationRoot $resolvedOperation -CancelFile $resolvedCancel -RequireOperation
 }
 
 $contract = Resolve-OperationContract -PackageRoot $Root -OperationRoot $OperationRoot -CancelFile $CancelFile
@@ -92,17 +95,23 @@ if ($Root.Length -gt 180) { throw "package path is too long for reliable Windows
 $drive = Get-PSDrive -Name ([System.IO.Path]::GetPathRoot($Root).Substring(0, 1)) -ErrorAction SilentlyContinue
 if ($drive -and $drive.Free -lt 3GB) { throw "at least 3 GB free space is required for transactional initialization" }
 
-function Test-LiveRuntime {
-    $python = Join-Path $Live "python.exe"
-    if (!(Test-Path -LiteralPath $python -PathType Leaf)) { return $false }
-    & $python -m pip check *> $null
-    if ($LASTEXITCODE -ne 0) { return $false }
-    & $python -c "import fastapi,pydantic,uvicorn" *> $null
-    return $LASTEXITCODE -eq 0
-}
-
-if ((Test-Path -LiteralPath $StatePath) -and (Test-LiveRuntime)) {
+$ManifestPath = Join-Path $Root "package\tts-more-package.json"
+$BuildId = if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) { [string](Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json).build_id } else { "source-checkout" }
+$RuntimePayload = Get-Content -LiteralPath $RuntimeLock -Raw | ConvertFrom-Json
+$ExpectedPython = if ([string]::IsNullOrWhiteSpace([string]$RuntimePayload.python_version)) { "3.11" } else { [string]$RuntimePayload.python_version }
+$ImportProbe = if ($RuntimePayload.PSObject.Properties["import_probe"] -and ![string]::IsNullOrWhiteSpace([string]$RuntimePayload.import_probe)) { [string]$RuntimePayload.import_probe } else { "import fastapi,pydantic,uvicorn" }
+if (Test-PortableInstallStateComplete -Root $Root -StatePath $StatePath -Component "tts-more" -BuildId $BuildId -RuntimeLock $RuntimeLock -ModelLock $ModelLock -ExpectedPython $ExpectedPython -ImportProbe $ImportProbe -ValidateAssets) {
     Write-Host "TTS More package runtime is already verified."
+    exit 0
+}
+if ((Test-PortableRuntime -Root $Root -PythonPath (Join-Path $Live "python.exe") -ExpectedVersion $ExpectedPython -ImportProbe $ImportProbe) -and (Test-PortableLockedAssets -Root $Root -ModelLock $ModelLock)) {
+    $ExistingState = if (Test-Path -LiteralPath $StatePath -PathType Leaf) { try { Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json } catch { $null } } else { $null }
+    $Profile = if ($ExistingState -and ![string]::IsNullOrWhiteSpace([string]$ExistingState.profile)) { [string]$ExistingState.profile } else { "cpu" }
+    $RuntimeSha = (Get-FileHash -LiteralPath $RuntimeLock -Algorithm SHA256).Hash.ToLowerInvariant()
+    $ModelSha = (Get-FileHash -LiteralPath $ModelLock -Algorithm SHA256).Hash.ToLowerInvariant()
+    & (Join-Path $Live "python.exe") (Join-Path $Root "scripts\portable_install.py") write-state --path $StatePath --component tts-more --build-id $BuildId --profile $Profile --runtime-lock-sha256 $RuntimeSha --model-lock-sha256 $ModelSha
+    if ($LASTEXITCODE -ne 0) { throw "failed to repair stale install-state.json" }
+    Write-Host "TTS More package install state was repaired from verified package-private assets."
     exit 0
 }
 if ($Repair) { Write-Host "Repairing only the missing or failed runtime transaction; user data is preserved." }
@@ -163,10 +172,8 @@ if (Test-Path -LiteralPath $Live) { Move-Item -LiteralPath $Live -Destination $b
 Move-Item -LiteralPath $Staging -Destination $Live
 if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
 
-$manifestPath = Join-Path $Root "package\tts-more-package.json"
-$buildId = if (Test-Path -LiteralPath $manifestPath) { [string](Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).build_id } else { "source-checkout" }
 $runtimeSha = (Get-FileHash -LiteralPath $RuntimeLock -Algorithm SHA256).Hash.ToLowerInvariant()
 $modelSha = (Get-FileHash -LiteralPath $ModelLock -Algorithm SHA256).Hash.ToLowerInvariant()
-& (Join-Path $Live "python.exe") (Join-Path $Root "scripts\portable_install.py") write-state --path $StatePath --component tts-more --build-id $buildId --profile $selected --runtime-lock-sha256 $runtimeSha --model-lock-sha256 $modelSha
+& (Join-Path $Live "python.exe") (Join-Path $Root "scripts\portable_install.py") write-state --path $StatePath --component tts-more --build-id $BuildId --profile $selected --runtime-lock-sha256 $runtimeSha --model-lock-sha256 $modelSha
 if ($LASTEXITCODE -ne 0) { throw "failed to commit install-state.json" }
 Write-Host "TTS More portable initialization completed."

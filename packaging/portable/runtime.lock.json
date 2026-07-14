@@ -2,6 +2,7 @@
   "schema_version": 1,
   "component": "tts-more",
   "python_version": "3.11",
+  "import_probe": "import fastapi,pydantic,uvicorn",
   "auto_order": ["cu128", "cu126", "cpu"],
   "profiles": {
     "cu128": {"minimum_nvidia_driver": "570.00", "dependency_lock": "backend/uv.lock"},

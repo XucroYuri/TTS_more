@@ -102,6 +102,56 @@ def write_process_record(
     os.replace(temporary, record_path)
 
 
+def listener_is_owned(
+    record_path: Path,
+    *,
+    package_root: Path,
+    port: int,
+    build_id: str,
+    executable_path: Path,
+    command: Iterable[str],
+    listener_pids: set[int],
+    inspector: ProcessInspector | None = None,
+) -> bool:
+    """Return true only when record, listener, process, command, and build identities agree."""
+    try:
+        root = package_root.resolve(strict=True)
+        executable = executable_path.resolve(strict=True)
+        _ensure_within(root, executable)
+        if executable != (root / "runtime" / "live" / "python.exe").resolve(strict=False):
+            return False
+        payload = json.loads(record_path.read_text(encoding="utf-8-sig"))
+        if int(payload.get("schema_version") or 0) != 2:
+            return False
+        if Path(str(payload.get("package_root") or "")).resolve(strict=False) != root:
+            return False
+        if Path(str(payload.get("executable_path") or "")).resolve(strict=False) != executable:
+            return False
+        pid = int(payload.get("pid") or 0)
+        expected_command = list(command)
+        command_digest = hashlib.sha256("\0".join(expected_command).encode("utf-8")).hexdigest()
+        if (
+            pid not in listener_pids
+            or int(payload.get("port") or 0) != int(port)
+            or str(payload.get("build_id") or "") != str(build_id)
+            or str(payload.get("command_sha256") or "") != command_digest
+        ):
+            return False
+        process = (inspector or _inspect_process)(pid)
+        if process is None or int(process.get("pid") or 0) != pid:
+            return False
+        if str(process.get("created_at") or "") != str(payload.get("process_created_at") or ""):
+            return False
+        if Path(str(process.get("executable_path") or "")).resolve(strict=False) != executable:
+            return False
+        actual_command = process.get("command_args")
+        if actual_command is not None and list(actual_command) != expected_command:
+            return False
+        return actual_command is not None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
 def stop_worker(
     package_root: Path,
     *,
@@ -175,13 +225,40 @@ def _inspect_process(pid: int) -> dict[str, object] | None:
         "-NonInteractive",
         "-Command",
         "$p=Get-Process -Id $args[0] -ErrorAction SilentlyContinue; "
+        "$c=Get-CimInstance Win32_Process -Filter ('ProcessId='+$args[0]) -ErrorAction SilentlyContinue; "
         "if($p){@{pid=$p.Id;created_at=$p.StartTime.ToUniversalTime().ToString('o');"
-        "executable_path=$p.Path}|ConvertTo-Json -Compress}",
+        "executable_path=$p.Path;command_line=if($c){$c.CommandLine}else{''}}|ConvertTo-Json -Compress}",
         str(pid),
     ]
     completed = subprocess.run(command, check=False, capture_output=True, text=True)
     output = completed.stdout.strip()
-    return json.loads(output) if output else None
+    if not output:
+        return None
+    payload = json.loads(output)
+    command_line = str(payload.pop("command_line", "") or "")
+    payload["command_args"] = _split_windows_command_line(command_line)[1:] if command_line else None
+    return payload
+
+
+def _split_windows_command_line(command_line: str) -> list[str]:
+    if os.name != "nt":
+        return []
+    import ctypes
+
+    argc = ctypes.c_int()
+    command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+    command_line_to_argv.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    command_line_to_argv.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argv = command_line_to_argv(command_line, ctypes.byref(argc))
+    if not argv:
+        return []
+    try:
+        return [argv[index] for index in range(argc.value)]
+    finally:
+        local_free = ctypes.windll.kernel32.LocalFree
+        local_free.argtypes = [ctypes.c_void_p]
+        local_free.restype = ctypes.c_void_p
+        local_free(argv)
 
 
 def _terminate_process_tree(pid: int) -> None:
@@ -231,6 +308,11 @@ def _ensure_within(root: Path, path: Path) -> None:
         raise ValueError(f"path is outside portable package: {path}") from exc
 
 
+def _command_arguments(values: Iterable[str]) -> list[str]:
+    arguments = list(values)
+    return arguments[1:] if arguments and arguments[0] == "--" else arguments
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare and stop a TTS More portable worker package")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -247,6 +329,14 @@ def main(argv: list[str] | None = None) -> int:
     record.add_argument("--port", required=True, type=int)
     record.add_argument("--build-id", required=True)
     record.add_argument("command_args", nargs=argparse.REMAINDER)
+    verify = subcommands.add_parser("verify-owned-listener")
+    verify.add_argument("--package-root", required=True, type=Path)
+    verify.add_argument("--record-path", required=True, type=Path)
+    verify.add_argument("--port", required=True, type=int)
+    verify.add_argument("--build-id", required=True)
+    verify.add_argument("--executable", required=True, type=Path)
+    verify.add_argument("--listener-pid", action="append", required=True, type=int)
+    verify.add_argument("command_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.command == "prepare-runtime":
         print(prepare_runtime(args.package_root))
@@ -261,12 +351,22 @@ def main(argv: list[str] | None = None) -> int:
             child_pids=[],
             process_created_at=args.process_created_at,
             executable_path=args.executable,
-            command=args.command_args,
+            command=_command_arguments(args.command_args),
             port=args.port,
             package_root=args.package_root,
             build_id=args.build_id,
         )
         return 0
+    if args.command == "verify-owned-listener":
+        return 0 if listener_is_owned(
+            args.record_path,
+            package_root=args.package_root,
+            port=args.port,
+            build_id=args.build_id,
+            executable_path=args.executable,
+            command=_command_arguments(args.command_args),
+            listener_pids=set(args.listener_pid),
+        ) else 3
     raise AssertionError(f"unsupported command: {args.command}")
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 
@@ -151,3 +152,139 @@ def test_stop_worker_rejects_record_from_another_package_root(tmp_path: Path) ->
     with pytest.raises(ValueError, match="different package root"):
         launcher.stop_worker(root)
     assert record_path.exists()
+
+
+def test_existing_listener_requires_record_build_command_and_process_identity(tmp_path: Path) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    executable = root / "runtime" / "live" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python")
+    command = ["-m", "uvicorn", "app.main:app", "--port", "8000"]
+    payload = _record(root)
+    payload["command_sha256"] = hashlib.sha256("\0".join(command).encode("utf-8")).hexdigest()
+    payload["command_args"] = command
+    record_path = root / "data" / "local" / "run" / "worker.pid.json"
+    record_path.parent.mkdir(parents=True)
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+    process = {
+        "pid": 4242,
+        "created_at": payload["process_created_at"],
+        "executable_path": str(executable),
+        "command_args": command,
+    }
+
+    assert launcher.listener_is_owned(
+        record_path,
+        package_root=root,
+        port=9880,
+        build_id=payload["build_id"],
+        executable_path=executable,
+        command=command,
+        listener_pids={4242},
+        inspector=lambda _pid: process,
+    )
+
+    for field, forged in (("build_id", "forged-build"), ("command_sha256", "0" * 64)):
+        original = payload[field]
+        payload[field] = forged
+        record_path.write_text(json.dumps(payload), encoding="utf-8")
+        assert not launcher.listener_is_owned(
+            record_path,
+            package_root=root,
+            port=9880,
+            build_id="gpt-sovits-2.0.0-deadbeef",
+            executable_path=executable,
+            command=command,
+            listener_pids={4242},
+            inspector=lambda _pid: process,
+        )
+        payload[field] = original
+
+
+def test_existing_listener_rejects_pid_reuse_and_foreign_runtime(tmp_path: Path) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    executable = root / "runtime" / "live" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python")
+    command = ["-m", "uvicorn", "app.main:app", "--port", "8000"]
+    payload = _record(root)
+    payload["command_sha256"] = hashlib.sha256("\0".join(command).encode("utf-8")).hexdigest()
+    payload["command_args"] = command
+    record_path = root / "data" / "local" / "run" / "worker.pid.json"
+    record_path.parent.mkdir(parents=True)
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    for process in (
+        {
+            "pid": 4242,
+            "created_at": "2026-07-14T01:05:03.000000+00:00",
+            "executable_path": str(executable),
+            "command_args": command,
+        },
+        {
+            "pid": 4242,
+            "created_at": payload["process_created_at"],
+            "executable_path": str(tmp_path / "foreign" / "python.exe"),
+            "command_args": command,
+        },
+    ):
+        assert not launcher.listener_is_owned(
+            record_path,
+            package_root=root,
+            port=9880,
+            build_id=payload["build_id"],
+            executable_path=executable,
+            command=command,
+            listener_pids={4242},
+            inspector=lambda _pid, current=process: current,
+        )
+
+
+def test_windows_process_command_line_is_split_for_identity_comparison() -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows command-line parsing is Windows-only")
+
+    assert launcher._split_windows_command_line(
+        '"C:\\Portable Root\\python.exe" -m uvicorn "worker app:api" --port 9880'
+    ) == ["C:\\Portable Root\\python.exe", "-m", "uvicorn", "worker app:api", "--port", "9880"]
+
+
+def test_cli_separator_is_not_part_of_persisted_command_identity(tmp_path: Path) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    executable = root / "runtime" / "live" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python")
+    record = root / "data" / "local" / "run" / "worker.pid.json"
+    command = ["-m", "uvicorn", "worker:app", "--port", "9880"]
+
+    result = launcher.main(
+        [
+            "write-process-record",
+            "--package-root",
+            str(root),
+            "--record-path",
+            str(record),
+            "--pid",
+            "4242",
+            "--parent-pid",
+            "100",
+            "--process-created-at",
+            "2026-07-14T01:02:03+00:00",
+            "--executable",
+            str(executable),
+            "--port",
+            "9880",
+            "--build-id",
+            "build-id",
+            "--",
+            *command,
+        ]
+    )
+
+    assert result == 0
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    assert payload["command_sha256"] == hashlib.sha256("\0".join(command).encode("utf-8")).hexdigest()

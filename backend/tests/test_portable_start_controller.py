@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -25,12 +26,14 @@ def _copy_controller(package_root: Path) -> None:
     scripts.mkdir(parents=True, exist_ok=True)
     shutil.copy2(REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1", scripts)
     shutil.copy2(REPO_ROOT / "scripts" / "Show-PortableProgress.ps1", scripts)
+    shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", scripts)
 
 
 def _source_package(package_root: Path, *, delay_seconds: int = 0) -> None:
     _copy_controller(package_root)
     _write_text(package_root / "packaging" / "portable" / "runtime.lock.json", "{}\n")
     _write_text(package_root / "packaging" / "portable" / "models.lock.json", "{}\n")
+    _compile_fake_python(package_root / "runtime" / "live" / "python.exe")
     _write_text(
         package_root / "scripts" / "initialize-portable.ps1",
         rf'''[CmdletBinding()]
@@ -44,8 +47,9 @@ Add-Content -LiteralPath (Join-Path $PackageRoot "order.log") -Value "initialize
 Add-Content -LiteralPath (Join-Path $PackageRoot "initialize-count.log") -Value "1"
 if ({delay_seconds} -gt 0) {{ Start-Sleep -Seconds {delay_seconds} }}
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "runtime\live"), (Join-Path $PackageRoot "data\local") | Out-Null
-[IO.File]::WriteAllBytes((Join-Path $PackageRoot "runtime\live\python.exe"), [byte[]](1))
-$state = @{{ schema_version = 1; component = "tts-more"; build_id = "source-checkout"; profile = "cpu" }} | ConvertTo-Json
+$runtimeSha = (Get-FileHash -LiteralPath (Join-Path $PackageRoot "packaging\portable\runtime.lock.json") -Algorithm SHA256).Hash.ToLowerInvariant()
+$modelSha = (Get-FileHash -LiteralPath (Join-Path $PackageRoot "packaging\portable\models.lock.json") -Algorithm SHA256).Hash.ToLowerInvariant()
+$state = @{{ schema_version = 1; component = "tts-more"; build_id = "source-checkout"; profile = "cpu"; runtime_lock_sha256 = $runtimeSha; model_lock_sha256 = $modelSha; ready = $true }} | ConvertTo-Json
 [IO.File]::WriteAllText((Join-Path $PackageRoot "data\local\install-state.json"), $state, [Text.UTF8Encoding]::new($false))
 exit 0
 ''',
@@ -117,7 +121,143 @@ def _manifest(package_root: Path, *, profile: str, operations: str = "data/local
         "licenses": "THIRD_PARTY_NOTICES.json",
     }
     _write_text(package_root / "package" / "tts-more-package.json", json.dumps(payload))
+    for relative in (
+        "Initialize.cmd",
+        "Start.cmd",
+        "Stop.cmd",
+        "Repair.cmd",
+        "Build-Package.ps1",
+        "THIRD_PARTY_NOTICES.json",
+    ):
+        _write_text(package_root / relative, "placeholder\n")
+    _write_sha256_manifest(package_root)
     return payload
+
+
+def _compile_fake_python(path: Path, *, version: str = "3.11", imports_ok: bool = True) -> None:
+    compiler_candidates = (
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe",
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Microsoft.NET" / "Framework" / "v4.0.30319" / "csc.exe",
+    )
+    compiler = next((candidate for candidate in compiler_candidates if candidate.is_file()), None)
+    if compiler is None:
+        pytest.skip("the .NET C# compiler is unavailable")
+    source = path.with_suffix(".cs")
+    _write_text(
+        source,
+        rf'''using System;
+using System.IO;
+class FakePython {{
+  static string Value(string[] args, string name) {{
+    for (int i = 0; i + 1 < args.Length; i++) if (args[i] == name) return args[i + 1];
+    return "";
+  }}
+  static int Main(string[] args) {{
+    string joined = String.Join(" ", args);
+    if (joined.Contains("version_info")) {{ Console.WriteLine("{version}"); return 0; }}
+    if (joined.Contains("definitely_missing") || {str(not imports_ok).lower()}) return 1;
+    if (joined.Contains("write-state")) {{
+      string json = "{{\"schema_version\":1,\"component\":\"" + Value(args,"--component") + "\",\"build_id\":\"" + Value(args,"--build-id") + "\",\"profile\":\"" + Value(args,"--profile") + "\",\"runtime_lock_sha256\":\"" + Value(args,"--runtime-lock-sha256") + "\",\"model_lock_sha256\":\"" + Value(args,"--model-lock-sha256") + "\",\"ready\":true}}";
+      Directory.CreateDirectory(Path.GetDirectoryName(Value(args,"--path")));
+      File.WriteAllText(Value(args,"--path"), json);
+      return 0;
+    }}
+    string marker = Environment.GetEnvironmentVariable("A4_FAKE_SPAWN_MARKER");
+    if (!String.IsNullOrEmpty(marker) && !joined.Contains("-c")) File.WriteAllText(marker, joined);
+    return 0;
+  }}
+}}
+''',
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [str(compiler), "/nologo", f"/out:{path}", str(source)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    source.unlink()
+
+
+def _write_sha256_manifest(package_root: Path) -> None:
+    lines = []
+    for path in sorted(package_root.rglob("*")):
+        if not path.is_file() or path.name == "SHA256SUMS.txt" or "operations" in path.parts:
+            continue
+        relative = path.relative_to(package_root).as_posix()
+        lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {relative}")
+    _write_text(package_root / "SHA256SUMS.txt", "\n".join(lines) + "\n")
+
+
+def _prepare_full_package(
+    package_root: Path,
+    *,
+    model_mode: str = "valid",
+    runtime_version: str = "3.11",
+    imports_ok: bool = True,
+) -> None:
+    _source_package(package_root)
+    payload = _manifest(package_root, profile="full")
+    payload["models"]["required"] = True
+    _write_text(package_root / "package" / "tts-more-package.json", json.dumps(payload))
+    runtime_lock = package_root / "packaging" / "portable" / "runtime.lock.json"
+    model_lock = package_root / "packaging" / "portable" / "models.lock.json"
+    _write_text(
+        runtime_lock,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "component": "tts-more",
+                "python_version": "3.11",
+                "import_probe": "import sys",
+                "profiles": {"cpu": {"dependency_lock": "backend/uv.lock"}},
+            }
+        ),
+    )
+    expected_model = b"locked-model"
+    model_target = package_root / "models" / "voice.bin"
+    model_payload = {
+        "schema_version": 1,
+        "component": "tts-more",
+        "component": "tts-more",
+        "required": True,
+        "required_paths": ["models/voice.bin"],
+        "assets": [
+            {
+                "id": "voice",
+                "target": "models/voice.bin",
+                "size_bytes": len(expected_model),
+                "sha256": hashlib.sha256(expected_model).hexdigest(),
+            }
+        ],
+    }
+    _write_text(model_lock, json.dumps(model_payload))
+    if model_mode != "missing":
+        model_target.parent.mkdir(parents=True)
+        model_target.write_bytes(expected_model if model_mode == "valid" else b"locked-modem")
+    python = package_root / "runtime" / "live" / "python.exe"
+    _compile_fake_python(python, version=runtime_version, imports_ok=imports_ok)
+    state = {
+        "schema_version": 1,
+        "component": "tts-more",
+        "build_id": "build-test",
+        "profile": "cpu",
+        "runtime_lock_sha256": hashlib.sha256(runtime_lock.read_bytes()).hexdigest(),
+        "model_lock_sha256": hashlib.sha256(model_lock.read_bytes()).hexdigest(),
+        "ready": True,
+    }
+    _write_text(package_root / "data" / "local" / "install-state.json", json.dumps(state))
+    for relative in (
+        "Initialize.cmd",
+        "Start.cmd",
+        "Stop.cmd",
+        "Repair.cmd",
+        "Build-Package.ps1",
+        "THIRD_PARTY_NOTICES.json",
+    ):
+        _write_text(package_root / relative, "placeholder\n")
+    _write_sha256_manifest(package_root)
 
 
 def _run_controller(package_root: Path, *arguments: str, timeout: int = 20) -> subprocess.CompletedProcess[str]:
@@ -268,6 +408,7 @@ def test_initializer_accepts_manifest_scoped_operation_contract_before_bootstrap
     scripts = package_root / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
     shutil.copy2(REPO_ROOT / "scripts" / "initialize-portable.ps1", scripts)
+    shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", scripts)
     operation_id = str(uuid4())
     operation = package_root / "state" / "start-operations" / operation_id
     operation.mkdir(parents=True)
@@ -307,6 +448,7 @@ def test_initializer_rejects_manifest_operation_junction(tmp_path: Path) -> None
     scripts = package_root / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
     shutil.copy2(REPO_ROOT / "scripts" / "initialize-portable.ps1", scripts)
+    shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", scripts)
     outside = tmp_path / "initializer-outside"
     outside.mkdir()
     junction_environment = os.environ.copy()
@@ -474,7 +616,7 @@ def test_launcher_staging_progress_and_error_catalog_contracts(tmp_path: Path) -
     assert "System.Windows.Forms" in progress
     assert "cancel.requested" in progress
     assert "console" in progress.lower()
-    for staged_name in ("Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "portable_operations.py"):
+    for staged_name in ("Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1", "portable_operations.py"):
         assert staged_name in builder
         assert staged_name in sync_source
 
@@ -498,6 +640,7 @@ def test_launcher_staging_progress_and_error_catalog_contracts(tmp_path: Path) -
     assert "Invoke-PortableStart.ps1" in synced_start
     assert (target / "tts_more" / "Invoke-PortableStart.ps1").is_file()
     assert (target / "tts_more" / "Show-PortableProgress.ps1").is_file()
+    assert (target / "tts_more" / "Portable-Validation.ps1").is_file()
     assert (target / "tts_more" / "error-catalog.zh-CN.json").is_file()
 
 
@@ -507,3 +650,446 @@ def test_worker_initializer_records_staged_manifest_build_id() -> None:
     assert '$manifestPath = Join-Path $Root "package\\tts-more-package.json"' in initializer
     assert '--build-id $buildId' in initializer
     assert '--build-id source-checkout' not in initializer
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("launchers.initialize", "C:/outside/Initialize.cmd"),
+        ("licenses", "../outside/licenses.json"),
+        ("sha256_manifest", "D:/outside/SHA256SUMS.txt"),
+        ("platform", "linux-x64"),
+        ("runtime.python_version", "3.10"),
+    ),
+)
+def test_staged_manifest_is_completely_validated_before_operation_creation(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    package_root = tmp_path / field.replace(".", "-")
+    _source_package(package_root)
+    payload = _manifest(package_root, profile="bootstrap")
+    target: dict[str, object] = payload
+    parts = field.split(".")
+    for part in parts[:-1]:
+        target = target[part]  # type: ignore[assignment,index]
+    target[parts[-1]] = value
+    _write_text(package_root / "package" / "tts-more-package.json", json.dumps(payload))
+
+    result = _run_controller(package_root, "-NoUi")
+
+    assert result.returncode == 22
+    assert "PACKAGE_CORRUPT" in result.stdout + result.stderr
+    assert not (package_root / "data" / "local" / "operations").exists()
+    assert not (package_root / "initialize-count.log").exists()
+
+
+@pytest.mark.parametrize(
+    ("model_mode", "runtime_version", "imports_ok"),
+    (
+        ("missing", "3.11", True),
+        ("corrupt", "3.11", True),
+        ("valid", "3.10", True),
+        ("valid", "3.11", False),
+    ),
+)
+def test_full_package_validates_models_runtime_version_and_imports_before_service(
+    tmp_path: Path, model_mode: str, runtime_version: str, imports_ok: bool
+) -> None:
+    package_root = tmp_path / f"full-{model_mode}-{runtime_version}-{imports_ok}"
+    _prepare_full_package(
+        package_root,
+        model_mode=model_mode,
+        runtime_version=runtime_version,
+        imports_ok=imports_ok,
+    )
+
+    result = _run_controller(package_root, "-NoUi", timeout=30)
+
+    assert result.returncode == 22, result.stdout + result.stderr
+    assert "PACKAGE_CORRUPT" in result.stdout + result.stderr
+    assert not (package_root / "initialize-count.log").exists()
+    assert not (package_root / "start-count.log").exists()
+
+
+def test_controller_rejects_uuid_operation_junction_before_writing(tmp_path: Path) -> None:
+    package_root = tmp_path / "uuid-junction-package"
+    _source_package(package_root)
+    operation_id = str(uuid4())
+    operations = package_root / "data" / "local" / "operations"
+    operations.mkdir(parents=True)
+    outside = tmp_path / "uuid-operation-outside"
+    outside.mkdir()
+    junction_environment = os.environ.copy()
+    junction_environment["A4_JUNCTION_PATH"] = str(operations / operation_id)
+    junction_environment["A4_JUNCTION_TARGET"] = str(outside)
+    junction = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "New-Item -ItemType Junction -Path $env:A4_JUNCTION_PATH -Target $env:A4_JUNCTION_TARGET | Out-Null",
+        ],
+        env=junction_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if junction.returncode != 0:
+        pytest.skip(f"directory junctions are unavailable: {junction.stderr}")
+
+    result = _run_controller(package_root, "-OperationId", operation_id, "-NoUi")
+
+    assert result.returncode == 22
+    assert "reparse" in (result.stdout + result.stderr).lower()
+    assert not (outside / "operation.json").exists()
+    assert not (outside / "events.jsonl").exists()
+
+
+def test_initializer_rejects_uuid_operation_junction(tmp_path: Path) -> None:
+    package_root = tmp_path / "initializer-uuid-junction"
+    _manifest(package_root, profile="bootstrap")
+    scripts = package_root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "initialize-portable.ps1", scripts)
+    shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", scripts)
+    operation_id = str(uuid4())
+    operations = package_root / "data" / "local" / "operations"
+    operations.mkdir(parents=True)
+    outside = tmp_path / "initializer-uuid-outside"
+    outside.mkdir()
+    junction_environment = os.environ.copy()
+    junction_environment["A4_JUNCTION_PATH"] = str(operations / operation_id)
+    junction_environment["A4_JUNCTION_TARGET"] = str(outside)
+    junction = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "New-Item -ItemType Junction -Path $env:A4_JUNCTION_PATH -Target $env:A4_JUNCTION_TARGET | Out-Null",
+        ],
+        env=junction_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if junction.returncode != 0:
+        pytest.skip(f"directory junctions are unavailable: {junction.stderr}")
+    cancel = operations / operation_id / "cancel.requested"
+    cancel.touch()
+
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(scripts / "initialize-portable.ps1"),
+            "-PackageRoot",
+            str(package_root),
+            "-OperationRoot",
+            str(operations / operation_id),
+            "-CancelFile",
+            str(cancel),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 20
+    assert "reparse" in (result.stdout + result.stderr).lower()
+
+
+def test_stale_active_pointer_without_lock_is_reclaimed(tmp_path: Path) -> None:
+    package_root = tmp_path / "stale-pointer-package"
+    _source_package(package_root)
+    operations = package_root / "data" / "local" / "operations"
+    stale_id = str(uuid4())
+    stale_operation = operations / stale_id
+    stale_operation.mkdir(parents=True)
+    _write_text(
+        stale_operation / "operation.json",
+        json.dumps(
+            {
+                "operation_id": stale_id,
+                "component": "tts-more",
+                "action": "start",
+                "initiator": "direct",
+                "started_at": "2026-07-14T00:00:00Z",
+                "status": "installing",
+                "exit_code": None,
+            }
+        ),
+    )
+    _write_text(
+        operations / "active-start.json",
+        json.dumps(
+            {
+                "operation_id": stale_id,
+                "owner_pid": 999999,
+                "owner_started_at": "2026-07-14T00:00:00Z",
+                "published_at": "2026-07-14T00:00:00Z",
+            }
+        ),
+    )
+
+    result = _run_controller(package_root, "-NoUi")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    stale = json.loads((stale_operation / "operation.json").read_text(encoding="utf-8"))
+    assert stale["status"] == "blocked"
+    assert stale["exit_code"] == 22
+    assert not (operations / "active-start.json").exists()
+    assert (package_root / "initialize-count.log").read_text(encoding="utf-8").splitlines() == ["1"]
+    assert (package_root / "start-count.log").read_text(encoding="utf-8").splitlines() == ["1"]
+
+
+def test_atomic_json_replacement_never_deletes_existing_destination() -> None:
+    controller = (REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1").read_text(encoding="utf-8")
+
+    assert "[IO.File]::Replace($temporary, $Path, $backup)" in controller
+    assert "[IO.File]::Delete($Path)" not in controller
+
+
+def test_progress_disables_cancel_at_starting_and_port_override_precedes_ui() -> None:
+    controller = (REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1").read_text(encoding="utf-8")
+    progress = (REPO_ROOT / "scripts" / "Show-PortableProgress.ps1").read_text(encoding="utf-8")
+
+    assert "Test-PortableCancellationAvailable" in progress
+    assert '$cancel.Enabled = Test-PortableCancellationAvailable -Phase ([string]$event.phase)' in progress
+    assert '"starting"' in progress and '"ready"' in progress
+    assert controller.index("$urlPort =") < controller.index("Start-ProgressWindow -Operation")
+
+
+def test_portable_start_scripts_reject_external_python_fallbacks_before_spawn() -> None:
+    for path in (
+        REPO_ROOT / "scripts" / "start-production.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Start-Worker.ps1",
+    ):
+        script = path.read_text(encoding="utf-8")
+        assert "TTS_MORE_PYTHON_EXE" not in script
+        assert '.venv\\Scripts\\python.exe' not in script
+        assert "Assert-PortableRuntime" in script
+        assert "listener_is_owned" in script or "verify-owned-listener" in script
+
+
+@pytest.mark.parametrize("component", ("tts-more", "gpt-sovits"))
+def test_initializers_repair_stale_state_from_verified_private_assets_without_bootstrap(
+    tmp_path: Path, component: str
+) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    root = tmp_path / component
+    bundle = root / "scripts" if component == "tts-more" else root / "tts_more"
+    bundle.mkdir(parents=True)
+    initializer = (
+        REPO_ROOT / "scripts" / "initialize-portable.ps1"
+        if component == "tts-more"
+        else REPO_ROOT / "integrations" / "windows" / "Initialize.ps1"
+    )
+    shutil.copy2(initializer, bundle)
+    shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", bundle)
+    shutil.copy2(REPO_ROOT / "scripts" / "portable_install.py", bundle)
+    expected_python = "3.11"
+    runtime_lock = (
+        root / "packaging" / "portable" / "runtime.lock.json"
+        if component == "tts-more"
+        else bundle / "locks" / "runtime.lock.json"
+    )
+    model_lock = (
+        root / "packaging" / "portable" / "models.lock.json"
+        if component == "tts-more"
+        else bundle / "locks" / "models.lock.json"
+    )
+    _write_text(
+        runtime_lock,
+        json.dumps(
+            {
+                "component": component,
+                "python_version": expected_python,
+                "import_probe": "import sys",
+                "required_free_bytes": 0,
+            }
+        ),
+    )
+    _write_text(
+        model_lock,
+        json.dumps(
+            {
+                "component": component,
+                "complete": True,
+                "required_free_bytes": 0,
+                "required_paths": [],
+                "assets": [],
+            }
+        ),
+    )
+    if component == "tts-more":
+        _write_text(root / "backend" / "uv.lock", "locked\n")
+    else:
+        _write_text(
+            bundle / "component.json",
+            json.dumps(
+                {
+                    "component": component,
+                    "python": expected_python,
+                    "import_probe": "import sys",
+                }
+            ),
+        )
+    _compile_fake_python(root / "runtime" / "live" / "python.exe")
+    _write_text(root / "package" / "tts-more-package.json", json.dumps({"build_id": "current-build"}))
+    state_path = root / "data" / "local" / "install-state.json"
+    _write_text(
+        state_path,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "component": component,
+                "build_id": "stale-build",
+                "profile": "cpu",
+                "runtime_lock_sha256": "0" * 64,
+                "model_lock_sha256": "0" * 64,
+                "ready": True,
+            }
+        ),
+    )
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(bundle / initializer.name),
+            "-PackageRoot",
+            str(root),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    repaired = json.loads(state_path.read_text(encoding="utf-8"))
+    assert repaired["build_id"] == "current-build"
+    assert repaired["runtime_lock_sha256"] == hashlib.sha256(runtime_lock.read_bytes()).hexdigest()
+    assert repaired["model_lock_sha256"] == hashlib.sha256(model_lock.read_bytes()).hexdigest()
+    assert "repaired" in result.stdout.lower()
+    assert not (root / "data" / "cache" / "portable" / "video-controllers.json").exists()
+
+
+def test_atomic_json_locked_destination_preserves_old_readable_document(tmp_path: Path) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    package = tmp_path / "atomic-package"
+    _copy_controller(package)
+    target = package / "state.json"
+    _write_text(target, '{"generation":"old"}\n')
+    probe = package / "atomic-probe.ps1"
+    _write_text(
+        probe,
+        r'''$ErrorActionPreference = "Stop"
+. $env:A4_CONTROLLER
+$stream = [IO.File]::Open($env:A4_TARGET, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+$threw = $false
+try { Write-JsonAtomic -Path $env:A4_TARGET -Payload ([ordered]@{ generation = "new" }) } catch { $threw = $true }
+finally { $stream.Dispose() }
+if (!$threw) { throw "locked replacement unexpectedly succeeded" }
+$payload = Get-Content -LiteralPath $env:A4_TARGET -Raw | ConvertFrom-Json
+if ([string]$payload.generation -ne "old") { throw "old destination was not preserved" }
+Write-Host "ATOMIC_OLD_PRESERVED"
+''',
+    )
+    environment = os.environ.copy()
+    environment["A4_CONTROLLER"] = str(package / "scripts" / "Invoke-PortableStart.ps1")
+    environment["A4_TARGET"] = str(target)
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(probe)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ATOMIC_OLD_PRESERVED" in result.stdout
+
+
+@pytest.mark.parametrize("runtime_case", ("environment", "venv", "reparse", "wrong-version"))
+def test_production_start_rejects_non_private_or_invalid_runtime_before_spawn(
+    tmp_path: Path, runtime_case: str
+) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    root = tmp_path / f"start-{runtime_case}"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "start-production.ps1", scripts)
+    shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", scripts)
+    (root / "backend").mkdir()
+    (root / "frontend" / "dist").mkdir(parents=True)
+    _write_text(
+        root / "packaging" / "portable" / "runtime.lock.json",
+        json.dumps({"python_version": "3.11", "import_probe": "import sys"}),
+    )
+    environment = os.environ.copy()
+    marker = root / "spawned.marker"
+    environment["A4_FAKE_SPAWN_MARKER"] = str(marker)
+    if runtime_case == "environment":
+        external = tmp_path / "external" / "python.exe"
+        _compile_fake_python(external)
+        environment["TTS_MORE_PYTHON_EXE"] = str(external)
+    elif runtime_case == "venv":
+        _compile_fake_python(root / ".venv" / "Scripts" / "python.exe")
+    elif runtime_case == "wrong-version":
+        _compile_fake_python(root / "runtime" / "live" / "python.exe", version="3.10")
+    else:
+        outside_live = tmp_path / "outside-live"
+        _compile_fake_python(outside_live / "python.exe")
+        (root / "runtime").mkdir()
+        junction_environment = environment.copy()
+        junction_environment["A4_JUNCTION_PATH"] = str(root / "runtime" / "live")
+        junction_environment["A4_JUNCTION_TARGET"] = str(outside_live)
+        junction = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "New-Item -ItemType Junction -Path $env:A4_JUNCTION_PATH -Target $env:A4_JUNCTION_TARGET | Out-Null",
+            ],
+            env=junction_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if junction.returncode != 0:
+            pytest.skip(f"directory junctions are unavailable: {junction.stderr}")
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(scripts / "start-production.ps1"),
+            "-PackageRoot",
+            str(root),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not marker.exists()
+    combined = (result.stdout + result.stderr).lower()
+    assert "runtime" in combined or "python" in combined or "reparse" in combined

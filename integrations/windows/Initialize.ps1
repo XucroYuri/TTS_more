@@ -9,6 +9,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$ValidationScript = Join-Path $PSScriptRoot "Portable-Validation.ps1"
+if (!(Test-Path -LiteralPath $ValidationScript -PathType Leaf)) { throw "Portable-Validation.ps1 is missing" }
+. $ValidationScript
 $Bundle = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $Root = if ([string]::IsNullOrWhiteSpace($PackageRoot)) {
     [System.IO.Path]::GetFullPath((Split-Path -Parent $Bundle))
@@ -72,7 +75,7 @@ function Resolve-OperationContract {
     if (![string]::Equals($resolvedCancel, $expectedCancel, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "CancelFile must resolve exactly to OperationRoot/cancel.requested"
     }
-    return [pscustomobject]@{ OperationRoot = $resolvedOperation; CancelFile = $resolvedCancel }
+    return Assert-PortableExactOperationContract -OperationsRoot $operations -OperationRoot $resolvedOperation -CancelFile $resolvedCancel -RequireOperation
 }
 
 $contract = Resolve-OperationContract -PackageRoot $Root -OperationRoot $OperationRoot -CancelFile $CancelFile
@@ -95,15 +98,21 @@ $requiredSpace = [int64]$runtimeLock.required_free_bytes + [int64]$modelLock.req
 $drive = Get-PSDrive -Name ([System.IO.Path]::GetPathRoot($Root).Substring(0, 1)) -ErrorAction SilentlyContinue
 if ($drive -and $drive.Free -lt $requiredSpace) { throw "insufficient free space: need $requiredSpace bytes" }
 
-function Test-LiveRuntime {
-    $python = Join-Path $live "python.exe"
-    if (!(Test-Path -LiteralPath $python)) { return $false }
-    & $python -m pip check *> $null
-    if ($LASTEXITCODE -ne 0) { return $false }
-    & $python -c ([string]$config.import_probe) *> $null
-    return $LASTEXITCODE -eq 0
+$manifestPath = Join-Path $Root "package\tts-more-package.json"
+$buildId = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { [string](Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).build_id } else { "source-checkout" }
+$expectedPython = if ([string]::IsNullOrWhiteSpace([string]$runtimeLock.python_version)) { [string]$config.python } else { [string]$runtimeLock.python_version }
+$importProbe = if ($runtimeLock.PSObject.Properties["import_probe"] -and ![string]::IsNullOrWhiteSpace([string]$runtimeLock.import_probe)) { [string]$runtimeLock.import_probe } else { [string]$config.import_probe }
+if (Test-PortableInstallStateComplete -Root $Root -StatePath $state -Component ([string]$config.component) -BuildId $buildId -RuntimeLock $runtimeLockPath -ModelLock $modelLockPath -ExpectedPython $expectedPython -ImportProbe $importProbe -ValidateAssets) { Write-Host "verified runtime and install state already exist"; exit 0 }
+if ((Test-PortableRuntime -Root $Root -PythonPath (Join-Path $live "python.exe") -ExpectedVersion $expectedPython -ImportProbe $importProbe) -and (Test-PortableLockedAssets -Root $Root -ModelLock $modelLockPath)) {
+    $existingState = if (Test-Path -LiteralPath $state -PathType Leaf) { try { Get-Content -LiteralPath $state -Raw | ConvertFrom-Json } catch { $null } } else { $null }
+    $selectedProfile = if ($existingState -and ![string]::IsNullOrWhiteSpace([string]$existingState.profile)) { [string]$existingState.profile } else { "cpu" }
+    $runtimeSha = (Get-FileHash -LiteralPath $runtimeLockPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $modelSha = (Get-FileHash -LiteralPath $modelLockPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    & (Join-Path $live "python.exe") (Join-Path $Bundle "portable_install.py") write-state --path $state --component ([string]$config.component) --build-id $buildId --profile $selectedProfile --runtime-lock-sha256 $runtimeSha --model-lock-sha256 $modelSha
+    if ($LASTEXITCODE -ne 0) { throw "failed to repair stale install-state.json" }
+    Write-Host "verified package-private assets and repaired stale install state"
+    exit 0
 }
-if ((Test-Path -LiteralPath $state) -and (Test-LiveRuntime)) { Write-Host "verified runtime and install state already exist"; exit 0 }
 if ($Repair) { Write-Host "repairing only missing or invalid locked assets; user data is preserved" }
 
 $bootstrap = Join-Path $Bundle "bootstrap-conda.ps1"
@@ -204,8 +213,6 @@ Move-Item -LiteralPath $staging -Destination $live
 if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
 $runtimeSha = (Get-FileHash -LiteralPath $runtimeLockPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $modelSha = (Get-FileHash -LiteralPath $modelLockPath -Algorithm SHA256).Hash.ToLowerInvariant()
-$manifestPath = Join-Path $Root "package\tts-more-package.json"
-$buildId = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { [string](Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).build_id } else { "source-checkout" }
 & (Join-Path $live "python.exe") (Join-Path $Bundle "portable_install.py") write-state --path $state --component ([string]$config.component) --build-id $buildId --profile $selected --runtime-lock-sha256 $runtimeSha --model-lock-sha256 $modelSha
 if ($LASTEXITCODE -ne 0) { throw "install state commit failed" }
 Write-Host "$($config.component) initialization completed for $selected"

@@ -7,6 +7,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$ValidationScript = Join-Path $PSScriptRoot "Portable-Validation.ps1"
+if (!(Test-Path -LiteralPath $ValidationScript -PathType Leaf)) { throw "Portable-Validation.ps1 is missing" }
+. $ValidationScript
 $Root = if ([string]::IsNullOrWhiteSpace($PackageRoot)) { [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)) } else { [System.IO.Path]::GetFullPath($PackageRoot) }
 $Port = if ($null -ne $PortOverride) { [int]$PortOverride } elseif ($env:TTS_MORE_PORT) { [int]$env:TTS_MORE_PORT } else { 8000 }
 
@@ -22,7 +25,17 @@ function Resolve-ExistingPath {
 
 $BackendRoot = Resolve-ExistingPath @((Join-Path $Root "backend"), (Join-Path $Root "app\backend")) "backend"
 $StaticRoot = Resolve-ExistingPath @((Join-Path $Root "frontend\dist"), (Join-Path $Root "app\frontend")) "frontend static assets"
-$Python = Resolve-ExistingPath @($env:TTS_MORE_PYTHON_EXE, (Join-Path $Root "runtime\live\python.exe"), (Join-Path $Root ".venv\Scripts\python.exe")) "package Python"
+$Python = Join-Path $Root "runtime\live\python.exe"
+$RuntimeLockPath = Join-Path $Root "packaging\portable\runtime.lock.json"
+$RuntimeLock = Get-Content -LiteralPath $RuntimeLockPath -Raw | ConvertFrom-Json
+$ExpectedPython = if ([string]::IsNullOrWhiteSpace([string]$RuntimeLock.python_version)) { "3.11" } else { [string]$RuntimeLock.python_version }
+$ImportProbe = if ($RuntimeLock.PSObject.Properties["import_probe"] -and ![string]::IsNullOrWhiteSpace([string]$RuntimeLock.import_probe)) { [string]$RuntimeLock.import_probe } else { "import fastapi,pydantic,uvicorn" }
+[void](Assert-PortableRuntime -Root $Root -PythonPath $Python -ExpectedVersion $ExpectedPython -ImportProbe $ImportProbe)
+$manifestPath = Join-Path $Root "package\tts-more-package.json"
+$buildId = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { [string](Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).build_id } else { "source-checkout" }
+$arguments = @("-m", "uvicorn", "app.main:app", "--app-dir", $BackendRoot, "--host", "127.0.0.1", "--port", [string]$Port)
+$recordPath = Join-Path $Root "data\local\run\worker.pid.json"
+$Launcher = Join-Path $Root "scripts\portable_launcher.py"
 
 $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
 if ($listeners.Count -gt 0) {
@@ -30,14 +43,12 @@ if ($listeners.Count -gt 0) {
         $process = Get-Process -Id $_ -ErrorAction SilentlyContinue
         [pscustomobject]@{ pid = $_; name = if ($process) { $process.ProcessName } else { "unknown" }; path = if ($process) { $process.Path } else { "unknown" } }
     })
-    $recordPath = Join-Path $Root "data\local\run\worker.pid.json"
-    $owned = $false
-    if (Test-Path -LiteralPath $recordPath -PathType Leaf) {
-        try {
-            $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
-            $owned = [int]$record.port -eq $Port -and [int]$record.pid -in @($listeners | Select-Object -ExpandProperty OwningProcess) -and [string]::Equals([IO.Path]::GetFullPath([string]$record.package_root), $Root, [StringComparison]::OrdinalIgnoreCase)
-        } catch { $owned = $false }
-    }
+    $verifyArguments = @($Launcher, "verify-owned-listener", "--package-root", $Root, "--record-path", $recordPath, "--port", [string]$Port, "--build-id", $buildId, "--executable", $Python)
+    foreach ($listenerPid in @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)) { $verifyArguments += @("--listener-pid", [string]$listenerPid) }
+    $verifyArguments += "--"
+    $verifyArguments += $arguments
+    & $Python @verifyArguments *> $null
+    $owned = $LASTEXITCODE -eq 0
     if ($owned) {
         try {
             $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2
@@ -49,16 +60,9 @@ if ($listeners.Count -gt 0) {
 
 $env:TTS_MORE_STATIC_ROOT = $StaticRoot
 $env:PATH = "$(Split-Path -Parent $Python);$env:PATH"
-$arguments = @("-m", "uvicorn", "app.main:app", "--app-dir", $BackendRoot, "--host", "127.0.0.1", "--port", [string]$Port)
 $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru
 $processCreatedAt = $process.StartTime.ToUniversalTime().ToString("o")
-$manifestPath = Join-Path $Root "package\tts-more-package.json"
-$buildId = "source-checkout"
-if (Test-Path -LiteralPath $manifestPath) {
-    $buildId = [string](Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).build_id
-}
-$recordPath = Join-Path $Root "data\local\run\worker.pid.json"
-& $Python (Join-Path $Root "scripts\portable_launcher.py") write-process-record `
+& $Python $Launcher write-process-record `
     --package-root $Root --record-path $recordPath --pid $process.Id --parent-pid $PID `
     --process-created-at $processCreatedAt --executable $Python --port $Port --build-id $buildId -- @arguments
 if ($LASTEXITCODE -ne 0) {

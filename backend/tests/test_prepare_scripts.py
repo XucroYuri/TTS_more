@@ -219,7 +219,8 @@ def test_root_windows_launchers_separate_production_and_development_modes() -> N
     stop = (REPO_ROOT / "Stop.cmd").read_text(encoding="utf-8")
     production = (REPO_ROOT / "scripts" / "start-production.ps1").read_text(encoding="utf-8")
 
-    assert "start-production.ps1" in start
+    assert "Invoke-PortableStart.ps1" in start
+    assert "start-production.ps1" not in start
     assert "start-dev.ps1" in start_dev
     assert "stop-production.ps1" in stop
     assert "TTS_MORE_STATIC_ROOT" in production

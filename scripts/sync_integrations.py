@@ -45,7 +45,7 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
     _copy_file(source_root / "backend" / "app" / "adapters" / "__init__.py", controlled / "app" / "adapters" / "__init__.py")
     for name in ("portable_install.py", "portable_launcher.py", "portable_operations.py", "portable_packages.py"):
         _copy_file(source_root / "scripts" / name, controlled / name)
-    for name in ("bootstrap-conda.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1"):
+    for name in ("bootstrap-conda.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1"):
         _copy_file(source_root / "scripts" / name, controlled / name)
     for name in ("Initialize.ps1", "Start-Worker.ps1", "Stop-Worker.ps1", "Repair.ps1", "Build-Package.ps1"):
         _copy_file(source_root / "integrations" / "windows" / name, controlled / name)

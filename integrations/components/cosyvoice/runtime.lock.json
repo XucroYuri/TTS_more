@@ -2,6 +2,7 @@
   "schema_version": 1,
   "component": "cosyvoice",
   "python_version": "3.10",
+  "import_probe": "import fastapi,onnxruntime,torch; import cosyvoice; from cosyvoice.cli.cosyvoice import CosyVoice",
   "dependency_mode": "requirements",
   "required_free_bytes": 21474836480,
   "auto_order": ["cu128", "cu126", "cpu"],

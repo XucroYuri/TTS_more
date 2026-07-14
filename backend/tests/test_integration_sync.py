@@ -38,6 +38,8 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
     assert manifest["source_revision"] == "a" * 40
     assert manifest["integration_version"] == "2.0.0"
     assert manifest["files"]
+    validation_relative = "tts_more/Portable-Validation.ps1"
+    assert manifest["files"][validation_relative] == sync.sha256_file(target / validation_relative)
     assert sync.check_integration(target) == []
 
 

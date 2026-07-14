@@ -19,6 +19,12 @@ class PortableStartException : System.Exception {
     }
 }
 
+$validationScript = Join-Path $PSScriptRoot "Portable-Validation.ps1"
+if (!(Test-Path -LiteralPath $validationScript -PathType Leaf)) {
+    throw [PortableStartException]::new("PACKAGE_CORRUPT", "Portable-Validation.ps1 is missing from the controller bundle")
+}
+. $validationScript
+
 function Throw-PortableStartError {
     param(
         [Parameter(Mandatory = $true)][string]$Code,
@@ -107,18 +113,49 @@ function Get-PackageContext {
         $profile = if ([int]$manifest.schema_version -eq 2) { [string]$manifest.package_profile } else { "bootstrap" }
         if ($profile -notin @("bootstrap", "full")) { Throw-PortableStartError "PACKAGE_CORRUPT" "The package profile is invalid" }
         if ([int]$manifest.schema_version -eq 2) {
-            if ($null -eq $manifest.data -or [string]::IsNullOrWhiteSpace([string]$manifest.data.operations)) {
-                Throw-PortableStartError "PACKAGE_CORRUPT" "The package data.operations path is missing"
+            try {
+                $requiredText = @("component", "package_id", "release_version", "version", "build_id", "api_contract")
+                foreach ($name in $requiredText) {
+                    if ($null -eq $manifest.PSObject.Properties[$name] -or [string]::IsNullOrWhiteSpace([string]$manifest.$name)) { throw "$name is required" }
+                }
+                if ([string]$manifest.component -notin @("tts-more", "gpt-sovits", "indextts", "cosyvoice")) { throw "component is unsupported" }
+                if ([string]$manifest.platform -ne "windows-x64") { throw "platform must be windows-x64" }
+                if ([string]$manifest.api_contract -ne "tts-more-v1") { throw "api_contract must be tts-more-v1" }
+                if ([string]$manifest.protocol.name -ne "tts-more-v1" -or [string]::IsNullOrWhiteSpace([string]$manifest.protocol.version) -or [string]::IsNullOrWhiteSpace([string]$manifest.protocol.controller_range)) { throw "protocol identity is invalid" }
+                if ([string]$manifest.source.repository -notmatch '^https://' -or [string]$manifest.source.revision -notmatch '^[0-9a-fA-F]{40,64}$') { throw "source identity is invalid" }
+                if ([string]::IsNullOrWhiteSpace([string]$manifest.integration.version) -or [string]$manifest.integration.source_revision -notmatch '^[0-9a-fA-F]{40,64}$' -or [string]$manifest.integration.bundle_sha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "integration identity is invalid" }
+                $expectedPython = [string]$manifest.runtime.python_version
+                if ($expectedPython -notin @("3.10", "3.11")) { throw "runtime.python_version is unsupported" }
+                if ($component -eq "tts-more" -and $expectedPython -ne "3.11") { throw "tts-more requires Python 3.11" }
+                if ($manifest.runtime.device_profiles -is [string]) { throw "runtime.device_profiles must be an array" }
+                $deviceProfiles = @($manifest.runtime.device_profiles)
+                if ($deviceProfiles.Count -eq 0) { throw "runtime.device_profiles is required" }
+                foreach ($deviceProfile in $deviceProfiles) { if ([string]$deviceProfile -notin @("auto", "cu128", "cu126", "cpu")) { throw "runtime.device_profiles contains an unsupported profile" } }
+                if ($manifest.models.required -isnot [bool]) { throw "models.required must be boolean" }
+                foreach ($name in @("user", "local", "cache", "operations")) { [void](Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.data.$name) -Label "data.$name") }
+                [void](Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.data_root) -Label "data_root")
+                foreach ($name in @("initialize", "start", "stop", "repair", "build")) { [void](Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.launchers.$name) -Label "launchers.$name" -MustExist) }
+                if ([string]$manifest.endpoint.default_url -notmatch '^http://' -or [int]$manifest.endpoint.port -lt 1 -or [int]$manifest.endpoint.port -gt 65535) { throw "endpoint URL or port is invalid" }
+                foreach ($name in @("health_path", "capabilities_path")) { if ([string]$manifest.endpoint.$name -notmatch '^/') { throw "endpoint.$name must start with /" } }
+                if ([string]$manifest.endpoint.bind_policy -notin @("loopback", "trusted-lan")) { throw "endpoint.bind_policy is invalid" }
+                if ($manifest.capabilities -is [string] -or @($manifest.capabilities).Count -eq 0) { throw "capabilities must be a non-empty array" }
+                $operationsRoot = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.data.operations) -Label "data.operations"
+                $statePath = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.runtime.state_path) -Label "runtime.state_path"
+                $runtimeLock = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.runtime.lock) -Label "runtime.lock" -MustExist
+                $modelLock = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.models.lock) -Label "models.lock" -MustExist
+                $sha256Manifest = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.sha256_manifest) -Label "sha256_manifest" -MustExist
+                $licenses = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.licenses) -Label "licenses" -MustExist
+            } catch {
+                Throw-PortableStartError "PACKAGE_CORRUPT" "The staged v2 manifest is invalid: $($_.Exception.Message)"
             }
-            $operationsRoot = Resolve-PackageRelativePath -Root $resolvedRoot -Value ([string]$manifest.data.operations) -Label "data.operations"
-            $statePath = Resolve-PackageRelativePath -Root $resolvedRoot -Value ([string]$manifest.runtime.state_path) -Label "runtime.state_path"
-            $runtimeLock = Resolve-PackageRelativePath -Root $resolvedRoot -Value ([string]$manifest.runtime.lock) -Label "runtime.lock"
-            $modelLock = Resolve-PackageRelativePath -Root $resolvedRoot -Value ([string]$manifest.models.lock) -Label "models.lock"
         } else {
             $operationsRoot = Join-Path $resolvedRoot "data\local\operations"
             $statePath = Join-Path $resolvedRoot "data\local\install-state.json"
             $runtimeLock = ""
             $modelLock = ""
+            $sha256Manifest = ""
+            $licenses = ""
+            $expectedPython = "3.11"
         }
         $buildId = [string]$manifest.build_id
         $port = if ($null -ne $manifest.endpoint -and $null -ne $manifest.endpoint.port) { [int]$manifest.endpoint.port } elseif ($componentConfig) { [int]$componentConfig.port } else { 8000 }
@@ -134,6 +171,13 @@ function Get-PackageContext {
         $buildId = "source-checkout"
         $port = if ($componentConfig) { [int]$componentConfig.port } else { 8000 }
         $healthPath = if ($component -eq "tts-more") { "/api/health" } else { "/health" }
+        $sha256Manifest = ""
+        $licenses = ""
+        try {
+            $runtimePayload = Get-Content -LiteralPath $runtimeLock -Raw | ConvertFrom-Json
+            $expectedPython = [string]$runtimePayload.python_version
+            if ([string]::IsNullOrWhiteSpace($expectedPython)) { $expectedPython = if ($component -eq "tts-more") { "3.11" } else { [string]$componentConfig.python } }
+        } catch { $expectedPython = if ($component -eq "tts-more") { "3.11" } else { [string]$componentConfig.python } }
     }
 
     $initializeScript = if ($component -eq "tts-more") { Join-Path $resolvedRoot "scripts\initialize-portable.ps1" } else { Join-Path $bundle "Initialize.ps1" }
@@ -141,6 +185,16 @@ function Get-PackageContext {
     if (!(Test-Path -LiteralPath $initializeScript -PathType Leaf) -or !(Test-Path -LiteralPath $serviceScript -PathType Leaf)) {
         Throw-PortableStartError "PACKAGE_CORRUPT" "Portable initialize or start controller is missing"
     }
+
+    $importProbe = if ($componentConfig -and $componentConfig.PSObject.Properties["import_probe"]) { [string]$componentConfig.import_probe } elseif ($component -eq "tts-more") { "import fastapi,pydantic,uvicorn" } else { "import sys" }
+    try {
+        if ($runtimeLock -and (Test-Path -LiteralPath $runtimeLock -PathType Leaf)) {
+            $runtimePayload = Get-Content -LiteralPath $runtimeLock -Raw | ConvertFrom-Json
+            if ($runtimePayload.PSObject.Properties["import_probe"] -and ![string]::IsNullOrWhiteSpace([string]$runtimePayload.import_probe)) { $importProbe = [string]$runtimePayload.import_probe }
+        }
+    } catch { Throw-PortableStartError "PACKAGE_CORRUPT" "The runtime lock is invalid JSON" }
+
+    $requiredCoverage = @($initializeScript, $serviceScript, $runtimeLock, $modelLock, $licenses, $manifestPath, $validationScript) | Where-Object { $_ }
 
     return [pscustomobject]@{
         Root = $resolvedRoot
@@ -153,6 +207,11 @@ function Get-PackageContext {
         StatePath = [IO.Path]::GetFullPath($statePath)
         RuntimeLock = if ($runtimeLock) { [IO.Path]::GetFullPath($runtimeLock) } else { "" }
         ModelLock = if ($modelLock) { [IO.Path]::GetFullPath($modelLock) } else { "" }
+        Sha256Manifest = if ($sha256Manifest) { [IO.Path]::GetFullPath($sha256Manifest) } else { "" }
+        Licenses = if ($licenses) { [IO.Path]::GetFullPath($licenses) } else { "" }
+        ExpectedPython = $expectedPython
+        ImportProbe = $importProbe
+        RequiredCoverage = @($requiredCoverage)
         InitializeScript = $initializeScript
         ServiceScript = $serviceScript
         Port = $port
@@ -205,15 +264,21 @@ function Write-JsonAtomic {
     $parent = Split-Path -Parent $Path
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
     $temporary = Join-Path $parent (".{0}.{1}.tmp" -f (Split-Path -Leaf $Path), [guid]::NewGuid().ToString("N"))
+    $backup = ""
     $json = ($Payload | ConvertTo-Json -Depth 12 -Compress) + "`n"
     [IO.File]::WriteAllText($temporary, $json, $script:Utf8NoBom)
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        try { [IO.File]::Replace($temporary, $Path, $null) } catch {
-            [IO.File]::Delete($Path)
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            $backup = Join-Path $parent (".{0}.{1}.backup" -f (Split-Path -Leaf $Path), [guid]::NewGuid().ToString("N"))
+            # File.Replace is the sole destination replacement primitive; it never deletes the old destination first.
+            [IO.File]::Replace($temporary, $Path, $backup)
+            if (Test-Path -LiteralPath $backup -PathType Leaf) { [IO.File]::Delete($backup) }
+        } else {
             [IO.File]::Move($temporary, $Path)
         }
-    } else {
-        [IO.File]::Move($temporary, $Path)
+    } catch {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { [IO.File]::Delete($temporary) }
+        throw
     }
 }
 
@@ -232,6 +297,9 @@ function Initialize-Operation {
         Throw-PortableStartError "PACKAGE_CORRUPT" "OperationRoot must be a UUID direct child of data.operations"
     }
     New-Item -ItemType Directory -Force -Path $operationRoot | Out-Null
+    try { [void](Assert-PortableExactOperationContract -OperationsRoot $context.OperationsRoot -OperationRoot $operationRoot -CancelFile (Join-Path $operationRoot "cancel.requested") -RequireOperation) } catch {
+        Throw-PortableStartError "PACKAGE_CORRUPT" $_.Exception.Message
+    }
     $operationPath = Join-Path $operationRoot "operation.json"
     if (Test-Path -LiteralPath $operationPath -PathType Leaf) { Throw-PortableStartError "OPERATION_ACTIVE" "Operation already exists: $canonicalId" }
     $operation = [ordered]@{
@@ -255,6 +323,9 @@ function Add-OperationEvent {
         [string]$ErrorCode = "",
         [Nullable[double]]$Percent = $null
     )
+    if ($script:Context) {
+        try { [void](Assert-PortableExactOperationContract -OperationsRoot $script:Context.OperationsRoot -OperationRoot $Operation -CancelFile (Join-Path $Operation "cancel.requested") -RequireOperation) } catch { Throw-PortableStartError "PACKAGE_CORRUPT" $_.Exception.Message }
+    }
     $eventsPath = Join-Path $Operation "events.jsonl"
     $sequence = 1
     if (Test-Path -LiteralPath $eventsPath -PathType Leaf) {
@@ -316,20 +387,10 @@ function Fail-Operation {
 }
 
 function Test-InstallState {
-    param([Parameter(Mandatory = $true)][string]$Root)
+    param([Parameter(Mandatory = $true)][string]$Root, [switch]$Full)
 
     $context = if ($script:Context) { $script:Context } else { Get-PackageContext -Root $Root }
-    $python = Join-Path $context.Root "runtime\live\python.exe"
-    if (!(Test-Path -LiteralPath $context.StatePath -PathType Leaf) -or !(Test-Path -LiteralPath $python -PathType Leaf)) { return $false }
-    try { $state = Get-Content -LiteralPath $context.StatePath -Raw | ConvertFrom-Json } catch { return $false }
-    if ([string]$state.component -ne $context.Component -or [string]$state.build_id -ne $context.BuildId) { return $false }
-    if ($context.IsStaged) {
-        if (!(Test-Path -LiteralPath $context.RuntimeLock -PathType Leaf) -or !(Test-Path -LiteralPath $context.ModelLock -PathType Leaf)) { return $false }
-        $runtimeHash = (Get-FileHash -LiteralPath $context.RuntimeLock -Algorithm SHA256).Hash.ToLowerInvariant()
-        $modelHash = (Get-FileHash -LiteralPath $context.ModelLock -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ([string]$state.runtime_lock_sha256 -ne $runtimeHash -or [string]$state.model_lock_sha256 -ne $modelHash) { return $false }
-    }
-    return $true
+    return Test-PortableInstallStateComplete -Root $context.Root -StatePath $context.StatePath -Component $context.Component -BuildId $context.BuildId -RuntimeLock $context.RuntimeLock -ModelLock $context.ModelLock -ExpectedPython $context.ExpectedPython -ImportProbe $context.ImportProbe -ValidateAssets:$Full -Sha256Manifest $context.Sha256Manifest -RequiredCoverage $context.RequiredCoverage
 }
 
 function Invoke-ChildPowerShell {
@@ -352,6 +413,7 @@ function Invoke-Initialize {
     )
     $context = if ($script:Context) { $script:Context } else { Get-PackageContext -Root $Root }
     $cancelFile = Join-Path $Operation "cancel.requested"
+    try { [void](Assert-PortableExactOperationContract -OperationsRoot $context.OperationsRoot -OperationRoot $Operation -CancelFile $cancelFile -RequireOperation) } catch { Throw-PortableStartError "PACKAGE_CORRUPT" $_.Exception.Message }
     $result = Invoke-ChildPowerShell -Script $context.InitializeScript -Arguments @("-PackageRoot", $context.Root, "-OperationRoot", $Operation, "-CancelFile", $cancelFile)
     if ($result.ExitCode -eq 20) { Throw-PortableStartError "CANCELLED" "Portable initialization was cancelled" }
     if ($result.ExitCode -ne 0) {
@@ -369,6 +431,7 @@ function Invoke-ServiceStart {
         [Nullable[int]]$PortOverride = $null
     )
     $context = if ($script:Context) { $script:Context } else { Get-PackageContext -Root $Root }
+    try { [void](Assert-PortableExactOperationContract -OperationsRoot $context.OperationsRoot -OperationRoot $Operation -CancelFile (Join-Path $Operation "cancel.requested") -RequireOperation) } catch { Throw-PortableStartError "PACKAGE_CORRUPT" $_.Exception.Message }
     $arguments = @("-PackageRoot", $context.Root, "-OperationRoot", $Operation)
     if ($null -ne $PortOverride) { $arguments += @("-PortOverride", [string]$PortOverride) }
     $result = Invoke-ChildPowerShell -Script $context.ServiceScript -Arguments $arguments
@@ -412,7 +475,7 @@ function Wait-ForActiveOperation {
         [switch]$NoUi
     )
     $activePath = Join-Path $Context.OperationsRoot "active-start.json"
-    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    $deadline = [DateTime]::UtcNow.AddSeconds(12)
     while (!(Test-Path -LiteralPath $activePath -PathType Leaf) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
     if (!(Test-Path -LiteralPath $activePath -PathType Leaf)) { Throw-PortableStartError "OPERATION_ACTIVE" "The active operation pointer was not published" }
     try { $active = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json } catch { Throw-PortableStartError "OPERATION_ACTIVE" "The active operation pointer is unreadable" }
@@ -429,9 +492,51 @@ function Wait-ForActiveOperation {
             try { $payload = Get-Content -LiteralPath $operationPath -Raw | ConvertFrom-Json } catch { $payload = $null }
             if ($payload -and $null -ne $payload.exit_code) { return [int]$payload.exit_code }
         }
+        $ownerAlive = $false
+        try {
+            $owner = Get-Process -Id ([int]$active.owner_pid) -ErrorAction Stop
+            $ownerStarted = $owner.StartTime.ToUniversalTime().ToString("o")
+            $ownerAlive = [string]::Equals($ownerStarted, [string]$active.owner_started_at, [StringComparison]::OrdinalIgnoreCase)
+        } catch { $ownerAlive = $false }
+        if (!$ownerAlive) {
+            try {
+                $probeLock = Open-PackageOperationLock -Root $Context.Root
+                $probeLock.Dispose()
+                return -999
+            } catch { }
+        }
         Start-Sleep -Milliseconds 200
-    } while ($true)
+    } while ([DateTime]::UtcNow -lt $deadline)
+    Throw-PortableStartError "OPERATION_ACTIVE" "The active operation did not reach a terminal state before the bounded attach deadline"
 }
+
+function Clear-StaleActivePointer {
+    param([Parameter(Mandatory = $true)][object]$Context)
+    $pointer = Join-Path $Context.OperationsRoot "active-start.json"
+    if (!(Test-Path -LiteralPath $pointer -PathType Leaf)) { return }
+    try {
+        $active = Get-Content -LiteralPath $pointer -Raw | ConvertFrom-Json
+        $parsed = [guid]::Empty
+        if (![guid]::TryParse([string]$active.operation_id, [ref]$parsed)) { throw "invalid operation id" }
+        $staleOperation = Join-Path $Context.OperationsRoot $parsed.ToString()
+        [void](Assert-PortableExactOperationContract -OperationsRoot $Context.OperationsRoot -OperationRoot $staleOperation -CancelFile (Join-Path $staleOperation "cancel.requested") -RequireOperation)
+        $operationPath = Join-Path $staleOperation "operation.json"
+        if (Test-Path -LiteralPath $operationPath -PathType Leaf) {
+            $payload = Get-Content -LiteralPath $operationPath -Raw | ConvertFrom-Json
+            if ($null -eq $payload.exit_code) {
+                Complete-Operation -Operation $staleOperation -Status "blocked" -ExitCode 22
+                Add-OperationEvent -Operation $staleOperation -Phase "blocked" -Message "先前的启动控制器已失去包级锁；该操作被安全回收" -ErrorCode "PACKAGE_CORRUPT"
+            }
+        }
+    } catch {
+        Write-Warning "Ignoring unsafe or unreadable stale active-operation evidence: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $pointer -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Dot-sourcing is used only by dependency-free tests of the controller's atomic helpers.
+if ($MyInvocation.InvocationName -eq ".") { return }
 
 $root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $operation = ""
@@ -443,25 +548,33 @@ try {
     if ([string]::IsNullOrWhiteSpace($ManagedBy) -or $ManagedBy.Length -gt 128) { Throw-PortableStartError "PACKAGE_CORRUPT" "ManagedBy must be non-empty and at most 128 characters" }
     $script:Context = Get-PackageContext -Root $root
     Assert-PackageWritable -Root $root
-    try {
-        $lock = Open-PackageOperationLock -Root $root
-    } catch {
-        if ((Get-PortableErrorCode -ErrorRecord $_) -eq "OPERATION_ACTIVE") {
-            exit (Wait-ForActiveOperation -Context $script:Context -NoUi:$NoUi)
+    while (!$lock) {
+        try {
+            $lock = Open-PackageOperationLock -Root $root
+        } catch {
+            if ((Get-PortableErrorCode -ErrorRecord $_) -eq "OPERATION_ACTIVE") {
+                $attachedExitCode = Wait-ForActiveOperation -Context $script:Context -NoUi:$NoUi
+                if ($attachedExitCode -ne -999) { exit $attachedExitCode }
+                continue
+            }
+            throw
         }
-        throw
     }
+    Clear-StaleActivePointer -Context $script:Context
 
     if ([string]::IsNullOrWhiteSpace($OperationId)) { $OperationId = [guid]::NewGuid().ToString() }
     $operation = Initialize-Operation -Root $root -OperationId $OperationId -Initiator $ManagedBy
     $OperationId = Split-Path -Leaf $operation
     $activePath = Join-Path $script:Context.OperationsRoot "active-start.json"
-    Write-JsonAtomic -Path $activePath -Payload ([ordered]@{ operation_id = $OperationId; owner_pid = $PID; published_at = [DateTime]::UtcNow.ToString("o") })
+    $ownerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o")
+    Write-JsonAtomic -Path $activePath -Payload ([ordered]@{ operation_id = $OperationId; owner_pid = $PID; owner_started_at = $ownerStartedAt; published_at = [DateTime]::UtcNow.ToString("o") })
     $ownsActivePointer = $true
     Add-OperationEvent -Operation $operation -Phase "checking" -Message "正在检查便携包安装状态" -Percent 0
-    if (!$NoUi) { Start-ProgressWindow -Operation $operation -Url $script:Context.EndpointUrl }
+    $urlPort = if ($null -ne $PortOverride) { [int]$PortOverride } else { [int]$script:Context.Port }
+    $url = "http://127.0.0.1:$urlPort"
+    if (!$NoUi) { Start-ProgressWindow -Operation $operation -Url $url }
 
-    $installed = Test-InstallState -Root $root
+    $installed = Test-InstallState -Root $root -Full:($script:Context.Profile -eq "full")
     if (!$installed) {
         if ($script:Context.Profile -eq "full") {
             Throw-PortableStartError "PACKAGE_CORRUPT" "Full package assets are missing or invalid; Start will not download replacements"
@@ -473,8 +586,6 @@ try {
     if (Test-Path -LiteralPath (Join-Path $operation "cancel.requested") -PathType Leaf) { Throw-PortableStartError "CANCELLED" "Portable start was cancelled" }
     Add-OperationEvent -Operation $operation -Phase "starting" -Message "正在启动本地服务" -Percent 95
     Invoke-ServiceStart -Root $root -Operation $operation -PortOverride $PortOverride
-    $urlPort = if ($null -ne $PortOverride) { [int]$PortOverride } else { [int]$script:Context.Port }
-    $url = "http://127.0.0.1:$urlPort"
     Add-OperationEvent -Operation $operation -Phase "ready" -Message "服务已就绪：$url" -Percent 100
     Complete-Operation -Operation $operation -Status "ready" -ExitCode 0
     Write-Host "$($script:Context.Component) ready: $url"

@@ -18,6 +18,12 @@ function Request-PortableCancellation {
     $stream.Dispose()
 }
 
+function Test-PortableCancellationAvailable {
+    param([string]$Phase)
+    if ($Phase -in @("starting", "ready", "stopped", "repairable", "blocked")) { return $false }
+    return $Phase -in @("not_initialized", "checking", "downloading", "installing", "validating")
+}
+
 function Read-PortableOperation {
     if (!(Test-Path -LiteralPath $operationPath -PathType Leaf)) { return $null }
     try { return Get-Content -LiteralPath $operationPath -Raw | ConvertFrom-Json } catch { return $null }
@@ -129,6 +135,7 @@ try {
             if ([int]$event.seq -le $lastSequence) { continue }
             $script:lastSequence = [int]$event.seq
             $phaseLabel.Text = [string]$event.message
+            $cancel.Enabled = Test-PortableCancellationAvailable -Phase ([string]$event.phase)
             $details.AppendText("$($event.phase): $($event.message)`r`n")
             if ($null -ne $event.PSObject.Properties["percent"]) {
                 $progress.Style = "Continuous"
