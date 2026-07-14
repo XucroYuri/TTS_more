@@ -133,7 +133,14 @@ def _validate_v1(payload: dict[str, Any], package_root: Path) -> tuple[list[str]
 
 
 def _validate_v2(payload: dict[str, Any], package_root: Path) -> tuple[list[str], str, str]:
-    errors = [f"{field} is required" for field in V2_REQUIRED_FIELDS if payload.get(field) in (None, "", [], {})]
+    identity_fields = {"package_id", "release_version"}
+    errors = [
+        f"{field} is required"
+        for field in V2_REQUIRED_FIELDS
+        if field not in identity_fields and payload.get(field) in (None, "", [], {})
+    ]
+    for field in ("package_id", "release_version"):
+        _require_text(payload, field, field, errors)
     profile = str(payload.get("package_profile") or "")
     if profile not in {"bootstrap", "full"}:
         errors.append("package_profile must be bootstrap or full")

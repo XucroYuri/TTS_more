@@ -7,6 +7,8 @@ import types
 import zipfile
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -215,6 +217,29 @@ def test_completed_v2_validates_protocol_and_every_data_path(tmp_path: Path) -> 
     assert "protocol.version is required" in report["errors"]
     assert "protocol.controller_range is required" in report["errors"]
     assert "data.operations must be a relative path" in report["errors"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("package_id", 123),
+        ("package_id", ""),
+        ("release_version", 123),
+        ("release_version", ""),
+    ),
+)
+def test_completed_v2_requires_non_empty_string_identity_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    packages = _load_portable_packages()
+    payload = _valid_v2_manifest()
+    payload[field] = value
+    manifest = _write_v2_manifest(tmp_path, payload)
+
+    report = packages.validate_manifest(manifest, tmp_path)
+
+    assert report["valid"] is False
+    assert f"{field} is required" in report["errors"]
 
 
 def test_validate_manifest_accepts_windows_powershell_utf8_bom(tmp_path: Path) -> None:

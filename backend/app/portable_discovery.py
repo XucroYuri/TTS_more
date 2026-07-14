@@ -150,6 +150,8 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
         errors.append("portable package Start launcher is missing or unsafe")
     if not _safe_relative_path(state_path):
         errors.append("portable package install state path is unsafe")
+    if not _safe_relative_path(operations_path):
+        errors.append("portable package operations path is unsafe")
 
     return PortablePackageDescriptor(
         package_root=str(root),

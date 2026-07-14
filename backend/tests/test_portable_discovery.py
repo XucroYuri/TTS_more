@@ -4,6 +4,7 @@ import json
 import importlib.util
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
@@ -19,7 +20,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _write_package(
-    root: Path, *, schema_version: int, component: str, port: int, completed_v2: bool = True
+    root: Path,
+    *,
+    schema_version: int,
+    component: str,
+    port: int,
+    completed_v2: bool = True,
+    operations_path: str = "data/local/operations",
 ) -> Path:
     for launcher in ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1"):
         (root / launcher).parent.mkdir(parents=True, exist_ok=True)
@@ -95,7 +102,7 @@ def _write_package(
                         "user": "data/user",
                         "local": "data/local",
                         "cache": "data/cache",
-                        "operations": "data/local/operations",
+                        "operations": operations_path,
                     },
                 }
             )
@@ -155,6 +162,22 @@ def test_reader_tolerates_older_rc_v2_identity_protocol_and_data_omissions(tmp_p
     assert descriptor.protocol_version == "1.0"
     assert descriptor.controller_range == ">=0.2.0,<0.3.0"
     assert descriptor.operations_path == "data/local/operations"
+
+
+@pytest.mark.parametrize("operations_path", ("C:/outside/operations", "../outside/operations"))
+def test_reader_rejects_supplied_unsafe_operations_path(tmp_path: Path, operations_path: str) -> None:
+    package_root = _write_package(
+        tmp_path / "unsafe operations package",
+        schema_version=2,
+        component="gpt-sovits",
+        port=9880,
+        operations_path=operations_path,
+    )
+
+    descriptor = read_portable_package(package_root)
+
+    assert descriptor.valid is False
+    assert "portable package operations path is unsafe" in descriptor.errors
 
 
 def test_local_package_registration_is_managed_but_lan_registration_is_not(tmp_path: Path) -> None:
