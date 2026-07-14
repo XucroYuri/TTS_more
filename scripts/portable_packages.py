@@ -81,19 +81,13 @@ def audit_release_zip(path: Path) -> dict[str, object]:
         with zipfile.ZipFile(path) as archive:
             entries = archive.infolist()
             raw_names = _raw_central_directory_names(archive, len(entries))
-            canonical_names: dict[str, str] = {}
-            file_roots: set[str] = set()
-            canonical_file_roots: set[str] = set()
-            for entry, name in zip(entries, raw_names, strict=True):
+            parsed_entries: list[tuple[str, str]] = []
+            entry_roots: set[str] = set()
+            canonical_entry_roots: set[str] = set()
+            for _entry, name in zip(entries, raw_names, strict=True):
                 if "\\" in name:
                     raise ValueError("release ZIP top-level package directory must use forward slashes")
                 canonical = _canonical_zip_entry(name)
-                if canonical in canonical_names:
-                    errors.append(f"unsafe ZIP entry collision: {name}")
-                    break
-                canonical_names[canonical] = name
-                if entry.is_dir():
-                    continue
                 raw_parts = name.split("/")
                 if len(raw_parts) < 2:
                     raise ValueError("release ZIP must contain files under one top-level package directory")
@@ -104,13 +98,20 @@ def audit_release_zip(path: Path) -> dict[str, object]:
                     or unicodedata.normalize("NFKC", raw_root) != raw_root
                 ):
                     raise ValueError("release ZIP top-level package directory name is unsafe or ambiguous")
-                file_roots.add(raw_root)
-                canonical_file_roots.add(canonical.split("/", 1)[0])
+                entry_roots.add(raw_root)
+                canonical_entry_roots.add(canonical.split("/", 1)[0])
+                parsed_entries.append((canonical, name))
+            if len(entry_roots) != 1 or len(canonical_entry_roots) != 1:
+                raise ValueError("release ZIP must contain exactly one top-level package directory")
+            canonical_names: dict[str, str] = {}
+            for canonical, name in parsed_entries:
+                if canonical in canonical_names:
+                    errors.append(f"unsafe ZIP entry collision: {name}")
+                    break
+                canonical_names[canonical] = name
             if errors:
                 return {"valid": False, "errors": errors, "path": str(path)}
-            if len(file_roots) != 1 or len(canonical_file_roots) != 1:
-                raise ValueError("release ZIP must contain exactly one top-level package directory")
-            package_root = next(iter(canonical_file_roots))
+            package_root = next(iter(canonical_entry_roots))
             relative_names = {
                 canonical.split("/", 1)[1]: original
                 for canonical, original in canonical_names.items()

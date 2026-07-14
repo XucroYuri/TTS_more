@@ -44,6 +44,26 @@ def _create_directory_junction(link: Path, target: Path) -> None:
         pytest.skip(f"directory junctions are unavailable: {result.stderr}")
 
 
+def test_package_root_chain_bootstrap_is_identical_in_all_pre_validator_entrypoints() -> None:
+    sources = (
+        REPO_ROOT / "scripts" / "Portable-Validation.ps1",
+        REPO_ROOT / "scripts" / "start-production.ps1",
+        REPO_ROOT / "scripts" / "stop-production.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Stop-Worker.ps1",
+    )
+    blocks = []
+    marker = "function Assert-PortablePackageRootChain {"
+    for source in sources:
+        text = source.read_text(encoding="utf-8")
+        start = text.index(marker)
+        end = text.index("\n}\n", start) + 2
+        blocks.append(text[start:end].replace("\r\n", "\n"))
+
+    assert len(set(blocks)) == 1
+    assert "[IO.Path]::GetPathRoot" in blocks[0]
+    assert "foreach ($segment in $segments)" in blocks[0]
+
+
 def _copy_controller(package_root: Path) -> None:
     scripts = package_root / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
@@ -1457,14 +1477,19 @@ def test_production_stop_is_idempotent_without_pid_record(tmp_path: Path) -> Non
     assert "not running" in result.stdout.lower()
 
 
+@pytest.mark.parametrize("junction_mode", ("root-self", "parent"))
 @pytest.mark.parametrize("entrypoint", ("tts-start", "tts-stop", "worker-stop"))
 def test_entrypoints_reject_a_whole_package_root_junction_before_runtime_execution(
-    tmp_path: Path, entrypoint: str
+    tmp_path: Path, entrypoint: str, junction_mode: str
 ) -> None:
     if not POWERSHELL:
         pytest.skip("Windows PowerShell is unavailable")
-    physical_root = tmp_path / f"physical-{entrypoint}"
-    linked_root = tmp_path / f"linked-{entrypoint}"
+    if junction_mode == "parent":
+        physical_root = tmp_path / f"physical-parent-{entrypoint}" / "普通 package"
+        linked_root = tmp_path / f"linked-parent-{entrypoint}" / "普通 package"
+    else:
+        physical_root = tmp_path / f"physical-{entrypoint}"
+        linked_root = tmp_path / f"linked-{entrypoint}"
     _compile_fake_python(physical_root / "runtime" / "live" / "python.exe")
     _write_text(
         physical_root / "packaging" / "portable" / "runtime.lock.json",
@@ -1545,7 +1570,10 @@ def test_entrypoints_reject_a_whole_package_root_junction_before_runtime_executi
         + validation_path.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
-    _create_directory_junction(linked_root, physical_root)
+    if junction_mode == "parent":
+        _create_directory_junction(linked_root.parent, physical_root.parent)
+    else:
+        _create_directory_junction(linked_root, physical_root)
     result = subprocess.run(
         command,
         env=environment,

@@ -580,6 +580,32 @@ def test_release_audit_requires_one_safe_unambiguous_top_level_package_directory
     assert any("top-level package directory" in error for error in report["errors"])
 
 
+@pytest.mark.parametrize(
+    "extra_directory",
+    ("Other/", "component/", "Component. /", "Ｃomponent/"),
+)
+def test_release_audit_counts_raw_directory_entries_when_enforcing_one_package_root(
+    tmp_path: Path, extra_directory: str
+) -> None:
+    packages = _load_portable_packages()
+    archive_path = tmp_path / "extra-directory-root.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("Component/", b"")
+        archive.writestr("Component/package/", b"")
+        archive.writestr(
+            "Component/package/tts-more-package.json",
+            json.dumps(
+                {"schema_version": 2, "component": "tts-more", "package_profile": "bootstrap"}
+            ),
+        )
+        archive.writestr(extra_directory, b"")
+
+    report = packages.audit_release_zip(archive_path)
+
+    assert report["valid"] is False
+    assert any("top-level package directory" in error for error in report["errors"])
+
+
 def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
     builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
 

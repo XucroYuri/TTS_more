@@ -3,12 +3,36 @@ param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+function Assert-PortablePackageRootChain {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    if ([string]::IsNullOrWhiteSpace($Root)) { throw "portable package root is required" }
+    $lexicalRoot = [IO.Path]::GetFullPath($Root)
+    $pathRoot = [IO.Path]::GetPathRoot($lexicalRoot)
+    if ([string]::IsNullOrWhiteSpace($pathRoot)) { throw "portable package root has no filesystem root" }
+    $trimmedRoot = $lexicalRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if ($trimmedRoot.Length -ge $pathRoot.Length) { $lexicalRoot = $trimmedRoot }
+    $current = [IO.Path]::GetFullPath($pathRoot)
+    $chain = [Collections.Generic.List[string]]::new()
+    [void]$chain.Add($current)
+    $relative = $lexicalRoot.Substring($pathRoot.Length).TrimStart([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $segments = @($relative -split '[\\/]' | Where-Object { ![string]::IsNullOrWhiteSpace($_) })
+    foreach ($segment in $segments) {
+        $current = [IO.Path]::GetFullPath((Join-Path $current $segment))
+        [void]$chain.Add($current)
+    }
+    foreach ($candidate in $chain) {
+        if (!(Test-Path -LiteralPath $candidate -PathType Container)) { throw "portable package root or ancestor is missing" }
+        if ((((Get-Item -LiteralPath $candidate -Force).Attributes) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "portable package root or ancestor cannot be a reparse point"
+        }
+    }
+    return $lexicalRoot
+}
+
 $Bundle = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $Bundle))
-if (!(Test-Path -LiteralPath $Root -PathType Container)) { throw "portable package root is missing" }
-if ((((Get-Item -LiteralPath $Root -Force).Attributes) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-    throw "portable package root cannot be a reparse point"
-}
+$Root = Assert-PortablePackageRootChain -Root $Root
 $ValidationScript = Join-Path $Bundle "Portable-Validation.ps1"
 if (!(Test-Path -LiteralPath $ValidationScript -PathType Leaf)) { throw "Portable-Validation.ps1 is missing" }
 . $ValidationScript
