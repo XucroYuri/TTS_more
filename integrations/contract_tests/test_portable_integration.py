@@ -43,6 +43,9 @@ class PortableIntegrationContractTests(unittest.TestCase):
         self.assertIn("tts_more\\Start-Worker.ps1", (ROOT / "Start.cmd").read_text(encoding="utf-8"))
         self.assertNotEqual((ROOT / "Start.cmd").read_bytes(), (ROOT / "Start-WebUI.cmd").read_bytes())
 
+    def test_operation_protocol_is_controlled(self) -> None:
+        self.assertTrue((BUNDLE / "portable_operations.py").is_file(), "portable operation protocol")
+
     def test_model_and_device_locks_are_complete_and_immutable(self) -> None:
         model_lock = json.loads((BUNDLE / "locks" / "models.lock.json").read_text(encoding="utf-8"))
         self.assertTrue(model_lock["complete"], model_lock["missing_required_paths"])
