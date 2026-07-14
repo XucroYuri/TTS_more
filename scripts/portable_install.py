@@ -4,13 +4,20 @@ import argparse
 import hashlib
 import json
 import os
+import time
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, BinaryIO, Callable, Iterable
 
 
-Downloader = Callable[[str, Path, int], None]
+class PortableInstallCancelled(RuntimeError):
+    pass
+
+
+ProgressCallback = Callable[[int, int, str], None]
+CancelCheck = Callable[[], bool]
+Downloader = Callable[[str, Path, int, ProgressCallback | None, CancelCheck | None], None]
 
 
 def load_json(path: Path) -> Any:
@@ -71,7 +78,12 @@ def select_device_profile(
 
 
 def ensure_locked_asset(
-    asset: dict[str, Any], destination: Path, *, downloader: Downloader | None = None
+    asset: dict[str, Any],
+    destination: Path,
+    *,
+    downloader: Downloader | None = None,
+    progress: ProgressCallback | None = None,
+    cancelled: CancelCheck | None = None,
 ) -> dict[str, object]:
     expected_hash = str(asset.get("sha256") or "").lower()
     expected_size = int(asset.get("size_bytes") or 0)
@@ -89,12 +101,18 @@ def ensure_locked_asset(
     download = downloader or _download_http
     failures: list[str] = []
     for url in urls:
+        if cancelled and cancelled():
+            raise PortableInstallCancelled("portable installation cancelled")
         resume_from = partial.stat().st_size if partial.exists() else 0
         try:
-            download(url, partial, resume_from)
+            download(url, partial, resume_from, progress, cancelled)
+        except PortableInstallCancelled:
+            raise
         except Exception as exc:  # URL fallback is part of the package contract.
             failures.append(f"{url}: {exc}")
             continue
+        if cancelled and cancelled():
+            raise PortableInstallCancelled("portable installation cancelled")
         if not _asset_matches(partial, expected_hash, expected_size):
             failures.append(f"{url}: failed SHA-256 verification")
             continue
@@ -143,18 +161,92 @@ def _asset_matches(path: Path, expected_hash: str, expected_size: int) -> bool:
     return path.is_file() and path.stat().st_size == expected_size and sha256_file(path) == expected_hash
 
 
-def _download_http(url: str, destination: Path, resume_from: int) -> None:
+def _download_http(
+    url: str,
+    destination: Path,
+    resume_from: int,
+    progress: ProgressCallback | None,
+    cancelled: CancelCheck | None,
+) -> None:
     request = urllib.request.Request(url)
     if resume_from:
         request.add_header("Range", f"bytes={resume_from}-")
     with urllib.request.urlopen(request, timeout=120) as response:
         append = resume_from > 0 and getattr(response, "status", None) == 206
         with destination.open("ab" if append else "wb") as output:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
+            start = resume_from if append else 0
+            total = _response_total(response, start=start)
+            _copy_response(
+                response,
+                output,
+                start=start,
+                total=total,
+                url=url,
+                progress=progress,
+                cancelled=cancelled,
+            )
+
+
+def _copy_response(
+    response: Any,
+    output: BinaryIO,
+    *,
+    start: int,
+    total: int,
+    url: str,
+    progress: ProgressCallback | None,
+    cancelled: CancelCheck | None,
+) -> None:
+    written = start
+    while chunk := response.read(1024 * 1024):
+        if cancelled and cancelled():
+            raise PortableInstallCancelled("portable installation cancelled")
+        output.write(chunk)
+        written += len(chunk)
+        if progress:
+            progress(written, total, url)
+
+
+def _response_total(response: Any, *, start: int) -> int:
+    content_range = response.headers.get("Content-Range")
+    if content_range and "/" in content_range:
+        try:
+            return int(content_range.rsplit("/", 1)[1])
+        except ValueError:
+            pass
+    content_length = response.headers.get("Content-Length")
+    try:
+        return start + int(content_length) if content_length is not None else 0
+    except ValueError:
+        return 0
+
+
+def _operation_progress(operation_root: Path, asset_id: str) -> ProgressCallback:
+    operation_root = operation_root.resolve(strict=False)
+    last_update = float("-inf")
+
+    def report(downloaded: int, total: int, _url: str) -> None:
+        nonlocal last_update
+        now = time.monotonic()
+        complete = total > 0 and downloaded >= total
+        if not complete and now - last_update < 0.25:
+            return
+        try:
+            from portable_operations import append_event
+        except ModuleNotFoundError:
+            from scripts.portable_operations import append_event
+
+        percent = downloaded * 100.0 / total if total > 0 else None
+        append_event(
+            operation_root.parent,
+            operation_root.name,
+            "downloading",
+            f"Downloading {asset_id}",
+            percent=percent,
+        )
+        last_update = now
+
+    return report
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -178,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
     ensure = subcommands.add_parser("ensure-asset")
     ensure.add_argument("--asset", required=True, type=Path)
     ensure.add_argument("--path", required=True, type=Path)
+    ensure.add_argument("--operation-root", type=Path)
+    ensure.add_argument("--cancel-file", type=Path)
     select = subcommands.add_parser("select-device")
     select.add_argument("--runtime-lock", required=True, type=Path)
     select.add_argument("--requested", default="auto")
@@ -197,7 +291,24 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if valid else 1
     if args.command == "ensure-asset":
         asset = load_json(args.asset)
-        print(json.dumps(ensure_locked_asset(asset, args.path), ensure_ascii=False, sort_keys=True))
+        cancel_file = args.cancel_file
+        if cancel_file is None and args.operation_root is not None:
+            cancel_file = args.operation_root / "cancel.requested"
+        progress = (
+            _operation_progress(args.operation_root, str(asset.get("id") or args.path.name))
+            if args.operation_root is not None
+            else None
+        )
+        try:
+            report = ensure_locked_asset(
+                asset,
+                args.path,
+                progress=progress,
+                cancelled=(lambda: cancel_file.is_file()) if cancel_file is not None else None,
+            )
+        except PortableInstallCancelled:
+            return 20
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0
     if args.command == "select-device":
         runtime_lock = load_json(args.runtime_lock)

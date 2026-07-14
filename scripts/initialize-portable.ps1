@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [ValidateSet("Auto", "CU128", "CU126", "CPU")][string]$Device = "Auto",
-    [switch]$Repair
+    [switch]$Repair,
+    [string]$OperationRoot = "",
+    [string]$CancelFile = ""
 )
 
 Set-StrictMode -Version Latest
@@ -13,6 +15,13 @@ $StatePath = Join-Path $Root "data\local\install-state.json"
 $Live = Join-Path $Root "runtime\live"
 $Staging = Join-Path $Root "runtime\staging"
 $BackendRoot = if (Test-Path -LiteralPath (Join-Path $Root "backend\uv.lock")) { Join-Path $Root "backend" } else { Join-Path $Root "app\backend" }
+$DownloadArguments = @()
+if (![string]::IsNullOrWhiteSpace($OperationRoot)) {
+    $OperationRoot = [System.IO.Path]::GetFullPath($OperationRoot)
+    if ([string]::IsNullOrWhiteSpace($CancelFile)) { $CancelFile = Join-Path $OperationRoot "cancel.requested" }
+    $CancelFile = [System.IO.Path]::GetFullPath($CancelFile)
+    $DownloadArguments = @("--operation-root", $OperationRoot, "--cancel-file", $CancelFile)
+}
 
 foreach ($required in @($RuntimeLock, $ModelLock, (Join-Path $BackendRoot "uv.lock"), (Join-Path $Root "scripts\portable_install.py"))) {
     if (!(Test-Path -LiteralPath $required -PathType Leaf)) { throw "required locked package input is missing: $required" }
@@ -44,7 +53,8 @@ $videoControllers = @(Get-CimInstance Win32_VideoController -ErrorAction Silentl
 ConvertTo-Json -InputObject $videoControllers | Set-Content -LiteralPath $controllersPath -Encoding UTF8
 
 $bootstrap = Join-Path $Root "scripts\bootstrap-conda.ps1"
-$Conda = (& $bootstrap -CacheRoot "data/cache/portable/conda" -LockPath "packaging/portable/toolchain.lock.json" -PassThru | Select-Object -Last 1)
+$Conda = (& $bootstrap -CacheRoot "data/cache/portable/conda" -LockPath "packaging/portable/toolchain.lock.json" -OperationRoot $OperationRoot -CancelFile $CancelFile -PassThru | Select-Object -Last 1)
+if ($LASTEXITCODE -eq 20) { exit 20 }
 if (!(Test-Path -LiteralPath $Conda -PathType Leaf)) { throw "private package Conda bootstrap did not return conda.bat" }
 $CondaRoot = Split-Path -Parent (Split-Path -Parent $Conda)
 $BootstrapPython = Join-Path $CondaRoot "python.exe"
@@ -59,7 +69,8 @@ $uvAssetPath = Join-Path $Root "data\cache\portable\assets\$($runtimeLockPayload
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $uvAssetPath) | Out-Null
 $runtimeLockPayload.assets.uv | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $uvAssetPath -Encoding UTF8
 $uvWheel = Join-Path $Root "data\cache\portable\assets\$($runtimeLockPayload.assets.uv.id).whl"
-& $BootstrapPython (Join-Path $Root "scripts\portable_install.py") ensure-asset --asset $uvAssetPath --path $uvWheel
+& $BootstrapPython (Join-Path $Root "scripts\portable_install.py") ensure-asset --asset $uvAssetPath --path $uvWheel @DownloadArguments
+if ($LASTEXITCODE -eq 20) { exit 20 }
 if ($LASTEXITCODE -ne 0) { throw "locked uv asset initialization failed" }
 
 if (Test-Path -LiteralPath $Staging) { Remove-Item -LiteralPath $Staging -Recurse -Force }

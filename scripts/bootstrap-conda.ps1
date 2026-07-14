@@ -2,6 +2,8 @@
 param(
     [string]$CacheRoot = "data/cache/portable/conda",
     [string]$LockPath = "packaging/portable/toolchain.lock.json",
+    [string]$OperationRoot = "",
+    [string]$CancelFile = "",
     [switch]$DryRun,
     [switch]$PassThru
 )
@@ -10,6 +12,18 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $script:RepoRoot = Split-Path -Parent $PSScriptRoot
+
+if (![string]::IsNullOrWhiteSpace($OperationRoot)) {
+    $OperationRoot = [System.IO.Path]::GetFullPath($OperationRoot)
+    if ([string]::IsNullOrWhiteSpace($CancelFile)) { $CancelFile = Join-Path $OperationRoot "cancel.requested" }
+}
+if (![string]::IsNullOrWhiteSpace($CancelFile)) { $CancelFile = [System.IO.Path]::GetFullPath($CancelFile) }
+
+function Assert-PortableNotCancelled {
+    if (![string]::IsNullOrWhiteSpace($CancelFile) -and (Test-Path -LiteralPath $CancelFile -PathType Leaf)) {
+        throw [System.OperationCanceledException]::new("Portable initialization cancelled")
+    }
+}
 
 function Resolve-RepoPath {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -54,22 +68,60 @@ function Receive-LockedArchive {
     )
 
     $partial = "$Archive.partial"
-    $segment = "$partial.segment"
-    if (Test-Path -LiteralPath $segment) { Remove-Item -LiteralPath $segment -Force }
     $resumeFrom = if (Test-Path -LiteralPath $partial) { (Get-Item -LiteralPath $partial).Length } else { 0 }
     $headers = @{}
     if ($resumeFrom -gt 0) { $headers = @{ Range = "bytes=$resumeFrom-" } }
-    $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -Headers $headers -OutFile $segment -PassThru
-    if ($resumeFrom -gt 0 -and [int]$response.StatusCode -eq 206) {
-        $destination = [System.IO.File]::Open($partial, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
-        try {
-            $source = [System.IO.File]::OpenRead($segment)
-            try { $source.CopyTo($destination) } finally { $source.Dispose() }
-        } finally { $destination.Dispose() }
-        Remove-Item -LiteralPath $segment -Force
-    } else {
-        Move-Item -LiteralPath $segment -Destination $partial -Force
+
+    Assert-PortableNotCancelled
+    Add-Type -AssemblyName System.Net.Http
+    $client = [System.Net.Http.HttpClient]::new()
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
+    if ($headers.ContainsKey("Range")) {
+        [void]$request.Headers.TryAddWithoutValidation("Range", [string]$headers.Range)
     }
+    $response = $null
+    $source = $null
+    $destination = $null
+    try {
+        $responseTask = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead)
+        $response = $responseTask.GetAwaiter().GetResult()
+        [void]$response.EnsureSuccessStatusCode()
+        $append = $resumeFrom -gt 0 -and [int]$response.StatusCode -eq 206
+        $start = if ($append) { $resumeFrom } else { 0 }
+        $mode = if ($append) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }
+        $destination = [System.IO.File]::Open($partial, $mode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $sourceTask = $response.Content.ReadAsStreamAsync()
+        $source = $sourceTask.GetAwaiter().GetResult()
+        $total = if ($null -ne $response.Content.Headers.ContentRange -and $response.Content.Headers.ContentRange.HasLength) {
+            [int64]$response.Content.Headers.ContentRange.Length
+        } elseif ($response.Content.Headers.ContentLength.HasValue) {
+            $start + [int64]$response.Content.Headers.ContentLength.Value
+        } else {
+            0
+        }
+        $written = [int64]$start
+        $buffer = [byte[]]::new(1024 * 1024)
+        while ($true) {
+            Assert-PortableNotCancelled
+            $read = $source.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+            Assert-PortableNotCancelled
+            $destination.Write($buffer, 0, $read)
+            $destination.Flush()
+            $written += $read
+            if ($total -gt 0) {
+                Write-Progress -Activity "Downloading pinned Miniforge" -Status "$written / $total bytes" -PercentComplete ([Math]::Min(100, 100 * $written / $total))
+            }
+        }
+        Write-Progress -Activity "Downloading pinned Miniforge" -Completed
+    } finally {
+        if ($null -ne $destination) { $destination.Dispose() }
+        if ($null -ne $source) { $source.Dispose() }
+        if ($null -ne $response) { $response.Dispose() }
+        $request.Dispose()
+        $client.Dispose()
+    }
+    Assert-PortableNotCancelled
     if (!(Test-LockedSha256 -Path $partial -ExpectedSha256 $ExpectedSha256)) {
         throw "downloaded Miniforge .partial failed SHA-256 verification; it was not promoted: $partial"
     }
@@ -134,7 +186,12 @@ function Ensure-BuildConda {
     return $conda
 }
 
-$privateConda = Ensure-BuildConda -CacheRoot $CacheRoot -LockPath $LockPath -DryRun:$DryRun
+try {
+    $privateConda = Ensure-BuildConda -CacheRoot $CacheRoot -LockPath $LockPath -DryRun:$DryRun
+} catch [System.OperationCanceledException] {
+    Write-Error -ErrorAction Continue $_.Exception.Message
+    exit 20
+}
 Write-Host "[portable-conda] conda command: $privateConda"
 if ($PassThru) {
     Write-Output $privateConda

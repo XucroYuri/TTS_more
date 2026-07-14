@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [ValidateSet("Auto", "CU128", "CU126", "CPU")][string]$Device = "Auto",
-    [switch]$Repair
+    [switch]$Repair,
+    [string]$OperationRoot = "",
+    [string]$CancelFile = ""
 )
 
 Set-StrictMode -Version Latest
@@ -19,6 +21,13 @@ if (!$modelLock.complete) {
 $live = Join-Path $Root "runtime\live"
 $staging = Join-Path $Root "runtime\staging"
 $state = Join-Path $Root "data\local\install-state.json"
+$DownloadArguments = @()
+if (![string]::IsNullOrWhiteSpace($OperationRoot)) {
+    $OperationRoot = [System.IO.Path]::GetFullPath($OperationRoot)
+    if ([string]::IsNullOrWhiteSpace($CancelFile)) { $CancelFile = Join-Path $OperationRoot "cancel.requested" }
+    $CancelFile = [System.IO.Path]::GetFullPath($CancelFile)
+    $DownloadArguments = @("--operation-root", $OperationRoot, "--cancel-file", $CancelFile)
+}
 if ($Root.Length -gt 180) { throw "package path is too long for reliable Windows model tooling: $Root" }
 $requiredSpace = [int64]$runtimeLock.required_free_bytes + [int64]$modelLock.required_free_bytes
 $drive = Get-PSDrive -Name ([System.IO.Path]::GetPathRoot($Root).Substring(0, 1)) -ErrorAction SilentlyContinue
@@ -36,7 +45,8 @@ if ((Test-Path -LiteralPath $state) -and (Test-LiveRuntime)) { Write-Host "verif
 if ($Repair) { Write-Host "repairing only missing or invalid locked assets; user data is preserved" }
 
 $bootstrap = Join-Path $Bundle "bootstrap-conda.ps1"
-$Conda = (& $bootstrap -CacheRoot "data/cache/portable/conda" -LockPath "tts_more/locks/toolchain.lock.json" -PassThru | Select-Object -Last 1)
+$Conda = (& $bootstrap -CacheRoot "data/cache/portable/conda" -LockPath "tts_more/locks/toolchain.lock.json" -OperationRoot $OperationRoot -CancelFile $CancelFile -PassThru | Select-Object -Last 1)
+if ($LASTEXITCODE -eq 20) { exit 20 }
 $CondaRoot = Split-Path -Parent (Split-Path -Parent $Conda)
 $BootstrapPython = Join-Path $CondaRoot "python.exe"
 if (!(Test-Path -LiteralPath $BootstrapPython)) { throw "private bootstrap Python is missing" }
@@ -54,7 +64,8 @@ foreach ($asset in $payloads) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $assetLock) | Out-Null
     $asset | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $assetLock -Encoding UTF8
     $archivePath = Join-Path $Root ([string]$asset.target)
-    & $BootstrapPython (Join-Path $Bundle "portable_install.py") ensure-asset --asset $assetLock --path $archivePath
+    & $BootstrapPython (Join-Path $Bundle "portable_install.py") ensure-asset --asset $assetLock --path $archivePath @DownloadArguments
+    if ($LASTEXITCODE -eq 20) { exit 20 }
     if ($LASTEXITCODE -ne 0) { throw "locked runtime asset failed: $($asset.id)" }
     if ($asset.extract_to) {
         $destination = Join-Path $Root ([string]$asset.extract_to)
@@ -76,7 +87,8 @@ foreach ($asset in @($modelLock.assets)) {
     $assetLock = Join-Path $Root "data\cache\portable\locks\$($asset.id).json"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $assetLock) | Out-Null
     $asset | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $assetLock -Encoding UTF8
-    & $BootstrapPython (Join-Path $Bundle "portable_install.py") ensure-asset --asset $assetLock --path (Join-Path $Root ([string]$asset.target))
+    & $BootstrapPython (Join-Path $Bundle "portable_install.py") ensure-asset --asset $assetLock --path (Join-Path $Root ([string]$asset.target)) @DownloadArguments
+    if ($LASTEXITCODE -eq 20) { exit 20 }
     if ($LASTEXITCODE -ne 0) { throw "locked model asset failed: $($asset.id)" }
 }
 foreach ($requiredModelPath in @($modelLock.required_paths)) {
@@ -93,7 +105,8 @@ $uv = $runtimeLock.assets.uv
 $uvLock = Join-Path $Root "data\cache\portable\locks\uv.json"
 $uvWheel = Join-Path $Root "data\cache\portable\assets\$($uv.id).whl"
 $uv | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $uvLock -Encoding UTF8
-& $BootstrapPython (Join-Path $Bundle "portable_install.py") ensure-asset --asset $uvLock --path $uvWheel
+& $BootstrapPython (Join-Path $Bundle "portable_install.py") ensure-asset --asset $uvLock --path $uvWheel @DownloadArguments
+if ($LASTEXITCODE -eq 20) { exit 20 }
 if ($LASTEXITCODE -ne 0) { throw "locked uv download failed" }
 & $StagePython -m pip install --no-deps $uvWheel
 $UvExe = Join-Path $staging "Scripts\uv.exe"
