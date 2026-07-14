@@ -135,8 +135,8 @@
           "properties": {
             "default_url": {"type": "string", "pattern": "^http://"},
             "port": {"type": "integer", "minimum": 1, "maximum": 65535},
-            "health_path": {"const": "/health"},
-            "capabilities_path": {"const": "/capabilities"},
+            "health_path": {"type": "string", "minLength": 1, "pattern": "^/"},
+            "capabilities_path": {"type": "string", "minLength": 1, "pattern": "^/"},
             "bind_policy": {"enum": ["loopback", "trusted-lan"]}
           },
           "additionalProperties": false

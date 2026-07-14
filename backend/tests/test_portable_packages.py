@@ -3,14 +3,19 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
+import sys
 import types
 import zipfile
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")
 
 
 def _load_portable_packages():
@@ -31,6 +36,191 @@ def _load_portable_launcher():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_sync_integrations():
+    module_path = REPO_ROOT / "scripts" / "sync_integrations.py"
+    spec = importlib.util.spec_from_file_location("sync_integrations_for_portable_schema", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _official_manifest_validator() -> Draft202012Validator:
+    schema = json.loads(
+        (REPO_ROOT / "packaging" / "portable" / "tts-more-package.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    Draft202012Validator.check_schema(schema)
+    return Draft202012Validator(schema)
+
+
+def _run_checked(command: list[str], cwd: Path, *, env: dict[str, str] | None = None) -> None:
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"command failed ({completed.returncode}): {' '.join(command)}\n"
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+
+
+def _initialize_git_repository(root: Path) -> None:
+    _run_checked(["git", "init", "--quiet"], root)
+    _run_checked(["git", "config", "user.name", "Portable Schema Test"], root)
+    _run_checked(["git", "config", "user.email", "portable-schema-test@example.invalid"], root)
+    _run_checked(["git", "add", "."], root)
+    _run_checked(["git", "commit", "--quiet", "-m", "portable schema fixture"], root)
+
+
+def _copy_controller_builder_fixture(root: Path) -> None:
+    root.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "Build-Package.ps1", root / "Build-Package.ps1")
+    shutil.copytree(
+        REPO_ROOT / "backend" / "app",
+        root / "backend" / "app",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    for name in ("pyproject.toml", "uv.lock", ".python-version"):
+        destination = root / "backend" / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / "backend" / name, destination)
+    frontend_dist = root / "frontend" / "dist"
+    frontend_dist.mkdir(parents=True)
+    (frontend_dist / "index.html").write_text("<!doctype html><title>schema fixture</title>\n", encoding="utf-8")
+    for name in (
+        "bootstrap-conda.ps1",
+        "initialize-portable.ps1",
+        "repair-portable.ps1",
+        "start-production.ps1",
+        "stop-production.ps1",
+        "Invoke-PortableStart.ps1",
+        "Show-PortableProgress.ps1",
+        "Portable-Validation.ps1",
+        "portable_install.py",
+        "portable_launcher.py",
+        "portable_operations.py",
+        "portable_packages.py",
+        "portable_package_runner.py",
+    ):
+        destination = root / "scripts" / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / "scripts" / name, destination)
+    for name in (
+        "toolchain.lock.json",
+        "runtime.lock.json",
+        "models.lock.json",
+        "tts-more-package.schema.json",
+        "error-catalog.zh-CN.json",
+    ):
+        destination = root / "packaging" / "portable" / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / "packaging" / "portable" / name, destination)
+    for name in (
+        "Initialize.cmd",
+        "Start.cmd",
+        "Stop.cmd",
+        "Repair.cmd",
+        "LICENSE",
+        "NOTICE",
+        "repo.lock.json",
+    ):
+        shutil.copy2(REPO_ROOT / name, root / name)
+
+
+@pytest.fixture(scope="module")
+def generated_v2_manifests(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, object]]:
+    if POWERSHELL is None:
+        pytest.skip("real portable builder contract test requires PowerShell")
+    root = tmp_path_factory.mktemp("official-portable-schema")
+    build_python = str(Path(sys.executable).resolve())
+    environment = {**os.environ, "TTS_MORE_BUILD_PYTHON": build_python}
+    version = "0.2.0-schema-contract"
+
+    controller_root = root / "controller"
+    _copy_controller_builder_fixture(controller_root)
+    _initialize_git_repository(controller_root)
+    _run_checked(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(controller_root / "Build-Package.ps1"),
+            "-Profile",
+            "Bootstrap",
+            "-Device",
+            "CPU",
+            "-Version",
+            version,
+            "-OutputRoot",
+            str(root / "controller-output"),
+        ],
+        controller_root,
+        env=environment,
+    )
+    controller_manifest_path = (
+        controller_root
+        / "artifacts"
+        / "portable"
+        / ".work"
+        / "tts-more-bootstrap"
+        / f"TTS-More-{version}-windows-x64-bootstrap"
+        / "package"
+        / "tts-more-package.json"
+    )
+
+    worker_root = root / "worker"
+    _load_sync_integrations().sync_integration(REPO_ROOT, worker_root, "gpt-sovits", "a" * 40)
+    _initialize_git_repository(worker_root)
+    _run_checked(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(worker_root / "Build-Package.ps1"),
+            "-Profile",
+            "Bootstrap",
+            "-Device",
+            "CPU",
+            "-Version",
+            version,
+            "-OutputRoot",
+            str(root / "worker-output"),
+        ],
+        worker_root,
+        env=environment,
+    )
+    worker_manifest_path = (
+        worker_root
+        / "artifacts"
+        / "portable"
+        / ".work"
+        / "gpt-sovits-bootstrap"
+        / f"gpt-sovits-{version}-windows-x64-bootstrap"
+        / "package"
+        / "tts-more-package.json"
+    )
+    assert controller_manifest_path.is_file()
+    assert worker_manifest_path.is_file()
+    return {
+        "controller": json.loads(controller_manifest_path.read_text(encoding="utf-8-sig")),
+        "worker": json.loads(worker_manifest_path.read_text(encoding="utf-8-sig")),
+    }
 
 
 def _valid_gpt_manifest() -> dict[str, object]:
@@ -368,7 +558,42 @@ def test_package_json_schema_defines_v1_compatibility_and_v2_output_contract() -
     assert {"package_id", "release_version", "protocol", "data"} <= set(schema["$defs"]["v2"]["required"])
     assert schema["$defs"]["v2"]["properties"]["protocol"]["properties"]["name"] == {"const": "tts-more-v1"}
     assert schema["$defs"]["v2"]["properties"]["data"]["required"] == ["user", "local", "cache", "operations"]
+    for field in ("health_path", "capabilities_path"):
+        assert schema["$defs"]["v2"]["properties"]["endpoint"]["properties"][field] == {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^/",
+        }
     assert schema["oneOf"] == [{"$ref": "#/$defs/v1"}, {"$ref": "#/$defs/v2"}]
+
+
+@pytest.mark.parametrize("component", ("controller", "worker"))
+def test_official_schema_accepts_real_builder_generated_v2_manifests(
+    generated_v2_manifests: dict[str, dict[str, object]], component: str
+) -> None:
+    manifest = generated_v2_manifests[component]
+
+    errors = sorted(_official_manifest_validator().iter_errors(manifest), key=lambda error: list(error.path))
+
+    assert not errors, "\n".join(error.message for error in errors)
+
+
+@pytest.mark.parametrize("field", ("health_path", "capabilities_path"))
+@pytest.mark.parametrize("invalid_value", ("", "api/health", 42))
+def test_official_schema_and_python_validator_reject_invalid_v2_endpoint_paths(
+    tmp_path: Path, field: str, invalid_value: object
+) -> None:
+    packages = _load_portable_packages()
+    payload = _valid_v2_manifest()
+    payload["endpoint"][field] = invalid_value
+    manifest = _write_v2_manifest(tmp_path, payload)
+
+    schema_errors = list(_official_manifest_validator().iter_errors(payload))
+    python_report = packages.validate_manifest(manifest, tmp_path)
+
+    assert schema_errors, f"official schema accepted endpoint.{field}={invalid_value!r}"
+    assert python_report["valid"] is False
+    assert f"endpoint.{field} must start with /" in python_report["errors"]
 
 
 def test_gpt_dev_sample_manifest_uses_builtin_windows_zip_runtime() -> None:
