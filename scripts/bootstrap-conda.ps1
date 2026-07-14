@@ -2,6 +2,7 @@
 param(
     [string]$CacheRoot = "data/cache/portable/conda",
     [string]$LockPath = "packaging/portable/toolchain.lock.json",
+    [string]$PackageRoot = "",
     [string]$OperationRoot = "",
     [string]$CancelFile = "",
     [switch]$DryRun,
@@ -11,13 +12,57 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$script:RepoRoot = Split-Path -Parent $PSScriptRoot
+function Resolve-PortableFullPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
 
-if (![string]::IsNullOrWhiteSpace($OperationRoot)) {
-    $OperationRoot = [System.IO.Path]::GetFullPath($OperationRoot)
-    if ([string]::IsNullOrWhiteSpace($CancelFile)) { $CancelFile = Join-Path $OperationRoot "cancel.requested" }
+    return [System.IO.Path]::GetFullPath($Path)
 }
-if (![string]::IsNullOrWhiteSpace($CancelFile)) { $CancelFile = [System.IO.Path]::GetFullPath($CancelFile) }
+
+function Resolve-OperationContract {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackageRoot,
+        [string]$OperationRoot = "",
+        [string]$CancelFile = ""
+    )
+
+    $hasOperation = ![string]::IsNullOrWhiteSpace($OperationRoot)
+    $hasCancel = ![string]::IsNullOrWhiteSpace($CancelFile)
+    if ($hasOperation -ne $hasCancel) {
+        throw "OperationRoot and CancelFile must be provided together"
+    }
+    $resolvedPackage = Resolve-PortableFullPath $PackageRoot
+    if (!$hasOperation) {
+        return [pscustomobject]@{ PackageRoot = $resolvedPackage; OperationRoot = ""; CancelFile = "" }
+    }
+
+    $operations = Resolve-PortableFullPath (Join-Path $resolvedPackage "data\local\operations")
+    $resolvedOperation = Resolve-PortableFullPath $OperationRoot
+    $operationParent = Resolve-PortableFullPath (Split-Path -Parent $resolvedOperation)
+    if (![string]::Equals($operationParent, $operations, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "OperationRoot must be a UUID-named direct child of package data/local/operations"
+    }
+    $operationId = Split-Path -Leaf $resolvedOperation
+    $parsedId = [guid]::Empty
+    if (![guid]::TryParse($operationId, [ref]$parsedId)) {
+        throw "OperationRoot name must be a valid UUID"
+    }
+    $resolvedCancel = Resolve-PortableFullPath $CancelFile
+    $expectedCancel = Resolve-PortableFullPath (Join-Path $resolvedOperation "cancel.requested")
+    if (![string]::Equals($resolvedCancel, $expectedCancel, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "CancelFile must resolve exactly to OperationRoot/cancel.requested"
+    }
+    return [pscustomobject]@{
+        PackageRoot = $resolvedPackage
+        OperationRoot = $resolvedOperation
+        CancelFile = $resolvedCancel
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($PackageRoot)) { $PackageRoot = Split-Path -Parent $PSScriptRoot }
+$contract = Resolve-OperationContract -PackageRoot $PackageRoot -OperationRoot $OperationRoot -CancelFile $CancelFile
+$script:RepoRoot = $contract.PackageRoot
+$OperationRoot = $contract.OperationRoot
+$CancelFile = $contract.CancelFile
 
 function Assert-PortableNotCancelled {
     if (![string]::IsNullOrWhiteSpace($CancelFile) -and (Test-Path -LiteralPath $CancelFile -PathType Leaf)) {
@@ -60,6 +105,70 @@ function Test-LockedSha256 {
     return $actual -eq $ExpectedSha256.ToLowerInvariant()
 }
 
+function Open-PortableHttpResponse {
+    param(
+        [Parameter(Mandatory = $true)][System.Net.Http.HttpClient]$Client,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][int64]$ResumeFrom
+    )
+
+    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
+    try {
+        $headers = @{}
+        if ($ResumeFrom -gt 0) {
+            $headers = @{ Range = "bytes=$resumeFrom-" }
+            [void]$request.Headers.TryAddWithoutValidation("Range", [string]$headers.Range)
+        }
+        $task = $Client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead)
+        return $task.GetAwaiter().GetResult()
+    } finally {
+        $request.Dispose()
+    }
+}
+
+function Get-PortableContentRange {
+    param([Parameter(Mandatory = $true)][System.Net.Http.HttpResponseMessage]$Response)
+
+    try { $range = $Response.Content.Headers.ContentRange } catch { return $null }
+    if ($null -eq $range -or $range.Unit -ne "bytes" -or !$range.HasRange -or !$range.HasLength) {
+        return $null
+    }
+    $start = [int64]$range.From
+    $end = [int64]$range.To
+    $total = [int64]$range.Length
+    if ($end -lt $start -or $total -le $end) { return $null }
+    $contentLength = $Response.Content.Headers.ContentLength
+    if ($null -ne $contentLength -and [int64]$contentLength -ne ($end - $start + 1)) {
+        return $null
+    }
+    return [pscustomobject]@{ Start = $start; End = $end; Total = $total }
+}
+
+function Get-PortableDownloadPlan {
+    param(
+        [Parameter(Mandatory = $true)][System.Net.Http.HttpResponseMessage]$Response,
+        [Parameter(Mandatory = $true)][int64]$ResumeFrom
+    )
+
+    $status = [int]$Response.StatusCode
+    if ($status -eq 200) {
+        $contentLength = $Response.Content.Headers.ContentLength
+        $total = if ($null -ne $contentLength) { [int64]$contentLength } else { 0 }
+        return [pscustomobject]@{ Append = $false; Start = [int64]0; Total = $total }
+    }
+    if ($status -eq 206) {
+        $range = Get-PortableContentRange -Response $Response
+        if ($null -ne $range -and $range.Start -eq $ResumeFrom) {
+            return [pscustomobject]@{ Append = ($ResumeFrom -gt 0); Start = $range.Start; Total = $range.Total }
+        }
+        if ($ResumeFrom -gt 0) { return $null }
+        throw "HTTP 206 response has an invalid zero-based Content-Range"
+    }
+    if ($status -eq 416 -and $ResumeFrom -gt 0) { return $null }
+    [void]$Response.EnsureSuccessStatusCode()
+    throw "Unexpected HTTP download status: $status"
+}
+
 function Receive-LockedArchive {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
@@ -68,38 +177,35 @@ function Receive-LockedArchive {
     )
 
     $partial = "$Archive.partial"
-    $resumeFrom = if (Test-Path -LiteralPath $partial) { (Get-Item -LiteralPath $partial).Length } else { 0 }
-    $headers = @{}
-    if ($resumeFrom -gt 0) { $headers = @{ Range = "bytes=$resumeFrom-" } }
-
     Assert-PortableNotCancelled
+    if ((Test-Path -LiteralPath $partial -PathType Leaf) -and (Test-LockedSha256 -Path $partial -ExpectedSha256 $ExpectedSha256)) {
+        Move-Item -LiteralPath $partial -Destination $Archive -Force
+        return
+    }
+    $resumeFrom = if (Test-Path -LiteralPath $partial) { (Get-Item -LiteralPath $partial).Length } else { 0 }
+
     Add-Type -AssemblyName System.Net.Http
     $client = [System.Net.Http.HttpClient]::new()
-    $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
-    if ($headers.ContainsKey("Range")) {
-        [void]$request.Headers.TryAddWithoutValidation("Range", [string]$headers.Range)
-    }
     $response = $null
     $source = $null
     $destination = $null
     try {
-        $responseTask = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead)
-        $response = $responseTask.GetAwaiter().GetResult()
-        [void]$response.EnsureSuccessStatusCode()
-        $append = $resumeFrom -gt 0 -and [int]$response.StatusCode -eq 206
-        $start = if ($append) { $resumeFrom } else { 0 }
-        $mode = if ($append) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }
+        $response = Open-PortableHttpResponse -Client $client -Url $Url -ResumeFrom $resumeFrom
+        $plan = Get-PortableDownloadPlan -Response $response -ResumeFrom $resumeFrom
+        if ($null -eq $plan) {
+            $response.Dispose()
+            $response = $null
+            Assert-PortableNotCancelled
+            $response = Open-PortableHttpResponse -Client $client -Url $Url -ResumeFrom 0
+            $plan = Get-PortableDownloadPlan -Response $response -ResumeFrom 0
+            if ($null -eq $plan) { throw "Clean HTTP download did not provide a complete zero-based response" }
+        }
+        $mode = if ($plan.Append) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }
         $destination = [System.IO.File]::Open($partial, $mode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
         $sourceTask = $response.Content.ReadAsStreamAsync()
         $source = $sourceTask.GetAwaiter().GetResult()
-        $total = if ($null -ne $response.Content.Headers.ContentRange -and $response.Content.Headers.ContentRange.HasLength) {
-            [int64]$response.Content.Headers.ContentRange.Length
-        } elseif ($response.Content.Headers.ContentLength.HasValue) {
-            $start + [int64]$response.Content.Headers.ContentLength.Value
-        } else {
-            0
-        }
-        $written = [int64]$start
+        $total = [int64]$plan.Total
+        $written = [int64]$plan.Start
         $buffer = [byte[]]::new(1024 * 1024)
         while ($true) {
             Assert-PortableNotCancelled
@@ -118,7 +224,6 @@ function Receive-LockedArchive {
         if ($null -ne $destination) { $destination.Dispose() }
         if ($null -ne $source) { $source.Dispose() }
         if ($null -ne $response) { $response.Dispose() }
-        $request.Dispose()
         $client.Dispose()
     }
     Assert-PortableNotCancelled
@@ -135,6 +240,7 @@ function Ensure-BuildConda {
         [switch]$DryRun
     )
 
+    Assert-PortableNotCancelled
     $cache = Resolve-RepoPath $CacheRoot
     $resolvedLockPath = Resolve-RepoPath $LockPath
     $toolchain = Get-LockedMiniforge $resolvedLockPath

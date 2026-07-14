@@ -21,13 +21,48 @@ if (!$modelLock.complete) {
 $live = Join-Path $Root "runtime\live"
 $staging = Join-Path $Root "runtime\staging"
 $state = Join-Path $Root "data\local\install-state.json"
-$DownloadArguments = @()
-if (![string]::IsNullOrWhiteSpace($OperationRoot)) {
-    $OperationRoot = [System.IO.Path]::GetFullPath($OperationRoot)
-    if ([string]::IsNullOrWhiteSpace($CancelFile)) { $CancelFile = Join-Path $OperationRoot "cancel.requested" }
-    $CancelFile = [System.IO.Path]::GetFullPath($CancelFile)
-    $DownloadArguments = @("--operation-root", $OperationRoot, "--cancel-file", $CancelFile)
+
+function Resolve-OperationContract {
+    param([string]$PackageRoot, [string]$OperationRoot = "", [string]$CancelFile = "")
+
+    $hasOperation = ![string]::IsNullOrWhiteSpace($OperationRoot)
+    $hasCancel = ![string]::IsNullOrWhiteSpace($CancelFile)
+    if ($hasOperation -ne $hasCancel) { throw "OperationRoot and CancelFile must be provided together" }
+    $resolvedPackage = [System.IO.Path]::GetFullPath($PackageRoot)
+    if (!$hasOperation) { return [pscustomobject]@{ OperationRoot = ""; CancelFile = "" } }
+    $operations = [System.IO.Path]::GetFullPath((Join-Path $resolvedPackage "data\local\operations"))
+    $resolvedOperation = [System.IO.Path]::GetFullPath($OperationRoot)
+    $operationParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $resolvedOperation))
+    if (![string]::Equals($operationParent, $operations, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "OperationRoot must be a UUID-named direct child of package data/local/operations"
+    }
+    $parsedId = [guid]::Empty
+    if (![guid]::TryParse((Split-Path -Leaf $resolvedOperation), [ref]$parsedId)) {
+        throw "OperationRoot name must be a valid UUID"
+    }
+    $resolvedCancel = [System.IO.Path]::GetFullPath($CancelFile)
+    $expectedCancel = [System.IO.Path]::GetFullPath((Join-Path $resolvedOperation "cancel.requested"))
+    if (![string]::Equals($resolvedCancel, $expectedCancel, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "CancelFile must resolve exactly to OperationRoot/cancel.requested"
+    }
+    return [pscustomobject]@{ OperationRoot = $resolvedOperation; CancelFile = $resolvedCancel }
 }
+
+$contract = Resolve-OperationContract -PackageRoot $Root -OperationRoot $OperationRoot -CancelFile $CancelFile
+$OperationRoot = $contract.OperationRoot
+$CancelFile = $contract.CancelFile
+$DownloadArguments = @("--package-root", $Root)
+if (![string]::IsNullOrWhiteSpace($OperationRoot)) {
+    $DownloadArguments += @("--operation-root", $OperationRoot, "--cancel-file", $CancelFile)
+}
+
+function Assert-PortableNotCancelled {
+    if (![string]::IsNullOrWhiteSpace($CancelFile) -and (Test-Path -LiteralPath $CancelFile -PathType Leaf)) {
+        exit 20
+    }
+}
+
+Assert-PortableNotCancelled
 if ($Root.Length -gt 180) { throw "package path is too long for reliable Windows model tooling: $Root" }
 $requiredSpace = [int64]$runtimeLock.required_free_bytes + [int64]$modelLock.required_free_bytes
 $drive = Get-PSDrive -Name ([System.IO.Path]::GetPathRoot($Root).Substring(0, 1)) -ErrorAction SilentlyContinue
@@ -45,7 +80,7 @@ if ((Test-Path -LiteralPath $state) -and (Test-LiveRuntime)) { Write-Host "verif
 if ($Repair) { Write-Host "repairing only missing or invalid locked assets; user data is preserved" }
 
 $bootstrap = Join-Path $Bundle "bootstrap-conda.ps1"
-$Conda = (& $bootstrap -CacheRoot "data/cache/portable/conda" -LockPath "tts_more/locks/toolchain.lock.json" -OperationRoot $OperationRoot -CancelFile $CancelFile -PassThru | Select-Object -Last 1)
+$Conda = (& $bootstrap -CacheRoot "data/cache/portable/conda" -LockPath "tts_more/locks/toolchain.lock.json" -PackageRoot $Root -OperationRoot $OperationRoot -CancelFile $CancelFile -PassThru | Select-Object -Last 1)
 if ($LASTEXITCODE -eq 20) { exit 20 }
 $CondaRoot = Split-Path -Parent (Split-Path -Parent $Conda)
 $BootstrapPython = Join-Path $CondaRoot "python.exe"

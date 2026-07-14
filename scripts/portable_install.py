@@ -4,11 +4,14 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import time
+import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterable
+from uuid import UUID
 
 
 class PortableInstallCancelled(RuntimeError):
@@ -18,11 +21,43 @@ class PortableInstallCancelled(RuntimeError):
 ProgressCallback = Callable[[int, int, str], None]
 CancelCheck = Callable[[], bool]
 Downloader = Callable[[str, Path, int, ProgressCallback | None, CancelCheck | None], None]
+CONTENT_RANGE_PATTERN = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
 
 
 def load_json(path: Path) -> Any:
     """Read JSON emitted by either Python or Windows PowerShell 5.1."""
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def validate_operation_paths(
+    package_root: Path,
+    operation_root: Path | None,
+    cancel_file: Path | None,
+) -> tuple[Path | None, Path | None]:
+    if (operation_root is None) != (cancel_file is None):
+        raise ValueError("operation-root and cancel-file must be provided together")
+    if operation_root is None or cancel_file is None:
+        return None, None
+
+    package_root = package_root.resolve(strict=False)
+    operations_root = (package_root / "data" / "local" / "operations").resolve(strict=False)
+    operation_root = operation_root.resolve(strict=False)
+    if operation_root.parent != operations_root:
+        raise ValueError("operation-root must be a UUID-named direct child of package data/local/operations")
+    try:
+        UUID(operation_root.name)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("operation-root name must be a valid UUID") from error
+
+    cancel_file = cancel_file.resolve(strict=False)
+    expected_cancel = (operation_root / "cancel.requested").resolve(strict=False)
+    if cancel_file != expected_cancel:
+        raise ValueError("cancel-file must resolve exactly to operation-root/cancel.requested")
+    return operation_root, cancel_file
+
+
+def _default_package_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
 
 def nvidia_marketing_driver(windows_driver_version: str) -> tuple[int, int]:
@@ -91,13 +126,22 @@ def ensure_locked_asset(
     if len(expected_hash) != 64 or expected_size <= 0 or not urls:
         raise ValueError(f"asset lock is incomplete: {asset.get('id') or destination.name}")
     destination = destination.resolve(strict=False)
+    if cancelled and cancelled():
+        raise PortableInstallCancelled("portable installation cancelled")
     if _asset_matches(destination, expected_hash, expected_size):
         return {"path": str(destination), "reused": True, "source": ""}
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(destination.name + ".partial")
-    if partial.exists() and partial.stat().st_size > expected_size:
-        partial.unlink()
+    if partial.exists():
+        partial_size = partial.stat().st_size
+        if partial_size == expected_size:
+            if _asset_matches(partial, expected_hash, expected_size):
+                os.replace(partial, destination)
+                return {"path": str(destination), "reused": False, "source": ""}
+            partial.unlink()
+        elif partial_size > expected_size:
+            partial.unlink()
     download = downloader or _download_http
     failures: list[str] = []
     for url in urls:
@@ -115,6 +159,8 @@ def ensure_locked_asset(
             raise PortableInstallCancelled("portable installation cancelled")
         if not _asset_matches(partial, expected_hash, expected_size):
             failures.append(f"{url}: failed SHA-256 verification")
+            if partial.is_file() and partial.stat().st_size >= expected_size:
+                partial.unlink()
             continue
         os.replace(partial, destination)
         return {"path": str(destination), "reused": False, "source": url}
@@ -168,23 +214,86 @@ def _download_http(
     progress: ProgressCallback | None,
     cancelled: CancelCheck | None,
 ) -> None:
+    plan: tuple[bool, int, int] | None
+    with _open_http_response(url, resume_from) as response:
+        plan = _response_download_plan(response, resume_from=resume_from)
+        if plan is not None:
+            _write_http_response(response, destination, plan, url, progress, cancelled)
+            return
+
+    if cancelled and cancelled():
+        raise PortableInstallCancelled("portable installation cancelled")
+    with _open_http_response(url, 0) as response:
+        plan = _response_download_plan(response, resume_from=0)
+        if plan is None:
+            raise RuntimeError("clean HTTP download did not provide a complete zero-based response")
+        _write_http_response(response, destination, plan, url, progress, cancelled)
+
+
+def _open_http_response(url: str, resume_from: int) -> Any:
     request = urllib.request.Request(url)
     if resume_from:
         request.add_header("Range", f"bytes={resume_from}-")
-    with urllib.request.urlopen(request, timeout=120) as response:
-        append = resume_from > 0 and getattr(response, "status", None) == 206
-        with destination.open("ab" if append else "wb") as output:
-            start = resume_from if append else 0
-            total = _response_total(response, start=start)
-            _copy_response(
-                response,
-                output,
-                start=start,
-                total=total,
-                url=url,
-                progress=progress,
-                cancelled=cancelled,
-            )
+    try:
+        return urllib.request.urlopen(request, timeout=120)
+    except urllib.error.HTTPError as error:
+        if resume_from > 0 and error.code == 416:
+            return error
+        raise
+
+
+def _write_http_response(
+    response: Any,
+    destination: Path,
+    plan: tuple[bool, int, int],
+    url: str,
+    progress: ProgressCallback | None,
+    cancelled: CancelCheck | None,
+) -> None:
+    append, start, total = plan
+    with destination.open("ab" if append else "wb") as output:
+        _copy_response(
+            response,
+            output,
+            start=start,
+            total=total,
+            url=url,
+            progress=progress,
+            cancelled=cancelled,
+        )
+
+
+def _response_download_plan(response: Any, *, resume_from: int) -> tuple[bool, int, int] | None:
+    status = int(getattr(response, "status", None) or getattr(response, "code", None) or 200)
+    if status == 200:
+        return False, 0, _response_total(response, start=0)
+    if status == 206:
+        content_range = _parse_content_range(response)
+        if content_range is not None and content_range[0] == resume_from:
+            return resume_from > 0, content_range[0], content_range[2]
+        if resume_from > 0:
+            return None
+        raise RuntimeError("HTTP 206 response has an invalid zero-based Content-Range")
+    if status == 416 and resume_from > 0:
+        return None
+    raise RuntimeError(f"unexpected HTTP download status: {status}")
+
+
+def _parse_content_range(response: Any) -> tuple[int, int, int] | None:
+    value = response.headers.get("Content-Range")
+    match = CONTENT_RANGE_PATTERN.fullmatch(str(value or ""))
+    if match is None:
+        return None
+    start, end, total = (int(item) for item in match.groups())
+    if end < start or total <= end:
+        return None
+    content_length = response.headers.get("Content-Length")
+    try:
+        if content_length is not None and int(content_length) != end - start + 1:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return start, end, total
 
 
 def _copy_response(
@@ -270,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     ensure = subcommands.add_parser("ensure-asset")
     ensure.add_argument("--asset", required=True, type=Path)
     ensure.add_argument("--path", required=True, type=Path)
+    ensure.add_argument("--package-root", type=Path, default=_default_package_root())
     ensure.add_argument("--operation-root", type=Path)
     ensure.add_argument("--cancel-file", type=Path)
     select = subcommands.add_parser("select-device")
@@ -290,13 +400,15 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"valid": valid, "path": str(args.path)}, sort_keys=True))
         return 0 if valid else 1
     if args.command == "ensure-asset":
+        operation_root, cancel_file = validate_operation_paths(
+            args.package_root,
+            args.operation_root,
+            args.cancel_file,
+        )
         asset = load_json(args.asset)
-        cancel_file = args.cancel_file
-        if cancel_file is None and args.operation_root is not None:
-            cancel_file = args.operation_root / "cancel.requested"
         progress = (
-            _operation_progress(args.operation_root, str(asset.get("id") or args.path.name))
-            if args.operation_root is not None
+            _operation_progress(operation_root, str(asset.get("id") or args.path.name))
+            if operation_root is not None
             else None
         )
         try:

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
+import os
+import urllib.error
 from pathlib import Path
 from uuid import UUID
 
@@ -53,6 +56,19 @@ def _chunked_downloader(payload: bytes) -> installer.Downloader:
                     progress(handle.tell(), len(payload), url)
 
     return download
+
+
+class _FakeHttpResponse(io.BytesIO):
+    def __init__(self, payload: bytes, *, status: int, headers: dict[str, str]) -> None:
+        super().__init__(payload)
+        self.status = status
+        self.headers = headers
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
 
 
 def test_select_device_profile_uses_cim_driver_without_nvidia_smi() -> None:
@@ -119,6 +135,173 @@ def test_ensure_locked_asset_resumes_partial_and_promotes_only_after_hash(tmp_pa
     assert not partial.exists()
 
 
+def test_complete_valid_partial_is_promoted_without_network(tmp_path: Path) -> None:
+    installer = _load_installer()
+    payload = b"complete-valid-partial"
+    destination = tmp_path / "model.bin"
+    partial = destination.with_name("model.bin.partial")
+    partial.write_bytes(payload)
+
+    def fail_download(*_args) -> None:
+        raise AssertionError("network must not be used for a complete valid partial")
+
+    report = installer.ensure_locked_asset(
+        {
+            "id": "model",
+            "urls": ["https://example.invalid/model.bin"],
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+        },
+        destination,
+        downloader=fail_download,
+    )
+
+    assert report == {"path": str(destination), "reused": False, "source": ""}
+    assert destination.read_bytes() == payload
+    assert not partial.exists()
+
+
+def test_complete_invalid_partial_restarts_from_zero(tmp_path: Path) -> None:
+    installer = _load_installer()
+    payload = b"expected-full-payload"
+    destination = tmp_path / "model.bin"
+    partial = destination.with_name("model.bin.partial")
+    partial.write_bytes(b"x" * len(payload))
+    resume_offsets: list[int] = []
+
+    def download(_url: str, target: Path, resume_from: int, _progress, _cancelled) -> None:
+        resume_offsets.append(resume_from)
+        target.write_bytes(payload)
+
+    installer.ensure_locked_asset(
+        {
+            "id": "model",
+            "urls": ["https://example.invalid/model.bin"],
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+        },
+        destination,
+        downloader=download,
+    )
+
+    assert resume_offsets == [0]
+    assert destination.read_bytes() == payload
+
+
+def test_http_resume_appends_only_matching_206(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    installer = _load_installer()
+    payload = b"0123456789"
+    destination = tmp_path / "payload.partial"
+    destination.write_bytes(payload[:4])
+    requests: list[str | None] = []
+    progress: list[tuple[int, int]] = []
+
+    def urlopen(request, timeout: int):
+        assert timeout == 120
+        requests.append(request.headers.get("Range"))
+        return _FakeHttpResponse(
+            payload[4:],
+            status=206,
+            headers={"Content-Range": "bytes 4-9/10", "Content-Length": "6"},
+        )
+
+    monkeypatch.setattr(installer.urllib.request, "urlopen", urlopen)
+    installer._download_http(
+        "https://example.invalid/payload.bin",
+        destination,
+        4,
+        lambda done, total, _url: progress.append((done, total)),
+        None,
+    )
+
+    assert requests == ["bytes=4-"]
+    assert destination.read_bytes() == payload
+    assert progress[-1] == (10, 10)
+
+
+@pytest.mark.parametrize(
+    "bad_headers",
+    [
+        {"Content-Length": "7"},
+        {"Content-Range": "not-a-range", "Content-Length": "7"},
+        {"Content-Range": "bytes 3-9/10", "Content-Length": "7"},
+    ],
+    ids=["missing-content-range", "malformed-content-range", "mismatched-start"],
+)
+def test_http_invalid_206_retries_clean_without_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_headers: dict[str, str]
+) -> None:
+    installer = _load_installer()
+    payload = b"0123456789"
+    destination = tmp_path / "payload.partial"
+    destination.write_bytes(payload[:4])
+    responses = iter(
+        [
+            _FakeHttpResponse(
+                payload[3:],
+                status=206,
+                headers=bad_headers,
+            ),
+            _FakeHttpResponse(payload, status=200, headers={"Content-Length": "10"}),
+        ]
+    )
+    requests: list[str | None] = []
+
+    def urlopen(request, timeout: int):
+        assert timeout == 120
+        requests.append(request.headers.get("Range"))
+        return next(responses)
+
+    monkeypatch.setattr(installer.urllib.request, "urlopen", urlopen)
+    installer._download_http("https://example.invalid/payload.bin", destination, 4, None, None)
+
+    assert requests == ["bytes=4-", None]
+    assert destination.read_bytes() == payload
+
+
+def test_http_ignored_range_200_replaces_partial_from_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = _load_installer()
+    payload = b"0123456789"
+    destination = tmp_path / "payload.partial"
+    destination.write_bytes(payload[:4])
+    requests: list[str | None] = []
+
+    def urlopen(request, timeout: int):
+        assert timeout == 120
+        requests.append(request.headers.get("Range"))
+        return _FakeHttpResponse(payload, status=200, headers={"Content-Length": "10"})
+
+    monkeypatch.setattr(installer.urllib.request, "urlopen", urlopen)
+    installer._download_http("https://example.invalid/payload.bin", destination, 4, None, None)
+
+    assert requests == ["bytes=4-"]
+    assert destination.read_bytes() == payload
+
+
+def test_http_range_416_retries_clean_without_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    installer = _load_installer()
+    payload = b"0123456789"
+    destination = tmp_path / "payload.partial"
+    destination.write_bytes(payload[:4])
+    requests: list[str | None] = []
+
+    def urlopen(request, timeout: int):
+        assert timeout == 120
+        range_header = request.headers.get("Range")
+        requests.append(range_header)
+        if range_header is not None:
+            raise urllib.error.HTTPError(request.full_url, 416, "range not satisfiable", {}, io.BytesIO())
+        return _FakeHttpResponse(payload, status=200, headers={"Content-Length": "10"})
+
+    monkeypatch.setattr(installer.urllib.request, "urlopen", urlopen)
+    installer._download_http("https://example.invalid/payload.bin", destination, 4, None, None)
+
+    assert requests == ["bytes=4-", None]
+    assert destination.read_bytes() == payload
+
+
 def test_ensure_locked_asset_keeps_corrupt_partial_and_never_promotes_it(tmp_path: Path) -> None:
     installer = _load_installer()
     destination = tmp_path / "model.bin"
@@ -165,6 +348,25 @@ def test_download_reports_progress_and_keeps_partial_on_cancel(tmp_path: Path) -
     assert (tmp_path / "model.bin.partial").read_bytes() == payload[:1]
 
 
+def test_cancel_is_checked_before_returning_cached_destination(tmp_path: Path) -> None:
+    installer = _load_installer()
+    payload = b"cached-destination"
+    destination = tmp_path / "model.bin"
+    destination.write_bytes(payload)
+
+    with pytest.raises(installer.PortableInstallCancelled):
+        installer.ensure_locked_asset(
+            {
+                "id": "model",
+                "urls": ["https://example.invalid/model.bin"],
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            },
+            destination,
+            cancelled=lambda: True,
+        )
+
+
 def test_cancellation_is_not_swallowed_as_a_url_fallback_failure(tmp_path: Path) -> None:
     installer = _load_installer()
     payload = b"fallback-must-not-run"
@@ -201,7 +403,8 @@ def test_ensure_asset_cli_throttles_operation_events_and_returns_20_on_cancel(
     from scripts.portable_operations import create_operation, read_operation
 
     operation_id = str(UUID("11111111-1111-4111-8111-111111111111"))
-    operations = tmp_path / "operations"
+    package_root = tmp_path / "package"
+    operations = package_root / "data" / "local" / "operations"
     create_operation(operations, operation_id, "gpt-sovits", "start", "direct")
     operation = operations / operation_id
     payload = b"event-progress"
@@ -234,6 +437,8 @@ def test_ensure_asset_cli_throttles_operation_events_and_returns_20_on_cancel(
                 str(asset_path),
                 "--path",
                 str(tmp_path / "model.bin"),
+                "--package-root",
+                str(package_root),
                 "--operation-root",
                 str(operation),
                 "--cancel-file",
@@ -260,6 +465,8 @@ def test_ensure_asset_cli_throttles_operation_events_and_returns_20_on_cancel(
                 str(asset_path),
                 "--path",
                 str(tmp_path / "cancelled-model.bin"),
+                "--package-root",
+                str(package_root),
                 "--operation-root",
                 str(cancelled_operation),
                 "--cancel-file",
@@ -270,6 +477,60 @@ def test_ensure_asset_cli_throttles_operation_events_and_returns_20_on_cancel(
     )
 
 
+def test_operation_contract_rejects_unpaired_and_uncontained_paths(tmp_path: Path) -> None:
+    installer = _load_installer()
+    package_root = tmp_path / "package"
+    operations = package_root / "data" / "local" / "operations"
+    valid_id = "11111111-1111-4111-8111-111111111111"
+    valid_operation = operations / valid_id
+    valid_cancel = valid_operation / "cancel.requested"
+    invalid_cases = [
+        (valid_operation, None, "provided together"),
+        (None, valid_cancel, "provided together"),
+        (tmp_path / "outside" / valid_id, tmp_path / "outside" / valid_id / "cancel.requested", "direct child"),
+        (
+            operations / ".." / valid_id,
+            operations / ".." / valid_id / "cancel.requested",
+            "direct child",
+        ),
+        (operations / "not-a-uuid", operations / "not-a-uuid" / "cancel.requested", "valid UUID"),
+        (valid_operation, operations / "cancel.requested", "cancel.requested"),
+    ]
+    if os.name == "nt":
+        drive = "Z:" if package_root.drive.upper() != "Z:" else "Y:"
+        other_drive_operation = Path(f"{drive}/{valid_id}")
+        invalid_cases.append(
+            (other_drive_operation, other_drive_operation / "cancel.requested", "direct child")
+        )
+
+    for operation_root, cancel_file, message in invalid_cases:
+        with pytest.raises(ValueError, match=message):
+            installer.validate_operation_paths(package_root, operation_root, cancel_file)
+
+
+def test_cli_rejects_invalid_operation_contract_before_asset_io(tmp_path: Path) -> None:
+    installer = _load_installer()
+    package_root = tmp_path / "package"
+    invalid_operation = tmp_path / "outside" / "11111111-1111-4111-8111-111111111111"
+
+    with pytest.raises(ValueError, match="direct child"):
+        installer.main(
+            [
+                "ensure-asset",
+                "--asset",
+                str(tmp_path / "missing-asset.json"),
+                "--path",
+                str(tmp_path / "model.bin"),
+                "--package-root",
+                str(package_root),
+                "--operation-root",
+                str(invalid_operation),
+                "--cancel-file",
+                str(invalid_operation / "cancel.requested"),
+            ]
+        )
+
+
 def test_initializers_forward_operation_and_cancel_contract_to_downloads() -> None:
     controller = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(encoding="utf-8")
     worker = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(encoding="utf-8")
@@ -277,13 +538,20 @@ def test_initializers_forward_operation_and_cancel_contract_to_downloads() -> No
 
     for initializer in (controller, worker):
         assert '[string]$OperationRoot = ""' in initializer
-        assert 'Join-Path $OperationRoot "cancel.requested"' in initializer
+        assert '[string]$CancelFile = ""' in initializer
+        assert "Resolve-OperationContract" in initializer
+        assert '"data\\local\\operations"' in initializer
+        assert "[guid]::TryParse" in initializer
+        assert "--package-root" in initializer
         assert "--operation-root" in initializer
         assert "--cancel-file" in initializer
+        assert "-PackageRoot $Root" in initializer
         assert "-OperationRoot $OperationRoot" in initializer
         assert "-CancelFile $CancelFile" in initializer
+    assert '[string]$PackageRoot = ""' in bootstrap
     assert '[string]$OperationRoot = ""' in bootstrap
     assert '[string]$CancelFile = ""' in bootstrap
+    assert "Resolve-OperationContract" in bootstrap
     assert "Portable initialization cancelled" in bootstrap
     assert 'FileMode]::Append' in bootstrap
 
