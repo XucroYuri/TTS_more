@@ -91,6 +91,7 @@ def test_windows_templates_are_safe_for_cpu_only_hosts_and_optional_lock_fields(
     assert '$env:GITHUB_ACTIONS -eq "true"' in builder
     assert "audit-release --zip" in builder
     assert "device_profiles = @($deviceProfiles)" in builder
+    assert "^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$" in builder
     assert "Copy-PortableTree" in builder
     assert "[IO.FileAttributes]::ReparsePoint" in builder
     assert "SoVITS_weights" in builder and "pretrained_models" in builder and "checkpoints" in builder

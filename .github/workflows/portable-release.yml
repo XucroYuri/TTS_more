@@ -56,6 +56,7 @@ jobs:
           TTS_MORE_BUILD_PYTHON: python
         run: |
           $version = $env:PACKAGE_VERSION -replace '^v', ''
+          $version = $version -replace '[^0-9A-Za-z._-]', '-'
           .\Build-Package.ps1 -Profile Bootstrap -Device CPU -Version $version
           $zip = @(Get-ChildItem artifacts\portable\bootstrap\*.zip)
           if ($zip.Count -ne 1) { throw "expected exactly one bootstrap ZIP" }

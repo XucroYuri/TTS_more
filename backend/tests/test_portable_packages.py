@@ -210,6 +210,13 @@ def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
     assert '"$zip.spdx.json"' in builder
     assert '"$zip.licenses.json"' in builder
     assert '"$zip.acceptance.json"' in builder
+    assert "^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$" in builder
+
+
+def test_portable_release_workflow_sanitizes_pr_ref_names() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "portable-release.yml").read_text(encoding="utf-8")
+
+    assert "[^0-9A-Za-z._-]" in workflow
 
 
 def test_tts_more_initializer_serializes_an_empty_controller_list_as_json() -> None:
