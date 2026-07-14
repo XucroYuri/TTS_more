@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
@@ -88,6 +89,7 @@ def create_app(
     runtime_root: Path | str | None = None,
     parser_config_path: Path | str | None = None,
     env_path: Path | str | None = None,
+    static_root: Path | str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="TTS More Orchestrator", version="0.1.0")
     app.add_middleware(
@@ -1144,6 +1146,33 @@ def create_app(
             raise HTTPException(status_code=404, detail="image not found")
         media_type = _image_media_type(image_path)
         return FileResponse(image_path, media_type=media_type)
+
+    configured_static_root = static_root or os.environ.get("TTS_MORE_STATIC_ROOT")
+    if configured_static_root:
+        frontend_root = Path(configured_static_root).resolve(strict=False)
+        index_path = frontend_root / "index.html"
+        if not index_path.is_file():
+            raise RuntimeError(f"frontend static assets are missing: {index_path}")
+        assets_root = frontend_root / "assets"
+        if assets_root.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets_root), name="frontend-assets")
+
+        @app.get("/", include_in_schema=False)
+        def frontend_index() -> FileResponse:
+            return FileResponse(index_path)
+
+        @app.get("/{frontend_path:path}", include_in_schema=False)
+        def frontend_spa(frontend_path: str) -> FileResponse:
+            if frontend_path == "api" or frontend_path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="API route not found")
+            candidate = (frontend_root / frontend_path).resolve(strict=False)
+            try:
+                candidate.relative_to(frontend_root)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail="frontend asset not found") from exc
+            if candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(index_path)
 
     return app
 

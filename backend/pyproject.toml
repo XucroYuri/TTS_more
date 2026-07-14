@@ -2,7 +2,7 @@
 name = "tts-more-backend"
 version = "0.1.0"
 description = "Orchestrator API for a three-engine script dubbing workstation."
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.12"
 dependencies = [
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.30.0",

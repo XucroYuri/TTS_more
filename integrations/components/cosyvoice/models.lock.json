@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "component": "cosyvoice",
+  "upstream_repository": "https://huggingface.co/FunAudioLLM/CosyVoice-300M",
+  "resolved_via": "https://www.modelscope.cn/models/iic/CosyVoice-300M",
+  "snapshot_revision": "26496019498987b729f9d4ceb8942331602a1c51602df7337af0d0170d035f80",
+  "mutable_revisions_allowed": false,
+  "fallback_policy": "hash-equivalent-assets-only",
+  "license": "Apache-2.0",
+  "required_free_bytes": 4591473540,
+  "complete": true,
+  "missing_required_paths": [],
+  "required_paths": [
+    "pretrained_models/CosyVoice-300M/cosyvoice.yaml",
+    "pretrained_models/CosyVoice-300M/flow.pt",
+    "pretrained_models/CosyVoice-300M/hift.pt",
+    "pretrained_models/CosyVoice-300M/llm.pt",
+    "pretrained_models/CosyVoice-300M/campplus.onnx",
+    "pretrained_models/CosyVoice-300M/speech_tokenizer_v1.onnx"
+  ],
+  "assets": [
+    {
+      "id": "611aeca404dc5bd82fc5f017",
+      "source_path": "README.md",
+      "source_revision": "d979372752f86be76f2b798435a0f1593bfddb4e",
+      "urls": [
+        "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/d979372752f86be76f2b798435a0f1593bfddb4e/README.md"
+      ],
+      "sha256": "97b420f4afcbbce667623a882439d5ee1a64a2f33d5023a942bc411862cccf0c",
+      "size_bytes": 10116,
+      "target": "pretrained_models/CosyVoice-300M/README.md"
+    },
+    {
+      "id": "3656bc022941dffecba0a0f6",
+      "source_path": "campplus.onnx",
+      "source_revision": "46b5c06a21fe6dfc3deedf7fc8fea4abe9c71e9b",
+      "urls": [
+        "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/46b5c06a21fe6dfc3deedf7fc8fea4abe9c71e9b/campplus.onnx"
+      ],
+      "sha256": "a6ac6a63997761ae2997373e2ee1c47040854b4b759ea41ec48e4e42df0f4d73",
+      "size_bytes": 28303423,
+      "target": "pretrained_models/CosyVoice-300M/campplus.onnx"
+    },
+    {
+      "id": "91dde9e9492b8e721c3f4ae6",
+      "source_path": "configuration.json",
+      "source_revision": "5e2b74b81af450bb537e5134156a11f9663f6d88",
+      "urls": [
+        "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/5e2b74b81af450bb537e5134156a11f9663f6d88/configuration.json"
+      ],
+      "sha256": "c502b6328c67638b401df8dd05de89e9e8d1cff9cd0ada10dfbdbe13556c20de",
+      "size_bytes": 47,
+      "target": "pretrained_models/CosyVoice-300M/configuration.json"
+    },
+    {
+      "id": "595cfb25b83c09a92eae1c10",
+      "source_path": "cosyvoice.yaml",
+      "source_revision": "121c883104db335799d20e8c1fe7f4963c5a8058",
+      "urls": [
+        "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/121c883104db335799d20e8c1fe7f4963c5a8058/cosyvoice.yaml"
+      ],
+      "sha256": "5475b9b2f788f3ddd3798898041197e076d20cb2ea783ef9638e6eed36ba16db",
+      "size_bytes": 6421,
+      "target": "pretrained_models/CosyVoice-300M/cosyvoice.yaml"
+    },
+    {
+      "id": "f79d2ce81a78c5511b2b6813",
+      "source_path": "flow.pt",
+      "source_revision": "46b5c06a21fe6dfc3deedf7fc8fea4abe9c71e9b",
+      "urls": [
+        "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/46b5c06a21fe6dfc3deedf7fc8fea4abe9c71e9b/flow.pt"
+      ],
+      "sha256": "fd80b089444a95e52956c57cdf177d7f6017a5af13b8a697717628a1d2be6b55",
+      "size_bytes": 419900943,
+      "target": "pretrained_models/CosyVoice-300M/flow.pt"
+    },
+    {
+      "id": "be09d17c1cd00d8e0593a8ef",
+      "source_path": "hift.pt",
+      "source_revision": "46b5c06a21fe6dfc3deedf7fc8fea4abe9c71e9b",
+      "urls": [
+        "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/46b5c06a21fe6dfc3deedf7fc8fea4abe9c71e9b/hift.pt"
+      ],
+      "sha256": "91e679b6ca1eff71187ffb4f3ab0444935594cdcc20a9bd12afad111ef8d6012",
+      "size_bytes": 81896716,
+      "target": "pretrained_models/CosyVoice-300M/hift.pt"
+    },
+    {
+      "id": "1398adc0edd2be974ac0ba26",
+      "source_path": "llm.pt",
+      "source_revision": "46b5c06a21fe6dfc3deedf7fc8fea4abe9c71e9b",
+      "urls": [
+        "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/46b5c06a21fe6dfc3deedf7fc8fea4abe9c71e9b/llm.pt"
+      ],
+      "sha256": "59f7eb172d2f33f6c8c02709d829c83960f97876fa9886c7ea232597b51af976",
+      "size_bytes": 1242994835,
+      "target": "pretrained_models/CosyVoice-300M/llm.pt"
+    },
+    {
+      "id": "c7292dce59ff39c32336370a",
+      "source_path": "speech_tokenizer_v1.onnx",
+      "source_revision": "46b5c06a21fe6dfc3deedf7fc8fea4abe9c71e9b",
+      "urls": [
+        "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/46b5c06a21fe6dfc3deedf7fc8fea4abe9c71e9b/speech_tokenizer_v1.onnx"
+      ],
+      "sha256": "23b5a723ed9143aebfd9ffda14ac4c21231f31c35ef837b6a13bb9e5488abb1e",
+      "size_bytes": 522624269,
+      "target": "pretrained_models/CosyVoice-300M/speech_tokenizer_v1.onnx"
+    }
+  ]
+}

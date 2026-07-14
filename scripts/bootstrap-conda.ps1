@@ -46,6 +46,36 @@ function Test-LockedSha256 {
     return $actual -eq $ExpectedSha256.ToLowerInvariant()
 }
 
+function Receive-LockedArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$Archive,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256
+    )
+
+    $partial = "$Archive.partial"
+    $segment = "$partial.segment"
+    if (Test-Path -LiteralPath $segment) { Remove-Item -LiteralPath $segment -Force }
+    $resumeFrom = if (Test-Path -LiteralPath $partial) { (Get-Item -LiteralPath $partial).Length } else { 0 }
+    $headers = @{}
+    if ($resumeFrom -gt 0) { $headers = @{ Range = "bytes=$resumeFrom-" } }
+    $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -Headers $headers -OutFile $segment -PassThru
+    if ($resumeFrom -gt 0 -and [int]$response.StatusCode -eq 206) {
+        $destination = [System.IO.File]::Open($partial, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
+        try {
+            $source = [System.IO.File]::OpenRead($segment)
+            try { $source.CopyTo($destination) } finally { $source.Dispose() }
+        } finally { $destination.Dispose() }
+        Remove-Item -LiteralPath $segment -Force
+    } else {
+        Move-Item -LiteralPath $segment -Destination $partial -Force
+    }
+    if (!(Test-LockedSha256 -Path $partial -ExpectedSha256 $ExpectedSha256)) {
+        throw "downloaded Miniforge .partial failed SHA-256 verification; it was not promoted: $partial"
+    }
+    Move-Item -LiteralPath $partial -Destination $archive -Force
+}
+
 function Ensure-BuildConda {
     param(
         [string]$CacheRoot = "data/cache/portable/conda",
@@ -80,7 +110,7 @@ function Ensure-BuildConda {
     New-Item -ItemType Directory -Force -Path $cache, $packageCache | Out-Null
     if (!(Test-Path -LiteralPath $archive -PathType Leaf)) {
         Write-Host "[portable-conda] downloading pinned Miniforge archive"
-        Invoke-WebRequest -Uri $toolchain.url -OutFile $archive -UseBasicParsing
+        Receive-LockedArchive -Url $toolchain.url -Archive $archive -ExpectedSha256 $toolchain.sha256
     }
     if (!(Test-LockedSha256 -Path $archive -ExpectedSha256 $toolchain.sha256)) {
         throw "Miniforge SHA-256 does not match toolchain.lock.json: $archive"

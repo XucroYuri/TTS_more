@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "component": "gpt-sovits",
+  "python_version": "3.11",
+  "dependency_mode": "requirements",
+  "required_free_bytes": 21474836480,
+  "auto_order": ["cu128", "cu126", "cpu"],
+  "profiles": {
+    "cu128": {"minimum_nvidia_driver": "570.00", "dependency_lock": "requirements-cu128.lock.txt"},
+    "cu126": {"minimum_nvidia_driver": "560.00", "dependency_lock": "requirements-cu126.lock.txt"},
+    "cpu": {"dependency_lock": "requirements-cpu.lock.txt"}
+  },
+  "assets": {"uv": {"id": "uv-0.11.28-windows-x64", "urls": ["https://files.pythonhosted.org/packages/40/bc/d67b18cddd54c503c7bad2b189a47fd7a1d07ea10b9212624f892b985498/uv-0.11.28-py3-none-win_amd64.whl"], "sha256": "f4fcf2c8d9f1444b900e6b8dbbb828825fb76eca01acd18aeaa5c90240408cda", "size_bytes": 27603677}},
+  "payloads": [
+    {
+      "id": "ffmpeg-8.1.2-full-build-shared",
+      "urls": ["https://github.com/GyanD/codexffmpeg/releases/download/8.1.2/ffmpeg-8.1.2-full_build-shared.zip"],
+      "sha256": "274923c68904a9b76c73b908f57923dafba81155856cd742138515ded570d066",
+      "size_bytes": 105925481,
+      "target": "data/cache/portable/assets/ffmpeg-8.1.2-full_build-shared.zip",
+      "extract_to": "ffmpeg-shared"
+    }
+  ]
+}

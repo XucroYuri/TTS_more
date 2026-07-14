@@ -48,6 +48,52 @@ def _valid_gpt_manifest() -> dict[str, object]:
     }
 
 
+def _valid_v2_manifest() -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "component": "gpt-sovits",
+        "version": "0.2.0",
+        "build_id": "gpt-main-test",
+        "package_profile": "bootstrap",
+        "platform": "windows-x64",
+        "api_contract": "tts-more-v1",
+        "source": {
+            "repository": "https://github.com/XucroYuri/GPT-SoVITS.git",
+            "revision": "f8a5865000000000000000000000000000000000",
+        },
+        "integration": {
+            "version": "2.0.0",
+            "source_revision": "d" * 40,
+            "bundle_sha256": "a" * 64,
+        },
+        "runtime": {
+            "python_version": "3.11",
+            "device_profiles": ["auto", "cu128", "cu126", "cpu"],
+            "lock": "locks/runtime.json",
+            "state_path": "data/local/install-state.json",
+        },
+        "models": {"lock": "locks/models.json", "required": True},
+        "data_root": "data/local",
+        "launchers": {
+            "initialize": "Initialize.cmd",
+            "start": "Start.cmd",
+            "stop": "Stop.cmd",
+            "repair": "Repair.cmd",
+            "build": "Build-Package.ps1",
+        },
+        "endpoint": {
+            "default_url": "http://127.0.0.1:9880",
+            "port": 9880,
+            "health_path": "/health",
+            "capabilities_path": "/capabilities",
+            "bind_policy": "loopback",
+        },
+        "capabilities": ["tts", "artifact-transfer"],
+        "sha256_manifest": "SHA256SUMS.txt",
+        "licenses": "licenses/THIRD-PARTY-NOTICES.json",
+    }
+
+
 def test_validate_manifest_rejects_absolute_paths_and_missing_worker_fields(tmp_path: Path) -> None:
     packages = _load_portable_packages()
     manifest = tmp_path / "tts-more-package.json"
@@ -79,6 +125,68 @@ def test_validate_manifest_accepts_staged_gpt_worker_package(tmp_path: Path) -> 
         "default_endpoint": "http://127.0.0.1:9883",
         "launcher": "Start.cmd",
     }
+
+
+def test_validate_manifest_accepts_schema_v2_and_keeps_v1_compatibility(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    payload = _valid_v2_manifest()
+    for relative_path in (
+        *payload["launchers"].values(),
+        payload["runtime"]["lock"],
+        payload["models"]["lock"],
+        payload["licenses"],
+    ):
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("test", encoding="utf-8")
+    manifest = tmp_path / "package" / "tts-more-package.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    v2_report = packages.validate_manifest(manifest, tmp_path)
+
+    assert v2_report == {
+        "valid": True,
+        "errors": [],
+        "component": "gpt-sovits",
+        "default_endpoint": "http://127.0.0.1:9880",
+        "launcher": "Start.cmd",
+    }
+
+
+def test_validate_manifest_accepts_windows_powershell_utf8_bom(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    (tmp_path / "Start.cmd").write_text("@echo off\r\n", encoding="utf-8")
+    manifest = tmp_path / "tts-more-package.json"
+    manifest.write_text(json.dumps(_valid_gpt_manifest()), encoding="utf-8-sig")
+
+    assert packages.validate_manifest(manifest, tmp_path)["valid"] is True
+
+
+def test_validate_manifest_rejects_invalid_v2_profile_and_nested_absolute_paths(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    payload = _valid_v2_manifest()
+    payload["package_profile"] = "portable"
+    payload["runtime"]["lock"] = "C:/machine/runtime.lock"
+    manifest = tmp_path / "tts-more-package.json"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = packages.validate_manifest(manifest, tmp_path)
+
+    assert report["valid"] is False
+    assert "package_profile must be bootstrap or full" in report["errors"]
+    assert "runtime.lock must be a relative path" in report["errors"]
+
+
+def test_package_json_schema_defines_v1_compatibility_and_v2_output_contract() -> None:
+    schema = json.loads(
+        (REPO_ROOT / "packaging" / "portable" / "tts-more-package.schema.json").read_text(encoding="utf-8")
+    )
+
+    assert schema["$defs"]["v1"]["properties"]["schema_version"] == {"const": 1}
+    assert schema["$defs"]["v2"]["properties"]["schema_version"] == {"const": 2}
+    assert schema["$defs"]["v2"]["properties"]["package_profile"]["enum"] == ["bootstrap", "full"]
+    assert schema["oneOf"] == [{"$ref": "#/$defs/v1"}, {"$ref": "#/$defs/v2"}]
 
 
 def test_gpt_dev_sample_manifest_uses_builtin_windows_zip_runtime() -> None:
@@ -243,7 +351,7 @@ def test_gpt_portable_builder_requires_dev_lock_and_offline_payloads() -> None:
 
 def test_every_local_tts_component_has_a_path_relative_start_and_stop_launcher() -> None:
     launchers = (
-        (REPO_ROOT, "8000", "scripts\\start-dev.ps1"),
+        (REPO_ROOT, None, "scripts\\start-production.ps1"),
         (REPO_ROOT / "deployment" / "portable" / "gpt-sovits-dev", "9883", "runtime\\runtime.zip"),
         (REPO_ROOT / "deployment" / "tts-repos" / "indextts" / "launchers", "7860", ".venv\\Scripts\\python.exe"),
         (REPO_ROOT / "deployment" / "tts-repos" / "cosyvoice" / "launchers", "9882", ".venv\\Scripts\\python.exe"),
@@ -256,14 +364,16 @@ def test_every_local_tts_component_has_a_path_relative_start_and_stop_launcher()
         assert stop.is_file(), f"missing Stop.cmd: {stop}"
         contents = start.read_text(encoding="utf-8")
         assert "%~dp0" in contents
-        assert port in contents
+        if port is not None:
+            assert port in contents
         assert entrypoint in contents
-        assert "pid.json" in stop.read_text(encoding="utf-8")
+        assert "stop-production.ps1" in stop.read_text(encoding="utf-8") if root == REPO_ROOT else "pid.json" in stop.read_text(encoding="utf-8")
+    assert "8000" in (REPO_ROOT / "scripts" / "start-production.ps1").read_text(encoding="utf-8")
 
 
 def test_local_start_launchers_allow_non_destructive_port_overrides() -> None:
     app_launcher = (REPO_ROOT / "scripts" / "start-dev.ps1").read_text(encoding="utf-8")
-    app_stop = (REPO_ROOT / "Stop.cmd").read_text(encoding="utf-8")
+    app_stop = (REPO_ROOT / "Stop-Dev.cmd").read_text(encoding="utf-8")
     assert "$env:TTS_MORE_BACKEND_PORT" in app_launcher
     assert "$env:TTS_MORE_FRONTEND_PORT" in app_launcher
     assert 'backend_port = $BackendPort' in app_launcher

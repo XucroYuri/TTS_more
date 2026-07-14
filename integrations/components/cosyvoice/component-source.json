@@ -1,0 +1,9 @@
+{
+  "upstream_repository": "https://github.com/XucroYuri/CosyVoice.git",
+  "branch": "main",
+  "worker_module": "tts_more_worker.cosyvoice:app",
+  "python": "3.10",
+  "port": 9882,
+  "import_probe": "import fastapi,onnxruntime,torch; import cosyvoice; from cosyvoice.cli.cosyvoice import CosyVoice; print('CosyVoice imports passed')",
+  "submodules": {"third_party/Matcha-TTS": "dd9105b34bf2be2230f4aa1e4769fb586a3c824e"}
+}
