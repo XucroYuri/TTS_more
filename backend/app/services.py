@@ -59,8 +59,11 @@ def _merge_service_delta(
     current: list[TTSServiceEndpoint],
     baseline: list[TTSServiceEndpoint] | None,
     desired: list[TTSServiceEndpoint],
+    *,
+    restore_missing_baseline: bool = False,
 ) -> list[TTSServiceEndpoint]:
     if baseline is None:
+        require_unique_service_identities(desired)
         return desired
     current_by_id = {service.service_id: service for service in current}
     baseline_by_id = {
@@ -73,9 +76,15 @@ def _merge_service_delta(
         current_by_id.pop(service_id, None)
     for service_id, service in desired_by_id.items():
         previous = baseline_by_id.get(service_id)
-        if previous is None or service.model_dump(mode="json") != previous.model_dump(mode="json"):
+        if (
+            restore_missing_baseline
+            or previous is None
+            or service.model_dump(mode="json") != previous.model_dump(mode="json")
+        ):
             current_by_id[service_id] = service
-    return sorted(current_by_id.values(), key=lambda item: item.service_id)
+    merged = sorted(current_by_id.values(), key=lambda item: item.service_id)
+    require_unique_service_identities(merged)
+    return merged
 
 
 class ServiceRegistry:
@@ -85,17 +94,22 @@ class ServiceRegistry:
         *,
         store_schema_version: int | None = None,
         _baseline: list[TTSServiceEndpoint] | None = None,
+        _baseline_was_missing: bool = False,
     ) -> None:
         _require_unique_service_ids(services)
         self.services = services
         self._by_id = {service.service_id: service for service in services}
         self.store_schema_version = store_schema_version
         self._baseline = _baseline
+        self._baseline_was_missing = _baseline_was_missing
 
     @classmethod
     def load(cls, path: Path) -> "ServiceRegistry":
         if not path.exists():
-            return cls.default_local(repo_root=Path("repo"))
+            registry = cls.default_local(repo_root=Path("repo"))
+            registry._baseline = list(registry.services)
+            registry._baseline_was_missing = True
+            return registry
         document = read_service_document(path)
         endpoints = [TTSServiceEndpoint.model_validate(item) for item in document.services]
         _require_unique_service_ids(endpoints)
@@ -111,6 +125,7 @@ class ServiceRegistry:
             services,
             store_schema_version=self.store_schema_version,
             _baseline=self._baseline,
+            _baseline_was_missing=self._baseline_was_missing,
         )
 
     def save(self, path: Path) -> None:
@@ -120,7 +135,12 @@ class ServiceRegistry:
         def merge(current: ServiceDocument) -> ServiceDocument:
             current_endpoints = [TTSServiceEndpoint.model_validate(item) for item in current.services]
             _require_unique_service_ids(current_endpoints)
-            merged = _merge_service_delta(current_endpoints, self._baseline, desired)
+            merged = _merge_service_delta(
+                current_endpoints,
+                self._baseline,
+                desired,
+                restore_missing_baseline=self._baseline_was_missing,
+            )
             schema_version = self.store_schema_version
             if schema_version is None:
                 schema_version = current.schema_version
@@ -129,8 +149,20 @@ class ServiceRegistry:
                 [service.model_dump(mode="json") for service in merged],
             )
 
-        update_service_document(path, merge, default_schema_version=self.store_schema_version)
-        self._baseline = desired
+        updated = update_service_document(
+            path,
+            merge,
+            default_schema_version=self.store_schema_version,
+        )
+        merged = [
+            sanitize_portable_endpoint(TTSServiceEndpoint.model_validate(item))
+            for item in updated.services
+        ]
+        require_unique_service_identities(merged)
+        self.services = merged
+        self._by_id = {service.service_id: service for service in merged}
+        self._baseline = list(merged)
+        self._baseline_was_missing = False
 
     @classmethod
     def default_local(cls, repo_root: Path) -> "ServiceRegistry":

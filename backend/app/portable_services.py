@@ -142,6 +142,7 @@ def _merge_service_delta(
     desired: list[TTSServiceEndpoint],
 ) -> list[TTSServiceEndpoint]:
     if baseline is None:
+        require_unique_service_identities(desired)
         return desired
     current_by_id = {endpoint.service_id: endpoint for endpoint in current}
     baseline_by_id = {
@@ -156,7 +157,9 @@ def _merge_service_delta(
         previous = baseline_by_id.get(service_id)
         if previous is None or endpoint.model_dump(mode="json") != previous.model_dump(mode="json"):
             current_by_id[service_id] = endpoint
-    return sorted(current_by_id.values(), key=_service_sort_key)
+    merged = sorted(current_by_id.values(), key=_service_sort_key)
+    require_unique_service_identities(merged)
+    return merged
 
 
 class PortableServiceStore:
@@ -181,18 +184,21 @@ class PortableServiceStore:
         validated = self._validate_services(list(services))
         path = self._safe_path(create_parent=True)
         persisted = [sanitize_portable_endpoint(endpoint) for endpoint in validated]
+        merged_result: list[TTSServiceEndpoint] = []
 
         def merge(current: ServiceDocument) -> ServiceDocument:
             current_endpoints = self._validate_services(current.services)
             merged = _merge_service_delta(current_endpoints, self._baseline, persisted)
+            require_unique_service_identities(merged)
+            merged_result[:] = merged
             return ServiceDocument(
                 STORE_SCHEMA_VERSION,
                 [endpoint.model_dump(mode="json") for endpoint in merged],
             )
 
         update_service_document(path, merge, default_schema_version=STORE_SCHEMA_VERSION)
-        self._baseline = validated
-        return validated
+        self._baseline = list(merged_result)
+        return merged_result
 
     def upsert(self, endpoint: TTSServiceEndpoint) -> list[TTSServiceEndpoint]:
         validated = TTSServiceEndpoint.model_validate(endpoint)
@@ -222,6 +228,7 @@ class PortableServiceStore:
             ]
             retained.append(trusted)
             retained.sort(key=_service_sort_key)
+            require_unique_service_identities(retained)
             resolved[:] = retained
             return ServiceDocument(
                 STORE_SCHEMA_VERSION,

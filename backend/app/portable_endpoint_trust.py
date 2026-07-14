@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Protocol
 
 from app.models import TTSServiceEndpoint
@@ -18,13 +20,25 @@ def require_unique_service_identities(services: list[TTSServiceEndpoint]) -> Non
     service_ids: set[str] = set()
     package_identities: set[tuple[str, str]] = set()
     for service in services:
-        if service.service_id in service_ids:
+        canonical_service_id = unicodedata.normalize("NFKC", service.service_id).casefold()
+        if canonical_service_id in service_ids:
             raise ValueError(f"duplicate service_id: {service.service_id}")
-        service_ids.add(service.service_id)
+        service_ids.add(canonical_service_id)
         locator = service.portable_locator
         if service.control_kind != "portable-package" or locator is None:
             continue
-        identity = (locator.component, locator.package_id)
+        component = unicodedata.normalize("NFKC", str(locator.component)).casefold()
+        package_id = unicodedata.normalize("NFKC", locator.package_id).casefold()
+        if (
+            component not in {"gpt-sovits", "indextts", "cosyvoice"}
+            or package_id != locator.package_id
+            or any(unicodedata.category(character).startswith("C") for character in locator.package_id)
+            or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", package_id) is None
+        ):
+            raise ValueError(
+                f"noncanonical portable package identity: {locator.component}/{locator.package_id}"
+            )
+        identity = (component, package_id)
         if identity in package_identities:
             raise ValueError(
                 f"duplicate portable package identity: {locator.component}/{locator.package_id}"

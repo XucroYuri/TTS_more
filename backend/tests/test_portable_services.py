@@ -19,11 +19,13 @@ from app.portable_discovery import (
     endpoint_from_portable_package,
     read_portable_package,
 )
+from app.portable_endpoint_trust import require_unique_service_identities
 from app.portable_services import (
     PortableServiceLocator,
     PortableServiceStore,
     resolve_locator,
 )
+from app.service_config import ServiceSettingsRecord, ServiceSettingsUpdate, save_service_settings
 from app.services import ServiceRegistry
 
 
@@ -1081,3 +1083,187 @@ def test_search_roots_and_total_candidate_enumeration_are_globally_bounded(tmp_p
     assert resolve_locator(controller, locator, roots) is None
     assert len(touched_roots) <= 16
     assert enumerated <= 512
+
+
+def test_settings_save_never_returns_forged_portable_runtime_authority(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    endpoint = _endpoint(_locator("gpt-sovits", "gpt-main", package))
+    record = ServiceSettingsRecord.model_validate(
+        endpoint.model_copy(
+            update={
+                "managed": True,
+                "repo_path": "C:/forged",
+                "start_command": ["FORGED-COMMAND-MARKER.exe"],
+                "start_cwd": "C:/forged",
+            }
+        ).model_dump(mode="python")
+    )
+    path = tmp_path / "data" / "local" / "services.json"
+
+    registry = save_service_settings(
+        path,
+        tmp_path / ".env.local",
+        ServiceSettingsUpdate(services=[record]),
+    )
+
+    [runtime] = registry.services
+    assert runtime.managed is False
+    assert runtime.repo_path is None
+    assert runtime.start_command == []
+    assert runtime.start_cwd is None
+    assert "FORGED-COMMAND-MARKER" not in json.dumps(runtime.model_dump(mode="json"))
+
+
+def test_settings_api_applies_only_sanitized_portable_endpoint_to_current_process(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    raw = _endpoint(_locator("gpt-sovits", "gpt-main", package)).model_dump(mode="json")
+    raw.update(
+        managed=True,
+        repo_path="C:/forged",
+        start_command=["FORGED-COMMAND-MARKER.exe"],
+        start_cwd="C:/forged",
+    )
+    app = create_app(data_root=tmp_path / "controller-data", env_path=tmp_path / ".env.local")
+
+    response = TestClient(app).put("/api/settings/services", json={"services": [raw]})
+
+    assert response.status_code == 200
+    [runtime] = app.state.service_registry.services
+    assert runtime.managed is False
+    assert runtime.repo_path is None
+    assert runtime.start_command == []
+    assert runtime.start_cwd is None
+    assert app.state.supervisor.status(runtime)["manageable"] is False
+
+
+def test_portable_store_save_returns_only_sanitized_merged_endpoints(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    forged = _endpoint(_locator("gpt-sovits", "gpt-main", package)).model_copy(
+        update={
+            "managed": True,
+            "repo_path": "C:/forged",
+            "start_command": ["FORGED-COMMAND-MARKER.exe"],
+            "start_cwd": "C:/forged",
+        }
+    )
+
+    [returned] = PortableServiceStore(controller).save([forged])
+
+    assert returned.managed is False
+    assert returned.repo_path is None
+    assert returned.start_command == []
+    assert returned.start_cwd is None
+
+
+def test_missing_registry_load_merges_first_portable_writer_without_losing_defaults(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    path = controller / "data" / "local" / "services.json"
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    stale = ServiceRegistry.load(path)
+    default_ids = {item.service_id for item in stale.services}
+    desired = [
+        *stale.services,
+        TTSServiceEndpoint(service_id="registry-add", base_url="http://127.0.0.1:9003"),
+    ]
+    go = tmp_path / "go"
+    done = tmp_path / "done"
+    backend_root = Path(__file__).resolve().parents[1]
+    upsert_code = """
+import sys, time
+from pathlib import Path
+from app.models import PortableServiceLocator, TTSServiceEndpoint
+from app.portable_services import PortableServiceStore
+controller, package, go, done = map(Path, sys.argv[1:5])
+while not go.exists(): time.sleep(0.005)
+locator = PortableServiceLocator(component='gpt-sovits', package_id='gpt-main', absolute_path_last_seen=str(package))
+endpoint = TTSServiceEndpoint(service_id='portable-gpt-sovits-gpt-main', provider_type='gpt-sovits', base_url='http://127.0.0.1:9880', control_kind='portable-package', portable_locator=locator)
+PortableServiceStore(controller).upsert(endpoint)
+done.write_text('done')
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", upsert_code, str(controller), str(package), str(go), str(done)],
+        cwd=backend_root,
+    )
+    try:
+        go.write_text("go")
+        assert process.wait(timeout=30) == 0
+        assert done.exists()
+        stale.with_services(desired).save(path)
+    finally:
+        if process.poll() is None:
+            process.kill()
+
+    loaded = ServiceRegistry.load(path).services
+    ids = [item.service_id for item in loaded]
+    assert "portable-gpt-sovits-gpt-main" in ids
+    assert "registry-add" in ids
+    assert default_ids.issubset(ids)
+    assert len(ids) == len(set(ids))
+
+
+def test_post_merge_portable_identity_collision_fails_before_replace(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    seed = TTSServiceEndpoint(service_id="seed", base_url="http://127.0.0.1:9001")
+    ServiceRegistry([seed]).save(controller / "data" / "local" / "services.json")
+    registry = ServiceRegistry.load(controller / "data" / "local" / "services.json")
+    store = PortableServiceStore(controller)
+    store_baseline = store.load()
+    first = _endpoint(_locator("gpt-sovits", "gpt-main", package)).model_copy(
+        update={"service_id": "first-portable"}
+    )
+    second = _endpoint(_locator("gpt-sovits", "gpt-main", package)).model_copy(
+        update={"service_id": "second-portable"}
+    )
+    registry.with_services([*registry.services, first]).save(store.path)
+    before = store.path.read_bytes()
+
+    with pytest.raises(ValueError, match="duplicate portable package identity"):
+        store.save([*store_baseline, second])
+
+    assert store.path.read_bytes() == before
+    assert len(ServiceRegistry.load(store.path).services) == 2
+
+
+@pytest.mark.parametrize("alias", ("GPT-MAIN", "ｇｐｔ-main", "gpt-main\u200b"))
+def test_noncanonical_portable_identity_from_stale_writer_fails_closed(
+    tmp_path: Path, alias: str
+) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    path = controller / "data" / "local" / "services.json"
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    canonical = _endpoint(_locator("gpt-sovits", "gpt-main", package)).model_dump(mode="json")
+    forged = {**canonical, "service_id": "alias-portable"}
+    forged["portable_locator"] = {**forged["portable_locator"], "package_id": alias}
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"schema_version": 1, "services": [forged]}), encoding="utf-8")
+    before = path.read_bytes()
+
+    with pytest.raises((ValueError, ValidationError)):
+        ServiceRegistry([TTSServiceEndpoint.model_validate(canonical)]).save(path)
+
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("alias", ("GPT-MAIN", "ｇｐｔ-main", "gpt-main\u200b"))
+def test_shared_identity_validator_rejects_case_and_unicode_package_aliases(
+    tmp_path: Path, alias: str
+) -> None:
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    canonical = _endpoint(_locator("gpt-sovits", "gpt-main", package))
+    alias_locator = PortableServiceLocator.model_construct(
+        component="gpt-sovits",
+        package_id=alias,
+        absolute_path_last_seen=str(package),
+    )
+    forged = canonical.model_copy(
+        update={"service_id": "alias-portable", "portable_locator": alias_locator}
+    )
+
+    with pytest.raises(ValueError, match="portable package identity"):
+        require_unique_service_identities([canonical, forged])
