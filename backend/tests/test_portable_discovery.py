@@ -198,9 +198,15 @@ def test_local_package_registration_is_managed_but_lan_registration_is_not(tmp_p
     )
 
     assert local.mode == "local" and local.managed is True
+    assert local.control_kind == "portable-package"
+    assert local.portable_locator is not None
+    assert local.portable_locator.component == "cosyvoice"
+    assert local.portable_locator.package_id == descriptor.package_id
     assert local.start_command[:2] == ["python.exe", "scripts/portable_package_runner.py"]
     assert local.repo_path == str(package_root.resolve())
     assert lan.mode == "external" and lan.managed is False
+    assert lan.control_kind == "generic"
+    assert lan.portable_locator is None
     assert lan.network_scope == "lan"
     assert lan.default_params["delivery"] == "artifact"
 

@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
+import re
+import stat
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
-from app.models import EngineName, ProviderType, TTSServiceEndpoint
+from app.models import EngineName, PortableServiceLocator, ProviderType, TTSServiceEndpoint
 
 
 SUPPORTED_COMPONENTS = {"gpt-sovits", "indextts", "cosyvoice"}
+CONTROLLER_VERSION = "0.2.0"
+SUPPORTED_PROTOCOL_VERSION = "1.0"
 PROVIDER_ENGINES = {
     "gpt-sovits": (ProviderType.GPT_SOVITS, EngineName.GPT_SOVITS),
     "indextts": (ProviderType.INDEX_TTS, EngineName.INDEX_TTS),
@@ -51,6 +56,11 @@ class PortablePackageDescriptor(BaseModel):
     initialized: bool
     valid: bool
     errors: list[str] = Field(default_factory=list)
+    complete_v2: bool = False
+    protocol_compatible: bool = False
+    controller_compatible: bool = False
+    manageable: bool = False
+    management_errors: list[str] = Field(default_factory=list)
 
 
 def discover_portable_packages(
@@ -102,17 +112,28 @@ def discover_portable_packages(
 
 
 def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
-    root = package_root.expanduser().resolve(strict=False)
+    root = Path(os.path.abspath(package_root.expanduser()))
     manifest_path = _manifest_path(root)
     payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError("portable manifest must be a JSON object")
     schema = int(payload.get("schema_version") or 0)
     errors: list[str] = []
-    component = str(payload.get("component") or "")
-    package_id = str(payload.get("package_id") or component)
-    release_version = str(payload.get("release_version") or payload.get("version") or "")
+    raw_component = payload.get("component")
+    component = raw_component if isinstance(raw_component, str) else ""
+    raw_package_id = payload.get("package_id")
+    package_id = raw_package_id if isinstance(raw_package_id, str) else component
+    raw_release_version = payload.get("release_version") or payload.get("version")
+    release_version = raw_release_version if isinstance(raw_release_version, str) else ""
     protocol = _mapping(payload.get("protocol"))
-    protocol_version = str(protocol.get("version") or "1.0")
-    controller_range = str(protocol.get("controller_range") or ">=0.2.0,<0.3.0")
+    raw_protocol_version = protocol.get("version")
+    protocol_version = raw_protocol_version if isinstance(raw_protocol_version, str) and raw_protocol_version else "1.0"
+    raw_controller_range = protocol.get("controller_range")
+    controller_range = (
+        raw_controller_range
+        if isinstance(raw_controller_range, str) and raw_controller_range
+        else ">=0.2.0,<0.3.0"
+    )
     data = _mapping(payload.get("data"))
     operations_path = str(data.get("operations") or "data/local/operations")
     if component not in SUPPORTED_COMPONENTS:
@@ -144,7 +165,7 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
 
     if not 1 <= port <= 65535:
         errors.append("portable endpoint port is invalid")
-    if not default_url.startswith("http://127.0.0.1:") and not default_url.startswith("http://localhost:"):
+    if not _loopback_default_url(default_url, port):
         errors.append("portable package default endpoint must be loopback")
     if not _safe_relative_path(launcher) or not (root / launcher).is_file():
         errors.append("portable package Start launcher is missing or unsafe")
@@ -153,6 +174,16 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
     if not _safe_relative_path(operations_path):
         errors.append("portable package operations path is unsafe")
 
+    management_errors = _management_errors(payload, root) if schema == 2 else ["schema_version 2 is required"]
+    complete_v2 = schema == 2 and not management_errors
+    protocol_compatible = (
+        schema == 2
+        and protocol.get("name") == "tts-more-v1"
+        and protocol_version == SUPPORTED_PROTOCOL_VERSION
+    )
+    controller_compatible = complete_v2 and is_controller_compatible(controller_range, CONTROLLER_VERSION)
+    manageable = not errors and complete_v2 and protocol_compatible and controller_compatible
+
     return PortablePackageDescriptor(
         package_root=str(root),
         manifest_path=str(manifest_path),
@@ -160,7 +191,7 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
         component=component,
         package_id=package_id,
         version=release_version,
-        build_id=str(payload.get("build_id") or ""),
+        build_id=payload.get("build_id") if isinstance(payload.get("build_id"), str) else "",
         package_profile=package_profile,
         default_url=default_url,
         port=port,
@@ -173,7 +204,29 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
         initialized=(root / state_path).is_file(),
         valid=not errors,
         errors=errors,
+        complete_v2=complete_v2,
+        protocol_compatible=protocol_compatible,
+        controller_compatible=controller_compatible,
+        manageable=manageable,
+        management_errors=management_errors,
     )
+
+
+def inspect_locator_candidate(package_root: Path) -> PortablePackageDescriptor | None:
+    """Read one locator candidate only when its root identity is stable and schema v2 is complete."""
+
+    root = Path(os.path.abspath(package_root.expanduser()))
+    try:
+        if not root.is_dir() or _is_reparse_point(root):
+            return None
+        if _canonical_path(root.resolve(strict=True)) != _canonical_path(root):
+            return None
+        descriptor = read_portable_package(root)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    if not descriptor.valid or not descriptor.complete_v2:
+        return None
+    return descriptor
 
 
 def endpoint_from_portable_package(
@@ -185,7 +238,7 @@ def endpoint_from_portable_package(
     if requested_root != Path(descriptor.package_root):
         raise ValueError("registered package root does not match the validated descriptor")
     provider, engine = PROVIDER_ENGINES[descriptor.component]
-    suffix = descriptor.build_id[:12] or descriptor.version.replace(".", "-") or "portable"
+    suffix = re.sub(r"[^a-z0-9._-]+", "-", descriptor.package_id.casefold()).strip("-") or "portable"
     service_id = f"portable-{descriptor.component}-{suffix}".lower()
     capabilities = list(dict.fromkeys([*descriptor.capabilities, "tts-more-worker", "artifact-transfer"]))
 
@@ -222,7 +275,7 @@ def endpoint_from_portable_package(
         base_url=descriptor.default_url,
         mode="local",
         network_scope="localhost",
-        managed=True,
+        managed=descriptor.manageable,
         enabled=request.enabled,
         repo_path=descriptor.package_root,
         start_command=[
@@ -238,6 +291,13 @@ def endpoint_from_portable_package(
         catalog_provider=descriptor.component,
         setup_state="ready" if descriptor.initialized else "env_missing",
         default_params={"delivery": "path"},
+        control_kind="portable-package",
+        portable_locator=PortableServiceLocator(
+            component=descriptor.component,
+            package_id=descriptor.package_id,
+            absolute_path_last_seen=descriptor.package_root,
+            build_id_last_seen=descriptor.build_id or None,
+        ),
     )
 
 
@@ -269,3 +329,213 @@ def _mapping(value: Any) -> dict[str, Any]:
 def _safe_relative_path(raw: str) -> bool:
     normalized = raw.replace("\\", "/")
     return bool(normalized) and not Path(normalized).is_absolute() and ":" not in normalized and ".." not in normalized.split("/")
+
+
+def is_controller_compatible(controller_range: str, controller_version: str = CONTROLLER_VERSION) -> bool:
+    try:
+        actual = _version_tuple(controller_version)
+        clauses = [clause.strip() for clause in controller_range.split(",") if clause.strip()]
+        if not clauses:
+            return False
+        for clause in clauses:
+            match = re.fullmatch(r"(>=|<=|==|>|<)\s*(\d+(?:\.\d+){0,3})", clause)
+            if match is None:
+                return False
+            expected = _version_tuple(match.group(2))
+            operator = match.group(1)
+            if operator == ">=" and actual < expected:
+                return False
+            if operator == "<=" and actual > expected:
+                return False
+            if operator == ">" and actual <= expected:
+                return False
+            if operator == "<" and actual >= expected:
+                return False
+            if operator == "==" and actual != expected:
+                return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _version_tuple(value: str) -> tuple[int, int, int, int]:
+    parts = value.split(".")
+    if not 1 <= len(parts) <= 4 or any(not part.isdigit() for part in parts):
+        raise ValueError("version must contain numeric dot-separated parts")
+    return tuple([*(int(part) for part in parts), *(0 for _ in range(4 - len(parts)))])  # type: ignore[return-value]
+
+
+def _management_errors(payload: dict[str, Any], root: Path) -> list[str]:
+    errors: list[str] = []
+    for field in ("package_id", "release_version", "build_id"):
+        if not _strict_identity(payload.get(field)):
+            errors.append(f"{field} must be an unambiguous non-empty string")
+    if payload.get("platform") != "windows-x64":
+        errors.append("platform must be windows-x64")
+    if payload.get("package_profile") not in {"bootstrap", "full"}:
+        errors.append("package_profile must be bootstrap or full")
+    if payload.get("api_contract") != "tts-more-v1":
+        errors.append("api_contract must be tts-more-v1")
+
+    source = _mapping(payload.get("source"))
+    if not _strict_text(source.get("repository")):
+        errors.append("source.repository is required")
+    if not _immutable_revision(source.get("revision")):
+        errors.append("source.revision must be immutable")
+    integration = _mapping(payload.get("integration"))
+    if not _strict_text(integration.get("version")):
+        errors.append("integration.version is required")
+    if not _immutable_revision(integration.get("source_revision")):
+        errors.append("integration.source_revision must be immutable")
+    if not _sha256(integration.get("bundle_sha256")):
+        errors.append("integration.bundle_sha256 must be a SHA-256 digest")
+
+    runtime = _mapping(payload.get("runtime"))
+    if not _strict_text(runtime.get("python_version")):
+        errors.append("runtime.python_version is required")
+    profiles = runtime.get("device_profiles")
+    if not isinstance(profiles, list) or not profiles or any(not isinstance(item, str) for item in profiles):
+        errors.append("runtime.device_profiles must be a non-empty string list")
+    _require_package_file(root, runtime.get("lock"), "runtime.lock", errors)
+    _require_relative(runtime.get("state_path"), "runtime.state_path", errors, root=root)
+
+    models = _mapping(payload.get("models"))
+    _require_package_file(root, models.get("lock"), "models.lock", errors)
+    if not isinstance(models.get("required"), bool):
+        errors.append("models.required must be a boolean")
+    _require_relative(payload.get("data_root"), "data_root", errors, root=root)
+
+    protocol = _mapping(payload.get("protocol"))
+    if protocol.get("name") != "tts-more-v1":
+        errors.append("protocol.name must be tts-more-v1")
+    for name in ("version", "controller_range"):
+        if not _strict_text(protocol.get(name)):
+            errors.append(f"protocol.{name} is required")
+    data = _mapping(payload.get("data"))
+    for name in ("user", "local", "cache", "operations"):
+        _require_relative(data.get(name), f"data.{name}", errors, root=root)
+
+    launchers = _mapping(payload.get("launchers"))
+    for name in ("initialize", "start", "stop", "repair", "build"):
+        _require_package_file(root, launchers.get(name), f"launchers.{name}", errors)
+    endpoint = _mapping(payload.get("endpoint"))
+    port = endpoint.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        errors.append("endpoint.port must be between 1 and 65535")
+    default_url = endpoint.get("default_url")
+    if not isinstance(default_url, str) or not _loopback_default_url(default_url, port):
+        errors.append("endpoint.default_url must be loopback")
+    for name in ("health_path", "capabilities_path"):
+        value = endpoint.get(name)
+        if not isinstance(value, str) or not value.startswith("/"):
+            errors.append(f"endpoint.{name} must start with /")
+    if endpoint.get("bind_policy") not in {"loopback", "trusted-lan"}:
+        errors.append("endpoint.bind_policy is invalid")
+    capabilities = payload.get("capabilities")
+    if not isinstance(capabilities, list) or any(not isinstance(item, str) for item in capabilities):
+        errors.append("capabilities must be a string list")
+    _require_relative(payload.get("sha256_manifest"), "sha256_manifest", errors, root=root)
+    _require_package_file(root, payload.get("licenses"), "licenses", errors)
+
+    try:
+        if _is_reparse_point(root):
+            errors.append("package root must not be a reparse point")
+        if _path_contains_reparse(root, _manifest_path(root)):
+            errors.append("package manifest path must not traverse a reparse point")
+    except OSError:
+        errors.append("package root is unavailable")
+    return errors
+
+
+def _strict_text(value: Any) -> bool:
+    import unicodedata
+
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and not any(unicodedata.category(character).startswith("C") for character in value)
+    )
+
+
+def _strict_identity(value: Any) -> bool:
+    return _strict_text(value) and not any(character.isspace() for character in value)
+
+
+def _immutable_revision(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", value) is not None
+
+
+def _sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None
+
+
+def _require_relative(
+    value: Any,
+    label: str,
+    errors: list[str],
+    *,
+    root: Path | None = None,
+) -> None:
+    if not isinstance(value, str) or not _safe_relative_path(value):
+        errors.append(f"{label} must be a safe relative path")
+        return
+    if root is not None:
+        path = root / Path(value.replace("\\", "/"))
+        try:
+            if _path_contains_reparse(root, path):
+                errors.append(f"{label} traverses a reparse point")
+        except OSError:
+            errors.append(f"{label} is unsafe")
+
+
+def _require_package_file(root: Path, value: Any, label: str, errors: list[str]) -> None:
+    if not isinstance(value, str) or not _safe_relative_path(value):
+        errors.append(f"{label} must be a safe relative path")
+        return
+    path = root / Path(value.replace("\\", "/"))
+    try:
+        if not path.is_file() or _path_contains_reparse(root, path):
+            errors.append(f"{label} is missing or unsafe")
+    except OSError:
+        errors.append(f"{label} is missing or unsafe")
+
+
+def _path_contains_reparse(root: Path, path: Path) -> bool:
+    current = root
+    for part in path.relative_to(root).parts:
+        current = current / part
+        if current.exists() and _is_reparse_point(current):
+            return True
+    return False
+
+
+def _is_reparse_point(path: Path) -> bool:
+    metadata = path.lstat()
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return path.is_symlink() or bool(attributes & flag)
+
+
+def _canonical_path(path: Path) -> str:
+    import unicodedata
+
+    return unicodedata.normalize("NFKC", os.path.normcase(str(path))).casefold()
+
+
+def _loopback_default_url(value: str, expected_port: int) -> bool:
+    try:
+        parsed = urlparse(value)
+        return (
+            parsed.scheme == "http"
+            and parsed.hostname in {"127.0.0.1", "localhost"}
+            and parsed.port == expected_port
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path in {"", "/"}
+            and not parsed.params
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except (TypeError, ValueError):
+        return False

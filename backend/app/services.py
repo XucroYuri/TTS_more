@@ -5,6 +5,7 @@ import os
 import base64
 import hashlib
 import re
+import tempfile
 import time
 import uuid
 from urllib.parse import quote
@@ -47,23 +48,61 @@ class ServiceRoute:
 
 
 class ServiceRegistry:
-    def __init__(self, services: list[TTSServiceEndpoint]) -> None:
+    def __init__(self, services: list[TTSServiceEndpoint], *, store_schema_version: int | None = None) -> None:
         self.services = services
         self._by_id = {service.service_id: service for service in services}
+        self.store_schema_version = store_schema_version
 
     @classmethod
     def load(cls, path: Path) -> "ServiceRegistry":
         if not path.exists():
             return cls.default_local(repo_root=Path("repo"))
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        return cls([TTSServiceEndpoint.model_validate(item) for item in raw])
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"services store is unreadable: {exc}") from exc
+        schema_version: int | None = None
+        if isinstance(raw, dict):
+            if set(raw) != {"schema_version", "services"} or raw.get("schema_version") != 1:
+                raise ValueError("services store has an unsupported versioned document")
+            services = raw.get("services")
+            schema_version = 1
+        else:
+            services = raw
+        if not isinstance(services, list) or any(not isinstance(item, dict) for item in services):
+            raise ValueError("services store must contain a list of endpoint objects")
+        return cls(
+            [TTSServiceEndpoint.model_validate(item) for item in services],
+            store_schema_version=schema_version,
+        )
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps([service.model_dump(mode="json") for service in self.services], ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        schema_version = self.store_schema_version
+        if path.is_file():
+            existing_schema_version = self.load(path).store_schema_version
+            if schema_version is None:
+                schema_version = existing_schema_version
+        services = [service.model_dump(mode="json") for service in self.services]
+        payload: object = (
+            {"schema_version": schema_version, "services": services}
+            if schema_version is not None
+            else services
         )
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
     @classmethod
     def default_local(cls, repo_root: Path) -> "ServiceRegistry":
