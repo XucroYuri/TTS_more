@@ -28,6 +28,7 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
 
     assert result["component"] == "gpt-sovits"
     assert (target / "tts_more" / "tts_more_worker" / "gpt_sovits.py").is_file()
+    assert (target / "tts_more" / "tests" / "test_portable_integration.py").is_file()
     assert "tts_more_worker.gpt_sovits:app" in (target / "tts_more" / "component.json").read_text(encoding="utf-8")
     for entry in ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1", "Start-WebUI.cmd"):
         assert (target / entry).is_file()

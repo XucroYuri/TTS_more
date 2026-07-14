@@ -37,6 +37,7 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
     controlled.mkdir(parents=True)
 
     _copy_tree(source_root / "integrations" / "tts_more_worker", controlled / "tts_more_worker")
+    _copy_tree(source_root / "integrations" / "contract_tests", controlled / "tests")
     _copy_tree(source_root / "backend" / "app" / "workers", controlled / "app" / "workers")
     _copy_file(source_root / "backend" / "app" / "models.py", controlled / "app" / "models.py")
     _copy_file(source_root / "backend" / "app" / "subprocess_safety.py", controlled / "app" / "subprocess_safety.py")
