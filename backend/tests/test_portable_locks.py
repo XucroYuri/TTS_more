@@ -37,6 +37,9 @@ def test_every_device_requirements_lock_is_exact_and_hash_pinned() -> None:
         for profile in PROFILES:
             lock_path = component_root / f"requirements-{profile}.lock.txt"
             contents = lock_path.read_text(encoding="utf-8")
+            assert re.search(r"(?i)(?:^|\s)[a-z]:\\", contents) is None, (
+                f"build-machine absolute path in {lock_path}"
+            )
             starts = list(re.finditer(r"(?m)^[A-Za-z0-9_.-]+==[^\s\\]+", contents))
             assert starts, f"empty dependency lock: {lock_path}"
             for index, start in enumerate(starts):
