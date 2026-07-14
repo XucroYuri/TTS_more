@@ -1267,3 +1267,131 @@ def test_shared_identity_validator_rejects_case_and_unicode_package_aliases(
 
     with pytest.raises(ValueError, match="portable package identity"):
         require_unique_service_identities([canonical, forged])
+
+
+@pytest.mark.parametrize("component", ("GPT-SOVITS", "ｇｐｔ-sovits"))
+def test_shared_identity_validator_requires_exact_lower_ascii_component(
+    tmp_path: Path, component: str
+) -> None:
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    endpoint = _endpoint(_locator("gpt-sovits", "gpt-main", package))
+    forged_locator = PortableServiceLocator.model_construct(
+        component=component,
+        package_id="gpt-main",
+        absolute_path_last_seen=str(package),
+    )
+    forged = endpoint.model_copy(update={"portable_locator": forged_locator})
+
+    with pytest.raises(ValueError, match="portable package component"):
+        require_unique_service_identities([forged])
+
+
+@pytest.mark.parametrize("service_id", ("alpha\u200b", "alpha\ue000", "ａｌｐｈａ"))
+def test_shared_identity_validator_rejects_noncanonical_or_category_c_service_id(
+    service_id: str,
+) -> None:
+    endpoint = TTSServiceEndpoint(service_id=service_id, base_url="http://127.0.0.1:9001")
+
+    with pytest.raises(ValueError, match="service_id"):
+        require_unique_service_identities([endpoint])
+
+
+def test_registry_writer_preflights_model_construct_before_atomic_replace(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "local" / "services.json"
+    seed = TTSServiceEndpoint(service_id="seed", base_url="http://127.0.0.1:9001")
+    ServiceRegistry([seed]).save(path)
+    before = path.read_bytes()
+    forged_locator = PortableServiceLocator.model_construct(
+        component="GPT-SOVITS",
+        package_id="gpt-main",
+        absolute_path_last_seen=str(tmp_path / "GPT"),
+    )
+    forged = TTSServiceEndpoint(
+        service_id="forged-portable",
+        base_url="http://127.0.0.1:9880",
+        control_kind="portable-package",
+        portable_locator=PortableServiceLocator(
+            component="gpt-sovits",
+            package_id="gpt-main",
+            absolute_path_last_seen=str(tmp_path / "GPT"),
+        ),
+    ).model_copy(update={"portable_locator": forged_locator})
+
+    with pytest.raises((ValueError, ValidationError)):
+        ServiceRegistry([forged]).save(path)
+
+    assert path.read_bytes() == before
+    assert [item.service_id for item in ServiceRegistry.load(path).services] == ["seed"]
+
+
+@pytest.mark.parametrize(
+    ("component", "service_id"),
+    (("ｇｐｔ-sovits", "portable-one"), ("gpt-sovits", "alpha\u200b")),
+)
+def test_portable_store_writer_preflights_model_copy_before_atomic_replace(
+    tmp_path: Path, component: str, service_id: str
+) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    store = PortableServiceStore(controller)
+    seed = TTSServiceEndpoint(service_id="seed", base_url="http://127.0.0.1:9001")
+    store.save([seed])
+    before = store.path.read_bytes()
+    locator = PortableServiceLocator.model_construct(
+        component=component,
+        package_id="gpt-main",
+        absolute_path_last_seen=str(tmp_path / "GPT"),
+    )
+    forged = TTSServiceEndpoint(
+        service_id="portable-one",
+        base_url="http://127.0.0.1:9880",
+        control_kind="portable-package",
+        portable_locator=PortableServiceLocator(
+            component="gpt-sovits",
+            package_id="gpt-main",
+            absolute_path_last_seen=str(tmp_path / "GPT"),
+        ),
+    ).model_copy(update={"service_id": service_id, "portable_locator": locator})
+
+    with pytest.raises((ValueError, ValidationError)):
+        store.save([forged])
+
+    assert store.path.read_bytes() == before
+    assert [item.service_id for item in ServiceRegistry.load(store.path).services] == ["seed"]
+
+
+def test_writer_preflight_accepts_legal_lowercase_portable_identity(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    endpoint = _endpoint(_locator("gpt-sovits", "gpt-main", package))
+
+    saved = PortableServiceStore(controller).save([endpoint])
+
+    assert [item.service_id for item in saved] == [endpoint.service_id]
+    assert ServiceRegistry.load(controller / "data" / "local" / "services.json").services
+
+
+@pytest.mark.parametrize("writer", ("registry", "portable-store"))
+def test_writer_preflight_roundtrip_rejects_invalid_model_copy_before_replace(
+    tmp_path: Path, writer: str
+) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    path = controller / "data" / "local" / "services.json"
+    seed = TTSServiceEndpoint(service_id="seed", base_url="http://127.0.0.1:9001")
+    ServiceRegistry([seed]).save(path)
+    before = path.read_bytes()
+    forged = TTSServiceEndpoint(
+        service_id="forged",
+        base_url="http://127.0.0.1:9002",
+    ).model_copy(update={"mode": "forged-mode"})
+
+    with pytest.raises((ValueError, ValidationError)):
+        if writer == "registry":
+            ServiceRegistry([forged]).save(path)
+        else:
+            PortableServiceStore(controller).save([forged])
+
+    assert path.read_bytes() == before
+    assert [item.service_id for item in ServiceRegistry.load(path).services] == ["seed"]

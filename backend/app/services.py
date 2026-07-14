@@ -19,6 +19,7 @@ from app.adapters.base import SynthesisRequest, SynthesisResult
 from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
 from app.net_guard import scrub_error
 from app.portable_endpoint_trust import (
+    preflight_service_endpoints,
     require_unique_service_identities,
     sanitize_portable_endpoint,
 )
@@ -63,8 +64,7 @@ def _merge_service_delta(
     restore_missing_baseline: bool = False,
 ) -> list[TTSServiceEndpoint]:
     if baseline is None:
-        require_unique_service_identities(desired)
-        return desired
+        return preflight_service_endpoints(desired)
     current_by_id = {service.service_id: service for service in current}
     baseline_by_id = {
         service.service_id: sanitize_portable_endpoint(service) for service in baseline
@@ -83,8 +83,7 @@ def _merge_service_delta(
         ):
             current_by_id[service_id] = service
     merged = sorted(current_by_id.values(), key=lambda item: item.service_id)
-    require_unique_service_identities(merged)
-    return merged
+    return preflight_service_endpoints(merged)
 
 
 class ServiceRegistry:

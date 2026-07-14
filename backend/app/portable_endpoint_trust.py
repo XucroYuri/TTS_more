@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from app.models import TTSServiceEndpoint
 
@@ -20,19 +20,29 @@ def require_unique_service_identities(services: list[TTSServiceEndpoint]) -> Non
     service_ids: set[str] = set()
     package_identities: set[tuple[str, str]] = set()
     for service in services:
-        canonical_service_id = unicodedata.normalize("NFKC", service.service_id).casefold()
+        service_id = _require_canonical_identity_text(service.service_id, "service_id")
+        canonical_service_id = service_id.casefold()
         if canonical_service_id in service_ids:
             raise ValueError(f"duplicate service_id: {service.service_id}")
         service_ids.add(canonical_service_id)
         locator = service.portable_locator
         if service.control_kind != "portable-package" or locator is None:
             continue
-        component = unicodedata.normalize("NFKC", str(locator.component)).casefold()
-        package_id = unicodedata.normalize("NFKC", locator.package_id).casefold()
+        component = _require_canonical_identity_text(
+            locator.component,
+            "portable package component",
+        )
+        package_id = _require_canonical_identity_text(
+            locator.package_id,
+            "portable package identity",
+        )
         if (
             component not in {"gpt-sovits", "indextts", "cosyvoice"}
-            or package_id != locator.package_id
-            or any(unicodedata.category(character).startswith("C") for character in locator.package_id)
+            or component != component.casefold()
+        ):
+            raise ValueError(f"noncanonical portable package component: {locator.component}")
+        if (
+            package_id != package_id.casefold()
             or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", package_id) is None
         ):
             raise ValueError(
@@ -44,6 +54,29 @@ def require_unique_service_identities(services: list[TTSServiceEndpoint]) -> Non
                 f"duplicate portable package identity: {locator.component}/{locator.package_id}"
             )
         package_identities.add(identity)
+
+
+def preflight_service_endpoints(
+    services: Sequence[TTSServiceEndpoint],
+) -> list[TTSServiceEndpoint]:
+    """Round-trip and validate the exact merged sequence before publication."""
+
+    validated = [
+        TTSServiceEndpoint.model_validate(service.model_dump(mode="json"))
+        for service in services
+    ]
+    require_unique_service_identities(validated)
+    return validated
+
+
+def _require_canonical_identity_text(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if unicodedata.normalize("NFKC", value) != value:
+        raise ValueError(f"{label} must use canonical NFKC characters")
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise ValueError(f"{label} must not contain Unicode category C characters")
+    return value
 
 
 def sanitize_portable_endpoint(endpoint: TTSServiceEndpoint) -> TTSServiceEndpoint:

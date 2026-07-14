@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from app.models import PortableServiceLocator, TTSServiceEndpoint
 from app.portable_endpoint_trust import (
+    preflight_service_endpoints,
     require_unique_service_identities,
     sanitize_portable_endpoint,
     trust_resolved_portable_endpoint,
@@ -142,8 +143,7 @@ def _merge_service_delta(
     desired: list[TTSServiceEndpoint],
 ) -> list[TTSServiceEndpoint]:
     if baseline is None:
-        require_unique_service_identities(desired)
-        return desired
+        return preflight_service_endpoints(desired)
     current_by_id = {endpoint.service_id: endpoint for endpoint in current}
     baseline_by_id = {
         endpoint.service_id: sanitize_portable_endpoint(endpoint) for endpoint in baseline
@@ -158,8 +158,7 @@ def _merge_service_delta(
         if previous is None or endpoint.model_dump(mode="json") != previous.model_dump(mode="json"):
             current_by_id[service_id] = endpoint
     merged = sorted(current_by_id.values(), key=_service_sort_key)
-    require_unique_service_identities(merged)
-    return merged
+    return preflight_service_endpoints(merged)
 
 
 class PortableServiceStore:
@@ -189,7 +188,6 @@ class PortableServiceStore:
         def merge(current: ServiceDocument) -> ServiceDocument:
             current_endpoints = self._validate_services(current.services)
             merged = _merge_service_delta(current_endpoints, self._baseline, persisted)
-            require_unique_service_identities(merged)
             merged_result[:] = merged
             return ServiceDocument(
                 STORE_SCHEMA_VERSION,
@@ -228,11 +226,14 @@ class PortableServiceStore:
             ]
             retained.append(trusted)
             retained.sort(key=_service_sort_key)
-            require_unique_service_identities(retained)
-            resolved[:] = retained
+            validated_retained = preflight_service_endpoints(retained)
+            resolved[:] = validated_retained
             return ServiceDocument(
                 STORE_SCHEMA_VERSION,
-                [sanitize_portable_endpoint(item).model_dump(mode="json") for item in retained],
+                [
+                    sanitize_portable_endpoint(item).model_dump(mode="json")
+                    for item in validated_retained
+                ],
             )
 
         update_service_document(path, merge, default_schema_version=STORE_SCHEMA_VERSION)
