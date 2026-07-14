@@ -1,0 +1,90 @@
+from __future__ import annotations
+
+from typing import Protocol
+
+from app.models import TTSServiceEndpoint
+
+
+class ResolvedPortableDescriptor(Protocol):
+    component: str
+    package_id: str
+    package_root: str
+    default_url: str
+    manageable: bool
+    initialized: bool
+
+
+def require_unique_service_identities(services: list[TTSServiceEndpoint]) -> None:
+    service_ids: set[str] = set()
+    package_identities: set[tuple[str, str]] = set()
+    for service in services:
+        if service.service_id in service_ids:
+            raise ValueError(f"duplicate service_id: {service.service_id}")
+        service_ids.add(service.service_id)
+        locator = service.portable_locator
+        if service.control_kind != "portable-package" or locator is None:
+            continue
+        identity = (locator.component, locator.package_id)
+        if identity in package_identities:
+            raise ValueError(
+                f"duplicate portable package identity: {locator.component}/{locator.package_id}"
+            )
+        package_identities.add(identity)
+
+
+def sanitize_portable_endpoint(endpoint: TTSServiceEndpoint) -> TTSServiceEndpoint:
+    """Strip machine-local authority from every persisted portable endpoint."""
+
+    if endpoint.control_kind != "portable-package":
+        return endpoint
+    return endpoint.model_copy(
+        update={
+            "managed": False,
+            "repo_path": None,
+            "start_command": [],
+            "start_cwd": None,
+        }
+    )
+
+
+def trust_resolved_portable_endpoint(
+    endpoint: TTSServiceEndpoint,
+    descriptor: ResolvedPortableDescriptor,
+    *,
+    include_runner: bool = False,
+) -> TTSServiceEndpoint:
+    """Restore local control only after a fresh, identity-bound locator resolution."""
+
+    sanitized = sanitize_portable_endpoint(endpoint)
+    locator = sanitized.portable_locator
+    trusted = (
+        sanitized.control_kind == "portable-package"
+        and locator is not None
+        and locator.component == descriptor.component
+        and locator.package_id == descriptor.package_id
+        and sanitized.mode == "local"
+        and sanitized.network_scope == "localhost"
+        and sanitized.api_contract == "tts-more-v1"
+        and descriptor.manageable
+    )
+    return sanitized.model_copy(
+        update={
+            "base_url": descriptor.default_url if trusted else sanitized.base_url,
+            "managed": trusted,
+            "repo_path": descriptor.package_root if trusted else None,
+            "start_command": [
+                "python.exe",
+                "scripts/portable_package_runner.py",
+                "--package-root",
+                descriptor.package_root,
+            ]
+            if trusted and include_runner
+            else [],
+            "start_cwd": "." if trusted and include_runner else None,
+            "setup_state": (
+                "ready" if descriptor.initialized else "env_missing"
+            )
+            if trusted
+            else sanitized.setup_state,
+        }
+    )

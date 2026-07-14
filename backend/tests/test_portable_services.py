@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pytest
 from pydantic import ValidationError
 from fastapi.testclient import TestClient
 
-import app.portable_services as portable_services
+import app.service_store_io as service_store_io
 from app.main import create_app
 from app.models import TTSServiceEndpoint
 from app.portable_discovery import (
@@ -62,6 +63,7 @@ def _write_package(
         "tts_more/locks/runtime.lock.json": "{}\n",
         "tts_more/locks/models.lock.json": "{}\n",
         "THIRD_PARTY_NOTICES.json": "{}\n",
+        "SHA256SUMS.txt": "portable checksum manifest\n",
     }
     for relative, content in files.items():
         path = root / relative
@@ -593,7 +595,7 @@ def test_store_atomic_replace_failure_preserves_old_readable_document(tmp_path: 
     store.save([existing])
     before = store.path.read_bytes()
 
-    monkeypatch.setattr("app.portable_services.os.replace", lambda *_args: (_ for _ in ()).throw(OSError("locked")))
+    monkeypatch.setattr("app.service_store_io.os.replace", lambda *_args: (_ for _ in ()).throw(OSError("locked")))
     with pytest.raises(OSError, match="locked"):
         store.save([existing.model_copy(update={"display_name": "after"})])
 
@@ -628,15 +630,15 @@ def test_empty_store_lock_is_initialized_only_after_exclusive_lock(monkeypatch, 
     directory.mkdir()
     lock_path = directory / ".services.lock"
     lock_path.touch()
-    original_acquire = portable_services._acquire_os_lock
+    original_acquire = service_store_io._acquire_os_lock
 
     def assert_empty_then_acquire(handle) -> None:
         assert lock_path.read_bytes() == b""
         original_acquire(handle)
 
-    monkeypatch.setattr(portable_services, "_acquire_os_lock", assert_empty_then_acquire)
+    monkeypatch.setattr(service_store_io, "_acquire_os_lock", assert_empty_then_acquire)
 
-    with portable_services._store_lock(directory):
+    with service_store_io.services_store_lock(directory):
         pass
     assert lock_path.read_bytes() == b"\0"
 
@@ -741,3 +743,341 @@ def test_legacy_registry_save_cannot_overwrite_a_corrupt_shared_store(tmp_path: 
         registry.save(path)
 
     assert path.read_text(encoding="utf-8") == "{broken"
+
+
+# Review regressions: trust boundaries, strict schema, shared writer, identity and budgets.
+
+
+def test_registry_load_sanitizes_forged_portable_control_fields(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    endpoint = _endpoint(_locator("gpt-sovits", "gpt-main", package))
+    raw = endpoint.model_dump(mode="json")
+    raw.update(
+        managed=True,
+        repo_path="C:/forged",
+        start_command=["FORGED-COMMAND-MARKER.exe"],
+        start_cwd="C:/forged",
+    )
+    path = tmp_path / "services.json"
+    path.write_text(json.dumps({"schema_version": 1, "services": [raw]}), encoding="utf-8")
+
+    [loaded] = ServiceRegistry.load(path).services
+
+    assert loaded.managed is False
+    assert loaded.repo_path is None
+    assert loaded.start_command == []
+    assert loaded.start_cwd is None
+    assert "FORGED-COMMAND-MARKER" not in json.dumps(loaded.model_dump(mode="json"))
+
+
+def test_upsert_sanitizes_every_retained_portable_record_before_write(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    index_package = _write_package(tmp_path / "Index", component="indextts", package_id="index-main")
+    gpt_package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    retained = _endpoint(_locator("indextts", "index-main", index_package))
+    raw = retained.model_dump(mode="json")
+    raw.update(
+        managed=True,
+        repo_path="C:/forged",
+        start_command=["FORGED-COMMAND-MARKER.exe"],
+        start_cwd="C:/forged",
+    )
+    store = PortableServiceStore(controller)
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text(json.dumps({"schema_version": 1, "services": [raw]}), encoding="utf-8")
+
+    store.upsert(_endpoint(_locator("gpt-sovits", "gpt-main", gpt_package)))
+
+    persisted = store.path.read_text(encoding="utf-8")
+    assert "FORGED-COMMAND-MARKER" not in persisted
+    loaded = {item.service_id: item for item in store.load()}
+    assert loaded[retained.service_id].start_command == []
+    assert loaded[retained.service_id].repo_path == str(index_package.resolve())
+
+
+@pytest.mark.parametrize(
+    "endpoint_updates",
+    (
+        {"mode": "external", "network_scope": "lan", "managed": True},
+        {"mode": "local", "network_scope": "lan", "managed": True},
+        {"mode": "local", "network_scope": "localhost", "api_contract": "forged-v1", "managed": True},
+    ),
+)
+def test_resolved_factory_never_trusts_nonlocal_or_wrong_contract_endpoint(
+    tmp_path: Path, endpoint_updates: dict[str, object]
+) -> None:
+    from app.portable_endpoint_trust import trust_resolved_portable_endpoint
+
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    descriptor = read_portable_package(package)
+    endpoint = _endpoint(_locator("gpt-sovits", "gpt-main", package)).model_copy(update=endpoint_updates)
+
+    trusted = trust_resolved_portable_endpoint(endpoint, descriptor)
+
+    assert trusted.managed is False
+    assert trusted.repo_path is None
+    assert trusted.start_command == []
+    assert trusted.start_cwd is None
+
+
+@pytest.mark.parametrize("schema_version", (True, "2", 2.0))
+def test_manifest_schema_version_requires_exact_json_integer_two(tmp_path: Path, schema_version: object) -> None:
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    manifest = package / "package" / "tts-more-package.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8-sig"))
+    payload["schema_version"] = schema_version
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema_version.*exact integer"):
+        read_portable_package(package)
+
+
+@pytest.mark.parametrize("schema_version", (True, "1", 1.0))
+def test_services_wrapper_version_requires_exact_json_integer_one(tmp_path: Path, schema_version: object) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    store = PortableServiceStore(controller)
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text(
+        json.dumps({"schema_version": schema_version, "services": []}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="schema_version"):
+        store.load()
+    with pytest.raises(ValueError, match="versioned|schema_version"):
+        ServiceRegistry.load(store.path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda payload: payload.update(runtime=[]),
+        lambda payload: payload["runtime"].update(device_profiles=["cpu", 1]),
+        lambda payload: payload["runtime"].update(device_profiles=["future-gpu"]),
+        lambda payload: payload["models"].update(required=1),
+        lambda payload: payload["endpoint"].update(port="9880"),
+        lambda payload: payload.update(capabilities=["tts", 1]),
+        lambda payload: payload["protocol"].update(version=1),
+        lambda payload: payload["data"].update(local=123),
+    ),
+)
+def test_strict_raw_v2_validator_rejects_nested_coercion_and_unknown_profiles(
+    tmp_path: Path, mutation
+) -> None:
+    from app.portable_manifest import validate_portable_manifest_v2_raw
+
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    payload = json.loads((package / "package" / "tts-more-package.json").read_text(encoding="utf-8-sig"))
+    mutation(payload)
+
+    model, errors = validate_portable_manifest_v2_raw(payload)
+
+    assert model is None
+    assert errors
+
+
+def test_sha256_manifest_must_be_an_existing_regular_contained_file(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    locator = _locator("gpt-sovits", "gpt-main", package)
+    sums = package / "SHA256SUMS.txt"
+    sums.unlink()
+    sums.mkdir()
+
+    assert resolve_locator(controller, locator, []) is None
+
+    sums.rmdir()
+    external = tmp_path / "external sums"
+    external.mkdir()
+    (external / "SHA256SUMS.txt").write_text("outside\n", encoding="utf-8")
+    _make_directory_link(package / "checksums", external)
+    manifest = package / "package" / "tts-more-package.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8-sig"))
+    payload["sha256_manifest"] = "checksums/SHA256SUMS.txt"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert resolve_locator(controller, locator, []) is None
+
+
+def test_stale_registry_delta_preserves_concurrent_add_and_applies_delete(tmp_path: Path) -> None:
+    path = tmp_path / "data" / "local" / "services.json"
+    initial = [
+        TTSServiceEndpoint(service_id="delete-me", base_url="http://127.0.0.1:9001"),
+        TTSServiceEndpoint(service_id="keep-me", base_url="http://127.0.0.1:9002"),
+    ]
+    ServiceRegistry(initial).save(path)
+    stale = ServiceRegistry.load(path)
+    desired = [service for service in stale.services if service.service_id != "delete-me"]
+    desired.append(TTSServiceEndpoint(service_id="registry-add", base_url="http://127.0.0.1:9003"))
+    ServiceRegistry([*initial, TTSServiceEndpoint(service_id="concurrent-add", base_url="http://127.0.0.1:9004")]).save(path)
+
+    stale.with_services(desired).save(path)
+
+    assert {item.service_id for item in ServiceRegistry.load(path).services} == {
+        "keep-me",
+        "registry-add",
+        "concurrent-add",
+    }
+
+
+def test_stale_portable_store_save_does_not_revive_a_concurrent_delete(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    store = PortableServiceStore(controller)
+    initial = [
+        TTSServiceEndpoint(service_id="delete-me", base_url="http://127.0.0.1:9001"),
+        TTSServiceEndpoint(service_id="keep-me", base_url="http://127.0.0.1:9002"),
+    ]
+    store.save(initial)
+    stale = store.load()
+    ServiceRegistry.load(store.path).with_services([initial[1]]).save(store.path)
+
+    store.save([*stale, TTSServiceEndpoint(service_id="portable-add", base_url="http://127.0.0.1:9003")])
+
+    assert {item.service_id for item in ServiceRegistry.load(store.path).services} == {
+        "keep-me",
+        "portable-add",
+    }
+
+
+def test_registry_and_portable_upsert_interleave_across_processes_without_lost_update(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    store = PortableServiceStore(controller)
+    store.save(
+        [
+            TTSServiceEndpoint(service_id="delete-me", base_url="http://127.0.0.1:9001"),
+            TTSServiceEndpoint(service_id="keep-me", base_url="http://127.0.0.1:9002"),
+        ]
+    )
+    ready = tmp_path / "registry.ready"
+    go = tmp_path / "go"
+    upsert_done = tmp_path / "upsert.done"
+    backend_root = Path(__file__).resolve().parents[1]
+    registry_code = """
+import sys, time
+from pathlib import Path
+from app.models import TTSServiceEndpoint
+from app.services import ServiceRegistry
+path, ready, go, done = map(Path, sys.argv[1:5])
+registry = ServiceRegistry.load(path)
+desired = [item for item in registry.services if item.service_id != 'delete-me']
+desired.append(TTSServiceEndpoint(service_id='registry-add', base_url='http://127.0.0.1:9003'))
+ready.write_text('ready')
+while not go.exists(): time.sleep(0.005)
+while not done.exists(): time.sleep(0.005)
+registry.with_services(desired).save(path)
+"""
+    upsert_code = """
+import sys, time
+from pathlib import Path
+from app.models import PortableServiceLocator, TTSServiceEndpoint
+from app.portable_services import PortableServiceStore
+controller, package, go, done = map(Path, sys.argv[1:5])
+while not go.exists(): time.sleep(0.005)
+locator = PortableServiceLocator(component='gpt-sovits', package_id='gpt-main', absolute_path_last_seen=str(package))
+endpoint = TTSServiceEndpoint(service_id='portable-gpt-sovits-gpt-main', provider_type='gpt-sovits', base_url='http://127.0.0.1:9880', control_kind='portable-package', portable_locator=locator)
+PortableServiceStore(controller).upsert(endpoint)
+done.write_text('done')
+"""
+    registry_process = subprocess.Popen(
+        [sys.executable, "-c", registry_code, str(store.path), str(ready), str(go), str(upsert_done)],
+        cwd=backend_root,
+    )
+    upsert_process = subprocess.Popen(
+        [sys.executable, "-c", upsert_code, str(controller), str(package), str(go), str(upsert_done)],
+        cwd=backend_root,
+    )
+    try:
+        for _ in range(1000):
+            if ready.exists():
+                break
+            __import__("time").sleep(0.005)
+        assert ready.exists()
+        go.write_text("go")
+        assert upsert_process.wait(timeout=30) == 0
+        assert registry_process.wait(timeout=30) == 0
+    finally:
+        for process in (registry_process, upsert_process):
+            if process.poll() is None:
+                process.kill()
+
+    assert {item.service_id for item in ServiceRegistry.load(store.path).services} == {
+        "keep-me",
+        "registry-add",
+        "portable-gpt-sovits-gpt-main",
+    }
+
+
+@pytest.mark.parametrize("package_id", ("Foo", "foo\u200b", "Ｆｏｏ"))
+def test_portable_package_identity_requires_canonical_lowercase(package_id: str) -> None:
+    with pytest.raises(ValidationError):
+        PortableServiceLocator(component="gpt-sovits", package_id=package_id)
+
+
+def test_store_fails_closed_on_duplicate_service_id(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    store = PortableServiceStore(controller)
+    raw = [
+        TTSServiceEndpoint(service_id="duplicate", base_url="http://127.0.0.1:9001").model_dump(mode="json"),
+        TTSServiceEndpoint(service_id="duplicate", base_url="http://127.0.0.1:9002").model_dump(mode="json"),
+    ]
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text(json.dumps({"schema_version": 1, "services": raw}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate service_id"):
+        store.load()
+    with pytest.raises(ValueError, match="duplicate service_id"):
+        ServiceRegistry.load(store.path)
+
+
+def test_store_fails_closed_on_duplicate_portable_package_identity(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    first = _endpoint(_locator("gpt-sovits", "gpt-main", package)).model_dump(mode="json")
+    second = {**first, "service_id": "alternate-service-id"}
+    store = PortableServiceStore(controller)
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text(
+        json.dumps({"schema_version": 1, "services": [first, second]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate portable package identity"):
+        store.load()
+    with pytest.raises(ValueError, match="duplicate portable package identity"):
+        ServiceRegistry.load(store.path)
+
+
+def test_search_roots_and_total_candidate_enumeration_are_globally_bounded(tmp_path: Path, monkeypatch) -> None:
+    controller = tmp_path / "controller" / "TTS More"
+    controller.mkdir(parents=True)
+    roots = [tmp_path / "roots" / f"root-{index:03d}" for index in range(100)]
+    for root in roots:
+        root.mkdir(parents=True)
+    original_iterdir = Path.iterdir
+    touched_roots: set[Path] = set()
+    enumerated = 0
+
+    def counted_iterdir(path: Path):
+        nonlocal enumerated
+        if path in roots:
+            touched_roots.add(path)
+            for index in range(256):
+                enumerated += 1
+                yield path / f"entry-{index:03d}"
+            return
+        yield from original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", counted_iterdir)
+    locator = PortableServiceLocator(component="cosyvoice", package_id="cosy-main")
+
+    assert resolve_locator(controller, locator, roots) is None
+    assert len(touched_roots) <= 16
+    assert enumerated <= 512

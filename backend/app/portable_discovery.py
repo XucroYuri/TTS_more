@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field
 
 from app.models import EngineName, PortableServiceLocator, ProviderType, TTSServiceEndpoint
+from app.portable_endpoint_trust import trust_resolved_portable_endpoint
+from app.portable_manifest import validate_portable_manifest_v2_raw
 
 
 SUPPORTED_COMPONENTS = {"gpt-sovits", "indextts", "cosyvoice"}
@@ -117,7 +119,10 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
     payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     if not isinstance(payload, dict):
         raise ValueError("portable manifest must be a JSON object")
-    schema = int(payload.get("schema_version") or 0)
+    raw_schema = payload.get("schema_version")
+    if type(raw_schema) is not int:
+        raise ValueError("schema_version must be an exact integer 1 or 2")
+    schema = raw_schema
     errors: list[str] = []
     raw_component = payload.get("component")
     component = raw_component if isinstance(raw_component, str) else ""
@@ -266,7 +271,7 @@ def endpoint_from_portable_package(
             default_params={"delivery": "artifact"},
         )
 
-    return TTSServiceEndpoint(
+    endpoint = TTSServiceEndpoint(
         service_id=service_id,
         display_name=request.display_name or f"{descriptor.component} portable",
         engine=engine,
@@ -275,16 +280,11 @@ def endpoint_from_portable_package(
         base_url=descriptor.default_url,
         mode="local",
         network_scope="localhost",
-        managed=descriptor.manageable,
+        managed=False,
         enabled=request.enabled,
-        repo_path=descriptor.package_root,
-        start_command=[
-            "python.exe",
-            "scripts/portable_package_runner.py",
-            "--package-root",
-            descriptor.package_root,
-        ],
-        start_cwd=".",
+        repo_path=None,
+        start_command=[],
+        start_cwd=None,
         resource_group="local-gpu-0",
         capabilities=capabilities,
         source_profile="local_repo",
@@ -299,6 +299,7 @@ def endpoint_from_portable_package(
             build_id_last_seen=descriptor.build_id or None,
         ),
     )
+    return trust_resolved_portable_endpoint(endpoint, descriptor, include_runner=True)
 
 
 def _trusted_lan_url(raw: str, default_port: int) -> str:
@@ -366,7 +367,9 @@ def _version_tuple(value: str) -> tuple[int, int, int, int]:
 
 
 def _management_errors(payload: dict[str, Any], root: Path) -> list[str]:
-    errors: list[str] = []
+    _manifest, errors = validate_portable_manifest_v2_raw(payload)
+    if errors:
+        return errors
     for field in ("package_id", "release_version", "build_id"):
         if not _strict_identity(payload.get(field)):
             errors.append(f"{field} must be an unambiguous non-empty string")
@@ -434,7 +437,7 @@ def _management_errors(payload: dict[str, Any], root: Path) -> list[str]:
     capabilities = payload.get("capabilities")
     if not isinstance(capabilities, list) or any(not isinstance(item, str) for item in capabilities):
         errors.append("capabilities must be a string list")
-    _require_relative(payload.get("sha256_manifest"), "sha256_manifest", errors, root=root)
+    _require_package_file(root, payload.get("sha256_manifest"), "sha256_manifest", errors)
     _require_package_file(root, payload.get("licenses"), "licenses", errors)
 
     try:

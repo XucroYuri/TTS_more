@@ -67,7 +67,9 @@ class PortableServiceLocator(BaseModel):
             raise ValueError("package_id must not contain control characters")
         if unicodedata.normalize("NFKC", value) != value:
             raise ValueError("package_id must use canonical characters")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
+        if value != value.casefold():
+            raise ValueError("package_id must use canonical lowercase characters")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", value):
             raise ValueError("package_id contains unsupported characters")
         return value
 

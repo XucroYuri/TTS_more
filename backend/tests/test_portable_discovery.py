@@ -35,6 +35,7 @@ def _write_package(
     (root / "tts_more" / "locks" / "runtime.lock.json").write_text("{}", encoding="utf-8")
     (root / "tts_more" / "locks" / "models.lock.json").write_text("{}", encoding="utf-8")
     (root / "THIRD_PARTY_NOTICES.json").write_text("{}", encoding="utf-8")
+    (root / "SHA256SUMS.txt").write_text("portable checksum manifest\n", encoding="utf-8")
     if schema_version == 1:
         payload = {
             "schema_version": 1,

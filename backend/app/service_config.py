@@ -39,7 +39,7 @@ def save_service_settings(path: Path, env_path: Path, payload: ServiceSettingsUp
                 set_env_value(env_path, key, value)
         data = record.model_dump(mode="python", exclude={"secrets"})
         services.append(TTSServiceEndpoint.model_validate(data))
-    registry = ServiceRegistry(services)
+    registry = ServiceRegistry.load(path).with_services(services)
     registry.save(path)
     return registry
 

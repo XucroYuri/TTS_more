@@ -214,7 +214,7 @@ def create_app(
         services = [service for service in app.state.service_registry.services if service.service_id != endpoint.service_id]
         services.append(endpoint)
         services.sort(key=lambda service: (service.priority, service.service_id))
-        registry = ServiceRegistry(services)
+        registry = app.state.service_registry.with_services(services)
         registry.save(app.state.writable_services_path)
         _apply_registry(app, registry, store)
         app.state.services_path = app.state.writable_services_path

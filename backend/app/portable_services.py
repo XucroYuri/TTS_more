@@ -1,31 +1,32 @@
 from __future__ import annotations
 
-import json
 import os
 import stat
-import tempfile
-import time
 import unicodedata
-from contextlib import contextmanager
 from itertools import islice
 from pathlib import Path
-from typing import BinaryIO, Iterator, Sequence
+from typing import Sequence
 
 from pydantic import ValidationError
 
 from app.models import PortableServiceLocator, TTSServiceEndpoint
+from app.portable_endpoint_trust import (
+    require_unique_service_identities,
+    sanitize_portable_endpoint,
+    trust_resolved_portable_endpoint,
+)
 from app.portable_discovery import PortablePackageDescriptor, inspect_locator_candidate
-
-if os.name == "nt":
-    import msvcrt
-else:
-    import fcntl
-
+from app.service_store_io import (
+    ServiceDocument,
+    read_service_document,
+    update_service_document,
+)
 
 STORE_SCHEMA_VERSION = 1
 MAX_SEARCH_CHILDREN = 256
-LOCK_TIMEOUT_SECONDS = 10.0
-LOCK_POLL_SECONDS = 0.025
+MAX_EXPLICIT_SEARCH_ROOTS = 16
+MAX_TOTAL_SEARCH_ENTRIES = 512
+MAX_TOTAL_CANDIDATES = 512
 
 __all__ = ["PortableServiceLocator", "PortableServiceStore", "resolve_locator"]
 
@@ -72,10 +73,18 @@ def _ordered_candidates(
     if locator.absolute_path_last_seen:
         raw_candidates.append(_lexical_absolute(Path(locator.absolute_path_last_seen)))
 
-    # The controller's own parent is the first bounded identity-search root.
-    raw_candidates.extend(_bounded_root_candidates(controller.parent))
-    for search_root in search_roots:
-        raw_candidates.extend(_bounded_root_candidates(_lexical_absolute(Path(search_root))))
+    # Bound both caller-controlled roots and the aggregate directory work.
+    remaining_entries = MAX_TOTAL_SEARCH_ENTRIES
+    roots = [controller.parent, *search_roots[:MAX_EXPLICIT_SEARCH_ROOTS]]
+    for search_root in roots:
+        if remaining_entries <= 0 or len(raw_candidates) >= MAX_TOTAL_CANDIDATES:
+            break
+        candidates, enumerated = _bounded_root_candidates(
+            _lexical_absolute(Path(search_root)),
+            min(MAX_SEARCH_CHILDREN, remaining_entries),
+        )
+        remaining_entries -= enumerated
+        raw_candidates.extend(candidates[: MAX_TOTAL_CANDIDATES - len(raw_candidates)])
 
     ordered: list[Path] = []
     seen: set[str] = set()
@@ -86,29 +95,31 @@ def _ordered_candidates(
             continue
         seen.add(identity)
         ordered.append(absolute)
+        if len(ordered) >= MAX_TOTAL_CANDIDATES:
+            break
     return ordered
 
 
-def _bounded_root_candidates(root: Path) -> list[Path]:
+def _bounded_root_candidates(root: Path, scan_limit: int) -> tuple[list[Path], int]:
     try:
         if _manifest_path(root).is_file():
-            return [root]
+            return [root], 0
         if _is_broad_search_root(root) or not root.is_dir() or _is_reparse_point(root):
-            return []
+            return [], 0
         children = sorted(
-            islice(root.iterdir(), MAX_SEARCH_CHILDREN),
+            islice(root.iterdir(), scan_limit),
             key=lambda path: _path_identity(path),
         )
     except OSError:
-        return []
+        return [], 0
     output: list[Path] = []
-    for child in children[:MAX_SEARCH_CHILDREN]:
+    for child in children:
         try:
             if child.is_dir() and not _is_reparse_point(child) and _manifest_path(child).is_file():
                 output.append(child)
         except OSError:
             continue
-    return output
+    return output, len(children)
 
 
 def _with_port_override(
@@ -125,27 +136,62 @@ def _with_port_override(
     )
 
 
+def _merge_service_delta(
+    current: list[TTSServiceEndpoint],
+    baseline: list[TTSServiceEndpoint] | None,
+    desired: list[TTSServiceEndpoint],
+) -> list[TTSServiceEndpoint]:
+    if baseline is None:
+        return desired
+    current_by_id = {endpoint.service_id: endpoint for endpoint in current}
+    baseline_by_id = {
+        endpoint.service_id: sanitize_portable_endpoint(endpoint) for endpoint in baseline
+    }
+    desired_by_id = {
+        endpoint.service_id: sanitize_portable_endpoint(endpoint) for endpoint in desired
+    }
+    for service_id in baseline_by_id.keys() - desired_by_id.keys():
+        current_by_id.pop(service_id, None)
+    for service_id, endpoint in desired_by_id.items():
+        previous = baseline_by_id.get(service_id)
+        if previous is None or endpoint.model_dump(mode="json") != previous.model_dump(mode="json"):
+            current_by_id[service_id] = endpoint
+    return sorted(current_by_id.values(), key=_service_sort_key)
+
+
 class PortableServiceStore:
     """Versioned, atomic storage for local endpoint records and locator hints."""
 
     def __init__(self, controller_root: Path) -> None:
         self.controller_root = _lexical_absolute(controller_root)
         self.path = self.controller_root / "data" / "local" / "services.json"
+        self._baseline: list[TTSServiceEndpoint] | None = None
 
     def load(self) -> list[TTSServiceEndpoint]:
         path = self._safe_path(create_parent=False)
         if not path.exists():
+            self._baseline = []
             return []
         raw_services = self._read_raw(path)
-        return [self._sanitize_loaded(endpoint) for endpoint in self._validate_services(raw_services)]
+        loaded = [self._sanitize_loaded(endpoint) for endpoint in self._validate_services(raw_services)]
+        self._baseline = loaded
+        return loaded
 
     def save(self, services: Sequence[TTSServiceEndpoint | dict[str, object]]) -> list[TTSServiceEndpoint]:
         validated = self._validate_services(list(services))
         path = self._safe_path(create_parent=True)
-        with _store_lock(path.parent):
-            if path.exists():
-                self._validate_services(self._read_raw(path))
-            self._write_atomic(path, [endpoint.model_dump(mode="json") for endpoint in validated])
+        persisted = [sanitize_portable_endpoint(endpoint) for endpoint in validated]
+
+        def merge(current: ServiceDocument) -> ServiceDocument:
+            current_endpoints = self._validate_services(current.services)
+            merged = _merge_service_delta(current_endpoints, self._baseline, persisted)
+            return ServiceDocument(
+                STORE_SCHEMA_VERSION,
+                [endpoint.model_dump(mode="json") for endpoint in merged],
+            )
+
+        update_service_document(path, merge, default_schema_version=STORE_SCHEMA_VERSION)
+        self._baseline = validated
         return validated
 
     def upsert(self, endpoint: TTSServiceEndpoint) -> list[TTSServiceEndpoint]:
@@ -161,9 +207,10 @@ class PortableServiceStore:
         trusted = self._apply_descriptor(validated, descriptor)
 
         path = self._safe_path(create_parent=True)
-        with _store_lock(path.parent):
-            raw_services = self._read_raw(path) if path.exists() else []
-            existing = self._validate_services(raw_services)
+        resolved: list[TTSServiceEndpoint] = []
+
+        def merge(current: ServiceDocument) -> ServiceDocument:
+            existing = [self._sanitize_loaded(item) for item in self._validate_services(current.services)]
             retained = [
                 item
                 for item in existing
@@ -175,8 +222,15 @@ class PortableServiceStore:
             ]
             retained.append(trusted)
             retained.sort(key=_service_sort_key)
-            self._write_atomic(path, [item.model_dump(mode="json") for item in retained])
-        return retained
+            resolved[:] = retained
+            return ServiceDocument(
+                STORE_SCHEMA_VERSION,
+                [sanitize_portable_endpoint(item).model_dump(mode="json") for item in retained],
+            )
+
+        update_service_document(path, merge, default_schema_version=STORE_SCHEMA_VERSION)
+        self._baseline = list(resolved)
+        return resolved
 
     def _safe_path(self, *, create_parent: bool) -> Path:
         root = self.controller_root
@@ -211,31 +265,17 @@ class PortableServiceStore:
         return self.path
 
     def _read_raw(self, path: Path) -> list[dict[str, object]]:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"services store is unreadable: {exc}") from exc
-        if isinstance(payload, list):
-            services = payload
-        elif isinstance(payload, dict):
-            if set(payload) != {"schema_version", "services"}:
-                raise ValueError("services store has unknown or missing document fields")
-            if payload.get("schema_version") != STORE_SCHEMA_VERSION:
-                raise ValueError("services store schema_version is unsupported")
-            services = payload.get("services")
-        else:
-            raise ValueError("services store must be a legacy list or versioned object")
-        if not isinstance(services, list) or any(not isinstance(item, dict) for item in services):
-            raise ValueError("services store services must be a list of objects")
-        return services
+        return read_service_document(path).services
 
     def _validate_services(
         self, services: Sequence[TTSServiceEndpoint | dict[str, object]]
     ) -> list[TTSServiceEndpoint]:
         try:
-            return [TTSServiceEndpoint.model_validate(item) for item in services]
+            endpoints = [TTSServiceEndpoint.model_validate(item) for item in services]
         except ValidationError as exc:
             raise ValueError(f"services store contains an invalid endpoint: {exc}") from exc
+        require_unique_service_identities(endpoints)
+        return endpoints
 
     def _sanitize_loaded(self, endpoint: TTSServiceEndpoint) -> TTSServiceEndpoint:
         if endpoint.control_kind != "portable-package":
@@ -247,49 +287,14 @@ class PortableServiceStore:
                 self.controller_root, locator, []
             )
         if descriptor is None:
-            return endpoint.model_copy(
-                update={
-                    "managed": False,
-                    "repo_path": None,
-                    "start_command": [],
-                    "start_cwd": None,
-                }
-            )
+            return sanitize_portable_endpoint(endpoint)
         return self._apply_descriptor(endpoint, descriptor)
 
     @staticmethod
     def _apply_descriptor(
         endpoint: TTSServiceEndpoint, descriptor: PortablePackageDescriptor
     ) -> TTSServiceEndpoint:
-        return endpoint.model_copy(
-            update={
-                "base_url": descriptor.default_url,
-                "managed": descriptor.manageable,
-                "repo_path": descriptor.package_root if descriptor.manageable else None,
-                "start_command": [],
-                "start_cwd": None,
-                "setup_state": "ready" if descriptor.initialized else "env_missing",
-            }
-        )
-
-    @staticmethod
-    def _write_atomic(path: Path, services: list[dict[str, object]]) -> None:
-        document = {"schema_version": STORE_SCHEMA_VERSION, "services": services}
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-        )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(document, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            _fsync_directory(path.parent)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
+        return trust_resolved_portable_endpoint(endpoint, descriptor)
 
 
 def _service_sort_key(endpoint: TTSServiceEndpoint) -> tuple[str, str, str]:
@@ -297,57 +302,6 @@ def _service_sort_key(endpoint: TTSServiceEndpoint) -> tuple[str, str, str]:
     if locator is None:
         return ("0", "", endpoint.service_id)
     return ("1", locator.component, locator.package_id)
-
-
-@contextmanager
-def _store_lock(directory: Path) -> Iterator[None]:
-    lock_path = directory / ".services.lock"
-    with lock_path.open("a+b", buffering=0) as handle:
-        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                _acquire_os_lock(handle)
-                break
-            except OSError as exc:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("timed out acquiring services store lock") from exc
-                time.sleep(min(LOCK_POLL_SECONDS, remaining))
-        try:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-                os.fsync(handle.fileno())
-            yield
-        finally:
-            _release_os_lock(handle)
-
-
-def _acquire_os_lock(handle: BinaryIO) -> None:
-    if os.name == "nt":
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-    else:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-
-def _release_os_lock(handle: BinaryIO) -> None:
-    if os.name == "nt":
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-    else:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-def _fsync_directory(directory: Path) -> None:
-    if os.name == "nt":
-        return
-    descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _manifest_path(root: Path) -> Path:

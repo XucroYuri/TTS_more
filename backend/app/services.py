@@ -5,7 +5,6 @@ import os
 import base64
 import hashlib
 import re
-import tempfile
 import time
 import uuid
 from urllib.parse import quote
@@ -19,6 +18,11 @@ import httpx
 from app.adapters.base import SynthesisRequest, SynthesisResult
 from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
 from app.net_guard import scrub_error
+from app.portable_endpoint_trust import (
+    require_unique_service_identities,
+    sanitize_portable_endpoint,
+)
+from app.service_store_io import ServiceDocument, read_service_document, update_service_document
 
 
 class TTSServiceClient(Protocol):
@@ -47,62 +51,86 @@ class ServiceRoute:
     binding: VoiceBinding | None = None
 
 
+def _require_unique_service_ids(services: list[TTSServiceEndpoint]) -> None:
+    require_unique_service_identities(services)
+
+
+def _merge_service_delta(
+    current: list[TTSServiceEndpoint],
+    baseline: list[TTSServiceEndpoint] | None,
+    desired: list[TTSServiceEndpoint],
+) -> list[TTSServiceEndpoint]:
+    if baseline is None:
+        return desired
+    current_by_id = {service.service_id: service for service in current}
+    baseline_by_id = {
+        service.service_id: sanitize_portable_endpoint(service) for service in baseline
+    }
+    desired_by_id = {
+        service.service_id: sanitize_portable_endpoint(service) for service in desired
+    }
+    for service_id in baseline_by_id.keys() - desired_by_id.keys():
+        current_by_id.pop(service_id, None)
+    for service_id, service in desired_by_id.items():
+        previous = baseline_by_id.get(service_id)
+        if previous is None or service.model_dump(mode="json") != previous.model_dump(mode="json"):
+            current_by_id[service_id] = service
+    return sorted(current_by_id.values(), key=lambda item: item.service_id)
+
+
 class ServiceRegistry:
-    def __init__(self, services: list[TTSServiceEndpoint], *, store_schema_version: int | None = None) -> None:
+    def __init__(
+        self,
+        services: list[TTSServiceEndpoint],
+        *,
+        store_schema_version: int | None = None,
+        _baseline: list[TTSServiceEndpoint] | None = None,
+    ) -> None:
+        _require_unique_service_ids(services)
         self.services = services
         self._by_id = {service.service_id: service for service in services}
         self.store_schema_version = store_schema_version
+        self._baseline = _baseline
 
     @classmethod
     def load(cls, path: Path) -> "ServiceRegistry":
         if not path.exists():
             return cls.default_local(repo_root=Path("repo"))
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"services store is unreadable: {exc}") from exc
-        schema_version: int | None = None
-        if isinstance(raw, dict):
-            if set(raw) != {"schema_version", "services"} or raw.get("schema_version") != 1:
-                raise ValueError("services store has an unsupported versioned document")
-            services = raw.get("services")
-            schema_version = 1
-        else:
-            services = raw
-        if not isinstance(services, list) or any(not isinstance(item, dict) for item in services):
-            raise ValueError("services store must contain a list of endpoint objects")
+        document = read_service_document(path)
+        endpoints = [TTSServiceEndpoint.model_validate(item) for item in document.services]
+        _require_unique_service_ids(endpoints)
+        sanitized = [sanitize_portable_endpoint(endpoint) for endpoint in endpoints]
         return cls(
-            [TTSServiceEndpoint.model_validate(item) for item in services],
-            store_schema_version=schema_version,
+            sanitized,
+            store_schema_version=document.schema_version,
+            _baseline=sanitized,
+        )
+
+    def with_services(self, services: list[TTSServiceEndpoint]) -> "ServiceRegistry":
+        return ServiceRegistry(
+            services,
+            store_schema_version=self.store_schema_version,
+            _baseline=self._baseline,
         )
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        schema_version = self.store_schema_version
-        if path.is_file():
-            existing_schema_version = self.load(path).store_schema_version
+        desired = [sanitize_portable_endpoint(service) for service in self.services]
+        _require_unique_service_ids(desired)
+
+        def merge(current: ServiceDocument) -> ServiceDocument:
+            current_endpoints = [TTSServiceEndpoint.model_validate(item) for item in current.services]
+            _require_unique_service_ids(current_endpoints)
+            merged = _merge_service_delta(current_endpoints, self._baseline, desired)
+            schema_version = self.store_schema_version
             if schema_version is None:
-                schema_version = existing_schema_version
-        services = [service.model_dump(mode="json") for service in self.services]
-        payload: object = (
-            {"schema_version": schema_version, "services": services}
-            if schema_version is not None
-            else services
-        )
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-        )
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
+                schema_version = current.schema_version
+            return ServiceDocument(
+                schema_version,
+                [service.model_dump(mode="json") for service in merged],
+            )
+
+        update_service_document(path, merge, default_schema_version=self.store_schema_version)
+        self._baseline = desired
 
     @classmethod
     def default_local(cls, repo_root: Path) -> "ServiceRegistry":

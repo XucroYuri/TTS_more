@@ -161,7 +161,7 @@ def configure_open_source_tts(
     services = [service for service in registry.services if service.service_id != endpoint.service_id]
     services.append(endpoint)
     services.sort(key=lambda service: (service.priority, service.service_id))
-    updated = ServiceRegistry(services)
+    updated = registry.with_services(services)
     updated.save(writable_path)
     return updated, endpoint, detect_payload
 
