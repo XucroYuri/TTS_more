@@ -1,5 +1,88 @@
 Set-StrictMode -Version Latest
 
+function Assert-PortableJsonObject {
+    param([object]$Value, [string]$Label)
+    if ($null -eq $Value -or $Value.GetType().FullName -ne "System.Management.Automation.PSCustomObject") { throw "$Label must be an object" }
+}
+
+function Assert-PortableJsonProperties {
+    param([object]$Value, [string]$Label, [string[]]$Required)
+    Assert-PortableJsonObject -Value $Value -Label $Label
+    $actual = @($Value.PSObject.Properties.Name)
+    foreach ($name in $Required) { if ($name -notin $actual) { throw "$Label.$name is required" } }
+    foreach ($name in $actual) { if ($name -notin $Required) { throw "$Label.$name is not allowed" } }
+}
+
+function Assert-PortableJsonString {
+    param([object]$Value, [string]$Label)
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Value)) { throw "$Label must be a non-empty string" }
+}
+
+function Assert-PortableJsonStringArray {
+    param([object]$Value, [string]$Label, [string[]]$Allowed = @())
+    if ($null -eq $Value -or $Value.GetType().FullName -ne "System.Object[]" -or @($Value).Count -eq 0) { throw "$Label must be a non-empty array" }
+    $seen = @{}
+    foreach ($item in @($Value)) {
+        Assert-PortableJsonString -Value $item -Label "$Label item"
+        if ($Allowed.Count -gt 0 -and [string]$item -notin $Allowed) { throw "$Label contains an unsupported value" }
+        if ($seen.ContainsKey([string]$item)) { throw "$Label items must be unique" }
+        $seen[[string]$item] = $true
+    }
+}
+
+function Assert-PortableV2Manifest {
+    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][object]$Manifest)
+    $top = @("schema_version", "component", "package_id", "release_version", "version", "build_id", "package_profile", "platform", "api_contract", "protocol", "source", "integration", "runtime", "models", "data_root", "data", "launchers", "endpoint", "capabilities", "sha256_manifest", "licenses")
+    Assert-PortableJsonProperties -Value $Manifest -Label "manifest" -Required $top
+    if ($Manifest.schema_version -isnot [int] -or [int]$Manifest.schema_version -ne 2) { throw "schema_version must be integer 2" }
+    foreach ($name in @("component", "package_id", "release_version", "version", "build_id", "package_profile", "platform", "api_contract", "data_root", "sha256_manifest", "licenses")) { Assert-PortableJsonString -Value $Manifest.$name -Label $name }
+    if ([string]$Manifest.component -notin @("tts-more", "gpt-sovits", "indextts", "cosyvoice")) { throw "component is unsupported" }
+    if ([string]$Manifest.package_profile -notin @("bootstrap", "full")) { throw "package_profile is invalid" }
+    if ([string]$Manifest.platform -ne "windows-x64") { throw "platform must be windows-x64" }
+    if ([string]$Manifest.api_contract -ne "tts-more-v1") { throw "api_contract must be tts-more-v1" }
+
+    Assert-PortableJsonProperties -Value $Manifest.protocol -Label "protocol" -Required @("name", "version", "controller_range")
+    foreach ($name in @("name", "version", "controller_range")) { Assert-PortableJsonString -Value $Manifest.protocol.$name -Label "protocol.$name" }
+    if ([string]$Manifest.protocol.name -ne "tts-more-v1") { throw "protocol.name must be tts-more-v1" }
+    Assert-PortableJsonProperties -Value $Manifest.source -Label "source" -Required @("repository", "revision")
+    foreach ($name in @("repository", "revision")) { Assert-PortableJsonString -Value $Manifest.source.$name -Label "source.$name" }
+    if ([string]$Manifest.source.repository -notmatch '^https://') { throw "source.repository must use https" }
+    if ([string]$Manifest.source.revision -notmatch '^[0-9a-fA-F]{40,64}$') { throw "source.revision is invalid" }
+    Assert-PortableJsonProperties -Value $Manifest.integration -Label "integration" -Required @("version", "source_revision", "bundle_sha256")
+    foreach ($name in @("version", "source_revision", "bundle_sha256")) { Assert-PortableJsonString -Value $Manifest.integration.$name -Label "integration.$name" }
+    if ([string]$Manifest.integration.source_revision -notmatch '^[0-9a-fA-F]{40,64}$' -or [string]$Manifest.integration.bundle_sha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "integration immutable identity is invalid" }
+
+    Assert-PortableJsonProperties -Value $Manifest.runtime -Label "runtime" -Required @("python_version", "device_profiles", "lock", "state_path")
+    foreach ($name in @("python_version", "lock", "state_path")) { Assert-PortableJsonString -Value $Manifest.runtime.$name -Label "runtime.$name" }
+    if ([string]$Manifest.runtime.python_version -notin @("3.10", "3.11")) { throw "runtime.python_version is unsupported" }
+    Assert-PortableJsonStringArray -Value $Manifest.runtime.device_profiles -Label "runtime.device_profiles" -Allowed @("auto", "cu128", "cu126", "cpu")
+    Assert-PortableJsonProperties -Value $Manifest.models -Label "models" -Required @("lock", "required")
+    Assert-PortableJsonString -Value $Manifest.models.lock -Label "models.lock"
+    if ($Manifest.models.required -isnot [bool]) { throw "models.required must be boolean" }
+    Assert-PortableJsonProperties -Value $Manifest.data -Label "data" -Required @("user", "local", "cache", "operations")
+    foreach ($name in @("user", "local", "cache", "operations")) { Assert-PortableJsonString -Value $Manifest.data.$name -Label "data.$name" }
+    Assert-PortableJsonProperties -Value $Manifest.launchers -Label "launchers" -Required @("initialize", "start", "stop", "repair", "build")
+    foreach ($name in @("initialize", "start", "stop", "repair", "build")) { Assert-PortableJsonString -Value $Manifest.launchers.$name -Label "launchers.$name" }
+    Assert-PortableJsonProperties -Value $Manifest.endpoint -Label "endpoint" -Required @("default_url", "port", "health_path", "capabilities_path", "bind_policy")
+    foreach ($name in @("default_url", "health_path", "capabilities_path", "bind_policy")) { Assert-PortableJsonString -Value $Manifest.endpoint.$name -Label "endpoint.$name" }
+    if ($Manifest.endpoint.port -isnot [int] -or [int]$Manifest.endpoint.port -lt 1 -or [int]$Manifest.endpoint.port -gt 65535) { throw "endpoint.port must be an integer between 1 and 65535" }
+    if ([string]$Manifest.endpoint.default_url -notmatch '^http://') { throw "endpoint.default_url must use http" }
+    foreach ($name in @("health_path", "capabilities_path")) { if ([string]$Manifest.endpoint.$name -notmatch '^/') { throw "endpoint.$name must start with /" } }
+    if ([string]$Manifest.endpoint.bind_policy -notin @("loopback", "trusted-lan")) { throw "endpoint.bind_policy is invalid" }
+    Assert-PortableJsonStringArray -Value $Manifest.capabilities -Label "capabilities"
+
+    foreach ($entry in @(
+        @{ Value = [string]$Manifest.data_root; Label = "data_root"; File = $false },
+        @{ Value = [string]$Manifest.runtime.lock; Label = "runtime.lock"; File = $true },
+        @{ Value = [string]$Manifest.runtime.state_path; Label = "runtime.state_path"; File = $false },
+        @{ Value = [string]$Manifest.models.lock; Label = "models.lock"; File = $true },
+        @{ Value = [string]$Manifest.sha256_manifest; Label = "sha256_manifest"; File = $true },
+        @{ Value = [string]$Manifest.licenses; Label = "licenses"; File = $true }
+    )) { [void](Resolve-PortablePackagePath -Root $Root -RelativePath $entry.Value -Label $entry.Label -MustExist:([bool]$entry.File)) }
+    foreach ($name in @("user", "local", "cache", "operations")) { [void](Resolve-PortablePackagePath -Root $Root -RelativePath ([string]$Manifest.data.$name) -Label "data.$name") }
+    foreach ($name in @("initialize", "start", "stop", "repair", "build")) { [void](Resolve-PortablePackagePath -Root $Root -RelativePath ([string]$Manifest.launchers.$name) -Label "launchers.$name" -MustExist) }
+}
+
 function Test-PortablePathWithinRoot {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -107,6 +190,21 @@ function Test-PortableRuntime {
     } catch { return $false }
 }
 
+function Resolve-PortableSupportedProfile {
+    param([Parameter(Mandatory = $true)][object]$RuntimeLockPayload, [string]$RequestedProfile = "")
+    if (!$RuntimeLockPayload.PSObject.Properties["profiles"]) { throw "runtime lock profiles are missing" }
+    $profiles = $RuntimeLockPayload.profiles
+    Assert-PortableJsonObject -Value $profiles -Label "runtime lock profiles"
+    if (![string]::IsNullOrWhiteSpace($RequestedProfile) -and $profiles.PSObject.Properties[$RequestedProfile]) { return $RequestedProfile }
+    if ($profiles.PSObject.Properties["cpu"]) { return "cpu" }
+    if ($RuntimeLockPayload.PSObject.Properties["auto_order"] -and $RuntimeLockPayload.auto_order.GetType().FullName -eq "System.Object[]") {
+        foreach ($candidate in @($RuntimeLockPayload.auto_order)) {
+            if ($candidate -is [string] -and $profiles.PSObject.Properties[[string]$candidate]) { return [string]$candidate }
+        }
+    }
+    throw "runtime lock has no deterministic supported fallback profile"
+}
+
 function Test-PortableLockedAssets {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -159,6 +257,44 @@ function Assert-PortableSha256Manifest {
     }
 }
 
+function Get-PortableIntegrityCoverage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$RuntimeLock,
+        [Parameter(Mandatory = $true)][string]$ModelLock,
+        [string[]]$RequiredCoverage = @()
+    )
+    $coverage = [Collections.Generic.List[string]]::new()
+    foreach ($path in $RequiredCoverage) { if (![string]::IsNullOrWhiteSpace($path)) { $coverage.Add([IO.Path]::GetFullPath($path)) } }
+    $python = Resolve-PortablePackagePath -Root $Root -RelativePath "runtime\live\python.exe" -Label "package runtime" -MustExist
+    $coverage.Add($python)
+    $runtimeRoot = Join-Path $Root "runtime\live"
+    foreach ($file in @(Get-ChildItem -LiteralPath $runtimeRoot -File -Recurse -Force)) {
+        $relative = $file.FullName.Substring([IO.Path]::GetFullPath($Root).TrimEnd('\', '/').Length).TrimStart('\', '/')
+        [void](Resolve-PortablePackagePath -Root $Root -RelativePath $relative -Label "runtime file" -MustExist)
+        $coverage.Add($file.FullName)
+    }
+    foreach ($lockPath in @($RuntimeLock, $ModelLock)) {
+        $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+        foreach ($collectionName in @("assets", "payloads")) {
+            if (!$lock.PSObject.Properties[$collectionName]) { continue }
+            foreach ($asset in @($lock.$collectionName)) {
+                if ($asset.PSObject.Properties["target"] -and ![string]::IsNullOrWhiteSpace([string]$asset.target)) {
+                    $target = Resolve-PortablePackagePath -Root $Root -RelativePath ([string]$asset.target) -Label "locked asset" -MustExist
+                    if (Test-Path -LiteralPath $target -PathType Leaf) { $coverage.Add($target) }
+                }
+            }
+        }
+        if ($lock.PSObject.Properties["required_paths"]) {
+            foreach ($relative in @($lock.required_paths)) {
+                $target = Resolve-PortablePackagePath -Root $Root -RelativePath ([string]$relative) -Label "locked required path" -MustExist
+                if (Test-Path -LiteralPath $target -PathType Leaf) { $coverage.Add($target) }
+            }
+        }
+    }
+    return @($coverage | Select-Object -Unique)
+}
+
 function Test-PortableInstallStateComplete {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -194,11 +330,14 @@ function Test-PortableInstallStateComplete {
             if ([string]$state.model_lock_sha256 -ne $modelHash) { return $false }
         }
         $python = Join-Path $Root "runtime\live\python.exe"
-        if (!(Test-PortableRuntime -Root $Root -PythonPath $python -ExpectedVersion $ExpectedPython -ImportProbe $ImportProbe)) { return $false }
-        if ($ValidateAssets -and !(Test-PortableLockedAssets -Root $Root -ModelLock $ModelLock)) { return $false }
-        if ($ValidateAssets -and $Sha256Manifest) {
-            Assert-PortableSha256Manifest -Root $Root -ManifestPath $Sha256Manifest -RequiredCoverage $RequiredCoverage
+        if ($ValidateAssets) {
+            if ($Sha256Manifest) {
+                $integrityCoverage = Get-PortableIntegrityCoverage -Root $Root -RuntimeLock $RuntimeLock -ModelLock $ModelLock -RequiredCoverage $RequiredCoverage
+                Assert-PortableSha256Manifest -Root $Root -ManifestPath $Sha256Manifest -RequiredCoverage $integrityCoverage
+            }
+            if (!(Test-PortableLockedAssets -Root $Root -ModelLock $ModelLock)) { return $false }
         }
+        if (!(Test-PortableRuntime -Root $Root -PythonPath $python -ExpectedVersion $ExpectedPython -ImportProbe $ImportProbe)) { return $false }
         return $true
     } catch { return $false }
 }

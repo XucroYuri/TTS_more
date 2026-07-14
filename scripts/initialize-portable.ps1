@@ -104,13 +104,15 @@ if (Test-PortableInstallStateComplete -Root $Root -StatePath $StatePath -Compone
     Write-Host "TTS More package runtime is already verified."
     exit 0
 }
-if ((Test-PortableRuntime -Root $Root -PythonPath (Join-Path $Live "python.exe") -ExpectedVersion $ExpectedPython -ImportProbe $ImportProbe) -and (Test-PortableLockedAssets -Root $Root -ModelLock $ModelLock)) {
+if ((Test-PortableLockedAssets -Root $Root -ModelLock $ModelLock) -and (Test-PortableRuntime -Root $Root -PythonPath (Join-Path $Live "python.exe") -ExpectedVersion $ExpectedPython -ImportProbe $ImportProbe)) {
     $ExistingState = if (Test-Path -LiteralPath $StatePath -PathType Leaf) { try { Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json } catch { $null } } else { $null }
-    $Profile = if ($ExistingState -and ![string]::IsNullOrWhiteSpace([string]$ExistingState.profile)) { [string]$ExistingState.profile } else { "cpu" }
+    $RequestedProfile = if ($ExistingState -and ![string]::IsNullOrWhiteSpace([string]$ExistingState.profile)) { [string]$ExistingState.profile } else { "" }
+    $Profile = Resolve-PortableSupportedProfile -RuntimeLockPayload $RuntimePayload -RequestedProfile $RequestedProfile
     $RuntimeSha = (Get-FileHash -LiteralPath $RuntimeLock -Algorithm SHA256).Hash.ToLowerInvariant()
     $ModelSha = (Get-FileHash -LiteralPath $ModelLock -Algorithm SHA256).Hash.ToLowerInvariant()
     & (Join-Path $Live "python.exe") (Join-Path $Root "scripts\portable_install.py") write-state --path $StatePath --component tts-more --build-id $BuildId --profile $Profile --runtime-lock-sha256 $RuntimeSha --model-lock-sha256 $ModelSha
     if ($LASTEXITCODE -ne 0) { throw "failed to repair stale install-state.json" }
+    if (!(Test-PortableInstallStateComplete -Root $Root -StatePath $StatePath -Component "tts-more" -BuildId $BuildId -RuntimeLock $RuntimeLock -ModelLock $ModelLock -ExpectedPython $ExpectedPython -ImportProbe $ImportProbe -ValidateAssets)) { throw "repaired install-state.json failed complete validation" }
     Write-Host "TTS More package install state was repaired from verified package-private assets."
     exit 0
 }

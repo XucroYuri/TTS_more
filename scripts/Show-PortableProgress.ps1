@@ -29,22 +29,54 @@ function Read-PortableOperation {
     try { return Get-Content -LiteralPath $operationPath -Raw | ConvertFrom-Json } catch { return $null }
 }
 
-function Read-PortableEvents {
-    if (!(Test-Path -LiteralPath $eventsPath -PathType Leaf)) { return @() }
+function Read-PortableEventDelta {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][ref]$Offset,
+        [Parameter(Mandatory = $true)][ref]$Carry
+    )
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+    [IO.FileStream]$stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    $reader = $null
+    try {
+        if ([int64]$Offset.Value -lt 0 -or [int64]$Offset.Value -gt $stream.Length) {
+            $Offset.Value = [int64]0
+            $Carry.Value = ""
+        }
+        [void]$stream.Seek([int64]$Offset.Value, [IO.SeekOrigin]::Begin)
+        $reader = New-Object IO.StreamReader($stream, (New-Object Text.UTF8Encoding($false, $true)), $true, 4096, $true)
+        $chunk = $reader.ReadToEnd()
+        $Offset.Value = [int64]$stream.Position
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        $stream.Dispose()
+    }
+    $text = [string]$Carry.Value + [string]$chunk
+    $lastNewline = $text.LastIndexOf("`n")
+    if ($lastNewline -lt 0) {
+        $Carry.Value = $text
+        return @()
+    }
+    $complete = $text.Substring(0, $lastNewline + 1)
+    $Carry.Value = $text.Substring($lastNewline + 1)
     $events = @()
-    foreach ($line in [IO.File]::ReadAllLines($eventsPath)) {
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        try { $events += ($line | ConvertFrom-Json) } catch { break }
+    foreach ($line in $complete.Split("`n")) {
+        $record = $line.TrimEnd("`r")
+        if ([string]::IsNullOrWhiteSpace($record)) { continue }
+        try { $events += ($record | ConvertFrom-Json) } catch { break }
     }
     return @($events)
 }
+
+$script:eventOffset = [int64]0
+$script:eventCarry = ""
 
 function Show-ConsoleProgress {
     Write-Host "Portable progress console: $OperationRoot"
     Write-Host "Press Ctrl+C to leave the display; create cancel.requested to cancel safely."
     $lastSequence = 0
     while ($true) {
-        foreach ($event in Read-PortableEvents) {
+        foreach ($event in @(Read-PortableEventDelta -Path $eventsPath -Offset ([ref]$script:eventOffset) -Carry ([ref]$script:eventCarry))) {
             if ([int]$event.seq -le $lastSequence) { continue }
             $lastSequence = [int]$event.seq
             $percent = if ($null -ne $event.PSObject.Properties["percent"]) { " [$($event.percent)%]" } else { "" }
@@ -58,6 +90,8 @@ function Show-ConsoleProgress {
         Start-Sleep -Milliseconds 250
     }
 }
+
+if ($MyInvocation.InvocationName -eq ".") { return }
 
 if ($RequestCancel) {
     Request-PortableCancellation
@@ -131,7 +165,7 @@ try {
     $timer = New-Object Windows.Forms.Timer
     $timer.Interval = 250
     $timer.Add_Tick({
-        foreach ($event in Read-PortableEvents) {
+        foreach ($event in @(Read-PortableEventDelta -Path $eventsPath -Offset ([ref]$script:eventOffset) -Carry ([ref]$script:eventCarry))) {
             if ([int]$event.seq -le $lastSequence) { continue }
             $script:lastSequence = [int]$event.seq
             $phaseLabel.Text = [string]$event.message

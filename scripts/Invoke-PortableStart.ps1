@@ -89,8 +89,13 @@ function Get-PackageContext {
         } catch {
             Throw-PortableStartError "PACKAGE_CORRUPT" "The staged package manifest is not valid JSON: $($_.Exception.Message)"
         }
-        if ([int]$manifest.schema_version -notin @(1, 2)) {
+        if ($null -eq $manifest.PSObject.Properties["schema_version"] -or $manifest.schema_version -isnot [int] -or [int]$manifest.schema_version -notin @(1, 2)) {
             Throw-PortableStartError "PACKAGE_CORRUPT" "The staged package manifest schema is unsupported"
+        }
+        if ([int]$manifest.schema_version -eq 2) {
+            try { Assert-PortableV2Manifest -Root $resolvedRoot -Manifest $manifest } catch {
+                Throw-PortableStartError "PACKAGE_CORRUPT" "The staged v2 manifest is invalid: $($_.Exception.Message)"
+            }
         }
     }
 
@@ -487,7 +492,8 @@ function Wait-ForActiveOperation {
     }
     Write-Host "Attaching to active operation $($parsed.ToString())"
     $operationPath = Join-Path $operation "operation.json"
-    do {
+    $deadOwnerDeadline = $null
+    while ($true) {
         if (Test-Path -LiteralPath $operationPath -PathType Leaf) {
             try { $payload = Get-Content -LiteralPath $operationPath -Raw | ConvertFrom-Json } catch { $payload = $null }
             if ($payload -and $null -ne $payload.exit_code) { return [int]$payload.exit_code }
@@ -498,16 +504,22 @@ function Wait-ForActiveOperation {
             $ownerStarted = $owner.StartTime.ToUniversalTime().ToString("o")
             $ownerAlive = [string]::Equals($ownerStarted, [string]$active.owner_started_at, [StringComparison]::OrdinalIgnoreCase)
         } catch { $ownerAlive = $false }
-        if (!$ownerAlive) {
-            try {
-                $probeLock = Open-PackageOperationLock -Root $Context.Root
-                $probeLock.Dispose()
-                return -999
-            } catch { }
+        try {
+            $probeLock = Open-PackageOperationLock -Root $Context.Root
+            $probeLock.Dispose()
+            return -999
+        } catch {
+            if ((Get-PortableErrorCode -ErrorRecord $_) -ne "OPERATION_ACTIVE") { throw }
+        }
+        if ($ownerAlive) {
+            $deadOwnerDeadline = $null
+        } elseif ($null -eq $deadOwnerDeadline) {
+            $deadOwnerDeadline = [DateTime]::UtcNow.AddSeconds(12)
+        } elseif ([DateTime]::UtcNow -ge $deadOwnerDeadline) {
+            Throw-PortableStartError "OPERATION_ACTIVE" "The dead active-operation owner did not release the package lock before the recovery deadline"
         }
         Start-Sleep -Milliseconds 200
-    } while ([DateTime]::UtcNow -lt $deadline)
-    Throw-PortableStartError "OPERATION_ACTIVE" "The active operation did not reach a terminal state before the bounded attach deadline"
+    }
 }
 
 function Clear-StaleActivePointer {
@@ -524,8 +536,8 @@ function Clear-StaleActivePointer {
         if (Test-Path -LiteralPath $operationPath -PathType Leaf) {
             $payload = Get-Content -LiteralPath $operationPath -Raw | ConvertFrom-Json
             if ($null -eq $payload.exit_code) {
-                Complete-Operation -Operation $staleOperation -Status "blocked" -ExitCode 22
                 Add-OperationEvent -Operation $staleOperation -Phase "blocked" -Message "先前的启动控制器已失去包级锁；该操作被安全回收" -ErrorCode "PACKAGE_CORRUPT"
+                Complete-Operation -Operation $staleOperation -Status "blocked" -ExitCode 22
             }
         }
     } catch {

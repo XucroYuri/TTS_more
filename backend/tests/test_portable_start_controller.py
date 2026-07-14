@@ -154,10 +154,13 @@ class FakePython {{
   }}
   static int Main(string[] args) {{
     string joined = String.Join(" ", args);
+    string executed = Environment.GetEnvironmentVariable("A4_FAKE_EXEC_MARKER");
+    if (!String.IsNullOrEmpty(executed)) File.AppendAllText(executed, joined + Environment.NewLine);
     if (joined.Contains("version_info")) {{ Console.WriteLine("{version}"); return 0; }}
     if (joined.Contains("definitely_missing") || {str(not imports_ok).lower()}) return 1;
     if (joined.Contains("write-state")) {{
-      string json = "{{\"schema_version\":1,\"component\":\"" + Value(args,"--component") + "\",\"build_id\":\"" + Value(args,"--build-id") + "\",\"profile\":\"" + Value(args,"--profile") + "\",\"runtime_lock_sha256\":\"" + Value(args,"--runtime-lock-sha256") + "\",\"model_lock_sha256\":\"" + Value(args,"--model-lock-sha256") + "\",\"ready\":true}}";
+      string build = Environment.GetEnvironmentVariable("A4_FAKE_WRITE_BAD_STATE") == "1" ? "bad-build" : Value(args,"--build-id");
+      string json = "{{\"schema_version\":1,\"component\":\"" + Value(args,"--component") + "\",\"build_id\":\"" + build + "\",\"profile\":\"" + Value(args,"--profile") + "\",\"runtime_lock_sha256\":\"" + Value(args,"--runtime-lock-sha256") + "\",\"model_lock_sha256\":\"" + Value(args,"--model-lock-sha256") + "\",\"ready\":true}}";
       Directory.CreateDirectory(Path.GetDirectoryName(Value(args,"--path")));
       File.WriteAllText(Value(args,"--path"), json);
       return 0;
@@ -260,11 +263,17 @@ def _prepare_full_package(
     _write_sha256_manifest(package_root)
 
 
-def _run_controller(package_root: Path, *arguments: str, timeout: int = 20) -> subprocess.CompletedProcess[str]:
+def _run_controller(
+    package_root: Path,
+    *arguments: str,
+    timeout: int = 20,
+    environment_updates: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     if not POWERSHELL:
         pytest.skip("Windows PowerShell is unavailable")
     environment = os.environ.copy()
     environment["PATH"] = ""
+    environment.update(environment_updates or {})
     return subprocess.run(
         [
             POWERSHELL,
@@ -590,6 +599,55 @@ def test_repeated_start_attaches_to_active_package_operation(tmp_path: Path) -> 
     assert len(_operation_directories(package_root / "data" / "local" / "operations")) == 1
 
 
+def test_repeated_start_stays_attached_to_live_owner_beyond_twelve_seconds(tmp_path: Path) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    package_root = tmp_path / "long-live-owner"
+    _source_package(package_root, delay_seconds=14)
+    environment = os.environ.copy()
+    environment["PATH"] = ""
+    command = [
+        POWERSHELL,
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(package_root / "scripts" / "Invoke-PortableStart.ps1"),
+        "-NoUi",
+    ]
+    first = subprocess.Popen(
+        command,
+        cwd=package_root,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    active = package_root / "data" / "local" / "operations" / "active-start.json"
+    deadline = time.monotonic() + 10
+    while not active.is_file() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert active.is_file(), first.communicate(timeout=5)
+
+    second = subprocess.run(
+        command,
+        cwd=package_root,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=25,
+        check=False,
+    )
+    first_stdout, first_stderr = first.communicate(timeout=25)
+
+    assert first.returncode == 0, first_stdout + first_stderr
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "Attaching to active operation" in second.stdout
+    assert (package_root / "initialize-count.log").read_text(encoding="utf-8").splitlines() == ["1"]
+    assert (package_root / "start-count.log").read_text(encoding="utf-8").splitlines() == ["1"]
+
+
 def test_launcher_staging_progress_and_error_catalog_contracts(tmp_path: Path) -> None:
     start = (REPO_ROOT / "Start.cmd").read_text(encoding="utf-8")
     controller = (REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1").read_text(encoding="utf-8")
@@ -660,10 +718,19 @@ def test_worker_initializer_records_staged_manifest_build_id() -> None:
         ("sha256_manifest", "D:/outside/SHA256SUMS.txt"),
         ("platform", "linux-x64"),
         ("runtime.python_version", "3.10"),
+        ("schema_version", "2"),
+        ("endpoint.port", "8000"),
+        ("capabilities", ["orchestrator", 1]),
+        ("runtime.device_profiles", ["cpu", 1]),
+        ("source", []),
+        ("protocol", "tts-more-v1"),
+        ("launchers.start", 17),
+        ("data.operations", []),
+        ("unexpected", "not-allowed"),
     ),
 )
 def test_staged_manifest_is_completely_validated_before_operation_creation(
-    tmp_path: Path, field: str, value: str
+    tmp_path: Path, field: str, value: object
 ) -> None:
     package_root = tmp_path / field.replace(".", "-")
     _source_package(package_root)
@@ -681,6 +748,22 @@ def test_staged_manifest_is_completely_validated_before_operation_creation(
     assert "PACKAGE_CORRUPT" in result.stdout + result.stderr
     assert not (package_root / "data" / "local" / "operations").exists()
     assert not (package_root / "initialize-count.log").exists()
+
+
+@pytest.mark.parametrize("required_field", ("package_id", "protocol", "runtime", "capabilities"))
+def test_staged_manifest_missing_required_field_creates_no_operation(
+    tmp_path: Path, required_field: str
+) -> None:
+    package_root = tmp_path / f"missing-{required_field}"
+    _source_package(package_root)
+    payload = _manifest(package_root, profile="bootstrap")
+    del payload[required_field]
+    _write_text(package_root / "package" / "tts-more-package.json", json.dumps(payload))
+
+    result = _run_controller(package_root, "-NoUi")
+
+    assert result.returncode == 22
+    assert not (package_root / "data" / "local" / "operations").exists()
 
 
 @pytest.mark.parametrize(
@@ -708,6 +791,37 @@ def test_full_package_validates_models_runtime_version_and_imports_before_servic
     assert result.returncode == 22, result.stdout + result.stderr
     assert "PACKAGE_CORRUPT" in result.stdout + result.stderr
     assert not (package_root / "initialize-count.log").exists()
+    assert not (package_root / "start-count.log").exists()
+
+
+@pytest.mark.parametrize("integrity_case", ("python-uncovered", "python-hash", "model-hash"))
+def test_full_package_never_executes_runtime_before_all_integrity_checks_pass(
+    tmp_path: Path, integrity_case: str
+) -> None:
+    package_root = tmp_path / integrity_case
+    _prepare_full_package(package_root)
+    sums = package_root / "SHA256SUMS.txt"
+    lines = sums.read_text(encoding="utf-8").splitlines()
+    python_suffix = "runtime/live/python.exe"
+    if integrity_case == "python-uncovered":
+        lines = [line for line in lines if not line.endswith(python_suffix)]
+        _write_text(sums, "\n".join(lines) + "\n")
+    elif integrity_case == "python-hash":
+        lines = [f"{'0' * 64}  {python_suffix}" if line.endswith(python_suffix) else line for line in lines]
+        _write_text(sums, "\n".join(lines) + "\n")
+    else:
+        (package_root / "models" / "voice.bin").write_bytes(b"tampered-model")
+    marker = package_root / "runtime-executed.marker"
+
+    result = _run_controller(
+        package_root,
+        "-NoUi",
+        timeout=30,
+        environment_updates={"A4_FAKE_EXEC_MARKER": str(marker)},
+    )
+
+    assert result.returncode == 22, result.stdout + result.stderr
+    assert not marker.exists(), "untrusted package runtime executed before integrity validation"
     assert not (package_root / "start-count.log").exists()
 
 
@@ -848,6 +962,51 @@ def test_stale_active_pointer_without_lock_is_reclaimed(tmp_path: Path) -> None:
     assert (package_root / "start-count.log").read_text(encoding="utf-8").splitlines() == ["1"]
 
 
+def test_stale_recovery_appends_terminal_event_before_committing_exit_state(tmp_path: Path) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    package = tmp_path / "stale-order-package"
+    _copy_controller(package)
+    operations = package / "data" / "local" / "operations"
+    operation_id = str(uuid4())
+    operation = operations / operation_id
+    operation.mkdir(parents=True)
+    _write_text(operation / "operation.json", json.dumps({"exit_code": None, "status": "installing"}))
+    _write_text(
+        operations / "active-start.json",
+        json.dumps({"operation_id": operation_id, "owner_pid": 999999}),
+    )
+    probe = package / "stale-order-probe.ps1"
+    _write_text(
+        probe,
+        r'''$ErrorActionPreference = "Stop"
+. $env:A4_CONTROLLER
+$script:trace = @()
+function Add-OperationEvent { param($Operation,$Phase,$Message,$ErrorCode,$Percent) $script:trace += "event" }
+function Complete-Operation { param($Operation,$Status,$ExitCode) $script:trace += "complete" }
+$context = [pscustomobject]@{ Root = $env:A4_ROOT; OperationsRoot = $env:A4_OPERATIONS }
+Clear-StaleActivePointer -Context $context
+Write-Host ($script:trace -join ",")
+''',
+    )
+    environment = os.environ.copy()
+    environment["A4_CONTROLLER"] = str(package / "scripts" / "Invoke-PortableStart.ps1")
+    environment["A4_ROOT"] = str(package)
+    environment["A4_OPERATIONS"] = str(operations)
+
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(probe)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("event,complete")
+
+
 def test_atomic_json_replacement_never_deletes_existing_destination() -> None:
     controller = (REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1").read_text(encoding="utf-8")
 
@@ -862,7 +1021,68 @@ def test_progress_disables_cancel_at_starting_and_port_override_precedes_ui() ->
     assert "Test-PortableCancellationAvailable" in progress
     assert '$cancel.Enabled = Test-PortableCancellationAvailable -Phase ([string]$event.phase)' in progress
     assert '"starting"' in progress and '"ready"' in progress
+    assert "Read-PortableEventDelta" in progress
+    assert "[IO.File]::ReadAllLines($eventsPath)" not in progress
+    assert "[IO.FileStream]" in progress and "Seek(" in progress
     assert controller.index("$urlPort =") < controller.index("Start-ProgressWindow -Operation")
+
+
+def test_progress_event_reader_consumes_only_complete_incremental_jsonl_records(tmp_path: Path) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    operation = tmp_path / "incremental-events"
+    operation.mkdir()
+    events = operation / "events.jsonl"
+    _write_text(events, '{"seq":1,"phase":"checking","message":"one"}\n')
+    progress_source = (REPO_ROOT / "scripts" / "Show-PortableProgress.ps1").read_text(encoding="utf-8")
+    # The injected dot-source guard only isolates the production helper for this executable probe.
+    progress_source = progress_source.replace(
+        "if ($RequestCancel)",
+        'if ($MyInvocation.InvocationName -eq ".") { return }\n\nif ($RequestCancel)',
+        1,
+    )
+    progress = tmp_path / "Show-PortableProgress.ps1"
+    _write_text(progress, progress_source)
+    probe = tmp_path / "incremental-reader-probe.ps1"
+    _write_text(
+        probe,
+        r'''$ErrorActionPreference = "Stop"
+. $env:A4_PROGRESS -OperationRoot $env:A4_OPERATION
+[long]$offset = 0
+$carry = ""
+$first = @(Read-PortableEventDelta -Path $env:A4_EVENTS -Offset ([ref]$offset) -Carry ([ref]$carry))
+if ($first.Count -ne 1 -or [int]$first[0].seq -ne 1) { throw "first delta mismatch" }
+[IO.File]::AppendAllText($env:A4_EVENTS, '{"seq":2,"phase":"installing"', [Text.UTF8Encoding]::new($false))
+$partial = @(Read-PortableEventDelta -Path $env:A4_EVENTS -Offset ([ref]$offset) -Carry ([ref]$carry))
+if ($partial.Count -ne 0) { throw "partial JSONL record was emitted" }
+[IO.File]::AppendAllText($env:A4_EVENTS, ',"message":"two"}' + "`n", [Text.UTF8Encoding]::new($false))
+$second = @(Read-PortableEventDelta -Path $env:A4_EVENTS -Offset ([ref]$offset) -Carry ([ref]$carry))
+if ($second.Count -ne 1 -or [int]$second[0].seq -ne 2) { throw "second delta mismatch" }
+$again = @(Read-PortableEventDelta -Path $env:A4_EVENTS -Offset ([ref]$offset) -Carry ([ref]$carry))
+if ($again.Count -ne 0) { throw "already consumed records were reread" }
+Write-Host "INCREMENTAL_JSONL_OK offset=$offset"
+''',
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "A4_PROGRESS": str(progress),
+            "A4_OPERATION": str(operation),
+            "A4_EVENTS": str(events),
+        }
+    )
+
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(probe)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "INCREMENTAL_JSONL_OK" in result.stdout
 
 
 def test_portable_start_scripts_reject_external_python_fallbacks_before_spawn() -> None:
@@ -877,9 +1097,19 @@ def test_portable_start_scripts_reject_external_python_fallbacks_before_spawn() 
         assert "listener_is_owned" in script or "verify-owned-listener" in script
 
 
-@pytest.mark.parametrize("component", ("tts-more", "gpt-sovits"))
+@pytest.mark.parametrize(
+    ("component", "profile_case", "bad_write"),
+    (
+        ("tts-more", "cpu", False),
+        ("gpt-sovits", "cpu", False),
+        ("tts-more", "ordered", False),
+        ("gpt-sovits", "ordered", False),
+        ("tts-more", "cpu", True),
+        ("gpt-sovits", "cpu", True),
+    ),
+)
 def test_initializers_repair_stale_state_from_verified_private_assets_without_bootstrap(
-    tmp_path: Path, component: str
+    tmp_path: Path, component: str, profile_case: str, bad_write: bool
 ) -> None:
     if not POWERSHELL:
         pytest.skip("Windows PowerShell is unavailable")
@@ -913,6 +1143,12 @@ def test_initializers_repair_stale_state_from_verified_private_assets_without_bo
                 "python_version": expected_python,
                 "import_probe": "import sys",
                 "required_free_bytes": 0,
+                "profiles": (
+                    {"cpu": {"dependency_lock": "cpu.lock"}, "cu128": {"dependency_lock": "cu.lock"}}
+                    if profile_case == "cpu"
+                    else {"cu126": {"dependency_lock": "cu126.lock"}, "cu128": {"dependency_lock": "cu128.lock"}}
+                ),
+                "auto_order": ["cu128", "cpu"] if profile_case == "cpu" else ["cu128", "cu126"],
             }
         ),
     )
@@ -951,13 +1187,16 @@ def test_initializers_repair_stale_state_from_verified_private_assets_without_bo
                 "schema_version": 1,
                 "component": component,
                 "build_id": "stale-build",
-                "profile": "cpu",
+                "profile": "unsupported-profile",
                 "runtime_lock_sha256": "0" * 64,
                 "model_lock_sha256": "0" * 64,
                 "ready": True,
             }
         ),
     )
+    environment = os.environ.copy()
+    if bad_write:
+        environment["A4_FAKE_WRITE_BAD_STATE"] = "1"
     result = subprocess.run(
         [
             POWERSHELL,
@@ -970,14 +1209,20 @@ def test_initializers_repair_stale_state_from_verified_private_assets_without_bo
             "-PackageRoot",
             str(root),
         ],
+        env=environment,
         text=True,
         capture_output=True,
         timeout=20,
         check=False,
     )
+    if bad_write:
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "repaired" not in result.stdout.lower()
+        return
     assert result.returncode == 0, result.stdout + result.stderr
     repaired = json.loads(state_path.read_text(encoding="utf-8"))
     assert repaired["build_id"] == "current-build"
+    assert repaired["profile"] == ("cpu" if profile_case == "cpu" else "cu128")
     assert repaired["runtime_lock_sha256"] == hashlib.sha256(runtime_lock.read_bytes()).hexdigest()
     assert repaired["model_lock_sha256"] == hashlib.sha256(model_lock.read_bytes()).hexdigest()
     assert "repaired" in result.stdout.lower()
