@@ -7,7 +7,7 @@
       "path": "repo/GPT-SoVITS-main",
       "remote": "https://github.com/XucroYuri/GPT-SoVITS.git",
       "branch": "main",
-      "commit": "1a9a14180868d4580f10aa445e49afc628d73450",
+      "commit": "29d6013baab31532c2414b2a0e8b40d3ef58a21c",
       "service_id": "local-gpt-sovits-main",
       "port": 9880,
       "default_selected": true
@@ -42,7 +42,7 @@
       "path": "repo/index-tts",
       "remote": "https://github.com/XucroYuri/index-tts.git",
       "branch": "main",
-      "commit": "4d340d0d504f62aebf1098fc35c4432587be974c",
+      "commit": "230e0e8f3b2e277981463a287b93da78388e7a23",
       "service_id": "local-indextts",
       "port": 9881
     },
@@ -52,7 +52,7 @@
       "path": "repo/CosyVoice",
       "remote": "https://github.com/XucroYuri/CosyVoice.git",
       "branch": "main",
-      "commit": "751878f7ea2932b2722c094a8f8345beafd235db",
+      "commit": "65071de81ee3db7142707297bcec19c3386f0eb8",
       "service_id": "local-cosyvoice",
       "port": 9882,
       "submodules": true,
