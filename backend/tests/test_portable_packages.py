@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
-import types
 import zipfile
 from pathlib import Path
 
@@ -457,6 +457,39 @@ def test_create_zip_uses_a_single_package_root_and_zip64(tmp_path: Path) -> None
         assert sorted(archive.namelist()) == ["Component 目录/Start.cmd", "Component 目录/nested/asset.txt"]
 
 
+def test_package_sha256_gate_requires_exact_coverage_and_rejects_tampering(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    root = tmp_path / "package"
+    first = root / "Start.cmd"
+    second = root / "scripts" / "portable_packages.py"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_bytes(b"start")
+    second.write_bytes(b"gate")
+
+    def write_sums(*, include_second: bool = True) -> None:
+        entries = [(first, "Start.cmd")]
+        if include_second:
+            entries.append((second, "scripts/portable_packages.py"))
+        (root / "SHA256SUMS.txt").write_text(
+            "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {relative}\n" for path, relative in entries),
+            encoding="utf-8",
+        )
+
+    write_sums()
+    assert packages.verify_sha256_manifest(root)["valid"] is True
+
+    second.write_bytes(b"tampered")
+    tampered = packages.verify_sha256_manifest(root)
+    assert tampered["valid"] is False
+    assert any("hash mismatch" in error for error in tampered["errors"])
+
+    write_sums(include_second=False)
+    uncovered = packages.verify_sha256_manifest(root)
+    assert uncovered["valid"] is False
+    assert any("exact coverage" in error for error in uncovered["errors"])
+
+
 def test_release_audit_accepts_bootstrap_and_rejects_full_or_runtime_assets(tmp_path: Path) -> None:
     packages = _load_portable_packages()
 
@@ -478,6 +511,38 @@ def test_release_audit_accepts_bootstrap_and_rejects_full_or_runtime_assets(tmp_
     assert packages.audit_release_zip(bootstrap)["valid"] is True
     assert "profile=full" in packages.audit_release_zip(full)["errors"][0]
     assert "forbidden release asset" in packages.audit_release_zip(contaminated)["errors"][0]
+
+
+@pytest.mark.parametrize(
+    "polluted_path",
+    (
+        "runtime/python.exe",
+        "Runtime/tools/ffmpeg.exe",
+        r"runtime\python.exe",
+        "ｒｕｎｔｉｍｅ/python.exe",
+        "runtime./python.exe",
+        "data/user/reference.wav",
+        "DATA/LOCAL/install-state.json",
+        r"data\cache\asset.bin",
+        "data/models/voice.onnx",
+    ),
+)
+def test_release_audit_rejects_all_runtime_and_private_data_path_variants(
+    tmp_path: Path, polluted_path: str
+) -> None:
+    packages = _load_portable_packages()
+    archive_path = tmp_path / f"polluted-{len(list(tmp_path.iterdir()))}.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "Component/package/tts-more-package.json",
+            json.dumps({"schema_version": 2, "component": "tts-more", "package_profile": "bootstrap"}),
+        )
+        archive.writestr(f"Component/{polluted_path}", b"private")
+
+    report = packages.audit_release_zip(archive_path)
+
+    assert report["valid"] is False
+    assert any("forbidden release asset" in error for error in report["errors"])
 
 
 def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
@@ -514,6 +579,9 @@ def test_portable_release_workflow_sanitizes_pr_ref_names() -> None:
     assert "[^0-9A-Za-z._-]" in workflow
     assert "audit_release_zip" in workflow
     assert "EXPECTED_FULL_REJECTION" in workflow
+    assert "verify-sha256 --package-root" in workflow
+    assert workflow.index("audit-release --zip") < workflow.index("verify-sha256 --package-root")
+    assert workflow.index("verify-sha256 --package-root") < workflow.index("actions/upload-artifact")
 
 
 def test_tts_more_initializer_serializes_an_empty_controller_list_as_json() -> None:
@@ -657,8 +725,8 @@ def test_prepare_runtime_finalizes_start_cmd_extraction_without_extracting_twice
     }
 
 
-def test_stop_worker_reads_bom_but_rejects_legacy_record_without_safe_identity(
-    tmp_path: Path, monkeypatch
+def test_stop_worker_reads_bom_but_rejects_live_legacy_record_without_safe_identity(
+    tmp_path: Path,
 ) -> None:
     launcher = _load_portable_launcher()
     package_root = tmp_path / "GPT-SoVITS-dev"
@@ -671,18 +739,18 @@ def test_stop_worker_reads_bom_but_rejects_legacy_record_without_safe_identity(
         json.dumps({"pid": 1234, "executable_path": str(executable), "port": 9883}),
         encoding="utf-8-sig",
     )
-    calls: list[list[str]] = []
-
-    def fake_run(command, **_kwargs):
-        calls.append(command)
-
-    monkeypatch.setattr(launcher, "os", types.SimpleNamespace(name="nt"))
-    assert launcher.os is not os
-    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
-
     with pytest.raises(RuntimeError, match="legacy PID record"):
-        launcher.stop_worker(package_root)
-    assert calls == []
+        launcher.stop_worker(
+            package_root,
+            inspector=lambda _pid: {
+                "pid": 1234,
+                "created_at": "unknown",
+                "executable_path": str(executable),
+                "command_args": [],
+            },
+            terminator=lambda _pid: pytest.fail("legacy process must not be terminated"),
+            port_owner_inspector=lambda _port: {1234},
+        )
     assert record.exists()
 
 

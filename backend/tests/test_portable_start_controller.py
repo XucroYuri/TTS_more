@@ -1344,3 +1344,91 @@ def test_production_start_rejects_non_private_or_invalid_runtime_before_spawn(
     assert not marker.exists()
     combined = (result.stdout + result.stderr).lower()
     assert "runtime" in combined or "python" in combined or "reparse" in combined
+
+
+@pytest.mark.parametrize("runtime_case", ("missing", "reparse", "wrong-version"))
+def test_production_stop_never_executes_pid_record_path_and_rejects_invalid_runtime(
+    tmp_path: Path, runtime_case: str
+) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    root = tmp_path / f"stop-{runtime_case}"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "stop-production.ps1", scripts)
+    shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", scripts)
+    _write_text(scripts / "portable_launcher.py", "raise SystemExit(0)\n")
+    _write_text(
+        root / "packaging" / "portable" / "runtime.lock.json",
+        json.dumps({"python_version": "3.11", "import_probe": "import sys"}),
+    )
+    marker = tmp_path / f"external-record-{runtime_case}.marker"
+    malicious = tmp_path / f"malicious-{runtime_case}.cmd"
+    _write_text(malicious, f'@echo PWNED>"{marker}"\n@exit /b 0\n')
+    record = root / "data" / "local" / "run" / "worker.pid.json"
+    _write_text(record, json.dumps({"executable_path": str(malicious)}))
+
+    if runtime_case == "wrong-version":
+        _compile_fake_python(root / "runtime" / "live" / "python.exe", version="3.10")
+    elif runtime_case == "reparse":
+        outside_live = tmp_path / "outside-stop-live"
+        _compile_fake_python(outside_live / "python.exe")
+        (root / "runtime").mkdir()
+        environment = {**os.environ, "A4_JUNCTION_PATH": str(root / "runtime" / "live"), "A4_JUNCTION_TARGET": str(outside_live)}
+        junction = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "New-Item -ItemType Junction -Path $env:A4_JUNCTION_PATH -Target $env:A4_JUNCTION_TARGET | Out-Null",
+            ],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if junction.returncode != 0:
+            pytest.skip(f"directory junctions are unavailable: {junction.stderr}")
+
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(scripts / "stop-production.ps1"),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not marker.exists(), "Stop executed the untrusted PID-record executable"
+    combined = (result.stdout + result.stderr).lower()
+    assert "runtime" in combined or "python" in combined or "reparse" in combined
+
+
+def test_production_stop_is_idempotent_without_pid_record(tmp_path: Path) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    root = tmp_path / "stop-idempotent"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "stop-production.ps1", scripts)
+    shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", scripts)
+
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(scripts / "stop-production.ps1")],
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "not running" in result.stdout.lower()

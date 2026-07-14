@@ -65,6 +65,7 @@ jobs:
           Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath $expanded
           $packageRoot = @(Get-ChildItem -LiteralPath $expanded -Directory)
           if ($packageRoot.Count -ne 1) { throw "expected exactly one package root" }
+          python (Join-Path $packageRoot[0].FullName "scripts\portable_packages.py") verify-sha256 --package-root $packageRoot[0].FullName
           $exporters = @(Get-ChildItem -LiteralPath $packageRoot[0].FullName -Recurse -File -Filter "export-portable-diagnostics.py")
           if ($exporters.Count -ne 1) { throw "expected exactly one diagnostic exporter" }
           $diagnosticZip = Join-Path $packageRoot[0].FullName "data\local\diagnostics\ci-diagnostics.zip"

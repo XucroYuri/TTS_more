@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,20 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_COMMAND = ["-m", "uvicorn", "worker:app", "--port", "9880"]
+
+
+def _junction(link: Path, target: Path) -> None:
+    if os.name != "nt":
+        link.symlink_to(target, target_is_directory=True)
+        return
+    result = subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"junction creation is unavailable: {result.stderr}")
 
 
 def _load_launcher():
@@ -69,6 +85,70 @@ def test_write_process_record_contains_full_ownership_identity(tmp_path: Path) -
     assert payload["build_id"] == "gpt-sovits-2.0.0-deadbeef"
     assert len(payload["command_sha256"]) == 64
     assert "uvicorn" not in path.read_text(encoding="utf-8")
+
+
+def test_write_process_record_is_bound_to_fixed_package_path_and_rejects_junction(
+    tmp_path: Path,
+) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    executable = root / "runtime" / "live" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python")
+    outside = tmp_path / "outside-run"
+    outside.mkdir()
+    (root / "data" / "local").mkdir(parents=True)
+    _junction(root / "data" / "local" / "run", outside)
+    record_path = root / "data" / "local" / "run" / "worker.pid.json"
+
+    with pytest.raises(ValueError, match="reparse|junction|fixed package"):
+        launcher.write_process_record(
+            record_path,
+            pid=4242,
+            parent_pid=100,
+            child_pids=[],
+            process_created_at="2026-07-14T01:02:03+00:00",
+            executable_path=executable,
+            command=DEFAULT_COMMAND,
+            port=9880,
+            package_root=root,
+            build_id="source-checkout",
+        )
+    assert not (outside / "worker.pid.json").exists()
+
+    with pytest.raises(ValueError, match="fixed package"):
+        launcher.write_process_record(
+            tmp_path / "outside-record.json",
+            pid=4242,
+            parent_pid=100,
+            child_pids=[],
+            process_created_at="2026-07-14T01:02:03+00:00",
+            executable_path=executable,
+            command=DEFAULT_COMMAND,
+            port=9880,
+            package_root=root,
+            build_id="source-checkout",
+        )
+    assert not (tmp_path / "outside-record.json").exists()
+
+
+def test_stop_worker_does_not_read_or_delete_pid_record_through_junction(tmp_path: Path) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    outside = tmp_path / "outside-run"
+    outside.mkdir()
+    (root / "data" / "local").mkdir(parents=True)
+    _junction(root / "data" / "local" / "run", outside)
+    external_record = outside / "worker.pid.json"
+    external_record.write_text(json.dumps(_record(root)), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="reparse|junction"):
+        launcher.stop_worker(
+            root,
+            inspector=lambda _pid: None,
+            port_owner_inspector=lambda _port: set(),
+        )
+    assert external_record.exists()
 
 
 def test_stop_worker_deletes_record_only_after_process_and_port_are_gone(tmp_path: Path) -> None:
@@ -209,7 +289,7 @@ def test_stop_worker_removes_stale_record_only_when_process_and_port_are_absent(
     assert launcher.stop_worker(root) == 0
 
 
-def test_stop_worker_rejects_foreign_build_identity_in_source_checkout(tmp_path: Path) -> None:
+def test_stop_worker_cleans_dead_stale_build_record_after_liveness_check(tmp_path: Path) -> None:
     launcher = _load_launcher()
     root = tmp_path / "package"
     record_path = root / "data" / "local" / "run" / "worker.pid.json"
@@ -218,11 +298,36 @@ def test_stop_worker_rejects_foreign_build_identity_in_source_checkout(tmp_path:
     payload["build_id"] = "foreign-build"
     record_path.write_text(json.dumps(payload), encoding="utf-8")
 
+    assert launcher.stop_worker(
+        root,
+        inspector=lambda _pid: None,
+        port_owner_inspector=lambda _port: set(),
+    ) == 0
+    assert not record_path.exists()
+
+
+def test_stop_worker_rejects_stale_build_record_when_process_or_port_is_live(tmp_path: Path) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    record_path = root / "data" / "local" / "run" / "worker.pid.json"
+    record_path.parent.mkdir(parents=True)
+    payload = _record(root)
+    payload["build_id"] = "foreign-build"
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+    process = {
+        "pid": 4242,
+        "parent_pid": 100,
+        "created_at": payload["process_created_at"],
+        "executable_path": payload["executable_path"],
+        "command_args": DEFAULT_COMMAND,
+    }
+
     with pytest.raises(RuntimeError, match="build identity"):
         launcher.stop_worker(
             root,
-            inspector=lambda _pid: None,
-            port_owner_inspector=lambda _port: set(),
+            inspector=lambda _pid: process,
+            terminator=lambda _pid: pytest.fail("stale build process must not be terminated"),
+            port_owner_inspector=lambda _port: {4242},
         )
     assert record_path.exists()
 
@@ -258,7 +363,18 @@ def test_stop_worker_rejects_record_from_another_package_root(tmp_path: Path) ->
     record_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="different package root"):
-        launcher.stop_worker(root)
+        launcher.stop_worker(
+            root,
+            inspector=lambda _pid: {
+                "pid": 4242,
+                "parent_pid": 100,
+                "created_at": payload["process_created_at"],
+                "executable_path": payload["executable_path"],
+                "command_args": DEFAULT_COMMAND,
+            },
+            terminator=lambda _pid: pytest.fail("foreign-root process must not be terminated"),
+            port_owner_inspector=lambda _port: {4242},
+        )
     assert record_path.exists()
 
 

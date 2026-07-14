@@ -5,12 +5,19 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $Bundle = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $Bundle))
-$recordPath = Join-Path $Root "data\local\run\worker.pid.json"
+$ValidationScript = Join-Path $Bundle "Portable-Validation.ps1"
+if (!(Test-Path -LiteralPath $ValidationScript -PathType Leaf)) { throw "Portable-Validation.ps1 is missing" }
+. $ValidationScript
+$recordPath = Resolve-PortablePackagePath -Root $Root -RelativePath "data\local\run\worker.pid.json" -Label "PID record"
 if (!(Test-Path -LiteralPath $recordPath)) { Write-Host "worker is not running"; exit 0 }
-$record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
-$Python = [string]$record.executable_path
-if (!(Test-Path -LiteralPath $Python -PathType Leaf)) { throw "recorded package Python is missing; preserving PID record" }
-& $Python (Join-Path $Bundle "portable_launcher.py") stop-worker --package-root $Root
+$runtimeLockPath = Resolve-PortablePackagePath -Root $Root -RelativePath "tts_more\locks\runtime.lock.json" -Label "runtime lock" -MustExist
+$runtimeLock = Get-Content -LiteralPath $runtimeLockPath -Raw | ConvertFrom-Json
+$expectedPython = [string]$runtimeLock.python_version
+if ($expectedPython -notin @("3.10", "3.11")) { throw "worker runtime lock has an unsupported Python version" }
+$Python = Join-Path $Root "runtime\live\python.exe"
+[void](Assert-PortableRuntime -Root $Root -PythonPath $Python -ExpectedVersion $expectedPython -ImportProbe "")
+$Launcher = Resolve-PortablePackagePath -Root $Root -RelativePath "tts_more\portable_launcher.py" -Label "portable launcher" -MustExist
+& $Python $Launcher stop-worker --package-root $Root
 if ($LASTEXITCODE -eq 2) { throw "owned worker stopped but port release was not confirmed; PID record preserved" }
 if ($LASTEXITCODE -ne 0) { throw "safe worker stop failed with exit code $LASTEXITCODE" }
 Write-Host "worker stopped and port released"

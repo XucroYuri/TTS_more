@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
+import unicodedata
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -48,7 +50,7 @@ V2_REQUIRED_FIELDS = (*V2_REQUIRED_FIELDS, "package_id", "release_version", "pro
 V2_LAUNCHERS = ("initialize", "start", "stop", "repair", "build")
 DEVICE_PROFILES = {"auto", "cu128", "cu126", "cpu"}
 RELEASE_FORBIDDEN_PATH = re.compile(
-    r"(^|/)(?:\.venv|runtime/live|data/(?:cache|local|models)|__pycache__)(?:/|$)|"
+    r"(^|/)(?:\.venv|__pycache__)(?:/|$)|"
     r"\.(?:safetensors|ckpt|pth|pt|onnx|bin)$",
     re.IGNORECASE,
 )
@@ -76,25 +78,112 @@ def audit_release_zip(path: Path) -> dict[str, object]:
     try:
         with zipfile.ZipFile(path) as archive:
             names = archive.namelist()
-            manifests = [name for name in names if name.endswith("/package/tts-more-package.json")]
+            canonical_names: dict[str, str] = {}
+            for name in names:
+                canonical = _canonical_zip_entry(name)
+                if canonical in canonical_names:
+                    errors.append(f"unsafe ZIP entry collision: {name}")
+                    break
+                canonical_names[canonical] = name
+            manifests = [
+                original
+                for canonical, original in canonical_names.items()
+                if canonical.endswith("/package/tts-more-package.json")
+            ]
             if len(manifests) != 1:
                 errors.append("release ZIP must contain exactly one package manifest")
             else:
                 payload = json.loads(archive.read(manifests[0]).decode("utf-8-sig"))
                 if payload.get("package_profile") != "bootstrap":
                     errors.append(f"GitHub release upload refused for profile={payload.get('package_profile')}")
-            for name in names:
-                normalized = name.replace("\\", "/").lstrip("/")
-                if ".." in normalized.split("/"):
-                    errors.append(f"unsafe ZIP entry: {name}")
-                    break
-                relative = normalized.split("/", 1)[1] if "/" in normalized else normalized
-                if RELEASE_FORBIDDEN_PATH.search(relative):
+            for canonical, name in canonical_names.items():
+                relative = canonical.split("/", 1)[1] if "/" in canonical else canonical
+                parts = tuple(part for part in relative.split("/") if part)
+                private_data = len(parts) >= 2 and parts[0] == "data" and parts[1] in {
+                    "user",
+                    "local",
+                    "cache",
+                    "models",
+                }
+                if (parts and parts[0] == "runtime") or private_data or RELEASE_FORBIDDEN_PATH.search(relative):
                     errors.append(f"forbidden release asset: {relative}")
                     break
-    except (OSError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
         errors.append(f"invalid release ZIP: {exc}")
     return {"valid": not errors, "errors": errors, "path": str(path)}
+
+
+def verify_sha256_manifest(package_root: Path) -> dict[str, object]:
+    """Verify exact SHA256SUMS coverage and every digest for an extracted package."""
+    errors: list[str] = []
+    try:
+        root = package_root.resolve(strict=True)
+        sums_path = root / "SHA256SUMS.txt"
+        if not sums_path.is_file() or sums_path.is_symlink():
+            raise ValueError("SHA256SUMS.txt is missing or unsafe")
+        covered: dict[str, tuple[str, str]] = {}
+        for line in sums_path.read_text(encoding="utf-8-sig").splitlines():
+            match = re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", line)
+            if match is None or not _is_relative_package_path(match.group(2)):
+                raise ValueError("SHA256SUMS contains an invalid record")
+            relative = unicodedata.normalize("NFKC", match.group(2)).replace("\\", "/")
+            canonical = _canonical_relative_path(relative)
+            if canonical in covered:
+                raise ValueError(f"SHA256SUMS contains a duplicate path: {relative}")
+            covered[canonical] = (relative, match.group(1).casefold())
+
+        files: dict[str, Path] = {}
+        for candidate in root.rglob("*"):
+            if candidate == sums_path:
+                continue
+            if candidate.is_symlink():
+                raise ValueError(f"package contains an unsafe link: {candidate.relative_to(root)}")
+            if not candidate.is_file():
+                continue
+            resolved = candidate.resolve(strict=True)
+            try:
+                relative = resolved.relative_to(root).as_posix()
+            except ValueError as exc:
+                raise ValueError("package file escapes package root") from exc
+            canonical = _canonical_relative_path(relative)
+            if canonical in files:
+                raise ValueError(f"package contains a normalized path collision: {relative}")
+            files[canonical] = candidate
+
+        if set(covered) != set(files):
+            missing = sorted(set(files) - set(covered))
+            extra = sorted(set(covered) - set(files))
+            errors.append(f"SHA256SUMS exact coverage mismatch: missing={missing}, extra={extra}")
+        for canonical in sorted(set(covered) & set(files)):
+            relative, expected = covered[canonical]
+            actual = hashlib.sha256(files[canonical].read_bytes()).hexdigest()
+            if actual != expected:
+                errors.append(f"SHA256SUMS hash mismatch: {relative}")
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        errors.append(str(exc))
+    return {"valid": not errors, "errors": errors, "package_root": str(package_root)}
+
+
+def _canonical_zip_entry(name: str) -> str:
+    normalized = unicodedata.normalize("NFKC", name).replace("\\", "/")
+    if not normalized or normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        raise ValueError(f"unsafe ZIP entry: {name}")
+    parts: list[str] = []
+    for raw_part in normalized.split("/"):
+        part = raw_part.rstrip(" .").casefold()
+        if not part or part == ".":
+            continue
+        if part == ".." or ":" in part or "\x00" in part:
+            raise ValueError(f"unsafe ZIP entry: {name}")
+        parts.append(part)
+    if not parts:
+        raise ValueError(f"unsafe ZIP entry: {name}")
+    return "/".join(parts)
+
+
+def _canonical_relative_path(value: str) -> str:
+    canonical = _canonical_zip_entry(f"package/{value}")
+    return canonical.split("/", 1)[1]
 
 
 def validate_manifest(manifest_path: Path, package_root: Path) -> dict[str, object]:
@@ -258,6 +347,8 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument("--output", required=True, type=Path)
     audit = subcommands.add_parser("audit-release")
     audit.add_argument("--zip", required=True, action="append", type=Path)
+    verify_sums = subcommands.add_parser("verify-sha256")
+    verify_sums.add_argument("--package-root", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.command == "validate-manifest":
         report = validate_manifest(args.manifest, args.package_root)
@@ -270,6 +361,10 @@ def main(argv: list[str] | None = None) -> int:
         reports = [audit_release_zip(path) for path in args.zip]
         print(json.dumps({"valid": all(report["valid"] for report in reports), "reports": reports}, ensure_ascii=False, sort_keys=True))
         return 0 if all(report["valid"] for report in reports) else 1
+    if args.command == "verify-sha256":
+        report = verify_sha256_manifest(args.package_root)
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 0 if report["valid"] else 1
     raise AssertionError(f"unsupported command: {args.command}")
 
 

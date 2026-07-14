@@ -126,6 +126,81 @@ def test_diagnostics_remove_machine_identity_and_embedded_secrets(tmp_path: Path
     assert set(report["lock_sha256"]) == {"models", "runtime"}
 
 
+def test_diagnostics_project_operation_and_probe_to_typed_machine_fields_only(tmp_path: Path) -> None:
+    diagnostics = _load_diagnostics()
+    package_root = _package(tmp_path)
+    report = diagnostics.build_diagnostic_report(
+        package_root=package_root,
+        operation={
+            "status": "ready",
+            "exit_code": 0,
+            "error_code": "PORT_IN_USE",
+            "message": "customer@example.invalid CUSTOMER-MARKER token=private voice.wav",
+            "environment": {"CUSTOMER": "nested-private"},
+            "events": [
+                {
+                    "seq": 1,
+                    "phase": "ready",
+                    "percent": 42.5,
+                    "error_code": "PORT_IN_USE",
+                    "message": "customer@example.invalid C:\\private\\voice.wav",
+                    "unknown": "CUSTOMER-EVENT",
+                },
+                {"seq": -1, "phase": "made-up", "percent": 900, "error_code": "secret"},
+            ],
+        },
+        probe={
+            "status": "failed",
+            "error_code": "CUDA_PROBE_FAILED",
+            "detail": "customer@example.invalid CUSTOMER-PROBE",
+            "environment": {"TOKEN": "nested-private"},
+            "checks": [
+                {
+                    "name": "python",
+                    "status": "passed",
+                    "passed": True,
+                    "version": "3.11.9",
+                    "duration_ms": 12.5,
+                    "email": "customer@example.invalid",
+                },
+                {"name": "CUSTOMER-CHECK", "status": "passed", "passed": "yes"},
+            ],
+        },
+    )
+
+    assert report["operation"] == {
+        "status": "ready",
+        "exit_code": 0,
+        "error_code": "PORT_IN_USE",
+        "events": [
+            {"seq": 1, "phase": "ready", "percent": 42.5, "error_code": "PORT_IN_USE"},
+        ],
+    }
+    assert report["probe"] == {
+        "status": "failed",
+        "error_code": "CUDA_PROBE_FAILED",
+        "checks": [
+            {
+                "name": "python",
+                "status": "passed",
+                "passed": True,
+                "version": "3.11.9",
+                "duration_ms": 12.5,
+            },
+        ],
+    }
+    text = json.dumps(report, ensure_ascii=False)
+    for forbidden in (
+        "customer@example.invalid",
+        "CUSTOMER",
+        "nested-private",
+        "private",
+        "voice.wav",
+        "token=",
+    ):
+        assert forbidden not in text
+
+
 def test_export_is_deterministic_atomic_contained_and_non_overwriting(tmp_path: Path) -> None:
     diagnostics = _load_diagnostics()
     package_root = _package(tmp_path)

@@ -4,17 +4,22 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-$recordPath = Join-Path $Root "data\local\run\worker.pid.json"
+$ValidationScript = Join-Path $PSScriptRoot "Portable-Validation.ps1"
+if (!(Test-Path -LiteralPath $ValidationScript -PathType Leaf)) { throw "Portable-Validation.ps1 is missing" }
+. $ValidationScript
+$recordPath = Resolve-PortablePackagePath -Root $Root -RelativePath "data\local\run\worker.pid.json" -Label "PID record"
 if (!(Test-Path -LiteralPath $recordPath)) {
     Write-Host "TTS More is not running."
     exit 0
 }
-$record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
-$Python = [System.IO.Path]::GetFullPath([string]$record.executable_path)
-if (!(Test-Path -LiteralPath $Python -PathType Leaf)) {
-    throw "Recorded package Python is missing; preserving PID evidence: $Python"
-}
-& $Python (Join-Path $Root "scripts\portable_launcher.py") stop-worker --package-root $Root
+$runtimeLockPath = Resolve-PortablePackagePath -Root $Root -RelativePath "packaging\portable\runtime.lock.json" -Label "runtime lock" -MustExist
+$runtimeLock = Get-Content -LiteralPath $runtimeLockPath -Raw | ConvertFrom-Json
+$expectedPython = [string]$runtimeLock.python_version
+if ($expectedPython -ne "3.11") { throw "TTS More runtime lock must require Python 3.11" }
+$Python = Join-Path $Root "runtime\live\python.exe"
+[void](Assert-PortableRuntime -Root $Root -PythonPath $Python -ExpectedVersion $expectedPython -ImportProbe "")
+$Launcher = Resolve-PortablePackagePath -Root $Root -RelativePath "scripts\portable_launcher.py" -Label "portable launcher" -MustExist
+& $Python $Launcher stop-worker --package-root $Root
 if ($LASTEXITCODE -eq 2) {
     throw "Owned process was terminated but its port did not release; PID record was preserved."
 }
