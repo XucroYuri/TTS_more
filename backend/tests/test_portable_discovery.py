@@ -11,13 +11,16 @@ from app.portable_discovery import (
     PortablePackageRegisterRequest,
     discover_portable_packages,
     endpoint_from_portable_package,
+    read_portable_package,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _write_package(root: Path, *, schema_version: int, component: str, port: int) -> Path:
+def _write_package(
+    root: Path, *, schema_version: int, component: str, port: int, completed_v2: bool = True
+) -> Path:
     for launcher in ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1"):
         (root / launcher).parent.mkdir(parents=True, exist_ok=True)
         (root / launcher).write_text("@echo off\n", encoding="utf-8")
@@ -78,6 +81,24 @@ def _write_package(root: Path, *, schema_version: int, component: str, port: int
             "sha256_manifest": "SHA256SUMS.txt",
             "licenses": "THIRD_PARTY_NOTICES.json",
         }
+        if completed_v2:
+            payload.update(
+                {
+                    "package_id": component,
+                    "release_version": "0.2.1",
+                    "protocol": {
+                        "name": "tts-more-v1",
+                        "version": "1.0",
+                        "controller_range": ">=0.2.0,<0.3.0",
+                    },
+                    "data": {
+                        "user": "data/user",
+                        "local": "data/local",
+                        "cache": "data/cache",
+                        "operations": "data/local/operations",
+                    },
+                }
+            )
     manifest = root / "package" / "tts-more-package.json"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(json.dumps(payload), encoding="utf-8-sig")
@@ -99,6 +120,41 @@ def test_discovers_v1_and_v2_packages_from_explicit_container_and_siblings(tmp_p
     ]
     assert all(item.valid for item in packages)
     assert packages[1].package_profile == "bootstrap"
+    assert packages[0].package_id == "gpt-sovits"
+    assert packages[0].version == "0.1.0"
+
+
+def test_completed_v2_descriptor_exposes_identity_protocol_and_operations_path(tmp_path: Path) -> None:
+    package_root = _write_package(
+        tmp_path / "GPT package", schema_version=2, component="gpt-sovits", port=9880
+    )
+
+    descriptor = read_portable_package(package_root)
+
+    assert descriptor.package_id == "gpt-sovits"
+    assert descriptor.version == "0.2.1"
+    assert descriptor.protocol_version == "1.0"
+    assert descriptor.controller_range == ">=0.2.0,<0.3.0"
+    assert descriptor.operations_path == "data/local/operations"
+
+
+def test_reader_tolerates_older_rc_v2_identity_protocol_and_data_omissions(tmp_path: Path) -> None:
+    package_root = _write_package(
+        tmp_path / "Index rc package",
+        schema_version=2,
+        component="indextts",
+        port=9881,
+        completed_v2=False,
+    )
+
+    descriptor = read_portable_package(package_root)
+
+    assert descriptor.valid is True
+    assert descriptor.package_id == "indextts"
+    assert descriptor.version == "0.2.0"
+    assert descriptor.protocol_version == "1.0"
+    assert descriptor.controller_range == ">=0.2.0,<0.3.0"
+    assert descriptor.operations_path == "data/local/operations"
 
 
 def test_local_package_registration_is_managed_but_lan_registration_is_not(tmp_path: Path) -> None:

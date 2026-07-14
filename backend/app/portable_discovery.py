@@ -36,6 +36,7 @@ class PortablePackageDescriptor(BaseModel):
     manifest_path: str
     schema_version: int
     component: str
+    package_id: str
     version: str
     build_id: str
     package_profile: str | None = None
@@ -44,6 +45,9 @@ class PortablePackageDescriptor(BaseModel):
     launcher: str
     health_path: str
     capabilities: list[str]
+    protocol_version: str
+    controller_range: str
+    operations_path: str
     initialized: bool
     valid: bool
     errors: list[str] = Field(default_factory=list)
@@ -78,6 +82,7 @@ def discover_portable_packages(
                     manifest_path=str(manifest),
                     schema_version=0,
                     component="unknown",
+                    package_id="unknown",
                     version="",
                     build_id="",
                     default_url="",
@@ -85,6 +90,9 @@ def discover_portable_packages(
                     launcher="",
                     health_path="/health",
                     capabilities=[],
+                    protocol_version="",
+                    controller_range="",
+                    operations_path="data/local/operations",
                     initialized=False,
                     valid=False,
                     errors=[str(exc)],
@@ -100,6 +108,13 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
     schema = int(payload.get("schema_version") or 0)
     errors: list[str] = []
     component = str(payload.get("component") or "")
+    package_id = str(payload.get("package_id") or component)
+    release_version = str(payload.get("release_version") or payload.get("version") or "")
+    protocol = _mapping(payload.get("protocol"))
+    protocol_version = str(protocol.get("version") or "1.0")
+    controller_range = str(protocol.get("controller_range") or ">=0.2.0,<0.3.0")
+    data = _mapping(payload.get("data"))
+    operations_path = str(data.get("operations") or "data/local/operations")
     if component not in SUPPORTED_COMPONENTS:
         errors.append(f"unsupported portable component: {component or 'missing'}")
     if payload.get("api_contract") != "tts-more-v1":
@@ -141,7 +156,8 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
         manifest_path=str(manifest_path),
         schema_version=schema,
         component=component,
-        version=str(payload.get("version") or ""),
+        package_id=package_id,
+        version=release_version,
         build_id=str(payload.get("build_id") or ""),
         package_profile=package_profile,
         default_url=default_url,
@@ -149,6 +165,9 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
         launcher=launcher,
         health_path=health_path,
         capabilities=[str(item) for item in payload.get("capabilities") or []],
+        protocol_version=protocol_version,
+        controller_range=controller_range,
+        operations_path=operations_path,
         initialized=(root / state_path).is_file(),
         valid=not errors,
         errors=errors,

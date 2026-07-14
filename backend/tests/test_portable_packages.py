@@ -53,6 +53,8 @@ def _valid_v2_manifest() -> dict[str, object]:
     return {
         "schema_version": 2,
         "component": "gpt-sovits",
+        "package_id": "gpt-sovits",
+        "release_version": "0.2.0",
         "version": "0.2.0",
         "build_id": "gpt-main-test",
         "package_profile": "bootstrap",
@@ -75,6 +77,17 @@ def _valid_v2_manifest() -> dict[str, object]:
         },
         "models": {"lock": "locks/models.json", "required": True},
         "data_root": "data/local",
+        "protocol": {
+            "name": "tts-more-v1",
+            "version": "1.0",
+            "controller_range": ">=0.2.0,<0.3.0",
+        },
+        "data": {
+            "user": "data/user",
+            "local": "data/local",
+            "cache": "data/cache",
+            "operations": "data/local/operations",
+        },
         "launchers": {
             "initialize": "Initialize.cmd",
             "start": "Start.cmd",
@@ -93,6 +106,22 @@ def _valid_v2_manifest() -> dict[str, object]:
         "sha256_manifest": "SHA256SUMS.txt",
         "licenses": "licenses/THIRD-PARTY-NOTICES.json",
     }
+
+
+def _write_v2_manifest(root: Path, payload: dict[str, object]) -> Path:
+    for relative_path in (
+        *payload["launchers"].values(),
+        payload["runtime"]["lock"],
+        payload["models"]["lock"],
+        payload["licenses"],
+    ):
+        path = root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("test", encoding="utf-8")
+    manifest = root / "package" / "tts-more-package.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    return manifest
 
 
 def test_validate_manifest_rejects_absolute_paths_and_missing_worker_fields(tmp_path: Path) -> None:
@@ -131,18 +160,7 @@ def test_validate_manifest_accepts_staged_gpt_worker_package(tmp_path: Path) -> 
 def test_validate_manifest_accepts_schema_v2_and_keeps_v1_compatibility(tmp_path: Path) -> None:
     packages = _load_portable_packages()
     payload = _valid_v2_manifest()
-    for relative_path in (
-        *payload["launchers"].values(),
-        payload["runtime"]["lock"],
-        payload["models"]["lock"],
-        payload["licenses"],
-    ):
-        path = tmp_path / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("test", encoding="utf-8")
-    manifest = tmp_path / "package" / "tts-more-package.json"
-    manifest.parent.mkdir()
-    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    manifest = _write_v2_manifest(tmp_path, payload)
 
     v2_report = packages.validate_manifest(manifest, tmp_path)
 
@@ -153,6 +171,50 @@ def test_validate_manifest_accepts_schema_v2_and_keeps_v1_compatibility(tmp_path
         "default_endpoint": "http://127.0.0.1:9880",
         "launcher": "Start.cmd",
     }
+
+
+def test_completed_v2_requires_identity_protocol_and_data_paths(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    payload = _valid_v2_manifest()
+    payload.update(
+        {
+            "package_id": "tts-more",
+            "release_version": "0.2.0",
+            "protocol": {
+                "name": "tts-more-v1",
+                "version": "1.0",
+                "controller_range": ">=0.2.0,<0.3.0",
+            },
+            "data": {
+                "user": "data/user",
+                "local": "data/local",
+                "cache": "data/cache",
+                "operations": "data/local/operations",
+            },
+        }
+    )
+    manifest = _write_v2_manifest(tmp_path, payload)
+    report = packages.validate_manifest(manifest, tmp_path)
+    assert report["valid"] is True
+    del payload["package_id"]
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    report = packages.validate_manifest(manifest, tmp_path)
+    assert "package_id is required" in report["errors"]
+
+
+def test_completed_v2_validates_protocol_and_every_data_path(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    payload = _valid_v2_manifest()
+    payload["protocol"] = {"name": "wrong", "version": "", "controller_range": ""}
+    payload["data"]["operations"] = "C:/machine/operations"
+    manifest = _write_v2_manifest(tmp_path, payload)
+
+    report = packages.validate_manifest(manifest, tmp_path)
+
+    assert "protocol.name must be tts-more-v1" in report["errors"]
+    assert "protocol.version is required" in report["errors"]
+    assert "protocol.controller_range is required" in report["errors"]
+    assert "data.operations must be a relative path" in report["errors"]
 
 
 def test_validate_manifest_accepts_windows_powershell_utf8_bom(tmp_path: Path) -> None:
@@ -213,6 +275,23 @@ def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
     assert "^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$" in builder
 
 
+def test_v2_builders_emit_completed_identity_protocol_and_data_contract() -> None:
+    controller_builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+    worker_builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(encoding="utf-8")
+
+    assert 'package_id = "tts-more"; release_version = $Version' in controller_builder
+    assert 'package_id = [string]$config.component; release_version = $Version' in worker_builder
+    for builder in (controller_builder, worker_builder):
+        assert (
+            'protocol = @{ name = "tts-more-v1"; version = "1.0"; '
+            'controller_range = ">=0.2.0,<0.3.0" }'
+        ) in builder
+        assert (
+            'data = @{ user = "data/user"; local = "data/local"; cache = "data/cache"; '
+            'operations = "data/local/operations" }'
+        ) in builder
+
+
 def test_portable_release_workflow_sanitizes_pr_ref_names() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "portable-release.yml").read_text(encoding="utf-8")
 
@@ -261,6 +340,9 @@ def test_package_json_schema_defines_v1_compatibility_and_v2_output_contract() -
     assert schema["$defs"]["v1"]["properties"]["schema_version"] == {"const": 1}
     assert schema["$defs"]["v2"]["properties"]["schema_version"] == {"const": 2}
     assert schema["$defs"]["v2"]["properties"]["package_profile"]["enum"] == ["bootstrap", "full"]
+    assert {"package_id", "release_version", "protocol", "data"} <= set(schema["$defs"]["v2"]["required"])
+    assert schema["$defs"]["v2"]["properties"]["protocol"]["properties"]["name"] == {"const": "tts-more-v1"}
+    assert schema["$defs"]["v2"]["properties"]["data"]["required"] == ["user", "local", "cache", "operations"]
     assert schema["oneOf"] == [{"$ref": "#/$defs/v1"}, {"$ref": "#/$defs/v2"}]
 
 

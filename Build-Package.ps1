@@ -46,13 +46,16 @@ $integrationDigestText = ($integrationFiles | ForEach-Object { (Get-FileHash -Li
 $sha256 = [System.Security.Cryptography.SHA256]::Create()
 $bundleSha = ([BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($integrationDigestText)))).Replace("-", "").ToLowerInvariant()
 $manifest = [ordered]@{
-    schema_version = 2; component = "tts-more"; version = $Version; build_id = "tts-more-$Version-$($revision.Substring(0, 12))"
+    schema_version = 2; component = "tts-more"; package_id = "tts-more"; release_version = $Version
+    version = $Version; build_id = "tts-more-$Version-$($revision.Substring(0, 12))"
     package_profile = $profileName; platform = "windows-x64"; api_contract = "tts-more-v1"
+    protocol = @{ name = "tts-more-v1"; version = "1.0"; controller_range = ">=0.2.0,<0.3.0" }
     source = @{ repository = "https://github.com/XucroYuri/TTS_more.git"; revision = $revision }
     integration = @{ version = "2.0.0"; source_revision = $revision; bundle_sha256 = $bundleSha }
     runtime = @{ python_version = "3.11"; device_profiles = @($Device.ToLowerInvariant()); lock = "packaging/portable/runtime.lock.json"; state_path = "data/local/install-state.json" }
     models = @{ lock = "packaging/portable/models.lock.json"; required = $false }
     data_root = "data/local"
+    data = @{ user = "data/user"; local = "data/local"; cache = "data/cache"; operations = "data/local/operations" }
     launchers = @{ initialize = "Initialize.cmd"; start = "Start.cmd"; stop = "Stop.cmd"; repair = "Repair.cmd"; build = "Build-Package.ps1" }
     endpoint = @{ default_url = "http://127.0.0.1:8000"; port = 8000; health_path = "/api/health"; capabilities_path = "/api/open-source-tts/catalog"; bind_policy = "loopback" }
     capabilities = @("orchestrator", "package-discovery", "artifact-transfer", "trusted-lan-registration")

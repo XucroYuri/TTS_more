@@ -43,6 +43,7 @@ V2_REQUIRED_FIELDS = (
     "sha256_manifest",
     "licenses",
 )
+V2_REQUIRED_FIELDS = (*V2_REQUIRED_FIELDS, "package_id", "release_version", "protocol", "data")
 
 V2_LAUNCHERS = ("initialize", "start", "stop", "repair", "build")
 DEVICE_PROFILES = {"auto", "cu128", "cu126", "cpu"}
@@ -140,6 +141,7 @@ def _validate_v2(payload: dict[str, Any], package_root: Path) -> tuple[list[str]
         errors.append("platform must be windows-x64")
     if payload.get("api_contract") != "tts-more-v1":
         errors.append("api_contract must be tts-more-v1")
+    _validate_v2_data(payload, errors)
 
     source = _mapping(payload.get("source"))
     _require_text(source, "repository", "source.repository", errors)
@@ -188,6 +190,17 @@ def _validate_v2(payload: dict[str, Any], package_root: Path) -> tuple[list[str]
     _validate_relative_path(payload.get("sha256_manifest"), "sha256_manifest", errors)
     _validate_package_file(payload.get("licenses"), "licenses", package_root, errors)
     return errors, launcher, default_endpoint
+
+
+def _validate_v2_data(payload: dict[str, Any], errors: list[str]) -> None:
+    protocol = _mapping(payload.get("protocol"))
+    if protocol.get("name") != "tts-more-v1":
+        errors.append("protocol.name must be tts-more-v1")
+    for key in ("version", "controller_range"):
+        _require_text(protocol, key, f"protocol.{key}", errors)
+    data = _mapping(payload.get("data"))
+    for key in ("user", "local", "cache", "operations"):
+        _validate_relative_path(data.get(key), f"data.{key}", errors)
 
 
 def _mapping(value: Any) -> dict[str, Any]:
