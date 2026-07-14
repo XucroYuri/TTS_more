@@ -217,6 +217,8 @@ def test_portable_release_workflow_sanitizes_pr_ref_names() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "portable-release.yml").read_text(encoding="utf-8")
 
     assert "[^0-9A-Za-z._-]" in workflow
+    assert "audit_release_zip" in workflow
+    assert "EXPECTED_FULL_REJECTION" in workflow
 
 
 def test_tts_more_initializer_serializes_an_empty_controller_list_as_json() -> None:

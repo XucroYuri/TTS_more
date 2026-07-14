@@ -69,8 +69,14 @@ jobs:
           with zipfile.ZipFile("artifacts/portable/forbidden-full.zip", "w") as archive:
               archive.writestr("Component/package/tts-more-package.json", json.dumps({"schema_version": 2, "component": "tts-more", "package_profile": "full"}))
           '@ | python -
-          python scripts\portable_packages.py audit-release --zip artifacts\portable\forbidden-full.zip
-          if ($LASTEXITCODE -eq 0) { throw "full profile release audit unexpectedly passed" }
+          @'
+          from pathlib import Path
+          from scripts.portable_packages import audit_release_zip
+          report = audit_release_zip(Path("artifacts/portable/forbidden-full.zip"))
+          if report["valid"] or not any("profile=full" in error for error in report["errors"]):
+              raise SystemExit("full profile release audit unexpectedly passed")
+          print("EXPECTED_FULL_REJECTION")
+          '@ | python -
           Remove-Item artifacts\portable\forbidden-full.zip
       - uses: actions/upload-artifact@v7
         with:
