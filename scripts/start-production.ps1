@@ -7,10 +7,15 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$Root = if ([string]::IsNullOrWhiteSpace($PackageRoot)) { [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)) } else { [System.IO.Path]::GetFullPath($PackageRoot) }
+if (!(Test-Path -LiteralPath $Root -PathType Container)) { throw "portable package root is missing" }
+if ((((Get-Item -LiteralPath $Root -Force).Attributes) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "portable package root cannot be a reparse point"
+}
 $ValidationScript = Join-Path $PSScriptRoot "Portable-Validation.ps1"
 if (!(Test-Path -LiteralPath $ValidationScript -PathType Leaf)) { throw "Portable-Validation.ps1 is missing" }
 . $ValidationScript
-$Root = if ([string]::IsNullOrWhiteSpace($PackageRoot)) { [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)) } else { [System.IO.Path]::GetFullPath($PackageRoot) }
+$Root = Assert-PortablePackageRoot -Root $Root
 $Port = if ($null -ne $PortOverride) { [int]$PortOverride } elseif ($env:TTS_MORE_PORT) { [int]$env:TTS_MORE_PORT } else { 8000 }
 
 function Resolve-ExistingPath {

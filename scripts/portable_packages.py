@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import re
+import struct
 import unicodedata
 import zipfile
 from pathlib import Path
@@ -54,6 +55,7 @@ RELEASE_FORBIDDEN_PATH = re.compile(
     r"\.(?:safetensors|ckpt|pth|pt|onnx|bin)$",
     re.IGNORECASE,
 )
+SAFE_PACKAGE_ROOT = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
 
 
 def create_zip(package_root: Path, output: Path) -> None:
@@ -77,18 +79,47 @@ def audit_release_zip(path: Path) -> dict[str, object]:
     errors: list[str] = []
     try:
         with zipfile.ZipFile(path) as archive:
-            names = archive.namelist()
+            entries = archive.infolist()
+            raw_names = _raw_central_directory_names(archive, len(entries))
             canonical_names: dict[str, str] = {}
-            for name in names:
+            file_roots: set[str] = set()
+            canonical_file_roots: set[str] = set()
+            for entry, name in zip(entries, raw_names, strict=True):
+                if "\\" in name:
+                    raise ValueError("release ZIP top-level package directory must use forward slashes")
                 canonical = _canonical_zip_entry(name)
                 if canonical in canonical_names:
                     errors.append(f"unsafe ZIP entry collision: {name}")
                     break
                 canonical_names[canonical] = name
+                if entry.is_dir():
+                    continue
+                raw_parts = name.split("/")
+                if len(raw_parts) < 2:
+                    raise ValueError("release ZIP must contain files under one top-level package directory")
+                raw_root = raw_parts[0]
+                if (
+                    not SAFE_PACKAGE_ROOT.fullmatch(raw_root)
+                    or raw_root != raw_root.rstrip(" .")
+                    or unicodedata.normalize("NFKC", raw_root) != raw_root
+                ):
+                    raise ValueError("release ZIP top-level package directory name is unsafe or ambiguous")
+                file_roots.add(raw_root)
+                canonical_file_roots.add(canonical.split("/", 1)[0])
+            if errors:
+                return {"valid": False, "errors": errors, "path": str(path)}
+            if len(file_roots) != 1 or len(canonical_file_roots) != 1:
+                raise ValueError("release ZIP must contain exactly one top-level package directory")
+            package_root = next(iter(canonical_file_roots))
+            relative_names = {
+                canonical.split("/", 1)[1]: original
+                for canonical, original in canonical_names.items()
+                if "/" in canonical and canonical.split("/", 1)[0] == package_root
+            }
             manifests = [
                 original
-                for canonical, original in canonical_names.items()
-                if canonical.endswith("/package/tts-more-package.json")
+                for relative, original in relative_names.items()
+                if relative == "package/tts-more-package.json"
             ]
             if len(manifests) != 1:
                 errors.append("release ZIP must contain exactly one package manifest")
@@ -96,8 +127,7 @@ def audit_release_zip(path: Path) -> dict[str, object]:
                 payload = json.loads(archive.read(manifests[0]).decode("utf-8-sig"))
                 if payload.get("package_profile") != "bootstrap":
                     errors.append(f"GitHub release upload refused for profile={payload.get('package_profile')}")
-            for canonical, name in canonical_names.items():
-                relative = canonical.split("/", 1)[1] if "/" in canonical else canonical
+            for relative, name in relative_names.items():
                 parts = tuple(part for part in relative.split("/") if part)
                 private_data = len(parts) >= 2 and parts[0] == "data" and parts[1] in {
                     "user",
@@ -179,6 +209,32 @@ def _canonical_zip_entry(name: str) -> str:
     if not parts:
         raise ValueError(f"unsafe ZIP entry: {name}")
     return "/".join(parts)
+
+
+def _raw_central_directory_names(archive: zipfile.ZipFile, count: int) -> list[str]:
+    """Read names before zipfile applies platform separator normalization."""
+    if archive.fp is None:
+        raise ValueError("release ZIP is closed")
+    stream = archive.fp
+    original_position = stream.tell()
+    names: list[str] = []
+    try:
+        stream.seek(archive.start_dir)
+        for _ in range(count):
+            header = stream.read(46)
+            if len(header) != 46 or header[:4] != b"PK\x01\x02":
+                raise ValueError("invalid ZIP central directory")
+            flags = int.from_bytes(header[8:10], "little")
+            name_length, extra_length, comment_length = struct.unpack_from("<HHH", header, 28)
+            raw_name = stream.read(name_length)
+            if len(raw_name) != name_length:
+                raise ValueError("truncated ZIP member name")
+            encoding = "utf-8" if flags & 0x800 else "cp437"
+            names.append(raw_name.decode(encoding, errors="strict"))
+            stream.seek(extra_length + comment_length, 1)
+    finally:
+        stream.seek(original_position)
+    return names
 
 
 def _canonical_relative_path(value: str) -> str:

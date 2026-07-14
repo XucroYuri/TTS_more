@@ -21,6 +21,29 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _create_directory_junction(link: Path, target: Path) -> None:
+    environment = {
+        **os.environ,
+        "A5_JUNCTION_PATH": str(link),
+        "A5_JUNCTION_TARGET": str(target),
+    }
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "New-Item -ItemType Junction -Path $env:A5_JUNCTION_PATH -Target $env:A5_JUNCTION_TARGET | Out-Null",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"directory junctions are unavailable: {result.stderr}")
+
+
 def _copy_controller(package_root: Path) -> None:
     scripts = package_root / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
@@ -1432,3 +1455,107 @@ def test_production_stop_is_idempotent_without_pid_record(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "not running" in result.stdout.lower()
+
+
+@pytest.mark.parametrize("entrypoint", ("tts-start", "tts-stop", "worker-stop"))
+def test_entrypoints_reject_a_whole_package_root_junction_before_runtime_execution(
+    tmp_path: Path, entrypoint: str
+) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    physical_root = tmp_path / f"physical-{entrypoint}"
+    linked_root = tmp_path / f"linked-{entrypoint}"
+    _compile_fake_python(physical_root / "runtime" / "live" / "python.exe")
+    _write_text(
+        physical_root / "packaging" / "portable" / "runtime.lock.json",
+        json.dumps({"python_version": "3.11", "import_probe": "import sys"}),
+    )
+    _write_text(
+        physical_root / "data" / "local" / "run" / "worker.pid.json",
+        json.dumps({"pid": 1}),
+    )
+    marker = tmp_path / f"executed-{entrypoint}.marker"
+    validation_marker = tmp_path / f"validation-{entrypoint}.marker"
+    environment = {
+        **os.environ,
+        "A4_FAKE_EXEC_MARKER": str(marker),
+        "A5_VALIDATION_MARKER": str(validation_marker),
+    }
+
+    if entrypoint == "tts-start":
+        scripts = physical_root / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / "scripts" / "start-production.ps1", scripts)
+        shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", scripts)
+        (physical_root / "backend").mkdir()
+        (physical_root / "frontend" / "dist").mkdir(parents=True)
+        command = [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(linked_root / "scripts" / "start-production.ps1"),
+            "-PackageRoot",
+            str(linked_root),
+        ]
+    elif entrypoint == "tts-stop":
+        scripts = physical_root / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / "scripts" / "stop-production.ps1", scripts)
+        shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", scripts)
+        _write_text(scripts / "portable_launcher.py", "raise SystemExit(0)\n")
+        command = [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(linked_root / "scripts" / "stop-production.ps1"),
+        ]
+    else:
+        bundle = physical_root / "tts_more"
+        bundle.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / "integrations" / "windows" / "Stop-Worker.ps1", bundle)
+        shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", bundle)
+        _write_text(bundle / "portable_launcher.py", "raise SystemExit(0)\n")
+        _write_text(
+            bundle / "locks" / "runtime.lock.json",
+            json.dumps({"python_version": "3.11"}),
+        )
+        command = [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(linked_root / "tts_more" / "Stop-Worker.ps1"),
+        ]
+
+    validation_path = (
+        physical_root / "tts_more" / "Portable-Validation.ps1"
+        if entrypoint == "worker-stop"
+        else physical_root / "scripts" / "Portable-Validation.ps1"
+    )
+    validation_path.write_text(
+        '[IO.File]::WriteAllText($env:A5_VALIDATION_MARKER, "executed")\n'
+        + validation_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    _create_directory_junction(linked_root, physical_root)
+    result = subprocess.run(
+        command,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not validation_marker.exists(), "a package-root junction loaded the package validator"
+    assert not marker.exists(), "a package-root junction executed the untrusted runtime"
+    assert "reparse" in (result.stdout + result.stderr).lower()

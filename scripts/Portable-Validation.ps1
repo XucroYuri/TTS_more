@@ -94,6 +94,22 @@ function Test-PortablePathWithinRoot {
     return $candidate.StartsWith($rootPath + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Assert-PortablePackageRoot {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    if ([string]::IsNullOrWhiteSpace($Root)) { throw "portable package root is required" }
+    $lexicalRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if (!(Test-Path -LiteralPath $lexicalRoot -PathType Container)) { throw "portable package root is missing" }
+    $rootItem = Get-Item -LiteralPath $lexicalRoot -Force
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "portable package root cannot be a reparse point"
+    }
+    $itemPath = [IO.Path]::GetFullPath($rootItem.FullName).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if (![string]::Equals($lexicalRoot, $itemPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "portable package root lexical identity does not match its filesystem identity"
+    }
+    return $lexicalRoot
+}
+
 function Resolve-PortablePackagePath {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -106,7 +122,7 @@ function Resolve-PortablePackagePath {
     }
     $segments = @($RelativePath -split '[\\/]')
     if ($segments -contains "..") { throw "$Label cannot escape the package" }
-    $resolvedRoot = [IO.Path]::GetFullPath($Root)
+    $resolvedRoot = Assert-PortablePackageRoot -Root $Root
     $resolved = [IO.Path]::GetFullPath((Join-Path $resolvedRoot $RelativePath))
     if (!(Test-PortablePathWithinRoot -Root $resolvedRoot -Path $resolved)) { throw "$Label resolves outside the package" }
     $current = $resolvedRoot
@@ -158,19 +174,24 @@ function Assert-PortableRuntime {
         [Parameter(Mandatory = $true)][string]$ExpectedVersion,
         [string]$ImportProbe = "import sys"
     )
-    $expectedPath = [IO.Path]::GetFullPath((Join-Path $Root "runtime\live\python.exe"))
+    $resolvedRoot = Assert-PortablePackageRoot -Root $Root
+    $expectedPath = [IO.Path]::GetFullPath((Join-Path $resolvedRoot "runtime\live\python.exe"))
     $resolvedPython = [IO.Path]::GetFullPath($PythonPath)
     if (![string]::Equals($resolvedPython, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw "package runtime must be runtime/live/python.exe"
     }
-    $relative = $resolvedPython.Substring([IO.Path]::GetFullPath($Root).TrimEnd('\', '/').Length).TrimStart('\', '/')
-    [void](Resolve-PortablePackagePath -Root $Root -RelativePath $relative -Label "package runtime" -MustExist)
+    $relative = $resolvedPython.Substring($resolvedRoot.Length).TrimStart('\', '/')
+    [void](Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath $relative -Label "package runtime" -MustExist)
     if (!(Test-Path -LiteralPath $resolvedPython -PathType Leaf)) { throw "package runtime is missing" }
+    [void](Assert-PortablePackageRoot -Root $resolvedRoot)
+    [void](Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath $relative -Label "package runtime" -MustExist)
     $versionOutput = @(& $resolvedPython -c "import sys;print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>&1)
     if ($LASTEXITCODE -ne 0 -or ($versionOutput -join "").Trim() -ne $ExpectedVersion) {
         throw "package runtime Python version must be $ExpectedVersion"
     }
     if (![string]::IsNullOrWhiteSpace($ImportProbe)) {
+        [void](Assert-PortablePackageRoot -Root $resolvedRoot)
+        [void](Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath $relative -Label "package runtime" -MustExist)
         & $resolvedPython -c $ImportProbe *> $null
         if ($LASTEXITCODE -ne 0) { throw "package runtime import probe failed" }
     }

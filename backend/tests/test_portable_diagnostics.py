@@ -31,6 +31,12 @@ def _package(root: Path) -> Path:
     model_lock = package_root / "packaging" / "portable" / "models.lock.json"
     runtime_lock.write_text('{"safe":"runtime"}\n', encoding="utf-8")
     model_lock.write_text('{"safe":"models"}\n', encoding="utf-8")
+    (package_root / "packaging" / "portable" / "error-catalog.zh-CN.json").write_text(
+        (REPO_ROOT / "packaging" / "portable" / "error-catalog.zh-CN.json").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
     manifest = {
         "schema_version": 2,
         "component": "tts-more",
@@ -199,6 +205,71 @@ def test_diagnostics_project_operation_and_probe_to_typed_machine_fields_only(tm
         "token=",
     ):
         assert forbidden not in text
+
+
+def test_diagnostic_error_codes_come_only_from_package_catalog_and_build_id_is_omitted(
+    tmp_path: Path,
+) -> None:
+    diagnostics = _load_diagnostics()
+    package_root = _package(tmp_path)
+    catalog_path = package_root / "packaging" / "portable" / "error-catalog.zh-CN.json"
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    catalog["errors"]["CATALOG_ONLY"] = {
+        "event": "safe",
+        "cause": "safe",
+        "unchanged_data": "safe",
+        "next_action": "safe",
+    }
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    manifest_path = package_root / "package" / "tts-more-package.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["build_id"] = "CUSTOMER-MARKER"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (package_root / "data" / "local" / "install-state.json").write_text(
+        json.dumps({"status": "blocked", "error_code": "CATALOG_ONLY"}),
+        encoding="utf-8",
+    )
+
+    report = diagnostics.build_diagnostic_report(
+        package_root=package_root,
+        operation={
+            "status": "blocked",
+            "error_code": "CANCELLED",
+            "events": [{"seq": 1, "phase": "blocked", "error_code": "OPERATION_ACTIVE"}],
+        },
+        probe={
+            "status": "failed",
+            "error_code": "NON_CATALOG",
+            "checks": [{"name": "runtime", "status": "failed", "error_code": "CANCELLED"}],
+        },
+    )
+
+    assert report["status"]["error_code"] == "CATALOG_ONLY"
+    assert "build_id" not in report["manifest"]
+    text = json.dumps(report, ensure_ascii=False)
+    for forbidden in ("CANCELLED", "OPERATION_ACTIVE", "NON_CATALOG", "CUSTOMER-MARKER"):
+        assert forbidden not in text
+
+
+@pytest.mark.parametrize("catalog_mode", ("missing", "corrupt"))
+def test_missing_or_corrupt_diagnostic_error_catalog_fails_closed(
+    tmp_path: Path, catalog_mode: str
+) -> None:
+    diagnostics = _load_diagnostics()
+    package_root = _package(tmp_path)
+    catalog_path = package_root / "packaging" / "portable" / "error-catalog.zh-CN.json"
+    if catalog_mode == "missing":
+        catalog_path.unlink()
+    else:
+        catalog_path.write_text("{", encoding="utf-8")
+    (package_root / "data" / "local" / "install-state.json").write_text(
+        json.dumps({"status": "blocked", "error_code": "CUDA_PROBE_FAILED"}),
+        encoding="utf-8",
+    )
+
+    report = diagnostics.build_diagnostic_report(package_root=package_root)
+
+    assert "error_code" not in report["status"]
 
 
 def test_export_is_deterministic_atomic_contained_and_non_overwriting(tmp_path: Path) -> None:

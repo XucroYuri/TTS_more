@@ -545,6 +545,41 @@ def test_release_audit_rejects_all_runtime_and_private_data_path_variants(
     assert any("forbidden release asset" in error for error in report["errors"])
 
 
+@pytest.mark.parametrize(
+    "entries",
+    (
+        ("package/tts-more-package.json", "runtime/runtime.zip"),
+        ("package/tts-more-package.json", "data/user/customer.wav"),
+        ("Component/package/tts-more-package.json", "Other/Start.cmd"),
+        ("Component", "Component/package/tts-more-package.json"),
+        (r"Component\package\tts-more-package.json",),
+        ("Component/package/tts-more-package.json", "component/Start.cmd"),
+        ("Component/package/tts-more-package.json", "Component./Start.cmd"),
+        ("Component/package/tts-more-package.json", "Ｃomponent/Start.cmd"),
+    ),
+)
+def test_release_audit_requires_one_safe_unambiguous_top_level_package_directory(
+    tmp_path: Path, entries: tuple[str, ...]
+) -> None:
+    packages = _load_portable_packages()
+    archive_path = tmp_path / f"unsafe-root-{len(list(tmp_path.iterdir()))}.zip"
+    manifest = json.dumps(
+        {"schema_version": 2, "component": "tts-more", "package_profile": "bootstrap"}
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for name in entries:
+            archive.writestr(name, manifest if name.replace("\\", "/").endswith("tts-more-package.json") else b"payload")
+    for name in entries:
+        if "\\" in name:
+            normalized = name.replace("\\", "/").encode("utf-8")
+            archive_path.write_bytes(archive_path.read_bytes().replace(normalized, name.encode("utf-8")))
+
+    report = packages.audit_release_zip(archive_path)
+
+    assert report["valid"] is False
+    assert any("top-level package directory" in error for error in report["errors"])
+
+
 def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
     builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
 

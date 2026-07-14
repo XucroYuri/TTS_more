@@ -51,19 +51,9 @@ OPERATION_PHASES = {
 PROBE_STATUSES = {"ok", "passed", "failed", "blocked", "ready", "unavailable", "unknown"}
 PROBE_NAMES = {"python", "runtime", "imports", "torch", "onnx", "cuda", "models", "disk", "network", "endpoint"}
 DEVICE_PROFILES = {"auto", "cpu", "cu126", "cu128"}
-ALLOWED_ERROR_CODES = {
-    "CANCELLED",
-    "CUDA_PROBE_FAILED",
-    "DISK_SPACE_INSUFFICIENT",
-    "DOWNLOAD_NETWORK_INTERRUPTED",
-    "OPERATION_ACTIVE",
-    "PACKAGE_CORRUPT",
-    "PACKAGE_NOT_WRITABLE",
-    "PORT_IN_USE",
-}
 VERSION_VALUE = re.compile(r"^[0-9]+(?:\.[0-9]+){0,3}$")
 RELEASE_VALUE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
-BUILD_VALUE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,191}$")
+ERROR_CODE_VALUE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 WINDOWS_PATH = re.compile(
     r"(?i)(?:[a-z]:[\\/]|\\\\(?:\?\\)?)[^\r\n;,|]*"
 )
@@ -133,9 +123,10 @@ def build_diagnostic_report(
     root = package_root.absolute()
     manifest = _read_json_regular(root, root / "package" / "tts-more-package.json")
     state = _read_json_regular(root, root / "data" / "local" / "install-state.json")
+    allowed_error_codes = _load_error_codes(root)
     manifest_report = _project_manifest(manifest)
-    state_report = _project_state(state)
-    operation_report = _project_operation(operation or {})
+    state_report = _project_state(state, allowed_error_codes)
+    operation_report = _project_operation(operation or {}, allowed_error_codes)
     locks: dict[str, str] = {}
     for label, section in (("runtime", "runtime"), ("models", "models")):
         descriptor = manifest.get(section)
@@ -153,7 +144,7 @@ def build_diagnostic_report(
         "lock_sha256": locks,
         "status": state_report,
         "operation": operation_report,
-        "probe": _project_probe(probe or {}),
+        "probe": _project_probe(probe or {}, allowed_error_codes),
     }
     return redact(report, package_root=root)  # type: ignore[return-value]
 
@@ -175,13 +166,12 @@ def _project_manifest(manifest: Mapping[str, object]) -> dict[str, object]:
     profile = manifest.get("package_profile")
     if isinstance(profile, str) and profile in {"bootstrap", "full"}:
         projected["package_profile"] = profile
-    build_id = manifest.get("build_id")
-    if isinstance(build_id, str) and BUILD_VALUE.fullmatch(build_id):
-        projected["build_id"] = build_id
     return projected
 
 
-def _project_state(state: Mapping[str, object]) -> dict[str, object]:
+def _project_state(
+    state: Mapping[str, object], allowed_error_codes: frozenset[str]
+) -> dict[str, object]:
     projected: dict[str, object] = {}
     schema_version = state.get("schema_version")
     if isinstance(schema_version, int) and not isinstance(schema_version, bool) and 1 <= schema_version <= 2:
@@ -192,13 +182,15 @@ def _project_state(state: Mapping[str, object]) -> dict[str, object]:
     selected_device = state.get("selected_device")
     if isinstance(selected_device, str) and selected_device.casefold() in DEVICE_PROFILES:
         projected["selected_device"] = selected_device.casefold()
-    error_code = _project_error_code(state.get("error_code"))
+    error_code = _project_error_code(state.get("error_code"), allowed_error_codes)
     if error_code is not None:
         projected["error_code"] = error_code
     return projected
 
 
-def _project_operation(operation: Mapping[str, object]) -> dict[str, object]:
+def _project_operation(
+    operation: Mapping[str, object], allowed_error_codes: frozenset[str]
+) -> dict[str, object]:
     projected: dict[str, object] = {}
     status = operation.get("status")
     if isinstance(status, str) and status in OPERATION_PHASES:
@@ -206,7 +198,7 @@ def _project_operation(operation: Mapping[str, object]) -> dict[str, object]:
     exit_code = operation.get("exit_code")
     if isinstance(exit_code, int) and not isinstance(exit_code, bool) and 0 <= exit_code <= 65535:
         projected["exit_code"] = exit_code
-    error_code = _project_error_code(operation.get("error_code"))
+    error_code = _project_error_code(operation.get("error_code"), allowed_error_codes)
     if error_code is not None:
         projected["error_code"] = error_code
     events = operation.get("events")
@@ -215,7 +207,7 @@ def _project_operation(operation: Mapping[str, object]) -> dict[str, object]:
             projected_event
             for event in events[-50:]
             if isinstance(event, Mapping)
-            for projected_event in (_project_event(event),)
+            for projected_event in (_project_event(event, allowed_error_codes),)
             if projected_event
         ]
         if projected_events:
@@ -223,7 +215,9 @@ def _project_operation(operation: Mapping[str, object]) -> dict[str, object]:
     return projected
 
 
-def _project_event(event: Mapping[str, object]) -> dict[str, object]:
+def _project_event(
+    event: Mapping[str, object], allowed_error_codes: frozenset[str]
+) -> dict[str, object]:
     projected: dict[str, object] = {}
     seq = event.get("seq")
     if isinstance(seq, int) and not isinstance(seq, bool) and 1 <= seq <= 2_147_483_647:
@@ -239,18 +233,20 @@ def _project_event(event: Mapping[str, object]) -> dict[str, object]:
         and 0 <= float(percent) <= 100
     ):
         projected["percent"] = percent
-    error_code = _project_error_code(event.get("error_code"))
+    error_code = _project_error_code(event.get("error_code"), allowed_error_codes)
     if error_code is not None:
         projected["error_code"] = error_code
     return projected
 
 
-def _project_probe(probe: Mapping[str, object]) -> dict[str, object]:
+def _project_probe(
+    probe: Mapping[str, object], allowed_error_codes: frozenset[str]
+) -> dict[str, object]:
     projected: dict[str, object] = {}
     status = probe.get("status")
     if isinstance(status, str) and status in PROBE_STATUSES:
         projected["status"] = status
-    error_code = _project_error_code(probe.get("error_code"))
+    error_code = _project_error_code(probe.get("error_code"), allowed_error_codes)
     if error_code is not None:
         projected["error_code"] = error_code
     checks = probe.get("checks")
@@ -259,7 +255,7 @@ def _project_probe(probe: Mapping[str, object]) -> dict[str, object]:
             projected_check
             for check in checks[:100]
             if isinstance(check, Mapping)
-            for projected_check in (_project_probe_check(check),)
+            for projected_check in (_project_probe_check(check, allowed_error_codes),)
             if projected_check
         ]
         if projected_checks:
@@ -267,7 +263,9 @@ def _project_probe(probe: Mapping[str, object]) -> dict[str, object]:
     return projected
 
 
-def _project_probe_check(check: Mapping[str, object]) -> dict[str, object]:
+def _project_probe_check(
+    check: Mapping[str, object], allowed_error_codes: frozenset[str]
+) -> dict[str, object]:
     projected: dict[str, object] = {}
     name = check.get("name")
     if isinstance(name, str) and name in PROBE_NAMES:
@@ -289,14 +287,39 @@ def _project_probe_check(check: Mapping[str, object]) -> dict[str, object]:
         and 0 <= float(duration_ms) <= 600_000
     ):
         projected["duration_ms"] = duration_ms
-    error_code = _project_error_code(check.get("error_code"))
+    error_code = _project_error_code(check.get("error_code"), allowed_error_codes)
     if error_code is not None:
         projected["error_code"] = error_code
     return projected if projected.get("name") else {}
 
 
-def _project_error_code(value: object) -> str | None:
-    return value if isinstance(value, str) and value in ALLOWED_ERROR_CODES else None
+def _project_error_code(value: object, allowed_error_codes: frozenset[str]) -> str | None:
+    return value if isinstance(value, str) and value in allowed_error_codes else None
+
+
+def _load_error_codes(root: Path) -> frozenset[str]:
+    catalog = _read_json_regular(
+        root, root / "packaging" / "portable" / "error-catalog.zh-CN.json"
+    )
+    errors = catalog.get("errors")
+    if catalog.get("schema_version") != 1 or catalog.get("locale") != "zh-CN" or not isinstance(errors, Mapping):
+        return frozenset()
+    required_fields = {"event", "cause", "unchanged_data", "next_action"}
+    codes: set[str] = set()
+    for code, descriptor in errors.items():
+        if (
+            not isinstance(code, str)
+            or not ERROR_CODE_VALUE.fullmatch(code)
+            or not isinstance(descriptor, Mapping)
+            or set(descriptor) != required_fields
+            or any(
+                not isinstance(descriptor[field], str) or not descriptor[field].strip()
+                for field in required_fields
+            )
+        ):
+            return frozenset()
+        codes.add(code)
+    return frozenset(codes)
 
 
 def export_diagnostic_zip(
