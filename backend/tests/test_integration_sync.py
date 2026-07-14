@@ -54,6 +54,16 @@ def test_check_detects_manual_drift_and_unexpected_controlled_files(tmp_path: Pa
     assert any("unexpected controlled file: tts_more/unexpected.txt" in error for error in errors)
 
 
+def test_check_treats_crlf_and_lf_as_the_same_controlled_text(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "Cosy fork"
+    sync.sync_integration(REPO_ROOT, target, "cosyvoice", "d" * 40)
+    launcher = target / "Start.cmd"
+    launcher.write_bytes(launcher.read_bytes().replace(b"\r\n", b"\n"))
+
+    assert sync.check_integration(target) == []
+
+
 def test_component_templates_preserve_native_webui_separately(tmp_path: Path) -> None:
     sync = _load_sync()
     expected = {

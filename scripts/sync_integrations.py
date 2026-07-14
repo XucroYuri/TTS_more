@@ -19,11 +19,10 @@ ROOT_ENTRIES = ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-
 
 
 def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    # All controlled integration files are text. Hash their canonical LF form
+    # so Git's Windows checkout conversion cannot create false mirror drift.
+    canonical = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def sync_integration(source_root: Path, target_root: Path, component: str, source_revision: str) -> dict[str, object]:
