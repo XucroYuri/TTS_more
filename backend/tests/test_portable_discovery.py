@@ -17,6 +17,7 @@ from app.portable_discovery import (
     endpoint_from_portable_package,
     read_portable_package,
 )
+from app.portable_services import discover_bounded_portable_packages
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -165,6 +166,55 @@ def test_discovers_v1_and_v2_packages_from_explicit_container_and_siblings(tmp_p
     assert packages[1].package_profile == "bootstrap"
     assert packages[0].package_id == "gpt-sovits"
     assert packages[0].version == "0.1.0"
+
+
+def test_bounded_sibling_discovery_handles_moved_chinese_and_space_paths(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "移动 硬盘" / "语音 四仓"
+    controller = suite / "TTS More"
+    controller.mkdir(parents=True)
+    expected = {
+        "gpt-sovits": _write_package(
+            suite / "GPT-SoVITS",
+            schema_version=2,
+            component="gpt-sovits",
+            port=9880,
+        ),
+        "indextts": _write_package(
+            suite / "IndexTTS",
+            schema_version=2,
+            component="indextts",
+            port=9881,
+        ),
+        "cosyvoice": _write_package(
+            suite / "CosyVoice",
+            schema_version=2,
+            component="cosyvoice",
+            port=9882,
+        ),
+    }
+    _write_package(
+        tmp_path / "不在扫描范围" / "Nested GPT",
+        schema_version=2,
+        component="gpt-sovits",
+        port=9980,
+    )
+
+    packages = discover_bounded_portable_packages(controller, [])
+
+    assert {item.component: Path(item.package_root) for item in packages} == {
+        component: root.resolve() for component, root in expected.items()
+    }
+    for descriptor in packages:
+        package_root = Path(descriptor.package_root)
+        package_root.relative_to(suite)
+        Path(descriptor.manifest_path).relative_to(package_root)
+        assert descriptor.complete_v2 is True
+        assert descriptor.manageable is True
+        assert all(not Path(path).is_absolute() for path in descriptor.launchers.values())
+        assert not Path(descriptor.operations_path).is_absolute()
+        assert not Path(descriptor.state_path).is_absolute()
 
 
 def test_completed_v2_descriptor_exposes_identity_protocol_and_operations_path(tmp_path: Path) -> None:

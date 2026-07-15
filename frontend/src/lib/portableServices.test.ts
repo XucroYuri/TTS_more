@@ -83,6 +83,55 @@ describe("portable service card rules", () => {
     expect(html).toContain("aria-live=\"polite\"");
   });
 
+  it("renders only allowlisted per-card controls and never exposes backend process fields", async () => {
+    const instance = createInstance();
+    await instance.init({ lng: "zh-CN", resources: { "zh-CN": { translation: resources["zh-CN"] } } });
+    const unsafeBackendShape = {
+      service_id: "gpt",
+      component: "gpt-sovits" as const,
+      package_id: "gpt-main",
+      display_name: "GPT-SoVITS",
+      base_url: "http://127.0.0.1:9880",
+      mode: "local",
+      network_scope: "localhost",
+      managed: true,
+      setup_state: "ready",
+      package_root: "D:/Portable/GPT-SoVITS",
+      build_id: "safe-build",
+      port_override: null,
+      command: "UNSAFE_COMMAND_VALUE",
+      cwd: "UNSAFE_CWD_VALUE",
+      env: { PRIVATE_VALUE: "UNSAFE_ENV_VALUE" },
+      control_token: "UNSAFE_CONTROL_VALUE",
+    };
+    const html = renderToStaticMarkup(
+      createElement(
+        I18nextProvider,
+        { i18n: instance },
+        createElement(LocalPortableServicesPanel, {
+          initialServices: [unsafeBackendShape],
+          onServicesStatusRefresh: async () => undefined,
+        }),
+      ),
+    );
+
+    expect(html).toContain("data-portable-component=\"gpt-sovits\"");
+    expect(html).not.toContain("UNSAFE_COMMAND_VALUE");
+    expect(html).not.toContain("UNSAFE_CWD_VALUE");
+    expect(html).not.toContain("UNSAFE_ENV_VALUE");
+    expect(html).not.toContain("UNSAFE_CONTROL_VALUE");
+    expect(html).not.toContain("全部启动");
+    expect(Object.keys(portableServiceCards([unsafeBackendShape])[0].actions).sort()).toEqual([
+      "browse",
+      "logs",
+      "openFolder",
+      "openService",
+      "repair",
+      "start",
+      "stop",
+    ]);
+  });
+
   it("makes only the busy card inert and preserves actions on its siblings", () => {
     const cards = portableServiceCards(
       [

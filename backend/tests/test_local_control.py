@@ -11,6 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -32,6 +33,7 @@ def _write_package(
     component: str = "gpt-sovits",
     package_id: str = "gpt-main",
     controller_range: str = ">=0.2.0,<0.3.0",
+    port: int = 9880,
 ) -> Path:
     root.mkdir(parents=True)
     for launcher in ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1"):
@@ -84,8 +86,8 @@ def _write_package(
             "build": "Build-Package.ps1",
         },
         "endpoint": {
-            "default_url": "http://127.0.0.1:9880",
-            "port": 9880,
+            "default_url": f"http://127.0.0.1:{port}",
+            "port": port,
             "health_path": "/health",
             "capabilities_path": "/capabilities",
             "bind_policy": "loopback",
@@ -122,6 +124,39 @@ def _token(client: TestClient, **headers: str) -> str:
 
 def _control(token: str) -> dict[str, str]:
     return {CONTROL_HEADER: token}
+
+
+def _write_suite(root: Path) -> Path:
+    """Create four sibling, complete schema-v2 packages without machine dependencies."""
+
+    _write_package(root / "TTS More", component="tts-more", package_id="tts-more", port=8000)
+    _write_package(
+        root / "GPT-SoVITS",
+        component="gpt-sovits",
+        package_id="gpt-main",
+        port=9880,
+    )
+    _write_package(
+        root / "IndexTTS",
+        component="indextts",
+        package_id="indextts-main",
+        port=9881,
+    )
+    _write_package(
+        root / "CosyVoice",
+        component="cosyvoice",
+        package_id="cosyvoice-main",
+        port=9882,
+    )
+    return root
+
+
+def _local_client(tts_more_root: Path) -> tuple[TestClient, str]:
+    """Install real routes/token with a deterministic process-free supervisor boundary."""
+
+    client = _client(tts_more_root)
+    client.app.state.supervisor = _FakeSupervisor()
+    return client, _token(client)
 
 
 def _raw_asgi_request(
@@ -831,6 +866,173 @@ def _register(client: TestClient, package: Path) -> tuple[str, dict[str, str]]:
     )
     assert response.status_code == 200, response.text
     return token, headers
+
+
+def test_moved_four_folder_suite_is_rediscovered_and_started_independently(
+    tmp_path: Path,
+) -> None:
+    suite = _write_suite(tmp_path / "普通用户 目录" / "四仓 套件")
+    client, token = _local_client(suite / "TTS More")
+    headers = _control(token)
+
+    discovered = client.post(
+        "/api/local-portable-services/discover",
+        headers=headers,
+        json={},
+    )
+
+    assert discovered.status_code == 200, discovered.text
+    packages = {item["component"]: item for item in discovered.json()["packages"]}
+    assert set(packages) == {"gpt-sovits", "indextts", "cosyvoice"}
+    assert all(item["complete_v2"] and item["manageable"] for item in packages.values())
+    for item in packages.values():
+        package_root = Path(item["package_root"])
+        package_root.relative_to(suite)
+        Path(item["manifest_path"]).relative_to(package_root)
+        assert not {"command", "cwd", "env"}.intersection(item)
+        assert all(not Path(path).is_absolute() for path in item["launchers"].values())
+        assert not Path(item["operations_path"]).is_absolute()
+        assert not Path(item["state_path"]).is_absolute()
+
+    gpt = packages["gpt-sovits"]
+    registered = client.post(
+        "/api/local-portable-services/register",
+        headers=headers,
+        json={
+            "component": "gpt-sovits",
+            "package_id": gpt["package_id"],
+            "path": gpt["package_root"],
+        },
+    )
+    assert registered.status_code == 200, registered.text
+
+    started = client.post(
+        "/api/local-portable-services/gpt-sovits/start",
+        headers=headers,
+        json={},
+    )
+    assert started.status_code == 200, started.text
+    assert started.json()["component"] == "gpt-sovits"
+    UUID(started.json()["operation_id"])
+    assert [(call[0], call[1].portable_locator.component) for call in client.app.state.supervisor.calls] == [
+        ("start", "gpt-sovits")
+    ]
+    assert client.post(
+        "/api/local-portable-services/indextts/start", headers=headers, json={}
+    ).status_code == 409
+    assert client.post(
+        "/api/local-portable-services/cosyvoice/start", headers=headers, json={}
+    ).status_code == 409
+    stored = json.loads(
+        (suite / "TTS More/data/local/services.json").read_text(encoding="utf-8")
+    )
+    gpt_locator = next(
+        item["portable_locator"]
+        for item in stored["services"]
+        if (item.get("portable_locator") or {}).get("component") == "gpt-sovits"
+    )
+    assert gpt_locator["relative_to_tts_more"] == "../GPT-SoVITS"
+    old_absolute_path = Path(gpt_locator["absolute_path_last_seen"])
+
+    client.close()
+    moved_suite = tmp_path / "移动后 目录" / "重命名 四仓"
+    moved_suite.parent.mkdir(parents=True)
+    suite.rename(moved_suite)
+    assert not old_absolute_path.exists()
+    moved_client, moved_token = _local_client(moved_suite / "TTS More")
+    moved_headers = _control(moved_token)
+
+    moved_discovered = moved_client.post(
+        "/api/local-portable-services/discover",
+        headers=moved_headers,
+        json={},
+    )
+    assert moved_discovered.status_code == 200, moved_discovered.text
+    assert {item["component"] for item in moved_discovered.json()["packages"]} == {
+        "gpt-sovits",
+        "indextts",
+        "cosyvoice",
+    }
+
+    moved_started = moved_client.post(
+        "/api/local-portable-services/gpt-sovits/start",
+        headers=moved_headers,
+        json={},
+    )
+    assert moved_started.status_code == 200, moved_started.text
+    UUID(moved_started.json()["operation_id"])
+    assert [(call[0], call[1].portable_locator.component) for call in moved_client.app.state.supervisor.calls] == [
+        ("start", "gpt-sovits")
+    ]
+    moved_listing = moved_client.get("/api/local-portable-services", headers=moved_headers)
+    moved_gpt = next(
+        item for item in moved_listing.json()["services"] if item["package_id"] == "gpt-main"
+    )
+    assert Path(moved_gpt["package_root"]) == (moved_suite / "GPT-SoVITS").resolve()
+
+
+def test_lan_service_remains_usable_but_local_lifecycle_and_browse_are_denied(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "可信 LAN 套件" / "TTS More"
+    controller.mkdir(parents=True)
+    PortableServiceStore(controller).save(
+        [
+            {
+                "service_id": "lan-gpt",
+                "display_name": "LAN GPT-SoVITS",
+                "engine": "gpt-sovits",
+                "provider_type": "gpt-sovits",
+                "catalog_provider": "gpt-sovits",
+                "api_contract": "tts-more-v1",
+                "base_url": "mock://lan-gpt",
+                "mode": "external",
+                "network_scope": "lan",
+                "managed": True,
+                "enabled": True,
+                "capabilities": ["tts", "artifact-transfer"],
+            }
+        ]
+    )
+    client, token = _local_client(controller)
+    headers = _control(token)
+
+    ordinary_services = client.get("/api/services")
+    assert ordinary_services.status_code == 200
+    lan_service = ordinary_services.json()["services"][0]
+    assert lan_service["service_id"] == "lan-gpt"
+    assert lan_service["ready"] is True
+    local_listing = client.get("/api/local-portable-services", headers=headers)
+    assert local_listing.status_code == 200
+    assert local_listing.json()["services"][0]["managed"] is False
+
+    for action in ("start", "stop", "repair", "open-folder"):
+        response = client.post(
+            f"/api/local-portable-services/gpt-sovits/{action}",
+            headers=headers,
+            json={},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "LOCAL_CONTROL_NOT_MANAGEABLE"
+    assert client.app.state.supervisor.calls == []
+
+    lan_client = TestClient(
+        client.app,
+        base_url="http://192.168.2.10:8000",
+        client=("192.168.2.20", 51000),
+    )
+    assert lan_client.get("/api/services").status_code == 200
+    denied_requests = [
+        ("/api/local-portable-services/select-folder", {"component": "gpt-sovits"}),
+        ("/api/local-portable-services/gpt-sovits/start", {}),
+        ("/api/local-portable-services/gpt-sovits/stop", {}),
+        ("/api/local-portable-services/gpt-sovits/repair", {}),
+        ("/api/local-portable-services/gpt-sovits/open-folder", {}),
+    ]
+    for path, payload in denied_requests:
+        response = lan_client.post(path, headers=headers, json=payload)
+        assert response.status_code == 403
+        assert response.json()["detail"]["code"] == "LOCAL_CONTROL_FORBIDDEN"
 
 
 def test_replacing_package_path_preserves_existing_port_override(tmp_path: Path) -> None:

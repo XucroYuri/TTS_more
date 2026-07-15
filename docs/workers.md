@@ -4,6 +4,19 @@ TTS More 通过**非侵入式 worker** 接入三个开源 TTS 服务（GPT-SoVIT
 
 主路径是 worker-first：工作台只需要一个“服务地址”，不要求用户理解上游 WebUI、repo 路径或模型内部目录。已有 Gradio 服务仍可作为兼容端点接入，但不要把 Gradio 写成唯一方案。
 
+## 本机四仓工作台与 LAN 边界
+
+Windows 便携交付仍然是四个可独立启动的文件夹，不是把三个 worker 合并进 TTS More 进程：
+
+1. 将 `TTS-More`、`GPT-SoVITS`、`IndexTTS`、`CosyVoice` 解压到任意可写目录，建议四个文件夹同级放置。
+2. 双击实际需要运行的组件 `Start.cmd`；或者先启动 TTS More，在“本地便携 TTS 服务”三张卡片中选择对应文件夹，再逐个启动。
+3. 工作台没有“全部启动”行为，不会自动批量启动三个 TTS。GPT-SoVITS、IndexTTS、CosyVoice 的启动、停止、修复和日志始终相互独立。
+4. 本机 loopback 用户可以维护包路径并执行本地控制。LAN worker 只通过注册地址参与健康检查、加载、合成与工件传输，必须保持 `mode:external`、`network_scope:lan`、`managed:false`；不能远程浏览目录、启动、停止或修复 Windows 包。
+5. `bootstrap` 首次启动联网补齐并校验锁定资产，成功后可离线；`full` 只在本地构建，包含运行条件，解压后离线运行，禁止作为 GitHub Release 资产上传。
+6. 路径跟随每台电脑和盘符变化。worker 配置不能写死 Conda、Python、模型或仓库绝对路径；同级包优先用相对 locator 解析，本机绝对路径只作为 `data/local/services.json` 中的最后发现提示。
+
+本地控制 token 由当前 TTS More 后端进程生成，前端只保存在当前页面内存中，不写入本地存储、URL 或日志；工作台 API 不接受 UI 传入的命令、工作目录或环境变量，也不会终止未知端口所有者。普通用户的完整初始化与修复步骤见 [部署方案](deployment.md#普通用户windows-四包解压即用)。
+
 ## 架构
 
 ```mermaid
