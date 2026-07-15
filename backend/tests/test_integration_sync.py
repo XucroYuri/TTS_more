@@ -283,6 +283,74 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
             '$activePath = Join-Path $root "active-start.json"\n'
             '    # $activePath = Join-Path $script:Context.OperationsRoot "active-start.json"',
         ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$operationRoot = [IO.Path]::GetFullPath((Join-Path $context.OperationsRoot $canonicalId))',
+            '$operationRoot = if ($false) { [IO.Path]::GetFullPath((Join-Path $context.OperationsRoot $canonicalId)) } '
+            'else { [IO.Path]::GetFullPath((Join-Path $Root $canonicalId)) }',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'Test-PathWithinRoot -Root $context.OperationsRoot -Path $operationRoot',
+            '$false -and (Test-PathWithinRoot -Root $context.OperationsRoot -Path $operationRoot)',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '[string]::Equals((Split-Path -Parent $operationRoot), [IO.Path]::GetFullPath($context.OperationsRoot), [StringComparison]::OrdinalIgnoreCase)',
+            '$false -and [string]::Equals((Split-Path -Parent $operationRoot), [IO.Path]::GetFullPath($context.OperationsRoot), [StringComparison]::OrdinalIgnoreCase)',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'OperationsRoot = [IO.Path]::GetFullPath($operationsRoot)',
+            'OperationsRoot = if ($false) { [IO.Path]::GetFullPath($operationsRoot) } '
+            'else { [IO.Path]::GetFullPath((Join-Path $resolvedRoot "data\\local\\operations")) }',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$serviceScript = if ($component -eq "tts-more") { Join-Path $resolvedRoot "scripts\\start-production.ps1" } else { Join-Path $bundle "Start-Worker.ps1" }',
+            '$serviceScript = if ($component -eq "tts-more") { '
+            'if ($false) { Join-Path $resolvedRoot "scripts\\start-production.ps1" } '
+            'else { Join-Path $resolvedRoot "scripts\\Noop.ps1" } '
+            '} else { Join-Path $bundle "Start-Worker.ps1" }',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$serviceScript = if ($component -eq "tts-more") { Join-Path $resolvedRoot "scripts\\start-production.ps1" } else { Join-Path $bundle "Start-Worker.ps1" }',
+            '$serviceScript = if ($component -eq "tts-more") { Join-Path $resolvedRoot "scripts\\start-production.ps1" } '
+            'else { if ($false) { Join-Path $bundle "Start-Worker.ps1" } '
+            'else { Join-Path $bundle "Noop.ps1" } }',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$activePath = Join-Path $Context.OperationsRoot "active-start.json"',
+            '$activePath = Join-Path $Root "active-start.json"',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$pointer = Join-Path $Context.OperationsRoot "active-start.json"',
+            '$pointer = Join-Path $Root "active-start.json"',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$operation = [IO.Path]::GetFullPath((Join-Path $Context.OperationsRoot $parsed.ToString()))',
+            '$operation = [IO.Path]::GetFullPath((Join-Path $Root $parsed.ToString()))',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '[string]::Equals((Split-Path -Parent $operation), [IO.Path]::GetFullPath($Context.OperationsRoot), [StringComparison]::OrdinalIgnoreCase)',
+            '[string]::Equals((Split-Path -Parent $operation), [IO.Path]::GetFullPath($Root), [StringComparison]::OrdinalIgnoreCase)',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$staleOperation = Join-Path $Context.OperationsRoot $parsed.ToString()',
+            '$staleOperation = Join-Path $Root $parsed.ToString()',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '[void](Assert-PortableExactOperationContract -OperationsRoot $Context.OperationsRoot -OperationRoot $staleOperation -CancelFile (Join-Path $staleOperation "cancel.requested") -RequireOperation)',
+            '[void](Assert-PortableExactOperationContract -OperationsRoot $Root -OperationRoot $staleOperation '
+            '-CancelFile (Join-Path $staleOperation "cancel.requested") -RequireOperation)',
+        ),
     ),
 )
 def test_copied_contract_rejects_commented_decoys_and_mutated_active_control_flow(

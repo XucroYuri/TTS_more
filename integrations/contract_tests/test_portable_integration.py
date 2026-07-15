@@ -130,6 +130,164 @@ function Test-ContractString {
     return $Node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and [string]$Node.Value -ceq $Expected
 }
 
+function Get-ContractExactExpression {
+    param($Ast)
+    if ($Ast -is [System.Management.Automation.Language.CommandExpressionAst]) { return $Ast.Expression }
+    if ($Ast -is [System.Management.Automation.Language.PipelineAst] -and $Ast.PipelineElements.Count -eq 1 -and $Ast.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+        return $Ast.PipelineElements[0].Expression
+    }
+    return $null
+}
+
+function Get-ContractExactPipelineCommand {
+    param($Ast, [string]$Name)
+    if ($Ast -isnot [System.Management.Automation.Language.PipelineAst] -or $Ast.PipelineElements.Count -ne 1) { return $null }
+    $command = $Ast.PipelineElements[0]
+    if ($command -isnot [System.Management.Automation.Language.CommandAst] -or $command.GetCommandName() -cne $Name) { return $null }
+    return $command
+}
+
+function Test-ContractExactJoinPathMemberString {
+    param($Ast, [string]$RootMember, [string]$Child)
+    $command = Get-ContractExactPipelineCommand $Ast "Join-Path"
+    if ($null -eq $command) { return $false }
+    $elements = @($command.CommandElements)
+    return $elements.Count -eq 3 -and (Get-ContractMemberPath $elements[1]) -ceq $RootMember -and (Test-ContractString $elements[2] $Child)
+}
+
+function Test-ContractExactJoinPathVariableString {
+    param($Ast, [string]$RootVariable, [string]$Child)
+    $command = Get-ContractExactPipelineCommand $Ast "Join-Path"
+    if ($null -eq $command) { return $false }
+    $elements = @($command.CommandElements)
+    return $elements.Count -eq 3 -and (Test-ContractVariable $elements[1] $RootVariable) -and (Test-ContractString $elements[2] $Child)
+}
+
+function Test-ContractExactVariableInvocation {
+    param($Node, [string]$Variable, [string]$Method)
+    return $Node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and !$Node.Static -and
+        (Test-ContractVariable $Node.Expression $Variable) -and [string]$Node.Member.Value -ceq $Method -and $Node.Arguments.Count -eq 0
+}
+
+function Test-ContractExactJoinPathMemberInvocation {
+    param($Ast, [string]$RootMember, [string]$ChildVariable, [string]$ChildMethod)
+    $command = Get-ContractExactPipelineCommand $Ast "Join-Path"
+    if ($null -eq $command) { return $false }
+    $elements = @($command.CommandElements)
+    return $elements.Count -eq 3 -and (Get-ContractMemberPath $elements[1]) -ceq $RootMember -and
+        (Test-ContractExactVariableInvocation $elements[2] $ChildVariable $ChildMethod)
+}
+
+function Test-ContractExactStaticInvocation {
+    param($Node, [string]$TypeName, [string]$Method, [int]$ArgumentCount)
+    return $Node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $Node.Static -and
+        $Node.Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and
+        [string]$Node.Expression.TypeName.FullName -ceq $TypeName -and [string]$Node.Member.Value -ceq $Method -and
+        $Node.Arguments.Count -eq $ArgumentCount
+}
+
+function Test-ContractExactGetFullPathVariable {
+    param($Ast, [string]$Variable)
+    $invoke = Get-ContractExactExpression $Ast
+    return (Test-ContractExactStaticInvocation $invoke "IO.Path" "GetFullPath" 1) -and (Test-ContractVariable $invoke.Arguments[0] $Variable)
+}
+
+function Test-ContractExactGetFullPathJoinMemberVariable {
+    param($Ast, [string]$RootMember, [string]$ChildVariable)
+    $invoke = Get-ContractExactExpression $Ast
+    if (!(Test-ContractExactStaticInvocation $invoke "IO.Path" "GetFullPath" 1)) { return $false }
+    $argument = $invoke.Arguments[0]
+    return $argument -is [System.Management.Automation.Language.ParenExpressionAst] -and
+        (Test-ContractExactJoinPathMemberInvocation $argument.Pipeline $RootMember $ChildVariable "ToString")
+}
+
+function Test-ContractExactGetFullPathJoinMemberChildVariable {
+    param($Ast, [string]$RootMember, [string]$ChildVariable)
+    $invoke = Get-ContractExactExpression $Ast
+    if (!(Test-ContractExactStaticInvocation $invoke "IO.Path" "GetFullPath" 1)) { return $false }
+    $argument = $invoke.Arguments[0]
+    if ($argument -isnot [System.Management.Automation.Language.ParenExpressionAst]) { return $false }
+    $command = Get-ContractExactPipelineCommand $argument.Pipeline "Join-Path"
+    if ($null -eq $command) { return $false }
+    $elements = @($command.CommandElements)
+    return $elements.Count -eq 3 -and (Get-ContractMemberPath $elements[1]) -ceq $RootMember -and (Test-ContractVariable $elements[2] $ChildVariable)
+}
+
+function Test-ContractExactParentEquals {
+    param($Node, [string]$OperationVariable, [string]$RootMember)
+    if (!(Test-ContractExactStaticInvocation $Node "string" "Equals" 3)) { return $false }
+    $parentArgument = $Node.Arguments[0]
+    if ($parentArgument -isnot [System.Management.Automation.Language.ParenExpressionAst]) { return $false }
+    $split = Get-ContractExactPipelineCommand $parentArgument.Pipeline "Split-Path"
+    if ($null -eq $split) { return $false }
+    $splitElements = @($split.CommandElements)
+    if ($splitElements.Count -ne 3 -or $splitElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst] -or
+        $splitElements[1].ParameterName -cne "Parent" -or !(Test-ContractVariable $splitElements[2] $OperationVariable)) { return $false }
+    $normalizedRoot = $Node.Arguments[1]
+    if (!(Test-ContractExactStaticInvocation $normalizedRoot "IO.Path" "GetFullPath" 1) -or
+        (Get-ContractMemberPath $normalizedRoot.Arguments[0]) -cne $RootMember) { return $false }
+    $comparison = $Node.Arguments[2]
+    return $comparison -is [System.Management.Automation.Language.MemberExpressionAst] -and $comparison.Static -and
+        $comparison.Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and
+        [string]$comparison.Expression.TypeName.FullName -ceq "StringComparison" -and
+        [string]$comparison.Member.Value -ceq "OrdinalIgnoreCase"
+}
+
+function Test-ContractExactBoundaryCondition {
+    param($Ast, [string]$OperationVariable, [string]$RootMember)
+    $binary = Get-ContractExactExpression $Ast
+    if ($binary -isnot [System.Management.Automation.Language.BinaryExpressionAst] -or $binary.Operator.ToString() -cne "Or") { return $false }
+    if ($binary.Left -isnot [System.Management.Automation.Language.UnaryExpressionAst] -or $binary.Left.TokenKind.ToString() -cne "Exclaim" -or
+        $binary.Right -isnot [System.Management.Automation.Language.UnaryExpressionAst] -or $binary.Right.TokenKind.ToString() -cne "Exclaim") { return $false }
+    $containment = $binary.Left.Child
+    if ($containment -isnot [System.Management.Automation.Language.ParenExpressionAst]) { return $false }
+    $pathCheck = Get-ContractExactPipelineCommand $containment.Pipeline "Test-PathWithinRoot"
+    if ($null -eq $pathCheck) { return $false }
+    $elements = @($pathCheck.CommandElements)
+    if ($elements.Count -ne 5 -or $elements[1] -isnot [System.Management.Automation.Language.CommandParameterAst] -or $elements[1].ParameterName -cne "Root" -or
+        (Get-ContractMemberPath $elements[2]) -cne $RootMember -or $elements[3] -isnot [System.Management.Automation.Language.CommandParameterAst] -or
+        $elements[3].ParameterName -cne "Path" -or !(Test-ContractVariable $elements[4] $OperationVariable)) { return $false }
+    return Test-ContractExactParentEquals $binary.Right.Child $OperationVariable $RootMember
+}
+
+function Test-ContractExactParentBoundaryCondition {
+    param($Ast, [string]$OperationVariable, [string]$RootMember)
+    $unary = Get-ContractExactExpression $Ast
+    return $unary -is [System.Management.Automation.Language.UnaryExpressionAst] -and $unary.TokenKind.ToString() -ceq "Exclaim" -and
+        (Test-ContractExactParentEquals $unary.Child $OperationVariable $RootMember)
+}
+
+function Test-ContractExactServiceCondition {
+    param($Ast)
+    $binary = Get-ContractExactExpression $Ast
+    return $binary -is [System.Management.Automation.Language.BinaryExpressionAst] -and $binary.Operator.ToString() -match "Eq$" -and
+        (Test-ContractVariable $binary.Left "component") -and (Test-ContractString $binary.Right "tts-more")
+}
+
+function Test-ContractExactStatementBlockJoinPath {
+    param($Block, [string]$RootVariable, [string]$Child)
+    return $Block -is [System.Management.Automation.Language.StatementBlockAst] -and $Block.Statements.Count -eq 1 -and
+        (Test-ContractExactJoinPathVariableString $Block.Statements[0] $RootVariable $Child)
+}
+
+function Test-ContractReturnedExactOperationsRoot {
+    param($Ast)
+    $matches = 0
+    foreach ($table in @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.HashtableAst] }, $true))) {
+        $returned = $false
+        $parent = $table.Parent
+        while ($null -ne $parent) {
+            if ($parent -is [System.Management.Automation.Language.ReturnStatementAst]) { $returned = $true; break }
+            $parent = $parent.Parent
+        }
+        if (!$returned) { continue }
+        foreach ($pair in $table.KeyValuePairs) {
+            if ((Test-ContractString $pair.Item1 "OperationsRoot") -and (Test-ContractExactGetFullPathVariable $pair.Item2 "operationsRoot")) { $matches++ }
+        }
+    }
+    return $matches -eq 1
+}
+
 function Test-ContractJoinPath {
     param($Ast, [string]$RootVariable, [string]$RelativePath)
     foreach ($command in @(Get-ContractCommands $Ast "Join-Path")) {
@@ -146,17 +304,6 @@ function Test-ContractJoinPathMember {
     foreach ($command in @(Get-ContractCommands $Ast "Join-Path")) {
         $elements = @($command.CommandElements)
         if ($elements.Count -eq 3 -and (Get-ContractMemberPath $elements[1]) -ceq $RootMember -and (Test-ContractString $elements[2] $RelativePath)) {
-            return $true
-        }
-    }
-    return $false
-}
-
-function Test-ContractJoinPathMemberVariable {
-    param($Ast, [string]$RootMember, [string]$ChildVariable)
-    foreach ($command in @(Get-ContractCommands $Ast "Join-Path")) {
-        $elements = @($command.CommandElements)
-        if ($elements.Count -eq 3 -and (Get-ContractMemberPath $elements[1]) -ceq $RootMember -and (Test-ContractVariable $elements[2] $ChildVariable)) {
             return $true
         }
     }
@@ -193,14 +340,6 @@ function Test-ContractSchemaV2Ancestor {
     return $false
 }
 
-function Test-ContractVariableEqualsString {
-    param($Ast, [string]$Variable, [string]$Value)
-    $binaries = @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.BinaryExpressionAst] }, $true))
-    if ($binaries.Count -ne 1) { return $false }
-    $binary = $binaries[0]
-    return $binary.Operator.ToString() -match "Eq$" -and (Test-ContractVariable $binary.Left $Variable) -and (Test-ContractString $binary.Right $Value)
-}
-
 function Test-ContractTopLevelAssignment {
     param($Assignment)
     return $Assignment.Parent -is [System.Management.Automation.Language.NamedBlockAst] -and $Assignment.Parent.Parent -is [System.Management.Automation.Language.ScriptBlockAst]
@@ -222,51 +361,14 @@ function Test-ContractDirectCommandInTry {
     return [object]::ReferenceEquals($current, $TryStatement.Body)
 }
 
-function Test-ContractInvokeMemberWithMemberArgument {
-    param($Ast, [string]$Method, [string]$MemberPath)
-    $matches = @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true) | Where-Object {
-        [string]$_.Member.Value -ceq $Method -and @($_.Arguments | Where-Object { (Get-ContractMemberPath $_) -ceq $MemberPath }).Count -eq 1
-    })
-    return $matches.Count -eq 1
-}
-
-function Test-ContractHashtableVariable {
-    param($Ast, [string]$Key, [string]$Variable)
-    $matches = 0
-    foreach ($table in @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.HashtableAst] }, $true))) {
-        $returned = $false
-        $parent = $table.Parent
-        while ($null -ne $parent) {
-            if ($parent -is [System.Management.Automation.Language.ReturnStatementAst]) { $returned = $true; break }
-            $parent = $parent.Parent
-        }
-        if (!$returned) { continue }
-        foreach ($pair in $table.KeyValuePairs) {
-            if (Test-ContractString $pair.Item1 $Key) {
-                $variables = @($pair.Item2.FindAll({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] -and $node.VariablePath.UserPath -ceq $Variable }, $true))
-                if ($variables.Count -gt 0) { $matches++ }
-            }
-        }
-    }
-    return $matches -eq 1
-}
-
-function Test-ContractCommandOutsideFunction {
-    param($Command)
-    $parent = $Command.Parent
-    while ($null -ne $parent) {
-        if ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false }
-        $parent = $parent.Parent
-    }
-    return $true
-}
-
 $controller = Parse-ContractAst $env:TTS_MORE_CONTRACT_CONTROLLER
 $worker = Parse-ContractAst $env:TTS_MORE_CONTRACT_WORKER
 $contextFunction = Get-ContractFunction $controller "Get-PackageContext"
 $serviceFunction = Get-ContractFunction $controller "Invoke-ServiceStart"
 $lockFunction = Get-ContractFunction $controller "Open-PackageOperationLock"
 $initializeOperationFunction = Get-ContractFunction $controller "Initialize-Operation"
+$waitFunction = Get-ContractFunction $controller "Wait-ForActiveOperation"
+$clearFunction = Get-ContractFunction $controller "Clear-StaleActivePointer"
 $mainTries = @($controller.FindAll({ param($node) $node -is [System.Management.Automation.Language.TryStatementAst] }, $true) | Where-Object { [object]::ReferenceEquals($_.Parent, $controller.EndBlock) })
 Assert-Contract ($mainTries.Count -eq 1) "controller must have exactly one direct main try statement"
 $mainTry = $mainTries[0]
@@ -285,17 +387,28 @@ foreach ($assignment in @(Get-ContractAssignments $contextFunction.Body "operati
 }
 Assert-Contract ($v2OperationsAssignments.Count -eq 1) ("schema-v2 branch must assign operationsRoot exactly once; found " + $v2OperationsAssignments.Count)
 Assert-Contract ($operationsMatches.Count -eq 1) "schema-v2 data.operations is not the active operations root assignment"
-Assert-Contract (Test-ContractHashtableVariable $contextFunction.Body "OperationsRoot" "operationsRoot") "Get-PackageContext does not return the resolved operationsRoot"
+Assert-Contract (Test-ContractReturnedExactOperationsRoot $contextFunction.Body) "Get-PackageContext does not return exactly GetFullPath(operationsRoot)"
+$hardcodedOperationFallbacks = @($controller.FindAll({ param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and [string]$node.Value -ceq "data\local\operations" }, $true))
+Assert-Contract ($hardcodedOperationFallbacks.Count -eq 2) "controller must contain exactly two source/v1 operations fallbacks"
+foreach ($literal in $hardcodedOperationFallbacks) {
+    $command = $literal.Parent
+    $pipeline = if ($command -is [System.Management.Automation.Language.CommandAst]) { $command.Parent } else { $null }
+    $assignment = if ($pipeline -is [System.Management.Automation.Language.PipelineAst]) { $pipeline.Parent } else { $null }
+    Assert-Contract ($assignment -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $assignment.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and $assignment.Left.VariablePath.UserPath -ceq "operationsRoot" -and
+        (Test-ContractExactJoinPathVariableString $pipeline "resolvedRoot" "data\local\operations") -and
+        (Test-ContractDescendantOf $assignment $contextFunction.Body)) "hardcoded operations fallback escaped Get-PackageContext"
+}
 $lockAssignments = @(Get-ContractAssignments $lockFunction.Body "lockPath")
 Assert-Contract ($lockAssignments.Count -eq 1 -and (Test-ContractJoinPathMember $lockAssignments[0].Right "context.OperationsRoot" ".start.lock")) "operation lock does not consume context.OperationsRoot"
 
 $serviceAssignments = @(Get-ContractAssignments $contextFunction.Body "serviceScript")
-Assert-Contract ($serviceAssignments.Count -eq 1) "serviceScript must have exactly one active assignment"
+Assert-Contract ($serviceAssignments.Count -eq 1 -and [object]::ReferenceEquals($serviceAssignments[0].Parent, $contextFunction.Body.EndBlock)) "serviceScript must have exactly one direct assignment"
 Assert-Contract ($serviceAssignments[0].Right -is [System.Management.Automation.Language.IfStatementAst]) "serviceScript assignment must select by component"
 $serviceSelector = $serviceAssignments[0].Right
-Assert-Contract ($serviceSelector.Clauses.Count -eq 1 -and (Test-ContractVariableEqualsString $serviceSelector.Clauses[0].Item1 "component" "tts-more")) "serviceScript selector must test component == tts-more"
-Assert-Contract (Test-ContractJoinPath $serviceSelector.Clauses[0].Item2 "resolvedRoot" "scripts\start-production.ps1") "TTS More serviceScript does not select scripts/start-production.ps1"
-Assert-Contract (Test-ContractJoinPath $serviceSelector.ElseClause "bundle" "Start-Worker.ps1") "fork serviceScript does not select the controlled Start-Worker.ps1"
+Assert-Contract ($serviceSelector.Clauses.Count -eq 1 -and (Test-ContractExactServiceCondition $serviceSelector.Clauses[0].Item1)) "serviceScript selector must test exactly component == tts-more"
+Assert-Contract (Test-ContractExactStatementBlockJoinPath $serviceSelector.Clauses[0].Item2 "resolvedRoot" "scripts\start-production.ps1") "TTS More serviceScript branch is not one direct start-production Join-Path"
+Assert-Contract (Test-ContractExactStatementBlockJoinPath $serviceSelector.ElseClause "bundle" "Start-Worker.ps1") "fork serviceScript branch is not one direct controlled worker Join-Path"
 
 $delegates = @(Get-ContractCommands $serviceFunction.Body "Invoke-ChildPowerShell")
 Assert-Contract ($delegates.Count -eq 1) "Invoke-ServiceStart must delegate exactly once"
@@ -314,24 +427,14 @@ Assert-Contract (Test-ContractVariable (Get-ContractParameterArgument $serviceCa
 
 $operationRootAssignments = @(Get-ContractAssignments $initializeOperationFunction.Body "operationRoot")
 Assert-Contract ($operationRootAssignments.Count -eq 1 -and [object]::ReferenceEquals($operationRootAssignments[0].Parent, $initializeOperationFunction.Body.EndBlock)) "Initialize-Operation operationRoot is not one direct assignment"
-Assert-Contract (Test-ContractJoinPathMemberVariable $operationRootAssignments[0].Right "context.OperationsRoot" "canonicalId") "operationRoot is not derived from context.OperationsRoot/canonicalId"
+Assert-Contract (Test-ContractExactGetFullPathJoinMemberChildVariable $operationRootAssignments[0].Right "context.OperationsRoot" "canonicalId") "operationRoot is not exactly GetFullPath(Join-Path context.OperationsRoot canonicalId)"
 
 $boundaryIfs = @($initializeOperationFunction.Body.EndBlock.Statements | Where-Object {
     $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses.Count -eq 1 -and @(Get-ContractCommands $_.Clauses[0].Item1 "Test-PathWithinRoot").Count -eq 1
 })
 Assert-Contract ($boundaryIfs.Count -eq 1) "Initialize-Operation boundary check is not one direct if statement"
 $boundaryCondition = $boundaryIfs[0].Clauses[0].Item1
-$pathChecks = @(Get-ContractCommands $boundaryCondition "Test-PathWithinRoot")
-Assert-Contract ($pathChecks.Count -eq 1) "Initialize-Operation must call Test-PathWithinRoot exactly once"
-Assert-Contract ((Get-ContractMemberPath (Get-ContractParameterArgument $pathChecks[0] "Root")) -ceq "context.OperationsRoot") "Test-PathWithinRoot does not use context.OperationsRoot"
-Assert-Contract (Test-ContractVariable (Get-ContractParameterArgument $pathChecks[0] "Path") "operationRoot") "Test-PathWithinRoot does not validate operationRoot"
-$orExpressions = @($boundaryCondition.FindAll({ param($node) $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and $node.Operator.ToString() -match "Or$" }, $true))
-Assert-Contract ($orExpressions.Count -eq 1) "Initialize-Operation boundary condition must combine containment and parent equality"
-$equalsCalls = @($boundaryCondition.FindAll({ param($node) $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and [string]$node.Member.Value -ceq "Equals" }, $true))
-Assert-Contract ($equalsCalls.Count -eq 1 -and $equalsCalls[0].Static) "Initialize-Operation parent equality is missing"
-$parentSplits = @(Get-ContractCommands $equalsCalls[0] "Split-Path")
-Assert-Contract ($parentSplits.Count -eq 1 -and (Test-ContractVariable (Get-ContractParameterArgument $parentSplits[0] "Parent") "operationRoot")) "parent equality does not inspect operationRoot parent"
-Assert-Contract (Test-ContractInvokeMemberWithMemberArgument $equalsCalls[0] "GetFullPath" "context.OperationsRoot") "parent equality does not normalize context.OperationsRoot"
+Assert-Contract (Test-ContractExactBoundaryCondition $boundaryCondition "operationRoot" "context.OperationsRoot") "Initialize-Operation boundary condition is not the exact negated containment OR negated parent equality"
 
 $operationContractTries = @($initializeOperationFunction.Body.EndBlock.Statements | Where-Object {
     $_ -is [System.Management.Automation.Language.TryStatementAst] -and @(Get-ContractCommands $_.Body "Assert-PortableExactOperationContract").Count -eq 1
@@ -342,15 +445,37 @@ Assert-Contract ($operationContractCommands.Count -eq 1 -and (Test-ContractDirec
 Assert-Contract ((Get-ContractMemberPath (Get-ContractParameterArgument $operationContractCommands[0] "OperationsRoot")) -ceq "context.OperationsRoot") "operation contract does not use context.OperationsRoot"
 Assert-Contract (Test-ContractVariable (Get-ContractParameterArgument $operationContractCommands[0] "OperationRoot") "operationRoot") "operation contract does not use operationRoot"
 
-$mainActivePathAssignments = @()
-foreach ($assignment in @(Get-ContractAssignments $controller "activePath")) {
-    if ($assignment.Right -is [System.Management.Automation.Language.PipelineAst] -and
-        [object]::ReferenceEquals($assignment.Parent, $mainTry.Body) -and
-        (Test-ContractJoinPathMember $assignment.Right "script:Context.OperationsRoot" "active-start.json")) {
-        $mainActivePathAssignments += $assignment
-    }
-}
-Assert-Contract ($mainActivePathAssignments.Count -eq 1) "main activePath is not one direct context.OperationsRoot assignment"
+$activePointerLiterals = @($controller.FindAll({ param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and [string]$node.Value -ceq "active-start.json" }, $true))
+Assert-Contract ($activePointerLiterals.Count -eq 3) "controller must have exactly Wait/Clear/main active pointer references"
+$allActivePathAssignments = @(Get-ContractAssignments $controller "activePath")
+$mainActivePathAssignments = @($allActivePathAssignments | Where-Object { [object]::ReferenceEquals($_.Parent, $mainTry.Body) })
+Assert-Contract ($mainActivePathAssignments.Count -eq 1 -and (Test-ContractExactJoinPathMemberString $mainActivePathAssignments[0].Right "script:Context.OperationsRoot" "active-start.json")) "main activePath is not one exact direct context.OperationsRoot assignment"
+$waitActivePathAssignments = @(Get-ContractAssignments $waitFunction.Body "activePath")
+Assert-Contract ($waitActivePathAssignments.Count -eq 1 -and [object]::ReferenceEquals($waitActivePathAssignments[0].Parent, $waitFunction.Body.EndBlock) -and
+    (Test-ContractExactJoinPathMemberString $waitActivePathAssignments[0].Right "Context.OperationsRoot" "active-start.json")) "Wait-ForActiveOperation activePath is not one exact direct Context.OperationsRoot assignment"
+$clearPointerAssignments = @(Get-ContractAssignments $clearFunction.Body "pointer")
+Assert-Contract ($clearPointerAssignments.Count -eq 1 -and [object]::ReferenceEquals($clearPointerAssignments[0].Parent, $clearFunction.Body.EndBlock) -and
+    (Test-ContractExactJoinPathMemberString $clearPointerAssignments[0].Right "Context.OperationsRoot" "active-start.json")) "Clear-StaleActivePointer pointer is not one exact direct Context.OperationsRoot assignment"
+
+$waitOperationAssignments = @(Get-ContractAssignments $waitFunction.Body "operation")
+Assert-Contract ($waitOperationAssignments.Count -eq 1 -and [object]::ReferenceEquals($waitOperationAssignments[0].Parent, $waitFunction.Body.EndBlock) -and
+    (Test-ContractExactGetFullPathJoinMemberVariable $waitOperationAssignments[0].Right "Context.OperationsRoot" "parsed")) "Wait-ForActiveOperation operation is not exactly derived from Context.OperationsRoot and parsed.ToString()"
+$waitParentChecks = @($waitFunction.Body.EndBlock.Statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses.Count -eq 1 -and
+    (Test-ContractExactParentBoundaryCondition $_.Clauses[0].Item1 "operation" "Context.OperationsRoot")
+})
+Assert-Contract ($waitParentChecks.Count -eq 1) "Wait-ForActiveOperation does not directly enforce the operation parent"
+
+$clearTries = @($clearFunction.Body.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] })
+Assert-Contract ($clearTries.Count -eq 1) "Clear-StaleActivePointer must have one direct validation try"
+$clearTry = $clearTries[0]
+$staleOperationAssignments = @(Get-ContractAssignments $clearFunction.Body "staleOperation")
+Assert-Contract ($staleOperationAssignments.Count -eq 1 -and [object]::ReferenceEquals($staleOperationAssignments[0].Parent, $clearTry.Body) -and
+    (Test-ContractExactJoinPathMemberInvocation $staleOperationAssignments[0].Right "Context.OperationsRoot" "parsed" "ToString")) "Clear-StaleActivePointer staleOperation is not one direct Context.OperationsRoot child"
+$clearContracts = @(Get-ContractCommands $clearTry.Body "Assert-PortableExactOperationContract")
+Assert-Contract ($clearContracts.Count -eq 1 -and (Test-ContractDirectCommandInTry $clearContracts[0] $clearTry)) "Clear-StaleActivePointer exact contract is nested or missing"
+Assert-Contract ((Get-ContractMemberPath (Get-ContractParameterArgument $clearContracts[0] "OperationsRoot")) -ceq "Context.OperationsRoot") "Clear-StaleActivePointer contract does not use Context.OperationsRoot"
+Assert-Contract (Test-ContractVariable (Get-ContractParameterArgument $clearContracts[0] "OperationRoot") "staleOperation") "Clear-StaleActivePointer contract does not validate staleOperation"
 
 $pythonAssignments = @(Get-ContractAssignments $worker "Python")
 Assert-Contract ($pythonAssignments.Count -eq 1) "worker Python must have exactly one active assignment"
