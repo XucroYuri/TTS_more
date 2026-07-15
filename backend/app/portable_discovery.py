@@ -55,6 +55,8 @@ class PortablePackageDescriptor(BaseModel):
     protocol_version: str
     controller_range: str
     operations_path: str
+    state_path: str = "data/local/install-state.json"
+    launchers: dict[str, str] = Field(default_factory=dict)
     initialized: bool
     valid: bool
     errors: list[str] = Field(default_factory=list)
@@ -153,6 +155,7 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
         health_path = str(payload.get("health_path") or "/health")
         package_profile = None
         state_path = "data/local/install-state.json"
+        launchers = {"start": launcher}
     elif schema == 2:
         endpoint = _mapping(payload.get("endpoint"))
         launchers = _mapping(payload.get("launchers"))
@@ -206,6 +209,8 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
         protocol_version=protocol_version,
         controller_range=controller_range,
         operations_path=operations_path,
+        state_path=state_path,
+        launchers={str(key): str(value) for key, value in launchers.items()},
         initialized=(root / state_path).is_file(),
         valid=not errors,
         errors=errors,
@@ -419,8 +424,17 @@ def _management_errors(payload: dict[str, Any], root: Path) -> list[str]:
         _require_relative(data.get(name), f"data.{name}", errors, root=root)
 
     launchers = _mapping(payload.get("launchers"))
+    exact_launchers = {
+        "initialize": "Initialize.cmd",
+        "start": "Start.cmd",
+        "stop": "Stop.cmd",
+        "repair": "Repair.cmd",
+        "build": "Build-Package.ps1",
+    }
     for name in ("initialize", "start", "stop", "repair", "build"):
         _require_package_file(root, launchers.get(name), f"launchers.{name}", errors)
+        if launchers.get(name) != exact_launchers[name]:
+            errors.append(f"launchers.{name} must be {exact_launchers[name]}")
     endpoint = _mapping(payload.get("endpoint"))
     port = endpoint.get("port")
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
