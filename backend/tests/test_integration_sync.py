@@ -588,6 +588,21 @@ def test_worker_builder_uses_bounded_external_unique_staging_and_fails_closed() 
     assert builder.index("WorkRoot must be outside source checkout") < builder.index(
         "$workIdentity"
     )
+    assert "WorkRoot path must not traverse a reparse point" in builder
+    assert "WorkRoot path contains an existing non-directory segment" in builder
+    assert "Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop" in builder
+    assert builder.index("WorkRoot path must not traverse a reparse point") < builder.index(
+        "$workIdentity"
+    )
+    stage_creation = builder.index("New-Item -ItemType Directory -Force -Path $stage")
+    post_create_check = builder.index(
+        "[void](Assert-PortableWorkPath -CandidatePath $stage)", stage_creation
+    )
+    source_copy = builder.index(
+        "foreach ($entry in Get-ChildItem -LiteralPath $Root -Force", post_create_check
+    )
+    assert stage_creation < post_create_check < source_copy
+    assert "$workPathExists = Assert-PortableWorkPath -CandidatePath $work" in builder
     assert "worker package staging path budget exceeded before copy" in builder
     assert builder.index("Assert-PortableTreePathBudget") < builder.index(
         "Copy-PortableTree -Source $entry.FullName"

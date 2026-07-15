@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -290,6 +291,35 @@ def _padded_checkout_root(tmp_path: Path, target_length: int = 145) -> Path:
     return prefix / ("x" * suffix_length) / "worker"
 
 
+def _create_windows_junction(link: Path, target: Path) -> None:
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert link.is_dir()
+
+
+def _remove_windows_junction(link: Path) -> None:
+    if os.path.lexists(link):
+        os.rmdir(link)
+
+
+def _remove_test_tree(root: Path) -> None:
+    if not os.path.lexists(root):
+        return
+
+    def remove_readonly(function, path: str, _error) -> None:
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
+
+    shutil.rmtree(root, onerror=remove_readonly)
+
+
 def test_worker_bootstrap_uses_short_external_unique_staging_from_deep_checkout(
     tmp_path: Path,
 ) -> None:
@@ -435,7 +465,7 @@ def test_worker_rejects_work_root_at_or_below_source_before_side_effects(
         elif mode == "default-child":
             assert not list(work_root.glob("tts-more-worker-*"))
     finally:
-        shutil.rmtree(fixture_root, ignore_errors=True)
+        _remove_test_tree(fixture_root)
 
 
 def test_worker_allows_similar_prefix_sibling_work_root(tmp_path: Path) -> None:
@@ -495,7 +525,149 @@ def test_worker_allows_similar_prefix_sibling_work_root(tmp_path: Path) -> None:
             ["git", "status", "--short"], cwd=worker_root, text=True
         ).strip() == ""
     finally:
-        shutil.rmtree(fixture_root, ignore_errors=True)
+        _remove_test_tree(fixture_root)
+
+
+@pytest.mark.parametrize("mode", ("junction", "junction-ancestor"))
+def test_worker_rejects_reparse_work_root_before_staging(
+    tmp_path: Path, mode: str
+) -> None:
+    if os.name != "nt" or POWERSHELL is None:
+        pytest.skip("Windows junction WorkRoot contract requires Windows PowerShell")
+    fixture_root = _external_worker_test_root(tmp_path, f"reparse-{mode}")
+    worker_root = fixture_root / "source"
+    output_root = fixture_root / "output"
+    junction = fixture_root / "external-work-link"
+    target = worker_root / "work-target"
+    _load_sync_integrations().sync_integration(
+        REPO_ROOT, worker_root, "gpt-sovits", "a" * 40
+    )
+    source_sentinel = target / "source-sentinel.txt"
+    sibling_sentinel = worker_root / "source-sibling.txt"
+    source_sentinel.parent.mkdir(parents=True)
+    source_sentinel.write_text("junction target sentinel\n", encoding="utf-8")
+    sibling_sentinel.write_text("source sibling\n", encoding="utf-8")
+    _initialize_git_repository(worker_root)
+    before_status = subprocess.check_output(
+        ["git", "status", "--short"], cwd=worker_root, text=True
+    )
+    before_sentinels = (source_sentinel.read_bytes(), sibling_sentinel.read_bytes())
+    try:
+        _create_windows_junction(junction, target)
+        work_root = (
+            junction
+            if mode == "junction"
+            else junction / "future" / "package-work"
+        )
+        completed = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(worker_root / "Build-Package.ps1"),
+                "-Profile",
+                "Bootstrap",
+                "-Device",
+                "CPU",
+                "-Version",
+                "j" * 128,
+                "-OutputRoot",
+                str(output_root),
+                "-WorkRoot",
+                str(work_root),
+            ],
+            cwd=worker_root,
+            env={
+                **os.environ,
+                "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
+            },
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=45,
+        )
+        message = (completed.stdout + completed.stderr).lower()
+        assert completed.returncode != 0
+        assert "workroot path must not traverse a reparse point" in message
+        assert "-workroot" in message
+        assert not output_root.exists()
+        assert (source_sentinel.read_bytes(), sibling_sentinel.read_bytes()) == before_sentinels
+        assert (
+            subprocess.check_output(
+                ["git", "status", "--short"], cwd=worker_root, text=True
+            )
+            == before_status
+        )
+        assert not list(target.glob("tts-more-worker-*"))
+        assert not (target / "future").exists()
+    finally:
+        _remove_windows_junction(junction)
+        _remove_test_tree(fixture_root)
+
+
+def test_worker_rejects_existing_file_in_work_root_path_before_staging(
+    tmp_path: Path,
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("worker WorkRoot fail-closed contract requires PowerShell")
+    fixture_root = _external_worker_test_root(tmp_path, "reparse-file")
+    worker_root = fixture_root / "source"
+    output_root = fixture_root / "output"
+    file_ancestor = fixture_root / "not-a-directory"
+    work_root = file_ancestor / "package-work"
+    _load_sync_integrations().sync_integration(
+        REPO_ROOT, worker_root, "gpt-sovits", "a" * 40
+    )
+    _initialize_git_repository(worker_root)
+    try:
+        file_ancestor.write_text("existing file ancestor\n", encoding="utf-8")
+        completed = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(worker_root / "Build-Package.ps1"),
+                "-Profile",
+                "Bootstrap",
+                "-Device",
+                "CPU",
+                "-Version",
+                "d3-file-ancestor",
+                "-OutputRoot",
+                str(output_root),
+                "-WorkRoot",
+                str(work_root),
+            ],
+            cwd=worker_root,
+            env={
+                **os.environ,
+                "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
+            },
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        message = (completed.stdout + completed.stderr).lower()
+        assert completed.returncode != 0
+        assert "workroot path contains an existing non-directory segment" in message
+        assert "-workroot" in message
+        assert file_ancestor.read_text(encoding="utf-8") == "existing file ancestor\n"
+        assert not output_root.exists()
+        assert subprocess.check_output(
+            ["git", "status", "--short"], cwd=worker_root, text=True
+        ).strip() == ""
+    finally:
+        _remove_test_tree(fixture_root)
 
 
 def test_worker_staging_path_budget_fails_before_copy_without_touching_siblings(
