@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
+  applyLocalPortableImport,
   fetchLocalControlToken,
   fetchLocalPortableServices,
   fetchPortableActionStatus,
@@ -9,25 +10,43 @@ import {
   fetchPortableOperationLogs,
   fetchServicesStatus,
   PortableApiError,
+  planLocalPortableImport,
   portableServiceAction,
   registerLocalPortableService,
   selectLocalPortableFolder,
 } from "../api";
 import {
   ACTIVE_PORTABLE_UI_PHASES,
+  beginPortableImport,
+  completePortableImport,
+  consumePortableImportPlan,
   createPortableActionConvergencePoller,
   createPortableOperationPoller,
+  failPortableImport,
+  initialPortableImportState,
+  invalidatePortableImport,
   mergePortableEvents,
   portableErrorMessageKey,
+  portableImportEligibility,
+  portableImportErrorMessageKey,
+  portableImportIdentity,
+  portableImportLocksCard,
   portablePhaseAfterAction,
   portablePhaseLabelKey,
   portableServiceCards,
+  PortableImportControlEpochError,
   PORTABLE_REPAIR_CONVERGENCE_TIMEOUT_MS,
   PORTABLE_STOP_CONVERGENCE_TIMEOUT_MS,
+  receivePortableImportPlan,
+  resetPortableImport,
   shouldRevealManualProxy,
   validatePortableProxyUrl,
   withControlTokenRetry,
+  withPortableImportControlEpoch,
+  withPortableImportPlanControlEpoch,
   type PortableServiceCard,
+  type PortableCardActions,
+  type PortableImportState,
   type PortableRuntimeStatus,
   type PortableUiPhase,
 } from "../lib/portableServices";
@@ -43,6 +62,13 @@ const COMPONENT_NAMES = {
   cosyvoice: "CosyVoice",
 } as const;
 type ControlRunner = <T>(run: (token: string) => Promise<T>) => Promise<T>;
+type ImportControlRunner = <T>(
+  expectedEpoch: number,
+  run: (token: string) => Promise<T>,
+) => Promise<T>;
+type ImportPlanControlRunner = <T>(
+  run: (token: string) => Promise<T>,
+) => Promise<{ value: T; controlEpoch: number }>;
 
 interface PortableWorkbenchSnapshot {
   services: LocalPortableService[];
@@ -58,6 +84,10 @@ interface LocalPortableServiceCardProps {
   card: PortableServiceCard;
   runtimeStatuses: PortableRuntimeStatus[];
   runWithControl: ControlRunner;
+  runWithImportControl: ImportControlRunner;
+  runWithImportPlanControl: ImportPlanControlRunner;
+  controlEpoch: number;
+  getControlEpoch: () => number;
   onReload: (signal?: AbortSignal) => Promise<PortableWorkbenchSnapshot>;
   onServicesStatusRefresh: () => Promise<void>;
   onLiveMessage: (message: string) => void;
@@ -69,10 +99,133 @@ function errorView(error: unknown): { code: string | undefined; detail: string }
   return { code: undefined, detail: "" };
 }
 
+function portableImportFailureKey(error: unknown): string {
+  if (
+    error instanceof PortableImportControlEpochError
+    || (error instanceof PortableApiError && error.status === 403)
+  ) return "portableServices.import.error.controlChanged";
+  return portableImportErrorMessageKey(error instanceof PortableApiError ? error.code : undefined);
+}
+
+export interface PortableImportInlineProps {
+  state: PortableImportState;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onRetry?: () => void;
+  retryDisabled?: boolean;
+  retryDescribedBy?: string;
+}
+
+export function PortableImportInline({
+  state,
+  onConfirm,
+  onCancel,
+  onRetry,
+  retryDisabled = false,
+  retryDescribedBy,
+}: PortableImportInlineProps) {
+  const { i18n, t } = useTranslation();
+  const number = useMemo(() => new Intl.NumberFormat(i18n.language), [i18n.language]);
+  if (state.phase === "idle") {
+    return state.notice === "cancelled"
+      ? <p className="portable-import-status" role="status">{t("portableServices.import.cancelled")}</p>
+      : null;
+  }
+  if (state.phase === "planning") {
+    return <p className="portable-import-status" role="status">{t("portableServices.import.planning")}</p>;
+  }
+  if (state.phase === "applying") {
+    return <p className="portable-import-status" role="status">{t("portableServices.import.applying")}</p>;
+  }
+  if (state.phase === "success") {
+    return (
+      <p className="portable-import-status portable-import-success" role="status">
+        {t("portableServices.import.success", {
+          copied: number.format(state.result.copied_user_files),
+          reused: number.format(state.result.reused_assets.length),
+          skipped: number.format(state.result.skipped_assets.length),
+          present: number.format(state.result.already_present.length),
+        })}
+      </p>
+    );
+  }
+  if (state.phase === "error" || state.phase === "expired") {
+    const messageKey = state.phase === "expired"
+      ? "portableServices.import.error.planUnavailable"
+      : state.errorKey;
+    return (
+      <div className="portable-import-result">
+        <p className="portable-import-error" role="alert">{t(messageKey)}</p>
+        <button
+          type="button"
+          onClick={onRetry ?? onCancel}
+          disabled={retryDisabled}
+          aria-describedby={retryDisabled ? retryDescribedBy : undefined}
+        >
+          {t("portableServices.import.retry")}
+        </button>
+      </div>
+    );
+  }
+  const summary = state.summary;
+  return (
+    <section className="portable-import-confirmation" aria-label={t("portableServices.import.action")}>
+      <p className="portable-import-preserved">{t("portableServices.import.preservedStopped")}</p>
+      <dl className="portable-import-summary">
+        <div><dt>{t("portableServices.import.userFiles", { count: number.format(summary.userFileCount), bytes: number.format(summary.userBytes) })}</dt></div>
+        <div><dt>{t("portableServices.import.reusableAssets", { count: number.format(summary.reusableAssetCount), bytes: number.format(summary.reusableAssetBytes) })}</dt></div>
+        <div><dt>{t("portableServices.import.skippedAssets", { count: number.format(summary.skippedAssetCount) })}</dt></div>
+        <div><dt>{t("portableServices.import.alreadyPresent", { count: number.format(summary.alreadyPresentCount) })}</dt></div>
+      </dl>
+      {summary.assetNames.length ? (
+        <details className="portable-import-assets">
+          <summary>{t("portableServices.import.assetDetails")}</summary>
+          <ul>{summary.assetNames.map((name) => <li key={name}>{name}</li>)}</ul>
+        </details>
+      ) : null}
+      <div className="portable-import-confirm-actions">
+        <button type="button" className="primary" onClick={onConfirm}>{t("portableServices.import.confirm")}</button>
+        <button type="button" onClick={onCancel}>{t("portableServices.import.cancel")}</button>
+      </div>
+    </section>
+  );
+}
+
+export interface PortableMutableControlsProps {
+  actions: Pick<PortableCardActions, "browse" | "start" | "stop" | "repair" | "openFolder">;
+  locked: boolean;
+  lifecycleDisabled: boolean;
+  onBrowse: () => void;
+  onAction: (action: PortableServiceAction) => void;
+}
+
+export function PortableMutableControls({
+  actions,
+  locked,
+  lifecycleDisabled,
+  onBrowse,
+  onAction,
+}: PortableMutableControlsProps) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <button type="button" onClick={onBrowse} disabled={locked || !actions.browse}>{t("portableServices.action.browse")}</button>
+      <button type="button" onClick={() => onAction("start")} disabled={locked || lifecycleDisabled || !actions.start}>{t("portableServices.action.start")}</button>
+      <button type="button" onClick={() => onAction("stop")} disabled={locked || lifecycleDisabled || !actions.stop}>{t("portableServices.action.stop")}</button>
+      <button type="button" onClick={() => onAction("repair")} disabled={locked || lifecycleDisabled || !actions.repair}>{t("portableServices.action.repair")}</button>
+      <button type="button" onClick={() => onAction("open-folder")} disabled={locked || lifecycleDisabled || !actions.openFolder}>{t("portableServices.action.openFolder")}</button>
+    </>
+  );
+}
+
 const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
   card,
   runtimeStatuses,
   runWithControl,
+  runWithImportControl,
+  runWithImportPlanControl,
+  controlEpoch,
+  getControlEpoch,
   onReload,
   onServicesStatusRefresh,
   onLiveMessage,
@@ -91,6 +244,8 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
   const [errorCode, setErrorCode] = useState<string | undefined>();
   const [errorDetail, setErrorDetail] = useState("");
   const [proxyUrl, setProxyUrl] = useState("");
+  const [importState, setImportState] = useState<PortableImportState>(initialPortableImportState);
+  const importStateRef = useRef<PortableImportState>(importState);
   const cursorRef = useRef(0);
   const effectivePhase = operationPhase ?? card.status;
   const effectiveCard = useMemo(() => {
@@ -102,11 +257,32 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
       .find((item) => item.component === card.component) ?? card;
   }, [card, operationPhase, runtimeStatuses]);
   const operationBusy = operationPhase ? ACTIVE_PORTABLE_UI_PHASES.has(operationPhase) : false;
-  const controlsBusy = pendingAction !== null || operationBusy;
+  const lifecycleBusy = pendingAction !== null || operationBusy;
+  const importLocked = portableImportLocksCard(importState);
+  const controlsBusy = lifecycleBusy || importLocked;
+  const importRuntime = card.service?.service_id
+    ? runtimeStatuses.find((runtime) => runtime.service_id === card.service?.service_id)
+    : undefined;
+  const importIdentity = portableImportIdentity(card.service, importRuntime);
+  const importIdentityRef = useRef(importIdentity);
+  importIdentityRef.current = importIdentity;
+  const importEligibility = portableImportEligibility(card.service, importRuntime, lifecycleBusy);
   const lastProgress = [...events].reverse().find((event) => typeof event.percent === "number")?.percent;
   const lastEvent = events.at(-1);
   const reasonId = `portable-disabled-${card.component}`;
   const statusId = `portable-status-${card.component}`;
+  const importReasonId = `portable-import-disabled-${card.component}`;
+
+  const updateImportState = useCallback((next: PortableImportState) => {
+    importStateRef.current = next;
+    setImportState(next);
+  }, []);
+
+  useEffect(() => {
+    const current = importStateRef.current;
+    const next = invalidatePortableImport(current, importIdentity, controlEpoch);
+    if (next !== current) updateImportState(next);
+  }, [controlEpoch, importIdentity?.buildId, importIdentity?.packageId, importIdentity?.serviceId, updateImportState]);
 
   useEffect(() => {
     if (!operationId && !convergence) setOperationPhase(null);
@@ -245,6 +421,70 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
     }
   }, [card.actions.browse, card.component, card.service?.port_override, controlsBusy, onLiveMessage, onReload, onServicesStatusRefresh, runWithControl, t]);
 
+  const chooseImportSource = useCallback(async () => {
+    if (!importEligibility.allowed || !importIdentity || portableImportLocksCard(importStateRef.current)) return;
+    const planning = beginPortableImport(importStateRef.current, importIdentity);
+    updateImportState(planning);
+    try {
+      const planned = await runWithImportPlanControl((token) => planLocalPortableImport(card.component, token));
+      const response = planned.value;
+      const epoch = planned.controlEpoch;
+      let next = receivePortableImportPlan(importStateRef.current, response, Date.now(), epoch);
+      next = invalidatePortableImport(next, importIdentityRef.current, epoch);
+      updateImportState(next);
+      if ("status" in response) {
+        onLiveMessage(t("portableServices.import.cancelled"));
+      } else if (next.phase === "error") {
+        onLiveMessage(t(next.errorKey));
+      }
+    } catch (error) {
+      const errorKey = portableImportFailureKey(error);
+      updateImportState(failPortableImport(importStateRef.current, errorKey));
+      onLiveMessage(t(errorKey));
+    }
+  }, [card.component, importEligibility.allowed, importIdentity, onLiveMessage, runWithImportPlanControl, t, updateImportState]);
+
+  const confirmImport = useCallback(async () => {
+    const consumed = consumePortableImportPlan(importStateRef.current, Date.now(), getControlEpoch());
+    updateImportState(consumed.state);
+    if (!consumed.request) {
+      if (consumed.state.phase === "expired") {
+        onLiveMessage(t("portableServices.import.error.planUnavailable"));
+      } else if (consumed.state.phase === "error") {
+        onLiveMessage(t(consumed.state.errorKey));
+      }
+      return;
+    }
+    try {
+      const result = await runWithImportControl(
+        consumed.request.controlEpoch,
+        (token) => applyLocalPortableImport(
+          card.component,
+          consumed.request?.planId as string,
+          consumed.request?.planDigest as string,
+          token,
+        ),
+      );
+      updateImportState(completePortableImport(importStateRef.current, result));
+      onLiveMessage(t("portableServices.import.success", {
+        copied: result.copied_user_files,
+        reused: result.reused_assets.length,
+        skipped: result.skipped_assets.length,
+        present: result.already_present.length,
+      }));
+      await Promise.all([onReload(), onServicesStatusRefresh()]);
+    } catch (error) {
+      const errorKey = portableImportFailureKey(error);
+      updateImportState(failPortableImport(importStateRef.current, errorKey));
+      onLiveMessage(t(errorKey));
+    }
+  }, [card.component, getControlEpoch, onLiveMessage, onReload, onServicesStatusRefresh, runWithImportControl, t, updateImportState]);
+
+  const cancelImport = useCallback(() => {
+    updateImportState(resetPortableImport(importStateRef.current));
+    onLiveMessage(t("portableServices.import.cancelled"));
+  }, [onLiveMessage, t, updateImportState]);
+
   const runAction = useCallback(async (action: PortableServiceAction) => {
     if (controlsBusy) return;
     const manualProxy = action === "repair" && shouldRevealManualProxy(errorCode)
@@ -266,6 +506,7 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
         token,
         manualProxy ? { proxy_url: manualProxy } : {},
       ));
+      if (action === "start") updateImportState(resetPortableImport(importStateRef.current));
       const nextPhase = portablePhaseAfterAction(action, response);
       if (action === "start" && response.operation_id) {
         cursorRef.current = 0;
@@ -305,7 +546,7 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
     } finally {
       if (!keepBusy) setPendingAction(null);
     }
-  }, [card.component, controlsBusy, errorCode, onLiveMessage, onReload, onServicesStatusRefresh, proxyUrl, runWithControl, t]);
+  }, [card.component, controlsBusy, errorCode, onLiveMessage, onReload, onServicesStatusRefresh, proxyUrl, runWithControl, t, updateImportState]);
 
   const toggleLogs = useCallback(async () => {
     const nextOpen = !logsOpen;
@@ -323,8 +564,9 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
   }, [card.component, logsOpen, operationId, runWithControl]);
 
   const cardActions = effectiveCard.actions;
-  const disableLifecycle = controlsBusy || card.disabledReason !== null;
   const phaseLabel = t(portablePhaseLabelKey(effectivePhase));
+  const showImportAction = importState.phase === "idle" || importState.phase === "success";
+  const showImportAvailability = showImportAction || importState.phase === "error" || importState.phase === "expired";
 
   return (
     <article className={`local-portable-card phase-${effectivePhase}`} data-portable-component={card.component}>
@@ -363,11 +605,24 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
       ) : null}
 
       <div className="portable-card-actions" aria-describedby={(card.disabledReason || controlsBusy) ? reasonId : undefined}>
-        <button type="button" onClick={() => void chooseFolder()} disabled={controlsBusy || !cardActions.browse}>{t("portableServices.action.browse")}</button>
-        <button type="button" onClick={() => void runAction("start")} disabled={disableLifecycle || !cardActions.start}>{t("portableServices.action.start")}</button>
-        <button type="button" onClick={() => void runAction("stop")} disabled={disableLifecycle || !cardActions.stop}>{t("portableServices.action.stop")}</button>
-        <button type="button" onClick={() => void runAction("repair")} disabled={disableLifecycle || !cardActions.repair}>{t("portableServices.action.repair")}</button>
-        <button type="button" onClick={() => void runAction("open-folder")} disabled={disableLifecycle || !cardActions.openFolder}>{t("portableServices.action.openFolder")}</button>
+        <PortableMutableControls
+          actions={cardActions}
+          locked={controlsBusy}
+          lifecycleDisabled={card.disabledReason !== null}
+          onBrowse={() => void chooseFolder()}
+          onAction={(action) => void runAction(action)}
+        />
+        {showImportAction ? (
+          <button
+            type="button"
+            className="portable-import-action"
+            onClick={() => void chooseImportSource()}
+            disabled={!importEligibility.allowed}
+            aria-describedby={!importEligibility.allowed ? importReasonId : undefined}
+          >
+            {t("portableServices.import.action")}
+          </button>
+        ) : null}
         {card.service?.base_url && cardActions.openService ? (
           <a href={card.service.base_url} target="_blank" rel="noreferrer">{t("portableServices.action.openService")}</a>
         ) : (
@@ -377,6 +632,21 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
           {t(logsOpen ? "portableServices.action.closeLogs" : "portableServices.action.logs")}
         </button>
       </div>
+
+      {showImportAvailability && !importEligibility.allowed && importEligibility.reason ? (
+        <p className="portable-import-disabled" id={importReasonId}>
+          {t(`portableServices.import.disabled.${importEligibility.reason}`)}
+        </p>
+      ) : null}
+
+      <PortableImportInline
+        state={importState}
+        onConfirm={() => void confirmImport()}
+        onCancel={cancelImport}
+        onRetry={() => void chooseImportSource()}
+        retryDisabled={!importEligibility.allowed}
+        retryDescribedBy={importReasonId}
+      />
 
       {lastEvent ? <p className="portable-next-action"><strong>{t("portableServices.nextAction")}:</strong> {lastEvent.message}</p> : null}
 
@@ -437,8 +707,10 @@ export function LocalPortableServicesPanel({ initialServices = [], onServicesSta
   const [loading, setLoading] = useState(initialServices.length === 0);
   const [loadError, setLoadError] = useState("");
   const [liveMessage, setLiveMessage] = useState("");
+  const [controlEpoch, setControlEpoch] = useState(0);
   const tokenRef = useRef<string | null>(null);
   const tokenPromiseRef = useRef<Promise<string> | null>(null);
+  const tokenEpochRef = useRef(0);
   const snapshotGenerationRef = useRef(0);
   const statusRefreshRef = useRef(onServicesStatusRefresh);
 
@@ -455,6 +727,8 @@ export function LocalPortableServicesPanel({ initialServices = [], onServicesSta
       tokenPromiseRef.current = fetchLocalControlToken()
         .then((token) => {
           tokenRef.current = token;
+          tokenEpochRef.current += 1;
+          setControlEpoch(tokenEpochRef.current);
           return token;
         })
         .finally(() => {
@@ -467,6 +741,21 @@ export function LocalPortableServicesPanel({ initialServices = [], onServicesSta
   const runWithControl = useCallback(async function runWithMemoryToken<T>(run: (token: string) => Promise<T>): Promise<T> {
     return withControlTokenRetry(acquireToken, run);
   }, [acquireToken]);
+
+  const getControlEpoch = useCallback(() => tokenEpochRef.current, []);
+
+  const runWithImportControl = useCallback(async function runWithBoundMemoryToken<T>(
+    expectedEpoch: number,
+    run: (token: string) => Promise<T>,
+  ): Promise<T> {
+    return withPortableImportControlEpoch(acquireToken, expectedEpoch, getControlEpoch, run);
+  }, [acquireToken, getControlEpoch]);
+
+  const runWithImportPlanControl = useCallback(async function runWithPlanMemoryToken<T>(
+    run: (token: string) => Promise<T>,
+  ): Promise<{ value: T; controlEpoch: number }> {
+    return withPortableImportPlanControlEpoch(acquireToken, getControlEpoch, run);
+  }, [acquireToken, getControlEpoch]);
 
   const refreshSnapshot = useCallback(async (signal?: AbortSignal): Promise<PortableWorkbenchSnapshot> => {
     const generation = ++snapshotGenerationRef.current;
@@ -523,6 +812,10 @@ export function LocalPortableServicesPanel({ initialServices = [], onServicesSta
             card={card}
             runtimeStatuses={runtimeStatuses}
             runWithControl={runWithControl}
+            runWithImportControl={runWithImportControl}
+            runWithImportPlanControl={runWithImportPlanControl}
+            controlEpoch={controlEpoch}
+            getControlEpoch={getControlEpoch}
             onReload={refreshSnapshot}
             onServicesStatusRefresh={refreshServicesStatus}
             onLiveMessage={setLiveMessage}

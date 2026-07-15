@@ -1,17 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  applyLocalPortableImport,
   fetchLocalControlToken,
   fetchLocalPortableServices,
   fetchPortableActionStatus,
   fetchPortableOperationLogs,
   getApiToken,
   PortableApiError,
+  planLocalPortableImport,
   portableServiceAction,
   registerLocalPortableService,
   selectLocalPortableFolder,
   setApiToken,
 } from "./api";
+import { withControlTokenRetry } from "./lib/portableServices";
 
 // vitest defaults to the node environment (no localStorage). Stub a minimal
 // localStorage so the token helpers can be exercised.
@@ -91,6 +94,69 @@ describe("local portable control API", () => {
     expect(fetchMock.mock.calls[2][0]).toBe("/api/local-portable-services/gpt-sovits/start");
     expect(fetchMock.mock.calls[2][1]).toMatchObject({ method: "POST" });
     expect(fetchMock.mock.calls[2][1]?.body).toBeUndefined();
+  });
+
+  it("plans and applies imports with exact local-only payloads, headers, retry, and cancellation", async () => {
+    const controller = new AbortController();
+    const setLocal = vi.spyOn(localStorage, "setItem");
+    const setSession = vi.spyOn(sessionStorage, "setItem");
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        detail: { code: "LOCAL_CONTROL_FORBIDDEN", message: "expired C:/Users/private" },
+      }, 403))
+      .mockResolvedValueOnce(jsonResponse({ status: "cancelled" }))
+      .mockResolvedValueOnce(jsonResponse({
+        copied_user_files: 2,
+        reused_assets: ["models/base.bin"],
+        skipped_assets: [],
+        already_present: ["data/user/existing.json"],
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+    const acquireToken = vi.fn().mockResolvedValueOnce("old-token").mockResolvedValueOnce("fresh-token");
+
+    const planned = await withControlTokenRetry(
+      acquireToken,
+      (token) => planLocalPortableImport("gpt-sovits", token, controller.signal),
+    );
+    const applied = await applyLocalPortableImport(
+      "gpt-sovits",
+      "11111111-1111-4111-8111-111111111111",
+      "a".repeat(64),
+      "fresh-token",
+      controller.signal,
+    );
+
+    expect(planned).toEqual({ status: "cancelled" });
+    expect(applied).toMatchObject({ copied_user_files: 2 });
+    expect(acquireToken).toHaveBeenNthCalledWith(1, false);
+    expect(acquireToken).toHaveBeenNthCalledWith(2, true);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    const [firstPlanUrl, firstPlanInit] = fetchMock.mock.calls[0];
+    const [retryPlanUrl, retryPlanInit] = fetchMock.mock.calls[1];
+    const [applyUrl, applyInit] = fetchMock.mock.calls[2];
+    expect(firstPlanUrl).toBe("/api/local-portable-services/gpt-sovits/imports/plan");
+    expect(retryPlanUrl).toBe(firstPlanUrl);
+    expect(firstPlanInit).toMatchObject({ method: "POST", body: "{}", signal: controller.signal });
+    expect(retryPlanInit).toMatchObject({ method: "POST", body: "{}", signal: controller.signal });
+    expect(new Headers(firstPlanInit?.headers).get("X-TTS-More-Control")).toBe("old-token");
+    expect(new Headers(retryPlanInit?.headers).get("X-TTS-More-Control")).toBe("fresh-token");
+    expect(new Headers(retryPlanInit?.headers).get("Content-Type")).toBe("application/json");
+    expect(applyUrl).toBe(
+      "/api/local-portable-services/gpt-sovits/imports/11111111-1111-4111-8111-111111111111/apply",
+    );
+    expect(applyInit).toMatchObject({ method: "POST", signal: controller.signal });
+    expect(JSON.parse(String(applyInit?.body))).toEqual({
+      confirmed: true,
+      plan_digest: "a".repeat(64),
+    });
+    expect(new Headers(applyInit?.headers).get("X-TTS-More-Control")).toBe("fresh-token");
+    expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("C:/Users/private");
+    expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("old_root");
+    expect(JSON.stringify(fetchMock.mock.calls)).not.toContain("package_root");
+    expect(setLocal).not.toHaveBeenCalled();
+    expect(setSession).not.toHaveBeenCalled();
   });
 
   it("sends only the strict folder and registration payload fields", async () => {

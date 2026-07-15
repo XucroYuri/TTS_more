@@ -807,6 +807,41 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       manualProxyGuidance: "所有锁定的自动下载源均已耗尽。可临时填写 HTTP(S) 代理后再次修复；代理只传给本次修复子进程，不会保存。",
       manualProxyLabel: "本次修复使用的临时代理",
       manualProxyInvalid: "请输入不含路径、查询参数或片段的 HTTP(S) 代理地址",
+      import: {
+        action: "从旧版本导入",
+        planning: "正在等待选择旧版本…",
+        cancelled: "已取消选择，未执行导入。",
+        preservedStopped: "旧版本便携包将保留，绝不会删除或修改。导入期间，此服务必须保持已停止。",
+        userFiles: "用户文件：{{count}} 个（{{bytes}} 字节）",
+        reusableAssets: "可复用资源：{{count}} 个（{{bytes}} 字节）",
+        skippedAssets: "跳过资源：{{count}} 个",
+        alreadyPresent: "已存在：{{count}} 个",
+        assetDetails: "查看可复用资源名称（最多 20 个）",
+        confirm: "确认并导入",
+        cancel: "取消",
+        applying: "正在导入，请保持服务已停止…",
+        success: "导入完成。已复制 {{copied}} 个用户文件，复用 {{reused}} 个资源，跳过 {{skipped}} 个，已有 {{present}} 个。",
+        retry: "重新选择旧版本",
+        disabled: {
+          busy: "当前服务正在执行操作，完成后才能导入。",
+          unconfigured: "请先选择并注册本机便携包。",
+          lan: "局域网服务不能导入本机旧版本数据。",
+          external: "外部服务不能导入本机旧版本数据。",
+          incompatible: "当前包身份与本机便携导入不兼容。",
+          notInstalled: "请先完成当前便携包的安装或修复。",
+          running: "请先停止服务，再导入旧版本数据。",
+          runtimeUnknown: "无法确认服务已停止，暂不能导入。"
+        },
+        error: {
+          planFailed: "无法读取所选旧版本，请重新选择。",
+          planUnavailable: "导入确认已过期或失效，请重新选择旧版本。",
+          blocked: "服务状态或包身份已变化，请重新选择旧版本。",
+          failed: "导入未完成，请重新选择旧版本。",
+          changed: "服务状态或包身份已变化，请重新选择旧版本。",
+          controlChanged: "本机控制会话已更新，请重新选择旧版本。",
+          unknown: "导入未完成，请重新选择旧版本。"
+        }
+      },
       action: {
         browse: "选择目录",
         start: "启动",
@@ -1644,6 +1679,41 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       manualProxyGuidance: "All locked download sources are exhausted. Enter a temporary HTTP(S) proxy and run Repair again. It is passed only to this repair child process and is never saved.",
       manualProxyLabel: "Temporary proxy for this repair",
       manualProxyInvalid: "Enter an HTTP(S) proxy URL without a path, query, or fragment",
+      import: {
+        action: "Import previous version",
+        planning: "Waiting for a previous version selection…",
+        cancelled: "Selection cancelled. Nothing was imported.",
+        preservedStopped: "The previous package is preserved and will never be deleted or modified. This worker must remain stopped during import.",
+        userFiles: "User files: {{count}} ({{bytes}} bytes)",
+        reusableAssets: "Reusable assets: {{count}} ({{bytes}} bytes)",
+        skippedAssets: "Skipped assets: {{count}}",
+        alreadyPresent: "Already present: {{count}}",
+        assetDetails: "Show reusable asset names (up to 20)",
+        confirm: "Confirm import",
+        cancel: "Cancel",
+        applying: "Importing. Keep this worker stopped…",
+        success: "Import complete. Copied {{copied}} user files, reused {{reused}} assets, skipped {{skipped}}, and found {{present}} already present.",
+        retry: "Choose previous version again",
+        disabled: {
+          busy: "This service is busy. Wait for it to finish before importing.",
+          unconfigured: "Choose and register a local portable package first.",
+          lan: "LAN services cannot import data from a local previous version.",
+          external: "External services cannot import data from a local previous version.",
+          incompatible: "This package identity is incompatible with local portable import.",
+          notInstalled: "Finish installing or repairing the current portable package first.",
+          running: "Stop this worker before importing previous-version data.",
+          runtimeUnknown: "The worker's stopped state cannot be confirmed, so import is unavailable."
+        },
+        error: {
+          planFailed: "The selected previous version could not be read. Choose it again.",
+          planUnavailable: "This import confirmation expired or became unavailable. Choose the previous version again.",
+          blocked: "The worker state or package identity changed. Choose the previous version again.",
+          failed: "The import did not complete. Choose the previous version again.",
+          changed: "The worker state or package identity changed. Choose the previous version again.",
+          controlChanged: "The local control session changed. Choose the previous version again.",
+          unknown: "The import did not complete. Choose the previous version again."
+        }
+      },
       action: {
         browse: "Choose folder",
         start: "Start",

@@ -68,6 +68,32 @@ export interface PortableRegistrationResponse {
   service: LocalPortableService;
 }
 
+export interface PortableImportCancelledResponse {
+  status: "cancelled";
+}
+
+export interface PortableImportPlanResponse {
+  plan_id: string;
+  plan_digest: string;
+  expires_in_seconds: number;
+  user_file_count: number;
+  user_bytes: number;
+  reusable_assets: string[];
+  reusable_asset_bytes: number;
+  skipped_assets: string[];
+  already_present: string[];
+  old_package_preserved: true;
+}
+
+export type PortableImportPlanResult = PortableImportCancelledResponse | PortableImportPlanResponse;
+
+export interface PortableImportApplyResponse {
+  copied_user_files: number;
+  reused_assets: string[];
+  skipped_assets: string[];
+  already_present: string[];
+}
+
 export interface PortableActionResponse {
   component: CatalogProvider;
   action: PortableServiceAction | "open_folder";

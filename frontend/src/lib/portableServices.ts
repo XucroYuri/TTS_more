@@ -3,6 +3,9 @@ export { validatePortableProxyUrl } from "./portableProxy";
 import type {
   CatalogProvider,
   LocalPortableService,
+  PortableImportApplyResponse,
+  PortableImportPlanResponse,
+  PortableImportPlanResult,
   PortableOperationEvent,
   PortableOperationLogsResponse,
   PortableOperationPhase,
@@ -72,6 +75,285 @@ export type PortableRuntimeStatus = Pick<
 export interface PortableServiceCardOptions {
   phases?: BusyPhases;
   runtimes?: PortableRuntimeStatus[];
+}
+
+export type PortableImportDisabledReason =
+  | "busy"
+  | "unconfigured"
+  | "lan"
+  | "external"
+  | "incompatible"
+  | "notInstalled"
+  | "running"
+  | "runtimeUnknown";
+
+export interface PortableImportIdentity {
+  serviceId: string;
+  packageId: string;
+  buildId: string;
+  runtimeState: "stopped";
+}
+
+export interface PortableImportSummary {
+  userFileCount: number;
+  userBytes: number;
+  reusableAssetCount: number;
+  reusableAssetBytes: number;
+  skippedAssetCount: number;
+  alreadyPresentCount: number;
+  assetNames: string[];
+}
+
+interface PortableImportPendingPlan {
+  planId: string;
+  planDigest: string;
+  expiresAtMs: number;
+  controlEpoch: number;
+  identity: PortableImportIdentity;
+}
+
+export type PortableImportState =
+  | { phase: "idle"; notice?: "cancelled" }
+  | { phase: "planning"; identity: PortableImportIdentity }
+  | { phase: "awaiting-confirmation"; summary: PortableImportSummary; pending: PortableImportPendingPlan }
+  | { phase: "applying"; summary: PortableImportSummary }
+  | { phase: "success"; result: PortableImportApplyResponse }
+  | { phase: "error"; errorKey: string }
+  | { phase: "expired" };
+
+export function portableImportEligibility(
+  service: LocalPortableService | null,
+  runtime: PortableRuntimeStatus | undefined,
+  busy = false,
+): { allowed: boolean; reason: PortableImportDisabledReason | null } {
+  if (busy) return { allowed: false, reason: "busy" };
+  if (!service) return { allowed: false, reason: "unconfigured" };
+  if (service.network_scope === "lan") return { allowed: false, reason: "lan" };
+  if (!service.managed) {
+    return {
+      allowed: false,
+      reason: service.mode === "external" || !service.package_root ? "external" : "incompatible",
+    };
+  }
+  if (
+    service.mode !== "local"
+    || service.network_scope !== "localhost"
+    || !service.service_id
+    || !service.package_id
+    || !service.package_root
+    || !service.build_id
+  ) {
+    return { allowed: false, reason: "incompatible" };
+  }
+  if (service.setup_state !== "ready") return { allowed: false, reason: "notInstalled" };
+  if (!runtime || runtime.service_id !== service.service_id || !runtime.supervisor_state) {
+    return { allowed: false, reason: "runtimeUnknown" };
+  }
+  if (runtime.supervisor_state === "stopped") return { allowed: true, reason: null };
+  if (runtime.supervisor_state === "running") return { allowed: false, reason: "running" };
+  if (["starting", "stopping", "repairing"].includes(runtime.supervisor_state)) {
+    return { allowed: false, reason: "busy" };
+  }
+  return { allowed: false, reason: "runtimeUnknown" };
+}
+
+export function portableImportIdentity(
+  service: LocalPortableService | null,
+  runtime: PortableRuntimeStatus | undefined,
+): PortableImportIdentity | null {
+  if (
+    !service?.service_id
+    || !service.package_id
+    || !service.build_id
+    || runtime?.service_id !== service.service_id
+    || runtime.supervisor_state !== "stopped"
+  ) return null;
+  return {
+    serviceId: service.service_id,
+    packageId: service.package_id,
+    buildId: service.build_id,
+    runtimeState: "stopped",
+  };
+}
+
+export function initialPortableImportState(): PortableImportState {
+  return { phase: "idle" };
+}
+
+export function beginPortableImport(
+  state: PortableImportState,
+  identity: PortableImportIdentity,
+): PortableImportState {
+  if (portableImportLocksCard(state)) return state;
+  return { phase: "planning", identity };
+}
+
+export function receivePortableImportPlan(
+  state: PortableImportState,
+  response: PortableImportPlanResult,
+  nowMs: number,
+  controlEpoch: number,
+): PortableImportState {
+  if (state.phase !== "planning") return state;
+  if ("status" in response) return { phase: "idle", notice: "cancelled" };
+  if (response.expires_in_seconds <= 0) return { phase: "expired" };
+  return {
+    phase: "awaiting-confirmation",
+    summary: safePortableImportSummary(response),
+    pending: {
+      planId: response.plan_id,
+      planDigest: response.plan_digest,
+      expiresAtMs: nowMs + response.expires_in_seconds * 1000,
+      controlEpoch,
+      identity: state.identity,
+    },
+  };
+}
+
+export function consumePortableImportPlan(
+  state: PortableImportState,
+  nowMs: number,
+  controlEpoch: number,
+): {
+  state: PortableImportState;
+  request: { planId: string; planDigest: string; controlEpoch: number } | null;
+} {
+  if (state.phase !== "awaiting-confirmation") return { state, request: null };
+  if (nowMs >= state.pending.expiresAtMs) return { state: { phase: "expired" }, request: null };
+  if (controlEpoch !== state.pending.controlEpoch) {
+    return {
+      state: { phase: "error", errorKey: "portableServices.import.error.controlChanged" },
+      request: null,
+    };
+  }
+  return {
+    state: { phase: "applying", summary: state.summary },
+    request: {
+      planId: state.pending.planId,
+      planDigest: state.pending.planDigest,
+      controlEpoch: state.pending.controlEpoch,
+    },
+  };
+}
+
+export function completePortableImport(
+  state: PortableImportState,
+  result: PortableImportApplyResponse,
+): PortableImportState {
+  if (state.phase !== "applying") return state;
+  return { phase: "success", result };
+}
+
+export function failPortableImport(state: PortableImportState, errorKey: string): PortableImportState {
+  if (state.phase === "idle" || state.phase === "success") return state;
+  return { phase: "error", errorKey };
+}
+
+function samePortableImportIdentity(
+  expected: PortableImportIdentity,
+  current: PortableImportIdentity | null,
+): boolean {
+  return Boolean(
+    current
+    && expected.serviceId === current.serviceId
+    && expected.packageId === current.packageId
+    && expected.buildId === current.buildId
+    && current.runtimeState === "stopped"
+  );
+}
+
+export function invalidatePortableImport(
+  state: PortableImportState,
+  current: PortableImportIdentity | null,
+  controlEpoch?: number,
+): PortableImportState {
+  if (
+    state.phase === "awaiting-confirmation"
+    && controlEpoch !== undefined
+    && state.pending.controlEpoch !== controlEpoch
+  ) {
+    return { phase: "error", errorKey: "portableServices.import.error.controlChanged" };
+  }
+  const expected = state.phase === "planning"
+    ? state.identity
+    : state.phase === "awaiting-confirmation" ? state.pending.identity : null;
+  if (!expected || samePortableImportIdentity(expected, current)) return state;
+  return { phase: "error", errorKey: "portableServices.import.error.changed" };
+}
+
+export function resetPortableImport(_state: PortableImportState): PortableImportState {
+  return initialPortableImportState();
+}
+
+export function portableImportLocksCard(state: PortableImportState): boolean {
+  return state.phase === "planning" || state.phase === "awaiting-confirmation" || state.phase === "applying";
+}
+
+const IMPORT_ERROR_KEYS: Record<string, string> = {
+  LOCAL_CONTROL_IMPORT_PLAN_FAILED: "portableServices.import.error.planFailed",
+  LOCAL_CONTROL_IMPORT_PLAN_UNAVAILABLE: "portableServices.import.error.planUnavailable",
+  LOCAL_CONTROL_IMPORT_BLOCKED: "portableServices.import.error.blocked",
+  LOCAL_CONTROL_IMPORT_FAILED: "portableServices.import.error.failed",
+};
+
+export function portableImportErrorMessageKey(code: string | undefined): string {
+  return (code && IMPORT_ERROR_KEYS[code]) || "portableServices.import.error.unknown";
+}
+
+export class PortableImportControlEpochError extends Error {
+  constructor() {
+    super("Portable import control epoch changed");
+    this.name = "PortableImportControlEpochError";
+  }
+}
+
+export async function withPortableImportControlEpoch<T>(
+  acquireToken: (force: boolean) => Promise<string>,
+  expectedEpoch: number,
+  currentEpoch: () => number,
+  run: (token: string) => Promise<T>,
+): Promise<T> {
+  if (currentEpoch() !== expectedEpoch) throw new PortableImportControlEpochError();
+  const token = await acquireToken(false);
+  if (currentEpoch() !== expectedEpoch) throw new PortableImportControlEpochError();
+  return run(token);
+}
+
+export async function withPortableImportPlanControlEpoch<T>(
+  acquireToken: (force: boolean) => Promise<string>,
+  currentEpoch: () => number,
+  run: (token: string) => Promise<T>,
+): Promise<{ value: T; controlEpoch: number }> {
+  let usedEpoch: number | null = null;
+  const value = await withControlTokenRetry(acquireToken, (token) => {
+    usedEpoch = currentEpoch();
+    return run(token);
+  });
+  if (usedEpoch === null || currentEpoch() !== usedEpoch) throw new PortableImportControlEpochError();
+  return { value, controlEpoch: usedEpoch };
+}
+
+function safeRelativeAssetName(value: string): boolean {
+  if (!value || value.includes("\\") || value.includes(":")) return false;
+  const parts = value.split("/");
+  return !value.startsWith("/")
+    && parts.every((part) => part !== "" && part !== "." && part !== "..")
+    && !Array.from(value).some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127;
+    });
+}
+
+export function safePortableImportSummary(plan: PortableImportPlanResponse): PortableImportSummary {
+  return {
+    userFileCount: plan.user_file_count,
+    userBytes: plan.user_bytes,
+    reusableAssetCount: plan.reusable_assets.length,
+    reusableAssetBytes: plan.reusable_asset_bytes,
+    skippedAssetCount: plan.skipped_assets.length,
+    alreadyPresentCount: plan.already_present.length,
+    assetNames: plan.reusable_assets.filter(safeRelativeAssetName).slice(0, 20),
+  };
 }
 
 function servicePhase(service: PortableCardInput): PortableOperationPhase | "not_configured" {

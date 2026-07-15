@@ -1,4 +1,4 @@
-import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LocalPortableServicesResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, PortableActionResponse, PortableActionStatusResponse, PortableDiscoveryResponse, PortableFolderSelectionResponse, PortableOperationLogsResponse, PortableOperationResponse, PortableRegistrationRequest, PortableRegistrationResponse, PortableServiceAction, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
+import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LocalPortableServicesResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, PortableActionResponse, PortableActionStatusResponse, PortableDiscoveryResponse, PortableFolderSelectionResponse, PortableImportApplyResponse, PortableImportPlanResult, PortableOperationLogsResponse, PortableOperationResponse, PortableRegistrationRequest, PortableRegistrationResponse, PortableServiceAction, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
 import { validatePortableProxyUrl } from "./lib/portableProxy";
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -203,6 +203,37 @@ export async function registerLocalPortableService(
     body: JSON.stringify(body),
     signal,
   });
+}
+
+export async function planLocalPortableImport(
+  component: CatalogProvider,
+  token: string,
+  signal?: AbortSignal,
+): Promise<PortableImportPlanResult> {
+  return portableRequest(`/api/local-portable-services/${encodeURIComponent(component)}/imports/plan`, {
+    method: "POST",
+    headers: portableHeaders(token, true),
+    body: JSON.stringify({}),
+    signal,
+  });
+}
+
+export async function applyLocalPortableImport(
+  component: CatalogProvider,
+  planId: string,
+  planDigest: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<PortableImportApplyResponse> {
+  return portableRequest(
+    `/api/local-portable-services/${encodeURIComponent(component)}/imports/${encodeURIComponent(planId)}/apply`,
+    {
+      method: "POST",
+      headers: portableHeaders(token, true),
+      body: JSON.stringify({ confirmed: true, plan_digest: planDigest }),
+      signal,
+    },
+  );
 }
 
 export async function portableServiceAction(
