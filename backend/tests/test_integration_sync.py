@@ -351,6 +351,45 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
             '[void](Assert-PortableExactOperationContract -OperationsRoot $Root -OperationRoot $staleOperation '
             '-CancelFile (Join-Path $staleOperation "cancel.requested") -RequireOperation)',
         ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'ServiceScript = $serviceScript',
+            'ServiceScript = $initializeScript',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'if ($profile -notin @("bootstrap", "full")) { Throw-PortableStartError "PACKAGE_CORRUPT" "The package profile is invalid" }\n'
+            '        if ([int]$manifest.schema_version -eq 2) {\n'
+            '            try {\n'
+            '                $requiredText = @("component", "package_id", "release_version", "version", "build_id", "api_contract")',
+            'if ($profile -notin @("bootstrap", "full")) { Throw-PortableStartError "PACKAGE_CORRUPT" "The package profile is invalid" }\n'
+            '        if ($false -and ([int]$manifest.schema_version -eq 2)) {\n'
+            '            try {\n'
+            '                $requiredText = @("component", "package_id", "release_version", "version", "build_id", "api_contract")',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$operationsRoot = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.data.operations) -Label "data.operations"',
+            '$operationsRoot = Resolve-PortablePackagePath -Root $resolvedRoot '
+            '-RelativePath ([string]$(if ($false) { $manifest.data.operations } '
+            'else { Join-Path "data\\local" "operations" })) -Label "data.operations"',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$lockPath = Join-Path $context.OperationsRoot ".start.lock"',
+            '$lockPath = if ($false) { Join-Path $context.OperationsRoot ".start.lock" } '
+            'else { Join-Path $Root ".start.lock" }',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'Throw-PortableStartError "PACKAGE_CORRUPT" "OperationRoot must be a UUID direct child of data.operations"',
+            '$null = "boundary check disabled"',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'Throw-PortableStartError "OPERATION_ACTIVE" "The active operation is outside data.operations"',
+            '$null = "parent check disabled"',
+        ),
     ),
 )
 def test_copied_contract_rejects_commented_decoys_and_mutated_active_control_flow(
@@ -392,6 +431,46 @@ def test_copied_contract_rejects_commented_decoys_and_mutated_active_control_flo
         if line.startswith(f"{semantic_test} ")
     ]
     assert len(semantic_lines) == 1 and semantic_lines[0].endswith("... FAIL"), combined
+
+
+def test_copied_contract_rejects_commented_decoys_in_nested_context_return(tmp_path: Path) -> None:
+    if os.name != "nt" and shutil.which("pwsh") is None:
+        pytest.skip("source mutation harness requires PowerShell AST support")
+    sync = _load_sync()
+    target = tmp_path / "nested return decoy fork"
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "6" * 40)
+    controller = target / "tts_more" / "Invoke-PortableStart.ps1"
+    source = controller.read_text(encoding="utf-8")
+    operations_field = "OperationsRoot = [IO.Path]::GetFullPath($operationsRoot)"
+    return_marker = "    return [pscustomobject]@{\n"
+    assert source.count(operations_field) == 1
+    assert source.count(return_marker) == 1
+    source = source.replace(
+        operations_field,
+        "OperationsRoot = [IO.Path]::GetFullPath($resolvedRoot)",
+        1,
+    )
+    source = source.replace(
+        return_marker,
+        "    if ($false) { return [pscustomobject]@{ "
+        "OperationsRoot = [IO.Path]::GetFullPath($operationsRoot) } }\n"
+        + return_marker,
+    )
+    controller.write_text(source, encoding="utf-8")
+
+    result = _run_copied_contract_after_mutation(sync, target)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, f"nested return decoy escaped contract\n{combined}"
+    assert any(
+        line.startswith("test_controlled_mirror_has_no_hash_drift ") and line.endswith("... ok")
+        for line in combined.splitlines()
+    ), combined
+    assert any(
+        line.startswith("test_controller_uses_manifest_operations_worker_delegate_and_private_runtime ")
+        and line.endswith("... FAIL")
+        for line in combined.splitlines()
+    ), combined
 
 
 def test_copied_contract_requires_operations_assignment_in_schema_v2_branch(tmp_path: Path) -> None:
