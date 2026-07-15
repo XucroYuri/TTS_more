@@ -207,7 +207,6 @@ class PortablePackageController:
             try:
                 return_code = tracked.process.poll()
             except (OSError, subprocess.SubprocessError) as exc:
-                self._actions.pop(canonical_id, None)
                 raise PortableControlError(
                     "PORTABLE_LAUNCH_FAILED", "portable action state could not be checked"
                 ) from exc
@@ -376,9 +375,14 @@ class PortablePackageController:
             if operation_id is not None:
                 result["operation_id"] = operation_id
             if not completed and canonical_action_id is not None:
-                self._commit_action_reservation(canonical_action_id, action, process, context)
+                committed_action_id = self._commit_action_reservation(
+                    canonical_action_id,
+                    action,
+                    process,
+                    context,
+                )
                 reservation_active = False
-                result["action_id"] = canonical_action_id
+                result["action_id"] = committed_action_id
             return result
         finally:
             if reservation_active:
@@ -419,15 +423,30 @@ class PortablePackageController:
         action: str,
         process: ProcessLike,
         context: _ActionContext,
-    ) -> None:
+    ) -> str:
         with self._actions_lock:
-            if action_id not in self._action_reservations:
-                raise PortableControlError(
-                    "PORTABLE_ACTION_RESERVATION_LOST",
-                    "portable action reservation is unavailable",
-                )
-            self._action_reservations.remove(action_id)
-            self._actions[action_id] = _TrackedAction(action, process, context)
+            self._action_reservations.discard(action_id)
+            tracked = _TrackedAction(action, process, context)
+            existing = self._actions.get(action_id)
+            if existing is None:
+                self._actions[action_id] = tracked
+                return action_id
+            if existing.process is process:
+                self._actions.move_to_end(action_id)
+                return action_id
+
+            # The public reservation protocol makes this collision unreachable:
+            # duplicate IDs are rejected while the same lock protects reservations
+            # and tracked actions. If internal state is nevertheless disturbed after
+            # spawn, preserve both processes and return a queryable rescue ID rather
+            # than overwriting the prior process or orphaning the new one.
+            rescue_value = UUID(action_id).int
+            rescue_id = action_id
+            while rescue_id in self._actions or rescue_id in self._action_reservations:
+                rescue_value = (rescue_value + 1) % (1 << 128)
+                rescue_id = str(UUID(int=rescue_value))
+            self._actions[rescue_id] = tracked
+            return rescue_id
 
     def _spawn_checked(
         self,
@@ -1203,7 +1222,9 @@ def _action_completed(process: ProcessLike) -> bool:
     try:
         return process.poll() is not None
     except (OSError, subprocess.SubprocessError):
-        return True
+        # Capacity may be reclaimed only from a process proven terminal. A
+        # transient query failure is unknown state and must remain tracked.
+        return False
 
 
 def _terminate_controller(process: ProcessLike) -> None:

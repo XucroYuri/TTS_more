@@ -36,6 +36,18 @@ class FakeProcess:
         self.terminated = True
 
 
+class FlakyPollProcess(FakeProcess):
+    def __init__(self, *, poll_failures: int, pid: int = 42) -> None:
+        super().__init__(pid=pid)
+        self.poll_failures = poll_failures
+
+    def poll(self) -> int | None:
+        if self.poll_failures > 0:
+            self.poll_failures -= 1
+            raise OSError("fixture poll failure")
+        return super().poll()
+
+
 def _write_package(root: Path, *, component: str = "gpt-sovits", package_id: str = "gpt-main") -> Path:
     root.mkdir(parents=True)
     for launcher in ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1"):
@@ -353,6 +365,51 @@ def test_action_tracker_reserves_capacity_before_concurrent_spawn(tmp_path: Path
     assert all(process.terminated is False for process in processes)
 
 
+def test_action_tracker_does_not_evict_process_when_poll_state_is_unknown(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    processes: list[FakeProcess] = []
+
+    def spawn(*_args, **_kwargs):
+        if not processes:
+            process: FakeProcess = FlakyPollProcess(poll_failures=2, pid=1500)
+        else:
+            process = FakeProcess(pid=1500 + len(processes))
+        processes.append(process)
+        return process
+
+    controller = PortablePackageController(spawn=spawn)
+    action_ids = [f"15000000-0000-4000-8000-{index:012d}" for index in range(65)]
+    for action_id in action_ids[:64]:
+        controller.stop(descriptor, action_id=action_id)
+
+    with pytest.raises(PortableControlError) as capacity:
+        controller.stop(descriptor, action_id=action_ids[64])
+    assert capacity.value.code == "PORTABLE_ACTION_CAPACITY"
+    assert len(processes) == 64
+    assert all(process.terminated is False for process in processes)
+
+    with pytest.raises(PortableControlError) as unavailable:
+        controller.action_status(descriptor, action_id=action_ids[0])
+    assert unavailable.value.code == "PORTABLE_LAUNCH_FAILED"
+    assert controller.action_status(descriptor, action_id=action_ids[0])["status"] == "stopping"
+
+
+def test_action_status_keeps_record_after_transient_poll_failure(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    process = FlakyPollProcess(poll_failures=1)
+    controller = PortablePackageController(spawn=lambda *_args, **_kwargs: process)
+    action_id = "15111111-1111-4111-8111-111111111111"
+    controller.stop(descriptor, action_id=action_id)
+
+    with pytest.raises(PortableControlError) as unavailable:
+        controller.action_status(descriptor, action_id=action_id)
+    assert unavailable.value.code == "PORTABLE_LAUNCH_FAILED"
+
+    assert controller.action_status(descriptor, action_id=action_id)["status"] == "stopping"
+
+
 def test_duplicate_action_id_is_rejected_before_spawn(tmp_path: Path) -> None:
     package = _write_package(tmp_path / "GPT")
     descriptor = read_portable_package(package)
@@ -440,6 +497,83 @@ def test_synchronous_completion_releases_action_reservation(tmp_path: Path) -> N
 
     assert retry["status"] == "stopping"
     assert retry["action_id"] == action_id
+
+
+def test_commit_self_heals_when_reservation_is_missing_after_spawn(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    process = FakeProcess(pid=2500)
+    controller: PortablePackageController
+
+    def spawn(*_args, **_kwargs):
+        with controller._actions_lock:
+            controller._action_reservations.clear()
+        return process
+
+    controller = PortablePackageController(spawn=spawn)
+    action_id = "25222222-2222-4222-8222-222222222222"
+
+    result = controller.stop(descriptor, action_id=action_id)
+
+    assert result["action_id"] == action_id
+    assert controller.action_status(descriptor, action_id=action_id)["controller_pid"] == 2500
+    assert process.terminated is False
+
+
+def test_commit_is_idempotent_for_the_same_tracked_process(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    process = FakeProcess(pid=2550)
+    controller = PortablePackageController(spawn=lambda *_args, **_kwargs: process)
+    action_id = "25555555-5555-4555-8555-555555555555"
+    controller.stop(descriptor, action_id=action_id)
+    tracked = controller._actions[action_id]
+
+    committed_id = controller._commit_action_reservation(
+        action_id,
+        tracked.action,
+        process,
+        tracked.context,
+    )
+
+    assert committed_id == action_id
+    assert list(controller._actions) == [action_id]
+    assert controller.action_status(descriptor, action_id=action_id)["controller_pid"] == 2550
+
+
+def test_commit_rescues_new_process_without_overwriting_unexpected_collision(
+    tmp_path: Path,
+) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    old_process = FakeProcess(pid=2600)
+    new_process = FakeProcess(pid=2601)
+    source_id = "26000000-0000-4000-8000-000000000000"
+    requested_id = "26000000-0000-4000-8000-000000000001"
+    calls = 0
+    controller: PortablePackageController
+
+    def spawn(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return old_process
+        with controller._actions_lock:
+            controller._actions[requested_id] = controller._actions.pop(source_id)
+            controller._action_reservations.discard(requested_id)
+        return new_process
+
+    controller = PortablePackageController(spawn=spawn)
+    controller.stop(descriptor, action_id=source_id)
+
+    result = controller.stop(descriptor, action_id=requested_id)
+
+    rescue_id = str(result["action_id"])
+    assert rescue_id != requested_id
+    assert controller.action_status(descriptor, action_id=requested_id)["controller_pid"] == 2600
+    assert controller.action_status(descriptor, action_id=rescue_id)["controller_pid"] == 2601
+    assert old_process.terminated is False
+    assert new_process.terminated is False
 
 
 def test_action_tracker_lru_evicts_only_oldest_terminal_record(
