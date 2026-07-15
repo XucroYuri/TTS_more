@@ -5,7 +5,7 @@ import time
 from fastapi.testclient import TestClient
 
 from app.models import Character, ScriptLine
-from app.main import _layer_service_status, create_app
+from app.main import _layer_service_status, _portable_controller_root, create_app
 from app.parser import ParsedScriptDraft, ParserProviderUnavailable, ParserQualityError
 
 
@@ -3088,3 +3088,32 @@ def test_generate_rejects_unmatched_project_character_without_binding(tmp_path: 
 
     assert response.status_code == 400
     assert "needs a voice binding" in response.json()["detail"]
+
+
+def test_portable_controller_root_does_not_accept_an_environment_script_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source_root = tmp_path / "trusted source"
+    source_root.mkdir()
+    attacker = tmp_path / "attacker controlled"
+    attacker.mkdir()
+    monkeypatch.setenv("TTS_MORE_PACKAGE_ROOT", str(attacker))
+    monkeypatch.chdir(tmp_path)
+
+    resolved = _portable_controller_root(Path("data"), source_root)
+
+    assert resolved == source_root
+
+
+def test_portable_controller_root_is_derived_from_packaged_module_layout(tmp_path: Path) -> None:
+    package = tmp_path / "TTS More package"
+    packaged_app = package / "app"
+    (package / "package").mkdir(parents=True)
+    (package / "package/tts-more-package.json").write_text("{}", encoding="utf-8")
+    (package / "scripts").mkdir()
+    (package / "scripts/select-portable-folder.ps1").write_text("# fixed", encoding="utf-8")
+    packaged_app.mkdir()
+
+    resolved = _portable_controller_root(Path("data"), packaged_app)
+
+    assert resolved == package

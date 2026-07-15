@@ -29,7 +29,52 @@ MAX_EXPLICIT_SEARCH_ROOTS = 16
 MAX_TOTAL_SEARCH_ENTRIES = 512
 MAX_TOTAL_CANDIDATES = 512
 
-__all__ = ["PortableServiceLocator", "PortableServiceStore", "resolve_locator"]
+__all__ = [
+    "PortableServiceLocator",
+    "PortableServiceStore",
+    "discover_bounded_portable_packages",
+    "resolve_locator",
+]
+
+
+def discover_bounded_portable_packages(
+    controller_root: Path,
+    search_roots: Sequence[Path],
+) -> list[PortablePackageDescriptor]:
+    """Inspect only bounded direct children of the controller parent and explicit roots."""
+
+    controller = _lexical_absolute(controller_root)
+    roots = [controller.parent, *search_roots[:MAX_EXPLICIT_SEARCH_ROOTS]]
+    remaining_entries = MAX_TOTAL_SEARCH_ENTRIES
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for raw_root in roots:
+        if remaining_entries <= 0 or len(candidates) >= MAX_TOTAL_CANDIDATES:
+            break
+        root = _lexical_absolute(Path(raw_root))
+        bounded, enumerated = _bounded_root_candidates(
+            root,
+            min(MAX_SEARCH_CHILDREN, remaining_entries),
+        )
+        remaining_entries -= enumerated
+        for candidate in bounded:
+            identity = _path_identity(candidate)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append(candidate)
+            if len(candidates) >= MAX_TOTAL_CANDIDATES:
+                break
+
+    descriptors: list[PortablePackageDescriptor] = []
+    for candidate in candidates:
+        descriptor = inspect_locator_candidate(candidate)
+        if descriptor is not None:
+            descriptors.append(descriptor)
+    return sorted(
+        descriptors,
+        key=lambda item: (item.component, item.package_id, item.package_root.casefold()),
+    )
 
 
 def resolve_locator(

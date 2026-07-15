@@ -106,6 +106,7 @@ def _copy_controller_builder_fixture(root: Path) -> None:
         "Invoke-PortableStart.ps1",
         "Show-PortableProgress.ps1",
         "Portable-Validation.ps1",
+        "select-portable-folder.ps1",
         "export-portable-diagnostics.py",
         "portable_install.py",
         "portable_launcher.py",

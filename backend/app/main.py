@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from app.hardware import collect_local_hardware_status
 from app.auth import auth_status_endpoint, install_token_middleware
+from app.local_control import install_local_control
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
@@ -91,6 +92,7 @@ def create_app(
     parser_config_path: Path | str | None = None,
     env_path: Path | str | None = None,
     static_root: Path | str | None = None,
+    controller_root: Path | str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="TTS More Orchestrator", version="0.1.0")
     app.add_middleware(
@@ -118,6 +120,7 @@ def create_app(
     job_manager = GenerationJobManager(queue, store)
     ref_root = Path(reference_audio_root)
     supervisor = ServiceSupervisor(project_root=project_root, runtime_root=Path(runtime_root) if runtime_root else Path(data_root) / ".runtime")
+    portable_controller_root = Path(controller_root) if controller_root is not None else _portable_controller_root(Path(data_root), project_root)
 
     app.state.store = store
     app.state.parser = parser
@@ -133,6 +136,12 @@ def create_app(
     app.state.env_path = env_file
     # Read at app-creation time so tests/processes can override via env.
     app.state.max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(MAX_UPLOAD_BYTES)))
+
+    install_local_control(
+        app,
+        controller_root=portable_controller_root,
+        refresh_services=lambda endpoints: _apply_registry(app, ServiceRegistry(list(endpoints)), store),
+    )
 
     @app.get("/api/auth/status")
     def auth_status() -> dict[str, Any]:
@@ -1251,6 +1260,17 @@ def _resolve_service_settings_paths(data_root: Path, explicit_path: Path | None)
         if candidate.exists():
             return candidate, local_path
     return local_path, local_path
+
+
+def _portable_controller_root(data_root: Path, project_root: Path) -> Path:
+    del data_root  # The executable/module layout, not process environment or cwd, is authoritative.
+    packaged_root = project_root.parent
+    if (
+        (packaged_root / "package" / "tts-more-package.json").is_file()
+        and (packaged_root / "scripts" / "select-portable-folder.ps1").is_file()
+    ):
+        return packaged_root
+    return project_root
 
 
 def _resolve_manifest_history_for_version(manifest: GenerationManifest, line_key: str, version_id: str) -> tuple[str, Any | None]:

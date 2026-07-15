@@ -46,6 +46,7 @@ TOKEN_ENV_VAR = "TTS_MORE_API_TOKEN"
 # GET routes that are nonetheless sensitive (network egress / heavy ops) and
 # must be token-gated even though they use GET. Matched as path prefixes.
 _PROTECTED_GET_PREFIXES = (
+    "/api/local-portable-services",
     "/api/open-source-tts/detect",
     "/api/services/",  # covers /test, /start, /stop, /start-and-wait, /logs
     "/api/parser/providers/test",
@@ -58,6 +59,7 @@ _PROTECTED_GET_PREFIXES = (
 
 # Path prefixes that are always open (read-only, needed for frontend boot).
 _OPEN_PREFIXES = (
+    "/api/local-control/token",
     "/api/auth/status",
     "/api/health",
     "/api/repos",
