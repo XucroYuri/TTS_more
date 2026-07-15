@@ -15,7 +15,16 @@ COMPONENTS = {
     "indextts": {"module": "tts_more_worker.indextts:app", "port": 9881, "python": "3.11"},
     "cosyvoice": {"module": "tts_more_worker.cosyvoice:app", "port": 9882, "python": "3.10"},
 }
-ROOT_ENTRIES = ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1", "Start-WebUI.cmd")
+GUIDE_NAME = "使用说明-先看这里.txt"
+ROOT_ENTRIES = (
+    "Initialize.cmd",
+    "Start.cmd",
+    "Stop.cmd",
+    "Repair.cmd",
+    "Build-Package.ps1",
+    "Start-WebUI.cmd",
+    GUIDE_NAME,
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -117,7 +126,34 @@ def _root_entry_payloads(component: str) -> dict[str, str]:
         "Repair.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Repair.ps1" %*\nexit /b %errorlevel%\n',
         "Build-Package.ps1": '& "$PSScriptRoot\\tts_more\\Build-Package.ps1" @args\nexit $LASTEXITCODE\n',
         "Start-WebUI.cmd": webui,
+        GUIDE_NAME: _guide_payload(component),
     }
+
+
+def _guide_payload(component: str) -> str:
+    display_name = {
+        "gpt-sovits": "GPT-SoVITS",
+        "indextts": "IndexTTS",
+        "cosyvoice": "CosyVoice",
+    }[component]
+    port = COMPONENTS[component]["port"]
+    return f"""{display_name} Windows 便携版使用说明
+
+常用入口
+- Start.cmd：启动 tts-more-v1 worker（默认端口：{port}）。
+- Start-WebUI.cmd：启动上游原生 WebUI；它与 worker 是两个独立入口。
+- Initialize.cmd：检查并补齐当前包的运行时、依赖和默认模型。
+- Stop.cmd：仅停止由当前便携包启动的 worker。
+- Repair.cmd：校验资产，并只重新获取缺失或损坏的内容，不删除用户数据。
+
+两种交付形态
+- Bootstrap：首次运行需要联网完成初始化；初始化成功之后可离线运行。
+- Full：仅在本地生成，包含已验证的运行资产，可断网直接运行；禁止上传 GitHub。
+
+运行说明
+- 运行时无需安装系统 Python、Conda 或 Node，也不要把这些系统路径写入配置。
+- 路径可能因电脑而异；请整体移动或解压文件夹，所有运行路径必须保持包内相对路径。
+"""
 
 
 def _tracked_paths(target_root: Path) -> Iterable[Path]:

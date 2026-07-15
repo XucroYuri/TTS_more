@@ -29,7 +29,16 @@ class PortableIntegrationContractTests(unittest.TestCase):
         self.assertEqual(controlled, {name for name in expected if name.startswith("tts_more/")})
         tracked = set(
             subprocess.run(
-                ["git", "-C", str(ROOT), "ls-files", "--", *sorted(expected)],
+                [
+                    "git",
+                    "-C",
+                    str(ROOT),
+                    "-c",
+                    "core.quotePath=false",
+                    "ls-files",
+                    "--",
+                    *sorted(expected),
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -38,10 +47,34 @@ class PortableIntegrationContractTests(unittest.TestCase):
         self.assertEqual(set(expected), tracked, "controlled integration files must be Git tracked")
 
     def test_package_entrypoints_and_native_webui_are_separate(self) -> None:
-        for name in ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1", "Start-WebUI.cmd"):
+        for name in (
+            "Initialize.cmd",
+            "Start.cmd",
+            "Stop.cmd",
+            "Repair.cmd",
+            "Build-Package.ps1",
+            "Start-WebUI.cmd",
+            "使用说明-先看这里.txt",
+        ):
             self.assertTrue((ROOT / name).is_file(), name)
-        self.assertIn("tts_more\\Start-Worker.ps1", (ROOT / "Start.cmd").read_text(encoding="utf-8"))
-        self.assertNotEqual((ROOT / "Start.cmd").read_bytes(), (ROOT / "Start-WebUI.cmd").read_bytes())
+        start = (ROOT / "Start.cmd").read_text(encoding="utf-8")
+        webui = (ROOT / "Start-WebUI.cmd").read_text(encoding="utf-8")
+        self.assertIn("tts_more\\Invoke-PortableStart.ps1", start)
+        self.assertNotIn("Start-Worker.ps1", start)
+        self.assertNotEqual(start, webui)
+
+    def test_controller_uses_manifest_operations_worker_delegate_and_private_runtime(self) -> None:
+        controller = (BUNDLE / "Invoke-PortableStart.ps1").read_text(encoding="utf-8")
+        worker = (BUNDLE / "Start-Worker.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('"package\\tts-more-package.json"', controller)
+        self.assertIn("[int]$manifest.schema_version -eq 2", controller)
+        self.assertIn("([string]$manifest.data.operations) -Label \"data.operations\"", controller)
+        self.assertIn('Join-Path $bundle "Start-Worker.ps1"', controller)
+        self.assertIn("Invoke-ChildPowerShell -Script $context.ServiceScript", controller)
+        self.assertIn('$Python = Join-Path $Root "runtime\\live\\python.exe"', worker)
+        self.assertNotIn(".venv", worker)
+        self.assertNotIn("TTS_MORE_PYTHON_EXE", worker)
 
     def test_operation_protocol_is_controlled(self) -> None:
         self.assertTrue((BUNDLE / "portable_operations.py").is_file(), "portable operation protocol")

@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+GUIDE_NAME = "使用说明-先看这里.txt"
 
 
 def _load_sync():
@@ -30,7 +31,15 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
     assert (target / "tts_more" / "tts_more_worker" / "gpt_sovits.py").is_file()
     assert (target / "tts_more" / "tests" / "test_portable_integration.py").is_file()
     assert "tts_more_worker.gpt_sovits:app" in (target / "tts_more" / "component.json").read_text(encoding="utf-8")
-    for entry in ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1", "Start-WebUI.cmd"):
+    for entry in (
+        "Initialize.cmd",
+        "Start.cmd",
+        "Stop.cmd",
+        "Repair.cmd",
+        "Build-Package.ps1",
+        "Start-WebUI.cmd",
+        GUIDE_NAME,
+    ):
         assert (target / entry).is_file()
     assert exclude.read_text(encoding="utf-8") == "user-owned\n"
 
@@ -40,7 +49,46 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
     assert manifest["files"]
     validation_relative = "tts_more/Portable-Validation.ps1"
     assert manifest["files"][validation_relative] == sync.sha256_file(target / validation_relative)
+    assert manifest["files"][GUIDE_NAME] == sync.sha256_file(target / GUIDE_NAME)
     assert sync.check_integration(target) == []
+
+
+def test_generated_guide_is_component_aware_and_package_relative(tmp_path: Path) -> None:
+    sync = _load_sync()
+    expected = {
+        "gpt-sovits": ("GPT-SoVITS", "9880"),
+        "indextts": ("IndexTTS", "9881"),
+        "cosyvoice": ("CosyVoice", "9882"),
+    }
+
+    for component, (display_name, port) in expected.items():
+        target = tmp_path / component
+        sync.sync_integration(REPO_ROOT, target, component, "e" * 40)
+        guide = (target / GUIDE_NAME).read_text(encoding="utf-8")
+
+        assert display_name in guide
+        assert f"默认端口：{port}" in guide
+        assert "Start.cmd：启动 tts-more-v1 worker" in guide
+        assert "Start-WebUI.cmd：启动上游原生 WebUI" in guide
+        assert "Initialize.cmd" in guide and "Stop.cmd" in guide and "Repair.cmd" in guide
+        assert "Bootstrap" in guide and "首次运行需要联网" in guide and "之后可离线运行" in guide
+        assert "Full" in guide and "断网直接运行" in guide and "禁止上传 GitHub" in guide
+        assert "无需安装系统 Python、Conda 或 Node" in guide
+        assert "路径可能因电脑而异" in guide and "包内相对路径" in guide
+
+
+def test_check_detects_generated_guide_drift_and_removal(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "Guide drift fork"
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "f" * 40)
+    guide = target / GUIDE_NAME
+
+    guide.write_text("manual edit", encoding="utf-8")
+    assert f"hash mismatch: {GUIDE_NAME}" in sync.check_integration(target)
+
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "f" * 40)
+    guide.unlink()
+    assert f"missing controlled file: {GUIDE_NAME}" in sync.check_integration(target)
 
 
 def test_check_detects_manual_drift_and_unexpected_controlled_files(tmp_path: Path) -> None:
