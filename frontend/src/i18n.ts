@@ -810,6 +810,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       import: {
         action: "从旧版本导入",
         planning: "正在等待选择旧版本…",
+        ready: "已准备好导入，请确认安全摘要。",
         cancelled: "已取消选择，未执行导入。",
         preservedStopped: "旧版本便携包将保留，绝不会删除或修改。导入期间，此服务必须保持已停止。",
         userFiles: "用户文件：{{count}} 个（{{bytes}} 字节）",
@@ -1682,6 +1683,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       import: {
         action: "Import previous version",
         planning: "Waiting for a previous version selection…",
+        ready: "Ready to import. Review the safe summary and confirm.",
         cancelled: "Selection cancelled. Nothing was imported.",
         preservedStopped: "The previous package is preserved and will never be deleted or modified. This worker must remain stopped during import.",
         userFiles: "User files: {{count}} ({{bytes}} bytes)",

@@ -109,12 +109,13 @@ interface PortableImportPendingPlan {
   planDigest: string;
   expiresAtMs: number;
   controlEpoch: number;
+  attemptNonce: symbol;
   identity: PortableImportIdentity;
 }
 
 export type PortableImportState =
   | { phase: "idle"; notice?: "cancelled" }
-  | { phase: "planning"; identity: PortableImportIdentity }
+  | { phase: "planning"; identity: PortableImportIdentity; attemptNonce: symbol; controlEpoch: number }
   | { phase: "awaiting-confirmation"; summary: PortableImportSummary; pending: PortableImportPendingPlan }
   | { phase: "applying"; summary: PortableImportSummary }
   | { phase: "success"; result: PortableImportApplyResponse }
@@ -184,8 +185,27 @@ export function beginPortableImport(
   state: PortableImportState,
   identity: PortableImportIdentity,
 ): PortableImportState {
+  return beginPortableImportAttempt(state, identity, Symbol("portable import attempt"), 0);
+}
+
+export function beginPortableImportAttempt(
+  state: PortableImportState,
+  identity: PortableImportIdentity,
+  attemptNonce: symbol,
+  controlEpoch: number,
+): PortableImportState {
   if (portableImportLocksCard(state)) return state;
-  return { phase: "planning", identity };
+  return { phase: "planning", identity, attemptNonce, controlEpoch };
+}
+
+export function rebindPortableImportPlanningEpoch(
+  state: PortableImportState,
+  attemptNonce: symbol,
+  controlEpoch: number,
+): PortableImportState {
+  if (state.phase !== "planning" || state.attemptNonce !== attemptNonce) return state;
+  if (state.controlEpoch === controlEpoch) return state;
+  return { ...state, controlEpoch };
 }
 
 export function receivePortableImportPlan(
@@ -195,6 +215,22 @@ export function receivePortableImportPlan(
   controlEpoch: number,
 ): PortableImportState {
   if (state.phase !== "planning") return state;
+  const rebound = rebindPortableImportPlanningEpoch(state, state.attemptNonce, controlEpoch);
+  return receivePortableImportPlanAttempt(rebound, response, nowMs, controlEpoch, state.attemptNonce);
+}
+
+export function receivePortableImportPlanAttempt(
+  state: PortableImportState,
+  response: PortableImportPlanResult,
+  nowMs: number,
+  controlEpoch: number,
+  attemptNonce: symbol,
+): PortableImportState {
+  if (
+    state.phase !== "planning"
+    || state.attemptNonce !== attemptNonce
+    || state.controlEpoch !== controlEpoch
+  ) return state;
   if ("status" in response) return { phase: "idle", notice: "cancelled" };
   if (response.expires_in_seconds <= 0) return { phase: "expired" };
   return {
@@ -205,6 +241,7 @@ export function receivePortableImportPlan(
       planDigest: response.plan_digest,
       expiresAtMs: nowMs + response.expires_in_seconds * 1000,
       controlEpoch,
+      attemptNonce,
       identity: state.identity,
     },
   };
@@ -249,6 +286,15 @@ export function failPortableImport(state: PortableImportState, errorKey: string)
   return { phase: "error", errorKey };
 }
 
+export function failPortableImportPlanAttempt(
+  state: PortableImportState,
+  attemptNonce: symbol,
+  errorKey: string,
+): PortableImportState {
+  if (state.phase !== "planning" || state.attemptNonce !== attemptNonce) return state;
+  return { phase: "error", errorKey };
+}
+
 function samePortableImportIdentity(
   expected: PortableImportIdentity,
   current: PortableImportIdentity | null,
@@ -268,9 +314,9 @@ export function invalidatePortableImport(
   controlEpoch?: number,
 ): PortableImportState {
   if (
-    state.phase === "awaiting-confirmation"
+    (state.phase === "planning" || state.phase === "awaiting-confirmation")
     && controlEpoch !== undefined
-    && state.pending.controlEpoch !== controlEpoch
+    && (state.phase === "planning" ? state.controlEpoch : state.pending.controlEpoch) !== controlEpoch
   ) {
     return { phase: "error", errorKey: "portableServices.import.error.controlChanged" };
   }
@@ -281,12 +327,36 @@ export function invalidatePortableImport(
   return { phase: "error", errorKey: "portableServices.import.error.changed" };
 }
 
+export function expirePortableImportPlan(
+  state: PortableImportState,
+  attemptNonce: symbol,
+  deadlineMs: number,
+  expectedIdentity: PortableImportIdentity,
+  nowMs: number,
+): PortableImportState {
+  if (
+    state.phase !== "awaiting-confirmation"
+    || state.pending.attemptNonce !== attemptNonce
+    || state.pending.expiresAtMs !== deadlineMs
+    || !samePortableImportIdentity(state.pending.identity, expectedIdentity)
+    || nowMs < deadlineMs
+  ) return state;
+  return { phase: "expired" };
+}
+
 export function resetPortableImport(_state: PortableImportState): PortableImportState {
   return initialPortableImportState();
 }
 
 export function portableImportLocksCard(state: PortableImportState): boolean {
   return state.phase === "planning" || state.phase === "awaiting-confirmation" || state.phase === "applying";
+}
+
+export function shouldShowPortableLifecycleProgress(
+  state: PortableImportState,
+  progress: number | undefined,
+): boolean {
+  return typeof progress === "number" && !portableImportLocksCard(state);
 }
 
 const IMPORT_ERROR_KEYS: Record<string, string> = {
@@ -322,12 +392,12 @@ export async function withPortableImportControlEpoch<T>(
 export async function withPortableImportPlanControlEpoch<T>(
   acquireToken: (force: boolean) => Promise<string>,
   currentEpoch: () => number,
-  run: (token: string) => Promise<T>,
+  run: (token: string, controlEpoch: number) => Promise<T>,
 ): Promise<{ value: T; controlEpoch: number }> {
   let usedEpoch: number | null = null;
   const value = await withControlTokenRetry(acquireToken, (token) => {
     usedEpoch = currentEpoch();
-    return run(token);
+    return run(token, usedEpoch);
   });
   if (usedEpoch === null || currentEpoch() !== usedEpoch) throw new PortableImportControlEpochError();
   return { value, controlEpoch: usedEpoch };
