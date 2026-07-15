@@ -120,6 +120,7 @@ export interface PortableImportInlineProps {
   retryDescribedBy?: string;
   confirmButtonRef?: RefObject<HTMLButtonElement | null>;
   retryButtonRef?: RefObject<HTMLButtonElement | null>;
+  resultStatusRef?: RefObject<HTMLParagraphElement | null>;
 }
 
 export function PortableImportInline({
@@ -131,6 +132,7 @@ export function PortableImportInline({
   retryDescribedBy,
   confirmButtonRef,
   retryButtonRef,
+  resultStatusRef,
 }: PortableImportInlineProps) {
   const { i18n, t } = useTranslation();
   const number = useMemo(() => new Intl.NumberFormat(i18n.language), [i18n.language]);
@@ -147,7 +149,7 @@ export function PortableImportInline({
   }
   if (state.phase === "success") {
     return (
-      <p className="portable-import-status portable-import-success" role="status">
+      <p ref={resultStatusRef} className="portable-import-status portable-import-success" role="status" tabIndex={-1}>
         {t("portableServices.import.success", {
           copied: number.format(state.result.copied_user_files),
           reused: number.format(state.result.reused_assets.length),
@@ -163,7 +165,7 @@ export function PortableImportInline({
       : state.errorKey;
     return (
       <div className="portable-import-result">
-        <p className="portable-import-error" role="alert">{t(messageKey)}</p>
+        <p ref={resultStatusRef} className="portable-import-error" role="alert" tabIndex={-1}>{t(messageKey)}</p>
         <button
           ref={retryButtonRef}
           type="button"
@@ -259,6 +261,7 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
   const planningAttemptRef = useRef<{ nonce: symbol; controller: AbortController } | null>(null);
   const importTriggerRef = useRef<HTMLButtonElement>(null);
   const importConfirmRef = useRef<HTMLButtonElement>(null);
+  const importResultStatusRef = useRef<HTMLParagraphElement>(null);
   const restoreImportFocusRef = useRef(false);
   const announcedReadyNonceRef = useRef<symbol | null>(null);
   const cursorRef = useRef(0);
@@ -323,11 +326,23 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
     }
     if (
       restoreImportFocusRef.current
-      && (importState.phase === "idle" || importState.phase === "error" || importState.phase === "expired")
-      && importTriggerRef.current
+      && (
+        importState.phase === "idle"
+        || importState.phase === "error"
+        || importState.phase === "expired"
+        || importState.phase === "success"
+      )
     ) {
-      importTriggerRef.current.focus();
-      restoreImportFocusRef.current = false;
+      const enabledTrigger = importTriggerRef.current && !importTriggerRef.current.disabled
+        ? importTriggerRef.current
+        : null;
+      const target = importState.phase === "success"
+        ? importResultStatusRef.current ?? enabledTrigger
+        : enabledTrigger ?? importResultStatusRef.current;
+      if (target) {
+        target.focus();
+        restoreImportFocusRef.current = false;
+      }
     }
   }, [importState, onLiveMessage, t]);
 
@@ -584,6 +599,7 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
       onLiveMessage(t(errorKey));
       return;
     }
+    restoreImportFocusRef.current = true;
     updateImportState(completePortableImport(importStateRef.current, result));
     onLiveMessage(t("portableServices.import.success", {
       copied: result.copied_user_files,
@@ -769,6 +785,7 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
         retryDescribedBy={importReasonId}
         confirmButtonRef={importConfirmRef}
         retryButtonRef={importTriggerRef}
+        resultStatusRef={importResultStatusRef}
       />
 
       {lastEvent ? <p className="portable-next-action"><strong>{t("portableServices.nextAction")}:</strong> {lastEvent.message}</p> : null}

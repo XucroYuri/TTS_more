@@ -232,7 +232,9 @@ describe("local portable import DOM lifecycle", () => {
       });
     await renderPanel();
     const gpt = card(container, "gpt-sovits");
-    await act(async () => button(gpt, "Import previous version").click());
+    const importTrigger = button(gpt, "Import previous version");
+    importTrigger.focus();
+    await act(async () => importTrigger.click());
 
     currentRuntimes = [
       { ...stoppedRuntimes[0], ready: true, supervisor_state: "running" },
@@ -241,6 +243,11 @@ describe("local portable import DOM lifecycle", () => {
     await act(async () => button(container, "Refresh").click());
     await flush();
     expect(signals[0]?.aborted).toBe(true);
+    const invalidatedAlert = gpt.querySelector<HTMLElement>(".portable-import-error");
+    expect(invalidatedAlert).toBeTruthy();
+    expect(button(gpt, "Choose previous version again").disabled).toBe(true);
+    expect(document.activeElement).toBe(invalidatedAlert);
+    expect(document.activeElement).not.toBe(document.body);
 
     currentRuntimes = stoppedRuntimes;
     await act(async () => button(container, "Refresh").click());
@@ -290,7 +297,10 @@ describe("local portable import DOM lifecycle", () => {
     await act(async () => button(gpt, "Confirm import").click());
     await flush();
 
-    expect(gpt.textContent).toContain("Import complete");
+    const successStatus = gpt.querySelector<HTMLElement>(".portable-import-success");
+    expect(successStatus?.textContent).toContain("Import complete");
+    expect(document.activeElement).toBe(successStatus);
+    expect(document.activeElement).not.toBe(document.body);
     expect(container.querySelector(".portable-panel-live")?.textContent).toContain("Import complete");
     expect(container.querySelector(".portable-panel-live")?.textContent).not.toContain("did not complete");
     expect(apiMocks.applyImport).toHaveBeenCalledTimes(1);
