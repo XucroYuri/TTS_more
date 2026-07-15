@@ -479,36 +479,44 @@ def install_local_control(
         )
         locator = endpoint.portable_locator
         assert locator is not None
-        previous_override = next(
-            (
-                item.portable_locator.port_override
-                for item in current_services()
-                if item.portable_locator is not None
-                and item.portable_locator.component == payload.component
-            ),
-            None,
-        )
-        effective_override = (
-            payload.port_override if payload.port_override is not None else previous_override
-        )
-        endpoint = endpoint.model_copy(
-            update={
-                "portable_locator": locator.model_copy(
+        supervisor = app.state.supervisor
+        try:
+            with supervisor.portable_lifecycle_guard(payload.component):
+                previous_services = current_services()
+                previous_override = next(
+                    (
+                        item.portable_locator.port_override
+                        for item in previous_services
+                        if item.portable_locator is not None
+                        and item.portable_locator.component == payload.component
+                    ),
+                    None,
+                )
+                effective_override = (
+                    payload.port_override
+                    if payload.port_override is not None
+                    else previous_override
+                )
+                endpoint = endpoint.model_copy(
                     update={
-                        "relative_to_tts_more": _relative_sibling(root, Path(descriptor.package_root)),
-                        "port_override": effective_override,
+                        "portable_locator": locator.model_copy(
+                            update={
+                                "relative_to_tts_more": _relative_sibling(
+                                    root, Path(descriptor.package_root)
+                                ),
+                                "port_override": effective_override,
+                            }
+                        )
                     }
                 )
-            }
-        )
-        store = current_store()
-        try:
-            initial_services = current_services() if not store.path.exists() else []
-            services = store.replace_component(
-                endpoint,
-                initial_services=initial_services,
-                publish=refresh_services,
-            )
+                store = current_store()
+                initial_services = previous_services if not store.path.exists() else []
+                services = store.replace_component(
+                    endpoint,
+                    initial_services=initial_services,
+                    publish=refresh_services,
+                )
+                import_plans.invalidate_component(payload.component)
         except ServicePostCommitError:
             _raise_error(
                 500,
