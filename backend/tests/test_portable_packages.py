@@ -532,6 +532,134 @@ def test_release_audit_rejects_nested_t7_model_weight(tmp_path: Path) -> None:
     assert any("forbidden release asset" in error for error in report["errors"])
 
 
+@pytest.mark.parametrize(
+    "git_metadata_path",
+    (
+        "third_party/Matcha-TTS/.git",
+        "third_party/Matcha-TTS/.git/config",
+    ),
+)
+def test_release_audit_rejects_nested_git_metadata(
+    tmp_path: Path, git_metadata_path: str
+) -> None:
+    packages = _load_portable_packages()
+    archive_path = tmp_path / f"nested-git-{len(list(tmp_path.iterdir()))}.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "Component/package/tts-more-package.json",
+            json.dumps(
+                {"schema_version": 2, "component": "cosyvoice", "package_profile": "bootstrap"}
+            ),
+        )
+        archive.writestr(f"Component/{git_metadata_path}", b"git metadata")
+
+    report = packages.audit_release_zip(archive_path)
+
+    assert report["valid"] is False
+    assert any("forbidden release asset" in error for error in report["errors"])
+
+
+def test_worker_bootstrap_recursively_excludes_nested_submodule_gitdir(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("real worker Bootstrap gitdir cleanup test requires PowerShell")
+    worker_root = tmp_path / "worker"
+    _load_sync_integrations().sync_integration(REPO_ROOT, worker_root, "cosyvoice", "a" * 40)
+    _initialize_git_repository(worker_root)
+
+    submodule_root = worker_root / "third_party" / "Matcha-TTS"
+    submodule_git_dir = tmp_path / "submodule-git"
+    submodule_root.mkdir(parents=True)
+    _run_checked(
+        [
+            "git",
+            "init",
+            "--quiet",
+            f"--separate-git-dir={submodule_git_dir}",
+            str(submodule_root),
+        ],
+        worker_root,
+    )
+    _run_checked(["git", "config", "user.name", "Portable Submodule Test"], submodule_root)
+    _run_checked(
+        ["git", "config", "user.email", "portable-submodule-test@example.invalid"],
+        submodule_root,
+    )
+    (submodule_root / "matcha.py").write_text("MATCHA_FIXTURE = True\n", encoding="utf-8")
+    _run_checked(["git", "add", "matcha.py"], submodule_root)
+    _run_checked(["git", "commit", "--quiet", "-m", "submodule fixture"], submodule_root)
+    submodule_revision = subprocess.check_output(
+        ["git", "-C", str(submodule_root), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+
+    gitdir_file = submodule_root / ".git"
+    assert gitdir_file.is_file()
+    assert (
+        subprocess.check_output(
+            ["git", "-C", str(submodule_root), "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        == submodule_revision
+    )
+    component_path = worker_root / "tts_more" / "component.json"
+    component = json.loads(component_path.read_text(encoding="utf-8"))
+    component["submodules"] = {"third_party/Matcha-TTS": submodule_revision}
+    component_path.write_text(json.dumps(component, indent=2) + "\n", encoding="utf-8")
+    _run_checked(["git", "add", "tts_more/component.json", "third_party/Matcha-TTS"], worker_root)
+    _run_checked(["git", "commit", "--quiet", "-m", "wire submodule fixture"], worker_root)
+    source_gitdir = gitdir_file.read_bytes()
+
+    version = "0.2.0-gitdir-contract"
+    output_root = tmp_path / "output"
+    _run_checked(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(worker_root / "Build-Package.ps1"),
+            "-Profile",
+            "Bootstrap",
+            "-Device",
+            "CPU",
+            "-Version",
+            version,
+            "-OutputRoot",
+            str(output_root),
+        ],
+        worker_root,
+        env={**os.environ, "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve())},
+    )
+
+    archives = list(output_root.glob("*.zip"))
+    assert len(archives) == 1
+    packages = _load_portable_packages()
+    assert packages.audit_release_zip(archives[0])["valid"] is True
+    with zipfile.ZipFile(archives[0]) as archive:
+        git_entries = [
+            name
+            for name in archive.namelist()
+            if ".git" in {part.casefold() for part in name.replace("\\", "/").split("/")}
+        ]
+        assert not git_entries
+        archive.extractall(tmp_path / "extracted")
+        package_root = tmp_path / "extracted" / archive.namelist()[0].split("/", 1)[0]
+    assert packages.verify_sha256_manifest(package_root)["valid"] is True
+
+    staged_root = (
+        worker_root
+        / "artifacts"
+        / "portable"
+        / ".work"
+        / "cosyvoice-bootstrap"
+        / f"cosyvoice-{version}-windows-x64-bootstrap"
+    )
+    assert not [path for path in staged_root.rglob("*") if path.name.casefold() == ".git"]
+    assert gitdir_file.read_bytes() == source_gitdir
+
+
 def test_worker_bootstrap_removes_tracked_nested_t7_before_packaging(tmp_path: Path) -> None:
     if POWERSHELL is None:
         pytest.skip("real worker Bootstrap cleanup test requires PowerShell")
