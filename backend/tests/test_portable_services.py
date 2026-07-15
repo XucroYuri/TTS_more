@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -625,6 +626,47 @@ def test_store_upsert_is_concurrent_unique_and_deterministic(tmp_path: Path) -> 
     identities = [(item.portable_locator.component, item.portable_locator.package_id) for item in loaded]  # type: ignore[union-attr]
     assert identities == sorted(set(identities))
     assert len(identities) == 3
+
+
+def test_replace_component_is_one_atomic_transaction_under_a_barrier(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    controller.mkdir()
+    gpt_a = _write_package(tmp_path / "GPT A", component="gpt-sovits", package_id="gpt-a")
+    gpt_b = _write_package(tmp_path / "GPT B", component="gpt-sovits", package_id="gpt-b")
+    index = _write_package(tmp_path / "Index", component="indextts", package_id="index-main")
+    legacy = TTSServiceEndpoint(service_id="legacy", base_url="http://127.0.0.1:9000")
+    index_endpoint = _endpoint(_locator("indextts", "index-main", index))
+    PortableServiceStore(controller).save([legacy, index_endpoint])
+    barrier = threading.Barrier(2)
+
+    def replace(package_id: str, package: Path) -> None:
+        barrier.wait(timeout=5)
+        PortableServiceStore(controller).replace_component(
+            _endpoint(_locator("gpt-sovits", package_id, package))
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(replace, "gpt-a", gpt_a),
+            pool.submit(replace, "gpt-b", gpt_b),
+        ]
+        for future in futures:
+            future.result(timeout=10)
+
+    loaded = PortableServiceStore(controller).load()
+    gpt = [
+        item
+        for item in loaded
+        if item.portable_locator is not None
+        and item.portable_locator.component == "gpt-sovits"
+    ]
+    assert len(gpt) == 1
+    assert gpt[0].portable_locator.package_id in {"gpt-a", "gpt-b"}
+    assert any(item.service_id == "legacy" for item in loaded)
+    assert any(
+        item.portable_locator is not None and item.portable_locator.component == "indextts"
+        for item in loaded
+    )
 
 
 def test_empty_store_lock_is_initialized_only_after_exclusive_lock(monkeypatch, tmp_path: Path) -> None:

@@ -46,6 +46,7 @@ TOKEN_ENV_VAR = "TTS_MORE_API_TOKEN"
 # GET routes that are nonetheless sensitive (network egress / heavy ops) and
 # must be token-gated even though they use GET. Matched as path prefixes.
 _PROTECTED_GET_PREFIXES = (
+    "/api/local-control",
     "/api/local-portable-services",
     "/api/open-source-tts/detect",
     "/api/services/",  # covers /test, /start, /stop, /start-and-wait, /logs
@@ -59,7 +60,6 @@ _PROTECTED_GET_PREFIXES = (
 
 # Path prefixes that are always open (read-only, needed for frontend boot).
 _OPEN_PREFIXES = (
-    "/api/local-control/token",
     "/api/auth/status",
     "/api/health",
     "/api/repos",
@@ -69,6 +69,8 @@ _OPEN_PREFIXES = (
     "/openapi.json",
     "/redoc",
 )
+
+_OPEN_EXACT_PATHS = {"/api/local-control/token"}
 
 
 def get_configured_token() -> str | None:
@@ -83,18 +85,28 @@ def is_auth_enabled() -> bool:
 
 def _path_needs_token(path: str, method: str) -> bool:
     """Decide whether a request path/method requires a token."""
+    if method == "OPTIONS":
+        return False
+    if path in _OPEN_EXACT_PATHS:
+        return False
     # Open paths never need a token.
     for prefix in _OPEN_PREFIXES:
-        if path == prefix or path.startswith(prefix.rstrip("/") + "/") or path.startswith(prefix):
+        if _matches_prefix(path, prefix):
             return False
     # Non-GET (POST/PUT/DELETE/PATCH) on /api/* always needs a token.
     if method != "GET" and path.startswith("/api/"):
         return True
     # Specific GET prefixes that egress/network or are sensitive.
     for prefix in _PROTECTED_GET_PREFIXES:
-        if path.startswith(prefix):
+        if _matches_prefix(path, prefix):
             return True
     return False
+
+
+def _matches_prefix(path: str, prefix: str) -> bool:
+    if prefix.endswith("/"):
+        return path.startswith(prefix)
+    return path == prefix or path.startswith(prefix + "/")
 
 
 def _extract_bearer(request: Request) -> str | None:

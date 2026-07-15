@@ -9,6 +9,8 @@ import re
 import secrets
 import stat
 import subprocess
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Iterator, Literal, Sequence
@@ -105,6 +107,105 @@ class LocalActionRequest(_StrictRequest):
 RefreshServices = Callable[[Sequence[TTSServiceEndpoint]], None]
 
 
+class LocalControlMiddleware:
+    """Guard local control from raw ASGI metadata before consuming a bounded body."""
+
+    def __init__(self, app: Any, *, token: str) -> None:
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or not _is_local_control_path(str(scope.get("path", ""))):
+            await self.app(scope, receive, send)
+            return
+        if str(scope.get("method", "GET")).upper() == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+        token = None if scope.get("path") == "/api/local-control/token" else self.token
+        if not _valid_local_scope(scope, token=token):
+            await _error_response(
+                403,
+                "LOCAL_CONTROL_FORBIDDEN",
+                "local control is unavailable",
+            )(scope, receive, send)
+            return
+        length_values = _raw_header_values(scope, b"content-length")
+        if len(length_values) > 1:
+            await _error_response(
+                400,
+                "LOCAL_CONTROL_INVALID_REQUEST",
+                "request validation failed",
+            )(scope, receive, send)
+            return
+        if length_values:
+            raw_length = _ascii_header(length_values[0], maximum=20)
+            if raw_length is None or not raw_length.isdigit():
+                await _error_response(
+                    400,
+                    "LOCAL_CONTROL_INVALID_REQUEST",
+                    "request validation failed",
+                )(scope, receive, send)
+                return
+            if int(raw_length) > MAX_LOCAL_CONTROL_BODY_BYTES:
+                await _error_response(
+                    413,
+                    "LOCAL_CONTROL_REQUEST_TOO_LARGE",
+                    "request body is too large",
+                )(scope, receive, send)
+                return
+        method = str(scope.get("method", "GET")).upper()
+        if method not in {"POST", "PUT", "PATCH"}:
+            await self.app(scope, receive, send)
+            return
+        buffered: list[dict[str, Any]] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                await _error_response(
+                    400,
+                    "LOCAL_CONTROL_INVALID_REQUEST",
+                    "request body is incomplete",
+                )(scope, _empty_receive, send)
+                return
+            body = message.get("body", b"")
+            if not isinstance(body, bytes):
+                await _error_response(
+                    400,
+                    "LOCAL_CONTROL_INVALID_REQUEST",
+                    "request validation failed",
+                )(scope, _empty_receive, send)
+                return
+            total += len(body)
+            if total > MAX_LOCAL_CONTROL_BODY_BYTES:
+                await _error_response(
+                    413,
+                    "LOCAL_CONTROL_REQUEST_TOO_LARGE",
+                    "request body is too large",
+                )(scope, _empty_receive, send)
+                return
+            buffered.append(
+                {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": bool(message.get("more_body", False)),
+                }
+            )
+            if not message.get("more_body", False):
+                break
+        index = 0
+
+        async def replay() -> dict[str, Any]:
+            nonlocal index
+            if index < len(buffered):
+                message = buffered[index]
+                index += 1
+                return message
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await self.app(scope, replay, send)
+
+
 def install_local_control(
     app: FastAPI,
     *,
@@ -117,33 +218,7 @@ def install_local_control(
     token = secrets.token_urlsafe(32)
     app.state.local_control_token = token
     app.state.local_control_root = root
-
-    @app.middleware("http")
-    async def bound_local_control_body(request: Request, call_next):
-        if _is_local_control_path(request.url.path):
-            raw_length = request.headers.get("content-length")
-            if raw_length:
-                try:
-                    if int(raw_length) > MAX_LOCAL_CONTROL_BODY_BYTES:
-                        return _error_response(
-                            413,
-                            "LOCAL_CONTROL_REQUEST_TOO_LARGE",
-                            "request body is too large",
-                        )
-                except ValueError:
-                    return _error_response(
-                        400,
-                        "LOCAL_CONTROL_INVALID_REQUEST",
-                        "request validation failed",
-                    )
-            body = await request.body()
-            if len(body) > MAX_LOCAL_CONTROL_BODY_BYTES:
-                return _error_response(
-                    413,
-                    "LOCAL_CONTROL_REQUEST_TOO_LARGE",
-                    "request body is too large",
-                )
-        return await call_next(request)
+    app.add_middleware(LocalControlMiddleware, token=token)
 
     @app.exception_handler(RequestValidationError)
     async def local_validation_error(request: Request, exc: RequestValidationError):
@@ -320,16 +395,8 @@ def install_local_control(
         )
         store = current_store()
         try:
-            existing = store.load() if store.path.exists() else current_services()
-            retained = [
-                item
-                for item in existing
-                if item.portable_locator is None
-                or item.portable_locator.component != payload.component
-            ]
-            if retained != existing or not store.path.exists():
-                store.save(retained)
-            services = store.upsert(endpoint)
+            initial_services = current_services() if not store.path.exists() else []
+            services = store.replace_component(endpoint, initial_services=initial_services)
             refresh_services(services)
         except (OSError, ValueError, json.JSONDecodeError):
             _raise_error(
@@ -436,11 +503,261 @@ def install_local_control(
         return _checked_control_result(result)
 
 
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("per_process_user_time_limit", ctypes.c_longlong),
+        ("per_job_user_time_limit", ctypes.c_longlong),
+        ("limit_flags", ctypes.c_uint32),
+        ("minimum_working_set_size", ctypes.c_size_t),
+        ("maximum_working_set_size", ctypes.c_size_t),
+        ("active_process_limit", ctypes.c_uint32),
+        ("affinity", ctypes.c_size_t),
+        ("priority_class", ctypes.c_uint32),
+        ("scheduling_class", ctypes.c_uint32),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("read_operation_count", ctypes.c_ulonglong),
+        ("write_operation_count", ctypes.c_ulonglong),
+        ("other_operation_count", ctypes.c_ulonglong),
+        ("read_transfer_count", ctypes.c_ulonglong),
+        ("write_transfer_count", ctypes.c_ulonglong),
+        ("other_transfer_count", ctypes.c_ulonglong),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("basic_limit_information", _JobObjectBasicLimitInformation),
+        ("io_info", _IoCounters),
+        ("process_memory_limit", ctypes.c_size_t),
+        ("job_memory_limit", ctypes.c_size_t),
+        ("peak_process_memory_used", ctypes.c_size_t),
+        ("peak_job_memory_used", ctypes.c_size_t),
+    ]
+
+
+class _WindowsSelectorJob:
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise OSError("Windows Job Objects are unavailable")
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._ntdll = ctypes.WinDLL("ntdll")
+        self._configure_api()
+        handle = self._kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+        self.handle = int(handle)
+        limits = _JobObjectExtendedLimitInformation()
+        limits.basic_limit_information.limit_flags = self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self._kernel32.SetInformationJobObject(
+            ctypes.c_void_p(self.handle),
+            self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes.get_last_error()
+            self.close()
+            raise OSError(error, "SetInformationJobObject failed")
+
+    def _configure_api(self) -> None:
+        self._kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        self._kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        self._kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        self._kernel32.SetInformationJobObject.restype = ctypes.c_int
+        self._kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self._kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+        self._kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self._kernel32.TerminateJobObject.restype = ctypes.c_int
+        self._kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self._kernel32.CloseHandle.restype = ctypes.c_int
+        self._ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
+        self._ntdll.NtResumeProcess.restype = ctypes.c_long
+
+    def assign(self, process: subprocess.Popen[bytes]) -> None:
+        process_handle = ctypes.c_void_p(int(getattr(process, "_handle")))
+        if not self._kernel32.AssignProcessToJobObject(
+            ctypes.c_void_p(self.handle), process_handle
+        ):
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+
+    def resume(self, process: subprocess.Popen[bytes]) -> None:
+        process_handle = ctypes.c_void_p(int(getattr(process, "_handle")))
+        status = int(self._ntdll.NtResumeProcess(process_handle))
+        if status != 0:
+            raise OSError(status, "NtResumeProcess failed")
+
+    def terminate(self) -> None:
+        if self.handle:
+            self._kernel32.TerminateJobObject(ctypes.c_void_p(self.handle), 1)
+
+    def close(self) -> None:
+        if getattr(self, "handle", 0):
+            self._kernel32.CloseHandle(ctypes.c_void_p(self.handle))
+            self.handle = 0
+
+
+def _run_bounded_selector(
+    command: Sequence[str],
+    *,
+    cwd: str | Path,
+    env: dict[str, str],
+    timeout: float,
+    output_limit: int,
+    stdin: Any = subprocess.DEVNULL,
+    stdout: Any = subprocess.PIPE,
+    stderr: Any = subprocess.PIPE,
+    shell: bool = False,
+    check: bool = False,
+    creationflags: int = 0,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one suspended Windows selector with bounded pipes and a kill-on-close job."""
+
+    del check
+    if os.name != "nt" or shell or stdin is not subprocess.DEVNULL:
+        raise OSError("unsafe folder selector process configuration")
+    if stdout is not subprocess.PIPE or stderr is not subprocess.PIPE:
+        raise OSError("folder selector pipes are required")
+    if output_limit < 1 or timeout <= 0:
+        raise ValueError("selector bounds must be positive")
+
+    job = _WindowsSelectorJob()
+    process: subprocess.Popen[bytes] | None = None
+    threads: list[threading.Thread] = []
+    out_buffer = bytearray()
+    err_buffer = bytearray()
+    overflow = threading.Event()
+    wake = threading.Event()
+    out_done = threading.Event()
+    err_done = threading.Event()
+
+    def read_bounded(pipe: Any, target: bytearray, done: threading.Event) -> None:
+        try:
+            while True:
+                reader = getattr(pipe, "read1", pipe.read)
+                chunk = reader(4096)
+                if not chunk:
+                    return
+                if len(target) + len(chunk) > output_limit:
+                    overflow.set()
+                    wake.set()
+                    return
+                target.extend(chunk)
+        finally:
+            done.set()
+            wake.set()
+
+    def terminate_tree() -> None:
+        job.terminate()
+        if process is not None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    try:
+        flags = int(creationflags)
+        flags |= int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        flags |= 0x00000004  # CREATE_SUSPENDED: attach the Job Object before selector code runs.
+        process = subprocess.Popen(
+            list(command),
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            creationflags=flags,
+            close_fds=False,
+        )
+        job.assign(process)
+        assert process.stdout is not None
+        assert process.stderr is not None
+        threads = [
+            threading.Thread(
+                target=read_bounded,
+                args=(process.stdout, out_buffer, out_done),
+                daemon=True,
+                name="folder-selector-stdout",
+            ),
+            threading.Thread(
+                target=read_bounded,
+                args=(process.stderr, err_buffer, err_done),
+                daemon=True,
+                name="folder-selector-stderr",
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        job.resume(process)
+        deadline = time.monotonic() + timeout
+        while True:
+            if overflow.is_set():
+                terminate_tree()
+                raise FolderSelectionError("LOCAL_CONTROL_FOLDER_OUTPUT_INVALID")
+            if process.poll() is not None and out_done.is_set() and err_done.is_set():
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate_tree()
+                raise FolderSelectionError("LOCAL_CONTROL_FOLDER_TIMEOUT")
+            wake.wait(min(remaining, 0.05))
+            wake.clear()
+        return subprocess.CompletedProcess(
+            list(command),
+            int(process.returncode),
+            bytes(out_buffer),
+            bytes(err_buffer),
+        )
+    except FolderSelectionError:
+        raise
+    except (OSError, ValueError):
+        if process is not None and process.poll() is None:
+            terminate_tree()
+        raise
+    finally:
+        if process is not None and process.poll() is None:
+            terminate_tree()
+        for pipe in (
+            getattr(process, "stdout", None),
+            getattr(process, "stderr", None),
+        ):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        for thread in threads:
+            thread.join(timeout=1)
+        job.close()
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
 def select_portable_folder(
     controller_root: Path,
     *,
     platform_name: str | None = None,
-    run: Callable[..., Any] = subprocess.run,
+    run: Callable[..., Any] | None = None,
     executable_resolver: Callable[[str], Path] | None = None,
 ) -> Path | None:
     """Invoke only the fixed package selector and parse one bounded path result."""
@@ -476,7 +793,8 @@ def select_portable_folder(
                 selector, directory=False
             ) != selector_identity:
                 raise FolderSelectionError("LOCAL_CONTROL_FOLDER_IDENTITY_CHANGED")
-            completed = run(
+            runner = run or _run_bounded_selector
+            completed = runner(
                 command,
                 cwd=str(powershell.parent),
                 env=_selector_environment(),
@@ -487,6 +805,7 @@ def select_portable_folder(
                 shell=False,
                 check=False,
                 creationflags=_no_window_creation_flags(),
+                output_limit=MAX_FOLDER_OUTPUT_BYTES,
             )
     except FolderSelectionError:
         raise
@@ -510,23 +829,15 @@ def select_portable_folder(
         text = stdout.decode("utf-8-sig", errors="strict").strip()
     except UnicodeError as exc:
         raise FolderSelectionError("LOCAL_CONTROL_FOLDER_OUTPUT_INVALID") from exc
-    if not text:
+    try:
+        payload = json.loads(text, object_pairs_hook=_unique_json_object)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise FolderSelectionError("LOCAL_CONTROL_FOLDER_OUTPUT_INVALID") from exc
+    if payload == {"cancelled": True}:
         return None
-    selected: object
-    if text.startswith("{"):
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise FolderSelectionError("LOCAL_CONTROL_FOLDER_OUTPUT_INVALID") from exc
-        if payload == {"cancelled": True}:
-            return None
-        if not isinstance(payload, dict) or set(payload) != {"selected_path"}:
-            raise FolderSelectionError("LOCAL_CONTROL_FOLDER_OUTPUT_INVALID")
-        selected = payload["selected_path"]
-    else:
-        if "\n" in text or "\r" in text:
-            raise FolderSelectionError("LOCAL_CONTROL_FOLDER_OUTPUT_INVALID")
-        selected = text
+    if not isinstance(payload, dict) or set(payload) != {"selected_path"}:
+        raise FolderSelectionError("LOCAL_CONTROL_FOLDER_OUTPUT_INVALID")
+    selected: object = payload["selected_path"]
     if not isinstance(selected, str):
         raise FolderSelectionError("LOCAL_CONTROL_FOLDER_OUTPUT_INVALID")
     selected_path = Path(_strict_absolute_path(selected, "selected_path"))
@@ -540,18 +851,63 @@ def select_portable_folder(
 
 
 def _require_local_request(request: Request, *, token: str | None) -> None:
-    client_host = request.client.host if request.client is not None else ""
-    if not _loopback_host(client_host):
+    if not _valid_local_scope(request.scope, token=token):
         _raise_error(403, "LOCAL_CONTROL_FORBIDDEN", "local control is unavailable")
-    if not _local_authority(request.headers.get("host", "")):
-        _raise_error(403, "LOCAL_CONTROL_FORBIDDEN", "local control is unavailable")
-    origin = request.headers.get("origin")
-    if origin is not None and not _local_origin(origin):
-        _raise_error(403, "LOCAL_CONTROL_FORBIDDEN", "local control is unavailable")
-    if token is not None:
-        provided = request.headers.get(CONTROL_HEADER, "")
-        if not hmac.compare_digest(provided, token):
-            _raise_error(403, "LOCAL_CONTROL_FORBIDDEN", "local control is unavailable")
+
+
+def _valid_local_scope(scope: dict[str, Any], *, token: str | None) -> bool:
+    client = scope.get("client")
+    client_host = client[0] if isinstance(client, (tuple, list)) and client else ""
+    if not isinstance(client_host, str) or not _loopback_host(client_host):
+        return False
+    host_values = _raw_header_values(scope, b"host")
+    origin_values = _raw_header_values(scope, b"origin")
+    control_values = _raw_header_values(scope, CONTROL_HEADER.casefold().encode("ascii"))
+    if len(host_values) != 1 or len(origin_values) > 1:
+        return False
+    raw_host = _ascii_header(host_values[0], maximum=512)
+    if raw_host is None or not _local_authority(raw_host):
+        return False
+    if origin_values:
+        raw_origin = _ascii_header(origin_values[0], maximum=2048)
+        if raw_origin is None or not _local_origin(raw_origin):
+            return False
+    if token is None:
+        return len(control_values) == 0
+    if len(control_values) != 1:
+        return False
+    provided = _ascii_header(control_values[0], maximum=256)
+    if provided is None:
+        return False
+    return hmac.compare_digest(provided, token)
+
+
+def _raw_header_values(scope: dict[str, Any], name: bytes) -> list[bytes]:
+    values: list[bytes] = []
+    raw_headers = scope.get("headers", [])
+    if not isinstance(raw_headers, (tuple, list)):
+        return values
+    for item in raw_headers:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        raw_name, raw_value = item
+        if not isinstance(raw_name, bytes) or not isinstance(raw_value, bytes):
+            continue
+        if raw_name.lower() == name:
+            values.append(raw_value)
+    return values
+
+
+def _ascii_header(raw: bytes, *, maximum: int) -> str | None:
+    if not raw or len(raw) > maximum:
+        return None
+    try:
+        value = raw.decode("ascii", errors="strict")
+    except UnicodeError:
+        return None
+    if any(ord(character) < 33 or ord(character) > 126 for character in value):
+        return None
+    return value
 
 
 def _loopback_host(host: str) -> bool:
@@ -562,36 +918,60 @@ def _loopback_host(host: str) -> bool:
 
 
 def _local_authority(raw: str) -> bool:
-    if not raw or any(character.isspace() or ord(character) < 32 for character in raw):
+    if not raw or "%" in raw or any(character in raw for character in "@/\\?#"):
         return False
-    if any(character in raw for character in "@/\\?#"):
+    host: str
+    port_text: str | None = None
+    if raw.startswith("["):
+        closing = raw.find("]")
+        if closing <= 1:
+            return False
+        host = raw[1:closing]
+        remainder = raw[closing + 1 :]
+        if remainder:
+            if not remainder.startswith(":"):
+                return False
+            port_text = remainder[1:]
+        if "]" in remainder or "[" in host or "]" in host:
+            return False
+    else:
+        if raw.count(":") > 1:
+            return False
+        if ":" in raw:
+            host, port_text = raw.rsplit(":", 1)
+        else:
+            host = raw
+    if not host or (port_text is not None and not _valid_port(port_text)):
         return False
-    try:
-        parsed = urlsplit(f"http://{raw}")
-        _ = parsed.port
-    except ValueError:
-        return False
-    return parsed.username is None and parsed.password is None and _local_hostname(parsed.hostname)
+    return _local_hostname(host)
 
 
 def _local_origin(raw: str) -> bool:
-    if not raw or raw == "null" or any(ord(character) < 32 for character in raw):
+    if (
+        not raw
+        or raw == "null"
+        or "%" in raw
+        or "\\" in raw
+        or "@" in raw
+    ):
         return False
     try:
         parsed = urlsplit(raw)
-        _ = parsed.port
     except ValueError:
         return False
     return (
         parsed.scheme in {"http", "https"}
         and bool(parsed.netloc)
-        and parsed.username is None
-        and parsed.password is None
         and parsed.path == ""
         and not parsed.query
         and not parsed.fragment
-        and _local_hostname(parsed.hostname)
+        and raw.startswith(parsed.scheme + "://")
+        and _local_authority(parsed.netloc)
     )
+
+
+def _valid_port(raw: str) -> bool:
+    return raw.isdigit() and 1 <= int(raw) <= 65535
 
 
 def _local_hostname(hostname: str | None) -> bool:
@@ -818,7 +1198,13 @@ def _no_window_creation_flags() -> int:
 
 
 def _is_local_control_path(path: str) -> bool:
-    return path == "/api/local-control/token" or path.startswith("/api/local-portable-services")
+    return path == "/api/local-control/token" or path == "/api/local-portable-services" or path.startswith(
+        "/api/local-portable-services/"
+    )
+
+
+async def _empty_receive() -> dict[str, object]:
+    return {"type": "http.request", "body": b"", "more_body": False}
 
 
 def _error_response(status: int, code: str, message: str) -> JSONResponse:

@@ -55,10 +55,12 @@ class ServiceSupervisor:
         project_root: Path,
         runtime_root: Path,
         *,
+        portable_controller_root: Path | None = None,
         portable_controller: PortablePackageController | None = None,
         portable_resolver=None,
     ) -> None:
         self.project_root = project_root.resolve()
+        self.portable_controller_root = (portable_controller_root or project_root).resolve()
         self.runtime_root = runtime_root
         self.records_dir = runtime_root / "services"
         self.logs_dir = runtime_root / "logs"
@@ -228,7 +230,7 @@ class ServiceSupervisor:
         lock = self._portable_lock(identity)
         with lock:
             try:
-                descriptor = self._portable_resolver(self.project_root, locator, [])
+                descriptor = self._portable_resolver(self.portable_controller_root, locator, [])
                 if (
                     descriptor is None
                     or not descriptor.manageable

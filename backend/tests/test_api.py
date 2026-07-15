@@ -3117,3 +3117,16 @@ def test_portable_controller_root_is_derived_from_packaged_module_layout(tmp_pat
     resolved = _portable_controller_root(Path("data"), packaged_app)
 
     assert resolved == package
+
+
+def test_create_app_wires_one_portable_controller_root_to_both_resolution_layers(tmp_path: Path) -> None:
+    controller_root = tmp_path / "moved suite"
+    controller_root.mkdir()
+
+    app = create_app(
+        data_root=tmp_path / "data",
+        controller_root=controller_root,
+    )
+
+    assert app.state.local_control_root == controller_root.resolve()
+    assert app.state.supervisor.portable_controller_root == controller_root.resolve()

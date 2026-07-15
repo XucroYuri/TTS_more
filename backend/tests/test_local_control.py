@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
+import asyncio
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
+import app.local_control as local_control
 from app.local_control import FolderSelectionError, select_portable_folder
 from app.main import create_app
 
@@ -115,6 +120,50 @@ def _control(token: str) -> dict[str, str]:
     return {CONTROL_HEADER: token}
 
 
+def _raw_asgi_request(
+    app,
+    *,
+    path: str,
+    method: str = "GET",
+    headers: list[tuple[bytes, bytes]] | None = None,
+    chunks: list[bytes] | None = None,
+    client_host: str = "127.0.0.1",
+) -> tuple[int, list[tuple[bytes, bytes]], bytes, int]:
+    sent: list[dict[str, object]] = []
+    bodies = list(chunks or [b""])
+    receive_count = 0
+
+    async def receive() -> dict[str, object]:
+        nonlocal receive_count
+        receive_count += 1
+        body = bodies.pop(0) if bodies else b""
+        return {"type": "http.request", "body": body, "more_body": bool(bodies)}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers or [(b"host", b"127.0.0.1:8000")],
+        "client": (client_host, 51000),
+        "server": ("127.0.0.1", 8000),
+    }
+    asyncio.run(app(scope, receive, send))
+    start = next(item for item in sent if item["type"] == "http.response.start")
+    body = b"".join(
+        item.get("body", b"") for item in sent if item["type"] == "http.response.body"
+    )
+    return int(start["status"]), list(start.get("headers", [])), body, receive_count
+
+
 @pytest.mark.parametrize(
     ("client_host", "base_url"),
     (
@@ -158,6 +207,72 @@ def test_token_ignores_forwarded_loopback_for_lan_client(tmp_path: Path) -> None
         headers={"X-Forwarded-For": "127.0.0.1", "Forwarded": "for=127.0.0.1"},
     )
     assert response.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "raw_headers",
+    (
+        [(b"host", b"127.0.0.1:8000"), (b"host", b"localhost:8000")],
+        [(b"host", b"127.0.0.1:8000"), (b"origin", b"http://localhost"), (b"origin", b"http://127.0.0.1")],
+        [(b"host", b"127.0.0.1:8000"), (b"host", b"127.0.0.1:8000"), (b"origin", b"http://localhost")],
+    ),
+)
+def test_token_rejects_duplicate_security_headers(
+    tmp_path: Path, raw_headers: list[tuple[bytes, bytes]]
+) -> None:
+    client = _client(tmp_path / "TTS More")
+    status, _headers, body, _reads = _raw_asgi_request(
+        client.app,
+        path="/api/local-control/token",
+        headers=raw_headers,
+    )
+    assert status == 403
+    assert json.loads(body)["detail"]["code"] == "LOCAL_CONTROL_FORBIDDEN"
+
+
+def test_control_route_rejects_duplicate_control_token_header(tmp_path: Path) -> None:
+    client = _client(tmp_path / "TTS More")
+    token = _token(client).encode("ascii")
+    status, _headers, _body, reads = _raw_asgi_request(
+        client.app,
+        path="/api/local-portable-services",
+        headers=[
+            (b"host", b"127.0.0.1:8000"),
+            (b"x-tts-more-control", token),
+            (b"x-tts-more-control", token),
+        ],
+    )
+    assert status == 403
+    assert reads == 0
+
+
+@pytest.mark.parametrize(
+    "header",
+    (
+        (b"host", b"localhost:0"),
+        (b"host", b"localhost:65536"),
+        (b"host", b"localhost:%38%30"),
+        (b"host", b"localh\xffst:8000"),
+        (b"origin", b"http://localhost:0"),
+        (b"origin", b"http://localhost:65536"),
+        (b"origin", b"http://localh\xffst:5173"),
+    ),
+)
+def test_security_headers_reject_malformed_ports_percent_and_non_ascii(
+    tmp_path: Path, header: tuple[bytes, bytes]
+) -> None:
+    raw = [(b"host", b"127.0.0.1:8000")]
+    if header[0] == b"host":
+        raw = [header]
+    else:
+        raw.append(header)
+    status, _headers, body, _reads = _raw_asgi_request(
+        _client(tmp_path / "TTS More").app,
+        path="/api/local-control/token",
+        headers=raw,
+    )
+    assert status == 403
+    assert b"Traceback" not in body
 
 
 @pytest.mark.parametrize(
@@ -256,6 +371,91 @@ def test_existing_bearer_auth_cannot_replace_local_control_token(
         headers={**bearer, **_control(token)},
         json={},
     ).status_code == 200
+
+
+def test_cors_preflight_never_executes_action_and_needs_no_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TTS_MORE_API_TOKEN", "global-bearer")
+    client = _client(tmp_path / "TTS More")
+    fake = _FakeSupervisor()
+    client.app.state.supervisor = fake
+
+    response = client.options(
+        "/api/local-portable-services/gpt-sovits/start",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,x-tts-more-control,content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert fake.calls == []
+
+
+def test_streaming_body_guard_rejects_before_receiving_any_body(tmp_path: Path) -> None:
+    client = _client(tmp_path / "TTS More")
+    status, _headers, _body, reads = _raw_asgi_request(
+        client.app,
+        path="/api/local-portable-services/discover",
+        method="POST",
+        headers=[(b"host", b"127.0.0.1:8000")],
+        chunks=[b'{"roots":[]}'],
+    )
+    assert status == 403
+    assert reads == 0
+
+
+def test_streaming_body_guard_stops_at_first_chunk_over_limit(tmp_path: Path) -> None:
+    client = _client(tmp_path / "TTS More")
+    token = client.app.state.local_control_token.encode("ascii")
+    status, _headers, body, reads = _raw_asgi_request(
+        client.app,
+        path="/api/local-portable-services/discover",
+        method="POST",
+        headers=[
+            (b"host", b"127.0.0.1:8000"),
+            (b"content-type", b"application/json"),
+            (b"x-tts-more-control", token),
+        ],
+        chunks=[b"x" * 40_000, b"y" * 30_000, b"must-not-be-read"],
+    )
+    assert status == 413
+    assert json.loads(body)["detail"]["code"] == "LOCAL_CONTROL_REQUEST_TOO_LARGE"
+    assert reads == 2
+
+
+def test_streaming_body_guard_replays_bounded_multichunk_json(tmp_path: Path) -> None:
+    client = _client(tmp_path / "TTS More")
+    token = client.app.state.local_control_token.encode("ascii")
+    status, _headers, body, reads = _raw_asgi_request(
+        client.app,
+        path="/api/local-portable-services/discover",
+        method="POST",
+        headers=[
+            (b"host", b"127.0.0.1:8000"),
+            (b"content-type", b"application/json"),
+            (b"x-tts-more-control", token),
+        ],
+        chunks=[b'{"roo', b'ts":[]}'],
+    )
+    assert status == 200
+    assert json.loads(body) == {"packages": []}
+    assert reads == 2
+
+
+def test_near_prefix_paths_are_not_treated_as_local_control_routes(tmp_path: Path) -> None:
+    client = _client(tmp_path / "TTS More")
+    status, _headers, _body, reads = _raw_asgi_request(
+        client.app,
+        path="/api/local-portable-services-evil",
+        method="POST",
+        headers=[(b"host", b"evil.test")],
+        chunks=[b"not consumed by local control middleware"],
+    )
+    assert status in {404, 405}
+    assert reads == 0
 
 
 @pytest.mark.parametrize(
@@ -371,6 +571,10 @@ def test_register_freshly_validates_identity_persists_locator_and_lists_service(
     package = _write_package(suite / "GPT 移动包", component="gpt-sovits", package_id="gpt-main")
     client = _client(controller)
     headers = _control(_token(client))
+    existing_ids = {
+        item["service_id"]
+        for item in client.get("/api/local-portable-services", headers=headers).json()["services"]
+    }
 
     registered = client.post(
         "/api/local-portable-services/register",
@@ -391,6 +595,7 @@ def test_register_freshly_validates_identity_persists_locator_and_lists_service(
     listed = client.get("/api/local-portable-services", headers=headers)
     assert listed.status_code == 200
     assert any(item["package_id"] == "gpt-main" for item in listed.json()["services"])
+    assert existing_ids.issubset({item["service_id"] for item in listed.json()["services"]})
     persisted = json.loads((controller / "data/local/services.json").read_text(encoding="utf-8"))
     portable = next(item for item in persisted["services"] if item.get("portable_locator"))
     assert portable["portable_locator"]["absolute_path_last_seen"] == str(package.resolve())
@@ -684,6 +889,129 @@ def _selector_root(tmp_path: Path) -> Path:
     return root
 
 
+def _raw_http_request(port: int, request: bytes) -> tuple[int, bytes, bytes]:
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
+        connection.sendall(request)
+        response = bytearray()
+        while True:
+            chunk = connection.recv(8192)
+            if not chunk:
+                break
+            response.extend(chunk)
+    headers, _, body = bytes(response).partition(b"\r\n\r\n")
+    status = int(headers.split(b"\r\n", 1)[0].split()[1])
+    return status, headers, body
+
+
+def test_real_httptools_rejects_ambiguous_headers_and_allows_bearer_cors_preflight(
+    tmp_path: Path,
+) -> None:
+    controller_root = tmp_path / "TTS More"
+    controller_root.mkdir()
+    data_root = tmp_path / "data"
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    backend_root = Path(__file__).resolve().parents[1]
+    server_code = (
+        "import sys,uvicorn;"
+        "from pathlib import Path;"
+        "from app.main import create_app;"
+        "app=create_app(data_root=Path(sys.argv[1]),controller_root=Path(sys.argv[2]));"
+        "uvicorn.run(app,host='127.0.0.1',port=int(sys.argv[3]),http='httptools',"
+        "log_level='critical',access_log=False)"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(backend_root)
+    env["TTS_MORE_API_TOKEN"] = "integration-secret"
+    server = subprocess.Popen(
+        [sys.executable, "-c", server_code, str(data_root), str(controller_root), str(port)],
+        cwd=str(backend_root.parent),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            if server.poll() is not None:
+                pytest.fail(f"uvicorn exited early with {server.returncode}")
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    pytest.fail("uvicorn did not accept loopback connections")
+                time.sleep(0.05)
+
+        token_status, _, token_body = _raw_http_request(
+            port,
+            (
+                f"GET /api/local-control/token HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii"),
+        )
+        assert token_status == 200
+        control_token = json.loads(token_body)["token"]
+
+        cors_status, cors_headers, _ = _raw_http_request(
+            port,
+            (
+                f"OPTIONS /api/local-portable-services HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                "Origin: http://localhost:5173\r\n"
+                "Access-Control-Request-Method: GET\r\n"
+                "Access-Control-Request-Headers: authorization,x-tts-more-control\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii"),
+        )
+        assert cors_status == 200
+        assert b"access-control-allow-origin: http://localhost:5173" in cors_headers.lower()
+
+        duplicate_host, _, duplicate_host_body = _raw_http_request(
+            port,
+            (
+                f"GET /api/local-control/token HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                "Host: evil.test\r\nConnection: close\r\n\r\n"
+            ).encode("ascii"),
+        )
+        assert duplicate_host in {400, 403}
+        assert b'"token"' not in duplicate_host_body
+
+        protected_base = (
+            f"GET /api/local-portable-services HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            "Origin: http://localhost:5173\r\n"
+            "Authorization: Bearer integration-secret\r\n"
+        )
+        duplicate_origin, _, _ = _raw_http_request(
+            port,
+            (
+                protected_base
+                + "Origin: http://evil.test\r\n"
+                + f"{CONTROL_HEADER}: {control_token}\r\nConnection: close\r\n\r\n"
+            ).encode("ascii"),
+        )
+        assert duplicate_origin == 403
+
+        duplicate_control, _, _ = _raw_http_request(
+            port,
+            (
+                protected_base
+                + f"{CONTROL_HEADER}: {control_token}\r\n"
+                + f"{CONTROL_HEADER}: {control_token}\r\nConnection: close\r\n\r\n"
+            ).encode("ascii"),
+        )
+        assert duplicate_control == 403
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait(timeout=5)
+
+
 def test_folder_selector_uses_absolute_system_powershell_and_fixed_script_only(
     tmp_path: Path,
 ) -> None:
@@ -744,6 +1072,134 @@ def test_folder_selector_has_stable_platform_exit_and_output_errors(
         )
     assert caught.value.code == code
     assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("case", ("raw", "duplicate-path", "duplicate-cancelled", "cancelled-extra", "path-extra", "empty"))
+def test_folder_selector_accepts_only_one_strict_json_object(
+    tmp_path: Path, case: str
+) -> None:
+    root = _selector_root(tmp_path)
+    selected = tmp_path / "selected"
+    selected.mkdir()
+    encoded_path = json.dumps(str(selected))
+    outputs = {
+        "raw": str(selected).encode("utf-8"),
+        "duplicate-path": f'{{"selected_path":{encoded_path},"selected_path":{encoded_path}}}'.encode("utf-8"),
+        "duplicate-cancelled": b'{"cancelled":true,"cancelled":true}',
+        "cancelled-extra": b'{"cancelled":true,"extra":false}',
+        "path-extra": f'{{"selected_path":{encoded_path},"extra":false}}'.encode("utf-8"),
+        "empty": b"",
+    }
+
+    with pytest.raises(FolderSelectionError) as caught:
+        select_portable_folder(
+            root,
+            platform_name="nt",
+            run=lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=0,
+                stdout=outputs[case],
+                stderr=b"",
+            ),
+            executable_resolver=lambda _name: Path(
+                "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+            ),
+        )
+
+    assert caught.value.code == "LOCAL_CONTROL_FOLDER_OUTPUT_INVALID"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object process-tree control is platform-specific")
+@pytest.mark.parametrize("stream", ("stdout", "stderr"))
+def test_bounded_selector_terminates_immediately_when_either_stream_overflows(
+    tmp_path: Path, stream: str
+) -> None:
+    target = "sys.stdout.buffer" if stream == "stdout" else "sys.stderr.buffer"
+    command = [
+        sys.executable,
+        "-c",
+        f"import sys,time; {target}.write(b'x'*4096); {target}.flush(); time.sleep(30)",
+    ]
+    started = time.monotonic()
+
+    with pytest.raises(FolderSelectionError) as caught:
+        local_control._run_bounded_selector(
+            command,
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            timeout=10,
+            output_limit=1024,
+        )
+
+    assert caught.value.code == "LOCAL_CONTROL_FOLDER_OUTPUT_INVALID"
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object process-tree control is platform-specific")
+def test_bounded_selector_returns_both_bounded_streams_without_communicate(tmp_path: Path) -> None:
+    completed = local_control._run_bounded_selector(
+        [
+            sys.executable,
+            "-c",
+            "import sys;sys.stdout.buffer.write(b'out');sys.stderr.buffer.write(b'err')",
+        ],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        timeout=5,
+        output_limit=1024,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == b"out"
+    assert completed.stderr == b"err"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object process-tree control is platform-specific")
+def test_bounded_selector_timeout_kills_descendant_process_tree(tmp_path: Path) -> None:
+    child_pid_file = tmp_path / "child.pid"
+    parent_code = (
+        "import pathlib,subprocess,sys,time;"
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']);"
+        f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid),encoding='ascii');"
+        "time.sleep(30)"
+    )
+
+    with pytest.raises(FolderSelectionError) as caught:
+        local_control._run_bounded_selector(
+            [sys.executable, "-c", parent_code],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            timeout=1,
+            output_limit=1024,
+        )
+
+    assert caught.value.code == "LOCAL_CONTROL_FOLDER_TIMEOUT"
+    assert child_pid_file.is_file()
+    child_pid = int(child_pid_file.read_text(encoding="ascii"))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _windows_process_is_running(child_pid):
+        time.sleep(0.05)
+    assert not _windows_process_is_running(child_pid)
+
+
+def _windows_process_is_running(pid: int) -> bool:
+    ctypes = __import__("ctypes")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return False
+    exit_code = ctypes.c_uint32()
+    try:
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == 259
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def test_folder_selector_reports_timeout_without_echoing_process_output(tmp_path: Path) -> None:

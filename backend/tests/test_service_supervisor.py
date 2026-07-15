@@ -353,6 +353,34 @@ def test_supervisor_routes_every_portable_action_through_fresh_resolver(tmp_path
     assert all(call[1] is resolved for call in controller.calls)
 
 
+def test_supervisor_uses_independent_portable_controller_root_for_every_resolution(tmp_path: Path) -> None:
+    legacy_project_root = tmp_path / "moved suite" / "app"
+    portable_controller_root = legacy_project_root.parent
+    resolution_roots: list[Path] = []
+
+    def resolver(root, _locator, _search):
+        resolution_roots.append(root)
+        return _descriptor(package_root=str(portable_controller_root / "GPT-SoVITS"))
+
+    supervisor = ServiceSupervisor(
+        project_root=legacy_project_root,
+        portable_controller_root=portable_controller_root,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=FakePortableController(),
+        portable_resolver=resolver,
+    )
+    endpoint = _portable_endpoint()
+
+    assert supervisor.start(
+        endpoint,
+        operation_id="11111111-1111-4111-8111-111111111111",
+    )["status"] == "starting"
+    assert supervisor.status(endpoint)["status"] == "ready"
+    assert resolution_roots == [portable_controller_root.resolve()] * 2
+    assert supervisor.project_root == legacy_project_root.resolve()
+    assert supervisor.portable_controller_root == portable_controller_root.resolve()
+
+
 @pytest.mark.parametrize(
     "endpoint,resolved",
     [

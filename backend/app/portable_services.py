@@ -285,6 +285,58 @@ class PortableServiceStore:
         self._baseline = list(resolved)
         return resolved
 
+    def replace_component(
+        self,
+        endpoint: TTSServiceEndpoint,
+        *,
+        initial_services: Sequence[TTSServiceEndpoint | dict[str, object]] = (),
+    ) -> list[TTSServiceEndpoint]:
+        """Atomically replace every portable record for one component."""
+
+        validated = TTSServiceEndpoint.model_validate(endpoint)
+        locator = validated.portable_locator
+        if validated.control_kind != "portable-package" or locator is None:
+            raise ValueError("portable component replacement requires a portable-package locator")
+        path = self._safe_path(create_parent=True)
+        initial = self._validate_services(list(initial_services))
+        resolved: list[TTSServiceEndpoint] = []
+
+        def replace(current: ServiceDocument) -> ServiceDocument:
+            descriptor = resolve_locator(self.controller_root, locator, []) or _inspect_locator(
+                self.controller_root, locator, []
+            )
+            if descriptor is None:
+                raise ValueError(
+                    "portable service locator does not identify a complete schema v2 package"
+                )
+            trusted = self._apply_descriptor(validated, descriptor)
+            source = current.services if current.services else initial
+            existing = [
+                self._sanitize_loaded(item)
+                for item in self._validate_services(source)
+            ]
+            retained = [
+                item
+                for item in existing
+                if item.portable_locator is None
+                or item.portable_locator.component != locator.component
+            ]
+            retained.append(trusted)
+            retained.sort(key=_service_sort_key)
+            published = preflight_service_endpoints(retained)
+            resolved[:] = published
+            return ServiceDocument(
+                STORE_SCHEMA_VERSION,
+                [
+                    sanitize_portable_endpoint(item).model_dump(mode="json")
+                    for item in published
+                ],
+            )
+
+        update_service_document(path, replace, default_schema_version=STORE_SCHEMA_VERSION)
+        self._baseline = list(resolved)
+        return resolved
+
     def _safe_path(self, *, create_parent: bool) -> Path:
         root = self.controller_root
         if not root.is_dir():

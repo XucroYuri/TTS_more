@@ -119,8 +119,12 @@ def create_app(
     queue = ServiceGenerationQueue(service_router)
     job_manager = GenerationJobManager(queue, store)
     ref_root = Path(reference_audio_root)
-    supervisor = ServiceSupervisor(project_root=project_root, runtime_root=Path(runtime_root) if runtime_root else Path(data_root) / ".runtime")
     portable_controller_root = Path(controller_root) if controller_root is not None else _portable_controller_root(Path(data_root), project_root)
+    supervisor = ServiceSupervisor(
+        project_root=project_root,
+        portable_controller_root=portable_controller_root,
+        runtime_root=Path(runtime_root) if runtime_root else Path(data_root) / ".runtime",
+    )
 
     app.state.store = store
     app.state.parser = parser
