@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +22,25 @@ def _load_sync():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _run_copied_contract_after_mutation(sync, target: Path) -> subprocess.CompletedProcess[str]:
+    manifest_path = target / "tts_more" / "integration.manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"] = {
+        relative: sync.sha256_file(target / relative)
+        for relative in manifest["files"]
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(target), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(target), "config", "core.autocrlf", "false"], check=True)
+    subprocess.run(["git", "-C", str(target), "add", "--all"], check=True)
+    return subprocess.run(
+        [sys.executable, str(target / "tts_more" / "tests" / "test_portable_integration.py"), "-v"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: Path) -> None:
@@ -129,6 +154,150 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
         assert "tts_more\\Invoke-PortableStart.ps1" in start
         assert (target / "tts_more" / "Start-Worker.ps1").is_file()
         assert native_entry in native
+
+
+@pytest.mark.parametrize(
+    ("relative", "active", "replacement"),
+    (
+        (
+            "Start.cmd",
+            'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*',
+            'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Noop.ps1" %*\n'
+            'rem powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$operationsRoot = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.data.operations) -Label "data.operations"',
+            '$operationsRoot = Join-Path $resolvedRoot "data\\local\\operations"\n'
+            '                # $operationsRoot = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.data.operations) -Label "data.operations"',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$serviceScript = if ($component -eq "tts-more") { Join-Path $resolvedRoot "scripts\\start-production.ps1" } else { Join-Path $bundle "Start-Worker.ps1" }',
+            '$serviceScript = if ($component -eq "tts-more") { Join-Path $resolvedRoot "scripts\\start-production.ps1" } else { Join-Path $bundle "Noop.ps1" }\n'
+            '    # $serviceScript = if ($component -eq "tts-more") { Join-Path $resolvedRoot "scripts\\start-production.ps1" } else { Join-Path $bundle "Start-Worker.ps1" }',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$result = Invoke-ChildPowerShell -Script $context.ServiceScript -Arguments $arguments',
+            '$result = Invoke-ChildPowerShell -Script $context.InitializeScript -Arguments $arguments\n'
+            '    # $result = Invoke-ChildPowerShell -Script $context.ServiceScript -Arguments $arguments',
+        ),
+        (
+            "tts_more/Start-Worker.ps1",
+            '$Python = Join-Path $Root "runtime\\live\\python.exe"',
+            '$Python = "python.exe"\n# $Python = Join-Path $Root "runtime\\live\\python.exe"',
+        ),
+        (
+            "tts_more/Start-Worker.ps1",
+            '$process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru',
+            '$process = Start-Process -FilePath "python.exe" -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru\n'
+            '# $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$serviceScript = if ($component -eq "tts-more") { Join-Path $resolvedRoot "scripts\\start-production.ps1" } else { Join-Path $bundle "Start-Worker.ps1" }',
+            '$serviceScript = if ($component -ne "tts-more") { Join-Path $resolvedRoot "scripts\\start-production.ps1" } else { Join-Path $bundle "Start-Worker.ps1" }\n'
+            '    # $serviceScript = if ($component -eq "tts-more") { Join-Path $resolvedRoot "scripts\\start-production.ps1" } else { Join-Path $bundle "Start-Worker.ps1" }',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'OperationsRoot = [IO.Path]::GetFullPath($operationsRoot)',
+            'OperationsRoot = [IO.Path]::GetFullPath((Join-Path $resolvedRoot "data\\local\\operations"))\n'
+            '        # OperationsRoot = [IO.Path]::GetFullPath($operationsRoot)',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$lockPath = Join-Path $context.OperationsRoot ".start.lock"',
+            '$lockPath = Join-Path $Root ".start.lock"\n'
+            '    # $lockPath = Join-Path $context.OperationsRoot ".start.lock"',
+        ),
+        (
+            "tts_more/Start-Worker.ps1",
+            '$Python = Join-Path $Root "runtime\\live\\python.exe"',
+            'if ($false) { $Python = Join-Path $Root "runtime\\live\\python.exe" }',
+        ),
+        (
+            "tts_more/Start-Worker.ps1",
+            '$process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru',
+            'if ($false) { $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru }',
+        ),
+    ),
+)
+def test_copied_contract_rejects_commented_decoys_and_mutated_active_control_flow(
+    tmp_path: Path,
+    relative: str,
+    active: str,
+    replacement: str,
+) -> None:
+    if os.name != "nt" and shutil.which("pwsh") is None:
+        pytest.skip("source mutation harness requires PowerShell AST support")
+    sync = _load_sync()
+    target = tmp_path / "mutated fork"
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "9" * 40)
+    path = target / relative
+    source = path.read_text(encoding="utf-8")
+    assert source.count(active) == 1
+    path.write_text(source.replace(active, replacement), encoding="utf-8")
+
+    result = _run_copied_contract_after_mutation(sync, target)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, (
+        f"active mutation escaped the copied contract: {relative}\n{combined}"
+    )
+    hash_lines = [
+        line
+        for line in combined.splitlines()
+        if line.startswith("test_controlled_mirror_has_no_hash_drift ")
+    ]
+    assert len(hash_lines) == 1 and hash_lines[0].endswith("... ok"), combined
+    semantic_test = (
+        "test_package_entrypoints_and_native_webui_are_separate"
+        if relative == "Start.cmd"
+        else "test_controller_uses_manifest_operations_worker_delegate_and_private_runtime"
+    )
+    semantic_lines = [
+        line
+        for line in combined.splitlines()
+        if line.startswith(f"{semantic_test} ")
+    ]
+    assert len(semantic_lines) == 1 and semantic_lines[0].endswith("... FAIL"), combined
+
+
+def test_copied_contract_requires_operations_assignment_in_schema_v2_branch(tmp_path: Path) -> None:
+    if os.name != "nt" and shutil.which("pwsh") is None:
+        pytest.skip("source mutation harness requires PowerShell AST support")
+    sync = _load_sync()
+    target = tmp_path / "wrong schema branch fork"
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "8" * 40)
+    controller = target / "tts_more" / "Invoke-PortableStart.ps1"
+    source = controller.read_text(encoding="utf-8")
+    correct = (
+        '$operationsRoot = Resolve-PortablePackagePath -Root $resolvedRoot '
+        '-RelativePath ([string]$manifest.data.operations) -Label "data.operations"'
+    )
+    fallback = '$operationsRoot = Join-Path $resolvedRoot "data\\local\\operations"'
+    schema_else = "        } else {\n            " + fallback
+    assert source.count(correct) == 1
+    assert source.count(schema_else) == 1
+    source = source.replace(correct, fallback)
+    source = source.replace(schema_else, "        } else {\n            " + correct)
+    controller.write_text(source, encoding="utf-8")
+
+    result = _run_copied_contract_after_mutation(sync, target)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, f"schema-v2 branch mutation escaped the copied contract\n{combined}"
+    assert any(
+        line.startswith("test_controlled_mirror_has_no_hash_drift ") and line.endswith("... ok")
+        for line in combined.splitlines()
+    ), combined
+    assert any(
+        line.startswith("test_controller_uses_manifest_operations_worker_delegate_and_private_runtime ")
+        and line.endswith("... FAIL")
+        for line in combined.splitlines()
+    ), combined
 
 
 def test_windows_templates_are_safe_for_cpu_only_hosts_and_optional_lock_fields() -> None:

@@ -2,17 +2,389 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "tts_more"
 
 
+def _git_tracked_paths(root: Path, expected: set[str] | dict[str, object]) -> set[str]:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "--",
+            *sorted(expected),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return set(completed.stdout.decode("utf-8", errors="strict").splitlines())
+
+
+def _active_cmd_lines(path: Path) -> list[str]:
+    active: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        if not line or lowered.startswith("rem ") or lowered.startswith("::"):
+            continue
+        if lowered in {"@echo off", "setlocal", "setlocal enableextensions"}:
+            continue
+        active.append(line)
+    return active
+
+
+_POWERSHELL_SEMANTIC_CONTRACT = r"""
+$ErrorActionPreference = "Stop"
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
+
+function Assert-Contract {
+    param([bool]$Condition, [string]$Message)
+    if (!$Condition) { throw $Message }
+}
+
+function Parse-ContractAst {
+    param([string]$Path)
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+    Assert-Contract ($errors.Count -eq 0) ("PowerShell parse failed: " + (($errors | ForEach-Object Message) -join "; "))
+    return $ast
+}
+
+function Get-ContractFunction {
+    param($Ast, [string]$Name)
+    $functions = @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object { $_.Name -ceq $Name })
+    Assert-Contract ($functions.Count -eq 1) ("expected one function: " + $Name)
+    return $functions[0]
+}
+
+function Get-ContractAssignments {
+    param($Ast, [string]$Variable)
+    return @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) | Where-Object {
+        $_.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Left.VariablePath.UserPath -ceq $Variable
+    })
+}
+
+function Get-ContractCommands {
+    param($Ast, [string]$Name)
+    return @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) | Where-Object { $_.GetCommandName() -ceq $Name })
+}
+
+function Get-ContractParameterArgument {
+    param($Command, [string]$Name)
+    $elements = @($Command.CommandElements)
+    for ($index = 1; $index -lt $elements.Count; $index++) {
+        $element = $elements[$index]
+        if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and $element.ParameterName -ceq $Name) {
+            Assert-Contract ($index + 1 -lt $elements.Count) ("missing argument for parameter: " + $Name)
+            return $elements[$index + 1]
+        }
+    }
+    return $null
+}
+
+function Get-ContractMemberPath {
+    param($Node)
+    if ($Node -is [System.Management.Automation.Language.VariableExpressionAst]) {
+        return $Node.VariablePath.UserPath
+    }
+    if ($Node -is [System.Management.Automation.Language.MemberExpressionAst]) {
+        $prefix = Get-ContractMemberPath $Node.Expression
+        if ([string]::IsNullOrWhiteSpace($prefix)) { return "" }
+        return $prefix + "." + [string]$Node.Member.Value
+    }
+    return ""
+}
+
+function Test-ContractContainsMemberPath {
+    param($Ast, [string]$Expected)
+    foreach ($member in @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.MemberExpressionAst] }, $true))) {
+        if ((Get-ContractMemberPath $member) -ceq $Expected) { return $true }
+    }
+    return $false
+}
+
+function Test-ContractVariable {
+    param($Node, [string]$Expected)
+    return $Node -is [System.Management.Automation.Language.VariableExpressionAst] -and $Node.VariablePath.UserPath -ceq $Expected
+}
+
+function Test-ContractString {
+    param($Node, [string]$Expected)
+    return $Node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and [string]$Node.Value -ceq $Expected
+}
+
+function Test-ContractJoinPath {
+    param($Ast, [string]$RootVariable, [string]$RelativePath)
+    foreach ($command in @(Get-ContractCommands $Ast "Join-Path")) {
+        $elements = @($command.CommandElements)
+        if ($elements.Count -eq 3 -and (Test-ContractVariable $elements[1] $RootVariable) -and (Test-ContractString $elements[2] $RelativePath)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-ContractJoinPathMember {
+    param($Ast, [string]$RootMember, [string]$RelativePath)
+    foreach ($command in @(Get-ContractCommands $Ast "Join-Path")) {
+        $elements = @($command.CommandElements)
+        if ($elements.Count -eq 3 -and (Get-ContractMemberPath $elements[1]) -ceq $RootMember -and (Test-ContractString $elements[2] $RelativePath)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-ContractDescendantOf {
+    param($Node, $Ancestor)
+    $current = $Node
+    while ($null -ne $current) {
+        if ([object]::ReferenceEquals($current, $Ancestor)) { return $true }
+        $current = $current.Parent
+    }
+    return $false
+}
+
+function Test-ContractSchemaV2Ancestor {
+    param($Node)
+    $parent = $Node.Parent
+    while ($null -ne $parent) {
+        if ($parent -is [System.Management.Automation.Language.IfStatementAst]) {
+            foreach ($clause in $parent.Clauses) {
+                $condition = $clause.Item1
+                $hasSchema = Test-ContractContainsMemberPath $condition "manifest.schema_version"
+                $hasTwo = @($condition.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.ConstantExpressionAst] -and $candidate.Value -eq 2 }, $true)).Count -gt 0
+                $hasEquality = @($condition.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.BinaryExpressionAst] -and $candidate.Operator.ToString() -match "Eq$" }, $true)).Count -gt 0
+                if ($hasSchema -and $hasTwo -and $hasEquality -and (Test-ContractDescendantOf $Node $clause.Item2)) { return $true }
+            }
+        }
+        $parent = $parent.Parent
+    }
+    return $false
+}
+
+function Test-ContractVariableEqualsString {
+    param($Ast, [string]$Variable, [string]$Value)
+    $binaries = @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.BinaryExpressionAst] }, $true))
+    if ($binaries.Count -ne 1) { return $false }
+    $binary = $binaries[0]
+    return $binary.Operator.ToString() -match "Eq$" -and (Test-ContractVariable $binary.Left $Variable) -and (Test-ContractString $binary.Right $Value)
+}
+
+function Test-ContractTopLevelAssignment {
+    param($Assignment)
+    return $Assignment.Parent -is [System.Management.Automation.Language.NamedBlockAst] -and $Assignment.Parent.Parent -is [System.Management.Automation.Language.ScriptBlockAst]
+}
+
+function Test-ContractHashtableVariable {
+    param($Ast, [string]$Key, [string]$Variable)
+    $matches = 0
+    foreach ($table in @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.HashtableAst] }, $true))) {
+        $returned = $false
+        $parent = $table.Parent
+        while ($null -ne $parent) {
+            if ($parent -is [System.Management.Automation.Language.ReturnStatementAst]) { $returned = $true; break }
+            $parent = $parent.Parent
+        }
+        if (!$returned) { continue }
+        foreach ($pair in $table.KeyValuePairs) {
+            if (Test-ContractString $pair.Item1 $Key) {
+                $variables = @($pair.Item2.FindAll({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] -and $node.VariablePath.UserPath -ceq $Variable }, $true))
+                if ($variables.Count -gt 0) { $matches++ }
+            }
+        }
+    }
+    return $matches -eq 1
+}
+
+function Test-ContractCommandOutsideFunction {
+    param($Command)
+    $parent = $Command.Parent
+    while ($null -ne $parent) {
+        if ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false }
+        $parent = $parent.Parent
+    }
+    return $true
+}
+
+$controller = Parse-ContractAst $env:TTS_MORE_CONTRACT_CONTROLLER
+$worker = Parse-ContractAst $env:TTS_MORE_CONTRACT_WORKER
+$contextFunction = Get-ContractFunction $controller "Get-PackageContext"
+$serviceFunction = Get-ContractFunction $controller "Invoke-ServiceStart"
+$lockFunction = Get-ContractFunction $controller "Open-PackageOperationLock"
+
+$operationsMatches = @()
+$v2OperationsAssignments = @()
+foreach ($assignment in @(Get-ContractAssignments $contextFunction.Body "operationsRoot")) {
+    if (Test-ContractSchemaV2Ancestor $assignment) { $v2OperationsAssignments += $assignment }
+    foreach ($command in @(Get-ContractCommands $assignment.Right "Resolve-PortablePackagePath")) {
+        $relative = Get-ContractParameterArgument $command "RelativePath"
+        $label = Get-ContractParameterArgument $command "Label"
+        if ($null -ne $relative -and $null -ne $label -and (Test-ContractContainsMemberPath $relative "manifest.data.operations") -and (Test-ContractString $label "data.operations") -and (Test-ContractSchemaV2Ancestor $assignment)) {
+            $operationsMatches += $assignment
+        }
+    }
+}
+Assert-Contract ($v2OperationsAssignments.Count -eq 1) ("schema-v2 branch must assign operationsRoot exactly once; found " + $v2OperationsAssignments.Count)
+Assert-Contract ($operationsMatches.Count -eq 1) "schema-v2 data.operations is not the active operations root assignment"
+Assert-Contract (Test-ContractHashtableVariable $contextFunction.Body "OperationsRoot" "operationsRoot") "Get-PackageContext does not return the resolved operationsRoot"
+$lockAssignments = @(Get-ContractAssignments $lockFunction.Body "lockPath")
+Assert-Contract ($lockAssignments.Count -eq 1 -and (Test-ContractJoinPathMember $lockAssignments[0].Right "context.OperationsRoot" ".start.lock")) "operation lock does not consume context.OperationsRoot"
+
+$serviceAssignments = @(Get-ContractAssignments $contextFunction.Body "serviceScript")
+Assert-Contract ($serviceAssignments.Count -eq 1) "serviceScript must have exactly one active assignment"
+Assert-Contract ($serviceAssignments[0].Right -is [System.Management.Automation.Language.IfStatementAst]) "serviceScript assignment must select by component"
+$serviceSelector = $serviceAssignments[0].Right
+Assert-Contract ($serviceSelector.Clauses.Count -eq 1 -and (Test-ContractVariableEqualsString $serviceSelector.Clauses[0].Item1 "component" "tts-more")) "serviceScript selector must test component == tts-more"
+Assert-Contract (Test-ContractJoinPath $serviceSelector.Clauses[0].Item2 "resolvedRoot" "scripts\start-production.ps1") "TTS More serviceScript does not select scripts/start-production.ps1"
+Assert-Contract (Test-ContractJoinPath $serviceSelector.ElseClause "bundle" "Start-Worker.ps1") "fork serviceScript does not select the controlled Start-Worker.ps1"
+
+$delegates = @(Get-ContractCommands $serviceFunction.Body "Invoke-ChildPowerShell")
+Assert-Contract ($delegates.Count -eq 1) "Invoke-ServiceStart must delegate exactly once"
+$delegateScript = Get-ContractParameterArgument $delegates[0] "Script"
+$delegateArguments = Get-ContractParameterArgument $delegates[0] "Arguments"
+Assert-Contract ((Get-ContractMemberPath $delegateScript) -ceq "context.ServiceScript") "Invoke-ServiceStart does not pass context.ServiceScript"
+Assert-Contract (Test-ContractVariable $delegateArguments "arguments") "Invoke-ServiceStart does not pass the worker arguments array"
+$serviceCalls = @(Get-ContractCommands $controller "Invoke-ServiceStart" | Where-Object { Test-ContractCommandOutsideFunction $_ })
+Assert-Contract ($serviceCalls.Count -eq 1) "the controller main flow does not call Invoke-ServiceStart exactly once"
+
+$pythonAssignments = @(Get-ContractAssignments $worker "Python")
+Assert-Contract ($pythonAssignments.Count -eq 1) "worker Python must have exactly one active assignment"
+Assert-Contract (Test-ContractTopLevelAssignment $pythonAssignments[0]) "worker Python assignment is not an active top-level statement"
+Assert-Contract ($pythonAssignments[0].Right -is [System.Management.Automation.Language.PipelineAst]) "worker Python assignment is not a direct executable pipeline"
+Assert-Contract (Test-ContractJoinPath $pythonAssignments[0].Right "Root" "runtime\live\python.exe") "worker Python is not package-private runtime/live/python.exe"
+
+$argumentAssignments = @(Get-ContractAssignments $worker "arguments")
+Assert-Contract ($argumentAssignments.Count -eq 1) "worker arguments must have exactly one active assignment"
+Assert-Contract (Test-ContractTopLevelAssignment $argumentAssignments[0]) "worker arguments assignment is not an active top-level statement"
+Assert-Contract ($argumentAssignments[0].Right -is [System.Management.Automation.Language.CommandExpressionAst]) "worker arguments assignment is not a direct array expression"
+$argumentStrings = @($argumentAssignments[0].Right.FindAll({ param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value })
+Assert-Contract ($argumentStrings -ccontains "-m" -and $argumentStrings -ccontains "uvicorn") "worker arguments do not execute uvicorn as a module"
+Assert-Contract (Test-ContractContainsMemberPath $argumentAssignments[0].Right "config.module") "worker arguments do not use the configured worker module"
+
+$processAssignments = @(Get-ContractAssignments $worker "process")
+Assert-Contract ($processAssignments.Count -eq 1 -and (Test-ContractTopLevelAssignment $processAssignments[0])) "worker process assignment is not an active top-level statement"
+Assert-Contract ($processAssignments[0].Right -is [System.Management.Automation.Language.PipelineAst]) "worker process assignment is not a direct executable pipeline"
+$startProcesses = @(Get-ContractCommands $processAssignments[0].Right "Start-Process")
+Assert-Contract ($startProcesses.Count -eq 1) "worker must start exactly one service process from the top-level process assignment"
+$filePath = Get-ContractParameterArgument $startProcesses[0] "FilePath"
+$argumentList = Get-ContractParameterArgument $startProcesses[0] "ArgumentList"
+Assert-Contract (Test-ContractVariable $filePath "Python") "worker service process does not use package-private Python"
+Assert-Contract (Test-ContractVariable $argumentList "arguments") "worker service process does not use the uvicorn arguments"
+
+$forbiddenParameters = @($worker.FindAll({ param($node) $node -is [System.Management.Automation.Language.ParameterAst] -and $node.Name.VariablePath.UserPath -match "(?i)python" }, $true))
+$forbiddenOverrides = @($worker.FindAll({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] -and $node.VariablePath.UserPath -ceq "env:TTS_MORE_PYTHON_EXE" }, $true))
+$forbiddenStrings = @($worker.FindAll({ param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and ([string]$node.Value -match "(?i)\.venv" -or ($node.Parent -isnot [System.Management.Automation.Language.MemberExpressionAst] -and [string]$node.Value -in @("python", "python.exe", "py", "py.exe"))) }, $true))
+Assert-Contract ($forbiddenParameters.Count -eq 0) "worker accepts a Python override parameter"
+Assert-Contract ($forbiddenOverrides.Count -eq 0) "worker accepts TTS_MORE_PYTHON_EXE"
+Assert-Contract ($forbiddenStrings.Count -eq 0) "worker contains a system/.venv Python fallback"
+
+Write-Output "PORTABLE_CONTROL_FLOW_AST_OK"
+"""
+
+
+def _powershell_executable(platform_name: str | None = None) -> str:
+    platform_name = platform_name or os.name
+    system_root = os.environ.get("SystemRoot")
+    if platform_name == "nt" and system_root:
+        windows_powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        if windows_powershell.is_file():
+            return str(windows_powershell)
+    candidates = ("powershell.exe", "pwsh") if platform_name == "nt" else ("pwsh",)
+    for name in candidates:
+        executable = shutil.which(name)
+        if executable:
+            return executable
+    raise AssertionError("PowerShell 5.1 or PowerShell 7 is required for the portable integration contract")
+
+
+def _verify_powershell_control_flow(bundle: Path) -> None:
+    environment = os.environ.copy()
+    environment["TTS_MORE_CONTRACT_CONTROLLER"] = str(bundle / "Invoke-PortableStart.ps1")
+    environment["TTS_MORE_CONTRACT_WORKER"] = str(bundle / "Start-Worker.ps1")
+    with tempfile.TemporaryDirectory(prefix="tts-more-contract-") as directory:
+        verifier = Path(directory) / "verify-portable-control-flow.ps1"
+        verifier.write_text(_POWERSHELL_SEMANTIC_CONTRACT, encoding="utf-8-sig")
+        completed = subprocess.run(
+            [
+                _powershell_executable(),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(verifier),
+            ],
+            env=environment,
+            capture_output=True,
+            check=False,
+        )
+    stdout = completed.stdout.decode("utf-8", errors="replace")
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    if completed.returncode != 0:
+        raise AssertionError(f"PowerShell control-flow contract failed:\n{stdout}\n{stderr}")
+    if "PORTABLE_CONTROL_FLOW_AST_OK" not in stdout:
+        raise AssertionError(f"PowerShell control-flow contract returned no success marker:\n{stdout}\n{stderr}")
+
+
 class PortableIntegrationContractTests(unittest.TestCase):
+    def test_powershell_resolver_prefers_windows_51_and_falls_back_to_pwsh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            system_root = Path(directory)
+            windows_powershell = (
+                system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+            )
+            windows_powershell.parent.mkdir(parents=True)
+            windows_powershell.touch()
+            with mock.patch.dict(os.environ, {"SystemRoot": str(system_root)}, clear=True):
+                with mock.patch("shutil.which", return_value="C:/Tools/pwsh.exe"):
+                    self.assertEqual(str(windows_powershell), _powershell_executable("nt"))
+
+        def find_pwsh(name: str) -> str | None:
+            return "/usr/bin/pwsh" if name == "pwsh" else None
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("shutil.which", side_effect=find_pwsh):
+                self.assertEqual("/usr/bin/pwsh", _powershell_executable("posix"))
+            with mock.patch("shutil.which", return_value=None):
+                with self.assertRaisesRegex(AssertionError, "PowerShell 5.1 or PowerShell 7"):
+                    _powershell_executable("posix")
+
+    def test_git_tracked_paths_decodes_utf8_without_locale_dependency(self) -> None:
+        expected = {"Start.cmd", "使用说明-先看这里.txt"}
+        completed = subprocess.CompletedProcess(
+            args=["git"],
+            returncode=0,
+            stdout="Start.cmd\n使用说明-先看这里.txt\n".encode("utf-8"),
+            stderr=b"",
+        )
+
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            tracked = _git_tracked_paths(ROOT, expected)
+
+        self.assertEqual(expected, tracked)
+        self.assertIn("core.quotePath=false", run.call_args.args[0])
+        self.assertNotIn("text", run.call_args.kwargs)
+        self.assertNotIn("encoding", run.call_args.kwargs)
+
     def test_controlled_mirror_has_no_hash_drift(self) -> None:
         manifest = json.loads((BUNDLE / "integration.manifest.json").read_text(encoding="utf-8"))
         expected = manifest["files"]
@@ -27,23 +399,7 @@ class PortableIntegrationContractTests(unittest.TestCase):
             if path.is_file() and "__pycache__" not in path.parts and path.name != "integration.manifest.json"
         }
         self.assertEqual(controlled, {name for name in expected if name.startswith("tts_more/")})
-        tracked = set(
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(ROOT),
-                    "-c",
-                    "core.quotePath=false",
-                    "ls-files",
-                    "--",
-                    *sorted(expected),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.splitlines()
-        )
+        tracked = _git_tracked_paths(ROOT, expected)
         self.assertEqual(set(expected), tracked, "controlled integration files must be Git tracked")
 
     def test_package_entrypoints_and_native_webui_are_separate(self) -> None:
@@ -57,24 +413,22 @@ class PortableIntegrationContractTests(unittest.TestCase):
             "使用说明-先看这里.txt",
         ):
             self.assertTrue((ROOT / name).is_file(), name)
-        start = (ROOT / "Start.cmd").read_text(encoding="utf-8")
+        start_path = ROOT / "Start.cmd"
+        start = start_path.read_text(encoding="utf-8")
         webui = (ROOT / "Start-WebUI.cmd").read_text(encoding="utf-8")
-        self.assertIn("tts_more\\Invoke-PortableStart.ps1", start)
-        self.assertNotIn("Start-Worker.ps1", start)
+        active_scripts = [line for line in _active_cmd_lines(start_path) if ".ps1" in line.lower()]
+        self.assertEqual(
+            [
+                'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '
+                '"%~dp0tts_more\\Invoke-PortableStart.ps1" %*'
+            ],
+            active_scripts,
+        )
+        self.assertTrue(all("Start-Worker.ps1" not in line for line in _active_cmd_lines(start_path)))
         self.assertNotEqual(start, webui)
 
     def test_controller_uses_manifest_operations_worker_delegate_and_private_runtime(self) -> None:
-        controller = (BUNDLE / "Invoke-PortableStart.ps1").read_text(encoding="utf-8")
-        worker = (BUNDLE / "Start-Worker.ps1").read_text(encoding="utf-8")
-
-        self.assertIn('"package\\tts-more-package.json"', controller)
-        self.assertIn("[int]$manifest.schema_version -eq 2", controller)
-        self.assertIn("([string]$manifest.data.operations) -Label \"data.operations\"", controller)
-        self.assertIn('Join-Path $bundle "Start-Worker.ps1"', controller)
-        self.assertIn("Invoke-ChildPowerShell -Script $context.ServiceScript", controller)
-        self.assertIn('$Python = Join-Path $Root "runtime\\live\\python.exe"', worker)
-        self.assertNotIn(".venv", worker)
-        self.assertNotIn("TTS_MORE_PYTHON_EXE", worker)
+        _verify_powershell_control_flow(BUNDLE)
 
     def test_operation_protocol_is_controlled(self) -> None:
         self.assertTrue((BUNDLE / "portable_operations.py").is_file(), "portable operation protocol")
