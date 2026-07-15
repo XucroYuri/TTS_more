@@ -6,11 +6,12 @@ import signal
 import subprocess
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
-from app.models import TTSServiceEndpoint
+from app.models import PortableComponent, TTSServiceEndpoint
 from app.portable_control import (
     PortableControlError,
     PortablePackageController,
@@ -67,8 +68,9 @@ class ServiceSupervisor:
         self._portable_controller = portable_controller or PortablePackageController()
         self._portable_resolver = portable_resolver or resolve_locator
         self._portable_locks_guard = threading.Lock()
-        self._portable_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._portable_locks: dict[str, threading.RLock] = {}
         self._portable_service_identities: dict[str, tuple[str, str]] = {}
+        self._portable_start_invalidator: Callable[[PortableComponent], None] | None = None
 
     def status(
         self,
@@ -237,6 +239,62 @@ class ServiceSupervisor:
             return {"status": "not manageable", "reason": "folder access is only available for portable packages"}
         return self._portable_action(endpoint, "open_folder")
 
+    @contextmanager
+    def portable_lifecycle_guard(self, component: PortableComponent) -> Iterator[None]:
+        """Serialize all lifecycle and import work for one worker component."""
+
+        if component not in {"gpt-sovits", "indextts", "cosyvoice"}:
+            raise PortableControlError(
+                "PORTABLE_NOT_MANAGEABLE", "portable component is not manageable"
+            )
+        with self._portable_lock(component):
+            yield
+
+    def set_portable_start_invalidator(
+        self, invalidator: Callable[[PortableComponent], None]
+    ) -> None:
+        if not callable(invalidator):
+            raise TypeError("portable start invalidator must be callable")
+        with self._portable_locks_guard:
+            self._portable_start_invalidator = invalidator
+
+    def require_portable_stopped(self, endpoint: TTSServiceEndpoint):
+        """Freshly resolve a trusted endpoint and prove its PID record is absent."""
+
+        locator = endpoint.portable_locator
+        if (
+            locator is None
+            or not endpoint.managed
+            or endpoint.mode != "local"
+            or endpoint.network_scope != "localhost"
+            or endpoint.api_contract != "tts-more-v1"
+            or endpoint.control_kind != "portable-package"
+        ):
+            raise PortableControlError(
+                "PORTABLE_NOT_MANAGEABLE", "portable endpoint is not locally manageable"
+            )
+        identity = (locator.component, locator.package_id)
+        with self.portable_lifecycle_guard(locator.component):
+            descriptor = self._portable_resolver(self.portable_controller_root, locator, [])
+            if (
+                descriptor is None
+                or not descriptor.manageable
+                or descriptor.component != locator.component
+                or descriptor.package_id != locator.package_id
+            ):
+                raise PortableControlError(
+                    "PORTABLE_NOT_MANAGEABLE", "portable package could not be freshly resolved"
+                )
+            trusted = trust_resolved_portable_endpoint(endpoint, descriptor)
+            if not trusted.managed or not self._bind_portable_service_identity(
+                endpoint.service_id, identity
+            ):
+                raise PortableControlError(
+                    "PORTABLE_NOT_MANAGEABLE", "portable endpoint identity is unavailable"
+                )
+            self._portable_controller.require_stopped(descriptor)
+            return descriptor
+
     def _portable_action(
         self,
         endpoint: TTSServiceEndpoint,
@@ -257,7 +315,7 @@ class ServiceSupervisor:
                 "reason": "portable endpoint is not trusted local tts-more-v1",
             }
         identity = (locator.component, locator.package_id)
-        lock = self._portable_lock(identity)
+        lock = self._portable_lock(locator.component)
         with lock:
             try:
                 descriptor = self._portable_resolver(self.portable_controller_root, locator, [])
@@ -289,6 +347,15 @@ class ServiceSupervisor:
                 if action == "start":
                     kwargs["port_override"] = locator.port_override
                 result = method(descriptor, **kwargs)
+                if (
+                    action == "start"
+                    and result.get("status") not in {"blocked", "not manageable"}
+                    and not result.get("error_code")
+                ):
+                    with self._portable_locks_guard:
+                        invalidator = self._portable_start_invalidator
+                    if invalidator is not None:
+                        invalidator(locator.component)
                 if action == "status":
                     result.setdefault("manageable", True)
                 return result
@@ -306,9 +373,9 @@ class ServiceSupervisor:
                     "reason": f"portable package validation failed: {type(exc).__name__}",
                 }
 
-    def _portable_lock(self, identity: tuple[str, str]) -> threading.RLock:
+    def _portable_lock(self, component: str) -> threading.RLock:
         with self._portable_locks_guard:
-            return self._portable_locks.setdefault(identity, threading.RLock())
+            return self._portable_locks.setdefault(component, threading.RLock())
 
     def _bind_portable_service_identity(
         self, service_id: str, identity: tuple[str, str]

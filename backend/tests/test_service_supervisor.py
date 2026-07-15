@@ -354,6 +354,45 @@ def test_supervisor_routes_every_portable_action_through_fresh_resolver(tmp_path
     assert all(call[1] is resolved for call in controller.calls)
 
 
+def test_supervisor_successful_start_notifies_process_local_plan_invalidator(
+    tmp_path: Path,
+) -> None:
+    invalidated: list[str] = []
+    supervisor = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=FakePortableController(),
+        portable_resolver=lambda *_args: _descriptor(),
+    )
+    supervisor.set_portable_start_invalidator(invalidated.append)
+
+    result = supervisor.start(
+        _portable_endpoint(),
+        operation_id="11111111-1111-4111-8111-111111111111",
+    )
+
+    assert result["status"] == "starting"
+    assert invalidated == ["gpt-sovits"]
+
+    class BlockedController(FakePortableController):
+        def start(self, descriptor, **kwargs):
+            return {"status": "blocked", "error_code": "START_FAILED"}
+
+    blocked = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".blocked-runtime",
+        portable_controller=BlockedController(),
+        portable_resolver=lambda *_args: _descriptor(),
+    )
+    blocked.set_portable_start_invalidator(invalidated.append)
+    failed = blocked.start(
+        _portable_endpoint(service_id="portable-gpt-blocked"),
+        operation_id="22222222-2222-4222-8222-222222222222",
+    )
+    assert failed["status"] == "blocked"
+    assert invalidated == ["gpt-sovits"]
+
+
 def test_supervisor_passes_ephemeral_proxy_only_to_repair_controller(tmp_path: Path) -> None:
     controller = FakePortableController()
     supervisor = ServiceSupervisor(

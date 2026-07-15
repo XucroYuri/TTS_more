@@ -303,6 +303,53 @@ class PortablePackageController:
         self._assert_context_stable(context)
         return result
 
+    def require_stopped(self, descriptor: PortablePackageDescriptor) -> None:
+        """Fail closed unless the fixed worker PID record is proven absent."""
+
+        context = self._action_context(descriptor, "start")
+        record_path = _contained_path(
+            context.root,
+            "data/local/run/worker.pid.json",
+            label="PID record",
+        )
+        try:
+            record_path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise PortableControlError(
+                "PORTABLE_WORKER_NOT_STOPPED",
+                "portable worker stopped state is unavailable",
+            ) from exc
+        else:
+            if _is_reparse_point(record_path):
+                raise PortableControlError(
+                    "PORTABLE_PATH_REPARSE", "PID record is a reparse point"
+                )
+            raise PortableControlError(
+                "PORTABLE_WORKER_NOT_STOPPED",
+                "portable worker PID record is present",
+            )
+        self._assert_context_stable(context)
+        verified_path = _contained_path(
+            context.root,
+            "data/local/run/worker.pid.json",
+            label="PID record",
+        )
+        try:
+            verified_path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise PortableControlError(
+                "PORTABLE_WORKER_NOT_STOPPED",
+                "portable worker stopped state is unavailable",
+            ) from exc
+        raise PortableControlError(
+            "PORTABLE_WORKER_NOT_STOPPED",
+            "portable worker PID record appeared during validation",
+        )
+
     def logs(
         self,
         descriptor: PortablePackageDescriptor,

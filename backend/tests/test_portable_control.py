@@ -1453,6 +1453,45 @@ def test_pid_status_never_returns_paths_or_command_digest(tmp_path: Path) -> Non
     assert result["recorded_at"] == "2026-07-15T00:00:01+00:00"
 
 
+def test_require_stopped_allows_only_an_absent_fixed_pid_record(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "package")
+    descriptor = read_portable_package(package)
+    controller = PortablePackageController()
+
+    controller.require_stopped(descriptor)
+
+    record = package / "data" / "local" / "run" / "worker.pid.json"
+    record.parent.mkdir(parents=True)
+    record.write_text("not-json", encoding="utf-8")
+    with pytest.raises(PortableControlError) as present:
+        controller.require_stopped(descriptor)
+    assert present.value.code == "PORTABLE_WORKER_NOT_STOPPED"
+
+
+def test_require_stopped_blocks_identity_drifted_pid_record_and_reparse(
+    tmp_path: Path,
+) -> None:
+    package = _write_package(tmp_path / "package")
+    descriptor = read_portable_package(package)
+    record = package / "data" / "local" / "run" / "worker.pid.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(json.dumps({**_pid_payload(package), "build_id": "wrong-build"}), encoding="utf-8")
+
+    with pytest.raises(PortableControlError) as drifted:
+        PortablePackageController().require_stopped(descriptor)
+    assert drifted.value.code == "PORTABLE_WORKER_NOT_STOPPED"
+
+    record.unlink()
+    record.parent.rmdir()
+    outside = tmp_path / "outside-run"
+    outside.mkdir()
+    (outside / "worker.pid.json").write_text("{}", encoding="utf-8")
+    _junction(record.parent, outside)
+    with pytest.raises(PortableControlError) as linked:
+        PortablePackageController().require_stopped(descriptor)
+    assert linked.value.code in {"PORTABLE_PATH_REPARSE", "PORTABLE_WORKER_NOT_STOPPED"}
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

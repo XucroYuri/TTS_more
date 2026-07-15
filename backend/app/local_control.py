@@ -30,6 +30,13 @@ from app.portable_discovery import (
     inspect_locator_candidate,
 )
 from app.portable_control import PortableControlError, validate_proxy_url
+from app.portable_imports import (
+    PortableImportPlanError,
+    PortableImportPlanStore,
+    load_portable_importer,
+    project_import_plan,
+    project_import_report,
+)
 from app.portable_services import (
     PortableServiceStore,
     discover_bounded_portable_packages,
@@ -116,6 +123,52 @@ class LocalActionRequest(_StrictRequest):
             return validate_proxy_url(value)
         except PortableControlError as exc:
             raise ValueError("proxy_url must be a valid HTTP(S) proxy") from exc
+
+
+class LocalPortableImportPlanRequest(_StrictRequest):
+    pass
+
+
+class LocalPortableImportApplyRequest(_StrictRequest):
+    confirmed: Literal[True]
+    plan_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
+
+    @field_validator("confirmed", mode="before")
+    @classmethod
+    def validate_literal_confirmation(cls, value: object) -> object:
+        if type(value) is not bool or value is not True:
+            raise ValueError("confirmed must be exactly true")
+        return value
+
+
+class LocalPortableImportCancelledResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    status: Literal["cancelled"]
+
+
+class LocalPortableImportPlanResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    plan_id: str
+    plan_digest: str
+    expires_in_seconds: int = Field(ge=0, le=300)
+    user_file_count: int = Field(ge=0)
+    user_bytes: int = Field(ge=0)
+    reusable_assets: list[str]
+    reusable_asset_bytes: int = Field(ge=0)
+    skipped_assets: list[str]
+    already_present: list[str]
+    old_package_preserved: Literal[True]
+
+
+class LocalPortableImportApplyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    copied_user_files: int = Field(ge=0)
+    reused_assets: list[str]
+    skipped_assets: list[str]
+    already_present: list[str]
 
 
 RefreshServices = Callable[[Sequence[TTSServiceEndpoint]], None]
@@ -232,6 +285,15 @@ def install_local_control(
     token = secrets.token_urlsafe(32)
     app.state.local_control_token = token
     app.state.local_control_root = root
+    import_plans = PortableImportPlanStore()
+    app.state.portable_import_plan_store = import_plans
+    supervisor_start_invalidator = getattr(
+        getattr(app.state, "supervisor", None), "set_portable_start_invalidator", None
+    )
+    if callable(supervisor_start_invalidator):
+        supervisor_start_invalidator(import_plans.invalidate_component)
+    importer_lock = threading.Lock()
+    importer_module: Any | None = None
     app.add_middleware(LocalControlMiddleware, token=token)
 
     @app.exception_handler(RequestValidationError)
@@ -264,7 +326,7 @@ def install_local_control(
                 "local portable service settings are unavailable",
             )
 
-    def managed_endpoint(component: PortableComponent) -> TTSServiceEndpoint:
+    def managed_package(component: PortableComponent) -> tuple[TTSServiceEndpoint, Any]:
         endpoints = [
             endpoint
             for endpoint in current_services()
@@ -281,13 +343,33 @@ def install_local_control(
         locator = endpoint.portable_locator
         assert locator is not None
         descriptor = resolve_locator(root, locator, [])
-        if descriptor is None or not endpoint.managed:
+        if (
+            descriptor is None
+            or not descriptor.manageable
+            or not endpoint.managed
+            or endpoint.mode != "local"
+            or endpoint.network_scope != "localhost"
+            or endpoint.api_contract != "tts-more-v1"
+            or endpoint.control_kind != "portable-package"
+        ):
             _raise_error(
                 409,
                 "LOCAL_CONTROL_NOT_MANAGEABLE",
                 "portable service is not locally manageable",
             )
+        return endpoint, descriptor
+
+    def managed_endpoint(component: PortableComponent) -> TTSServiceEndpoint:
+        endpoint, _descriptor = managed_package(component)
         return endpoint
+
+    def portable_importer() -> Any:
+        nonlocal importer_module
+        if importer_module is None:
+            with importer_lock:
+                if importer_module is None:
+                    importer_module = load_portable_importer(root)
+        return importer_module
 
     @app.get(
         "/api/local-control/token",
@@ -452,6 +534,88 @@ def install_local_control(
         }
 
     @app.post(
+        "/api/local-portable-services/{component}/imports/plan",
+        summary="Plan one local portable worker data import",
+        response_model=LocalPortableImportPlanResponse | LocalPortableImportCancelledResponse,
+    )
+    def plan_local_portable_import(
+        component: PortableComponent,
+        payload: LocalPortableImportPlanRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        require_token(request)
+        endpoint, descriptor = managed_package(component)
+        try:
+            selected = select_portable_folder(root)
+        except FolderSelectionError as exc:
+            status = 501 if exc.code == "LOCAL_CONTROL_FOLDER_UNSUPPORTED" else 409
+            _raise_error(status, exc.code, str(exc))
+        if selected is None:
+            return {"status": "cancelled"}
+        try:
+            importer = portable_importer()
+            plan = importer.plan_import(selected, Path(descriptor.package_root))
+            stored = import_plans.create(
+                plan,
+                component=component,
+                service_id=endpoint.service_id,
+                package_id=descriptor.package_id,
+                build_id=descriptor.build_id,
+            )
+            return project_import_plan(stored)
+        except PortableImportPlanError as exc:
+            _raise_error(409, "LOCAL_CONTROL_IMPORT_PLAN_FAILED", "portable import plan is unavailable")
+            raise AssertionError from exc
+        except Exception as exc:
+            _raise_error(409, "LOCAL_CONTROL_IMPORT_PLAN_FAILED", "portable import plan is unavailable")
+            raise AssertionError from exc
+
+    @app.post(
+        "/api/local-portable-services/{component}/imports/{plan_id}/apply",
+        summary="Apply one confirmed local portable worker data import",
+        response_model=LocalPortableImportApplyResponse,
+    )
+    def apply_local_portable_import(
+        component: PortableComponent,
+        plan_id: str,
+        payload: LocalPortableImportApplyRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        require_token(request)
+        plan_id = _operation_id(plan_id)
+        supervisor = app.state.supervisor
+        try:
+            with supervisor.portable_lifecycle_guard(component):
+                try:
+                    stored = import_plans.consume(plan_id, payload.plan_digest)
+                except PortableImportPlanError as exc:
+                    _raise_error(
+                        409,
+                        "LOCAL_CONTROL_IMPORT_PLAN_UNAVAILABLE",
+                        "portable import plan is unavailable",
+                    )
+                    raise AssertionError from exc
+                endpoint = managed_endpoint(component)
+                descriptor = supervisor.require_portable_stopped(endpoint)
+                if not _portable_import_identity_matches(stored, endpoint, descriptor):
+                    _raise_error(
+                        409,
+                        "LOCAL_CONTROL_IMPORT_BLOCKED",
+                        "portable import is unavailable",
+                    )
+                importer = portable_importer()
+                report = importer.apply_import(stored.plan)
+                return project_import_report(report)
+        except HTTPException:
+            raise
+        except (PortableControlError, PortableImportPlanError) as exc:
+            _raise_error(409, "LOCAL_CONTROL_IMPORT_BLOCKED", "portable import is unavailable")
+            raise AssertionError from exc
+        except Exception as exc:
+            _raise_error(409, "LOCAL_CONTROL_IMPORT_FAILED", "portable import failed")
+            raise AssertionError from exc
+
+    @app.post(
         "/api/local-portable-services/{component}/{action}",
         summary="Run an allowlisted portable lifecycle action",
     )
@@ -473,22 +637,27 @@ def install_local_control(
                 "LOCAL_CONTROL_INVALID_REQUEST",
                 "request validation failed",
             )
-        endpoint = managed_endpoint(component)
-        if payload.port_override is not None:
-            locator = endpoint.portable_locator
-            assert locator is not None
-            endpoint = endpoint.model_copy(
-                update={
-                    "portable_locator": locator.model_copy(
-                        update={"port_override": payload.port_override}
-                    )
-                }
-            )
         supervisor = app.state.supervisor
         if action == "start":
-            operation_id = str(uuid4())
-            result = supervisor.start(endpoint, operation_id=operation_id)
-        elif action == "stop":
+            with supervisor.portable_lifecycle_guard(component):
+                endpoint = managed_endpoint(component)
+                if payload.port_override is not None:
+                    locator = endpoint.portable_locator
+                    assert locator is not None
+                    endpoint = endpoint.model_copy(
+                        update={
+                            "portable_locator": locator.model_copy(
+                                update={"port_override": payload.port_override}
+                            )
+                        }
+                    )
+                operation_id = str(uuid4())
+                result = supervisor.start(endpoint, operation_id=operation_id)
+                checked = _checked_control_result(result)
+                import_plans.invalidate_component(component)
+                return {"component": component, "action": action, **checked}
+        endpoint = managed_endpoint(component)
+        if action == "stop":
             result = supervisor.stop(endpoint, action_id=str(uuid4()))
         elif action == "repair":
             result = supervisor.repair(
@@ -1027,6 +1196,27 @@ def _service_projection(
         "build_id": build_id,
         "port_override": locator.port_override if locator is not None else None,
     }
+
+
+def _portable_import_identity_matches(
+    stored: Any,
+    endpoint: TTSServiceEndpoint,
+    descriptor: Any,
+) -> bool:
+    locator = endpoint.portable_locator
+    try:
+        descriptor_root = Path(os.path.abspath(Path(descriptor.package_root)))
+        planned_root = Path(os.path.abspath(stored.new_root))
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(
+        locator is not None
+        and stored.component == locator.component == descriptor.component
+        and stored.service_id == endpoint.service_id
+        and stored.package_id == locator.package_id == descriptor.package_id
+        and stored.build_id == descriptor.build_id
+        and _path_key(descriptor_root) == _path_key(planned_root)
+    )
 
 
 def _checked_control_result(result: dict[str, Any]) -> dict[str, object]:

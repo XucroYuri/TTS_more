@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import asyncio
@@ -9,6 +10,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -19,6 +21,14 @@ from fastapi.testclient import TestClient
 import app.local_control as local_control
 import app.main as main_module
 from app.local_control import FolderSelectionError, select_portable_folder
+from app.portable_imports import (
+    PortableImportPlanError,
+    PortableImportPlanStore,
+    load_portable_importer,
+    project_import_plan,
+    project_import_report,
+)
+from app.portable_discovery import inspect_locator_candidate
 from app.main import create_app
 from app.portable_services import PortableServiceStore
 
@@ -124,6 +134,166 @@ def _token(client: TestClient, **headers: str) -> str:
 
 def _control(token: str) -> dict[str, str]:
     return {CONTROL_HEADER: token}
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.value = 100.0
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def _stored_plan(
+    store: PortableImportPlanStore,
+    root: Path,
+    *,
+    digest: str = "a" * 64,
+    component: str = "gpt-sovits",
+):
+    plan = SimpleNamespace(
+        new_root=root,
+        plan_digest=digest,
+        user_files=(
+            SimpleNamespace(relative_path="data/user/project.json", size_bytes=9),
+        ),
+        reusable_assets=(
+            SimpleNamespace(relative_path="models/base.safetensors", size_bytes=12),
+        ),
+        skipped_assets=("models/skipped.bin",),
+        already_present=("data/user/existing.json",),
+    )
+    return store.create(
+        plan,
+        component=component,
+        service_id=f"local-{component}",
+        package_id=f"{component}-main",
+        build_id="build-two",
+    )
+
+
+def test_portable_import_plan_store_uses_ttl_capacity_single_use_and_component_invalidation(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    store = PortableImportPlanStore(ttl_seconds=5, capacity=2, clock=clock)
+    first = _stored_plan(store, tmp_path / "first")
+    second = _stored_plan(store, tmp_path / "second", digest="b" * 64)
+    third = _stored_plan(store, tmp_path / "third", digest="c" * 64)
+
+    with pytest.raises(PortableImportPlanError) as evicted:
+        store.consume(first.plan_id, "a" * 64)
+    assert evicted.value.code == "PORTABLE_IMPORT_PLAN_UNAVAILABLE"
+
+    consumed = store.consume(second.plan_id, "b" * 64)
+    assert consumed.plan is second.plan
+    with pytest.raises(PortableImportPlanError) as replayed:
+        store.consume(second.plan_id, "b" * 64)
+    assert replayed.value.code == "PORTABLE_IMPORT_PLAN_UNAVAILABLE"
+
+    cosy = _stored_plan(
+        store,
+        tmp_path / "cosy",
+        digest="d" * 64,
+        component="cosyvoice",
+    )
+    store.invalidate_component("gpt-sovits")
+    with pytest.raises(PortableImportPlanError):
+        store.consume(third.plan_id, "c" * 64)
+    assert store.consume(cosy.plan_id, "d" * 64).component == "cosyvoice"
+
+    expired = _stored_plan(store, tmp_path / "expired", digest="e" * 64)
+    clock.value += 5.01
+    with pytest.raises(PortableImportPlanError) as stale:
+        store.consume(expired.plan_id, "e" * 64)
+    assert stale.value.code == "PORTABLE_IMPORT_PLAN_UNAVAILABLE"
+
+
+def test_portable_importer_loads_only_the_fixed_controller_script(tmp_path: Path) -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    importer = load_portable_importer(repository_root)
+
+    assert Path(importer.__file__) == repository_root / "scripts" / "import_portable_data.py"
+    assert callable(importer.plan_import)
+    assert callable(importer.apply_import)
+
+    with pytest.raises(PortableImportPlanError) as unavailable:
+        load_portable_importer(tmp_path / "not-a-controller")
+    assert unavailable.value.code == "PORTABLE_IMPORT_CORE_UNAVAILABLE"
+
+
+def test_portable_import_plan_store_compares_digest_in_constant_time_and_keeps_mismatch_unconsumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = PortableImportPlanStore()
+    stored = _stored_plan(store, tmp_path / "new")
+    compared: list[tuple[str, str]] = []
+
+    def compare(left: str, right: str) -> bool:
+        compared.append((left, right))
+        return left == right
+
+    monkeypatch.setattr("app.portable_imports.hmac.compare_digest", compare)
+    with pytest.raises(PortableImportPlanError) as mismatch:
+        store.consume(stored.plan_id, "f" * 64)
+    assert mismatch.value.code == "PORTABLE_IMPORT_PLAN_UNAVAILABLE"
+    assert compared == [("a" * 64, "f" * 64)]
+    assert store.consume(stored.plan_id, "a" * 64).plan is stored.plan
+
+
+def test_portable_import_safe_projections_contain_only_counts_bytes_and_relative_paths(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    store = PortableImportPlanStore(ttl_seconds=300, clock=clock)
+    stored = _stored_plan(store, tmp_path / "machine" / "new package")
+
+    planned = project_import_plan(stored, now=clock())
+    report = project_import_report(
+        SimpleNamespace(
+            copied_user_files=1,
+            reused_assets=["models/base.safetensors"],
+            skipped_assets=["models/skipped.bin"],
+            already_present=["data/user/existing.json"],
+        )
+    )
+
+    assert planned == {
+        "plan_id": stored.plan_id,
+        "plan_digest": "a" * 64,
+        "expires_in_seconds": 300,
+        "user_file_count": 1,
+        "user_bytes": 9,
+        "reusable_assets": ["models/base.safetensors"],
+        "reusable_asset_bytes": 12,
+        "skipped_assets": ["models/skipped.bin"],
+        "already_present": ["data/user/existing.json"],
+        "old_package_preserved": True,
+    }
+    assert report == {
+        "copied_user_files": 1,
+        "reused_assets": ["models/base.safetensors"],
+        "skipped_assets": ["models/skipped.bin"],
+        "already_present": ["data/user/existing.json"],
+    }
+    serialized = json.dumps({"plan": planned, "report": report})
+    assert str(tmp_path) not in serialized
+    assert not {"path", "old_root", "new_root", "root", "command", "cwd", "env"}.intersection(
+        planned
+    )
+
+
+@pytest.mark.parametrize("unsafe", ["C:/secret/model.bin", "../escape", "models\\secret.bin"])
+def test_portable_import_safe_projection_rejects_non_relative_or_noncanonical_paths(
+    tmp_path: Path, unsafe: str
+) -> None:
+    store = PortableImportPlanStore()
+    stored = _stored_plan(store, tmp_path / "new")
+    stored.plan.reusable_assets = (SimpleNamespace(relative_path=unsafe, size_bytes=1),)
+
+    with pytest.raises(PortableImportPlanError) as error:
+        project_import_plan(stored)
+    assert error.value.code == "PORTABLE_IMPORT_PROJECTION_INVALID"
 
 
 def _write_suite(root: Path) -> Path:
@@ -827,6 +997,9 @@ class _FakeSupervisor:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object, object]] = []
 
+    def portable_lifecycle_guard(self, _component):
+        return nullcontext()
+
     def start(self, endpoint, *, operation_id=None):
         self.calls.append(("start", endpoint, operation_id))
         return {"status": "starting", "operation_id": operation_id}
@@ -866,6 +1039,519 @@ def _register(client: TestClient, package: Path) -> tuple[str, dict[str, str]]:
     )
     assert response.status_code == 200, response.text
     return token, headers
+
+
+def _install_portable_import_core(controller: Path) -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    scripts = controller / "scripts"
+    schema_root = controller / "packaging" / "portable"
+    scripts.mkdir(parents=True, exist_ok=True)
+    schema_root.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(repository_root / "scripts" / "import_portable_data.py", scripts)
+    shutil.copy2(
+        repository_root / "packaging" / "portable" / "tts-more-package.schema.json",
+        schema_root,
+    )
+
+
+def _portable_import_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[TestClient, dict[str, str], Path, Path]:
+    controller = tmp_path / "TTS More"
+    _install_portable_import_core(controller)
+    old = _write_package(tmp_path / "old worker", component="gpt-sovits", package_id="gpt-main")
+    new = _write_package(tmp_path / "new worker", component="gpt-sovits", package_id="gpt-main")
+    user_file = old / "data" / "user" / "project.json"
+    user_file.parent.mkdir(parents=True)
+    user_file.write_text("user-data", encoding="utf-8")
+    client = _client(controller)
+    _token_value, headers = _register(client, new)
+    monkeypatch.setattr("app.local_control.select_portable_folder", lambda _root: old)
+    return client, headers, old, new
+
+
+def test_portable_import_routes_require_existing_local_control_header_and_managed_loopback_service(
+    tmp_path: Path,
+) -> None:
+    client = _client(tmp_path / "TTS More")
+    token = _token(client)
+    path = "/api/local-portable-services/gpt-sovits/imports/plan"
+
+    assert client.post(path, json={}).status_code == 403
+    assert client.post(
+        path,
+        headers={"X-TTS-More-Local-Control": token},
+        json={},
+    ).status_code == 403
+    assert client.post(
+        path,
+        headers={"Authorization": "Bearer global-token"},
+        json={},
+    ).status_code == 403
+    unmanaged = client.post(path, headers=_control(token), json={})
+    assert unmanaged.status_code == 409
+    assert unmanaged.json()["detail"]["code"] == "LOCAL_CONTROL_NOT_MANAGEABLE"
+
+    external_root = tmp_path / "external" / "TTS More"
+    external_root.mkdir(parents=True)
+    PortableServiceStore(external_root).save(
+        [
+            {
+                "service_id": "lan-gpt",
+                "display_name": "LAN GPT-SoVITS",
+                "engine": "gpt-sovits",
+                "provider_type": "gpt-sovits",
+                "catalog_provider": "gpt-sovits",
+                "api_contract": "tts-more-v1",
+                "base_url": "http://192.168.2.20:9880",
+                "mode": "external",
+                "network_scope": "lan",
+                "managed": False,
+                "enabled": True,
+                "capabilities": ["tts", "artifact-transfer"],
+            }
+        ]
+    )
+    external = _client(external_root)
+    external_response = external.post(
+        path,
+        headers=_control(_token(external)),
+        json={},
+    )
+    assert external_response.status_code == 409
+    assert external_response.json()["detail"]["code"] == "LOCAL_CONTROL_NOT_MANAGEABLE"
+
+    lan = TestClient(
+        client.app,
+        base_url="http://192.168.2.10:8000",
+        client=("192.168.2.20", 51000),
+    )
+    denied = lan.post(path, headers=_control(token), json={})
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["code"] == "LOCAL_CONTROL_FORBIDDEN"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"old_root": "C:/old"},
+        {"new_root": "C:/new"},
+        {"path": "C:/worker"},
+        {"roots": ["C:/worker"]},
+        {"command": ["powershell", "evil.ps1"]},
+        {"cwd": "C:/"},
+        {"env": {"PATH": "C:/evil"}},
+    ],
+)
+def test_portable_import_plan_request_is_strictly_empty(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    client = _client(tmp_path / "TTS More")
+    response = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan",
+        headers=_control(_token(client)),
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "LOCAL_CONTROL_INVALID_REQUEST",
+        "message": "request validation failed",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"confirmed": False, "plan_digest": "a" * 64},
+        {"confirmed": 1, "plan_digest": "a" * 64},
+        {"confirmed": True, "plan_digest": "a" * 63},
+        {"confirmed": True, "plan_digest": "g" * 64},
+        {"confirmed": True, "plan_digest": "a" * 64, "old_root": "C:/old"},
+    ],
+)
+def test_portable_import_apply_requires_only_literal_confirmation_and_exact_digest(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    client = _client(tmp_path / "TTS More")
+    response = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/11111111-1111-4111-8111-111111111111/apply",
+        headers=_control(_token(client)),
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "LOCAL_CONTROL_INVALID_REQUEST"
+
+
+def test_portable_import_openapi_contract_has_no_browser_path_or_process_fields(
+    tmp_path: Path,
+) -> None:
+    schema = _client(tmp_path / "TTS More").get("/openapi.json").json()
+    plan_path = schema["paths"]["/api/local-portable-services/{component}/imports/plan"]["post"]
+    apply_path = schema["paths"][
+        "/api/local-portable-services/{component}/imports/{plan_id}/apply"
+    ]["post"]
+    contracts = {
+        name: schema["components"]["schemas"][name]
+        for name in (
+            "LocalPortableImportPlanRequest",
+            "LocalPortableImportApplyRequest",
+            "LocalPortableImportPlanResponse",
+            "LocalPortableImportApplyResponse",
+            "LocalPortableImportCancelledResponse",
+        )
+    }
+    serialized = json.dumps(contracts)
+
+    for forbidden in ("old_root", "new_root", '"path"', '"roots"', '"command"', '"cwd"', '"env"'):
+        assert forbidden not in serialized
+    assert '"confirmed"' in serialized
+    assert '"plan_digest"' in serialized
+    assert plan_path["requestBody"]["required"] is True
+    assert apply_path["requestBody"]["required"] is True
+
+
+def test_portable_import_plan_is_read_only_uses_picker_and_fresh_locator_then_applies_safely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, headers, old, new = _portable_import_client(tmp_path, monkeypatch)
+    destination = new / "data" / "user" / "project.json"
+    assert not destination.exists()
+
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan",
+        headers=headers,
+        json={},
+    )
+
+    assert planned.status_code == 200, planned.text
+    plan = planned.json()
+    assert set(plan) == {
+        "plan_id",
+        "plan_digest",
+        "expires_in_seconds",
+        "user_file_count",
+        "user_bytes",
+        "reusable_assets",
+        "reusable_asset_bytes",
+        "skipped_assets",
+        "already_present",
+        "old_package_preserved",
+    }
+    assert plan["user_file_count"] == 1
+    assert plan["user_bytes"] == len(b"user-data")
+    assert plan["old_package_preserved"] is True
+    assert not destination.exists()
+    assert str(old) not in planned.text
+    assert str(new) not in planned.text
+
+    applied = client.post(
+        f"/api/local-portable-services/gpt-sovits/imports/{plan['plan_id']}/apply",
+        headers=headers,
+        json={"confirmed": True, "plan_digest": plan["plan_digest"]},
+    )
+
+    assert applied.status_code == 200, applied.text
+    assert applied.json() == {
+        "copied_user_files": 1,
+        "reused_assets": [],
+        "skipped_assets": [],
+        "already_present": [],
+    }
+    assert destination.read_text(encoding="utf-8") == "user-data"
+    assert (old / "data" / "user" / "project.json").read_text(encoding="utf-8") == "user-data"
+    assert str(old) not in applied.text
+    assert str(new) not in applied.text
+
+
+def test_portable_import_digest_mismatch_does_not_consume_but_apply_and_failure_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, headers, _old, new = _portable_import_client(tmp_path, monkeypatch)
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    ).json()
+    path = f"/api/local-portable-services/gpt-sovits/imports/{planned['plan_id']}/apply"
+
+    mismatch = client.post(
+        path,
+        headers=headers,
+        json={"confirmed": True, "plan_digest": "f" * 64},
+    )
+    assert mismatch.status_code == 409
+    assert mismatch.json()["detail"]["code"] == "LOCAL_CONTROL_IMPORT_PLAN_UNAVAILABLE"
+
+    pid_record = new / "data" / "local" / "run" / "worker.pid.json"
+    pid_record.parent.mkdir(parents=True)
+    pid_record.write_text("malformed-but-present", encoding="utf-8")
+    blocked = client.post(
+        path,
+        headers=headers,
+        json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == {
+        "code": "LOCAL_CONTROL_IMPORT_BLOCKED",
+        "message": "portable import is unavailable",
+    }
+    assert str(new) not in blocked.text
+
+    pid_record.unlink()
+    replayed = client.post(
+        path,
+        headers=headers,
+        json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+    )
+    assert replayed.status_code == 409
+    assert replayed.json()["detail"]["code"] == "LOCAL_CONTROL_IMPORT_PLAN_UNAVAILABLE"
+
+
+def test_portable_import_picker_cancellation_returns_existing_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = tmp_path / "TTS More"
+    _install_portable_import_core(controller)
+    package = _write_package(tmp_path / "new worker")
+    client = _client(controller)
+    _token_value, headers = _register(client, package)
+    monkeypatch.setattr("app.local_control.select_portable_folder", lambda _root: None)
+
+    response = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "cancelled"}
+
+
+@pytest.mark.parametrize("drift", ["manifest", "lock", "source", "target"])
+def test_portable_import_rejects_manifest_lock_source_and_target_drift_with_redacted_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
+) -> None:
+    client, headers, old, new = _portable_import_client(tmp_path, monkeypatch)
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    ).json()
+    if drift == "manifest":
+        manifest = new / "package" / "tts-more-package.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    elif drift == "lock":
+        (new / "tts_more" / "locks" / "models.lock.json").write_text(
+            '{"assets": []}\n', encoding="utf-8"
+        )
+    elif drift == "source":
+        (old / "data" / "user" / "project.json").write_text("changed", encoding="utf-8")
+    else:
+        destination = new / "data" / "user" / "project.json"
+        destination.parent.mkdir(parents=True)
+        destination.write_text("target appeared", encoding="utf-8")
+    path = f"/api/local-portable-services/gpt-sovits/imports/{planned['plan_id']}/apply"
+
+    response = client.post(
+        path,
+        headers=headers,
+        json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "LOCAL_CONTROL_IMPORT_FAILED",
+        "message": "portable import failed",
+    }
+    assert str(old) not in response.text
+    assert str(new) not in response.text
+    replay = client.post(
+        path,
+        headers=headers,
+        json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+    )
+    assert replay.status_code == 409
+    assert replay.json()["detail"]["code"] == "LOCAL_CONTROL_IMPORT_PLAN_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("drift", ["component", "package", "build"])
+def test_portable_import_rejects_registered_component_package_and_build_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
+) -> None:
+    client, headers, _old, new = _portable_import_client(tmp_path, monkeypatch)
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    ).json()
+    manifest = new / "package" / "tts-more-package.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    if drift == "component":
+        payload["component"] = "cosyvoice"
+    elif drift == "package":
+        payload["package_id"] = "gpt-other"
+    else:
+        payload["build_id"] = "different-build"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    response = client.post(
+        f"/api/local-portable-services/gpt-sovits/imports/{planned['plan_id']}/apply",
+        headers=headers,
+        json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["message"] in {
+        "portable service is not locally manageable",
+        "portable import is unavailable",
+    }
+    assert str(new) not in response.text
+
+
+def test_portable_import_rejects_registered_target_root_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, headers, _old, original = _portable_import_client(tmp_path, monkeypatch)
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    ).json()
+    replacement = _write_package(
+        tmp_path / "replacement worker", component="gpt-sovits", package_id="gpt-main"
+    )
+    registered = client.post(
+        "/api/local-portable-services/register",
+        headers=headers,
+        json={
+            "component": "gpt-sovits",
+            "package_id": "gpt-main",
+            "path": str(replacement),
+        },
+    )
+    assert registered.status_code == 200
+
+    response = client.post(
+        f"/api/local-portable-services/gpt-sovits/imports/{planned['plan_id']}/apply",
+        headers=headers,
+        json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "LOCAL_CONTROL_IMPORT_BLOCKED",
+        "message": "portable import is unavailable",
+    }
+    assert not (original / "data" / "user" / "project.json").exists()
+    assert str(original) not in response.text
+    assert str(replacement) not in response.text
+
+
+def test_successful_start_invalidates_component_plans_but_failed_start_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, headers, _old, _new = _portable_import_client(tmp_path, monkeypatch)
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    ).json()
+    client.app.state.supervisor = _FakeSupervisor()
+
+    started = client.post(
+        "/api/local-portable-services/gpt-sovits/start", headers=headers, json={}
+    )
+    assert started.status_code == 200
+    unavailable = client.post(
+        f"/api/local-portable-services/gpt-sovits/imports/{planned['plan_id']}/apply",
+        headers=headers,
+        json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+    )
+    assert unavailable.status_code == 409
+    assert unavailable.json()["detail"]["code"] == "LOCAL_CONTROL_IMPORT_PLAN_UNAVAILABLE"
+
+    client2, headers2, _old2, _new2 = _portable_import_client(
+        tmp_path / "failed", monkeypatch
+    )
+    planned2 = client2.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers2, json={}
+    ).json()
+    failed = _FakeSupervisor()
+    failed.start = lambda _endpoint, operation_id=None: {
+        "status": "blocked",
+        "error_code": "START_FAILED",
+        "operation_id": operation_id,
+    }
+    client2.app.state.supervisor = failed
+    response = client2.post(
+        "/api/local-portable-services/gpt-sovits/start", headers=headers2, json={}
+    )
+    assert response.status_code == 409
+    retained = client2.app.state.portable_import_plan_store.consume(
+        planned2["plan_id"], planned2["plan_digest"]
+    )
+    assert retained.component == "gpt-sovits"
+
+
+class _SerializedImportSupervisor(_FakeSupervisor):
+    def __init__(self, descriptor) -> None:
+        super().__init__()
+        self.descriptor = descriptor
+        self.lock = threading.RLock()
+        self.start_entered = threading.Event()
+        self.release_start = threading.Event()
+        self.active = 0
+        self.maximum_active = 0
+
+    @contextmanager
+    def portable_lifecycle_guard(self, _component):
+        with self.lock:
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            try:
+                yield
+            finally:
+                self.active -= 1
+
+    def start(self, endpoint, *, operation_id=None):
+        self.calls.append(("start", endpoint, operation_id))
+        self.start_entered.set()
+        assert self.release_start.wait(5)
+        return {"status": "starting", "operation_id": operation_id}
+
+    def require_portable_stopped(self, _endpoint):
+        return self.descriptor
+
+
+def test_start_and_apply_share_one_component_guard_and_cannot_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, headers, _old, new = _portable_import_client(tmp_path, monkeypatch)
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    ).json()
+    descriptor = inspect_locator_candidate(new)
+    assert descriptor is not None
+    supervisor = _SerializedImportSupervisor(descriptor)
+    client.app.state.supervisor = supervisor
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        starting = executor.submit(
+            client.post,
+            "/api/local-portable-services/gpt-sovits/start",
+            headers=headers,
+            json={},
+        )
+        assert supervisor.start_entered.wait(2)
+        applying = executor.submit(
+            client.post,
+            f"/api/local-portable-services/gpt-sovits/imports/{planned['plan_id']}/apply",
+            headers=headers,
+            json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+        )
+        time.sleep(0.15)
+        serialized = not applying.done()
+        supervisor.release_start.set()
+        started = starting.result(timeout=5)
+        applied = applying.result(timeout=5)
+
+    assert serialized is True
+    assert supervisor.maximum_active == 1
+    assert started.status_code == 200
+    assert applied.status_code == 409
+    assert applied.json()["detail"]["code"] == "LOCAL_CONTROL_IMPORT_PLAN_UNAVAILABLE"
 
 
 def test_moved_four_folder_suite_is_rediscovered_and_started_independently(
