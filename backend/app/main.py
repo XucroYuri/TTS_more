@@ -286,7 +286,7 @@ def create_app(
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        def persist_and_publish() -> ServiceRegistry:
+        def persist_managed_and_publish() -> ServiceRegistry:
             portable_store = PortableServiceStore(
                 portable_controller_root,
                 services_path=app.state.writable_services_path,
@@ -308,11 +308,37 @@ def create_app(
             app.state.services_path = app.state.writable_services_path
             return ServiceRegistry(list(services))
 
-        try:
-            registry = app.state.portable_locator_mutations.mutate_component(
-                descriptor.component,
-                persist_and_publish,
+        def persist_external_and_publish(
+            published_registry: ServiceRegistry,
+        ) -> ServiceRegistry:
+            services = [
+                service
+                for service in published_registry.services
+                if service.service_id != endpoint.service_id
+            ]
+            services.append(endpoint)
+            services.sort(key=lambda service: (service.priority, service.service_id))
+            registry = published_registry.with_services(services)
+            registry.save(
+                app.state.writable_services_path,
+                publish=lambda candidate: _apply_registry(app, candidate, store),
             )
+            app.state.services_path = app.state.writable_services_path
+            return registry
+
+        try:
+            if endpoint.portable_locator is None:
+                registry = app.state.portable_locator_mutations.run_generic_transaction(
+                    current_published=lambda: app.state.service_registry,
+                    transaction=persist_external_and_publish,
+                )
+            else:
+                registry = app.state.portable_locator_mutations.mutate_component(
+                    descriptor.component,
+                    persist_managed_and_publish,
+                )
+        except ManagedPortableLocatorMutationError as exc:
+            raise _managed_portable_locator_mutation_http_error() from exc
         except ServicePostCommitError as exc:
             raise HTTPException(
                 status_code=500,
