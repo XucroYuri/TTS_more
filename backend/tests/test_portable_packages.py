@@ -514,6 +514,77 @@ def test_release_audit_accepts_bootstrap_and_rejects_full_or_runtime_assets(tmp_
     assert "forbidden release asset" in packages.audit_release_zip(contaminated)["errors"][0]
 
 
+def test_release_audit_rejects_nested_t7_model_weight(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    archive_path = tmp_path / "nested-t7.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "Component/package/tts-more-package.json",
+            json.dumps(
+                {"schema_version": 2, "component": "indextts", "package_profile": "bootstrap"}
+            ),
+        )
+        archive.writestr("Component/indextts/indextts/utils/JDC/bst.t7", b"tracked model")
+
+    report = packages.audit_release_zip(archive_path)
+
+    assert report["valid"] is False
+    assert any("forbidden release asset" in error for error in report["errors"])
+
+
+def test_worker_bootstrap_removes_tracked_nested_t7_before_packaging(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("real worker Bootstrap cleanup test requires PowerShell")
+    worker_root = tmp_path / "worker"
+    _load_sync_integrations().sync_integration(REPO_ROOT, worker_root, "indextts", "a" * 40)
+    tracked_weight = worker_root / "indextts" / "indextts" / "utils" / "JDC" / "bst.t7"
+    tracked_weight.parent.mkdir(parents=True)
+    tracked_weight.write_bytes(b"tracked model weight fixture")
+    _initialize_git_repository(worker_root)
+
+    version = "0.2.0-t7-contract"
+    output_root = tmp_path / "output"
+    _run_checked(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(worker_root / "Build-Package.ps1"),
+            "-Profile",
+            "Bootstrap",
+            "-Device",
+            "CPU",
+            "-Version",
+            version,
+            "-OutputRoot",
+            str(output_root),
+        ],
+        worker_root,
+        env={**os.environ, "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve())},
+    )
+
+    archives = list(output_root.glob("*.zip"))
+    assert len(archives) == 1
+    packages = _load_portable_packages()
+    assert packages.audit_release_zip(archives[0])["valid"] is True
+    with zipfile.ZipFile(archives[0]) as archive:
+        assert not [name for name in archive.namelist() if name.casefold().endswith(".t7")]
+    staged_weight = (
+        worker_root
+        / "artifacts"
+        / "portable"
+        / ".work"
+        / "indextts-bootstrap"
+        / f"indextts-{version}-windows-x64-bootstrap"
+        / tracked_weight.relative_to(worker_root)
+    )
+    assert not staged_weight.exists()
+    assert tracked_weight.read_bytes() == b"tracked model weight fixture"
+
+
 @pytest.mark.parametrize(
     "polluted_path",
     (
