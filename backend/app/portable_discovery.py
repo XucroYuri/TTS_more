@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from app.models import EngineName, PortableServiceLocator, ProviderType, TTSServiceEndpoint
 from app.portable_endpoint_trust import trust_resolved_portable_endpoint
+from app.portable_file_io import safe_read_bytes
 from app.portable_manifest import validate_portable_manifest_v2_raw
 
 
@@ -118,7 +119,15 @@ def discover_portable_packages(
 def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
     root = Path(os.path.abspath(package_root.expanduser()))
     manifest_path = _manifest_path(root)
-    payload = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    manifest_bytes = safe_read_bytes(
+        root,
+        manifest_path,
+        max_bytes=512 * 1024,
+        label="portable package manifest",
+        retries=2,
+    )
+    assert manifest_bytes is not None
+    payload = json.loads(manifest_bytes.decode("utf-8-sig"))
     if not isinstance(payload, dict):
         raise ValueError("portable manifest must be a JSON object")
     raw_schema = payload.get("schema_version")

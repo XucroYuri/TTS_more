@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app import portable_file_io
 from app.portable_discovery import (
     PortablePackageRegisterRequest,
     discover_portable_packages,
@@ -17,6 +20,24 @@ from app.portable_discovery import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _junction(link: Path, target: Path) -> None:
+    environment = os.environ.copy()
+    environment["B2_DISCOVERY_JUNCTION_PATH"] = str(link)
+    environment["B2_DISCOVERY_JUNCTION_TARGET"] = str(target)
+    completed = subprocess.run(
+        [
+            "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+            "New-Item -ItemType Junction -Path $env:B2_DISCOVERY_JUNCTION_PATH -Target $env:B2_DISCOVERY_JUNCTION_TARGET | Out-Null",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"junction creation is unavailable: {completed.stderr}")
 
 
 def _write_package(
@@ -144,6 +165,49 @@ def test_completed_v2_descriptor_exposes_identity_protocol_and_operations_path(t
     assert descriptor.protocol_version == "1.0"
     assert descriptor.controller_range == ">=0.2.0,<0.3.0"
     assert descriptor.operations_path == "data/local/operations"
+
+
+def test_reader_rejects_manifest_hardlink_before_parsing_content(tmp_path: Path) -> None:
+    package_root = _write_package(
+        tmp_path / "GPT hardlink package", schema_version=2, component="gpt-sovits", port=9880
+    )
+    manifest = package_root / "package" / "tts-more-package.json"
+    outside = tmp_path / "outside-manifest.json"
+    manifest.replace(outside)
+    os.link(outside, manifest)
+
+    with pytest.raises(OSError, match="hard link"):
+        read_portable_package(package_root)
+
+
+def test_reader_never_accepts_manifest_after_parent_switches_to_junction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package_root = _write_package(
+        tmp_path / "GPT race package", schema_version=2, component="gpt-sovits", port=9880
+    )
+    manifest_directory = package_root / "package"
+    moved = package_root / "package-old"
+    outside = tmp_path / "outside-package"
+    outside.mkdir()
+    (outside / "tts-more-package.json").write_bytes(
+        (manifest_directory / "tts-more-package.json").read_bytes()
+    )
+    original_open = portable_file_io._open_binary
+    swapped = False
+
+    def swap_parent_before_open(current: Path):
+        nonlocal swapped
+        if not swapped and current.name == "tts-more-package.json":
+            swapped = True
+            manifest_directory.rename(moved)
+            _junction(manifest_directory, outside)
+        return original_open(current)
+
+    monkeypatch.setattr(portable_file_io, "_open_binary", swap_parent_before_open)
+
+    with pytest.raises(OSError, match="reparse|changed|escape"):
+        read_portable_package(package_root)
 
 
 def test_reader_tolerates_older_rc_v2_identity_protocol_and_data_omissions(tmp_path: Path) -> None:

@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import ctypes
 import json
+import math
 import os
 import re
 import stat
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 from uuid import UUID
 
 from app.portable_discovery import PortablePackageDescriptor, inspect_locator_candidate
+from app.portable_file_io import PortableFileError, safe_read_bytes
 
 
 _EXACT_LAUNCHERS = {
@@ -51,6 +56,8 @@ class ProcessLike(Protocol):
 
     def poll(self) -> int | None: ...
 
+    def wait(self, timeout: float | None = None) -> int: ...
+
 
 Spawn = Callable[..., ProcessLike]
 
@@ -89,9 +96,13 @@ class PortablePackageController:
         *,
         spawn: Spawn | None = None,
         environment: Mapping[str, str] | None = None,
+        handshake_seconds: float = 0.75,
+        system_executable_resolver: Callable[[str], Path] | None = None,
     ) -> None:
         self._spawn = spawn or subprocess.Popen
         self._environment = dict(os.environ if environment is None else environment)
+        self._handshake_seconds = max(0.05, min(float(handshake_seconds), 2.0))
+        self._system_executable_resolver = system_executable_resolver or _windows_system_executable
 
     def start(
         self,
@@ -126,8 +137,9 @@ class PortablePackageController:
 
     def open_folder(self, descriptor: PortablePackageDescriptor) -> dict[str, object]:
         context = self._action_context(descriptor, "start")
-        process = self._spawn_checked(
-            ["explorer.exe", str(context.root)],
+        explorer = self._system_executable("explorer.exe")
+        process, _completed = self._spawn_checked(
+            [str(explorer), str(context.root)],
             context,
             action="open_folder",
         )
@@ -146,7 +158,9 @@ class PortablePackageController:
         context = self._action_context(descriptor, "start")
         root, fresh = context.root, context.descriptor
         if operation_id is not None:
-            operation, _directory = self._read_operation(root, fresh, operation_id)
+            operation, _directory, _directory_identity = self._read_operation(
+                root, fresh, operation_id
+            )
             result = {
                 "status": operation["status"],
                 "operation": operation,
@@ -185,9 +199,21 @@ class PortablePackageController:
             raise PortableControlError("PORTABLE_INVALID_LIMIT", f"limit must be between 1 and {_MAX_EVENTS}")
         context = self._action_context(descriptor, "start")
         root, fresh = context.root, context.descriptor
-        operation, directory = self._read_operation(root, fresh, operation_id)
-        events_path = _regular_file(directory / "events.jsonl", "operation event log", required=False)
-        events = [] if events_path is None else _read_events(events_path, after_seq=after_seq, limit=limit)
+        operation, directory, directory_identity = self._read_operation(root, fresh, operation_id)
+        events = _read_events(
+            root,
+            directory / "events.jsonl",
+            after_seq=after_seq,
+            limit=limit,
+        )
+        try:
+            directory_stable = _object_identity(directory) == directory_identity
+        except OSError:
+            directory_stable = False
+        if not directory_stable:
+            raise PortableControlError(
+                "PORTABLE_FILE_CHANGED", "portable operation directory changed during read"
+            )
         next_seq = int(events[-1]["seq"]) if events else after_seq
         result = {
             "status": operation["status"],
@@ -207,9 +233,37 @@ class PortablePackageController:
         operation_id: str | None = None,
     ) -> dict[str, object]:
         context = self._action_context(descriptor, action)
-        command = ["cmd.exe", "/d", "/c", str(context.launcher), *arguments]
-        process = self._spawn_checked(command, context, action=action)
-        status = {"start": "starting", "stop": "stopping", "repair": "repairing"}[action]
+        command_processor = self._system_executable("cmd.exe")
+        # `/c` receives only the fixed literal root launcher. The absolute
+        # package path remains in cwd and never enters cmd.exe's parser.
+        command = [str(command_processor), "/d", "/c", _EXACT_LAUNCHERS[action], *arguments]
+        process, completed = self._spawn_checked(command, context, action=action)
+        if completed and action == "start" and operation_id is not None:
+            try:
+                operation, _directory, _identity = self._read_operation(
+                    context.root, context.descriptor, operation_id
+                )
+            except PortableControlError as exc:
+                if exc.code != "PORTABLE_OPERATION_MISSING":
+                    raise
+                status = "completed"
+            else:
+                operation_status = str(operation["status"])
+                if operation_status in _NONTERMINAL_PHASES:
+                    raise PortableControlError(
+                        "PORTABLE_OPERATION_INCOMPLETE",
+                        "portable start launcher exited before the operation reached a terminal state",
+                    )
+                if operation_status in {"blocked", "repairable"}:
+                    raise PortableControlError(
+                        "PORTABLE_OPERATION_FAILED",
+                        "portable start operation completed with a failure status",
+                    )
+                status = operation_status
+        elif completed:
+            status = {"start": "completed", "stop": "stopped", "repair": "completed"}[action]
+        else:
+            status = {"start": "starting", "stop": "stopping", "repair": "repairing"}[action]
         result: dict[str, object] = {
             "status": status,
             "action": action,
@@ -225,7 +279,7 @@ class PortablePackageController:
         context: _ActionContext,
         *,
         action: str,
-    ) -> ProcessLike:
+    ) -> tuple[ProcessLike, bool]:
         kwargs: dict[str, object] = {
             "cwd": context.root,
             "env": _safe_environment(self._environment),
@@ -237,56 +291,84 @@ class PortablePackageController:
         flags = windows_creation_flags()
         if flags:
             kwargs["creationflags"] = flags
+        process: ProcessLike | None = None
         try:
-            process = self._spawn(command, **kwargs)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise PortableControlError(
-                "PORTABLE_LAUNCH_FAILED", f"portable {action} launcher could not be started"
-            ) from exc
-        try:
-            self._assert_context_stable(context)
+            with _execution_identity_guard(context):
+                self._assert_context_stable(context)
+                try:
+                    process = self._spawn(command, **kwargs)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    raise PortableControlError(
+                        "PORTABLE_LAUNCH_FAILED", f"portable {action} launcher could not be started"
+                    ) from exc
+                try:
+                    return_code = process.wait(timeout=self._handshake_seconds)
+                    completed = True
+                except subprocess.TimeoutExpired:
+                    return_code = None
+                    completed = False
+                except (OSError, subprocess.SubprocessError) as exc:
+                    raise PortableControlError(
+                        "PORTABLE_LAUNCH_FAILED", f"portable {action} launcher state could not be checked"
+                    ) from exc
+                self._assert_context_stable(context)
+                if return_code not in (None, 0):
+                    raise PortableControlError(
+                        "PORTABLE_LAUNCH_EXITED", f"portable {action} launcher exited with a failure"
+                    )
         except PortableControlError:
-            _terminate_controller(process)
+            if process is not None:
+                _terminate_controller(process)
             raise
+        return process, completed
+
+    def _system_executable(self, name: str) -> Path:
         try:
-            return_code = process.poll()
-        except (OSError, subprocess.SubprocessError) as exc:
-            _terminate_controller(process)
+            executable = self._system_executable_resolver(name)
+            _validate_system_executable(executable, name)
+            return executable
+        except PortableControlError:
+            raise
+        except (OSError, ValueError) as exc:
             raise PortableControlError(
-                "PORTABLE_LAUNCH_FAILED", f"portable {action} launcher state could not be checked"
+                "PORTABLE_SYSTEM_EXECUTABLE_INVALID",
+                f"Windows system executable is unavailable: {name}",
             ) from exc
-        if return_code not in (None, 0):
-            raise PortableControlError(
-                "PORTABLE_LAUNCH_EXITED", f"portable {action} launcher exited with a failure"
-            )
-        return process
 
     def _action_context(
         self, descriptor: PortablePackageDescriptor, action: str
     ) -> _ActionContext:
         root, fresh = self._fresh_root(descriptor)
-        expected = _EXACT_LAUNCHERS[action]
-        if fresh.launchers.get(action) != expected:
-            raise PortableControlError(
-                "PORTABLE_LAUNCHER_INVALID", f"portable {action} launcher is not the fixed root launcher"
+        try:
+            expected = _EXACT_LAUNCHERS[action]
+            if fresh.launchers.get(action) != expected:
+                raise PortableControlError(
+                    "PORTABLE_LAUNCHER_INVALID", f"portable {action} launcher is not the fixed root launcher"
+                )
+            launcher = _contained_path(root, expected, label=f"{action} launcher")
+            launcher_file = _regular_file(launcher, f"{action} launcher", required=True)
+            assert launcher_file is not None
+            manifest = _regular_file(
+                root / "package" / "tts-more-package.json", "package manifest", required=True
             )
-        launcher = _contained_path(root, expected, label=f"{action} launcher")
-        launcher_file = _regular_file(launcher, f"{action} launcher", required=True)
-        assert launcher_file is not None
-        manifest = _regular_file(
-            root / "package" / "tts-more-package.json", "package manifest", required=True
-        )
-        assert manifest is not None
-        return _ActionContext(
-            root=root,
-            descriptor=fresh,
-            descriptor_identity=_descriptor_identity(fresh),
-            effective_port=descriptor.port,
-            root_identity=_object_identity(root),
-            manifest_identity=_stat_identity(manifest),
-            launcher=launcher_file,
-            launcher_identity=_stat_identity(launcher_file),
-        )
+            assert manifest is not None
+            return _ActionContext(
+                root=root,
+                descriptor=fresh,
+                descriptor_identity=_descriptor_identity(fresh),
+                effective_port=descriptor.port,
+                root_identity=_object_identity(root),
+                manifest_identity=_stat_identity(manifest),
+                launcher=launcher_file,
+                launcher_identity=_stat_identity(launcher_file),
+            )
+        except PortableControlError:
+            raise
+        except OSError as exc:
+            raise PortableControlError(
+                "PORTABLE_PACKAGE_INVALID",
+                "portable package metadata could not be safely inspected",
+            ) from exc
 
     def _assert_context_stable(self, context: _ActionContext) -> None:
         try:
@@ -336,27 +418,47 @@ class PortablePackageController:
         root: Path,
         descriptor: PortablePackageDescriptor,
         operation_id: str,
-    ) -> tuple[dict[str, object], Path]:
+    ) -> tuple[dict[str, object], Path, tuple[int, int]]:
         canonical_id = _canonical_operation_id(operation_id)
-        operations_root = _contained_path(
-            root, descriptor.operations_path, label="operations root"
-        )
-        directory = operations_root / canonical_id
-        if not directory.exists():
-            raise PortableControlError("PORTABLE_OPERATION_MISSING", "portable operation does not exist")
-        if _is_reparse_point(directory):
-            raise PortableControlError("PORTABLE_PATH_REPARSE", "portable operation path is a reparse point")
-        if not directory.is_dir():
-            raise PortableControlError("PORTABLE_OPERATION_INVALID", "portable operation path is not a directory")
         try:
+            operations_root = _contained_path(
+                root, descriptor.operations_path, label="operations root"
+            )
+            directory = operations_root / canonical_id
+            if not directory.exists():
+                raise PortableControlError("PORTABLE_OPERATION_MISSING", "portable operation does not exist")
+            if _is_reparse_point(directory):
+                raise PortableControlError("PORTABLE_PATH_REPARSE", "portable operation path is a reparse point")
+            if not directory.is_dir():
+                raise PortableControlError("PORTABLE_OPERATION_INVALID", "portable operation path is not a directory")
             directory.resolve(strict=True).relative_to(root.resolve(strict=True))
-        except (OSError, ValueError) as exc:
+        except PortableControlError:
+            raise
+        except ValueError as exc:
             raise PortableControlError("PORTABLE_PATH_ESCAPE", "portable operation path escapes package root") from exc
-        operation_path = _regular_file(directory / "operation.json", "operation state", required=True)
-        assert operation_path is not None
-        operation = _read_json(operation_path, "operation state")
-        _validate_operation(operation, canonical_id, descriptor.component)
-        return operation, directory
+        except OSError as exc:
+            raise PortableControlError(
+                "PORTABLE_FILE_CHANGED", "portable operation metadata changed during read"
+            ) from exc
+        try:
+            directory_identity = _object_identity(directory)
+            operation = _project_operation(
+                _read_json(root, directory / "operation.json", "operation state"),
+                canonical_id,
+                descriptor.component,
+            )
+            directory_stable = _object_identity(directory) == directory_identity
+        except PortableControlError:
+            raise
+        except OSError as exc:
+            raise PortableControlError(
+                "PORTABLE_FILE_CHANGED", "portable operation metadata changed during read"
+            ) from exc
+        if not directory_stable:
+            raise PortableControlError(
+                "PORTABLE_FILE_CHANGED", "portable operation directory changed during read"
+            )
+        return operation, directory, directory_identity
 
     @staticmethod
     def _read_process_record(
@@ -366,12 +468,20 @@ class PortablePackageController:
         *,
         expected_port: int,
     ) -> dict[str, object] | None:
-        regular = _regular_file(path, "PID record", required=False)
-        if regular is None:
+        content = _safe_read_control(
+            root,
+            path,
+            max_bytes=_MAX_JSON_BYTES,
+            label="PID record",
+            allow_missing=True,
+        )
+        if content is None:
             return None
         try:
-            payload = _read_json(regular, "PID record")
-        except PortableControlError:
+            payload = _decode_json_object(content, "PID record")
+        except PortableControlError as exc:
+            if exc.code != "PORTABLE_JSON_INVALID":
+                raise
             return None
         child_pids = payload.get("child_pids")
         executable_raw = payload.get("executable_path")
@@ -403,7 +513,7 @@ class PortablePackageController:
         # Only return bounded diagnostic fields; this record does not grant authority.
         allowed = {
             "schema_version", "pid", "parent_pid", "child_pids", "process_created_at",
-            "recorded_at", "executable_path", "command_sha256", "port", "package_root", "build_id",
+            "recorded_at", "port", "build_id",
         }
         return {key: value for key, value in payload.items() if key in allowed}
 
@@ -446,6 +556,141 @@ def _safe_environment(environment: Mapping[str, str]) -> dict[str, str]:
     }
 
 
+def _windows_system_executable(name: str) -> Path:
+    if os.name != "nt":
+        raise PortableControlError(
+            "PORTABLE_SYSTEM_EXECUTABLE_INVALID",
+            f"Windows system executable lookup is unavailable: {name}",
+        )
+    if name == "cmd.exe":
+        directory = _windows_directory_from_api("GetSystemDirectoryW")
+    elif name == "explorer.exe":
+        directory = _windows_directory_from_api("GetWindowsDirectoryW")
+    else:
+        raise PortableControlError(
+            "PORTABLE_SYSTEM_EXECUTABLE_INVALID", "unsupported Windows system executable"
+        )
+    return directory / name
+
+
+def _windows_directory_from_api(function_name: str) -> Path:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = getattr(kernel32, function_name)
+    function.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+    function.restype = ctypes.c_uint
+    size = 32768
+    buffer = ctypes.create_unicode_buffer(size)
+    length = int(function(buffer, size))
+    if length == 0 or length >= size:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"{function_name} failed")
+    directory = Path(buffer.value)
+    if not directory.is_absolute():
+        raise ValueError(f"{function_name} returned a relative path")
+    return directory
+
+
+def _validate_system_executable(path: Path, expected_name: str) -> None:
+    executable = Path(path)
+    if not executable.is_absolute() or executable.name.casefold() != expected_name.casefold():
+        raise PortableControlError(
+            "PORTABLE_SYSTEM_EXECUTABLE_INVALID",
+            f"Windows system executable path is invalid: {expected_name}",
+        )
+    try:
+        metadata = executable.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or _is_reparse_point(executable)
+            or os.path.normcase(str(executable.resolve(strict=True)))
+            != os.path.normcase(str(executable))
+        ):
+            raise ValueError("system executable is not a stable regular file")
+    except OSError as exc:
+        raise PortableControlError(
+            "PORTABLE_SYSTEM_EXECUTABLE_INVALID",
+            f"Windows system executable is unavailable: {expected_name}",
+        ) from exc
+
+
+@contextmanager
+def _execution_identity_guard(context: _ActionContext) -> Iterator[None]:
+    if os.name != "nt":
+        yield
+        return
+    handles: list[int] = []
+    try:
+        handles.append(
+            _open_windows_guard_handle(
+                context.root,
+                share_mode=0x00000001 | 0x00000002,  # READ | WRITE; deny DELETE/rename.
+                directory=True,
+            )
+        )
+        handles.append(
+            _open_windows_guard_handle(
+                context.root / "package" / "tts-more-package.json",
+                share_mode=0x00000001,  # Other readers only; deny write/delete replacement.
+                directory=False,
+            )
+        )
+        handles.append(
+            _open_windows_guard_handle(
+                context.launcher,
+                share_mode=0x00000001,
+                directory=False,
+            )
+        )
+        yield
+    except PortableControlError:
+        raise
+    except OSError as exc:
+        raise PortableControlError(
+            "PORTABLE_IDENTITY_GUARD_FAILED",
+            "portable package execution identity could not be locked",
+        ) from exc
+    finally:
+        if handles:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [ctypes.c_void_p]
+            close_handle.restype = ctypes.c_int
+            for handle in reversed(handles):
+                close_handle(ctypes.c_void_p(handle))
+
+
+def _open_windows_guard_handle(path: Path, *, share_mode: int, directory: bool) -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    flags = 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
+    if directory:
+        flags |= 0x02000000  # FILE_FLAG_BACKUP_SEMANTICS
+    handle = create_file(
+        str(path),
+        0x80000000,  # GENERIC_READ; makes share-mode write/delete denial effective.
+        share_mode,
+        None,
+        3,  # OPEN_EXISTING
+        flags,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        error = ctypes.get_last_error()
+        raise OSError(error, f"CreateFileW identity guard failed: {path.name}")
+    return int(handle)
+
+
 def _contained_path(root: Path, relative: str, *, label: str) -> Path:
     normalized = relative.replace("\\", "/")
     path = Path(normalized)
@@ -477,11 +722,32 @@ def _regular_file(path: Path, label: str, *, required: bool) -> Path | None:
     return path
 
 
-def _read_json(path: Path, label: str) -> dict[str, object]:
-    with path.open("rb") as handle:
-        content = handle.read(_MAX_JSON_BYTES + 1)
-    if len(content) > _MAX_JSON_BYTES:
-        raise PortableControlError("PORTABLE_FILE_TOO_LARGE", f"{label} is too large")
+def _safe_read_control(
+    root: Path,
+    path: Path,
+    *,
+    max_bytes: int,
+    label: str,
+    allow_missing: bool = False,
+) -> bytes | None:
+    try:
+        return safe_read_bytes(
+            root,
+            path,
+            max_bytes=max_bytes,
+            label=label,
+            retries=2,
+            allow_missing=allow_missing,
+        )
+    except PortableFileError as exc:
+        raise PortableControlError(exc.code, str(exc)) from exc
+    except OSError as exc:
+        raise PortableControlError(
+            "PORTABLE_FILE_CHANGED", f"{label} could not be read safely"
+        ) from exc
+
+
+def _decode_json_object(content: bytes, label: str) -> dict[str, object]:
     try:
         payload = json.loads(content)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -491,67 +757,198 @@ def _read_json(path: Path, label: str) -> dict[str, object]:
     return payload
 
 
-def _read_events(path: Path, *, after_seq: int, limit: int) -> list[dict[str, object]]:
+def _read_json(root: Path, path: Path, label: str) -> dict[str, object]:
+    content = _safe_read_control(root, path, max_bytes=_MAX_JSON_BYTES, label=label)
+    assert content is not None
+    return _decode_json_object(content, label)
+
+
+def _read_events(
+    root: Path,
+    path: Path,
+    *,
+    after_seq: int,
+    limit: int,
+) -> list[dict[str, object]]:
+    content = _safe_read_control(
+        root,
+        path,
+        max_bytes=_MAX_EVENT_BYTES,
+        label="operation event log",
+        allow_missing=True,
+    )
+    if content is None:
+        return []
     events: list[dict[str, object]] = []
-    bytes_read = 0
     previous_seq = 0
-    with path.open("rb") as handle:
-        while True:
-            line = handle.readline(_MAX_EVENT_LINE_BYTES + 1)
-            if not line:
+    for line in content.splitlines(keepends=True):
+        if len(line) > _MAX_EVENT_LINE_BYTES:
+            raise PortableControlError("PORTABLE_FILE_TOO_LARGE", "operation event log is too large")
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            # Writers append one fsynced JSON object plus newline. A reader may
+            # observe only the in-progress final append.
+            if not line.endswith((b"\n", b"\r")):
                 break
-            bytes_read += len(line)
-            if len(line) > _MAX_EVENT_LINE_BYTES or bytes_read > _MAX_EVENT_BYTES:
-                raise PortableControlError("PORTABLE_FILE_TOO_LARGE", "operation event log is too large")
-            if not line.strip():
-                continue
-            try:
-                event = json.loads(line)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                # Writers append one fsynced JSON object plus newline. A reader
-                # may observe only the in-progress final append; never hide a
-                # malformed completed line in the middle of the stream.
-                if not line.endswith(b"\n"):
-                    break
-                raise PortableControlError("PORTABLE_JSON_INVALID", "operation event log is invalid") from exc
-            _validate_event(event, previous_seq)
-            previous_seq = int(event["seq"])
-            if previous_seq > after_seq and len(events) < limit:
-                events.append(event)
+            raise PortableControlError("PORTABLE_JSON_INVALID", "operation event log is invalid") from exc
+        projected = _project_event(event, previous_seq, root)
+        previous_seq = int(projected["seq"])
+        if previous_seq > after_seq and len(events) < limit:
+            events.append(projected)
     return events
 
 
-def _validate_operation(payload: dict[str, object], operation_id: str, component: str) -> None:
+_PHASES = {
+    "not_initialized", "checking", "downloading", "installing", "validating",
+    "starting", "ready", "stopped", "repairable", "blocked",
+}
+_NONTERMINAL_PHASES = {
+    "not_initialized", "checking", "downloading", "installing", "validating", "starting",
+}
+_OPERATION_REQUIRED_FIELDS = {
+    "operation_id", "component", "action", "initiator", "started_at", "status", "exit_code",
+}
+_EVENT_REQUIRED_FIELDS = {"seq", "timestamp", "phase", "message"}
+
+
+def _project_operation(
+    payload: dict[str, object], operation_id: str, component: str
+) -> dict[str, object]:
+    fields = set(payload)
     if (
-        payload.get("operation_id") != operation_id
+        not _OPERATION_REQUIRED_FIELDS.issubset(fields)
+        or not fields.issubset(_OPERATION_REQUIRED_FIELDS | {"finished_at"})
+        or payload.get("operation_id") != operation_id
         or payload.get("component") != component
+        or type(payload.get("action")) is not str
         or payload.get("action") not in {"start", "stop", "repair"}
-        or payload.get("status")
-        not in {
-            "not_initialized", "checking", "downloading", "installing", "validating",
-            "starting", "ready", "stopped", "repairable", "blocked",
-        }
-        or not isinstance(payload.get("started_at"), str)
+        or type(payload.get("status")) is not str
+        or payload.get("status") not in _PHASES
+        or not _bounded_text(payload.get("initiator"), 128)
+        or not _valid_timestamp(payload.get("started_at"))
     ):
         raise PortableControlError("PORTABLE_OPERATION_INVALID", "portable operation schema is invalid")
+    status = str(payload["status"])
+    exit_code = payload["exit_code"]
+    has_finished = "finished_at" in payload
+    if status in _NONTERMINAL_PHASES:
+        valid_completion = exit_code is None and not has_finished
+    elif status == "ready":
+        valid_completion = (
+            type(exit_code) is int
+            and exit_code == 0
+            and has_finished
+            and _valid_timestamp(payload.get("finished_at"))
+        )
+    else:
+        valid_completion = (
+            type(exit_code) is int
+            and exit_code != 0
+            and has_finished
+            and _valid_timestamp(payload.get("finished_at"))
+        )
+    if not valid_completion:
+        raise PortableControlError("PORTABLE_OPERATION_INVALID", "portable operation schema is invalid")
+    return {key: payload[key] for key in _OPERATION_REQUIRED_FIELDS | {"finished_at"} if key in payload}
 
 
-def _validate_event(payload: object, previous_seq: int) -> None:
+def _project_event(
+    payload: object, previous_seq: int, root: Path
+) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise PortableControlError("PORTABLE_EVENT_INVALID", "portable operation event must be an object")
+    fields = set(payload)
     seq = payload.get("seq")
+    percent = payload.get("percent")
+    error_code = payload.get("error_code")
     if (
-        type(seq) is not int
+        not _EVENT_REQUIRED_FIELDS.issubset(fields)
+        or not fields.issubset(_EVENT_REQUIRED_FIELDS | {"percent", "error_code"})
+        or type(seq) is not int
         or seq != previous_seq + 1
-        or not isinstance(payload.get("timestamp"), str)
-        or payload.get("phase")
-        not in {
-            "not_initialized", "checking", "downloading", "installing", "validating",
-            "starting", "ready", "stopped", "repairable", "blocked",
-        }
-        or not isinstance(payload.get("message"), str)
+        or not _valid_timestamp(payload.get("timestamp"))
+        or type(payload.get("phase")) is not str
+        or payload.get("phase") not in _PHASES
+        or not _bounded_text(payload.get("message"), 4096)
+        or (
+            "percent" in payload
+            and (
+                type(percent) not in {int, float}
+                or not math.isfinite(float(percent))
+                or not 0 <= float(percent) <= 100
+            )
+        )
+        or (
+            "error_code" in payload
+            and (
+                type(error_code) is not str
+                or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", error_code) is None
+            )
+        )
     ):
         raise PortableControlError("PORTABLE_EVENT_INVALID", "portable operation event schema is invalid")
+    projected = {key: payload[key] for key in _EVENT_REQUIRED_FIELDS | {"percent", "error_code"} if key in payload}
+    projected["message"] = _sanitize_event_message(str(payload["message"]), root)
+    return projected
+
+
+def _bounded_text(value: object, maximum: int) -> bool:
+    return (
+        type(value) is str
+        and 0 < len(value) <= maximum
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
+
+
+def _valid_timestamp(value: object) -> bool:
+    if not _bounded_text(value, 64):
+        return False
+    assert isinstance(value, str)
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _sanitize_event_message(message: str, root: Path) -> str:
+    sanitized = message
+    root_text = str(root)
+    if root_text:
+        sanitized = re.sub(re.escape(root_text), "[REDACTED_PACKAGE_ROOT]", sanitized, flags=re.IGNORECASE)
+    sanitized = re.sub(
+        r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@",
+        r"\1[REDACTED_CREDENTIALS]@",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)\b(?:authorization\s*:\s*)?bearer\s+[^\s,;]+",
+        "Authorization: Bearer [REDACTED_TOKEN]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+",
+        lambda match: f"{match.group(1)}=[REDACTED_SECRET]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)(?:[A-Z]:[\\/]|\\\\)[^\s\"'<>|]+",
+        "[REDACTED_PATH]",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)\b(?:DESKTOP|LAPTOP)-[A-Z0-9_-]+\b",
+        "[REDACTED_COMPUTER]",
+        sanitized,
+    )
+    for key in ("USERNAME", "COMPUTERNAME"):
+        identity = os.environ.get(key, "").strip()
+        if len(identity) >= 3:
+            sanitized = re.sub(re.escape(identity), f"[REDACTED_{key}]", sanitized, flags=re.IGNORECASE)
+    return sanitized
 
 
 def _stat_identity(path: Path) -> tuple[int, int, int, int]:

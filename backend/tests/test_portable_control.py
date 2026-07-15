@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
-from app import portable_control
+from app import portable_control, portable_file_io
 from app.portable_control import PortableControlError, PortablePackageController
 from app.portable_discovery import read_portable_package
 
@@ -25,7 +26,9 @@ class FakeProcess:
         return self.returncode
 
     def wait(self, timeout=None) -> int:
-        return 0 if self.returncode is None else self.returncode
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("fake-controller", timeout)
+        return self.returncode
 
     def terminate(self) -> None:
         self.terminated = True
@@ -116,6 +119,27 @@ def _junction(link: Path, target: Path) -> None:
         pytest.skip(f"junction creation is unavailable: {completed.stderr}")
 
 
+def _operation_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "operation_id": OPERATION_ID,
+        "component": "gpt-sovits",
+        "action": "start",
+        "initiator": "tts-more",
+        "started_at": "2026-07-15T00:00:00Z",
+        "status": "starting",
+        "exit_code": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _write_operation_state(package: Path, payload: dict[str, object]) -> Path:
+    directory = package / "data" / "local" / "operations" / OPERATION_ID
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "operation.json").write_text(json.dumps(payload), encoding="utf-8")
+    return directory
+
+
 def test_controller_executes_exact_root_launcher_with_safe_process_contract(tmp_path: Path) -> None:
     package = _write_package(tmp_path / "GPT 包 & (便携)")
     calls: list[tuple[list[str], dict[str, object]]] = []
@@ -127,14 +151,137 @@ def test_controller_executes_exact_root_launcher_with_safe_process_contract(tmp_
     controller = PortablePackageController(spawn=spawn, environment={"SYSTEMROOT": "C:/Windows", "UNSAFE": "drop"})
     result = controller.start(read_portable_package(package), operation_id=OPERATION_ID, port_override=9980)
 
-    assert calls[0][0] == [
-        "cmd.exe", "/d", "/c", str(package / "Start.cmd"),
+    command = calls[0][0]
+    assert Path(command[0]).is_absolute()
+    assert Path(command[0]).name.casefold() == "cmd.exe"
+    assert command == [
+        command[0], "/d", "/c", "Start.cmd",
         "-OperationId", OPERATION_ID, "-ManagedBy", "tts-more", "-NoUi", "-PortOverride", "9980",
     ]
     assert calls[0][1]["cwd"] == package
     assert calls[0][1]["close_fds"] is True
     assert calls[0][1]["env"] == {"SYSTEMROOT": "C:/Windows"}
     assert result == {"status": "starting", "action": "start", "operation_id": OPERATION_ID, "controller_pid": 42}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real cmd.exe contract is Windows-only")
+@pytest.mark.parametrize(
+    "directory_name",
+    [
+        "普通 package with spaces",
+        "中文 & caret^ (括号) %百分% !感叹!",
+    ],
+)
+def test_real_windows_cmd_runs_fixed_literal_launcher_from_special_cwd(
+    tmp_path: Path, directory_name: str
+) -> None:
+    package = _write_package(tmp_path / directory_name)
+    marker = package / "real-start.marker"
+    (package / "Start.cmd").write_text(
+        "@echo off\r\n"
+        "setlocal DisableDelayedExpansion\r\n"
+        "> \"%~dp0real-start.marker\" echo SAFE_MARKER\r\n"
+        "exit /b 0\r\n",
+        encoding="utf-8",
+    )
+
+    result = PortablePackageController().start(
+        read_portable_package(package), operation_id=OPERATION_ID
+    )
+
+    assert marker.read_text(encoding="utf-8").strip() == "SAFE_MARKER"
+    assert result["status"] == "completed"
+    assert result["status"] != "starting"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows system executable lookup is Windows-only")
+def test_real_windows_cmd_ignores_cwd_and_path_name_hijacks(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "package")
+    marker = package / "system-cmd.marker"
+    (package / "Start.cmd").write_text(
+        "@echo off\r\n> system-cmd.marker echo SYSTEM_CMD\r\nexit /b 0\r\n",
+        encoding="utf-8",
+    )
+    (package / "cmd.exe").write_bytes(b"MZ-not-a-real-system-command")
+    path_hijack = tmp_path / "path-hijack"
+    path_hijack.mkdir()
+    (path_hijack / "cmd.exe").write_bytes(b"MZ-not-a-real-system-command")
+    environment = dict(os.environ)
+    environment["PATH"] = f"{path_hijack};{environment.get('PATH', '')}"
+
+    result = PortablePackageController(environment=environment).start(
+        read_portable_package(package), operation_id=OPERATION_ID
+    )
+
+    assert marker.read_text(encoding="utf-8").strip() == "SYSTEM_CMD"
+    assert result["status"] == "completed"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real cmd.exe timing is Windows-only")
+def test_real_windows_short_delayed_failure_is_never_reported_starting(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "package")
+    (package / "Start.cmd").write_text(
+        "@echo off\r\n"
+        "powershell -NoProfile -NonInteractive -Command \"Start-Sleep -Milliseconds 80\"\r\n"
+        "exit /b 9\r\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PortableControlError) as error:
+        PortablePackageController().start(
+            read_portable_package(package), operation_id=OPERATION_ID
+        )
+
+    assert error.value.code == "PORTABLE_LAUNCH_EXITED"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real cmd.exe timing is Windows-only")
+def test_real_windows_long_controller_returns_starting_after_bounded_handshake(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "package")
+    (package / "Start.cmd").write_text(
+        "@echo off\r\n"
+        "powershell -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2\"\r\n"
+        "exit /b 0\r\n",
+        encoding="utf-8",
+    )
+
+    started_at = time.monotonic()
+    result = PortablePackageController().start(
+        read_portable_package(package), operation_id=OPERATION_ID
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert result["status"] == "starting"
+    assert elapsed < 1.0
+    time.sleep(2.2)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows share-mode guard is Windows-only")
+@pytest.mark.parametrize("target", ["launcher", "manifest"])
+def test_real_windows_execution_guard_blocks_launcher_or_manifest_replacement(
+    tmp_path: Path, target: str
+) -> None:
+    package = _write_package(tmp_path / f"guard-{target}")
+    if target == "launcher":
+        command = '> "%~f0" echo REPLACED'
+    else:
+        command = 'del /f /q "package\\tts-more-package.json"'
+    original_launcher = (
+        "@echo off\r\n"
+        f"{command}\r\n"
+        "if errorlevel 1 exit /b 17\r\n"
+        "exit /b 0\r\n"
+    )
+    (package / "Start.cmd").write_text(original_launcher, encoding="utf-8")
+    original_launcher_bytes = (package / "Start.cmd").read_bytes()
+
+    result = PortablePackageController().start(
+        read_portable_package(package), operation_id=OPERATION_ID
+    )
+
+    assert result["status"] == "completed"
+    assert (package / "Start.cmd").read_bytes() == original_launcher_bytes
+    assert (package / "package" / "tts-more-package.json").is_file()
 
 
 @pytest.mark.parametrize("operation_id", ["../escape", "{11111111-1111-4111-8111-111111111111}", "11111111-1111-4111-8111-111111111111 & whoami", 7])
@@ -197,9 +344,15 @@ def test_controller_detects_launcher_swap_during_spawn_and_terminates_controller
         return process
 
     controller = PortablePackageController(spawn=swap_during_spawn)
-    with pytest.raises(PortableControlError, match="changed during action"):
+    with pytest.raises(PortableControlError) as error:
         controller.start(read_portable_package(package), operation_id=OPERATION_ID)
-    assert process.terminated is True
+    if os.name == "nt":
+        assert error.value.code == "PORTABLE_LAUNCH_FAILED"
+        assert process.terminated is False
+        assert (package / "Start.cmd").read_text(encoding="utf-8") == "@echo off\n"
+    else:
+        assert error.value.code == "PORTABLE_IDENTITY_CHANGED"
+        assert process.terminated is True
 
 
 def test_controller_detects_package_root_swap_during_spawn(tmp_path: Path) -> None:
@@ -213,9 +366,15 @@ def test_controller_detects_package_root_swap_during_spawn(tmp_path: Path) -> No
         return process
 
     controller = PortablePackageController(spawn=swap_root)
-    with pytest.raises(PortableControlError, match="changed during action"):
+    with pytest.raises(PortableControlError) as error:
         controller.start(read_portable_package(package), operation_id=OPERATION_ID)
-    assert process.terminated is True
+    if os.name == "nt":
+        assert error.value.code == "PORTABLE_LAUNCH_FAILED"
+        assert process.terminated is False
+        assert not moved.exists()
+    else:
+        assert error.value.code == "PORTABLE_IDENTITY_CHANGED"
+        assert process.terminated is True
 
 
 def test_controller_allows_launcher_to_create_package_data_children(tmp_path: Path) -> None:
@@ -247,10 +406,8 @@ def test_controller_rejects_package_root_and_manifest_directory_junctions(tmp_pa
     outside_manifest = tmp_path / "outside-manifest"
     manifest_directory.rename(outside_manifest)
     _junction(manifest_directory, outside_manifest)
-    with pytest.raises(PortableControlError, match="freshly validated"):
-        PortablePackageController(spawn=lambda *_args, **_kwargs: pytest.fail("must not spawn")).start(
-            read_portable_package(package), operation_id=OPERATION_ID
-        )
+    with pytest.raises(OSError, match="reparse"):
+        read_portable_package(package)
 
 
 def test_stop_repair_and_open_folder_use_only_fixed_commands(tmp_path: Path) -> None:
@@ -262,11 +419,11 @@ def test_stop_repair_and_open_folder_use_only_fixed_commands(tmp_path: Path) -> 
     assert controller.stop(descriptor)["status"] == "stopping"
     assert controller.repair(descriptor)["status"] == "repairing"
     assert controller.open_folder(descriptor)["status"] == "opened"
-    assert calls == [
-        ["cmd.exe", "/d", "/c", str(package / "Stop.cmd")],
-        ["cmd.exe", "/d", "/c", str(package / "Repair.cmd")],
-        ["explorer.exe", str(package)],
-    ]
+    assert all(Path(command[0]).is_absolute() for command in calls)
+    assert [Path(command[0]).name.casefold() for command in calls] == ["cmd.exe", "cmd.exe", "explorer.exe"]
+    assert calls[0][1:] == ["/d", "/c", "Stop.cmd"]
+    assert calls[1][1:] == ["/d", "/c", "Repair.cmd"]
+    assert calls[2][1:] == [str(package)]
 
 
 def test_spawn_failure_has_stable_error_and_never_reports_starting(tmp_path: Path) -> None:
@@ -287,6 +444,37 @@ def test_immediate_launcher_failure_is_blocked_not_starting(tmp_path: Path) -> N
     with pytest.raises(PortableControlError) as error:
         controller.start(read_portable_package(package), operation_id=OPERATION_ID)
     assert error.value.code == "PORTABLE_LAUNCH_EXITED"
+
+
+def test_immediate_success_reports_terminal_operation_status(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "package")
+    _write_operation_state(package, _operation_payload(
+        status="ready", exit_code=0, finished_at="2026-07-15T00:00:01Z"
+    ))
+    controller = PortablePackageController(
+        spawn=lambda *_args, **_kwargs: FakeProcess(returncode=0)
+    )
+
+    result = controller.start(
+        read_portable_package(package), operation_id=OPERATION_ID
+    )
+
+    assert result["status"] == "ready"
+
+
+def test_immediate_success_never_reports_completed_for_nonterminal_operation(
+    tmp_path: Path,
+) -> None:
+    package = _write_package(tmp_path / "package")
+    _write_operation_state(package, _operation_payload(status="starting"))
+    controller = PortablePackageController(
+        spawn=lambda *_args, **_kwargs: FakeProcess(returncode=0)
+    )
+
+    with pytest.raises(PortableControlError) as error:
+        controller.start(read_portable_package(package), operation_id=OPERATION_ID)
+
+    assert error.value.code == "PORTABLE_OPERATION_INCOMPLETE"
 
 
 def test_status_and_logs_read_only_schema_bound_package_data(tmp_path: Path) -> None:
@@ -320,6 +508,124 @@ def test_status_and_logs_read_only_schema_bound_package_data(tmp_path: Path) -> 
     pid_status = controller.status(descriptor)
     assert pid_status["process_record"]["pid"] == 1234
     assert pid_status["running"] is None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.pop("initiator"),
+        lambda payload: payload.update(exit_code="0", status="ready", finished_at="2026-07-15T00:00:01Z"),
+        lambda payload: payload.update(status="ready", exit_code=0),
+        lambda payload: payload.update(exit_code=7),
+        lambda payload: payload.update(secret="must-not-cross-api"),
+        lambda payload: payload.update(initiator="tts-more\nheader-injection"),
+        lambda payload: payload.update(action=["start"]),
+    ],
+    ids=[
+        "missing-initiator",
+        "string-exit-code",
+        "terminal-without-finished-at",
+        "nonterminal-with-exit-code",
+        "unknown-sensitive-field",
+        "control-character-initiator",
+        "non-string-action",
+    ],
+)
+def test_status_rejects_non_exact_operation_protocol(
+    tmp_path: Path, mutation
+) -> None:
+    package = _write_package(tmp_path / "package")
+    payload = _operation_payload()
+    mutation(payload)
+    _write_operation_state(package, payload)
+
+    with pytest.raises(PortableControlError) as error:
+        PortablePackageController().status(
+            read_portable_package(package), operation_id=OPERATION_ID
+        )
+
+    assert error.value.code == "PORTABLE_OPERATION_INVALID"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"seq": 1, "timestamp": "2026-07-15T00:00:00Z", "phase": "checking", "message": "ok", "secret": "token"},
+        {"seq": 1, "timestamp": "2026-07-15T00:00:00Z", "phase": "checking", "message": "ok", "percent": True},
+        {"seq": 1, "timestamp": "2026-07-15T00:00:00Z", "phase": "checking", "message": "ok", "percent": 101},
+        {"seq": 1, "timestamp": "2026-07-15T00:00:00Z", "phase": "checking", "message": "ok", "error_code": "secret value"},
+        {"seq": 1, "timestamp": "2026-07-15T00:00:00Z", "phase": ["checking"], "message": "ok"},
+    ],
+    ids=["unknown-field", "boolean-percent", "percent-out-of-range", "unsafe-error-code", "non-string-phase"],
+)
+def test_logs_reject_non_exact_event_protocol(tmp_path: Path, event: dict[str, object]) -> None:
+    package = _write_package(tmp_path / "package")
+    operation = _write_operation_state(package, _operation_payload())
+    (operation / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+    with pytest.raises(PortableControlError) as error:
+        PortablePackageController().logs(
+            read_portable_package(package), operation_id=OPERATION_ID
+        )
+
+    assert error.value.code == "PORTABLE_EVENT_INVALID"
+
+
+def test_logs_project_only_protocol_fields_and_redact_sensitive_message_data(
+    tmp_path: Path,
+) -> None:
+    package = _write_package(tmp_path / "package")
+    operation = _write_operation_state(package, _operation_payload())
+    raw_message = (
+        rf"loaded {package}\private\voice.wav from C:\Users\xuyu_\secret.wav "
+        "Authorization: Bearer abc.def.ghi api_key=top-secret "
+        "https://alice:password@example.invalid/path DESKTOP-SECRET"
+    )
+    event = {
+        "seq": 1,
+        "timestamp": "2026-07-15T00:00:00Z",
+        "phase": "checking",
+        "message": raw_message,
+        "percent": 42.5,
+        "error_code": "CUDA_PROBE_FAILED",
+    }
+    (operation / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+    returned = PortablePackageController().logs(
+        read_portable_package(package), operation_id=OPERATION_ID
+    )["events"][0]
+
+    assert set(returned) == {"seq", "timestamp", "phase", "message", "percent", "error_code"}
+    message = str(returned["message"])
+    for secret in (str(package), "C:\\Users\\xuyu_", "abc.def.ghi", "top-secret", "alice", "password", "DESKTOP-SECRET"):
+        assert secret.casefold() not in message.casefold()
+    assert "[REDACTED" in message
+
+
+def test_pid_status_never_returns_paths_or_command_digest(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "package")
+    record = package / "data" / "local" / "run" / "worker.pid.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(json.dumps({
+        "schema_version": 2,
+        "pid": 1234,
+        "parent_pid": 100,
+        "child_pids": [1235],
+        "process_created_at": "2026-07-15T00:00:00Z",
+        "recorded_at": "2026-07-15T00:00:01Z",
+        "executable_path": str(package / "runtime/live/python.exe"),
+        "command_sha256": "a" * 64,
+        "port": 9880,
+        "package_root": str(package.resolve()),
+        "build_id": "build-one",
+    }), encoding="utf-8")
+
+    result = PortablePackageController().status(read_portable_package(package))["process_record"]
+
+    assert set(result) == {
+        "schema_version", "pid", "parent_pid", "child_pids", "process_created_at",
+        "recorded_at", "port", "build_id",
+    }
 
 
 @pytest.mark.parametrize("operation_id", ["../secret", "not-a-uuid"])
@@ -425,6 +731,157 @@ def test_logs_fail_closed_when_package_identity_drifts_during_read(
         )
 
 
+def test_status_retries_atomic_operation_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = _write_package(tmp_path / "package")
+    operation = package / "data" / "local" / "operations" / OPERATION_ID
+    operation.mkdir(parents=True)
+    operation_path = operation / "operation.json"
+    operation_path.write_text(json.dumps({
+        "operation_id": OPERATION_ID, "component": "gpt-sovits", "action": "start",
+        "initiator": "tts-more", "started_at": "2026-07-15T00:00:00Z",
+        "status": "not_initialized", "exit_code": None,
+    }), encoding="utf-8")
+    replacement = operation / "operation.next.json"
+    replacement.write_text(json.dumps({
+        "operation_id": OPERATION_ID, "component": "gpt-sovits", "action": "start",
+        "initiator": "tts-more", "started_at": "2026-07-15T00:00:00Z",
+        "status": "ready", "exit_code": 0, "finished_at": "2026-07-15T00:00:01Z",
+    }), encoding="utf-8")
+    original_open = portable_file_io._open_binary
+    swapped = False
+
+    def replace_before_open(current: Path):
+        nonlocal swapped
+        if not swapped and current.name == "operation.json":
+            swapped = True
+            os.replace(replacement, current)
+        return original_open(current)
+
+    monkeypatch.setattr(portable_file_io, "_open_binary", replace_before_open)
+
+    result = PortablePackageController().status(
+        read_portable_package(package), operation_id=OPERATION_ID
+    )
+
+    assert result["status"] == "ready"
+
+
+def test_logs_never_return_after_operation_parent_switches_to_junction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = _write_package(tmp_path / "package")
+    operations_root = package / "data" / "local" / "operations"
+    operation = operations_root / OPERATION_ID
+    operation.mkdir(parents=True)
+    payload = {
+        "operation_id": OPERATION_ID, "component": "gpt-sovits", "action": "start",
+        "initiator": "tts-more", "started_at": "2026-07-15T00:00:00Z",
+        "status": "not_initialized", "exit_code": None,
+    }
+    (operation / "operation.json").write_text(json.dumps(payload), encoding="utf-8")
+    (operation / "events.jsonl").write_text("", encoding="utf-8")
+    outside = tmp_path / "outside-operation"
+    outside.mkdir()
+    (outside / "operation.json").write_text(json.dumps(payload), encoding="utf-8")
+    (outside / "events.jsonl").write_text("", encoding="utf-8")
+    moved = operations_root / f"{OPERATION_ID}-old"
+    original_open = portable_file_io._open_binary
+    swapped = False
+
+    def swap_parent_before_open(current: Path):
+        nonlocal swapped
+        if not swapped and current.name == "operation.json":
+            swapped = True
+            operation.rename(moved)
+            _junction(operation, outside)
+        return original_open(current)
+
+    monkeypatch.setattr(portable_file_io, "_open_binary", swap_parent_before_open)
+
+    with pytest.raises(PortableControlError) as error:
+        PortablePackageController().logs(
+            read_portable_package(package), operation_id=OPERATION_ID
+        )
+
+    assert error.value.code in {"PORTABLE_PATH_REPARSE", "PORTABLE_FILE_CHANGED", "PORTABLE_PATH_ESCAPE"}
+
+
+def test_status_maps_low_level_read_errors_to_stable_control_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = _write_package(tmp_path / "package")
+    operation = package / "data" / "local" / "operations" / OPERATION_ID
+    operation.mkdir(parents=True)
+    (operation / "operation.json").write_text(json.dumps({
+        "operation_id": OPERATION_ID, "component": "gpt-sovits", "action": "start",
+        "initiator": "tts-more", "started_at": "2026-07-15T00:00:00Z",
+        "status": "not_initialized", "exit_code": None,
+    }), encoding="utf-8")
+    descriptor = read_portable_package(package)
+
+    original_open = portable_file_io._open_binary
+
+    def fail_operation_only(current: Path):
+        if current.name == "operation.json":
+            raise OSError("localized filesystem error")
+        return original_open(current)
+
+    monkeypatch.setattr(portable_file_io, "_open_binary", fail_operation_only)
+
+    with pytest.raises(PortableControlError) as error:
+        PortablePackageController().status(
+            descriptor, operation_id=OPERATION_ID
+        )
+
+    assert error.value.code == "PORTABLE_FILE_CHANGED"
+    assert "localized filesystem error" not in str(error.value)
+
+
+def test_action_context_maps_launcher_metadata_errors_to_stable_control_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = _write_package(tmp_path / "package")
+    descriptor = read_portable_package(package)
+    original_lstat = Path.lstat
+
+    def fail_launcher_only(current: Path):
+        if current == package / "Start.cmd":
+            raise OSError("localized launcher metadata detail")
+        return original_lstat(current)
+
+    monkeypatch.setattr(Path, "lstat", fail_launcher_only)
+
+    with pytest.raises(PortableControlError) as error:
+        PortablePackageController().start(descriptor, operation_id=OPERATION_ID)
+
+    assert error.value.code == "PORTABLE_PACKAGE_INVALID"
+    assert "localized launcher metadata detail" not in str(error.value)
+
+
+def test_operation_directory_metadata_errors_are_stable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = _write_package(tmp_path / "package")
+    operation = _write_operation_state(package, _operation_payload())
+    descriptor = read_portable_package(package)
+    original_exists = Path.exists
+
+    def fail_operation_only(current: Path):
+        if current == operation:
+            raise OSError("localized operation metadata detail")
+        return original_exists(current)
+
+    monkeypatch.setattr(Path, "exists", fail_operation_only)
+
+    with pytest.raises(PortableControlError) as error:
+        PortablePackageController().status(descriptor, operation_id=OPERATION_ID)
+
+    assert error.value.code == "PORTABLE_FILE_CHANGED"
+    assert "localized operation metadata detail" not in str(error.value)
+
+
 def test_pid_record_never_authorizes_running_or_stop(tmp_path: Path) -> None:
     package = _write_package(tmp_path / "package")
     record = package / "data" / "local" / "run" / "worker.pid.json"
@@ -437,7 +894,10 @@ def test_pid_record_never_authorizes_running_or_stop(tmp_path: Path) -> None:
     status = controller.status(descriptor)
     assert status["running"] is None
     controller.stop(descriptor)
-    assert calls == [["cmd.exe", "/d", "/c", str(package / "Stop.cmd")]]
+    assert len(calls) == 1
+    assert Path(calls[0][0]).is_absolute()
+    assert Path(calls[0][0]).name.casefold() == "cmd.exe"
+    assert calls[0][1:] == ["/d", "/c", "Stop.cmd"]
 
 
 def test_status_rejects_a_partially_forged_pid_record_schema(tmp_path: Path) -> None:
