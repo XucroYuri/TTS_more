@@ -379,6 +379,7 @@ function Test-ContractDirectCommandInTry {
 
 $controller = Parse-ContractAst $env:TTS_MORE_CONTRACT_CONTROLLER
 $worker = Parse-ContractAst $env:TTS_MORE_CONTRACT_WORKER
+$errorFunction = Get-ContractFunction $controller "Throw-PortableStartError"
 $contextFunction = Get-ContractFunction $controller "Get-PackageContext"
 $serviceFunction = Get-ContractFunction $controller "Invoke-ServiceStart"
 $lockFunction = Get-ContractFunction $controller "Open-PackageOperationLock"
@@ -388,6 +389,18 @@ $clearFunction = Get-ContractFunction $controller "Clear-StaleActivePointer"
 $mainTries = @($controller.FindAll({ param($node) $node -is [System.Management.Automation.Language.TryStatementAst] }, $true) | Where-Object { [object]::ReferenceEquals($_.Parent, $controller.EndBlock) })
 Assert-Contract ($mainTries.Count -eq 1) "controller must have exactly one direct main try statement"
 $mainTry = $mainTries[0]
+
+$errorParameters = @($errorFunction.Body.ParamBlock.Parameters)
+Assert-Contract ($errorParameters.Count -eq 2 -and
+    $errorParameters[0].Name.VariablePath.UserPath -ceq "Code" -and $errorParameters[0].StaticType -eq [string] -and
+    $errorParameters[1].Name.VariablePath.UserPath -ceq "Message" -and $errorParameters[1].StaticType -eq [string]) "Throw-PortableStartError must declare exactly string Code and Message parameters"
+$errorStatements = @($errorFunction.Body.EndBlock.Statements)
+Assert-Contract ($errorStatements.Count -eq 1 -and $errorStatements[0] -is [System.Management.Automation.Language.ThrowStatementAst]) "Throw-PortableStartError must contain one direct throw statement"
+$errorThrow = $errorStatements[0]
+$errorExpression = Get-ContractExactExpression $errorThrow.Pipeline
+Assert-Contract ((Test-ContractExactStaticInvocation $errorExpression "PortableStartException" "new" 2) -and
+    (Test-ContractVariable $errorExpression.Arguments[0] "Code") -and
+    (Test-ContractVariable $errorExpression.Arguments[1] "Message")) "Throw-PortableStartError must directly throw PortableStartException.new(Code, Message)"
 
 $operationsMatches = @()
 $v2OperationsAssignments = @()
