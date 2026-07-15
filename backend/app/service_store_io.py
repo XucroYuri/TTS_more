@@ -26,6 +26,10 @@ class ServiceDocument:
     services: list[dict[str, object]]
 
 
+class ServicePostCommitError(RuntimeError):
+    """The document is durable, but its in-process publication failed."""
+
+
 def read_service_document(path: Path) -> ServiceDocument:
     try:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -53,8 +57,14 @@ def update_service_document(
     updater: Callable[[ServiceDocument], ServiceDocument],
     *,
     default_schema_version: int | None,
+    after_write: Callable[[ServiceDocument], None] | None = None,
 ) -> ServiceDocument:
-    """Lock, re-read, merge and atomically replace the shared services document."""
+    """Lock, replace, then publish under the same lock.
+
+    ``after_write`` is only for non-blocking in-memory publication. It must not
+    re-enter this store. A callback failure is reported explicitly after the
+    durable replace so callers never describe the committed mutation as absent.
+    """
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with services_store_lock(path.parent):
@@ -65,6 +75,13 @@ def update_service_document(
         )
         updated = updater(current)
         write_service_document_atomic(path, updated)
+        if after_write is not None:
+            try:
+                after_write(updated)
+            except Exception as exc:
+                raise ServicePostCommitError(
+                    "service document was committed but in-memory publication failed"
+                ) from exc
         return updated
 
 

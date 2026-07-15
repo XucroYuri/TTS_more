@@ -34,6 +34,7 @@ from app.portable_services import (
     discover_bounded_portable_packages,
     resolve_locator,
 )
+from app.service_store_io import ServicePostCommitError
 
 
 CONTROL_HEADER = "X-TTS-More-Control"
@@ -396,8 +397,17 @@ def install_local_control(
         store = current_store()
         try:
             initial_services = current_services() if not store.path.exists() else []
-            services = store.replace_component(endpoint, initial_services=initial_services)
-            refresh_services(services)
+            services = store.replace_component(
+                endpoint,
+                initial_services=initial_services,
+                publish=refresh_services,
+            )
+        except ServicePostCommitError:
+            _raise_error(
+                500,
+                "LOCAL_CONTROL_PUBLICATION_FAILED",
+                "portable service registration was persisted but runtime refresh failed",
+            )
         except (OSError, ValueError, json.JSONDecodeError):
             _raise_error(
                 409,
@@ -966,6 +976,7 @@ def _local_origin(raw: str) -> bool:
         and not parsed.query
         and not parsed.fragment
         and raw.startswith(parsed.scheme + "://")
+        and raw == f"{parsed.scheme}://{parsed.netloc}"
         and _local_authority(parsed.netloc)
     )
 

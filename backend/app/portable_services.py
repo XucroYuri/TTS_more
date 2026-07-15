@@ -5,7 +5,7 @@ import stat
 import unicodedata
 from itertools import islice
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from pydantic import ValidationError
 
@@ -290,8 +290,9 @@ class PortableServiceStore:
         endpoint: TTSServiceEndpoint,
         *,
         initial_services: Sequence[TTSServiceEndpoint | dict[str, object]] = (),
+        publish: Callable[[Sequence[TTSServiceEndpoint]], None] | None = None,
     ) -> list[TTSServiceEndpoint]:
-        """Atomically replace every portable record for one component."""
+        """Atomically replace and optionally publish one component under the store lock."""
 
         validated = TTSServiceEndpoint.model_validate(endpoint)
         locator = validated.portable_locator
@@ -333,7 +334,16 @@ class PortableServiceStore:
                 ],
             )
 
-        update_service_document(path, replace, default_schema_version=STORE_SCHEMA_VERSION)
+        def publish_written(_document: ServiceDocument) -> None:
+            if publish is not None:
+                publish(tuple(resolved))
+
+        update_service_document(
+            path,
+            replace,
+            default_schema_version=STORE_SCHEMA_VERSION,
+            after_write=publish_written if publish is not None else None,
+        )
         self._baseline = list(resolved)
         return resolved
 

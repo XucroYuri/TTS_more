@@ -6,7 +6,9 @@ import socket
 import subprocess
 import asyncio
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,8 +16,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.local_control as local_control
+import app.main as main_module
 from app.local_control import FolderSelectionError, select_portable_folder
 from app.main import create_app
+from app.portable_services import PortableServiceStore
 
 
 OPERATION_ID = "11111111-1111-4111-8111-111111111111"
@@ -307,6 +311,9 @@ def test_token_allows_ipv6_loopback_host_authority(tmp_path: Path) -> None:
         "http://127.0.0.1@evil.test:5173",
         "http://user@localhost:5173",
         "http://localhost:5173/not-an-origin",
+        "http://localhost:5173?",
+        "http://localhost:5173#",
+        "http://localhost:5173/",
         "http://[::1",
     ),
 )
@@ -634,6 +641,100 @@ def test_register_replaces_the_previous_package_for_the_same_component(tmp_path:
     assert [(item["package_id"], item["package_root"]) for item in registered] == [
         ("gpt-new", str(second.resolve()))
     ]
+
+
+def test_racing_register_publication_cannot_overwrite_newer_persisted_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = tmp_path / "TTS More"
+    first = _write_package(tmp_path / "GPT one", component="gpt-sovits", package_id="gpt-one")
+    second = _write_package(tmp_path / "GPT two", component="gpt-sovits", package_id="gpt-two")
+    first_publish_entered = threading.Event()
+    release_first_publish = threading.Event()
+    original_apply = main_module._apply_registry
+
+    def ordered_apply(app, registry, store) -> None:
+        package_ids = {
+            endpoint.portable_locator.package_id
+            for endpoint in registry.services
+            if endpoint.portable_locator is not None
+            and endpoint.portable_locator.component == "gpt-sovits"
+        }
+        if package_ids == {"gpt-one"}:
+            first_publish_entered.set()
+            assert release_first_publish.wait(5)
+        original_apply(app, registry, store)
+
+    monkeypatch.setattr(main_module, "_apply_registry", ordered_apply)
+    client = _client(controller)
+    headers = _control(_token(client))
+
+    def register(package: Path, package_id: str):
+        return client.post(
+            "/api/local-portable-services/register",
+            headers=headers,
+            json={"component": "gpt-sovits", "package_id": package_id, "path": str(package)},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_request = pool.submit(register, first, "gpt-one")
+        assert first_publish_entered.wait(5)
+        second_request = pool.submit(register, second, "gpt-two")
+        try:
+            time.sleep(0.1)
+            assert not second_request.done(), "newer registration crossed an older in-flight publication"
+        finally:
+            release_first_publish.set()
+        first_response = first_request.result(timeout=10)
+        second_response = second_request.result(timeout=10)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    persisted = PortableServiceStore(controller).load()
+    memory = client.app.state.service_registry.services
+
+    def gpt_ids(services) -> list[str]:
+        return [
+            endpoint.portable_locator.package_id
+            for endpoint in services
+            if endpoint.portable_locator is not None
+            and endpoint.portable_locator.component == "gpt-sovits"
+        ]
+
+    assert gpt_ids(persisted) == ["gpt-two"]
+    assert gpt_ids(memory) == ["gpt-two"]
+
+
+def test_register_publication_failure_reports_that_the_service_was_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = tmp_path / "TTS More"
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    client = _client(controller)
+    headers = _control(_token(client))
+
+    def fail_publication(*_args, **_kwargs) -> None:
+        raise ValueError("simulated runtime publication failure")
+
+    monkeypatch.setattr(main_module, "_apply_registry", fail_publication)
+    response = client.post(
+        "/api/local-portable-services/register",
+        headers=headers,
+        json={"component": "gpt-sovits", "package_id": "gpt-main", "path": str(package)},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "code": "LOCAL_CONTROL_PUBLICATION_FAILED",
+        "message": "portable service registration was persisted but runtime refresh failed",
+    }
+    persisted = PortableServiceStore(controller).load()
+    assert [
+        endpoint.portable_locator.package_id
+        for endpoint in persisted
+        if endpoint.portable_locator is not None
+        and endpoint.portable_locator.component == "gpt-sovits"
+    ] == ["gpt-main"]
 
 
 def test_select_folder_validates_selected_package_and_never_accepts_command(
