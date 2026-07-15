@@ -222,6 +222,67 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
             '$process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru',
             'if ($false) { $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru }',
         ),
+        (
+            "Start.cmd",
+            'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*',
+            'exit /b 0\n'
+            'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*',
+        ),
+        (
+            "Start.cmd",
+            'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*',
+            'goto :end\n'
+            'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*\n'
+            ':end',
+        ),
+        (
+            "Start.cmd",
+            'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*',
+            'cmd.exe /c ver\n'
+            'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$operationsRoot = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.data.operations) -Label "data.operations"',
+            'if ($false) { $operationsRoot = Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath ([string]$manifest.data.operations) -Label "data.operations" }',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$result = Invoke-ChildPowerShell -Script $context.ServiceScript -Arguments $arguments',
+            'if ($false) { $result = Invoke-ChildPowerShell -Script $context.ServiceScript -Arguments $arguments }',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'Invoke-ServiceStart -Root $root -Operation $operation -PortOverride $PortOverride',
+            'if ($false) { Invoke-ServiceStart -Root $root -Operation $operation -PortOverride $PortOverride }',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$operationRoot = [IO.Path]::GetFullPath((Join-Path $context.OperationsRoot $canonicalId))',
+            '$operationRoot = [IO.Path]::GetFullPath((Join-Path $Root $canonicalId))\n'
+            '    # $operationRoot = [IO.Path]::GetFullPath((Join-Path $context.OperationsRoot $canonicalId))',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'Test-PathWithinRoot -Root $context.OperationsRoot -Path $operationRoot',
+            'Test-PathWithinRoot -Root $Root -Path $operationRoot',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '[IO.Path]::GetFullPath($context.OperationsRoot), [StringComparison]::OrdinalIgnoreCase',
+            '[IO.Path]::GetFullPath($Root), [StringComparison]::OrdinalIgnoreCase',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'Assert-PortableExactOperationContract -OperationsRoot $context.OperationsRoot -OperationRoot $operationRoot',
+            'Assert-PortableExactOperationContract -OperationsRoot $Root -OperationRoot $operationRoot',
+        ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            '$activePath = Join-Path $script:Context.OperationsRoot "active-start.json"',
+            '$activePath = Join-Path $root "active-start.json"\n'
+            '    # $activePath = Join-Path $script:Context.OperationsRoot "active-start.json"',
+        ),
     ),
 )
 def test_copied_contract_rejects_commented_decoys_and_mutated_active_control_flow(
@@ -289,6 +350,39 @@ def test_copied_contract_requires_operations_assignment_in_schema_v2_branch(tmp_
 
     combined = result.stdout + result.stderr
     assert result.returncode != 0, f"schema-v2 branch mutation escaped the copied contract\n{combined}"
+    assert any(
+        line.startswith("test_controlled_mirror_has_no_hash_drift ") and line.endswith("... ok")
+        for line in combined.splitlines()
+    ), combined
+    assert any(
+        line.startswith("test_controller_uses_manifest_operations_worker_delegate_and_private_runtime ")
+        and line.endswith("... FAIL")
+        for line in combined.splitlines()
+    ), combined
+
+
+def test_copied_contract_rejects_hardcoded_initialize_operation_consumers(tmp_path: Path) -> None:
+    if os.name != "nt" and shutil.which("pwsh") is None:
+        pytest.skip("source mutation harness requires PowerShell AST support")
+    sync = _load_sync()
+    target = tmp_path / "hardcoded operation consumers fork"
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "7" * 40)
+    controller = target / "tts_more" / "Invoke-PortableStart.ps1"
+    source = controller.read_text(encoding="utf-8")
+    start = source.index("function Initialize-Operation")
+    end = source.index("function Add-OperationEvent")
+    block = source[start:end]
+    assert block.count("$context.OperationsRoot") == 4
+    block = block.replace(
+        "$context.OperationsRoot",
+        '(Join-Path $Root "data\\local\\operations")',
+    )
+    controller.write_text(source[:start] + block + source[end:], encoding="utf-8")
+
+    result = _run_copied_contract_after_mutation(sync, target)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, f"hardcoded operation consumers escaped contract\n{combined}"
     assert any(
         line.startswith("test_controlled_mirror_has_no_hash_drift ") and line.endswith("... ok")
         for line in combined.splitlines()

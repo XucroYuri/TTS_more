@@ -152,6 +152,17 @@ function Test-ContractJoinPathMember {
     return $false
 }
 
+function Test-ContractJoinPathMemberVariable {
+    param($Ast, [string]$RootMember, [string]$ChildVariable)
+    foreach ($command in @(Get-ContractCommands $Ast "Join-Path")) {
+        $elements = @($command.CommandElements)
+        if ($elements.Count -eq 3 -and (Get-ContractMemberPath $elements[1]) -ceq $RootMember -and (Test-ContractVariable $elements[2] $ChildVariable)) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Test-ContractDescendantOf {
     param($Node, $Ancestor)
     $current = $Node
@@ -164,18 +175,20 @@ function Test-ContractDescendantOf {
 
 function Test-ContractSchemaV2Ancestor {
     param($Node)
-    $parent = $Node.Parent
-    while ($null -ne $parent) {
-        if ($parent -is [System.Management.Automation.Language.IfStatementAst]) {
-            foreach ($clause in $parent.Clauses) {
-                $condition = $clause.Item1
-                $hasSchema = Test-ContractContainsMemberPath $condition "manifest.schema_version"
-                $hasTwo = @($condition.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.ConstantExpressionAst] -and $candidate.Value -eq 2 }, $true)).Count -gt 0
-                $hasEquality = @($condition.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.BinaryExpressionAst] -and $candidate.Operator.ToString() -match "Eq$" }, $true)).Count -gt 0
-                if ($hasSchema -and $hasTwo -and $hasEquality -and (Test-ContractDescendantOf $Node $clause.Item2)) { return $true }
-            }
-        }
-        $parent = $parent.Parent
+    $tryBody = $Node.Parent
+    if ($tryBody -isnot [System.Management.Automation.Language.StatementBlockAst]) { return $false }
+    $tryStatement = $tryBody.Parent
+    if ($tryStatement -isnot [System.Management.Automation.Language.TryStatementAst] -or ![object]::ReferenceEquals($tryStatement.Body, $tryBody)) { return $false }
+    $clauseBody = $tryStatement.Parent
+    if ($clauseBody -isnot [System.Management.Automation.Language.StatementBlockAst]) { return $false }
+    $ifStatement = $clauseBody.Parent
+    if ($ifStatement -isnot [System.Management.Automation.Language.IfStatementAst]) { return $false }
+    foreach ($clause in $ifStatement.Clauses) {
+        $condition = $clause.Item1
+        $hasSchema = Test-ContractContainsMemberPath $condition "manifest.schema_version"
+        $hasTwo = @($condition.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.ConstantExpressionAst] -and $candidate.Value -eq 2 }, $true)).Count -gt 0
+        $hasEquality = @($condition.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.BinaryExpressionAst] -and $candidate.Operator.ToString() -match "Eq$" }, $true)).Count -gt 0
+        if ($hasSchema -and $hasTwo -and $hasEquality -and [object]::ReferenceEquals($clause.Item2, $clauseBody)) { return $true }
     }
     return $false
 }
@@ -191,6 +204,30 @@ function Test-ContractVariableEqualsString {
 function Test-ContractTopLevelAssignment {
     param($Assignment)
     return $Assignment.Parent -is [System.Management.Automation.Language.NamedBlockAst] -and $Assignment.Parent.Parent -is [System.Management.Automation.Language.ScriptBlockAst]
+}
+
+function Test-ContractDirectCommandInTry {
+    param($Command, $TryStatement)
+    if ($TryStatement -isnot [System.Management.Automation.Language.TryStatementAst]) { return $false }
+    $current = $Command.Parent
+    while ($null -ne $current -and ![object]::ReferenceEquals($current, $TryStatement.Body)) {
+        if ($current -is [System.Management.Automation.Language.IfStatementAst] -or
+            $current -is [System.Management.Automation.Language.SwitchStatementAst] -or
+            $current -is [System.Management.Automation.Language.LoopStatementAst] -or
+            $current -is [System.Management.Automation.Language.TrapStatementAst] -or
+            $current -is [System.Management.Automation.Language.FunctionDefinitionAst] -or
+            $current -is [System.Management.Automation.Language.TryStatementAst]) { return $false }
+        $current = $current.Parent
+    }
+    return [object]::ReferenceEquals($current, $TryStatement.Body)
+}
+
+function Test-ContractInvokeMemberWithMemberArgument {
+    param($Ast, [string]$Method, [string]$MemberPath)
+    $matches = @($Ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true) | Where-Object {
+        [string]$_.Member.Value -ceq $Method -and @($_.Arguments | Where-Object { (Get-ContractMemberPath $_) -ceq $MemberPath }).Count -eq 1
+    })
+    return $matches.Count -eq 1
 }
 
 function Test-ContractHashtableVariable {
@@ -229,6 +266,10 @@ $worker = Parse-ContractAst $env:TTS_MORE_CONTRACT_WORKER
 $contextFunction = Get-ContractFunction $controller "Get-PackageContext"
 $serviceFunction = Get-ContractFunction $controller "Invoke-ServiceStart"
 $lockFunction = Get-ContractFunction $controller "Open-PackageOperationLock"
+$initializeOperationFunction = Get-ContractFunction $controller "Initialize-Operation"
+$mainTries = @($controller.FindAll({ param($node) $node -is [System.Management.Automation.Language.TryStatementAst] }, $true) | Where-Object { [object]::ReferenceEquals($_.Parent, $controller.EndBlock) })
+Assert-Contract ($mainTries.Count -eq 1) "controller must have exactly one direct main try statement"
+$mainTry = $mainTries[0]
 
 $operationsMatches = @()
 $v2OperationsAssignments = @()
@@ -237,7 +278,7 @@ foreach ($assignment in @(Get-ContractAssignments $contextFunction.Body "operati
     foreach ($command in @(Get-ContractCommands $assignment.Right "Resolve-PortablePackagePath")) {
         $relative = Get-ContractParameterArgument $command "RelativePath"
         $label = Get-ContractParameterArgument $command "Label"
-        if ($null -ne $relative -and $null -ne $label -and (Test-ContractContainsMemberPath $relative "manifest.data.operations") -and (Test-ContractString $label "data.operations") -and (Test-ContractSchemaV2Ancestor $assignment)) {
+        if ($null -ne $relative -and $null -ne $label -and [object]::ReferenceEquals($command.Parent, $assignment.Right) -and (Test-ContractContainsMemberPath $relative "manifest.data.operations") -and (Test-ContractString $label "data.operations") -and (Test-ContractSchemaV2Ancestor $assignment)) {
             $operationsMatches += $assignment
         }
     }
@@ -258,12 +299,58 @@ Assert-Contract (Test-ContractJoinPath $serviceSelector.ElseClause "bundle" "Sta
 
 $delegates = @(Get-ContractCommands $serviceFunction.Body "Invoke-ChildPowerShell")
 Assert-Contract ($delegates.Count -eq 1) "Invoke-ServiceStart must delegate exactly once"
+$delegateAssignments = @(Get-ContractAssignments $serviceFunction.Body "result")
+Assert-Contract ($delegateAssignments.Count -eq 1 -and [object]::ReferenceEquals($delegateAssignments[0].Parent, $serviceFunction.Body.EndBlock)) "Invoke-ServiceStart delegate assignment is not a direct function statement"
+Assert-Contract ($delegateAssignments[0].Right -is [System.Management.Automation.Language.PipelineAst] -and [object]::ReferenceEquals($delegates[0].Parent, $delegateAssignments[0].Right)) "Invoke-ServiceStart delegate is not the direct result pipeline"
 $delegateScript = Get-ContractParameterArgument $delegates[0] "Script"
 $delegateArguments = Get-ContractParameterArgument $delegates[0] "Arguments"
 Assert-Contract ((Get-ContractMemberPath $delegateScript) -ceq "context.ServiceScript") "Invoke-ServiceStart does not pass context.ServiceScript"
 Assert-Contract (Test-ContractVariable $delegateArguments "arguments") "Invoke-ServiceStart does not pass the worker arguments array"
-$serviceCalls = @(Get-ContractCommands $controller "Invoke-ServiceStart" | Where-Object { Test-ContractCommandOutsideFunction $_ })
-Assert-Contract ($serviceCalls.Count -eq 1) "the controller main flow does not call Invoke-ServiceStart exactly once"
+$serviceCalls = @(Get-ContractCommands $mainTry.Body "Invoke-ServiceStart")
+Assert-Contract ($serviceCalls.Count -eq 1 -and $serviceCalls[0].Parent -is [System.Management.Automation.Language.PipelineAst] -and [object]::ReferenceEquals($serviceCalls[0].Parent.Parent, $mainTry.Body)) "the controller main flow does not call Invoke-ServiceStart as a direct try statement"
+Assert-Contract (Test-ContractVariable (Get-ContractParameterArgument $serviceCalls[0] "Root") "root") "main service call does not pass root"
+Assert-Contract (Test-ContractVariable (Get-ContractParameterArgument $serviceCalls[0] "Operation") "operation") "main service call does not pass operation"
+Assert-Contract (Test-ContractVariable (Get-ContractParameterArgument $serviceCalls[0] "PortOverride") "PortOverride") "main service call does not pass PortOverride"
+
+$operationRootAssignments = @(Get-ContractAssignments $initializeOperationFunction.Body "operationRoot")
+Assert-Contract ($operationRootAssignments.Count -eq 1 -and [object]::ReferenceEquals($operationRootAssignments[0].Parent, $initializeOperationFunction.Body.EndBlock)) "Initialize-Operation operationRoot is not one direct assignment"
+Assert-Contract (Test-ContractJoinPathMemberVariable $operationRootAssignments[0].Right "context.OperationsRoot" "canonicalId") "operationRoot is not derived from context.OperationsRoot/canonicalId"
+
+$boundaryIfs = @($initializeOperationFunction.Body.EndBlock.Statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.IfStatementAst] -and $_.Clauses.Count -eq 1 -and @(Get-ContractCommands $_.Clauses[0].Item1 "Test-PathWithinRoot").Count -eq 1
+})
+Assert-Contract ($boundaryIfs.Count -eq 1) "Initialize-Operation boundary check is not one direct if statement"
+$boundaryCondition = $boundaryIfs[0].Clauses[0].Item1
+$pathChecks = @(Get-ContractCommands $boundaryCondition "Test-PathWithinRoot")
+Assert-Contract ($pathChecks.Count -eq 1) "Initialize-Operation must call Test-PathWithinRoot exactly once"
+Assert-Contract ((Get-ContractMemberPath (Get-ContractParameterArgument $pathChecks[0] "Root")) -ceq "context.OperationsRoot") "Test-PathWithinRoot does not use context.OperationsRoot"
+Assert-Contract (Test-ContractVariable (Get-ContractParameterArgument $pathChecks[0] "Path") "operationRoot") "Test-PathWithinRoot does not validate operationRoot"
+$orExpressions = @($boundaryCondition.FindAll({ param($node) $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and $node.Operator.ToString() -match "Or$" }, $true))
+Assert-Contract ($orExpressions.Count -eq 1) "Initialize-Operation boundary condition must combine containment and parent equality"
+$equalsCalls = @($boundaryCondition.FindAll({ param($node) $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and [string]$node.Member.Value -ceq "Equals" }, $true))
+Assert-Contract ($equalsCalls.Count -eq 1 -and $equalsCalls[0].Static) "Initialize-Operation parent equality is missing"
+$parentSplits = @(Get-ContractCommands $equalsCalls[0] "Split-Path")
+Assert-Contract ($parentSplits.Count -eq 1 -and (Test-ContractVariable (Get-ContractParameterArgument $parentSplits[0] "Parent") "operationRoot")) "parent equality does not inspect operationRoot parent"
+Assert-Contract (Test-ContractInvokeMemberWithMemberArgument $equalsCalls[0] "GetFullPath" "context.OperationsRoot") "parent equality does not normalize context.OperationsRoot"
+
+$operationContractTries = @($initializeOperationFunction.Body.EndBlock.Statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.TryStatementAst] -and @(Get-ContractCommands $_.Body "Assert-PortableExactOperationContract").Count -eq 1
+})
+Assert-Contract ($operationContractTries.Count -eq 1) "Initialize-Operation operation contract is not one direct try statement"
+$operationContractCommands = @(Get-ContractCommands $operationContractTries[0].Body "Assert-PortableExactOperationContract")
+Assert-Contract ($operationContractCommands.Count -eq 1 -and (Test-ContractDirectCommandInTry $operationContractCommands[0] $operationContractTries[0])) "operation contract call is nested or unreachable"
+Assert-Contract ((Get-ContractMemberPath (Get-ContractParameterArgument $operationContractCommands[0] "OperationsRoot")) -ceq "context.OperationsRoot") "operation contract does not use context.OperationsRoot"
+Assert-Contract (Test-ContractVariable (Get-ContractParameterArgument $operationContractCommands[0] "OperationRoot") "operationRoot") "operation contract does not use operationRoot"
+
+$mainActivePathAssignments = @()
+foreach ($assignment in @(Get-ContractAssignments $controller "activePath")) {
+    if ($assignment.Right -is [System.Management.Automation.Language.PipelineAst] -and
+        [object]::ReferenceEquals($assignment.Parent, $mainTry.Body) -and
+        (Test-ContractJoinPathMember $assignment.Right "script:Context.OperationsRoot" "active-start.json")) {
+        $mainActivePathAssignments += $assignment
+    }
+}
+Assert-Contract ($mainActivePathAssignments.Count -eq 1) "main activePath is not one direct context.OperationsRoot assignment"
 
 $pythonAssignments = @(Get-ContractAssignments $worker "Python")
 Assert-Contract ($pythonAssignments.Count -eq 1) "worker Python must have exactly one active assignment"
@@ -416,15 +503,14 @@ class PortableIntegrationContractTests(unittest.TestCase):
         start_path = ROOT / "Start.cmd"
         start = start_path.read_text(encoding="utf-8")
         webui = (ROOT / "Start-WebUI.cmd").read_text(encoding="utf-8")
-        active_scripts = [line for line in _active_cmd_lines(start_path) if ".ps1" in line.lower()]
         self.assertEqual(
             [
                 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File '
-                '"%~dp0tts_more\\Invoke-PortableStart.ps1" %*'
+                '"%~dp0tts_more\\Invoke-PortableStart.ps1" %*',
+                "exit /b %errorlevel%",
             ],
-            active_scripts,
+            _active_cmd_lines(start_path),
         )
-        self.assertTrue(all("Start-Worker.ps1" not in line for line in _active_cmd_lines(start_path)))
         self.assertNotEqual(start, webui)
 
     def test_controller_uses_manifest_operations_worker_delegate_and_private_runtime(self) -> None:
