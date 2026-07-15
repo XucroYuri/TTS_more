@@ -11,7 +11,7 @@ from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import httpx
 
@@ -23,6 +23,7 @@ from app.portable_endpoint_trust import (
     require_unique_service_identities,
     sanitize_portable_endpoint,
 )
+from app.portable_locator_mutations import require_managed_portable_locator_mutation_permitted
 from app.service_store_io import ServiceDocument, read_service_document, update_service_document
 
 
@@ -127,7 +128,13 @@ class ServiceRegistry:
             _baseline_was_missing=self._baseline_was_missing,
         )
 
-    def save(self, path: Path) -> None:
+    def save(
+        self,
+        path: Path,
+        *,
+        portable_locator_mutation_permit: object | None = None,
+        publish: Callable[["ServiceRegistry"], None] | None = None,
+    ) -> None:
         desired = [sanitize_portable_endpoint(service) for service in self.services]
         _require_unique_service_ids(desired)
 
@@ -140,6 +147,11 @@ class ServiceRegistry:
                 desired,
                 restore_missing_baseline=self._baseline_was_missing,
             )
+            require_managed_portable_locator_mutation_permitted(
+                current_endpoints,
+                merged,
+                portable_locator_mutation_permit,
+            )
             schema_version = self.store_schema_version
             if schema_version is None:
                 schema_version = current.schema_version
@@ -148,10 +160,26 @@ class ServiceRegistry:
                 [service.model_dump(mode="json") for service in merged],
             )
 
+        def publish_written(document: ServiceDocument) -> None:
+            if publish is None:
+                return
+            published = [
+                sanitize_portable_endpoint(TTSServiceEndpoint.model_validate(item))
+                for item in document.services
+            ]
+            publish(
+                ServiceRegistry(
+                    published,
+                    store_schema_version=document.schema_version,
+                    _baseline=published,
+                )
+            )
+
         updated = update_service_document(
             path,
             merge,
             default_schema_version=self.store_schema_version,
+            after_write=publish_written if publish is not None else None,
         )
         merged = [
             sanitize_portable_endpoint(TTSServiceEndpoint.model_validate(item))

@@ -23,6 +23,7 @@ from app.models import Character, EngineName, GenerationManifest, GenerationTask
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
 from app.portable_discovery import PortablePackageDiscoverRequest, PortablePackageRegisterRequest, discover_portable_packages, endpoint_from_portable_package, read_portable_package
+from app.portable_locator_mutations import ManagedPortableLocatorMutationError
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
@@ -32,6 +33,7 @@ from app.service_config import ServiceSettingsUpdate, public_service_settings, s
 from app.services import ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
 from app.storage import ProjectStore
 from app.supervisor import ServiceSupervisor
+from app.service_store_io import ServicePostCommitError
 
 DEFAULT_REFERENCE_AUDIO_ROOT = Path("data") / "local" / "reference-audio"
 DEFAULT_DATA_ROOT = Path("data")
@@ -180,22 +182,46 @@ def create_app(
 
     @app.put("/api/settings/services")
     def put_service_settings(request: ServiceSettingsUpdate) -> dict[str, Any]:
-        registry = save_service_settings(app.state.writable_services_path, env_file, request)
-        if _service_mode() == "mock":
+        mock_mode = _service_mode() == "mock"
+
+        def publish_settings(candidate: ServiceRegistry) -> None:
+            _apply_registry(app, _mocked_registry(candidate) if mock_mode else candidate, store)
+
+        try:
+            registry = save_service_settings(
+                app.state.writable_services_path,
+                env_file,
+                request,
+                publish=publish_settings,
+            )
+        except ManagedPortableLocatorMutationError as exc:
+            raise _managed_portable_locator_mutation_http_error() from exc
+        if mock_mode:
             registry = _mocked_registry(registry)
-        _apply_registry(app, registry, store)
         app.state.services_path = app.state.writable_services_path
         return public_service_settings(registry, env_file)
 
     @app.post("/api/settings/services/reload")
     def reload_service_settings() -> dict[str, Any]:
         try:
-            if services_path is None:
-                app.state.services_path, app.state.writable_services_path = _resolve_service_settings_paths(store.root, None)
-            registry = _load_service_registry(app.state.services_path)
+            def load_candidate() -> ServiceRegistry:
+                if services_path is None:
+                    (
+                        app.state.services_path,
+                        app.state.writable_services_path,
+                    ) = _resolve_service_settings_paths(store.root, None)
+                return _load_service_registry(app.state.services_path)
+
+            registry = app.state.portable_locator_mutations.publish_without_locator_changes(
+                current_services=lambda: tuple(app.state.service_registry.services),
+                load_candidate=load_candidate,
+                candidate_services=lambda candidate: tuple(candidate.services),
+                publish=lambda candidate: _apply_registry(app, candidate, store),
+            )
+        except ManagedPortableLocatorMutationError as exc:
+            raise _managed_portable_locator_mutation_http_error() from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"failed to reload services: {exc}") from exc
-        _apply_registry(app, registry, store)
         return public_service_settings(registry, env_file)
 
     @app.get("/api/open-source-tts/catalog")
@@ -208,13 +234,16 @@ def create_app(
 
     @app.post("/api/open-source-tts/configure")
     def open_source_tts_configure(request: OpenSourceTTSConfigureRequest) -> dict[str, Any]:
-        registry, endpoint, detect_payload = configure_open_source_tts(
-            request,
-            app.state.service_registry,
-            app.state.writable_services_path,
-            project_root,
-        )
-        _apply_registry(app, registry, store)
+        try:
+            registry, endpoint, detect_payload = configure_open_source_tts(
+                request,
+                app.state.service_registry,
+                app.state.writable_services_path,
+                project_root,
+                publish=lambda candidate: _apply_registry(app, candidate, store),
+            )
+        except ManagedPortableLocatorMutationError as exc:
+            raise _managed_portable_locator_mutation_http_error() from exc
         app.state.services_path = app.state.writable_services_path
         return {
             "service": endpoint.model_dump(mode="json"),
@@ -238,13 +267,44 @@ def create_app(
             endpoint = endpoint_from_portable_package(descriptor, request)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        services = [service for service in app.state.service_registry.services if service.service_id != endpoint.service_id]
-        services.append(endpoint)
-        services.sort(key=lambda service: (service.priority, service.service_id))
-        registry = app.state.service_registry.with_services(services)
-        registry.save(app.state.writable_services_path)
-        _apply_registry(app, registry, store)
-        app.state.services_path = app.state.writable_services_path
+
+        def persist_and_publish(permit: object) -> ServiceRegistry:
+            current = ServiceRegistry.load(app.state.writable_services_path)
+            services = [
+                service for service in current.services if service.service_id != endpoint.service_id
+            ]
+            services.append(endpoint)
+            services.sort(key=lambda service: (service.priority, service.service_id))
+            registry = current.with_services(services)
+            registry.save(
+                app.state.writable_services_path,
+                portable_locator_mutation_permit=permit,
+                publish=lambda published: _apply_registry(app, published, store),
+            )
+            app.state.services_path = app.state.writable_services_path
+            return registry
+
+        try:
+            registry = app.state.portable_locator_mutations.mutate_component(
+                descriptor.component,
+                persist_and_publish,
+            )
+        except ServicePostCommitError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "PORTABLE_REGISTRATION_PUBLICATION_FAILED",
+                    "message": "portable package registration was persisted but publication failed",
+                },
+            ) from exc
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PORTABLE_REGISTRATION_STORE_FAILED",
+                    "message": "portable package registration settings are unavailable",
+                },
+            ) from exc
         return {
             "package": descriptor.model_dump(mode="json"),
             "service": endpoint.model_dump(mode="json"),
@@ -1262,6 +1322,16 @@ def _apply_registry(app: FastAPI, registry: ServiceRegistry, store: ProjectStore
     app.state.service_router = router
     app.state.queue = queue
     app.state.job_manager = GenerationJobManager(queue, store)
+
+
+def _managed_portable_locator_mutation_http_error() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "MANAGED_PORTABLE_LOCATOR_MUTATION_FORBIDDEN",
+            "message": "managed portable locators must use a portable registration route",
+        },
+    )
 
 
 def _resolve_service_settings_paths(data_root: Path, explicit_path: Path | None) -> tuple[Path, Path]:

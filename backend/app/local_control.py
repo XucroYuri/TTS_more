@@ -37,6 +37,7 @@ from app.portable_imports import (
     project_import_plan,
     project_import_report,
 )
+from app.portable_locator_mutations import PortableLocatorMutationCoordinator
 from app.portable_services import (
     PortableServiceStore,
     discover_bounded_portable_packages,
@@ -287,6 +288,11 @@ def install_local_control(
     app.state.local_control_root = root
     import_plans = PortableImportPlanStore()
     app.state.portable_import_plan_store = import_plans
+    portable_locator_mutations = PortableLocatorMutationCoordinator(
+        app.state.supervisor,
+        import_plans,
+    )
+    app.state.portable_locator_mutations = portable_locator_mutations
     supervisor_start_invalidator = getattr(
         getattr(app.state, "supervisor", None), "set_portable_start_invalidator", None
     )
@@ -479,44 +485,46 @@ def install_local_control(
         )
         locator = endpoint.portable_locator
         assert locator is not None
-        supervisor = app.state.supervisor
+
+        def replace_registration(_permit: object) -> list[TTSServiceEndpoint]:
+            previous_services = current_services()
+            previous_override = next(
+                (
+                    item.portable_locator.port_override
+                    for item in previous_services
+                    if item.portable_locator is not None
+                    and item.portable_locator.component == payload.component
+                ),
+                None,
+            )
+            effective_override = (
+                payload.port_override if payload.port_override is not None else previous_override
+            )
+            registered_endpoint = endpoint.model_copy(
+                update={
+                    "portable_locator": locator.model_copy(
+                        update={
+                            "relative_to_tts_more": _relative_sibling(
+                                root, Path(descriptor.package_root)
+                            ),
+                            "port_override": effective_override,
+                        }
+                    )
+                }
+            )
+            store = current_store()
+            initial_services = previous_services if not store.path.exists() else []
+            return store.replace_component(
+                registered_endpoint,
+                initial_services=initial_services,
+                publish=refresh_services,
+            )
+
         try:
-            with supervisor.portable_lifecycle_guard(payload.component):
-                previous_services = current_services()
-                previous_override = next(
-                    (
-                        item.portable_locator.port_override
-                        for item in previous_services
-                        if item.portable_locator is not None
-                        and item.portable_locator.component == payload.component
-                    ),
-                    None,
-                )
-                effective_override = (
-                    payload.port_override
-                    if payload.port_override is not None
-                    else previous_override
-                )
-                endpoint = endpoint.model_copy(
-                    update={
-                        "portable_locator": locator.model_copy(
-                            update={
-                                "relative_to_tts_more": _relative_sibling(
-                                    root, Path(descriptor.package_root)
-                                ),
-                                "port_override": effective_override,
-                            }
-                        )
-                    }
-                )
-                store = current_store()
-                initial_services = previous_services if not store.path.exists() else []
-                services = store.replace_component(
-                    endpoint,
-                    initial_services=initial_services,
-                    publish=refresh_services,
-                )
-                import_plans.invalidate_component(payload.component)
+            services = portable_locator_mutations.mutate_component(
+                payload.component,
+                replace_registration,
+            )
         except ServicePostCommitError:
             _raise_error(
                 500,

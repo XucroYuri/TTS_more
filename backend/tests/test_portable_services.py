@@ -21,6 +21,7 @@ from app.portable_discovery import (
     read_portable_package,
 )
 from app.portable_endpoint_trust import require_unique_service_identities
+from app.portable_locator_mutations import ManagedPortableLocatorMutationError
 from app.portable_services import (
     PortableServiceLocator,
     PortableServiceStore,
@@ -1127,7 +1128,7 @@ def test_search_roots_and_total_candidate_enumeration_are_globally_bounded(tmp_p
     assert enumerated <= 512
 
 
-def test_settings_save_never_returns_forged_portable_runtime_authority(tmp_path: Path) -> None:
+def test_settings_save_rejects_forged_portable_runtime_authority(tmp_path: Path) -> None:
     package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
     endpoint = _endpoint(_locator("gpt-sovits", "gpt-main", package))
     record = ServiceSettingsRecord.model_validate(
@@ -1142,21 +1143,17 @@ def test_settings_save_never_returns_forged_portable_runtime_authority(tmp_path:
     )
     path = tmp_path / "data" / "local" / "services.json"
 
-    registry = save_service_settings(
-        path,
-        tmp_path / ".env.local",
-        ServiceSettingsUpdate(services=[record]),
-    )
+    with pytest.raises(ManagedPortableLocatorMutationError):
+        save_service_settings(
+            path,
+            tmp_path / ".env.local",
+            ServiceSettingsUpdate(services=[record]),
+        )
 
-    [runtime] = registry.services
-    assert runtime.managed is False
-    assert runtime.repo_path is None
-    assert runtime.start_command == []
-    assert runtime.start_cwd is None
-    assert "FORGED-COMMAND-MARKER" not in json.dumps(runtime.model_dump(mode="json"))
+    assert not path.exists()
 
 
-def test_settings_api_applies_only_sanitized_portable_endpoint_to_current_process(tmp_path: Path) -> None:
+def test_settings_api_forbids_creating_a_managed_portable_locator(tmp_path: Path) -> None:
     package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
     raw = _endpoint(_locator("gpt-sovits", "gpt-main", package)).model_dump(mode="json")
     raw.update(
@@ -1169,13 +1166,56 @@ def test_settings_api_applies_only_sanitized_portable_endpoint_to_current_proces
 
     response = TestClient(app).put("/api/settings/services", json={"services": [raw]})
 
-    assert response.status_code == 200
-    [runtime] = app.state.service_registry.services
-    assert runtime.managed is False
-    assert runtime.repo_path is None
-    assert runtime.start_command == []
-    assert runtime.start_cwd is None
-    assert app.state.supervisor.status(runtime)["manageable"] is False
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "MANAGED_PORTABLE_LOCATOR_MUTATION_FORBIDDEN",
+        "message": "managed portable locators must use a portable registration route",
+    }
+    assert all(endpoint.portable_locator is None for endpoint in app.state.service_registry.services)
+
+
+def test_open_source_configure_cannot_replace_a_managed_portable_locator_by_service_id(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "TTS More"
+    package = _write_package(
+        tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main"
+    )
+    app = create_app(
+        data_root=controller / "data",
+        controller_root=controller,
+        env_path=tmp_path / ".env.local",
+    )
+    client = TestClient(app)
+    registered = client.post(
+        "/api/portable-packages/register", json={"package_root": str(package)}
+    )
+    service_id = registered.json()["service"]["service_id"]
+
+    configured = client.post(
+        "/api/open-source-tts/configure",
+        json={
+            "provider_type": "gpt-sovits",
+            "service_id": service_id,
+            "display_name": "replacement generic endpoint",
+            "source_profile": "local_endpoint",
+            "base_url": "http://127.0.0.1:9872",
+            "api_contract": "gradio-gpt-sovits-webui",
+        },
+    )
+
+    assert configured.status_code == 409
+    assert configured.json()["detail"] == {
+        "code": "MANAGED_PORTABLE_LOCATOR_MUTATION_FORBIDDEN",
+        "message": "managed portable locators must use a portable registration route",
+    }
+    persisted = next(
+        endpoint
+        for endpoint in PortableServiceStore(controller).load()
+        if endpoint.portable_locator is not None
+    )
+    assert persisted.portable_locator is not None
+    assert persisted.portable_locator.package_id == "gpt-main"
 
 
 def test_portable_store_save_returns_only_sanitized_merged_endpoints(tmp_path: Path) -> None:
@@ -1261,7 +1301,7 @@ def test_post_merge_portable_identity_collision_fails_before_replace(tmp_path: P
     second = _endpoint(_locator("gpt-sovits", "gpt-main", package)).model_copy(
         update={"service_id": "second-portable"}
     )
-    registry.with_services([*registry.services, first]).save(store.path)
+    PortableServiceStore(controller).replace_component(first, initial_services=registry.services)
     before = store.path.read_bytes()
 
     with pytest.raises(ValueError, match="duplicate portable package identity"):
