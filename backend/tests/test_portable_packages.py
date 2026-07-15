@@ -195,7 +195,11 @@ def _build_controller_bootstrap(tmp_path: Path, version: str) -> tuple[Path, Pat
 
 
 def _build_worker_bootstrap(
-    tmp_path: Path, version: str, component: str = "gpt-sovits"
+    tmp_path: Path,
+    version: str,
+    component: str = "gpt-sovits",
+    *,
+    add_plain_locked_paths: bool = False,
 ) -> tuple[Path, Path, Path, dict[str, bytes]]:
     assert POWERSHELL is not None
     worker_root = tmp_path / "worker"
@@ -209,6 +213,14 @@ def _build_worker_bootstrap(
     (worker_root / "nested" / ".env.local").write_text("PRIVATE_TOKEN=secret\n", encoding="utf-8")
     source_component = worker_root / "tts_more" / "component.json"
     source_model_lock = worker_root / "tts_more" / "locks" / "models.lock.json"
+    if add_plain_locked_paths:
+        model_lock = json.loads(source_model_lock.read_text(encoding="utf-8-sig"))
+        locked_asset = dict(model_lock["assets"][0])
+        locked_asset["id"] = "plain-extension-audit-fixture"
+        locked_asset["target"] = "locked_assets/metadata.json"
+        model_lock["assets"].append(locked_asset)
+        model_lock["required_paths"].append(r"locked_required\payload.txt")
+        source_model_lock.write_text(json.dumps(model_lock, indent=2) + "\n", encoding="utf-8")
     source_before = {
         "component.json": source_component.read_bytes(),
         "locks/models.lock.json": source_model_lock.read_bytes(),
@@ -249,6 +261,13 @@ def _build_worker_bootstrap(
         / f"{component}-{version}-windows-x64-bootstrap"
     )
     return worker_root, stage, archives[0], source_before
+
+
+def _inject_release_zip_entry(source: Path, destination: Path, relative: str) -> None:
+    shutil.copy2(source, destination)
+    with zipfile.ZipFile(destination, "a", compression=zipfile.ZIP_DEFLATED) as archive:
+        package_root = archive.namelist()[0].replace("\\", "/").split("/", 1)[0]
+        archive.writestr(f"{package_root}/{relative}", b"ordinary extension payload")
 
 
 @pytest.fixture(scope="module")
@@ -361,6 +380,99 @@ def test_worker_bootstrap_stages_all_upstream_source_under_app_without_mutating_
     packages = _load_portable_packages()
     assert packages.audit_release_zip(archive_path)["valid"] is True
     assert packages.verify_sha256_manifest(stage)["valid"] is True
+
+
+@pytest.mark.parametrize("archive_key", ("controller_zip", "worker_zip"))
+@pytest.mark.parametrize(
+    "model_directory",
+    ("pretrained_models", "checkpoints", "SoVITS_weights", "GPT_weights"),
+)
+def test_release_audit_rejects_plain_files_in_model_data_directories(
+    clean_portable_builds: dict[str, object],
+    tmp_path: Path,
+    archive_key: str,
+    model_directory: str,
+) -> None:
+    packages = _load_portable_packages()
+    clean_archive = Path(clean_portable_builds[archive_key])
+    assert packages.audit_release_zip(clean_archive)["valid"] is True
+    polluted_archive = tmp_path / f"{archive_key}-{model_directory}.zip"
+    _inject_release_zip_entry(
+        clean_archive,
+        polluted_archive,
+        f"app/nested/{model_directory}/ordinary-payload.txt",
+    )
+
+    report = packages.audit_release_zip(polluted_archive)
+
+    assert report["valid"] is False
+    assert any("forbidden release asset" in error for error in report["errors"])
+
+
+def test_release_audit_canonicalizes_model_directories_without_rejecting_models_packages(
+    clean_portable_builds: dict[str, object], tmp_path: Path
+) -> None:
+    packages = _load_portable_packages()
+    clean_archive = Path(clean_portable_builds["controller_zip"])
+    canonical_attack = tmp_path / "canonical-model-directory.zip"
+    _inject_release_zip_entry(
+        clean_archive,
+        canonical_attack,
+        "app/nested/ＰＲＥＴＲＡＩＮＥＤ＿ＭＯＤＥＬＳ/ordinary.json",
+    )
+    legal_models_package = tmp_path / "legal-models-package.zip"
+    _inject_release_zip_entry(
+        clean_archive,
+        legal_models_package,
+        "app/python_package/models/__init__.py",
+    )
+    legal_file_boundary = tmp_path / "legal-file-boundary.zip"
+    _inject_release_zip_entry(
+        clean_archive,
+        legal_file_boundary,
+        "app/python_package/checkpoints",
+    )
+
+    rejected = packages.audit_release_zip(canonical_attack)
+
+    assert rejected["valid"] is False
+    assert any("forbidden release asset" in error for error in rejected["errors"])
+    assert packages.audit_release_zip(legal_models_package)["valid"] is True
+    assert packages.audit_release_zip(legal_file_boundary)["valid"] is True
+
+
+def test_worker_release_audit_rejects_exact_staged_model_lock_paths(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("real worker Bootstrap model-lock audit test requires PowerShell")
+    _, stage, clean_archive, _ = _build_worker_bootstrap(
+        tmp_path / "w",
+        "d1-lock",
+        add_plain_locked_paths=True,
+    )
+    packages = _load_portable_packages()
+    assert packages.audit_release_zip(clean_archive)["valid"] is True
+    assert packages.verify_sha256_manifest(stage)["valid"] is True
+    staged_lock = json.loads(
+        (stage / "app" / "tts_more" / "locks" / "models.lock.json").read_text(
+            encoding="utf-8-sig"
+        )
+    )
+    assert any(
+        asset.get("target") == "app/locked_assets/metadata.json"
+        for asset in staged_lock["assets"]
+    )
+    assert "app/locked_required/payload.txt" in staged_lock["required_paths"]
+
+    for index, relative in enumerate(
+        ("APP/LOCKED_ASSETS/METADATA.JSON", "app/locked_REQUIRED/PAYLOAD.TXT")
+    ):
+        polluted_archive = tmp_path / f"locked-path-{index}.zip"
+        _inject_release_zip_entry(clean_archive, polluted_archive, relative)
+
+        report = packages.audit_release_zip(polluted_archive)
+
+        assert report["valid"] is False
+        assert any("locked model" in error for error in report["errors"])
 
 
 def test_worker_package_resolves_package_source_and_bundle_roots_independently(

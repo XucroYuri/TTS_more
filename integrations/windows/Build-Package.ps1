@@ -131,6 +131,7 @@ if (Test-Path -LiteralPath (Join-Path $stageApp "LICENSE") -PathType Leaf) {
 }
 Copy-Item -LiteralPath (Join-Path $stagedBundle "LICENSE.integration") -Destination (Join-Path $stage "licenses\INTEGRATION-LICENSE") -Force
 Copy-Item -LiteralPath (Join-Path $stagedBundle "NOTICE.integration") -Destination (Join-Path $stage "licenses\INTEGRATION-NOTICE") -Force
+$modelDataDirectories = @("pretrained_models", "checkpoints", "SoVITS_weights", "GPT_weights")
 $alwaysLocalModelDirectories = @("SoVITS_weights", "GPT_weights")
 @(Get-ChildItem -LiteralPath $stageApp -Directory -Recurse -Force | Where-Object { $_.Name -in $alwaysLocalModelDirectories } | Sort-Object FullName -Descending) | ForEach-Object {
     $resolved = [System.IO.Path]::GetFullPath($_.FullName)
@@ -192,9 +193,15 @@ if ($Profile -eq "Full") {
 }
 if ($Profile -eq "Bootstrap") {
     $forbidden = @(Get-ChildItem -LiteralPath $stage -Recurse -Force | Where-Object {
-        $_.Name -eq ".git" -or $_.FullName -match "[\\/](\.venv|runtime[\\/]live|data[\\/](cache|local|models))([\\/]|$)" -or $_.Name -match "\.(safetensors|ckpt|pth|pt|t7|onnx|bin)$"
+        $_.Name -eq ".git" -or ($_.PSIsContainer -and $_.Name -in $modelDataDirectories) -or $_.FullName -match "[\\/](\.venv|runtime[\\/]live|data[\\/](cache|local|models))([\\/]|$)" -or $_.Name -match "\.(safetensors|ckpt|pth|pt|t7|onnx|bin)$"
     })
     if ($forbidden.Count -gt 0) { throw "bootstrap audit found forbidden runtime/model asset: $($forbidden.FullName -join ', ')" }
+    $lockedModelPaths = @($stagedModelLock.required_paths) + @($stagedModelLock.assets | ForEach-Object { $_.target })
+    $forbiddenLockedAssets = @($lockedModelPaths | ForEach-Object {
+        $candidate = Join-Path $stage ([string]$_).Replace("/", "\")
+        if (Test-Path -LiteralPath $candidate) { Get-Item -LiteralPath $candidate -Force }
+    })
+    if ($forbiddenLockedAssets.Count -gt 0) { throw "bootstrap audit found locked model asset: $($forbiddenLockedAssets.FullName -join ', ')" }
 }
 $machinePathLeak = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Length -lt 5MB } | Select-String -SimpleMatch -Pattern $Root -ErrorAction SilentlyContinue)
 if ($machinePathLeak.Count -gt 0) { throw "package contains a build-machine absolute path: $($machinePathLeak[0].Path)" }

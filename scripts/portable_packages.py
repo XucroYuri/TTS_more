@@ -56,6 +56,9 @@ RELEASE_FORBIDDEN_PATH = re.compile(
     r"\.(?:safetensors|ckpt|pth|pt|t7|onnx|bin)$",
     re.IGNORECASE,
 )
+RELEASE_FORBIDDEN_MODEL_DIRECTORIES = frozenset(
+    {"pretrained_models", "checkpoints", "sovits_weights", "gpt_weights"}
+)
 SAFE_PACKAGE_ROOT = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
 
 
@@ -139,7 +142,16 @@ def audit_release_zip(path: Path) -> dict[str, object]:
                     "cache",
                     "models",
                 }
-                if (parts and parts[0] == "runtime") or private_data or RELEASE_FORBIDDEN_PATH.search(relative):
+                directory_parts = parts if archive.getinfo(name).is_dir() else parts[:-1]
+                model_data = any(
+                    part in RELEASE_FORBIDDEN_MODEL_DIRECTORIES for part in directory_parts
+                )
+                if (
+                    (parts and parts[0] == "runtime")
+                    or private_data
+                    or model_data
+                    or RELEASE_FORBIDDEN_PATH.search(relative)
+                ):
                     errors.append(f"forbidden release asset: {relative}")
                     break
     except (OSError, ValueError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -194,16 +206,41 @@ def _audit_v2_user_layout(
     if component_config.get("source_root") != "app":
         errors.append("worker component source_root must be app")
         return
-    locked_paths = [str(path).replace("\\", "/") for path in model_payload.get("required_paths", [])]
-    locked_paths.extend(
-        str(asset.get("target") or "").replace("\\", "/")
-        for asset in model_payload.get("assets", [])
-        if isinstance(asset, dict)
-    )
-    if not locked_paths or any(
-        not path.startswith("app/") or path.startswith("app/app/") for path in locked_paths
+    required_paths = model_payload.get("required_paths")
+    assets = model_payload.get("assets")
+    if (
+        not isinstance(required_paths, list)
+        or not isinstance(assets, list)
+        or any(not isinstance(asset, dict) for asset in assets)
+    ):
+        errors.append("worker staged model lock paths are invalid")
+        return
+    raw_locked_paths = [*required_paths, *(asset.get("target") for asset in assets)]
+    canonical_locked_paths: list[str] = []
+    try:
+        for raw_path in raw_locked_paths:
+            if (
+                not isinstance(raw_path, str)
+                or not raw_path
+                or not _is_relative_package_path(raw_path)
+            ):
+                raise ValueError("invalid model lock path")
+            canonical_locked_paths.append(_canonical_relative_path(raw_path))
+    except ValueError:
+        errors.append("worker staged model lock paths are invalid")
+        return
+    if not canonical_locked_paths or any(
+        not path.startswith("app/") or path.startswith("app/app/")
+        for path in canonical_locked_paths
     ):
         errors.append("worker model lock paths must be prefixed with app/ exactly once")
+        return
+    embedded_locked_paths = sorted(set(canonical_locked_paths) & set(relative_names))
+    if embedded_locked_paths:
+        errors.append(
+            "worker bootstrap contains locked model asset: "
+            f"{relative_names[embedded_locked_paths[0]]}"
+        )
 
 
 def verify_sha256_manifest(package_root: Path) -> dict[str, object]:
