@@ -128,6 +128,7 @@ class PortablePackageController:
         self._handshake_seconds = max(0.05, min(float(handshake_seconds), 2.0))
         self._system_executable_resolver = system_executable_resolver or _windows_system_executable
         self._actions: OrderedDict[str, _TrackedAction] = OrderedDict()
+        self._action_reservations: set[str] = set()
         self._actions_lock = threading.RLock()
 
     def start(
@@ -210,6 +211,7 @@ class PortablePackageController:
                 raise PortableControlError(
                     "PORTABLE_LAUNCH_FAILED", "portable action state could not be checked"
                 ) from exc
+            self._actions.move_to_end(canonical_id)
             if return_code is None:
                 status = {"stop": "stopping", "repair": "repairing"}[tracked.action]
             else:
@@ -335,45 +337,83 @@ class PortablePackageController:
         # `/c` receives only the fixed literal root launcher. The absolute
         # package path remains in cwd and never enters cmd.exe's parser.
         command = [str(command_processor), "/d", "/c", _EXACT_LAUNCHERS[action], *arguments]
-        process, completed = self._spawn_checked(
-            command,
-            context,
-            action=action,
-            environment_overrides=environment_overrides,
-        )
-        if completed and action == "start" and operation_id is not None:
-            operation, _directory, _identity = self._read_operation(
-                context.root, context.descriptor, operation_id
+        reservation_active = False
+        if canonical_action_id is not None:
+            self._reserve_action(canonical_action_id)
+            reservation_active = True
+        try:
+            process, completed = self._spawn_checked(
+                command,
+                context,
+                action=action,
+                environment_overrides=environment_overrides,
             )
-            operation_status = str(operation["status"])
-            if operation_status in _NONTERMINAL_PHASES:
-                raise PortableControlError(
-                    "PORTABLE_OPERATION_INCOMPLETE",
-                    "portable start launcher exited before the operation reached a terminal state",
+            if completed and action == "start" and operation_id is not None:
+                operation, _directory, _identity = self._read_operation(
+                    context.root, context.descriptor, operation_id
                 )
-            if operation_status != "ready":
-                raise PortableControlError(
-                    "PORTABLE_OPERATION_FAILED",
-                    "portable start operation completed without reaching ready",
-                )
-            status = "ready"
-        elif completed:
-            status = {"start": "completed", "stop": "stopped", "repair": "completed"}[action]
-        else:
-            status = {"start": "starting", "stop": "stopping", "repair": "repairing"}[action]
-        result: dict[str, object] = {
-            "status": status,
-            "action": action,
-            "controller_pid": int(process.pid),
-        }
-        if operation_id is not None:
-            result["operation_id"] = operation_id
-        if not completed and canonical_action_id is not None:
-            self._track_action(canonical_action_id, action, process, context)
-            result["action_id"] = canonical_action_id
-        return result
+                operation_status = str(operation["status"])
+                if operation_status in _NONTERMINAL_PHASES:
+                    raise PortableControlError(
+                        "PORTABLE_OPERATION_INCOMPLETE",
+                        "portable start launcher exited before the operation reached a terminal state",
+                    )
+                if operation_status != "ready":
+                    raise PortableControlError(
+                        "PORTABLE_OPERATION_FAILED",
+                        "portable start operation completed without reaching ready",
+                    )
+                status = "ready"
+            elif completed:
+                status = {"start": "completed", "stop": "stopped", "repair": "completed"}[action]
+            else:
+                status = {"start": "starting", "stop": "stopping", "repair": "repairing"}[action]
+            result: dict[str, object] = {
+                "status": status,
+                "action": action,
+                "controller_pid": int(process.pid),
+            }
+            if operation_id is not None:
+                result["operation_id"] = operation_id
+            if not completed and canonical_action_id is not None:
+                self._commit_action_reservation(canonical_action_id, action, process, context)
+                reservation_active = False
+                result["action_id"] = canonical_action_id
+            return result
+        finally:
+            if reservation_active:
+                self._release_action_reservation(canonical_action_id)
 
-    def _track_action(
+    def _reserve_action(self, action_id: str) -> None:
+        with self._actions_lock:
+            if action_id in self._actions or action_id in self._action_reservations:
+                raise PortableControlError(
+                    "PORTABLE_ACTION_EXISTS", "portable action identifier is already active"
+                )
+            if len(self._actions) + len(self._action_reservations) >= _MAX_ACTIVE_ACTIONS:
+                completed_id = next(
+                    (
+                        existing_id
+                        for existing_id, tracked in self._actions.items()
+                        if _action_completed(tracked.process)
+                    ),
+                    None,
+                )
+                if completed_id is not None:
+                    self._actions.pop(completed_id, None)
+            if len(self._actions) + len(self._action_reservations) >= _MAX_ACTIVE_ACTIONS:
+                raise PortableControlError(
+                    "PORTABLE_ACTION_CAPACITY", "too many portable actions are active"
+                )
+            self._action_reservations.add(action_id)
+
+    def _release_action_reservation(self, action_id: str | None) -> None:
+        if action_id is None:
+            return
+        with self._actions_lock:
+            self._action_reservations.discard(action_id)
+
+    def _commit_action_reservation(
         self,
         action_id: str,
         action: str,
@@ -381,24 +421,12 @@ class PortablePackageController:
         context: _ActionContext,
     ) -> None:
         with self._actions_lock:
-            if action_id in self._actions:
-                _terminate_controller(process)
+            if action_id not in self._action_reservations:
                 raise PortableControlError(
-                    "PORTABLE_ACTION_EXISTS", "portable action identifier is already active"
+                    "PORTABLE_ACTION_RESERVATION_LOST",
+                    "portable action reservation is unavailable",
                 )
-            if len(self._actions) >= _MAX_ACTIVE_ACTIONS:
-                for existing_id, tracked in list(self._actions.items()):
-                    try:
-                        completed = tracked.process.poll() is not None
-                    except (OSError, subprocess.SubprocessError):
-                        completed = True
-                    if completed:
-                        self._actions.pop(existing_id, None)
-            if len(self._actions) >= _MAX_ACTIVE_ACTIONS:
-                _terminate_controller(process)
-                raise PortableControlError(
-                    "PORTABLE_ACTION_CAPACITY", "too many portable actions are active"
-                )
+            self._action_reservations.remove(action_id)
             self._actions[action_id] = _TrackedAction(action, process, context)
 
     def _spawn_checked(
@@ -1169,6 +1197,13 @@ def _is_reparse_point(path: Path) -> bool:
     attributes = int(getattr(metadata, "st_file_attributes", 0))
     flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
     return path.is_symlink() or bool(attributes & flag)
+
+
+def _action_completed(process: ProcessLike) -> bool:
+    try:
+        return process.poll() is not None
+    except (OSError, subprocess.SubprocessError):
+        return True
 
 
 def _terminate_controller(process: ProcessLike) -> None:

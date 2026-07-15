@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -314,7 +316,168 @@ def test_action_tracker_rejects_more_than_bounded_concurrent_actions(tmp_path: P
     with pytest.raises(PortableControlError) as error:
         controller.stop(descriptor, action_id="00000000-0000-4000-8000-000000000064")
     assert error.value.code == "PORTABLE_ACTION_CAPACITY"
-    assert processes[-1].terminated is True
+    assert len(processes) == 64
+    assert all(process.terminated is False for process in processes)
+
+
+def test_action_tracker_reserves_capacity_before_concurrent_spawn(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    processes: list[FakeProcess] = []
+    processes_lock = threading.Lock()
+
+    def spawn(*_args, **_kwargs):
+        with processes_lock:
+            process = FakeProcess(pid=1000 + len(processes))
+            processes.append(process)
+            return process
+
+    controller = PortablePackageController(spawn=spawn)
+
+    def launch(index: int) -> str:
+        try:
+            controller.stop(
+                descriptor,
+                action_id=f"10000000-0000-4000-8000-{index:012d}",
+            )
+            return "spawned"
+        except PortableControlError as exc:
+            return exc.code
+
+    with ThreadPoolExecutor(max_workers=80) as executor:
+        results = list(executor.map(launch, range(80)))
+
+    assert results.count("spawned") == 64
+    assert results.count("PORTABLE_ACTION_CAPACITY") == 16
+    assert len(processes) == 64
+    assert all(process.terminated is False for process in processes)
+
+
+def test_duplicate_action_id_is_rejected_before_spawn(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    processes: list[FakeProcess] = []
+
+    def spawn(*_args, **_kwargs):
+        process = FakeProcess(pid=2000 + len(processes))
+        processes.append(process)
+        return process
+
+    controller = PortablePackageController(spawn=spawn)
+    action_id = "22222222-2222-4222-8222-222222222222"
+    controller.stop(descriptor, action_id=action_id)
+
+    with pytest.raises(PortableControlError) as error:
+        controller.stop(descriptor, action_id=action_id)
+
+    assert error.value.code == "PORTABLE_ACTION_EXISTS"
+    assert len(processes) == 1
+    assert processes[0].terminated is False
+
+
+def test_duplicate_action_id_is_rejected_while_first_spawn_is_reserved(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    spawn_entered = threading.Event()
+    allow_spawn = threading.Event()
+    processes: list[FakeProcess] = []
+
+    def spawn(*_args, **_kwargs):
+        process = FakeProcess(pid=2100)
+        processes.append(process)
+        spawn_entered.set()
+        assert allow_spawn.wait(timeout=2)
+        return process
+
+    controller = PortablePackageController(spawn=spawn)
+    action_id = "22222222-2222-4222-8222-222222222222"
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(controller.stop, descriptor, action_id=action_id)
+        assert spawn_entered.wait(timeout=2)
+
+        with pytest.raises(PortableControlError) as error:
+            controller.stop(descriptor, action_id=action_id)
+        assert error.value.code == "PORTABLE_ACTION_EXISTS"
+        assert len(processes) == 1
+
+        allow_spawn.set()
+        assert first.result(timeout=2)["status"] == "stopping"
+
+
+def test_spawn_failure_releases_action_reservation_for_retry(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    calls = 0
+
+    def spawn(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("fixture spawn failure")
+        return FakeProcess()
+
+    controller = PortablePackageController(spawn=spawn)
+    action_id = "22222222-2222-4222-8222-222222222222"
+
+    with pytest.raises(PortableControlError) as error:
+        controller.stop(descriptor, action_id=action_id)
+    assert error.value.code == "PORTABLE_LAUNCH_FAILED"
+
+    result = controller.stop(descriptor, action_id=action_id)
+    assert result["status"] == "stopping"
+    assert calls == 2
+
+
+def test_synchronous_completion_releases_action_reservation(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    processes = [FakeProcess(returncode=0), FakeProcess()]
+    controller = PortablePackageController(spawn=lambda *_args, **_kwargs: processes.pop(0))
+    action_id = "22222222-2222-4222-8222-222222222222"
+
+    assert controller.stop(descriptor, action_id=action_id)["status"] == "stopped"
+    retry = controller.stop(descriptor, action_id=action_id)
+
+    assert retry["status"] == "stopping"
+    assert retry["action_id"] == action_id
+
+
+def test_action_tracker_lru_evicts_only_oldest_terminal_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(portable_control, "_MAX_ACTIVE_ACTIONS", 3)
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    processes: list[FakeProcess] = []
+
+    def spawn(*_args, **_kwargs):
+        process = FakeProcess(pid=3000 + len(processes))
+        processes.append(process)
+        return process
+
+    controller = PortablePackageController(spawn=spawn)
+    action_ids = [
+        "30000000-0000-4000-8000-000000000000",
+        "30000000-0000-4000-8000-000000000001",
+        "30000000-0000-4000-8000-000000000002",
+        "30000000-0000-4000-8000-000000000003",
+    ]
+    for action_id in action_ids[:3]:
+        controller.stop(descriptor, action_id=action_id)
+    processes[0].returncode = 0
+    processes[1].returncode = 0
+
+    # Refresh the oldest terminal record so the second record becomes the LRU.
+    assert controller.action_status(descriptor, action_id=action_ids[0])["status"] == "stopped"
+    controller.stop(descriptor, action_id=action_ids[3])
+
+    with pytest.raises(PortableControlError) as evicted:
+        controller.action_status(descriptor, action_id=action_ids[1])
+    assert evicted.value.code == "PORTABLE_ACTION_NOT_FOUND"
+    assert controller.action_status(descriptor, action_id=action_ids[0])["status"] == "stopped"
+    assert controller.action_status(descriptor, action_id=action_ids[2])["status"] == "stopping"
+    assert controller.action_status(descriptor, action_id=action_ids[3])["status"] == "stopping"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="real cmd.exe contract is Windows-only")
