@@ -128,6 +128,17 @@ def test_no_dev_runtime_can_import_packaged_portable_cli_dependencies() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_controller_guide_explains_explicit_prestart_previous_version_import() -> None:
+    guide = (REPO_ROOT / "packaging" / "portable" / "使用说明-先看这里.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "旧版便携包" in guide and "不会自动扫描" in guide
+    assert "原包保持不变" in guide and "启动服务之前" in guide
+    assert "data/cache/portable/conda" in guide
+    assert "runtime/live、models、data/user" in guide
+
+
 def _copy_controller_builder_fixture(root: Path) -> None:
     root.mkdir(parents=True)
     shutil.copy2(REPO_ROOT / "Build-Package.ps1", root / "Build-Package.ps1")
@@ -1111,6 +1122,7 @@ def test_controller_bootstrap_has_clean_normal_user_root(
     assert (stage / "app" / "frontend" / "index.html").is_file()
     assert (stage / "scripts" / "import-portable-data.py").is_file()
     assert (stage / "scripts" / "import_portable_data.py").is_file()
+    assert (stage / "scripts" / "select-portable-folder.ps1").is_file()
     assert (stage / "licenses" / "LICENSE").is_file()
     assert (stage / "licenses" / "NOTICE").is_file()
     assert (stage / "licenses" / "THIRD_PARTY_NOTICES.json").is_file()
@@ -1145,6 +1157,12 @@ def test_worker_bootstrap_stages_all_upstream_source_under_app_without_mutating_
     assert (stage / "app" / "upstream-entry.py").is_file()
     assert (stage / "app" / "README.md").is_file()
     assert (stage / "app" / "tts_more" / "component.json").is_file()
+    for relative in (
+        "import_portable_data.py",
+        "import-portable-data.py",
+        "select-portable-folder.ps1",
+    ):
+        assert (stage / "app" / "tts_more" / relative).is_file()
     assert not (stage / "app" / "nested" / "artifacts").exists()
     assert not (stage / "app" / "nested" / ".env.local").exists()
     for clutter in (

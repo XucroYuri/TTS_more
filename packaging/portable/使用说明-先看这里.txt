@@ -12,6 +12,13 @@ TTS More Windows 便携版使用说明
 - Repair.cmd：校验并重新获取缺失或损坏的资产，不删除用户数据。
 - Initialize.cmd：只执行初始化和校验，不启动服务。
 
+导入旧版便携包
+- 直接双击当前包的 Start.cmd 时，启动器会在启动服务之前询问是否导入；由工作台管理或自动化启动时不会询问。
+- 启动器不会自动扫描旧包。确认需要导入后，只会打开固定的文件夹选择器，由你明确选择旧版 TTS More、GPT-SoVITS、IndexTTS 或 CosyVoice 包。
+- 启动器先显示仅含数量、大小和相对模型名的摘要；再次确认后才复制数据。旧版原包保持不变。
+- 选择旧目录后、确认摘要前，Bootstrap 包可能只在 data/cache/portable/conda 下载或复用受锁定的包内 Miniforge 来生成计划；此步骤不会写入 runtime/live、models、data/user。
+- 当前构建默认只询问一次；如需再次选择，可从 PowerShell 启动时传入 -OfferImport。
+
 本机组合部署
 - TTS More、GPT-SoVITS、IndexTTS、CosyVoice 四个包可以分别解压、分别启动。
 - 在 TTS More 工作台中维护另外三个包的路径后，可以使用快捷按钮启动对应 worker。

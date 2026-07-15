@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = [System.Windows.Forms.FolderBrowserDialog]::new()
-$dialog.Description = "选择 GPT-SoVITS、IndexTTS 或 CosyVoice 便携包文件夹"
+$dialog.Description = "选择旧版 TTS More、GPT-SoVITS、IndexTTS 或 CosyVoice 便携包文件夹"
 $dialog.ShowNewFolderButton = $false
 try {
     $result = $dialog.ShowDialog()

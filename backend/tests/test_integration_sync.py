@@ -55,6 +55,12 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
     assert result["component"] == "gpt-sovits"
     assert (target / "tts_more" / "tts_more_worker" / "gpt_sovits.py").is_file()
     assert (target / "tts_more" / "tests" / "test_portable_integration.py").is_file()
+    for relative in (
+        "import_portable_data.py",
+        "import-portable-data.py",
+        "select-portable-folder.ps1",
+    ):
+        assert (target / "tts_more" / relative).is_file()
     assert "tts_more_worker.gpt_sovits:app" in (target / "tts_more" / "component.json").read_text(encoding="utf-8")
     for entry in (
         "Initialize.cmd",
@@ -74,8 +80,36 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
     assert manifest["files"]
     validation_relative = "tts_more/Portable-Validation.ps1"
     assert manifest["files"][validation_relative] == sync.sha256_file(target / validation_relative)
+    for relative in (
+        "tts_more/import_portable_data.py",
+        "tts_more/import-portable-data.py",
+        "tts_more/select-portable-folder.ps1",
+    ):
+        assert manifest["files"][relative] == sync.sha256_file(target / relative)
     assert manifest["files"][GUIDE_NAME] == sync.sha256_file(target / GUIDE_NAME)
     assert sync.check_integration(target) == []
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "tts_more/import_portable_data.py",
+        "tts_more/import-portable-data.py",
+        "tts_more/select-portable-folder.ps1",
+    ),
+)
+def test_check_rejects_missing_or_drifted_controlled_import_tools(
+    tmp_path: Path, relative: str
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / relative.replace("/", "-")
+    sync.sync_integration(REPO_ROOT, target, "cosyvoice", "d" * 40)
+    controlled = target / relative
+    controlled.write_text("drift", encoding="utf-8")
+    assert f"hash mismatch: {relative}" in sync.check_integration(target)
+    sync.sync_integration(REPO_ROOT, target, "cosyvoice", "d" * 40)
+    controlled.unlink()
+    assert f"missing controlled file: {relative}" in sync.check_integration(target)
 
 
 def test_generated_guide_is_component_aware_and_package_relative(tmp_path: Path) -> None:
@@ -100,6 +134,10 @@ def test_generated_guide_is_component_aware_and_package_relative(tmp_path: Path)
         assert "Full" in guide and "断网直接运行" in guide and "禁止上传 GitHub" in guide
         assert "无需安装系统 Python、Conda 或 Node" in guide
         assert "路径可能因电脑而异" in guide and "包内相对路径" in guide
+        assert "旧版便携包" in guide and "不会自动扫描" in guide
+        assert "原包保持不变" in guide and "启动服务之前" in guide
+        assert "data/cache/portable/conda" in guide
+        assert "runtime/live、models、data/user" in guide
 
 
 def test_check_detects_generated_guide_drift_and_removal(tmp_path: Path) -> None:
@@ -458,20 +496,24 @@ def test_copied_contract_rejects_commented_decoys_in_nested_context_return(tmp_p
     source = controller.read_text(encoding="utf-8")
     operations_field = "OperationsRoot = [IO.Path]::GetFullPath($operationsRoot)"
     return_marker = "    return [pscustomobject]@{\n"
-    assert source.count(operations_field) == 1
-    assert source.count(return_marker) == 1
-    source = source.replace(
+    context_start = source.index("function Get-PackageContext")
+    context_end = source.index("function Resolve-PortableStartRoot")
+    context = source[context_start:context_end]
+    assert context.count(operations_field) == 1
+    assert context.count(return_marker) == 1
+    context = context.replace(
         operations_field,
         "OperationsRoot = [IO.Path]::GetFullPath($resolvedRoot)",
         1,
     )
-    source = source.replace(
+    context = context.replace(
         return_marker,
         "    if ($false) { return [pscustomobject]@{ "
         "OperationsRoot = [IO.Path]::GetFullPath($operationsRoot) } }\n"
         + return_marker,
+        1,
     )
-    controller.write_text(source, encoding="utf-8")
+    controller.write_text(source[:context_start] + context + source[context_end:], encoding="utf-8")
 
     result = _run_copied_contract_after_mutation(sync, target)
 

@@ -32,6 +32,19 @@ def _load_importer():
     return module
 
 
+def _load_importer_at(module_path: Path, module_name: str):
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
+
+
 def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -208,6 +221,58 @@ def test_import_copies_user_data_reuses_matching_assets_and_skips_pid_state(tmp_
     assert not (new / "runtime").exists()
     assert not (new / "data/cache").exists()
     assert (old / "data/user/project.json").exists()
+
+
+@pytest.mark.parametrize("layout", ("controller", "worker"))
+def test_importer_resolves_only_the_fixed_schema_for_each_packaged_layout(
+    tmp_path: Path, layout: str
+) -> None:
+    package_code = tmp_path / layout
+    if layout == "controller":
+        module_path = package_code / "scripts" / "import_portable_data.py"
+        schema_path = package_code / "packaging" / "portable" / "tts-more-package.schema.json"
+    else:
+        module_path = package_code / "tts_more" / "import_portable_data.py"
+        schema_path = package_code / "tts_more" / "tts-more-package.schema.json"
+    module_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "import_portable_data.py", module_path)
+    schema_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        REPO_ROOT / "packaging" / "portable" / "tts-more-package.schema.json",
+        schema_path,
+    )
+    importer = _load_importer_at(module_path, f"portable_importer_{layout}")
+    old, new = _write_version_pair(tmp_path / f"versions-{layout}", matching_asset=True)
+
+    plan = importer.plan_import(old, new)
+
+    assert plan.old_root == old.resolve()
+    assert plan.new_root == new.resolve()
+
+
+@pytest.mark.parametrize("failure", ("missing", "ambiguous"))
+def test_importer_fails_closed_when_fixed_schema_is_missing_or_ambiguous(
+    tmp_path: Path, failure: str
+) -> None:
+    package_code = tmp_path / failure
+    module_path = package_code / "scripts" / "import_portable_data.py"
+    module_path.parent.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "import_portable_data.py", module_path)
+    if failure == "ambiguous":
+        for schema_path in (
+            package_code / "scripts" / "tts-more-package.schema.json",
+            package_code / "packaging" / "portable" / "tts-more-package.schema.json",
+        ):
+            schema_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(
+                REPO_ROOT / "packaging" / "portable" / "tts-more-package.schema.json",
+                schema_path,
+            )
+    importer = _load_importer_at(module_path, f"portable_importer_{failure}")
+    old, new = _write_version_pair(tmp_path / f"versions-{failure}", matching_asset=True)
+
+    with pytest.raises(importer.PortableMigrationError, match="schema.*(missing|ambiguous)"):
+        importer.plan_import(old, new)
 
 
 def test_hash_mismatch_is_not_reused(tmp_path: Path) -> None:

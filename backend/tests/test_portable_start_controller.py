@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -19,6 +21,12 @@ POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _unused_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
 
 
 def _create_directory_junction(link: Path, target: Path) -> None:
@@ -114,6 +122,7 @@ exit 0
 
 
 def _manifest(package_root: Path, *, profile: str, operations: str = "data/local/operations") -> dict[str, object]:
+    port = _unused_tcp_port()
     runtime_lock = package_root / "packaging" / "portable" / "runtime.lock.json"
     model_lock = package_root / "packaging" / "portable" / "models.lock.json"
     _write_text(runtime_lock, "{}\n")
@@ -153,8 +162,8 @@ def _manifest(package_root: Path, *, profile: str, operations: str = "data/local
             "build": "Build-Package.ps1",
         },
         "endpoint": {
-            "default_url": "http://127.0.0.1:8000",
-            "port": 8000,
+            "default_url": f"http://127.0.0.1:{port}",
+            "port": port,
             "health_path": "/api/health",
             "capabilities_path": "/capabilities",
             "bind_policy": "loopback",
@@ -201,6 +210,40 @@ class FakePython {{
     if (!String.IsNullOrEmpty(executed)) File.AppendAllText(executed, joined + Environment.NewLine);
     if (joined.Contains("version_info")) {{ Console.WriteLine("{version}"); return 0; }}
     if (joined.Contains("definitely_missing") || {str(not imports_ok).lower()}) return 1;
+    if (joined.Contains(" plan ")) {{
+      string order = Environment.GetEnvironmentVariable("A4_ORDER_MARKER");
+      if (!String.IsNullOrEmpty(order)) File.AppendAllText(order, "plan" + Environment.NewLine);
+      string cancelRoot = Environment.GetEnvironmentVariable("A4_CANCEL_AFTER_PLAN_ROOT");
+      if (!String.IsNullOrEmpty(cancelRoot)) {{
+        string operations = Path.Combine(cancelRoot, "data", "local", "operations");
+        string[] candidates = Directory.GetDirectories(operations);
+        if (candidates.Length == 1) File.WriteAllText(Path.Combine(candidates[0], "cancel.requested"), "cancel");
+      }}
+      string blockedRoot = Environment.GetEnvironmentVariable("A4_BLOCK_AFTER_PLAN_ROOT");
+      string blockedPid = Environment.GetEnvironmentVariable("A4_BLOCK_AFTER_PLAN_PID");
+      if (!String.IsNullOrEmpty(blockedRoot) && !String.IsNullOrEmpty(blockedPid)) {{
+        string run = Path.Combine(blockedRoot, "data", "local", "run");
+        Directory.CreateDirectory(run);
+        File.WriteAllText(Path.Combine(run, "worker.pid.json"), "{{\"schema_version\":2,\"pid\":" + blockedPid + "}}");
+      }}
+      if (Environment.GetEnvironmentVariable("A4_FAIL_PLAN") == "1") {{ Console.Error.WriteLine("PRIVATE-PLAN-ERROR"); return 7; }}
+      string invalidList = Environment.GetEnvironmentVariable("A4_INVALID_PLAN_LIST");
+      if (!String.IsNullOrEmpty(invalidList)) {{
+        string invalidPlan = "{{\"plan_digest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"user_file_count\":2,\"user_bytes\":17,\"reusable_assets\":[],\"reusable_asset_bytes\":23,\"skipped_assets\":[],\"already_present\":[],\"old_package_preserved\":true}}";
+        Console.WriteLine(invalidPlan.Replace("\"" + invalidList + "\":[]", "\"" + invalidList + "\":1"));
+        return 0;
+      }}
+      Console.WriteLine("{{\"plan_digest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"old_root\":\"C:\\\\PRIVATE-OLD-PATH\",\"new_root\":\"C:\\\\PRIVATE-NEW-PATH\",\"user_file_count\":2,\"user_bytes\":17,\"reusable_assets\":[\"models/asset-00.bin\",\"models/asset-01.bin\",\"models/asset-02.bin\",\"models/asset-03.bin\",\"models/asset-04.bin\",\"models/asset-05.bin\",\"models/asset-06.bin\",\"models/asset-07.bin\",\"models/asset-08.bin\",\"models/asset-09.bin\",\"models/asset-10.bin\",\"models/asset-11.bin\",\"models/asset-12.bin\",\"models/asset-13.bin\",\"models/asset-14.bin\",\"models/asset-15.bin\",\"models/asset-16.bin\",\"models/asset-17.bin\",\"models/asset-18.bin\",\"models/asset-19.bin\",\"models/asset-20.bin\"],\"reusable_asset_bytes\":23,\"skipped_assets\":[\"models/PRIVATE-SKIPPED-00.bin\",\"models/PRIVATE-SKIPPED-01.bin\"],\"already_present\":[\"models/PRIVATE-ALREADY-00.bin\"],\"old_package_preserved\":true}}");
+      return 0;
+    }}
+    if (joined.Contains(" apply ")) {{
+      string order = Environment.GetEnvironmentVariable("A4_ORDER_MARKER");
+      if (!String.IsNullOrEmpty(order)) File.AppendAllText(order, "apply" + Environment.NewLine);
+      if (Environment.GetEnvironmentVariable("A4_FAIL_APPLY") == "1") {{ Console.Error.WriteLine("PRIVATE-APPLY-ERROR"); return 8; }}
+      if (!joined.Contains("--confirmed-digest dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")) return 9;
+      Console.WriteLine("{{\"copied_user_files\":2,\"reused_assets\":[\"models/asset-00.bin\"],\"skipped_assets\":[],\"already_present\":[]}}");
+      return 0;
+    }}
     if (joined.Contains("write-state")) {{
       string build = Environment.GetEnvironmentVariable("A4_FAKE_WRITE_BAD_STATE") == "1" ? "bad-build" : Value(args,"--build-id");
       string json = "{{\"schema_version\":1,\"component\":\"" + Value(args,"--component") + "\",\"build_id\":\"" + build + "\",\"profile\":\"" + Value(args,"--profile") + "\",\"runtime_lock_sha256\":\"" + Value(args,"--runtime-lock-sha256") + "\",\"model_lock_sha256\":\"" + Value(args,"--model-lock-sha256") + "\",\"ready\":true}}";
@@ -236,6 +279,25 @@ def _write_sha256_manifest(package_root: Path) -> None:
     _write_text(package_root / "SHA256SUMS.txt", "\n".join(lines) + "\n")
 
 
+def _stage_import_toolchain(package_root: Path, bundle: Path) -> None:
+    for name in (
+        "import_portable_data.py",
+        "import-portable-data.py",
+        "bootstrap-conda.ps1",
+        "select-portable-folder.ps1",
+    ):
+        shutil.copy2(REPO_ROOT / "scripts" / name, bundle / name)
+    schema = (
+        package_root / "packaging" / "portable" / "tts-more-package.schema.json"
+        if bundle.name == "scripts"
+        else bundle / "tts-more-package.schema.json"
+    )
+    shutil.copy2(
+        REPO_ROOT / "packaging" / "portable" / "tts-more-package.schema.json",
+        schema,
+    )
+
+
 def _prepare_full_package(
     package_root: Path,
     *,
@@ -244,6 +306,7 @@ def _prepare_full_package(
     imports_ok: bool = True,
 ) -> None:
     _source_package(package_root)
+    _stage_import_toolchain(package_root, package_root / "scripts")
     payload = _manifest(package_root, profile="full")
     payload["models"]["required"] = True
     _write_text(package_root / "package" / "tts-more-package.json", json.dumps(payload))
@@ -311,6 +374,7 @@ def _run_controller(
     *arguments: str,
     timeout: int = 20,
     environment_updates: dict[str, str] | None = None,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if not POWERSHELL:
         pytest.skip("Windows PowerShell is unavailable")
@@ -330,9 +394,189 @@ def _run_controller(
         ],
         cwd=package_root,
         env=environment,
+        input=input_text,
         text=True,
         capture_output=True,
         timeout=timeout,
+        check=False,
+    )
+
+
+def _run_direct_controller(
+    package_root: Path,
+    *,
+    choices: str,
+    offer_import: bool = True,
+    timeout: int = 30,
+    environment_updates: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    environment = os.environ.copy()
+    environment["PATH"] = ""
+    environment["A4_CONTROLLER"] = str(
+        next(
+            path
+            for path in (
+                package_root / "scripts" / "Invoke-PortableStart.ps1",
+                package_root / "app" / "tts_more" / "Invoke-PortableStart.ps1",
+            )
+            if path.is_file()
+        )
+    )
+    environment.update(environment_updates or {})
+    offer = "-OfferImport" if offer_import else ""
+    command = (
+        "function Start-Process { param([Parameter(ValueFromRemainingArguments=$true)]$Arguments) }\n"
+        f"& $env:A4_CONTROLLER -ManagedBy direct {offer}\n"
+        "exit $LASTEXITCODE\n"
+    )
+    return subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=package_root,
+        env=environment,
+        input=choices,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _prepare_import_offer_fixture(package_root: Path, *, with_runtime: bool) -> Path:
+    _source_package(package_root)
+    payload = _manifest(package_root, profile="bootstrap")
+    _write_text(package_root / "package" / "tts-more-package.json", json.dumps(payload))
+    _stage_import_toolchain(package_root, package_root / "scripts")
+    initializer = package_root / "scripts" / "initialize-portable.ps1"
+    _write_text(
+        initializer,
+        initializer.read_text(encoding="utf-8").replace('build_id = "source-checkout"', 'build_id = "build-test"'),
+    )
+    old_root = package_root.parent / "PRIVATE 旧版便携包"
+    old_root.mkdir()
+    _write_text(
+        package_root / "scripts" / "select-portable-folder.ps1",
+        "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"
+        "if ($env:A4_SELECTOR_CANCEL -eq '1') { [Console]::Out.WriteLine('{\"cancelled\":true}') } "
+        "else { [Console]::Out.WriteLine((@{ selected_path = [string]$env:A4_OLD_ROOT } | ConvertTo-Json -Compress)) }\n",
+    )
+    if with_runtime:
+        _compile_fake_python(package_root / "runtime" / "live" / "python.exe")
+    else:
+        shutil.rmtree(package_root / "runtime" / "live")
+        bootstrap_python = package_root / "data" / "cache" / "portable" / "conda" / "miniforge" / "python.exe"
+        _compile_fake_python(bootstrap_python)
+        conda = bootstrap_python.parent / "condabin" / "conda.bat"
+        _write_text(conda, "@echo off\n")
+        _write_text(
+            package_root / "scripts" / "bootstrap-conda.ps1",
+            "[CmdletBinding()] param([string]$CacheRoot,[string]$LockPath,[string]$PackageRoot,[string]$OperationRoot,[string]$CancelFile,[switch]$PassThru)\n"
+            "$root = [IO.Path]::GetFullPath($PackageRoot)\n"
+            "if ($CacheRoot -ne 'data/cache/portable/conda') { exit 31 }\n"
+            "if ($LockPath -notmatch 'toolchain\\.lock\\.json$') { exit 32 }\n"
+            "Add-Content -LiteralPath (Join-Path $root 'import-order.log') -Value 'bootstrap'\n"
+            "$conda = Join-Path $root 'data\\cache\\portable\\conda\\miniforge\\condabin\\conda.bat'\n"
+            "if ($PassThru) { [Console]::Out.WriteLine($conda) }\n",
+        )
+    _write_sha256_manifest(package_root)
+    return old_root
+
+
+def _prepare_worker_import_fixture(package_root: Path) -> Path:
+    from scripts import sync_integrations
+
+    generated = package_root.parent / "generated-worker-source"
+    sync_integrations.sync_integration(REPO_ROOT, generated, "gpt-sovits", "e" * 40)
+    bundle = package_root / "app" / "tts_more"
+    shutil.copytree(generated / "tts_more", bundle)
+    config_path = bundle / "component.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["source_root"] = "app"
+    config["import_probe"] = "import sys"
+    _write_text(config_path, json.dumps(config))
+    payload = _manifest(package_root, profile="bootstrap")
+    payload["component"] = "gpt-sovits"
+    payload["runtime"]["lock"] = "app/tts_more/locks/runtime.lock.json"
+    payload["models"]["lock"] = "app/tts_more/locks/models.lock.json"
+    payload["models"]["required"] = False
+    worker_port = _unused_tcp_port()
+    payload["endpoint"]["port"] = worker_port
+    payload["endpoint"]["default_url"] = f"http://127.0.0.1:{worker_port}"
+    payload["endpoint"]["health_path"] = "/health"
+    _write_text(package_root / "package" / "tts-more-package.json", json.dumps(payload))
+    _write_text(
+        bundle / "Initialize.ps1",
+        r'''[CmdletBinding()]
+param([string]$PackageRoot = "", [string]$OperationRoot = "", [string]$CancelFile = "")
+$ErrorActionPreference = "Stop"
+Add-Content -LiteralPath (Join-Path $PackageRoot "order.log") -Value "initialize"
+New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "data\local") | Out-Null
+$runtimeLock = Join-Path $PackageRoot "app\tts_more\locks\runtime.lock.json"
+$modelLock = Join-Path $PackageRoot "app\tts_more\locks\models.lock.json"
+$state = @{ schema_version = 1; component = "gpt-sovits"; build_id = "build-test"; profile = "cpu"; runtime_lock_sha256 = (Get-FileHash -LiteralPath $runtimeLock -Algorithm SHA256).Hash.ToLowerInvariant(); model_lock_sha256 = (Get-FileHash -LiteralPath $modelLock -Algorithm SHA256).Hash.ToLowerInvariant(); ready = $true } | ConvertTo-Json
+[IO.File]::WriteAllText((Join-Path $PackageRoot "data\local\install-state.json"), $state, [Text.UTF8Encoding]::new($false))
+exit 0
+''',
+    )
+    _write_text(
+        bundle / "Start-Worker.ps1",
+        '''[CmdletBinding()]
+param([string]$PackageRoot = "", [string]$OperationRoot = "", [Nullable[int]]$PortOverride = $null)
+Add-Content -LiteralPath (Join-Path $PackageRoot "order.log") -Value "start"
+exit 0
+''',
+    )
+    old_root = package_root.parent / "PRIVATE old worker package"
+    old_root.mkdir()
+    _write_text(
+        bundle / "select-portable-folder.ps1",
+        "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"
+        "[Console]::Out.WriteLine((@{ selected_path = [string]$env:A4_OLD_ROOT } | ConvertTo-Json -Compress))\n",
+    )
+    _compile_fake_python(package_root / "runtime" / "live" / "python.exe")
+    _write_sha256_manifest(package_root)
+    return old_root
+
+
+def _invoke_import_offer(
+    package_root: Path,
+    *,
+    choices: str = "",
+    managed_by: str = "direct",
+    no_ui: bool = False,
+    offer_import: bool = False,
+    environment_updates: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    probe = package_root / "invoke-import-offer.ps1"
+    _write_text(
+        probe,
+        "$ErrorActionPreference = 'Stop'\n"
+        ". $env:A4_CONTROLLER\n"
+        "$context = Get-PackageContext -Root $env:A4_ROOT\n"
+        "$result = Invoke-PortableImportOffer -Context $context -Operation '' -ManagedBy $env:A4_MANAGED_BY -NoUi:([bool]::Parse($env:A4_NO_UI)) -OfferImport:([bool]::Parse($env:A4_OFFER_IMPORT))\n"
+        "$result | ConvertTo-Json -Compress\n",
+    )
+    environment = {
+        **os.environ,
+        "PATH": "",
+        "A4_CONTROLLER": str(package_root / "scripts" / "Invoke-PortableStart.ps1"),
+        "A4_ROOT": str(package_root),
+        "A4_OLD_ROOT": str(package_root.parent / "PRIVATE 旧版便携包"),
+        "A4_MANAGED_BY": managed_by,
+        "A4_NO_UI": str(no_ui),
+        "A4_OFFER_IMPORT": str(offer_import),
+        "A4_FAKE_EXEC_MARKER": str(package_root / "import-python.log"),
+        **(environment_updates or {}),
+    }
+    return subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(probe)],
+        cwd=package_root,
+        env=environment,
+        input=choices,
+        text=True,
+        capture_output=True,
+        timeout=30,
         check=False,
     )
 
@@ -350,6 +594,439 @@ def _is_uuid(value: str) -> bool:
         return str(UUID(value)) == value.lower()
     except ValueError:
         return False
+
+
+def test_direct_staged_import_offer_uses_safe_summary_and_exact_in_memory_digest(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "中文 new staged package"
+    old_root = _prepare_import_offer_fixture(package_root, with_runtime=True)
+
+    result = _invoke_import_offer(package_root, choices="Y\nY\n", offer_import=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert str(old_root) not in combined
+    assert "PRIVATE-OLD-PATH" not in combined
+    assert "PRIVATE-NEW-PATH" not in combined
+    assert "models/asset-00.bin" in combined
+    assert "models/asset-19.bin" in combined
+    assert "models/asset-20.bin" not in combined
+    assert "跳过 2 个；已存在 1 个" in combined
+    assert "PRIVATE-SKIPPED" not in combined
+    assert "PRIVATE-ALREADY" not in combined
+    assert "worker/服务必须保持停止" in combined
+    python_calls = (package_root / "import-python.log").read_text(encoding="utf-8").splitlines()
+    assert any("import jsonschema" in line for line in python_calls)
+    plan_index = next(index for index, line in enumerate(python_calls) if " plan " in f" {line} ")
+    apply_index = next(index for index, line in enumerate(python_calls) if " apply " in f" {line} ")
+    assert plan_index < apply_index
+    assert "--confirmed-digest " + "d" * 64 in python_calls[apply_index]
+    marker = json.loads(
+        (package_root / "data" / "local" / "portable-import-decision.json").read_text(
+            encoding="utf-8-sig"
+        )
+    )
+    assert set(marker) == {"schema_version", "build_id", "status", "timestamp"}
+    assert marker["build_id"] == "build-test"
+    assert marker["status"] == "completed"
+    assert not re.search(r"(?i)path|root|digest|plan|asset|token", json.dumps(marker))
+
+
+@pytest.mark.parametrize("field", ("reusable_assets", "skipped_assets", "already_present"))
+def test_import_plan_rejects_non_array_asset_count_fields(tmp_path: Path, field: str) -> None:
+    package_root = tmp_path / f"invalid {field}"
+    _prepare_import_offer_fixture(package_root, with_runtime=True)
+
+    result = _invoke_import_offer(
+        package_root,
+        choices="Y\n",
+        offer_import=True,
+        environment_updates={"A4_INVALID_PLAN_LIST": field},
+    )
+
+    assert result.returncode != 0
+    assert "invalid asset list" in result.stdout + result.stderr
+    assert not any(
+        " apply " in f" {line} "
+        for line in (package_root / "import-python.log").read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_bootstrap_import_runs_only_after_selection_and_decline_mutates_no_runtime_model_or_user(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "bootstrap staged package"
+    old_root = _prepare_import_offer_fixture(package_root, with_runtime=False)
+    before_user = tuple((package_root / "data" / "user").rglob("*")) if (package_root / "data" / "user").exists() else ()
+    before_models = tuple((package_root / "models").rglob("*")) if (package_root / "models").exists() else ()
+
+    result = _invoke_import_offer(package_root, choices="Y\nN\n", offer_import=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert str(old_root) not in result.stdout + result.stderr
+    assert (package_root / "import-order.log").read_text(encoding="utf-8").splitlines() == ["bootstrap"]
+    calls = (package_root / "import-python.log").read_text(encoding="utf-8").splitlines()
+    assert any("import jsonschema" in line for line in calls)
+    assert any(" plan " in f" {line} " for line in calls)
+    assert not any(" apply " in f" {line} " for line in calls)
+    assert not (package_root / "runtime" / "live").exists()
+    assert (
+        tuple((package_root / "data" / "user").rglob("*"))
+        if (package_root / "data" / "user").exists()
+        else ()
+    ) == before_user
+    assert (
+        tuple((package_root / "models").rglob("*"))
+        if (package_root / "models").exists()
+        else ()
+    ) == before_models
+    assert not (package_root / "data" / "local" / "portable-import-decision.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("managed_by", "no_ui"),
+    (("tts-more", False), ("automation", False), ("direct", True)),
+)
+def test_noninteractive_or_managed_starts_never_touch_import_flow(
+    tmp_path: Path, managed_by: str, no_ui: bool
+) -> None:
+    package_root = tmp_path / f"skip-{managed_by}-{no_ui}"
+    _prepare_import_offer_fixture(package_root, with_runtime=True)
+
+    result = _invoke_import_offer(
+        package_root,
+        managed_by=managed_by,
+        no_ui=no_ui,
+        offer_import=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (package_root / "import-python.log").exists()
+
+
+def test_prompt_once_marker_skips_by_default_and_offer_import_overrides_for_direct_user(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "prompt once"
+    _prepare_import_offer_fixture(package_root, with_runtime=True)
+    marker = package_root / "data" / "local" / "portable-import-decision.json"
+    _write_text(
+        marker,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "build_id": "build-test",
+                "status": "declined",
+                "timestamp": "2026-07-16T00:00:00Z",
+            }
+        ),
+    )
+
+    skipped = _invoke_import_offer(package_root)
+    forced = _invoke_import_offer(package_root, choices="N\n", offer_import=True)
+
+    assert skipped.returncode == 0, skipped.stdout + skipped.stderr
+    assert forced.returncode == 0, forced.stdout + forced.stderr
+    assert not (package_root / "import-python.log").exists()
+
+
+def test_missing_native_confirmation_is_not_treated_as_decline(tmp_path: Path) -> None:
+    package_root = tmp_path / "missing explicit choice"
+    _prepare_import_offer_fixture(package_root, with_runtime=True)
+
+    result = _invoke_import_offer(package_root, choices="", offer_import=True)
+
+    assert result.returncode != 0
+    assert "confirmation tool did not receive an explicit choice" in result.stdout + result.stderr
+    assert not (package_root / "import-python.log").exists()
+    assert not (package_root / "data" / "local" / "portable-import-decision.json").exists()
+
+
+def test_tampered_fixed_import_tool_is_rejected_before_selector_or_importer(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "tampered selector"
+    _prepare_import_offer_fixture(package_root, with_runtime=True)
+    _write_text(package_root / "scripts" / "select-portable-folder.ps1", "throw 'tampered'\n")
+
+    result = _invoke_import_offer(package_root, choices="Y\n", offer_import=True)
+
+    assert result.returncode != 0
+    assert "SHA256SUMS" in result.stdout + result.stderr
+    assert "PRIVATE" not in result.stdout + result.stderr
+    assert not (package_root / "import-python.log").exists()
+
+
+def test_running_package_process_record_blocks_hot_import_before_selector(tmp_path: Path) -> None:
+    package_root = tmp_path / "running package blocks import"
+    _prepare_import_offer_fixture(package_root, with_runtime=True)
+    _write_text(
+        package_root / "data" / "local" / "run" / "worker.pid.json",
+        json.dumps({"schema_version": 2, "pid": os.getpid()}),
+    )
+
+    result = _invoke_import_offer(package_root, choices="Y\n", offer_import=True)
+
+    assert result.returncode != 0
+    assert "Stop the running worker/service before importing" in result.stdout + result.stderr
+    assert not (package_root / "import-python.log").exists()
+
+
+def test_recordless_target_port_listener_blocks_hot_import(tmp_path: Path) -> None:
+    package_root = tmp_path / "recordless listener blocks import"
+    _prepare_import_offer_fixture(package_root, with_runtime=True)
+    manifest = json.loads(
+        (package_root / "package" / "tts-more-package.json").read_text(encoding="utf-8")
+    )
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", int(manifest["endpoint"]["port"])))
+        listener.listen()
+        result = _invoke_import_offer(package_root, choices="Y\n", offer_import=True)
+
+    assert result.returncode != 0
+    assert "Stop the running worker/service before importing" in result.stdout + result.stderr
+    assert not (package_root / "import-python.log").exists()
+
+
+def test_controller_staged_main_orders_import_before_initialize_before_service(tmp_path: Path) -> None:
+    package_root = tmp_path / "controller staged main"
+    old_root = _prepare_import_offer_fixture(package_root, with_runtime=True)
+    order = package_root / "order.log"
+
+    result = _run_direct_controller(
+        package_root,
+        choices="Y\nY\n",
+        environment_updates={
+            "A4_OLD_ROOT": str(old_root),
+            "A4_FAKE_EXEC_MARKER": str(package_root / "import-python.log"),
+            "A4_ORDER_MARKER": str(order),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert order.read_text(encoding="utf-8").splitlines() == ["plan", "apply", "initialize", "start"]
+
+
+def test_generated_worker_staged_main_orders_import_before_initialize_before_service(tmp_path: Path) -> None:
+    package_root = tmp_path / "worker staged main"
+    old_root = _prepare_worker_import_fixture(package_root)
+    order = package_root / "order.log"
+
+    result = _run_direct_controller(
+        package_root,
+        choices="Y\nY\n",
+        environment_updates={
+            "A4_OLD_ROOT": str(old_root),
+            "A4_FAKE_EXEC_MARKER": str(package_root / "import-python.log"),
+            "A4_ORDER_MARKER": str(order),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert order.read_text(encoding="utf-8").splitlines() == ["plan", "apply", "initialize", "start"]
+
+
+def test_installed_full_main_validates_then_imports_before_service(tmp_path: Path) -> None:
+    package_root = tmp_path / "installed full import"
+    _prepare_full_package(package_root)
+    old_root = package_root.parent / "PRIVATE old full package"
+    old_root.mkdir()
+    _write_text(
+        package_root / "scripts" / "select-portable-folder.ps1",
+        "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"
+        "[Console]::Out.WriteLine((@{ selected_path = [string]$env:A4_OLD_ROOT } | ConvertTo-Json -Compress))\n",
+    )
+    _write_sha256_manifest(package_root)
+    order = package_root / "order.log"
+
+    result = _run_direct_controller(
+        package_root,
+        choices="Y\nY\n",
+        environment_updates={
+            "A4_OLD_ROOT": str(old_root),
+            "A4_FAKE_EXEC_MARKER": str(package_root / "import-python.log"),
+            "A4_ORDER_MARKER": str(order),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert order.read_text(encoding="utf-8").splitlines() == ["plan", "apply", "start"]
+
+
+def test_invalid_full_main_fails_integrity_before_prompt_or_importer(tmp_path: Path) -> None:
+    package_root = tmp_path / "invalid full before import"
+    _prepare_full_package(package_root, model_mode="missing")
+    executed = package_root / "runtime-or-import-executed.log"
+
+    result = _run_direct_controller(
+        package_root,
+        choices="Y\nY\n",
+        environment_updates={"A4_FAKE_EXEC_MARKER": str(executed)},
+    )
+
+    assert result.returncode == 22
+    assert "PACKAGE_CORRUPT" in result.stdout + result.stderr
+    assert not executed.exists()
+    assert not (package_root / "start-count.log").exists()
+
+
+@pytest.mark.parametrize(("cancel", "expected"), ((False, "declined"), (True, "cancelled")))
+def test_decline_or_cancel_marker_is_written_only_after_main_service_ready(
+    tmp_path: Path, cancel: bool, expected: str
+) -> None:
+    package_root = tmp_path / f"main marker {expected}"
+    old_root = _prepare_import_offer_fixture(package_root, with_runtime=True)
+    choices = "Y\n" if cancel else "N\n"
+
+    result = _run_direct_controller(
+        package_root,
+        choices=choices,
+        environment_updates={
+            "A4_OLD_ROOT": str(old_root),
+            "A4_SELECTOR_CANCEL": "1" if cancel else "0",
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (package_root / "order.log").read_text(encoding="utf-8").splitlines()[-1] == "start"
+    marker = json.loads(
+        (package_root / "data" / "local" / "portable-import-decision.json").read_text(encoding="utf-8-sig")
+    )
+    assert marker["status"] == expected
+
+
+def test_failed_main_start_does_not_write_delayed_decline_marker(tmp_path: Path) -> None:
+    package_root = tmp_path / "failed start marker"
+    _prepare_import_offer_fixture(package_root, with_runtime=True)
+    _write_text(
+        package_root / "scripts" / "start-production.ps1",
+        "[CmdletBinding()] param([string]$PackageRoot,[string]$OperationRoot,[Nullable[int]]$PortOverride=$null)\nexit 9\n",
+    )
+    _write_sha256_manifest(package_root)
+
+    result = _run_direct_controller(package_root, choices="N\n")
+
+    assert result.returncode != 0
+    assert not (package_root / "data" / "local" / "portable-import-decision.json").exists()
+
+
+def test_failed_plan_is_redacted_starts_nothing_and_writes_no_marker(tmp_path: Path) -> None:
+    package_root = tmp_path / "failed plan redacted"
+    old_root = _prepare_import_offer_fixture(package_root, with_runtime=True)
+    order = package_root / "order.log"
+
+    result = _run_direct_controller(
+        package_root,
+        choices="Y\n",
+        environment_updates={
+            "A4_OLD_ROOT": str(old_root),
+            "A4_FAIL_PLAN": "1",
+            "A4_ORDER_MARKER": str(order),
+        },
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Previous-version import planning failed" in combined
+    assert "PRIVATE-PLAN-ERROR" not in combined
+    assert order.read_text(encoding="utf-8").splitlines() == ["plan"]
+    assert not (package_root / "data" / "local" / "portable-import-decision.json").exists()
+
+
+def test_failed_apply_is_redacted_starts_nothing_and_writes_no_marker(tmp_path: Path) -> None:
+    package_root = tmp_path / "failed apply redacted"
+    old_root = _prepare_import_offer_fixture(package_root, with_runtime=True)
+    order = package_root / "order.log"
+
+    result = _run_direct_controller(
+        package_root,
+        choices="Y\nY\n",
+        environment_updates={
+            "A4_OLD_ROOT": str(old_root),
+            "A4_FAIL_APPLY": "1",
+            "A4_ORDER_MARKER": str(order),
+        },
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Previous-version import failed" in combined
+    assert "PRIVATE-APPLY-ERROR" not in combined
+    assert order.read_text(encoding="utf-8").splitlines() == ["plan", "apply"]
+    assert not (package_root / "data" / "local" / "portable-import-decision.json").exists()
+
+
+def test_progress_cancellation_after_plan_prevents_confirmation_apply_and_service(tmp_path: Path) -> None:
+    package_root = tmp_path / "cancel after plan"
+    old_root = _prepare_import_offer_fixture(package_root, with_runtime=True)
+    order = package_root / "order.log"
+
+    result = _run_direct_controller(
+        package_root,
+        choices="Y\n",
+        environment_updates={
+            "A4_OLD_ROOT": str(old_root),
+            "A4_ORDER_MARKER": str(order),
+            "A4_CANCEL_AFTER_PLAN_ROOT": str(package_root),
+        },
+    )
+
+    assert result.returncode == 20, result.stdout + result.stderr
+    assert order.read_text(encoding="utf-8").splitlines() == ["plan"]
+    assert not (package_root / "data" / "local" / "portable-import-decision.json").exists()
+
+
+def test_service_started_after_plan_is_rechecked_immediately_before_apply(tmp_path: Path) -> None:
+    package_root = tmp_path / "service race after plan"
+    old_root = _prepare_import_offer_fixture(package_root, with_runtime=True)
+    order = package_root / "order.log"
+
+    result = _run_direct_controller(
+        package_root,
+        choices="Y\nY\n",
+        environment_updates={
+            "A4_OLD_ROOT": str(old_root),
+            "A4_ORDER_MARKER": str(order),
+            "A4_BLOCK_AFTER_PLAN_ROOT": str(package_root),
+            "A4_BLOCK_AFTER_PLAN_PID": str(os.getpid()),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "Stop the running worker/service before importing" in result.stdout + result.stderr
+    assert order.read_text(encoding="utf-8").splitlines() == ["plan"]
+    assert not (package_root / "data" / "local" / "portable-import-decision.json").exists()
+
+
+def test_restart_replans_and_never_reuses_declined_plan_or_digest(tmp_path: Path) -> None:
+    package_root = tmp_path / "restart replans"
+    _prepare_import_offer_fixture(package_root, with_runtime=True)
+
+    first = _invoke_import_offer(package_root, choices="Y\nN\n", offer_import=True)
+    second = _invoke_import_offer(package_root, choices="Y\nY\n", offer_import=True)
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert second.returncode == 0, second.stdout + second.stderr
+    calls = (package_root / "import-python.log").read_text(encoding="utf-8").splitlines()
+    assert sum(" plan " in f" {line} " for line in calls) == 2
+    assert sum(" apply " in f" {line} " for line in calls) == 1
+    assert not (package_root / "data" / "local" / "portable-import-plan.json").exists()
+
+
+def test_delayed_marker_write_failure_does_not_turn_ready_service_into_failure(tmp_path: Path) -> None:
+    package_root = tmp_path / "marker write warning"
+    _prepare_import_offer_fixture(package_root, with_runtime=True)
+    marker = package_root / "data" / "local" / "portable-import-decision.json"
+    marker.mkdir(parents=True)
+
+    result = _run_direct_controller(package_root, choices="N\n")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (package_root / "start-count.log").is_file()
+    operation = next((package_root / "data" / "local" / "operations").glob("*/operation.json"))
+    assert json.loads(operation.read_text(encoding="utf-8"))["status"] == "ready"
+    assert "Unable to record the deferred import decision" in result.stdout + result.stderr
 
 
 def test_source_start_initializes_before_service_without_system_python(tmp_path: Path) -> None:
@@ -714,6 +1391,20 @@ def test_launcher_staging_progress_and_error_catalog_contracts(tmp_path: Path) -
     ):
         assert f"function {function}" in controller
     assert controller.index("Invoke-Initialize -Root") < controller.index("Invoke-ServiceStart -Root")
+    assert "[switch]$OfferImport" in controller
+    for function in (
+        "Invoke-PortableImportOffer",
+        "Read-PortableImportDecision",
+        "Write-PortableImportDecision",
+        "Resolve-PortableImportPython",
+        "Confirm-PortableImport",
+    ):
+        assert f"function {function}" in controller
+    assert controller.index("Invoke-PortableImportOffer -Context") < controller.index("Invoke-Initialize -Root")
+    assert "Read-Host" not in controller
+    assert "PYTHONUTF8" in controller and "StandardOutputEncoding" in controller
+    assert 'FullyQualifiedErrorId -eq "CmdletizationQuery_NotFound,Get-NetTCPConnection"' in controller
+    assert "CategoryInfo.Category -eq" not in controller
     assert "System.Windows.Forms" in progress
     assert "cancel.requested" in progress
     assert "console" in progress.lower()

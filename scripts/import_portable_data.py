@@ -407,6 +407,27 @@ def _load_json_with_evidence(
     return payload, evidence
 
 
+def _package_schema() -> dict[str, Any]:
+    module_path = Path(__file__).resolve()
+    candidates = (
+        module_path.parent / "tts-more-package.schema.json",
+        module_path.parent.parent
+        / "packaging"
+        / "portable"
+        / "tts-more-package.schema.json",
+    )
+    existing = tuple(path for path in candidates if path.is_file())
+    if not existing:
+        raise PortableMigrationError("portable package schema is missing")
+    if len(existing) != 1:
+        raise PortableMigrationError("portable package schema location is ambiguous")
+    schema_root = module_path.parent.parent
+    schema, _ = _load_json_with_evidence(
+        schema_root, existing[0], "portable package schema"
+    )
+    return schema
+
+
 def _manifest(root: Path) -> tuple[dict[str, Any], FileEvidence]:
     manifest, evidence = _load_json_with_evidence(
         root, root / "package" / "tts-more-package.json", "package manifest"
@@ -417,14 +438,8 @@ def _manifest(root: Path) -> tuple[dict[str, Any], FileEvidence]:
         raise PortableMigrationError(
             "portable migration requires jsonschema to validate package manifests"
         ) from exc
-    schema_path = (
-        Path(__file__).resolve().parents[1]
-        / "packaging"
-        / "portable"
-        / "tts-more-package.schema.json"
-    )
     try:
-        schema = json.loads(schema_path.read_text(encoding="utf-8-sig"))
+        schema = _package_schema()
         errors = sorted(
             Draft202012Validator(schema).iter_errors(manifest),
             key=lambda error: tuple(str(part) for part in error.absolute_path),

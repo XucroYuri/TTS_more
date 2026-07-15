@@ -52,9 +52,22 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
     _copy_file(source_root / "backend" / "app" / "__init__.py", controlled / "app" / "__init__.py")
     _copy_file(source_root / "backend" / "app" / "adapters" / "base.py", controlled / "app" / "adapters" / "base.py")
     _copy_file(source_root / "backend" / "app" / "adapters" / "__init__.py", controlled / "app" / "adapters" / "__init__.py")
-    for name in ("portable_install.py", "portable_launcher.py", "portable_operations.py", "portable_packages.py"):
+    for name in (
+        "portable_install.py",
+        "portable_launcher.py",
+        "portable_operations.py",
+        "portable_packages.py",
+        "import_portable_data.py",
+        "import-portable-data.py",
+    ):
         _copy_file(source_root / "scripts" / name, controlled / name)
-    for name in ("bootstrap-conda.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1"):
+    for name in (
+        "bootstrap-conda.ps1",
+        "Invoke-PortableStart.ps1",
+        "Show-PortableProgress.ps1",
+        "Portable-Validation.ps1",
+        "select-portable-folder.ps1",
+    ):
         _copy_file(source_root / "scripts" / name, controlled / name)
     for name in (
         "Initialize.ps1",
@@ -166,6 +179,9 @@ def _guide_payload(component: str) -> str:
 运行说明
 - 运行时无需安装系统 Python、Conda 或 Node，也不要把这些系统路径写入配置。
 - 路径可能因电脑而异；请整体移动或解压文件夹，所有运行路径必须保持包内相对路径。
+- 直接运行当前包的 Start.cmd 时，启动器会在启动服务之前询问是否从旧版便携包导入；工作台管理或自动化启动不会询问。
+- 启动器不会自动扫描旧包，只使用你在固定选择器中明确选择的文件夹；再次确认后才复制数据，旧版原包保持不变。
+- 选择旧目录后、确认摘要前，Bootstrap 包可能只在 data/cache/portable/conda 下载或复用受锁定的包内 Miniforge 来生成计划；此步骤不会写入 runtime/live、models、data/user。
 """
 
 
