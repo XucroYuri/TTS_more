@@ -23,21 +23,35 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _junction(link: Path, target: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("directory junction verification is Windows-only")
     environment = os.environ.copy()
     environment["B2_DISCOVERY_JUNCTION_PATH"] = str(link)
     environment["B2_DISCOVERY_JUNCTION_TARGET"] = str(target)
-    completed = subprocess.run(
-        [
-            "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
-            "New-Item -ItemType Junction -Path $env:B2_DISCOVERY_JUNCTION_PATH -Target $env:B2_DISCOVERY_JUNCTION_TARGET | Out-Null",
-        ],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+                "New-Item -ItemType Junction -Path $env:B2_DISCOVERY_JUNCTION_PATH -Target $env:B2_DISCOVERY_JUNCTION_TARGET | Out-Null",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        pytest.fail(f"Windows junction command failed: {exc}")
     if completed.returncode != 0:
-        pytest.skip(f"junction creation is unavailable: {completed.stderr}")
+        pytest.fail(f"Windows junction creation failed: {completed.stderr}")
+
+
+def _hardlink(link: Path, target: Path) -> None:
+    try:
+        os.link(target, link)
+    except OSError as exc:
+        if os.name != "nt":
+            pytest.skip(f"hardlink creation is unavailable: {exc}")
+        pytest.fail(f"Windows hardlink creation failed: {exc}")
 
 
 def _write_package(
@@ -174,7 +188,7 @@ def test_reader_rejects_manifest_hardlink_before_parsing_content(tmp_path: Path)
     manifest = package_root / "package" / "tts-more-package.json"
     outside = tmp_path / "outside-manifest.json"
     manifest.replace(outside)
-    os.link(outside, manifest)
+    _hardlink(manifest, outside)
 
     with pytest.raises(OSError, match="hard link"):
         read_portable_package(package_root)

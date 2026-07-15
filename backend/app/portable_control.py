@@ -9,7 +9,7 @@ import stat
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
 from uuid import UUID
@@ -49,6 +49,19 @@ _MAX_JSON_BYTES = 64 * 1024
 _MAX_EVENT_LINE_BYTES = 64 * 1024
 _MAX_EVENT_BYTES = 1024 * 1024
 _MAX_EVENTS = 500
+_PID_RECORD_FIELDS = {
+    "schema_version",
+    "pid",
+    "parent_pid",
+    "child_pids",
+    "process_created_at",
+    "recorded_at",
+    "executable_path",
+    "command_sha256",
+    "port",
+    "package_root",
+    "build_id",
+}
 
 
 class ProcessLike(Protocol):
@@ -239,27 +252,21 @@ class PortablePackageController:
         command = [str(command_processor), "/d", "/c", _EXACT_LAUNCHERS[action], *arguments]
         process, completed = self._spawn_checked(command, context, action=action)
         if completed and action == "start" and operation_id is not None:
-            try:
-                operation, _directory, _identity = self._read_operation(
-                    context.root, context.descriptor, operation_id
+            operation, _directory, _identity = self._read_operation(
+                context.root, context.descriptor, operation_id
+            )
+            operation_status = str(operation["status"])
+            if operation_status in _NONTERMINAL_PHASES:
+                raise PortableControlError(
+                    "PORTABLE_OPERATION_INCOMPLETE",
+                    "portable start launcher exited before the operation reached a terminal state",
                 )
-            except PortableControlError as exc:
-                if exc.code != "PORTABLE_OPERATION_MISSING":
-                    raise
-                status = "completed"
-            else:
-                operation_status = str(operation["status"])
-                if operation_status in _NONTERMINAL_PHASES:
-                    raise PortableControlError(
-                        "PORTABLE_OPERATION_INCOMPLETE",
-                        "portable start launcher exited before the operation reached a terminal state",
-                    )
-                if operation_status in {"blocked", "repairable"}:
-                    raise PortableControlError(
-                        "PORTABLE_OPERATION_FAILED",
-                        "portable start operation completed with a failure status",
-                    )
-                status = operation_status
+            if operation_status != "ready":
+                raise PortableControlError(
+                    "PORTABLE_OPERATION_FAILED",
+                    "portable start operation completed without reaching ready",
+                )
+            status = "ready"
         elif completed:
             status = {"start": "completed", "stop": "stopped", "repair": "completed"}[action]
         else:
@@ -485,37 +492,46 @@ class PortablePackageController:
             return None
         child_pids = payload.get("child_pids")
         executable_raw = payload.get("executable_path")
+        process_created_at = _normalize_iso_timestamp(payload.get("process_created_at"))
+        recorded_at = _normalize_iso_timestamp(payload.get("recorded_at"))
         valid_executable = False
-        if isinstance(executable_raw, str) and Path(executable_raw).is_absolute():
+        if type(executable_raw) is str and Path(executable_raw).is_absolute():
             try:
                 Path(executable_raw).resolve(strict=False).relative_to(root.resolve(strict=True))
                 valid_executable = True
             except (OSError, ValueError):
                 pass
         if (
-            type(payload.get("schema_version")) is not int
+            set(payload) != _PID_RECORD_FIELDS
+            or type(payload.get("schema_version")) is not int
             or payload.get("schema_version") != 2
             or not _positive_integer(payload.get("pid"))
             or not _positive_integer(payload.get("parent_pid"))
-            or not isinstance(child_pids, list)
+            or type(child_pids) is not list
             or any(not _positive_integer(child) for child in child_pids)
-            or not isinstance(payload.get("process_created_at"), str)
-            or not payload.get("process_created_at")
+            or process_created_at is None
+            or recorded_at is None
             or not valid_executable
-            or not isinstance(payload.get("command_sha256"), str)
-            or re.fullmatch(r"[0-9a-fA-F]{64}", str(payload.get("command_sha256"))) is None
+            or type(payload.get("command_sha256")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", str(payload.get("command_sha256"))) is None
             or type(payload.get("port")) is not int
             or payload.get("port") != expected_port
             or payload.get("package_root") != str(root.resolve(strict=True))
             or payload.get("build_id") != descriptor.build_id
         ):
             return None
-        # Only return bounded diagnostic fields; this record does not grant authority.
-        allowed = {
-            "schema_version", "pid", "parent_pid", "child_pids", "process_created_at",
-            "recorded_at", "port", "build_id",
+        # Construct the safe projection instead of passing package-controlled
+        # values through. This record never grants process authority.
+        return {
+            "schema_version": 2,
+            "pid": int(payload["pid"]),
+            "parent_pid": int(payload["parent_pid"]),
+            "child_pids": [int(child) for child in child_pids],
+            "process_created_at": process_created_at,
+            "recorded_at": recorded_at,
+            "port": expected_port,
+            "build_id": descriptor.build_id,
         }
-        return {key: value for key, value in payload.items() if key in allowed}
 
 
 def _descriptor_identity(descriptor: PortablePackageDescriptor) -> tuple[object, ...]:
@@ -818,6 +834,7 @@ def _project_operation(
     payload: dict[str, object], operation_id: str, component: str
 ) -> dict[str, object]:
     fields = set(payload)
+    started_at = _normalize_iso_timestamp(payload.get("started_at"))
     if (
         not _OPERATION_REQUIRED_FIELDS.issubset(fields)
         or not fields.issubset(_OPERATION_REQUIRED_FIELDS | {"finished_at"})
@@ -828,12 +845,15 @@ def _project_operation(
         or type(payload.get("status")) is not str
         or payload.get("status") not in _PHASES
         or not _bounded_text(payload.get("initiator"), 128)
-        or not _valid_timestamp(payload.get("started_at"))
+        or started_at is None
     ):
         raise PortableControlError("PORTABLE_OPERATION_INVALID", "portable operation schema is invalid")
     status = str(payload["status"])
     exit_code = payload["exit_code"]
     has_finished = "finished_at" in payload
+    finished_at = (
+        _normalize_iso_timestamp(payload.get("finished_at")) if has_finished else None
+    )
     if status in _NONTERMINAL_PHASES:
         valid_completion = exit_code is None and not has_finished
     elif status == "ready":
@@ -841,18 +861,26 @@ def _project_operation(
             type(exit_code) is int
             and exit_code == 0
             and has_finished
-            and _valid_timestamp(payload.get("finished_at"))
+            and finished_at is not None
         )
     else:
         valid_completion = (
             type(exit_code) is int
             and exit_code != 0
             and has_finished
-            and _valid_timestamp(payload.get("finished_at"))
+            and finished_at is not None
         )
     if not valid_completion:
         raise PortableControlError("PORTABLE_OPERATION_INVALID", "portable operation schema is invalid")
-    return {key: payload[key] for key in _OPERATION_REQUIRED_FIELDS | {"finished_at"} if key in payload}
+    projected = {
+        key: payload[key]
+        for key in _OPERATION_REQUIRED_FIELDS | {"finished_at"}
+        if key in payload
+    }
+    projected["started_at"] = started_at
+    if has_finished:
+        projected["finished_at"] = finished_at
+    return projected
 
 
 def _project_event(
@@ -864,12 +892,13 @@ def _project_event(
     seq = payload.get("seq")
     percent = payload.get("percent")
     error_code = payload.get("error_code")
+    timestamp = _normalize_iso_timestamp(payload.get("timestamp"))
     if (
         not _EVENT_REQUIRED_FIELDS.issubset(fields)
         or not fields.issubset(_EVENT_REQUIRED_FIELDS | {"percent", "error_code"})
         or type(seq) is not int
         or seq != previous_seq + 1
-        or not _valid_timestamp(payload.get("timestamp"))
+        or timestamp is None
         or type(payload.get("phase")) is not str
         or payload.get("phase") not in _PHASES
         or not _bounded_text(payload.get("message"), 4096)
@@ -891,6 +920,7 @@ def _project_event(
     ):
         raise PortableControlError("PORTABLE_EVENT_INVALID", "portable operation event schema is invalid")
     projected = {key: payload[key] for key in _EVENT_REQUIRED_FIELDS | {"percent", "error_code"} if key in payload}
+    projected["timestamp"] = timestamp
     projected["message"] = _sanitize_event_message(str(payload["message"]), root)
     return projected
 
@@ -903,15 +933,17 @@ def _bounded_text(value: object, maximum: int) -> bool:
     )
 
 
-def _valid_timestamp(value: object) -> bool:
+def _normalize_iso_timestamp(value: object) -> str | None:
     if not _bounded_text(value, 64):
-        return False
+        return None
     assert isinstance(value, str)
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-    except ValueError:
-        return False
-    return parsed.tzinfo is not None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(UTC).isoformat()
+    except (OverflowError, ValueError):
+        return None
 
 
 def _sanitize_event_message(message: str, root: Path) -> str:

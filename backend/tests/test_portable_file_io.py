@@ -11,21 +11,35 @@ from app.portable_file_io import PortableFileError, safe_read_bytes
 
 
 def _junction(link: Path, target: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("directory junction verification is Windows-only")
     environment = os.environ.copy()
     environment["B2_IO_JUNCTION_PATH"] = str(link)
     environment["B2_IO_JUNCTION_TARGET"] = str(target)
-    completed = subprocess.run(
-        [
-            "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
-            "New-Item -ItemType Junction -Path $env:B2_IO_JUNCTION_PATH -Target $env:B2_IO_JUNCTION_TARGET | Out-Null",
-        ],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+                "New-Item -ItemType Junction -Path $env:B2_IO_JUNCTION_PATH -Target $env:B2_IO_JUNCTION_TARGET | Out-Null",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        pytest.fail(f"Windows junction command failed: {exc}")
     if completed.returncode != 0:
-        pytest.skip(f"junction creation is unavailable: {completed.stderr}")
+        pytest.fail(f"Windows junction creation failed: {completed.stderr}")
+
+
+def _hardlink(link: Path, target: Path) -> None:
+    try:
+        os.link(target, link)
+    except OSError as exc:
+        if os.name != "nt":
+            pytest.skip(f"hardlink creation is unavailable: {exc}")
+        pytest.fail(f"Windows hardlink creation failed: {exc}")
 
 
 def test_safe_read_is_handle_first_bounded_and_stable(tmp_path: Path) -> None:
@@ -47,7 +61,7 @@ def test_safe_read_rejects_hardlinks_before_returning_content(tmp_path: Path) ->
     path.parent.mkdir(parents=True)
     outside = tmp_path / "outside.jsonl"
     outside.write_bytes(b'{"message":"outside"}\n')
-    os.link(outside, path)
+    _hardlink(path, outside)
 
     with pytest.raises(PortableFileError, match="hard link"):
         safe_read_bytes(root, path, max_bytes=1024, label="events")
