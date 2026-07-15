@@ -120,6 +120,8 @@ def _copy_controller_builder_fixture(root: Path) -> None:
         "Portable-Validation.ps1",
         "select-portable-folder.ps1",
         "export-portable-diagnostics.py",
+        "import-portable-data.py",
+        "import_portable_data.py",
         "portable_install.py",
         "portable_launcher.py",
         "portable_operations.py",
@@ -162,6 +164,7 @@ def _build_controller_bootstrap(tmp_path: Path, version: str) -> tuple[Path, Pat
     _copy_controller_builder_fixture(controller_root)
     _initialize_git_repository(controller_root)
     output_root = tmp_path / "controller-output"
+    staging_before = {path.resolve() for path in Path(tempfile.gettempdir()).glob("tts-more-controller-*")}
     _run_checked(
         [
             POWERSHELL,
@@ -185,14 +188,8 @@ def _build_controller_bootstrap(tmp_path: Path, version: str) -> tuple[Path, Pat
     )
     archives = list(output_root.glob("*.zip"))
     assert len(archives) == 1
-    stage = (
-        controller_root
-        / "artifacts"
-        / "portable"
-        / ".work"
-        / "tts-more-bootstrap"
-        / f"TTS-More-{version}-windows-x64-bootstrap"
-    )
+    stage = _extract_zip_package_root(archives[0], tmp_path / "controller-extracted")
+    assert {path.resolve() for path in Path(tempfile.gettempdir()).glob("tts-more-controller-*")} == staging_before
     return stage, archives[0]
 
 
@@ -863,6 +860,8 @@ def test_controller_bootstrap_has_clean_normal_user_root(
     assert required_root <= {path.name for path in stage.iterdir() if path.is_file()}
     assert (stage / "app" / "backend" / "app").is_dir()
     assert (stage / "app" / "frontend" / "index.html").is_file()
+    assert (stage / "scripts" / "import-portable-data.py").is_file()
+    assert (stage / "scripts" / "import_portable_data.py").is_file()
     assert (stage / "licenses" / "LICENSE").is_file()
     assert (stage / "licenses" / "NOTICE").is_file()
     assert (stage / "licenses" / "THIRD_PARTY_NOTICES.json").is_file()
@@ -1268,16 +1267,11 @@ def generated_v2_manifests(tmp_path_factory: pytest.TempPathFactory) -> dict[str
         controller_root,
         env=environment,
     )
-    controller_manifest_path = (
-        controller_root
-        / "artifacts"
-        / "portable"
-        / ".work"
-        / "tts-more-bootstrap"
-        / f"TTS-More-{version}-windows-x64-bootstrap"
-        / "package"
-        / "tts-more-package.json"
+    controller_archive = next((root / "controller-output").glob("*.zip"))
+    controller_package_root = _extract_zip_package_root(
+        controller_archive, root / "controller-extracted"
     )
+    controller_manifest_path = controller_package_root / "package" / "tts-more-package.json"
 
     worker_root = root / "worker"
     _load_sync_integrations().sync_integration(REPO_ROOT, worker_root, "gpt-sovits", "a" * 40)
@@ -1917,6 +1911,8 @@ def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
     assert '"$zip.licenses.json"' in builder
     assert '"$zip.acceptance.json"' in builder
     assert "^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$" in builder
+    assert '"import-portable-data.py"' in builder
+    assert '"import_portable_data.py"' in builder
 
 
 def test_v2_builders_emit_completed_identity_protocol_and_data_contract() -> None:

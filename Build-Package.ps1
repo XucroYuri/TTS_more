@@ -3,32 +3,105 @@ param(
     [ValidateSet("Bootstrap", "Full")][string]$Profile = "Bootstrap",
     [ValidateSet("Auto", "CU128", "CU126", "CPU")][string]$Device = "Auto",
     [string]$Version = "0.2.0",
-    [string]$OutputRoot = ""
+    [string]$OutputRoot = "",
+    [string]$WorkRoot = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 if ($Profile -eq "Full" -and $env:GITHUB_ACTIONS -eq "true") { throw "profile=full is local-only and cannot be built by a GitHub upload workflow" }
 if ($Version -notmatch "^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$") { throw "package Version must contain only ASCII letters, digits, dot, underscore, or hyphen (maximum 128 characters)" }
+
+function Assert-PortableWorkPath {
+    param([Parameter(Mandatory = $true)][string]$CandidatePath)
+    try {
+        $fullPath = [IO.Path]::GetFullPath($CandidatePath)
+        $volumeRoot = [IO.Path]::GetPathRoot($fullPath)
+    }
+    catch {
+        throw "WorkRoot path validation failed closed. Choose a different -WorkRoot path. Error: $($_.Exception.Message)"
+    }
+    if ([string]::IsNullOrWhiteSpace($volumeRoot)) { throw "WorkRoot path validation failed closed. Choose an absolute -WorkRoot path." }
+    $pathsToCheck = @($volumeRoot)
+    $currentPath = $volumeRoot
+    foreach ($segment in @($fullPath.Substring($volumeRoot.Length) -split '[\\/]' | Where-Object { $_ })) {
+        $currentPath = Join-Path $currentPath $segment
+        $pathsToCheck += $currentPath
+    }
+    foreach ($currentPath in $pathsToCheck) {
+        try { $item = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] { return $false }
+        catch { throw "WorkRoot path validation failed closed. Choose a different -WorkRoot path. Path: $currentPath. Error: $($_.Exception.Message)" }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "WorkRoot path must not traverse a reparse point. Choose -WorkRoot outside junctions and symbolic links. Path: $currentPath"
+        }
+        if (!$item.PSIsContainer) { throw "WorkRoot path contains an existing non-directory segment. Choose a different -WorkRoot path. Path: $currentPath" }
+    }
+    return $true
+}
+
+function Update-PortablePathBudget {
+    param([string]$ProjectedPath, [ref]$MaximumLength, [ref]$MaximumPath)
+    if ($ProjectedPath.Length -gt $MaximumLength.Value) {
+        $MaximumLength.Value = $ProjectedPath.Length
+        $MaximumPath.Value = $ProjectedPath
+    }
+}
+
+function Measure-PortableCopyTree {
+    param([string]$Source, [string]$Destination, [ref]$MaximumLength, [ref]$MaximumPath)
+    Update-PortablePathBudget -ProjectedPath $Destination -MaximumLength $MaximumLength -MaximumPath $MaximumPath
+    foreach ($entry in Get-ChildItem -LiteralPath $Source -Force) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "controller package source cannot contain a reparse point: $($entry.FullName)" }
+        $target = Join-Path $Destination $entry.Name
+        Update-PortablePathBudget -ProjectedPath $target -MaximumLength $MaximumLength -MaximumPath $MaximumPath
+        if ($entry.PSIsContainer) { Measure-PortableCopyTree -Source $entry.FullName -Destination $target -MaximumLength $MaximumLength -MaximumPath $MaximumPath }
+    }
+}
+
 $Root = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $profileName = $Profile.ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) { $OutputRoot = Join-Path $Root "artifacts\portable\$profileName" }
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
-$work = Join-Path $Root "artifacts\portable\.work\tts-more-$profileName"
 $packageName = "TTS-More-$Version-windows-x64-$profileName"
+$workBase = if ($WorkRoot) { [IO.Path]::GetFullPath($WorkRoot) } else { [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) }
+$normalizedSourceRoot = $Root.TrimEnd("\", "/")
+$normalizedWorkBase = $workBase.TrimEnd("\", "/")
+if (
+    [string]::Equals($normalizedWorkBase, $normalizedSourceRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    $normalizedWorkBase.StartsWith($normalizedSourceRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+) { throw "WorkRoot must be outside source checkout. Set -WorkRoot to a directory outside '$Root' (for example C:\tm)." }
+[void](Assert-PortableWorkPath -CandidatePath $workBase)
+$workIdentity = "tts-more-controller-$PID-$([Guid]::NewGuid().ToString('N').Substring(0, 12))"
+$work = [IO.Path]::GetFullPath((Join-Path $workBase $workIdentity))
 $stage = Join-Path $work $packageName
 
 if (!(Test-Path -LiteralPath (Join-Path $Root "frontend\dist\index.html"))) {
     & pnpm --dir (Join-Path $Root "frontend") build
     if ($LASTEXITCODE -ne 0) { throw "frontend production build failed" }
 }
-if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+$maximumPathLength = 0
+$maximumProjectedPath = ""
+Measure-PortableCopyTree -Source (Join-Path $Root "backend\app") -Destination (Join-Path $stage "app\backend\app") -MaximumLength ([ref]$maximumPathLength) -MaximumPath ([ref]$maximumProjectedPath)
+Measure-PortableCopyTree -Source (Join-Path $Root "frontend\dist") -Destination (Join-Path $stage "app\frontend") -MaximumLength ([ref]$maximumPathLength) -MaximumPath ([ref]$maximumProjectedPath)
+foreach ($projected in @(
+    (Join-Path $stage "package\tts-more-package.json"),
+    (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json"),
+    (Join-Path $stage "packaging\portable\tts-more-package.schema.json"),
+    (Join-Path $stage "scripts\import_portable_data.py"),
+    (Join-Path $stage "SHA256SUMS.txt")
+)) { Update-PortablePathBudget -ProjectedPath $projected -MaximumLength ([ref]$maximumPathLength) -MaximumPath ([ref]$maximumProjectedPath) }
+if ($maximumPathLength -gt 240) {
+    throw "controller package staging path budget exceeded before copy: projected path length $maximumPathLength exceeds the safe Windows limit 240. Use -WorkRoot with a shorter external directory (for example C:\tm). Projected path: $maximumProjectedPath"
+}
+try {
 New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "app\backend"), (Join-Path $stage "package"), (Join-Path $stage "scripts"), (Join-Path $stage "packaging\portable"), (Join-Path $stage "licenses") | Out-Null
+[void](Assert-PortableWorkPath -CandidatePath $stage)
 
 Copy-Item -LiteralPath (Join-Path $Root "backend\app") -Destination (Join-Path $stage "app\backend\app") -Recurse
 foreach ($file in @("pyproject.toml", "uv.lock", ".python-version")) { Copy-Item -LiteralPath (Join-Path $Root "backend\$file") -Destination (Join-Path $stage "app\backend\$file") }
 Copy-Item -LiteralPath (Join-Path $Root "frontend\dist") -Destination (Join-Path $stage "app\frontend") -Recurse
-foreach ($file in @("bootstrap-conda.ps1", "initialize-portable.ps1", "repair-portable.ps1", "start-production.ps1", "stop-production.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1", "select-portable-folder.ps1", "export-portable-diagnostics.py", "portable_install.py", "portable_launcher.py", "portable_operations.py", "portable_packages.py", "portable_package_runner.py")) { Copy-Item -LiteralPath (Join-Path $Root "scripts\$file") -Destination (Join-Path $stage "scripts\$file") }
+foreach ($file in @("bootstrap-conda.ps1", "initialize-portable.ps1", "repair-portable.ps1", "start-production.ps1", "stop-production.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1", "select-portable-folder.ps1", "export-portable-diagnostics.py", "import-portable-data.py", "import_portable_data.py", "portable_install.py", "portable_launcher.py", "portable_operations.py", "portable_packages.py", "portable_package_runner.py")) { Copy-Item -LiteralPath (Join-Path $Root "scripts\$file") -Destination (Join-Path $stage "scripts\$file") }
 foreach ($file in @("toolchain.lock.json", "runtime.lock.json", "models.lock.json", "tts-more-package.schema.json", "error-catalog.zh-CN.json")) { Copy-Item -LiteralPath (Join-Path $Root "packaging\portable\$file") -Destination (Join-Path $stage "packaging\portable\$file") }
 @(Get-ChildItem -LiteralPath $stage -Directory -Recurse -Force | Where-Object { $_.Name -in @("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache") } | Sort-Object FullName -Descending) | ForEach-Object {
     $resolved = [System.IO.Path]::GetFullPath($_.FullName)
@@ -138,3 +211,16 @@ foreach ($match in [regex]::Matches($lockText, '(?ms)\[\[package\]\]\s+name\s*=\
 Copy-Item -LiteralPath (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json") -Destination "$zip.licenses.json"
 @{ schema_version=1; component="tts-more"; profile=$profileName; manifest_valid=$true; bootstrap_audit=$auditPassed; machine_path_scan=$true; generated_at=[DateTime]::UtcNow.ToString("o") } | ConvertTo-Json | Set-Content -LiteralPath "$zip.acceptance.json" -Encoding UTF8
 Write-Host "Created $Profile package: $zip"
+}
+finally {
+    $workPathExists = Assert-PortableWorkPath -CandidatePath $work
+    if ($workPathExists) {
+        $resolvedWork = [IO.Path]::GetFullPath($work)
+        $resolvedParent = [IO.Path]::GetFullPath((Split-Path -Parent $resolvedWork))
+        $resolvedLeaf = Split-Path -Leaf $resolvedWork
+        if (![string]::Equals($resolvedParent.TrimEnd("\", "/"), $workBase.TrimEnd("\", "/"), [StringComparison]::OrdinalIgnoreCase) -or $resolvedLeaf -ne $workIdentity) {
+            throw "refusing to clean a controller package staging directory that is not the unique directory created by this build: $resolvedWork"
+        }
+        Remove-Item -LiteralPath $resolvedWork -Recurse -Force
+    }
+}
