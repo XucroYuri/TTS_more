@@ -70,9 +70,19 @@ export interface PortableRegistrationResponse {
 
 export interface PortableActionResponse {
   component: CatalogProvider;
-  action: PortableServiceAction;
-  status: PortableOperationPhase | "stopping" | "repairing" | "opened";
+  action: PortableServiceAction | "open_folder";
+  status: PortableOperationPhase | "stopping" | "repairing" | "opened" | "completed";
   operation_id?: string;
+  action_id?: string;
+  controller_pid?: number;
+  error_code?: string;
+  reason?: string;
+}
+
+export interface PortableActionStatusResponse {
+  action: "stop" | "repair";
+  action_id: string;
+  status: "stopping" | "repairing" | "stopped" | "completed" | "blocked";
   controller_pid?: number;
   error_code?: string;
   reason?: string;

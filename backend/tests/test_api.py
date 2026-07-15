@@ -506,6 +506,30 @@ def test_layered_status_does_not_mark_stopped_managed_service_ready() -> None:
     assert status["supervisor_state"] == "stopped"
 
 
+def test_layered_status_uses_live_health_for_portable_runtime_with_untrusted_pid_record() -> None:
+    status = _layer_service_status(
+        {
+            "service_id": "portable-gpt",
+            "enabled": True,
+            "ready": True,
+            "network_scope": "localhost",
+            "control_kind": "portable-package",
+            "health": {
+                "ready": True,
+                "port_reachable": True,
+                "config_ok": True,
+                "required_api_ok": True,
+            },
+        },
+        {"manageable": True, "running": None},
+    )
+
+    assert status["ready"] is True
+    assert status["state"] == "ready"
+    assert status["supervisor_state"] == "running"
+    assert status["can_start"] is False
+
+
 def test_generation_preflight_offers_local_fallback_when_primary_is_unavailable(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("app.services.ServiceRouter._client_ready", lambda *_args: False)
     services_path = tmp_path / "services.json"

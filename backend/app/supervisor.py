@@ -145,10 +145,19 @@ class ServiceSupervisor:
         self._record_path(endpoint.service_id).write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
         return {"status": "started", **record}
 
-    def stop(self, service_id: str | TTSServiceEndpoint) -> dict[str, Any]:
+    def stop(
+        self,
+        service_id: str | TTSServiceEndpoint,
+        *,
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
         if isinstance(service_id, TTSServiceEndpoint):
             if service_id.control_kind == "portable-package":
-                return self._portable_action(service_id, "stop")
+                return self._portable_action(
+                    service_id,
+                    "stop",
+                    action_id=action_id or str(uuid.uuid4()),
+                )
             service_id = service_id.service_id
         record = self._read_record(service_id)
         if not record:
@@ -197,10 +206,31 @@ class ServiceSupervisor:
         content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         return {"status": "ok", "service_id": service_id, "log_path": str(log_path), "lines": content[-max(1, lines):]}
 
-    def repair(self, endpoint: TTSServiceEndpoint) -> dict[str, Any]:
+    def repair(
+        self,
+        endpoint: TTSServiceEndpoint,
+        *,
+        proxy_url: str | None = None,
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
         if endpoint.control_kind != "portable-package":
             return {"status": "not manageable", "reason": "repair is only available for portable packages"}
-        return self._portable_action(endpoint, "repair")
+        return self._portable_action(
+            endpoint,
+            "repair",
+            proxy_url=proxy_url,
+            action_id=action_id or str(uuid.uuid4()),
+        )
+
+    def action_status(
+        self,
+        endpoint: TTSServiceEndpoint,
+        *,
+        action_id: str,
+    ) -> dict[str, Any]:
+        if endpoint.control_kind != "portable-package":
+            return {"status": "not manageable", "reason": "action status is only available for portable packages"}
+        return self._portable_action(endpoint, "action_status", action_id=action_id)
 
     def open_folder(self, endpoint: TTSServiceEndpoint) -> dict[str, Any]:
         if endpoint.control_kind != "portable-package":

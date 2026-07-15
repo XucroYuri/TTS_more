@@ -1,4 +1,5 @@
-import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LocalPortableServicesResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, PortableActionResponse, PortableDiscoveryResponse, PortableFolderSelectionResponse, PortableOperationLogsResponse, PortableOperationResponse, PortableRegistrationRequest, PortableRegistrationResponse, PortableServiceAction, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
+import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LocalPortableServicesResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, PortableActionResponse, PortableActionStatusResponse, PortableDiscoveryResponse, PortableFolderSelectionResponse, PortableOperationLogsResponse, PortableOperationResponse, PortableRegistrationRequest, PortableRegistrationResponse, PortableServiceAction, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
+import { validatePortableProxyUrl } from "./lib/portableProxy";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -66,7 +67,7 @@ export class PortableApiError extends Error {
   }
 }
 
-async function portableRequest<T>(url: string, init?: RequestInit): Promise<T> {
+async function portableRequest<T>(url: string, init?: RequestInit, allowBlocked = false): Promise<T> {
   const response = await fetch(url, withAuthHeader(init));
   let payload: unknown;
   try {
@@ -88,6 +89,18 @@ async function portableRequest<T>(url: string, init?: RequestInit): Promise<T> {
       ? detail.message
       : response.statusText || "Portable service request failed";
     throw new PortableApiError(response.status, code, message);
+  }
+  if (!allowBlocked && payload && typeof payload === "object") {
+    const semantic = payload as { status?: unknown; error_code?: unknown; reason?: unknown };
+    if (semantic.status === "blocked" || typeof semantic.error_code === "string") {
+      const code = typeof semantic.error_code === "string"
+        ? semantic.error_code
+        : "LOCAL_CONTROL_ACTION_FAILED";
+      const message = typeof semantic.reason === "string"
+        ? semantic.reason
+        : "Portable service action failed";
+      throw new PortableApiError(response.status, code, message);
+    }
   }
   return payload as T;
 }
@@ -127,8 +140,8 @@ export async function testService(serviceId: string): Promise<{ service_id: stri
   return request(`/api/services/${encodeURIComponent(serviceId)}/test`, { method: "POST" });
 }
 
-export async function fetchServicesStatus(): Promise<{ services: WorkerHealth[]; hardware: Record<string, unknown> }> {
-  return request("/api/services/status");
+export async function fetchServicesStatus(signal?: AbortSignal): Promise<{ services: WorkerHealth[]; hardware: Record<string, unknown> }> {
+  return request("/api/services/status", { signal });
 }
 
 export async function fetchLocalControlToken(signal?: AbortSignal): Promise<string> {
@@ -196,19 +209,41 @@ export async function portableServiceAction(
   component: CatalogProvider,
   action: PortableServiceAction,
   token: string,
-  options: { port_override?: number } = {},
+  options: { port_override?: number; proxy_url?: string } = {},
   signal?: AbortSignal,
 ): Promise<PortableActionResponse> {
   if (options.port_override !== undefined && action !== "start") {
     throw new RangeError("port_override is supported only by start");
   }
-  const hasBody = options.port_override !== undefined;
+  if (options.proxy_url !== undefined && action !== "repair") {
+    throw new RangeError("proxy_url is supported only by repair");
+  }
+  if (options.proxy_url !== undefined && !validatePortableProxyUrl(options.proxy_url)) {
+    throw new RangeError("proxy_url must be a valid HTTP(S) proxy URL");
+  }
+  const body = {
+    ...(options.port_override === undefined ? {} : { port_override: options.port_override }),
+    ...(options.proxy_url === undefined ? {} : { proxy_url: options.proxy_url }),
+  };
+  const hasBody = Object.keys(body).length > 0;
   return portableRequest(`/api/local-portable-services/${encodeURIComponent(component)}/${action}`, {
     method: "POST",
     headers: portableHeaders(token, hasBody),
-    ...(hasBody ? { body: JSON.stringify({ port_override: options.port_override }) } : {}),
+    ...(hasBody ? { body: JSON.stringify(body) } : {}),
     signal,
   });
+}
+
+export async function fetchPortableActionStatus(
+  component: CatalogProvider,
+  actionId: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<PortableActionStatusResponse> {
+  return portableRequest(
+    `/api/local-portable-services/${encodeURIComponent(component)}/actions/${encodeURIComponent(actionId)}`,
+    { headers: portableHeaders(token), signal },
+  );
 }
 
 export async function fetchPortableOperation(
@@ -220,6 +255,7 @@ export async function fetchPortableOperation(
   return portableRequest(
     `/api/local-portable-services/${encodeURIComponent(component)}/operations/${encodeURIComponent(operationId)}`,
     { headers: portableHeaders(token), signal },
+    true,
   );
 }
 
@@ -237,6 +273,7 @@ export async function fetchPortableOperationLogs(
   return portableRequest(
     `/api/local-portable-services/${encodeURIComponent(component)}/operations/${encodeURIComponent(operationId)}/logs?${query.toString()}`,
     { headers: portableHeaders(token), signal },
+    true,
   );
 }
 

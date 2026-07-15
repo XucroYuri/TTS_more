@@ -7,11 +7,14 @@ import os
 import re
 import stat
 import subprocess
+import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from app.portable_discovery import PortablePackageDescriptor, inspect_locator_candidate
@@ -49,6 +52,7 @@ _MAX_JSON_BYTES = 64 * 1024
 _MAX_EVENT_LINE_BYTES = 64 * 1024
 _MAX_EVENT_BYTES = 1024 * 1024
 _MAX_EVENTS = 500
+_MAX_ACTIVE_ACTIONS = 64
 _PID_RECORD_FIELDS = {
     "schema_version",
     "pid",
@@ -93,6 +97,13 @@ class _ActionContext:
     launcher_identity: tuple[int, int, int, int]
 
 
+@dataclass(frozen=True)
+class _TrackedAction:
+    action: str
+    process: ProcessLike
+    context: _ActionContext
+
+
 def windows_creation_flags() -> int:
     if os.name != "nt":
         return 0
@@ -116,6 +127,8 @@ class PortablePackageController:
         self._environment = dict(os.environ if environment is None else environment)
         self._handshake_seconds = max(0.05, min(float(handshake_seconds), 2.0))
         self._system_executable_resolver = system_executable_resolver or _windows_system_executable
+        self._actions: OrderedDict[str, _TrackedAction] = OrderedDict()
+        self._actions_lock = threading.RLock()
 
     def start(
         self,
@@ -142,11 +155,80 @@ class PortablePackageController:
             arguments.extend(["-PortOverride", str(port_override)])
         return self._launch(descriptor, "start", arguments, operation_id=canonical_id)
 
-    def stop(self, descriptor: PortablePackageDescriptor) -> dict[str, object]:
-        return self._launch(descriptor, "stop", [])
+    def stop(
+        self,
+        descriptor: PortablePackageDescriptor,
+        *,
+        action_id: str | None = None,
+    ) -> dict[str, object]:
+        return self._launch(descriptor, "stop", [], action_id=action_id)
 
-    def repair(self, descriptor: PortablePackageDescriptor) -> dict[str, object]:
-        return self._launch(descriptor, "repair", [])
+    def repair(
+        self,
+        descriptor: PortablePackageDescriptor,
+        *,
+        proxy_url: str | None = None,
+        action_id: str | None = None,
+    ) -> dict[str, object]:
+        proxy = validate_proxy_url(proxy_url) if proxy_url is not None else None
+        environment = None if proxy is None else {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy}
+        return self._launch(
+            descriptor,
+            "repair",
+            [],
+            action_id=action_id,
+            environment_overrides=environment,
+        )
+
+    def action_status(
+        self,
+        descriptor: PortablePackageDescriptor,
+        *,
+        action_id: str,
+    ) -> dict[str, object]:
+        canonical_id = _canonical_action_id(action_id)
+        with self._actions_lock:
+            tracked = self._actions.get(canonical_id)
+            if tracked is None:
+                raise PortableControlError(
+                    "PORTABLE_ACTION_NOT_FOUND", "portable action is unavailable"
+                )
+            current = self._action_context(descriptor, tracked.action)
+            if (
+                current.descriptor_identity != tracked.context.descriptor_identity
+                or current.root_identity != tracked.context.root_identity
+                or current.launcher_identity != tracked.context.launcher_identity
+            ):
+                raise PortableControlError(
+                    "PORTABLE_ACTION_NOT_FOUND", "portable action is unavailable"
+                )
+            self._assert_context_stable(tracked.context)
+            try:
+                return_code = tracked.process.poll()
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._actions.pop(canonical_id, None)
+                raise PortableControlError(
+                    "PORTABLE_LAUNCH_FAILED", "portable action state could not be checked"
+                ) from exc
+            if return_code is None:
+                status = {"stop": "stopping", "repair": "repairing"}[tracked.action]
+            else:
+                if return_code != 0:
+                    return {
+                        "status": "blocked",
+                        "action": tracked.action,
+                        "action_id": canonical_id,
+                        "controller_pid": int(tracked.process.pid),
+                        "error_code": "PORTABLE_LAUNCH_EXITED",
+                        "reason": "portable action launcher exited with a failure",
+                    }
+                status = {"stop": "stopped", "repair": "completed"}[tracked.action]
+            return {
+                "status": status,
+                "action": tracked.action,
+                "action_id": canonical_id,
+                "controller_pid": int(tracked.process.pid),
+            }
 
     def open_folder(self, descriptor: PortablePackageDescriptor) -> dict[str, object]:
         context = self._action_context(descriptor, "start")
@@ -244,13 +326,21 @@ class PortablePackageController:
         arguments: list[str],
         *,
         operation_id: str | None = None,
+        action_id: str | None = None,
+        environment_overrides: Mapping[str, str] | None = None,
     ) -> dict[str, object]:
+        canonical_action_id = _canonical_action_id(action_id) if action_id is not None else None
         context = self._action_context(descriptor, action)
         command_processor = self._system_executable("cmd.exe")
         # `/c` receives only the fixed literal root launcher. The absolute
         # package path remains in cwd and never enters cmd.exe's parser.
         command = [str(command_processor), "/d", "/c", _EXACT_LAUNCHERS[action], *arguments]
-        process, completed = self._spawn_checked(command, context, action=action)
+        process, completed = self._spawn_checked(
+            command,
+            context,
+            action=action,
+            environment_overrides=environment_overrides,
+        )
         if completed and action == "start" and operation_id is not None:
             operation, _directory, _identity = self._read_operation(
                 context.root, context.descriptor, operation_id
@@ -278,7 +368,38 @@ class PortablePackageController:
         }
         if operation_id is not None:
             result["operation_id"] = operation_id
+        if not completed and canonical_action_id is not None:
+            self._track_action(canonical_action_id, action, process, context)
+            result["action_id"] = canonical_action_id
         return result
+
+    def _track_action(
+        self,
+        action_id: str,
+        action: str,
+        process: ProcessLike,
+        context: _ActionContext,
+    ) -> None:
+        with self._actions_lock:
+            if action_id in self._actions:
+                _terminate_controller(process)
+                raise PortableControlError(
+                    "PORTABLE_ACTION_EXISTS", "portable action identifier is already active"
+                )
+            if len(self._actions) >= _MAX_ACTIVE_ACTIONS:
+                for existing_id, tracked in list(self._actions.items()):
+                    try:
+                        completed = tracked.process.poll() is not None
+                    except (OSError, subprocess.SubprocessError):
+                        completed = True
+                    if completed:
+                        self._actions.pop(existing_id, None)
+            if len(self._actions) >= _MAX_ACTIVE_ACTIONS:
+                _terminate_controller(process)
+                raise PortableControlError(
+                    "PORTABLE_ACTION_CAPACITY", "too many portable actions are active"
+                )
+            self._actions[action_id] = _TrackedAction(action, process, context)
 
     def _spawn_checked(
         self,
@@ -286,10 +407,14 @@ class PortablePackageController:
         context: _ActionContext,
         *,
         action: str,
+        environment_overrides: Mapping[str, str] | None = None,
     ) -> tuple[ProcessLike, bool]:
+        child_environment = _safe_environment(self._environment)
+        if environment_overrides:
+            child_environment.update(environment_overrides)
         kwargs: dict[str, object] = {
             "cwd": context.root,
-            "env": _safe_environment(self._environment),
+            "env": child_environment,
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
@@ -557,6 +682,47 @@ def _canonical_operation_id(value: str) -> str:
         raise PortableControlError("PORTABLE_INVALID_OPERATION", "operation_id must be a canonical UUID") from exc
     if str(parsed) != value:
         raise PortableControlError("PORTABLE_INVALID_OPERATION", "operation_id must be a canonical UUID")
+    return value
+
+
+def _canonical_action_id(value: str) -> str:
+    if type(value) is not str:
+        raise PortableControlError("PORTABLE_INVALID_ACTION", "action_id must be a canonical UUID")
+    try:
+        parsed = UUID(value)
+    except ValueError as exc:
+        raise PortableControlError(
+            "PORTABLE_INVALID_ACTION", "action_id must be a canonical UUID"
+        ) from exc
+    if str(parsed) != value:
+        raise PortableControlError("PORTABLE_INVALID_ACTION", "action_id must be a canonical UUID")
+    return value
+
+
+def validate_proxy_url(value: str) -> str:
+    """Validate an ephemeral HTTP(S) proxy without logging or normalizing credentials."""
+    if type(value) is not str or not value or len(value) > 2048 or value != value.strip():
+        raise PortableControlError("PORTABLE_INVALID_PROXY", "proxy_url must be a valid HTTP(S) proxy")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise PortableControlError("PORTABLE_INVALID_PROXY", "proxy_url must be a valid HTTP(S) proxy")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise PortableControlError(
+            "PORTABLE_INVALID_PROXY", "proxy_url must be a valid HTTP(S) proxy"
+        ) from exc
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or "\\" in value
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise PortableControlError("PORTABLE_INVALID_PROXY", "proxy_url must be a valid HTTP(S) proxy")
     return value
 
 

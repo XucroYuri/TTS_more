@@ -29,6 +29,7 @@ from app.portable_discovery import (
     endpoint_from_portable_package,
     inspect_locator_candidate,
 )
+from app.portable_control import PortableControlError, validate_proxy_url
 from app.portable_services import (
     PortableServiceStore,
     discover_bounded_portable_packages,
@@ -103,6 +104,17 @@ class LocalSelectFolderRequest(_StrictRequest):
 
 class LocalActionRequest(_StrictRequest):
     port_override: int | None = Field(default=None, ge=1, le=65535)
+    proxy_url: str | None = Field(default=None, max_length=2048)
+
+    @field_validator("proxy_url")
+    @classmethod
+    def validate_proxy(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return validate_proxy_url(value)
+        except PortableControlError as exc:
+            raise ValueError("proxy_url must be a valid HTTP(S) proxy") from exc
 
 
 RefreshServices = Callable[[Sequence[TTSServiceEndpoint]], None]
@@ -301,7 +313,7 @@ def install_local_control(
     def list_local_portable_services(request: Request) -> dict[str, object]:
         require_token(request)
         services = [
-            _service_projection(endpoint)
+            _service_projection(endpoint, root)
             for endpoint in current_services()
             if endpoint.catalog_provider in {"gpt-sovits", "indextts", "cosyvoice"}
             or endpoint.portable_locator is not None
@@ -384,12 +396,24 @@ def install_local_control(
         )
         locator = endpoint.portable_locator
         assert locator is not None
+        previous_override = next(
+            (
+                item.portable_locator.port_override
+                for item in current_services()
+                if item.portable_locator is not None
+                and item.portable_locator.component == payload.component
+            ),
+            None,
+        )
+        effective_override = (
+            payload.port_override if payload.port_override is not None else previous_override
+        )
         endpoint = endpoint.model_copy(
             update={
                 "portable_locator": locator.model_copy(
                     update={
                         "relative_to_tts_more": _relative_sibling(root, Path(descriptor.package_root)),
-                        "port_override": payload.port_override,
+                        "port_override": effective_override,
                     }
                 )
             }
@@ -423,7 +447,7 @@ def install_local_control(
         )
         return {
             "package": descriptor.model_dump(mode="json"),
-            "service": _service_projection(stored),
+            "service": _service_projection(stored, root),
         }
 
     @app.post(
@@ -438,7 +462,11 @@ def install_local_control(
     ) -> dict[str, object]:
         require_token(request)
         payload = payload or LocalActionRequest()
-        if action != "start" and payload.port_override is not None:
+        if (
+            action != "start" and payload.port_override is not None
+        ) or (
+            action != "repair" and payload.proxy_url is not None
+        ):
             _raise_error(
                 422,
                 "LOCAL_CONTROL_INVALID_REQUEST",
@@ -460,18 +488,32 @@ def install_local_control(
             operation_id = str(uuid4())
             result = supervisor.start(endpoint, operation_id=operation_id)
         elif action == "stop":
-            result = supervisor.stop(endpoint)
+            result = supervisor.stop(endpoint, action_id=str(uuid4()))
         elif action == "repair":
-            result = supervisor.repair(endpoint)
+            result = supervisor.repair(
+                endpoint,
+                proxy_url=payload.proxy_url,
+                action_id=str(uuid4()),
+            )
         else:
             result = supervisor.open_folder(endpoint)
-        if result.get("status") == "not manageable":
-            _raise_error(
-                409,
-                "LOCAL_CONTROL_NOT_MANAGEABLE",
-                "portable service is not locally manageable",
-            )
-        return {"component": component, "action": action, **result}
+        checked = _checked_control_result(result)
+        return {"component": component, "action": action, **checked}
+
+    @app.get(
+        "/api/local-portable-services/{component}/actions/{action_id}",
+        summary="Read one in-process portable stop or repair action",
+    )
+    def local_portable_action_status(
+        component: PortableComponent,
+        action_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        require_token(request)
+        action_id = _operation_id(action_id)
+        endpoint = managed_endpoint(component)
+        result = app.state.supervisor.action_status(endpoint, action_id=action_id)
+        return _checked_control_result(result)
 
     @app.get(
         "/api/local-portable-services/{component}/operations/{operation_id}",
@@ -996,9 +1038,27 @@ def _local_hostname(hostname: str | None) -> bool:
         return False
 
 
-def _service_projection(endpoint: TTSServiceEndpoint) -> dict[str, object]:
+def _service_projection(
+    endpoint: TTSServiceEndpoint,
+    controller_root: Path | None = None,
+) -> dict[str, object]:
     locator = endpoint.portable_locator
     component = locator.component if locator is not None else endpoint.catalog_provider
+    descriptor = (
+        resolve_locator(controller_root, locator, [])
+        if controller_root is not None and locator is not None
+        else None
+    )
+    setup_state = endpoint.setup_state
+    package_root = endpoint.repo_path if locator is not None else None
+    build_id = locator.build_id_last_seen if locator is not None else None
+    if locator is not None and controller_root is not None:
+        if descriptor is None:
+            setup_state = "repo_missing"
+        else:
+            setup_state = "ready" if descriptor.initialized else "env_missing"
+            package_root = descriptor.package_root
+            build_id = descriptor.build_id
     return {
         "service_id": endpoint.service_id,
         "component": component,
@@ -1012,19 +1072,25 @@ def _service_projection(endpoint: TTSServiceEndpoint) -> dict[str, object]:
             and endpoint.mode == "local"
             and endpoint.network_scope == "localhost"
             and locator is not None
+            and (controller_root is None or descriptor is not None)
         ),
-        "setup_state": endpoint.setup_state,
-        "package_root": endpoint.repo_path if locator is not None else None,
-        "build_id": locator.build_id_last_seen if locator is not None else None,
+        "setup_state": setup_state,
+        "package_root": package_root,
+        "build_id": build_id,
         "port_override": locator.port_override if locator is not None else None,
     }
 
 
 def _checked_control_result(result: dict[str, Any]) -> dict[str, object]:
-    if result.get("status") != "not manageable" and not result.get("error_code"):
+    if result.get("status") not in {"not manageable", "blocked"} and not result.get("error_code"):
         return result
-    error_code = str(result.get("error_code") or "LOCAL_CONTROL_NOT_MANAGEABLE")
-    status = 404 if error_code == "PORTABLE_OPERATION_NOT_FOUND" else 409
+    default_code = (
+        "LOCAL_CONTROL_ACTION_FAILED"
+        if result.get("status") == "blocked"
+        else "LOCAL_CONTROL_NOT_MANAGEABLE"
+    )
+    error_code = str(result.get("error_code") or default_code)
+    status = 404 if error_code in {"PORTABLE_OPERATION_NOT_FOUND", "PORTABLE_ACTION_NOT_FOUND"} else 409
     _raise_error(status, error_code, "portable operation is unavailable")
 
 

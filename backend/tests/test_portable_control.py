@@ -214,6 +214,109 @@ def test_controller_executes_exact_root_launcher_with_safe_process_contract(tmp_
     assert result == {"status": "starting", "action": "start", "operation_id": OPERATION_ID, "controller_pid": 42}
 
 
+def test_repair_passes_temporary_proxy_only_in_child_environment(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def spawn(command, **kwargs):
+        calls.append((command, kwargs))
+        return FakeProcess()
+
+    proxy = "https://proxy-user:proxy-password@proxy.example:8443"
+    controller = PortablePackageController(
+        spawn=spawn,
+        environment={"SYSTEMROOT": "C:/Windows", "HTTP_PROXY": "http://ambient.invalid"},
+    )
+
+    result = controller.repair(read_portable_package(package), proxy_url=proxy)
+
+    command, kwargs = calls[0]
+    assert command[-1] == "Repair.cmd"
+    assert proxy not in " ".join(command)
+    assert kwargs["env"] == {
+        "SYSTEMROOT": "C:/Windows",
+        "HTTP_PROXY": proxy,
+        "HTTPS_PROXY": proxy,
+    }
+    assert proxy not in json.dumps(result)
+    assert result["status"] == "repairing"
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    (
+        "socks5://127.0.0.1:1080",
+        "http://proxy.example/path",
+        "http://127.0.0.1:70000",
+        "http://127.0.0.1:10808\nPATH=C:/evil",
+    ),
+)
+def test_repair_rejects_invalid_proxy_without_spawning(tmp_path: Path, proxy: str) -> None:
+    package = _write_package(tmp_path / "GPT")
+    controller = PortablePackageController(
+        spawn=lambda *_args, **_kwargs: pytest.fail("must not spawn")
+    )
+
+    with pytest.raises(PortableControlError, match="proxy"):
+        controller.repair(read_portable_package(package), proxy_url=proxy)
+
+
+@pytest.mark.parametrize(
+    ("action", "terminal_status"),
+    (("stop", "stopped"), ("repair", "completed")),
+)
+def test_async_action_status_tracks_real_process_and_keeps_terminal_retryable(
+    tmp_path: Path, action: str, terminal_status: str
+) -> None:
+    package = _write_package(tmp_path / "GPT")
+    process = FakeProcess()
+    controller = PortablePackageController(spawn=lambda *_args, **_kwargs: process)
+    descriptor = read_portable_package(package)
+    action_id = "22222222-2222-4222-8222-222222222222"
+
+    result = getattr(controller, action)(descriptor, action_id=action_id)
+    assert result["action_id"] == action_id
+    active_status = {"stop": "stopping", "repair": "repairing"}[action]
+    assert controller.action_status(descriptor, action_id=action_id)["status"] == active_status
+
+    process.returncode = 0
+    assert controller.action_status(descriptor, action_id=action_id)["status"] == terminal_status
+    assert controller.action_status(descriptor, action_id=action_id)["status"] == terminal_status
+
+
+def test_action_status_is_bound_to_package_identity(tmp_path: Path) -> None:
+    first = _write_package(tmp_path / "GPT one", package_id="gpt-one")
+    second = _write_package(tmp_path / "GPT two", package_id="gpt-two")
+    controller = PortablePackageController(spawn=lambda *_args, **_kwargs: FakeProcess())
+    action_id = "22222222-2222-4222-8222-222222222222"
+    controller.stop(read_portable_package(first), action_id=action_id)
+
+    with pytest.raises(PortableControlError) as error:
+        controller.action_status(read_portable_package(second), action_id=action_id)
+    assert error.value.code == "PORTABLE_ACTION_NOT_FOUND"
+    assert controller.action_status(read_portable_package(first), action_id=action_id)["status"] == "stopping"
+
+
+def test_action_tracker_rejects_more_than_bounded_concurrent_actions(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    processes: list[FakeProcess] = []
+
+    def spawn(*_args, **_kwargs):
+        process = FakeProcess(pid=100 + len(processes))
+        processes.append(process)
+        return process
+
+    controller = PortablePackageController(spawn=spawn)
+    for index in range(64):
+        controller.stop(descriptor, action_id=f"00000000-0000-4000-8000-{index:012d}")
+
+    with pytest.raises(PortableControlError) as error:
+        controller.stop(descriptor, action_id="00000000-0000-4000-8000-000000000064")
+    assert error.value.code == "PORTABLE_ACTION_CAPACITY"
+    assert processes[-1].terminated is True
+
+
 @pytest.mark.skipif(os.name != "nt", reason="real cmd.exe contract is Windows-only")
 @pytest.mark.parametrize(
     "directory_name",

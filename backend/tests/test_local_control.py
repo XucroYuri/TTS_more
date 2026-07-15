@@ -796,13 +796,13 @@ class _FakeSupervisor:
         self.calls.append(("start", endpoint, operation_id))
         return {"status": "starting", "operation_id": operation_id}
 
-    def stop(self, endpoint):
-        self.calls.append(("stop", endpoint, None))
-        return {"status": "stopping"}
+    def stop(self, endpoint, *, action_id=None):
+        self.calls.append(("stop", endpoint, action_id))
+        return {"status": "stopping", "action_id": action_id}
 
-    def repair(self, endpoint):
-        self.calls.append(("repair", endpoint, None))
-        return {"status": "repairing"}
+    def repair(self, endpoint, *, proxy_url=None, action_id=None):
+        self.calls.append(("repair", endpoint, {"proxy_url": proxy_url, "action_id": action_id}))
+        return {"status": "repairing", "action_id": action_id}
 
     def open_folder(self, endpoint):
         self.calls.append(("open-folder", endpoint, None))
@@ -816,6 +816,10 @@ class _FakeSupervisor:
         self.calls.append(("logs", endpoint, operation_id))
         return {"status": "ready", "events": [], "next_seq": after_seq}
 
+    def action_status(self, endpoint, *, action_id=None):
+        self.calls.append(("action-status", endpoint, action_id))
+        return {"status": "stopped", "action_id": action_id, "action": "stop"}
+
 
 def _register(client: TestClient, package: Path) -> tuple[str, dict[str, str]]:
     token = _token(client)
@@ -827,6 +831,63 @@ def _register(client: TestClient, package: Path) -> tuple[str, dict[str, str]]:
     )
     assert response.status_code == 200, response.text
     return token, headers
+
+
+def test_replacing_package_path_preserves_existing_port_override(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    first = _write_package(tmp_path / "GPT old", component="gpt-sovits", package_id="gpt-main")
+    replacement = _write_package(tmp_path / "GPT new", component="gpt-sovits", package_id="gpt-main")
+    client = _client(controller)
+    headers = _control(_token(client))
+
+    first_response = client.post(
+        "/api/local-portable-services/register",
+        headers=headers,
+        json={
+            "component": "gpt-sovits",
+            "package_id": "gpt-main",
+            "path": str(first),
+            "port_override": 9988,
+        },
+    )
+    replacement_response = client.post(
+        "/api/local-portable-services/register",
+        headers=headers,
+        json={
+            "component": "gpt-sovits",
+            "package_id": "gpt-main",
+            "path": str(replacement),
+        },
+    )
+
+    assert first_response.status_code == 200, first_response.text
+    assert replacement_response.status_code == 200, replacement_response.text
+    assert replacement_response.json()["service"]["package_root"] == str(replacement.resolve())
+    assert replacement_response.json()["service"]["port_override"] == 9988
+
+
+def test_local_service_list_refreshes_install_state_from_fresh_package(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    client = _client(controller)
+    _token_value, headers = _register(client, package)
+
+    before = client.get("/api/local-portable-services", headers=headers)
+    state_path = package / "data/local/install-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text("{}", encoding="utf-8")
+    after = client.get("/api/local-portable-services", headers=headers)
+
+    assert before.status_code == 200
+    before_service = next(
+        service for service in before.json()["services"] if service["package_id"] == "gpt-main"
+    )
+    after_service = next(
+        service for service in after.json()["services"] if service["package_id"] == "gpt-main"
+    )
+    assert before_service["setup_state"] == "env_missing"
+    assert after.status_code == 200
+    assert after_service["setup_state"] == "ready"
 
 
 @pytest.mark.parametrize("action", ("start", "stop", "repair", "open-folder"))
@@ -853,6 +914,83 @@ def test_actions_use_only_action_enum_and_fresh_stored_locator(
     if action == "start":
         assert endpoint.portable_locator.port_override == 9981
         assert fake.calls[0][2]
+    elif action in {"stop", "repair"}:
+        action_id = response.json()["action_id"]
+        assert action_id
+        assert fake.calls[0][2]
+
+
+def test_action_converts_semantic_controller_failure_to_http_error(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    client = _client(controller)
+    _token_value, headers = _register(client, package)
+    fake = _FakeSupervisor()
+    fake.start = lambda _endpoint, operation_id=None: {
+        "status": "blocked",
+        "error_code": "CUDA_PROBE_FAILED",
+        "reason": "probe failed",
+        "operation_id": operation_id,
+    }
+    client.app.state.supervisor = fake
+
+    response = client.post(
+        "/api/local-portable-services/gpt-sovits/start",
+        headers=headers,
+        json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CUDA_PROBE_FAILED"
+
+
+def test_repair_accepts_only_strict_http_proxy_and_never_echoes_credentials(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    client = _client(controller)
+    _token_value, headers = _register(client, package)
+    fake = _FakeSupervisor()
+    client.app.state.supervisor = fake
+    proxy = "http://proxy-user:proxy-password@127.0.0.1:10808"
+
+    response = client.post(
+        "/api/local-portable-services/gpt-sovits/repair",
+        headers=headers,
+        json={"proxy_url": proxy},
+    )
+
+    assert response.status_code == 200, response.text
+    assert fake.calls[0][0] == "repair"
+    assert fake.calls[0][2]["proxy_url"] == proxy
+    assert fake.calls[0][2]["action_id"]
+    assert proxy not in response.text
+    assert "proxy-password" not in response.text
+    services_file = controller / "data/local/services.json"
+    assert proxy not in services_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("action", "proxy_url"),
+    (
+        ("start", "http://127.0.0.1:10808"),
+        ("stop", "http://127.0.0.1:10808"),
+        ("open-folder", "http://127.0.0.1:10808"),
+        ("repair", "socks5://127.0.0.1:1080"),
+        ("repair", "http://proxy.example/path?secret=1"),
+        ("repair", "http://127.0.0.1:70000"),
+        ("repair", "http://127.0.0.1:10808\nINJECTED=1"),
+    ),
+)
+def test_actions_reject_proxy_outside_strict_repair_contract(
+    tmp_path: Path, action: str, proxy_url: str
+) -> None:
+    client = _client(tmp_path / "TTS More")
+    response = client.post(
+        f"/api/local-portable-services/gpt-sovits/{action}",
+        headers=_control(_token(client)),
+        json={"proxy_url": proxy_url},
+    )
+    assert response.status_code == 422
 
 
 def test_start_action_accepts_empty_body_for_the_one_click_client(tmp_path: Path) -> None:
@@ -910,6 +1048,28 @@ def test_action_rejects_missing_or_identity_drifted_local_package(tmp_path: Path
     )
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "LOCAL_CONTROL_NOT_MANAGEABLE"
+
+
+def test_action_status_route_is_token_and_fresh_identity_protected(tmp_path: Path) -> None:
+    controller = tmp_path / "TTS More"
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    client = _client(controller)
+    _token_value, headers = _register(client, package)
+    fake = _FakeSupervisor()
+    client.app.state.supervisor = fake
+    action_id = "22222222-2222-4222-8222-222222222222"
+
+    assert client.get(
+        f"/api/local-portable-services/gpt-sovits/actions/{action_id}"
+    ).status_code == 403
+    response = client.get(
+        f"/api/local-portable-services/gpt-sovits/actions/{action_id}",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"status": "stopped", "action_id": action_id, "action": "stop"}
+    assert fake.calls[-1][0] == "action-status"
 
 
 def test_operation_and_logs_routes_delegate_to_strict_portable_reader(tmp_path: Path) -> None:

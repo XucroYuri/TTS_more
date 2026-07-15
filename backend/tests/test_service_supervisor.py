@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -351,6 +352,25 @@ def test_supervisor_routes_every_portable_action_through_fresh_resolver(tmp_path
     assert len(resolutions) == 6
     assert controller.calls[0][2]["port_override"] == 9980
     assert all(call[1] is resolved for call in controller.calls)
+
+
+def test_supervisor_passes_ephemeral_proxy_only_to_repair_controller(tmp_path: Path) -> None:
+    controller = FakePortableController()
+    supervisor = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=controller,
+        portable_resolver=lambda *_args: _descriptor(),
+    )
+    endpoint = _portable_endpoint()
+    proxy = "http://user:password@127.0.0.1:10808"
+
+    result = supervisor.repair(endpoint, proxy_url=proxy)
+
+    assert result["status"] == "repairing"
+    assert controller.calls[0][0] == "repair"
+    assert controller.calls[0][2]["proxy_url"] == proxy
+    assert str(uuid.UUID(str(controller.calls[0][2]["action_id"]))) == controller.calls[0][2]["action_id"]
 
 
 def test_supervisor_uses_independent_portable_controller_root_for_every_resolution(tmp_path: Path) -> None:

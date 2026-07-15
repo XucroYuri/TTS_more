@@ -8019,7 +8019,25 @@ h3 {
 }
 
 .portable-error { background: #fff1f0; color: #b42318; }
-.portable-proxy-guidance { background: #fffaeb; color: #93370d; }
+.portable-proxy-guidance {
+  display: grid;
+  gap: 6px;
+  background: #fffaeb;
+  color: #93370d;
+}
+
+.portable-proxy-guidance p { margin: 0; }
+
+.portable-proxy-guidance input {
+  min-width: 0;
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 9px;
+  border: 1px solid #f79009;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text, #101828);
+}
 
 .portable-progress-wrap {
   display: grid;

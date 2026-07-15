@@ -804,7 +804,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       selected: "已更新 {{component}} 的本地目录",
       selectionCancelled: "未更改目录",
       actionFailed: "操作未完成",
-      manualProxyGuidance: "所有锁定的自动下载源均已耗尽。当前版本尚未提供安全的代理提交接口；请先配置 Windows 系统代理，再点“修复”。控制令牌和代理信息不会写入浏览器存储。",
+      manualProxyGuidance: "所有锁定的自动下载源均已耗尽。可临时填写 HTTP(S) 代理后再次修复；代理只传给本次修复子进程，不会保存。",
+      manualProxyLabel: "本次修复使用的临时代理",
+      manualProxyInvalid: "请输入不含路径、查询参数或片段的 HTTP(S) 代理地址",
       action: {
         browse: "选择目录",
         start: "启动",
@@ -823,6 +825,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         installing: "正在安装运行环境",
         validating: "正在验证运行环境",
         starting: "正在启动服务",
+        stopping: "正在停止服务",
+        repairing: "正在修复环境",
         ready: "可用",
         stopped: "已停止",
         repairable: "需要修复",
@@ -844,6 +848,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         invalidPackage: "所选目录不是完整的便携包",
         notManageable: "当前服务不能由本机工作台控制",
         portInUse: "服务端口已被其他程序占用",
+        statusTimeout: "未在限定时间内确认操作完成，请按当前状态重试或查看技术详情",
         unknown: "操作未完成，请查看技术详情"
       }
     }
@@ -1636,7 +1641,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       selected: "Updated the local folder for {{component}}",
       selectionCancelled: "Folder was not changed",
       actionFailed: "The operation did not complete",
-      manualProxyGuidance: "All locked automatic download sources are exhausted. This version does not yet expose a safe proxy submission API. Configure the Windows system proxy, then choose Repair. Control tokens and proxy details are never persisted by the browser.",
+      manualProxyGuidance: "All locked download sources are exhausted. Enter a temporary HTTP(S) proxy and run Repair again. It is passed only to this repair child process and is never saved.",
+      manualProxyLabel: "Temporary proxy for this repair",
+      manualProxyInvalid: "Enter an HTTP(S) proxy URL without a path, query, or fragment",
       action: {
         browse: "Choose folder",
         start: "Start",
@@ -1655,6 +1662,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         installing: "Installing runtime",
         validating: "Validating runtime",
         starting: "Starting service",
+        stopping: "Stopping service",
+        repairing: "Repairing runtime",
         ready: "Ready",
         stopped: "Stopped",
         repairable: "Repair needed",
@@ -1676,6 +1685,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         invalidPackage: "The selected folder is not a complete portable package",
         notManageable: "This service cannot be controlled by the local workstation",
         portInUse: "The service port is owned by another program",
+        statusTimeout: "The operation could not be confirmed in time. Retry from the current state or open technical details.",
         unknown: "The operation did not complete; open technical details"
       }
     }

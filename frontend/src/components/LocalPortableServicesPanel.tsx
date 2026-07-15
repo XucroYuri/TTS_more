@@ -4,28 +4,36 @@ import { useTranslation } from "react-i18next";
 import {
   fetchLocalControlToken,
   fetchLocalPortableServices,
+  fetchPortableActionStatus,
   fetchPortableOperation,
   fetchPortableOperationLogs,
+  fetchServicesStatus,
   PortableApiError,
   portableServiceAction,
   registerLocalPortableService,
   selectLocalPortableFolder,
 } from "../api";
 import {
-  ACTIVE_PORTABLE_PHASES,
+  ACTIVE_PORTABLE_UI_PHASES,
+  createPortableActionConvergencePoller,
   createPortableOperationPoller,
+  mergePortableEvents,
   portableErrorMessageKey,
   portablePhaseAfterAction,
   portablePhaseLabelKey,
   portableServiceCards,
+  PORTABLE_REPAIR_CONVERGENCE_TIMEOUT_MS,
+  PORTABLE_STOP_CONVERGENCE_TIMEOUT_MS,
   shouldRevealManualProxy,
+  validatePortableProxyUrl,
   withControlTokenRetry,
   type PortableServiceCard,
+  type PortableRuntimeStatus,
+  type PortableUiPhase,
 } from "../lib/portableServices";
 import type {
   LocalPortableService,
   PortableOperationEvent,
-  PortableOperationPhase,
   PortableServiceAction,
 } from "../types";
 
@@ -34,9 +42,12 @@ const COMPONENT_NAMES = {
   indextts: "IndexTTS",
   cosyvoice: "CosyVoice",
 } as const;
-const MAX_VISIBLE_EVENTS = 200;
-
 type ControlRunner = <T>(run: (token: string) => Promise<T>) => Promise<T>;
+
+interface PortableWorkbenchSnapshot {
+  services: LocalPortableService[];
+  runtimes: PortableRuntimeStatus[];
+}
 
 export interface LocalPortableServicesPanelProps {
   initialServices?: LocalPortableService[];
@@ -45,17 +56,11 @@ export interface LocalPortableServicesPanelProps {
 
 interface LocalPortableServiceCardProps {
   card: PortableServiceCard;
+  runtimeStatuses: PortableRuntimeStatus[];
   runWithControl: ControlRunner;
-  onReload: () => Promise<void>;
+  onReload: (signal?: AbortSignal) => Promise<PortableWorkbenchSnapshot>;
   onServicesStatusRefresh: () => Promise<void>;
   onLiveMessage: (message: string) => void;
-}
-
-function mergeEvents(current: PortableOperationEvent[], incoming: PortableOperationEvent[]): PortableOperationEvent[] {
-  if (incoming.length === 0) return current;
-  const events = new Map(current.map((event) => [event.seq, event]));
-  for (const event of incoming) events.set(event.seq, event);
-  return [...events.values()].sort((left, right) => left.seq - right.seq).slice(-MAX_VISIBLE_EVENTS);
 }
 
 function errorView(error: unknown): { code: string | undefined; detail: string } {
@@ -66,6 +71,7 @@ function errorView(error: unknown): { code: string | undefined; detail: string }
 
 const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
   card,
+  runtimeStatuses,
   runWithControl,
   onReload,
   onServicesStatusRefresh,
@@ -74,19 +80,28 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
   const { t } = useTranslation();
   const [pendingAction, setPendingAction] = useState<PortableServiceAction | "browse" | null>(null);
   const [operationId, setOperationId] = useState<string | null>(null);
-  const [operationPhase, setOperationPhase] = useState<PortableOperationPhase | null>(null);
+  const [operationPhase, setOperationPhase] = useState<PortableUiPhase | null>(null);
+  const [convergence, setConvergence] = useState<{
+    action: "stop" | "repair";
+    actionId: string | null;
+    terminalFromResponse: boolean;
+  } | null>(null);
   const [events, setEvents] = useState<PortableOperationEvent[]>([]);
   const [logsOpen, setLogsOpen] = useState(false);
   const [errorCode, setErrorCode] = useState<string | undefined>();
   const [errorDetail, setErrorDetail] = useState("");
+  const [proxyUrl, setProxyUrl] = useState("");
   const cursorRef = useRef(0);
   const effectivePhase = operationPhase ?? card.status;
   const effectiveCard = useMemo(() => {
     if (!operationPhase || !card.service) return card;
-    return portableServiceCards([card.service], { [card.component]: operationPhase })
+    return portableServiceCards([card.service], {
+      phases: { [card.component]: operationPhase },
+      runtimes: runtimeStatuses,
+    })
       .find((item) => item.component === card.component) ?? card;
-  }, [card, operationPhase]);
-  const operationBusy = operationPhase ? ACTIVE_PORTABLE_PHASES.has(operationPhase) : false;
+  }, [card, operationPhase, runtimeStatuses]);
+  const operationBusy = operationPhase ? ACTIVE_PORTABLE_UI_PHASES.has(operationPhase) : false;
   const controlsBusy = pendingAction !== null || operationBusy;
   const lastProgress = [...events].reverse().find((event) => typeof event.percent === "number")?.percent;
   const lastEvent = events.at(-1);
@@ -94,8 +109,8 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
   const statusId = `portable-status-${card.component}`;
 
   useEffect(() => {
-    if (!operationId) setOperationPhase(null);
-  }, [card.status, operationId]);
+    if (!operationId && !convergence) setOperationPhase(null);
+  }, [card.status, convergence, operationId]);
 
   useEffect(() => {
     if (!operationId) return;
@@ -105,7 +120,7 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
       onSnapshot: (snapshot) => {
         cursorRef.current = snapshot.nextSeq;
         setOperationPhase(snapshot.phase);
-        setEvents((current) => mergeEvents(current, snapshot.events));
+        setEvents((current) => mergePortableEvents(current, snapshot.events));
         const latestError = [...snapshot.events].reverse().find((event) => event.error_code);
         if (latestError?.error_code) {
           setErrorCode(latestError.error_code);
@@ -118,6 +133,7 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
       },
       onError: (error) => {
         const view = errorView(error);
+        setOperationPhase("blocked");
         setErrorCode(view.code);
         setErrorDetail(view.detail);
       },
@@ -134,6 +150,68 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
     };
   }, [card.component, onLiveMessage, onReload, onServicesStatusRefresh, operationId, runWithControl, t]);
 
+  useEffect(() => {
+    if (!convergence) return;
+    const serviceId = card.service?.service_id;
+    const poller = createPortableActionConvergencePoller({
+      check: async (signal) => {
+        let terminal = convergence.terminalFromResponse;
+        if (convergence.actionId) {
+          const actionState = await runWithControl((token) => fetchPortableActionStatus(
+            card.component,
+            convergence.actionId as string,
+            token,
+            signal,
+          ));
+          setOperationPhase(actionState.status === "stopping" || actionState.status === "repairing"
+            ? actionState.status
+            : convergence.action === "stop" ? "stopping" : "repairing");
+          terminal = convergence.action === "stop"
+            ? actionState.status === "stopped"
+            : actionState.status === "completed";
+        }
+        if (!terminal) return false;
+        const snapshot = await onReload(signal);
+        if (convergence.action === "repair") {
+          const local = snapshot.services.find((service) => service.service_id === serviceId);
+          return local?.setup_state === "ready";
+        }
+        const runtime = snapshot.runtimes.find((service) => service.service_id === serviceId);
+        return Boolean(runtime && runtime.supervisor_state === "stopped" && runtime.ready !== true);
+      },
+      onSettled: async () => {
+        setConvergence(null);
+        setPendingAction(null);
+        setOperationPhase(null);
+        if (convergence.action === "repair") setProxyUrl("");
+        onLiveMessage(t(`portableServices.action.${convergence.action}`));
+        await onServicesStatusRefresh();
+      },
+      onTimeout: () => {
+        setConvergence(null);
+        setPendingAction(null);
+        setOperationPhase(null);
+        setErrorCode("LOCAL_CONTROL_STATUS_TIMEOUT");
+        setErrorDetail(t("portableServices.error.statusTimeout"));
+        onLiveMessage(t("portableServices.error.statusTimeout"));
+      },
+      onError: (error) => {
+        const view = errorView(error);
+        setConvergence(null);
+        setPendingAction(null);
+        setOperationPhase(null);
+        setErrorCode(view.code);
+        setErrorDetail(view.detail);
+        onLiveMessage(t(portableErrorMessageKey(view.code)));
+      },
+      timeoutMs: convergence.action === "repair"
+        ? PORTABLE_REPAIR_CONVERGENCE_TIMEOUT_MS
+        : PORTABLE_STOP_CONVERGENCE_TIMEOUT_MS,
+    });
+    poller.start();
+    return () => poller.stop();
+  }, [card.component, card.service?.service_id, convergence, onLiveMessage, onReload, onServicesStatusRefresh, runWithControl, t]);
+
   const chooseFolder = useCallback(async () => {
     if (controlsBusy || !card.actions.browse) return;
     setPendingAction("browse");
@@ -149,6 +227,7 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
         component: card.component,
         package_id: selection.package.package_id,
         path: selection.package.package_root,
+        ...(card.service?.port_override == null ? {} : { port_override: card.service.port_override }),
       }, token));
       setOperationId(null);
       setOperationPhase(null);
@@ -164,15 +243,29 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
     } finally {
       setPendingAction(null);
     }
-  }, [card.actions.browse, card.component, controlsBusy, onLiveMessage, onReload, onServicesStatusRefresh, runWithControl, t]);
+  }, [card.actions.browse, card.component, card.service?.port_override, controlsBusy, onLiveMessage, onReload, onServicesStatusRefresh, runWithControl, t]);
 
   const runAction = useCallback(async (action: PortableServiceAction) => {
     if (controlsBusy) return;
+    const manualProxy = action === "repair" && shouldRevealManualProxy(errorCode)
+      ? proxyUrl
+      : undefined;
+    if (manualProxy && !validatePortableProxyUrl(manualProxy)) {
+      setErrorDetail(t("portableServices.manualProxyInvalid"));
+      onLiveMessage(t("portableServices.manualProxyInvalid"));
+      return;
+    }
     setPendingAction(action);
     setErrorCode(undefined);
     setErrorDetail("");
+    let keepBusy = false;
     try {
-      const response = await runWithControl((token) => portableServiceAction(card.component, action, token));
+      const response = await runWithControl((token) => portableServiceAction(
+        card.component,
+        action,
+        token,
+        manualProxy ? { proxy_url: manualProxy } : {},
+      ));
       const nextPhase = portablePhaseAfterAction(action, response);
       if (action === "start" && response.operation_id) {
         cursorRef.current = 0;
@@ -180,6 +273,24 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
         setLogsOpen(true);
         setOperationId(response.operation_id);
         setOperationPhase(nextPhase);
+      } else if (action === "stop" || action === "repair") {
+        const terminalFromResponse = action === "stop"
+          ? response.status === "stopped"
+          : response.status === "completed";
+        if (!terminalFromResponse && !response.action_id) {
+          throw new PortableApiError(
+            502,
+            "LOCAL_CONTROL_INVALID_RESPONSE",
+            "Portable action response did not include an action_id",
+          );
+        }
+        setOperationPhase(nextPhase);
+        setConvergence({
+          action,
+          actionId: response.action_id ?? null,
+          terminalFromResponse,
+        });
+        keepBusy = true;
       } else {
         if (action === "start") setOperationId(null);
         setOperationPhase(nextPhase);
@@ -192,9 +303,9 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
       setErrorDetail(view.detail);
       onLiveMessage(t(portableErrorMessageKey(view.code)));
     } finally {
-      setPendingAction(null);
+      if (!keepBusy) setPendingAction(null);
     }
-  }, [card.component, controlsBusy, onLiveMessage, onReload, onServicesStatusRefresh, runWithControl, t]);
+  }, [card.component, controlsBusy, errorCode, onLiveMessage, onReload, onServicesStatusRefresh, proxyUrl, runWithControl, t]);
 
   const toggleLogs = useCallback(async () => {
     const nextOpen = !logsOpen;
@@ -203,7 +314,7 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
     try {
       const page = await runWithControl((token) => fetchPortableOperationLogs(card.component, operationId, token, cursorRef.current, 100));
       cursorRef.current = page.next_seq;
-      setEvents((current) => mergeEvents(current, page.events));
+      setEvents((current) => mergePortableEvents(current, page.events));
     } catch (error) {
       const view = errorView(error);
       setErrorCode(view.code);
@@ -282,7 +393,22 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
       ) : null}
 
       {errorCode ? <p className="portable-error" role="alert">{t(portableErrorMessageKey(errorCode))}</p> : null}
-      {shouldRevealManualProxy(errorCode) ? <p className="portable-proxy-guidance">{t("portableServices.manualProxyGuidance")}</p> : null}
+      {shouldRevealManualProxy(errorCode) ? (
+        <div className="portable-proxy-guidance">
+          <p>{t("portableServices.manualProxyGuidance")}</p>
+          <label htmlFor={`portable-proxy-${card.component}`}>{t("portableServices.manualProxyLabel")}</label>
+          <input
+            id={`portable-proxy-${card.component}`}
+            type="password"
+            value={proxyUrl}
+            onChange={(event) => setProxyUrl(event.target.value)}
+            autoComplete="off"
+            autoCapitalize="none"
+            spellCheck={false}
+            placeholder="http://127.0.0.1:10808"
+          />
+        </div>
+      ) : null}
 
       {logsOpen ? (
         <section className="portable-event-log" aria-labelledby={`portable-logs-${card.component}`}>
@@ -307,11 +433,13 @@ const LocalPortableServiceCard = memo(function LocalPortableServiceCard({
 export function LocalPortableServicesPanel({ initialServices = [], onServicesStatusRefresh }: LocalPortableServicesPanelProps) {
   const { t } = useTranslation();
   const [services, setServices] = useState<LocalPortableService[]>(initialServices);
+  const [runtimeStatuses, setRuntimeStatuses] = useState<PortableRuntimeStatus[]>([]);
   const [loading, setLoading] = useState(initialServices.length === 0);
   const [loadError, setLoadError] = useState("");
   const [liveMessage, setLiveMessage] = useState("");
   const tokenRef = useRef<string | null>(null);
   const tokenPromiseRef = useRef<Promise<string> | null>(null);
+  const snapshotGenerationRef = useRef(0);
   const statusRefreshRef = useRef(onServicesStatusRefresh);
 
   useEffect(() => {
@@ -340,25 +468,41 @@ export function LocalPortableServicesPanel({ initialServices = [], onServicesSta
     return withControlTokenRetry(acquireToken, run);
   }, [acquireToken]);
 
+  const refreshSnapshot = useCallback(async (signal?: AbortSignal): Promise<PortableWorkbenchSnapshot> => {
+    const generation = ++snapshotGenerationRef.current;
+    const [local, status] = await Promise.all([
+      runWithControl((token) => fetchLocalPortableServices(token, signal)),
+      fetchServicesStatus(signal),
+    ]);
+    const snapshot = { services: local.services, runtimes: status.services };
+    if (generation === snapshotGenerationRef.current) {
+      setServices(snapshot.services);
+      setRuntimeStatuses(snapshot.runtimes);
+      setLoadError("");
+    }
+    return snapshot;
+  }, [runWithControl]);
+
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const payload = await runWithControl((token) => fetchLocalPortableServices(token));
-      setServices(payload.services);
-      setLoadError("");
+      await refreshSnapshot();
     } catch (error) {
       const view = errorView(error);
       setLoadError(t(portableErrorMessageKey(view.code)));
     } finally {
       setLoading(false);
     }
-  }, [runWithControl, t]);
+  }, [refreshSnapshot, t]);
 
   useEffect(() => {
     void reload();
   }, [reload]);
 
-  const cards = useMemo(() => portableServiceCards(services), [services]);
+  const cards = useMemo(
+    () => portableServiceCards(services, { runtimes: runtimeStatuses }),
+    [runtimeStatuses, services],
+  );
 
   return (
     <section className="local-portable-services-panel" aria-labelledby="local-portable-services-title">
@@ -377,8 +521,9 @@ export function LocalPortableServicesPanel({ initialServices = [], onServicesSta
           <LocalPortableServiceCard
             key={card.component}
             card={card}
+            runtimeStatuses={runtimeStatuses}
             runWithControl={runWithControl}
-            onReload={reload}
+            onReload={refreshSnapshot}
             onServicesStatusRefresh={refreshServicesStatus}
             onLiveMessage={setLiveMessage}
           />

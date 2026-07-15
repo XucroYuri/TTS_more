@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   fetchLocalControlToken,
   fetchLocalPortableServices,
+  fetchPortableActionStatus,
   fetchPortableOperationLogs,
   getApiToken,
   PortableApiError,
@@ -62,6 +63,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 describe("local portable control API", () => {
   beforeEach(() => {
     vi.stubGlobal("localStorage", makeLocalStorage());
+    vi.stubGlobal("sessionStorage", makeLocalStorage());
   });
 
   afterEach(() => {
@@ -127,6 +129,29 @@ describe("local portable control API", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("reads async stop and repair convergence by opaque action id", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      action: "repair",
+      action_id: "22222222-2222-4222-8222-222222222222",
+      status: "completed",
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+
+    const response = await fetchPortableActionStatus(
+      "gpt-sovits",
+      "22222222-2222-4222-8222-222222222222",
+      "control",
+      controller.signal,
+    );
+
+    expect(response.status).toBe("completed");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/local-portable-services/gpt-sovits/actions/22222222-2222-4222-8222-222222222222",
+    );
+    expect(fetchMock.mock.calls[0][1]?.signal).toBe(controller.signal);
+  });
+
   it("projects structured 403, 409 and 422 API failures", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
@@ -140,5 +165,57 @@ describe("local portable control API", () => {
         status: expectedStatus,
       } satisfies Partial<PortableApiError>);
     }
+  });
+
+  it("rejects semantic action failures even when the HTTP status is 200", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        component: "gpt-sovits",
+        action: "start",
+        status: "blocked",
+        error_code: "CUDA_PROBE_FAILED",
+        reason: "device probe failed",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        component: "gpt-sovits",
+        action: "repair",
+        status: "repairing",
+        error_code: "ALL_LOCKED_SOURCES_EXHAUSTED",
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(portableServiceAction("gpt-sovits", "start", "control")).rejects.toMatchObject({
+      status: 200,
+      code: "CUDA_PROBE_FAILED",
+    } satisfies Partial<PortableApiError>);
+    await expect(portableServiceAction("gpt-sovits", "repair", "control")).rejects.toMatchObject({
+      status: 200,
+      code: "ALL_LOCKED_SOURCES_EXHAUSTED",
+    } satisfies Partial<PortableApiError>);
+  });
+
+  it("submits a validated repair-only proxy without persisting or leaking it", async () => {
+    const proxy = "http://proxy-user:proxy-password@127.0.0.1:10808";
+    const setItem = vi.spyOn(localStorage, "setItem");
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      component: "cosyvoice",
+      action: "repair",
+      status: "completed",
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await portableServiceAction("cosyvoice", "repair", "control", { proxy_url: proxy });
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/local-portable-services/cosyvoice/repair");
+    expect(JSON.parse(String(init?.body))).toEqual({ proxy_url: proxy });
+    expect(String(url)).not.toContain(proxy);
+    expect(new Headers(init?.headers).get("X-TTS-More-Control")).toBe("control");
+    expect(setItem).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem("proxy_url")).toBeNull();
+    await expect(portableServiceAction("cosyvoice", "start", "control", { proxy_url: proxy })).rejects.toThrow(/repair/i);
+    await expect(portableServiceAction("cosyvoice", "repair", "control", { proxy_url: "socks5://127.0.0.1:1080" })).rejects.toThrow(/http/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

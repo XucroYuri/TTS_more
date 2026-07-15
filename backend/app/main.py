@@ -1321,7 +1321,18 @@ def _service_health_with_supervisor(
 def _layer_service_status(service: dict[str, Any], supervisor_state: dict[str, Any]) -> dict[str, Any]:
     health = service.get("health") or {}
     setup_state = _effective_setup_state(service, health)
-    managed_local_stopped = bool(supervisor_state.get("manageable") and not supervisor_state.get("running") and service.get("network_scope") == "localhost")
+    reported_running = supervisor_state.get("running")
+    portable_health_running = bool(
+        service.get("control_kind") == "portable-package"
+        and reported_running is None
+        and service.get("ready")
+    )
+    effective_running = bool(reported_running is True or portable_health_running)
+    managed_local_stopped = bool(
+        supervisor_state.get("manageable")
+        and not effective_running
+        and service.get("network_scope") == "localhost"
+    )
     hard_blocked_setup = setup_state in {"not_configured", "repo_missing", "env_missing", "endpoint_unreachable"}
     if service.get("enabled") is False:
         state = "disabled"
@@ -1361,8 +1372,8 @@ def _layer_service_status(service: dict[str, Any], supervisor_state: dict[str, A
         "config_ok": bool(health.get("config_ok", service.get("ready", False))),
         "required_api_ok": bool(health.get("required_api_ok", service.get("ready", False))),
         "auth_ok": bool(health.get("auth_ok", True)),
-        "can_start": bool(supervisor_state.get("manageable") and not supervisor_state.get("running")),
-        "supervisor_state": "running" if supervisor_state.get("running") else "stopped",
+        "can_start": bool(supervisor_state.get("manageable") and not effective_running),
+        "supervisor_state": "running" if effective_running else "stopped",
         "source_profile": service.get("source_profile"),
         "catalog_provider": service.get("catalog_provider"),
         "setup_state": setup_state,
