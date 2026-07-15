@@ -11,7 +11,7 @@ from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 import httpx
 
@@ -23,7 +23,7 @@ from app.portable_endpoint_trust import (
     require_unique_service_identities,
     sanitize_portable_endpoint,
 )
-from app.portable_locator_mutations import require_managed_portable_locator_mutation_permitted
+from app.portable_locator_mutations import require_managed_portable_locators_unchanged
 from app.service_store_io import ServiceDocument, read_service_document, update_service_document
 
 
@@ -121,10 +121,13 @@ class ServiceRegistry:
         )
 
     def with_services(self, services: list[TTSServiceEndpoint]) -> "ServiceRegistry":
+        baseline = self._baseline
+        if baseline is None:
+            baseline = list(self.services)
         return ServiceRegistry(
             services,
             store_schema_version=self.store_schema_version,
-            _baseline=self._baseline,
+            _baseline=baseline,
             _baseline_was_missing=self._baseline_was_missing,
         )
 
@@ -132,7 +135,6 @@ class ServiceRegistry:
         self,
         path: Path,
         *,
-        portable_locator_mutation_permit: object | None = None,
         publish: Callable[["ServiceRegistry"], None] | None = None,
     ) -> None:
         desired = [sanitize_portable_endpoint(service) for service in self.services]
@@ -147,11 +149,17 @@ class ServiceRegistry:
                 desired,
                 restore_missing_baseline=self._baseline_was_missing,
             )
-            require_managed_portable_locator_mutation_permitted(
-                current_endpoints,
-                merged,
-                portable_locator_mutation_permit,
-            )
+            require_managed_portable_locators_unchanged(current_endpoints, merged)
+            # A publishing save must also agree with the registry that is live in
+            # the app. Non-publishing saves may legitimately merge a portable
+            # locator concurrently added by PortableServiceStore in another
+            # process; the disk-current comparison above still prevents them
+            # from changing that locator themselves.
+            if publish is not None and self._baseline is not None:
+                require_managed_portable_locators_unchanged(
+                    self._baseline,
+                    merged,
+                )
             schema_version = self.store_schema_version
             if schema_version is None:
                 schema_version = current.schema_version

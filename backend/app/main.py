@@ -24,6 +24,7 @@ from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
 from app.portable_discovery import PortablePackageDiscoverRequest, PortablePackageRegisterRequest, discover_portable_packages, endpoint_from_portable_package, read_portable_package
 from app.portable_locator_mutations import ManagedPortableLocatorMutationError
+from app.portable_services import PortableServiceStore
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
@@ -187,12 +188,19 @@ def create_app(
         def publish_settings(candidate: ServiceRegistry) -> None:
             _apply_registry(app, _mocked_registry(candidate) if mock_mode else candidate, store)
 
-        try:
-            registry = save_service_settings(
+        def save_settings(published_registry: ServiceRegistry) -> ServiceRegistry:
+            return save_service_settings(
                 app.state.writable_services_path,
                 env_file,
                 request,
+                registry=published_registry,
                 publish=publish_settings,
+            )
+
+        try:
+            registry = app.state.portable_locator_mutations.run_generic_transaction(
+                current_published=lambda: app.state.service_registry,
+                transaction=save_settings,
             )
         except ManagedPortableLocatorMutationError as exc:
             raise _managed_portable_locator_mutation_http_error() from exc
@@ -234,13 +242,23 @@ def create_app(
 
     @app.post("/api/open-source-tts/configure")
     def open_source_tts_configure(request: OpenSourceTTSConfigureRequest) -> dict[str, Any]:
-        try:
-            registry, endpoint, detect_payload = configure_open_source_tts(
+        def configure(
+            published_registry: ServiceRegistry,
+        ) -> tuple[ServiceRegistry, Any, dict[str, Any]]:
+            return configure_open_source_tts(
                 request,
-                app.state.service_registry,
+                published_registry,
                 app.state.writable_services_path,
                 project_root,
                 publish=lambda candidate: _apply_registry(app, candidate, store),
+            )
+
+        try:
+            registry, endpoint, detect_payload = (
+                app.state.portable_locator_mutations.run_generic_transaction(
+                    current_published=lambda: app.state.service_registry,
+                    transaction=configure,
+                )
             )
         except ManagedPortableLocatorMutationError as exc:
             raise _managed_portable_locator_mutation_http_error() from exc
@@ -268,21 +286,27 @@ def create_app(
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        def persist_and_publish(permit: object) -> ServiceRegistry:
-            current = ServiceRegistry.load(app.state.writable_services_path)
-            services = [
-                service for service in current.services if service.service_id != endpoint.service_id
-            ]
-            services.append(endpoint)
-            services.sort(key=lambda service: (service.priority, service.service_id))
-            registry = current.with_services(services)
-            registry.save(
-                app.state.writable_services_path,
-                portable_locator_mutation_permit=permit,
-                publish=lambda published: _apply_registry(app, published, store),
+        def persist_and_publish() -> ServiceRegistry:
+            portable_store = PortableServiceStore(
+                portable_controller_root,
+                services_path=app.state.writable_services_path,
+            )
+            initial_services = (
+                tuple(app.state.service_registry.services)
+                if not portable_store.path.exists()
+                else ()
+            )
+            services = portable_store.replace_component(
+                endpoint,
+                initial_services=initial_services,
+                publish=lambda published: _apply_registry(
+                    app,
+                    ServiceRegistry(list(published)),
+                    store,
+                ),
             )
             app.state.services_path = app.state.writable_services_path
-            return registry
+            return ServiceRegistry(list(services))
 
         try:
             registry = app.state.portable_locator_mutations.mutate_component(

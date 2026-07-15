@@ -209,9 +209,14 @@ def _merge_service_delta(
 class PortableServiceStore:
     """Versioned, atomic storage for local endpoint records and locator hints."""
 
-    def __init__(self, controller_root: Path) -> None:
+    def __init__(self, controller_root: Path, *, services_path: Path | None = None) -> None:
         self.controller_root = _lexical_absolute(controller_root)
-        self.path = self.controller_root / "data" / "local" / "services.json"
+        self.path = (
+            _lexical_absolute(services_path)
+            if services_path is not None
+            else self.controller_root / "data" / "local" / "services.json"
+        )
+        self._configured_services_path = services_path is not None
         self._baseline: list[TTSServiceEndpoint] | None = None
 
     def load(self) -> list[TTSServiceEndpoint]:
@@ -349,10 +354,29 @@ class PortableServiceStore:
 
     def _safe_path(self, *, create_parent: bool) -> Path:
         root = self.controller_root
+        if self._configured_services_path and create_parent and not root.exists():
+            root.mkdir(parents=True, exist_ok=True)
         if not root.is_dir():
             raise FileNotFoundError(f"TTS More root does not exist: {root}")
         if _is_reparse_point(root) or _path_identity(root.resolve(strict=True)) != _path_identity(root):
             raise ValueError("TTS More root is a link or reparse point")
+        if self._configured_services_path:
+            parent = self.path.parent
+            if create_parent:
+                parent.mkdir(parents=True, exist_ok=True)
+            if not parent.exists():
+                return self.path
+            if (
+                not parent.is_dir()
+                or _is_reparse_point(parent)
+                or _path_identity(parent.resolve(strict=True)) != _path_identity(parent)
+            ):
+                raise ValueError("services path parent is unsafe")
+            if self.path.exists() and (
+                not self.path.is_file() or _is_reparse_point(self.path)
+            ):
+                raise ValueError("services path is unsafe")
+            return self.path
         current = root
         for part in ("data", "local"):
             current = current / part

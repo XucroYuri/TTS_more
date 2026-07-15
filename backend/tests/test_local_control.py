@@ -2108,24 +2108,30 @@ def test_reload_and_main_portable_registration_share_deterministic_component_gua
     assert reloaded.status_code == 200, reloaded.text
 
 
-def test_settings_save_cannot_republish_a_stale_portable_locator_after_registration(
+def test_settings_save_waits_for_inflight_apply_component_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    client, _headers, _old, _original = _portable_import_client(tmp_path, monkeypatch)
-    replacement = _write_package(
-        tmp_path / "settings race replacement", component="gpt-sovits", package_id="gpt-main"
+    client, headers, _old, _original = _portable_import_client(tmp_path, monkeypatch)
+    importer = load_portable_importer(tmp_path / "TTS More")
+    apply_entered = threading.Event()
+    release_apply = threading.Event()
+
+    def blocking_apply(plan):
+        apply_entered.set()
+        assert release_apply.wait(5)
+        return importer.apply_import(plan)
+
+    monkeypatch.setattr(
+        local_control,
+        "load_portable_importer",
+        lambda _root: SimpleNamespace(
+            plan_import=importer.plan_import,
+            apply_import=blocking_apply,
+        ),
     )
-    settings_saved = threading.Event()
-    release_settings = threading.Event()
-    original_save = main_module.save_service_settings
-
-    def blocking_save(*args, **kwargs):
-        registry = original_save(*args, **kwargs)
-        settings_saved.set()
-        assert release_settings.wait(5)
-        return registry
-
-    monkeypatch.setattr(main_module, "save_service_settings", blocking_save)
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    ).json()
     services = client.get("/api/settings/services").json()["services"]
     services.append(
         {
@@ -2138,53 +2144,114 @@ def test_settings_save_cannot_republish_a_stale_portable_locator_after_registrat
             "managed": False,
         }
     )
+    supervisor = client.app.state.supervisor
+    original_guard = supervisor.portable_lifecycle_guard
+    settings_guard_attempted = threading.Event()
+    settings_guard_acquired = threading.Event()
+
+    @contextmanager
+    def observed_guard(component):
+        frame = sys._getframe()
+        called_by_settings = False
+        while frame is not None:
+            if (
+                frame.f_code.co_name == "put_service_settings"
+                and component == "gpt-sovits"
+            ):
+                called_by_settings = True
+                settings_guard_attempted.set()
+                break
+            frame = frame.f_back
+        with original_guard(component):
+            if called_by_settings:
+                settings_guard_acquired.set()
+            yield
+
+    monkeypatch.setattr(supervisor, "portable_lifecycle_guard", observed_guard)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
+        applying = executor.submit(
+            client.post,
+            f"/api/local-portable-services/gpt-sovits/imports/{planned['plan_id']}/apply",
+            headers=headers,
+            json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+        )
+        assert apply_entered.wait(5)
         saving = executor.submit(
             client.put,
             "/api/settings/services",
             json={"services": services},
         )
-        assert settings_saved.wait(5)
-        registered = client.post(
-            "/api/portable-packages/register", json={"package_root": str(replacement)}
-        )
-        release_settings.set()
+        try:
+            assert settings_guard_attempted.wait(2)
+            assert not settings_guard_acquired.wait(0.25)
+            assert not saving.done()
+        finally:
+            release_apply.set()
+        applied = applying.result(timeout=10)
         saved = saving.result(timeout=10)
 
-    assert registered.status_code == 200, registered.text
+    assert applied.status_code == 200, applied.text
     assert saved.status_code == 200, saved.text
-    published = next(
-        endpoint
-        for endpoint in client.app.state.service_registry.services
-        if endpoint.portable_locator is not None
-    )
-    assert published.portable_locator is not None
-    assert published.portable_locator.absolute_path_last_seen == str(replacement.resolve())
 
 
-def test_open_source_configure_cannot_republish_a_stale_locator_after_registration(
+def test_open_source_configure_waits_for_inflight_apply_component_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    client, _headers, _old, _original = _portable_import_client(tmp_path, monkeypatch)
-    replacement = _write_package(
-        tmp_path / "configure race replacement",
-        component="gpt-sovits",
-        package_id="gpt-main",
+    client, headers, _old, _original = _portable_import_client(tmp_path, monkeypatch)
+    importer = load_portable_importer(tmp_path / "TTS More")
+    apply_entered = threading.Event()
+    release_apply = threading.Event()
+
+    def blocking_apply(plan):
+        apply_entered.set()
+        assert release_apply.wait(5)
+        return importer.apply_import(plan)
+
+    monkeypatch.setattr(
+        local_control,
+        "load_portable_importer",
+        lambda _root: SimpleNamespace(
+            plan_import=importer.plan_import,
+            apply_import=blocking_apply,
+        ),
     )
-    configured_saved = threading.Event()
-    release_configure = threading.Event()
-    original_configure = main_module.configure_open_source_tts
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    ).json()
+    supervisor = client.app.state.supervisor
+    original_guard = supervisor.portable_lifecycle_guard
+    configure_guard_attempted = threading.Event()
+    configure_guard_acquired = threading.Event()
 
-    def blocking_configure(*args, **kwargs):
-        result = original_configure(*args, **kwargs)
-        configured_saved.set()
-        assert release_configure.wait(5)
-        return result
+    @contextmanager
+    def observed_guard(component):
+        frame = sys._getframe()
+        called_by_configure = False
+        while frame is not None:
+            if (
+                frame.f_code.co_name == "open_source_tts_configure"
+                and component == "gpt-sovits"
+            ):
+                called_by_configure = True
+                configure_guard_attempted.set()
+                break
+            frame = frame.f_back
+        with original_guard(component):
+            if called_by_configure:
+                configure_guard_acquired.set()
+            yield
 
-    monkeypatch.setattr(main_module, "configure_open_source_tts", blocking_configure)
+    monkeypatch.setattr(supervisor, "portable_lifecycle_guard", observed_guard)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
+        applying = executor.submit(
+            client.post,
+            f"/api/local-portable-services/gpt-sovits/imports/{planned['plan_id']}/apply",
+            headers=headers,
+            json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+        )
+        assert apply_entered.wait(5)
         configuring = executor.submit(
             client.post,
             "/api/open-source-tts/configure",
@@ -2196,22 +2263,125 @@ def test_open_source_configure_cannot_republish_a_stale_locator_after_registrati
                 "base_url": "http://192.168.1.30:50000",
             },
         )
-        assert configured_saved.wait(5)
-        registered = client.post(
-            "/api/portable-packages/register", json={"package_root": str(replacement)}
-        )
-        release_configure.set()
+        try:
+            assert configure_guard_attempted.wait(2)
+            assert not configure_guard_acquired.wait(0.25)
+            assert not configuring.done()
+        finally:
+            release_apply.set()
+        applied = applying.result(timeout=10)
         configured = configuring.result(timeout=10)
 
-    assert registered.status_code == 200, registered.text
+    assert applied.status_code == 200, applied.text
     assert configured.status_code == 200, configured.text
+
+
+def test_settings_external_locator_edit_is_rejected_against_published_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, headers, _old, original = _portable_import_client(tmp_path, monkeypatch)
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    ).json()
+    replacement = _write_package(
+        tmp_path / "settings external replacement",
+        component="gpt-sovits",
+        package_id="gpt-main",
+    )
+    descriptor = inspect_locator_candidate(replacement)
+    assert descriptor is not None
+    endpoint = endpoint_from_portable_package(
+        descriptor,
+        PortablePackageRegisterRequest(package_root=str(replacement)),
+    )
+    store = PortableServiceStore(tmp_path / "TTS More")
+    store.replace_component(endpoint)
+    services = [item.model_dump(mode="json") for item in store.load()]
+    services.append(
+        {
+            "service_id": "external-settings-test",
+            "engine": "gpt-sovits",
+            "provider_type": "gpt-sovits",
+            "base_url": "http://192.168.1.20:9880",
+            "mode": "external",
+            "network_scope": "lan",
+            "managed": False,
+        }
+    )
+
+    saved = client.put("/api/settings/services", json={"services": services})
+
+    assert saved.status_code == 409
+    assert saved.json()["detail"] == {
+        "code": "MANAGED_PORTABLE_LOCATOR_MUTATION_FORBIDDEN",
+        "message": "managed portable locators must use a portable registration route",
+    }
     published = next(
         endpoint
         for endpoint in client.app.state.service_registry.services
         if endpoint.portable_locator is not None
     )
     assert published.portable_locator is not None
-    assert published.portable_locator.absolute_path_last_seen == str(replacement.resolve())
+    assert published.portable_locator.absolute_path_last_seen == str(original.resolve())
+    applied = client.post(
+        f"/api/local-portable-services/gpt-sovits/imports/{planned['plan_id']}/apply",
+        headers=headers,
+        json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+    )
+    assert applied.status_code == 409
+    assert applied.json()["detail"]["code"] == "LOCAL_CONTROL_IMPORT_BLOCKED"
+
+
+def test_configure_external_locator_edit_is_rejected_against_published_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, headers, _old, original = _portable_import_client(tmp_path, monkeypatch)
+    planned = client.post(
+        "/api/local-portable-services/gpt-sovits/imports/plan", headers=headers, json={}
+    ).json()
+    replacement = _write_package(
+        tmp_path / "configure external replacement",
+        component="gpt-sovits",
+        package_id="gpt-main",
+    )
+    descriptor = inspect_locator_candidate(replacement)
+    assert descriptor is not None
+    endpoint = endpoint_from_portable_package(
+        descriptor,
+        PortablePackageRegisterRequest(package_root=str(replacement)),
+    )
+    PortableServiceStore(tmp_path / "TTS More").replace_component(endpoint)
+
+    configured = client.post(
+        "/api/open-source-tts/configure",
+        json={
+            "provider_type": "cosyvoice",
+            "service_id": "lan-cosyvoice-external-edit",
+            "display_name": "CosyVoice LAN",
+            "source_profile": "lan_endpoint",
+            "base_url": "http://192.168.1.30:50000",
+        },
+    )
+
+    assert configured.status_code == 409
+    assert configured.json()["detail"] == {
+        "code": "MANAGED_PORTABLE_LOCATOR_MUTATION_FORBIDDEN",
+        "message": "managed portable locators must use a portable registration route",
+    }
+    published = next(
+        item
+        for item in client.app.state.service_registry.services
+        if item.portable_locator is not None
+    )
+    assert published.portable_locator is not None
+    assert published.portable_locator.absolute_path_last_seen == str(original.resolve())
+    applied = client.post(
+        f"/api/local-portable-services/gpt-sovits/imports/{planned['plan_id']}/apply",
+        headers=headers,
+        json={"confirmed": True, "plan_digest": planned["plan_digest"]},
+    )
+    assert applied.status_code == 409
+    assert applied.json()["detail"]["code"] == "LOCAL_CONTROL_IMPORT_BLOCKED"
 
 
 def test_successful_start_invalidates_component_plans_but_failed_start_does_not(

@@ -36,6 +36,7 @@ def save_service_settings(
     env_path: Path,
     payload: ServiceSettingsUpdate,
     *,
+    registry: ServiceRegistry | None = None,
     publish: Callable[[ServiceRegistry], None] | None = None,
 ) -> ServiceRegistry:
     services: list[TTSServiceEndpoint] = []
@@ -45,9 +46,9 @@ def save_service_settings(
                 set_env_value(env_path, key, value)
         data = record.model_dump(mode="python", exclude={"secrets"})
         services.append(TTSServiceEndpoint.model_validate(data))
-    registry = ServiceRegistry.load(path).with_services(services)
-    registry.save(path, publish=publish)
-    return registry
+    updated = (registry or ServiceRegistry.load(path)).with_services(services)
+    updated.save(path, publish=publish)
+    return updated
 
 
 def _service_key_configured(service: TTSServiceEndpoint, env_path: Path) -> bool:

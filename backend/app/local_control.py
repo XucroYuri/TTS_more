@@ -486,7 +486,7 @@ def install_local_control(
         locator = endpoint.portable_locator
         assert locator is not None
 
-        def replace_registration(_permit: object) -> list[TTSServiceEndpoint]:
+        def replace_registration() -> list[TTSServiceEndpoint]:
             previous_services = current_services()
             previous_override = next(
                 (

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 from fastapi.testclient import TestClient
 
+import app.portable_locator_mutations as portable_locator_mutations
 import app.service_store_io as service_store_io
 from app.main import create_app
 from app.models import TTSServiceEndpoint
@@ -21,7 +24,10 @@ from app.portable_discovery import (
     read_portable_package,
 )
 from app.portable_endpoint_trust import require_unique_service_identities
-from app.portable_locator_mutations import ManagedPortableLocatorMutationError
+from app.portable_locator_mutations import (
+    ManagedPortableLocatorMutationError,
+    PortableLocatorMutationCoordinator,
+)
 from app.portable_services import (
     PortableServiceLocator,
     PortableServiceStore,
@@ -46,6 +52,80 @@ def _make_directory_link(link: Path, target: Path) -> None:
     )
     if result.returncode != 0:
         pytest.skip(f"directory junctions are unavailable: {result.stderr or result.stdout}")
+
+
+def test_registry_save_exposes_no_portable_locator_mutation_authorization_surface() -> None:
+    parameters = inspect.signature(ServiceRegistry.save).parameters
+
+    assert not hasattr(portable_locator_mutations, "_PortableLocatorMutationPermit")
+    assert all("permit" not in name and "authoriz" not in name for name in parameters)
+    assert "expected_published_services" not in parameters
+
+
+def test_generic_registry_save_rejects_forged_expected_published_snapshot_argument(
+    tmp_path: Path,
+) -> None:
+    controller = tmp_path / "forged snapshot root"
+    controller.mkdir()
+    package = _write_package(
+        tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main"
+    )
+    endpoint = _endpoint(_locator("gpt-sovits", "gpt-main", package))
+    store = PortableServiceStore(controller)
+    store.replace_component(endpoint)
+    registry = ServiceRegistry.load(store.path)
+
+    with pytest.raises(TypeError):
+        registry.save(
+            store.path,
+            expected_published_services=registry.services,
+        )
+
+
+@pytest.mark.parametrize("coordinator_component", [None, "gpt-sovits", "cosyvoice"])
+def test_generic_registry_save_always_rejects_locator_delta_in_every_caller_context(
+    tmp_path: Path,
+    coordinator_component: str | None,
+) -> None:
+    controller = tmp_path / "alternate registry root"
+    controller.mkdir()
+    first_package = _write_package(
+        tmp_path / "GPT A", component="gpt-sovits", package_id="gpt-main"
+    )
+    second_package = _write_package(
+        tmp_path / "GPT B", component="gpt-sovits", package_id="gpt-main"
+    )
+    first = _endpoint(_locator("gpt-sovits", "gpt-main", first_package))
+    second = _endpoint(_locator("gpt-sovits", "gpt-main", second_package))
+    store = PortableServiceStore(controller)
+    store.replace_component(first)
+    before = store.path.read_bytes()
+    current = ServiceRegistry.load(store.path)
+    updated = current.with_services(
+        [second if item.service_id == first.service_id else item for item in current.services]
+    )
+
+    class NoOpSupervisor:
+        def portable_lifecycle_guard(self, _component):
+            return nullcontext()
+
+    class Invalidator:
+        def invalidate_component(self, _component) -> None:
+            raise AssertionError("failed generic save must not invalidate")
+
+    def save() -> None:
+        updated.save(store.path)
+
+    with pytest.raises(ManagedPortableLocatorMutationError):
+        if coordinator_component is None:
+            save()
+        else:
+            PortableLocatorMutationCoordinator(
+                NoOpSupervisor(),
+                Invalidator(),
+            ).mutate_component(coordinator_component, save)
+
+    assert store.path.read_bytes() == before
 
 
 def _write_package(
@@ -1190,6 +1270,7 @@ def test_open_source_configure_cannot_replace_a_managed_portable_locator_by_serv
     registered = client.post(
         "/api/portable-packages/register", json={"package_root": str(package)}
     )
+    assert registered.status_code == 200, registered.text
     service_id = registered.json()["service"]["service_id"]
 
     configured = client.post(

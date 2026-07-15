@@ -15,15 +15,11 @@ PORTABLE_COMPONENT_LOCK_ORDER: tuple[PortableComponent, ...] = (
 )
 _PORTABLE_COMPONENTS = frozenset(PORTABLE_COMPONENT_LOCK_ORDER)
 _Result = TypeVar("_Result")
+_Published = TypeVar("_Published")
 
 
 class ManagedPortableLocatorMutationError(ValueError):
     """A generic registry write attempted to change protected locator identity."""
-
-
-@dataclass(frozen=True)
-class _PortableLocatorMutationPermit:
-    component: PortableComponent
 
 
 class _LifecycleSupervisor(Protocol):
@@ -48,26 +44,6 @@ def require_managed_portable_locators_unchanged(
         )
 
 
-def require_managed_portable_locator_mutation_permitted(
-    current: Sequence[TTSServiceEndpoint],
-    desired: Sequence[TTSServiceEndpoint],
-    permit: object | None,
-) -> None:
-    current_by_component = _managed_portable_locator_fingerprints_by_component(current)
-    desired_by_component = _managed_portable_locator_fingerprints_by_component(desired)
-    changed = {
-        component
-        for component in _PORTABLE_COMPONENTS
-        if current_by_component[component] != desired_by_component[component]
-    }
-    if not changed:
-        return
-    if not isinstance(permit, _PortableLocatorMutationPermit) or changed != {permit.component}:
-        raise ManagedPortableLocatorMutationError(
-            "managed portable locators must use a portable registration route"
-        )
-
-
 @dataclass(frozen=True)
 class PortableLocatorMutationCoordinator:
     supervisor: _LifecycleSupervisor
@@ -76,12 +52,21 @@ class PortableLocatorMutationCoordinator:
     def mutate_component(
         self,
         component: PortableComponent,
-        mutation: Callable[[object], _Result],
+        mutation: Callable[[], _Result],
     ) -> _Result:
         with self.supervisor.portable_lifecycle_guard(component):
-            result = mutation(_PortableLocatorMutationPermit(component))
+            result = mutation()
             self.import_plans.invalidate_component(component)
             return result
+
+    def run_generic_transaction(
+        self,
+        *,
+        current_published: Callable[[], _Published],
+        transaction: Callable[[_Published], _Result],
+    ) -> _Result:
+        with self._all_component_guards():
+            return transaction(current_published())
 
     def publish_without_locator_changes(
         self,
@@ -91,9 +76,7 @@ class PortableLocatorMutationCoordinator:
         candidate_services: Callable[[_Result], Sequence[TTSServiceEndpoint]],
         publish: Callable[[_Result], None],
     ) -> _Result:
-        with ExitStack() as stack:
-            for component in PORTABLE_COMPONENT_LOCK_ORDER:
-                stack.enter_context(self.supervisor.portable_lifecycle_guard(component))
+        with self._all_component_guards():
             candidate = load_candidate()
             require_managed_portable_locators_unchanged(
                 current_services(),
@@ -101,6 +84,16 @@ class PortableLocatorMutationCoordinator:
             )
             publish(candidate)
             return candidate
+
+    def _all_component_guards(self) -> ExitStack:
+        stack = ExitStack()
+        try:
+            for component in PORTABLE_COMPONENT_LOCK_ORDER:
+                stack.enter_context(self.supervisor.portable_lifecycle_guard(component))
+        except BaseException:
+            stack.close()
+            raise
+        return stack
 
 
 def _managed_portable_locator_fingerprints(
@@ -119,16 +112,6 @@ def _managed_portable_locator_fingerprints(
             )
         )
     return tuple(sorted(fingerprints))
-
-
-def _managed_portable_locator_fingerprints_by_component(
-    services: Sequence[TTSServiceEndpoint],
-) -> dict[str, tuple[tuple[str, str, str], ...]]:
-    fingerprints = _managed_portable_locator_fingerprints(services)
-    return {
-        component: tuple(item for item in fingerprints if item[0] == component)
-        for component in _PORTABLE_COMPONENTS
-    }
 
 
 def _managed_portable_locator(

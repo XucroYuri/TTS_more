@@ -374,7 +374,10 @@ def test_portable_package_api_discovers_and_persists_registration(tmp_path: Path
     assert registered.status_code == 200
     assert registered.json()["service"]["managed"] is True
     saved = json.loads((data_root / "local" / "services.json").read_text(encoding="utf-8"))
-    assert any(service["display_name"] == "GPT portable" for service in saved)
+    assert saved["schema_version"] == 1
+    assert any(
+        service["display_name"] == "GPT portable" for service in saved["services"]
+    )
 
 
 def test_managed_runner_uses_only_the_worker_packages_private_runtime(tmp_path: Path) -> None:
