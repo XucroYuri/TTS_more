@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -46,6 +48,44 @@ class FlakyPollProcess(FakeProcess):
             self.poll_failures -= 1
             raise OSError("fixture poll failure")
         return super().poll()
+
+
+class WaitErrorProcess(FakeProcess):
+    def __init__(self, *, wait_failures: int, pid: int = 42) -> None:
+        super().__init__(pid=pid)
+        self.wait_failures = wait_failures
+
+    def wait(self, timeout=None) -> int:
+        if self.wait_failures > 0:
+            self.wait_failures -= 1
+            raise OSError("fixture wait failure")
+        return super().wait(timeout)
+
+
+class FakeJob:
+    def __init__(self, *, fail_assign: bool = False, fail_resume: bool = False) -> None:
+        self.fail_assign = fail_assign
+        self.fail_resume = fail_resume
+        self.assigned: list[FakeProcess] = []
+        self.resumed: list[FakeProcess] = []
+        self.terminate_calls = 0
+        self.close_calls = 0
+
+    def assign(self, process: FakeProcess) -> None:
+        self.assigned.append(process)
+        if self.fail_assign:
+            raise OSError("fixture assign failure")
+
+    def resume(self, process: FakeProcess) -> None:
+        self.resumed.append(process)
+        if self.fail_resume:
+            raise OSError("fixture resume failure")
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 def _write_package(root: Path, *, component: str = "gpt-sovits", package_id: str = "gpt-main") -> Path:
@@ -576,6 +616,188 @@ def test_commit_rescues_new_process_without_overwriting_unexpected_collision(
     assert new_process.terminated is False
 
 
+@pytest.mark.parametrize(
+    ("action", "expected_status", "terminal_status"),
+    [("stop", "stopping", "stopped"), ("repair", "repairing", "completed")],
+)
+def test_wait_error_is_tracked_as_unknown_active_action(
+    tmp_path: Path,
+    action: str,
+    expected_status: str,
+    terminal_status: str,
+) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    process = WaitErrorProcess(wait_failures=1, pid=2700)
+    job = FakeJob()
+    controller = PortablePackageController(
+        spawn=lambda *_args, **_kwargs: process,
+        job_factory=lambda: job,
+    )
+    action_id = "27000000-0000-4000-8000-000000000000"
+
+    result = getattr(controller, action)(descriptor, action_id=action_id)
+
+    assert result["status"] == expected_status
+    assert result["action_id"] == action_id
+    assert controller.action_status(descriptor, action_id=action_id)["status"] == expected_status
+    assert job.close_calls == 0
+    process.returncode = 0
+    assert controller.action_status(descriptor, action_id=action_id)["status"] == terminal_status
+    assert job.close_calls == 1
+
+
+def test_post_spawn_identity_failure_terminates_job_tree_and_releases_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    process = FakeProcess(pid=2750)
+    job = FakeJob()
+    monkeypatch.setattr(portable_control, "_execution_identity_guard", lambda _context: nullcontext())
+
+    def spawn(*_args, **_kwargs):
+        (package / "Stop.cmd").write_text("@echo changed\n", encoding="utf-8")
+        return process
+
+    controller = PortablePackageController(spawn=spawn, job_factory=lambda: job)
+    action_id = "27500000-0000-4000-8000-000000000000"
+
+    with pytest.raises(PortableControlError) as failure:
+        controller.stop(descriptor, action_id=action_id)
+
+    assert failure.value.code == "PORTABLE_IDENTITY_CHANGED"
+    assert job.terminate_calls == 1
+    assert job.close_calls == 1
+    assert action_id not in controller._actions
+    assert action_id not in controller._action_reservations
+
+
+@pytest.mark.parametrize("failure_point", ["assign", "resume"])
+def test_job_setup_failure_terminates_tree_before_releasing_reservation(
+    tmp_path: Path,
+    failure_point: str,
+) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    process = FakeProcess(pid=2800)
+    job = FakeJob(
+        fail_assign=failure_point == "assign",
+        fail_resume=failure_point == "resume",
+    )
+    controller = PortablePackageController(
+        spawn=lambda *_args, **_kwargs: process,
+        job_factory=lambda: job,
+    )
+    action_id = "28000000-0000-4000-8000-000000000000"
+
+    with pytest.raises(PortableControlError) as failure:
+        controller.stop(descriptor, action_id=action_id)
+
+    assert failure.value.code == "PORTABLE_LAUNCH_FAILED"
+    assert job.terminate_calls == 1
+    assert job.close_calls == 1
+    assert action_id not in controller._actions
+    assert action_id not in controller._action_reservations
+
+
+def test_async_action_holds_job_until_terminal_and_closes_it_once(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    process = FakeProcess(pid=2850)
+    job = FakeJob()
+    controller = PortablePackageController(
+        spawn=lambda *_args, **_kwargs: process,
+        job_factory=lambda: job,
+    )
+    action_id = "28500000-0000-4000-8000-000000000000"
+
+    result = controller.stop(descriptor, action_id=action_id)
+
+    assert result["status"] == "stopping"
+    assert job.assigned == [process]
+    assert job.resumed == [process]
+    assert job.terminate_calls == 0
+    assert job.close_calls == 0
+    process.returncode = 0
+    assert controller.action_status(descriptor, action_id=action_id)["status"] == "stopped"
+    assert controller.action_status(descriptor, action_id=action_id)["status"] == "stopped"
+    assert job.close_calls == 1
+
+
+def test_action_status_identity_drift_blocks_and_terminates_job_tree_repeatably(
+    tmp_path: Path,
+) -> None:
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    process = FakeProcess(pid=2875)
+    job = FakeJob()
+    controller = PortablePackageController(
+        spawn=lambda *_args, **_kwargs: process,
+        job_factory=lambda: job,
+    )
+    action_id = "28750000-0000-4000-8000-000000000000"
+    controller.stop(descriptor, action_id=action_id)
+    (package / "Stop.cmd").write_text("@echo identity drift\n", encoding="utf-8")
+
+    first = controller.action_status(descriptor, action_id=action_id)
+    second = controller.action_status(descriptor, action_id=action_id)
+
+    assert first == second
+    assert first["status"] == "blocked"
+    assert first["error_code"] == "PORTABLE_IDENTITY_CHANGED"
+    assert job.terminate_calls == 1
+    assert job.close_calls == 1
+    assert action_id in controller._actions
+
+
+def test_capacity_lru_eviction_closes_terminal_action_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(portable_control, "_MAX_ACTIVE_ACTIONS", 2)
+    package = _write_package(tmp_path / "GPT")
+    descriptor = read_portable_package(package)
+    processes = [FakeProcess(pid=2900 + index) for index in range(3)]
+    jobs = [FakeJob() for _index in range(3)]
+    controller = PortablePackageController(
+        spawn=lambda *_args, **_kwargs: processes.pop(0),
+        job_factory=lambda: jobs.pop(0),
+    )
+    action_ids = [f"29000000-0000-4000-8000-{index:012d}" for index in range(3)]
+
+    controller.stop(descriptor, action_id=action_ids[0])
+    first_job = controller._actions[action_ids[0]].job
+    controller.stop(descriptor, action_id=action_ids[1])
+    processes_by_id = {
+        action_id: controller._actions[action_id].process for action_id in action_ids[:2]
+    }
+    processes_by_id[action_ids[0]].returncode = 0
+
+    controller.stop(descriptor, action_id=action_ids[2])
+
+    assert isinstance(first_job, FakeJob)
+    assert first_job.close_calls == 1
+    with pytest.raises(PortableControlError) as evicted:
+        controller.action_status(descriptor, action_id=action_ids[0])
+    assert evicted.value.code == "PORTABLE_ACTION_NOT_FOUND"
+
+
+def test_start_does_not_create_kill_on_close_job(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "GPT")
+    _write_operation_state(package, _operation_payload(status="starting"))
+    process = FakeProcess(pid=2950)
+    controller = PortablePackageController(
+        spawn=lambda *_args, **_kwargs: process,
+        job_factory=lambda: pytest.fail("Start must not create a kill-on-close job"),
+    )
+
+    result = controller.start(read_portable_package(package), operation_id=OPERATION_ID)
+
+    assert result["status"] == "starting"
+
+
 def test_action_tracker_lru_evicts_only_oldest_terminal_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -612,6 +834,71 @@ def test_action_tracker_lru_evicts_only_oldest_terminal_record(
     assert controller.action_status(descriptor, action_id=action_ids[0])["status"] == "stopped"
     assert controller.action_status(descriptor, action_id=action_ids[2])["status"] == "stopping"
     assert controller.action_status(descriptor, action_id=action_ids[3])["status"] == "stopping"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object process-tree control is platform-specific")
+def test_real_windows_known_failure_job_kills_powershell_descendant(tmp_path: Path) -> None:
+    package = _write_package(tmp_path / "job-tree-package")
+    child_pid_file = package / "job-child.pid"
+    (package / "spawn-child.ps1").write_text(
+        "$child = Start-Process -FilePath \"$env:SystemRoot\\System32\\cmd.exe\" "
+        "-ArgumentList @('/d','/c','ping.exe -n 31 127.0.0.1 > nul') -PassThru\n"
+        "[System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'job-child.pid'), [string]$child.Id)\n"
+        "exit 9\n",
+        encoding="utf-8",
+    )
+    (package / "Stop.cmd").write_text(
+        "@echo off\n"
+        '"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
+        '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0spawn-child.ps1"\n'
+        "@exit /b %errorlevel%\n",
+        encoding="utf-8",
+    )
+    action_id = "29999999-9999-4999-8999-999999999999"
+
+    with pytest.raises(PortableControlError) as failure:
+        PortablePackageController(handshake_seconds=2.0).stop(
+            read_portable_package(package),
+            action_id=action_id,
+        )
+
+    assert failure.value.code == "PORTABLE_LAUNCH_EXITED"
+    assert child_pid_file.is_file()
+    child_pid = int(child_pid_file.read_text(encoding="ascii"))
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _windows_process_is_running(child_pid):
+        time.sleep(0.05)
+    survived = _windows_process_is_running(child_pid)
+    if survived:
+        taskkill = Path(os.environ["SystemRoot"]) / "System32" / "taskkill.exe"
+        subprocess.run(
+            [str(taskkill), "/PID", str(child_pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    assert survived is False
+
+
+def _windows_process_is_running(pid: int) -> bool:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return False
+    exit_code = ctypes.c_uint32()
+    try:
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == 259
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="real cmd.exe contract is Windows-only")

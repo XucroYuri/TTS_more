@@ -36,6 +36,7 @@ from app.portable_services import (
     resolve_locator,
 )
 from app.service_store_io import ServicePostCommitError
+from app.windows_job import CREATE_SUSPENDED, WindowsKillOnCloseJob
 
 
 CONTROL_HEADER = "X-TTS-More-Control"
@@ -555,110 +556,6 @@ def install_local_control(
         return _checked_control_result(result)
 
 
-class _JobObjectBasicLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("per_process_user_time_limit", ctypes.c_longlong),
-        ("per_job_user_time_limit", ctypes.c_longlong),
-        ("limit_flags", ctypes.c_uint32),
-        ("minimum_working_set_size", ctypes.c_size_t),
-        ("maximum_working_set_size", ctypes.c_size_t),
-        ("active_process_limit", ctypes.c_uint32),
-        ("affinity", ctypes.c_size_t),
-        ("priority_class", ctypes.c_uint32),
-        ("scheduling_class", ctypes.c_uint32),
-    ]
-
-
-class _IoCounters(ctypes.Structure):
-    _fields_ = [
-        ("read_operation_count", ctypes.c_ulonglong),
-        ("write_operation_count", ctypes.c_ulonglong),
-        ("other_operation_count", ctypes.c_ulonglong),
-        ("read_transfer_count", ctypes.c_ulonglong),
-        ("write_transfer_count", ctypes.c_ulonglong),
-        ("other_transfer_count", ctypes.c_ulonglong),
-    ]
-
-
-class _JobObjectExtendedLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("basic_limit_information", _JobObjectBasicLimitInformation),
-        ("io_info", _IoCounters),
-        ("process_memory_limit", ctypes.c_size_t),
-        ("job_memory_limit", ctypes.c_size_t),
-        ("peak_process_memory_used", ctypes.c_size_t),
-        ("peak_job_memory_used", ctypes.c_size_t),
-    ]
-
-
-class _WindowsSelectorJob:
-    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
-    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-
-    def __init__(self) -> None:
-        if os.name != "nt":
-            raise OSError("Windows Job Objects are unavailable")
-        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        self._ntdll = ctypes.WinDLL("ntdll")
-        self._configure_api()
-        handle = self._kernel32.CreateJobObjectW(None, None)
-        if not handle:
-            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
-        self.handle = int(handle)
-        limits = _JobObjectExtendedLimitInformation()
-        limits.basic_limit_information.limit_flags = self._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not self._kernel32.SetInformationJobObject(
-            ctypes.c_void_p(self.handle),
-            self._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-            ctypes.byref(limits),
-            ctypes.sizeof(limits),
-        ):
-            error = ctypes.get_last_error()
-            self.close()
-            raise OSError(error, "SetInformationJobObject failed")
-
-    def _configure_api(self) -> None:
-        self._kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
-        self._kernel32.CreateJobObjectW.restype = ctypes.c_void_p
-        self._kernel32.SetInformationJobObject.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-        ]
-        self._kernel32.SetInformationJobObject.restype = ctypes.c_int
-        self._kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        self._kernel32.AssignProcessToJobObject.restype = ctypes.c_int
-        self._kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        self._kernel32.TerminateJobObject.restype = ctypes.c_int
-        self._kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        self._kernel32.CloseHandle.restype = ctypes.c_int
-        self._ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
-        self._ntdll.NtResumeProcess.restype = ctypes.c_long
-
-    def assign(self, process: subprocess.Popen[bytes]) -> None:
-        process_handle = ctypes.c_void_p(int(getattr(process, "_handle")))
-        if not self._kernel32.AssignProcessToJobObject(
-            ctypes.c_void_p(self.handle), process_handle
-        ):
-            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
-
-    def resume(self, process: subprocess.Popen[bytes]) -> None:
-        process_handle = ctypes.c_void_p(int(getattr(process, "_handle")))
-        status = int(self._ntdll.NtResumeProcess(process_handle))
-        if status != 0:
-            raise OSError(status, "NtResumeProcess failed")
-
-    def terminate(self) -> None:
-        if self.handle:
-            self._kernel32.TerminateJobObject(ctypes.c_void_p(self.handle), 1)
-
-    def close(self) -> None:
-        if getattr(self, "handle", 0):
-            self._kernel32.CloseHandle(ctypes.c_void_p(self.handle))
-            self.handle = 0
-
-
 def _run_bounded_selector(
     command: Sequence[str],
     *,
@@ -683,7 +580,7 @@ def _run_bounded_selector(
     if output_limit < 1 or timeout <= 0:
         raise ValueError("selector bounds must be positive")
 
-    job = _WindowsSelectorJob()
+    job = WindowsKillOnCloseJob()
     process: subprocess.Popen[bytes] | None = None
     threads: list[threading.Thread] = []
     out_buffer = bytearray()
@@ -710,7 +607,14 @@ def _run_bounded_selector(
             wake.set()
 
     def terminate_tree() -> None:
-        job.terminate()
+        try:
+            job.terminate()
+        except OSError:
+            pass
+        try:
+            job.close()
+        except OSError:
+            pass
         if process is not None:
             try:
                 process.wait(timeout=5)
@@ -722,7 +626,7 @@ def _run_bounded_selector(
         flags = int(creationflags)
         flags |= int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
         flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-        flags |= 0x00000004  # CREATE_SUSPENDED: attach the Job Object before selector code runs.
+        flags |= CREATE_SUSPENDED  # Attach the Job Object before selector code runs.
         process = subprocess.Popen(
             list(command),
             cwd=str(cwd),
@@ -793,7 +697,11 @@ def _run_bounded_selector(
                     pass
         for thread in threads:
             thread.join(timeout=1)
-        job.close()
+        try:
+            job.close()
+        except OSError:
+            # Cleanup must not replace the selector's bounded structured error.
+            pass
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

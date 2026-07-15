@@ -19,6 +19,7 @@ from uuid import UUID
 
 from app.portable_discovery import PortablePackageDescriptor, inspect_locator_candidate
 from app.portable_file_io import PortableFileError, safe_read_bytes
+from app.windows_job import CREATE_SUSPENDED, KillOnCloseJob, WindowsKillOnCloseJob
 
 
 _EXACT_LAUNCHERS = {
@@ -97,11 +98,14 @@ class _ActionContext:
     launcher_identity: tuple[int, int, int, int]
 
 
-@dataclass(frozen=True)
+@dataclass
 class _TrackedAction:
     action: str
     process: ProcessLike
     context: _ActionContext
+    job: KillOnCloseJob | None = None
+    failure_code: str | None = None
+    failure_reason: str | None = None
 
 
 def windows_creation_flags() -> int:
@@ -122,11 +126,17 @@ class PortablePackageController:
         environment: Mapping[str, str] | None = None,
         handshake_seconds: float = 0.75,
         system_executable_resolver: Callable[[str], Path] | None = None,
+        job_factory: Callable[[], KillOnCloseJob] | None = None,
     ) -> None:
         self._spawn = spawn or subprocess.Popen
         self._environment = dict(os.environ if environment is None else environment)
         self._handshake_seconds = max(0.05, min(float(handshake_seconds), 2.0))
         self._system_executable_resolver = system_executable_resolver or _windows_system_executable
+        self._job_factory = (
+            job_factory
+            if job_factory is not None
+            else (WindowsKillOnCloseJob if spawn is None else None)
+        )
         self._actions: OrderedDict[str, _TrackedAction] = OrderedDict()
         self._action_reservations: set[str] = set()
         self._actions_lock = threading.RLock()
@@ -194,16 +204,27 @@ class PortablePackageController:
                 raise PortableControlError(
                     "PORTABLE_ACTION_NOT_FOUND", "portable action is unavailable"
                 )
-            current = self._action_context(descriptor, tracked.action)
+            if _descriptor_identity(descriptor) != tracked.context.descriptor_identity:
+                raise PortableControlError(
+                    "PORTABLE_ACTION_NOT_FOUND", "portable action is unavailable"
+                )
+            if tracked.failure_code is not None:
+                self._actions.move_to_end(canonical_id)
+                return self._blocked_action_result(canonical_id, tracked)
+            try:
+                current = self._action_context(descriptor, tracked.action)
+            except PortableControlError:
+                return self._block_identity_changed(canonical_id, tracked)
             if (
                 current.descriptor_identity != tracked.context.descriptor_identity
                 or current.root_identity != tracked.context.root_identity
                 or current.launcher_identity != tracked.context.launcher_identity
             ):
-                raise PortableControlError(
-                    "PORTABLE_ACTION_NOT_FOUND", "portable action is unavailable"
-                )
-            self._assert_context_stable(tracked.context)
+                return self._block_identity_changed(canonical_id, tracked)
+            try:
+                self._assert_context_stable(tracked.context)
+            except PortableControlError:
+                return self._block_identity_changed(canonical_id, tracked)
             try:
                 return_code = tracked.process.poll()
             except (OSError, subprocess.SubprocessError) as exc:
@@ -214,6 +235,7 @@ class PortablePackageController:
             if return_code is None:
                 status = {"stop": "stopping", "repair": "repairing"}[tracked.action]
             else:
+                self._close_tracked_job(tracked)
                 if return_code != 0:
                     return {
                         "status": "blocked",
@@ -234,7 +256,7 @@ class PortablePackageController:
     def open_folder(self, descriptor: PortablePackageDescriptor) -> dict[str, object]:
         context = self._action_context(descriptor, "start")
         explorer = self._system_executable("explorer.exe")
-        process, _completed = self._spawn_checked(
+        process, _completed, _job = self._spawn_checked(
             [str(explorer), str(context.root)],
             context,
             action="open_folder",
@@ -341,11 +363,12 @@ class PortablePackageController:
             self._reserve_action(canonical_action_id)
             reservation_active = True
         try:
-            process, completed = self._spawn_checked(
+            process, completed, job = self._spawn_checked(
                 command,
                 context,
                 action=action,
                 environment_overrides=environment_overrides,
+                use_action_job=canonical_action_id is not None,
             )
             if completed and action == "start" and operation_id is not None:
                 operation, _directory, _identity = self._read_operation(
@@ -380,6 +403,7 @@ class PortablePackageController:
                     action,
                     process,
                     context,
+                    job,
                 )
                 reservation_active = False
                 result["action_id"] = committed_action_id
@@ -395,14 +419,12 @@ class PortablePackageController:
                     "PORTABLE_ACTION_EXISTS", "portable action identifier is already active"
                 )
             if len(self._actions) + len(self._action_reservations) >= _MAX_ACTIVE_ACTIONS:
-                completed_id = next(
-                    (
-                        existing_id
-                        for existing_id, tracked in self._actions.items()
-                        if _action_completed(tracked.process)
-                    ),
-                    None,
-                )
+                completed_id = None
+                for existing_id, tracked in self._actions.items():
+                    if _action_completed(tracked.process):
+                        self._close_tracked_job(tracked)
+                        completed_id = existing_id
+                        break
                 if completed_id is not None:
                     self._actions.pop(completed_id, None)
             if len(self._actions) + len(self._action_reservations) >= _MAX_ACTIVE_ACTIONS:
@@ -423,15 +445,18 @@ class PortablePackageController:
         action: str,
         process: ProcessLike,
         context: _ActionContext,
+        job: KillOnCloseJob | None = None,
     ) -> str:
         with self._actions_lock:
             self._action_reservations.discard(action_id)
-            tracked = _TrackedAction(action, process, context)
+            tracked = _TrackedAction(action, process, context, job)
             existing = self._actions.get(action_id)
             if existing is None:
                 self._actions[action_id] = tracked
                 return action_id
             if existing.process is process:
+                if existing.job is None:
+                    existing.job = job
                 self._actions.move_to_end(action_id)
                 return action_id
 
@@ -455,7 +480,8 @@ class PortablePackageController:
         *,
         action: str,
         environment_overrides: Mapping[str, str] | None = None,
-    ) -> tuple[ProcessLike, bool]:
+        use_action_job: bool = False,
+    ) -> tuple[ProcessLike, bool, KillOnCloseJob | None]:
         child_environment = _safe_environment(self._environment)
         if environment_overrides:
             child_environment.update(environment_overrides)
@@ -467,7 +493,18 @@ class PortablePackageController:
             "stderr": subprocess.DEVNULL,
             "close_fds": True,
         }
+        job: KillOnCloseJob | None = None
+        if use_action_job and self._job_factory is not None:
+            try:
+                job = self._job_factory()
+            except (OSError, ValueError) as exc:
+                raise PortableControlError(
+                    "PORTABLE_LAUNCH_FAILED",
+                    f"portable {action} launcher process tree could not be secured",
+                ) from exc
         flags = windows_creation_flags()
+        if job is not None:
+            flags |= CREATE_SUSPENDED
         if flags:
             kwargs["creationflags"] = flags
         process: ProcessLike | None = None
@@ -480,6 +517,15 @@ class PortablePackageController:
                     raise PortableControlError(
                         "PORTABLE_LAUNCH_FAILED", f"portable {action} launcher could not be started"
                     ) from exc
+                if job is not None:
+                    try:
+                        job.assign(process)
+                        job.resume(process)
+                    except (OSError, ValueError) as exc:
+                        raise PortableControlError(
+                            "PORTABLE_LAUNCH_FAILED",
+                            f"portable {action} launcher process tree could not be secured",
+                        ) from exc
                 try:
                     return_code = process.wait(timeout=self._handshake_seconds)
                     completed = True
@@ -487,19 +533,82 @@ class PortablePackageController:
                     return_code = None
                     completed = False
                 except (OSError, subprocess.SubprocessError) as exc:
-                    raise PortableControlError(
-                        "PORTABLE_LAUNCH_FAILED", f"portable {action} launcher state could not be checked"
-                    ) from exc
+                    if job is None:
+                        raise PortableControlError(
+                            "PORTABLE_LAUNCH_FAILED",
+                            f"portable {action} launcher state could not be checked",
+                        ) from exc
+                    return_code = None
+                    completed = False
                 self._assert_context_stable(context)
                 if return_code not in (None, 0):
                     raise PortableControlError(
                         "PORTABLE_LAUNCH_EXITED", f"portable {action} launcher exited with a failure"
                     )
+                if completed and job is not None:
+                    try:
+                        job.close()
+                    except OSError as exc:
+                        raise PortableControlError(
+                            "PORTABLE_LAUNCH_FAILED",
+                            f"portable {action} launcher process tree could not be released",
+                        ) from exc
+                    job = None
         except PortableControlError:
             if process is not None:
-                _terminate_controller(process)
+                if job is not None:
+                    _terminate_job_tree(job, process)
+                    job = None
+                else:
+                    _terminate_controller(process)
+            elif job is not None:
+                _close_job(job)
+                job = None
             raise
-        return process, completed
+        return process, completed, job
+
+    def _close_tracked_job(self, tracked: _TrackedAction) -> None:
+        if tracked.job is None:
+            return
+        try:
+            tracked.job.close()
+        except OSError as exc:
+            raise PortableControlError(
+                "PORTABLE_LAUNCH_FAILED",
+                "portable action process tree could not be released",
+            ) from exc
+        tracked.job = None
+
+    def _block_identity_changed(
+        self,
+        action_id: str,
+        tracked: _TrackedAction,
+    ) -> dict[str, object]:
+        tracked.failure_code = "PORTABLE_IDENTITY_CHANGED"
+        tracked.failure_reason = "portable package identity changed while the action was active"
+        if tracked.job is not None:
+            _terminate_job_tree(tracked.job, tracked.process)
+            tracked.job = None
+        else:
+            _terminate_controller(tracked.process)
+        self._actions.move_to_end(action_id)
+        return self._blocked_action_result(action_id, tracked)
+
+    @staticmethod
+    def _blocked_action_result(
+        action_id: str,
+        tracked: _TrackedAction,
+    ) -> dict[str, object]:
+        assert tracked.failure_code is not None
+        assert tracked.failure_reason is not None
+        return {
+            "status": "blocked",
+            "action": tracked.action,
+            "action_id": action_id,
+            "controller_pid": int(tracked.process.pid),
+            "error_code": tracked.failure_code,
+            "reason": tracked.failure_reason,
+        }
 
     def _system_executable(self, name: str) -> Path:
         try:
@@ -1225,6 +1334,24 @@ def _action_completed(process: ProcessLike) -> bool:
         # Capacity may be reclaimed only from a process proven terminal. A
         # transient query failure is unknown state and must remain tracked.
         return False
+
+
+def _close_job(job: KillOnCloseJob) -> None:
+    try:
+        job.close()
+    except OSError:
+        pass
+
+
+def _terminate_job_tree(job: KillOnCloseJob, process: ProcessLike) -> None:
+    try:
+        job.terminate()
+    except OSError:
+        pass
+    _close_job(job)
+    # The suspended assign-failure path has no descendants yet and may not be
+    # in the Job Object. Terminating the root is therefore a required fallback.
+    _terminate_controller(process)
 
 
 def _terminate_controller(process: ProcessLike) -> None:
