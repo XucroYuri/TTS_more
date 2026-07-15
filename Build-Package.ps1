@@ -12,6 +12,205 @@ $ErrorActionPreference = "Stop"
 if ($Profile -eq "Full" -and $env:GITHUB_ACTIONS -eq "true") { throw "profile=full is local-only and cannot be built by a GitHub upload workflow" }
 if ($Version -notmatch "^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$") { throw "package Version must contain only ASCII letters, digits, dot, underscore, or hyphen (maximum 128 characters)" }
 
+if (-not ("TtsMorePortableDirectoryHandle" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class TtsMorePortableDirectoryHandle
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UnicodeString
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ObjectAttributes
+    {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IoStatusBlock
+    {
+        public IntPtr Status;
+        public IntPtr Information;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle file,
+        out ByHandleFileInformation information);
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtCreateFile(
+        out IntPtr fileHandle,
+        uint desiredAccess,
+        ref ObjectAttributes objectAttributes,
+        out IoStatusBlock ioStatusBlock,
+        IntPtr allocationSize,
+        uint fileAttributes,
+        uint shareAccess,
+        uint createDisposition,
+        uint createOptions,
+        IntPtr eaBuffer,
+        uint eaLength);
+
+    [DllImport("ntdll.dll")]
+    private static extern uint RtlNtStatusToDosError(int status);
+
+    public static SafeFileHandle Open(string path, bool shareDelete)
+    {
+        return Open(path, shareDelete, false);
+    }
+
+    public static SafeFileHandle Open(string path, bool shareDelete, bool childAccess)
+    {
+        const uint FileReadAttributes = 0x00000080;
+        const uint FileListDirectory = 0x00000001;
+        const uint FileAddSubdirectory = 0x00000004;
+        const uint FileShareRead = 0x00000001;
+        const uint FileShareWrite = 0x00000002;
+        const uint FileShareDelete = 0x00000004;
+        const uint OpenExisting = 3;
+        const uint FileFlagBackupSemantics = 0x02000000;
+        const uint FileFlagOpenReparsePoint = 0x00200000;
+        uint share = FileShareRead | FileShareWrite | (shareDelete ? FileShareDelete : 0);
+        uint access = FileReadAttributes | FileListDirectory | (childAccess ? FileAddSubdirectory : 0);
+        SafeFileHandle handle = CreateFile(
+            path,
+            access,
+            share,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, "Cannot open controller staging directory by handle: " + path);
+        }
+        return handle;
+    }
+
+    public static SafeFileHandle CreateDirectoryRelative(
+        SafeFileHandle parent,
+        string name,
+        bool shareDelete)
+    {
+        if (String.IsNullOrEmpty(name) || name == "." || name == ".." || name.Contains("\\") || name.Contains("/"))
+        {
+            throw new ArgumentException("Unsafe controller staging directory name", "name");
+        }
+        IntPtr nameBuffer = IntPtr.Zero;
+        IntPtr unicodePointer = IntPtr.Zero;
+        try
+        {
+            nameBuffer = Marshal.StringToHGlobalUni(name);
+            UnicodeString unicode = new UnicodeString();
+            unicode.Length = checked((ushort)(name.Length * 2));
+            unicode.MaximumLength = checked((ushort)((name.Length + 1) * 2));
+            unicode.Buffer = nameBuffer;
+            unicodePointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+            Marshal.StructureToPtr(unicode, unicodePointer, false);
+            ObjectAttributes attributes = new ObjectAttributes();
+            attributes.Length = Marshal.SizeOf(typeof(ObjectAttributes));
+            attributes.RootDirectory = parent.DangerousGetHandle();
+            attributes.ObjectName = unicodePointer;
+            attributes.Attributes = 0x00000040;
+            IoStatusBlock ioStatus;
+            IntPtr rawHandle;
+            const uint DesiredAccess = 0x00100000 | 0x00000080 | 0x00000007;
+            const uint ShareRead = 0x00000001;
+            const uint ShareWrite = 0x00000002;
+            const uint ShareDelete = 0x00000004;
+            const uint FileCreate = 2;
+            const uint FileDirectoryFile = 0x00000001;
+            const uint FileSynchronousIoNonalert = 0x00000020;
+            const uint FileOpenReparsePoint = 0x00200000;
+            uint share = ShareRead | ShareWrite | (shareDelete ? ShareDelete : 0);
+            int status = NtCreateFile(
+                out rawHandle,
+                DesiredAccess,
+                ref attributes,
+                out ioStatus,
+                IntPtr.Zero,
+                0x00000010,
+                share,
+                FileCreate,
+                FileDirectoryFile | FileSynchronousIoNonalert | FileOpenReparsePoint,
+                IntPtr.Zero,
+                0);
+            if (status < 0)
+            {
+                throw new Win32Exception(
+                    unchecked((int)RtlNtStatusToDosError(status)),
+                    "Cannot atomically create controller staging directory: " + name);
+            }
+            return new SafeFileHandle(rawHandle, true);
+        }
+        finally
+        {
+            if (unicodePointer != IntPtr.Zero) { Marshal.FreeHGlobal(unicodePointer); }
+            if (nameBuffer != IntPtr.Zero) { Marshal.FreeHGlobal(nameBuffer); }
+        }
+    }
+
+    public static string Identity(SafeFileHandle handle)
+    {
+        ByHandleFileInformation information;
+        if (!GetFileInformationByHandle(handle, out information))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot inspect controller staging directory handle");
+        }
+        const uint FileAttributeReparsePoint = 0x00000400;
+        if ((information.FileAttributes & FileAttributeReparsePoint) != 0)
+        {
+            throw new InvalidOperationException("Controller staging directory handle resolves to a reparse point");
+        }
+        ulong index = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
+        return information.VolumeSerialNumber.ToString("X8") + ":" + index.ToString("X16");
+    }
+}
+'@
+}
+
 function Assert-PortableWorkPath {
     param([Parameter(Mandatory = $true)][string]$CandidatePath)
     try {
@@ -94,7 +293,17 @@ foreach ($projected in @(
 if ($maximumPathLength -gt 240) {
     throw "controller package staging path budget exceeded before copy: projected path length $maximumPathLength exceeds the safe Windows limit 240. Use -WorkRoot with a shorter external directory (for example C:\tm). Projected path: $maximumProjectedPath"
 }
+$createdWorkHandle = $null
+$createdWorkIdentity = $null
+$workCreated = $false
+$workBaseHandle = $null
 try {
+New-Item -ItemType Directory -Force -Path $workBase | Out-Null
+[void](Assert-PortableWorkPath -CandidatePath $workBase)
+$workBaseHandle = [TtsMorePortableDirectoryHandle]::Open($workBase, $false, $true)
+$createdWorkHandle = [TtsMorePortableDirectoryHandle]::CreateDirectoryRelative($workBaseHandle, $workIdentity, $true)
+$workCreated = $true
+$createdWorkIdentity = [TtsMorePortableDirectoryHandle]::Identity($createdWorkHandle)
 New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "app\backend"), (Join-Path $stage "package"), (Join-Path $stage "scripts"), (Join-Path $stage "packaging\portable"), (Join-Path $stage "licenses") | Out-Null
 [void](Assert-PortableWorkPath -CandidatePath $stage)
 
@@ -213,14 +422,40 @@ Copy-Item -LiteralPath (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json") -D
 Write-Host "Created $Profile package: $zip"
 }
 finally {
-    $workPathExists = Assert-PortableWorkPath -CandidatePath $work
-    if ($workPathExists) {
-        $resolvedWork = [IO.Path]::GetFullPath($work)
-        $resolvedParent = [IO.Path]::GetFullPath((Split-Path -Parent $resolvedWork))
-        $resolvedLeaf = Split-Path -Leaf $resolvedWork
-        if (![string]::Equals($resolvedParent.TrimEnd("\", "/"), $workBase.TrimEnd("\", "/"), [StringComparison]::OrdinalIgnoreCase) -or $resolvedLeaf -ne $workIdentity) {
-            throw "refusing to clean a controller package staging directory that is not the unique directory created by this build: $resolvedWork"
+    $cleanupHandle = $null
+    try {
+        if ($workCreated) {
+            $workPathExists = Assert-PortableWorkPath -CandidatePath $work
+            if (!$workPathExists) {
+                throw "controller package cleanup path disappeared after creation; refusing path-based cleanup: $work"
+            }
+            $resolvedWork = [IO.Path]::GetFullPath($work)
+            $resolvedParent = [IO.Path]::GetFullPath((Split-Path -Parent $resolvedWork))
+            $resolvedLeaf = Split-Path -Leaf $resolvedWork
+            if (![string]::Equals($resolvedParent.TrimEnd("\", "/"), $workBase.TrimEnd("\", "/"), [StringComparison]::OrdinalIgnoreCase) -or $resolvedLeaf -ne $workIdentity) {
+                throw "refusing to clean a controller package staging directory that is not the unique directory created by this build: $resolvedWork"
+            }
+            $cleanupHandle = [TtsMorePortableDirectoryHandle]::Open($resolvedWork, $false)
+            $cleanupIdentity = [TtsMorePortableDirectoryHandle]::Identity($cleanupHandle)
+            if (![string]::Equals($cleanupIdentity, $createdWorkIdentity, [StringComparison]::Ordinal)) {
+                throw "controller package cleanup identity changed; refusing to delete a replacement staging directory: $resolvedWork"
+            }
+            $createdWorkHandle.Dispose()
+            $createdWorkHandle = $null
+            foreach ($child in @(Get-ChildItem -LiteralPath $resolvedWork -Force)) {
+                Remove-Item -LiteralPath $child.FullName -Recurse -Force
+            }
+            if (@(Get-ChildItem -LiteralPath $resolvedWork -Force).Count -ne 0) {
+                throw "controller package staging directory is not empty after child cleanup; refusing recursive root deletion: $resolvedWork"
+            }
+            $cleanupHandle.Dispose()
+            $cleanupHandle = $null
+            Remove-Item -LiteralPath $resolvedWork -Force
         }
-        Remove-Item -LiteralPath $resolvedWork -Recurse -Force
+    }
+    finally {
+        if ($cleanupHandle -ne $null) { $cleanupHandle.Dispose() }
+        if ($createdWorkHandle -ne $null) { $createdWorkHandle.Dispose() }
+        if ($workBaseHandle -ne $null) { $workBaseHandle.Dispose() }
     }
 }

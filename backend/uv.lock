@@ -450,6 +450,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx", extra = ["socks"] },
+    { name = "jsonschema" },
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "python-multipart" },
@@ -461,7 +462,6 @@ dependencies = [
 dev = [
     { name = "httpx", extra = ["socks"] },
     { name = "httpx2" },
-    { name = "jsonschema" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -472,7 +472,7 @@ requires-dist = [
     { name = "httpx", extras = ["socks"], specifier = ">=0.27.0" },
     { name = "httpx", extras = ["socks"], marker = "extra == 'dev'", specifier = ">=0.27.0" },
     { name = "httpx2", marker = "extra == 'dev'", specifier = ">=2.5.0" },
-    { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.26.0,<5" },
+    { name = "jsonschema", specifier = ">=4.26.0,<5" },
     { name = "pydantic", specifier = ">=2.8.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },

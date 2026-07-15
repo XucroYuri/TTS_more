@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -530,8 +531,8 @@ def test_target_appearing_during_copy_is_never_overwritten(tmp_path: Path, monke
     plan = importer.plan_import(old, new)
     original = importer._copy_source_to_temporary
 
-    def racing_copy(item, temporary):
-        result = original(item, temporary)
+    def racing_copy(item, temporary, *args, **kwargs):
+        result = original(item, temporary, *args, **kwargs)
         item.destination.parent.mkdir(parents=True, exist_ok=True)
         item.destination.write_text("racing-target", encoding="utf-8")
         return result
@@ -569,6 +570,102 @@ def test_apply_rejects_destination_parent_created_after_planning(tmp_path: Path)
         importer.apply_import(plan)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-relative creation contract")
+def test_destination_root_replacement_during_parent_creation_never_receives_import_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    importer = _load_importer()
+    old, new = _write_version_pair(tmp_path, matching_asset=True)
+    plan = importer.plan_import(old, new)
+    original_mkdir = Path.mkdir
+    detached = tmp_path / "detached-planned-root"
+    replacement = new
+    swapped = False
+
+    def replace_root_then_mkdir(path: Path, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and path == new / "data":
+            new.rename(detached)
+            original_mkdir(new)
+            swapped = True
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", replace_root_then_mkdir)
+    error: BaseException | None = None
+    try:
+        importer.apply_import(plan)
+    except BaseException as exc:  # the invariant matters even when the attack is blocked
+        error = exc
+
+    assert error is None or isinstance(error, importer.PortableMigrationError)
+    assert not swapped or not (replacement / "data").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-relative creation contract")
+def test_file_exists_racer_is_drift_and_is_never_adopted_as_created_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    importer = _load_importer()
+    old, new = _write_version_pair(tmp_path, matching_asset=True)
+    plan = importer.plan_import(old, new)
+    original_mkdir = Path.mkdir
+    raced = False
+
+    def race_directory_creation(path: Path, *args, **kwargs):
+        nonlocal raced
+        if not raced and path == new / "data":
+            original_mkdir(path, *args, **kwargs)
+            raced = True
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", race_directory_creation)
+    error: BaseException | None = None
+    try:
+        importer.apply_import(plan)
+    except BaseException as exc:
+        error = exc
+
+    assert not raced or isinstance(error, importer.PortableMigrationError)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-relative creation contract")
+def test_destination_parent_replacement_before_temp_create_never_receives_source_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    importer = _load_importer()
+    old, new = _write_version_pair(tmp_path, matching_asset=True)
+    plan = importer.plan_import(old, new)
+    original_copy = importer._copy_source_to_temporary
+    detached = tmp_path / "detached-planned-parent"
+    replacement: Path | None = None
+    swapped = False
+
+    def replace_parent_then_copy(item, temporary, *args, **kwargs):
+        nonlocal replacement, swapped
+        if not swapped:
+            replacement = item.destination.parent
+            try:
+                replacement.rename(detached)
+            except OSError:
+                return original_copy(item, temporary, *args, **kwargs)
+            replacement.mkdir()
+            swapped = True
+        return original_copy(item, temporary, *args, **kwargs)
+
+    monkeypatch.setattr(importer, "_copy_source_to_temporary", replace_parent_then_copy)
+    monkeypatch.setattr(importer, "_cleanup_owned_temporary", lambda *args, **kwargs: None)
+    error: BaseException | None = None
+    try:
+        importer.apply_import(plan)
+    except BaseException as exc:
+        error = exc
+
+    assert error is None or isinstance(error, importer.PortableMigrationError)
+    assert not swapped or replacement is not None
+    if swapped and replacement is not None:
+        assert all(path.read_bytes() != b"user-data" for path in replacement.iterdir())
+
+
 def test_parent_junction_race_cannot_publish_outside_package(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -580,23 +677,35 @@ def test_parent_junction_race_cannot_publish_outside_package(
     outside.mkdir()
     detached = new / "detached-user"
     raced_parent: Path | None = None
+    attack_blocked = False
 
-    def racing_copy(item, temporary):
-        nonlocal raced_parent
+    def racing_copy(item, temporary, *args, **kwargs):
+        nonlocal raced_parent, attack_blocked
         if raced_parent is not None:
-            return original(item, temporary)
+            return original(item, temporary, *args, **kwargs)
         raced_parent = item.destination.parent
-        raced_parent.rename(detached)
+        try:
+            raced_parent.rename(detached)
+        except OSError:
+            attack_blocked = True
+            return original(item, temporary, *args, **kwargs)
         _junction(raced_parent, outside)
-        return original(item, temporary)
+        return original(item, temporary, *args, **kwargs)
 
     monkeypatch.setattr(importer, "_copy_source_to_temporary", racing_copy)
     try:
-        with pytest.raises(importer.PortableMigrationError, match="changed|drift|escape|unsafe|identity"):
+        if attack_blocked:
             importer.apply_import(plan)
+        else:
+            try:
+                importer.apply_import(plan)
+            except importer.PortableMigrationError as exc:
+                assert re.search("changed|drift|escape|unsafe|identity", str(exc), re.I)
+            else:
+                assert attack_blocked
         assert not (outside / "project.json").exists()
     finally:
-        if raced_parent is not None and raced_parent.exists():
+        if raced_parent is not None and detached.exists() and raced_parent.exists():
             os.rmdir(raced_parent)
 
 
@@ -611,24 +720,33 @@ def test_publish_parent_race_uses_frozen_directory_and_temp_identity(
     outside.mkdir()
     detached = new / "detached-publish-parent"
     raced_parent: Path | None = None
+    attack_blocked = False
 
     def racing_publish(temporary: Path, destination: Path, **kwargs) -> None:
-        nonlocal raced_parent
+        nonlocal raced_parent, attack_blocked
         if raced_parent is not None:
             return original(temporary, destination, **kwargs)
         raced_parent = destination.parent
-        raced_parent.rename(detached)
+        try:
+            raced_parent.rename(detached)
+        except OSError:
+            attack_blocked = True
+            return original(temporary, destination, **kwargs)
         _junction(raced_parent, outside)
         shutil.copy2(detached / temporary.name, outside / temporary.name)
         return original(temporary, destination, **kwargs)
 
     monkeypatch.setattr(importer, "_publish_no_replace", racing_publish)
     try:
-        with pytest.raises(importer.PortableMigrationError, match="changed|drift|escape|unsafe|identity"):
+        try:
             importer.apply_import(plan)
+        except importer.PortableMigrationError as exc:
+            assert re.search("changed|drift|escape|unsafe|identity", str(exc), re.I)
+        else:
+            assert attack_blocked
         assert not (outside / "project.json").exists()
     finally:
-        if raced_parent is not None and raced_parent.exists():
+        if raced_parent is not None and detached.exists() and raced_parent.exists():
             os.rmdir(raced_parent)
 
 
@@ -687,8 +805,8 @@ def test_apply_detects_source_change_while_copying_and_never_publishes_target(
     plan = importer.plan_import(old, new)
     original = importer._copy_source_to_temporary
 
-    def changing_copy(item, temporary):
-        result = original(item, temporary)
+    def changing_copy(item, temporary, *args, **kwargs):
+        result = original(item, temporary, *args, **kwargs)
         item.source.write_text("changed-during-copy", encoding="utf-8")
         return result
 

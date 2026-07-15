@@ -67,6 +67,18 @@ class DirectoryEvidence:
     file_attributes: int
 
 
+@dataclass
+class WindowsDestinationContext:
+    root: Path
+    root_handle: int
+    directory_handles: dict[str, int]
+
+    def close(self) -> None:
+        for handle in reversed(tuple(dict.fromkeys(self.directory_handles.values()))):
+            _windows_close_handle(handle)
+        self.directory_handles.clear()
+
+
 @dataclass(frozen=True)
 class DirectorySnapshot:
     path: Path
@@ -832,6 +844,7 @@ def _ensure_destination_parent(
     plan: ImportPlan,
     destination: Path,
     created: dict[str, DirectoryEvidence],
+    windows_context: WindowsDestinationContext | None = None,
 ) -> None:
     root = plan.new_root
     planned = {_path_key(item.path): item for item in plan.new_directories}
@@ -840,6 +853,7 @@ def _ensure_destination_parent(
     except ValueError as exc:
         raise PortableMigrationError("migration target escapes the new package root") from exc
     current = root
+    current_handle = windows_context.root_handle if windows_context is not None else None
     for part in ((), *relative.parts):
         if part:
             current /= part
@@ -849,6 +863,39 @@ def _ensure_destination_parent(
             raise PortableMigrationError(
                 f"migration target directory was not frozen by the plan: {current}"
             )
+        if windows_context is not None:
+            if not part:
+                handle = windows_context.root_handle
+            else:
+                if current_handle is None:
+                    raise PortableMigrationError("migration destination parent handle is unavailable")
+                handle = windows_context.directory_handles.get(key)
+                if handle is None:
+                    handle = _windows_open_relative(
+                        current_handle,
+                        part,
+                        directory=True,
+                        create=snapshot.evidence is None and key not in created,
+                        display_path=current,
+                    )
+                    windows_context.directory_handles[key] = handle
+            expected = created.get(key, snapshot.evidence)
+            if expected is None:
+                expected = _windows_directory_evidence(handle)
+                created[key] = expected
+            elif not _windows_directory_handle_matches(handle, expected):
+                raise PortableMigrationError(
+                    f"planned destination directory identity changed: {current}"
+                )
+            if _windows_handle_metadata(handle)[5] & _REPARSE_POINT:
+                raise PortableMigrationError(
+                    f"migration target directory is an unsafe reparse point: {current}"
+                )
+            _windows_assert_handle_below_root(
+                handle, windows_context.root_handle, "migration destination directory"
+            )
+            current_handle = handle
+            continue
         if snapshot.evidence is not None or key in created:
             _verify_directory_snapshot(snapshot, created, "destination directory")
             continue
@@ -866,14 +913,22 @@ def _ensure_destination_parent(
             )
         try:
             current.mkdir()
-        except FileExistsError:
-            pass
+        except FileExistsError as exc:
+            raise PortableMigrationError(
+                f"migration target directory appeared during creation: {current}"
+            ) from exc
         except OSError as exc:
             raise PortableMigrationError(f"cannot create migration target directory: {current}: {exc}") from exc
         created[key] = _capture_directory(current, "migration target directory")
 
 
-def _copy_source_to_temporary(item: ImportItem, temporary: Path) -> FileEvidence:
+def _copy_source_to_temporary(
+    item: ImportItem,
+    temporary: Path,
+    *,
+    parent_handle: int | None = None,
+    retained_handle: list[int] | None = None,
+) -> FileEvidence:
     relative = _relative_path(item.relative_path, "migration item path")
     source_root = item.source
     destination_root = item.destination
@@ -886,6 +941,71 @@ def _copy_source_to_temporary(item: ImportItem, temporary: Path) -> FileEvidence
         item.destination
     ):
         raise PortableMigrationError(f"migration target path is inconsistent: {item.relative_path}")
+    if os.name == "nt" and parent_handle is not None:
+        temporary_handle: int | None = None
+        try:
+            temporary_handle = _windows_open_relative(
+                parent_handle,
+                temporary.name,
+                directory=False,
+                create=True,
+                display_path=temporary,
+            )
+            with item.source.open("rb") as source:
+                before = os.fstat(source.fileno())
+                if _stat_identity(before) != (
+                    item.evidence.device,
+                    item.evidence.inode,
+                    item.evidence.size_bytes,
+                    item.evidence.mtime_ns,
+                    item.evidence.nlink,
+                    item.evidence.file_attributes,
+                ):
+                    raise PortableMigrationError(
+                        f"migration source identity changed: {item.relative_path}"
+                    )
+                import msvcrt
+
+                _windows_assert_handle_inside(
+                    msvcrt.get_osfhandle(source.fileno()), source_root, "migration source"
+                )
+                _windows_assert_handle_below_root(
+                    temporary_handle, parent_handle, "migration temporary file"
+                )
+                digest = hashlib.sha256()
+                copied = 0
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    _windows_write_all(temporary_handle, block)
+                    digest.update(block)
+                    copied += len(block)
+                _windows_flush_handle(temporary_handle)
+                after = os.fstat(source.fileno())
+            if _stat_identity(before) != _stat_identity(after):
+                raise PortableMigrationError(
+                    f"migration source changed while copying: {item.relative_path}"
+                )
+            if copied != item.size_bytes or digest.hexdigest() != item.sha256:
+                raise PortableMigrationError(
+                    f"migration source content changed while copying: {item.relative_path}"
+                )
+            evidence = _windows_file_evidence(temporary_handle, digest.hexdigest())
+            if retained_handle is not None:
+                retained_handle.append(temporary_handle)
+                temporary_handle = None
+            return evidence
+        except PortableMigrationError:
+            if temporary_handle is not None:
+                _windows_delete_handle(temporary_handle)
+            raise
+        except OSError as exc:
+            if temporary_handle is not None:
+                _windows_delete_handle(temporary_handle)
+            raise PortableMigrationError(
+                f"cannot copy migration item {item.relative_path}: {exc}"
+            ) from exc
+        finally:
+            if temporary_handle is not None:
+                _windows_close_handle(temporary_handle)
     try:
         with item.source.open("rb") as source, temporary.open("xb") as target:
             before = os.fstat(source.fileno())
@@ -927,7 +1047,14 @@ def _copy_source_to_temporary(item: ImportItem, temporary: Path) -> FileEvidence
     return _capture_file(temporary, "migration temporary file")
 
 
-def _windows_open_handle(path: Path, *, directory: bool, delete: bool) -> int:
+def _windows_open_handle(
+    path: Path,
+    *,
+    directory: bool,
+    delete: bool,
+    share_delete: bool = True,
+    child_access: bool = False,
+) -> int:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     create = kernel32.CreateFileW
     create.argtypes = [
@@ -942,14 +1069,122 @@ def _windows_open_handle(path: Path, *, directory: bool, delete: bool) -> int:
     create.restype = ctypes.c_void_p
     access = 0x00000080 | (0x00010000 if delete else 0)
     if directory:
-        access |= 0x00000001
+        access |= 0x00000001 | (0x00000006 if child_access else 0)
     flags = 0x00200000 | (0x02000000 if directory else 0)
-    handle = create(str(path), access, 0x00000007, None, 3, flags, None)
+    share = 0x00000001 | 0x00000002 | (0x00000004 if share_delete else 0)
+    handle = create(str(path), access, share, None, 3, flags, None)
     invalid = ctypes.c_void_p(-1).value
     if handle in {None, invalid}:
         error = ctypes.get_last_error()
         raise PortableMigrationError(f"cannot open verified Windows path: {path}: error {error}")
     return int(handle)
+
+
+def _windows_open_relative(
+    parent_handle: int,
+    name: str,
+    *,
+    directory: bool,
+    create: bool,
+    display_path: Path,
+) -> int:
+    if not name or name in {".", ".."} or "\\" in name or "/" in name:
+        raise PortableMigrationError(f"unsafe relative Windows path component: {name!r}")
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("length", ctypes.c_ushort),
+            ("maximum_length", ctypes.c_ushort),
+            ("buffer", ctypes.c_wchar_p),
+        ]
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", ctypes.c_ulong),
+            ("root_directory", ctypes.c_void_p),
+            ("object_name", ctypes.POINTER(UnicodeString)),
+            ("attributes", ctypes.c_ulong),
+            ("security_descriptor", ctypes.c_void_p),
+            ("security_quality_of_service", ctypes.c_void_p),
+        ]
+
+    class IoStatusBlock(ctypes.Structure):
+        _fields_ = [("status", ctypes.c_void_p), ("information", ctypes.c_size_t)]
+
+    name_buffer = ctypes.create_unicode_buffer(name)
+    unicode_name = UnicodeString(
+        len(name.encode("utf-16-le")),
+        len(name.encode("utf-16-le")) + 2,
+        ctypes.cast(name_buffer, ctypes.c_wchar_p),
+    )
+    attributes = ObjectAttributes(
+        ctypes.sizeof(ObjectAttributes),
+        ctypes.c_void_p(parent_handle),
+        ctypes.pointer(unicode_name),
+        0x00000040,
+        None,
+        None,
+    )
+    io_status = IoStatusBlock()
+    handle = ctypes.c_void_p()
+    desired_access = 0x00000080 | 0x00100000
+    share_access = 0x00000001 | 0x00000002
+    options = 0x00000020 | 0x00200000
+    if directory:
+        desired_access |= 0x00000007
+        options |= 0x00000001
+    else:
+        desired_access |= 0x00000002 | 0x00010000
+        share_access |= 0x00000004
+        options |= 0x00000040
+    ntdll = ctypes.WinDLL("ntdll")
+    nt_create = ntdll.NtCreateFile
+    nt_create.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_ulong,
+        ctypes.POINTER(ObjectAttributes),
+        ctypes.POINTER(IoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+    ]
+    nt_create.restype = ctypes.c_long
+    status = int(
+        nt_create(
+            ctypes.byref(handle),
+            desired_access,
+            ctypes.byref(attributes),
+            ctypes.byref(io_status),
+            None,
+            0x00000080,
+            share_access,
+            2 if create else 1,
+            options,
+            None,
+            0,
+        )
+    )
+    if status < 0:
+        rtl_error = ntdll.RtlNtStatusToDosError
+        rtl_error.argtypes = [ctypes.c_long]
+        rtl_error.restype = ctypes.c_uint32
+        error = int(rtl_error(status))
+        if create and error in {5, 80, 183}:
+            raise PortableMigrationError(
+                f"migration target appeared during relative creation: {display_path}"
+            )
+        raise PortableMigrationError(
+            f"cannot open verified relative Windows path: {display_path}: error {error}"
+        )
+    if handle.value is None:
+        raise PortableMigrationError(
+            f"cannot open verified relative Windows path: {display_path}"
+        )
+    return int(handle.value)
 
 
 def _windows_close_handle(handle: int) -> None:
@@ -993,6 +1228,65 @@ def _windows_handle_metadata(handle: int) -> tuple[int, int, int, int, int, int]
     )
 
 
+def _windows_directory_evidence(handle: int) -> DirectoryEvidence:
+    metadata = _windows_handle_metadata(handle)
+    return DirectoryEvidence(metadata[0], metadata[1], metadata[4], metadata[5])
+
+
+def _windows_file_evidence(handle: int, digest: str) -> FileEvidence:
+    metadata = _windows_handle_metadata(handle)
+    return FileEvidence(*metadata, digest)
+
+
+def _windows_write_all(handle: int, data: bytes) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    write_file = kernel32.WriteFile
+    write_file.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_void_p,
+    ]
+    write_file.restype = ctypes.c_int
+    offset = 0
+    while offset < len(data):
+        block = data[offset:]
+        buffer = ctypes.create_string_buffer(block)
+        written = ctypes.c_uint32()
+        if not write_file(
+            ctypes.c_void_p(handle),
+            ctypes.byref(buffer),
+            len(block),
+            ctypes.byref(written),
+            None,
+        ):
+            error = ctypes.get_last_error()
+            raise PortableMigrationError(
+                f"cannot write migration temporary file: Windows error {error}"
+            )
+        if written.value == 0:
+            raise PortableMigrationError("cannot write migration temporary file: zero-byte write")
+        offset += int(written.value)
+
+
+def _windows_flush_handle(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.FlushFileBuffers(ctypes.c_void_p(handle)):
+        error = ctypes.get_last_error()
+        raise PortableMigrationError(
+            f"cannot flush migration temporary file: Windows error {error}"
+        )
+
+
+def _windows_delete_handle(handle: int) -> None:
+    disposition = ctypes.c_ubyte(1)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle(
+        ctypes.c_void_p(handle), 4, ctypes.byref(disposition), ctypes.sizeof(disposition)
+    )
+
+
 def _windows_final_path(handle: int) -> str:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     get_final = kernel32.GetFinalPathNameByHandleW
@@ -1027,6 +1321,48 @@ def _windows_assert_handle_inside(handle: int, root: Path, label: str) -> None:
     root_key = _path_key(root_final).rstrip("\\")
     if handle_key != root_key and not handle_key.startswith(root_key + "\\"):
         raise PortableMigrationError(f"{label} escapes the portable package root")
+
+
+def _windows_assert_handle_below_root(handle: int, root_handle: int, label: str) -> None:
+    if _windows_handle_metadata(handle)[5] & _REPARSE_POINT:
+        raise PortableMigrationError(f"{label} is an unsafe reparse point")
+    handle_key = _path_key(_windows_final_path(handle)).rstrip("\\")
+    root_key = _path_key(_windows_final_path(root_handle)).rstrip("\\")
+    if handle_key != root_key and not handle_key.startswith(root_key + "\\"):
+        raise PortableMigrationError(f"{label} escapes the verified destination root")
+
+
+def _windows_destination_context(plan: ImportPlan) -> WindowsDestinationContext:
+    root_snapshot = next(
+        (
+            snapshot
+            for snapshot in plan.new_directories
+            if _path_key(snapshot.path) == _path_key(plan.new_root)
+        ),
+        None,
+    )
+    if root_snapshot is None or root_snapshot.evidence is None:
+        raise PortableMigrationError("planned destination root identity is unavailable")
+    root_handle = _windows_open_handle(
+        plan.new_root,
+        directory=True,
+        delete=False,
+        share_delete=False,
+        child_access=True,
+    )
+    try:
+        if not _windows_directory_handle_matches(root_handle, root_snapshot.evidence):
+            raise PortableMigrationError("planned destination root identity changed")
+        if _path_key(_windows_final_path(root_handle)) != _path_key(plan.new_root):
+            raise PortableMigrationError("planned destination root resolved unexpectedly")
+        return WindowsDestinationContext(
+            plan.new_root,
+            root_handle,
+            {_path_key(plan.new_root): root_handle},
+        )
+    except BaseException:
+        _windows_close_handle(root_handle)
+        raise
 
 
 def _windows_file_handle_matches(handle: int, evidence: FileEvidence) -> bool:
@@ -1127,14 +1463,29 @@ def _publish_no_replace(
     expected_temporary: FileEvidence,
     expected_parent: DirectoryEvidence,
     root: Path,
+    temporary_handle: int | None = None,
+    parent_handle: int | None = None,
 ) -> None:
     if os.name == "nt":
-        if not _evidence_matches(temporary, expected_temporary, "migration temporary file"):
-            raise PortableMigrationError("migration temporary identity changed before publish")
+        if temporary_handle is None:
+            if not _evidence_matches(temporary, expected_temporary, "migration temporary file"):
+                raise PortableMigrationError("migration temporary identity changed before publish")
+        elif not _path_stat_matches_file_evidence(temporary, expected_temporary):
+            raise PortableMigrationError("migration temporary path changed before publish")
         if _capture_directory(destination.parent, "migration destination parent") != expected_parent:
             raise PortableMigrationError("migration destination parent identity changed before publish")
-        temporary_handle = _windows_open_handle(temporary, directory=False, delete=True)
-        parent_handle = _windows_open_handle(destination.parent, directory=True, delete=False)
+        owns_temporary = temporary_handle is None
+        owns_parent = parent_handle is None
+        if temporary_handle is None:
+            temporary_handle = _windows_open_handle(temporary, directory=False, delete=True)
+        if parent_handle is None:
+            parent_handle = _windows_open_handle(
+                destination.parent,
+                directory=True,
+                delete=False,
+                share_delete=False,
+                child_access=True,
+            )
         try:
             if not _windows_file_handle_matches(temporary_handle, expected_temporary):
                 raise PortableMigrationError("migration temporary identity changed during publish")
@@ -1153,8 +1504,10 @@ def _publish_no_replace(
                 temporary_handle, parent_handle, destination.name, destination
             )
         finally:
-            _windows_close_handle(parent_handle)
-            _windows_close_handle(temporary_handle)
+            if owns_parent:
+                _windows_close_handle(parent_handle)
+            if owns_temporary:
+                _windows_close_handle(temporary_handle)
         return
     try:
         os.link(temporary, destination)
@@ -1166,8 +1519,22 @@ def _publish_no_replace(
 
 
 def _cleanup_owned_temporary(
-    temporary: Path, expected: FileEvidence | None, root: Path
+    temporary: Path,
+    expected: FileEvidence | None,
+    root: Path,
+    retained_handle: int | None = None,
 ) -> None:
+    if os.name == "nt" and retained_handle is not None:
+        if (
+            expected is not None
+            and _windows_file_handle_matches(retained_handle, expected)
+            and _path_stat_matches_file_evidence(temporary, expected)
+        ):
+            _windows_assert_handle_inside(
+                retained_handle, root, "migration temporary cleanup candidate"
+            )
+            _windows_delete_handle(retained_handle)
+        return
     if expected is None or not _evidence_matches(
         temporary, expected, "migration temporary cleanup candidate"
     ):
@@ -1202,21 +1569,44 @@ def _copy_without_overwrite(
     item: ImportItem,
     plan: ImportPlan,
     created: dict[str, DirectoryEvidence],
+    windows_context: WindowsDestinationContext | None = None,
 ) -> None:
     _verify_import_state(plan, created)
-    _ensure_destination_parent(plan, item.destination, created)
+    _ensure_destination_parent(plan, item.destination, created, windows_context)
     if item.destination.exists():
         raise PortableMigrationError(f"migration target appeared after planning: {item.relative_path}")
     temporary = item.destination.parent / (
         f"{item.destination.name}.tts-more-import-{uuid.uuid4().hex}.tmp"
     )
     expected_temporary: FileEvidence | None = None
+    retained_temporary: list[int] = []
     try:
-        expected_temporary = _copy_source_to_temporary(item, temporary)
+        parent_handle = (
+            windows_context.directory_handles.get(_path_key(item.destination.parent))
+            if windows_context is not None
+            else None
+        )
+        if windows_context is not None and parent_handle is None:
+            raise PortableMigrationError("migration destination parent handle is unavailable")
+        expected_temporary = _copy_source_to_temporary(
+            item,
+            temporary,
+            parent_handle=parent_handle,
+            retained_handle=retained_temporary,
+        )
         _verify_import_state(plan, created)
         if not _evidence_matches(item.source, item.evidence, "migration source"):
             raise PortableMigrationError(f"migration source identity changed: {item.relative_path}")
-        copied = _capture_file(temporary, "migration temporary file")
+        if retained_temporary:
+            copied = _windows_file_evidence(
+                retained_temporary[0], expected_temporary.sha256
+            )
+            if not _path_stat_matches_file_evidence(temporary, copied):
+                raise PortableMigrationError(
+                    f"migration temporary path identity changed: {item.relative_path}"
+                )
+        else:
+            copied = _capture_file(temporary, "migration temporary file")
         if copied != expected_temporary:
             raise PortableMigrationError(f"migration temporary identity changed: {item.relative_path}")
         if copied.size_bytes != item.size_bytes or copied.sha256 != item.sha256:
@@ -1242,9 +1632,18 @@ def _copy_without_overwrite(
             expected_temporary=copied,
             expected_parent=expected_parent,
             root=plan.new_root,
+            temporary_handle=retained_temporary[0] if retained_temporary else None,
+            parent_handle=parent_handle,
         )
     finally:
-        _cleanup_owned_temporary(temporary, expected_temporary, plan.new_root)
+        _cleanup_owned_temporary(
+            temporary,
+            expected_temporary,
+            plan.new_root,
+            retained_temporary[0] if retained_temporary else None,
+        )
+        for handle in retained_temporary:
+            _windows_close_handle(handle)
 
 
 def apply_import(plan: ImportPlan) -> ImportReport:
@@ -1257,19 +1656,24 @@ def apply_import(plan: ImportPlan) -> ImportReport:
     if current.plan_digest != plan.plan_digest:
         raise PortableMigrationError("portable migration plan changed or identity drifted")
     created_directories: dict[str, DirectoryEvidence] = {}
-    _verify_import_state(plan, created_directories)
-    copied_user = 0
-    for item in plan.user_files:
-        _copy_without_overwrite(item, plan, created_directories)
-        copied_user += 1
-    for item in plan.reusable_assets:
-        _copy_without_overwrite(item, plan, created_directories)
-    return ImportReport(
-        copied_user_files=copied_user,
-        reused_assets=[item.relative_path for item in plan.reusable_assets],
-        skipped_assets=list(plan.skipped_assets),
-        already_present=list(plan.already_present),
-    )
+    windows_context = _windows_destination_context(plan) if os.name == "nt" else None
+    try:
+        _verify_import_state(plan, created_directories)
+        copied_user = 0
+        for item in plan.user_files:
+            _copy_without_overwrite(item, plan, created_directories, windows_context)
+            copied_user += 1
+        for item in plan.reusable_assets:
+            _copy_without_overwrite(item, plan, created_directories, windows_context)
+        return ImportReport(
+            copied_user_files=copied_user,
+            reused_assets=[item.relative_path for item in plan.reusable_assets],
+            skipped_assets=list(plan.skipped_assets),
+            already_present=list(plan.already_present),
+        )
+    finally:
+        if windows_context is not None:
+            windows_context.close()
 
 
 def _summary(plan: ImportPlan) -> dict[str, object]:

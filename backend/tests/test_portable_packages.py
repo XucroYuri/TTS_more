@@ -94,6 +94,40 @@ def _initialize_git_repository(root: Path) -> None:
     _run_checked(["git", "commit", "--quiet", "-m", "portable schema fixture"], root)
 
 
+def test_no_dev_runtime_can_import_packaged_portable_cli_dependencies() -> None:
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("isolated no-dev runtime smoke requires uv")
+    cli = REPO_ROOT / "scripts" / "import-portable-data.py"
+    command = (
+        "import jsonschema, runpy, sys; "
+        f"sys.path.insert(0, {str(cli.parent)!r}); "
+        f"sys.argv = [{str(cli)!r}, '--help']; "
+        f"runpy.run_path({str(cli)!r}, run_name='__main__')"
+    )
+    completed = subprocess.run(
+        [
+            uv,
+            "run",
+            "--isolated",
+            "--frozen",
+            "--no-dev",
+            "--project",
+            str(REPO_ROOT / "backend"),
+            "python",
+            "-c",
+            command,
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def _copy_controller_builder_fixture(root: Path) -> None:
     root.mkdir(parents=True)
     shutil.copy2(REPO_ROOT / "Build-Package.ps1", root / "Build-Package.ps1")
@@ -777,6 +811,152 @@ def test_worker_build_failure_cleans_only_its_unique_staging(tmp_path: Path) -> 
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
         shutil.rmtree(output_root, ignore_errors=True)
+
+
+def test_worker_cleanup_never_recursively_deletes_replacement_work_directory(
+    tmp_path: Path,
+) -> None:
+    if os.name != "nt" or POWERSHELL is None:
+        pytest.skip("Windows worker cleanup identity contract requires PowerShell")
+    worker_root = tmp_path / "worker"
+    _load_sync_integrations().sync_integration(
+        REPO_ROOT, worker_root, "gpt-sovits", "a" * 40
+    )
+    portable_packages = worker_root / "tts_more" / "portable_packages.py"
+    portable_packages.write_text(
+        """from pathlib import Path
+import os
+
+work = Path(__file__).resolve().parents[3]
+moved = Path(os.environ["TTS_MORE_CLEANUP_ATTACK_MOVED"])
+work.rename(moved)
+work.mkdir()
+(work / "replacement-sentinel.txt").write_text("preserve replacement\\n", encoding="utf-8")
+raise RuntimeError("forced worker cleanup replacement attack")
+""",
+        encoding="utf-8",
+    )
+    _initialize_git_repository(worker_root)
+    work_root = _external_worker_test_root(tmp_path, "worker-cleanup")
+    output_root = _external_worker_test_root(tmp_path, "worker-cleanup-output")
+    moved = work_root.parent / f"{work_root.name}-moved-original"
+    try:
+        completed = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(worker_root / "Build-Package.ps1"),
+                "-Profile",
+                "Bootstrap",
+                "-Device",
+                "CPU",
+                "-Version",
+                "d2-worker-cleanup-replacement",
+                "-OutputRoot",
+                str(output_root),
+                "-WorkRoot",
+                str(work_root),
+            ],
+            cwd=worker_root,
+            env={
+                **os.environ,
+                "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
+                "TTS_MORE_CLEANUP_ATTACK_MOVED": str(moved),
+            },
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        message = (completed.stdout + completed.stderr).lower()
+        assert completed.returncode != 0
+        assert "forced worker cleanup replacement attack" in message
+        replacements = list(work_root.glob("tts-more-worker-*"))
+        assert len(replacements) == 1
+        assert (replacements[0] / "replacement-sentinel.txt").read_text(
+            encoding="utf-8"
+        ) == "preserve replacement\n"
+    finally:
+        _remove_test_tree(work_root)
+        _remove_test_tree(output_root)
+        _remove_test_tree(moved)
+
+
+def test_controller_cleanup_never_recursively_deletes_replacement_work_directory(
+    tmp_path: Path,
+) -> None:
+    if os.name != "nt" or POWERSHELL is None:
+        pytest.skip("Windows controller cleanup identity contract requires PowerShell")
+    controller_root = tmp_path / "controller"
+    _copy_controller_builder_fixture(controller_root)
+    portable_packages = controller_root / "scripts" / "portable_packages.py"
+    portable_packages.write_text(
+        """from pathlib import Path
+import os
+
+work = Path(__file__).resolve().parents[2]
+moved = Path(os.environ["TTS_MORE_CLEANUP_ATTACK_MOVED"])
+work.rename(moved)
+work.mkdir()
+(work / "replacement-sentinel.txt").write_text("preserve replacement\\n", encoding="utf-8")
+raise RuntimeError("forced cleanup replacement attack")
+""",
+        encoding="utf-8",
+    )
+    _initialize_git_repository(controller_root)
+    work_root = _external_worker_test_root(tmp_path, "controller-cleanup")
+    output_root = _external_worker_test_root(tmp_path, "controller-cleanup-output")
+    moved = work_root.parent / f"{work_root.name}-moved-original"
+    try:
+        completed = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(controller_root / "Build-Package.ps1"),
+                "-Profile",
+                "Bootstrap",
+                "-Device",
+                "CPU",
+                "-Version",
+                "d2-cleanup-replacement",
+                "-OutputRoot",
+                str(output_root),
+                "-WorkRoot",
+                str(work_root),
+            ],
+            cwd=controller_root,
+            env={
+                **os.environ,
+                "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
+                "TTS_MORE_CLEANUP_ATTACK_MOVED": str(moved),
+            },
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        message = (completed.stdout + completed.stderr).lower()
+        assert completed.returncode != 0
+        assert "forced cleanup replacement attack" in message
+        replacements = list(work_root.glob("tts-more-controller-*"))
+        assert len(replacements) == 1
+        assert (replacements[0] / "replacement-sentinel.txt").read_text(
+            encoding="utf-8"
+        ) == "preserve replacement\n"
+    finally:
+        _remove_test_tree(work_root)
+        _remove_test_tree(output_root)
+        _remove_test_tree(moved)
 
 
 def test_worker_full_github_gate_precedes_work_root_side_effects(tmp_path: Path) -> None:
