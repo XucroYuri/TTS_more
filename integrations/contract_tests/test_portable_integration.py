@@ -390,6 +390,10 @@ $mainTries = @($controller.FindAll({ param($node) $node -is [System.Management.A
 Assert-Contract ($mainTries.Count -eq 1) "controller must have exactly one direct main try statement"
 $mainTry = $mainTries[0]
 
+$errorBody = $errorFunction.Body
+$cleanBlockProperty = $errorBody.PSObject.Properties["CleanBlock"]
+Assert-Contract ($null -eq $errorBody.DynamicParamBlock -and $null -eq $errorBody.BeginBlock -and
+    $null -eq $errorBody.ProcessBlock -and ($null -eq $cleanBlockProperty -or $null -eq $cleanBlockProperty.Value)) "Throw-PortableStartError must not contain bypass named blocks"
 $errorParameters = @($errorFunction.Body.ParamBlock.Parameters)
 Assert-Contract ($errorParameters.Count -eq 2 -and
     $errorParameters[0].Name.VariablePath.UserPath -ceq "Code" -and $errorParameters[0].StaticType -eq [string] -and

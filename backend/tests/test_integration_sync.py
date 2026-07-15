@@ -395,6 +395,12 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
             'throw [PortableStartException]::new($Code, $Message)',
             '$null = [PortableStartException]::new($Code, $Message)',
         ),
+        (
+            "tts_more/Invoke-PortableStart.ps1",
+            'throw [PortableStartException]::new($Code, $Message)',
+            'begin { exit 0 }\n'
+            '    end { throw [PortableStartException]::new($Code, $Message) }',
+        ),
     ),
 )
 def test_copied_contract_rejects_commented_decoys_and_mutated_active_control_flow(
