@@ -10,7 +10,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPONENTS = ("gpt-sovits", "indextts", "cosyvoice")
 PROFILES = ("cpu", "cu126", "cu128")
 PROBE_FILES = ("component-source.json", "runtime.lock.json")
-LOCAL_COMPONENT_MODULES = {"gpt_sovits", "indextts", "cosyvoice"}
+LOCAL_COMPONENT_MODULES = {
+    "gpt-sovits": {"gpt_sovits"},
+    "indextts": {"indextts"},
+    "cosyvoice": {"cosyvoice"},
+}
 
 
 def _canonical_distribution_name(value: str) -> str:
@@ -80,6 +84,20 @@ def test_every_device_requirements_lock_is_exact_and_hash_pinned() -> None:
                 )
 
 
+def test_each_component_only_excludes_its_own_local_probe_module() -> None:
+    expected = {
+        "gpt-sovits": {"gpt_sovits"},
+        "indextts": {"indextts"},
+        "cosyvoice": {"cosyvoice"},
+    }
+    assert LOCAL_COMPONENT_MODULES == expected
+
+    all_component_modules = set().union(*expected.values())
+    for component, local_modules in expected.items():
+        external_modules = all_component_modules - LOCAL_COMPONENT_MODULES[component]
+        assert external_modules == all_component_modules - local_modules
+
+
 def test_import_probes_only_reference_locked_or_component_local_modules() -> None:
     missing: list[str] = []
     for component in COMPONENTS:
@@ -90,7 +108,7 @@ def test_import_probes_only_reference_locked_or_component_local_modules() -> Non
             probe_modules[probe_file] = {
                 module
                 for module in _probe_import_roots(payload["import_probe"])
-                if module.lower() not in LOCAL_COMPONENT_MODULES
+                if module.lower() not in LOCAL_COMPONENT_MODULES[component]
             }
 
         for profile in PROFILES:
