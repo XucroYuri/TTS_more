@@ -589,6 +589,12 @@ def _run_bounded_selector(
     wake = threading.Event()
     out_done = threading.Event()
     err_done = threading.Event()
+    process_exited = False
+    process_completed = False
+    process_returncode: int | None = None
+    tree_terminated = False
+    job_closed = False
+    resources_closed = False
 
     def read_bounded(pipe: Any, target: bytearray, done: threading.Event) -> None:
         try:
@@ -606,21 +612,59 @@ def _run_bounded_selector(
             done.set()
             wake.set()
 
-    def terminate_tree() -> None:
-        try:
-            job.terminate()
-        except OSError:
-            pass
+    def close_job() -> None:
+        nonlocal job_closed
+        if job_closed:
+            return
+        job_closed = True
         try:
             job.close()
         except OSError:
             pass
+
+    def close_resources() -> None:
+        nonlocal resources_closed
+        if resources_closed:
+            return
+        resources_closed = True
+        for pipe in (
+            getattr(process, "stdout", None),
+            getattr(process, "stderr", None),
+        ):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        for thread in threads:
+            try:
+                thread.join(timeout=1)
+            except (OSError, RuntimeError):
+                pass
+
+    def terminate_tree() -> None:
+        nonlocal tree_terminated
+        if tree_terminated:
+            return
+        tree_terminated = True
+        try:
+            job.terminate()
+        except OSError:
+            pass
+        close_job()
         if process is not None:
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+                process.wait(timeout=0.25)
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    process.kill()
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+        close_resources()
 
     try:
         flags = int(creationflags)
@@ -661,47 +705,43 @@ def _run_bounded_selector(
         deadline = time.monotonic() + timeout
         while True:
             if overflow.is_set():
-                terminate_tree()
                 raise FolderSelectionError("LOCAL_CONTROL_FOLDER_OUTPUT_INVALID")
-            if process.poll() is not None and out_done.is_set() and err_done.is_set():
+            if not process_exited:
+                try:
+                    returncode = process.poll()
+                except (OSError, subprocess.SubprocessError):
+                    raise FolderSelectionError("LOCAL_CONTROL_FOLDER_FAILED") from None
+                if returncode is not None:
+                    process_exited = True
+                    process_returncode = int(returncode)
+            if process_exited and out_done.is_set() and err_done.is_set():
+                process_completed = True
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                terminate_tree()
                 raise FolderSelectionError("LOCAL_CONTROL_FOLDER_TIMEOUT")
             wake.wait(min(remaining, 0.05))
             wake.clear()
+        assert process_returncode is not None
         return subprocess.CompletedProcess(
             list(command),
-            int(process.returncode),
+            process_returncode,
             bytes(out_buffer),
             bytes(err_buffer),
         )
     except FolderSelectionError:
-        raise
-    except (OSError, ValueError):
-        if process is not None and process.poll() is None:
+        if process is not None and not process_completed:
             terminate_tree()
         raise
+    except (OSError, subprocess.SubprocessError, ValueError):
+        if process is not None and not process_completed:
+            terminate_tree()
+        raise FolderSelectionError("LOCAL_CONTROL_FOLDER_FAILED") from None
     finally:
-        if process is not None and process.poll() is None:
+        if process is not None and not process_completed:
             terminate_tree()
-        for pipe in (
-            getattr(process, "stdout", None),
-            getattr(process, "stderr", None),
-        ):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
-        for thread in threads:
-            thread.join(timeout=1)
-        try:
-            job.close()
-        except OSError:
-            # Cleanup must not replace the selector's bounded structured error.
-            pass
+        close_resources()
+        close_job()
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

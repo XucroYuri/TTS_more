@@ -1369,6 +1369,227 @@ def test_folder_selector_accepts_only_one_strict_json_object(
     assert caught.value.code == "LOCAL_CONTROL_FOLDER_OUTPUT_INVALID"
 
 
+class _SelectorPipe:
+    def __init__(self, chunks: list[bytes], *, close_error: bool = False) -> None:
+        self.chunks = list(chunks)
+        self.close_error = close_error
+        self.close_calls = 0
+
+    def read1(self, _size: int) -> bytes:
+        return self.chunks.pop(0) if self.chunks else b""
+
+    def read(self, size: int) -> bytes:
+        return self.read1(size)
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error:
+            raise OSError("secret pipe close failure")
+
+
+class _SelectorProcess:
+    def __init__(
+        self,
+        *,
+        poll_result: int | None = None,
+        poll_error: bool = False,
+        wait_error: bool = False,
+        kill_error: bool = False,
+        stdout_chunks: list[bytes] | None = None,
+        stderr_chunks: list[bytes] | None = None,
+        pipe_close_error: bool = False,
+    ) -> None:
+        self.pid = 4200
+        self.returncode = poll_result
+        self.poll_error = poll_error
+        self.wait_error = wait_error
+        self.kill_error = kill_error
+        self.poll_calls = 0
+        self.wait_calls = 0
+        self.kill_calls = 0
+        self.stdout = _SelectorPipe(stdout_chunks or [], close_error=pipe_close_error)
+        self.stderr = _SelectorPipe(stderr_chunks or [], close_error=pipe_close_error)
+
+    def poll(self) -> int | None:
+        self.poll_calls += 1
+        if self.poll_error:
+            raise OSError("secret poll failure")
+        return self.returncode
+
+    def wait(self, timeout=None) -> int:
+        self.wait_calls += 1
+        if self.wait_error:
+            raise OSError("secret wait failure")
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("secret selector", timeout)
+        return self.returncode
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        if self.kill_error:
+            raise OSError("secret kill failure")
+        self.returncode = 1
+
+
+class _SelectorJob:
+    def __init__(self, *, terminate_error: bool = False, close_error: bool = False) -> None:
+        self.terminate_error = terminate_error
+        self.close_error = close_error
+        self.assign_calls = 0
+        self.resume_calls = 0
+        self.terminate_calls = 0
+        self.close_calls = 0
+
+    def assign(self, _process) -> None:
+        self.assign_calls += 1
+
+    def resume(self, _process) -> None:
+        self.resume_calls += 1
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        if self.terminate_error:
+            raise OSError("secret terminate failure")
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error:
+            raise OSError("secret job close failure")
+
+
+class _InlineSelectorThread:
+    instances: list["_InlineSelectorThread"] = []
+
+    def __init__(self, *, target, args, **_kwargs) -> None:
+        self.target = target
+        self.args = args
+        self.join_calls = 0
+        self.__class__.instances.append(self)
+
+    def start(self) -> None:
+        self.target(*self.args)
+
+    def join(self, timeout=None) -> None:
+        self.join_calls += 1
+
+
+def _install_fake_selector_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    process: _SelectorProcess,
+    job: _SelectorJob,
+) -> None:
+    _InlineSelectorThread.instances = []
+    monkeypatch.setattr(local_control, "WindowsKillOnCloseJob", lambda: job)
+    monkeypatch.setattr(local_control.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(local_control.threading, "Thread", _InlineSelectorThread)
+
+
+def test_bounded_selector_poll_error_is_structured_and_cleans_every_resource(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _SelectorProcess(poll_error=True)
+    job = _SelectorJob()
+    _install_fake_selector_runtime(monkeypatch, process, job)
+
+    with pytest.raises(FolderSelectionError) as failure:
+        local_control._run_bounded_selector(
+            ["selector.exe"],
+            cwd=tmp_path,
+            env={},
+            timeout=1,
+            output_limit=1024,
+        )
+
+    assert failure.value.code == "LOCAL_CONTROL_FOLDER_FAILED"
+    assert "secret" not in str(failure.value)
+    assert job.assign_calls == 1
+    assert job.resume_calls == 1
+    assert job.terminate_calls == 1
+    assert job.close_calls == 1
+    assert process.stdout.close_calls == 1
+    assert process.stderr.close_calls == 1
+    assert [thread.join_calls for thread in _InlineSelectorThread.instances] == [1, 1]
+
+
+def test_bounded_selector_cleanup_continues_when_every_termination_step_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _SelectorProcess(
+        poll_error=True,
+        wait_error=True,
+        kill_error=True,
+        pipe_close_error=True,
+    )
+    job = _SelectorJob(terminate_error=True, close_error=True)
+    _install_fake_selector_runtime(monkeypatch, process, job)
+
+    with pytest.raises(FolderSelectionError) as failure:
+        local_control._run_bounded_selector(
+            ["selector.exe"],
+            cwd=tmp_path,
+            env={},
+            timeout=1,
+            output_limit=1024,
+        )
+
+    assert failure.value.code == "LOCAL_CONTROL_FOLDER_FAILED"
+    assert "secret" not in str(failure.value)
+    assert job.terminate_calls == 1
+    assert job.close_calls == 1
+    assert process.wait_calls >= 1
+    assert process.kill_calls == 1
+    assert process.stdout.close_calls == 1
+    assert process.stderr.close_calls == 1
+    assert [thread.join_calls for thread in _InlineSelectorThread.instances] == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_code", "expected_terminate"),
+    [
+        ("normal", None, 0),
+        ("overflow", "LOCAL_CONTROL_FOLDER_OUTPUT_INVALID", 1),
+        ("timeout", "LOCAL_CONTROL_FOLDER_TIMEOUT", 1),
+    ],
+)
+def test_bounded_selector_cleanup_is_idempotent_for_every_exit_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_code: str | None,
+    expected_terminate: int,
+) -> None:
+    process = _SelectorProcess(
+        poll_result=0 if scenario == "normal" else None,
+        stdout_chunks=[b"ok"] if scenario == "normal" else ([b"x" * 2048] if scenario == "overflow" else []),
+    )
+    job = _SelectorJob()
+    _install_fake_selector_runtime(monkeypatch, process, job)
+
+    if expected_code is None:
+        completed = local_control._run_bounded_selector(
+            ["selector.exe"], cwd=tmp_path, env={}, timeout=1, output_limit=1024
+        )
+        assert completed.returncode == 0
+    else:
+        with pytest.raises(FolderSelectionError) as failure:
+            local_control._run_bounded_selector(
+                ["selector.exe"],
+                cwd=tmp_path,
+                env={},
+                timeout=0.001 if scenario == "timeout" else 1,
+                output_limit=1024,
+            )
+        assert failure.value.code == expected_code
+
+    assert job.terminate_calls == expected_terminate
+    assert job.close_calls == 1
+    assert process.stdout.close_calls == 1
+    assert process.stderr.close_calls == 1
+    assert [thread.join_calls for thread in _InlineSelectorThread.instances] == [1, 1]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object process-tree control is platform-specific")
 @pytest.mark.parametrize("stream", ("stdout", "stderr"))
 def test_bounded_selector_terminates_immediately_when_either_stream_overflows(
