@@ -353,6 +353,151 @@ def test_worker_bootstrap_uses_short_external_unique_staging_from_deep_checkout(
         shutil.rmtree(output_root, ignore_errors=True)
 
 
+@pytest.mark.parametrize("mode", ("root", "child", "default-child"))
+def test_worker_rejects_work_root_at_or_below_source_before_side_effects(
+    tmp_path: Path, mode: str
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("Windows worker WorkRoot overlap contract requires PowerShell")
+    fixture_root = _external_worker_test_root(tmp_path, f"overlap-{mode}")
+    worker_root = fixture_root / "source"
+    output_root = fixture_root / "output"
+    _load_sync_integrations().sync_integration(
+        REPO_ROOT, worker_root, "gpt-sovits", "a" * 40
+    )
+    source_sentinel = worker_root / "source-sentinel.txt"
+    sibling_sentinel = worker_root / "source-sibling" / "keep.txt"
+    source_sentinel.write_text("source sentinel\n", encoding="utf-8")
+    sibling_sentinel.parent.mkdir(parents=True)
+    sibling_sentinel.write_text("source sibling\n", encoding="utf-8")
+    _initialize_git_repository(worker_root)
+    before_status = subprocess.check_output(
+        ["git", "status", "--short"], cwd=worker_root, text=True
+    )
+    before_sentinels = (source_sentinel.read_bytes(), sibling_sentinel.read_bytes())
+    environment = {
+        **os.environ,
+        "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
+    }
+    arguments = [
+        POWERSHELL,
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(worker_root / "Build-Package.ps1"),
+        "-Profile",
+        "Bootstrap",
+        "-Device",
+        "CPU",
+        "-Version",
+        "v" * 128 if mode == "root" else f"d2-overlap-{mode}",
+        "-OutputRoot",
+        str(output_root),
+    ]
+    if mode == "root":
+        work_root = Path(str(worker_root).upper())
+        arguments.extend(["-WorkRoot", str(work_root)])
+    else:
+        work_root = worker_root / "artifacts" / mode
+        if mode == "child":
+            arguments.extend(["-WorkRoot", str(work_root)])
+        else:
+            environment.update({"TEMP": str(work_root), "TMP": str(work_root)})
+    try:
+        completed = subprocess.run(
+            arguments,
+            cwd=worker_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=45,
+        )
+        message = (completed.stdout + completed.stderr).lower()
+        assert completed.returncode != 0
+        assert "workroot must be outside source checkout" in message
+        assert "-workroot" in message
+        assert not output_root.exists()
+        assert (source_sentinel.read_bytes(), sibling_sentinel.read_bytes()) == before_sentinels
+        assert (
+            subprocess.check_output(
+                ["git", "status", "--short"], cwd=worker_root, text=True
+            )
+            == before_status
+        )
+        assert not list(worker_root.rglob("tts-more-worker-*"))
+        if mode == "child":
+            assert not work_root.exists()
+        elif mode == "default-child":
+            assert not list(work_root.glob("tts-more-worker-*"))
+    finally:
+        shutil.rmtree(fixture_root, ignore_errors=True)
+
+
+def test_worker_allows_similar_prefix_sibling_work_root(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("Windows worker WorkRoot boundary contract requires PowerShell")
+    fixture_root = _external_worker_test_root(tmp_path, "overlap-prefix")
+    worker_root = fixture_root / "source"
+    work_root = fixture_root / "source-work"
+    output_root = fixture_root / "output"
+    _load_sync_integrations().sync_integration(
+        REPO_ROOT, worker_root, "gpt-sovits", "a" * 40
+    )
+    _initialize_git_repository(worker_root)
+    sentinel = work_root / "sibling-build.txt"
+    try:
+        sentinel.parent.mkdir(parents=True)
+        sentinel.write_text("preserve prefix sibling\n", encoding="utf-8")
+        completed = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(worker_root / "Build-Package.ps1"),
+                "-Profile",
+                "Bootstrap",
+                "-Device",
+                "CPU",
+                "-Version",
+                "d2-prefix-sibling",
+                "-OutputRoot",
+                str(output_root),
+                "-WorkRoot",
+                str(work_root),
+            ],
+            cwd=worker_root,
+            env={
+                **os.environ,
+                "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
+            },
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        archives = list(output_root.glob("*.zip"))
+        assert len(archives) == 1
+        assert _load_portable_packages().audit_release_zip(archives[0])["valid"] is True
+        assert sentinel.read_text(encoding="utf-8") == "preserve prefix sibling\n"
+        assert [path for path in work_root.rglob("*") if path.is_file()] == [sentinel]
+        assert not list(work_root.glob("tts-more-worker-*"))
+        assert subprocess.check_output(
+            ["git", "status", "--short"], cwd=worker_root, text=True
+        ).strip() == ""
+    finally:
+        shutil.rmtree(fixture_root, ignore_errors=True)
+
+
 def test_worker_staging_path_budget_fails_before_copy_without_touching_siblings(
     tmp_path: Path,
 ) -> None:

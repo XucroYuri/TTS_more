@@ -582,6 +582,12 @@ def test_worker_builder_uses_bounded_external_unique_staging_and_fails_closed() 
     assert '[string]$WorkRoot = ""' in builder
     assert "[IO.Path]::GetTempPath()" in builder
     assert "[Guid]::NewGuid()" in builder
+    assert "WorkRoot must be outside source checkout" in builder
+    assert "[StringComparison]::OrdinalIgnoreCase" in builder
+    assert "[IO.Path]::DirectorySeparatorChar" in builder
+    assert builder.index("WorkRoot must be outside source checkout") < builder.index(
+        "$workIdentity"
+    )
     assert "worker package staging path budget exceeded before copy" in builder
     assert builder.index("Assert-PortableTreePathBudget") < builder.index(
         "Copy-PortableTree -Source $entry.FullName"
