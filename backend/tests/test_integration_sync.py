@@ -571,3 +571,22 @@ def test_windows_templates_are_safe_for_cpu_only_hosts_and_optional_lock_fields(
     assert "Copy-PortableTree" in builder
     assert "[IO.FileAttributes]::ReparsePoint" in builder
     assert "SoVITS_weights" in builder and "pretrained_models" in builder and "checkpoints" in builder
+
+
+def test_worker_builder_uses_bounded_external_unique_staging_and_fails_closed() -> None:
+    builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+    root_wrapper = _load_sync()._root_entry_payloads("gpt-sovits")["Build-Package.ps1"]
+
+    assert '[string]$WorkRoot = ""' in builder
+    assert "[IO.Path]::GetTempPath()" in builder
+    assert "[Guid]::NewGuid()" in builder
+    assert "worker package staging path budget exceeded before copy" in builder
+    assert builder.index("Assert-PortableTreePathBudget") < builder.index(
+        "Copy-PortableTree -Source $entry.FullName"
+    )
+    assert "finally {" in builder
+    assert "try {" in root_wrapper
+    assert "catch {" in root_wrapper
+    assert "exit $LASTEXITCODE" not in root_wrapper

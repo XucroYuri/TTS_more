@@ -127,7 +127,17 @@ def _root_entry_payloads(component: str) -> dict[str, str]:
         "Start.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*\nexit /b %errorlevel%\n',
         "Stop.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Stop-Worker.ps1" %*\nexit /b %errorlevel%\n',
         "Repair.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Repair.ps1" %*\nexit /b %errorlevel%\n',
-        "Build-Package.ps1": '& "$PSScriptRoot\\tts_more\\Build-Package.ps1" @args\nexit $LASTEXITCODE\n',
+        "Build-Package.ps1": (
+            '$ErrorActionPreference = "Stop"\n'
+            "try {\n"
+            '    & "$PSScriptRoot\\tts_more\\Build-Package.ps1" @args\n'
+            "}\n"
+            "catch {\n"
+            "    [Console]::Error.WriteLine($_.Exception.Message)\n"
+            "    exit 1\n"
+            "}\n"
+            "exit 0\n"
+        ),
         "Start-WebUI.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Start-WebUI.ps1" %*\nexit /b %errorlevel%\n',
         GUIDE_NAME: _guide_payload(component),
     }

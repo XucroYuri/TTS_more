@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -229,7 +230,250 @@ def _build_worker_bootstrap(
     }
     _initialize_git_repository(worker_root)
     output_root = tmp_path / "worker-output"
-    _run_checked(
+    work_root = _external_worker_test_root(tmp_path, "fixture-work")
+    try:
+        _run_checked(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(worker_root / "Build-Package.ps1"),
+                "-Profile",
+                "Bootstrap",
+                "-Device",
+                "CPU",
+                "-Version",
+                version,
+                "-OutputRoot",
+                str(output_root),
+                "-WorkRoot",
+                str(work_root),
+            ],
+            worker_root,
+            env={**os.environ, "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve())},
+        )
+        archives = list(output_root.glob("*.zip"))
+        assert len(archives) == 1
+        stage = _extract_zip_package_root(archives[0], tmp_path / "worker-extracted")
+        assert not [path for path in work_root.rglob("*") if path.is_file()]
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
+    return worker_root, stage, archives[0], source_before
+
+
+def _inject_release_zip_entry(source: Path, destination: Path, relative: str) -> None:
+    shutil.copy2(source, destination)
+    with zipfile.ZipFile(destination, "a", compression=zipfile.ZIP_DEFLATED) as archive:
+        package_root = archive.namelist()[0].replace("\\", "/").split("/", 1)[0]
+        archive.writestr(f"{package_root}/{relative}", b"ordinary extension payload")
+
+
+def _extract_zip_package_root(archive_path: Path, destination: Path) -> Path:
+    with zipfile.ZipFile(archive_path) as archive:
+        roots = {name.replace("\\", "/").split("/", 1)[0] for name in archive.namelist()}
+        assert len(roots) == 1
+        archive.extractall(destination)
+    return destination / roots.pop()
+
+
+def _external_worker_test_root(tmp_path: Path, label: str) -> Path:
+    identity = hashlib.sha256(str(tmp_path).encode("utf-8")).hexdigest()[:10]
+    return Path(tempfile.gettempdir()) / f"tm-{label}-{identity}"
+
+
+def _padded_checkout_root(tmp_path: Path, target_length: int = 145) -> Path:
+    prefix = tmp_path / "deep-checkout"
+    suffix_length = max(16, target_length - len(str(prefix)) - len(str(Path("worker"))) - 2)
+    return prefix / ("x" * suffix_length) / "worker"
+
+
+def test_worker_bootstrap_uses_short_external_unique_staging_from_deep_checkout(
+    tmp_path: Path,
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("deep Windows worker package build requires PowerShell")
+    worker_root = _padded_checkout_root(tmp_path)
+    _load_sync_integrations().sync_integration(REPO_ROOT, worker_root, "gpt-sovits", "a" * 40)
+    workflow = worker_root / ".github" / "workflows" / "build_windows_packages.yaml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: deep checkout fixture\n", encoding="utf-8")
+    _initialize_git_repository(worker_root)
+    work_root = _external_worker_test_root(tmp_path, "deep-work")
+    output_root = _external_worker_test_root(tmp_path, "deep-output")
+    sentinel = work_root / "other-build" / "sentinel.txt"
+    try:
+        sentinel.parent.mkdir(parents=True)
+        sentinel.write_text("preserve sibling build\n", encoding="utf-8")
+        completed = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(worker_root / "Build-Package.ps1"),
+                "-Profile",
+                "Bootstrap",
+                "-Device",
+                "CPU",
+                "-Version",
+                "d1-long-path",
+                "-OutputRoot",
+                str(output_root),
+            ],
+            cwd=worker_root,
+            env={
+                **os.environ,
+                "TEMP": str(work_root),
+                "TMP": str(work_root),
+                "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
+            },
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        archives = list(output_root.glob("*.zip"))
+        assert len(archives) == 1
+        assert _load_portable_packages().audit_release_zip(archives[0])["valid"] is True
+        assert sentinel.read_text(encoding="utf-8") == "preserve sibling build\n"
+        assert [path for path in work_root.rglob("*") if path.is_file()] == [sentinel]
+        assert not (worker_root / "artifacts" / "portable" / ".work").exists()
+        assert subprocess.check_output(
+            ["git", "status", "--short"], cwd=worker_root, text=True
+        ).strip() == ""
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
+        shutil.rmtree(output_root, ignore_errors=True)
+
+
+def test_worker_staging_path_budget_fails_before_copy_without_touching_siblings(
+    tmp_path: Path,
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("Windows worker path budget contract requires PowerShell")
+    worker_root = tmp_path / "worker"
+    _load_sync_integrations().sync_integration(REPO_ROOT, worker_root, "gpt-sovits", "a" * 40)
+    _initialize_git_repository(worker_root)
+    work_root = _padded_checkout_root(tmp_path, target_length=205).parent
+    output_root = _external_worker_test_root(tmp_path, "budget-output")
+    sentinel = work_root / "existing-build.txt"
+    try:
+        work_root.mkdir(parents=True)
+        sentinel.write_text("preserve me\n", encoding="utf-8")
+        before = {path.name: path.read_bytes() for path in work_root.iterdir() if path.is_file()}
+        completed = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(worker_root / "Build-Package.ps1"),
+                "-Profile",
+                "Bootstrap",
+                "-Device",
+                "CPU",
+                "-Version",
+                "d1-budget",
+                "-OutputRoot",
+                str(output_root),
+                "-WorkRoot",
+                str(work_root),
+            ],
+            cwd=worker_root,
+            env={**os.environ, "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve())},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        message = (completed.stdout + completed.stderr).lower()
+        assert completed.returncode != 0
+        assert "path budget" in message
+        assert "-workroot" in message
+        assert {path.name: path.read_bytes() for path in work_root.iterdir() if path.is_file()} == before
+        assert list(path for path in work_root.iterdir() if path.is_dir()) == []
+        assert not output_root.exists()
+        assert not (worker_root / "artifacts" / "portable" / ".work").exists()
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
+        shutil.rmtree(output_root, ignore_errors=True)
+
+
+def test_worker_build_failure_cleans_only_its_unique_staging(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("Windows worker staging cleanup requires PowerShell")
+    worker_root = tmp_path / "worker"
+    _load_sync_integrations().sync_integration(REPO_ROOT, worker_root, "gpt-sovits", "a" * 40)
+    _initialize_git_repository(worker_root)
+    portable_packages = worker_root / "tts_more" / "portable_packages.py"
+    portable_packages.write_text(
+        'raise RuntimeError("forced post-copy package failure")\n', encoding="utf-8"
+    )
+    work_root = _external_worker_test_root(tmp_path, "failure-work")
+    output_root = _external_worker_test_root(tmp_path, "failure-output")
+    sentinel = work_root / "sibling-build.txt"
+    try:
+        work_root.mkdir(parents=True)
+        sentinel.write_text("preserve sibling\n", encoding="utf-8")
+        completed = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(worker_root / "Build-Package.ps1"),
+                "-Profile",
+                "Bootstrap",
+                "-Device",
+                "CPU",
+                "-Version",
+                "d1-cleanup",
+                "-OutputRoot",
+                str(output_root),
+                "-WorkRoot",
+                str(work_root),
+            ],
+            cwd=worker_root,
+            env={**os.environ, "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve())},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        message = (completed.stdout + completed.stderr).lower()
+        assert completed.returncode != 0
+        assert "forced post-copy package failure" in message
+        assert sentinel.read_text(encoding="utf-8") == "preserve sibling\n"
+        assert [path for path in work_root.rglob("*") if path.is_file()] == [sentinel]
+        assert not [path for path in work_root.iterdir() if path.is_dir()]
+        assert not output_root.exists()
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
+        shutil.rmtree(output_root, ignore_errors=True)
+
+
+def test_worker_full_github_gate_precedes_work_root_side_effects(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("Windows Full package gate requires PowerShell")
+    worker_root = tmp_path / "worker"
+    _load_sync_integrations().sync_integration(REPO_ROOT, worker_root, "gpt-sovits", "a" * 40)
+    _initialize_git_repository(worker_root)
+    work_root = _external_worker_test_root(tmp_path, "full-work")
+    output_root = _external_worker_test_root(tmp_path, "full-output")
+    completed = subprocess.run(
         [
             POWERSHELL,
             "-NoProfile",
@@ -239,35 +483,30 @@ def _build_worker_bootstrap(
             "-File",
             str(worker_root / "Build-Package.ps1"),
             "-Profile",
-            "Bootstrap",
+            "Full",
             "-Device",
             "CPU",
-            "-Version",
-            version,
             "-OutputRoot",
             str(output_root),
+            "-WorkRoot",
+            str(work_root),
         ],
-        worker_root,
-        env={**os.environ, "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve())},
+        cwd=worker_root,
+        env={
+            **os.environ,
+            "GITHUB_ACTIONS": "true",
+            "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
+        },
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
     )
-    archives = list(output_root.glob("*.zip"))
-    assert len(archives) == 1
-    stage = (
-        worker_root
-        / "artifacts"
-        / "portable"
-        / ".work"
-        / f"{component}-bootstrap"
-        / f"{component}-{version}-windows-x64-bootstrap"
-    )
-    return worker_root, stage, archives[0], source_before
-
-
-def _inject_release_zip_entry(source: Path, destination: Path, relative: str) -> None:
-    shutil.copy2(source, destination)
-    with zipfile.ZipFile(destination, "a", compression=zipfile.ZIP_DEFLATED) as archive:
-        package_root = archive.namelist()[0].replace("\\", "/").split("/", 1)[0]
-        archive.writestr(f"{package_root}/{relative}", b"ordinary extension payload")
+    assert completed.returncode != 0
+    assert "profile=full is local-only" in (completed.stdout + completed.stderr).lower()
+    assert not work_root.exists()
+    assert not output_root.exists()
 
 
 @pytest.fixture(scope="module")
@@ -747,16 +986,9 @@ def generated_v2_manifests(tmp_path_factory: pytest.TempPathFactory) -> dict[str
         worker_root,
         env=environment,
     )
-    worker_manifest_path = (
-        worker_root
-        / "artifacts"
-        / "portable"
-        / ".work"
-        / "gpt-sovits-bootstrap"
-        / f"gpt-sovits-{version}-windows-x64-bootstrap"
-        / "package"
-        / "tts-more-package.json"
-    )
+    worker_archive = next((root / "worker-output").glob("*.zip"))
+    worker_package_root = _extract_zip_package_root(worker_archive, root / "worker-extracted")
+    worker_manifest_path = worker_package_root / "package" / "tts-more-package.json"
     assert controller_manifest_path.is_file()
     assert worker_manifest_path.is_file()
     return {
@@ -1218,15 +1450,7 @@ def test_worker_bootstrap_recursively_excludes_nested_submodule_gitdir(tmp_path:
         package_root = tmp_path / "extracted" / archive.namelist()[0].split("/", 1)[0]
     assert packages.verify_sha256_manifest(package_root)["valid"] is True
 
-    staged_root = (
-        worker_root
-        / "artifacts"
-        / "portable"
-        / ".work"
-        / "cosyvoice-bootstrap"
-        / f"cosyvoice-{version}-windows-x64-bootstrap"
-    )
-    assert not [path for path in staged_root.rglob("*") if path.name.casefold() == ".git"]
+    assert not (worker_root / "artifacts" / "portable" / ".work").exists()
     assert gitdir_file.read_bytes() == source_gitdir
 
 
@@ -1270,16 +1494,7 @@ def test_worker_bootstrap_removes_tracked_nested_t7_before_packaging(tmp_path: P
     assert packages.audit_release_zip(archives[0])["valid"] is True
     with zipfile.ZipFile(archives[0]) as archive:
         assert not [name for name in archive.namelist() if name.casefold().endswith(".t7")]
-    staged_weight = (
-        worker_root
-        / "artifacts"
-        / "portable"
-        / ".work"
-        / "indextts-bootstrap"
-        / f"indextts-{version}-windows-x64-bootstrap"
-        / tracked_weight.relative_to(worker_root)
-    )
-    assert not staged_weight.exists()
+    assert not (worker_root / "artifacts" / "portable" / ".work").exists()
     assert tracked_weight.read_bytes() == b"tracked model weight fixture"
 
 
