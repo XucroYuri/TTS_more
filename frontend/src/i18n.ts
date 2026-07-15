@@ -788,6 +788,64 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       uploadingReference: "正在上传参考音频…",
       referenceUploaded: "参考音频已保存到当前项目",
       referenceUploadFailed: "参考音频上传失败"
+    },
+    portableServices: {
+      title: "本地便携 TTS 服务",
+      description: "维护三个独立便携包的路径，并按需逐个启动。这里不会自动批量启动服务。",
+      loading: "正在读取本地服务…",
+      path: "路径",
+      endpoint: "服务地址",
+      notConfiguredPath: "尚未选择便携包目录",
+      operationDetails: "技术详情",
+      nextAction: "下一步",
+      progress: "初始化进度 {{percent}}%",
+      logsTitle: "操作记录",
+      noLogs: "暂无操作记录",
+      selected: "已更新 {{component}} 的本地目录",
+      selectionCancelled: "未更改目录",
+      actionFailed: "操作未完成",
+      manualProxyGuidance: "所有锁定的自动下载源均已耗尽。当前版本尚未提供安全的代理提交接口；请先配置 Windows 系统代理，再点“修复”。控制令牌和代理信息不会写入浏览器存储。",
+      action: {
+        browse: "选择目录",
+        start: "启动",
+        stop: "停止",
+        repair: "修复",
+        openFolder: "打开目录",
+        openService: "打开服务",
+        logs: "查看记录",
+        closeLogs: "收起记录"
+      },
+      phase: {
+        notConfigured: "未配置",
+        notInitialized: "等待初始化",
+        checking: "正在检查",
+        downloading: "正在下载必要文件",
+        installing: "正在安装运行环境",
+        validating: "正在验证运行环境",
+        starting: "正在启动服务",
+        ready: "可用",
+        stopped: "已停止",
+        repairable: "需要修复",
+        blocked: "需要处理"
+      },
+      disabled: {
+        lan: "局域网服务只能使用，不能从这里启动、停止或修复。",
+        external: "外部服务地址可继续使用，但不包含可由本机工作台控制的便携包。",
+        incompatible: "已找到本地包，但版本或包身份与当前控制器不兼容。",
+        busy: "当前服务正在执行操作，请等待完成。"
+      },
+      error: {
+        allSourcesExhausted: "自动下载源均不可用",
+        cudaProbeFailed: "显卡运行环境验证失败",
+        diskSpaceInsufficient: "包所在磁盘空间不足",
+        downloadInterrupted: "下载因网络问题中断，可修复后续传",
+        controlExpired: "本机控制会话已更新，正在重新连接",
+        identityMismatch: "所选目录不是这个服务的便携包",
+        invalidPackage: "所选目录不是完整的便携包",
+        notManageable: "当前服务不能由本机工作台控制",
+        portInUse: "服务端口已被其他程序占用",
+        unknown: "操作未完成，请查看技术详情"
+      }
     }
   },
   "en-US": {
@@ -1562,6 +1620,64 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       uploadingReference: "Uploading reference audio…",
       referenceUploaded: "Reference audio saved to this project",
       referenceUploadFailed: "Reference audio upload failed"
+    },
+    portableServices: {
+      title: "Local portable TTS services",
+      description: "Maintain the three independent package paths and start each service only when needed. Services are never started in bulk.",
+      loading: "Loading local services…",
+      path: "Path",
+      endpoint: "Service URL",
+      notConfiguredPath: "No portable package folder selected",
+      operationDetails: "Technical details",
+      nextAction: "Next step",
+      progress: "Initialization progress {{percent}}%",
+      logsTitle: "Operation log",
+      noLogs: "No operation events yet",
+      selected: "Updated the local folder for {{component}}",
+      selectionCancelled: "Folder was not changed",
+      actionFailed: "The operation did not complete",
+      manualProxyGuidance: "All locked automatic download sources are exhausted. This version does not yet expose a safe proxy submission API. Configure the Windows system proxy, then choose Repair. Control tokens and proxy details are never persisted by the browser.",
+      action: {
+        browse: "Choose folder",
+        start: "Start",
+        stop: "Stop",
+        repair: "Repair",
+        openFolder: "Open folder",
+        openService: "Open service",
+        logs: "Show log",
+        closeLogs: "Hide log"
+      },
+      phase: {
+        notConfigured: "Not configured",
+        notInitialized: "Waiting for initialization",
+        checking: "Checking",
+        downloading: "Downloading required files",
+        installing: "Installing runtime",
+        validating: "Validating runtime",
+        starting: "Starting service",
+        ready: "Ready",
+        stopped: "Stopped",
+        repairable: "Repair needed",
+        blocked: "Action needed"
+      },
+      disabled: {
+        lan: "LAN services can be used, but cannot be started, stopped, or repaired from this workstation.",
+        external: "The external service URL remains usable, but it is not a local portable package this workstation can control.",
+        incompatible: "A local package was found, but its version or identity is incompatible with this controller.",
+        busy: "This service is busy. Wait for the current operation to finish."
+      },
+      error: {
+        allSourcesExhausted: "All automatic download sources are unavailable",
+        cudaProbeFailed: "GPU runtime validation failed",
+        diskSpaceInsufficient: "The package drive does not have enough free space",
+        downloadInterrupted: "The download was interrupted and can resume after repair",
+        controlExpired: "The local control session changed; reconnecting",
+        identityMismatch: "The selected folder is not this service's package",
+        invalidPackage: "The selected folder is not a complete portable package",
+        notManageable: "This service cannot be controlled by the local workstation",
+        portInUse: "The service port is owned by another program",
+        unknown: "The operation did not complete; open technical details"
+      }
     }
   }
 };

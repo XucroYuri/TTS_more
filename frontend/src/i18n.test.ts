@@ -78,4 +78,31 @@ describe("i18n configuration", () => {
     expect(tText(resources["en-US"], "inspector.method.indextts")).toBe("Index");
     expect(tText(resources["en-US"], "inspector.createIndexTemporary")).toBe("Set temporary voice");
   });
+
+  it("ships complete local portable service workbench labels in both languages", () => {
+    const keys = [
+      "portableServices.title",
+      "portableServices.action.browse",
+      "portableServices.action.start",
+      "portableServices.action.stop",
+      "portableServices.action.repair",
+      "portableServices.action.openFolder",
+      "portableServices.action.openService",
+      "portableServices.action.logs",
+      "portableServices.phase.notConfigured",
+      "portableServices.phase.downloading",
+      "portableServices.phase.ready",
+      "portableServices.disabled.lan",
+      "portableServices.error.cudaProbeFailed",
+      "portableServices.error.unknown",
+      "portableServices.manualProxyGuidance",
+    ];
+
+    for (const key of keys) {
+      expect(tText(resources["zh-CN"], key), `zh-CN ${key}`).toBeTruthy();
+      expect(tText(resources["en-US"], key), `en-US ${key}`).toBeTruthy();
+    }
+    expect(tText(resources["zh-CN"], "portableServices.title")).toBe("本地便携 TTS 服务");
+    expect(tText(resources["en-US"], "portableServices.title")).toBe("Local portable TTS services");
+  });
 });

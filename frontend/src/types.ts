@@ -5,6 +5,112 @@ export type CatalogProvider = "gpt-sovits" | "indextts" | "cosyvoice";
 export type SetupState = "not_configured" | "repo_missing" | "repo_found" | "env_missing" | "endpoint_unreachable" | "partial" | "ready";
 export type GenerationStatus = "queued" | "loading" | "running" | "finalizing" | "completed" | "failed" | "cancelled";
 
+export type PortableOperationPhase =
+  | "not_initialized"
+  | "checking"
+  | "downloading"
+  | "installing"
+  | "validating"
+  | "starting"
+  | "ready"
+  | "stopped"
+  | "repairable"
+  | "blocked";
+
+export type PortableServiceAction = "start" | "stop" | "repair" | "open-folder";
+
+export interface LocalPortableService {
+  service_id: string;
+  component: CatalogProvider;
+  package_id: string | null;
+  display_name: string;
+  base_url: string | null;
+  mode: string;
+  network_scope: "localhost" | "lan" | "public" | "commercial" | string;
+  managed: boolean;
+  setup_state: SetupState | string | null;
+  package_root: string | null;
+  build_id: string | null;
+  port_override: number | null;
+}
+
+export interface LocalPortableServicesResponse {
+  services: LocalPortableService[];
+}
+
+export interface PortablePackageSummary {
+  package_root: string;
+  component: CatalogProvider;
+  package_id: string;
+  build_id?: string;
+  version?: string;
+  initialized?: boolean;
+  manageable?: boolean;
+}
+
+export interface PortableDiscoveryResponse {
+  packages: PortablePackageSummary[];
+}
+
+export type PortableFolderSelectionResponse =
+  | { status: "cancelled" }
+  | { status: "selected"; package: PortablePackageSummary };
+
+export interface PortableRegistrationRequest {
+  component: CatalogProvider;
+  package_id: string;
+  path: string;
+  port_override?: number;
+}
+
+export interface PortableRegistrationResponse {
+  package: PortablePackageSummary;
+  service: LocalPortableService;
+}
+
+export interface PortableActionResponse {
+  component: CatalogProvider;
+  action: PortableServiceAction;
+  status: PortableOperationPhase | "stopping" | "repairing" | "opened";
+  operation_id?: string;
+  controller_pid?: number;
+  error_code?: string;
+  reason?: string;
+}
+
+export interface PortableOperationState {
+  operation_id: string;
+  component?: CatalogProvider;
+  action?: "start" | "stop" | "repair";
+  initiator?: string;
+  started_at?: string;
+  finished_at?: string;
+  status: PortableOperationPhase;
+  exit_code?: number | null;
+}
+
+export interface PortableOperationResponse {
+  status: PortableOperationPhase;
+  operation: PortableOperationState;
+  running: boolean | null;
+}
+
+export interface PortableOperationEvent {
+  seq: number;
+  timestamp: string;
+  phase: PortableOperationPhase;
+  message: string;
+  percent?: number;
+  error_code?: string;
+}
+
+export interface PortableOperationLogsResponse {
+  status: PortableOperationPhase;
+  operation_id?: string;
+  events: PortableOperationEvent[];
+  next_seq: number;
+}
+
 export interface WorkerHealth {
   service_id?: string;
   service_kind?: "tts" | "llm-parser";
