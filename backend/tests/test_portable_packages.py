@@ -823,23 +823,34 @@ def test_worker_cleanup_never_recursively_deletes_replacement_work_directory(
         REPO_ROOT, worker_root, "gpt-sovits", "a" * 40
     )
     portable_packages = worker_root / "tts_more" / "portable_packages.py"
+    original = portable_packages.read_text(encoding="utf-8")
+    future = "from __future__ import annotations\n"
+    assert original.startswith(future)
     portable_packages.write_text(
-        """from pathlib import Path
+        future
+        + """from pathlib import Path
 import os
 
 work = Path(__file__).resolve().parents[3]
 moved = Path(os.environ["TTS_MORE_CLEANUP_ATTACK_MOVED"])
-work.rename(moved)
-work.mkdir()
-(work / "replacement-sentinel.txt").write_text("preserve replacement\\n", encoding="utf-8")
-raise RuntimeError("forced worker cleanup replacement attack")
-""",
+denied = Path(os.environ["TTS_MORE_CLEANUP_ATTACK_DENIED"])
+try:
+    work.rename(moved)
+except OSError as exc:
+    denied.write_text(f"{type(exc).__name__}: {exc}\\n", encoding="utf-8")
+else:
+    work.mkdir()
+    (work / "replacement-sentinel.txt").write_text("replacement received build path\\n", encoding="utf-8")
+
+"""
+        + original[len(future) :],
         encoding="utf-8",
     )
     _initialize_git_repository(worker_root)
     work_root = _external_worker_test_root(tmp_path, "worker-cleanup")
     output_root = _external_worker_test_root(tmp_path, "worker-cleanup-output")
     moved = work_root.parent / f"{work_root.name}-moved-original"
+    denied = work_root.parent / f"{work_root.name}-rename-denied.txt"
     try:
         completed = subprocess.run(
             [
@@ -866,6 +877,7 @@ raise RuntimeError("forced worker cleanup replacement attack")
                 **os.environ,
                 "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
                 "TTS_MORE_CLEANUP_ATTACK_MOVED": str(moved),
+                "TTS_MORE_CLEANUP_ATTACK_DENIED": str(denied),
             },
             capture_output=True,
             text=True,
@@ -873,18 +885,19 @@ raise RuntimeError("forced worker cleanup replacement attack")
             errors="replace",
             check=False,
         )
-        message = (completed.stdout + completed.stderr).lower()
-        assert completed.returncode != 0
-        assert "forced worker cleanup replacement attack" in message
-        replacements = list(work_root.glob("tts-more-worker-*"))
-        assert len(replacements) == 1
-        assert (replacements[0] / "replacement-sentinel.txt").read_text(
-            encoding="utf-8"
-        ) == "preserve replacement\n"
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert "permissionerror" in denied.read_text(encoding="utf-8").lower()
+        assert not moved.exists()
+        assert not list(work_root.glob("tts-more-worker-*"))
+        archives = list(output_root.glob("*.zip"))
+        assert len(archives) == 1
+        assert _load_portable_packages().audit_release_zip(archives[0])["valid"] is True
+        assert not list(work_root.rglob("replacement-sentinel.txt"))
     finally:
         _remove_test_tree(work_root)
         _remove_test_tree(output_root)
         _remove_test_tree(moved)
+        denied.unlink(missing_ok=True)
 
 
 def test_controller_cleanup_never_recursively_deletes_replacement_work_directory(
@@ -895,23 +908,34 @@ def test_controller_cleanup_never_recursively_deletes_replacement_work_directory
     controller_root = tmp_path / "controller"
     _copy_controller_builder_fixture(controller_root)
     portable_packages = controller_root / "scripts" / "portable_packages.py"
+    original = portable_packages.read_text(encoding="utf-8")
+    future = "from __future__ import annotations\n"
+    assert original.startswith(future)
     portable_packages.write_text(
-        """from pathlib import Path
+        future
+        + """from pathlib import Path
 import os
 
 work = Path(__file__).resolve().parents[2]
 moved = Path(os.environ["TTS_MORE_CLEANUP_ATTACK_MOVED"])
-work.rename(moved)
-work.mkdir()
-(work / "replacement-sentinel.txt").write_text("preserve replacement\\n", encoding="utf-8")
-raise RuntimeError("forced cleanup replacement attack")
-""",
+denied = Path(os.environ["TTS_MORE_CLEANUP_ATTACK_DENIED"])
+try:
+    work.rename(moved)
+except OSError as exc:
+    denied.write_text(f"{type(exc).__name__}: {exc}\\n", encoding="utf-8")
+else:
+    work.mkdir()
+    (work / "replacement-sentinel.txt").write_text("replacement received build path\\n", encoding="utf-8")
+
+"""
+        + original[len(future) :],
         encoding="utf-8",
     )
     _initialize_git_repository(controller_root)
     work_root = _external_worker_test_root(tmp_path, "controller-cleanup")
     output_root = _external_worker_test_root(tmp_path, "controller-cleanup-output")
     moved = work_root.parent / f"{work_root.name}-moved-original"
+    denied = work_root.parent / f"{work_root.name}-rename-denied.txt"
     try:
         completed = subprocess.run(
             [
@@ -938,6 +962,7 @@ raise RuntimeError("forced cleanup replacement attack")
                 **os.environ,
                 "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
                 "TTS_MORE_CLEANUP_ATTACK_MOVED": str(moved),
+                "TTS_MORE_CLEANUP_ATTACK_DENIED": str(denied),
             },
             capture_output=True,
             text=True,
@@ -945,18 +970,19 @@ raise RuntimeError("forced cleanup replacement attack")
             errors="replace",
             check=False,
         )
-        message = (completed.stdout + completed.stderr).lower()
-        assert completed.returncode != 0
-        assert "forced cleanup replacement attack" in message
-        replacements = list(work_root.glob("tts-more-controller-*"))
-        assert len(replacements) == 1
-        assert (replacements[0] / "replacement-sentinel.txt").read_text(
-            encoding="utf-8"
-        ) == "preserve replacement\n"
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert "permissionerror" in denied.read_text(encoding="utf-8").lower()
+        assert not moved.exists()
+        assert not list(work_root.glob("tts-more-controller-*"))
+        archives = list(output_root.glob("*.zip"))
+        assert len(archives) == 1
+        assert _load_portable_packages().audit_release_zip(archives[0])["valid"] is True
+        assert not list(work_root.rglob("replacement-sentinel.txt"))
     finally:
         _remove_test_tree(work_root)
         _remove_test_tree(output_root)
         _remove_test_tree(moved)
+        denied.unlink(missing_ok=True)
 
 
 def test_worker_full_github_gate_precedes_work_root_side_effects(tmp_path: Path) -> None:
@@ -986,6 +1012,49 @@ def test_worker_full_github_gate_precedes_work_root_side_effects(tmp_path: Path)
             str(work_root),
         ],
         cwd=worker_root,
+        env={
+            **os.environ,
+            "GITHUB_ACTIONS": "true",
+            "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
+        },
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "profile=full is local-only" in (completed.stdout + completed.stderr).lower()
+    assert not work_root.exists()
+    assert not output_root.exists()
+
+
+def test_controller_full_github_gate_precedes_work_root_side_effects(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("Windows Full package gate requires PowerShell")
+    controller_root = tmp_path / "controller"
+    _copy_controller_builder_fixture(controller_root)
+    work_root = _external_worker_test_root(tmp_path, "controller-full-work")
+    output_root = _external_worker_test_root(tmp_path, "controller-full-output")
+    completed = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(controller_root / "Build-Package.ps1"),
+            "-Profile",
+            "Full",
+            "-Device",
+            "CPU",
+            "-OutputRoot",
+            str(output_root),
+            "-WorkRoot",
+            str(work_root),
+        ],
+        cwd=controller_root,
         env={
             **os.environ,
             "GITHUB_ACTIONS": "true",
@@ -2093,6 +2162,21 @@ def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
     assert "^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$" in builder
     assert '"import-portable-data.py"' in builder
     assert '"import_portable_data.py"' in builder
+
+
+def test_builders_pin_staging_without_delete_share_and_delete_root_by_handle() -> None:
+    controller = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+    worker = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    for builder in (controller, worker):
+        assert "0x00010000" in builder  # DELETE access on the retained work handle
+        assert "CreateDirectoryRelative($workBaseHandle, $workIdentity, $false)" in builder
+        disposition = builder.index("MarkDirectoryForDeletion($createdWorkHandle)")
+        close = builder.index("$createdWorkHandle.Dispose()", disposition)
+        assert disposition < close
+        assert "Remove-Item -LiteralPath $resolvedWork -Force" not in builder
 
 
 def test_v2_builders_emit_completed_identity_protocol_and_data_contract() -> None:

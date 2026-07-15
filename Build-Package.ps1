@@ -62,6 +62,13 @@ public static class TtsMorePortableDirectoryHandle
         public IntPtr Information;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileDispositionInformation
+    {
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool DeleteFile;
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFile(
         string fileName,
@@ -93,6 +100,13 @@ public static class TtsMorePortableDirectoryHandle
 
     [DllImport("ntdll.dll")]
     private static extern uint RtlNtStatusToDosError(int status);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetFileInformationByHandle(
+        SafeFileHandle file,
+        int fileInformationClass,
+        ref FileDispositionInformation information,
+        int bufferSize);
 
     public static SafeFileHandle Open(string path, bool shareDelete)
     {
@@ -156,7 +170,7 @@ public static class TtsMorePortableDirectoryHandle
             attributes.Attributes = 0x00000040;
             IoStatusBlock ioStatus;
             IntPtr rawHandle;
-            const uint DesiredAccess = 0x00100000 | 0x00000080 | 0x00000007;
+            const uint DesiredAccess = 0x00100000 | 0x00010000 | 0x00000080 | 0x00000007;
             const uint ShareRead = 0x00000001;
             const uint ShareWrite = 0x00000002;
             const uint ShareDelete = 0x00000004;
@@ -189,6 +203,22 @@ public static class TtsMorePortableDirectoryHandle
         {
             if (unicodePointer != IntPtr.Zero) { Marshal.FreeHGlobal(unicodePointer); }
             if (nameBuffer != IntPtr.Zero) { Marshal.FreeHGlobal(nameBuffer); }
+        }
+    }
+
+    public static void MarkDirectoryForDeletion(SafeFileHandle handle)
+    {
+        FileDispositionInformation information = new FileDispositionInformation();
+        information.DeleteFile = true;
+        if (!SetFileInformationByHandle(
+            handle,
+            4,
+            ref information,
+            Marshal.SizeOf(typeof(FileDispositionInformation))))
+        {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "Cannot mark verified controller staging directory for deletion");
         }
     }
 
@@ -301,7 +331,7 @@ try {
 New-Item -ItemType Directory -Force -Path $workBase | Out-Null
 [void](Assert-PortableWorkPath -CandidatePath $workBase)
 $workBaseHandle = [TtsMorePortableDirectoryHandle]::Open($workBase, $false, $true)
-$createdWorkHandle = [TtsMorePortableDirectoryHandle]::CreateDirectoryRelative($workBaseHandle, $workIdentity, $true)
+$createdWorkHandle = [TtsMorePortableDirectoryHandle]::CreateDirectoryRelative($workBaseHandle, $workIdentity, $false)
 $workCreated = $true
 $createdWorkIdentity = [TtsMorePortableDirectoryHandle]::Identity($createdWorkHandle)
 New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "app\backend"), (Join-Path $stage "package"), (Join-Path $stage "scripts"), (Join-Path $stage "packaging\portable"), (Join-Path $stage "licenses") | Out-Null
@@ -422,7 +452,6 @@ Copy-Item -LiteralPath (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json") -D
 Write-Host "Created $Profile package: $zip"
 }
 finally {
-    $cleanupHandle = $null
     try {
         if ($workCreated) {
             $workPathExists = Assert-PortableWorkPath -CandidatePath $work
@@ -435,26 +464,23 @@ finally {
             if (![string]::Equals($resolvedParent.TrimEnd("\", "/"), $workBase.TrimEnd("\", "/"), [StringComparison]::OrdinalIgnoreCase) -or $resolvedLeaf -ne $workIdentity) {
                 throw "refusing to clean a controller package staging directory that is not the unique directory created by this build: $resolvedWork"
             }
-            $cleanupHandle = [TtsMorePortableDirectoryHandle]::Open($resolvedWork, $false)
-            $cleanupIdentity = [TtsMorePortableDirectoryHandle]::Identity($cleanupHandle)
+            $cleanupIdentity = [TtsMorePortableDirectoryHandle]::Identity($createdWorkHandle)
             if (![string]::Equals($cleanupIdentity, $createdWorkIdentity, [StringComparison]::Ordinal)) {
-                throw "controller package cleanup identity changed; refusing to delete a replacement staging directory: $resolvedWork"
+                throw "controller package staging handle identity changed unexpectedly: $resolvedWork"
             }
-            $createdWorkHandle.Dispose()
-            $createdWorkHandle = $null
             foreach ($child in @(Get-ChildItem -LiteralPath $resolvedWork -Force)) {
                 Remove-Item -LiteralPath $child.FullName -Recurse -Force
             }
             if (@(Get-ChildItem -LiteralPath $resolvedWork -Force).Count -ne 0) {
                 throw "controller package staging directory is not empty after child cleanup; refusing recursive root deletion: $resolvedWork"
             }
-            $cleanupHandle.Dispose()
-            $cleanupHandle = $null
-            Remove-Item -LiteralPath $resolvedWork -Force
+            [TtsMorePortableDirectoryHandle]::MarkDirectoryForDeletion($createdWorkHandle)
+            $createdWorkHandle.Dispose()
+            $createdWorkHandle = $null
+            $workCreated = $false
         }
     }
     finally {
-        if ($cleanupHandle -ne $null) { $cleanupHandle.Dispose() }
         if ($createdWorkHandle -ne $null) { $createdWorkHandle.Dispose() }
         if ($workBaseHandle -ne $null) { $workBaseHandle.Dispose() }
     }
