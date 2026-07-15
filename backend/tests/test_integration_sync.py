@@ -151,9 +151,13 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
         sync.sync_integration(REPO_ROOT, target, component, "c" * 40)
         start = (target / "Start.cmd").read_text(encoding="utf-8")
         native = (target / "Start-WebUI.cmd").read_text(encoding="utf-8")
+        native_controller = (target / "tts_more" / "Start-WebUI.ps1").read_text(
+            encoding="utf-8"
+        )
         assert "tts_more\\Invoke-PortableStart.ps1" in start
         assert (target / "tts_more" / "Start-Worker.ps1").is_file()
-        assert native_entry in native
+        assert "tts_more\\Start-WebUI.ps1" in native
+        assert native_entry in native_controller
 
 
 @pytest.mark.parametrize(
@@ -190,9 +194,9 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
         ),
         (
             "tts_more/Start-Worker.ps1",
-            '$process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru',
-            '$process = Start-Process -FilePath "python.exe" -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru\n'
-            '# $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru',
+            '$process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru',
+            '$process = Start-Process -FilePath "python.exe" -ArgumentList $arguments -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru\n'
+            '# $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru',
         ),
         (
             "tts_more/Invoke-PortableStart.ps1",
@@ -219,8 +223,8 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
         ),
         (
             "tts_more/Start-Worker.ps1",
-            '$process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru',
-            'if ($false) { $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru }',
+            '$process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru',
+            'if ($false) { $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru }',
         ),
         (
             "Start.cmd",

@@ -56,7 +56,15 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
         _copy_file(source_root / "scripts" / name, controlled / name)
     for name in ("bootstrap-conda.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1"):
         _copy_file(source_root / "scripts" / name, controlled / name)
-    for name in ("Initialize.ps1", "Start-Worker.ps1", "Stop-Worker.ps1", "Repair.ps1", "Build-Package.ps1"):
+    for name in (
+        "Initialize.ps1",
+        "Start-Worker.ps1",
+        "Stop-Worker.ps1",
+        "Repair.ps1",
+        "Build-Package.ps1",
+        "Portable-Paths.ps1",
+        "Start-WebUI.ps1",
+    ):
         _copy_file(source_root / "integrations" / "windows" / name, controlled / name)
     _copy_file(source_root / "packaging" / "portable" / "toolchain.lock.json", controlled / "locks" / "toolchain.lock.json")
     _copy_file(source_root / "packaging" / "portable" / "tts-more-package.schema.json", controlled / "tts-more-package.schema.json")
@@ -114,18 +122,13 @@ def check_integration(target_root: Path) -> list[str]:
 
 
 def _root_entry_payloads(component: str) -> dict[str, str]:
-    webui = {
-        "gpt-sovits": '@echo off\ncall "%~dp0go-webui.bat" %*\nexit /b %errorlevel%\n',
-        "indextts": '@echo off\nsetlocal\nset "PYTHON=%~dp0.venv\\Scripts\\python.exe"\nif not exist "%PYTHON%" set "PYTHON=%~dp0runtime\\live\\python.exe"\n"%PYTHON%" "%~dp0webui.py" %*\nexit /b %errorlevel%\n',
-        "cosyvoice": '@echo off\nsetlocal\nset "PYTHON=%~dp0.venv\\Scripts\\python.exe"\nif not exist "%PYTHON%" set "PYTHON=%~dp0runtime\\live\\python.exe"\n"%PYTHON%" "%~dp0webui.py" %*\nexit /b %errorlevel%\n',
-    }[component]
     return {
         "Initialize.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Initialize.ps1" %*\nexit /b %errorlevel%\n',
         "Start.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Invoke-PortableStart.ps1" %*\nexit /b %errorlevel%\n',
         "Stop.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Stop-Worker.ps1" %*\nexit /b %errorlevel%\n',
         "Repair.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Repair.ps1" %*\nexit /b %errorlevel%\n',
         "Build-Package.ps1": '& "$PSScriptRoot\\tts_more\\Build-Package.ps1" @args\nexit $LASTEXITCODE\n',
-        "Start-WebUI.cmd": webui,
+        "Start-WebUI.cmd": '@echo off\npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0tts_more\\Start-WebUI.ps1" %*\nexit /b %errorlevel%\n',
         GUIDE_NAME: _guide_payload(component),
     }
 

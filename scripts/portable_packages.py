@@ -51,7 +51,8 @@ V2_REQUIRED_FIELDS = (*V2_REQUIRED_FIELDS, "package_id", "release_version", "pro
 V2_LAUNCHERS = ("initialize", "start", "stop", "repair", "build")
 DEVICE_PROFILES = {"auto", "cu128", "cu126", "cpu"}
 RELEASE_FORBIDDEN_PATH = re.compile(
-    r"(^|/)(?:\.git|\.venv|__pycache__)(?:/|$)|"
+    r"(^|/)(?:\.git|\.venv|__pycache__|artifacts?|caches?|\.cache)(?:/|$)|"
+    r"(^|/)\.env(?:\.[^/]+)?$|"
     r"\.(?:safetensors|ckpt|pth|pt|t7|onnx|bin)$",
     re.IGNORECASE,
 )
@@ -128,6 +129,8 @@ def audit_release_zip(path: Path) -> dict[str, object]:
                 payload = json.loads(archive.read(manifests[0]).decode("utf-8-sig"))
                 if payload.get("package_profile") != "bootstrap":
                     errors.append(f"GitHub release upload refused for profile={payload.get('package_profile')}")
+                if payload.get("schema_version") == 2 and isinstance(payload.get("launchers"), dict):
+                    _audit_v2_user_layout(archive, payload, relative_names, errors)
             for relative, name in relative_names.items():
                 parts = tuple(part for part in relative.split("/") if part)
                 private_data = len(parts) >= 2 and parts[0] == "data" and parts[1] in {
@@ -142,6 +145,65 @@ def audit_release_zip(path: Path) -> dict[str, object]:
     except (OSError, ValueError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
         errors.append(f"invalid release ZIP: {exc}")
     return {"valid": not errors, "errors": errors, "path": str(path)}
+
+
+def _audit_v2_user_layout(
+    archive: zipfile.ZipFile,
+    payload: dict[str, Any],
+    relative_names: dict[str, str],
+    errors: list[str],
+) -> None:
+    required_root = {"使用说明-先看这里.txt", "app", "package", "licenses"}
+    present_roots = {relative.split("/", 1)[0] for relative in relative_names}
+    if not required_root <= present_roots:
+        errors.append("portable package is missing the normal-user app/package/licenses layout or root guide")
+        return
+    for name in V2_LAUNCHERS:
+        relative = str(payload["launchers"].get(name) or "").replace("\\", "/").casefold()
+        if relative not in relative_names:
+            errors.append(f"portable package root launcher is missing: {name}")
+            return
+    license_path = str(payload.get("licenses") or "").replace("\\", "/").casefold()
+    if not license_path.startswith("licenses/") or license_path not in relative_names:
+        errors.append("portable package licenses must be stored under licenses/")
+        return
+    if not any(relative.startswith("app/") for relative in relative_names):
+        errors.append("portable package source is missing from app/")
+        return
+
+    component = str(payload.get("component") or "")
+    if component not in {"gpt-sovits", "indextts", "cosyvoice"}:
+        return
+    if any(relative.startswith("tts_more/") for relative in relative_names):
+        errors.append("worker integration bundle must be staged under app/tts_more")
+        return
+    component_path = "app/tts_more/component.json"
+    runtime_lock = str(_mapping(payload.get("runtime")).get("lock") or "").replace("\\", "/").casefold()
+    model_lock = str(_mapping(payload.get("models")).get("lock") or "").replace("\\", "/").casefold()
+    if component_path not in relative_names or runtime_lock != "app/tts_more/locks/runtime.lock.json" or model_lock != "app/tts_more/locks/models.lock.json":
+        errors.append("worker package manifest does not point to the staged app/tts_more locks")
+        return
+    try:
+        component_config = json.loads(
+            archive.read(relative_names[component_path]).decode("utf-8-sig")
+        )
+        model_payload = json.loads(archive.read(relative_names[model_lock]).decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        errors.append(f"worker staged metadata is invalid: {exc}")
+        return
+    if component_config.get("source_root") != "app":
+        errors.append("worker component source_root must be app")
+        return
+    locked_paths = [str(path).replace("\\", "/") for path in model_payload.get("required_paths", [])]
+    locked_paths.extend(
+        str(asset.get("target") or "").replace("\\", "/")
+        for asset in model_payload.get("assets", [])
+        if isinstance(asset, dict)
+    )
+    if not locked_paths or any(
+        not path.startswith("app/") or path.startswith("app/app/") for path in locked_paths
+    ):
+        errors.append("worker model lock paths must be prefixed with app/ exactly once")
 
 
 def verify_sha256_manifest(package_root: Path) -> dict[str, object]:

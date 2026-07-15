@@ -38,6 +38,16 @@ def _load_portable_launcher():
     return module
 
 
+def _load_portable_package_runner():
+    module_path = REPO_ROOT / "scripts" / "portable_package_runner.py"
+    assert module_path.is_file(), "portable package runner script is missing"
+    spec = importlib.util.spec_from_file_location("portable_package_runner_for_layout", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_sync_integrations():
     module_path = REPO_ROOT / "scripts" / "sync_integrations.py"
     spec = importlib.util.spec_from_file_location("sync_integrations_for_portable_schema", module_path)
@@ -137,6 +147,424 @@ def _copy_controller_builder_fixture(root: Path) -> None:
         "repo.lock.json",
     ):
         shutil.copy2(REPO_ROOT / name, root / name)
+    guide = REPO_ROOT / "packaging" / "portable" / "使用说明-先看这里.txt"
+    assert guide.is_file(), "portable package root guide is missing"
+    destination = root / "packaging" / "portable" / guide.name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(guide, destination)
+
+
+def _build_controller_bootstrap(tmp_path: Path, version: str) -> tuple[Path, Path]:
+    assert POWERSHELL is not None
+    controller_root = tmp_path / "controller"
+    _copy_controller_builder_fixture(controller_root)
+    _initialize_git_repository(controller_root)
+    output_root = tmp_path / "controller-output"
+    _run_checked(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(controller_root / "Build-Package.ps1"),
+            "-Profile",
+            "Bootstrap",
+            "-Device",
+            "CPU",
+            "-Version",
+            version,
+            "-OutputRoot",
+            str(output_root),
+        ],
+        controller_root,
+        env={**os.environ, "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve())},
+    )
+    archives = list(output_root.glob("*.zip"))
+    assert len(archives) == 1
+    stage = (
+        controller_root
+        / "artifacts"
+        / "portable"
+        / ".work"
+        / "tts-more-bootstrap"
+        / f"TTS-More-{version}-windows-x64-bootstrap"
+    )
+    return stage, archives[0]
+
+
+def _build_worker_bootstrap(
+    tmp_path: Path, version: str, component: str = "gpt-sovits"
+) -> tuple[Path, Path, Path, dict[str, bytes]]:
+    assert POWERSHELL is not None
+    worker_root = tmp_path / "worker"
+    _load_sync_integrations().sync_integration(REPO_ROOT, worker_root, component, "a" * 40)
+    (worker_root / "upstream-entry.py").write_text("UPSTREAM_FIXTURE = True\n", encoding="utf-8")
+    (worker_root / "README.md").write_text("upstream fixture\n", encoding="utf-8")
+    (worker_root / "nested" / "artifacts").mkdir(parents=True)
+    (worker_root / "nested" / "artifacts" / "machine.log").write_text(
+        "private build artifact\n", encoding="utf-8"
+    )
+    (worker_root / "nested" / ".env.local").write_text("PRIVATE_TOKEN=secret\n", encoding="utf-8")
+    source_component = worker_root / "tts_more" / "component.json"
+    source_model_lock = worker_root / "tts_more" / "locks" / "models.lock.json"
+    source_before = {
+        "component.json": source_component.read_bytes(),
+        "locks/models.lock.json": source_model_lock.read_bytes(),
+        "locks/runtime.lock.json": (worker_root / "tts_more" / "locks" / "runtime.lock.json").read_bytes(),
+        "integration.manifest.json": (worker_root / "tts_more" / "integration.manifest.json").read_bytes(),
+    }
+    _initialize_git_repository(worker_root)
+    output_root = tmp_path / "worker-output"
+    _run_checked(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(worker_root / "Build-Package.ps1"),
+            "-Profile",
+            "Bootstrap",
+            "-Device",
+            "CPU",
+            "-Version",
+            version,
+            "-OutputRoot",
+            str(output_root),
+        ],
+        worker_root,
+        env={**os.environ, "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve())},
+    )
+    archives = list(output_root.glob("*.zip"))
+    assert len(archives) == 1
+    stage = (
+        worker_root
+        / "artifacts"
+        / "portable"
+        / ".work"
+        / f"{component}-bootstrap"
+        / f"{component}-{version}-windows-x64-bootstrap"
+    )
+    return worker_root, stage, archives[0], source_before
+
+
+@pytest.fixture(scope="module")
+def clean_portable_builds(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
+    if POWERSHELL is None:
+        pytest.skip("clean portable package contract requires PowerShell")
+    root = tmp_path_factory.mktemp("clean-portable-layout")
+    controller_stage, controller_zip = _build_controller_bootstrap(
+        root / "controller-build", "0.2.0-clean-controller"
+    )
+    worker_root, worker_stage, worker_zip, source_before = (
+        _build_worker_bootstrap(root / "worker-build", "0.2.0-clean-worker")
+    )
+    return {
+        "controller_stage": controller_stage,
+        "controller_zip": controller_zip,
+        "worker_root": worker_root,
+        "worker_stage": worker_stage,
+        "worker_zip": worker_zip,
+        "source_before": source_before,
+    }
+
+
+def test_controller_bootstrap_has_clean_normal_user_root(
+    clean_portable_builds: dict[str, object],
+) -> None:
+    stage = Path(clean_portable_builds["controller_stage"])
+    archive_path = Path(clean_portable_builds["controller_zip"])
+    required_root = {
+        "Initialize.cmd",
+        "Start.cmd",
+        "Stop.cmd",
+        "Repair.cmd",
+        "Build-Package.ps1",
+        "使用说明-先看这里.txt",
+    }
+    assert required_root <= {path.name for path in stage.iterdir() if path.is_file()}
+    assert (stage / "app" / "backend" / "app").is_dir()
+    assert (stage / "app" / "frontend" / "index.html").is_file()
+    assert (stage / "licenses" / "LICENSE").is_file()
+    assert (stage / "licenses" / "NOTICE").is_file()
+    assert (stage / "licenses" / "THIRD_PARTY_NOTICES.json").is_file()
+    assert (stage / "package" / "repo.lock.json").is_file()
+    for clutter in (".git", "artifacts", "backend", "frontend", "LICENSE", "NOTICE", "repo.lock.json"):
+        assert not (stage / clutter).exists(), f"checkout clutter leaked to package root: {clutter}"
+    manifest = json.loads(
+        (stage / "package" / "tts-more-package.json").read_text(encoding="utf-8-sig")
+    )
+    assert manifest["licenses"] == "licenses/THIRD_PARTY_NOTICES.json"
+    packages = _load_portable_packages()
+    assert packages.audit_release_zip(archive_path)["valid"] is True
+    assert packages.verify_sha256_manifest(stage)["valid"] is True
+
+
+def test_worker_bootstrap_stages_all_upstream_source_under_app_without_mutating_checkout(
+    clean_portable_builds: dict[str, object],
+) -> None:
+    worker_root = Path(clean_portable_builds["worker_root"])
+    stage = Path(clean_portable_builds["worker_stage"])
+    archive_path = Path(clean_portable_builds["worker_zip"])
+    required_root = {
+        "Initialize.cmd",
+        "Start.cmd",
+        "Stop.cmd",
+        "Repair.cmd",
+        "Build-Package.ps1",
+        "Start-WebUI.cmd",
+        "使用说明-先看这里.txt",
+    }
+    assert required_root <= {path.name for path in stage.iterdir() if path.is_file()}
+    assert (stage / "app" / "upstream-entry.py").is_file()
+    assert (stage / "app" / "README.md").is_file()
+    assert (stage / "app" / "tts_more" / "component.json").is_file()
+    assert not (stage / "app" / "nested" / "artifacts").exists()
+    assert not (stage / "app" / "nested" / ".env.local").exists()
+    for clutter in (
+        ".git",
+        ".venv",
+        "artifacts",
+        "runtime",
+        "data",
+        "tts_more",
+        "README.md",
+        "upstream-entry.py",
+    ):
+        assert not (stage / clutter).exists(), f"worker checkout clutter leaked to package root: {clutter}"
+
+    component = json.loads(
+        (stage / "app" / "tts_more" / "component.json").read_text(encoding="utf-8-sig")
+    )
+    manifest = json.loads(
+        (stage / "package" / "tts-more-package.json").read_text(encoding="utf-8-sig")
+    )
+    model_lock = json.loads(
+        (stage / "app" / "tts_more" / "locks" / "models.lock.json").read_text(
+            encoding="utf-8-sig"
+        )
+    )
+    assert component["source_root"] == "app"
+    assert manifest["runtime"]["lock"] == "app/tts_more/locks/runtime.lock.json"
+    assert manifest["models"]["lock"] == "app/tts_more/locks/models.lock.json"
+    targets = [str(asset["target"]).replace("\\", "/") for asset in model_lock["assets"]]
+    required_paths = [str(path).replace("\\", "/") for path in model_lock["required_paths"]]
+    assert targets and required_paths
+    assert all(path.startswith("app/") and not path.startswith("app/app/") for path in targets)
+    assert all(path.startswith("app/") and not path.startswith("app/app/") for path in required_paths)
+    for relative, before in dict(clean_portable_builds["source_before"]).items():
+        assert (worker_root / "tts_more" / relative).read_bytes() == before
+    assert _load_sync_integrations().check_integration(stage / "app") == []
+    packages = _load_portable_packages()
+    assert packages.audit_release_zip(archive_path)["valid"] is True
+    assert packages.verify_sha256_manifest(stage)["valid"] is True
+
+
+def test_worker_package_resolves_package_source_and_bundle_roots_independently(
+    clean_portable_builds: dict[str, object], tmp_path: Path
+) -> None:
+    stage = Path(clean_portable_builds["worker_stage"])
+    package_root = tmp_path / "移动盘 worker 包"
+    shutil.copytree(stage, package_root)
+    runtime_python = package_root / "runtime" / "live" / "python.exe"
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_bytes(b"fixture runtime")
+
+    runner = _load_portable_package_runner()
+    command, cwd, environment = runner.build_worker_process(package_root)
+    source_root = package_root / "app"
+    bundle_root = source_root / "tts_more"
+    assert cwd == source_root
+    assert command[0] == str(runtime_python)
+    assert command[command.index("--app-dir") + 1] == str(bundle_root)
+    assert environment["TTS_MORE_PACKAGE_ROOT"] == str(package_root)
+    assert environment["TTS_MORE_GPTSOVITS_REPO"] == str(source_root)
+    assert environment["PYTHONPATH"] == str(source_root)
+    assert environment["TTS_MORE_ARTIFACT_ROOT"] == str(
+        package_root / "data" / "local" / "artifacts"
+    )
+
+    paths_script = bundle_root / "Portable-Paths.ps1"
+    completed = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            f". '{paths_script}'; Get-PortableWorkerPaths -BundleRoot '{bundle_root}' | ConvertTo-Json -Compress",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    resolved = json.loads(completed.stdout.strip())
+    assert Path(resolved["PackageRoot"]) == package_root
+    assert Path(resolved["SourceRoot"]) == source_root
+    assert Path(resolved["BundleRoot"]) == bundle_root
+
+    start_controller = (bundle_root / "Invoke-PortableStart.ps1").read_text(encoding="utf-8")
+    initializer = (bundle_root / "Initialize.ps1").read_text(encoding="utf-8")
+    worker_start = (bundle_root / "Start-Worker.ps1").read_text(encoding="utf-8")
+    worker_stop = (bundle_root / "Stop-Worker.ps1").read_text(encoding="utf-8")
+    assert "Get-PortableWorkerPaths" in start_controller
+    assert "SourceRoot = $sourceRoot" in start_controller
+    assert 'lock --check --project $SourceRoot' in initializer
+    assert 'export --frozen --no-dev --no-emit-project --project $SourceRoot' in initializer
+    assert "ToolchainLockRelative" in initializer
+    assert "-WorkingDirectory $SourceRoot" in worker_start
+    assert 'TTS_MORE_GPTSOVITS_REPO = $SourceRoot' in worker_start
+    assert "Get-PortableWorkerPaths" in worker_stop
+    assert 'RelativePath "tts_more\\locks\\runtime.lock.json"' not in worker_stop
+
+
+def test_worker_source_checkout_keeps_checkout_root_as_package_and_source_root(
+    clean_portable_builds: dict[str, object],
+) -> None:
+    worker_root = Path(clean_portable_builds["worker_root"])
+    bundle_root = worker_root / "tts_more"
+    paths_script = bundle_root / "Portable-Paths.ps1"
+    completed = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            f". '{paths_script}'; Get-PortableWorkerPaths -BundleRoot '{bundle_root}' | ConvertTo-Json -Compress",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    resolved = json.loads(completed.stdout.strip())
+    assert Path(resolved["PackageRoot"]) == worker_root
+    assert Path(resolved["SourceRoot"]) == worker_root
+    assert Path(resolved["BundleRoot"]) == bundle_root
+    assert json.loads((bundle_root / "component.json").read_text(encoding="utf-8"))["component"] == (
+        "gpt-sovits"
+    )
+    assert "source_root" not in json.loads(
+        (bundle_root / "component.json").read_text(encoding="utf-8")
+    )
+    assert "tts_more\\Start-WebUI.ps1" in (worker_root / "Start-WebUI.cmd").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_worker_source_root_rejects_a_junction_in_the_package_path(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("junction source_root contract is Windows-specific")
+    package_root = tmp_path / "package"
+    external_app = tmp_path / "external-app"
+    bundle_root = external_app / "tts_more"
+    bundle_root.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "integrations" / "windows" / "Portable-Paths.ps1", bundle_root)
+    (bundle_root / "component.json").write_text(
+        json.dumps({"component": "gpt-sovits", "source_root": "app"}), encoding="utf-8"
+    )
+    (package_root / "package").mkdir(parents=True)
+    (package_root / "package" / "tts-more-package.json").write_text("{}\n", encoding="utf-8")
+    junction = package_root / "app"
+    create = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"New-Item -ItemType Junction -Path '{junction}' -Target '{external_app}' | Out-Null",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert create.returncode == 0, create.stderr
+
+    completed = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            f". '{junction / 'tts_more' / 'Portable-Paths.ps1'}'; Get-PortableWorkerPaths -BundleRoot '{junction / 'tts_more'}' -PackageRoot '{package_root}'",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "reparse point" in (completed.stdout + completed.stderr).lower()
+
+
+def test_staged_gpt_webui_uses_only_package_private_python_and_requires_initialize(
+    clean_portable_builds: dict[str, object],
+) -> None:
+    stage = Path(clean_portable_builds["worker_stage"])
+    webui_script = stage / "app" / "tts_more" / "Start-WebUI.ps1"
+    script = webui_script.read_text(encoding="utf-8")
+    assert 'Join-Path $Root "runtime\\live\\python.exe"' in script
+    assert '@("-I", (Join-Path $SourceRoot "webui.py"), "zh_CN")' in script
+    assert "go-webui.bat" in script
+    completed = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(webui_script),
+            "-PackageRoot",
+            str(stage),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "initialize.cmd first" in (completed.stdout + completed.stderr).lower()
+
+
+def test_packaged_build_entry_fails_with_an_intentional_user_facing_message(
+    clean_portable_builds: dict[str, object],
+) -> None:
+    for stage_key in ("controller_stage", "worker_stage"):
+        script = Path(clean_portable_builds[stage_key]) / "Build-Package.ps1"
+        completed = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        assert completed.returncode != 0
+        assert "source checkout" in (completed.stdout + completed.stderr).lower()
 
 
 @pytest.fixture(scope="module")
@@ -552,6 +980,36 @@ def test_release_audit_rejects_nested_git_metadata(
             ),
         )
         archive.writestr(f"Component/{git_metadata_path}", b"git metadata")
+
+    report = packages.audit_release_zip(archive_path)
+
+    assert report["valid"] is False
+    assert any("forbidden release asset" in error for error in report["errors"])
+
+
+@pytest.mark.parametrize(
+    "private_path",
+    (
+        "app/artifacts/build.log",
+        "app/nested/cache/download.part",
+        "app/.env",
+        "app/nested/.env.local",
+        "app/nested/.env.production",
+    ),
+)
+def test_release_audit_rejects_checkout_artifacts_caches_and_environment_files(
+    tmp_path: Path, private_path: str
+) -> None:
+    packages = _load_portable_packages()
+    archive_path = tmp_path / f"private-{len(list(tmp_path.iterdir()))}.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "Component/package/tts-more-package.json",
+            json.dumps(
+                {"schema_version": 2, "component": "gpt-sovits", "package_profile": "bootstrap"}
+            ),
+        )
+        archive.writestr(f"Component/{private_path}", b"private")
 
     report = packages.audit_release_zip(archive_path)
 

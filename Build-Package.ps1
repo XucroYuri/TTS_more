@@ -23,7 +23,7 @@ if (!(Test-Path -LiteralPath (Join-Path $Root "frontend\dist\index.html"))) {
     if ($LASTEXITCODE -ne 0) { throw "frontend production build failed" }
 }
 if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "app\backend"), (Join-Path $stage "package"), (Join-Path $stage "scripts"), (Join-Path $stage "packaging\portable") | Out-Null
+New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "app\backend"), (Join-Path $stage "package"), (Join-Path $stage "scripts"), (Join-Path $stage "packaging\portable"), (Join-Path $stage "licenses") | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $Root "backend\app") -Destination (Join-Path $stage "app\backend\app") -Recurse
 foreach ($file in @("pyproject.toml", "uv.lock", ".python-version")) { Copy-Item -LiteralPath (Join-Path $Root "backend\$file") -Destination (Join-Path $stage "app\backend\$file") }
@@ -35,10 +35,16 @@ foreach ($file in @("toolchain.lock.json", "runtime.lock.json", "models.lock.jso
     if (!$resolved.StartsWith([System.IO.Path]::GetFullPath($stage), [System.StringComparison]::OrdinalIgnoreCase)) { throw "refusing to clean outside package stage: $resolved" }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
-foreach ($file in @("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "LICENSE", "NOTICE", "repo.lock.json")) {
+foreach ($file in @("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd")) {
     Copy-Item -LiteralPath (Join-Path $Root $file) -Destination (Join-Path $stage $file)
 }
-Copy-Item -LiteralPath (Join-Path $Root "Build-Package.ps1") -Destination (Join-Path $stage "Build-Package.ps1")
+Copy-Item -LiteralPath (Join-Path $Root "LICENSE") -Destination (Join-Path $stage "licenses\LICENSE")
+Copy-Item -LiteralPath (Join-Path $Root "NOTICE") -Destination (Join-Path $stage "licenses\NOTICE")
+Copy-Item -LiteralPath (Join-Path $Root "repo.lock.json") -Destination (Join-Path $stage "package\repo.lock.json")
+Copy-Item -LiteralPath (Join-Path $Root "packaging\portable\使用说明-先看这里.txt") -Destination (Join-Path $stage "使用说明-先看这里.txt")
+@'
+throw "This delivered portable package cannot rebuild itself. Use the corresponding source checkout and its Build-Package.ps1."
+'@ | Set-Content -LiteralPath (Join-Path $stage "Build-Package.ps1") -Encoding ASCII
 
 $revision = (& git -C $Root rev-parse HEAD).Trim()
 $integrationFiles = @(Get-ChildItem -LiteralPath (Join-Path $stage "scripts") -File | Sort-Object FullName)
@@ -59,10 +65,10 @@ $manifest = [ordered]@{
     launchers = @{ initialize = "Initialize.cmd"; start = "Start.cmd"; stop = "Stop.cmd"; repair = "Repair.cmd"; build = "Build-Package.ps1" }
     endpoint = @{ default_url = "http://127.0.0.1:8000"; port = 8000; health_path = "/api/health"; capabilities_path = "/api/open-source-tts/catalog"; bind_policy = "loopback" }
     capabilities = @("orchestrator", "package-discovery", "artifact-transfer", "trusted-lan-registration")
-    sha256_manifest = "SHA256SUMS.txt"; licenses = "THIRD_PARTY_NOTICES.json"
+    sha256_manifest = "SHA256SUMS.txt"; licenses = "licenses/THIRD_PARTY_NOTICES.json"
 }
 $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $stage "package\tts-more-package.json") -Encoding UTF8
-@{ schema_version = 1; component = "tts-more"; packages = @(); upstream_repositories = @("GPT-SoVITS", "IndexTTS", "CosyVoice") } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage "THIRD_PARTY_NOTICES.json") -Encoding UTF8
+@{ schema_version = 1; component = "tts-more"; packages = @(); upstream_repositories = @("GPT-SoVITS", "IndexTTS", "CosyVoice") } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json") -Encoding UTF8
 
 if ($Profile -eq "Full") {
     & (Join-Path $stage "scripts\initialize-portable.ps1") -Device $Device
@@ -88,7 +94,7 @@ $machinePaths = @(
 ) | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) -and ([string]$_).Length -ge 4 } | Select-Object -Unique
 $machineNames = @($env:USERNAME, $env:COMPUTERNAME) | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) -and ([string]$_).Length -ge 4 } | Select-Object -Unique
 $machinePathLeak = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Length -lt 5MB } | Select-String -SimpleMatch -Pattern $machinePaths -ErrorAction SilentlyContinue)
-$generatedMetadata = @((Join-Path $stage "package\tts-more-package.json"), (Join-Path $stage "THIRD_PARTY_NOTICES.json"))
+$generatedMetadata = @((Join-Path $stage "package\tts-more-package.json"), (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json"))
 $generatedMetadata = @($generatedMetadata | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
 $machineNameLeak = @()
 if (@($machineNames).Count -gt 0 -and $generatedMetadata.Count -gt 0) { $machineNameLeak = @(Select-String -LiteralPath $generatedMetadata -SimpleMatch -Pattern $machineNames -ErrorAction SilentlyContinue) }
@@ -129,6 +135,6 @@ foreach ($match in [regex]::Matches($lockText, '(?ms)\[\[package\]\]\s+name\s*=\
     $packages += @{ SPDXID="SPDXRef-Package-$spdxId"; name=$match.Groups[1].Value; versionInfo=$match.Groups[2].Value; downloadLocation="NOASSERTION"; filesAnalyzed=$false }
 }
 @{ spdxVersion="SPDX-2.3"; dataLicense="CC0-1.0"; SPDXID="SPDXRef-DOCUMENT"; name=$packageName; documentNamespace="https://tts-more.local/spdx/tts-more/$Version/$zipSha"; creationInfo=@{created=[DateTime]::UtcNow.ToString("o");creators=@("Tool: TTS-More-Build-Package-2.0.0")}; packages=$packages } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$zip.spdx.json" -Encoding UTF8
-Copy-Item -LiteralPath (Join-Path $stage "THIRD_PARTY_NOTICES.json") -Destination "$zip.licenses.json"
+Copy-Item -LiteralPath (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json") -Destination "$zip.licenses.json"
 @{ schema_version=1; component="tts-more"; profile=$profileName; manifest_valid=$true; bootstrap_audit=$auditPassed; machine_path_scan=$true; generated_at=[DateTime]::UtcNow.ToString("o") } | ConvertTo-Json | Set-Content -LiteralPath "$zip.acceptance.json" -Encoding UTF8
 Write-Host "Created $Profile package: $zip"

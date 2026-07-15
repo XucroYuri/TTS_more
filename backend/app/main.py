@@ -36,7 +36,17 @@ from app.supervisor import ServiceSupervisor
 DEFAULT_REFERENCE_AUDIO_ROOT = Path("data") / "local" / "reference-audio"
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_ROOT = Path("data") / ".runtime"
-REPO_LOCK_PATH = Path(__file__).resolve().parents[2] / "repo.lock.json"
+
+
+def _resolve_repo_lock_path(module_file: Path = Path(__file__)) -> Path:
+    project_root = Path(module_file).resolve().parents[2]
+    package_root = project_root.parent
+    if (package_root / "package" / "tts-more-package.json").is_file():
+        return package_root / "package" / "repo.lock.json"
+    return project_root / "repo.lock.json"
+
+
+REPO_LOCK_PATH = _resolve_repo_lock_path()
 AUDIO_UPLOAD_SUFFIXES = AUDIO_SUFFIXES | {".webm", ".aac", ".opus"}
 # Maximum accepted upload size for avatar / reference-audio endpoints.
 MAX_UPLOAD_BYTES = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
@@ -214,7 +224,11 @@ def create_app(
 
     @app.post("/api/portable-packages/discover")
     def portable_packages_discover(request: PortablePackageDiscoverRequest) -> dict[str, Any]:
-        packages = discover_portable_packages(project_root, request.roots, include_siblings=request.include_siblings)
+        packages = discover_portable_packages(
+            portable_controller_root,
+            request.roots,
+            include_siblings=request.include_siblings,
+        )
         return {"packages": [package.model_dump(mode="json") for package in packages]}
 
     @app.post("/api/portable-packages/register")

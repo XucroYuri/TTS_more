@@ -1173,6 +1173,8 @@ def test_initializers_repair_stale_state_from_verified_private_assets_without_bo
     shutil.copy2(initializer, bundle)
     shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", bundle)
     shutil.copy2(REPO_ROOT / "scripts" / "portable_install.py", bundle)
+    if component != "tts-more":
+        shutil.copy2(REPO_ROOT / "integrations" / "windows" / "Portable-Paths.ps1", bundle)
     expected_python = "3.11"
     runtime_lock = (
         root / "packaging" / "portable" / "runtime.lock.json"

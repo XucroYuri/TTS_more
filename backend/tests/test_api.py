@@ -4,8 +4,9 @@ import time
 
 from fastapi.testclient import TestClient
 
+import app.main as main_module
 from app.models import Character, ScriptLine
-from app.main import _layer_service_status, _portable_controller_root, create_app
+from app.main import _layer_service_status, _portable_controller_root, _resolve_repo_lock_path, create_app
 from app.parser import ParsedScriptDraft, ParserProviderUnavailable, ParserQualityError
 
 
@@ -3141,6 +3142,52 @@ def test_portable_controller_root_is_derived_from_packaged_module_layout(tmp_pat
     resolved = _portable_controller_root(Path("data"), packaged_app)
 
     assert resolved == package
+
+
+def test_repo_lock_path_resolves_checkout_and_staged_controller_layouts(tmp_path: Path) -> None:
+    checkout_main = tmp_path / "checkout" / "backend" / "app" / "main.py"
+    checkout_main.parent.mkdir(parents=True)
+    checkout_lock = tmp_path / "checkout" / "repo.lock.json"
+    checkout_lock.write_text("{}\n", encoding="utf-8")
+    staged_main = tmp_path / "package" / "app" / "backend" / "app" / "main.py"
+    staged_main.parent.mkdir(parents=True)
+    staged_lock = tmp_path / "package" / "package" / "repo.lock.json"
+    staged_lock.parent.mkdir(parents=True)
+    staged_lock.write_text("{}\n", encoding="utf-8")
+    (staged_lock.parent / "tts-more-package.json").write_text("{}\n", encoding="utf-8")
+
+    assert _resolve_repo_lock_path(checkout_main) == checkout_lock
+    assert _resolve_repo_lock_path(staged_main) == staged_lock
+
+
+def test_staged_controller_discovers_sibling_packages_from_package_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    package = tmp_path / "TTS More package"
+    packaged_main = package / "app" / "backend" / "app" / "main.py"
+    packaged_main.parent.mkdir(parents=True)
+    (package / "package").mkdir(parents=True)
+    (package / "package" / "tts-more-package.json").write_text("{}\n", encoding="utf-8")
+    (package / "scripts").mkdir()
+    (package / "scripts" / "select-portable-folder.ps1").write_text("# fixed\n", encoding="utf-8")
+    observed: list[Path] = []
+
+    def fake_discover(base_root: Path, _roots: list[Path], *, include_siblings: bool):
+        assert include_siblings is True
+        observed.append(base_root)
+        return []
+
+    monkeypatch.setattr(main_module, "__file__", str(packaged_main))
+    monkeypatch.setattr(main_module, "discover_portable_packages", fake_discover)
+    client = TestClient(main_module.create_app(data_root=package / "data"))
+
+    response = client.post(
+        "/api/portable-packages/discover",
+        json={"roots": [], "include_siblings": True},
+    )
+
+    assert response.status_code == 200
+    assert observed == [package]
 
 
 def test_create_app_wires_one_portable_controller_root_to_both_resolution_layers(tmp_path: Path) -> None:
