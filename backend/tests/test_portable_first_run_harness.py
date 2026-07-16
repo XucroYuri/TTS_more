@@ -132,6 +132,13 @@ def test_harness_contract_limits_path_audits_before_expand_and_covers_exact_comp
     assert "Get-Command" in script and "COMMAND_LEAK" in script
 
 
+def test_harness_accepts_json_integer_width_differences_from_powershell_hosts() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert "schema_version -isnot [int]" not in script
+    assert "TryParse([string]$manifest.schema_version" in script
+
+
 def test_harness_contract_uses_real_root_launchers_and_fixture_only_copy_mutation() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
     assert all(name in script for name in ("Start.cmd", "Stop.cmd", "Repair.cmd", "Initialize.cmd"))

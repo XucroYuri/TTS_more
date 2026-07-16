@@ -222,7 +222,8 @@ function Assert-InputPackages {
         if ($LASTEXITCODE -ne 0) { Throw-HarnessError "PACKAGE_AUDIT_FAILED" "Bootstrap release ZIP audit failed" }
         Assert-ZipHashSidecar -Zip $zip
         $manifest = Get-ArchiveManifest -Zip $zip
-        if ($manifest.schema_version -isnot [int] -or [int]$manifest.schema_version -ne 2 -or [string]$manifest.package_profile -ne "bootstrap") {
+        $schemaVersion = 0
+        if (![int]::TryParse([string]$manifest.schema_version, [ref]$schemaVersion) -or $schemaVersion -ne 2 -or [string]$manifest.package_profile -ne "bootstrap") {
             Throw-HarnessError "PACKAGE_AUDIT_FAILED" "input must be a schema v2 Bootstrap ZIP"
         }
         $component = [string]$manifest.component

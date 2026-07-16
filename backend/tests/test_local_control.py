@@ -287,6 +287,18 @@ def test_portable_import_safe_projections_contain_only_counts_bytes_and_relative
     )
 
 
+def test_portable_import_projection_clamps_expires_seconds_to_store_ttl(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    store = PortableImportPlanStore(ttl_seconds=300, clock=clock)
+    stored = _stored_plan(store, tmp_path / "new package")
+
+    projected = project_import_plan(stored, now=clock() - 0.001)
+
+    assert projected["expires_in_seconds"] == 300
+
+
 @pytest.mark.parametrize("unsafe", ["C:/secret/model.bin", "../escape", "models\\secret.bin"])
 def test_portable_import_safe_projection_rejects_non_relative_or_noncanonical_paths(
     tmp_path: Path, unsafe: str

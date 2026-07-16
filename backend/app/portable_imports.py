@@ -139,10 +139,12 @@ def project_import_plan(
 ) -> dict[str, object]:
     plan = stored.plan
     current = time.monotonic() if now is None else now
+    ttl_seconds = max(0.0, stored.expires_at - stored.created_at)
+    remaining_seconds = min(ttl_seconds, max(0.0, stored.expires_at - current))
     return {
         "plan_id": stored.plan_id,
         "plan_digest": _digest(getattr(plan, "plan_digest", None)),
-        "expires_in_seconds": int(math.ceil(max(0.0, stored.expires_at - current))),
+        "expires_in_seconds": int(math.ceil(remaining_seconds)),
         "user_file_count": len(plan.user_files),
         "user_bytes": sum(_size(item) for item in plan.user_files),
         "reusable_assets": _relative_items(plan.reusable_assets),
