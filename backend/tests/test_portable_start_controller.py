@@ -1383,6 +1383,7 @@ def test_launcher_staging_progress_and_error_catalog_contracts(tmp_path: Path) -
     for function in (
         "Get-PackageContext",
         "Resolve-PortablePowerShellHost",
+        "Get-PortableSafeSystemPath",
         "Assert-PackageWritable",
         "Open-PackageOperationLock",
         "Test-InstallState",
@@ -1399,6 +1400,8 @@ def test_launcher_staging_progress_and_error_catalog_contracts(tmp_path: Path) -
     assert "& $powerShell @command" not in controller
     assert "Invoke-PortableCapturedProcess -FilePath $powerShell -Arguments $command" in controller
     assert "PowerShell host executable is unavailable for portable child launch" in controller
+    assert 'Join-Path $systemDirectory "WindowsPowerShell\\v1.0"' in controller
+    assert "Conda" not in controller[controller.index("function Get-PortableSafeSystemPath") : controller.index("function Invoke-PortableCapturedProcess")]
     assert "Initialization did not produce a valid package-private runtime state ($installDiagnostic)" in controller
     assert "[switch]$OfferImport" in controller
     for function in (

@@ -467,6 +467,19 @@ function ConvertTo-PortableNativeArgument {
     return $builder.ToString()
 }
 
+function Get-PortableSafeSystemPath {
+    $systemDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::System)
+    if ([string]::IsNullOrWhiteSpace($systemDirectory)) { return "" }
+    $windowsDirectory = Split-Path -Parent $systemDirectory
+    $entries = @(
+        $systemDirectory,
+        $windowsDirectory,
+        (Join-Path $systemDirectory "Wbem"),
+        (Join-Path $systemDirectory "WindowsPowerShell\v1.0")
+    ) | Where-Object { ![string]::IsNullOrWhiteSpace($_) -and (Test-Path -LiteralPath $_ -PathType Container) }
+    return (@($entries | Select-Object -Unique) -join ";")
+}
+
 function Invoke-PortableCapturedProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -484,6 +497,14 @@ function Invoke-PortableCapturedProcess {
         $startInfo.CreateNoWindow = $true
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError = $true
+        $pathKey = @($startInfo.EnvironmentVariables.Keys | Where-Object { [string]$_ -ieq "PATH" } | Select-Object -First 1)
+        if ([string]::IsNullOrWhiteSpace($pathKey)) { $pathKey = "PATH" }
+        if ([string]::IsNullOrWhiteSpace([string]$startInfo.EnvironmentVariables[$pathKey])) {
+            $safePath = Get-PortableSafeSystemPath
+            if (![string]::IsNullOrWhiteSpace($safePath)) {
+                $startInfo.EnvironmentVariables[$pathKey] = $safePath
+            }
+        }
         if ($Utf8) {
             $startInfo.StandardOutputEncoding = $script:Utf8NoBom
             $startInfo.StandardErrorEncoding = $script:Utf8NoBom
