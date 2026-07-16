@@ -185,7 +185,7 @@ def select_full_package(
     try:
         actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
         with zipfile.ZipFile(path) as archive:
-            package_root, relative_names = _single_zip_package_root(archive)
+            raw_package_root, package_root, relative_names = _single_zip_package_root(archive)
             manifest_name = relative_names.get("package/tts-more-package.json")
             if manifest_name is None:
                 raise ValueError("full ZIP is missing its embedded package manifest")
@@ -218,7 +218,12 @@ def select_full_package(
             if runtime.get("device_profiles") != [resolved]:
                 raise ValueError("full ZIP manifest does not bind the resolved profile")
             expected_filename = full_package_name(component, version, resolved)
-            if path.name != expected_filename or package_root != expected_filename.removesuffix(".zip").casefold():
+            expected_root = expected_filename.removesuffix(".zip")
+            if (
+                path.name != expected_filename
+                or raw_package_root != expected_root
+                or package_root != expected_root.casefold()
+            ):
                 raise ValueError("full ZIP filename, archive root, and manifest identity do not match")
             _verify_zip_sha256_manifest(archive, relative_names)
 
@@ -261,12 +266,19 @@ def select_full_package(
     return report
 
 
-def _single_zip_package_root(archive: zipfile.ZipFile) -> tuple[str, dict[str, str]]:
+def _single_zip_package_root(
+    archive: zipfile.ZipFile,
+) -> tuple[str, str, dict[str, str]]:
     entries = archive.infolist()
     raw_names = _raw_central_directory_names(archive, len(entries))
+    raw_roots: set[str] = set()
     roots: set[str] = set()
     relative_names: dict[str, str] = {}
     for entry, raw_name in zip(entries, raw_names, strict=True):
+        if "\\" in raw_name or "/" not in raw_name:
+            raise ValueError("ZIP entry is outside its exact archive root")
+        raw_root = raw_name.split("/", 1)[0]
+        raw_roots.add(raw_root)
         canonical = _canonical_zip_entry(raw_name)
         if "/" not in canonical:
             raise ValueError("full ZIP entry is outside its package root")
@@ -277,9 +289,16 @@ def _single_zip_package_root(archive: zipfile.ZipFile) -> tuple[str, dict[str, s
         if relative in relative_names:
             raise ValueError(f"full ZIP contains a normalized path collision: {raw_name}")
         relative_names[relative] = raw_name
-    if len(roots) != 1:
-        raise ValueError("full ZIP must contain exactly one package root")
-    return next(iter(roots)), relative_names
+    if len(raw_roots) != 1 or len(roots) != 1:
+        raise ValueError("full ZIP must contain exactly one archive root")
+    raw_root = next(iter(raw_roots))
+    if (
+        not SAFE_PACKAGE_ROOT.fullmatch(raw_root)
+        or raw_root != raw_root.rstrip(" .")
+        or unicodedata.normalize("NFKC", raw_root) != raw_root
+    ):
+        raise ValueError("full ZIP archive root is unsafe or ambiguous")
+    return raw_root, next(iter(roots)), relative_names
 
 
 def _verify_zip_sha256_manifest(
@@ -405,7 +424,7 @@ def audit_release_assets(directory: Path) -> dict[str, object]:
                 continue
             actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
             with zipfile.ZipFile(path) as archive:
-                package_root, relative_names = _single_zip_package_root(archive)
+                raw_package_root, package_root, relative_names = _single_zip_package_root(archive)
                 manifest_name = relative_names.get("package/tts-more-package.json")
                 if manifest_name is None:
                     raise ValueError(f"release ZIP manifest is missing: {path.name}")
@@ -426,7 +445,12 @@ def audit_release_assets(directory: Path) -> dict[str, object]:
                 if component == "tts-more"
                 else f"{component}-{version}-windows-x64-bootstrap.zip"
             )
-            if path.name != expected_name or package_root != expected_name.removesuffix(".zip").casefold():
+            expected_root = expected_name.removesuffix(".zip")
+            if (
+                path.name != expected_name
+                or raw_package_root != expected_root
+                or package_root != expected_root.casefold()
+            ):
                 raise ValueError(f"release ZIP filename, archive root, and manifest identity mismatch: {path.name}")
             suffixes = (
                 "",

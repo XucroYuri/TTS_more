@@ -2371,6 +2371,25 @@ def _write_full_package_candidate(
     return archive_path
 
 
+def _rewrite_full_candidate_archive_root(archive_path: Path, archive_root: str) -> None:
+    temporary = archive_path.with_suffix(".rewritten.zip")
+    with zipfile.ZipFile(archive_path) as source, zipfile.ZipFile(
+        temporary, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True
+    ) as destination:
+        for entry in source.infolist():
+            _old_root, relative = entry.filename.split("/", 1)
+            destination.writestr(f"{archive_root}/{relative}", source.read(entry))
+    temporary.replace(archive_path)
+    digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    Path(f"{archive_path}.sha256").write_text(
+        f"{digest}  {archive_path.name}\n", encoding="ascii"
+    )
+    provenance_path = Path(f"{archive_path}.provenance.json")
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["sha256"] = digest
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+
 def test_select_full_package_reads_manifest_state_and_verifies_sha_sidecars(tmp_path: Path) -> None:
     packages = _load_portable_packages()
     archive_path = _write_full_package_candidate(tmp_path)
@@ -2385,6 +2404,37 @@ def test_select_full_package_reads_manifest_state_and_verifies_sha_sidecars(tmp_
     assert report["valid"] is True
     assert report["resolved_profile"] == "cu128"
     assert report["filename"] == archive_path.name
+
+
+@pytest.mark.parametrize(
+    "archive_root_variant",
+    [
+        lambda expected: expected + ".",
+        lambda expected: expected + " ",
+        lambda expected: expected.replace("g", "ｇ", 1),
+        lambda expected: expected.replace("g", "G", 1),
+    ],
+    ids=("trailing-dot", "trailing-space", "nfkc-lookalike", "case-variant"),
+)
+def test_select_full_package_rejects_raw_archive_root_aliases(
+    tmp_path: Path, archive_root_variant
+) -> None:
+    packages = _load_portable_packages()
+    archive_path = _write_full_package_candidate(tmp_path)
+    expected_root = archive_path.name.removesuffix(".zip")
+    _rewrite_full_candidate_archive_root(
+        archive_path, archive_root_variant(expected_root)
+    )
+
+    report = packages.select_full_package(
+        [archive_path],
+        expected_component="gpt-sovits",
+        expected_version="0.2.0",
+        requested_profile="auto",
+    )
+
+    assert report["valid"] is False
+    assert any("archive root" in error for error in report["errors"])
 
 
 @pytest.mark.parametrize(
