@@ -3598,6 +3598,41 @@ def test_release_asset_gate_returns_nonzero_for_concurrent_seventh_asset() -> No
     assert exit_code != 0
 
 
+def test_release_asset_gate_rejects_foreign_asset_replacing_expected_asset(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gate = _load_release_asset_gate()
+    expected = _release_gate_expected_names()
+    replaced = expected[-1]
+    foreign = "foreign.zip"
+
+    def fake_run(command: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        actual = [*expected[:-1], foreign]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="\n".join(actual) + "\n",
+            stderr="",
+        )
+
+    exit_code = gate.main(
+        [
+            "--repository",
+            "XucroYuri/TTS_more",
+            "--tag",
+            "v0.2.0-test",
+            *(argument for name in expected for argument in ("--expected-name", name)),
+        ],
+        run=fake_run,
+    )
+
+    assert exit_code != 0
+    error = capsys.readouterr().err
+    assert "mismatch" in error
+    assert f"missing=['{replaced}']" in error
+    assert f"extra=['{foreign}']" in error
+
+
 def test_validate_manifest_rejects_invalid_v2_profile_and_nested_absolute_paths(tmp_path: Path) -> None:
     packages = _load_portable_packages()
     payload = _valid_v2_manifest()
