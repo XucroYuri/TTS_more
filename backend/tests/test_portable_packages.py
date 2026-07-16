@@ -3500,6 +3500,24 @@ def test_portable_release_workflow_passes_expected_component_and_version() -> No
     assert "$candidateZips[0]" not in workflow
 
 
+def test_portable_release_workflow_uses_locked_backend_build_environment() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "portable-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'python -m pip install -e "backend[dev]"' not in workflow
+    assert "uv sync --locked --project backend --extra dev" in workflow
+    assert "$buildPython = (Resolve-Path backend\\.venv\\Scripts\\python.exe).Path" in workflow
+    assert "$env:TTS_MORE_BUILD_PYTHON = $buildPython" in workflow
+    assert "& $buildPython scripts\\portable_packages.py audit-release" in workflow
+    assert "& $buildPython scripts\\portable_packages.py audit-release-assets" in workflow
+    release = workflow.split("github-release:", 1)[1]
+    assert "uv sync --locked --project integrations/build_tools" in release
+    assert 'build_python="$RUNNER_TEMP/tts-more-build-tools/bin/python"' in release
+    assert '"$build_python" scripts/portable_packages.py audit-release' in release
+    assert '"$build_python" scripts/portable_packages.py audit-release-assets' in release
+
+
 def test_portable_release_workflow_fails_closed_on_existing_remote_extra_assets() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "portable-release.yml").read_text(
         encoding="utf-8"
@@ -3520,7 +3538,7 @@ def test_portable_release_workflow_rechecks_exact_remote_assets_after_upload() -
     )
     publish = workflow.split("- name: Publish bootstrap assets only", 1)[1]
     upload = 'gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber'
-    gate_call = "python scripts/verify-release-asset-set.py"
+    gate_call = '"$build_python" scripts/verify-release-asset-set.py'
 
     assert upload in publish
     assert gate_call in publish

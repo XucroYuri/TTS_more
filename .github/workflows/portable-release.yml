@@ -42,8 +42,9 @@ jobs:
         shell: pwsh
         run: |
           uv lock --check --project backend
-          python -m pip install -e "backend[dev]"
-          python -m pytest backend/tests/test_portable_install.py backend/tests/test_portable_launcher.py backend/tests/test_portable_diagnostics.py backend/tests/test_portable_packages.py backend/tests/test_portable_locks.py backend/tests/test_portable_discovery.py backend/tests/test_integration_sync.py -q
+          uv sync --locked --project backend --extra dev
+          $testPython = (Resolve-Path backend\.venv\Scripts\python.exe).Path
+          & $testPython -m pytest backend/tests/test_portable_install.py backend/tests/test_portable_launcher.py backend/tests/test_portable_diagnostics.py backend/tests/test_portable_packages.py backend/tests/test_portable_locks.py backend/tests/test_portable_discovery.py backend/tests/test_integration_sync.py -q
       - name: Build static frontend
         shell: pwsh
         run: |
@@ -52,30 +53,30 @@ jobs:
           pnpm --dir frontend build
       - name: Build and audit bootstrap ZIP
         shell: pwsh
-        env:
-          TTS_MORE_BUILD_PYTHON: python
         run: |
+          $buildPython = (Resolve-Path backend\.venv\Scripts\python.exe).Path
+          $env:TTS_MORE_BUILD_PYTHON = $buildPython
           $version = $env:PACKAGE_VERSION -replace '^v', ''
           $version = $version -replace '[^0-9A-Za-z._-]', '-'
           .\Build-Package.ps1 -Profile Bootstrap -Device CPU -Version $version
           $candidateZips = @(Get-ChildItem artifacts\portable\bootstrap\*.zip)
           if ($candidateZips.Count -ne 1) { throw "expected exactly one bootstrap ZIP" }
           foreach ($candidateZip in $candidateZips) {
-            python scripts\portable_packages.py audit-release --zip $candidateZip.FullName
+            & $buildPython scripts\portable_packages.py audit-release --zip $candidateZip.FullName
             if ($LASTEXITCODE -ne 0) { throw "bootstrap ZIP release audit failed" }
           }
-          python scripts\portable_packages.py audit-release-assets --directory artifacts\portable\bootstrap --expected-component tts-more --expected-version $version
+          & $buildPython scripts\portable_packages.py audit-release-assets --directory artifacts\portable\bootstrap --expected-component tts-more --expected-version $version
           if ($LASTEXITCODE -ne 0) { throw "bootstrap release asset set or embedded package_profile audit failed" }
           $zip = Get-Item -LiteralPath (Join-Path "artifacts\portable\bootstrap" "TTS-More-$version-windows-x64-bootstrap.zip")
           $expanded = Join-Path $env:RUNNER_TEMP "tts-more-bootstrap-audit"
           Expand-Archive -LiteralPath $zip.FullName -DestinationPath $expanded
           $packageRoot = @(Get-ChildItem -LiteralPath $expanded -Directory)
           if ($packageRoot.Count -ne 1) { throw "expected exactly one package root" }
-          python (Join-Path $packageRoot[0].FullName "scripts\portable_packages.py") verify-sha256 --package-root $packageRoot[0].FullName
+          & $buildPython (Join-Path $packageRoot[0].FullName "scripts\portable_packages.py") verify-sha256 --package-root $packageRoot[0].FullName
           $exporters = @(Get-ChildItem -LiteralPath $packageRoot[0].FullName -Recurse -File -Filter "export-portable-diagnostics.py")
           if ($exporters.Count -ne 1) { throw "expected exactly one diagnostic exporter" }
           $diagnosticZip = Join-Path $packageRoot[0].FullName "data\local\diagnostics\ci-diagnostics.zip"
-          python $exporters[0].FullName --package-root $packageRoot[0].FullName --output $diagnosticZip
+          & $buildPython $exporters[0].FullName --package-root $packageRoot[0].FullName --output $diagnosticZip
           $env:PORTABLE_DIAGNOSTIC_ZIP = $diagnosticZip
           @'
           import json, os, zipfile
@@ -92,15 +93,16 @@ jobs:
           if payload.get("schema_version") != 1:
               raise SystemExit("diagnostic schema gate failed")
           print("DIAGNOSTIC_AUDIT_OK")
-          '@ | python -
+          '@ | & $buildPython -
       - name: Prove full-profile upload is refused
         shell: pwsh
         run: |
+          $buildPython = (Resolve-Path backend\.venv\Scripts\python.exe).Path
           @'
           import json, zipfile
           with zipfile.ZipFile("artifacts/portable/forbidden-full.zip", "w") as archive:
               archive.writestr("Component/package/tts-more-package.json", json.dumps({"schema_version": 2, "component": "tts-more", "package_profile": "full"}))
-          '@ | python -
+          '@ | & $buildPython -
           @'
           from pathlib import Path
           from scripts.portable_packages import audit_release_zip
@@ -108,7 +110,7 @@ jobs:
           if report["valid"] or not any("profile=full" in error for error in report["errors"]):
               raise SystemExit("full profile release audit unexpectedly passed")
           print("EXPECTED_FULL_REJECTION")
-          '@ | python -
+          '@ | & $buildPython -
           Remove-Item artifacts\portable\forbidden-full.zip
       - uses: actions/upload-artifact@v7
         with:
@@ -133,6 +135,10 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - name: Install frozen uv tool
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
       - uses: actions/download-artifact@v8
         with:
           name: tts-more-windows-bootstrap
@@ -140,19 +146,26 @@ jobs:
       - name: Publish bootstrap assets only
         env:
           GH_TOKEN: ${{ github.token }}
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/tts-more-build-tools
         run: |
+          uv sync --locked --project integrations/build_tools
+          build_python="$RUNNER_TEMP/tts-more-build-tools/bin/python"
+          if [ ! -x "$build_python" ]; then
+            echo "locked portable build-tools Python is missing" >&2
+            exit 1
+          fi
           version="${GITHUB_REF_NAME#v}"
           found_zip=false
           for candidate_zip in release-assets/*.zip; do
             [ -e "$candidate_zip" ] || continue
             found_zip=true
-            python scripts/portable_packages.py audit-release --zip "$candidate_zip"
+            "$build_python" scripts/portable_packages.py audit-release --zip "$candidate_zip"
           done
           if [ "$found_zip" != true ]; then
             echo "no Bootstrap ZIP was downloaded" >&2
             exit 1
           fi
-          python scripts/portable_packages.py audit-release-assets --directory release-assets --expected-component tts-more --expected-version "$version"
+          "$build_python" scripts/portable_packages.py audit-release-assets --directory release-assets --expected-component tts-more --expected-version "$version"
           shopt -s nullglob
           assets=(
             release-assets/*.zip
@@ -192,7 +205,7 @@ jobs:
           for asset_name in "${local_asset_names[@]}"; do
             verify_asset_args+=(--expected-name "$asset_name")
           done
-          python scripts/verify-release-asset-set.py \
+          "$build_python" scripts/verify-release-asset-set.py \
             --repository "$GITHUB_REPOSITORY" \
             --tag "$GITHUB_REF_NAME" \
             "${verify_asset_args[@]}"
