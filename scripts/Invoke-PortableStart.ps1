@@ -994,10 +994,12 @@ function Invoke-ChildPowerShell {
     )
     $powerShell = Resolve-PortablePowerShellHost
     $command = @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $Script) + $Arguments
-    $output = @(& $powerShell @command 2>&1)
-    $exitCode = $LASTEXITCODE
+    $result = Invoke-PortableCapturedProcess -FilePath $powerShell -Arguments $command
+    $output = @()
+    if (![string]::IsNullOrEmpty($result.StdOut)) { $output += @($result.StdOut -split '\r?\n') }
+    if (![string]::IsNullOrEmpty($result.StdErr)) { $output += @($result.StdErr -split '\r?\n') }
     foreach ($line in $output) { Write-Host ([string]$line) }
-    return [pscustomobject]@{ ExitCode = $exitCode; Output = ($output -join "`n") }
+    return [pscustomobject]@{ ExitCode = [int]$result.ExitCode; Output = ($output -join "`n") }
 }
 
 function Invoke-Initialize {
