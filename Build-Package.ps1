@@ -323,6 +323,16 @@ if (!(Test-Path -LiteralPath (Join-Path $Root "frontend\dist\index.html"))) {
     & pnpm --dir (Join-Path $Root "frontend") build
     if ($LASTEXITCODE -ne 0) { throw "frontend production build failed" }
 }
+$buildPythonOutput = @(& (Join-Path $Root "scripts\Resolve-PortableBuildPython.ps1") `
+    -PackageRoot $Root `
+    -BuildToolsRoot (Join-Path $Root "integrations\build_tools") `
+    -BootstrapCondaPath (Join-Path $Root "scripts\bootstrap-conda.ps1") `
+    -ToolchainLockPath (Join-Path $Root "packaging\portable\toolchain.lock.json") `
+    -PortableInstallPath (Join-Path $Root "scripts\portable_install.py"))
+if ($LASTEXITCODE -ne 0 -or $buildPythonOutput.Count -eq 0) { throw "portable build-tools bootstrap failed" }
+$buildPython = [IO.Path]::GetFullPath([string]$buildPythonOutput[-1])
+& $buildPython (Join-Path $Root "scripts\portable_packages.py") audit-builder-source --root $Root --component tts-more --profile $profileName
+if ($LASTEXITCODE -ne 0) { throw "TTS More source dirty: copied source audit failed" }
 $maximumPathLength = 0
 $maximumProjectedPath = ""
 Measure-PortableCopyTree -Source (Join-Path $Root "backend\app") -Destination (Join-Path $stage "app\backend\app") -MaximumLength ([ref]$maximumPathLength) -MaximumPath ([ref]$maximumProjectedPath)
@@ -428,18 +438,8 @@ if (@($machineNames).Count -gt 0 -and $generatedMetadata.Count -gt 0) { $machine
 if ($machinePathLeak.Count -gt 0) { throw "package contains build-machine identity or path data: $($machinePathLeak[0].Path)" }
 if ($machineNameLeak.Count -gt 0) { throw "package metadata contains build-machine identity data: $($machineNameLeak[0].Path)" }
 
-$python = if ($env:TTS_MORE_BUILD_PYTHON) {
-    $env:TTS_MORE_BUILD_PYTHON
-} elseif (Test-Path -LiteralPath (Join-Path $Root "runtime\live\python.exe")) {
-    Join-Path $Root "runtime\live\python.exe"
-} elseif (Test-Path -LiteralPath (Join-Path $Root ".venv\Scripts\python.exe")) {
-    Join-Path $Root ".venv\Scripts\python.exe"
-} else {
-    $conda = (& (Join-Path $Root "scripts\bootstrap-conda.ps1") -CacheRoot "data/cache/portable/conda" -LockPath "packaging/portable/toolchain.lock.json" -PassThru | Select-Object -Last 1)
-    Join-Path (Split-Path -Parent (Split-Path -Parent $conda)) "python.exe"
-}
 if ($Profile -eq "Full") {
-    $packageNameOutput = @(& $python (Join-Path $Root "scripts\portable_packages.py") full-package-name --component tts-more --version $Version --resolved-profile cpu 2>&1)
+    $packageNameOutput = @(& $buildPython (Join-Path $Root "scripts\portable_packages.py") full-package-name --component tts-more --version $Version --resolved-profile cpu 2>&1)
     $packageNameExit = $LASTEXITCODE
     if ($packageNameExit -ne 0 -or $packageNameOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$packageNameOutput[0])) {
         throw "shared Full package naming rule failed for TTS More"
@@ -447,19 +447,19 @@ if ($Profile -eq "Full") {
     $packageName = ([string]$packageNameOutput[0]).Trim()
     if ($packageName.EndsWith(".zip", [StringComparison]::OrdinalIgnoreCase)) { $packageName = $packageName.Substring(0, $packageName.Length - 4) }
 }
-& $python (Join-Path $stage "scripts\portable_packages.py") validate-manifest --manifest (Join-Path $stage "package\tts-more-package.json") --package-root $stage
+& $buildPython (Join-Path $stage "scripts\portable_packages.py") validate-manifest --manifest (Join-Path $stage "package\tts-more-package.json") --package-root $stage
 if ($LASTEXITCODE -ne 0) { throw "staged package manifest failed schema v2 validation" }
-& $python (Join-Path $stage "scripts\portable_packages.py") verify-sha256 --package-root $stage
+& $buildPython (Join-Path $stage "scripts\portable_packages.py") verify-sha256 --package-root $stage
 if ($LASTEXITCODE -ne 0) { throw "staged package SHA256SUMS exact coverage validation failed" }
 
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 $zip = Join-Path $OutputRoot "$packageName.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-& $python (Join-Path $stage "scripts\portable_packages.py") create-zip --package-root $stage --output $zip --archive-root $packageName
+& $buildPython (Join-Path $stage "scripts\portable_packages.py") create-zip --package-root $stage --output $zip --archive-root $packageName
 if ($LASTEXITCODE -ne 0) { throw "ZIP64 package creation failed" }
 $auditPassed = $false
 if ($Profile -eq "Bootstrap") {
-    & $python (Join-Path $stage "scripts\portable_packages.py") audit-release --zip $zip
+    & $buildPython (Join-Path $stage "scripts\portable_packages.py") audit-release --zip $zip
     if ($LASTEXITCODE -ne 0) { throw "GitHub bootstrap release audit failed" }
     $auditPassed = $true
 }

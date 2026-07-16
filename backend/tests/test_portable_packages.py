@@ -153,6 +153,10 @@ def test_controller_guide_explains_explicit_prestart_previous_version_import() -
 def _copy_controller_builder_fixture(root: Path) -> None:
     root.mkdir(parents=True)
     shutil.copy2(REPO_ROOT / "Build-Package.ps1", root / "Build-Package.ps1")
+    helper = root / "scripts" / "Resolve-PortableBuildPython.ps1"
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "Resolve-PortableBuildPython.ps1", helper)
+    shutil.copytree(REPO_ROOT / "integrations" / "build_tools", root / "integrations" / "build_tools")
     shutil.copytree(
         REPO_ROOT / "backend" / "app",
         root / "backend" / "app",
@@ -1165,6 +1169,17 @@ def test_worker_bootstrap_stages_all_upstream_source_under_app_without_mutating_
         "使用说明-先看这里.txt",
     }
     assert required_root <= {path.name for path in stage.iterdir() if path.is_file()}
+    for launcher in ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Start-WebUI.cmd"):
+        command = (stage / launcher).read_text(encoding="utf-8-sig")
+        match = re.search(r'-File\s+"%~dp0([^\"]+\.ps1)"', command, re.IGNORECASE)
+        assert match is not None, f"{launcher} does not expose a package-relative PowerShell target"
+        relative_target = match.group(1).replace("\\", "/")
+        assert relative_target.startswith("app/tts_more/"), (
+            f"{launcher} still targets the source-checkout integration layout: {relative_target}"
+        )
+        assert stage.joinpath(*relative_target.split("/")).is_file(), (
+            f"{launcher} target is missing from the extracted ZIP: {relative_target}"
+        )
     assert (stage / "app" / "upstream-entry.py").is_file()
     assert (stage / "app" / "README.md").is_file()
     assert (stage / "app" / "tts_more" / "component.json").is_file()
@@ -2191,6 +2206,41 @@ def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
     assert "^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$" in builder
     assert '"import-portable-data.py"' in builder
     assert '"import_portable_data.py"' in builder
+
+
+def test_public_builders_self_bootstrap_locked_build_tools_before_source_staging() -> None:
+    controller = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+    worker = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+    helper = (REPO_ROOT / "scripts" / "Resolve-PortableBuildPython.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"python=3.11"' in helper
+    assert 'data\\cache\\portable\\build-tools' in helper
+    assert 'uv sync --locked' in helper
+    assert '"sync", "--locked", "--project"' in helper
+    assert "import jsonschema" in helper
+    assert "version('jsonschema') == '4.26.0'" in helper
+    assert "0.11.28" in helper
+    assert "urls = @([string]$toolchain.uv.url)" in helper
+    assert '"^uv 0\\.11\\.28(?:\\s|$)"' in helper
+    assert '.venv\\Scripts\\python.exe' not in helper
+    for builder, first_stage_operation in (
+        (controller, "Measure-PortableCopyTree"),
+        (worker, "Assert-PortableTreePathBudget"),
+    ):
+        assert "Resolve-PortableBuildPython.ps1" in builder
+        assert "audit-builder-source" in builder
+        assert builder.index("Resolve-PortableBuildPython.ps1") < builder.index(
+            "audit-builder-source"
+        )
+        audit_call = builder.index("audit-builder-source")
+        assert audit_call < builder.index(first_stage_operation, audit_call)
+        assert audit_call < builder.index("CreateDirectoryRelative($workBaseHandle", audit_call)
+        assert 'runtime\\live\\python.exe' not in builder[audit_call - 1500 : audit_call]
+        assert '.venv\\Scripts\\python.exe' not in builder[audit_call - 1500 : audit_call]
 
 
 def test_builders_pin_staging_without_delete_share_and_delete_root_by_handle() -> None:
@@ -3266,6 +3316,174 @@ def test_builder_source_audit_applies_nested_cache_and_env_exclusions_per_file(
 
     assert report["valid"] is False
     assert "scratch/ordinary.txt" in " ".join(report["errors"])
+
+
+@pytest.mark.parametrize(
+    ("component", "relative"),
+    (("tts-more", "backend/app/main.py"), ("gpt-sovits", "ordinary.py")),
+)
+def test_builder_source_audit_rejects_copied_tracked_modifications(
+    tmp_path: Path, component: str, relative: str
+) -> None:
+    packages = _load_portable_packages()
+    root = tmp_path / component
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("REVISION_BOUND = True\n", encoding="utf-8")
+    if component != "tts-more":
+        lock = root / "tts_more" / "locks" / "models.lock.json"
+        lock.parent.mkdir(parents=True)
+        lock.write_text(json.dumps({"assets": []}), encoding="utf-8")
+    _initialize_git_repository(root)
+    path.write_text("REVISION_BOUND = False\n", encoding="utf-8")
+
+    report = packages.audit_builder_source(root, component=component, profile="full")
+
+    assert report["valid"] is False
+    assert "tracked source differs from revision" in " ".join(report["errors"])
+    assert relative in " ".join(report["errors"])
+
+
+def test_controller_source_audit_allows_ignored_generated_frontend_dist_only(
+    tmp_path: Path,
+) -> None:
+    packages = _load_portable_packages()
+    root = tmp_path / "controller"
+    source = root / "frontend" / "src" / "main.tsx"
+    source.parent.mkdir(parents=True)
+    source.write_text("export const value = 1;\n", encoding="utf-8")
+    (root / ".gitignore").write_text("frontend/dist/\n", encoding="utf-8")
+    _initialize_git_repository(root)
+    generated = root / "frontend" / "dist" / "index.html"
+    generated.parent.mkdir(parents=True)
+    generated.write_text("<!doctype html>\n", encoding="utf-8")
+
+    allowed = packages.audit_builder_source(root, component="tts-more", profile="bootstrap")
+    rogue = root / "backend" / "app" / "rogue.py"
+    rogue.parent.mkdir(parents=True)
+    rogue.write_text("ROGUE = True\n", encoding="utf-8")
+    rejected = packages.audit_builder_source(root, component="tts-more", profile="bootstrap")
+
+    assert allowed["valid"] is True, allowed["errors"]
+    assert rejected["valid"] is False
+    assert "backend/app/rogue.py" in " ".join(rejected["errors"])
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "frontend/src/main.tsx",
+        "frontend/package.json",
+        "frontend/pnpm-lock.yaml",
+        "frontend/vite.config.ts",
+        "frontend/tsconfig.json",
+        "Build-Package.ps1",
+        "scripts/Resolve-PortableBuildPython.ps1",
+        "integrations/build_tools/pyproject.toml",
+        "integrations/build_tools/uv.lock",
+    ),
+)
+def test_controller_source_audit_rejects_tracked_build_input_drift(
+    tmp_path: Path, relative: str
+) -> None:
+    packages = _load_portable_packages()
+    root = tmp_path / "controller"
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("revision-bound\n", encoding="utf-8")
+    _initialize_git_repository(root)
+    path.write_text("modified\n", encoding="utf-8")
+
+    report = packages.audit_builder_source(root, component="tts-more", profile="bootstrap")
+
+    assert report["valid"] is False
+    assert relative in " ".join(report["errors"])
+
+
+def test_builder_source_audit_recurses_into_modified_submodule(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    child = tmp_path / "child"
+    child.mkdir()
+    (child / "tracked.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _initialize_git_repository(child)
+    root = tmp_path / "worker"
+    root.mkdir()
+    lock = root / "tts_more" / "locks" / "models.lock.json"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(json.dumps({"assets": []}), encoding="utf-8")
+    _initialize_git_repository(root)
+    _run_checked(
+        [
+            "git",
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            str(child),
+            "third_party/child",
+        ],
+        root,
+    )
+    _run_checked(["git", "commit", "--quiet", "-am", "add child"], root)
+    (root / "third_party" / "child" / "tracked.py").write_text(
+        "VALUE = 2\n", encoding="utf-8"
+    )
+
+    report = packages.audit_builder_source(root, component="gpt-sovits", profile="full")
+
+    assert report["valid"] is False
+    assert "third_party/child/tracked.py" in " ".join(report["errors"])
+
+
+def test_builder_source_audit_ignores_package_private_bootstrap_cache(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    root = tmp_path / "worker"
+    lock = root / "tts_more" / "locks" / "models.lock.json"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(json.dumps({"assets": []}), encoding="utf-8")
+    _initialize_git_repository(root)
+    cached_python = root / "data" / "cache" / "portable" / "build-tools" / "python.exe"
+    cached_python.parent.mkdir(parents=True)
+    cached_python.write_bytes(b"private build python")
+
+    report = packages.audit_builder_source(root, component="gpt-sovits", profile="full")
+
+    assert report["valid"] is True, report["errors"]
+
+
+def test_builder_source_audit_allows_modified_tracked_model_only_at_locked_full_hash(
+    tmp_path: Path,
+) -> None:
+    packages = _load_portable_packages()
+    root = tmp_path / "worker"
+    target = "pretrained_models/model.bin"
+    locked_payload = b"locked final payload\n"
+    lock = root / "tts_more" / "locks" / "models.lock.json"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(
+        json.dumps(
+            {
+                "assets": [
+                    {"target": target, "sha256": hashlib.sha256(locked_payload).hexdigest()}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = root / target
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"revision placeholder\n")
+    _initialize_git_repository(root)
+    model.write_bytes(locked_payload)
+
+    allowed = packages.audit_builder_source(root, component="gpt-sovits", profile="full")
+    model.write_bytes(b"wrong payload\n")
+    rejected = packages.audit_builder_source(root, component="gpt-sovits", profile="full")
+
+    assert allowed["valid"] is True, allowed["errors"]
+    assert rejected["valid"] is False
+    assert "unlocked or modified model asset" in " ".join(rejected["errors"])
 
 
 @pytest.mark.parametrize("mode", ("mutate-earlier", "delete-earlier", "inject"))

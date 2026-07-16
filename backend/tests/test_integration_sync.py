@@ -60,6 +60,7 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
         "import-portable-data.py",
         "verify-release-asset-set.py",
         "select-portable-folder.ps1",
+        "Resolve-PortableBuildPython.ps1",
     ):
         assert (target / "tts_more" / relative).is_file()
     for relative in ("build-tools/pyproject.toml", "build-tools/uv.lock"):
@@ -88,6 +89,7 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
         "tts_more/import-portable-data.py",
         "tts_more/verify-release-asset-set.py",
         "tts_more/select-portable-folder.ps1",
+        "tts_more/Resolve-PortableBuildPython.ps1",
         "tts_more/build-tools/pyproject.toml",
         "tts_more/build-tools/uv.lock",
     ):
@@ -103,6 +105,7 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
         "tts_more/import-portable-data.py",
         "tts_more/verify-release-asset-set.py",
         "tts_more/select-portable-folder.ps1",
+        "tts_more/Resolve-PortableBuildPython.ps1",
         "tts_more/build-tools/pyproject.toml",
         "tts_more/build-tools/uv.lock",
     ),

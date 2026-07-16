@@ -426,6 +426,17 @@ function Get-CanonicalTextSha256 {
     finally { $hasher.Dispose() }
 }
 
+$buildPythonOutput = @(& (Join-Path $Bundle "Resolve-PortableBuildPython.ps1") `
+    -PackageRoot $Root `
+    -BuildToolsRoot (Join-Path $Bundle "build-tools") `
+    -BootstrapCondaPath (Join-Path $Bundle "bootstrap-conda.ps1") `
+    -ToolchainLockPath (Join-Path $Bundle "locks\toolchain.lock.json") `
+    -PortableInstallPath (Join-Path $Bundle "portable_install.py"))
+if ($LASTEXITCODE -ne 0 -or $buildPythonOutput.Count -eq 0) { throw "portable build-tools bootstrap failed" }
+$buildPython = [IO.Path]::GetFullPath([string]$buildPythonOutput[-1])
+& $buildPython (Join-Path $Bundle "portable_packages.py") audit-builder-source --root $Root --component ([string]$config.component) --profile $profileName
+if ($LASTEXITCODE -ne 0) { throw "$($config.component) source dirty: copied source audit failed" }
+
 Assert-PortableTreePathBudget
 $createdWorkHandle = $null
 $createdWorkIdentity = $null
@@ -450,7 +461,7 @@ foreach ($entry in Get-ChildItem -LiteralPath $Root -Force | Where-Object { $_.N
     }
 }
 foreach ($name in @("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Start-WebUI.cmd")) {
-    $payload = (Get-Content -LiteralPath (Join-Path $Root $name) -Raw).Replace("\tts_more\", "\app\tts_more\")
+    $payload = (Get-Content -LiteralPath (Join-Path $Root $name) -Raw).Replace("%~dp0tts_more\", "%~dp0app\tts_more\")
     Set-Content -LiteralPath (Join-Path $stage $name) -Value $payload -Encoding ASCII
 }
 Copy-Item -LiteralPath (Join-Path $Root "使用说明-先看这里.txt") -Destination (Join-Path $stage "使用说明-先看这里.txt") -Force
@@ -546,10 +557,6 @@ $manifest = [ordered]@{
 $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $stage "package\tts-more-package.json") -Encoding UTF8
 @{ schema_version = 1; component = $config.component; integration_license = "Apache-2.0"; upstream_license = "app/LICENSE"; model_license = $modelLock.license; model_repository = $modelLock.upstream_repository; model_snapshot_revision = $modelLock.snapshot_revision } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json") -Encoding UTF8
 
-$buildPython = if ($env:TTS_MORE_BUILD_PYTHON) { $env:TTS_MORE_BUILD_PYTHON } elseif (Test-Path -LiteralPath (Join-Path $Root "runtime\live\python.exe")) { Join-Path $Root "runtime\live\python.exe" } elseif (Test-Path -LiteralPath (Join-Path $Root ".venv\Scripts\python.exe")) { Join-Path $Root ".venv\Scripts\python.exe" } else {
-    $conda = (& (Join-Path $Bundle "bootstrap-conda.ps1") -CacheRoot "data/cache/portable/conda" -LockPath "tts_more/locks/toolchain.lock.json" -PassThru | Select-Object -Last 1)
-    Join-Path (Split-Path -Parent (Split-Path -Parent $conda)) "python.exe"
-}
 $resolvedProfile = ""
 if ($Profile -eq "Full") {
     & (Join-Path $stagedBundle "Initialize.ps1") -Device $Device -PackageRoot $stage

@@ -65,6 +65,7 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
         _copy_file(source_root / "scripts" / name, controlled / name)
     for name in (
         "bootstrap-conda.ps1",
+        "Resolve-PortableBuildPython.ps1",
         "Invoke-PortableStart.ps1",
         "Show-PortableProgress.ps1",
         "Portable-Validation.ps1",
