@@ -58,11 +58,17 @@ jobs:
           $version = $env:PACKAGE_VERSION -replace '^v', ''
           $version = $version -replace '[^0-9A-Za-z._-]', '-'
           .\Build-Package.ps1 -Profile Bootstrap -Device CPU -Version $version
-          $zip = @(Get-ChildItem artifacts\portable\bootstrap\*.zip)
-          if ($zip.Count -ne 1) { throw "expected exactly one bootstrap ZIP" }
-          python scripts\portable_packages.py audit-release --zip $zip[0].FullName
+          $candidateZips = @(Get-ChildItem artifacts\portable\bootstrap\*.zip)
+          if ($candidateZips.Count -lt 1) { throw "expected at least one bootstrap ZIP" }
+          foreach ($candidateZip in $candidateZips) {
+            python scripts\portable_packages.py audit-release --zip $candidateZip.FullName
+            if ($LASTEXITCODE -ne 0) { throw "bootstrap ZIP release audit failed" }
+          }
+          python scripts\portable_packages.py audit-release-assets --directory artifacts\portable\bootstrap
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap release asset set or embedded package_profile audit failed" }
+          $zip = $candidateZips[0]
           $expanded = Join-Path $env:RUNNER_TEMP "tts-more-bootstrap-audit"
-          Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath $expanded
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $expanded
           $packageRoot = @(Get-ChildItem -LiteralPath $expanded -Directory)
           if ($packageRoot.Count -ne 1) { throw "expected exactly one package root" }
           python (Join-Path $packageRoot[0].FullName "scripts\portable_packages.py") verify-sha256 --package-root $packageRoot[0].FullName
@@ -123,6 +129,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
       - uses: actions/download-artifact@v8
         with:
           name: tts-more-windows-bootstrap
@@ -131,9 +141,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if find release-assets -type f -name '*-full.zip' | grep -q .; then
-            echo "profile=full is prohibited from GitHub Releases" >&2
+          found_zip=false
+          for candidate_zip in release-assets/*.zip; do
+            [ -e "$candidate_zip" ] || continue
+            found_zip=true
+            python scripts/portable_packages.py audit-release --zip "$candidate_zip"
+          done
+          if [ "$found_zip" != true ]; then
+            echo "no Bootstrap ZIP was downloaded" >&2
             exit 1
           fi
+          python scripts/portable_packages.py audit-release-assets --directory release-assets
+          shopt -s nullglob
+          assets=(
+            release-assets/*.zip
+            release-assets/*.zip.sha256
+            release-assets/*.zip.spdx.json
+            release-assets/*.zip.licenses.json
+            release-assets/*.zip.provenance.json
+            release-assets/*.zip.acceptance.json
+          )
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
-          gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber

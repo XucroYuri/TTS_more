@@ -288,11 +288,25 @@ function Measure-PortableCopyTree {
     }
 }
 
+function Assert-TtsMoreFullPayloadBoundary {
+    param([Parameter(Mandatory = $true)][string]$PackageRoot)
+    $manifestPath = Join-Path $PackageRoot "package\tts-more-package.json"
+    $payload = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ([string]$payload.component -ne "tts-more" -or $payload.models.required -ne $false) {
+        throw "TTS More Full manifest must remain controller-only and device-neutral"
+    }
+    foreach ($relative in @("models", "app\repo", "app\tts_more")) {
+        if (Test-Path -LiteralPath (Join-Path $PackageRoot $relative)) {
+            throw "TTS More Full package contains worker runtime or model payload"
+        }
+    }
+}
+
 $Root = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $profileName = $Profile.ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) { $OutputRoot = Join-Path $Root "artifacts\portable\$profileName" }
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
-$packageName = "TTS-More-$Version-windows-x64-$profileName"
+$packageName = if ($Profile -eq "Full") { "TTS-More-$Version-windows-x64-full-staging" } else { "TTS-More-$Version-windows-x64-$profileName" }
 $workBase = if ($WorkRoot) { [IO.Path]::GetFullPath($WorkRoot) } else { [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) }
 $normalizedSourceRoot = $Root.TrimEnd("\", "/")
 $normalizedWorkBase = $workBase.TrimEnd("\", "/")
@@ -370,7 +384,7 @@ $manifest = [ordered]@{
     protocol = @{ name = "tts-more-v1"; version = "1.0"; controller_range = ">=0.2.0,<0.3.0" }
     source = @{ repository = "https://github.com/XucroYuri/TTS_more.git"; revision = $revision }
     integration = @{ version = "2.0.0"; source_revision = $revision; bundle_sha256 = $bundleSha }
-    runtime = @{ python_version = "3.11"; device_profiles = @($Device.ToLowerInvariant()); lock = "packaging/portable/runtime.lock.json"; state_path = "data/local/install-state.json" }
+    runtime = @{ python_version = "3.11"; device_profiles = @("cpu"); lock = "packaging/portable/runtime.lock.json"; state_path = "data/local/install-state.json" }
     models = @{ lock = "packaging/portable/models.lock.json"; required = $false }
     data_root = "data/local"
     data = @{ user = "data/user"; local = "data/local"; cache = "data/cache"; operations = "data/local/operations" }
@@ -383,8 +397,9 @@ $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $stag
 @{ schema_version = 1; component = "tts-more"; packages = @(); upstream_repositories = @("GPT-SoVITS", "IndexTTS", "CosyVoice") } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json") -Encoding UTF8
 
 if ($Profile -eq "Full") {
-    & (Join-Path $stage "scripts\initialize-portable.ps1") -Device $Device
+    & (Join-Path $stage "scripts\initialize-portable.ps1") -Device CPU
     if ($LASTEXITCODE -ne 0) { throw "full package initialization failed" }
+    Assert-TtsMoreFullPayloadBoundary -PackageRoot $stage
 }
 
 $sumPath = Join-Path $stage "SHA256SUMS.txt"
@@ -423,13 +438,22 @@ $python = if ($env:TTS_MORE_BUILD_PYTHON) {
     $conda = (& (Join-Path $Root "scripts\bootstrap-conda.ps1") -CacheRoot "data/cache/portable/conda" -LockPath "packaging/portable/toolchain.lock.json" -PassThru | Select-Object -Last 1)
     Join-Path (Split-Path -Parent (Split-Path -Parent $conda)) "python.exe"
 }
+if ($Profile -eq "Full") {
+    $packageNameOutput = @(& $python (Join-Path $Root "scripts\portable_packages.py") full-package-name --component tts-more --version $Version --resolved-profile cpu 2>&1)
+    $packageNameExit = $LASTEXITCODE
+    if ($packageNameExit -ne 0 -or $packageNameOutput.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$packageNameOutput[0])) {
+        throw "shared Full package naming rule failed for TTS More"
+    }
+    $packageName = ([string]$packageNameOutput[0]).Trim()
+    if ($packageName.EndsWith(".zip", [StringComparison]::OrdinalIgnoreCase)) { $packageName = $packageName.Substring(0, $packageName.Length - 4) }
+}
 & $python (Join-Path $stage "scripts\portable_packages.py") validate-manifest --manifest (Join-Path $stage "package\tts-more-package.json") --package-root $stage
 if ($LASTEXITCODE -ne 0) { throw "staged package manifest failed schema v2 validation" }
 
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 $zip = Join-Path $OutputRoot "$packageName.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-& $python (Join-Path $stage "scripts\portable_packages.py") create-zip --package-root $stage --output $zip
+& $python (Join-Path $stage "scripts\portable_packages.py") create-zip --package-root $stage --output $zip --archive-root $packageName
 if ($LASTEXITCODE -ne 0) { throw "ZIP64 package creation failed" }
 $auditPassed = $false
 if ($Profile -eq "Bootstrap") {
@@ -439,7 +463,9 @@ if ($Profile -eq "Bootstrap") {
 }
 $zipSha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 "$zipSha  $([System.IO.Path]::GetFileName($zip))" | Set-Content -LiteralPath "$zip.sha256" -Encoding ASCII
-@{ schema_version = 1; component = "tts-more"; version = $Version; profile = $profileName; source_revision = $revision; sha256 = $zipSha } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$zip.provenance.json" -Encoding UTF8
+$provenance = [ordered]@{ schema_version = 1; component = "tts-more"; version = $Version; profile = $profileName; source_revision = $revision; sha256 = $zipSha }
+if ($Profile -eq "Full") { $provenance.resolved_profile = "cpu" }
+$provenance | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$zip.provenance.json" -Encoding UTF8
 $packages = @()
 $lockText = Get-Content -LiteralPath (Join-Path $Root "backend\uv.lock") -Raw
 foreach ($match in [regex]::Matches($lockText, '(?ms)\[\[package\]\]\s+name\s*=\s*"([^"]+)"\s+version\s*=\s*"([^"]+)"')) {

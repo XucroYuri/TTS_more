@@ -60,12 +60,95 @@ RELEASE_FORBIDDEN_MODEL_DIRECTORIES = frozenset(
     {"pretrained_models", "checkpoints", "sovits_weights", "gpt_weights"}
 )
 SAFE_PACKAGE_ROOT = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$")
+SAFE_VERSION = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]*$")
+PORTABLE_COMPONENTS = frozenset({"tts-more", "gpt-sovits", "indextts", "cosyvoice"})
+RESOLVED_DEVICE_PROFILES = frozenset({"cpu", "cu126", "cu128"})
 
 
-def create_zip(package_root: Path, output: Path) -> None:
+def full_package_name(component: str, version: str, resolved_profile: str) -> str:
+    """Return the only permitted Full ZIP name for a resolved device profile."""
+    normalized_component = str(component).casefold()
+    normalized_profile = str(resolved_profile).casefold()
+    if normalized_component not in PORTABLE_COMPONENTS:
+        raise ValueError("unknown portable component")
+    if normalized_profile not in RESOLVED_DEVICE_PROFILES:
+        raise ValueError("full package naming requires a resolved profile")
+    if not isinstance(version, str) or not SAFE_VERSION.fullmatch(version):
+        raise ValueError("package version is unsafe")
+    if normalized_component == "tts-more":
+        filename = f"TTS-More-{version}-windows-x64-full.zip"
+    else:
+        filename = (
+            f"{normalized_component}-{version}-windows-x64-full-{normalized_profile}.zip"
+        )
+    if not SAFE_PACKAGE_ROOT.fullmatch(filename.removesuffix(".zip")):
+        raise ValueError("full package name exceeds the safe package-root boundary")
+    return filename
+
+
+def resolve_full_profile(
+    state_path: Path,
+    *,
+    expected_component: str,
+    expected_build_id: str,
+    requested_profile: str,
+) -> str:
+    """Resolve a Full worker profile only from a completed package-private state."""
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("full package install-state.json is missing or invalid") from exc
+    return _resolve_full_profile_payload(
+        payload,
+        expected_component=expected_component,
+        expected_build_id=expected_build_id,
+        requested_profile=requested_profile,
+    )
+
+
+def _resolve_full_profile_payload(
+    payload: Any,
+    *,
+    expected_component: str,
+    expected_build_id: str,
+    requested_profile: str,
+) -> str:
+    state = _mapping(payload)
+    requested = str(requested_profile).casefold()
+    if requested not in DEVICE_PROFILES:
+        raise ValueError("requested device profile is unsupported")
+    if state.get("schema_version") != 1 or state.get("ready") is not True:
+        raise ValueError("full package install state is not ready")
+    if state.get("component") != expected_component or state.get("build_id") != expected_build_id:
+        raise ValueError("full package install state identity mismatch")
+    for field in ("runtime_lock_sha256", "model_lock_sha256"):
+        value = state.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+            raise ValueError(f"full package install state {field} is invalid")
+    completed_at = state.get("completed_at")
+    if not isinstance(completed_at, str) or not completed_at.strip():
+        raise ValueError("full package install state completed_at is invalid")
+    resolved = str(state.get("profile") or "").casefold()
+    if resolved not in RESOLVED_DEVICE_PROFILES:
+        raise ValueError("full package install state requires a resolved profile")
+    if requested != "auto" and requested != resolved:
+        raise ValueError("requested device profile does not match resolved profile")
+    return resolved
+
+
+def create_zip(package_root: Path, output: Path, archive_root: str | None = None) -> None:
     """Create a deterministic-order ZIP64 archive with one package root."""
     package_root = package_root.resolve(strict=True)
     output = output.resolve(strict=False)
+    if archive_root is None:
+        archive_root = package_root.name
+    elif (
+        not isinstance(archive_root, str)
+        or not SAFE_PACKAGE_ROOT.fullmatch(archive_root)
+        or archive_root != archive_root.rstrip(" .")
+        or unicodedata.normalize("NFKC", archive_root) != archive_root
+    ):
+        raise ValueError("archive root is unsafe or ambiguous")
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")
     temporary.unlink(missing_ok=True)
@@ -74,8 +157,152 @@ def create_zip(package_root: Path, output: Path) -> None:
     ) as archive:
         for path in sorted(candidate for candidate in package_root.rglob("*") if candidate.is_file()):
             relative = path.relative_to(package_root).as_posix()
-            archive.write(path, f"{package_root.name}/{relative}")
+            archive.write(path, f"{archive_root}/{relative}")
     temporary.replace(output)
+
+
+def select_full_package(
+    candidates: list[Path],
+    *,
+    expected_component: str,
+    expected_version: str,
+    requested_profile: str,
+) -> dict[str, object]:
+    """Select and verify exactly one newly changed Full package artifact."""
+    errors: list[str] = []
+    report: dict[str, object] = {
+        "valid": False,
+        "errors": errors,
+        "component": expected_component,
+        "version": expected_version,
+    }
+    if len(candidates) != 1:
+        errors.append("component did not produce exactly one changed full ZIP")
+        return report
+    path = Path(candidates[0])
+    report["path"] = str(path)
+    report["filename"] = path.name
+    try:
+        actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        with zipfile.ZipFile(path) as archive:
+            package_root, relative_names = _single_zip_package_root(archive)
+            manifest_name = relative_names.get("package/tts-more-package.json")
+            if manifest_name is None:
+                raise ValueError("full ZIP is missing its embedded package manifest")
+            manifest = json.loads(archive.read(manifest_name).decode("utf-8-sig"))
+            if manifest.get("schema_version") != 2:
+                raise ValueError("full ZIP manifest must use schema v2")
+            component = str(manifest.get("component") or "")
+            version = str(manifest.get("release_version") or "")
+            if component != expected_component or manifest.get("package_id") != component:
+                raise ValueError("full ZIP manifest component mismatch")
+            if version != expected_version or manifest.get("version") != version:
+                raise ValueError("full ZIP manifest version mismatch")
+            if manifest.get("package_profile") != "full":
+                raise ValueError("full ZIP manifest profile mismatch")
+            build_id = str(manifest.get("build_id") or "")
+            runtime = _mapping(manifest.get("runtime"))
+            state_relative = runtime.get("state_path")
+            if not isinstance(state_relative, str) or not _is_relative_package_path(state_relative):
+                raise ValueError("full ZIP manifest state path is invalid")
+            state_name = relative_names.get(_canonical_relative_path(state_relative))
+            if state_name is None:
+                raise ValueError("full ZIP install state is missing")
+            state = json.loads(archive.read(state_name).decode("utf-8-sig"))
+            resolved = _resolve_full_profile_payload(
+                state,
+                expected_component=component,
+                expected_build_id=build_id,
+                requested_profile=requested_profile,
+            )
+            if runtime.get("device_profiles") != [resolved]:
+                raise ValueError("full ZIP manifest does not bind the resolved profile")
+            expected_filename = full_package_name(component, version, resolved)
+            if path.name != expected_filename or package_root != expected_filename.removesuffix(".zip").casefold():
+                raise ValueError("full ZIP filename, archive root, and manifest identity do not match")
+            _verify_zip_sha256_manifest(archive, relative_names)
+
+        sidecar_text = Path(f"{path}.sha256").read_text(encoding="ascii").strip()
+        sidecar_match = re.fullmatch(r"([0-9a-fA-F]{64})  ([^/\\]+)", sidecar_text)
+        if sidecar_match is None or sidecar_match.group(2) != path.name:
+            raise ValueError("full ZIP SHA-256 sidecar is invalid")
+        if sidecar_match.group(1).casefold() != actual_sha:
+            raise ValueError("full ZIP SHA-256 sidecar mismatch")
+        provenance = json.loads(Path(f"{path}.provenance.json").read_text(encoding="utf-8-sig"))
+        source_revision = str(_mapping(manifest.get("source")).get("revision") or "")
+        expected_provenance = {
+            "component": expected_component,
+            "version": expected_version,
+            "profile": "full",
+            "resolved_profile": resolved,
+            "sha256": actual_sha,
+            "source_revision": source_revision,
+        }
+        for key, expected in expected_provenance.items():
+            if provenance.get(key) != expected:
+                raise ValueError(f"full ZIP provenance {key} mismatch")
+        report.update(
+            {
+                "valid": True,
+                "errors": [],
+                "resolved_profile": resolved,
+                "sha256": actual_sha,
+                "source_revision": source_revision,
+            }
+        )
+    except (
+        OSError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+    ) as exc:
+        errors.append(str(exc))
+    return report
+
+
+def _single_zip_package_root(archive: zipfile.ZipFile) -> tuple[str, dict[str, str]]:
+    entries = archive.infolist()
+    raw_names = _raw_central_directory_names(archive, len(entries))
+    roots: set[str] = set()
+    relative_names: dict[str, str] = {}
+    for entry, raw_name in zip(entries, raw_names, strict=True):
+        canonical = _canonical_zip_entry(raw_name)
+        if "/" not in canonical:
+            raise ValueError("full ZIP entry is outside its package root")
+        root, relative = canonical.split("/", 1)
+        roots.add(root)
+        if entry.is_dir():
+            continue
+        if relative in relative_names:
+            raise ValueError(f"full ZIP contains a normalized path collision: {raw_name}")
+        relative_names[relative] = raw_name
+    if len(roots) != 1:
+        raise ValueError("full ZIP must contain exactly one package root")
+    return next(iter(roots)), relative_names
+
+
+def _verify_zip_sha256_manifest(
+    archive: zipfile.ZipFile, relative_names: dict[str, str]
+) -> None:
+    sums_name = relative_names.get("sha256sums.txt")
+    if sums_name is None:
+        raise ValueError("full ZIP SHA256SUMS.txt is missing")
+    covered: dict[str, str] = {}
+    for line in archive.read(sums_name).decode("utf-8-sig").splitlines():
+        match = re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", line)
+        if match is None or not _is_relative_package_path(match.group(2)):
+            raise ValueError("full ZIP SHA256SUMS contains an invalid record")
+        relative = _canonical_relative_path(match.group(2))
+        if relative in covered:
+            raise ValueError("full ZIP SHA256SUMS contains a duplicate path")
+        covered[relative] = match.group(1).casefold()
+    files = {key: value for key, value in relative_names.items() if key != "sha256sums.txt"}
+    if set(covered) != set(files):
+        raise ValueError("full ZIP SHA256SUMS exact coverage mismatch")
+    for relative, expected in covered.items():
+        if hashlib.sha256(archive.read(files[relative])).hexdigest() != expected:
+            raise ValueError(f"full ZIP SHA256SUMS hash mismatch: {relative}")
 
 
 def audit_release_zip(path: Path) -> dict[str, object]:
@@ -157,6 +384,89 @@ def audit_release_zip(path: Path) -> dict[str, object]:
     except (OSError, ValueError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
         errors.append(f"invalid release ZIP: {exc}")
     return {"valid": not errors, "errors": errors, "path": str(path)}
+
+
+def audit_release_assets(directory: Path) -> dict[str, object]:
+    """Audit the exact Bootstrap asset set that may cross the GitHub boundary."""
+    errors: list[str] = []
+    directory = directory.resolve(strict=False)
+    try:
+        if not directory.is_dir():
+            raise ValueError("release asset directory is missing")
+        files = sorted(path for path in directory.iterdir() if path.is_file())
+        zips = [path for path in files if path.name.casefold().endswith(".zip")]
+        if not zips:
+            raise ValueError("release asset directory contains no candidate ZIP")
+        expected_files: set[str] = set()
+        for path in zips:
+            report = audit_release_zip(path)
+            if not report["valid"]:
+                errors.extend(str(error) for error in report["errors"])
+                continue
+            actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            with zipfile.ZipFile(path) as archive:
+                package_root, relative_names = _single_zip_package_root(archive)
+                manifest_name = relative_names.get("package/tts-more-package.json")
+                if manifest_name is None:
+                    raise ValueError(f"release ZIP manifest is missing: {path.name}")
+                manifest = json.loads(archive.read(manifest_name).decode("utf-8-sig"))
+            if manifest.get("schema_version") != 2:
+                raise ValueError(f"release ZIP manifest must use schema v2: {path.name}")
+            profile = manifest.get("package_profile")
+            if profile != "bootstrap":
+                raise ValueError(f"profile={profile} is prohibited from GitHub Releases")
+            component = str(manifest.get("component") or "")
+            version = str(manifest.get("release_version") or "")
+            if component not in PORTABLE_COMPONENTS or manifest.get("package_id") != component:
+                raise ValueError(f"release ZIP manifest component is invalid: {path.name}")
+            if not SAFE_VERSION.fullmatch(version) or manifest.get("version") != version:
+                raise ValueError(f"release ZIP manifest version is invalid: {path.name}")
+            expected_name = (
+                f"TTS-More-{version}-windows-x64-bootstrap.zip"
+                if component == "tts-more"
+                else f"{component}-{version}-windows-x64-bootstrap.zip"
+            )
+            if path.name != expected_name or package_root != expected_name.removesuffix(".zip").casefold():
+                raise ValueError(f"release ZIP filename, archive root, and manifest identity mismatch: {path.name}")
+            suffixes = (
+                "",
+                ".sha256",
+                ".spdx.json",
+                ".licenses.json",
+                ".provenance.json",
+                ".acceptance.json",
+            )
+            expected_files.update(f"{path.name}{suffix}" for suffix in suffixes)
+            sidecar_text = Path(f"{path}.sha256").read_text(encoding="ascii").strip()
+            sidecar = re.fullmatch(r"([0-9a-fA-F]{64})  ([^/\\]+)", sidecar_text)
+            if sidecar is None or sidecar.group(2) != path.name or sidecar.group(1).casefold() != actual_sha:
+                raise ValueError(f"release ZIP SHA-256 sidecar mismatch: {path.name}")
+            provenance = json.loads(Path(f"{path}.provenance.json").read_text(encoding="utf-8-sig"))
+            source_revision = str(_mapping(manifest.get("source")).get("revision") or "")
+            expected_provenance = {
+                "component": component,
+                "version": version,
+                "profile": "bootstrap",
+                "source_revision": source_revision,
+                "sha256": actual_sha,
+            }
+            for key, expected in expected_provenance.items():
+                if provenance.get(key) != expected:
+                    raise ValueError(f"release ZIP provenance {key} mismatch: {path.name}")
+        actual_files = {path.name for path in files}
+        if expected_files and actual_files != expected_files:
+            missing = sorted(expected_files - actual_files)
+            extra = sorted(actual_files - expected_files)
+            errors.append(f"release asset allowlist mismatch: missing={missing}, extra={extra}")
+    except (
+        OSError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+    ) as exc:
+        errors.append(str(exc))
+    return {"valid": not errors, "errors": errors, "directory": str(directory)}
 
 
 def _audit_v2_user_layout(
@@ -501,8 +811,25 @@ def main(argv: list[str] | None = None) -> int:
     create = subcommands.add_parser("create-zip")
     create.add_argument("--package-root", required=True, type=Path)
     create.add_argument("--output", required=True, type=Path)
+    create.add_argument("--archive-root")
+    full_name = subcommands.add_parser("full-package-name")
+    full_name.add_argument("--component", required=True)
+    full_name.add_argument("--version", required=True)
+    full_name.add_argument("--resolved-profile", required=True)
+    resolve_profile = subcommands.add_parser("resolve-full-profile")
+    resolve_profile.add_argument("--state", required=True, type=Path)
+    resolve_profile.add_argument("--component", required=True)
+    resolve_profile.add_argument("--build-id", required=True)
+    resolve_profile.add_argument("--requested-profile", required=True)
+    select_full = subcommands.add_parser("select-full-package")
+    select_full.add_argument("--zip", required=True, action="append", type=Path)
+    select_full.add_argument("--expected-component", required=True)
+    select_full.add_argument("--expected-version", required=True)
+    select_full.add_argument("--requested-profile", required=True)
     audit = subcommands.add_parser("audit-release")
     audit.add_argument("--zip", required=True, action="append", type=Path)
+    audit_assets = subcommands.add_parser("audit-release-assets")
+    audit_assets.add_argument("--directory", required=True, type=Path)
     verify_sums = subcommands.add_parser("verify-sha256")
     verify_sums.add_argument("--package-root", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -511,12 +838,38 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0 if report["valid"] else 1
     if args.command == "create-zip":
-        create_zip(args.package_root, args.output)
+        create_zip(args.package_root, args.output, args.archive_root)
         return 0
+    if args.command == "full-package-name":
+        print(full_package_name(args.component, args.version, args.resolved_profile))
+        return 0
+    if args.command == "resolve-full-profile":
+        print(
+            resolve_full_profile(
+                args.state,
+                expected_component=args.component,
+                expected_build_id=args.build_id,
+                requested_profile=args.requested_profile,
+            )
+        )
+        return 0
+    if args.command == "select-full-package":
+        report = select_full_package(
+            args.zip,
+            expected_component=args.expected_component,
+            expected_version=args.expected_version,
+            requested_profile=args.requested_profile,
+        )
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 0 if report["valid"] else 1
     if args.command == "audit-release":
         reports = [audit_release_zip(path) for path in args.zip]
         print(json.dumps({"valid": all(report["valid"] for report in reports), "reports": reports}, ensure_ascii=False, sort_keys=True))
         return 0 if all(report["valid"] for report in reports) else 1
+    if args.command == "audit-release-assets":
+        report = audit_release_assets(args.directory)
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 0 if report["valid"] else 1
     if args.command == "verify-sha256":
         report = verify_sha256_manifest(args.package_root)
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
