@@ -372,10 +372,11 @@ foreach ($file in @("toolchain.lock.json", "runtime.lock.json", "models.lock.jso
 foreach ($file in @("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd")) {
     Copy-Item -LiteralPath (Join-Path $Root $file) -Destination (Join-Path $stage $file)
 }
+$GuideFileName = [string]::Concat([char]0x4F7F, [char]0x7528, [char]0x8BF4, [char]0x660E, "-", [char]0x5148, [char]0x770B, [char]0x8FD9, [char]0x91CC, ".txt")
 Copy-Item -LiteralPath (Join-Path $Root "LICENSE") -Destination (Join-Path $stage "licenses\LICENSE")
 Copy-Item -LiteralPath (Join-Path $Root "NOTICE") -Destination (Join-Path $stage "licenses\NOTICE")
 Copy-Item -LiteralPath (Join-Path $Root "repo.lock.json") -Destination (Join-Path $stage "package\repo.lock.json")
-Copy-Item -LiteralPath (Join-Path $Root "packaging\portable\使用说明-先看这里.txt") -Destination (Join-Path $stage "使用说明-先看这里.txt")
+Copy-Item -LiteralPath (Join-Path (Join-Path $Root "packaging\portable") $GuideFileName) -Destination (Join-Path $stage $GuideFileName)
 @'
 throw "This delivered portable package cannot rebuild itself. Use the corresponding source checkout and its Build-Package.ps1."
 '@ | Set-Content -LiteralPath (Join-Path $stage "Build-Package.ps1") -Encoding ASCII

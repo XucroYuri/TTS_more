@@ -317,7 +317,8 @@ if ($null -ne $config.PSObject.Properties['submodules']) {
 $excluded = @(".git", ".venv", "runtime", "data", "artifacts", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache")
 $recursiveExcluded = @(".git", ".venv", "artifacts", "cache", ".cache", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache")
 $excludedFiles = @(".env", ".env.local")
-$rootEntries = @("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1", "Start-WebUI.cmd", "使用说明-先看这里.txt")
+$GuideFileName = [string]::Concat([char]0x4F7F, [char]0x7528, [char]0x8BF4, [char]0x660E, "-", [char]0x5148, [char]0x770B, [char]0x8FD9, [char]0x91CC, ".txt")
+$rootEntries = @("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1", "Start-WebUI.cmd", $GuideFileName)
 $stageApp = Join-Path $stage "app"
 $safeWindowsPathBudget = 240
 
@@ -464,7 +465,7 @@ foreach ($name in @("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "St
     $payload = (Get-Content -LiteralPath (Join-Path $Root $name) -Raw).Replace("%~dp0tts_more\", "%~dp0app\tts_more\")
     Set-Content -LiteralPath (Join-Path $stage $name) -Value $payload -Encoding ASCII
 }
-Copy-Item -LiteralPath (Join-Path $Root "使用说明-先看这里.txt") -Destination (Join-Path $stage "使用说明-先看这里.txt") -Force
+Copy-Item -LiteralPath (Join-Path $Root $GuideFileName) -Destination (Join-Path $stage $GuideFileName) -Force
 @'
 throw "This delivered portable package cannot rebuild itself. Use the corresponding source checkout and its Build-Package.ps1."
 '@ | Set-Content -LiteralPath (Join-Path $stage "Build-Package.ps1") -Encoding ASCII
