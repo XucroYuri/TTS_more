@@ -44,7 +44,7 @@ jobs:
           uv lock --check --project backend
           uv sync --locked --project backend --extra dev
           $testPython = (Resolve-Path backend\.venv\Scripts\python.exe).Path
-          & $testPython -m pytest backend/tests/test_portable_install.py backend/tests/test_portable_launcher.py backend/tests/test_portable_diagnostics.py backend/tests/test_portable_packages.py backend/tests/test_portable_locks.py backend/tests/test_portable_discovery.py backend/tests/test_integration_sync.py -q
+          & $testPython -m pytest backend/tests/test_portable_install.py backend/tests/test_portable_launcher.py backend/tests/test_portable_diagnostics.py backend/tests/test_portable_packages.py backend/tests/test_portable_first_run_harness.py backend/tests/test_portable_locks.py backend/tests/test_portable_discovery.py backend/tests/test_integration_sync.py -q
       - name: Build static frontend
         shell: pwsh
         run: |
@@ -94,6 +94,27 @@ jobs:
               raise SystemExit("diagnostic schema gate failed")
           print("DIAGNOSTIC_AUDIT_OK")
           '@ | & $buildPython -
+      - name: Run TTS More clean-Windows single-package smoke
+        id: first-run-smoke
+        shell: pwsh
+        run: |
+          $buildPython = (Resolve-Path backend\.venv\Scripts\python.exe).Path
+          $version = $env:PACKAGE_VERSION -replace '^v', ''
+          $version = $version -replace '[^0-9A-Za-z._-]', '-'
+          $zip = Get-Item -LiteralPath (Join-Path "artifacts\portable\bootstrap" "TTS-More-$version-windows-x64-bootstrap.zip")
+          $env:TTS_MORE_FIRST_RUN_PYTHON = $buildPython
+          $env:TTS_MORE_FIRST_RUN_SINGLE_PACKAGE_SMOKE = "1"
+          & .\scripts\test-portable-first-run.ps1 -Packages $zip.FullName -Output (Join-Path $env:RUNNER_TEMP "single-package-smoke")
+          if ($LASTEXITCODE -ne 0) { throw "TTS More Bootstrap clean-Windows fixture smoke failed" }
+      - name: Upload sanitized clean-Windows smoke evidence
+        if: always() && steps.first-run-smoke.outcome != 'skipped'
+        uses: actions/upload-artifact@v7
+        with:
+          name: portable-first-run-smoke-evidence
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/single-package-smoke/acceptance.json
+            ${{ runner.temp }}/single-package-smoke/acceptance.junit.xml
       - name: Prove full-profile upload is refused
         shell: pwsh
         run: |
