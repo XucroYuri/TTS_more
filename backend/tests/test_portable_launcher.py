@@ -496,6 +496,24 @@ def test_windows_powershell_51_inspects_current_process_identity() -> None:
     assert process["command_args"]
 
 
+def test_windows_powershell_51_reports_a_missing_process_without_query_failure() -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+
+    assert launcher._inspect_process(2**31 - 1) is None
+
+
+def test_windows_powershell_51_reports_a_process_missing_after_exit() -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+    process = subprocess.Popen([sys.executable, "-c", "pass"])
+    process.wait(timeout=10)
+
+    assert launcher._inspect_process(process.pid) is None
+
+
 def test_windows_powershell_51_finds_current_loopback_listener_owner() -> None:
     launcher = _load_launcher()
     if launcher.os.name != "nt":
@@ -539,6 +557,27 @@ def test_windows_process_inspection_fails_closed_on_untrusted_powershell_output(
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [
+        {"found": False, "process": {"pid": 4242}},
+        {"found": True, "process": None},
+        {"found": True, "process": {"pid": 4242}},
+    ],
+)
+def test_windows_process_inspection_rejects_inconsistent_found_schema(
+    monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]
+) -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+    completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    with pytest.raises(RuntimeError, match="process ownership"):
+        launcher._inspect_process(4242)
+
+
+@pytest.mark.parametrize(
     ("stdout", "stderr"),
     [
         ('{"listener_pids":[]}', "unexpected diagnostic"),
@@ -564,6 +603,7 @@ def test_windows_port_inspection_fails_closed_on_untrusted_powershell_output(
     ("function_name", "value"),
     [
         ("_inspect_process", "4242; Write-Output forged"),
+        ("_inspect_process", 2**31),
         ("_listener_pids_for_port", 65536),
     ],
 )
