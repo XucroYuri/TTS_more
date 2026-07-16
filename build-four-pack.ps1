@@ -50,6 +50,102 @@ function Resolve-MetadataPython {
     throw "Python 3.11 is required to validate four-pack metadata"
 }
 
+function Assert-CleanSourceRepository {
+    param([Parameter(Mandatory = $true)]$Target)
+    $status = @(& git -C $Target.root status --porcelain=v1 --untracked-files=no 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "$($Target.component) source is not a readable Git repository" }
+    if (@($status | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) }).Count -ne 0) {
+        throw "$($Target.component) source is dirty; tracked content is not revision-bound"
+    }
+    $allUntracked = @(& git -C $Target.root ls-files --others --directory 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "$($Target.component) untracked source inventory failed" }
+    $copiedUntracked = @($allUntracked | Where-Object {
+        $relative = ([string]$_).Replace("\", "/")
+        if ([string]::IsNullOrWhiteSpace($relative)) { return $false }
+        $parts = @($relative.TrimEnd("/").Split("/"))
+        if ($Target.component -eq "tts-more") {
+            if (@($parts | Where-Object { $_ -in @("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache") }).Count -ne 0) { return $false }
+            $controllerFiles = @(
+                "backend/pyproject.toml", "backend/uv.lock", "backend/.python-version",
+                "Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "LICENSE", "NOTICE", "repo.lock.json",
+                "packaging/portable/toolchain.lock.json", "packaging/portable/runtime.lock.json", "packaging/portable/models.lock.json",
+                "packaging/portable/tts-more-package.schema.json", "packaging/portable/error-catalog.zh-CN.json", "packaging/portable/使用说明-先看这里.txt"
+            )
+            $controllerScripts = @(
+                "bootstrap-conda.ps1", "initialize-portable.ps1", "repair-portable.ps1", "start-production.ps1", "stop-production.ps1",
+                "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1", "select-portable-folder.ps1",
+                "export-portable-diagnostics.py", "import-portable-data.py", "import_portable_data.py", "portable_install.py",
+                "portable_launcher.py", "portable_operations.py", "portable_packages.py", "portable_package_runner.py"
+            )
+            return $relative.StartsWith("backend/app/", [StringComparison]::OrdinalIgnoreCase) -or
+                $relative.StartsWith("frontend/dist/", [StringComparison]::OrdinalIgnoreCase) -or
+                $relative -in $controllerFiles -or
+                ($relative.StartsWith("scripts/", [StringComparison]::OrdinalIgnoreCase) -and $relative.Substring(8) -in $controllerScripts)
+        }
+        $workerRootExcluded = @(".git", ".venv", "runtime", "data", "artifacts", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache")
+        $workerRecursiveExcluded = @(".git", ".venv", "artifacts", "cache", ".cache", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache")
+        $modelDirectories = @("models", "pretrained_models", "checkpoints", "SoVITS_weights", "GPT_weights")
+        if ($parts[0] -in $workerRootExcluded -or @($parts | Where-Object { $_ -in $workerRecursiveExcluded }).Count -ne 0) { return $false }
+        if (@($parts | Where-Object { $_ -in $modelDirectories }).Count -ne 0 -or $relative -match "\.(safetensors|ckpt|pth|pt|t7|onnx|bin)/?$") { return $false }
+        if ($parts[-1] -match '^\.env(?:\..+)?$') { return $false }
+        return $true
+    })
+    if ($copiedUntracked.Count -ne 0) {
+        throw "$($Target.component) source is dirty; copied untracked content is not revision-bound: $($copiedUntracked[0])"
+    }
+    $submoduleStatus = @(& git -C $Target.root submodule status --recursive 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "$($Target.component) recursive submodule status failed" }
+    if (@($submoduleStatus | Where-Object { ([string]$_) -match "^[+-U]" }).Count -ne 0) {
+        throw "$($Target.component) recursive submodule revision is not bound to HEAD"
+    }
+    $dirtySubmodules = @(& git -C $Target.root submodule foreach --quiet --recursive "git status --porcelain=v1 --untracked-files=all" 2>&1)
+    if ($LASTEXITCODE -ne 0 -or @($dirtySubmodules | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) }).Count -ne 0) {
+        throw "$($Target.component) recursive submodule source is dirty"
+    }
+}
+
+function Invoke-MetadataPython {
+    param(
+        [Parameter(Mandatory = $true)]$MetadataPython,
+        [Parameter(Mandatory = $true)][string]$PortablePackages,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Failure
+    )
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = @(& $MetadataPython.command @($MetadataPython.prefix) $PortablePackages @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    if ($exitCode -ne 0) { throw "$Failure`: $($output -join [Environment]::NewLine)" }
+    return $output
+}
+
+function Get-ValidatedFullPackage {
+    param(
+        [Parameter(Mandatory = $true)]$Target,
+        [Parameter(Mandatory = $true)][string]$ZipPath,
+        [Parameter(Mandatory = $true)]$MetadataPython,
+        [Parameter(Mandatory = $true)][string]$PortablePackages
+    )
+    $selectArguments = @(
+        "select-full-package",
+        "--zip", $ZipPath,
+        "--expected-component", $Target.component,
+        "--expected-version", $Version,
+        "--requested-profile", ([string]$Target.device).ToLowerInvariant(),
+        "--expected-source-revision", [string]$Target.expected_revision
+    )
+    $selectionOutput = @(Invoke-MetadataPython -MetadataPython $MetadataPython -PortablePackages $PortablePackages -Arguments $selectArguments -Failure "$($Target.component) full package metadata verification failed")
+    if ($selectionOutput.Count -ne 1) { throw "$($Target.component) full package metadata verification failed" }
+    $selection = ([string]$selectionOutput[0]) | ConvertFrom-Json
+    if (!$selection.valid) { throw "$($Target.component) full package metadata verification failed" }
+    return $selection
+}
+
 $repoLock = Get-Content -LiteralPath (Join-Path $Root "repo.lock.json") -Raw | ConvertFrom-Json
 $gptLock = @($repoLock.repositories | Where-Object { $_.name -eq "GPT-SoVITS-main" })[0]
 $indexLock = @($repoLock.repositories | Where-Object { $_.provider_type -eq "indextts" })[0]
@@ -84,17 +180,39 @@ if ($PlanOnly) {
     exit 0
 }
 
+$metadataPython = Resolve-MetadataPython
+$portablePackages = Join-Path $Root "scripts\portable_packages.py"
+$controllerRevision = (& git -C $Root rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $controllerRevision -notmatch "^[0-9a-f]{40}$") {
+    throw "tts-more source revision is not an exact Git commit"
+}
+$targets[0].expected_revision = $controllerRevision
+foreach ($target in $targets) {
+    if ([string]$target.expected_revision -notmatch "^[0-9a-f]{40}$") {
+        throw "$($target.component) expected source revision is invalid"
+    }
+    $actualRevision = (& git -C $target.root rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $actualRevision -ne $target.expected_revision) {
+        throw "$($target.component) source revision drift: expected $($target.expected_revision), found $actualRevision"
+    }
+    Assert-CleanSourceRepository -Target $target
+}
+
+$pathArguments = @("validate-transaction-paths", "--output-root", $OutputRoot, "--controller-root", $Root)
+foreach ($target in $targets) { $pathArguments += @("--source-root", [string]$target.root) }
+Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments $pathArguments -Failure "four-pack OutputRoot/source-root safety validation failed" | Out-Null
+
 if (Test-Path -LiteralPath $OutputRoot) { throw "OutputRoot already exists; use a new version directory so previous packages remain unchanged" }
 $outputParent = [System.IO.Path]::GetDirectoryName($OutputRoot)
 if ([string]::IsNullOrWhiteSpace($outputParent)) { throw "OutputRoot must have a parent directory" }
 New-Item -ItemType Directory -Force -Path $outputParent | Out-Null
+$parentIdentity = [string](@(Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("directory-identity", "--path", $outputParent) -Failure "four-pack output parent identity capture failed")[0])
 $transactionRoot = Join-Path $outputParent (".tts-more-four-pack-transaction-$PID-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $transactionRoot | Out-Null
+$transactionIdentity = [string](@(Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("directory-identity", "--path", $transactionRoot) -Failure "four-pack transaction identity capture failed")[0])
 $published = $false
 try {
-    $metadataPython = Resolve-MetadataPython
-    $portablePackages = Join-Path $Root "scripts\portable_packages.py"
-    $packages = @()
+    $builtPackages = @()
     foreach ($target in $targets) {
         $before = Get-ZipSnapshot -Directory $transactionRoot
         & (Join-Path $target.root "Build-Package.ps1") -Profile Full -Device $target.device -Version $Version -OutputRoot $transactionRoot
@@ -104,20 +222,30 @@ try {
             !$before.ContainsKey($_.FullName) -or $before[$_.FullName] -ne $after[$_.FullName]
         })
         if ($changed.Count -ne 1) { throw "$($target.component) did not produce exactly one changed full ZIP" }
-        $selectArguments = @(
-            "select-full-package",
-            "--zip", $changed[0].FullName,
-            "--expected-component", $target.component,
-            "--expected-version", $Version,
-            "--requested-profile", ([string]$target.device).ToLowerInvariant()
-        )
-        $selectionOutput = @(& $metadataPython.command @($metadataPython.prefix) $portablePackages @selectArguments 2>&1)
-        $selectionExit = $LASTEXITCODE
-        if ($selectionExit -ne 0 -or $selectionOutput.Count -ne 1) { throw "$($target.component) full package metadata verification failed" }
-        $selection = ([string]$selectionOutput[0]) | ConvertFrom-Json
-        if (!$selection.valid) { throw "$($target.component) full package metadata verification failed" }
+        $selection = Get-ValidatedFullPackage -Target $target -ZipPath $changed[0].FullName -MetadataPython $metadataPython -PortablePackages $portablePackages
+        $builtPackages += [pscustomobject]@{
+            target=$target
+            path=$changed[0].FullName
+        }
+    }
+
+    $expectedAssetNames = @()
+    foreach ($built in $builtPackages) {
+        $zipName = [System.IO.Path]::GetFileName([string]$built.path)
+        foreach ($suffix in @("", ".sha256", ".spdx.json", ".licenses.json", ".provenance.json", ".acceptance.json")) {
+            $expectedAssetNames += "$zipName$suffix"
+        }
+    }
+    $actualAssetNames = @(Get-ChildItem -LiteralPath $transactionRoot | ForEach-Object { $_.Name })
+    if ($expectedAssetNames.Count -ne 24 -or @($expectedAssetNames | Sort-Object -Unique).Count -ne 24 -or (Compare-Object ($expectedAssetNames | Sort-Object) ($actualAssetNames | Sort-Object))) {
+        throw "four-pack final asset set must contain exactly four packages with six assets each"
+    }
+
+    $packages = @()
+    foreach ($built in $builtPackages) {
+        $selection = Get-ValidatedFullPackage -Target $built.target -ZipPath $built.path -MetadataPython $metadataPython -PortablePackages $portablePackages
         $packages += [ordered]@{
-            component=$target.component
+            component=[string]$built.target.component
             file=[string]$selection.filename
             resolved_profile=[string]$selection.resolved_profile
             sha256=[string]$selection.sha256
@@ -140,12 +268,17 @@ try {
         package_set_sha256=$trainSha; generated_at=[DateTime]::UtcNow.ToString("o"); components=$packages
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $transactionRoot "four-pack.provenance.json") -Encoding UTF8
 
-    Move-Item -LiteralPath $transactionRoot -Destination $OutputRoot
+    $finalAssetNames = @(Get-ChildItem -LiteralPath $transactionRoot | ForEach-Object { $_.Name })
+    $expectedFinalNames = @($expectedAssetNames + @("compatibility-matrix.json", "four-pack.provenance.json"))
+    if ($expectedFinalNames.Count -ne 26 -or (Compare-Object ($expectedFinalNames | Sort-Object) ($finalAssetNames | Sort-Object))) {
+        throw "four-pack final publication layout is not the exact 4x6 plus matrix/provenance set"
+    }
+    Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("publish-directory", "--source", $transactionRoot, "--destination", $OutputRoot, "--expected-identity", $transactionIdentity, "--expected-parent-identity", $parentIdentity) -Failure "four-pack atomic no-replace publication failed" | Out-Null
     $published = $true
     Write-Host "Created local full four-pack: $OutputRoot"
 }
 finally {
     if (!$published -and (Test-Path -LiteralPath $transactionRoot)) {
-        Remove-Item -LiteralPath $transactionRoot -Recurse -Force
+        Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("cleanup-directory", "--path", $transactionRoot, "--expected-identity", $transactionIdentity) -Failure "four-pack transaction cleanup refused because directory identity changed" | Out-Null
     }
 }

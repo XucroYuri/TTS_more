@@ -3,12 +3,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import shutil
+import stat
 import struct
+import time
 import unicodedata
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
+
+from jsonschema import Draft202012Validator
 
 
 V1_REQUIRED_FIELDS = (
@@ -167,6 +174,7 @@ def select_full_package(
     expected_component: str,
     expected_version: str,
     requested_profile: str,
+    expected_source_revision: str,
 ) -> dict[str, object]:
     """Select and verify exactly one newly changed Full package artifact."""
     errors: list[str] = []
@@ -176,6 +184,9 @@ def select_full_package(
         "component": expected_component,
         "version": expected_version,
     }
+    if re.fullmatch(r"[0-9a-f]{40}", expected_source_revision) is None:
+        errors.append("expected source revision must be exactly 40 lowercase hexadecimal characters")
+        return report
     if len(candidates) != 1:
         errors.append("component did not produce exactly one changed full ZIP")
         return report
@@ -190,6 +201,7 @@ def select_full_package(
             if manifest_name is None:
                 raise ValueError("full ZIP is missing its embedded package manifest")
             manifest = json.loads(archive.read(manifest_name).decode("utf-8-sig"))
+            _validate_embedded_v2_package(archive, manifest, relative_names)
             if manifest.get("schema_version") != 2:
                 raise ValueError("full ZIP manifest must use schema v2")
             component = str(manifest.get("component") or "")
@@ -217,6 +229,21 @@ def select_full_package(
             )
             if runtime.get("device_profiles") != [resolved]:
                 raise ValueError("full ZIP manifest does not bind the resolved profile")
+            source_revision = str(_mapping(manifest.get("source")).get("revision") or "")
+            if source_revision != expected_source_revision:
+                raise ValueError("full ZIP source revision does not match the expected repository revision")
+            runtime_lock_name = relative_names[_canonical_relative_path(str(runtime["lock"]))]
+            model_lock_name = relative_names[
+                _canonical_relative_path(str(_mapping(manifest.get("models"))["lock"]))
+            ]
+            if state.get("runtime_lock_sha256") != hashlib.sha256(
+                archive.read(runtime_lock_name)
+            ).hexdigest():
+                raise ValueError("full ZIP install state runtime lock digest mismatch")
+            if state.get("model_lock_sha256") != hashlib.sha256(
+                archive.read(model_lock_name)
+            ).hexdigest():
+                raise ValueError("full ZIP install state model lock digest mismatch")
             expected_filename = full_package_name(component, version, resolved)
             expected_root = expected_filename.removesuffix(".zip")
             if (
@@ -234,7 +261,6 @@ def select_full_package(
         if sidecar_match.group(1).casefold() != actual_sha:
             raise ValueError("full ZIP SHA-256 sidecar mismatch")
         provenance = json.loads(Path(f"{path}.provenance.json").read_text(encoding="utf-8-sig"))
-        source_revision = str(_mapping(manifest.get("source")).get("revision") or "")
         expected_provenance = {
             "component": expected_component,
             "version": expected_version,
@@ -264,6 +290,72 @@ def select_full_package(
     ) as exc:
         errors.append(str(exc))
     return report
+
+
+def _portable_schema_path() -> Path:
+    candidates = (
+        Path(__file__).resolve().parents[1]
+        / "packaging"
+        / "portable"
+        / "tts-more-package.schema.json",
+        Path(__file__).resolve().with_name("tts-more-package.schema.json"),
+    )
+    found = [path for path in candidates if path.is_file()]
+    if len(found) != 1:
+        raise ValueError("portable package schema is missing or ambiguous")
+    return found[0]
+
+
+def _validate_embedded_v2_package(
+    archive: zipfile.ZipFile,
+    manifest: Any,
+    relative_names: dict[str, str],
+    *,
+    require_install_state: bool = True,
+) -> None:
+    schema = json.loads(_portable_schema_path().read_text(encoding="utf-8-sig"))
+    validator = Draft202012Validator(schema)
+    schema_errors = sorted(validator.iter_errors(manifest), key=lambda error: list(error.path))
+    if schema_errors:
+        raise ValueError(f"full ZIP manifest schema v2 validation failed: {schema_errors[0].message}")
+    payload = _mapping(manifest)
+    runtime = _mapping(payload.get("runtime"))
+    models = _mapping(payload.get("models"))
+    data = _mapping(payload.get("data"))
+    launchers = _mapping(payload.get("launchers"))
+    path_values = [
+        payload.get("data_root"),
+        payload.get("sha256_manifest"),
+        payload.get("licenses"),
+        runtime.get("lock"),
+        runtime.get("state_path"),
+        models.get("lock"),
+        *data.values(),
+        *launchers.values(),
+    ]
+    for value in path_values:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or not _is_relative_package_path(value)
+        ):
+            raise ValueError("full ZIP manifest contains an unsafe required relative path")
+    required_files = [
+        payload["sha256_manifest"],
+        payload["licenses"],
+        runtime["lock"],
+        models["lock"],
+        *launchers.values(),
+    ]
+    if require_install_state:
+        required_files.append(runtime["state_path"])
+    for relative in required_files:
+        canonical = _canonical_relative_path(str(relative))
+        if canonical not in relative_names:
+            raise ValueError(f"full ZIP required package file is missing: {relative}")
+    if _canonical_relative_path(str(payload["sha256_manifest"])) != "sha256sums.txt":
+        raise ValueError("full ZIP manifest must bind SHA256SUMS.txt")
 
 
 def _single_zip_package_root(
@@ -405,17 +497,26 @@ def audit_release_zip(path: Path) -> dict[str, object]:
     return {"valid": not errors, "errors": errors, "path": str(path)}
 
 
-def audit_release_assets(directory: Path) -> dict[str, object]:
+def audit_release_assets(
+    directory: Path,
+    *,
+    expected_component: str,
+    expected_version: str,
+) -> dict[str, object]:
     """Audit the exact Bootstrap asset set that may cross the GitHub boundary."""
     errors: list[str] = []
     directory = directory.resolve(strict=False)
     try:
+        if expected_component not in PORTABLE_COMPONENTS:
+            raise ValueError("expected release component is invalid")
+        if SAFE_VERSION.fullmatch(expected_version) is None:
+            raise ValueError("expected release version is invalid")
         if not directory.is_dir():
             raise ValueError("release asset directory is missing")
         files = sorted(path for path in directory.iterdir() if path.is_file())
         zips = [path for path in files if path.name.casefold().endswith(".zip")]
-        if not zips:
-            raise ValueError("release asset directory contains no candidate ZIP")
+        if len(zips) != 1:
+            errors.append("release asset directory must contain exactly one candidate ZIP")
         expected_files: set[str] = set()
         for path in zips:
             report = audit_release_zip(path)
@@ -429,6 +530,13 @@ def audit_release_assets(directory: Path) -> dict[str, object]:
                 if manifest_name is None:
                     raise ValueError(f"release ZIP manifest is missing: {path.name}")
                 manifest = json.loads(archive.read(manifest_name).decode("utf-8-sig"))
+                _validate_embedded_v2_package(
+                    archive,
+                    manifest,
+                    relative_names,
+                    require_install_state=False,
+                )
+                _verify_zip_sha256_manifest(archive, relative_names)
             if manifest.get("schema_version") != 2:
                 raise ValueError(f"release ZIP manifest must use schema v2: {path.name}")
             profile = manifest.get("package_profile")
@@ -440,6 +548,10 @@ def audit_release_assets(directory: Path) -> dict[str, object]:
                 raise ValueError(f"release ZIP manifest component is invalid: {path.name}")
             if not SAFE_VERSION.fullmatch(version) or manifest.get("version") != version:
                 raise ValueError(f"release ZIP manifest version is invalid: {path.name}")
+            if component != expected_component or version != expected_version:
+                raise ValueError(
+                    f"release ZIP does not match expected component/version: {path.name}"
+                )
             expected_name = (
                 f"TTS-More-{version}-windows-x64-bootstrap.zip"
                 if component == "tts-more"
@@ -491,6 +603,129 @@ def audit_release_assets(directory: Path) -> dict[str, object]:
     ) as exc:
         errors.append(str(exc))
     return {"valid": not errors, "errors": errors, "directory": str(directory)}
+
+
+def _lexical_absolute(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _is_reparse_stat(stat_result: os.stat_result) -> bool:
+    attributes = getattr(stat_result, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag) or stat.S_ISLNK(stat_result.st_mode)
+
+
+def _reject_existing_reparse_ancestors(path: Path) -> None:
+    path = _lexical_absolute(path)
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            current_stat = os.lstat(current)
+        except FileNotFoundError:
+            break
+        if _is_reparse_stat(current_stat):
+            raise ValueError(f"output path contains a reparse point: {current}")
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    path_text = os.path.normcase(os.path.abspath(os.fspath(path)))
+    parent_text = os.path.normcase(os.path.abspath(os.fspath(parent)))
+    try:
+        return os.path.commonpath((path_text, parent_text)) == parent_text
+    except ValueError:
+        return False
+
+
+def validate_transaction_paths(
+    output_root: Path,
+    *,
+    controller_root: Path,
+    source_roots: list[Path],
+) -> None:
+    """Reject output/source overlap and existing reparse-point path components."""
+    output = _lexical_absolute(output_root)
+    controller = _lexical_absolute(controller_root)
+    sources = [_lexical_absolute(path) for path in source_roots]
+    if not sources or os.path.normcase(str(sources[0])) != os.path.normcase(str(controller)):
+        raise ValueError("controller root must be the first source root")
+    _reject_existing_reparse_ancestors(output)
+
+    real_output = Path(os.path.realpath(output))
+    real_controller = Path(os.path.realpath(controller))
+    canonical_local_output = real_controller / "artifacts" / "portable" / "full-four"
+    for index, source in enumerate(sources):
+        real_source = Path(os.path.realpath(source))
+        output_inside_source = _path_is_within(real_output, real_source)
+        source_inside_output = _path_is_within(real_source, real_output)
+        if not output_inside_source and not source_inside_output:
+            continue
+        allowed_controller_output = (
+            index == 0
+            and output_inside_source
+            and _path_is_within(real_output, canonical_local_output)
+        )
+        if not allowed_controller_output:
+            raise ValueError(f"OutputRoot overlaps a source root: {source}")
+
+
+def directory_identity(path: Path) -> str:
+    path = _lexical_absolute(path)
+    path_stat = os.lstat(path)
+    if not stat.S_ISDIR(path_stat.st_mode) or _is_reparse_stat(path_stat):
+        raise ValueError(f"owned transaction path is not a plain directory: {path}")
+    if int(path_stat.st_ino) == 0:
+        raise ValueError(f"owned transaction path has no stable file identity: {path}")
+    return f"{int(path_stat.st_dev):x}:{int(path_stat.st_ino):x}"
+
+
+def publish_directory_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    expected_identity: str,
+    expected_parent_identity: str,
+) -> None:
+    source = _lexical_absolute(source)
+    destination = _lexical_absolute(destination)
+    if source.parent != destination.parent:
+        raise ValueError("transaction publication must remain within one parent directory")
+    if directory_identity(source) != expected_identity:
+        raise ValueError("transaction directory identity changed before publication")
+    if directory_identity(destination.parent) != expected_parent_identity:
+        raise ValueError("transaction parent directory identity changed before publication")
+    try:
+        os.lstat(destination)
+    except FileNotFoundError:
+        pass
+    else:
+        raise FileExistsError(f"publication destination already exists: {destination}")
+    os.rename(source, destination)
+    if directory_identity(destination) != expected_identity:
+        raise RuntimeError("published directory identity does not match the owned transaction")
+
+
+def cleanup_owned_directory(path: Path, *, expected_identity: str) -> None:
+    path = _lexical_absolute(path)
+    if directory_identity(path) != expected_identity:
+        raise ValueError("refusing to clean a replaced transaction directory")
+    quarantine = path.with_name(f"{path.name}.cleanup-{uuid.uuid4().hex}")
+    os.rename(path, quarantine)
+    if directory_identity(quarantine) != expected_identity:
+        raise RuntimeError("refusing to clean a transaction after identity changed")
+    cleanup_path = os.fspath(quarantine)
+    if os.name == "nt" and not cleanup_path.startswith("\\\\?\\"):
+        cleanup_path = "\\\\?\\" + cleanup_path
+    for attempt in range(10):
+        try:
+            if directory_identity(quarantine) != expected_identity:
+                raise RuntimeError("refusing to clean a replaced quarantined transaction")
+            shutil.rmtree(cleanup_path)
+            return
+        except OSError:
+            if attempt == 9:
+                raise
+            time.sleep(0.05)
 
 
 def _audit_v2_user_layout(
@@ -850,10 +1085,27 @@ def main(argv: list[str] | None = None) -> int:
     select_full.add_argument("--expected-component", required=True)
     select_full.add_argument("--expected-version", required=True)
     select_full.add_argument("--requested-profile", required=True)
+    select_full.add_argument("--expected-source-revision", required=True)
     audit = subcommands.add_parser("audit-release")
     audit.add_argument("--zip", required=True, action="append", type=Path)
     audit_assets = subcommands.add_parser("audit-release-assets")
     audit_assets.add_argument("--directory", required=True, type=Path)
+    audit_assets.add_argument("--expected-component", required=True)
+    audit_assets.add_argument("--expected-version", required=True)
+    validate_paths = subcommands.add_parser("validate-transaction-paths")
+    validate_paths.add_argument("--output-root", required=True, type=Path)
+    validate_paths.add_argument("--controller-root", required=True, type=Path)
+    validate_paths.add_argument("--source-root", required=True, action="append", type=Path)
+    identity = subcommands.add_parser("directory-identity")
+    identity.add_argument("--path", required=True, type=Path)
+    publish = subcommands.add_parser("publish-directory")
+    publish.add_argument("--source", required=True, type=Path)
+    publish.add_argument("--destination", required=True, type=Path)
+    publish.add_argument("--expected-identity", required=True)
+    publish.add_argument("--expected-parent-identity", required=True)
+    cleanup = subcommands.add_parser("cleanup-directory")
+    cleanup.add_argument("--path", required=True, type=Path)
+    cleanup.add_argument("--expected-identity", required=True)
     verify_sums = subcommands.add_parser("verify-sha256")
     verify_sums.add_argument("--package-root", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -883,6 +1135,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_component=args.expected_component,
             expected_version=args.expected_version,
             requested_profile=args.requested_profile,
+            expected_source_revision=args.expected_source_revision,
         )
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0 if report["valid"] else 1
@@ -891,9 +1144,34 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"valid": all(report["valid"] for report in reports), "reports": reports}, ensure_ascii=False, sort_keys=True))
         return 0 if all(report["valid"] for report in reports) else 1
     if args.command == "audit-release-assets":
-        report = audit_release_assets(args.directory)
+        report = audit_release_assets(
+            args.directory,
+            expected_component=args.expected_component,
+            expected_version=args.expected_version,
+        )
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0 if report["valid"] else 1
+    if args.command == "validate-transaction-paths":
+        validate_transaction_paths(
+            args.output_root,
+            controller_root=args.controller_root,
+            source_roots=args.source_root,
+        )
+        return 0
+    if args.command == "directory-identity":
+        print(directory_identity(args.path))
+        return 0
+    if args.command == "publish-directory":
+        publish_directory_no_replace(
+            args.source,
+            args.destination,
+            expected_identity=args.expected_identity,
+            expected_parent_identity=args.expected_parent_identity,
+        )
+        return 0
+    if args.command == "cleanup-directory":
+        cleanup_owned_directory(args.path, expected_identity=args.expected_identity)
+        return 0
     if args.command == "verify-sha256":
         report = verify_sha256_manifest(args.package_root)
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))

@@ -2322,8 +2322,8 @@ def _write_full_package_candidate(
         "component": component,
         "build_id": build_id,
         "profile": resolved_profile,
-        "runtime_lock_sha256": "c" * 64,
-        "model_lock_sha256": "d" * 64,
+        "runtime_lock_sha256": hashlib.sha256(b"fixture\n").hexdigest(),
+        "model_lock_sha256": hashlib.sha256(b"fixture\n").hexdigest(),
         "ready": True,
         "completed_at": "2026-07-16T00:00:00+00:00",
     }
@@ -2390,6 +2390,33 @@ def _rewrite_full_candidate_archive_root(archive_path: Path, archive_root: str) 
     provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
 
 
+def _rewrite_full_candidate_entries(archive_path: Path, mutate) -> None:
+    temporary = archive_path.with_suffix(".rewritten.zip")
+    with zipfile.ZipFile(archive_path) as source:
+        root = source.namelist()[0].split("/", 1)[0]
+        entries = {
+            entry.filename.split("/", 1)[1]: source.read(entry)
+            for entry in source.infolist()
+            if not entry.is_dir() and not entry.filename.endswith("/SHA256SUMS.txt")
+        }
+    mutate(entries)
+    sums = "".join(
+        f"{hashlib.sha256(payload).hexdigest()}  {relative}\n"
+        for relative, payload in sorted(entries.items())
+    )
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as destination:
+        for relative, payload in entries.items():
+            destination.writestr(f"{root}/{relative}", payload)
+        destination.writestr(f"{root}/SHA256SUMS.txt", sums.encode("utf-8"))
+    temporary.replace(archive_path)
+    digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+    Path(f"{archive_path}.sha256").write_text(f"{digest}  {archive_path.name}\n", encoding="ascii")
+    provenance_path = Path(f"{archive_path}.provenance.json")
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["sha256"] = digest
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+
 def test_select_full_package_reads_manifest_state_and_verifies_sha_sidecars(tmp_path: Path) -> None:
     packages = _load_portable_packages()
     archive_path = _write_full_package_candidate(tmp_path)
@@ -2399,6 +2426,7 @@ def test_select_full_package_reads_manifest_state_and_verifies_sha_sidecars(tmp_
         expected_component="gpt-sovits",
         expected_version="0.2.0",
         requested_profile="auto",
+        expected_source_revision="f8a5865000000000000000000000000000000000",
     )
 
     assert report["valid"] is True
@@ -2431,10 +2459,68 @@ def test_select_full_package_rejects_raw_archive_root_aliases(
         expected_component="gpt-sovits",
         expected_version="0.2.0",
         requested_profile="auto",
+        expected_source_revision="f8a5865000000000000000000000000000000000",
     )
 
     assert report["valid"] is False
     assert any("archive root" in error for error in report["errors"])
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("schema", "launcher", "runtime-lock", "model-lock", "license", "lock-digest"),
+)
+def test_select_full_package_requires_complete_schema_files_and_lock_binding(
+    tmp_path: Path, failure: str
+) -> None:
+    packages = _load_portable_packages()
+    archive_path = _write_full_package_candidate(tmp_path)
+
+    def mutate(entries: dict[str, bytes]) -> None:
+        manifest = json.loads(entries["package/tts-more-package.json"])
+        if failure == "schema":
+            manifest.pop("endpoint")
+        elif failure == "launcher":
+            entries.pop(manifest["launchers"]["start"])
+        elif failure == "runtime-lock":
+            entries.pop(manifest["runtime"]["lock"])
+        elif failure == "model-lock":
+            entries.pop(manifest["models"]["lock"])
+        elif failure == "license":
+            entries.pop(manifest["licenses"])
+        elif failure == "lock-digest":
+            state = json.loads(entries[manifest["runtime"]["state_path"]])
+            state["runtime_lock_sha256"] = "0" * 64
+            entries[manifest["runtime"]["state_path"]] = json.dumps(state).encode()
+        entries["package/tts-more-package.json"] = json.dumps(manifest).encode()
+
+    _rewrite_full_candidate_entries(archive_path, mutate)
+    report = packages.select_full_package(
+        [archive_path],
+        expected_component="gpt-sovits",
+        expected_version="0.2.0",
+        requested_profile="auto",
+        expected_source_revision="f8a5865000000000000000000000000000000000",
+    )
+
+    assert report["valid"] is False
+    assert report["errors"]
+
+
+def test_select_full_package_binds_expected_source_revision(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    archive_path = _write_full_package_candidate(tmp_path)
+
+    report = packages.select_full_package(
+        [archive_path],
+        expected_component="gpt-sovits",
+        expected_version="0.2.0",
+        requested_profile="auto",
+        expected_source_revision="b" * 40,
+    )
+
+    assert report["valid"] is False
+    assert any("source revision" in error for error in report["errors"])
 
 
 @pytest.mark.parametrize(
@@ -2485,6 +2571,7 @@ def test_select_full_package_rejects_ambiguous_or_mislabelled_candidates(
         expected_component=expected_component,
         expected_version="0.2.0",
         requested_profile=requested_profile,
+        expected_source_revision="f8a5865000000000000000000000000000000000",
     )
 
     assert report["valid"] is False
@@ -2701,7 +2788,7 @@ def test_four_pack_discovers_changed_zips_by_manifest_not_filename_glob() -> Non
     assert 'Filter "*-$Version-windows-x64-full.zip"' not in builder
     assert "did not produce exactly one changed full ZIP" in builder
     assert "transaction" in builder.lower()
-    assert builder.index("compatibility-matrix.json") < builder.index("Move-Item")
+    assert builder.index("compatibility-matrix.json") < builder.index("publish-directory")
 
 
 def _write_fake_full_package_maker(root: Path) -> Path:
@@ -2724,17 +2811,18 @@ parser.add_argument("--mode", default="ok")
 args = parser.parse_args()
 if args.mode == "stale":
     raise SystemExit(0)
+source_revision = "b" * 40 if args.mode == "wrong-source" else args.source_revision
 resolved = "cpu" if args.component == "tts-more" else ("cu126" if args.device.casefold() == "auto" else args.device.casefold())
 filename = full_package_name(args.component, args.version, resolved)
 stage = args.output / f".fixture-stage-{args.component}"
 stage.mkdir(parents=True, exist_ok=False)
-build_id = f"{args.component}-{args.version}-{args.source_revision[:12]}"
+build_id = f"{args.component}-{args.version}-{source_revision[:12]}"
 port = {"tts-more": 8000, "gpt-sovits": 9880, "indextts": 9881, "cosyvoice": 9882}[args.component]
 manifest = {
     "schema_version": 2, "component": args.component, "package_id": args.component,
     "release_version": args.version, "version": args.version, "build_id": build_id,
     "package_profile": "full", "platform": "windows-x64", "api_contract": "tts-more-v1",
-    "source": {"repository": "https://example.invalid/source", "revision": args.source_revision},
+    "source": {"repository": "https://example.invalid/source", "revision": source_revision},
     "integration": {"version": "2.0.0", "source_revision": "d" * 40, "bundle_sha256": "a" * 64},
     "runtime": {"python_version": "3.11", "device_profiles": [resolved], "lock": "locks/runtime.json", "state_path": "data/local/install-state.json"},
     "models": {"lock": "locks/models.json", "required": args.component != "tts-more"},
@@ -2744,10 +2832,13 @@ manifest = {
     "endpoint": {"default_url": f"http://127.0.0.1:{port}", "port": port, "health_path": "/health", "capabilities_path": "/capabilities", "bind_policy": "loopback"},
     "capabilities": ["tts"], "sha256_manifest": "SHA256SUMS.txt", "licenses": "licenses/THIRD-PARTY-NOTICES.json",
 }
-state = {"schema_version": 1, "component": args.component, "build_id": build_id, "profile": resolved, "runtime_lock_sha256": "c" * 64, "model_lock_sha256": "d" * 64, "ready": True, "completed_at": "2026-07-16T00:00:00+00:00"}
-files = {"package/tts-more-package.json": json.dumps(manifest).encode(), "data/local/install-state.json": json.dumps(state).encode()}
+state = {"schema_version": 1, "component": args.component, "build_id": build_id, "profile": resolved, "runtime_lock_sha256": "", "model_lock_sha256": "", "ready": True, "completed_at": "2026-07-16T00:00:00+00:00"}
+files = {"package/tts-more-package.json": json.dumps(manifest).encode()}
 for relative in (*manifest["launchers"].values(), manifest["runtime"]["lock"], manifest["models"]["lock"], manifest["licenses"]):
     files[str(relative)] = b"fixture\n"
+state["runtime_lock_sha256"] = hashlib.sha256(files[manifest["runtime"]["lock"]]).hexdigest()
+state["model_lock_sha256"] = hashlib.sha256(files[manifest["models"]["lock"]]).hexdigest()
+files[manifest["runtime"]["state_path"]] = json.dumps(state).encode()
 for relative, payload in files.items():
     path = stage / relative
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2759,7 +2850,7 @@ create_zip(stage, archive, filename.removesuffix(".zip"))
 shutil.rmtree(stage)
 digest = hashlib.sha256(archive.read_bytes()).hexdigest()
 Path(f"{archive}.sha256").write_text(f"{digest}  {filename}\n", encoding="ascii")
-Path(f"{archive}.provenance.json").write_text(json.dumps({"schema_version": 1, "component": args.component, "version": args.version, "profile": "full", "resolved_profile": resolved, "source_revision": args.source_revision, "sha256": digest}), encoding="utf-8")
+Path(f"{archive}.provenance.json").write_text(json.dumps({"schema_version": 1, "component": args.component, "version": args.version, "profile": "full", "resolved_profile": resolved, "source_revision": source_revision, "sha256": digest}), encoding="utf-8")
 for suffix in ("spdx.json", "licenses.json", "acceptance.json"):
     Path(f"{archive}.{suffix}").write_text("{}\n", encoding="utf-8")
 if args.mode == "duplicate":
@@ -2767,6 +2858,23 @@ if args.mode == "duplicate":
     shutil.copy2(archive, duplicate)
     for suffix in ("sha256", "provenance.json", "spdx.json", "licenses.json", "acceptance.json"):
         shutil.copy2(Path(f"{archive}.{suffix}"), Path(f"{duplicate}.{suffix}"))
+if args.mode in {"mutate-earlier", "delete-earlier"}:
+    earlier = next(args.output.glob("TTS-More-*.zip"))
+    if args.mode == "mutate-earlier":
+        earlier.write_bytes(earlier.read_bytes() + b"late mutation")
+    else:
+        earlier.unlink()
+if args.mode == "inject":
+    (args.output / "unexpected-injected.txt").write_text("injected", encoding="utf-8")
+if args.mode == "publish-collision":
+    collision = Path(__import__("os").environ["TTS_MORE_FIXTURE_FINAL_OUTPUT"])
+    collision.mkdir(parents=True)
+    (collision / "sentinel.txt").write_text("collision", encoding="utf-8")
+if args.mode == "replace-transaction":
+    owned = args.output.with_name(args.output.name + "-owned")
+    args.output.rename(owned)
+    args.output.mkdir()
+    (args.output / "replacement-sentinel.txt").write_text("replacement", encoding="utf-8")
 ''',
         encoding="utf-8",
     )
@@ -2792,6 +2900,9 @@ def _write_executable_four_pack_fixture(root: Path) -> tuple[Path, dict[str, Pat
     root.mkdir()
     shutil.copy2(REPO_ROOT / "build-four-pack.ps1", root / "build-four-pack.ps1")
     shutil.copytree(REPO_ROOT / "scripts", root / "scripts")
+    schema_target = root / "packaging" / "portable" / "tts-more-package.schema.json"
+    schema_target.parent.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "packaging" / "portable" / "tts-more-package.schema.json", schema_target)
     _write_fake_full_builder(root, "tts-more")
     workers: dict[str, Path] = {}
     repositories: list[dict[str, str]] = []
@@ -2804,6 +2915,7 @@ def _write_executable_four_pack_fixture(root: Path) -> tuple[Path, dict[str, Pat
         workers[component] = worker
     (root / "repo.lock.json").write_text(json.dumps({"repositories": repositories}), encoding="utf-8")
     _write_fake_full_package_maker(root)
+    _initialize_git_repository(root)
     return root, workers
 
 
@@ -2821,6 +2933,7 @@ def _run_executable_four_pack_fixture(
         "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
         "TTS_MORE_FIXTURE_MAKER": str(fixture / "make-full-package.py"),
         "TTS_MORE_FIXTURE_LOG": str(log),
+        "TTS_MORE_FIXTURE_FINAL_OUTPUT": str(output),
         **(extra_env or {}),
     }
     return subprocess.run(
@@ -2903,6 +3016,123 @@ def test_four_pack_component_failure_leaves_final_output_untouched(tmp_path: Pat
     ]
 
 
+def test_four_pack_rejects_package_source_revision_not_bound_to_repo_lock(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("four-pack execution contract requires PowerShell")
+    fixture, workers = _write_executable_four_pack_fixture(tmp_path / "four-pack")
+    output = tmp_path / "published"
+
+    completed = _run_executable_four_pack_fixture(
+        fixture,
+        workers,
+        output,
+        extra_env={"TTS_MORE_FIXTURE_MODE_COMPONENT": "gpt-sovits", "TTS_MORE_FIXTURE_MODE": "wrong-source"},
+    )
+
+    assert completed.returncode != 0
+    assert not output.exists()
+
+
+def test_four_pack_rejects_untracked_worker_source_that_builder_would_copy(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("four-pack execution contract requires PowerShell")
+    fixture, workers = _write_executable_four_pack_fixture(tmp_path / "four-pack")
+    (workers["gpt-sovits"] / "copied-untracked.py").write_text("DIRTY = True\n", encoding="utf-8")
+    output = tmp_path / "published"
+
+    completed = _run_executable_four_pack_fixture(fixture, workers, output)
+
+    assert completed.returncode != 0
+    assert "dirty" in (completed.stdout + completed.stderr).lower()
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("mode", ("mutate-earlier", "delete-earlier", "inject"))
+def test_four_pack_revalidates_final_asset_set_before_publication(tmp_path: Path, mode: str) -> None:
+    if POWERSHELL is None:
+        pytest.skip("four-pack execution contract requires PowerShell")
+    fixture, workers = _write_executable_four_pack_fixture(tmp_path / "four-pack")
+    output = tmp_path / "published"
+
+    completed = _run_executable_four_pack_fixture(
+        fixture,
+        workers,
+        output,
+        extra_env={"TTS_MORE_FIXTURE_MODE_COMPONENT": "cosyvoice", "TTS_MORE_FIXTURE_MODE": mode},
+    )
+
+    assert completed.returncode != 0
+    assert not output.exists()
+
+
+def test_four_pack_rejects_worker_nested_output_root(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("four-pack execution contract requires PowerShell")
+    fixture, workers = _write_executable_four_pack_fixture(tmp_path / "four-pack")
+    output = workers["gpt-sovits"] / "nested-delivery"
+
+    completed = _run_executable_four_pack_fixture(fixture, workers, output)
+
+    assert completed.returncode != 0
+    assert "source root" in (completed.stdout + completed.stderr).lower()
+    assert not output.exists()
+
+
+def test_four_pack_publication_collision_is_no_replace_and_preserves_destination(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("four-pack execution contract requires PowerShell")
+    fixture, workers = _write_executable_four_pack_fixture(tmp_path / "four-pack")
+    output = tmp_path / "published"
+
+    completed = _run_executable_four_pack_fixture(
+        fixture,
+        workers,
+        output,
+        extra_env={"TTS_MORE_FIXTURE_MODE_COMPONENT": "cosyvoice", "TTS_MORE_FIXTURE_MODE": "publish-collision"},
+    )
+
+    assert completed.returncode != 0
+    assert (output / "sentinel.txt").read_text(encoding="utf-8") == "collision"
+    assert list(output.iterdir()) == [output / "sentinel.txt"]
+
+
+def test_four_pack_rejects_reparse_output_parent(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("four-pack execution contract requires PowerShell")
+    fixture, workers = _write_executable_four_pack_fixture(tmp_path / "four-pack")
+    real_parent = tmp_path / "real-output-parent"
+    real_parent.mkdir()
+    junction = tmp_path / "output-parent-junction"
+    _create_windows_junction(junction, real_parent)
+    output = junction / "published"
+
+    completed = _run_executable_four_pack_fixture(fixture, workers, output)
+
+    assert completed.returncode != 0
+    assert "reparse" in (completed.stdout + completed.stderr).lower()
+    assert not output.exists()
+
+
+def test_four_pack_cleanup_refuses_replaced_transaction_identity(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("four-pack execution contract requires PowerShell")
+    fixture, workers = _write_executable_four_pack_fixture(tmp_path / "four-pack")
+    output = tmp_path / "published"
+
+    completed = _run_executable_four_pack_fixture(
+        fixture,
+        workers,
+        output,
+        extra_env={"TTS_MORE_FIXTURE_MODE_COMPONENT": "cosyvoice", "TTS_MORE_FIXTURE_MODE": "replace-transaction"},
+    )
+
+    assert completed.returncode != 0
+    replacements = list(tmp_path.glob(".tts-more-four-pack-transaction-*/replacement-sentinel.txt"))
+    assert len(replacements) == 1
+    assert replacements[0].read_text(encoding="utf-8") == "replacement"
+    assert not output.exists()
+
+
 def test_portable_release_workflow_audits_every_zip_and_uses_exact_asset_allowlist() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "portable-release.yml").read_text(
         encoding="utf-8"
@@ -2950,7 +3180,12 @@ def test_release_asset_set_audits_each_zip_and_rejects_filename_manifest_spoof(
     ):
         shutil.copy2(source, release / source.name)
 
-    assert packages.audit_release_assets(release)["valid"] is True
+    audit = packages.audit_release_assets(
+        release,
+        expected_component="tts-more",
+        expected_version="0.2.0-clean-controller",
+    )
+    assert audit["valid"] is True, audit["errors"]
 
     renamed = release / "TTS-More-9.9.9-windows-x64-bootstrap.zip"
     (release / source_zip.name).rename(renamed)
@@ -2965,7 +3200,11 @@ def test_release_asset_set_audits_each_zip_and_rejects_filename_manifest_spoof(
     provenance["sha256"] = digest
     provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
 
-    report = packages.audit_release_assets(release)
+    report = packages.audit_release_assets(
+        release,
+        expected_component="tts-more",
+        expected_version="0.2.0-clean-controller",
+    )
 
     assert report["valid"] is False
     assert any("filename" in error for error in report["errors"])
@@ -2982,10 +3221,14 @@ def test_release_asset_set_rejects_full_zip_even_beside_valid_bootstrap(
         shutil.copy2(source, release / source.name)
     _write_full_package_candidate(release, component="tts-more", resolved_profile="cpu")
 
-    report = packages.audit_release_assets(release)
+    report = packages.audit_release_assets(
+        release,
+        expected_component="tts-more",
+        expected_version="0.2.0-clean-controller",
+    )
 
     assert report["valid"] is False
-    assert any("profile=full" in error for error in report["errors"])
+    assert any("exactly one" in error or "profile=full" in error for error in report["errors"])
 
 
 def test_portable_release_workflow_is_valid_yaml_and_has_no_broad_asset_glob() -> None:
@@ -2999,6 +3242,41 @@ def test_portable_release_workflow_is_valid_yaml_and_has_no_broad_asset_glob() -
     assert "artifacts/portable/bootstrap/*\n" not in workflow
     assert "release-assets/* --clobber" not in workflow
     assert "audit-release-assets --directory" in workflow
+
+
+def test_release_asset_set_requires_one_expected_component_and_version(
+    clean_portable_builds: dict[str, object], tmp_path: Path
+) -> None:
+    packages = _load_portable_packages()
+    release = tmp_path / "release"
+    release.mkdir()
+    first = Path(clean_portable_builds["controller_zip"])
+    _second_stage, second = _build_controller_bootstrap(
+        tmp_path / "second-controller", "9.9.9-foreign"
+    )
+    for archive_path in (first, second):
+        for source in archive_path.parent.glob(f"{archive_path.name}*"):
+            shutil.copy2(source, release / source.name)
+
+    report = packages.audit_release_assets(
+        release,
+        expected_component="tts-more",
+        expected_version="0.2.0-clean-controller",
+    )
+
+    assert report["valid"] is False
+    assert any("exactly one" in error for error in report["errors"])
+
+
+def test_portable_release_workflow_passes_expected_component_and_version() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "portable-release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert workflow.count("audit-release-assets --directory") == 2
+    assert workflow.count("--expected-component tts-more") == 2
+    assert workflow.count("--expected-version") >= 2
+    assert "$candidateZips[0]" not in workflow
 
 
 def test_validate_manifest_rejects_invalid_v2_profile_and_nested_absolute_paths(tmp_path: Path) -> None:

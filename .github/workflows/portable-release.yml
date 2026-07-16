@@ -59,14 +59,14 @@ jobs:
           $version = $version -replace '[^0-9A-Za-z._-]', '-'
           .\Build-Package.ps1 -Profile Bootstrap -Device CPU -Version $version
           $candidateZips = @(Get-ChildItem artifacts\portable\bootstrap\*.zip)
-          if ($candidateZips.Count -lt 1) { throw "expected at least one bootstrap ZIP" }
+          if ($candidateZips.Count -ne 1) { throw "expected exactly one bootstrap ZIP" }
           foreach ($candidateZip in $candidateZips) {
             python scripts\portable_packages.py audit-release --zip $candidateZip.FullName
             if ($LASTEXITCODE -ne 0) { throw "bootstrap ZIP release audit failed" }
           }
-          python scripts\portable_packages.py audit-release-assets --directory artifacts\portable\bootstrap
+          python scripts\portable_packages.py audit-release-assets --directory artifacts\portable\bootstrap --expected-component tts-more --expected-version $version
           if ($LASTEXITCODE -ne 0) { throw "bootstrap release asset set or embedded package_profile audit failed" }
-          $zip = $candidateZips[0]
+          $zip = Get-Item -LiteralPath (Join-Path "artifacts\portable\bootstrap" "TTS-More-$version-windows-x64-bootstrap.zip")
           $expanded = Join-Path $env:RUNNER_TEMP "tts-more-bootstrap-audit"
           Expand-Archive -LiteralPath $zip.FullName -DestinationPath $expanded
           $packageRoot = @(Get-ChildItem -LiteralPath $expanded -Directory)
@@ -141,6 +141,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version="${GITHUB_REF_NAME#v}"
           found_zip=false
           for candidate_zip in release-assets/*.zip; do
             [ -e "$candidate_zip" ] || continue
@@ -151,7 +152,7 @@ jobs:
             echo "no Bootstrap ZIP was downloaded" >&2
             exit 1
           fi
-          python scripts/portable_packages.py audit-release-assets --directory release-assets
+          python scripts/portable_packages.py audit-release-assets --directory release-assets --expected-component tts-more --expected-version "$version"
           shopt -s nullglob
           assets=(
             release-assets/*.zip
