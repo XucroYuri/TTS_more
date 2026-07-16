@@ -4,7 +4,10 @@ import importlib.util
 import hashlib
 import json
 import os
+import socket
 import subprocess
+import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -474,6 +477,112 @@ def test_windows_process_command_line_is_split_for_identity_comparison() -> None
     assert launcher._split_windows_command_line(
         '"C:\\Portable Root\\python.exe" -m uvicorn "worker app:api" --port 9880'
     ) == ["C:\\Portable Root\\python.exe", "-m", "uvicorn", "worker app:api", "--port", "9880"]
+
+
+def test_windows_powershell_51_inspects_current_process_identity() -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+
+    process = launcher._inspect_process(os.getpid())
+
+    assert process is not None
+    assert process["pid"] == os.getpid()
+    executable = Path(str(process["executable_path"])).resolve()
+    assert executable.is_file()
+    assert executable.name.casefold() == Path(sys.executable).name.casefold()
+    assert datetime.fromisoformat(str(process["created_at"]))
+    assert isinstance(process["command_args"], list)
+    assert process["command_args"]
+
+
+def test_windows_powershell_51_finds_current_loopback_listener_owner() -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell port inspection is Windows-only")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = int(listener.getsockname()[1])
+
+        assert os.getpid() in launcher._listener_pids_for_port(port)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    [
+        (1, "", "query failed"),
+        (
+            0,
+            '{"pid":4242,"parent_pid":1,"created_at":"2026-07-16T00:00:00Z",'
+            '"executable_path":"C:\\\\Python\\\\python.exe","command_line":"python.exe"}',
+            "unexpected diagnostic",
+        ),
+        (0, "4242", ""),
+    ],
+)
+def test_windows_process_inspection_fails_closed_on_untrusted_powershell_output(
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+) -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+    completed = subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    with pytest.raises(RuntimeError, match="process ownership"):
+        launcher._inspect_process(4242)
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr"),
+    [
+        ('{"listener_pids":[]}', "unexpected diagnostic"),
+        ("4242", ""),
+    ],
+)
+def test_windows_port_inspection_fails_closed_on_untrusted_powershell_output(
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    stderr: str,
+) -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell port inspection is Windows-only")
+    completed = subprocess.CompletedProcess([], 0, stdout=stdout, stderr=stderr)
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    with pytest.raises(RuntimeError, match="port ownership"):
+        launcher._listener_pids_for_port(9880)
+
+
+@pytest.mark.parametrize(
+    ("function_name", "value"),
+    [
+        ("_inspect_process", "4242; Write-Output forged"),
+        ("_listener_pids_for_port", 65536),
+    ],
+)
+def test_windows_ownership_queries_reject_unvalidated_values_before_powershell(
+    monkeypatch: pytest.MonkeyPatch,
+    function_name: str,
+    value: object,
+) -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell ownership inspection is Windows-only")
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("invalid values must not reach PowerShell"),
+    )
+
+    with pytest.raises(ValueError, match="integer|range"):
+        getattr(launcher, function_name)(value)
 
 
 def test_cli_separator_is_not_part_of_persisted_command_identity(tmp_path: Path) -> None:

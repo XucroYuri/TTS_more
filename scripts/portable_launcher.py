@@ -270,25 +270,52 @@ def stop_worker(
 def _inspect_process(pid: int) -> dict[str, object] | None:
     if os.name != "nt":
         return None
+    query_pid = _validated_query_integer(pid, label="process ID", minimum=1, maximum=2**32 - 1)
+    environment = os.environ.copy()
+    environment["TTS_MORE_PORTABLE_QUERY_PID"] = str(query_pid)
     command = [
         "powershell",
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "$p=Get-Process -Id $args[0] -ErrorAction SilentlyContinue; "
-        "$c=Get-CimInstance Win32_Process -Filter ('ProcessId='+$args[0]) -ErrorAction SilentlyContinue; "
-        "if($p){@{pid=$p.Id;parent_pid=if($c){$c.ParentProcessId}else{$null};"
+        "$ErrorActionPreference='Stop';"
+        "$queryPid=[uint32]::Parse($env:TTS_MORE_PORTABLE_QUERY_PID,"
+        "[Globalization.CultureInfo]::InvariantCulture);"
+        "$p=Get-Process -Id $queryPid -ErrorAction SilentlyContinue;"
+        "if($p){"
+        "$c=Get-CimInstance Win32_Process -Filter ('ProcessId = {0}' -f $queryPid) "
+        "-ErrorAction Stop;"
+        "[ordered]@{pid=[int]$p.Id;parent_pid=if($c){[int]$c.ParentProcessId}else{$null};"
         "created_at=$p.StartTime.ToUniversalTime().ToString('o');executable_path=$p.Path;"
         "command_line=if($c){$c.CommandLine}else{''}}|ConvertTo-Json -Compress}",
-        str(pid),
     ]
-    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    completed = subprocess.run(
+        command, check=False, capture_output=True, text=True, env=environment
+    )
+    if completed.returncode != 0 or completed.stderr.strip():
+        raise RuntimeError("unable to verify process ownership")
     output = completed.stdout.strip()
     if not output:
         return None
-    payload = json.loads(output)
-    if not isinstance(payload, dict):
-        return None
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("unable to verify process ownership") from exc
+    expected_keys = {"pid", "parent_pid", "created_at", "executable_path", "command_line"}
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        raise RuntimeError("unable to verify process ownership")
+    parent_pid = payload["parent_pid"]
+    if (
+        type(payload["pid"]) is not int
+        or payload["pid"] != query_pid
+        or (parent_pid is not None and (type(parent_pid) is not int or parent_pid < 0))
+        or not isinstance(payload["created_at"], str)
+        or not payload["created_at"]
+        or not isinstance(payload["executable_path"], str)
+        or not payload["executable_path"]
+        or not isinstance(payload["command_line"], str)
+    ):
+        raise RuntimeError("unable to verify process ownership")
     command_line = str(payload.pop("command_line", "") or "")
     payload["command_args"] = _split_windows_command_line(command_line)[1:] if command_line else None
     return payload
@@ -329,24 +356,51 @@ def _listener_pids_for_port(port: int) -> set[int]:
     """Return all Windows listener PIDs so unknown owners can never be terminated."""
     if os.name != "nt":
         return set()
+    query_port = _validated_query_integer(port, label="port", minimum=1, maximum=65535)
+    environment = os.environ.copy()
+    environment["TTS_MORE_PORTABLE_QUERY_PORT"] = str(query_port)
     command = [
         "powershell",
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "@(Get-NetTCPConnection -State Listen -LocalPort $args[0] -ErrorAction SilentlyContinue | "
-        "Select-Object -ExpandProperty OwningProcess -Unique) | ConvertTo-Json -Compress",
-        str(port),
+        "$ErrorActionPreference='Stop';"
+        "$queryPort=[uint16]::Parse($env:TTS_MORE_PORTABLE_QUERY_PORT,"
+        "[Globalization.CultureInfo]::InvariantCulture);"
+        "$owners=@(Get-NetTCPConnection -State Listen -LocalPort $queryPort "
+        "-ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique);"
+        "[ordered]@{listener_pids=[object[]]$owners}|ConvertTo-Json -Compress",
     ]
-    completed = subprocess.run(command, check=False, capture_output=True, text=True)
-    if completed.returncode != 0:
+    completed = subprocess.run(
+        command, check=False, capture_output=True, text=True, env=environment
+    )
+    if completed.returncode != 0 or completed.stderr.strip():
         raise RuntimeError("unable to verify port ownership")
     output = completed.stdout.strip()
     if not output:
-        return set()
-    payload = json.loads(output)
-    values = payload if isinstance(payload, list) else [payload]
-    return {int(value) for value in values}
+        raise RuntimeError("unable to verify port ownership")
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("unable to verify port ownership") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"listener_pids"}
+        or not isinstance(payload["listener_pids"], list)
+    ):
+        raise RuntimeError("unable to verify port ownership")
+    owners = payload["listener_pids"]
+    if any(type(value) is not int or value <= 0 for value in owners):
+        raise RuntimeError("unable to verify port ownership")
+    return set(owners)
+
+
+def _validated_query_integer(value: object, *, label: str, minimum: int, maximum: int) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{label} must be an integer")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{label} is outside the allowed range")
+    return value
 
 
 def _run_conda_unpack(live: Path) -> None:
