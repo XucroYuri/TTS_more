@@ -1112,6 +1112,8 @@ try {
     $exitCode = Resolve-PortableExitCode -ErrorRecord $_
     $code = Get-PortableErrorCode -ErrorRecord $_
     if ($operation) { Fail-Operation -Operation $operation -ErrorRecord $_ }
+    $flatMessage = ([string]$_.Exception.Message) -replace '[\r\n]+', ' '
+    [Console]::Error.WriteLine(("PORTABLE_START_ERROR:{0}:{1}" -f $code, $flatMessage))
     Write-Error "[$code] $($_.Exception.Message)" -ErrorAction Continue
 } finally {
     if ($ownsActivePointer -and $activePath -and (Test-Path -LiteralPath $activePath -PathType Leaf)) {

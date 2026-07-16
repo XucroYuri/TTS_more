@@ -150,9 +150,13 @@ def test_harness_builds_micro_python_stdlib_seed_instead_of_copying_full_lib() -
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
 
     assert "function Copy-FixturePythonStdlib" in script
+    assert "function Copy-FixturePythonExtensions" in script
     assert 'foreach ($directory in @("collections", "ctypes", "email", "encodings", "html", "http", "importlib", "json", "re", "urllib", "xml"))' in script
+    assert 'Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Force -Filter "*.pyd"' in script
+    assert 'Copy-FixturePythonExtensions -Destination (Join-Path $seed "DLLs")' in script
     assert 'Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "Lib")' not in script
     assert 'Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed could not be copied or validated"' in script
+    assert 'Throw-HarnessError "FIXTURE_RUNTIME_IMPORT_FAILED" "fixture Python seed is missing required stdlib or extension modules"' in script
 
 
 def test_harness_contract_uses_real_root_launchers_and_fixture_only_copy_mutation() -> None:

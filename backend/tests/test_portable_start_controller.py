@@ -1391,6 +1391,7 @@ def test_launcher_staging_progress_and_error_catalog_contracts(tmp_path: Path) -
     ):
         assert f"function {function}" in controller
     assert controller.index("Invoke-Initialize -Root") < controller.index("Invoke-ServiceStart -Root")
+    assert "PORTABLE_START_ERROR:{0}:{1}" in controller
     assert "[switch]$OfferImport" in controller
     for function in (
         "Invoke-PortableImportOffer",

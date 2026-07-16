@@ -619,6 +619,17 @@ function Copy-FixturePythonStdlib {
     }
 }
 
+function Copy-FixturePythonExtensions {
+    param([Parameter(Mandatory = $true)][string]$Destination)
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $sourceRoot = [IO.Path]::GetFullPath($FixtureBasePrefix)
+    foreach ($extension in @(Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Force -Filter "*.pyd" -ErrorAction SilentlyContinue)) {
+        $relative = [IO.Path]::GetFullPath($extension.FullName).Substring($sourceRoot.Length).TrimStart('\', '/').Replace('\', '/')
+        if ($relative -match '^(Lib/)?site-packages/' -or $relative -match '(^|/)(test|tests)/') { continue }
+        Copy-Item -LiteralPath $extension.FullName -Destination (Join-Path $Destination $extension.Name) -Force
+    }
+}
+
 function Copy-FixturePythonRuntime {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -640,12 +651,13 @@ function Copy-FixturePythonRuntime {
                 }
             }
             Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "DLLs") -Destination (Join-Path $seed "DLLs") -SkipDirectories @("__pycache__") -Optional
+            Copy-FixturePythonExtensions -Destination (Join-Path $seed "DLLs")
             Copy-FixturePythonStdlib -Destination (Join-Path $seed "Lib")
             New-Item -ItemType Directory -Force -Path (Join-Path $seed "Scripts") | Out-Null
             Write-FixtureUvExe -Path (Join-Path $seed "Scripts\uv.exe")
             Write-FixturePythonPackages -RuntimeRoot $seed
             & (Join-Path $seed "python.exe") -c "import urllib.request, email.parser, http.client"
-            if ($LASTEXITCODE -ne 0) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed is missing required stdlib modules" }
+            if ($LASTEXITCODE -ne 0) { Throw-HarnessError "FIXTURE_RUNTIME_IMPORT_FAILED" "fixture Python seed is missing required stdlib or extension modules" }
         }
     }
     catch {
