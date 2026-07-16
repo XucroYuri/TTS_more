@@ -576,9 +576,14 @@ function Copy-FixtureDirectoryFiltered {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
         [Parameter(Mandatory = $true)][string]$Destination,
-        [string[]]$SkipDirectories = @()
+        [string[]]$SkipDirectories = @(),
+        [switch]$Optional
     )
     $sourceRoot = [IO.Path]::GetFullPath($Source)
+    if (!(Test-Path -LiteralPath $sourceRoot -PathType Container)) {
+        if ($Optional) { return }
+        Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base runtime directory is missing"
+    }
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
     $stack = [Collections.Generic.Stack[string]]::new()
     $stack.Push($sourceRoot)
@@ -614,7 +619,7 @@ function Copy-FixturePythonRuntime {
         foreach ($dll in @(Get-ChildItem -LiteralPath $FixtureBasePrefix -Filter "*.dll" -File -ErrorAction SilentlyContinue)) {
             Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $seed $dll.Name) -Force
         }
-        Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "DLLs") -Destination (Join-Path $seed "DLLs") -SkipDirectories @("__pycache__")
+        Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "DLLs") -Destination (Join-Path $seed "DLLs") -SkipDirectories @("__pycache__") -Optional
         Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "Lib") -Destination (Join-Path $seed "Lib") -SkipDirectories @("__pycache__", "site-packages", "test", "tests", "tkinter", "idlelib", "ensurepip", "venv", "turtledemo", "lib2to3", "pydoc_data", "unittest")
         Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "Lib\email") -Destination (Join-Path $seed "Lib\email") -SkipDirectories @("__pycache__", "test", "tests")
         New-Item -ItemType Directory -Force -Path (Join-Path $seed "Scripts") | Out-Null

@@ -294,6 +294,7 @@ def test_portable_import_projection_clamps_expires_seconds_to_store_ttl(
     store = PortableImportPlanStore(ttl_seconds=300, clock=clock)
     stored = _stored_plan(store, tmp_path / "new package")
 
+    object.__setattr__(stored, "expires_at", stored.created_at + 300.000001)
     projected = project_import_plan(stored, now=clock() - 0.001)
 
     assert projected["expires_in_seconds"] == 300

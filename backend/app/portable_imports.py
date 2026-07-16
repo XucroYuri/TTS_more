@@ -144,7 +144,7 @@ def project_import_plan(
     return {
         "plan_id": stored.plan_id,
         "plan_digest": _digest(getattr(plan, "plan_digest", None)),
-        "expires_in_seconds": int(math.ceil(remaining_seconds)),
+        "expires_in_seconds": int(remaining_seconds),
         "user_file_count": len(plan.user_files),
         "user_bytes": sum(_size(item) for item in plan.user_files),
         "reusable_assets": _relative_items(plan.reusable_assets),

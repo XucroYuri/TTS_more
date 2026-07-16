@@ -139,6 +139,13 @@ def test_harness_accepts_json_integer_width_differences_from_powershell_hosts() 
     assert "TryParse([string]$manifest.schema_version" in script
 
 
+def test_harness_treats_python_dlls_directory_as_optional_for_hosted_runtimes() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert "Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix \"DLLs\")" in script
+    assert "-SkipDirectories @(\"__pycache__\") -Optional" in script
+
+
 def test_harness_contract_uses_real_root_launchers_and_fixture_only_copy_mutation() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
     assert all(name in script for name in ("Start.cmd", "Stop.cmd", "Repair.cmd", "Initialize.cmd"))
