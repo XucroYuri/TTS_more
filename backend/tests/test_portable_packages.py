@@ -51,6 +51,16 @@ def _load_portable_package_runner():
     return module
 
 
+def _load_release_asset_gate():
+    module_path = REPO_ROOT / "scripts" / "verify-release-asset-set.py"
+    assert module_path.is_file(), "executable release asset gate is missing"
+    spec = importlib.util.spec_from_file_location("verify_release_asset_set", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_sync_integrations():
     module_path = REPO_ROOT / "scripts" / "sync_integrations.py"
     spec = importlib.util.spec_from_file_location("sync_integrations_for_portable_schema", module_path)
@@ -3510,16 +3520,82 @@ def test_portable_release_workflow_rechecks_exact_remote_assets_after_upload() -
     )
     publish = workflow.split("- name: Publish bootstrap assets only", 1)[1]
     upload = 'gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber'
-    post_query = (
-        'gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" '
-        "--jq '.assets[].name'"
-    )
+    gate_call = "python scripts/verify-release-asset-set.py"
 
     assert upload in publish
-    assert post_query in publish
-    assert publish.index(upload) < publish.index(post_query)
-    assert "published_asset_names" in publish
-    assert "diff -u" in publish[publish.index(post_query) :]
+    assert gate_call in publish
+    assert publish.index(upload) < publish.index(gate_call)
+    assert 'verify_asset_args+=(--expected-name "$asset_name")' in publish
+    gate_block = publish[publish.index(gate_call) :]
+    assert '--repository "$GITHUB_REPOSITORY"' in gate_block
+    assert '--tag "$GITHUB_REF_NAME"' in gate_block
+    assert '"${verify_asset_args[@]}"' in gate_block
+
+
+def _release_gate_expected_names() -> list[str]:
+    archive = "TTS-More-0.2.0-test-windows-x64-bootstrap.zip"
+    return [
+        archive,
+        f"{archive}.sha256",
+        f"{archive}.spdx.json",
+        f"{archive}.licenses.json",
+        f"{archive}.provenance.json",
+        f"{archive}.acceptance.json",
+    ]
+
+
+def test_release_asset_gate_executes_tag_query_and_accepts_exact_six() -> None:
+    gate = _load_release_asset_gate()
+    expected = _release_gate_expected_names()
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="\n".join(reversed(expected)) + "\n", stderr="")
+
+    exit_code = gate.main(
+        [
+            "--repository",
+            "XucroYuri/TTS_more",
+            "--tag",
+            "v0.2.0/rc1",
+            *(argument for name in expected for argument in ("--expected-name", name)),
+        ],
+        run=fake_run,
+    )
+
+    assert exit_code == 0
+    assert calls == [
+        [
+            "gh",
+            "api",
+            "repos/XucroYuri/TTS_more/releases/tags/v0.2.0%2Frc1",
+            "--jq",
+            ".assets[].name",
+        ]
+    ]
+
+
+def test_release_asset_gate_returns_nonzero_for_concurrent_seventh_asset() -> None:
+    gate = _load_release_asset_gate()
+    expected = _release_gate_expected_names()
+
+    def fake_run(command: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        actual = [*expected, "concurrent-foreign-full.zip"]
+        return subprocess.CompletedProcess(command, 0, stdout="\n".join(actual) + "\n", stderr="")
+
+    exit_code = gate.main(
+        [
+            "--repository",
+            "XucroYuri/TTS_more",
+            "--tag",
+            "v0.2.0-test",
+            *(argument for name in expected for argument in ("--expected-name", name)),
+        ],
+        run=fake_run,
+    )
+
+    assert exit_code != 0
 
 
 def test_validate_manifest_rejects_invalid_v2_profile_and_nested_absolute_paths(tmp_path: Path) -> None:

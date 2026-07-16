@@ -188,8 +188,11 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
           fi
           gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
-          mapfile -t published_asset_names < <(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.assets[].name' | LC_ALL=C sort -u)
-          if ! diff -u <(printf '%s\n' "${local_asset_names[@]}") <(printf '%s\n' "${published_asset_names[@]}"); then
-            echo "published GitHub Release assets do not exactly match the local six-asset allowlist" >&2
-            exit 1
-          fi
+          verify_asset_args=()
+          for asset_name in "${local_asset_names[@]}"; do
+            verify_asset_args+=(--expected-name "$asset_name")
+          done
+          python scripts/verify-release-asset-set.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            "${verify_asset_args[@]}"
