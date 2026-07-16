@@ -17,6 +17,56 @@ function Resolve-RequiredFile {
     return $resolved
 }
 
+function Assert-NoReparsePathSegments {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd("\", "/")
+    $resolvedPath = [IO.Path]::GetFullPath($Path)
+    $boundary = $resolvedRoot + [IO.Path]::DirectorySeparatorChar
+    if (!$resolvedPath.StartsWith($boundary, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label must remain below the package source root"
+    }
+    $relative = $resolvedPath.Substring($boundary.Length)
+    $current = $resolvedRoot
+    foreach ($segment in @($relative -split '[\\/]' | Where-Object { $_ })) {
+        $current = Join-Path $current $segment
+        if (!(Test-Path -LiteralPath $current)) { continue }
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Label must not traverse a reparse point: $current"
+        }
+    }
+}
+
+function Assert-NoReparseTree {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    Assert-NoReparsePathSegments -Root $Root -Path $Path -Label $Label
+    if (!(Test-Path -LiteralPath $Path)) { return }
+    $pending = New-Object 'System.Collections.Generic.Stack[string]'
+    $pending.Push([IO.Path]::GetFullPath($Path))
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Label contains a reparse point: $current"
+        }
+        if (!$item.PSIsContainer) { continue }
+        foreach ($child in Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Label contains a reparse point: $($child.FullName)"
+            }
+            if ($child.PSIsContainer) { $pending.Push($child.FullName) }
+        }
+    }
+}
+
 function Resolve-PackageChildDirectory {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Label)
     $resolved = [IO.Path]::GetFullPath($Path)
@@ -24,6 +74,7 @@ function Resolve-PackageChildDirectory {
     if (!$resolved.StartsWith($boundary, [StringComparison]::OrdinalIgnoreCase)) {
         throw "$Label must remain below the package source root"
     }
+    Assert-NoReparsePathSegments -Root $script:ResolvedPackageRoot -Path $resolved -Label $Label
     return $resolved
 }
 
@@ -56,10 +107,9 @@ function Remove-OwnedCacheDirectory {
     if (!$resolvedPath.StartsWith($resolvedCache + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
         throw "refusing to replace a build-tool cache outside the package-private cache root"
     }
-    $item = Get-Item -LiteralPath $resolvedPath -Force
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "refusing to replace a reparse-point build-tool cache: $resolvedPath"
-    }
+    Assert-NoReparsePathSegments -Root $script:ResolvedPackageRoot -Path $resolvedCache -Label "build-tools cache root"
+    Assert-NoReparsePathSegments -Root $script:ResolvedPackageRoot -Path $resolvedPath -Label "owned build-tools cache"
+    Assert-NoReparseTree -Root $script:ResolvedPackageRoot -Path $resolvedPath -Label "owned build-tools cache"
     Remove-Item -LiteralPath $resolvedPath -Recurse -Force
 }
 
@@ -70,9 +120,9 @@ if (!(Test-Path -LiteralPath $script:ResolvedPackageRoot -PathType Container)) {
 $resolvedBuildTools = Resolve-PackageChildDirectory -Path $BuildToolsRoot -Label "build-tools project"
 $pyproject = Resolve-RequiredFile -Path (Join-Path $resolvedBuildTools "pyproject.toml") -Label "build-tools pyproject"
 $uvLock = Resolve-RequiredFile -Path (Join-Path $resolvedBuildTools "uv.lock") -Label "build-tools uv.lock"
-$bootstrapConda = Resolve-RequiredFile -Path $BootstrapCondaPath -Label "private Conda bootstrap"
-$toolchainLock = Resolve-RequiredFile -Path $ToolchainLockPath -Label "portable toolchain lock"
-$portableInstall = Resolve-RequiredFile -Path $PortableInstallPath -Label "portable asset installer"
+$bootstrapConda = Resolve-PackageChildDirectory -Path (Resolve-RequiredFile -Path $BootstrapCondaPath -Label "private Conda bootstrap") -Label "private Conda bootstrap"
+$toolchainLock = Resolve-PackageChildDirectory -Path (Resolve-RequiredFile -Path $ToolchainLockPath -Label "portable toolchain lock") -Label "portable toolchain lock"
+$portableInstall = Resolve-PackageChildDirectory -Path (Resolve-RequiredFile -Path $PortableInstallPath -Label "portable asset installer") -Label "portable asset installer"
 
 if (![string]::IsNullOrWhiteSpace([string]$env:TTS_MORE_BUILD_PYTHON)) {
     $explicitPython = [IO.Path]::GetFullPath([string]$env:TTS_MORE_BUILD_PYTHON)
@@ -91,45 +141,73 @@ if (
 ) {
     throw "portable toolchain lock must pin uv 0.11.28 with URL and SHA-256"
 }
+$uvArchive = [string]$toolchain.uv.archive
+if (
+    [string]::IsNullOrWhiteSpace($uvArchive) -or
+    [IO.Path]::IsPathRooted($uvArchive) -or
+    $uvArchive -in @(".", "..") -or
+    $uvArchive -ne [IO.Path]::GetFileName($uvArchive) -or
+    $uvArchive.Contains("\") -or
+    $uvArchive.Contains("/")
+) {
+    throw "portable toolchain lock uv.archive must be a single safe file name"
+}
+$uvSize = [int64]0
+$uvSizeText = [string]$toolchain.uv.size_bytes
+if (
+    ![int64]::TryParse(
+        $uvSizeText,
+        [Globalization.NumberStyles]::None,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$uvSize
+    ) -or $uvSize -le 0
+) {
+    throw "portable toolchain lock uv.size_bytes must be a positive integer"
+}
 
 $cacheRoot = Resolve-PackageChildDirectory -Path (Join-Path $script:ResolvedPackageRoot "data\cache\portable\build-tools") -Label "build-tools cache"
 $condaCache = Resolve-PackageChildDirectory -Path (Join-Path $script:ResolvedPackageRoot "data\cache\portable\conda") -Label "private Conda cache"
+$condaPackageCache = Resolve-PackageChildDirectory -Path (Join-Path $condaCache "conda-pkgs") -Label "private Conda package cache"
 New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
 
 $condaOutput = @(& $bootstrapConda -CacheRoot $condaCache -LockPath $toolchainLock -PackageRoot $script:ResolvedPackageRoot -PassThru)
 if ($LASTEXITCODE -ne 0 -or $condaOutput.Count -eq 0) { throw "private Conda bootstrap failed for build tools" }
-$conda = [IO.Path]::GetFullPath([string]$condaOutput[-1])
+$conda = Resolve-PackageChildDirectory -Path ([string]$condaOutput[-1]) -Label "private Conda command"
 if (!(Test-Path -LiteralPath $conda -PathType Leaf)) { throw "private Conda command is missing: $conda" }
-$condaBasePython = Join-Path (Split-Path -Parent (Split-Path -Parent $conda)) "python.exe"
+$condaBasePython = Resolve-PackageChildDirectory -Path (Join-Path (Split-Path -Parent (Split-Path -Parent $conda)) "python.exe") -Label "private Miniforge base Python"
 if (!(Test-Path -LiteralPath $condaBasePython -PathType Leaf)) { throw "private Miniforge base Python is missing" }
 
-$assetRoot = Join-Path $cacheRoot "assets"
+$assetRoot = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot "assets") -Label "build-tools asset cache"
 New-Item -ItemType Directory -Force -Path $assetRoot | Out-Null
-$uvAssetLock = Join-Path $assetRoot "uv.json"
+$uvAssetLock = Resolve-PackageChildDirectory -Path (Join-Path $assetRoot "uv.json") -Label "locked uv asset metadata"
 $uvAsset = [ordered]@{
     id = "uv-0.11.28-windows-x64"
     urls = @([string]$toolchain.uv.url)
     sha256 = [string]$toolchain.uv.sha256
-    size_bytes = [int64]$toolchain.uv.size_bytes
+    size_bytes = $uvSize
 }
 $uvAsset | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $uvAssetLock -Encoding UTF8
-$uvWheel = Join-Path $assetRoot ([string]$toolchain.uv.archive)
+$uvWheel = Resolve-PackageChildDirectory -Path (Join-Path $assetRoot $uvArchive) -Label "locked uv wheel"
+if (![string]::Equals([IO.Path]::GetFullPath((Split-Path -Parent $uvWheel)), $assetRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "locked uv wheel must remain a direct child of the package asset cache"
+}
 & $condaBasePython $portableInstall ensure-asset --asset $uvAssetLock --path $uvWheel
 if ($LASTEXITCODE -ne 0) { throw "locked uv 0.11.28 asset initialization failed" }
 
-$uvBootstrap = Join-Path $cacheRoot "uv-bootstrap"
-$uvBootstrapPython = Join-Path $uvBootstrap "python.exe"
-$uvExe = Join-Path $uvBootstrap "Scripts\uv.exe"
+$uvBootstrap = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot "uv-bootstrap") -Label "uv bootstrap environment"
+Assert-NoReparseTree -Root $script:ResolvedPackageRoot -Path $uvBootstrap -Label "uv bootstrap environment"
+$uvBootstrapPython = Resolve-PackageChildDirectory -Path (Join-Path $uvBootstrap "python.exe") -Label "uv bootstrap Python"
+$uvExe = Resolve-PackageChildDirectory -Path (Join-Path $uvBootstrap "Scripts\uv.exe") -Label "locked uv executable"
 if (!(Test-Python311 -Python $uvBootstrapPython) -or !(Test-LockedUv -UvExe $uvExe)) {
     Remove-OwnedCacheDirectory -Path $uvBootstrap -CacheRoot $cacheRoot
-    $uvBootstrapStaging = Join-Path $cacheRoot (".uv-bootstrap-" + $PID + "-" + [Guid]::NewGuid().ToString("N"))
+    $uvBootstrapStaging = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot (".uv-bootstrap-" + $PID + "-" + [Guid]::NewGuid().ToString("N"))) -Label "uv bootstrap staging"
     try {
         & $conda create --yes --prefix $uvBootstrapStaging "python=3.11" pip
         if ($LASTEXITCODE -ne 0) { throw "private Conda failed to create the Python 3.11 uv bootstrap" }
-        $stagingPython = Join-Path $uvBootstrapStaging "python.exe"
+        $stagingPython = Resolve-PackageChildDirectory -Path (Join-Path $uvBootstrapStaging "python.exe") -Label "uv bootstrap staging Python"
         & $stagingPython -m pip install --no-deps $uvWheel
         if ($LASTEXITCODE -ne 0) { throw "locked uv wheel installation failed" }
-        $stagingUv = Join-Path $uvBootstrapStaging "Scripts\uv.exe"
+        $stagingUv = Resolve-PackageChildDirectory -Path (Join-Path $uvBootstrapStaging "Scripts\uv.exe") -Label "uv bootstrap staging executable"
         if (!(Test-Python311 -Python $stagingPython) -or !(Test-LockedUv -UvExe $stagingUv)) {
             throw "private uv bootstrap failed the Python 3.11/uv 0.11.28 probe"
         }
@@ -142,7 +220,8 @@ if (!(Test-Python311 -Python $uvBootstrapPython) -or !(Test-LockedUv -UvExe $uvE
     }
 }
 
-$environment = Join-Path $cacheRoot "environment"
+$environment = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot "environment") -Label "build-tools environment"
+Assert-NoReparseTree -Root $script:ResolvedPackageRoot -Path $environment -Label "build-tools environment"
 $lockDigestBefore = (Get-FileHash -LiteralPath $uvLock -Algorithm SHA256).Hash
 $previousProjectEnvironment = $env:UV_PROJECT_ENVIRONMENT
 try {
@@ -158,7 +237,7 @@ if ((Get-FileHash -LiteralPath $uvLock -Algorithm SHA256).Hash -ne $lockDigestBe
     throw "uv sync modified the locked portable build-tools dependency graph"
 }
 
-$buildPython = Join-Path $environment "Scripts\python.exe"
+$buildPython = Resolve-PackageChildDirectory -Path (Join-Path $environment "Scripts\python.exe") -Label "build-tools Python"
 if (!(Test-BuildPython -Python $buildPython)) {
     throw "portable build-tools Python 3.11/jsonschema probe failed"
 }

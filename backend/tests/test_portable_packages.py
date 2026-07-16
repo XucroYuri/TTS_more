@@ -81,10 +81,14 @@ def _official_manifest_validator() -> Draft202012Validator:
 
 
 def _run_checked(command: list[str], cwd: Path, *, env: dict[str, str] | None = None) -> None:
+    effective_env = dict(os.environ if env is None else env)
+    test_bin = cwd / ".test-bin"
+    if test_bin.is_dir():
+        effective_env["PATH"] = str(test_bin) + os.pathsep + effective_env.get("PATH", "")
     completed = subprocess.run(
         command,
         cwd=cwd,
-        env=env,
+        env=effective_env,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -152,6 +156,21 @@ def test_controller_guide_explains_explicit_prestart_previous_version_import() -
 
 def _copy_controller_builder_fixture(root: Path) -> None:
     root.mkdir(parents=True)
+    (root / ".gitignore").write_text("frontend/dist/\n.test-bin/\n", encoding="utf-8")
+    test_bin = root / ".test-bin"
+    test_bin.mkdir()
+    (test_bin / "pnpm.cmd").write_text(
+        "@echo off\n"
+        "if /I not \"%~1\"==\"--dir\" exit /b 21\n"
+        "if /I not \"%~3\"==\"build\" exit /b 22\n"
+        "set \"DIST=%~2\\dist\"\n"
+        "if exist \"%DIST%\" rmdir /s /q \"%DIST%\"\n"
+        "mkdir \"%DIST%\\assets\"\n"
+        ">\"%DIST%\\index.html\" echo ^<!doctype html^>fresh fixture dist\n"
+        ">\"%DIST%\\assets\\fixture.js\" echo console.log('fresh fixture');\n"
+        "exit /b 0\n",
+        encoding="ascii",
+    )
     shutil.copy2(REPO_ROOT / "Build-Package.ps1", root / "Build-Package.ps1")
     helper = root / "scripts" / "Resolve-PortableBuildPython.ps1"
     helper.parent.mkdir(parents=True, exist_ok=True)
@@ -986,6 +1005,9 @@ else:
             cwd=controller_root,
             env={
                 **os.environ,
+                "PATH": str(controller_root / ".test-bin")
+                + os.pathsep
+                + os.environ.get("PATH", ""),
                 "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
                 "TTS_MORE_CLEANUP_ATTACK_MOVED": str(moved),
                 "TTS_MORE_CLEANUP_ATTACK_DENIED": str(denied),
@@ -2227,6 +2249,11 @@ def test_public_builders_self_bootstrap_locked_build_tools_before_source_staging
     assert "urls = @([string]$toolchain.uv.url)" in helper
     assert '"^uv 0\\.11\\.28(?:\\s|$)"' in helper
     assert '.venv\\Scripts\\python.exe' not in helper
+    assert 'if (!(Test-Path -LiteralPath (Join-Path $Root "frontend\\dist\\index.html")))' not in controller
+    assert controller.count('& pnpm --dir (Join-Path $Root "frontend") build') == 1
+    assert controller.index('& pnpm --dir (Join-Path $Root "frontend") build') < controller.index(
+        "Resolve-PortableBuildPython.ps1"
+    )
     for builder, first_stage_operation in (
         (controller, "Measure-PortableCopyTree"),
         (worker, "Assert-PortableTreePathBudget"),
@@ -2241,6 +2268,218 @@ def test_public_builders_self_bootstrap_locked_build_tools_before_source_staging
         assert audit_call < builder.index("CreateDirectoryRelative($workBaseHandle", audit_call)
         assert 'runtime\\live\\python.exe' not in builder[audit_call - 1500 : audit_call]
         assert '.venv\\Scripts\\python.exe' not in builder[audit_call - 1500 : audit_call]
+
+
+def test_controller_builder_rebuilds_ignored_frontend_dist_before_packaging(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("controller dist rebuild contract requires PowerShell")
+    root = tmp_path / "controller"
+    _copy_controller_builder_fixture(root)
+    _initialize_git_repository(root)
+    dist = root / "frontend" / "dist"
+    (dist / "index.html").write_text("tampered stale dist\n", encoding="utf-8")
+    (dist / "rogue.js").write_text("ROGUE = true;\n", encoding="utf-8")
+    output = tmp_path / "output"
+
+    _run_checked(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(root / "Build-Package.ps1"),
+            "-Profile",
+            "Bootstrap",
+            "-Device",
+            "CPU",
+            "-Version",
+            "0.2.0-rebuild-dist",
+            "-OutputRoot",
+            str(output),
+        ],
+        root,
+        env={**os.environ, "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve())},
+    )
+
+    archives = list(output.glob("*.zip"))
+    assert len(archives) == 1
+    stage = _extract_zip_package_root(archives[0], tmp_path / "extracted")
+    assert (stage / "app" / "frontend" / "index.html").read_text(
+        encoding="utf-8"
+    ).strip().endswith("fresh fixture dist")
+    assert (stage / "app" / "frontend" / "assets" / "fixture.js").is_file()
+    assert not (stage / "app" / "frontend" / "rogue.js").exists()
+
+
+def _create_windows_junction(link: Path, target: Path) -> None:
+    assert POWERSHELL is not None
+    completed = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"New-Item -ItemType Junction -Path '{link}' -Target '{target}' | Out-Null",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"Windows junction creation is unavailable: {completed.stderr}")
+
+
+def _write_build_helper_fixture(root: Path, toolchain: dict[str, object] | None = None) -> dict[str, Path]:
+    build_tools = root / "integrations" / "build_tools"
+    build_tools.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "integrations" / "build_tools" / "pyproject.toml", build_tools)
+    shutil.copy2(REPO_ROOT / "integrations" / "build_tools" / "uv.lock", build_tools)
+    scripts = root / "scripts"
+    scripts.mkdir()
+    bootstrap = scripts / "bootstrap-conda.ps1"
+    bootstrap.write_text("throw 'unsafe bootstrap reached'\n", encoding="utf-8")
+    portable_install = scripts / "portable_install.py"
+    portable_install.write_text("raise SystemExit('unsafe installer reached')\n", encoding="utf-8")
+    lock = root / "toolchain.lock.json"
+    payload = toolchain or json.loads(
+        (REPO_ROOT / "packaging" / "portable" / "toolchain.lock.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    lock.write_text(json.dumps(payload), encoding="utf-8")
+    return {
+        "build_tools": build_tools,
+        "bootstrap": bootstrap,
+        "portable_install": portable_install,
+        "lock": lock,
+    }
+
+
+def _invoke_build_helper(root: Path, paths: dict[str, Path], *, explicit_python: bool) -> subprocess.CompletedProcess[str]:
+    assert POWERSHELL is not None
+    environment = dict(os.environ)
+    if explicit_python:
+        environment["TTS_MORE_BUILD_PYTHON"] = str(Path(sys.executable).resolve())
+    else:
+        environment.pop("TTS_MORE_BUILD_PYTHON", None)
+    return subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(REPO_ROOT / "scripts" / "Resolve-PortableBuildPython.ps1"),
+            "-PackageRoot",
+            str(root),
+            "-BuildToolsRoot",
+            str(paths["build_tools"]),
+            "-BootstrapCondaPath",
+            str(paths["bootstrap"]),
+            "-ToolchainLockPath",
+            str(paths["lock"]),
+            "-PortableInstallPath",
+            str(paths["portable_install"]),
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+
+def test_build_helper_rejects_reparse_build_tools_source(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("build helper junction contract requires PowerShell")
+    root = tmp_path / "package"
+    root.mkdir()
+    paths = _write_build_helper_fixture(root)
+    external = tmp_path / "external-build-tools"
+    shutil.copytree(paths["build_tools"], external)
+    shutil.rmtree(paths["build_tools"])
+    paths["build_tools"].parent.mkdir(parents=True, exist_ok=True)
+    _create_windows_junction(paths["build_tools"], external)
+
+    completed = _invoke_build_helper(root, paths, explicit_python=True)
+
+    assert completed.returncode != 0
+    assert "reparse" in (completed.stdout + completed.stderr).lower()
+
+
+def test_build_helper_rejects_reparse_cache_ancestor_before_writing(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("build helper junction contract requires PowerShell")
+    root = tmp_path / "package"
+    root.mkdir()
+    paths = _write_build_helper_fixture(root)
+    external = tmp_path / "outside-data"
+    external.mkdir()
+    _create_windows_junction(root / "data", external)
+
+    completed = _invoke_build_helper(root, paths, explicit_python=False)
+
+    assert completed.returncode != 0
+    assert "reparse" in (completed.stdout + completed.stderr).lower()
+    assert not list(external.iterdir()), "helper wrote through a package cache junction"
+
+
+@pytest.mark.parametrize(
+    ("archive", "size_bytes", "expected"),
+    (
+        ("../uv.whl", 10, "archive"),
+        (r"nested\\uv.whl", 10, "archive"),
+        (r"C:\\outside\\uv.whl", 10, "archive"),
+        ("uv.whl", 0, "size_bytes"),
+        ("uv.whl", -1, "size_bytes"),
+        ("uv.whl", 1.5, "size_bytes"),
+    ),
+)
+def test_build_helper_rejects_unsafe_locked_uv_asset_before_cache_write(
+    tmp_path: Path, archive: str, size_bytes: object, expected: str
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("build helper lock contract requires PowerShell")
+    root = tmp_path / "package"
+    root.mkdir()
+    toolchain = {
+        "schema_version": 1,
+        "uv": {
+            "version": "0.11.28",
+            "archive": archive,
+            "url": "https://example.invalid/uv.whl",
+            "sha256": "0" * 64,
+            "size_bytes": size_bytes,
+        },
+    }
+    paths = _write_build_helper_fixture(root, toolchain)
+
+    completed = _invoke_build_helper(root, paths, explicit_python=False)
+
+    combined = (completed.stdout + completed.stderr).lower()
+    assert completed.returncode != 0
+    assert expected in combined
+    assert not (root / "data").exists(), "invalid uv lock reached package cache creation"
+
+
+def test_build_helper_revalidates_reparse_tree_before_recursive_cache_delete() -> None:
+    helper = (REPO_ROOT / "scripts" / "Resolve-PortableBuildPython.ps1").read_text(
+        encoding="utf-8"
+    )
+    start = helper.index("function Remove-OwnedCacheDirectory")
+    body = helper[start : helper.index("$script:ResolvedPackageRoot =", start)]
+
+    assert "Assert-NoReparsePathSegments" in body
+    assert "Assert-NoReparseTree" in body
+    assert body.index("Assert-NoReparsePathSegments") < body.index("Remove-Item")
+    assert body.index("Assert-NoReparseTree") < body.index("Remove-Item")
 
 
 def test_builders_pin_staging_without_delete_share_and_delete_root_by_handle() -> None:

@@ -319,10 +319,8 @@ $workIdentity = "tts-more-controller-$PID-$([Guid]::NewGuid().ToString('N').Subs
 $work = [IO.Path]::GetFullPath((Join-Path $workBase $workIdentity))
 $stage = Join-Path $work $packageName
 
-if (!(Test-Path -LiteralPath (Join-Path $Root "frontend\dist\index.html"))) {
-    & pnpm --dir (Join-Path $Root "frontend") build
-    if ($LASTEXITCODE -ne 0) { throw "frontend production build failed" }
-}
+& pnpm --dir (Join-Path $Root "frontend") build
+if ($LASTEXITCODE -ne 0) { throw "frontend production build failed" }
 $buildPythonOutput = @(& (Join-Path $Root "scripts\Resolve-PortableBuildPython.ps1") `
     -PackageRoot $Root `
     -BuildToolsRoot (Join-Path $Root "integrations\build_tools") `
