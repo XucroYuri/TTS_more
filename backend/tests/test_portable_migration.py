@@ -16,6 +16,11 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+pytestmark = pytest.mark.skipif(
+    os.name != "nt",
+    reason="portable migration filesystem identity checks target Windows package moves",
+)
+
 
 def _load_importer():
     module_path = REPO_ROOT / "scripts" / "import_portable_data.py"

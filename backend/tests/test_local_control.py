@@ -3270,6 +3270,13 @@ def _selector_root(tmp_path: Path) -> Path:
     return root
 
 
+def _fake_powershell(tmp_path: Path) -> Path:
+    executable = tmp_path / "fake-system" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fake powershell")
+    return executable
+
+
 def _raw_http_request(port: int, request: bytes) -> tuple[int, bytes, bytes]:
     with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
         connection.sendall(request)
@@ -3413,7 +3420,7 @@ def test_folder_selector_uses_absolute_system_powershell_and_fixed_script_only(
         root,
         platform_name="nt",
         run=run,
-        executable_resolver=lambda _name: Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
+        executable_resolver=lambda _name: _fake_powershell(tmp_path),
     )
 
     assert result == selected.resolve()
@@ -3449,7 +3456,7 @@ def test_folder_selector_has_stable_platform_exit_and_output_errors(
             root,
             platform_name=platform_name,
             run=run,
-            executable_resolver=lambda _name: Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
+            executable_resolver=lambda _name: _fake_powershell(tmp_path),
         )
     assert caught.value.code == code
     assert "secret" not in str(caught.value)
@@ -3481,9 +3488,7 @@ def test_folder_selector_accepts_only_one_strict_json_object(
                 stdout=outputs[case],
                 stderr=b"",
             ),
-            executable_resolver=lambda _name: Path(
-                "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-            ),
+            executable_resolver=lambda _name: _fake_powershell(tmp_path),
         )
 
     assert caught.value.code == "LOCAL_CONTROL_FOLDER_OUTPUT_INVALID"
@@ -3815,9 +3820,7 @@ def test_folder_selector_reports_timeout_without_echoing_process_output(tmp_path
             root,
             platform_name="nt",
             run=run,
-            executable_resolver=lambda _name: Path(
-                "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-            ),
+            executable_resolver=lambda _name: _fake_powershell(tmp_path),
         )
 
     assert caught.value.code == "LOCAL_CONTROL_FOLDER_TIMEOUT"
@@ -3842,7 +3845,7 @@ def test_folder_selector_detects_script_identity_change_during_execution(
             root,
             platform_name="nt",
             run=run,
-            executable_resolver=lambda _name: Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
+            executable_resolver=lambda _name: _fake_powershell(tmp_path),
         )
     assert caught.value.code == "LOCAL_CONTROL_FOLDER_IDENTITY_CHANGED"
 

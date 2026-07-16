@@ -537,11 +537,9 @@ def audit_release_zip(path: Path) -> dict[str, object]:
             entry_roots: set[str] = set()
             canonical_entry_roots: set[str] = set()
             for _entry, name in zip(entries, raw_names, strict=True):
-                if "\\" in name:
-                    raise ValueError("release ZIP top-level package directory must use forward slashes")
                 canonical = _canonical_zip_entry(name)
                 raw_parts = name.split("/")
-                if len(raw_parts) < 2:
+                if len(raw_parts) < 2 or "\\" in raw_parts[0]:
                     raise ValueError("release ZIP must contain files under one top-level package directory")
                 raw_root = raw_parts[0]
                 if (

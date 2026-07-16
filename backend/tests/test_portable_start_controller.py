@@ -1566,6 +1566,8 @@ def test_full_package_never_executes_runtime_before_all_integrity_checks_pass(
 
 
 def test_controller_rejects_uuid_operation_junction_before_writing(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("PowerShell is required to create a directory junction")
     package_root = tmp_path / "uuid-junction-package"
     _source_package(package_root)
     operation_id = str(uuid4())
@@ -1601,6 +1603,8 @@ def test_controller_rejects_uuid_operation_junction_before_writing(tmp_path: Pat
 
 
 def test_initializer_rejects_uuid_operation_junction(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("PowerShell is required to create a directory junction")
     package_root = tmp_path / "initializer-uuid-junction"
     _manifest(package_root, profile="bootstrap")
     scripts = package_root / "scripts"
