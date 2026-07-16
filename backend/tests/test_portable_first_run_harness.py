@@ -44,6 +44,7 @@ def _local_first_run_env() -> dict[str, str]:
     env = dict(os.environ)
     env.pop("GITHUB_ACTIONS", None)
     env["TTS_MORE_FIRST_RUN_PYTHON"] = sys.executable
+    env["TTS_MORE_FIRST_RUN_DEBUG"] = "1"
     return env
 
 

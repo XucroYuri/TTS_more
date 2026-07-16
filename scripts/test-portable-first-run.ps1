@@ -834,6 +834,17 @@ function Start-FixtureAssetServer {
     $script:FixtureEndpoint = $endpoint
 }
 
+function Restart-FixtureAssetServer {
+    if ($null -ne $ServerProcess) {
+        $owned = @($OwnedProcesses | Where-Object {
+            $null -ne $_.Process -and $_.Process.Id -eq $ServerProcess.Id
+        } | Select-Object -Last 1)
+        if ($owned.Count -gt 0) { Stop-OwnedFixtureProcess -Owned $owned[0] }
+        $script:ServerProcess = $null
+    }
+    Start-FixtureAssetServer
+}
+
 function Assert-AssetHash {
     param([Parameter(Mandatory = $true)][object]$Package)
     if (!(Test-Path -LiteralPath $Package.AssetPath -PathType Leaf)) { Throw-HarnessError "ASSET_MISSING" "fixture asset is missing" }
@@ -946,6 +957,9 @@ function Invoke-PackageAcceptance {
     $interruptedAssetPath = if ($component -eq "tts-more") { [string]$Package.UvAssetPath } else { [string]$Package.AssetPath }
     $partial = "$interruptedAssetPath.partial"
     Remove-Item -LiteralPath $interruptedAssetPath -Force
+    Restart-FixtureAssetServer
+    $Package.AssetUrl = "$FixtureEndpoint/$component.bin"
+    Set-FixtureAssetUrl -Package $Package -Url $Package.AssetUrl
     if ($component -eq "tts-more") {
         foreach ($runtimeDirectory in @("runtime\live", "runtime\staging", "runtime\previous")) {
             Remove-Item -LiteralPath (Join-Path $Package.Root $runtimeDirectory) -Recurse -Force -ErrorAction SilentlyContinue
@@ -956,7 +970,12 @@ function Invoke-PackageAcceptance {
     $first = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
     $clock.Stop()
     if ($first.ExitCode -ne 26 -or !(Test-Path -LiteralPath $partial -PathType Leaf) -or (Get-Item -LiteralPath $partial).Length -ne 8) {
-        if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { $ServerProcess.Refresh(); [Console]::Error.WriteLine("FIRST_EXIT=$($first.ExitCode) SERVER_EXITED=$($ServerProcess.HasExited)`n$($first.Output)") }
+        if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") {
+            $ServerProcess.Refresh()
+            $partialExists = Test-Path -LiteralPath $partial -PathType Leaf
+            $partialLength = if ($partialExists) { (Get-Item -LiteralPath $partial).Length } else { -1 }
+            [Console]::Error.WriteLine("FIRST_EXIT=$($first.ExitCode) SERVER_EXITED=$($ServerProcess.HasExited) PARTIAL_EXISTS=$partialExists PARTIAL_LENGTH=$partialLength PARTIAL=$partial`n$($first.Output)")
+        }
         Add-Evidence -Component $component -Scenario "interruption" -Result fail -Duration $clock.Elapsed.TotalSeconds -ErrorCode "INTERRUPTION_NOT_PRESERVED"
         Throw-HarnessError "INTERRUPTION_NOT_PRESERVED" "first start did not retain an eight-byte partial"
     }
