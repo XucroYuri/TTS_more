@@ -2359,6 +2359,73 @@ def _write_build_helper_fixture(root: Path, toolchain: dict[str, object] | None 
     }
 
 
+def _read_portable_toolchain_lock() -> dict[str, object]:
+    return json.loads(
+        (REPO_ROOT / "packaging" / "portable" / "toolchain.lock.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def _invoke_conda_bootstrap(
+    root: Path, lock: Path, *, cache_root: Path | None = None, dry_run: bool = False
+) -> subprocess.CompletedProcess[str]:
+    assert POWERSHELL is not None
+    command = [
+        POWERSHELL,
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(REPO_ROOT / "scripts" / "bootstrap-conda.ps1"),
+        "-PackageRoot",
+        str(root),
+        "-CacheRoot",
+        str(cache_root or root / "data" / "cache" / "portable" / "conda"),
+        "-LockPath",
+        str(lock),
+    ]
+    if dry_run:
+        command.append("-DryRun")
+    return subprocess.run(
+        command,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+
+def _compile_marker_executable(destination: Path, marker: Path) -> None:
+    compiler = Path(os.environ["WINDIR"]) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe"
+    if not compiler.is_file():
+        pytest.skip("Windows C# compiler is unavailable for the execution boundary test")
+    source = destination.with_suffix(".cs")
+    source.write_text(
+        "using System.IO;\n"
+        "public static class Program {\n"
+        "  public static int Main(string[] args) {\n"
+        f"    File.WriteAllText({json.dumps(str(marker))}, \"EXECUTED\");\n"
+        "    return 0;\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [str(compiler), "/nologo", "/target:exe", f"/out:{destination}", str(source)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(f"marker executable compilation failed:\n{completed.stdout}\n{completed.stderr}")
+
+
 def _invoke_build_helper(root: Path, paths: dict[str, Path], *, explicit_python: bool) -> subprocess.CompletedProcess[str]:
     assert POWERSHELL is not None
     environment = dict(os.environ)
@@ -2440,6 +2507,10 @@ def test_build_helper_rejects_reparse_cache_ancestor_before_writing(tmp_path: Pa
         ("uv.whl", 0, "size_bytes"),
         ("uv.whl", -1, "size_bytes"),
         ("uv.whl", 1.5, "size_bytes"),
+        ("CON", 10, "archive"),
+        ("CON.whl", 10, "archive"),
+        ("uv.whl. ", 10, "archive"),
+        ("uv?.whl", 10, "archive"),
     ),
 )
 def test_build_helper_rejects_unsafe_locked_uv_asset_before_cache_write(
@@ -2449,15 +2520,13 @@ def test_build_helper_rejects_unsafe_locked_uv_asset_before_cache_write(
         pytest.skip("build helper lock contract requires PowerShell")
     root = tmp_path / "package"
     root.mkdir()
-    toolchain = {
-        "schema_version": 1,
-        "uv": {
-            "version": "0.11.28",
-            "archive": archive,
-            "url": "https://example.invalid/uv.whl",
-            "sha256": "0" * 64,
-            "size_bytes": size_bytes,
-        },
+    toolchain = _read_portable_toolchain_lock()
+    toolchain["uv"] = {
+        "version": "0.11.28",
+        "archive": archive,
+        "url": "https://example.invalid/uv.whl",
+        "sha256": "0" * 64,
+        "size_bytes": size_bytes,
     }
     paths = _write_build_helper_fixture(root, toolchain)
 
@@ -2467,6 +2536,172 @@ def test_build_helper_rejects_unsafe_locked_uv_asset_before_cache_write(
     assert completed.returncode != 0
     assert expected in combined
     assert not (root / "data").exists(), "invalid uv lock reached package cache creation"
+
+
+@pytest.mark.parametrize(
+    "archive",
+    ("CON", "CON.exe", "Miniforge.exe. ", "Miniforge?.exe"),
+)
+def test_build_helper_rejects_windows_unsafe_miniforge_archive_before_bootstrap(
+    tmp_path: Path, archive: str
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("build helper lock contract requires PowerShell")
+    root = tmp_path / "package"
+    root.mkdir()
+    toolchain = _read_portable_toolchain_lock()
+    toolchain["miniforge"]["archive"] = archive
+    paths = _write_build_helper_fixture(root, toolchain)
+
+    completed = _invoke_build_helper(root, paths, explicit_python=False)
+
+    combined = (completed.stdout + completed.stderr).lower()
+    assert completed.returncode != 0
+    assert "miniforge.archive" in combined
+    assert "unsafe bootstrap reached" not in combined
+    assert not (root / "data").exists(), "invalid Miniforge lock reached package cache creation"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("version", r"..\\escaped"),
+        ("url", "relative-url"),
+        ("sha256", "0" * 63),
+        ("size_bytes", 0),
+        ("size_bytes", -1),
+        ("size_bytes", 1.5),
+    ),
+)
+def test_build_helper_fully_validates_miniforge_lock_before_bootstrap(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("build helper lock contract requires PowerShell")
+    root = tmp_path / "package"
+    root.mkdir()
+    toolchain = _read_portable_toolchain_lock()
+    toolchain["miniforge"][field] = value
+    paths = _write_build_helper_fixture(root, toolchain)
+
+    completed = _invoke_build_helper(root, paths, explicit_python=False)
+
+    combined = (completed.stdout + completed.stderr).lower()
+    assert completed.returncode != 0
+    assert f"miniforge.{field}" in combined
+    assert "unsafe bootstrap reached" not in combined
+    assert not (root / "data").exists(), "invalid Miniforge lock reached package cache creation"
+
+
+def test_build_helper_does_not_read_undefined_last_exit_code_after_powershell_bootstrap(
+    tmp_path: Path,
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("build helper bootstrap contract requires PowerShell")
+    root = tmp_path / "package"
+    root.mkdir()
+    paths = _write_build_helper_fixture(root)
+    expected_conda = (
+        root
+        / "data"
+        / "cache"
+        / "portable"
+        / "conda"
+        / "miniforge-26.3.2-2"
+        / "condabin"
+        / "conda.bat"
+    )
+    paths["bootstrap"].write_text(
+        f"Write-Output {json.dumps(str(expected_conda))}\n", encoding="utf-8"
+    )
+
+    completed = _invoke_build_helper(root, paths, explicit_python=False)
+
+    combined = (completed.stdout + completed.stderr).lower()
+    assert completed.returncode != 0
+    assert "last" not in combined or "exitcode" not in combined
+    assert "private conda command is missing" in combined
+
+
+@pytest.mark.parametrize(
+    "archive", ("CON", "CON.exe", "Miniforge.exe. ", "Miniforge?.exe")
+)
+def test_conda_bootstrap_rejects_windows_unsafe_archive_before_cache_write(
+    tmp_path: Path, archive: str
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("portable Conda bootstrap contract requires PowerShell")
+    root = tmp_path / "package"
+    root.mkdir()
+    toolchain = _read_portable_toolchain_lock()
+    toolchain["miniforge"]["archive"] = archive
+    lock = root / "toolchain.lock.json"
+    lock.write_text(json.dumps(toolchain), encoding="utf-8")
+
+    completed = _invoke_conda_bootstrap(root, lock, dry_run=True)
+
+    assert completed.returncode != 0
+    assert "miniforge.archive" in (completed.stdout + completed.stderr).lower()
+    assert not (root / "data").exists(), "invalid Miniforge lock reached package cache creation"
+
+
+def test_conda_bootstrap_rejects_traversal_before_promoting_or_executing_partial(
+    tmp_path: Path,
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("portable Conda execution boundary test requires PowerShell")
+    root = tmp_path / "package"
+    root.mkdir()
+    cache = root / "data" / "cache" / "portable" / "conda"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped = outside / "escaped.exe"
+    partial = Path(f"{escaped}.partial")
+    marker = outside / "executed.txt"
+    payload = tmp_path / "marker-payload.exe"
+    _compile_marker_executable(payload, marker)
+    shutil.copy2(payload, partial)
+    toolchain = _read_portable_toolchain_lock()
+    toolchain["miniforge"].update(
+        {
+            "archive": os.path.relpath(escaped, cache).replace("/", "\\"),
+            "url": "https://example.invalid/escaped.exe",
+            "sha256": hashlib.sha256(partial.read_bytes()).hexdigest(),
+            "size_bytes": partial.stat().st_size,
+        }
+    )
+    lock = root / "toolchain.lock.json"
+    lock.write_text(json.dumps(toolchain), encoding="utf-8")
+
+    completed = _invoke_conda_bootstrap(root, lock)
+
+    assert completed.returncode != 0
+    assert partial.is_file(), "unsafe external partial was promoted"
+    assert not escaped.exists(), "unsafe archive escaped the package cache"
+    assert not marker.exists(), "unsafe external archive was executed"
+    assert not (root / "data").exists(), "invalid lock reached package cache creation"
+
+
+def test_conda_bootstrap_rejects_cache_root_outside_package_before_writing(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("portable Conda path boundary test requires PowerShell")
+    root = tmp_path / "package"
+    root.mkdir()
+    outside_cache = tmp_path / "outside-cache"
+    lock = root / "toolchain.lock.json"
+    lock.write_text(json.dumps(_read_portable_toolchain_lock()), encoding="utf-8")
+
+    completed = _invoke_conda_bootstrap(root, lock, cache_root=outside_cache, dry_run=True)
+
+    assert completed.returncode != 0
+    assert "package" in (completed.stdout + completed.stderr).lower()
+    assert not outside_cache.exists()
+
+
+def test_toolchain_lock_pins_miniforge_size() -> None:
+    miniforge = _read_portable_toolchain_lock()["miniforge"]
+
+    assert miniforge["size_bytes"] == 79_227_640
 
 
 def test_build_helper_revalidates_reparse_tree_before_recursive_cache_delete() -> None:

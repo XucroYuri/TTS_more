@@ -17,6 +17,71 @@ function Resolve-RequiredFile {
     return $resolved
 }
 
+function Assert-WindowsSafeDirectName {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [string]$RequiredExtension = ""
+    )
+    $deviceBase = [regex]::Match($Name, "^[^.]*").Value
+    if (
+        [string]::IsNullOrWhiteSpace($Name) -or
+        [IO.Path]::IsPathRooted($Name) -or
+        $Name -in @(".", "..") -or
+        $Name -ne [IO.Path]::GetFileName($Name) -or
+        $Name -match '[<>:"/\\|?*\x00-\x1F]' -or
+        $Name.EndsWith(" ") -or
+        $Name.EndsWith(".") -or
+        $deviceBase -match '^(?i:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])$' -or
+        (![string]::IsNullOrEmpty($RequiredExtension) -and !$Name.EndsWith($RequiredExtension, [StringComparison]::OrdinalIgnoreCase))
+    ) {
+        throw "$Label must be a Windows-safe direct file name"
+    }
+}
+
+function ConvertTo-LockedPositiveSize {
+    param([Parameter(Mandatory = $true)]$Value, [Parameter(Mandatory = $true)][string]$Label)
+    $size = [int64]0
+    if (
+        ![int64]::TryParse(
+            [string]$Value,
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$size
+        ) -or $size -le 0
+    ) {
+        throw "$Label must be a positive integer"
+    }
+    return $size
+}
+
+function Assert-LockedAssetUrl {
+    param([Parameter(Mandatory = $true)][string]$Url, [Parameter(Mandatory = $true)][string]$Label)
+    $uri = $null
+    if (
+        [string]::IsNullOrWhiteSpace($Url) -or
+        $Url -ne $Url.Trim() -or
+        ![Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or
+        !(($uri.Scheme -eq [Uri]::UriSchemeHttps) -or ($uri.Scheme -eq [Uri]::UriSchemeHttp -and $uri.IsLoopback)) -or
+        ![string]::IsNullOrEmpty($uri.UserInfo)
+    ) {
+        throw "$Label must be an absolute HTTPS URL (HTTP is allowed only for loopback fixtures)"
+    }
+}
+
+function Assert-DirectChildPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Parent,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    $resolvedParent = [IO.Path]::GetFullPath($Parent).TrimEnd("\", "/")
+    $resolvedPathParent = [IO.Path]::GetFullPath((Split-Path -Parent ([IO.Path]::GetFullPath($Path)))).TrimEnd("\", "/")
+    if (![string]::Equals($resolvedPathParent, $resolvedParent, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label must remain a direct child of its package-private cache"
+    }
+}
+
 function Assert-NoReparsePathSegments {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -124,6 +189,51 @@ $bootstrapConda = Resolve-PackageChildDirectory -Path (Resolve-RequiredFile -Pat
 $toolchainLock = Resolve-PackageChildDirectory -Path (Resolve-RequiredFile -Path $ToolchainLockPath -Label "portable toolchain lock") -Label "portable toolchain lock"
 $portableInstall = Resolve-PackageChildDirectory -Path (Resolve-RequiredFile -Path $PortableInstallPath -Label "portable asset installer") -Label "portable asset installer"
 
+$toolchain = Get-Content -LiteralPath $toolchainLock -Raw | ConvertFrom-Json
+if ([int]$toolchain.schema_version -ne 1) {
+    throw "portable toolchain lock schema_version must be 1"
+}
+$miniforgeVersion = [string]$toolchain.miniforge.version
+Assert-WindowsSafeDirectName -Name $miniforgeVersion -Label "portable toolchain lock miniforge.version"
+$miniforgeArchiveName = [string]$toolchain.miniforge.archive
+Assert-WindowsSafeDirectName -Name $miniforgeArchiveName -Label "portable toolchain lock miniforge.archive" -RequiredExtension ".exe"
+Assert-LockedAssetUrl -Url ([string]$toolchain.miniforge.url) -Label "portable toolchain lock miniforge.url"
+if ([string]$toolchain.miniforge.sha256 -notmatch "^[0-9a-fA-F]{64}$") {
+    throw "portable toolchain lock miniforge.sha256 must be exactly 64 hexadecimal characters"
+}
+$miniforgeSize = ConvertTo-LockedPositiveSize -Value $toolchain.miniforge.size_bytes -Label "portable toolchain lock miniforge.size_bytes"
+if (
+    [string]$toolchain.uv.version -ne "0.11.28" -or
+    [string]$toolchain.uv.sha256 -notmatch "^[0-9a-fA-F]{64}$"
+) {
+    throw "portable toolchain lock must pin uv 0.11.28 with SHA-256"
+}
+Assert-LockedAssetUrl -Url ([string]$toolchain.uv.url) -Label "portable toolchain lock uv.url"
+$uvArchive = [string]$toolchain.uv.archive
+Assert-WindowsSafeDirectName -Name $uvArchive -Label "portable toolchain lock uv.archive" -RequiredExtension ".whl"
+$uvSize = ConvertTo-LockedPositiveSize -Value $toolchain.uv.size_bytes -Label "portable toolchain lock uv.size_bytes"
+
+$cacheRoot = Resolve-PackageChildDirectory -Path (Join-Path $script:ResolvedPackageRoot "data\cache\portable\build-tools") -Label "build-tools cache"
+$condaCache = Resolve-PackageChildDirectory -Path (Join-Path $script:ResolvedPackageRoot "data\cache\portable\conda") -Label "private Conda cache"
+$condaPackageCache = Resolve-PackageChildDirectory -Path (Join-Path $condaCache "conda-pkgs") -Label "private Conda package cache"
+$miniforgeArchive = Resolve-PackageChildDirectory -Path (Join-Path $condaCache $miniforgeArchiveName) -Label "locked Miniforge archive"
+Assert-DirectChildPath -Parent $condaCache -Path $miniforgeArchive -Label "locked Miniforge archive"
+$miniforgePartial = Resolve-PackageChildDirectory -Path "$miniforgeArchive.partial" -Label "locked Miniforge partial"
+Assert-DirectChildPath -Parent $condaCache -Path $miniforgePartial -Label "locked Miniforge partial"
+$miniforgeInstallRoot = Resolve-PackageChildDirectory -Path (Join-Path $condaCache ("miniforge-" + $miniforgeVersion)) -Label "private Miniforge installation"
+Assert-DirectChildPath -Parent $condaCache -Path $miniforgeInstallRoot -Label "private Miniforge installation"
+$expectedConda = Resolve-PackageChildDirectory -Path (Join-Path $miniforgeInstallRoot "condabin\conda.bat") -Label "expected private Conda command"
+$condaBasePython = Resolve-PackageChildDirectory -Path (Join-Path $miniforgeInstallRoot "python.exe") -Label "private Miniforge base Python"
+$assetRoot = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot "assets") -Label "build-tools asset cache"
+$uvAssetLock = Resolve-PackageChildDirectory -Path (Join-Path $assetRoot "uv.json") -Label "locked uv asset metadata"
+$uvWheel = Resolve-PackageChildDirectory -Path (Join-Path $assetRoot $uvArchive) -Label "locked uv wheel"
+Assert-DirectChildPath -Parent $assetRoot -Path $uvWheel -Label "locked uv wheel"
+$uvBootstrap = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot "uv-bootstrap") -Label "uv bootstrap environment"
+$uvBootstrapPython = Resolve-PackageChildDirectory -Path (Join-Path $uvBootstrap "python.exe") -Label "uv bootstrap Python"
+$uvExe = Resolve-PackageChildDirectory -Path (Join-Path $uvBootstrap "Scripts\uv.exe") -Label "locked uv executable"
+$environment = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot "environment") -Label "build-tools environment"
+$buildPython = Resolve-PackageChildDirectory -Path (Join-Path $environment "Scripts\python.exe") -Label "build-tools Python"
+
 if (![string]::IsNullOrWhiteSpace([string]$env:TTS_MORE_BUILD_PYTHON)) {
     $explicitPython = [IO.Path]::GetFullPath([string]$env:TTS_MORE_BUILD_PYTHON)
     if (!(Test-BuildPython -Python $explicitPython)) {
@@ -133,53 +243,18 @@ if (![string]::IsNullOrWhiteSpace([string]$env:TTS_MORE_BUILD_PYTHON)) {
     return
 }
 
-$toolchain = Get-Content -LiteralPath $toolchainLock -Raw | ConvertFrom-Json
-if (
-    [string]$toolchain.uv.version -ne "0.11.28" -or
-    [string]::IsNullOrWhiteSpace([string]$toolchain.uv.url) -or
-    [string]$toolchain.uv.sha256 -notmatch "^[0-9a-fA-F]{64}$"
-) {
-    throw "portable toolchain lock must pin uv 0.11.28 with URL and SHA-256"
-}
-$uvArchive = [string]$toolchain.uv.archive
-if (
-    [string]::IsNullOrWhiteSpace($uvArchive) -or
-    [IO.Path]::IsPathRooted($uvArchive) -or
-    $uvArchive -in @(".", "..") -or
-    $uvArchive -ne [IO.Path]::GetFileName($uvArchive) -or
-    $uvArchive.Contains("\") -or
-    $uvArchive.Contains("/")
-) {
-    throw "portable toolchain lock uv.archive must be a single safe file name"
-}
-$uvSize = [int64]0
-$uvSizeText = [string]$toolchain.uv.size_bytes
-if (
-    ![int64]::TryParse(
-        $uvSizeText,
-        [Globalization.NumberStyles]::None,
-        [Globalization.CultureInfo]::InvariantCulture,
-        [ref]$uvSize
-    ) -or $uvSize -le 0
-) {
-    throw "portable toolchain lock uv.size_bytes must be a positive integer"
-}
-
-$cacheRoot = Resolve-PackageChildDirectory -Path (Join-Path $script:ResolvedPackageRoot "data\cache\portable\build-tools") -Label "build-tools cache"
-$condaCache = Resolve-PackageChildDirectory -Path (Join-Path $script:ResolvedPackageRoot "data\cache\portable\conda") -Label "private Conda cache"
-$condaPackageCache = Resolve-PackageChildDirectory -Path (Join-Path $condaCache "conda-pkgs") -Label "private Conda package cache"
 New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
 
 $condaOutput = @(& $bootstrapConda -CacheRoot $condaCache -LockPath $toolchainLock -PackageRoot $script:ResolvedPackageRoot -PassThru)
-if ($LASTEXITCODE -ne 0 -or $condaOutput.Count -eq 0) { throw "private Conda bootstrap failed for build tools" }
+if ($condaOutput.Count -eq 0) { throw "private Conda bootstrap failed for build tools" }
 $conda = Resolve-PackageChildDirectory -Path ([string]$condaOutput[-1]) -Label "private Conda command"
+if (![string]::Equals($conda, $expectedConda, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "private Conda bootstrap returned a command outside the locked Miniforge installation"
+}
 if (!(Test-Path -LiteralPath $conda -PathType Leaf)) { throw "private Conda command is missing: $conda" }
-$condaBasePython = Resolve-PackageChildDirectory -Path (Join-Path (Split-Path -Parent (Split-Path -Parent $conda)) "python.exe") -Label "private Miniforge base Python"
 if (!(Test-Path -LiteralPath $condaBasePython -PathType Leaf)) { throw "private Miniforge base Python is missing" }
 
-$assetRoot = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot "assets") -Label "build-tools asset cache"
 New-Item -ItemType Directory -Force -Path $assetRoot | Out-Null
-$uvAssetLock = Resolve-PackageChildDirectory -Path (Join-Path $assetRoot "uv.json") -Label "locked uv asset metadata"
 $uvAsset = [ordered]@{
     id = "uv-0.11.28-windows-x64"
     urls = @([string]$toolchain.uv.url)
@@ -187,17 +262,10 @@ $uvAsset = [ordered]@{
     size_bytes = $uvSize
 }
 $uvAsset | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $uvAssetLock -Encoding UTF8
-$uvWheel = Resolve-PackageChildDirectory -Path (Join-Path $assetRoot $uvArchive) -Label "locked uv wheel"
-if (![string]::Equals([IO.Path]::GetFullPath((Split-Path -Parent $uvWheel)), $assetRoot, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "locked uv wheel must remain a direct child of the package asset cache"
-}
 & $condaBasePython $portableInstall ensure-asset --asset $uvAssetLock --path $uvWheel
 if ($LASTEXITCODE -ne 0) { throw "locked uv 0.11.28 asset initialization failed" }
 
-$uvBootstrap = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot "uv-bootstrap") -Label "uv bootstrap environment"
 Assert-NoReparseTree -Root $script:ResolvedPackageRoot -Path $uvBootstrap -Label "uv bootstrap environment"
-$uvBootstrapPython = Resolve-PackageChildDirectory -Path (Join-Path $uvBootstrap "python.exe") -Label "uv bootstrap Python"
-$uvExe = Resolve-PackageChildDirectory -Path (Join-Path $uvBootstrap "Scripts\uv.exe") -Label "locked uv executable"
 if (!(Test-Python311 -Python $uvBootstrapPython) -or !(Test-LockedUv -UvExe $uvExe)) {
     Remove-OwnedCacheDirectory -Path $uvBootstrap -CacheRoot $cacheRoot
     $uvBootstrapStaging = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot (".uv-bootstrap-" + $PID + "-" + [Guid]::NewGuid().ToString("N"))) -Label "uv bootstrap staging"
@@ -220,7 +288,6 @@ if (!(Test-Python311 -Python $uvBootstrapPython) -or !(Test-LockedUv -UvExe $uvE
     }
 }
 
-$environment = Resolve-PackageChildDirectory -Path (Join-Path $cacheRoot "environment") -Label "build-tools environment"
 Assert-NoReparseTree -Root $script:ResolvedPackageRoot -Path $environment -Label "build-tools environment"
 $lockDigestBefore = (Get-FileHash -LiteralPath $uvLock -Algorithm SHA256).Hash
 $previousProjectEnvironment = $env:UV_PROJECT_ENVIRONMENT
@@ -237,7 +304,6 @@ if ((Get-FileHash -LiteralPath $uvLock -Algorithm SHA256).Hash -ne $lockDigestBe
     throw "uv sync modified the locked portable build-tools dependency graph"
 }
 
-$buildPython = Resolve-PackageChildDirectory -Path (Join-Path $environment "Scripts\python.exe") -Label "build-tools Python"
 if (!(Test-BuildPython -Python $buildPython)) {
     throw "portable build-tools Python 3.11/jsonschema probe failed"
 }
