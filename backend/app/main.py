@@ -133,6 +133,7 @@ def create_app(
     job_manager = GenerationJobManager(queue, store)
     ref_root = Path(reference_audio_root)
     portable_controller_root = Path(controller_root) if controller_root is not None else _portable_controller_root(Path(data_root), project_root)
+    hardware_controller_cache = portable_controller_root / "data" / "cache" / "portable" / "video-controllers.json"
     supervisor = ServiceSupervisor(
         project_root=project_root,
         portable_controller_root=portable_controller_root,
@@ -374,7 +375,7 @@ def create_app(
     def services_status() -> dict[str, Any]:
         return {
             "services": _service_health_with_supervisor(app.state.service_router, supervisor, app.state.queue),
-            "hardware": collect_local_hardware_status(),
+            "hardware": collect_local_hardware_status(controller_cache_path=hardware_controller_cache),
         }
 
     @app.get("/api/startup/checks")
@@ -397,7 +398,7 @@ def create_app(
             },
             "services": _service_health_with_supervisor(app.state.service_router, supervisor),
             "resources": resources,
-            "hardware": collect_local_hardware_status(),
+            "hardware": collect_local_hardware_status(controller_cache_path=hardware_controller_cache),
         }
 
     @app.get("/api/runtime/mode")

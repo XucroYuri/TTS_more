@@ -12,21 +12,22 @@ from app.subprocess_safety import noninteractive_subprocess_kwargs
 
 _CIM_QUERY = (
     "Get-CimInstance Win32_VideoController -ErrorAction Stop | "
-    "Select-Object Name,DriverVersion,AdapterRAM,AdapterCompatibility,PNPDeviceID | "
+    "Select-Object Name,DriverVersion,AdapterCompatibility,PNPDeviceID | "
     "ConvertTo-Json -Compress"
 )
 
 
-def collect_local_hardware_status() -> dict[str, Any]:
+def collect_local_hardware_status(*, controller_cache_path: Path | str | None = None) -> dict[str, Any]:
+    cache_path = Path(controller_cache_path) if controller_cache_path is not None else _video_controllers_cache_path()
     return {
         "host": "local",
-        "gpu": _gpu_status(),
+        "gpu": _gpu_status(cache_path),
         "system": _system_status(),
     }
 
 
-def _gpu_status() -> dict[str, Any]:
-    cached = _read_controller_cache(_video_controllers_cache_path())
+def _gpu_status(controller_cache_path: Path) -> dict[str, Any]:
+    cached = _read_controller_cache(controller_cache_path)
     if cached is not None:
         return _controller_status(cached, source="portable-cache")
     if sys.platform != "win32":
@@ -136,12 +137,13 @@ def _controller_status(controllers: list[dict[str, Any]], *, source: str) -> dic
         driver_version = str(
             controller.get("driver_version") or controller.get("DriverVersion") or ""
         ).strip() or None
-        adapter_ram = controller.get("adapter_ram", controller.get("AdapterRAM"))
         devices.append(
             {
                 "name": name or "NVIDIA GPU",
                 "driver_version": driver_version,
-                "memory_total_mb": _bytes_to_mb(adapter_ram),
+                # Win32_VideoController.AdapterRAM is a 32-bit value and
+                # commonly truncates modern GPUs to roughly 4 GiB.
+                "memory_total_mb": None,
             }
         )
     if not devices:
@@ -153,16 +155,6 @@ def _controller_status(controllers: list[dict[str, Any]], *, source: str) -> dic
             "devices": [],
         }
     return {"available": True, "status": "ok", "source": source, "devices": devices}
-
-
-def _bytes_to_mb(value: Any) -> int | None:
-    try:
-        bytes_value = int(value)
-    except (TypeError, ValueError):
-        return None
-    return bytes_value // (1024 * 1024) if bytes_value > 0 else None
-
-
 def _system_status() -> dict[str, Any]:
     try:
         load = os.getloadavg() if hasattr(os, "getloadavg") else None

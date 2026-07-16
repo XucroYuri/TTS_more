@@ -29,10 +29,9 @@ def test_hardware_status_prefers_portable_controller_cache_without_spawning(tmp_
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(hardware, "_video_controllers_cache_path", lambda: cache, raising=False)
     monkeypatch.setattr(hardware.subprocess, "run", _poison_nvidia_smi)
 
-    status = hardware.collect_local_hardware_status()["gpu"]
+    status = hardware.collect_local_hardware_status(controller_cache_path=cache)["gpu"]
 
     assert status == {
         "available": True,
@@ -110,6 +109,7 @@ def test_windows_cim_probe_accepts_single_object_or_array_and_never_launches_nvi
     assert status["status"] == "ok"
     assert status["source"] == "windows-cim"
     assert [device["name"] for device in status["devices"]] == expected_names
+    assert all(device["memory_total_mb"] is None for device in status["devices"])
     assert len(spawned) == 1
 
 

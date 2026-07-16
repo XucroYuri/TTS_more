@@ -1585,6 +1585,44 @@ def test_status_endpoints_never_launch_nvidia_smi(tmp_path: Path, monkeypatch) -
     assert all(Path(str(command[0])).name.casefold() not in {"nvidia-smi", "nvidia-smi.exe"} for command in commands)
 
 
+def test_staged_controller_status_reads_hardware_cache_from_package_root(tmp_path: Path, monkeypatch) -> None:
+    from app import hardware
+
+    package_root = tmp_path / "portable package"
+    packaged_main = package_root / "app" / "backend" / "app" / "main.py"
+    packaged_main.parent.mkdir(parents=True)
+    packaged_main.touch()
+    (package_root / "package").mkdir()
+    (package_root / "package" / "tts-more-package.json").write_text("{}\n", encoding="utf-8")
+    (package_root / "scripts").mkdir()
+    (package_root / "scripts" / "select-portable-folder.ps1").touch()
+    cache = package_root / "data" / "cache" / "portable" / "video-controllers.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_text(
+        json.dumps([{"name": "NVIDIA staged GPU", "driver_version": "32.0.15.9186"}]),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main_module, "__file__", str(packaged_main))
+    original_run = subprocess.run
+
+    def reject_gpu_probe(command, **kwargs):
+        executable = Path(str(command[0])).name.casefold()
+        if executable in {"nvidia-smi", "nvidia-smi.exe", "powershell.exe", "pwsh.exe"}:
+            raise AssertionError("staged controller status must use the package-root cache")
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(hardware.subprocess, "run", reject_gpu_probe)
+    client = TestClient(create_app(data_root=tmp_path / "test-data"))
+
+    for endpoint in ("/api/services/status", "/api/startup/checks"):
+        response = client.get(endpoint)
+        assert response.status_code == 200
+        gpu = response.json()["hardware"]["gpu"]
+        assert gpu["source"] == "portable-cache"
+        assert gpu["devices"][0]["name"] == "NVIDIA staged GPU"
+
+
 def test_generate_routes_task_to_service_endpoint(tmp_path: Path) -> None:
     services_path = tmp_path / "services.json"
     services_path.write_text(
