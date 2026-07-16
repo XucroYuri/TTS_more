@@ -12,6 +12,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Get-PortableFileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
 function Resolve-PortableFullPath {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -237,7 +248,7 @@ function Test-LockedSha256 {
         [Parameter(Mandatory = $true)][string]$ExpectedSha256
     )
 
-    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actual = Get-PortableFileSha256 -Path $Path
     return $actual -eq $ExpectedSha256.ToLowerInvariant()
 }
 

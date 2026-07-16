@@ -10,6 +10,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Get-PortableFileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
 function Resolve-RequiredFile {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Label)
     $resolved = [IO.Path]::GetFullPath($Path)
@@ -289,7 +300,7 @@ if (!(Test-Python311 -Python $uvBootstrapPython) -or !(Test-LockedUv -UvExe $uvE
 }
 
 Assert-NoReparseTree -Root $script:ResolvedPackageRoot -Path $environment -Label "build-tools environment"
-$lockDigestBefore = (Get-FileHash -LiteralPath $uvLock -Algorithm SHA256).Hash
+$lockDigestBefore = Get-PortableFileSha256 -Path $uvLock
 $previousProjectEnvironment = $env:UV_PROJECT_ENVIRONMENT
 try {
     $env:UV_PROJECT_ENVIRONMENT = $environment
@@ -300,7 +311,7 @@ try {
 finally {
     $env:UV_PROJECT_ENVIRONMENT = $previousProjectEnvironment
 }
-if ((Get-FileHash -LiteralPath $uvLock -Algorithm SHA256).Hash -ne $lockDigestBefore) {
+if ((Get-PortableFileSha256 -Path $uvLock) -ne $lockDigestBefore) {
     throw "uv sync modified the locked portable build-tools dependency graph"
 }
 

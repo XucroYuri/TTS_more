@@ -204,13 +204,31 @@ def test_portable_conda_bootstrap_uses_locked_archive_and_never_requires_system_
     script = script_path.read_text(encoding="utf-8")
 
     assert "function Ensure-BuildConda" in script
-    assert "Get-FileHash" in script
+    assert "function Get-PortableFileSha256" in script
+    assert "Get-FileHash" not in script
     assert "toolchain.lock.json" in script
     assert "CONDA_PKGS_DIRS" in script
     assert "Get-Command conda" not in script
     assert ".partial" in script
     assert 'Range = "bytes=$resumeFrom-"' in script
     assert "Move-Item -LiteralPath $partial -Destination $archive" in script
+
+
+def test_portable_first_run_powershell_scripts_do_not_depend_on_get_file_hash() -> None:
+    for relative in (
+        "scripts/initialize-portable.ps1",
+        "integrations/windows/Initialize.ps1",
+        "scripts/Portable-Validation.ps1",
+        "scripts/bootstrap-conda.ps1",
+        "scripts/Resolve-PortableBuildPython.ps1",
+    ):
+        script = (REPO_ROOT / relative).read_text(encoding="utf-8-sig")
+
+        assert (
+            "function Get-PortableFileSha256" in script
+            or '. $ValidationScript' in script
+        )
+        assert "Get-FileHash" not in script
 
 
 def test_portable_conda_bootstrap_can_return_its_private_conda_path_to_a_builder() -> None:

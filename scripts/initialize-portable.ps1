@@ -108,8 +108,8 @@ if ((Test-PortableLockedAssets -Root $Root -ModelLock $ModelLock) -and (Test-Por
     $ExistingState = if (Test-Path -LiteralPath $StatePath -PathType Leaf) { try { Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json } catch { $null } } else { $null }
     $RequestedProfile = if ($ExistingState -and ![string]::IsNullOrWhiteSpace([string]$ExistingState.profile)) { [string]$ExistingState.profile } else { "" }
     $Profile = Resolve-PortableSupportedProfile -RuntimeLockPayload $RuntimePayload -RequestedProfile $RequestedProfile
-    $RuntimeSha = (Get-FileHash -LiteralPath $RuntimeLock -Algorithm SHA256).Hash.ToLowerInvariant()
-    $ModelSha = (Get-FileHash -LiteralPath $ModelLock -Algorithm SHA256).Hash.ToLowerInvariant()
+    $RuntimeSha = Get-PortableFileSha256 -Path $RuntimeLock
+    $ModelSha = Get-PortableFileSha256 -Path $ModelLock
     & (Join-Path $Live "python.exe") (Join-Path $Root "scripts\portable_install.py") write-state --path $StatePath --component tts-more --build-id $BuildId --profile $Profile --runtime-lock-sha256 $RuntimeSha --model-lock-sha256 $ModelSha
     if ($LASTEXITCODE -ne 0) { throw "failed to repair stale install-state.json" }
     if (!(Test-PortableInstallStateComplete -Root $Root -StatePath $StatePath -Component "tts-more" -BuildId $BuildId -RuntimeLock $RuntimeLock -ModelLock $ModelLock -ExpectedPython $ExpectedPython -ImportProbe $ImportProbe -ValidateAssets)) { throw "repaired install-state.json failed complete validation" }
@@ -191,8 +191,8 @@ if (Test-Path -LiteralPath $Live) { Move-Item -LiteralPath $Live -Destination $b
 Move-Item -LiteralPath $Staging -Destination $Live
 if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
 
-$runtimeSha = (Get-FileHash -LiteralPath $RuntimeLock -Algorithm SHA256).Hash.ToLowerInvariant()
-$modelSha = (Get-FileHash -LiteralPath $ModelLock -Algorithm SHA256).Hash.ToLowerInvariant()
+$runtimeSha = Get-PortableFileSha256 -Path $RuntimeLock
+$modelSha = Get-PortableFileSha256 -Path $ModelLock
 & (Join-Path $Live "python.exe") (Join-Path $Root "scripts\portable_install.py") write-state --path $StatePath --component tts-more --build-id $BuildId --profile $selected --runtime-lock-sha256 $runtimeSha --model-lock-sha256 $modelSha
 if ($LASTEXITCODE -ne 0) { throw "failed to commit install-state.json" }
 Write-Host "TTS More portable initialization completed."

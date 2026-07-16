@@ -111,8 +111,8 @@ if ((Test-PortableLockedAssets -Root $Root -ModelLock $modelLockPath) -and (Test
     $existingState = if (Test-Path -LiteralPath $state -PathType Leaf) { try { Get-Content -LiteralPath $state -Raw | ConvertFrom-Json } catch { $null } } else { $null }
     $requestedProfile = if ($existingState -and ![string]::IsNullOrWhiteSpace([string]$existingState.profile)) { [string]$existingState.profile } else { "" }
     $selectedProfile = Resolve-PortableSupportedProfile -RuntimeLockPayload $runtimeLock -RequestedProfile $requestedProfile
-    $runtimeSha = (Get-FileHash -LiteralPath $runtimeLockPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    $modelSha = (Get-FileHash -LiteralPath $modelLockPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $runtimeSha = Get-PortableFileSha256 -Path $runtimeLockPath
+    $modelSha = Get-PortableFileSha256 -Path $modelLockPath
     & (Join-Path $live "python.exe") (Join-Path $Bundle "portable_install.py") write-state --path $state --component ([string]$config.component) --build-id $buildId --profile $selectedProfile --runtime-lock-sha256 $runtimeSha --model-lock-sha256 $modelSha
     if ($LASTEXITCODE -ne 0) { throw "failed to repair stale install-state.json" }
     if (!(Test-PortableInstallStateComplete -Root $Root -StatePath $state -Component ([string]$config.component) -BuildId $buildId -RuntimeLock $runtimeLockPath -ModelLock $modelLockPath -ExpectedPython $expectedPython -ImportProbe $importProbe -ValidateAssets)) { throw "repaired install-state.json failed complete validation" }
@@ -219,8 +219,8 @@ if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse 
 if (Test-Path -LiteralPath $live) { Move-Item -LiteralPath $live -Destination $backup }
 Move-Item -LiteralPath $staging -Destination $live
 if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
-$runtimeSha = (Get-FileHash -LiteralPath $runtimeLockPath -Algorithm SHA256).Hash.ToLowerInvariant()
-$modelSha = (Get-FileHash -LiteralPath $modelLockPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$runtimeSha = Get-PortableFileSha256 -Path $runtimeLockPath
+$modelSha = Get-PortableFileSha256 -Path $modelLockPath
 & (Join-Path $live "python.exe") (Join-Path $Bundle "portable_install.py") write-state --path $state --component ([string]$config.component) --build-id $buildId --profile $selected --runtime-lock-sha256 $runtimeSha --model-lock-sha256 $modelSha
 if ($LASTEXITCODE -ne 0) { throw "install state commit failed" }
 Write-Host "$($config.component) initialization completed for $selected"
