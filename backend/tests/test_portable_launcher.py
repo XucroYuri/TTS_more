@@ -531,6 +531,7 @@ def test_windows_powershell_51_finds_current_loopback_listener_owner() -> None:
     ("returncode", "stdout", "stderr"),
     [
         (1, "", "query failed"),
+        (0, "", ""),
         (
             0,
             '{"pid":4242,"parent_pid":1,"created_at":"2026-07-16T00:00:00Z",'

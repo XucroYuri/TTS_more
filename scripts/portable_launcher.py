@@ -299,7 +299,7 @@ def _inspect_process(pid: int) -> dict[str, object] | None:
         raise RuntimeError("unable to verify process ownership")
     output = completed.stdout.strip()
     if not output:
-        return None
+        raise RuntimeError("unable to verify process ownership")
     try:
         payload = json.loads(output)
     except json.JSONDecodeError as exc:
