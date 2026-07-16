@@ -1061,6 +1061,8 @@ def _install_portable_import_core(controller: Path) -> None:
 def _portable_import_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[TestClient, dict[str, str], Path, Path]:
+    if os.name != "nt":
+        pytest.skip("portable import apply filesystem identity checks target Windows package moves")
     controller = tmp_path / "TTS More"
     _install_portable_import_core(controller)
     old = _write_package(tmp_path / "old worker", component="gpt-sovits", package_id="gpt-main")
@@ -3604,6 +3606,7 @@ def _install_fake_selector_runtime(
     job: _SelectorJob,
 ) -> None:
     _InlineSelectorThread.instances = []
+    monkeypatch.setattr(local_control.os, "name", "nt")
     monkeypatch.setattr(local_control, "WindowsKillOnCloseJob", lambda: job)
     monkeypatch.setattr(local_control.subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(local_control.threading, "Thread", _InlineSelectorThread)
