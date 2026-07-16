@@ -122,6 +122,11 @@ $targets = @(
 )
 $componentOrder = @("tts-more", "gpt-sovits", "indextts", "cosyvoice")
 if (($targets.component -join ',') -ne ($componentOrder -join ',')) { throw "four-pack component order drifted" }
+$controllerRevision = (& git -C $Root rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $controllerRevision -notmatch "^[0-9a-f]{40}$") {
+    throw "tts-more source revision is not an exact Git commit"
+}
+$targets[0].expected_revision = $controllerRevision
 foreach ($target in $targets) {
     if (!$target.expected_revision) { continue }
     $actualRevision = (& git -C $target.root rev-parse HEAD).Trim()
@@ -146,11 +151,6 @@ if ($PlanOnly) {
 
 $metadataPython = Resolve-MetadataPython
 $portablePackages = Join-Path $Root "scripts\portable_packages.py"
-$controllerRevision = (& git -C $Root rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or $controllerRevision -notmatch "^[0-9a-f]{40}$") {
-    throw "tts-more source revision is not an exact Git commit"
-}
-$targets[0].expected_revision = $controllerRevision
 foreach ($target in $targets) {
     if ([string]$target.expected_revision -notmatch "^[0-9a-f]{40}$") {
         throw "$($target.component) expected source revision is invalid"

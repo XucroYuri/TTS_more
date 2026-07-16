@@ -188,3 +188,8 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
           fi
           gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          mapfile -t published_asset_names < <(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.assets[].name' | LC_ALL=C sort -u)
+          if ! diff -u <(printf '%s\n' "${local_asset_names[@]}") <(printf '%s\n' "${published_asset_names[@]}"); then
+            echo "published GitHub Release assets do not exactly match the local six-asset allowlist" >&2
+            exit 1
+          fi

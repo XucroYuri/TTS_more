@@ -4,6 +4,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -2795,6 +2796,7 @@ def _write_plan_only_four_pack_fixture(root: Path) -> tuple[Path, dict[str, Path
     (root / "repo.lock.json").write_text(
         json.dumps({"repositories": repositories}), encoding="utf-8"
     )
+    _initialize_git_repository(root)
     return root, workers
 
 
@@ -2842,6 +2844,11 @@ def test_four_pack_plan_only_records_device_intentions_without_machine_paths(tmp
         ("indextts", "cu126"),
         ("cosyvoice", "cu126"),
     ]
+    controller_revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=fixture, text=True, encoding="utf-8"
+    ).strip()
+    assert plan["components"][0]["expected_revision"] == controller_revision
+    assert re.fullmatch(r"[0-9a-f]{40}", controller_revision)
     serialized = json.dumps(plan)
     assert str(fixture) not in serialized
     assert str(output) not in serialized
@@ -3495,6 +3502,24 @@ def test_portable_release_workflow_fails_closed_on_existing_remote_extra_assets(
     assert "comm -23" in publish
     assert publish.index(remote_query) < publish.index("gh release upload")
     assert "release delete-asset" not in publish
+
+
+def test_portable_release_workflow_rechecks_exact_remote_assets_after_upload() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "portable-release.yml").read_text(
+        encoding="utf-8"
+    )
+    publish = workflow.split("- name: Publish bootstrap assets only", 1)[1]
+    upload = 'gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber'
+    post_query = (
+        'gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" '
+        "--jq '.assets[].name'"
+    )
+
+    assert upload in publish
+    assert post_query in publish
+    assert publish.index(upload) < publish.index(post_query)
+    assert "published_asset_names" in publish
+    assert "diff -u" in publish[publish.index(post_query) :]
 
 
 def test_validate_manifest_rejects_invalid_v2_profile_and_nested_absolute_paths(tmp_path: Path) -> None:
