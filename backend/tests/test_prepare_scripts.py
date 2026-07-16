@@ -231,6 +231,17 @@ def test_portable_first_run_powershell_scripts_do_not_depend_on_get_file_hash() 
         assert "Get-FileHash" not in script
 
 
+def test_portable_runtime_powershell_entrypoints_are_ascii_only_for_winps51() -> None:
+    for relative in (
+        "scripts/Invoke-PortableStart.ps1",
+        "scripts/Show-PortableProgress.ps1",
+    ):
+        script = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        non_ascii = sorted({character for character in script if ord(character) > 127})
+
+        assert non_ascii == []
+
+
 def test_portable_conda_bootstrap_can_return_its_private_conda_path_to_a_builder() -> None:
     script = (REPO_ROOT / "scripts" / "bootstrap-conda.ps1").read_text(encoding="utf-8")
 

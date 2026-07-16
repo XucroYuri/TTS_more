@@ -701,7 +701,7 @@ function Invoke-PortableImportOffer {
     if (!$OfferImport -and $null -ne (Read-PortableImportDecision -Context $Context)) { return [pscustomobject]$result }
     $effectivePort = if ($Port -gt 0) { $Port } else { [int]$Context.Port }
 
-    if (!(Confirm-PortableImport -Prompt "是否从旧版便携包导入用户数据和可复用模型？[Y/N]")) {
+    if (!(Confirm-PortableImport -Prompt "Import user data and reusable models from a previous portable package? [Y/N]")) {
         return [pscustomobject]@{ Status = "declined"; MarkAfterReady = $true }
     }
 
@@ -756,12 +756,12 @@ function Invoke-PortableImportOffer {
     $skippedAssetCount = @($plan.skipped_assets).Count
     $alreadyPresentCount = @($plan.already_present).Count
 
-    Write-Host ("导入计划：用户文件 {0} 个，共 {1} 字节；可复用模型 {2} 个，共 {3} 字节；跳过 {4} 个；已存在 {5} 个。" -f $userFiles, $userBytes, $safeAssets.Count, $assetBytes, $skippedAssetCount, $alreadyPresentCount)
+    Write-Host ("Import plan: user files {0}, user bytes {1}; reusable assets {2}, asset bytes {3}; skipped {4}; already present {5}." -f $userFiles, $userBytes, $safeAssets.Count, $assetBytes, $skippedAssetCount, $alreadyPresentCount)
     foreach ($asset in @($safeAssets | Select-Object -First 20)) { Write-Host ("  - {0}" -f $asset) }
-    if ($safeAssets.Count -gt 20) { Write-Host ("  （另有 {0} 项未展开）" -f ($safeAssets.Count - 20)) }
-    Write-Host "旧版便携包会原样保留；导入会复制到当前包。"
-    Write-Host "导入期间 worker/服务必须保持停止；启动器会在导入完成后再启动服务。"
-    if (!(Confirm-PortableImport -Prompt "确认立即执行上述导入？[Y/N]")) {
+    if ($safeAssets.Count -gt 20) { Write-Host ("  (plus {0} more not shown)" -f ($safeAssets.Count - 20)) }
+    Write-Host "The previous portable package will be left unchanged; import copies into this package."
+    Write-Host "Workers/services must stay stopped during import; the launcher starts services after import completes."
+    if (!(Confirm-PortableImport -Prompt "Apply this import now? [Y/N]")) {
         return [pscustomobject]@{ Status = "declined"; MarkAfterReady = $true }
     }
     Assert-PortableImportNotCancelled -Context $Context -Operation $Operation
@@ -775,7 +775,7 @@ function Invoke-PortableImportOffer {
     [void](ConvertFrom-PortableBoundedJson -Output @($applyResult.StdOut) -Label "Previous-version import")
     Write-PortableImportDecision -Context $Context -Status "completed"
     Assert-PortableImportNotCancelled -Context $Context -Operation $Operation
-    Write-Host "旧版便携包数据导入完成；原包未被修改。"
+    Write-Host "Previous portable package import completed; the original package was not modified."
     return [pscustomobject]@{ Status = "completed"; MarkAfterReady = $false }
 }
 
@@ -1028,7 +1028,7 @@ function Clear-StaleActivePointer {
         if (Test-Path -LiteralPath $operationPath -PathType Leaf) {
             $payload = Get-Content -LiteralPath $operationPath -Raw | ConvertFrom-Json
             if ($null -eq $payload.exit_code) {
-                Add-OperationEvent -Operation $staleOperation -Phase "blocked" -Message "先前的启动控制器已失去包级锁；该操作被安全回收" -ErrorCode "PACKAGE_CORRUPT"
+                Add-OperationEvent -Operation $staleOperation -Phase "blocked" -Message "Previous start controller lost the package lock; this operation was safely recovered" -ErrorCode "PACKAGE_CORRUPT"
                 Complete-Operation -Operation $staleOperation -Status "blocked" -ExitCode 22
             }
         }
@@ -1073,7 +1073,7 @@ try {
     $ownerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o")
     Write-JsonAtomic -Path $activePath -Payload ([ordered]@{ operation_id = $OperationId; owner_pid = $PID; owner_started_at = $ownerStartedAt; published_at = [DateTime]::UtcNow.ToString("o") })
     $ownsActivePointer = $true
-    Add-OperationEvent -Operation $operation -Phase "checking" -Message "正在检查便携包安装状态" -Percent 0
+    Add-OperationEvent -Operation $operation -Phase "checking" -Message "Checking portable package install state" -Percent 0
     $urlPort = if ($null -ne $PortOverride) { [int]$PortOverride } else { [int]$script:Context.Port }
     $url = "http://127.0.0.1:$urlPort"
     if (!$NoUi) { Start-ProgressWindow -Operation $operation -Url $url }
@@ -1084,14 +1084,14 @@ try {
     }
     $importOutcome = Invoke-PortableImportOffer -Context $script:Context -Operation $operation -ManagedBy $ManagedBy -NoUi:$NoUi -OfferImport:$OfferImport -Port $urlPort
     if (!$installed) {
-        Add-OperationEvent -Operation $operation -Phase "installing" -Message "正在初始化包内私有运行时" -Percent 5
+        Add-OperationEvent -Operation $operation -Phase "installing" -Message "Initializing private package runtime" -Percent 5
         Invoke-Initialize -Root $root -Operation $operation
         if (!(Test-InstallState -Root $root)) { Throw-PortableStartError "PACKAGE_CORRUPT" "Initialization did not produce a valid package-private runtime state" }
     }
     if (Test-Path -LiteralPath (Join-Path $operation "cancel.requested") -PathType Leaf) { Throw-PortableStartError "CANCELLED" "Portable start was cancelled" }
-    Add-OperationEvent -Operation $operation -Phase "starting" -Message "正在启动本地服务" -Percent 95
+    Add-OperationEvent -Operation $operation -Phase "starting" -Message "Starting local service" -Percent 95
     Invoke-ServiceStart -Root $root -Operation $operation -PortOverride $PortOverride
-    Add-OperationEvent -Operation $operation -Phase "ready" -Message "服务已就绪：$url" -Percent 100
+    Add-OperationEvent -Operation $operation -Phase "ready" -Message "Service ready: $url" -Percent 100
     Complete-Operation -Operation $operation -Status "ready" -ExitCode 0
     if ($importOutcome.MarkAfterReady) {
         try {

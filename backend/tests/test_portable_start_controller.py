@@ -612,10 +612,10 @@ def test_direct_staged_import_offer_uses_safe_summary_and_exact_in_memory_digest
     assert "models/asset-00.bin" in combined
     assert "models/asset-19.bin" in combined
     assert "models/asset-20.bin" not in combined
-    assert "跳过 2 个；已存在 1 个" in combined
+    assert "skipped 2; already present 1" in combined
     assert "PRIVATE-SKIPPED" not in combined
     assert "PRIVATE-ALREADY" not in combined
-    assert "worker/服务必须保持停止" in combined
+    assert "Workers/services must stay stopped" in combined
     python_calls = (package_root / "import-python.log").read_text(encoding="utf-8").splitlines()
     assert any("import jsonschema" in line for line in python_calls)
     plan_index = next(index for index, line in enumerate(python_calls) if " plan " in f" {line} ")
