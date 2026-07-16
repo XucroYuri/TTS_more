@@ -480,6 +480,20 @@ function Get-PortableSafeSystemPath {
     return (@($entries | Select-Object -Unique) -join ";")
 }
 
+function Get-PortableSafeModulePath {
+    $entries = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in @(
+        (Join-Path $PSHOME "Modules"),
+        $(if (![string]::IsNullOrWhiteSpace($env:ProgramFiles)) { Join-Path $env:ProgramFiles "WindowsPowerShell\Modules" } else { "" }),
+        $(if (![string]::IsNullOrWhiteSpace($env:SystemRoot)) { Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\Modules" } else { "" })
+    )) {
+        if (![string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate -PathType Container)) {
+            $entries.Add([IO.Path]::GetFullPath($candidate))
+        }
+    }
+    return (@($entries | Select-Object -Unique) -join ";")
+}
+
 function Invoke-PortableCapturedProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -503,6 +517,17 @@ function Invoke-PortableCapturedProcess {
             $safePath = Get-PortableSafeSystemPath
             if (![string]::IsNullOrWhiteSpace($safePath)) {
                 $startInfo.EnvironmentVariables[$pathKey] = $safePath
+            }
+        }
+        $modulePathKey = @($startInfo.EnvironmentVariables.Keys | Where-Object { [string]$_ -ieq "PSModulePath" } | Select-Object -First 1)
+        if ([string]::IsNullOrWhiteSpace($modulePathKey)) { $modulePathKey = "PSModulePath" }
+        $safeModulePath = Get-PortableSafeModulePath
+        if (![string]::IsNullOrWhiteSpace($safeModulePath)) {
+            $currentModulePath = [string]$startInfo.EnvironmentVariables[$modulePathKey]
+            if ([string]::IsNullOrWhiteSpace($currentModulePath)) {
+                $startInfo.EnvironmentVariables[$modulePathKey] = $safeModulePath
+            } elseif (!$currentModulePath.ToLowerInvariant().Contains($PSHOME.ToLowerInvariant())) {
+                $startInfo.EnvironmentVariables[$modulePathKey] = $safeModulePath + ";" + $currentModulePath
             }
         }
         if ($Utf8) {
