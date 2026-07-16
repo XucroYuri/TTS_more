@@ -57,48 +57,12 @@ function Assert-CleanSourceRepository {
     if (@($status | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) }).Count -ne 0) {
         throw "$($Target.component) source is dirty; tracked content is not revision-bound"
     }
-    $allUntracked = @(& git -C $Target.root ls-files --others --directory 2>&1)
-    if ($LASTEXITCODE -ne 0) { throw "$($Target.component) untracked source inventory failed" }
-    $copiedUntracked = @($allUntracked | Where-Object {
-        $relative = ([string]$_).Replace("\", "/")
-        if ([string]::IsNullOrWhiteSpace($relative)) { return $false }
-        $parts = @($relative.TrimEnd("/").Split("/"))
-        if ($Target.component -eq "tts-more") {
-            if (@($parts | Where-Object { $_ -in @("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache") }).Count -ne 0) { return $false }
-            $controllerFiles = @(
-                "backend/pyproject.toml", "backend/uv.lock", "backend/.python-version",
-                "Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "LICENSE", "NOTICE", "repo.lock.json",
-                "packaging/portable/toolchain.lock.json", "packaging/portable/runtime.lock.json", "packaging/portable/models.lock.json",
-                "packaging/portable/tts-more-package.schema.json", "packaging/portable/error-catalog.zh-CN.json", "packaging/portable/使用说明-先看这里.txt"
-            )
-            $controllerScripts = @(
-                "bootstrap-conda.ps1", "initialize-portable.ps1", "repair-portable.ps1", "start-production.ps1", "stop-production.ps1",
-                "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1", "select-portable-folder.ps1",
-                "export-portable-diagnostics.py", "import-portable-data.py", "import_portable_data.py", "portable_install.py",
-                "portable_launcher.py", "portable_operations.py", "portable_packages.py", "portable_package_runner.py"
-            )
-            return $relative.StartsWith("backend/app/", [StringComparison]::OrdinalIgnoreCase) -or
-                $relative.StartsWith("frontend/dist/", [StringComparison]::OrdinalIgnoreCase) -or
-                $relative -in $controllerFiles -or
-                ($relative.StartsWith("scripts/", [StringComparison]::OrdinalIgnoreCase) -and $relative.Substring(8) -in $controllerScripts)
-        }
-        $workerRootExcluded = @(".git", ".venv", "runtime", "data", "artifacts", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache")
-        $workerRecursiveExcluded = @(".git", ".venv", "artifacts", "cache", ".cache", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache")
-        $modelDirectories = @("models", "pretrained_models", "checkpoints", "SoVITS_weights", "GPT_weights")
-        if ($parts[0] -in $workerRootExcluded -or @($parts | Where-Object { $_ -in $workerRecursiveExcluded }).Count -ne 0) { return $false }
-        if (@($parts | Where-Object { $_ -in $modelDirectories }).Count -ne 0 -or $relative -match "\.(safetensors|ckpt|pth|pt|t7|onnx|bin)/?$") { return $false }
-        if ($parts[-1] -match '^\.env(?:\..+)?$') { return $false }
-        return $true
-    })
-    if ($copiedUntracked.Count -ne 0) {
-        throw "$($Target.component) source is dirty; copied untracked content is not revision-bound: $($copiedUntracked[0])"
-    }
     $submoduleStatus = @(& git -C $Target.root submodule status --recursive 2>&1)
     if ($LASTEXITCODE -ne 0) { throw "$($Target.component) recursive submodule status failed" }
     if (@($submoduleStatus | Where-Object { ([string]$_) -match "^[+-U]" }).Count -ne 0) {
         throw "$($Target.component) recursive submodule revision is not bound to HEAD"
     }
-    $dirtySubmodules = @(& git -C $Target.root submodule foreach --quiet --recursive "git status --porcelain=v1 --untracked-files=all" 2>&1)
+    $dirtySubmodules = @(& git -C $Target.root submodule foreach --quiet --recursive "git status --porcelain=v1 --untracked-files=no" 2>&1)
     if ($LASTEXITCODE -ne 0 -or @($dirtySubmodules | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) }).Count -ne 0) {
         throw "$($Target.component) recursive submodule source is dirty"
     }
@@ -196,6 +160,7 @@ foreach ($target in $targets) {
         throw "$($target.component) source revision drift: expected $($target.expected_revision), found $actualRevision"
     }
     Assert-CleanSourceRepository -Target $target
+    Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("audit-builder-source", "--root", [string]$target.root, "--component", [string]$target.component, "--profile", "Full") -Failure "$($target.component) source dirty: copied untracked source audit failed" | Out-Null
 }
 
 $pathArguments = @("validate-transaction-paths", "--output-root", $OutputRoot, "--controller-root", $Root)

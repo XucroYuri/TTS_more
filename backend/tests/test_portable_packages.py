@@ -2366,8 +2366,48 @@ def _write_full_package_candidate(
         ),
         encoding="utf-8",
     )
-    for suffix in ("spdx.json", "licenses.json", "acceptance.json"):
-        (root / f"{filename}.{suffix}").write_text("{}\n", encoding="utf-8")
+    resolved_binding = resolved_profile if package_profile == "full" else "none"
+    delivery = {
+        "component": component,
+        "version": version,
+        "profile": package_profile,
+        "source_revision": source_revision,
+        "sha256": digest,
+    }
+    if package_profile == "full":
+        delivery["resolved_profile"] = resolved_profile
+    spdx = {
+        "spdxVersion": "SPDX-2.3",
+        "dataLicense": "CC0-1.0",
+        "SPDXID": "SPDXRef-DOCUMENT",
+        "name": package_root,
+        "documentNamespace": f"https://tts-more.local/spdx/{component}/{version}/{digest}",
+        "comment": (
+            "TTS-More delivery binding: "
+            f"component={component};version={version};profile={package_profile};"
+            f"resolved_profile={resolved_binding};source_revision={source_revision};sha256={digest}"
+        ),
+        "creationInfo": {"created": "2026-07-16T00:00:00Z", "creators": ["Tool: fixture"]},
+        "packages": [],
+    }
+    (root / f"{filename}.spdx.json").write_text(json.dumps(spdx), encoding="utf-8")
+    (root / f"{filename}.licenses.json").write_text(
+        json.dumps({"schema_version": 1, "component": component, "packages": [], "delivery": delivery}),
+        encoding="utf-8",
+    )
+    acceptance = {
+        "schema_version": 1,
+        **delivery,
+        "manifest_valid": True,
+        "schema_audit": True,
+        "path_audit": True,
+        "sha256_manifest_audit": True,
+        "bootstrap_audit": package_profile == "bootstrap",
+        "machine_path_scan": True,
+    }
+    (root / f"{filename}.acceptance.json").write_text(
+        json.dumps(acceptance), encoding="utf-8"
+    )
     return archive_path
 
 
@@ -2521,6 +2561,74 @@ def test_select_full_package_binds_expected_source_revision(tmp_path: Path) -> N
 
     assert report["valid"] is False
     assert any("source revision" in error for error in report["errors"])
+
+
+@pytest.mark.parametrize(
+    ("suffix", "payload"),
+    [
+        (
+            "spdx.json",
+            {
+                "spdxVersion": "SPDX-2.3",
+                "dataLicense": "CC0-1.0",
+                "SPDXID": "SPDXRef-DOCUMENT",
+                "name": "foreign-package",
+                "documentNamespace": "not-a-valid-namespace",
+                "comment": "wrong delivery binding",
+                "creationInfo": {"created": "2026-07-16T00:00:00Z", "creators": ["Tool: fixture"]},
+                "packages": [],
+            },
+        ),
+        (
+            "licenses.json",
+            {
+                "schema_version": 1,
+                "component": "gpt-sovits",
+                "packages": [],
+                "delivery": {
+                    "component": "foreign",
+                    "version": "9.9.9",
+                    "profile": "bootstrap",
+                    "source_revision": "b" * 40,
+                    "sha256": "0" * 64,
+                },
+            },
+        ),
+        (
+            "acceptance.json",
+            {
+                "schema_version": 1,
+                "component": "gpt-sovits",
+                "version": "0.2.0",
+                "profile": "full",
+                "source_revision": "f8a5865000000000000000000000000000000000",
+                "sha256": "0" * 64,
+                "manifest_valid": True,
+                "schema_audit": False,
+                "path_audit": True,
+                "sha256_manifest_audit": True,
+                "machine_path_scan": True,
+            },
+        ),
+    ],
+)
+def test_select_full_package_semantically_binds_all_three_json_sidecars(
+    tmp_path: Path, suffix: str, payload: dict[str, object]
+) -> None:
+    packages = _load_portable_packages()
+    archive_path = _write_full_package_candidate(tmp_path)
+    Path(f"{archive_path}.{suffix}").write_text(json.dumps(payload), encoding="utf-8")
+
+    report = packages.select_full_package(
+        [archive_path],
+        expected_component="gpt-sovits",
+        expected_version="0.2.0",
+        requested_profile="auto",
+        expected_source_revision="f8a5865000000000000000000000000000000000",
+    )
+
+    assert report["valid"] is False
+    assert suffix.split(".", 1)[0] in " ".join(report["errors"]).lower()
 
 
 @pytest.mark.parametrize(
@@ -2851,8 +2959,11 @@ shutil.rmtree(stage)
 digest = hashlib.sha256(archive.read_bytes()).hexdigest()
 Path(f"{archive}.sha256").write_text(f"{digest}  {filename}\n", encoding="ascii")
 Path(f"{archive}.provenance.json").write_text(json.dumps({"schema_version": 1, "component": args.component, "version": args.version, "profile": "full", "resolved_profile": resolved, "source_revision": source_revision, "sha256": digest}), encoding="utf-8")
-for suffix in ("spdx.json", "licenses.json", "acceptance.json"):
-    Path(f"{archive}.{suffix}").write_text("{}\n", encoding="utf-8")
+delivery = {"component": args.component, "version": args.version, "profile": "full", "resolved_profile": resolved, "source_revision": source_revision, "sha256": digest}
+spdx = {"spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0", "SPDXID": "SPDXRef-DOCUMENT", "name": filename.removesuffix(".zip"), "documentNamespace": f"https://tts-more.local/spdx/{args.component}/{args.version}/{digest}", "comment": f"TTS-More delivery binding: component={args.component};version={args.version};profile=full;resolved_profile={resolved};source_revision={source_revision};sha256={digest}", "creationInfo": {"created": "2026-07-16T00:00:00Z", "creators": ["Tool: fixture"]}, "packages": []}
+Path(f"{archive}.spdx.json").write_text(json.dumps(spdx), encoding="utf-8")
+Path(f"{archive}.licenses.json").write_text(json.dumps({"schema_version": 1, "component": args.component, "packages": [], "delivery": delivery}), encoding="utf-8")
+Path(f"{archive}.acceptance.json").write_text(json.dumps({"schema_version": 1, **delivery, "manifest_valid": True, "schema_audit": True, "path_audit": True, "sha256_manifest_audit": True, "bootstrap_audit": False, "machine_path_scan": True}), encoding="utf-8")
 if args.mode == "duplicate":
     duplicate = args.output / f"duplicate-{args.component}.zip"
     shutil.copy2(archive, duplicate)
@@ -3045,6 +3156,70 @@ def test_four_pack_rejects_untracked_worker_source_that_builder_would_copy(tmp_p
     assert completed.returncode != 0
     assert "dirty" in (completed.stdout + completed.stderr).lower()
     assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("profile", "relative"),
+    (("bootstrap", "models/private.txt"), ("full", "pretrained_models/extra.dat")),
+)
+def test_builder_source_audit_rejects_unlocked_files_in_model_named_paths(
+    tmp_path: Path, profile: str, relative: str
+) -> None:
+    packages = _load_portable_packages()
+    root = tmp_path / "worker"
+    lock = root / "tts_more" / "locks" / "models.lock.json"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(
+        json.dumps({"schema_version": 1, "component": "gpt-sovits", "assets": []}),
+        encoding="utf-8",
+    )
+    _initialize_git_repository(root)
+    extra = root / relative
+    extra.parent.mkdir(parents=True, exist_ok=True)
+    extra.write_text("not a locked model asset\n", encoding="utf-8")
+
+    report = packages.audit_builder_source(root, component="gpt-sovits", profile=profile)
+
+    assert report["valid"] is False
+    assert relative in " ".join(report["errors"])
+
+
+def test_builder_source_audit_allows_only_exact_locked_full_model_payloads(tmp_path: Path) -> None:
+    packages = _load_portable_packages()
+    root = tmp_path / "worker"
+    payload = b"locked model payload\n"
+    target = "pretrained_models/model.bin"
+    lock = root / "tts_more" / "locks" / "models.lock.json"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "component": "gpt-sovits",
+                "assets": [
+                    {"target": target, "sha256": hashlib.sha256(payload).hexdigest()}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _initialize_git_repository(root)
+    model = root / target
+    model.parent.mkdir(parents=True)
+    model.write_bytes(payload)
+    for relative in (
+        "runtime/live/python.exe",
+        "data/user/voice.wav",
+        "cache/download.bin",
+        "artifacts/old.zip",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"ignored local asset")
+
+    report = packages.audit_builder_source(root, component="gpt-sovits", profile="full")
+
+    assert report["valid"] is True, report["errors"]
 
 
 @pytest.mark.parametrize("mode", ("mutate-earlier", "delete-earlier", "inject"))
@@ -3277,6 +3452,20 @@ def test_portable_release_workflow_passes_expected_component_and_version() -> No
     assert workflow.count("--expected-component tts-more") == 2
     assert workflow.count("--expected-version") >= 2
     assert "$candidateZips[0]" not in workflow
+
+
+def test_portable_release_workflow_fails_closed_on_existing_remote_extra_assets() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "portable-release.yml").read_text(
+        encoding="utf-8"
+    )
+    publish = workflow.split("- name: Publish bootstrap assets only", 1)[1]
+
+    remote_query = "gh release view \"$GITHUB_REF_NAME\" --json assets --jq '.assets[].name'"
+    assert remote_query in publish
+    assert "remote_asset_names" in publish and "local_asset_names" in publish
+    assert "comm -23" in publish
+    assert publish.index(remote_query) < publish.index("gh release upload")
+    assert "release delete-asset" not in publish
 
 
 def test_validate_manifest_rejects_invalid_v2_profile_and_nested_absolute_paths(tmp_path: Path) -> None:

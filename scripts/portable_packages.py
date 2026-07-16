@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import struct
+import subprocess
 import time
 import unicodedata
 import uuid
@@ -272,6 +273,15 @@ def select_full_package(
         for key, expected in expected_provenance.items():
             if provenance.get(key) != expected:
                 raise ValueError(f"full ZIP provenance {key} mismatch")
+        _validate_delivery_sidecars(
+            path,
+            component=expected_component,
+            version=expected_version,
+            profile="full",
+            resolved_profile=resolved,
+            source_revision=source_revision,
+            sha256=actual_sha,
+        )
         report.update(
             {
                 "valid": True,
@@ -279,6 +289,7 @@ def select_full_package(
                 "resolved_profile": resolved,
                 "sha256": actual_sha,
                 "source_revision": source_revision,
+                "sidecars_valid": True,
             }
         )
     except (
@@ -304,6 +315,105 @@ def _portable_schema_path() -> Path:
     if len(found) != 1:
         raise ValueError("portable package schema is missing or ambiguous")
     return found[0]
+
+
+def _delivery_comment(
+    *,
+    component: str,
+    version: str,
+    profile: str,
+    resolved_profile: str | None,
+    source_revision: str,
+    sha256: str,
+) -> str:
+    resolved = resolved_profile or "none"
+    return (
+        "TTS-More delivery binding: "
+        f"component={component};version={version};profile={profile};"
+        f"resolved_profile={resolved};source_revision={source_revision};sha256={sha256}"
+    )
+
+
+def _validate_delivery_sidecars(
+    path: Path,
+    *,
+    component: str,
+    version: str,
+    profile: str,
+    resolved_profile: str | None,
+    source_revision: str,
+    sha256: str,
+) -> None:
+    def read_json(suffix: str) -> dict[str, Any]:
+        try:
+            payload = json.loads(Path(f"{path}.{suffix}").read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{suffix} sidecar is missing or invalid") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"{suffix} sidecar must be a JSON object")
+        return payload
+
+    spdx = read_json("spdx.json")
+    expected_namespace = f"https://tts-more.local/spdx/{component}/{version}/{sha256}"
+    creation = _mapping(spdx.get("creationInfo"))
+    creators = creation.get("creators")
+    if (
+        spdx.get("spdxVersion") != "SPDX-2.3"
+        or spdx.get("dataLicense") != "CC0-1.0"
+        or spdx.get("SPDXID") != "SPDXRef-DOCUMENT"
+        or spdx.get("name") != path.name.removesuffix(".zip")
+        or spdx.get("documentNamespace") != expected_namespace
+        or spdx.get("comment")
+        != _delivery_comment(
+            component=component,
+            version=version,
+            profile=profile,
+            resolved_profile=resolved_profile,
+            source_revision=source_revision,
+            sha256=sha256,
+        )
+        or not isinstance(creation.get("created"), str)
+        or not creation.get("created")
+        or not isinstance(creators, list)
+        or not creators
+        or not isinstance(spdx.get("packages"), list)
+    ):
+        raise ValueError("spdx sidecar delivery binding or SPDX document metadata mismatch")
+
+    licenses = read_json("licenses.json")
+    license_delivery = _mapping(licenses.get("delivery"))
+    expected_binding: dict[str, object] = {
+        "component": component,
+        "version": version,
+        "profile": profile,
+        "source_revision": source_revision,
+        "sha256": sha256,
+    }
+    if resolved_profile is not None:
+        expected_binding["resolved_profile"] = resolved_profile
+    if (
+        licenses.get("schema_version") != 1
+        or licenses.get("component") != component
+        or any(license_delivery.get(key) != value for key, value in expected_binding.items())
+    ):
+        raise ValueError("licenses sidecar delivery binding mismatch")
+
+    acceptance = read_json("acceptance.json")
+    acceptance_binding = dict(expected_binding)
+    required_flags = (
+        "manifest_valid",
+        "schema_audit",
+        "path_audit",
+        "sha256_manifest_audit",
+        "machine_path_scan",
+    )
+    if (
+        acceptance.get("schema_version") != 1
+        or any(acceptance.get(key) != value for key, value in acceptance_binding.items())
+        or any(acceptance.get(flag) is not True for flag in required_flags)
+        or acceptance.get("bootstrap_audit") is not (profile == "bootstrap")
+    ):
+        raise ValueError("acceptance sidecar identity or required audit flags mismatch")
 
 
 def _validate_embedded_v2_package(
@@ -589,6 +699,15 @@ def audit_release_assets(
             for key, expected in expected_provenance.items():
                 if provenance.get(key) != expected:
                     raise ValueError(f"release ZIP provenance {key} mismatch: {path.name}")
+            _validate_delivery_sidecars(
+                path,
+                component=component,
+                version=version,
+                profile="bootstrap",
+                resolved_profile=None,
+                source_revision=source_revision,
+                sha256=actual_sha,
+            )
         actual_files = {path.name for path in files}
         if expected_files and actual_files != expected_files:
             missing = sorted(expected_files - actual_files)
@@ -726,6 +845,225 @@ def cleanup_owned_directory(path: Path, *, expected_identity: str) -> None:
             if attempt == 9:
                 raise
             time.sleep(0.05)
+
+
+def _git_output(root: Path, *arguments: str, allow_empty_failure: bool = False) -> str:
+    completed = subprocess.run(
+        ["git", "-C", os.fspath(root), *arguments],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        if allow_empty_failure and not completed.stdout.strip():
+            return ""
+        raise ValueError(f"Git source inventory failed: {' '.join(arguments)}")
+    return completed.stdout
+
+
+def _controller_builder_includes(relative: str) -> bool:
+    relative = relative.replace("\\", "/")
+    parts = relative.rstrip("/").split("/")
+    if any(
+        part in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+        for part in parts
+    ):
+        return False
+    if relative.startswith(("backend/app/", "frontend/dist/")):
+        return True
+    copied_files = {
+        "backend/pyproject.toml",
+        "backend/uv.lock",
+        "backend/.python-version",
+        "Initialize.cmd",
+        "Start.cmd",
+        "Stop.cmd",
+        "Repair.cmd",
+        "LICENSE",
+        "NOTICE",
+        "repo.lock.json",
+        "packaging/portable/toolchain.lock.json",
+        "packaging/portable/runtime.lock.json",
+        "packaging/portable/models.lock.json",
+        "packaging/portable/tts-more-package.schema.json",
+        "packaging/portable/error-catalog.zh-CN.json",
+        "packaging/portable/使用说明-先看这里.txt",
+    }
+    copied_scripts = {
+        "bootstrap-conda.ps1",
+        "initialize-portable.ps1",
+        "repair-portable.ps1",
+        "start-production.ps1",
+        "stop-production.ps1",
+        "Invoke-PortableStart.ps1",
+        "Show-PortableProgress.ps1",
+        "Portable-Validation.ps1",
+        "select-portable-folder.ps1",
+        "export-portable-diagnostics.py",
+        "import-portable-data.py",
+        "import_portable_data.py",
+        "portable_install.py",
+        "portable_launcher.py",
+        "portable_operations.py",
+        "portable_packages.py",
+        "portable_package_runner.py",
+    }
+    return relative in copied_files or (
+        relative.startswith("scripts/") and relative[8:] in copied_scripts
+    )
+
+
+def _worker_builder_excludes(relative: str, profile: str) -> bool:
+    parts = relative.replace("\\", "/").rstrip("/").split("/")
+    root_excluded = {
+        ".git",
+        ".venv",
+        "runtime",
+        "data",
+        "artifacts",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+    recursive_excluded = {
+        ".git",
+        ".venv",
+        "artifacts",
+        "cache",
+        ".cache",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+    if parts[0] in root_excluded or any(part in recursive_excluded for part in parts):
+        return True
+    if re.fullmatch(r"\.env(?:\..+)?", parts[-1]):
+        return True
+    if any(part in {"SoVITS_weights", "GPT_weights"} for part in parts):
+        return True
+    if profile == "bootstrap" and (
+        any(part in {"pretrained_models", "checkpoints"} for part in parts)
+        or re.search(r"\.(safetensors|ckpt|pth|pt|t7|onnx|bin)$", parts[-1], re.IGNORECASE)
+    ):
+        return True
+    return False
+
+
+def _model_candidate(relative: str) -> bool:
+    parts = relative.replace("\\", "/").split("/")
+    return any(
+        part in {"models", "pretrained_models", "checkpoints"} for part in parts
+    ) or re.search(
+        r"\.(safetensors|ckpt|pth|pt|t7|onnx|bin)$", parts[-1], re.IGNORECASE
+    ) is not None
+
+
+def _locked_model_assets(root: Path, component: str) -> dict[str, str]:
+    if component == "tts-more":
+        lock_path = root / "packaging" / "portable" / "models.lock.json"
+    else:
+        lock_path = root / "tts_more" / "locks" / "models.lock.json"
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    locked: dict[str, str] = {}
+    for asset in payload.get("assets", []):
+        if not isinstance(asset, dict):
+            continue
+        target = asset.get("target")
+        digest = asset.get("sha256")
+        if (
+            isinstance(target, str)
+            and _is_relative_package_path(target)
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", digest)
+        ):
+            locked[_canonical_relative_path(target)] = digest.casefold()
+    return locked
+
+
+def _untracked_repository_entries(root: Path) -> list[str]:
+    output = _git_output(root, "ls-files", "--others", "--directory", "-z")
+    return [entry for entry in output.split("\0") if entry]
+
+
+def _submodule_paths(root: Path) -> list[str]:
+    output = _git_output(
+        root,
+        "config",
+        "--file",
+        ".gitmodules",
+        "--get-regexp",
+        r"^submodule\..*\.path$",
+        allow_empty_failure=True,
+    )
+    paths: list[str] = []
+    for line in output.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) == 2 and _is_relative_package_path(fields[1]):
+            paths.append(fields[1].replace("\\", "/"))
+    return paths
+
+
+def audit_builder_source(root: Path, *, component: str, profile: str) -> dict[str, object]:
+    """Audit ignored and untracked files using the active package builder's copy rules."""
+    errors: list[str] = []
+    root = root.resolve(strict=True)
+    normalized_profile = profile.casefold()
+    if component not in PORTABLE_COMPONENTS or normalized_profile not in {"bootstrap", "full"}:
+        return {"valid": False, "errors": ["builder source audit identity is invalid"]}
+    locked = _locked_model_assets(root, component)
+
+    def inspect_repository(repository: Path, prefix: str = "") -> None:
+        for entry in _untracked_repository_entries(repository):
+            combined = f"{prefix}/{entry}".strip("/").replace("\\", "/")
+            if component == "tts-more":
+                if _controller_builder_includes(combined):
+                    errors.append(f"copied untracked source is not revision-bound: {combined}")
+                continue
+            if _worker_builder_excludes(combined, normalized_profile):
+                continue
+            candidates: list[tuple[str, Path]] = []
+            candidate_path = repository / entry.rstrip("/")
+            if entry.endswith("/") and _model_candidate(combined):
+                for directory, directory_names, file_names in os.walk(candidate_path):
+                    directory_names[:] = [
+                        name
+                        for name in directory_names
+                        if not (Path(directory) / name).is_symlink()
+                    ]
+                    for filename in file_names:
+                        path = Path(directory) / filename
+                        relative = path.relative_to(root).as_posix()
+                        if not _worker_builder_excludes(relative, normalized_profile):
+                            candidates.append((relative, path))
+            elif not entry.endswith("/"):
+                candidates.append((combined, candidate_path))
+            else:
+                errors.append(f"copied untracked source is not revision-bound: {combined}")
+                continue
+            for relative, path in candidates:
+                if not _model_candidate(relative):
+                    errors.append(f"copied untracked source is not revision-bound: {relative}")
+                    continue
+                expected = locked.get(_canonical_relative_path(relative))
+                if expected is None or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                    errors.append(f"unlocked or modified model asset would be embedded: {relative}")
+        for submodule in _submodule_paths(repository):
+            submodule_root = repository / submodule
+            if submodule_root.is_dir():
+                inspect_repository(submodule_root, f"{prefix}/{submodule}".strip("/"))
+
+    try:
+        inspect_repository(root)
+    except (OSError, ValueError) as exc:
+        errors.append(str(exc))
+    return {"valid": not errors, "errors": errors, "root": str(root)}
 
 
 def _audit_v2_user_layout(
@@ -1106,6 +1444,10 @@ def main(argv: list[str] | None = None) -> int:
     cleanup = subcommands.add_parser("cleanup-directory")
     cleanup.add_argument("--path", required=True, type=Path)
     cleanup.add_argument("--expected-identity", required=True)
+    audit_source = subcommands.add_parser("audit-builder-source")
+    audit_source.add_argument("--root", required=True, type=Path)
+    audit_source.add_argument("--component", required=True)
+    audit_source.add_argument("--profile", required=True)
     verify_sums = subcommands.add_parser("verify-sha256")
     verify_sums.add_argument("--package-root", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -1172,6 +1514,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "cleanup-directory":
         cleanup_owned_directory(args.path, expected_identity=args.expected_identity)
         return 0
+    if args.command == "audit-builder-source":
+        report = audit_builder_source(
+            args.root,
+            component=args.component,
+            profile=args.profile,
+        )
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 0 if report["valid"] else 1
     if args.command == "verify-sha256":
         report = verify_sha256_manifest(args.package_root)
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))

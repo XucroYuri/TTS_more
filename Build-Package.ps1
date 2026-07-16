@@ -449,6 +449,8 @@ if ($Profile -eq "Full") {
 }
 & $python (Join-Path $stage "scripts\portable_packages.py") validate-manifest --manifest (Join-Path $stage "package\tts-more-package.json") --package-root $stage
 if ($LASTEXITCODE -ne 0) { throw "staged package manifest failed schema v2 validation" }
+& $python (Join-Path $stage "scripts\portable_packages.py") verify-sha256 --package-root $stage
+if ($LASTEXITCODE -ne 0) { throw "staged package SHA256SUMS exact coverage validation failed" }
 
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 $zip = Join-Path $OutputRoot "$packageName.zip"
@@ -472,9 +474,17 @@ foreach ($match in [regex]::Matches($lockText, '(?ms)\[\[package\]\]\s+name\s*=\
     $spdxId = ($match.Groups[1].Value -replace '[^A-Za-z0-9.-]', '-')
     $packages += @{ SPDXID="SPDXRef-Package-$spdxId"; name=$match.Groups[1].Value; versionInfo=$match.Groups[2].Value; downloadLocation="NOASSERTION"; filesAnalyzed=$false }
 }
-@{ spdxVersion="SPDX-2.3"; dataLicense="CC0-1.0"; SPDXID="SPDXRef-DOCUMENT"; name=$packageName; documentNamespace="https://tts-more.local/spdx/tts-more/$Version/$zipSha"; creationInfo=@{created=[DateTime]::UtcNow.ToString("o");creators=@("Tool: TTS-More-Build-Package-2.0.0")}; packages=$packages } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$zip.spdx.json" -Encoding UTF8
-Copy-Item -LiteralPath (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json") -Destination "$zip.licenses.json"
-@{ schema_version=1; component="tts-more"; profile=$profileName; manifest_valid=$true; bootstrap_audit=$auditPassed; machine_path_scan=$true; generated_at=[DateTime]::UtcNow.ToString("o") } | ConvertTo-Json | Set-Content -LiteralPath "$zip.acceptance.json" -Encoding UTF8
+$deliveryResolvedProfile = if ($Profile -eq "Full") { "cpu" } else { "none" }
+$deliveryComment = "TTS-More delivery binding: component=tts-more;version=$Version;profile=$profileName;resolved_profile=$deliveryResolvedProfile;source_revision=$revision;sha256=$zipSha"
+@{ spdxVersion="SPDX-2.3"; dataLicense="CC0-1.0"; SPDXID="SPDXRef-DOCUMENT"; name=$packageName; documentNamespace="https://tts-more.local/spdx/tts-more/$Version/$zipSha"; comment=$deliveryComment; creationInfo=@{created=[DateTime]::UtcNow.ToString("o");creators=@("Tool: TTS-More-Build-Package-2.0.0")}; packages=$packages } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$zip.spdx.json" -Encoding UTF8
+$licenseSidecar = Get-Content -LiteralPath (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json") -Raw | ConvertFrom-Json
+$licenseDelivery = [ordered]@{ component="tts-more"; version=$Version; profile=$profileName; source_revision=$revision; sha256=$zipSha }
+if ($Profile -eq "Full") { $licenseDelivery.resolved_profile = "cpu" }
+$licenseSidecar | Add-Member -NotePropertyName delivery -NotePropertyValue $licenseDelivery -Force
+$licenseSidecar | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath "$zip.licenses.json" -Encoding UTF8
+$acceptance = [ordered]@{ schema_version=1; component="tts-more"; version=$Version; profile=$profileName; source_revision=$revision; sha256=$zipSha; manifest_valid=$true; schema_audit=$true; path_audit=$true; sha256_manifest_audit=$true; bootstrap_audit=$auditPassed; machine_path_scan=$true; generated_at=[DateTime]::UtcNow.ToString("o") }
+if ($Profile -eq "Full") { $acceptance.resolved_profile = "cpu" }
+$acceptance | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$zip.acceptance.json" -Encoding UTF8
 Write-Host "Created $Profile package: $zip"
 }
 finally {

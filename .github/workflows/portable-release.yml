@@ -162,5 +162,29 @@ jobs:
             release-assets/*.zip.provenance.json
             release-assets/*.zip.acceptance.json
           )
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          mapfile -t local_asset_names < <(printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort -u)
+          if [ "${#local_asset_names[@]}" -ne 6 ]; then
+            echo "local Bootstrap release allowlist must contain exactly six assets" >&2
+            exit 1
+          fi
+          remote_asset_names=()
+          release_exists=false
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            release_exists=true
+            mapfile -t remote_asset_names < <(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | LC_ALL=C sort -u)
+            unexpected_remote="$(comm -23 <(printf '%s\n' "${remote_asset_names[@]}") <(printf '%s\n' "${local_asset_names[@]}"))"
+            if [ -n "$unexpected_remote" ]; then
+              echo "existing GitHub Release has foreign, Full, old-version, or extra assets:" >&2
+              printf '%s\n' "$unexpected_remote" >&2
+              exit 1
+            fi
+          fi
+          mapfile -t post_upload_union < <(printf '%s\n' "${local_asset_names[@]}" "${remote_asset_names[@]}" | LC_ALL=C sort -u)
+          if ! diff -u <(printf '%s\n' "${local_asset_names[@]}") <(printf '%s\n' "${post_upload_union[@]}"); then
+            echo "GitHub Release asset union would exceed the exact local six-asset allowlist" >&2
+            exit 1
+          fi
+          if [ "$release_exists" != true ]; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          fi
           gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
