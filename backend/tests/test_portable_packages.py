@@ -3222,6 +3222,35 @@ def test_builder_source_audit_allows_only_exact_locked_full_model_payloads(tmp_p
     assert report["valid"] is True, report["errors"]
 
 
+def test_builder_source_audit_applies_nested_cache_and_env_exclusions_per_file(
+    tmp_path: Path,
+) -> None:
+    packages = _load_portable_packages()
+    root = tmp_path / "worker"
+    lock = root / "tts_more" / "locks" / "models.lock.json"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(
+        json.dumps({"schema_version": 1, "component": "gpt-sovits", "assets": []}),
+        encoding="utf-8",
+    )
+    _initialize_git_repository(root)
+    for relative in ("scratch/cache/only.tmp", "scratch/config/.env.local"):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("builder excluded\n", encoding="utf-8")
+
+    report = packages.audit_builder_source(root, component="gpt-sovits", profile="full")
+
+    assert report["valid"] is True, report["errors"]
+
+    ordinary = root / "scratch" / "ordinary.txt"
+    ordinary.write_text("builder copies this\n", encoding="utf-8")
+    report = packages.audit_builder_source(root, component="gpt-sovits", profile="full")
+
+    assert report["valid"] is False
+    assert "scratch/ordinary.txt" in " ".join(report["errors"])
+
+
 @pytest.mark.parametrize("mode", ("mutate-earlier", "delete-earlier", "inject"))
 def test_four_pack_revalidates_final_asset_set_before_publication(tmp_path: Path, mode: str) -> None:
     if POWERSHELL is None:

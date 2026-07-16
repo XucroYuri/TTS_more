@@ -988,7 +988,7 @@ def _locked_model_assets(root: Path, component: str) -> dict[str, str]:
 
 
 def _untracked_repository_entries(root: Path) -> list[str]:
-    output = _git_output(root, "ls-files", "--others", "--directory", "-z")
+    output = _git_output(root, "ls-files", "--others", "-z")
     return [entry for entry in output.split("\0") if entry]
 
 
@@ -1028,32 +1028,15 @@ def audit_builder_source(root: Path, *, component: str, profile: str) -> dict[st
                 continue
             if _worker_builder_excludes(combined, normalized_profile):
                 continue
-            candidates: list[tuple[str, Path]] = []
             candidate_path = repository / entry.rstrip("/")
-            if entry.endswith("/") and _model_candidate(combined):
-                for directory, directory_names, file_names in os.walk(candidate_path):
-                    directory_names[:] = [
-                        name
-                        for name in directory_names
-                        if not (Path(directory) / name).is_symlink()
-                    ]
-                    for filename in file_names:
-                        path = Path(directory) / filename
-                        relative = path.relative_to(root).as_posix()
-                        if not _worker_builder_excludes(relative, normalized_profile):
-                            candidates.append((relative, path))
-            elif not entry.endswith("/"):
-                candidates.append((combined, candidate_path))
-            else:
+            if candidate_path.is_symlink():
+                continue
+            if not _model_candidate(combined):
                 errors.append(f"copied untracked source is not revision-bound: {combined}")
                 continue
-            for relative, path in candidates:
-                if not _model_candidate(relative):
-                    errors.append(f"copied untracked source is not revision-bound: {relative}")
-                    continue
-                expected = locked.get(_canonical_relative_path(relative))
-                if expected is None or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-                    errors.append(f"unlocked or modified model asset would be embedded: {relative}")
+            expected = locked.get(_canonical_relative_path(combined))
+            if expected is None or hashlib.sha256(candidate_path.read_bytes()).hexdigest() != expected:
+                errors.append(f"unlocked or modified model asset would be embedded: {combined}")
         for submodule in _submodule_paths(repository):
             submodule_root = repository / submodule
             if submodule_root.is_dir():
