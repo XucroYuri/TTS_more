@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 import io
+import subprocess
 import wave
 from pathlib import Path
 
@@ -165,6 +166,11 @@ def test_worker_runtime_reports_and_releases_cuda_memory(monkeypatch) -> None:
             return 1024, 2048
 
         @staticmethod
+        def get_device_properties(index: int):
+            assert index == 1
+            return types.SimpleNamespace(uuid="GPU-logical-one")
+
+        @staticmethod
         def empty_cache() -> None:
             calls.append("empty_cache")
 
@@ -178,11 +184,9 @@ def test_worker_runtime_reports_and_releases_cuda_memory(monkeypatch) -> None:
         types.SimpleNamespace(cuda=FakeCuda(), version=types.SimpleNamespace(cuda="12.8")),
     )
     monkeypatch.setattr(
-        runtime.subprocess,
+        subprocess,
         "run",
-        lambda *args, **kwargs: __import__("subprocess").CompletedProcess(
-            args[0], 0, stdout="0, GPU-zero\n1, GPU-one\n", stderr=""
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker status must not spawn nvidia-smi")),
     )
     runtime._DEVICE_UUID_CACHE.clear()
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -193,7 +197,7 @@ def test_worker_runtime_reports_and_releases_cuda_memory(monkeypatch) -> None:
 
     assert payload == {
         "device": "cuda:1",
-        "device_uuid": "GPU-one",
+        "device_uuid": "GPU-logical-one",
         "cuda_runtime": "12.8",
         "loaded": True,
         "model": "demo",
@@ -207,10 +211,8 @@ def test_worker_runtime_reports_and_releases_cuda_memory(monkeypatch) -> None:
     assert calls == ["gc", "empty_cache", "ipc_collect"]
 
 
-def test_worker_uuid_probe_uses_noninteractive_subprocess_kwargs(monkeypatch) -> None:
+def test_worker_uuid_probe_uses_torch_properties_without_spawning(monkeypatch) -> None:
     from app.workers import runtime
-
-    captured: dict[str, object] = {}
 
     class FakeCuda:
         is_available = staticmethod(lambda: True)
@@ -218,28 +220,27 @@ def test_worker_uuid_probe_uses_noninteractive_subprocess_kwargs(monkeypatch) ->
         memory_allocated = staticmethod(lambda _index: 0)
         memory_reserved = staticmethod(lambda _index: 0)
         mem_get_info = staticmethod(lambda _index: (1024, 2048))
-
-    def fake_run(command, **kwargs):
-        captured.update(kwargs)
-        return __import__("subprocess").CompletedProcess(command, 0, stdout="0, GPU-test\n", stderr="")
+        get_device_properties = staticmethod(lambda index: types.SimpleNamespace(uuid=f"GPU-logical-{index}"))
 
     monkeypatch.setitem(
         sys.modules,
         "torch",
         types.SimpleNamespace(cuda=FakeCuda(), version=types.SimpleNamespace(cuda="12.8")),
     )
-    monkeypatch.setattr(runtime, "noninteractive_subprocess_kwargs", lambda: {"creationflags": 0x08000000})
-    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker status must not spawn nvidia-smi")),
+    )
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     runtime._DEVICE_UUID_CACHE.clear()
 
     status = runtime.worker_runtime_status(loaded=False, model=None)
 
-    assert captured["creationflags"] == 0x08000000
-    assert status["device_uuid"] == "GPU-test"
+    assert status["device_uuid"] == "GPU-logical-0"
 
 
-def test_worker_runtime_maps_visible_and_explicit_cuda_devices_to_physical_uuid(monkeypatch) -> None:
+def test_worker_runtime_maps_visible_devices_by_torch_logical_index_without_spawning(monkeypatch) -> None:
     from app.workers import runtime
 
     class FakeCuda:
@@ -254,6 +255,7 @@ def test_worker_runtime_maps_visible_and_explicit_cuda_devices_to_physical_uuid(
         memory_allocated = staticmethod(lambda _index: 0)
         memory_reserved = staticmethod(lambda _index: 0)
         mem_get_info = staticmethod(lambda _index: (1024, 2048))
+        get_device_properties = staticmethod(lambda index: types.SimpleNamespace(uuid=f"GPU-logical-{index}"))
 
     monkeypatch.setitem(
         sys.modules,
@@ -262,22 +264,20 @@ def test_worker_runtime_maps_visible_and_explicit_cuda_devices_to_physical_uuid(
     )
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
     monkeypatch.setattr(
-        runtime.subprocess,
+        subprocess,
         "run",
-        lambda *args, **kwargs: __import__("subprocess").CompletedProcess(
-            args[0], 0, stdout="1, GPU-one\n3, GPU-three\n", stderr=""
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker status must not spawn nvidia-smi")),
     )
     runtime._DEVICE_UUID_CACHE.clear()
 
     current = runtime.worker_runtime_status(loaded=False, model=None)
     hinted = runtime.worker_runtime_status(loaded=False, model=None, device_hint="cuda:1")
 
-    assert current["device_uuid"] == "GPU-three"
-    assert hinted["device_uuid"] == "GPU-one"
+    assert current["device_uuid"] == "GPU-logical-0"
+    assert hinted["device_uuid"] == "GPU-logical-1"
 
 
-def test_worker_runtime_expands_visible_gpu_uuid_prefix(monkeypatch) -> None:
+def test_worker_runtime_uses_visible_gpu_uuid_prefix_when_torch_properties_are_unavailable(monkeypatch) -> None:
     from app.workers import runtime
 
     class FakeCuda:
@@ -286,6 +286,7 @@ def test_worker_runtime_expands_visible_gpu_uuid_prefix(monkeypatch) -> None:
         memory_allocated = staticmethod(lambda _index: 0)
         memory_reserved = staticmethod(lambda _index: 0)
         mem_get_info = staticmethod(lambda _index: (1024, 2048))
+        get_device_properties = staticmethod(lambda _index: (_ for _ in ()).throw(RuntimeError("unavailable")))
 
     monkeypatch.setitem(
         sys.modules,
@@ -294,17 +295,15 @@ def test_worker_runtime_expands_visible_gpu_uuid_prefix(monkeypatch) -> None:
     )
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abcdef")
     monkeypatch.setattr(
-        runtime.subprocess,
+        subprocess,
         "run",
-        lambda *args, **kwargs: __import__("subprocess").CompletedProcess(
-            args[0], 0, stdout="0, GPU-abcdef1234567890\n", stderr=""
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker status must not spawn nvidia-smi")),
     )
     runtime._DEVICE_UUID_CACHE.clear()
 
     status = runtime.worker_runtime_status(loaded=False, model=None)
 
-    assert status["device_uuid"] == "GPU-abcdef1234567890"
+    assert status["device_uuid"] == "GPU-abcdef"
 
 
 def test_gpt_unloaded_status_preserves_cuda_runtime_device(monkeypatch) -> None:

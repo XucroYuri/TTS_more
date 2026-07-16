@@ -31,6 +31,13 @@ def _read_repo_text(relative_path: str) -> str:
     return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
 
 
+def test_prepare_models_uses_cim_instead_of_nvidia_smi_for_gpu_preflight() -> None:
+    script = _read_repo_text("scripts/prepare-models.ps1")
+
+    assert "Get-CimInstance Win32_VideoController" in script
+    assert "nvidia-smi" not in script.casefold()
+
+
 def _powershell_blocks(relative_path: str) -> list[tuple[int, str]]:
     text = _read_repo_text(relative_path)
     blocks = []

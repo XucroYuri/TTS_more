@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
+import subprocess
 import time
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -1555,6 +1557,32 @@ def test_startup_checks_include_hardware_and_service_diagnostics(tmp_path: Path)
     assert "hardware" in payload
     assert "services" in payload
     assert payload["service_mode"] in {"mock", "real"}
+
+
+def test_status_endpoints_never_launch_nvidia_smi(tmp_path: Path, monkeypatch) -> None:
+    from app import hardware
+
+    powershell = tmp_path / "powershell.exe"
+    powershell.touch()
+    commands: list[list[str]] = []
+
+    def guarded_run(command, **_kwargs):
+        commands.append(command)
+        executable = Path(str(command[0])).name.casefold()
+        if executable in {"nvidia-smi", "nvidia-smi.exe"}:
+            raise AssertionError("status endpoints must not launch nvidia-smi")
+        return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(hardware, "sys", SimpleNamespace(platform="win32"), raising=False)
+    monkeypatch.setattr(hardware, "_video_controllers_cache_path", lambda: tmp_path / "missing.json", raising=False)
+    monkeypatch.setattr(hardware, "_fixed_windows_powershell_path", lambda: powershell, raising=False)
+    monkeypatch.setattr(hardware, "shutil", SimpleNamespace(which=lambda _name: "nvidia-smi.exe"), raising=False)
+    monkeypatch.setattr(hardware.subprocess, "run", guarded_run)
+    client = TestClient(create_app(data_root=tmp_path))
+
+    assert client.get("/api/services/status").status_code == 200
+    assert client.get("/api/startup/checks").status_code == 200
+    assert all(Path(str(command[0])).name.casefold() not in {"nvidia-smi", "nvidia-smi.exe"} for command in commands)
 
 
 def test_generate_routes_task_to_service_endpoint(tmp_path: Path) -> None:
