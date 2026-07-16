@@ -602,31 +602,55 @@ function Copy-FixtureDirectoryFiltered {
     }
 }
 
+function Copy-FixturePythonStdlib {
+    param([Parameter(Mandatory = $true)][string]$Destination)
+    $libRoot = Join-Path $FixtureBasePrefix "Lib"
+    if (!(Test-Path -LiteralPath $libRoot -PathType Container)) {
+        Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base runtime stdlib is missing"
+    }
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    foreach ($file in @(Get-ChildItem -LiteralPath $libRoot -File -Force)) {
+        if ($file.Extension -in @(".py", ".txt")) {
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $Destination $file.Name) -Force
+        }
+    }
+    foreach ($directory in @("collections", "ctypes", "email", "encodings", "html", "http", "importlib", "json", "re", "urllib", "xml")) {
+        Copy-FixtureDirectoryFiltered -Source (Join-Path $libRoot $directory) -Destination (Join-Path $Destination $directory) -SkipDirectories @("__pycache__", "test", "tests")
+    }
+}
+
 function Copy-FixturePythonRuntime {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
         [Parameter(Mandatory = $true)][string]$Destination
     )
     $seed = Join-Path $Root "data\local\fixture\python-seed"
-    if (!(Test-Path -LiteralPath (Join-Path $seed "python.exe") -PathType Leaf)) {
-        if (Test-Path -LiteralPath $seed) { Remove-Item -LiteralPath $seed -Recurse -Force }
-        New-Item -ItemType Directory -Force -Path $seed | Out-Null
-        foreach ($file in @("python.exe", "python311.dll")) {
-            $source = Join-Path $FixtureBasePrefix $file
-            if (!(Test-Path -LiteralPath $source -PathType Leaf)) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base runtime file is missing" }
-            Copy-Item -LiteralPath $source -Destination (Join-Path $seed $file) -Force
+    try {
+        if (!(Test-Path -LiteralPath (Join-Path $seed "python.exe") -PathType Leaf)) {
+            if (Test-Path -LiteralPath $seed) { Remove-Item -LiteralPath $seed -Recurse -Force }
+            New-Item -ItemType Directory -Force -Path $seed | Out-Null
+            foreach ($file in @("python.exe", "python311.dll")) {
+                $source = Join-Path $FixtureBasePrefix $file
+                if (!(Test-Path -LiteralPath $source -PathType Leaf)) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base runtime file is missing" }
+                Copy-Item -LiteralPath $source -Destination (Join-Path $seed $file) -Force
+            }
+            foreach ($pattern in @("*.dll", "*.pyd")) {
+                foreach ($runtimeFile in @(Get-ChildItem -LiteralPath $FixtureBasePrefix -Filter $pattern -File -ErrorAction SilentlyContinue)) {
+                    Copy-Item -LiteralPath $runtimeFile.FullName -Destination (Join-Path $seed $runtimeFile.Name) -Force
+                }
+            }
+            Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "DLLs") -Destination (Join-Path $seed "DLLs") -SkipDirectories @("__pycache__") -Optional
+            Copy-FixturePythonStdlib -Destination (Join-Path $seed "Lib")
+            New-Item -ItemType Directory -Force -Path (Join-Path $seed "Scripts") | Out-Null
+            Write-FixtureUvExe -Path (Join-Path $seed "Scripts\uv.exe")
+            Write-FixturePythonPackages -RuntimeRoot $seed
+            & (Join-Path $seed "python.exe") -c "import urllib.request, email.parser, http.client"
+            if ($LASTEXITCODE -ne 0) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed is missing required stdlib modules" }
         }
-        foreach ($dll in @(Get-ChildItem -LiteralPath $FixtureBasePrefix -Filter "*.dll" -File -ErrorAction SilentlyContinue)) {
-            Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $seed $dll.Name) -Force
-        }
-        Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "DLLs") -Destination (Join-Path $seed "DLLs") -SkipDirectories @("__pycache__") -Optional
-        Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "Lib") -Destination (Join-Path $seed "Lib") -SkipDirectories @("__pycache__", "site-packages", "test", "tests", "tkinter", "idlelib", "ensurepip", "venv", "turtledemo", "lib2to3", "pydoc_data", "unittest")
-        Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "Lib\email") -Destination (Join-Path $seed "Lib\email") -SkipDirectories @("__pycache__", "test", "tests")
-        New-Item -ItemType Directory -Force -Path (Join-Path $seed "Scripts") | Out-Null
-        Write-FixtureUvExe -Path (Join-Path $seed "Scripts\uv.exe")
-        Write-FixturePythonPackages -RuntimeRoot $seed
-        & (Join-Path $seed "python.exe") -c "import urllib.request, email.parser, http.client"
-        if ($LASTEXITCODE -ne 0) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed is missing required stdlib modules" }
+    }
+    catch {
+        if ((Get-ErrorCode -ErrorRecord $_) -ne "HARNESS_FAILURE") { throw }
+        Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed could not be copied or validated"
     }
     if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
     Copy-Item -LiteralPath $seed -Destination $Destination -Recurse -Force

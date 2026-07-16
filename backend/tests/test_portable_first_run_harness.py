@@ -146,6 +146,15 @@ def test_harness_treats_python_dlls_directory_as_optional_for_hosted_runtimes() 
     assert "-SkipDirectories @(\"__pycache__\") -Optional" in script
 
 
+def test_harness_builds_micro_python_stdlib_seed_instead_of_copying_full_lib() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert "function Copy-FixturePythonStdlib" in script
+    assert 'foreach ($directory in @("collections", "ctypes", "email", "encodings", "html", "http", "importlib", "json", "re", "urllib", "xml"))' in script
+    assert 'Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "Lib")' not in script
+    assert 'Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed could not be copied or validated"' in script
+
+
 def test_harness_contract_uses_real_root_launchers_and_fixture_only_copy_mutation() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
     assert all(name in script for name in ("Start.cmd", "Stop.cmd", "Repair.cmd", "Initialize.cmd"))
