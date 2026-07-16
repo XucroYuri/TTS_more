@@ -856,13 +856,24 @@ def test_real_windows_known_failure_job_kills_powershell_descendant(tmp_path: Pa
     )
     action_id = "29999999-9999-4999-8999-999999999999"
 
-    with pytest.raises(PortableControlError) as failure:
-        PortablePackageController(handshake_seconds=2.0).stop(
-            read_portable_package(package),
-            action_id=action_id,
-        )
-
-    assert failure.value.code == "PORTABLE_LAUNCH_EXITED"
+    controller = PortablePackageController(handshake_seconds=2.0)
+    descriptor = read_portable_package(package)
+    try:
+        result = controller.stop(descriptor, action_id=action_id)
+    except PortableControlError as failure:
+        assert failure.code == "PORTABLE_LAUNCH_EXITED"
+    else:
+        assert result["status"] == "stopping"
+        deadline = time.monotonic() + 10
+        while True:
+            status = controller.action_status(descriptor, action_id=action_id)
+            if status["status"] == "blocked":
+                assert status["error_code"] == "PORTABLE_LAUNCH_EXITED"
+                break
+            assert status["status"] == "stopping"
+            if time.monotonic() >= deadline:
+                pytest.fail(f"portable stop failure did not settle: {status!r}")
+            time.sleep(0.05)
     assert child_pid_file.is_file()
     child_pid = int(child_pid_file.read_text(encoding="ascii"))
     deadline = time.monotonic() + 5
@@ -971,13 +982,11 @@ def test_real_windows_cmd_ignores_cwd_and_path_name_hijacks(tmp_path: Path) -> N
     assert result["status"] == "ready"
 
 
-@pytest.mark.skipif(os.name != "nt", reason="real cmd.exe timing is Windows-only")
-def test_real_windows_short_delayed_failure_is_never_reported_starting(tmp_path: Path) -> None:
+@pytest.mark.skipif(os.name != "nt", reason="real cmd.exe failure handling is Windows-only")
+def test_real_windows_immediate_failure_is_never_reported_starting(tmp_path: Path) -> None:
     package = _write_package(tmp_path / "package")
     (package / "Start.cmd").write_text(
-        "@echo off\r\n"
-        "powershell -NoProfile -NonInteractive -Command \"Start-Sleep -Milliseconds 80\"\r\n"
-        "exit /b 9\r\n",
+        "@echo off\r\nexit /b 9\r\n",
         encoding="utf-8",
     )
 

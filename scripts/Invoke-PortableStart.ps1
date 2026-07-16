@@ -1109,12 +1109,20 @@ try {
         }
     }
 } catch {
-    $exitCode = Resolve-PortableExitCode -ErrorRecord $_
-    $code = Get-PortableErrorCode -ErrorRecord $_
-    if ($operation) { Fail-Operation -Operation $operation -ErrorRecord $_ }
-    $flatMessage = ([string]$_.Exception.Message) -replace '[\r\n]+', ' '
+    $primaryError = $_
+    $exitCode = Resolve-PortableExitCode -ErrorRecord $primaryError
+    $code = Get-PortableErrorCode -ErrorRecord $primaryError
+    if ($operation) {
+        try {
+            Fail-Operation -Operation $operation -ErrorRecord $primaryError
+        } catch {
+            Write-Warning "Unable to persist failed operation state; preserving the original start failure"
+        }
+    }
+    $flatMessage = ([string]$primaryError.Exception.Message) -replace '[\r\n]+', ' '
+    if ([string]::IsNullOrWhiteSpace($flatMessage)) { $flatMessage = ([string]$primaryError) -replace '[\r\n]+', ' ' }
     [Console]::Error.WriteLine(("PORTABLE_START_ERROR:{0}:{1}" -f $code, $flatMessage))
-    Write-Error "[$code] $($_.Exception.Message)" -ErrorAction Continue
+    Write-Error "[$code] $flatMessage" -ErrorAction Continue
 } finally {
     if ($ownsActivePointer -and $activePath -and (Test-Path -LiteralPath $activePath -PathType Leaf)) {
         try {

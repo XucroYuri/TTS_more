@@ -170,7 +170,21 @@ function Assert-FixturePython {
         Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "the explicit fixture runtime must be Python 3.11"
     }
     $script:FixtureBasePrefix = (@(& $FixturePython -c "import sys;print(sys.base_prefix)" 2>&1) -join "").Trim()
-    $script:FixtureBasePython = (@(& $FixturePython -c "import pathlib,sys;print(pathlib.Path(sys.base_prefix)/'python.exe')" 2>&1) -join "").Trim()
+    $baseExecutable = (@(& $FixturePython -c "import sys;print(sys._base_executable)" 2>&1) -join "").Trim()
+    $basePythonCandidates = [Collections.Generic.List[string]]::new()
+    if (![string]::IsNullOrWhiteSpace($baseExecutable) -and [IO.Path]::IsPathRooted($baseExecutable)) {
+        [void]$basePythonCandidates.Add($baseExecutable)
+    }
+    foreach ($name in @("python.exe", "python3.exe")) {
+        [void]$basePythonCandidates.Add((Join-Path $FixtureBasePrefix $name))
+    }
+    $script:FixtureBasePython = ""
+    foreach ($candidate in $basePythonCandidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $script:FixtureBasePython = [IO.Path]::GetFullPath($candidate)
+            break
+        }
+    }
     if (![IO.Path]::IsPathRooted($FixtureBasePython) -or !(Test-Path -LiteralPath $FixtureBasePython -PathType Leaf)) {
         Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "the explicit fixture runtime has no Python 3.11 base executable"
     }
@@ -640,10 +654,19 @@ function Copy-FixturePythonRuntime {
         if (!(Test-Path -LiteralPath (Join-Path $seed "python.exe") -PathType Leaf)) {
             if (Test-Path -LiteralPath $seed) { Remove-Item -LiteralPath $seed -Recurse -Force }
             New-Item -ItemType Directory -Force -Path $seed | Out-Null
-            foreach ($file in @("python.exe", "python311.dll")) {
-                $source = Join-Path $FixtureBasePrefix $file
-                if (!(Test-Path -LiteralPath $source -PathType Leaf)) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base runtime file is missing" }
-                Copy-Item -LiteralPath $source -Destination (Join-Path $seed $file) -Force
+            $baseExecutableName = Split-Path -Leaf $FixtureBasePython
+            Copy-Item -LiteralPath $FixtureBasePython -Destination (Join-Path $seed "python.exe") -Force
+            if (![string]::Equals($baseExecutableName, "python.exe", [StringComparison]::OrdinalIgnoreCase)) {
+                Copy-Item -LiteralPath $FixtureBasePython -Destination (Join-Path $seed $baseExecutableName) -Force
+            }
+            $pythonDlls = @(
+                Get-ChildItem -LiteralPath $FixtureBasePrefix -Filter "python*.dll" -File -ErrorAction SilentlyContinue
+            )
+            if ($pythonDlls.Count -eq 0) {
+                Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base runtime Python DLLs are missing"
+            }
+            foreach ($runtimeFile in $pythonDlls) {
+                Copy-Item -LiteralPath $runtimeFile.FullName -Destination (Join-Path $seed $runtimeFile.Name) -Force
             }
             foreach ($pattern in @("*.dll", "*.pyd")) {
                 foreach ($runtimeFile in @(Get-ChildItem -LiteralPath $FixtureBasePrefix -Filter $pattern -File -ErrorAction SilentlyContinue)) {
