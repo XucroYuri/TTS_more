@@ -62,6 +62,8 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
         "select-portable-folder.ps1",
     ):
         assert (target / "tts_more" / relative).is_file()
+    for relative in ("build-tools/pyproject.toml", "build-tools/uv.lock"):
+        assert (target / "tts_more" / relative).is_file()
     assert "tts_more_worker.gpt_sovits:app" in (target / "tts_more" / "component.json").read_text(encoding="utf-8")
     for entry in (
         "Initialize.cmd",
@@ -86,6 +88,8 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
         "tts_more/import-portable-data.py",
         "tts_more/verify-release-asset-set.py",
         "tts_more/select-portable-folder.ps1",
+        "tts_more/build-tools/pyproject.toml",
+        "tts_more/build-tools/uv.lock",
     ):
         assert manifest["files"][relative] == sync.sha256_file(target / relative)
     assert manifest["files"][GUIDE_NAME] == sync.sha256_file(target / GUIDE_NAME)
@@ -99,6 +103,8 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
         "tts_more/import-portable-data.py",
         "tts_more/verify-release-asset-set.py",
         "tts_more/select-portable-folder.ps1",
+        "tts_more/build-tools/pyproject.toml",
+        "tts_more/build-tools/uv.lock",
     ),
 )
 def test_check_rejects_missing_or_drifted_controlled_import_tools(
