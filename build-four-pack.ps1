@@ -17,6 +17,17 @@ $Root = [System.IO.Path]::GetFullPath($PSScriptRoot)
 if (!$OutputRoot) { $OutputRoot = Join-Path $Root "artifacts\portable\full-four\$Version" }
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 
+function Get-PortableFileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
 function Resolve-ComponentRoot {
     param([string]$Explicit, [string]$EnvironmentName, [string]$LockedPath)
     $environmentValue = [Environment]::GetEnvironmentVariable($EnvironmentName)
@@ -31,7 +42,7 @@ function Get-ZipSnapshot {
     $snapshot = @{}
     if (!(Test-Path -LiteralPath $Directory -PathType Container)) { return $snapshot }
     foreach ($zip in @(Get-ChildItem -LiteralPath $Directory -Filter "*.zip" -File -ErrorAction SilentlyContinue)) {
-        $snapshot[$zip.FullName] = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $snapshot[$zip.FullName] = Get-PortableFileSha256 -Path $zip.FullName
     }
     return $snapshot
 }

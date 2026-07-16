@@ -32,6 +32,17 @@ $WorkIdentity = [guid]::NewGuid().ToString("N")
 $OwnerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o")
 $Utf8NoBom = New-Object Text.UTF8Encoding($false)
 
+function Get-PortableFileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
 function Throw-HarnessError {
     param([Parameter(Mandatory = $true)][string]$Code, [Parameter(Mandatory = $true)][string]$Message)
     throw "${Code}: $Message"
@@ -193,7 +204,7 @@ function Assert-ZipHashSidecar {
     $line = (Get-Content -LiteralPath $sidecar -Raw -Encoding ASCII).Trim()
     if ($line -notmatch '^([0-9a-fA-F]{64})  ([^/\\]+)$') { Throw-HarnessError "ZIP_HASH_INVALID" "ZIP SHA-256 sidecar is invalid" }
     if ($Matches[2] -ne (Split-Path -Leaf $Zip)) { Throw-HarnessError "ZIP_HASH_INVALID" "ZIP SHA-256 sidecar names another archive" }
-    $actual = (Get-FileHash -LiteralPath $Zip -Algorithm SHA256).Hash
+    $actual = Get-PortableFileSha256 -Path $Zip
     if (![string]::Equals($actual, $Matches[1], [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "ZIP_HASH_INVALID" "ZIP SHA-256 does not match" }
 }
 
@@ -345,7 +356,7 @@ function Write-FixtureSha256Manifest {
         foreach ($attempt in 1..6) {
             try {
                 if (!(Test-Path -LiteralPath $full -PathType Leaf)) { throw "fixture integrity file disappeared before hashing" }
-                $digest = (Get-FileHash -LiteralPath $full -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+                $digest = Get-PortableFileSha256 -Path $full
                 break
             }
             catch {
@@ -396,7 +407,7 @@ function Write-FixtureReleaseSha256SourceEntries {
         $full = [IO.Path]::GetFullPath((Join-Path $rootFull $relative))
         if (!$full.StartsWith($rootFull.TrimEnd('\') + "\", [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture release SHA path escapes package root" }
         if (!(Test-Path -LiteralPath $full -PathType Leaf)) { continue }
-        $entries[$relative] = (Get-FileHash -LiteralPath $full -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $entries[$relative] = Get-PortableFileSha256 -Path $full
     }
     $lines = @(
         $entries.Keys |
@@ -419,7 +430,7 @@ function Test-FixtureSha256Manifest {
         $file = [IO.Path]::GetFullPath((Join-Path $rootFull $relative))
         if (!$file.StartsWith($rootFull.TrimEnd('\') + "\", [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture runtime manifest path escapes package root" }
         if (!(Test-Path -LiteralPath $file -PathType Leaf)) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture runtime manifest path is missing" }
-        $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actual = Get-PortableFileSha256 -Path $file
         if ($actual -ne ([string]$entry.sha256).ToLowerInvariant()) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture runtime manifest hash mismatch" }
     }
 }
@@ -826,7 +837,7 @@ function Start-FixtureAssetServer {
 function Assert-AssetHash {
     param([Parameter(Mandatory = $true)][object]$Package)
     if (!(Test-Path -LiteralPath $Package.AssetPath -PathType Leaf)) { Throw-HarnessError "ASSET_MISSING" "fixture asset is missing" }
-    $actual = (Get-FileHash -LiteralPath $Package.AssetPath -Algorithm SHA256).Hash
+    $actual = Get-PortableFileSha256 -Path ([string]$Package.AssetPath)
     if (![string]::Equals($actual, $Package.AssetSha, [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "ASSET_HASH_INVALID" "fixture asset hash is invalid" }
 }
 
@@ -834,7 +845,7 @@ function Assert-DownloadAssetHash {
     param([Parameter(Mandatory = $true)][object]$Package)
     if ([string]$Package.Component -eq "tts-more") {
         if (!(Test-Path -LiteralPath ([string]$Package.UvAssetPath) -PathType Leaf)) { Throw-HarnessError "ASSET_MISSING" "fixture uv asset is missing" }
-        $actual = (Get-FileHash -LiteralPath ([string]$Package.UvAssetPath) -Algorithm SHA256).Hash
+        $actual = Get-PortableFileSha256 -Path ([string]$Package.UvAssetPath)
         if (![string]::Equals($actual, [string]$Package.UvAssetSha, [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "ASSET_HASH_INVALID" "fixture uv asset hash is invalid" }
         return
     }
@@ -967,7 +978,7 @@ function Invoke-PackageAcceptance {
         }
         Assert-AssetHash -Package $Package
         if ($component -eq "tts-more") {
-            $uvActual = (Get-FileHash -LiteralPath ([string]$Package.UvAssetPath) -Algorithm SHA256).Hash
+            $uvActual = Get-PortableFileSha256 -Path ([string]$Package.UvAssetPath)
             if (![string]::Equals($uvActual, [string]$Package.UvAssetSha, [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "ASSET_HASH_INVALID" "fixture uv asset hash is invalid" }
         }
         Wait-LoopbackPort -Port $Package.Port -Listening $true

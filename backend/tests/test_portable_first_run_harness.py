@@ -238,6 +238,13 @@ def test_portable_release_workflow_runs_harness_unit_tests_and_single_package_sm
     )
 
 
+def test_first_run_harness_uses_embedded_sha256_helper_instead_of_get_file_hash() -> None:
+    harness = HARNESS_SCRIPT.read_text(encoding="utf-8")
+
+    assert "function Get-PortableFileSha256" in harness
+    assert "Get-FileHash" not in harness
+
+
 def _portable_package_test_helpers():
     return _load_script(
         REPO_ROOT / "backend" / "tests" / "test_portable_packages.py",

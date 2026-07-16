@@ -3453,7 +3453,8 @@ def test_four_pack_discovers_changed_zips_by_manifest_not_filename_glob() -> Non
     assert 'device=$Device' in builder
     assert "select-full-package" in builder
     assert 'Get-ChildItem -LiteralPath $transactionRoot -Filter "*.zip"' in builder
-    assert "Get-FileHash" in builder
+    assert "function Get-PortableFileSha256" in builder
+    assert "Get-FileHash" not in builder
     assert 'Filter "*-$Version-windows-x64-full.zip"' not in builder
     assert "did not produce exactly one changed full ZIP" in builder
     assert "transaction" in builder.lower()
