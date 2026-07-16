@@ -40,6 +40,13 @@ def _portable_install_module():
     return _load_script(REPO_ROOT / "scripts" / "portable_install.py", "portable_install_for_fixture_test")
 
 
+def _local_first_run_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.pop("GITHUB_ACTIONS", None)
+    env["TTS_MORE_FIRST_RUN_PYTHON"] = sys.executable
+    return env
+
+
 def _urlopen_status(url: str) -> int:
     try:
         with urllib.request.urlopen(url, timeout=5) as response:
@@ -377,7 +384,7 @@ def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_
             errors="replace",
             check=False,
             timeout=240,
-            env={**os.environ, "TTS_MORE_FIRST_RUN_PYTHON": sys.executable},
+            env=_local_first_run_env(),
         )
     finally:
         leftovers = _wait_for_first_run_cleanup(run_dirs_before) - run_dirs_before
@@ -442,7 +449,7 @@ def test_real_micro_four_package_fixture_harness_allows_two_concurrent_runs(tmp_
             text=True,
             encoding="utf-8",
             errors="replace",
-            env={**os.environ, "TTS_MORE_FIRST_RUN_PYTHON": sys.executable},
+            env=_local_first_run_env(),
         )
         for command in commands
     ]

@@ -101,6 +101,14 @@ def _run_checked(command: list[str], cwd: Path, *, env: dict[str, str] | None = 
     )
 
 
+def _local_full_builder_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ)
+    env.pop("GITHUB_ACTIONS", None)
+    if extra:
+        env.update(extra)
+    return env
+
+
 def _initialize_git_repository(root: Path) -> None:
     _run_checked(["git", "init", "--quiet"], root)
     _run_checked(["git", "config", "user.name", "Portable Schema Test"], root)
@@ -3375,6 +3383,7 @@ def test_four_pack_plan_only_records_device_intentions_without_machine_paths(tmp
             "-PlanOnly",
         ],
         cwd=fixture,
+        env=_local_full_builder_env(),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -3591,14 +3600,15 @@ def _run_executable_four_pack_fixture(
 ) -> subprocess.CompletedProcess[str]:
     assert POWERSHELL is not None
     log = fixture / "routing.log"
-    env = {
-        **os.environ,
-        "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
-        "TTS_MORE_FIXTURE_MAKER": str(fixture / "make-full-package.py"),
-        "TTS_MORE_FIXTURE_LOG": str(log),
-        "TTS_MORE_FIXTURE_FINAL_OUTPUT": str(output),
-        **(extra_env or {}),
-    }
+    env = _local_full_builder_env(
+        {
+            "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
+            "TTS_MORE_FIXTURE_MAKER": str(fixture / "make-full-package.py"),
+            "TTS_MORE_FIXTURE_LOG": str(log),
+            "TTS_MORE_FIXTURE_FINAL_OUTPUT": str(output),
+            **(extra_env or {}),
+        }
+    )
     return subprocess.run(
         [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(fixture / "build-four-pack.ps1"), "-Device", "CU126", "-Version", "0.2.0-test", "-OutputRoot", str(output), "-GptRoot", str(workers["gpt-sovits"]), "-IndexRoot", str(workers["indextts"]), "-CosyVoiceRoot", str(workers["cosyvoice"])],
         cwd=fixture,
