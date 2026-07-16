@@ -241,6 +241,17 @@ public static class TtsMorePortableDirectoryHandle
 '@
 }
 
+function Get-PortableFileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
 function Assert-PortableWorkPath {
     param([Parameter(Mandatory = $true)][string]$CandidatePath)
     try {
@@ -383,7 +394,7 @@ throw "This delivered portable package cannot rebuild itself. Use the correspond
 
 $revision = (& git -C $Root rev-parse HEAD).Trim()
 $integrationFiles = @(Get-ChildItem -LiteralPath (Join-Path $stage "scripts") -File | Sort-Object FullName)
-$integrationDigestText = ($integrationFiles | ForEach-Object { (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }) -join "`n"
+$integrationDigestText = ($integrationFiles | ForEach-Object { Get-PortableFileSha256 -Path $_.FullName }) -join "`n"
 $sha256 = [System.Security.Cryptography.SHA256]::Create()
 $bundleSha = ([BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($integrationDigestText)))).Replace("-", "").ToLowerInvariant()
 $manifest = [ordered]@{
@@ -414,7 +425,7 @@ if ($Profile -eq "Full") {
 $sumPath = Join-Path $stage "SHA256SUMS.txt"
 @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.FullName -ne $sumPath } | Sort-Object FullName | ForEach-Object {
     $relative = $_.FullName.Substring($stage.Length).TrimStart("\", "/").Replace("\", "/")
-    "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $relative"
+    "$(Get-PortableFileSha256 -Path $_.FullName)  $relative"
 }) | Set-Content -LiteralPath $sumPath -Encoding UTF8
 
 if ($Profile -eq "Bootstrap") {
@@ -462,7 +473,7 @@ if ($Profile -eq "Bootstrap") {
     if ($LASTEXITCODE -ne 0) { throw "GitHub bootstrap release audit failed" }
     $auditPassed = $true
 }
-$zipSha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+$zipSha = Get-PortableFileSha256 -Path $zip
 "$zipSha  $([System.IO.Path]::GetFileName($zip))" | Set-Content -LiteralPath "$zip.sha256" -Encoding ASCII
 $provenance = [ordered]@{ schema_version = 1; component = "tts-more"; version = $Version; profile = $profileName; source_revision = $revision; sha256 = $zipSha }
 if ($Profile -eq "Full") { $provenance.resolved_profile = "cpu" }

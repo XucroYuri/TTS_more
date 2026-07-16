@@ -241,6 +241,17 @@ public static class TtsMorePortableDirectoryHandle
 '@
 }
 
+function Get-PortableFileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
 function Assert-PortableWorkPath {
     param([Parameter(Mandatory = $true)][string]$CandidatePath)
     try {
@@ -532,7 +543,7 @@ if ($Profile -eq "Bootstrap") {
 }
 
 $integrationManifest = Get-Content -LiteralPath (Join-Path $stagedBundle "integration.manifest.json") -Raw | ConvertFrom-Json
-$integrationSha = (Get-FileHash -LiteralPath (Join-Path $stagedBundle "integration.manifest.json") -Algorithm SHA256).Hash.ToLowerInvariant()
+$integrationSha = Get-PortableFileSha256 -Path (Join-Path $stagedBundle "integration.manifest.json")
 $deviceProfiles = if ($Device -eq "Auto") { @("auto", "cu128", "cu126", "cpu") } else { @($Device.ToLowerInvariant()) }
 $capabilities = switch ([string]$config.component) {
     "gpt-sovits" { @("tts", "trained_weights_voice", "reference_audio_voice", "artifact-transfer") }
@@ -597,7 +608,7 @@ if ($machinePathLeak.Count -gt 0) { throw "package contains a build-machine abso
 $sumPath = Join-Path $stage "SHA256SUMS.txt"
 @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.FullName -ne $sumPath } | Sort-Object FullName | ForEach-Object {
     $relative = $_.FullName.Substring($stage.Length).TrimStart("\", "/").Replace("\", "/")
-    "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $relative"
+    "$(Get-PortableFileSha256 -Path $_.FullName)  $relative"
 }) | Set-Content -LiteralPath $sumPath -Encoding UTF8
 
 & $buildPython (Join-Path $stagedBundle "portable_packages.py") validate-manifest --manifest (Join-Path $stage "package\tts-more-package.json") --package-root $stage
@@ -615,7 +626,7 @@ if ($Profile -eq "Bootstrap") {
     if ($LASTEXITCODE -ne 0) { throw "GitHub bootstrap release audit failed" }
     $auditPassed = $true
 }
-$hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+$hash = Get-PortableFileSha256 -Path $zip
 "$hash  $([IO.Path]::GetFileName($zip))" | Set-Content -LiteralPath "$zip.sha256" -Encoding ASCII
 $provenance = [ordered]@{ component=$config.component; version=$Version; profile=$profileName; source_revision=$revision; integration_revision=$integrationManifest.source_revision; model_snapshot=$modelLock.snapshot_revision; sha256=$hash }
 if ($Profile -eq "Full") { $provenance.resolved_profile = $resolvedProfile }

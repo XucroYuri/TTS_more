@@ -2230,6 +2230,17 @@ def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
     assert '"import_portable_data.py"' in builder
 
 
+def test_public_builders_use_embedded_sha256_helper_instead_of_get_file_hash() -> None:
+    controller = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+    worker = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    for builder in (controller, worker):
+        assert "function Get-PortableFileSha256" in builder
+        assert "Get-FileHash" not in builder
+
+
 def test_public_builders_self_bootstrap_locked_build_tools_before_source_staging() -> None:
     controller = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
     worker = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
