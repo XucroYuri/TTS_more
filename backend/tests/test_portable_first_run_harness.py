@@ -261,6 +261,9 @@ def test_portable_release_workflow_runs_harness_unit_tests_and_single_package_sm
     assert "backend/tests/test_portable_first_run_harness.py" in workflow
     assert "test-portable-first-run.ps1" in workflow
     assert "TTS_MORE_FIRST_RUN_PYTHON" in workflow
+    single_smoke = workflow[workflow.index("Run TTS More clean-Windows single-package smoke") :]
+    single_smoke = single_smoke[: single_smoke.index("Upload sanitized clean-Windows smoke evidence")]
+    assert "shell: powershell" in single_smoke
     assert "-Packages $zip.FullName" in workflow
     assert "single-package-smoke" in workflow
     assert "portable-first-run-smoke-evidence" in workflow

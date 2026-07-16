@@ -1382,16 +1382,22 @@ def test_launcher_staging_progress_and_error_catalog_contracts(tmp_path: Path) -
     assert "start-production.ps1" not in start
     for function in (
         "Get-PackageContext",
+        "Resolve-PortablePowerShellHost",
         "Assert-PackageWritable",
         "Open-PackageOperationLock",
         "Test-InstallState",
+        "Get-PortableInstallStateDiagnostic",
         "Invoke-Initialize",
         "Invoke-ServiceStart",
         "Resolve-PortableExitCode",
+        "Format-PortableErrorMessage",
     ):
         assert f"function {function}" in controller
     assert controller.index("Invoke-Initialize -Root") < controller.index("Invoke-ServiceStart -Root")
     assert "PORTABLE_START_ERROR:{0}:{1}" in controller
+    assert 'Join-Path $PSHOME "powershell.exe"' not in controller
+    assert "PowerShell host executable is unavailable for portable child launch" in controller
+    assert "Initialization did not produce a valid package-private runtime state ($installDiagnostic)" in controller
     assert "[switch]$OfferImport" in controller
     for function in (
         "Invoke-PortableImportOffer",

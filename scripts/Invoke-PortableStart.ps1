@@ -34,6 +34,24 @@ function Throw-PortableStartError {
     throw [PortableStartException]::new($Code, $Message)
 }
 
+function Resolve-PortablePowerShellHost {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($name in @("powershell.exe", "pwsh.exe")) {
+        try { $candidates.Add((Join-Path $PSHOME $name)) } catch { }
+    }
+    try {
+        if (![string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+            $candidates.Add((Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"))
+        }
+    } catch { }
+    foreach ($candidate in @($candidates)) {
+        if (![string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return [IO.Path]::GetFullPath($candidate)
+        }
+    }
+    Throw-PortableStartError "PACKAGE_CORRUPT" "PowerShell host executable is unavailable for portable child launch"
+}
+
 function Test-PathWithinRoot {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -517,7 +535,7 @@ function Resolve-PortableImportPython {
     if (![string]::IsNullOrWhiteSpace($Operation)) {
         $bootstrapArguments += @("-OperationRoot", $Operation, "-CancelFile", (Join-Path $Operation "cancel.requested"))
     }
-    $bootstrapPowerShell = Join-Path $PSHOME "powershell.exe"
+    $bootstrapPowerShell = Resolve-PortablePowerShellHost
     $bootstrapResult = Invoke-PortableCapturedProcess -FilePath $bootstrapPowerShell -Arguments $bootstrapArguments
     if ($bootstrapResult.ExitCode -ne 0 -or $bootstrapResult.Exceeded) {
         Throw-PortableStartError "PACKAGE_CORRUPT" "The locked package bootstrap for import failed"
@@ -577,7 +595,7 @@ function ConvertFrom-PortableBoundedJson {
 function Select-PortableImportFolder {
     param([Parameter(Mandatory = $true)][object]$Context)
 
-    $powerShell = Join-Path $PSHOME "powershell.exe"
+    $powerShell = Resolve-PortablePowerShellHost
     $selectorResult = Invoke-PortableCapturedProcess -FilePath $powerShell -Arguments @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", [string]$Context.ImportSelector) -MaximumBytes 65536 -Utf8
     if ($selectorResult.ExitCode -ne 0 -or $selectorResult.Exceeded) {
         Throw-PortableStartError "PACKAGE_CORRUPT" "The fixed previous-version folder selector failed"
@@ -870,6 +888,28 @@ function Get-PortableErrorCode {
     return "PACKAGE_CORRUPT"
 }
 
+function Format-PortableErrorMessage {
+    param([Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in @(
+        $ErrorRecord.Exception.Message,
+        $(if ($ErrorRecord.ErrorDetails) { $ErrorRecord.ErrorDetails.Message } else { "" }),
+        $(if ($ErrorRecord.InvocationInfo) { $ErrorRecord.InvocationInfo.PositionMessage } else { "" }),
+        ([string]$ErrorRecord)
+    )) {
+        $message = ([string]$candidate) -replace '[\r\n]+', ' '
+        $message = $message.Trim()
+        if (![string]::IsNullOrWhiteSpace($message) -and !$parts.Contains($message)) {
+            $parts.Add($message)
+        }
+    }
+    if ($parts.Count -eq 0) { return "No diagnostic message was provided by PowerShell" }
+    $combined = $parts -join " | "
+    if ($combined.Length -gt 2048) { return $combined.Substring(0, 2048) + "..." }
+    return $combined
+}
+
 function Fail-Operation {
     param(
         [Parameter(Mandatory = $true)][string]$Operation,
@@ -879,7 +919,7 @@ function Fail-Operation {
     $code = Get-PortableErrorCode -ErrorRecord $ErrorRecord
     $exitCode = Resolve-PortableExitCode -ErrorRecord $ErrorRecord
     $status = if ($exitCode -eq 20) { "stopped" } else { "blocked" }
-    Add-OperationEvent -Operation $Operation -Phase $status -Message ([string]$ErrorRecord.Exception.Message) -ErrorCode $code
+    Add-OperationEvent -Operation $Operation -Phase $status -Message (Format-PortableErrorMessage -ErrorRecord $ErrorRecord) -ErrorCode $code
     Complete-Operation -Operation $Operation -Status $status -ExitCode $exitCode
 }
 
@@ -890,12 +930,69 @@ function Test-InstallState {
     return Test-PortableInstallStateComplete -Root $context.Root -StatePath $context.StatePath -Component $context.Component -BuildId $context.BuildId -RuntimeLock $context.RuntimeLock -ModelLock $context.ModelLock -ExpectedPython $context.ExpectedPython -ImportProbe $context.ImportProbe -ValidateAssets:$Full -Sha256Manifest $context.Sha256Manifest -RequiredCoverage $context.RequiredCoverage
 }
 
+function Get-PortableInstallStateDiagnostic {
+    param(
+        [Parameter(Mandatory = $true)][object]$Context,
+        [switch]$ProbeRuntime
+    )
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    try {
+        $stateExists = Test-Path -LiteralPath $Context.StatePath -PathType Leaf
+        $parts.Add("state=" + $(if ($stateExists) { "present" } else { "missing" }))
+        if ($stateExists) {
+            try {
+                $state = Get-Content -LiteralPath $Context.StatePath -Raw | ConvertFrom-Json
+                $parts.Add("state_component=$([string]$state.component)")
+                $parts.Add("state_build_id=$([string]$state.build_id)")
+                $parts.Add("state_profile=$([string]$state.profile)")
+                if ([string]::IsNullOrWhiteSpace([string]$state.runtime_lock_sha256)) { $parts.Add("runtime_lock_sha256=missing") }
+                if ([string]::IsNullOrWhiteSpace([string]$state.model_lock_sha256)) { $parts.Add("model_lock_sha256=missing") }
+            } catch {
+                $parts.Add("state_json=invalid")
+            }
+        }
+        foreach ($entry in @(
+            @("runtime_lock", [string]$Context.RuntimeLock),
+            @("model_lock", [string]$Context.ModelLock)
+        )) {
+            $label = [string]$entry[0]
+            $path = [string]$entry[1]
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                $parts.Add("$label=not_configured")
+            } else {
+                $parts.Add("$label=" + $(if (Test-Path -LiteralPath $path -PathType Leaf) { "present" } else { "missing" }))
+            }
+        }
+        $python = Join-Path $Context.Root "runtime\live\python.exe"
+        $pythonExists = Test-Path -LiteralPath $python -PathType Leaf
+        $parts.Add("runtime_python=" + $(if ($pythonExists) { "present" } else { "missing" }))
+        $parts.Add("expected_python=$([string]$Context.ExpectedPython)")
+        if ($pythonExists -and $ProbeRuntime) {
+            try {
+                $versionOutput = @(& $python -c "import sys;print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>&1)
+                $versionText = (($versionOutput -join " ") -replace '[\r\n]+', ' ').Trim()
+                if ($versionText.Length -gt 160) { $versionText = $versionText.Substring(0, 160) + "..." }
+                $parts.Add("python_version_exit=$LASTEXITCODE")
+                if (![string]::IsNullOrWhiteSpace($versionText)) { $parts.Add("python_version_output=$versionText") }
+            } catch {
+                $parts.Add("python_version_error=$(Format-PortableErrorMessage -ErrorRecord $_)")
+            }
+        } elseif ($pythonExists) {
+            $parts.Add("runtime_probe=skipped_until_integrity_passes")
+        }
+    } catch {
+        $parts.Add("diagnostic_error=$(Format-PortableErrorMessage -ErrorRecord $_)")
+    }
+    return ($parts -join "; ")
+}
+
 function Invoke-ChildPowerShell {
     param(
         [Parameter(Mandatory = $true)][string]$Script,
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
-    $powerShell = Join-Path $PSHOME "powershell.exe"
+    $powerShell = Resolve-PortablePowerShellHost
     $command = @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $Script) + $Arguments
     $output = @(& $powerShell @command 2>&1)
     $exitCode = $LASTEXITCODE
@@ -963,7 +1060,7 @@ function Start-ProgressWindow {
     $quotedScript = '"{0}"' -f $progressScript.Replace('"', '\"')
     $quotedOperation = '"{0}"' -f $Operation.Replace('"', '\"')
     $quotedUrl = '"{0}"' -f $Url.Replace('"', '\"')
-    Start-Process -FilePath (Join-Path $PSHOME "powershell.exe") -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $quotedScript, "-OperationRoot", $quotedOperation, "-Url", $quotedUrl) -WindowStyle Normal | Out-Null
+    Start-Process -FilePath (Resolve-PortablePowerShellHost) -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $quotedScript, "-OperationRoot", $quotedOperation, "-Url", $quotedUrl) -WindowStyle Normal | Out-Null
 }
 
 function Wait-ForActiveOperation {
@@ -1080,13 +1177,17 @@ try {
 
     $installed = Test-InstallState -Root $root -Full:($script:Context.Profile -eq "full")
     if (!$installed -and $script:Context.Profile -eq "full") {
-        Throw-PortableStartError "PACKAGE_CORRUPT" "Full package assets are missing or invalid; Start will not download replacements"
+        $installDiagnostic = Get-PortableInstallStateDiagnostic -Context $script:Context
+        Throw-PortableStartError "PACKAGE_CORRUPT" "Full package assets are missing or invalid; Start will not download replacements ($installDiagnostic)"
     }
     $importOutcome = Invoke-PortableImportOffer -Context $script:Context -Operation $operation -ManagedBy $ManagedBy -NoUi:$NoUi -OfferImport:$OfferImport -Port $urlPort
     if (!$installed) {
         Add-OperationEvent -Operation $operation -Phase "installing" -Message "Initializing private package runtime" -Percent 5
         Invoke-Initialize -Root $root -Operation $operation
-        if (!(Test-InstallState -Root $root)) { Throw-PortableStartError "PACKAGE_CORRUPT" "Initialization did not produce a valid package-private runtime state" }
+        if (!(Test-InstallState -Root $root)) {
+            $installDiagnostic = Get-PortableInstallStateDiagnostic -Context $script:Context -ProbeRuntime
+            Throw-PortableStartError "PACKAGE_CORRUPT" "Initialization did not produce a valid package-private runtime state ($installDiagnostic)"
+        }
     }
     if (Test-Path -LiteralPath (Join-Path $operation "cancel.requested") -PathType Leaf) { Throw-PortableStartError "CANCELLED" "Portable start was cancelled" }
     Add-OperationEvent -Operation $operation -Phase "starting" -Message "Starting local service" -Percent 95
@@ -1119,8 +1220,7 @@ try {
             Write-Warning "Unable to persist failed operation state; preserving the original start failure"
         }
     }
-    $flatMessage = ([string]$primaryError.Exception.Message) -replace '[\r\n]+', ' '
-    if ([string]::IsNullOrWhiteSpace($flatMessage)) { $flatMessage = ([string]$primaryError) -replace '[\r\n]+', ' ' }
+    $flatMessage = Format-PortableErrorMessage -ErrorRecord $primaryError
     [Console]::Error.WriteLine(("PORTABLE_START_ERROR:{0}:{1}" -f $code, $flatMessage))
     Write-Error "[$code] $flatMessage" -ErrorAction Continue
 } finally {

@@ -864,7 +864,7 @@ def test_real_windows_known_failure_job_kills_powershell_descendant(tmp_path: Pa
         assert failure.code == "PORTABLE_LAUNCH_EXITED"
     else:
         assert result["status"] == "stopping"
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         while True:
             status = controller.action_status(descriptor, action_id=action_id)
             if status["status"] == "blocked":

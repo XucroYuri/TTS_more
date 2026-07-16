@@ -96,7 +96,7 @@ jobs:
           '@ | & $buildPython -
       - name: Run TTS More clean-Windows single-package smoke
         id: first-run-smoke
-        shell: pwsh
+        shell: powershell
         run: |
           $buildPython = (Resolve-Path backend\.venv\Scripts\python.exe).Path
           $version = $env:PACKAGE_VERSION -replace '^v', ''
