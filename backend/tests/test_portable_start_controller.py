@@ -94,12 +94,13 @@ param(
     [string]$CancelFile = ""
 )
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "Portable-Validation.ps1")
 Add-Content -LiteralPath (Join-Path $PackageRoot "order.log") -Value "initialize"
 Add-Content -LiteralPath (Join-Path $PackageRoot "initialize-count.log") -Value "1"
 if ({delay_seconds} -gt 0) {{ Start-Sleep -Seconds {delay_seconds} }}
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "runtime\live"), (Join-Path $PackageRoot "data\local") | Out-Null
-$runtimeSha = (Get-FileHash -LiteralPath (Join-Path $PackageRoot "packaging\portable\runtime.lock.json") -Algorithm SHA256).Hash.ToLowerInvariant()
-$modelSha = (Get-FileHash -LiteralPath (Join-Path $PackageRoot "packaging\portable\models.lock.json") -Algorithm SHA256).Hash.ToLowerInvariant()
+$runtimeSha = Get-PortableFileSha256 -Path (Join-Path $PackageRoot "packaging\portable\runtime.lock.json")
+$modelSha = Get-PortableFileSha256 -Path (Join-Path $PackageRoot "packaging\portable\models.lock.json")
 $state = @{{ schema_version = 1; component = "tts-more"; build_id = "source-checkout"; profile = "cpu"; runtime_lock_sha256 = $runtimeSha; model_lock_sha256 = $modelSha; ready = $true }} | ConvertTo-Json
 [IO.File]::WriteAllText((Join-Path $PackageRoot "data\local\install-state.json"), $state, [Text.UTF8Encoding]::new($false))
 exit 0
@@ -510,11 +511,12 @@ def _prepare_worker_import_fixture(package_root: Path) -> Path:
         r'''[CmdletBinding()]
 param([string]$PackageRoot = "", [string]$OperationRoot = "", [string]$CancelFile = "")
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "Portable-Validation.ps1")
 Add-Content -LiteralPath (Join-Path $PackageRoot "order.log") -Value "initialize"
 New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot "data\local") | Out-Null
 $runtimeLock = Join-Path $PackageRoot "app\tts_more\locks\runtime.lock.json"
 $modelLock = Join-Path $PackageRoot "app\tts_more\locks\models.lock.json"
-$state = @{ schema_version = 1; component = "gpt-sovits"; build_id = "build-test"; profile = "cpu"; runtime_lock_sha256 = (Get-FileHash -LiteralPath $runtimeLock -Algorithm SHA256).Hash.ToLowerInvariant(); model_lock_sha256 = (Get-FileHash -LiteralPath $modelLock -Algorithm SHA256).Hash.ToLowerInvariant(); ready = $true } | ConvertTo-Json
+$state = @{ schema_version = 1; component = "gpt-sovits"; build_id = "build-test"; profile = "cpu"; runtime_lock_sha256 = (Get-PortableFileSha256 -Path $runtimeLock); model_lock_sha256 = (Get-PortableFileSha256 -Path $modelLock); ready = $true } | ConvertTo-Json
 [IO.File]::WriteAllText((Join-Path $PackageRoot "data\local\install-state.json"), $state, [Text.UTF8Encoding]::new($false))
 exit 0
 ''',
