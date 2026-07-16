@@ -123,7 +123,9 @@ if ($Repair) { Write-Host "repairing only missing or invalid locked assets; user
 
 $bootstrap = Join-Path $Bundle "bootstrap-conda.ps1"
 $Conda = (& $bootstrap -CacheRoot "data/cache/portable/conda" -LockPath $ToolchainLockRelative -PackageRoot $Root -OperationRoot $OperationRoot -CancelFile $CancelFile -PassThru | Select-Object -Last 1)
-if ($LASTEXITCODE -eq 20) { exit 20 }
+$bootstrapExitCode = if (Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue) { [int]$LASTEXITCODE } else { 0 }
+if ($bootstrapExitCode -eq 20) { exit 20 }
+if ($bootstrapExitCode -ne 0) { throw "private package Conda bootstrap failed with exit code $bootstrapExitCode" }
 $CondaRoot = Split-Path -Parent (Split-Path -Parent $Conda)
 $BootstrapPython = Join-Path $CondaRoot "python.exe"
 if (!(Test-Path -LiteralPath $BootstrapPython)) { throw "private bootstrap Python is missing" }
@@ -204,7 +206,7 @@ if ($runtimeLock.dependency_mode -eq "uv-project") {
 if ($LASTEXITCODE -ne 0) { throw "frozen dependency synchronization failed" }
 & $StagePython -m pip check
 if ($LASTEXITCODE -ne 0) { throw "pip check failed" }
-& $StagePython -c ([string]$config.import_probe)
+& $StagePython -c $importProbe
 if ($LASTEXITCODE -ne 0) { throw "core import/ONNX probe failed" }
 if ($selected -ne "cpu") {
     $expectedCuda = if ($selected -eq "cu128") { "12.8" } else { "12.6" }

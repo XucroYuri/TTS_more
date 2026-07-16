@@ -2008,6 +2008,71 @@ Write-Host "ATOMIC_OLD_PRESERVED"
     assert "ATOMIC_OLD_PRESERVED" in result.stdout
 
 
+def test_atomic_json_retries_transient_locked_destination(tmp_path: Path) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    package = tmp_path / "atomic-retry-package"
+    _copy_controller(package)
+    target = package / "state.json"
+    ready = package / "holder-ready.txt"
+    holder = package / "hold-open.ps1"
+    probe = package / "atomic-retry-probe.ps1"
+    _write_text(target, '{"generation":"old"}\n')
+    _write_text(
+        holder,
+        r'''$ErrorActionPreference = "Stop"
+$stream = [IO.File]::Open($env:A4_TARGET, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+try {
+    Set-Content -LiteralPath $env:A4_READY -Value "ready" -Encoding ASCII
+    Start-Sleep -Milliseconds 900
+}
+finally { $stream.Dispose() }
+''',
+    )
+    _write_text(
+        probe,
+        r'''$ErrorActionPreference = "Stop"
+. $env:A4_CONTROLLER
+Write-JsonAtomic -Path $env:A4_TARGET -Payload ([ordered]@{ generation = "new" })
+$payload = Get-Content -LiteralPath $env:A4_TARGET -Raw | ConvertFrom-Json
+if ([string]$payload.generation -ne "new") { throw "transient replacement did not commit" }
+Write-Host "ATOMIC_RETRY_COMMITTED"
+''',
+    )
+    environment = os.environ.copy()
+    environment["A4_CONTROLLER"] = str(package / "scripts" / "Invoke-PortableStart.ps1")
+    environment["A4_TARGET"] = str(target)
+    environment["A4_READY"] = str(ready)
+    holder_process = subprocess.Popen(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(holder)],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.is_file() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ready.is_file(), holder_process.communicate(timeout=5)
+        result = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(probe)],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        holder_stdout, holder_stderr = holder_process.communicate(timeout=10)
+    finally:
+        if holder_process.poll() is None:
+            holder_process.kill()
+            holder_process.wait(timeout=5)
+    assert holder_process.returncode == 0, holder_stdout + holder_stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ATOMIC_RETRY_COMMITTED" in result.stdout
+
+
 @pytest.mark.parametrize("runtime_case", ("environment", "venv", "reparse", "wrong-version"))
 def test_production_start_rejects_non_private_or_invalid_runtime_before_spawn(
     tmp_path: Path, runtime_case: str

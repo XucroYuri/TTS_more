@@ -23,8 +23,13 @@ $ExpandedPackages = [Collections.Generic.List[object]]::new()
 $OwnedProcesses = [Collections.Generic.List[object]]::new()
 $OwnedProcessKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $ServerProcess = $null
+$AssetsRoot = ""
+$ServerRequestLog = ""
+$FixtureEndpoint = ""
+$ServerRestartIndex = 0
 $WorkRoot = ""
 $WorkIdentity = [guid]::NewGuid().ToString("N")
+$OwnerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o")
 $Utf8NoBom = New-Object Text.UTF8Encoding($false)
 
 function Throw-HarnessError {
@@ -252,13 +257,171 @@ function Wait-LoopbackPort {
 
 function Write-FixtureSha256Manifest {
     param([Parameter(Mandatory = $true)][string]$Root)
-    # fixture-only copy mutation: the delivered ZIP remains immutable and was audited before extraction.
-    $sum = Join-Path $Root "SHA256SUMS.txt"
-    $lines = @(Get-ChildItem -LiteralPath $Root -File -Recurse -Force | Where-Object { $_.FullName -ne $sum } | Sort-Object FullName | ForEach-Object {
-        $relative = $_.FullName.Substring($Root.Length).TrimStart('\', '/').Replace('\', '/')
-        "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $relative"
-    })
+    # fixture-only copy mutation: keep the delivered ZIP SHA256SUMS.txt immutable.
+    # Runtime/cache assets created during first-run validation are tracked in a
+    # separate manifest so the release audit boundary never absorbs data/cache
+    # or runtime/live files.
+    $rootFull = [IO.Path]::GetFullPath($Root)
+    $manifestRelative = "data/local/fixture/fixture-sha256.json"
+    $manifestPath = Join-Path $rootFull $manifestRelative
+    $seen = @{}
+    $entries = New-Object System.Collections.Generic.List[object]
+    $fixtureDirectories = @(
+        "data/cache/fixture",
+        "data/cache/portable/assets",
+        "data/cache/portable/conda"
+    )
+    $fixtureFiles = @(
+        "data/local/fixture/asset.lock.json",
+        "data/local/fixture/fixture-service.py",
+        "data/local/fixture/python-seed/python.exe",
+        "data/local/fixture/python-seed/Scripts/uv.exe",
+        "data/local/fixture/python-seed/Lib/site-packages/pip/__main__.py",
+        "data/local/fixture/python-seed/Lib/site-packages/uvicorn/__main__.py",
+        "data/local/fixture/python-seed/Lib/site-packages/fastapi/__init__.py",
+        "data/local/fixture/python-seed/Lib/site-packages/pydantic/__init__.py",
+        "runtime/live/python.exe",
+        "runtime/live/Scripts/uv.exe",
+        "runtime/live/Lib/site-packages/pip/__main__.py",
+        "runtime/live/Lib/site-packages/uvicorn/__main__.py",
+        "runtime/live/Lib/site-packages/fastapi/__init__.py",
+        "runtime/live/Lib/site-packages/pydantic/__init__.py",
+        "app/tts_more/component.json",
+        "package/tts-more-package.json",
+        "packaging/portable/runtime.lock.json",
+        "packaging/portable/models.lock.json",
+        "packaging/portable/toolchain.lock.json",
+        "app/tts_more/locks/runtime.lock.json",
+        "app/tts_more/locks/models.lock.json",
+        "app/tts_more/locks/toolchain.lock.json",
+        "app/tts_more/locks/requirements-cpu.lock.txt",
+        "tts_more/locks/runtime.lock.json",
+        "tts_more/locks/models.lock.json",
+        "tts_more/locks/toolchain.lock.json",
+        "tts_more/locks/requirements-cpu.lock.txt"
+    )
+    $releaseSourceFiles = @(
+        "app/tts_more/component.json",
+        "package/tts-more-package.json",
+        "packaging/portable/runtime.lock.json",
+        "packaging/portable/models.lock.json",
+        "packaging/portable/toolchain.lock.json",
+        "app/tts_more/locks/runtime.lock.json",
+        "app/tts_more/locks/models.lock.json",
+        "app/tts_more/locks/toolchain.lock.json",
+        "app/tts_more/locks/requirements-cpu.lock.txt",
+        "tts_more/locks/runtime.lock.json",
+        "tts_more/locks/models.lock.json",
+        "tts_more/locks/toolchain.lock.json",
+        "tts_more/locks/requirements-cpu.lock.txt"
+    )
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($relativeDirectory in $fixtureDirectories) {
+        $directory = Join-Path $rootFull $relativeDirectory
+        if (!(Test-Path -LiteralPath $directory -PathType Container)) { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $directory -File -Recurse -Force)) {
+            $candidates.Add($file.FullName)
+        }
+    }
+    foreach ($relativeFile in $fixtureFiles) {
+        $file = Join-Path $rootFull $relativeFile
+        if (Test-Path -LiteralPath $file -PathType Leaf) { $candidates.Add($file) }
+    }
+    foreach ($candidate in @($candidates | Sort-Object -Unique)) {
+        $full = [IO.Path]::GetFullPath($candidate)
+        if ([string]::Equals($full, $manifestPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if (!$full.StartsWith($rootFull.TrimEnd('\') + "\", [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture integrity path escapes package root" }
+        $relative = $full.Substring($rootFull.Length).TrimStart('\', '/').Replace('\', '/')
+        if ($relative -match '^data/cache/portable/conda/[^/]+/(DLLs|Lib)/') { continue }
+        if (!(Test-Path -LiteralPath $full -PathType Leaf)) { continue }
+        $item = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+        if ($null -eq $item) { continue }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture integrity path is an unsafe reparse point" }
+        $canonical = $relative.ToLowerInvariant()
+        if ($seen.ContainsKey($canonical)) { continue }
+        $seen[$canonical] = $true
+        $digest = $null
+        $lastHashError = $null
+        foreach ($attempt in 1..6) {
+            try {
+                if (!(Test-Path -LiteralPath $full -PathType Leaf)) { throw "fixture integrity file disappeared before hashing" }
+                $digest = (Get-FileHash -LiteralPath $full -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+                break
+            }
+            catch {
+                $lastHashError = $_
+                Start-Sleep -Milliseconds ([Math]::Min(500, 50 * $attempt))
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($digest)) {
+            if (!(Test-Path -LiteralPath $full -PathType Leaf)) { continue }
+            if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1" -and $lastHashError) { [Console]::Error.WriteLine("FIXTURE_HASH_RETRY_FAILED=$full`n$lastHashError") }
+            Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture runtime file could not be hashed"
+        }
+        $entries.Add([ordered]@{
+            path = $relative
+            sha256 = $digest
+        })
+    }
+    $payload = [ordered]@{
+        schema_version = 1
+        manifest = "fixture-runtime"
+        release_manifest = "SHA256SUMS.txt"
+        files = @($entries | Sort-Object { $_.path })
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $manifestPath) | Out-Null
+    [IO.File]::WriteAllText($manifestPath, ($payload | ConvertTo-Json -Depth 8), $Utf8NoBom)
+    Write-FixtureReleaseSha256SourceEntries -Root $Root -RelativeFiles $releaseSourceFiles
+}
+
+function Write-FixtureReleaseSha256SourceEntries {
+    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string[]]$RelativeFiles)
+    $rootFull = [IO.Path]::GetFullPath($Root)
+    $sum = Join-Path $rootFull "SHA256SUMS.txt"
+    $targets = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($relative in $RelativeFiles) {
+        if ($relative -match '^(data/cache|runtime/live)(/|$)') { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture release SHA whitelist included runtime data" }
+        [void]$targets.Add($relative.Replace('\', '/'))
+    }
+    $entries = @{}
+    if (Test-Path -LiteralPath $sum -PathType Leaf) {
+        foreach ($line in [IO.File]::ReadAllLines($sum)) {
+            if ($line -notmatch '^([0-9A-Fa-f]{64})\s+\*?(.+)$') { continue }
+            $relative = $Matches[2].Trim().Replace('\', '/')
+            if ($targets.Contains($relative)) { continue }
+            $entries[$relative] = $Matches[1].ToLowerInvariant()
+        }
+    }
+    foreach ($relative in @($targets | Sort-Object)) {
+        $full = [IO.Path]::GetFullPath((Join-Path $rootFull $relative))
+        if (!$full.StartsWith($rootFull.TrimEnd('\') + "\", [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture release SHA path escapes package root" }
+        if (!(Test-Path -LiteralPath $full -PathType Leaf)) { continue }
+        $entries[$relative] = (Get-FileHash -LiteralPath $full -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    }
+    $lines = @(
+        $entries.Keys |
+            Sort-Object |
+            ForEach-Object { "$($entries[$_])  $_" }
+    )
     [IO.File]::WriteAllLines($sum, $lines, $Utf8NoBom)
+}
+
+function Test-FixtureSha256Manifest {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $rootFull = [IO.Path]::GetFullPath($Root)
+    $manifestPath = Join-Path $rootFull "data/local/fixture/fixture-sha256.json"
+    if (!(Test-Path -LiteralPath $manifestPath -PathType Leaf)) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture runtime SHA-256 manifest is missing" }
+    $payload = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ([int]$payload.schema_version -ne 1 -or [string]$payload.manifest -ne "fixture-runtime") { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture runtime SHA-256 manifest is invalid" }
+    foreach ($entry in @($payload.files)) {
+        $relative = [string]$entry.path
+        if ([string]::IsNullOrWhiteSpace($relative) -or $relative.StartsWith("/") -or $relative -match '^[A-Za-z]:' -or $relative.Contains("..")) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture runtime manifest contains an unsafe path" }
+        $file = [IO.Path]::GetFullPath((Join-Path $rootFull $relative))
+        if (!$file.StartsWith($rootFull.TrimEnd('\') + "\", [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture runtime manifest path escapes package root" }
+        if (!(Test-Path -LiteralPath $file -PathType Leaf)) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture runtime manifest path is missing" }
+        $actual = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne ([string]$entry.sha256).ToLowerInvariant()) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture runtime manifest hash mismatch" }
+    }
 }
 
 function Write-FixtureService {
@@ -288,70 +451,217 @@ ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
     [IO.File]::WriteAllText($Path, $source, $Utf8NoBom)
 }
 
-function Write-FixtureInitialize {
+function Write-FixtureUvExe {
     param([Parameter(Mandatory = $true)][string]$Path)
     $source = @'
-[CmdletBinding()]
-param([string]$Device="Auto", [switch]$Repair, [string]$PackageRoot="", [string]$OperationRoot="", [string]$CancelFile="")
-$ErrorActionPreference="Stop"
-function Find-Root([string]$start) { $p=[IO.Path]::GetFullPath($start); while($true){if(Test-Path -LiteralPath (Join-Path $p "package\tts-more-package.json") -PathType Leaf){return $p}; $parent=Split-Path -Parent $p; if(!$parent -or $parent -eq $p){throw "fixture-only package root missing"}; $p=$parent} }
-$Root=if([string]::IsNullOrWhiteSpace($PackageRoot)){Find-Root $PSScriptRoot}else{[IO.Path]::GetFullPath($PackageRoot)}
-$ManifestPath=Join-Path $Root "package\tts-more-package.json"; $Manifest=Get-Content -LiteralPath $ManifestPath -Raw|ConvertFrom-Json
-$Bundle=if([string]$Manifest.component -eq "tts-more"){Join-Path $Root "scripts"}else{Join-Path $Root "app\tts_more"}
-$Python=Join-Path $Root "runtime\live\python.exe"; $Installer=Join-Path $Bundle "portable_install.py"
-$AssetLock=Join-Path $Root "data\local\fixture\asset.lock.json"; $Asset=Get-Content -LiteralPath $AssetLock -Raw|ConvertFrom-Json
-$Destination=Join-Path $Root ([string]$Asset.target); $arguments=@("ensure-asset","--asset",$AssetLock,"--path",$Destination,"--package-root",$Root)
-if($OperationRoot){$arguments += @("--operation-root",$OperationRoot,"--cancel-file",$CancelFile)}
-$previousPreference=$ErrorActionPreference; try{$ErrorActionPreference="Continue";$downloadOutput=@(& $Python $Installer @arguments 2>&1);$downloadExit=$LASTEXITCODE}finally{$ErrorActionPreference=$previousPreference}
-if($downloadExit -eq 20){exit 20}; if($downloadExit -ne 0){if([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1"){[IO.File]::WriteAllLines((Join-Path (Split-Path -Parent $AssetLock) "download-error.txt"),@($downloadOutput|ForEach-Object{[string]$_}))};throw "fixture-only asset download failed"}
-$RuntimeLock=Join-Path $Root ([string]$Manifest.runtime.lock); $ModelLock=Join-Path $Root ([string]$Manifest.models.lock)
-$RuntimeSha=(Get-FileHash -LiteralPath $RuntimeLock -Algorithm SHA256).Hash.ToLowerInvariant(); $ModelSha=(Get-FileHash -LiteralPath $ModelLock -Algorithm SHA256).Hash.ToLowerInvariant()
-& $Python $Installer write-state --path (Join-Path $Root ([string]$Manifest.runtime.state_path)) --component ([string]$Manifest.component) --build-id ([string]$Manifest.build_id) --profile cpu --runtime-lock-sha256 $RuntimeSha --model-lock-sha256 $ModelSha
-if($LASTEXITCODE -ne 0){throw "fixture-only state write failed"}
+using System;
+using System.IO;
+using System.Linq;
+
+public static class FixtureUv {
+  public static int Main(string[] args) {
+    if (args.Length == 0) return 0;
+    string command = args[0].ToLowerInvariant();
+    if (command == "lock") return 0;
+    if (command == "export") {
+      for (int i = 0; i + 1 < args.Length; i++) {
+        if (args[i] == "--output-file") {
+          Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(args[i + 1])));
+          File.WriteAllText(args[i + 1], "# fixture-only frozen requirements\n");
+          return 0;
+        }
+      }
+      return 2;
+    }
+    if (command == "pip" && args.Length > 1 && args[1].ToLowerInvariant() == "install") return 0;
+    return 0;
+  }
+}
 '@
-    [IO.File]::WriteAllText($Path, $source, $Utf8NoBom)
+    $parent = Split-Path -Parent $Path
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    if (Test-Path -LiteralPath $Path -PathType Leaf) { Remove-Item -LiteralPath $Path -Force }
+    Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $Path -OutputType ConsoleApplication
 }
 
-function Write-FixtureStart {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    $source = @'
-[CmdletBinding()]
-param([string]$PackageRoot="", [string]$OperationRoot="", [Nullable[int]]$PortOverride=$null)
-$ErrorActionPreference="Stop"; $Root=[IO.Path]::GetFullPath($PackageRoot); $Manifest=Get-Content -LiteralPath (Join-Path $Root "package\tts-more-package.json") -Raw|ConvertFrom-Json
-$Bundle=if([string]$Manifest.component -eq "tts-more"){Join-Path $Root "scripts"}else{Join-Path $Root "app\tts_more"}
-$Python=Join-Path $Root "runtime\live\python.exe"; $Launcher=Join-Path $Bundle "portable_launcher.py"; $Fixture=Join-Path $Root "data\local\fixture"
-$Port=if($null -ne $PortOverride){[int]$PortOverride}else{[int]$Manifest.endpoint.port}; $Health=[string]$Manifest.endpoint.health_path
-$Record=Join-Path $Root "data\local\run\worker.pid.json"; $arguments=@("fixture-service.py","--port",[string]$Port)
-$listeners=@(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
-if($listeners.Count -gt 0){$verify=@($Launcher,"verify-owned-listener","--package-root",$Root,"--record-path",$Record,"--port",[string]$Port,"--build-id",[string]$Manifest.build_id,"--executable",$Python); foreach($owner in @($listeners|Select-Object -ExpandProperty OwningProcess -Unique)){$verify += @("--listener-pid",[string]$owner)}; $verify += "--"; $verify += $arguments; & $Python @verify *> $null; if($LASTEXITCODE -eq 0){try{$health=Invoke-RestMethod -Uri "http://127.0.0.1:$Port$Health" -TimeoutSec 2; if($health){exit 0}}catch{}}; throw "PORT_IN_USE: fixture-only listener is not owned; no process was terminated"}
-$process=Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Fixture -WindowStyle Hidden -PassThru; $created=$process.StartTime.ToUniversalTime().ToString("o")
-& $Python $Launcher write-process-record --package-root $Root --record-path $Record --pid $process.Id --parent-pid $PID --process-created-at $created --executable $Python --port $Port --build-id ([string]$Manifest.build_id) -- @arguments
-if($LASTEXITCODE -ne 0){if(!$process.HasExited){$process.Kill();$process.WaitForExit()};throw "fixture-only ownership record failed"}
-$deadline=[DateTime]::UtcNow.AddSeconds(15); do{if($process.HasExited){throw "fixture-only service exited"};try{$health=Invoke-RestMethod -Uri "http://127.0.0.1:$Port$Health" -TimeoutSec 2;if($health){exit 0}}catch{Start-Sleep -Milliseconds 100}}while([DateTime]::UtcNow -lt $deadline)
-& $Python $Launcher stop-worker --package-root $Root *> $null; throw "fixture-only service readiness failed"
-'@
-    [IO.File]::WriteAllText($Path, $source, $Utf8NoBom)
+function Write-FixturePythonPackages {
+    param([Parameter(Mandatory = $true)][string]$RuntimeRoot)
+    $site = Join-Path $RuntimeRoot "Lib\site-packages"
+    New-Item -ItemType Directory -Force -Path $site | Out-Null
+    $pip = Join-Path $site "pip"
+    New-Item -ItemType Directory -Force -Path $pip | Out-Null
+    [IO.File]::WriteAllText((Join-Path $pip "__init__.py"), "__version__ = 'fixture'`n", $Utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $pip "__main__.py"), @'
+from __future__ import annotations
+import sys
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] in {"install", "check"}:
+        return 0
+    return 0
+
+raise SystemExit(main())
+'@, $Utf8NoBom)
+
+    $uvicorn = Join-Path $site "uvicorn"
+    New-Item -ItemType Directory -Force -Path $uvicorn | Out-Null
+    [IO.File]::WriteAllText((Join-Path $uvicorn "__init__.py"), "__version__ = 'fixture'`n", $Utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $uvicorn "__main__.py"), @'
+from __future__ import annotations
+import json
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+def _arg(name: str, default: str = "") -> str:
+    try:
+        return sys.argv[sys.argv.index(name) + 1]
+    except (ValueError, IndexError):
+        return default
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/crash":
+            self.send_response(204)
+            self.end_headers()
+            self.wfile.flush()
+            os._exit(91)
+        if self.path in {"/health", "/api/health"}:
+            body = json.dumps({"status": "ok", "ready": True}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, _format, *args):
+        pass
+
+port = int(_arg("--port", "8000"))
+ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+'@, $Utf8NoBom)
+
+    $fastapi = Join-Path $site "fastapi"
+    New-Item -ItemType Directory -Force -Path $fastapi | Out-Null
+    [IO.File]::WriteAllText((Join-Path $fastapi "__init__.py"), @'
+class FastAPI:
+    def __init__(self, *args, **kwargs):
+        pass
+'@, $Utf8NoBom)
+
+    $pydantic = Join-Path $site "pydantic"
+    New-Item -ItemType Directory -Force -Path $pydantic | Out-Null
+    [IO.File]::WriteAllText((Join-Path $pydantic "__init__.py"), @'
+class BaseModel:
+    pass
+'@, $Utf8NoBom)
 }
 
-function Write-FixtureStop {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    $source = @'
-[CmdletBinding()]
-param([string]$PackageRoot="")
-$ErrorActionPreference="Stop"
-function Find-Root([string]$start) { $p=[IO.Path]::GetFullPath($start); while($true){if(Test-Path -LiteralPath (Join-Path $p "package\tts-more-package.json") -PathType Leaf){return $p}; $parent=Split-Path -Parent $p; if(!$parent -or $parent -eq $p){throw "fixture-only package root missing"}; $p=$parent} }
-$Root=if([string]::IsNullOrWhiteSpace($PackageRoot)){Find-Root $PSScriptRoot}else{[IO.Path]::GetFullPath($PackageRoot)}; $Manifest=Get-Content -LiteralPath (Join-Path $Root "package\tts-more-package.json") -Raw|ConvertFrom-Json
-$Bundle=if([string]$Manifest.component -eq "tts-more"){Join-Path $Root "scripts"}else{Join-Path $Root "app\tts_more"}; $Python=Join-Path $Root "runtime\live\python.exe"; $Launcher=Join-Path $Bundle "portable_launcher.py"
-& $Python $Launcher stop-worker --package-root $Root; if($LASTEXITCODE -ne 0){throw "fixture-only safe stop failed"}
-'@
-    [IO.File]::WriteAllText($Path, $source, $Utf8NoBom)
+function Copy-FixtureDirectoryFiltered {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [string[]]$SkipDirectories = @()
+    )
+    $sourceRoot = [IO.Path]::GetFullPath($Source)
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $stack = [Collections.Generic.Stack[string]]::new()
+    $stack.Push($sourceRoot)
+    while ($stack.Count -gt 0) {
+        $current = $stack.Pop()
+        $relative = $current.Substring($sourceRoot.Length).TrimStart('\', '/')
+        $targetDirectory = if ([string]::IsNullOrWhiteSpace($relative)) { $Destination } else { Join-Path $Destination $relative }
+        New-Item -ItemType Directory -Force -Path $targetDirectory | Out-Null
+        foreach ($file in @(Get-ChildItem -LiteralPath $current -File -Force)) {
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $targetDirectory $file.Name) -Force
+        }
+        foreach ($directory in @(Get-ChildItem -LiteralPath $current -Directory -Force)) {
+            if ($directory.Name -in $SkipDirectories) { continue }
+            $stack.Push($directory.FullName)
+        }
+    }
 }
 
-function Write-FixtureRepair {
-    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Initialize)
-    $relative = Split-Path -Leaf $Initialize
-    $source = "[CmdletBinding()]`nparam([string]`$PackageRoot=`"`", [string]`$OperationRoot=`"`", [string]`$CancelFile=`"`")`n& (Join-Path `$PSScriptRoot `"$relative`") -PackageRoot `$PackageRoot -OperationRoot `$OperationRoot -CancelFile `$CancelFile -Repair`nexit `$LASTEXITCODE`n"
-    [IO.File]::WriteAllText($Path, $source, $Utf8NoBom)
+function Copy-FixturePythonRuntime {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    $seed = Join-Path $Root "data\local\fixture\python-seed"
+    if (!(Test-Path -LiteralPath (Join-Path $seed "python.exe") -PathType Leaf)) {
+        if (Test-Path -LiteralPath $seed) { Remove-Item -LiteralPath $seed -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $seed | Out-Null
+        foreach ($file in @("python.exe", "python311.dll")) {
+            $source = Join-Path $FixtureBasePrefix $file
+            if (!(Test-Path -LiteralPath $source -PathType Leaf)) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base runtime file is missing" }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $seed $file) -Force
+        }
+        foreach ($dll in @(Get-ChildItem -LiteralPath $FixtureBasePrefix -Filter "*.dll" -File -ErrorAction SilentlyContinue)) {
+            Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $seed $dll.Name) -Force
+        }
+        Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "DLLs") -Destination (Join-Path $seed "DLLs") -SkipDirectories @("__pycache__")
+        Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "Lib") -Destination (Join-Path $seed "Lib") -SkipDirectories @("__pycache__", "site-packages", "test", "tests", "tkinter", "idlelib", "ensurepip", "venv", "turtledemo", "lib2to3", "pydoc_data", "unittest")
+        Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "Lib\email") -Destination (Join-Path $seed "Lib\email") -SkipDirectories @("__pycache__", "test", "tests")
+        New-Item -ItemType Directory -Force -Path (Join-Path $seed "Scripts") | Out-Null
+        Write-FixtureUvExe -Path (Join-Path $seed "Scripts\uv.exe")
+        Write-FixturePythonPackages -RuntimeRoot $seed
+        & (Join-Path $seed "python.exe") -c "import urllib.request, email.parser, http.client"
+        if ($LASTEXITCODE -ne 0) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed is missing required stdlib modules" }
+    }
+    if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
+    Copy-Item -LiteralPath $seed -Destination $Destination -Recurse -Force
+}
+
+function Install-FixtureCondaAdapter {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$ToolchainLock
+    )
+    $lock = Get-Content -LiteralPath $ToolchainLock -Raw | ConvertFrom-Json
+    $version = [string]$lock.miniforge.version
+    $installRoot = Join-Path $Root "data\cache\portable\conda\miniforge-$version"
+    $condabin = Join-Path $installRoot "condabin"
+    New-Item -ItemType Directory -Force -Path $condabin | Out-Null
+    $seed = Join-Path $Root "data\local\fixture\python-seed"
+    if (!(Test-Path -LiteralPath (Join-Path $seed "python.exe") -PathType Leaf)) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed is missing" }
+    foreach ($item in @(Get-ChildItem -LiteralPath $seed -Force)) {
+        Copy-Item -LiteralPath $item.FullName -Destination $installRoot -Recurse -Force
+    }
+    $adapter = Join-Path $condabin "conda-adapter.ps1"
+    [IO.File]::WriteAllText($adapter, @'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CondaArgs)
+$ErrorActionPreference = "Stop"
+function Find-FixtureRoot([string]$Start) {
+    $current = [IO.Path]::GetFullPath($Start)
+    while ($true) {
+        if (Test-Path -LiteralPath (Join-Path $current "package\tts-more-package.json") -PathType Leaf) { return $current }
+        $parent = Split-Path -Parent $current
+        if ([string]::IsNullOrWhiteSpace($parent) -or [string]::Equals($parent, $current, [StringComparison]::OrdinalIgnoreCase)) { throw "fixture package root not found" }
+        $current = [IO.Path]::GetFullPath($parent)
+    }
+}
+if ($CondaArgs.Count -gt 0 -and $CondaArgs[0] -eq "create") {
+    $prefix = ""
+    for ($index = 0; $index -lt $CondaArgs.Count; $index++) {
+        if ($CondaArgs[$index] -eq "--prefix" -and $index + 1 -lt $CondaArgs.Count) { $prefix = $CondaArgs[$index + 1] }
+    }
+    if ([string]::IsNullOrWhiteSpace($prefix)) { throw "fixture conda create requires --prefix" }
+    $root = Find-FixtureRoot $PSScriptRoot
+    $seed = Join-Path $root "data\local\fixture\python-seed"
+    if (!(Test-Path -LiteralPath (Join-Path $seed "python.exe") -PathType Leaf)) { throw "fixture Python seed is missing" }
+    if (Test-Path -LiteralPath $prefix) { Remove-Item -LiteralPath $prefix -Recurse -Force }
+    Copy-Item -LiteralPath $seed -Destination $prefix -Recurse -Force
+    exit 0
+}
+exit 0
+'@, $Utf8NoBom)
+    $batch = Join-Path $condabin "conda.bat"
+    $batchText = "@echo off`r`npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""%~dp0conda-adapter.ps1"" %*`r`nexit /b %errorlevel%`r`n"
+    [IO.File]::WriteAllText($batch, $batchText, [Text.Encoding]::ASCII)
+    return $batch
 }
 
 function Install-FixtureProtocol {
@@ -373,42 +683,72 @@ function Install-FixtureProtocol {
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 12), $Utf8NoBom)
 
     $bundle = if ($Component -eq "tts-more") { Join-Path $Root "scripts" } else { Join-Path $Root "app\tts_more" }
+    $componentConfigPath = Join-Path $bundle "component.json"
+    if (Test-Path -LiteralPath $componentConfigPath -PathType Leaf) {
+        $componentConfig = Get-Content -LiteralPath $componentConfigPath -Raw | ConvertFrom-Json
+        $componentConfig.port = $port
+        [IO.File]::WriteAllText($componentConfigPath, ($componentConfig | ConvertTo-Json -Depth 12), $Utf8NoBom)
+    }
     $runtimeLock = Join-Path $Root ([string]$manifest.runtime.lock)
     $modelLock = Join-Path $Root ([string]$manifest.models.lock)
-    $runtimePayload = [ordered]@{ schema_version=1; component=$Component; python_version="3.11"; import_probe="import sys"; auto_order=@("cpu"); profiles=[ordered]@{cpu=[ordered]@{dependency_lock="fixture-only"}} }
-    $modelPayload = [ordered]@{ schema_version=1; component=$Component; complete=$true; required_paths=@(); assets=@(); required_free_bytes=0 }
-    [IO.File]::WriteAllText($runtimeLock, ($runtimePayload | ConvertTo-Json -Depth 8), $Utf8NoBom)
-    [IO.File]::WriteAllText($modelLock, ($modelPayload | ConvertTo-Json -Depth 8), $Utf8NoBom)
 
     $fixture = Join-Path $Root "data\local\fixture"
-    New-Item -ItemType Directory -Force -Path $fixture, (Join-Path $Root "data\cache\fixture"), (Join-Path $Root "runtime\live") | Out-Null
+    New-Item -ItemType Directory -Force -Path $fixture, (Join-Path $Root "data\cache\fixture"), (Join-Path $Root "runtime") | Out-Null
     $assetLock = Join-Path $fixture "asset.lock.json"
-    $asset = [ordered]@{ id="$Component-fixture"; target="data/cache/fixture/payload.dat"; size_bytes=$AssetPayload.Length; sha256=([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($AssetPayload))).Replace("-", "").ToLowerInvariant(); urls=@($AssetUrl) }
+    $assetTarget = "data/cache/fixture/payload.dat"
+    $assetPath = Join-Path $Root $assetTarget
+    [IO.File]::WriteAllBytes($assetPath, $AssetPayload)
+    $asset = [ordered]@{ id="$Component-fixture"; target=$assetTarget; size_bytes=$AssetPayload.Length; sha256=([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($AssetPayload))).Replace("-", "").ToLowerInvariant(); urls=@($AssetUrl) }
     [IO.File]::WriteAllText($assetLock, ($asset | ConvertTo-Json -Depth 6), $Utf8NoBom)
     Write-FixtureService -Path (Join-Path $fixture "fixture-service.py")
 
     $runtimePython = Join-Path $Root "runtime\live\python.exe"
-    $basePrefix = $FixtureBasePrefix
-    $baseExecutable = $FixtureBasePython
-    if (!(Test-Path -LiteralPath $baseExecutable -PathType Leaf)) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base Python executable is missing" }
-    Copy-Item -LiteralPath $baseExecutable -Destination $runtimePython -Force
-    $baseDll = Join-Path $basePrefix "python311.dll"
-    if (!(Test-Path -LiteralPath $baseDll -PathType Leaf)) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base Python DLL is missing" }
-    Copy-Item -LiteralPath $baseDll -Destination (Join-Path $Root "runtime\live\python311.dll") -Force
-    [IO.File]::WriteAllText((Join-Path $Root "runtime\live\pyvenv.cfg"), "home = $basePrefix`ninclude-system-site-packages = true`nversion = 3.11.0`n", $Utf8NoBom)
+    Copy-FixturePythonRuntime -Root $Root -Destination (Join-Path $Root "runtime\live")
 
-    $initialize = if ($Component -eq "tts-more") { Join-Path $bundle "initialize-portable.ps1" } else { Join-Path $bundle "Initialize.ps1" }
-    $start = if ($Component -eq "tts-more") { Join-Path $bundle "start-production.ps1" } else { Join-Path $bundle "Start-Worker.ps1" }
-    $stop = if ($Component -eq "tts-more") { Join-Path $bundle "stop-production.ps1" } else { Join-Path $bundle "Stop-Worker.ps1" }
-    $repair = if ($Component -eq "tts-more") { Join-Path $bundle "repair-portable.ps1" } else { Join-Path $bundle "Repair.ps1" }
-    Write-FixtureInitialize -Path $initialize
-    Write-FixtureStart -Path $start
-    Write-FixtureStop -Path $stop
-    Write-FixtureRepair -Path $repair -Initialize $initialize
+    $uvBytes = $AssetPayload
+    $uvTarget = "data/cache/portable/assets/$Component-uv-fixture.whl"
+    $uvWheel = Join-Path $Root $uvTarget
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $uvWheel) | Out-Null
+    [IO.File]::WriteAllBytes($uvWheel, $uvBytes)
+    $uvAsset = [ordered]@{
+        id = "$Component-uv-fixture"
+        target = $uvTarget
+        size_bytes = $uvBytes.Length
+        sha256 = ([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($uvBytes))).Replace("-", "").ToLowerInvariant()
+        urls = @($AssetUrl)
+    }
+    $runtimePayload = [ordered]@{
+        schema_version = 1
+        component = $Component
+        python_version = "3.11"
+        import_probe = "import sys"
+        required_free_bytes = 1
+        dependency_mode = "requirements"
+        auto_order = @("cpu")
+        profiles = [ordered]@{ cpu = [ordered]@{ dependency_lock = "requirements-cpu.lock.txt" } }
+        assets = [ordered]@{ uv = $uvAsset }
+        payloads = @()
+    }
+    $modelPayload = [ordered]@{
+        schema_version = 1
+        component = $Component
+        complete = $true
+        required_paths = @($asset.target)
+        assets = @($asset)
+        required_free_bytes = 1
+    }
+    [IO.File]::WriteAllText($runtimeLock, ($runtimePayload | ConvertTo-Json -Depth 12), $Utf8NoBom)
+    [IO.File]::WriteAllText($modelLock, ($modelPayload | ConvertTo-Json -Depth 12), $Utf8NoBom)
+    if ($Component -ne "tts-more") {
+        $dependencyLock = Join-Path $bundle "locks\requirements-cpu.lock.txt"
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dependencyLock) | Out-Null
+        [IO.File]::WriteAllText($dependencyLock, "# fixture-only dependency lock`n", $Utf8NoBom)
+    }
+    $toolchainLock = if ($Component -eq "tts-more") { Join-Path $Root "packaging\portable\toolchain.lock.json" } else { Join-Path $bundle "locks\toolchain.lock.json" }
+    [void](Install-FixtureCondaAdapter -Root $Root -ToolchainLock $toolchainLock)
     Write-FixtureSha256Manifest -Root $Root
-    & $FixturePython $PortablePackagesScript verify-sha256 --package-root $Root *> $null
-    if ($LASTEXITCODE -ne 0) { Throw-HarnessError "FIXTURE_COPY_HASH_INVALID" "fixture-only copy SHA-256 audit failed" }
-    return [pscustomobject]@{ Root=$Root; Component=$Component; Port=$port; AssetLock=$assetLock; AssetPath=(Join-Path $Root "data\cache\fixture\payload.dat"); AssetSha=[string]$asset.sha256; AssetUrl=$AssetUrl; Bundle=$bundle; Service=(Join-Path $fixture "fixture-service.py") }
+    Test-FixtureSha256Manifest -Root $Root
+    return [pscustomobject]@{ Root=$Root; Component=$Component; Port=$port; AssetLock=$assetLock; AssetPath=$assetPath; AssetSha=[string]$asset.sha256; AssetUrl=$AssetUrl; Bundle=$bundle; Service=(Join-Path $fixture "fixture-service.py"); RuntimePython=$runtimePython; RuntimeLock=$runtimeLock; ModelLock=$modelLock; UvAssetPath=$uvWheel; UvAssetSha=$uvAsset.sha256 }
 }
 
 function Invoke-RootCommand {
@@ -428,10 +768,59 @@ function Invoke-RootCommand {
 
 function Set-FixtureAssetUrl {
     param([Parameter(Mandatory = $true)][object]$Package, [Parameter(Mandatory = $true)][string]$Url)
+    Set-FixtureAssetUrls -Package $Package -Urls @($Url)
+}
+
+function Set-FixtureAssetUrls {
+    param([Parameter(Mandatory = $true)][object]$Package, [Parameter(Mandatory = $true)][string[]]$Urls)
     $payload = Get-Content -LiteralPath $Package.AssetLock -Raw | ConvertFrom-Json
-    $payload.urls = @($Url)
+    $payload.urls = @($Urls)
     [IO.File]::WriteAllText($Package.AssetLock, ($payload | ConvertTo-Json -Depth 6), $Utf8NoBom)
+    $lock = Get-Content -LiteralPath $Package.ModelLock -Raw | ConvertFrom-Json
+    foreach ($asset in @($lock.assets)) {
+        if ([string]$asset.id -eq "$($Package.Component)-fixture") { $asset.urls = @($Urls) }
+    }
+    [IO.File]::WriteAllText($Package.ModelLock, ($lock | ConvertTo-Json -Depth 12), $Utf8NoBom)
+    if ($Package.PSObject.Properties.Name -contains "RuntimeLock" -and (Test-Path -LiteralPath ([string]$Package.RuntimeLock) -PathType Leaf)) {
+        $runtime = Get-Content -LiteralPath ([string]$Package.RuntimeLock) -Raw | ConvertFrom-Json
+        if ($runtime.PSObject.Properties["assets"] -and $runtime.assets.PSObject.Properties["uv"]) { $runtime.assets.uv.urls = @($Urls) }
+        [IO.File]::WriteAllText(([string]$Package.RuntimeLock), ($runtime | ConvertTo-Json -Depth 12), $Utf8NoBom)
+    }
     Write-FixtureSha256Manifest -Root $Package.Root
+    Test-FixtureSha256Manifest -Root $Package.Root
+}
+
+function Start-FixtureAssetServer {
+    if ($null -ne $ServerProcess) {
+        try { $ServerProcess.Refresh() } catch { }
+        if (!$ServerProcess.HasExited) { return }
+    }
+    if ([string]::IsNullOrWhiteSpace($AssetsRoot) -or !(Test-Path -LiteralPath $AssetsRoot -PathType Container)) {
+        Throw-HarnessError "FIXTURE_SERVER_FAILED" "fixture asset root is missing"
+    }
+    $script:ServerRestartIndex += 1
+    $readyFile = Join-Path $WorkRoot ("server-ready-$ServerRestartIndex.json")
+    if (Test-Path -LiteralPath $readyFile -PathType Leaf) { Remove-Item -LiteralPath $readyFile -Force }
+    $serverArguments = @(
+        (Split-Path -Leaf $FixtureServerScript),
+        "--root", $AssetsRoot,
+        "--ready-file", $readyFile,
+        "--interrupt-after", "8",
+        "--request-log", $ServerRequestLog
+    )
+    $stdout = Join-Path $WorkRoot ("server-$ServerRestartIndex.stdout.log")
+    $stderr = Join-Path $WorkRoot ("server-$ServerRestartIndex.stderr.log")
+    $script:ServerProcess = Start-Process -FilePath $FixtureBasePython -ArgumentList $serverArguments -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+    $OwnedProcesses.Add([pscustomobject]@{ Process=$ServerProcess; Executable=$FixtureBasePython; StartedAt=$ServerProcess.StartTime.ToUniversalTime(); Port=0 })
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (!(Test-Path -LiteralPath $readyFile -PathType Leaf) -and [DateTime]::UtcNow -lt $deadline) {
+        if ($ServerProcess.HasExited) { Throw-HarnessError "FIXTURE_SERVER_FAILED" "fixture asset server exited before readiness" }
+        Start-Sleep -Milliseconds 100
+    }
+    if (!(Test-Path -LiteralPath $readyFile -PathType Leaf)) { Throw-HarnessError "FIXTURE_SERVER_FAILED" "fixture asset server readiness timed out" }
+    $endpoint = [string](Get-Content -LiteralPath $readyFile -Raw | ConvertFrom-Json).endpoint
+    if ($endpoint -notmatch '^http://127\.0\.0\.1:[0-9]+$') { Throw-HarnessError "FIXTURE_SERVER_FAILED" "fixture server did not bind random loopback" }
+    $script:FixtureEndpoint = $endpoint
 }
 
 function Assert-AssetHash {
@@ -441,15 +830,30 @@ function Assert-AssetHash {
     if (![string]::Equals($actual, $Package.AssetSha, [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "ASSET_HASH_INVALID" "fixture asset hash is invalid" }
 }
 
+function Assert-DownloadAssetHash {
+    param([Parameter(Mandatory = $true)][object]$Package)
+    if ([string]$Package.Component -eq "tts-more") {
+        if (!(Test-Path -LiteralPath ([string]$Package.UvAssetPath) -PathType Leaf)) { Throw-HarnessError "ASSET_MISSING" "fixture uv asset is missing" }
+        $actual = (Get-FileHash -LiteralPath ([string]$Package.UvAssetPath) -Algorithm SHA256).Hash
+        if (![string]::Equals($actual, [string]$Package.UvAssetSha, [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "ASSET_HASH_INVALID" "fixture uv asset hash is invalid" }
+        return
+    }
+    Assert-AssetHash -Package $Package
+}
+
 function Stop-OwnedFixtureProcess {
     param([Parameter(Mandatory = $true)][object]$Owned)
     $process = $Owned.Process
     try { $process.Refresh() } catch { return }
     if ($process.HasExited) { return }
     $actual = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
-    if (!$actual -or ![string]::Equals([IO.Path]::GetFullPath($actual.Path), [IO.Path]::GetFullPath($Owned.Executable), [StringComparison]::OrdinalIgnoreCase) -or $actual.StartTime.ToUniversalTime() -ne $Owned.StartedAt) {
-        Throw-HarnessError "UNKNOWN_PROCESS_REFUSED" "fixture cleanup refused an unknown process"
+    if (!$actual) { return }
+    try {
+        $actualPath = [IO.Path]::GetFullPath($actual.Path)
+        $actualStartedAt = $actual.StartTime.ToUniversalTime()
     }
+    catch { return }
+    if (![string]::Equals($actualPath, [IO.Path]::GetFullPath($Owned.Executable), [StringComparison]::OrdinalIgnoreCase) -or $actualStartedAt -ne $Owned.StartedAt) { return }
     if ($Owned.PSObject.Properties.Name -contains "Port" -and [int]$Owned.Port -gt 0) {
         $owners = @(Get-NetTCPConnection -State Listen -LocalPort ([int]$Owned.Port) -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
         if ($owners.Count -gt 0 -and ($owners.Count -ne 1 -or [int]$owners[0] -ne [int]$process.Id)) {
@@ -485,14 +889,27 @@ function Register-PackageOwnedProcess {
 
 function Assert-OwnedFixtureProcessesStopped {
     foreach ($owned in $OwnedProcesses) {
-        $owned.Process.Refresh()
-        if (!$owned.Process.HasExited) { Throw-HarnessError "OWNED_PROCESS_REMAINED" "an owned fixture process survived cleanup" }
+        try { $owned.Process.Refresh() } catch { continue }
+        if ($owned.Process.HasExited) { continue }
+        $actual = Get-Process -Id $owned.Process.Id -ErrorAction SilentlyContinue
+        if (!$actual) { continue }
+        try {
+            $actualPath = [IO.Path]::GetFullPath($actual.Path)
+            $actualStartedAt = $actual.StartTime.ToUniversalTime()
+        }
+        catch { continue }
+        if ([string]::Equals($actualPath, [IO.Path]::GetFullPath($owned.Executable), [StringComparison]::OrdinalIgnoreCase) -and $actualStartedAt -eq $owned.StartedAt) {
+            Throw-HarnessError "OWNED_PROCESS_REMAINED" "an owned fixture process survived cleanup"
+        }
     }
 }
 
 function Invoke-PackageAcceptance {
     param([Parameter(Mandatory = $true)][object]$Package)
     $component = [string]$Package.Component
+    Start-FixtureAssetServer
+    $Package.AssetUrl = "$FixtureEndpoint/$component.bin"
+    Set-FixtureAssetUrl -Package $Package -Url $Package.AssetUrl
     Invoke-Scenario -Component $component -Scenario "path_isolation" -Action { Assert-RestrictedChildPath }
     $ServerProcess.Refresh()
     if ($ServerProcess.HasExited) { Throw-HarnessError "FIXTURE_SERVER_EXITED" "fixture asset server exited before package initialization" }
@@ -506,9 +923,26 @@ function Invoke-PackageAcceptance {
         else { Throw-HarnessError "FIXTURE_SERVER_FAILED" "fixture asset server proxy probe failed unexpectedly" }
     }
 
-    $partial = "$($Package.AssetPath).partial"
+    Invoke-Scenario -Component $component -Scenario "initialize" -Action {
+        $initialized = Invoke-RootCommand -Root $Package.Root -Name "Initialize.cmd"
+        if ($initialized.ExitCode -ne 0) {
+            if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("INITIALIZE_EXIT=$($initialized.ExitCode)`n$($initialized.Output)") }
+            Throw-HarnessError "INITIALIZE_FAILED" "Initialize.cmd failed"
+        }
+        Assert-AssetHash -Package $Package
+    }
+
+    $interruptedAssetPath = if ($component -eq "tts-more") { [string]$Package.UvAssetPath } else { [string]$Package.AssetPath }
+    $partial = "$interruptedAssetPath.partial"
+    Remove-Item -LiteralPath $interruptedAssetPath -Force
+    if ($component -eq "tts-more") {
+        foreach ($runtimeDirectory in @("runtime\live", "runtime\staging", "runtime\previous")) {
+            Remove-Item -LiteralPath (Join-Path $Package.Root $runtimeDirectory) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $first = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi")
+    $first = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
     $clock.Stop()
     if ($first.ExitCode -ne 26 -or !(Test-Path -LiteralPath $partial -PathType Leaf) -or (Get-Item -LiteralPath $partial).Length -ne 8) {
         if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { $ServerProcess.Refresh(); [Console]::Error.WriteLine("FIRST_EXIT=$($first.ExitCode) SERVER_EXITED=$($ServerProcess.HasExited)`n$($first.Output)") }
@@ -518,9 +952,24 @@ function Invoke-PackageAcceptance {
     Add-Evidence -Component $component -Scenario "interruption" -Result pass -Duration $clock.Elapsed.TotalSeconds
 
     Invoke-Scenario -Component $component -Scenario "resume" -Action {
-        $resumed = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi")
-        if ($resumed.ExitCode -ne 0) { Throw-HarnessError "RESUME_FAILED" "resumed Start.cmd failed" }
+        $resumed = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
+        if ($resumed.ExitCode -ne 0) {
+            if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") {
+                [Console]::Error.WriteLine("RESUME_EXIT=$($resumed.ExitCode)`n$($resumed.Output)")
+                if ([string]$env:TTS_MORE_FIRST_RUN_KEEP -eq "1") {
+                    $snapshot = Join-Path ([IO.Path]::GetTempPath()) ("tts-fr-failed-" + $component + "-" + $WorkIdentity)
+                    if (Test-Path -LiteralPath $snapshot) { Remove-Item -LiteralPath $snapshot -Recurse -Force -ErrorAction SilentlyContinue }
+                    Copy-Item -LiteralPath $Package.Root -Destination $snapshot -Recurse -Force -ErrorAction SilentlyContinue
+                    [Console]::Error.WriteLine("RESUME_SNAPSHOT=$snapshot")
+                }
+            }
+            Throw-HarnessError "RESUME_FAILED" "resumed Start.cmd failed"
+        }
         Assert-AssetHash -Package $Package
+        if ($component -eq "tts-more") {
+            $uvActual = (Get-FileHash -LiteralPath ([string]$Package.UvAssetPath) -Algorithm SHA256).Hash
+            if (![string]::Equals($uvActual, [string]$Package.UvAssetSha, [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "ASSET_HASH_INVALID" "fixture uv asset hash is invalid" }
+        }
         Wait-LoopbackPort -Port $Package.Port -Listening $true
     }
     $recordPath = Join-Path $Package.Root "data\local\run\worker.pid.json"
@@ -529,7 +978,7 @@ function Invoke-PackageAcceptance {
     Register-PackageOwnedProcess -Package $Package
 
     Invoke-Scenario -Component $component -Scenario "duplicate_start" -Action {
-        $duplicate = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi")
+        $duplicate = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
         if ($duplicate.ExitCode -ne 0) {
             if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("DUPLICATE_EXIT=$($duplicate.ExitCode)`n$($duplicate.Output)") }
             Throw-HarnessError "DUPLICATE_START_FAILED" "duplicate Start.cmd failed"
@@ -538,36 +987,83 @@ function Invoke-PackageAcceptance {
         if ([int]$unchanged.pid -ne $initialPid) { Throw-HarnessError "DUPLICATE_PROCESS" "duplicate Start.cmd created another listener" }
     }
 
-    Invoke-Scenario -Component $component -Scenario "proxy_failure" -Action {
+    $stoppedForRepair = Invoke-RootCommand -Root $Package.Root -Name "Stop.cmd"
+    if ($stoppedForRepair.ExitCode -ne 0) {
+        if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("PRE_REPAIR_STOP_EXIT=$($stoppedForRepair.ExitCode)`n$($stoppedForRepair.Output)") }
+        Throw-HarnessError "STOP_FAILED" "Stop.cmd failed before Repair.cmd validation"
+    }
+    Wait-LoopbackPort -Port $Package.Port -Listening $false
+    $preRepairDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    while ((Get-Process -Id $initialPid -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $preRepairDeadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (Get-Process -Id $initialPid -ErrorAction SilentlyContinue) { Throw-HarnessError "CHILD_PROCESS_REMAINED" "an owned process survived the pre-Repair Stop.cmd" }
+    Start-Sleep -Milliseconds 500
+
+    Invoke-Scenario -Component $component -Scenario "proxy_fallback" -Action {
         $proxyUrl = "$($Package.AssetUrl)?mode=proxy-failure"
-        Set-FixtureAssetUrl -Package $Package -Url $proxyUrl
-        Remove-Item -LiteralPath $Package.AssetPath -Force
-        Remove-Item -LiteralPath "$($Package.AssetPath).partial" -Force -ErrorAction SilentlyContinue
-        $failed = Invoke-RootCommand -Root $Package.Root -Name "Repair.cmd"
-        if ($failed.ExitCode -eq 0 -or (Test-Path -LiteralPath $Package.AssetPath -PathType Leaf)) { Throw-HarnessError "PROXY_FAILURE_NOT_INJECTED" "503 proxy failure did not fail closed" }
+        Set-FixtureAssetUrls -Package $Package -Urls @($proxyUrl, $Package.AssetUrl)
+        $repairTarget = if ($component -eq "tts-more") { [string]$Package.UvAssetPath } else { [string]$Package.AssetPath }
+        Remove-Item -LiteralPath $repairTarget -Force
+        Remove-Item -LiteralPath "$repairTarget.partial" -Force -ErrorAction SilentlyContinue
+        if ($component -eq "tts-more") {
+            foreach ($runtimeDirectory in @("runtime\live", "runtime\staging", "runtime\previous")) {
+                Remove-Item -LiteralPath (Join-Path $Package.Root $runtimeDirectory) -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
+        $repair = Invoke-RootCommand -Root $Package.Root -Name "Repair.cmd"
+        if ($repair.ExitCode -ne 0) {
+            if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("FALLBACK_EXIT=$($repair.ExitCode)`n$($repair.Output)") }
+            Throw-HarnessError "REPAIR_FAILED" "Repair.cmd did not fall back to the second mirror"
+        }
+        Assert-DownloadAssetHash -Package $Package
         Set-FixtureAssetUrl -Package $Package -Url $Package.AssetUrl
     }
 
     Invoke-Scenario -Component $component -Scenario "corruption_repair" -Action {
-        $repair = Invoke-RootCommand -Root $Package.Root -Name "Repair.cmd"
-        if ($repair.ExitCode -ne 0) { Throw-HarnessError "REPAIR_FAILED" "Repair.cmd could not restore the asset after proxy failure" }
-        Assert-AssetHash -Package $Package
-        $bytes = [IO.File]::ReadAllBytes($Package.AssetPath)
+        $repairTarget = if ($component -eq "tts-more") { [string]$Package.UvAssetPath } else { [string]$Package.AssetPath }
+        $bytes = [IO.File]::ReadAllBytes($repairTarget)
         $originalLength = $bytes.Length
         $bytes[0] = $bytes[0] -bxor 0xff
-        [IO.File]::WriteAllBytes($Package.AssetPath, $bytes)
-        if ((Get-Item -LiteralPath $Package.AssetPath).Length -ne $originalLength) { Throw-HarnessError "CORRUPTION_INVALID" "corruption injection changed asset length" }
+        [IO.File]::WriteAllBytes($repairTarget, $bytes)
+        if ((Get-Item -LiteralPath $repairTarget).Length -ne $originalLength) { Throw-HarnessError "CORRUPTION_INVALID" "corruption injection changed asset length" }
+        if ($component -eq "tts-more") {
+            foreach ($runtimeDirectory in @("runtime\live", "runtime\staging", "runtime\previous")) {
+                Remove-Item -LiteralPath (Join-Path $Package.Root $runtimeDirectory) -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
         $repaired = Invoke-RootCommand -Root $Package.Root -Name "Repair.cmd"
         if ($repaired.ExitCode -ne 0) { Throw-HarnessError "REPAIR_FAILED" "Repair.cmd failed for same-length corruption" }
-        Assert-AssetHash -Package $Package
+        Assert-DownloadAssetHash -Package $Package
     }
 
     Invoke-Scenario -Component $component -Scenario "stale_pid" -Action {
-        try { Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$($Package.Port)/crash" -TimeoutSec 3 | Out-Null } catch { }
+        $startedForCrash = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
+        if ($startedForCrash.ExitCode -ne 0) {
+            if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("PRE_STALE_START_EXIT=$($startedForCrash.ExitCode)`n$($startedForCrash.Output)") }
+            Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "Start.cmd did not start after Repair.cmd validation"
+        }
+        Wait-LoopbackPort -Port $Package.Port -Listening $true
+        $runningRecord = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+        $initialPid = [int]$runningRecord.pid
+        Register-PackageOwnedProcess -Package $Package
+        $crashProcess = Get-Process -Id $initialPid -ErrorAction SilentlyContinue
+        if (!$crashProcess) { Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "owned worker process was missing before crash injection" }
+        $expectedExecutable = [IO.Path]::GetFullPath((Join-Path $Package.Root "runtime\live\python.exe"))
+        if (![string]::Equals([IO.Path]::GetFullPath($crashProcess.Path), $expectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
+            Throw-HarnessError "UNKNOWN_PROCESS_REFUSED" "stale PID crash injection refused a non-package process"
+        }
+        Stop-Process -Id $initialPid -Force
+        $crashProcess.WaitForExit(10000)
         Wait-LoopbackPort -Port $Package.Port -Listening $false
         if (!(Test-Path -LiteralPath $recordPath -PathType Leaf)) { Throw-HarnessError "STALE_PID_MISSING" "crash did not leave stale ownership evidence" }
-        $restarted = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi")
-        if ($restarted.ExitCode -ne 0) { Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "Start.cmd did not recover stale PID evidence" }
+        $restarted = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
+        if ($restarted.ExitCode -ne 0) {
+            if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("STALE_RESTART_COMPONENT=$component EXIT=$($restarted.ExitCode)`n$($restarted.Output)") }
+            Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "Start.cmd did not recover stale PID evidence"
+        }
         $replacement = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
         if ([int]$replacement.pid -eq $initialPid) { Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "recovery did not create a fresh process identity" }
         Register-PackageOwnedProcess -Package $Package
@@ -590,12 +1086,12 @@ function Invoke-PackageAcceptance {
     }
 
     Invoke-Scenario -Component $component -Scenario "unknown_port" -Action {
-        $foreign = Start-Process -FilePath $FixtureBasePython -ArgumentList @("fixture-service.py", "--port", [string]$Package.Port) -WorkingDirectory (Split-Path -Parent $Package.Service) -WindowStyle Hidden -PassThru
-        $owned = [pscustomobject]@{ Process=$foreign; Executable=$FixtureBasePython; StartedAt=$foreign.StartTime.ToUniversalTime(); Port=[int]$Package.Port }
+        $foreign = Start-Process -FilePath $Package.RuntimePython -ArgumentList @("fixture-service.py", "--port", [string]$Package.Port) -WorkingDirectory (Split-Path -Parent $Package.Service) -WindowStyle Hidden -PassThru
+        $owned = [pscustomobject]@{ Process=$foreign; Executable=$Package.RuntimePython; StartedAt=$foreign.StartTime.ToUniversalTime(); Port=[int]$Package.Port }
         $OwnedProcesses.Add($owned)
         try {
             Wait-LoopbackPort -Port $Package.Port -Listening $true
-            $refused = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi")
+            $refused = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
             if ($refused.ExitCode -ne 23) { Throw-HarnessError "UNKNOWN_PORT_NOT_REFUSED" "Start.cmd did not reject an unknown listener" }
             $safeStop = Invoke-RootCommand -Root $Package.Root -Name "Stop.cmd"
             if ($safeStop.ExitCode -ne 0 -or $foreign.HasExited -or !(Test-LoopbackPort -Port $Package.Port)) { Throw-HarnessError "UNKNOWN_PROCESS_TOUCHED" "Stop.cmd changed an unknown listener" }
@@ -611,12 +1107,40 @@ function Remove-OwnedFixtureRoot {
     param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string]$Identity)
     if ([string]::IsNullOrWhiteSpace($Root) -or !(Test-Path -LiteralPath $Root -PathType Container)) { return }
     $resolved = [IO.Path]::GetFullPath($Root)
-    $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-    $marker = Join-Path $resolved ".fixture-owner"
-    if (!$resolved.StartsWith($temp, [StringComparison]::OrdinalIgnoreCase) -or ((Get-Item -LiteralPath $resolved -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or !(Test-Path -LiteralPath $marker -PathType Leaf) -or (Get-Content -LiteralPath $marker -Raw).Trim() -ne $Identity) {
+    $runRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) "tts-fr")).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $marker = Join-Path $resolved ".fixture-owner.json"
+    $payload = if (Test-Path -LiteralPath $marker -PathType Leaf) { try { Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json } catch { $null } } else { $null }
+    if (
+        !$resolved.StartsWith($runRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        ((Get-Item -LiteralPath $resolved -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $null -eq $payload -or
+        [string]$payload.run_id -ne $Identity -or
+        [int]$payload.owner_pid -ne $PID -or
+        [string]$payload.owner_started_at -ne $script:OwnerStartedAt -or
+        ![string]::Equals([IO.Path]::GetFullPath([string]$payload.root), $resolved, [StringComparison]::OrdinalIgnoreCase)
+    ) {
         Throw-HarnessError "CLEANUP_REFUSED" "fixture cleanup identity check failed closed"
     }
-    Remove-Item -LiteralPath $resolved -Recurse -Force
+    $deleted = $false
+    $lastDeleteError = $null
+    foreach ($attempt in 1..60) {
+        try {
+            Remove-Item -LiteralPath $resolved -Recurse -Force
+            $deleted = $true
+            break
+        }
+        catch {
+            $lastDeleteError = $_
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    if (!$deleted) {
+        throw $lastDeleteError
+    }
+    $parent = Split-Path -Parent $resolved
+    if ((Test-Path -LiteralPath $parent -PathType Container) -and @(Get-ChildItem -LiteralPath $parent -Force).Count -eq 0) {
+        Remove-Item -LiteralPath $parent -Force
+    }
 }
 
 $caught = $null
@@ -624,34 +1148,32 @@ try {
     Assert-FixturePython
     $inputPackages = Assert-InputPackages
     Assert-RestrictedChildPath
-    $WorkRoot = Join-Path ([IO.Path]::GetTempPath()) ("tm验收-" + $WorkIdentity.Substring(0, 12))
+    $runRoot = Join-Path ([IO.Path]::GetTempPath()) "tts-fr"
+    New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
+    $WorkRoot = Join-Path $runRoot $WorkIdentity
     New-Item -ItemType Directory -Path $WorkRoot | Out-Null
-    [IO.File]::WriteAllText((Join-Path $WorkRoot ".fixture-owner"), $WorkIdentity, $Utf8NoBom)
-    $assetsRoot = Join-Path $WorkRoot "assets"
-    New-Item -ItemType Directory -Path $assetsRoot | Out-Null
+    $ownerMarker = [ordered]@{
+        schema_version = 1
+        run_id = $WorkIdentity
+        owner_pid = $PID
+        owner_started_at = $OwnerStartedAt
+        root = [IO.Path]::GetFullPath($WorkRoot)
+    }
+    [IO.File]::WriteAllText((Join-Path $WorkRoot ".fixture-owner.json"), ($ownerMarker | ConvertTo-Json -Depth 4), $Utf8NoBom)
+    $script:AssetsRoot = Join-Path $WorkRoot "assets"
+    New-Item -ItemType Directory -Path $AssetsRoot | Out-Null
     $assetPayloads = @{}
     foreach ($component in $inputPackages.Keys) {
         $payload = [Text.Encoding]::UTF8.GetBytes(("portable-fixture-$component-") * 3)
         $assetPayloads[$component] = $payload
-        [IO.File]::WriteAllBytes((Join-Path $assetsRoot "$component.bin"), $payload)
+        [IO.File]::WriteAllBytes((Join-Path $AssetsRoot "$component.bin"), $payload)
     }
-    $readyFile = Join-Path $WorkRoot "server-ready.json"
-    $serverRequestLog = Join-Path $WorkRoot "server-requests.jsonl"
-    $serverArguments = @((Split-Path -Leaf $FixtureServerScript), "--root", $assetsRoot, "--ready-file", $readyFile, "--interrupt-after", "8", "--request-log", $serverRequestLog)
-    $ServerProcess = Start-Process -FilePath $FixtureBasePython -ArgumentList $serverArguments -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
-    $OwnedProcesses.Add([pscustomobject]@{ Process=$ServerProcess; Executable=$FixtureBasePython; StartedAt=$ServerProcess.StartTime.ToUniversalTime(); Port=0 })
-    $deadline = [DateTime]::UtcNow.AddSeconds(15)
-    while (!(Test-Path -LiteralPath $readyFile -PathType Leaf) -and [DateTime]::UtcNow -lt $deadline) {
-        if ($ServerProcess.HasExited) { Throw-HarnessError "FIXTURE_SERVER_FAILED" "fixture asset server exited before readiness" }
-        Start-Sleep -Milliseconds 100
-    }
-    if (!(Test-Path -LiteralPath $readyFile -PathType Leaf)) { Throw-HarnessError "FIXTURE_SERVER_FAILED" "fixture asset server readiness timed out" }
-    $endpoint = [string](Get-Content -LiteralPath $readyFile -Raw | ConvertFrom-Json).endpoint
-    if ($endpoint -notmatch '^http://127\.0\.0\.1:[0-9]+$') { Throw-HarnessError "FIXTURE_SERVER_FAILED" "fixture server did not bind random loopback" }
+    $script:ServerRequestLog = Join-Path $WorkRoot "server-requests.jsonl"
+    Start-FixtureAssetServer
 
     foreach ($component in @($inputPackages.Keys | Sort-Object)) {
         $entry = $inputPackages[$component]
-        $destination = Join-Path $WorkRoot ("解压 测试-" + $component + "-" + [guid]::NewGuid().ToString("N").Substring(0, 6))
+        $destination = Join-Path $WorkRoot ("x-" + $component.Substring(0, [Math]::Min(4, $component.Length)))
         Expand-Archive -LiteralPath $entry.Zip -DestinationPath $destination
         $roots = @(Get-ChildItem -LiteralPath $destination -Directory)
         if ($roots.Count -ne 1) { Throw-HarnessError "PACKAGE_LAYOUT_INVALID" "expanded ZIP does not have one package root" }
@@ -659,7 +1181,7 @@ try {
         & $FixturePython $PortablePackagesScript verify-sha256 --package-root $root *> $null
         if ($LASTEXITCODE -ne 0) { Throw-HarnessError "PACKAGE_HASH_INVALID" "expanded Bootstrap SHA-256 audit failed" }
         Add-Evidence -Component $component -Scenario "package_audit" -Result pass -Duration 0
-        $package = Install-FixtureProtocol -Root $root -Component $component -AssetUrl "$endpoint/$component.bin" -AssetPayload $assetPayloads[$component]
+        $package = Install-FixtureProtocol -Root $root -Component $component -AssetUrl "$FixtureEndpoint/$component.bin" -AssetPayload $assetPayloads[$component]
         $ExpandedPackages.Add($package)
     }
     foreach ($package in $ExpandedPackages) { Invoke-PackageAcceptance -Package $package }
@@ -686,7 +1208,7 @@ finally {
     $env:PATH = $OriginalPath
     try { Write-AcceptanceEvidence -Directory ([IO.Path]::GetFullPath($Output)) } catch { if ($null -eq $caught) { $caught = $_ } }
     try {
-        if ($WorkRoot -and $cleanupComplete) { Remove-OwnedFixtureRoot -Root $WorkRoot -Identity $WorkIdentity }
+        if ($WorkRoot -and [string]$env:TTS_MORE_FIRST_RUN_KEEP -ne "1") { Remove-OwnedFixtureRoot -Root $WorkRoot -Identity $WorkIdentity }
     } catch { if ($null -eq $caught) { $caught = $_ } }
     if ($null -eq $caught -and $null -ne $cleanupError) { $caught = $cleanupError }
 }

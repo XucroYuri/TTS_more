@@ -167,7 +167,14 @@ class PortableFixtureServer:
         if should_interrupt:
             self._interrupted_paths.add(relative)
             body = payload[: self.interrupt_after]
-            self._send(handler, 200, body)
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/octet-stream")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+            handler.wfile.write(body)
+            handler.wfile.flush()
+            handler.close_connection = True
             self._record(path=relative, range=None, status=200, content_range=None, interrupted=True)
             return
         self._send(handler, 200, payload)

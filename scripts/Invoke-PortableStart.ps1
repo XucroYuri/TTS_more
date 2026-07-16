@@ -332,13 +332,31 @@ function Write-JsonAtomic {
     $json = ($Payload | ConvertTo-Json -Depth 12 -Compress) + "`n"
     [IO.File]::WriteAllText($temporary, $json, $script:Utf8NoBom)
     try {
-        if (Test-Path -LiteralPath $Path -PathType Leaf) {
-            $backup = Join-Path $parent (".{0}.{1}.backup" -f (Split-Path -Leaf $Path), [guid]::NewGuid().ToString("N"))
-            # File.Replace is the sole destination replacement primitive; it never deletes the old destination first.
-            [IO.File]::Replace($temporary, $Path, $backup)
-            if (Test-Path -LiteralPath $backup -PathType Leaf) { [IO.File]::Delete($backup) }
-        } else {
-            [IO.File]::Move($temporary, $Path)
+        $lastWriteError = $null
+        foreach ($attempt in 1..15) {
+            try {
+                if (Test-Path -LiteralPath $Path -PathType Leaf) {
+                    if ([string]::IsNullOrWhiteSpace($backup)) {
+                        $backup = Join-Path $parent (".{0}.{1}.backup" -f (Split-Path -Leaf $Path), [guid]::NewGuid().ToString("N"))
+                    }
+                    # File.Replace is the sole destination replacement primitive; it never deletes the old destination first.
+                    [IO.File]::Replace($temporary, $Path, $backup)
+                    if (Test-Path -LiteralPath $backup -PathType Leaf) { [IO.File]::Delete($backup) }
+                } else {
+                    [IO.File]::Move($temporary, $Path)
+                }
+                $lastWriteError = $null
+                break
+            } catch [IO.IOException] {
+                $lastWriteError = $_
+                Start-Sleep -Milliseconds ([Math]::Min(500, 40 * $attempt))
+            } catch [UnauthorizedAccessException] {
+                $lastWriteError = $_
+                Start-Sleep -Milliseconds ([Math]::Min(500, 40 * $attempt))
+            }
+        }
+        if ($null -ne $lastWriteError) {
+            throw $lastWriteError
         }
     } catch {
         if (Test-Path -LiteralPath $temporary -PathType Leaf) { [IO.File]::Delete($temporary) }

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -333,6 +334,8 @@ def _copy_response(
         written += len(chunk)
         if progress:
             progress(written, total, url)
+    if total > 0 and written != total:
+        raise RuntimeError(f"incomplete HTTP download: received {written} of {total} bytes")
 
 
 def _response_total(response: Any, *, start: int) -> int:
@@ -439,6 +442,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         except PortableInstallCancelled:
             return 20
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         return 0
     if args.command == "select-device":

@@ -556,6 +556,20 @@ def test_initializers_forward_operation_and_cancel_contract_to_downloads() -> No
     assert 'FileMode]::Append' in bootstrap
 
 
+def test_initializers_execute_runtime_lock_import_probe() -> None:
+    controller = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(encoding="utf-8")
+    worker = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(encoding="utf-8")
+
+    assert '$ImportProbe = if ($RuntimePayload.PSObject.Properties["import_probe"]' in controller
+    assert "& $StagePython -c $ImportProbe" in controller
+    assert 'import fastapi,pydantic,uvicorn; print(' not in controller
+    assert "foreach ($asset in @($modelLockPayload.assets))" in controller
+    assert "required model asset is missing after locked initialization" in controller
+    assert '$importProbe = if ($runtimeLock.PSObject.Properties["import_probe"]' in worker
+    assert "& $StagePython -c $importProbe" in worker
+    assert "& $StagePython -c ([string]$config.import_probe)" not in worker
+
+
 def test_write_install_state_is_atomic_and_records_lock_digests(tmp_path: Path) -> None:
     installer = _load_installer()
     state = tmp_path / "data" / "local" / "install-state.json"

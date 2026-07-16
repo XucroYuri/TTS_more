@@ -29,6 +29,39 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _iter_product_source_files(repo_root: Path) -> list[Path]:
+    """Return release-governed source/template files, not local runtime caches."""
+
+    checked_roots = [
+        repo_root / "README.md",
+        repo_root / "docs",
+        repo_root / "data" / "services.json",
+        repo_root / "data" / "templates",
+        repo_root / "backend" / "app",
+        repo_root / "frontend" / "src",
+    ]
+    skipped_parts = {
+        "tests",
+        "superpowers",
+        "__pycache__",
+    }
+    allowed_suffixes = {".css", ".html", ".json", ".md", ".py", ".ts", ".tsx"}
+    paths: list[Path] = []
+
+    for root in checked_roots:
+        candidates = [root] if root.is_file() else [path for path in root.rglob("*") if path.is_file()]
+        for path in candidates:
+            if skipped_parts.intersection(path.parts):
+                continue
+            if ".test." in path.name:
+                continue
+            if path.suffix.lower() not in allowed_suffixes:
+                continue
+            paths.append(path)
+
+    return paths
+
+
 def test_committable_templates_do_not_contain_local_runtime_identifiers() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     checked_paths = [
@@ -118,20 +151,22 @@ def test_committable_character_template_is_empty() -> None:
     assert json.loads(template_path.read_text(encoding="utf-8")) == []
 
 
+def test_product_source_scan_excludes_runtime_cache_directories(tmp_path: Path) -> None:
+    (tmp_path / "data" / "templates").mkdir(parents=True)
+    (tmp_path / "data" / "cache" / "portable" / "python").mkdir(parents=True)
+    template = tmp_path / "data" / "templates" / "services.example.json"
+    cache_file = tmp_path / "data" / "cache" / "portable" / "python" / "pygettext.py"
+
+    template.write_text("{}\n", encoding="utf-8")
+    cache_file.write_bytes(b"\xffSignal Over Blackridge")
+
+    scanned_paths = set(_iter_product_source_files(tmp_path))
+
+    assert template in scanned_paths
+    assert cache_file not in scanned_paths
+
+
 def test_product_source_does_not_embed_fixed_script_sample_text() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    checked_roots = [
-        repo_root / "README.md",
-        repo_root / "docs",
-        repo_root / "data",
-        repo_root / "backend" / "app",
-        repo_root / "frontend" / "src",
-    ]
-    skipped_parts = {
-        "tests",
-        "superpowers",
-        "__pycache__",
-    }
     forbidden_tokens = [
         "Signal Over Blackridge",
         "BLACKRIDGE",
@@ -146,18 +181,10 @@ def test_product_source_does_not_embed_fixed_script_sample_text() -> None:
         "风声吞没了街角的脚步",
     ]
 
-    for root in checked_roots:
-        paths = [root] if root.is_file() else [path for path in root.rglob("*") if path.is_file()]
-        for path in paths:
-            if skipped_parts.intersection(path.parts):
-                continue
-            if ".test." in path.name:
-                continue
-            if path.suffix.lower() not in {".css", ".html", ".json", ".md", ".py", ".ts", ".tsx"}:
-                continue
-            text = path.read_text(encoding="utf-8")
-            for token in forbidden_tokens:
-                assert token not in text, f"{path} contains fixed script sample text {token!r}"
+    for path in _iter_product_source_files(_repo_root()):
+        text = path.read_text(encoding="utf-8")
+        for token in forbidden_tokens:
+            assert token not in text, f"{path} contains fixed script sample text {token!r}"
 
 
 def test_character_library_prefers_local_runtime_config_and_saves_there(tmp_path: Path) -> None:

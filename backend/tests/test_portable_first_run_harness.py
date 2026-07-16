@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -70,7 +71,7 @@ def test_fixture_server_preserves_partial_then_resumes_with_strict_range(tmp_pat
     }
     with module.PortableFixtureServer(tmp_path, interrupt_after=8) as server:
         asset["urls"] = [server.url("runtime.bin")]
-        with pytest.raises(RuntimeError, match="SHA-256"):
+        with pytest.raises(RuntimeError, match="asset download failed"):
             installer.ensure_locked_asset(asset, destination)
         assert destination.with_name("runtime.bin.partial").read_bytes() == payload[:8]
         report = installer.ensure_locked_asset(asset, destination)
@@ -126,16 +127,49 @@ def test_harness_contract_limits_path_audits_before_expand_and_covers_exact_comp
 def test_harness_contract_uses_real_root_launchers_and_fixture_only_copy_mutation() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
     assert all(name in script for name in ("Start.cmd", "Stop.cmd", "Repair.cmd", "Initialize.cmd"))
-    assert "portable_install.py" in script and "portable_launcher.py" in script
+    assert "Install-FixtureCondaAdapter" in script and "Copy-FixturePythonRuntime" in script
     assert "SHA256SUMS.txt" in script and "Write-FixtureSha256Manifest" in script
     assert "fixture-only" in script.lower()
-    assert all(scenario in script for scenario in ("interruption", "resume", "proxy_failure", "corruption_repair", "duplicate_start", "stale_pid", "clean_stop"))
+    assert 'Invoke-RootCommand -Root $Package.Root -Name "Initialize.cmd"' in script
+    assert '-Scenario "initialize"' in script
+    assert all(
+        scenario in script
+        for scenario in (
+            "initialize",
+            "interruption",
+            "resume",
+            "proxy_fallback",
+            "corruption_repair",
+            "duplicate_start",
+            "stale_pid",
+            "clean_stop",
+        )
+    )
     assert "taskkill" not in script.lower()
-    assert "Stop-Process" not in script
+    assert "Stop-Process -Id $initialPid -Force" in script
+    assert "stale PID crash injection refused a non-package process" in script
     assert "Register-PackageOwnedProcess" in script
     assert "Assert-OwnedFixtureProcessesStopped" in script
     assert 'TTS_MORE_FIRST_RUN_DEBUG -ne "1"' not in script
     assert 'TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("DEBUG_WORK_ROOT=' not in script
+
+
+def test_harness_contract_forbids_overwriting_production_control_scripts() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+    forbidden_targets = (
+        '"initialize-portable.ps1"',
+        '"start-production.ps1"',
+        '"stop-production.ps1"',
+        '"repair-portable.ps1"',
+        '"Initialize.ps1"',
+        '"Start-Worker.ps1"',
+        '"Stop-Worker.ps1"',
+        '"Repair.ps1"',
+    )
+    for target in forbidden_targets:
+        assert target not in script, f"harness must not write fixture content to {target}"
+    assert "Install-FixtureProtocol" in script
+    assert "Install-FixtureControlScripts" not in script
 
 
 def test_harness_evidence_schema_is_allowlisted_and_identity_fields_are_forbidden() -> None:
@@ -209,7 +243,7 @@ def _fixture_runtime_processes() -> set[int]:
         return set()
     command = (
         "$items=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue|"
-        "Where-Object {$_.ExecutablePath -match '\\\\tm验收-[^\\\\]+\\\\.*\\\\runtime\\\\live\\\\python\\.exe$'}|"
+        "Where-Object {$_.ExecutablePath -match '\\\\tts-fr\\\\[^\\\\]+\\\\.*\\\\runtime\\\\live\\\\python\\.exe$'}|"
         "Select-Object -ExpandProperty ProcessId); @($items)|ConvertTo-Json -Compress"
     )
     completed = subprocess.run(
@@ -225,6 +259,25 @@ def _fixture_runtime_processes() -> set[int]:
     if isinstance(payload, int):
         return {payload}
     return {int(pid) for pid in payload}
+
+
+def _first_run_directories() -> set[Path]:
+    root = Path(os.environ["TEMP"]) / "tts-fr"
+    if not root.exists():
+        return set()
+    return {path.resolve() for path in root.glob("*") if path.is_dir()}
+
+
+def _wait_for_first_run_cleanup(baseline: set[Path], timeout: float = 35.0) -> set[Path]:
+    deadline = time.monotonic() + timeout
+    latest: set[Path] = set()
+    while True:
+        latest = _first_run_directories()
+        if latest <= baseline:
+            return latest
+        if time.monotonic() >= deadline:
+            return latest
+        time.sleep(0.2)
 
 
 def _build_micro_worker_bootstrap(
@@ -276,33 +329,36 @@ def _build_micro_worker_bootstrap(
     return archives[0]
 
 
-@pytest.mark.skipif(os.name != "nt" or POWERSHELL is None, reason="Windows acceptance harness")
-def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_path: Path) -> None:
+def _four_micro_bootstrap_zips(tmp_path: Path, version: str) -> tuple[Path, Path, Path, Path]:
     helpers = _portable_package_test_helpers()
-    version = "0.2.0-first-run"
     _controller_stage, controller_zip = helpers._build_controller_bootstrap(
         tmp_path / "controller-package", version
     )
-    worker_zips: list[Path] = []
-    for component in ("gpt-sovits", "indextts", "cosyvoice"):
-        worker_zips.append(
-            _build_micro_worker_bootstrap(
-                helpers, tmp_path / component, version, component
-            )
-        )
-    output = tmp_path / "sanitized-evidence"
-    before = {path.name for path in Path(os.environ["TEMP"]).glob("tm验收-*")}
-    processes_before = _fixture_runtime_processes()
-    package_literals = ",".join(
-        "'" + str(path).replace("'", "''") + "'"
-        for path in (controller_zip, *worker_zips)
-    )
-    command = (
+    worker_zips = [
+        _build_micro_worker_bootstrap(helpers, tmp_path / component, version, component)
+        for component in ("gpt-sovits", "indextts", "cosyvoice")
+    ]
+    return (controller_zip, *worker_zips)
+
+
+def _harness_command(packages: tuple[Path, ...], output: Path) -> str:
+    package_literals = ",".join("'" + str(path).replace("'", "''") + "'" for path in packages)
+    return (
         f"$packages=@({package_literals}); "
         f"& '{str(HARNESS_SCRIPT).replace(chr(39), chr(39) * 2)}' "
         f"-Packages $packages -Output '{str(output).replace(chr(39), chr(39) * 2)}'; "
         "exit $LASTEXITCODE"
     )
+
+
+@pytest.mark.skipif(os.name != "nt" or POWERSHELL is None, reason="Windows acceptance harness")
+def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_path: Path) -> None:
+    version = "0.2.0-first-run"
+    packages = _four_micro_bootstrap_zips(tmp_path, version)
+    output = tmp_path / "sanitized-evidence"
+    processes_before = _fixture_runtime_processes()
+    run_dirs_before = _first_run_directories()
+    command = _harness_command(packages, output)
     try:
         completed = subprocess.run(
             [
@@ -324,9 +380,9 @@ def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_
             env={**os.environ, "TTS_MORE_FIRST_RUN_PYTHON": sys.executable},
         )
     finally:
-        after = {path.name for path in Path(os.environ["TEMP"]).glob("tm验收-*")}
-        assert after == before
-        assert _fixture_runtime_processes() == processes_before
+        leftovers = _wait_for_first_run_cleanup(run_dirs_before) - run_dirs_before
+        assert leftovers == set()
+        assert _fixture_runtime_processes() - processes_before == set()
     assert completed.returncode == 0, completed.stdout + completed.stderr
     records = json.loads((output / "acceptance.json").read_text(encoding="utf-8"))
     assert records
@@ -339,9 +395,10 @@ def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_
     expected_scenarios = {
         "package_audit",
         "path_isolation",
+        "initialize",
         "interruption",
         "resume",
-        "proxy_failure",
+        "proxy_fallback",
         "corruption_repair",
         "duplicate_start",
         "stale_pid",
@@ -350,6 +407,7 @@ def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_
     }
     for component in {record["component"] for record in records}:
         assert {record["scenario"] for record in records if record["component"] == component} == expected_scenarios
+    assert len(records) == 44
     assert all(set(record) == {"component", "scenario", "result", "duration", "error_code"} for record in records)
     assert all(record["result"] == "pass" for record in records)
     serialized = json.dumps(records, ensure_ascii=False)
@@ -358,3 +416,53 @@ def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_
         for value in (os.environ.get("USERNAME"), os.environ.get("COMPUTERNAME"), os.environ.get("USERPROFILE"))
     )
     assert (output / "acceptance.junit.xml").is_file()
+
+
+@pytest.mark.skipif(os.name != "nt" or POWERSHELL is None, reason="Windows acceptance harness")
+def test_real_micro_four_package_fixture_harness_allows_two_concurrent_runs(tmp_path: Path) -> None:
+    packages = _four_micro_bootstrap_zips(tmp_path, "0.2.0-first-run-concurrent")
+    outputs = (tmp_path / "evidence-a", tmp_path / "evidence-b")
+    processes_before = _fixture_runtime_processes()
+    run_dirs_before = _first_run_directories()
+    commands = [_harness_command(packages, output) for output in outputs]
+    running = [
+        subprocess.Popen(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "TTS_MORE_FIRST_RUN_PYTHON": sys.executable},
+        )
+        for command in commands
+    ]
+    results = []
+    try:
+        for process in running:
+            stdout, stderr = process.communicate(timeout=360)
+            results.append((process.returncode, stdout, stderr))
+    finally:
+        for process in running:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+        leftovers = _wait_for_first_run_cleanup(run_dirs_before, timeout=45.0) - run_dirs_before
+        assert leftovers == set()
+        assert _fixture_runtime_processes() - processes_before == set()
+
+    for returncode, stdout, stderr in results:
+        assert returncode == 0, stdout + stderr
+    for output in outputs:
+        records = json.loads((output / "acceptance.json").read_text(encoding="utf-8"))
+        assert len(records) == 44
+        assert all(record["result"] == "pass" for record in records)

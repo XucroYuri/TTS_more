@@ -127,7 +127,9 @@ ConvertTo-Json -InputObject $videoControllers | Set-Content -LiteralPath $contro
 
 $bootstrap = Join-Path $Root "scripts\bootstrap-conda.ps1"
 $Conda = (& $bootstrap -CacheRoot "data/cache/portable/conda" -LockPath "packaging/portable/toolchain.lock.json" -PackageRoot $Root -OperationRoot $OperationRoot -CancelFile $CancelFile -PassThru | Select-Object -Last 1)
-if ($LASTEXITCODE -eq 20) { exit 20 }
+$bootstrapExitCode = if (Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue) { [int]$LASTEXITCODE } else { 0 }
+if ($bootstrapExitCode -eq 20) { exit 20 }
+if ($bootstrapExitCode -ne 0) { throw "private package Conda bootstrap failed with exit code $bootstrapExitCode" }
 if (!(Test-Path -LiteralPath $Conda -PathType Leaf)) { throw "private package Conda bootstrap did not return conda.bat" }
 $CondaRoot = Split-Path -Parent (Split-Path -Parent $Conda)
 $BootstrapPython = Join-Path $CondaRoot "python.exe"
@@ -138,6 +140,21 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($selected)) { throw "de
 Write-Host "Selected device profile: $selected"
 
 $runtimeLockPayload = Get-Content -LiteralPath $RuntimeLock -Raw | ConvertFrom-Json
+$modelLockPayload = Get-Content -LiteralPath $ModelLock -Raw | ConvertFrom-Json
+foreach ($asset in @($modelLockPayload.assets)) {
+    $assetLock = Join-Path $Root "data\cache\portable\locks\$($asset.id).json"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $assetLock) | Out-Null
+    $asset | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $assetLock -Encoding UTF8
+    & $BootstrapPython (Join-Path $Root "scripts\portable_install.py") ensure-asset --asset $assetLock --path (Join-Path $Root ([string]$asset.target)) @DownloadArguments
+    if ($LASTEXITCODE -eq 20) { exit 20 }
+    if ($LASTEXITCODE -ne 0) { throw "locked model asset failed: $($asset.id)" }
+}
+foreach ($requiredModelPath in @($modelLockPayload.required_paths)) {
+    if (!(Test-Path -LiteralPath (Join-Path $Root ([string]$requiredModelPath)))) {
+        throw "required model asset is missing after locked initialization: $requiredModelPath"
+    }
+}
+
 $uvAssetPath = Join-Path $Root "data\cache\portable\assets\$($runtimeLockPayload.assets.uv.id).json"
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $uvAssetPath) | Out-Null
 $runtimeLockPayload.assets.uv | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $uvAssetPath -Encoding UTF8
@@ -165,7 +182,7 @@ if ($LASTEXITCODE -ne 0) { throw "failed to export frozen backend dependencies" 
 if ($LASTEXITCODE -ne 0) { throw "failed to synchronize frozen backend dependencies" }
 & $StagePython -m pip check
 if ($LASTEXITCODE -ne 0) { throw "pip check failed in temporary runtime" }
-& $StagePython -c "import fastapi,pydantic,uvicorn; print('TTS More runtime import probe passed')"
+& $StagePython -c $ImportProbe
 if ($LASTEXITCODE -ne 0) { throw "core import probe failed in temporary runtime" }
 
 $backup = Join-Path $Root "runtime\previous"
