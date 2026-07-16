@@ -58,6 +58,7 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
     for relative in (
         "import_portable_data.py",
         "import-portable-data.py",
+        "verify-release-asset-set.py",
         "select-portable-folder.ps1",
     ):
         assert (target / "tts_more" / relative).is_file()
@@ -83,6 +84,7 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
     for relative in (
         "tts_more/import_portable_data.py",
         "tts_more/import-portable-data.py",
+        "tts_more/verify-release-asset-set.py",
         "tts_more/select-portable-folder.ps1",
     ):
         assert manifest["files"][relative] == sync.sha256_file(target / relative)
@@ -95,6 +97,7 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
     (
         "tts_more/import_portable_data.py",
         "tts_more/import-portable-data.py",
+        "tts_more/verify-release-asset-set.py",
         "tts_more/select-portable-folder.ps1",
     ),
 )

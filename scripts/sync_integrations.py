@@ -57,6 +57,7 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
         "portable_launcher.py",
         "portable_operations.py",
         "portable_packages.py",
+        "verify-release-asset-set.py",
         "import_portable_data.py",
         "import-portable-data.py",
     ):
