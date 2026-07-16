@@ -514,6 +514,72 @@ def test_windows_powershell_51_reports_a_process_missing_after_exit() -> None:
     assert launcher._inspect_process(process.pid) is None
 
 
+def test_process_creation_times_compare_at_utc_microsecond_precision() -> None:
+    launcher = _load_launcher()
+
+    assert launcher._same_process_creation_time(
+        "2026-07-16T03:32:14.2146700Z", "2026-07-16T03:32:14.2146706+00:00"
+    )
+    assert not launcher._same_process_creation_time(
+        "2026-07-16T03:32:14.2146700Z", "2026-07-16T03:32:14.2146710+00:00"
+    )
+    assert not launcher._same_process_creation_time("not-a-date", "2026-07-16T03:32:14Z")
+
+
+def test_windows_cim_creation_time_matches_get_process_record_time() -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+    process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(5)"])
+    try:
+        identity = launcher._inspect_process(process.pid)
+        assert identity is not None
+        environment = {**os.environ, "TTS_MORE_TEST_PROCESS_PID": str(process.pid)}
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$p=Get-Process -Id ([int]$env:TTS_MORE_TEST_PROCESS_PID) -ErrorAction Stop;"
+                "$p.StartTime.ToUniversalTime().ToString('o')",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert launcher._same_process_creation_time(
+            str(identity["created_at"]), completed.stdout.strip()
+        )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=10)
+
+
+def test_windows_powershell_51_exit_race_is_complete_identity_or_missing() -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+    delays = (0.30, 0.34, 0.38) * 10
+    for delay in delays:
+        process = subprocess.Popen(
+            [sys.executable, "-c", f"import time;time.sleep({delay})"]
+        )
+        try:
+            identity = launcher._inspect_process(process.pid)
+            if identity is None:
+                continue
+            assert identity["pid"] == process.pid
+            assert identity["created_at"]
+            assert identity["executable_path"]
+            assert identity["command_args"]
+        finally:
+            process.wait(timeout=10)
+
+
 def test_windows_powershell_51_finds_current_loopback_listener_owner() -> None:
     launcher = _load_launcher()
     if launcher.os.name != "nt":
@@ -563,6 +629,26 @@ def test_windows_process_inspection_fails_closed_on_untrusted_powershell_output(
         {"found": False, "process": {"pid": 4242}},
         {"found": True, "process": None},
         {"found": True, "process": {"pid": 4242}},
+        {
+            "found": True,
+            "process": {
+                "pid": 4242,
+                "parent_pid": 1,
+                "created_at": "2026-07-16T00:00:00Z",
+                "executable_path": None,
+                "command_line": "python.exe fixture.py",
+            },
+        },
+        {
+            "found": True,
+            "process": {
+                "pid": 4242,
+                "parent_pid": 1,
+                "created_at": "not-a-date",
+                "executable_path": "C:\\Python\\python.exe",
+                "command_line": "python.exe fixture.py",
+            },
+        },
     ],
 )
 def test_windows_process_inspection_rejects_inconsistent_found_schema(
@@ -576,6 +662,124 @@ def test_windows_process_inspection_rejects_inconsistent_found_schema(
 
     with pytest.raises(RuntimeError, match="process ownership"):
         launcher._inspect_process(4242)
+
+
+def test_windows_process_inspection_uses_one_cim_snapshot_for_complete_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+    payload = {
+        "found": True,
+        "process": {
+            "pid": 4242,
+            "parent_pid": 1,
+            "created_at": "2026-07-16T00:00:00Z",
+            "executable_path": "C:\\Python\\python.exe",
+            "command_line": "python.exe fixture.py",
+        },
+    }
+    captured: list[str] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.append(command[-1])
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+    assert launcher._inspect_process(4242) is not None
+    assert len(captured) == 1
+    assert captured[0].count("Get-CimInstance") == 1
+    assert "Get-Process" not in captured[0]
+
+
+def test_windows_process_inspection_retries_half_snapshot_then_accepts_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+    half = {
+        "found": True,
+        "process": {
+            "pid": 4242,
+            "parent_pid": 1,
+            "created_at": "2026-07-16T00:00:00Z",
+            "executable_path": None,
+            "command_line": None,
+        },
+    }
+    responses = [half, {"found": False, "process": None}]
+    calls: list[int] = []
+
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess([], 0, json.dumps(responses.pop(0)), "")
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    monkeypatch.setattr(launcher.time, "sleep", lambda _seconds: None)
+
+    assert launcher._inspect_process(4242) is None
+    assert len(calls) == 2
+
+
+def test_windows_process_inspection_rejects_persistent_half_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+    half = {
+        "found": True,
+        "process": {
+            "pid": 4242,
+            "parent_pid": 1,
+            "created_at": None,
+            "executable_path": None,
+            "command_line": None,
+        },
+    }
+    calls: list[int] = []
+
+    def fake_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(1)
+        return subprocess.CompletedProcess([], 0, json.dumps(half), "")
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    monkeypatch.setattr(launcher.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="process ownership"):
+        launcher._inspect_process(4242)
+    assert len(calls) == 3
+
+
+def test_windows_process_inspection_does_not_downgrade_retry_query_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = _load_launcher()
+    if launcher.os.name != "nt":
+        pytest.skip("Windows PowerShell process inspection is Windows-only")
+    half = {
+        "found": True,
+        "process": {
+            "pid": 4242,
+            "parent_pid": 1,
+            "created_at": "2026-07-16T00:00:00Z",
+            "executable_path": None,
+            "command_line": None,
+        },
+    }
+    responses = [
+        subprocess.CompletedProcess([], 0, json.dumps(half), ""),
+        subprocess.CompletedProcess([], 1, "", "CIM failed"),
+    ]
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *_args, **_kwargs: responses.pop(0))
+    monkeypatch.setattr(launcher.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="process ownership"):
+        launcher._inspect_process(4242)
+    assert not responses
 
 
 @pytest.mark.parametrize(
