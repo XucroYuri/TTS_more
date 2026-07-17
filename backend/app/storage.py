@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ WINDOWS_RESERVED_NAMES = {
 class ProjectStore:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self._replace_lock = threading.Lock()
 
     def project_dir(self, project_id: str) -> Path:
         safe_id = self._safe_project_id(project_id)
@@ -194,7 +196,8 @@ class ProjectStore:
         temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
             temp_path.write_text(text, encoding="utf-8")
-            temp_path.replace(path)
+            with self._replace_lock:
+                temp_path.replace(path)
         finally:
             try:
                 temp_path.unlink(missing_ok=True)

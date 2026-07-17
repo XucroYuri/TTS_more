@@ -1,6 +1,6 @@
 import os
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -185,7 +185,13 @@ def test_pinned_host_key_uses_bracketed_ipv6_lookup(tmp_path: Path) -> None:
     digest = WindowsSshExecutor(config, runner=runner).pinned_host_key_sha256("gpt-worker")
 
     assert len(digest) == 64
-    assert runner.calls[1] == ["ssh-keygen", "-F", "[2001:db8::10]", "-f", str(known_hosts)]
+    assert runner.calls[1] == [
+        "ssh-keygen",
+        "-F",
+        "[2001:db8::10]",
+        "-f",
+        known_hosts.as_posix(),
+    ]
 
 
 def test_resolve_does_not_cache_a_validated_target(tmp_path: Path) -> None:
@@ -271,7 +277,7 @@ def test_execution_binds_validated_target_and_policy_in_argv(tmp_path: Path) -> 
     assert "HostKeyAlias=tts-gpt.lan" in argv
     assert "User=tester" in argv
     assert "StrictHostKeyChecking=yes" in argv
-    assert f"UserKnownHostsFile={known_hosts}" in argv
+    assert f"UserKnownHostsFile={known_hosts.as_posix()}" in argv
     assert "GlobalKnownHostsFile=none" in argv
     assert "gpt-worker" in argv
     assert str(config) not in argv
@@ -601,6 +607,7 @@ def test_relative_include_uses_user_ssh_directory_like_openssh(
     config = config_directory / "ssh_config"
     config.write_text("Include included.conf\nHost gpt-worker\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
 
     class SnapshotRunner(FakeRunner):
         def __call__(self, argv: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
@@ -751,13 +758,13 @@ def test_alias_authentication_semantics_are_bound_across_all_operations(
         argv = runner.calls[call_index]
         assert argv[1:3] == ["-F", os.devnull] or argv[1:4] == ["-s", "-F", os.devnull]
         assert "Port=2222" in argv
-        assert ["-i", str(identity_one)] == argv[
-            argv.index(str(identity_one)) - 1 : argv.index(str(identity_one)) + 1
+        assert ["-i", identity_one.as_posix()] == argv[
+            argv.index(identity_one.as_posix()) - 1 : argv.index(identity_one.as_posix()) + 1
         ]
-        assert ["-i", str(identity_two)] == argv[
-            argv.index(str(identity_two)) - 1 : argv.index(str(identity_two)) + 1
+        assert ["-i", identity_two.as_posix()] == argv[
+            argv.index(identity_two.as_posix()) - 1 : argv.index(identity_two.as_posix()) + 1
         ]
-        assert f"CertificateFile={certificate}" in argv
+        assert f"CertificateFile={certificate.as_posix()}" in argv
         assert any(
             argument == "gpt-worker" or argument.startswith("gpt-worker:")
             for argument in argv
@@ -769,7 +776,7 @@ def test_alias_authentication_semantics_are_bound_across_all_operations(
         "-F",
         "[tts-gpt.lan]:2222",
         "-f",
-        str(known_hosts),
+        known_hosts.as_posix(),
     ]
 
 
@@ -854,6 +861,7 @@ def test_all_match_directives_are_rejected_before_runner(
     assert runner.calls == []
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="os.mkfifo is unavailable")
 def test_fifo_include_is_rejected_before_open_or_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -926,24 +934,61 @@ def test_config_file_count_limit_is_enforced(
     assert runner.calls == []
 
 
-@pytest.mark.parametrize("setting", ["identityfile", "certificatefile"])
+@pytest.mark.parametrize("setting", ["IdentityFile", "CertificateFile"])
 @pytest.mark.parametrize(
-    "filename",
-    ["worker key", "worker\tkey", 'worker"key', "worker\\key"],
+    "value",
+    [
+        "/safe/worker key",
+        "/safe/worker\tkey",
+        '/safe/worker"key',
+        "/safe/worker%hkey",
+        "/safe/worker${HOME}key",
+        "/safe/worker\nkey",
+    ],
 )
-def test_auth_paths_with_unsafe_config_characters_are_rejected(
-    tmp_path: Path, setting: str, filename: str
+def test_auth_paths_with_unsafe_config_characters_are_rejected_before_filesystem_access(
+    setting: str, value: str
 ) -> None:
-    auth_file = tmp_path / filename
-    auth_file.write_text("key material\n", encoding="utf-8")
-    runner = FakeRunner([completed(resolved_settings() + f"{setting} {auth_file}\n")])
+    with pytest.raises(ValueError, match=setting):
+        WindowsSshExecutor._validate_literal_path(value, setting)
 
-    with pytest.raises(ValueError, match="IdentityFile|CertificateFile"):
-        WindowsSshExecutor(
-            write_config(tmp_path),
-            runner=runner,
-            resolver=FakeResolver([["192.0.2.10"]]),
-        ).resolve("gpt-worker")
+
+def test_native_windows_separators_are_accepted_at_openssh_output_boundary() -> None:
+    WindowsSshExecutor._validate_literal_path(
+        r"C:\Users\runneradmin\.ssh\worker_key",
+        "IdentityFile",
+        native_windows_paths=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        r"C:\safe\worker%hkey",
+        r"C:\safe\worker${HOME}key",
+        "C:\\safe\\worker key",
+        'C:\\safe\\worker"key',
+        "C:\\safe\\worker\tkey",
+    ],
+)
+def test_native_windows_paths_still_reject_config_tokens_and_controls(
+    value: str,
+) -> None:
+    with pytest.raises(ValueError, match="IdentityFile"):
+        WindowsSshExecutor._validate_literal_path(
+            value,
+            "IdentityFile",
+            native_windows_paths=True,
+        )
+
+
+def test_backslashes_remain_rejected_for_posix_openssh_paths() -> None:
+    with pytest.raises(ValueError, match="IdentityFile"):
+        WindowsSshExecutor._validate_literal_path(
+            r"/safe/worker\key",
+            "IdentityFile",
+            native_windows_paths=False,
+        )
 
 
 def test_generated_auth_arguments_parse_with_real_openssh(tmp_path: Path) -> None:
@@ -973,8 +1018,13 @@ def test_generated_auth_arguments_parse_with_real_openssh(tmp_path: Path) -> Non
         shell=False,
     )
     assert parsed.returncode == 0, parsed.stderr
-    assert f"identityfile {identity}" in parsed.stdout
-    assert f"certificatefile {certificate}" in parsed.stdout
+    parsed_settings = WindowsSshExecutor._parse_settings(parsed.stdout)
+    assert identity.resolve() in {
+        Path(value).resolve() for value in parsed_settings["identityfile"]
+    }
+    assert certificate.resolve() in {
+        Path(value).resolve() for value in parsed_settings["certificatefile"]
+    }
 
 
 def test_known_hosts_rejects_percent_token_after_first_openssh_expansion(
@@ -1005,41 +1055,59 @@ def test_known_hosts_rejects_percent_token_after_first_openssh_expansion(
 
 
 @pytest.mark.parametrize(
-    "parent_name", ["parent%h", "parent${HOME}", "parent space", 'parent"quote', "parent\\slash"]
-)
-@pytest.mark.parametrize(
-    ("setting", "error"),
+    "setting",
     [
-        ("userknownhostsfile", "UserKnownHostsFile"),
-        ("identityfile", "IdentityFile"),
-        ("certificatefile", "CertificateFile"),
+        "UserKnownHostsFile",
+        "IdentityFile",
+        "CertificateFile",
     ],
 )
-def test_canonical_parent_cannot_introduce_unsafe_path_characters(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    parent_name: str,
-    setting: str,
-    error: str,
+@pytest.mark.parametrize(
+    "path",
+    [
+        PurePosixPath("/safe/parent%h/key"),
+        PurePosixPath("/safe/parent${HOME}/key"),
+        PurePosixPath("/safe/parent space/key"),
+        PurePosixPath('/safe/parent"quote/key'),
+        PurePosixPath("/safe/parent\\slash/key"),
+        PureWindowsPath(r"C:\safe\parent%h\key"),
+        PureWindowsPath(r"C:\safe\parent${HOME}\key"),
+        PureWindowsPath(r"C:\safe\parent space\key"),
+        PureWindowsPath('C:/safe/parent"quote/key'),
+    ],
+)
+def test_canonical_parent_cannot_introduce_unsafe_path_characters_without_filesystem_access(
+    setting: str, path: PurePosixPath | PureWindowsPath
 ) -> None:
-    unsafe_parent = tmp_path / parent_name
-    unsafe_parent.mkdir()
-    filename = "known_hosts" if setting == "userknownhostsfile" else "worker_key"
-    (unsafe_parent / filename).write_text("key material\n", encoding="utf-8")
-    monkeypatch.chdir(unsafe_parent)
-    output = (
-        resolved_settings(known_hosts=filename)
-        if setting == "userknownhostsfile"
-        else resolved_settings() + f"{setting} {filename}\n"
-    )
-    runner = FakeRunner([completed(output)])
+    with pytest.raises(ValueError, match=setting):
+        WindowsSshExecutor._canonical_openssh_path(path, setting)
 
-    with pytest.raises(ValueError, match=error):
-        WindowsSshExecutor(
-            write_config(tmp_path),
-            runner=runner,
-            resolver=FakeResolver([["192.0.2.10"]]),
-        ).resolve("gpt-worker")
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        PurePosixPath("/safe/parent/key"),
+        PureWindowsPath(r"C:\safe\parent\key"),
+    ],
+)
+def test_canonical_openssh_paths_are_absolute_and_use_forward_slashes(
+    path: PurePosixPath | PureWindowsPath,
+) -> None:
+    rendered = WindowsSshExecutor._canonical_openssh_path(path, "IdentityFile")
+
+    assert rendered == path.as_posix()
+    assert "\\" not in rendered
+
+
+@pytest.mark.parametrize(
+    "path",
+    [PurePosixPath("relative/key"), PureWindowsPath(r"relative\key")],
+)
+def test_canonical_openssh_paths_reject_relative_paths(
+    path: PurePosixPath | PureWindowsPath,
+) -> None:
+    with pytest.raises(ValueError, match="IdentityFile"):
+        WindowsSshExecutor._canonical_openssh_path(path, "IdentityFile")
 
 
 def test_safe_known_hosts_literal_matches_ssh_and_keygen_argv(tmp_path: Path) -> None:
@@ -1063,7 +1131,7 @@ def test_safe_known_hosts_literal_matches_ssh_and_keygen_argv(tmp_path: Path) ->
     executor.run_powershell("gpt-worker", "Get-Date")
     executor.pinned_host_key_sha256("gpt-worker")
 
-    canonical = str(known_hosts.resolve())
+    canonical = known_hosts.resolve().as_posix()
     assert f"UserKnownHostsFile={canonical}" in runner.calls[1]
     assert runner.calls[3][-1] == canonical
 

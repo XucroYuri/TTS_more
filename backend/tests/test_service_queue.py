@@ -761,6 +761,9 @@ def test_project_store_atomic_writes_use_unique_temp_paths_under_concurrency(tmp
     errors: list[BaseException] = []
     paths_lock = threading.Lock()
     original_write_text = Path.write_text
+    original_replace = Path.replace
+    active_replaces = 0
+    max_active_replaces = 0
 
     def synchronized_write_text(path: Path, text: str, *args, **kwargs):
         result = original_write_text(path, text, *args, **kwargs)
@@ -770,6 +773,18 @@ def test_project_store_atomic_writes_use_unique_temp_paths_under_concurrency(tmp
             write_barrier.wait(2)
         return result
 
+    def monitored_replace(path: Path, destination: Path):
+        nonlocal active_replaces, max_active_replaces
+        with paths_lock:
+            active_replaces += 1
+            max_active_replaces = max(max_active_replaces, active_replaces)
+        try:
+            time.sleep(0.05)
+            return original_replace(path, destination)
+        finally:
+            with paths_lock:
+                active_replaces -= 1
+
     def write_payload(payload: str) -> None:
         try:
             store._write_text(target, payload)
@@ -777,6 +792,7 @@ def test_project_store_atomic_writes_use_unique_temp_paths_under_concurrency(tmp
             errors.append(exc)
 
     monkeypatch.setattr(Path, "write_text", synchronized_write_text)
+    monkeypatch.setattr(Path, "replace", monitored_replace)
     workers = [threading.Thread(target=write_payload, args=(payload,)) for payload in ("first", "second")]
     for worker in workers:
         worker.start()
@@ -787,6 +803,7 @@ def test_project_store_atomic_writes_use_unique_temp_paths_under_concurrency(tmp
     assert errors == []
     assert len(temp_paths) == 2
     assert len(set(temp_paths)) == 2
+    assert max_active_replaces == 1
     assert target.read_text(encoding="utf-8") in {"first", "second"}
 
 

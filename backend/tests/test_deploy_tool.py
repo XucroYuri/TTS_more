@@ -322,8 +322,8 @@ def test_render_app_only_uses_each_assigned_worker_endpoint(tmp_path: Path) -> N
 
 
 def test_render_app_only_defers_endpoint_state_to_runtime_health_and_is_routable(tmp_path: Path) -> None:
-    from backend.app.models import ProviderType, TTSServiceEndpoint
-    from backend.app.services import ServiceRegistry
+    from app.models import ProviderType, TTSServiceEndpoint
+    from app.services import ServiceRegistry
 
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)

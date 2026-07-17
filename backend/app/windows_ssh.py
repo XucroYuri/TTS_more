@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import unicodedata
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Callable, Mapping
 
 
@@ -331,22 +331,40 @@ class WindowsSshExecutor:
             raise ValueError("SSH target must use a pinned UserKnownHostsFile") from None
         if not stat.S_ISREG(mode):
             raise ValueError("SSH target must use a pinned UserKnownHostsFile")
-        WindowsSshExecutor._validate_literal_path(
-            str(canonical), "UserKnownHostsFile"
+        WindowsSshExecutor._canonical_openssh_path(
+            canonical, "UserKnownHostsFile"
         )
         return canonical
 
     @staticmethod
-    def _validate_literal_path(value: str, setting: str) -> None:
+    def _validate_literal_path(
+        value: str,
+        setting: str,
+        *,
+        native_windows_paths: bool | None = None,
+    ) -> None:
+        if native_windows_paths is None:
+            native_windows_paths = os.name == "nt"
         if (
             not value
             or "%" in value
             or "${" in value
             or any(character.isspace() for character in value)
-            or any(character in "\"'\\" for character in value)
+            or any(character in "\"'" for character in value)
+            or ("\\" in value and not native_windows_paths)
             or any(unicodedata.category(character) == "Cc" for character in value)
         ):
             raise ValueError(f"SSH target has an invalid {setting}")
+
+    @staticmethod
+    def _canonical_openssh_path(path: PurePath, setting: str) -> str:
+        if not path.is_absolute():
+            raise ValueError(f"SSH target has an invalid {setting}")
+        value = path.as_posix()
+        WindowsSshExecutor._validate_literal_path(
+            value, setting, native_windows_paths=False
+        )
+        return value
 
     @staticmethod
     def _validate_auth_files(
@@ -373,7 +391,7 @@ class WindowsSshExecutor:
                     raise ValueError(f"SSH target has an invalid {setting}")
             except OSError:
                 raise ValueError(f"SSH target has an invalid {setting}") from None
-            WindowsSshExecutor._validate_literal_path(str(canonical), setting)
+            WindowsSshExecutor._canonical_openssh_path(canonical, setting)
             validated.append(canonical)
         return tuple(validated)
 
@@ -489,6 +507,9 @@ class WindowsSshExecutor:
 
     @staticmethod
     def _connection_arguments(target: SshResolvedTarget) -> list[str]:
+        known_hosts_file = WindowsSshExecutor._canonical_openssh_path(
+            target.known_hosts_file, "UserKnownHostsFile"
+        )
         options = [
             f"HostName={target.address}",
             f"HostKeyAlias={target.hostname}",
@@ -497,7 +518,7 @@ class WindowsSshExecutor:
             "BatchMode=yes",
             "IdentitiesOnly=yes",
             "StrictHostKeyChecking=yes",
-            f"UserKnownHostsFile={target.known_hosts_file}",
+            f"UserKnownHostsFile={known_hosts_file}",
             "GlobalKnownHostsFile=none",
             "ProxyCommand=none",
             "ProxyJump=none",
@@ -508,13 +529,22 @@ class WindowsSshExecutor:
             "ControlPersist=no",
             "KnownHostsCommand=none",
             "VerifyHostKeyDNS=no",
-            *(f"CertificateFile={path}" for path in target.certificate_files),
+            *(
+                "CertificateFile="
+                + WindowsSshExecutor._canonical_openssh_path(
+                    path, "CertificateFile"
+                )
+                for path in target.certificate_files
+            ),
         ]
         arguments = [argument for option in options for argument in ("-o", option)]
         arguments.extend(
             argument
             for path in target.identity_files
-            for argument in ("-i", str(path))
+            for argument in (
+                "-i",
+                WindowsSshExecutor._canonical_openssh_path(path, "IdentityFile"),
+            )
         )
         return arguments
 
@@ -598,7 +628,15 @@ class WindowsSshExecutor:
                     f"[{address.compressed}]" if address.version == 6 else address.compressed
                 )
         result = self._run(
-            ["ssh-keygen", "-F", lookup_host, "-f", str(target.known_hosts_file)],
+            [
+                "ssh-keygen",
+                "-F",
+                lookup_host,
+                "-f",
+                self._canonical_openssh_path(
+                    target.known_hosts_file, "UserKnownHostsFile"
+                ),
+            ],
             operation="SSH host key lookup",
             alias=alias,
             timeout=30,
