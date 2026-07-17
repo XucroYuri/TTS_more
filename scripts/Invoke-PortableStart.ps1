@@ -166,8 +166,8 @@ function Get-PackageContext {
                 if ([string]$manifest.source.repository -notmatch '^https://' -or [string]$manifest.source.revision -notmatch '^[0-9a-fA-F]{40,64}$') { throw "source identity is invalid" }
                 if ([string]::IsNullOrWhiteSpace([string]$manifest.integration.version) -or [string]$manifest.integration.source_revision -notmatch '^[0-9a-fA-F]{40,64}$' -or [string]$manifest.integration.bundle_sha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "integration identity is invalid" }
                 $expectedPython = [string]$manifest.runtime.python_version
-                if ($expectedPython -notin @("3.10", "3.11")) { throw "runtime.python_version is unsupported" }
-                if ($component -eq "tts-more" -and $expectedPython -ne "3.11") { throw "tts-more requires Python 3.11" }
+                if ($expectedPython -notin @("3.10", "3.10.11", "3.11", "3.11.9")) { throw "runtime.python_version is unsupported" }
+                if ($component -eq "tts-more" -and $expectedPython -notin @("3.11", "3.11.9")) { throw "tts-more requires Python 3.11" }
                 if ($manifest.runtime.device_profiles -is [string]) { throw "runtime.device_profiles must be an array" }
                 $deviceProfiles = @($manifest.runtime.device_profiles)
                 if ($deviceProfiles.Count -eq 0) { throw "runtime.device_profiles is required" }
@@ -607,7 +607,8 @@ function Resolve-PortableImportPython {
     if (!(Test-PathWithinRoot -Root $cacheRoot -Path $resolvedPython)) {
         Throw-PortableStartError "PACKAGE_CORRUPT" "The locked package bootstrap runtime is outside its fixed cache"
     }
-    $versionResult = Invoke-PortableCapturedProcess -FilePath $resolvedPython -Arguments @("-c", "import sys;print(f'{sys.version_info.major}.{sys.version_info.minor}')") -MaximumBytes 65536 -Utf8
+    $versionProbe = if ([string]$Context.ExpectedPython -match '^\d+\.\d+\.\d+$') { "import platform;print(platform.python_version())" } else { "import sys;print(f'{sys.version_info.major}.{sys.version_info.minor}')" }
+    $versionResult = Invoke-PortableCapturedProcess -FilePath $resolvedPython -Arguments @("-c", $versionProbe) -MaximumBytes 65536 -Utf8
     if ($versionResult.ExitCode -ne 0 -or $versionResult.Exceeded -or $versionResult.StdOut.Trim() -ne [string]$Context.ExpectedPython) {
         Throw-PortableStartError "PACKAGE_CORRUPT" "The locked package bootstrap runtime version is invalid"
     }
@@ -1016,7 +1017,8 @@ function Get-PortableInstallStateDiagnostic {
         $parts.Add("expected_python=$([string]$Context.ExpectedPython)")
         if ($pythonExists -and $ProbeRuntime) {
             try {
-                $versionOutput = @(& $python -c "import sys;print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>&1)
+                $versionProbe = if ([string]$Context.ExpectedPython -match '^\d+\.\d+\.\d+$') { "import platform;print(platform.python_version())" } else { "import sys;print(f'{sys.version_info[0]}.{sys.version_info[1]}')" }
+                $versionOutput = @(& $python -c $versionProbe 2>&1)
                 $versionText = (($versionOutput -join " ") -replace '[\r\n]+', ' ').Trim()
                 if ($versionText.Length -gt 160) { $versionText = $versionText.Substring(0, 160) + "..." }
                 $parts.Add("python_version_exit=$LASTEXITCODE")

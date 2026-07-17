@@ -44,7 +44,7 @@ if (!(Test-Path -LiteralPath $recordPath)) {
 $runtimeLockPath = Resolve-PortablePackagePath -Root $Root -RelativePath "packaging\portable\runtime.lock.json" -Label "runtime lock" -MustExist
 $runtimeLock = Get-Content -LiteralPath $runtimeLockPath -Raw | ConvertFrom-Json
 $expectedPython = [string]$runtimeLock.python_version
-if ($expectedPython -ne "3.11") { throw "TTS More runtime lock must require Python 3.11" }
+if ($expectedPython -notin @("3.11", "3.11.9")) { throw "TTS More runtime lock must require Python 3.11" }
 $Python = Join-Path $Root "runtime\live\python.exe"
 [void](Assert-PortableRuntime -Root $Root -PythonPath $Python -ExpectedVersion $expectedPython -ImportProbe "")
 $Launcher = Resolve-PortablePackagePath -Root $Root -RelativePath "scripts\portable_launcher.py" -Label "portable launcher" -MustExist

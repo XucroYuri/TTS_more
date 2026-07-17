@@ -349,7 +349,7 @@ function Install-PortablePythonRuntime {
         $arguments = @($portableInstall, 'ensure-asset', '--asset', $uvLockPath, '--path', $uvWheel, '--package-root', $PackageRoot)
         if ($OperationRoot) { $arguments += @('--operation-root', $OperationRoot) }
         if ($CancelFile) { $arguments += @('--cancel-file', $CancelFile) }
-        $portableInstallBootstrap = "import datetime,runpy,sys; datetime.UTC = getattr(datetime, 'UTC', datetime.timezone.utc); script = sys.argv[1]; sys.argv = sys.argv[1:]; runpy.run_path(script, run_name='__main__')"
+        $portableInstallBootstrap = "import os,runpy,sys; script=sys.argv[1]; sys.argv=sys.argv[1:]; sys.path.insert(0,os.path.dirname(script)); runpy.run_path(script,run_name='__main__')"
         & $candidatePython -c $portableInstallBootstrap @arguments 2>&1 | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "portable_install.py ensure-asset failed for uv" }
 

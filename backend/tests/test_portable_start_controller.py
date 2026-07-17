@@ -209,7 +209,8 @@ class FakePython {{
     string joined = String.Join(" ", args);
     string executed = Environment.GetEnvironmentVariable("A4_FAKE_EXEC_MARKER");
     if (!String.IsNullOrEmpty(executed)) File.AppendAllText(executed, joined + Environment.NewLine);
-    if (joined.Contains("version_info")) {{ Console.WriteLine("{version}"); return 0; }}
+    if (joined.Contains("platform.python_version")) {{ Console.WriteLine("{version}"); return 0; }}
+    if (joined.Contains("version_info")) {{ Console.WriteLine("{'.'.join(version.split('.')[:2])}"); return 0; }}
     if (joined.Contains("definitely_missing") || {str(not imports_ok).lower()}) return 1;
     if (joined.Contains(" plan ")) {{
       string order = Environment.GetEnvironmentVariable("A4_ORDER_MARKER");
@@ -499,6 +500,8 @@ def _prepare_worker_import_fixture(package_root: Path) -> Path:
     payload = _manifest(package_root, profile="bootstrap")
     payload["component"] = "gpt-sovits"
     payload["runtime"]["lock"] = "app/tts_more/locks/runtime.lock.json"
+    runtime_payload = json.loads((bundle / "locks" / "runtime.lock.json").read_text(encoding="utf-8"))
+    payload["runtime"]["python_version"] = runtime_payload["python_version"]
     payload["models"]["lock"] = "app/tts_more/locks/models.lock.json"
     payload["models"]["required"] = False
     worker_port = _unused_tcp_port()
@@ -536,7 +539,10 @@ exit 0
         "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"
         "[Console]::Out.WriteLine((@{ selected_path = [string]$env:A4_OLD_ROOT } | ConvertTo-Json -Compress))\n",
     )
-    _compile_fake_python(package_root / "runtime" / "live" / "python.exe")
+    _compile_fake_python(
+        package_root / "runtime" / "live" / "python.exe",
+        version=runtime_payload["python_version"],
+    )
     _write_sha256_manifest(package_root)
     return old_root
 
@@ -1859,6 +1865,61 @@ def test_portable_start_scripts_reject_external_python_fallbacks_before_spawn() 
 
 
 @pytest.mark.parametrize(
+    ("expected", "actual", "accepted"),
+    (
+        ("3.11.9", "3.11.9", True),
+        ("3.11.9", "3.11.8", False),
+        ("3.11", "3.11.8", True),
+        ("3.10", "3.10.11", True),
+    ),
+)
+def test_runtime_validation_enforces_exact_patch_and_reads_legacy_versions(
+    tmp_path: Path, expected: str, actual: str, accepted: bool
+) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    root = tmp_path / "package"
+    validation = root / "scripts" / "Portable-Validation.ps1"
+    validation.parent.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", validation)
+    python = root / "runtime" / "live" / "python.exe"
+    _compile_fake_python(python, version=actual)
+    environment = {
+        **os.environ,
+        "A4_ROOT": str(root),
+        "A4_VALIDATION": str(validation),
+        "A4_PYTHON": str(python),
+        "A4_EXPECTED": expected,
+    }
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ". $env:A4_VALIDATION; Assert-PortableRuntime -Root $env:A4_ROOT -PythonPath $env:A4_PYTHON -ExpectedVersion $env:A4_EXPECTED -ImportProbe 'import sys' | Out-Null",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
+
+
+def test_controller_schema_accepts_pinned_and_legacy_python_versions() -> None:
+    schema = json.loads(
+        (REPO_ROOT / "packaging" / "portable" / "tts-more-package.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    versions = schema["$defs"]["v2"]["properties"]["runtime"]["properties"]["python_version"]["enum"]
+    assert versions == ["3.10", "3.10.11", "3.11", "3.11.9"]
+
+
+@pytest.mark.parametrize(
     ("component", "profile_case", "bad_write"),
     (
         ("tts-more", "cpu", False),
@@ -1885,6 +1946,8 @@ def test_initializers_repair_stale_state_from_verified_private_assets_without_bo
     shutil.copy2(initializer, bundle)
     shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", bundle)
     shutil.copy2(REPO_ROOT / "scripts" / "portable_install.py", bundle)
+    if component == "tts-more":
+        shutil.copy2(REPO_ROOT / "scripts" / "portable-python.ps1", bundle)
     if component != "tts-more":
         shutil.copy2(REPO_ROOT / "integrations" / "windows" / "Portable-Paths.ps1", bundle)
     expected_python = "3.11"
@@ -2233,6 +2296,38 @@ def test_production_stop_never_executes_pid_record_path_and_rejects_invalid_runt
     assert not marker.exists(), "Stop executed the untrusted PID-record executable"
     combined = (result.stdout + result.stderr).lower()
     assert "runtime" in combined or "python" in combined or "reparse" in combined
+
+
+@pytest.mark.parametrize(
+    ("expected", "actual", "accepted"),
+    (("3.11", "3.11.8", True), ("3.11.9", "3.11.9", True), ("3.11.9", "3.11.8", False)),
+)
+def test_controller_stop_accepts_legacy_and_pinned_versions_but_rejects_wrong_patch(
+    tmp_path: Path, expected: str, actual: str, accepted: bool
+) -> None:
+    if not POWERSHELL:
+        pytest.skip("Windows PowerShell is unavailable")
+    root = tmp_path / "controller-stop"
+    scripts = root / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "scripts" / "stop-production.ps1", scripts)
+    shutil.copy2(REPO_ROOT / "scripts" / "Portable-Validation.ps1", scripts)
+    _write_text(scripts / "portable_launcher.py", "# fixture launcher\n")
+    _write_text(
+        root / "packaging" / "portable" / "runtime.lock.json",
+        json.dumps({"python_version": expected, "import_probe": "import sys"}),
+    )
+    _write_text(root / "data" / "local" / "run" / "worker.pid.json", "{}\n")
+    python = root / "runtime" / "live" / "python.exe"
+    _compile_fake_python(python, version=actual)
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(scripts / "stop-production.ps1")],
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
 
 
 def test_production_stop_is_idempotent_without_pid_record(tmp_path: Path) -> None:

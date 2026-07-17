@@ -9,7 +9,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterable
 from uuid import UUID
@@ -208,7 +208,7 @@ def write_install_state(
         "runtime_lock_sha256": runtime_lock_sha256,
         "model_lock_sha256": model_lock_sha256,
         "ready": True,
-        "completed_at": datetime.now(UTC).isoformat(),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
     }
     temporary = state_path.with_suffix(state_path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

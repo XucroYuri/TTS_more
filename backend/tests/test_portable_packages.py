@@ -198,6 +198,7 @@ def _copy_controller_builder_fixture(root: Path) -> None:
     (frontend_dist / "index.html").write_text("<!doctype html><title>schema fixture</title>\n", encoding="utf-8")
     for name in (
         "bootstrap-conda.ps1",
+        "portable-python.ps1",
         "initialize-portable.ps1",
         "repair-portable.ps1",
         "start-production.ps1",
@@ -2236,6 +2237,22 @@ def test_tts_more_builder_uses_the_shared_zip64_writer() -> None:
     assert "^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$" in builder
     assert '"import-portable-data.py"' in builder
     assert '"import_portable_data.py"' in builder
+
+
+def test_tts_more_builder_stages_embedded_runtime_helper_and_audits_full_payload() -> None:
+    builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+
+    assert '"portable-python.ps1"' in builder
+    assert "Assert-TtsMoreFullRuntimeBoundary" in builder
+    assert "pyvenv.cfg" in builder
+    assert "conda-meta" in builder
+    assert "condabin" in builder
+    assert "Miniforge" in builder
+    assert '-like "Miniforge*"' in builder
+    assert "package contains build-machine identity or path data" in builder
+    assert builder.index("Assert-TtsMoreFullRuntimeBoundary") < builder.index(
+        "create-zip --package-root"
+    )
 
 
 def test_public_builders_use_embedded_sha256_helper_instead_of_get_file_hash() -> None:

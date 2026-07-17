@@ -162,12 +162,19 @@ def test_harness_builds_micro_python_stdlib_seed_instead_of_copying_full_lib() -
     assert 'Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "Lib")' not in script
     assert 'Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed could not be copied or validated"' in script
     assert 'Throw-HarnessError "FIXTURE_RUNTIME_IMPORT_FAILED" "fixture Python seed is missing required stdlib or extension modules"' in script
+    assert 'Get-ChildItem -LiteralPath (Join-Path $source "DLLs") -Filter "*.dll"' in script
+    assert 'Copy-Item -LiteralPath $dependency.FullName -Destination (Join-Path $source $dependency.Name)' in script
 
 
-def test_harness_contract_uses_real_root_launchers_and_fixture_only_copy_mutation() -> None:
+def test_harness_initialize_contract_uses_embedded_python_and_uv_fixtures() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
     assert all(name in script for name in ("Start.cmd", "Stop.cmd", "Repair.cmd", "Initialize.cmd"))
-    assert "Install-FixtureCondaAdapter" in script and "Copy-FixturePythonRuntime" in script
+    assert "New-FixtureEmbeddedPythonZip" in script
+    assert "New-FixtureUvWheel" in script
+    assert "uv-0.11.28.data/scripts/uv.exe" in script
+    assert "Install-FixtureCondaAdapter" not in script
+    assert "runtime\\Scripts\\uv.exe" not in script
+    assert "data\\cache\\portable\\conda" not in script
     assert "SHA256SUMS.txt" in script and "Write-FixtureSha256Manifest" in script
     assert "fixture-only" in script.lower()
     assert 'Invoke-RootCommand -Root $Package.Root -Name "Initialize.cmd"' in script

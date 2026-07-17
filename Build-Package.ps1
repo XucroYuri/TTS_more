@@ -313,6 +313,38 @@ function Assert-TtsMoreFullPayloadBoundary {
     }
 }
 
+function Assert-TtsMoreFullRuntimeBoundary {
+    param([Parameter(Mandatory = $true)][string]$PackageRoot)
+    $forbiddenNames = @("pyvenv.cfg", "conda-meta", "condabin", "Miniforge")
+    foreach ($entry in @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -Force)) {
+        foreach ($segment in @($entry.FullName.Substring($PackageRoot.Length).TrimStart("\", "/") -split '[\\/]')) {
+            if ($forbiddenNames -contains $segment -or $segment -like "Miniforge*") {
+                throw "Full package staging contains forbidden portable-runtime content: $($entry.FullName)"
+            }
+        }
+    }
+}
+
+function Assert-TtsMoreFullArchiveBoundary {
+    param([Parameter(Mandatory = $true)][string]$ArchivePath)
+    Add-Type -AssemblyName System.IO.Compression
+    $stream = [IO.File]::OpenRead($ArchivePath)
+    try {
+        $archive = New-Object IO.Compression.ZipArchive($stream, [IO.Compression.ZipArchiveMode]::Read, $false)
+        try {
+            foreach ($entry in $archive.Entries) {
+                foreach ($segment in @($entry.FullName -split '[/\\]')) {
+                    if ($segment -in @("pyvenv.cfg", "conda-meta", "condabin", "Miniforge") -or $segment -like "Miniforge*") {
+                        throw "Full package archive contains forbidden portable-runtime content: $($entry.FullName)"
+                    }
+                }
+            }
+        }
+        finally { $archive.Dispose() }
+    }
+    finally { $stream.Dispose() }
+}
+
 $Root = [System.IO.Path]::GetFullPath($PSScriptRoot)
 $profileName = $Profile.ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) { $OutputRoot = Join-Path $Root "artifacts\portable\$profileName" }
@@ -373,7 +405,7 @@ New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "app\backend
 Copy-Item -LiteralPath (Join-Path $Root "backend\app") -Destination (Join-Path $stage "app\backend\app") -Recurse
 foreach ($file in @("pyproject.toml", "uv.lock", ".python-version")) { Copy-Item -LiteralPath (Join-Path $Root "backend\$file") -Destination (Join-Path $stage "app\backend\$file") }
 Copy-Item -LiteralPath (Join-Path $Root "frontend\dist") -Destination (Join-Path $stage "app\frontend") -Recurse
-foreach ($file in @("bootstrap-conda.ps1", "initialize-portable.ps1", "repair-portable.ps1", "start-production.ps1", "stop-production.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1", "select-portable-folder.ps1", "export-portable-diagnostics.py", "import-portable-data.py", "import_portable_data.py", "portable_install.py", "portable_launcher.py", "portable_operations.py", "portable_packages.py", "portable_package_runner.py")) { Copy-Item -LiteralPath (Join-Path $Root "scripts\$file") -Destination (Join-Path $stage "scripts\$file") }
+foreach ($file in @("bootstrap-conda.ps1", "portable-python.ps1", "initialize-portable.ps1", "repair-portable.ps1", "start-production.ps1", "stop-production.ps1", "Invoke-PortableStart.ps1", "Show-PortableProgress.ps1", "Portable-Validation.ps1", "select-portable-folder.ps1", "export-portable-diagnostics.py", "import-portable-data.py", "import_portable_data.py", "portable_install.py", "portable_launcher.py", "portable_operations.py", "portable_packages.py", "portable_package_runner.py")) { Copy-Item -LiteralPath (Join-Path $Root "scripts\$file") -Destination (Join-Path $stage "scripts\$file") }
 foreach ($file in @("toolchain.lock.json", "runtime.lock.json", "models.lock.json", "tts-more-package.schema.json", "error-catalog.zh-CN.json")) { Copy-Item -LiteralPath (Join-Path $Root "packaging\portable\$file") -Destination (Join-Path $stage "packaging\portable\$file") }
 @(Get-ChildItem -LiteralPath $stage -Directory -Recurse -Force | Where-Object { $_.Name -in @("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache") } | Sort-Object FullName -Descending) | ForEach-Object {
     $resolved = [System.IO.Path]::GetFullPath($_.FullName)
@@ -404,7 +436,7 @@ $manifest = [ordered]@{
     protocol = @{ name = "tts-more-v1"; version = "1.0"; controller_range = ">=0.2.0,<0.3.0" }
     source = @{ repository = "https://github.com/XucroYuri/TTS_more.git"; revision = $revision }
     integration = @{ version = "2.0.0"; source_revision = $revision; bundle_sha256 = $bundleSha }
-    runtime = @{ python_version = "3.11"; device_profiles = @("cpu"); lock = "packaging/portable/runtime.lock.json"; state_path = "data/local/install-state.json" }
+    runtime = @{ python_version = "3.11.9"; device_profiles = @("cpu"); lock = "packaging/portable/runtime.lock.json"; state_path = "data/local/install-state.json" }
     models = @{ lock = "packaging/portable/models.lock.json"; required = $false }
     data_root = "data/local"
     data = @{ user = "data/user"; local = "data/local"; cache = "data/cache"; operations = "data/local/operations" }
@@ -420,6 +452,7 @@ if ($Profile -eq "Full") {
     & (Join-Path $stage "scripts\initialize-portable.ps1") -Device CPU
     if ($LASTEXITCODE -ne 0) { throw "full package initialization failed" }
     Assert-TtsMoreFullPayloadBoundary -PackageRoot $stage
+    Assert-TtsMoreFullRuntimeBoundary -PackageRoot $stage
 }
 
 $sumPath = Join-Path $stage "SHA256SUMS.txt"
@@ -467,6 +500,7 @@ $zip = Join-Path $OutputRoot "$packageName.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 & $buildPython (Join-Path $stage "scripts\portable_packages.py") create-zip --package-root $stage --output $zip --archive-root $packageName
 if ($LASTEXITCODE -ne 0) { throw "ZIP64 package creation failed" }
+if ($Profile -eq "Full") { Assert-TtsMoreFullArchiveBoundary -ArchivePath $zip }
 $auditPassed = $false
 if ($Profile -eq "Bootstrap") {
     & $buildPython (Join-Path $stage "scripts\portable_packages.py") audit-release --zip $zip

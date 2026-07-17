@@ -676,8 +676,6 @@ function Copy-FixturePythonRuntime {
             Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "DLLs") -Destination (Join-Path $seed "DLLs") -SkipDirectories @("__pycache__") -Optional
             Copy-FixturePythonExtensions -Destination (Join-Path $seed "DLLs")
             Copy-FixturePythonStdlib -Destination (Join-Path $seed "Lib")
-            New-Item -ItemType Directory -Force -Path (Join-Path $seed "Scripts") | Out-Null
-            Write-FixtureUvExe -Path (Join-Path $seed "Scripts\uv.exe")
             Write-FixturePythonPackages -RuntimeRoot $seed
             & (Join-Path $seed "python.exe") -c "import urllib.request, email.parser, http.client"
             if ($LASTEXITCODE -ne 0) { Throw-HarnessError "FIXTURE_RUNTIME_IMPORT_FAILED" "fixture Python seed is missing required stdlib or extension modules" }
@@ -691,53 +689,72 @@ function Copy-FixturePythonRuntime {
     Copy-Item -LiteralPath $seed -Destination $Destination -Recurse -Force
 }
 
-function Install-FixtureCondaAdapter {
+function New-FixtureEmbeddedPythonZip {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
-        [Parameter(Mandatory = $true)][string]$ToolchainLock
+        [Parameter(Mandatory = $true)][string]$Path
     )
-    $lock = Get-Content -LiteralPath $ToolchainLock -Raw | ConvertFrom-Json
-    $version = [string]$lock.miniforge.version
-    $installRoot = Join-Path $Root "data\cache\portable\conda\miniforge-$version"
-    $condabin = Join-Path $installRoot "condabin"
-    New-Item -ItemType Directory -Force -Path $condabin | Out-Null
-    $seed = Join-Path $Root "data\local\fixture\python-seed"
-    if (!(Test-Path -LiteralPath (Join-Path $seed "python.exe") -PathType Leaf)) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed is missing" }
-    foreach ($item in @(Get-ChildItem -LiteralPath $seed -Force)) {
-        Copy-Item -LiteralPath $item.FullName -Destination $installRoot -Recurse -Force
+    $source = Join-Path $Root "data\local\fixture\embedded-python"
+    Copy-FixturePythonRuntime -Root $Root -Destination $source
+    Remove-Item -LiteralPath (Join-Path $source "Scripts") -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $source "pyvenv.cfg") -Force -ErrorAction SilentlyContinue
+    foreach ($extension in @(Get-ChildItem -LiteralPath (Join-Path $source "DLLs") -Filter "*.pyd" -File -ErrorAction SilentlyContinue)) {
+        Copy-Item -LiteralPath $extension.FullName -Destination (Join-Path $source $extension.Name) -Force
     }
-    $adapter = Join-Path $condabin "conda-adapter.ps1"
-    [IO.File]::WriteAllText($adapter, @'
-param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CondaArgs)
-$ErrorActionPreference = "Stop"
-function Find-FixtureRoot([string]$Start) {
-    $current = [IO.Path]::GetFullPath($Start)
-    while ($true) {
-        if (Test-Path -LiteralPath (Join-Path $current "package\tts-more-package.json") -PathType Leaf) { return $current }
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrWhiteSpace($parent) -or [string]::Equals($parent, $current, [StringComparison]::OrdinalIgnoreCase)) { throw "fixture package root not found" }
-        $current = [IO.Path]::GetFullPath($parent)
+    foreach ($dependency in @(Get-ChildItem -LiteralPath (Join-Path $source "DLLs") -Filter "*.dll" -File -ErrorAction SilentlyContinue)) {
+        Copy-Item -LiteralPath $dependency.FullName -Destination (Join-Path $source $dependency.Name) -Force
     }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $stdlibArchive = Join-Path $source "python311.zip"
+    $stdlibStream = [IO.File]::Open($stdlibArchive, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $stdlibZip = New-Object IO.Compression.ZipArchive($stdlibStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $lib = Join-Path $source "Lib"
+            foreach ($file in @(Get-ChildItem -LiteralPath $lib -Recurse -File -Force | Where-Object { $_.FullName -notlike (Join-Path $lib "site-packages\*") })) {
+                $relative = $file.FullName.Substring($lib.Length).TrimStart("\", "/").Replace("\", "/")
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($stdlibZip, $file.FullName, $relative, [IO.Compression.CompressionLevel]::Optimal) | Out-Null
+            }
+        }
+        finally { $stdlibZip.Dispose() }
+    }
+    finally { $stdlibStream.Dispose() }
+    foreach ($item in @(Get-ChildItem -LiteralPath (Join-Path $source "Lib") -Force | Where-Object { $_.Name -ne "site-packages" })) {
+        Remove-Item -LiteralPath $item.FullName -Recurse -Force
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $source "python311._pth"),
+        "python311.zip`n.`nLib\site-packages`nimport site`n",
+        [Text.Encoding]::ASCII
+    )
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+    [IO.Compression.ZipFile]::CreateFromDirectory($source, $Path, [IO.Compression.CompressionLevel]::Optimal, $false)
 }
-if ($CondaArgs.Count -gt 0 -and $CondaArgs[0] -eq "create") {
-    $prefix = ""
-    for ($index = 0; $index -lt $CondaArgs.Count; $index++) {
-        if ($CondaArgs[$index] -eq "--prefix" -and $index + 1 -lt $CondaArgs.Count) { $prefix = $CondaArgs[$index + 1] }
+
+function New-FixtureUvWheel {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $root = Join-Path (Split-Path -Parent $Path) ("uv-wheel-" + [guid]::NewGuid().ToString("N"))
+    $entry = Join-Path $root "uv-0.11.28.data\scripts\uv.exe"
+    try {
+        Write-FixtureUvExe -Path $entry
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+        $wheelStream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $wheel = New-Object IO.Compression.ZipArchive($wheelStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+            try {
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $wheel,
+                    $entry,
+                    "uv-0.11.28.data/scripts/uv.exe",
+                    [IO.Compression.CompressionLevel]::Optimal
+                ) | Out-Null
+            }
+            finally { $wheel.Dispose() }
+        }
+        finally { $wheelStream.Dispose() }
     }
-    if ([string]::IsNullOrWhiteSpace($prefix)) { throw "fixture conda create requires --prefix" }
-    $root = Find-FixtureRoot $PSScriptRoot
-    $seed = Join-Path $root "data\local\fixture\python-seed"
-    if (!(Test-Path -LiteralPath (Join-Path $seed "python.exe") -PathType Leaf)) { throw "fixture Python seed is missing" }
-    if (Test-Path -LiteralPath $prefix) { Remove-Item -LiteralPath $prefix -Recurse -Force }
-    Copy-Item -LiteralPath $seed -Destination $prefix -Recurse -Force
-    exit 0
-}
-exit 0
-'@, $Utf8NoBom)
-    $batch = Join-Path $condabin "conda.bat"
-    $batchText = "@echo off`r`npowershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""%~dp0conda-adapter.ps1"" %*`r`nexit /b %errorlevel%`r`n"
-    [IO.File]::WriteAllText($batch, $batchText, [Text.Encoding]::ASCII)
-    return $batch
+    finally { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 function Install-FixtureProtocol {
@@ -755,7 +772,7 @@ function Install-FixtureProtocol {
     $port = Get-RandomLoopbackPort
     $manifest.endpoint.port = $port
     $manifest.endpoint.default_url = "http://127.0.0.1:$port"
-    $manifest.runtime.python_version = "3.11"
+    $manifest.runtime.python_version = if ($Component -eq "tts-more") { "3.11.9" } else { "3.11" }
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 12), $Utf8NoBom)
 
     $bundle = if ($Component -eq "tts-more") { Join-Path $Root "scripts" } else { Join-Path $Root "app\tts_more" }
@@ -779,31 +796,52 @@ function Install-FixtureProtocol {
     Write-FixtureService -Path (Join-Path $fixture "fixture-service.py")
 
     $runtimePython = Join-Path $Root "runtime\live\python.exe"
-    Copy-FixturePythonRuntime -Root $Root -Destination (Join-Path $Root "runtime\live")
+    if ($Component -ne "tts-more") {
+        Copy-FixturePythonRuntime -Root $Root -Destination (Join-Path $Root "runtime\live")
+    }
 
-    $uvBytes = $AssetPayload
-    $uvTarget = "data/cache/portable/assets/$Component-uv-fixture.whl"
+    $pythonFixture = Join-Path $AssetsRoot "$Component-python-3.11.9-embed.zip"
+    New-FixtureEmbeddedPythonZip -Root $Root -Path $pythonFixture
+    $uvFixture = Join-Path $AssetsRoot "$Component-uv-0.11.28.whl"
+    New-FixtureUvWheel -Path $uvFixture
+    $uvId = "uv-0.11.28-$Component-fixture"
+    $uvTarget = "data/cache/portable/assets/$uvId.whl"
     $uvWheel = Join-Path $Root $uvTarget
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $uvWheel) | Out-Null
-    [IO.File]::WriteAllBytes($uvWheel, $uvBytes)
+    $pythonAsset = [ordered]@{
+        id = "$Component-python-fixture"
+        size_bytes = (Get-Item -LiteralPath $pythonFixture).Length
+        sha256 = Get-PortableFileSha256 -Path $pythonFixture
+        urls = @("$FixtureEndpoint/$Component-python-3.11.9-embed.zip")
+        archive_entry = "python.exe"
+    }
     $uvAsset = [ordered]@{
-        id = "$Component-uv-fixture"
+        id = $uvId
         target = $uvTarget
-        size_bytes = $uvBytes.Length
-        sha256 = ([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($uvBytes))).Replace("-", "").ToLowerInvariant()
-        urls = @($AssetUrl)
+        size_bytes = (Get-Item -LiteralPath $uvFixture).Length
+        sha256 = Get-PortableFileSha256 -Path $uvFixture
+        urls = @("$FixtureEndpoint/$Component-uv-0.11.28.whl")
+        archive_entry = "uv-0.11.28.data/scripts/uv.exe"
     }
     $runtimePayload = [ordered]@{
         schema_version = 1
         component = $Component
-        python_version = "3.11"
+        python_version = if ($Component -eq "tts-more") { "3.11.9" } else { "3.11" }
         import_probe = "import sys"
         required_free_bytes = 1
         dependency_mode = "requirements"
         auto_order = @("cpu")
         profiles = [ordered]@{ cpu = [ordered]@{ dependency_lock = "requirements-cpu.lock.txt" } }
-        assets = [ordered]@{ uv = $uvAsset }
+        assets = [ordered]@{ python = $pythonAsset; uv = $uvAsset }
         payloads = @()
+    }
+    if ($Component -eq "tts-more") {
+        $pythonPartial = Join-Path $Root "data\cache\portable\assets\$($pythonAsset.id).zip.partial"
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $pythonPartial) | Out-Null
+        $pythonBytes = [IO.File]::ReadAllBytes($pythonFixture)
+        [IO.File]::WriteAllBytes($pythonPartial, $pythonBytes[0..7])
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $uvWheel) | Out-Null
+        $uvBytes = [IO.File]::ReadAllBytes($uvFixture)
+        [IO.File]::WriteAllBytes("$uvWheel.partial", $uvBytes[0..7])
     }
     $modelPayload = [ordered]@{
         schema_version = 1
@@ -820,11 +858,9 @@ function Install-FixtureProtocol {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dependencyLock) | Out-Null
         [IO.File]::WriteAllText($dependencyLock, "# fixture-only dependency lock`n", $Utf8NoBom)
     }
-    $toolchainLock = if ($Component -eq "tts-more") { Join-Path $Root "packaging\portable\toolchain.lock.json" } else { Join-Path $bundle "locks\toolchain.lock.json" }
-    [void](Install-FixtureCondaAdapter -Root $Root -ToolchainLock $toolchainLock)
     Write-FixtureSha256Manifest -Root $Root
     Test-FixtureSha256Manifest -Root $Root
-    return [pscustomobject]@{ Root=$Root; Component=$Component; Port=$port; AssetLock=$assetLock; AssetPath=$assetPath; AssetSha=[string]$asset.sha256; AssetUrl=$AssetUrl; Bundle=$bundle; Service=(Join-Path $fixture "fixture-service.py"); RuntimePython=$runtimePython; RuntimeLock=$runtimeLock; ModelLock=$modelLock; UvAssetPath=$uvWheel; UvAssetSha=$uvAsset.sha256 }
+    return [pscustomobject]@{ Root=$Root; Component=$Component; Port=$port; AssetLock=$assetLock; AssetPath=$assetPath; AssetSha=[string]$asset.sha256; AssetUrl=$AssetUrl; PythonAssetName="$Component-python-3.11.9-embed.zip"; UvAssetName="$Component-uv-0.11.28.whl"; Bundle=$bundle; Service=(Join-Path $fixture "fixture-service.py"); RuntimePython=$runtimePython; RuntimeLock=$runtimeLock; ModelLock=$modelLock; UvAssetPath=$uvWheel; UvAssetSha=$uvAsset.sha256 }
 }
 
 function Invoke-RootCommand {
@@ -859,6 +895,9 @@ function Set-FixtureAssetUrls {
     [IO.File]::WriteAllText($Package.ModelLock, ($lock | ConvertTo-Json -Depth 12), $Utf8NoBom)
     if ($Package.PSObject.Properties.Name -contains "RuntimeLock" -and (Test-Path -LiteralPath ([string]$Package.RuntimeLock) -PathType Leaf)) {
         $runtime = Get-Content -LiteralPath ([string]$Package.RuntimeLock) -Raw | ConvertFrom-Json
+        if ($runtime.PSObject.Properties["assets"] -and $runtime.assets.PSObject.Properties["python"]) {
+            $runtime.assets.python.urls = @("$FixtureEndpoint/$($Package.PythonAssetName)")
+        }
         if ($runtime.PSObject.Properties["assets"] -and $runtime.assets.PSObject.Properties["uv"]) { $runtime.assets.uv.urls = @($Urls) }
         [IO.File]::WriteAllText(([string]$Package.RuntimeLock), ($runtime | ConvertTo-Json -Depth 12), $Utf8NoBom)
     }
@@ -928,6 +967,19 @@ function Assert-DownloadAssetHash {
     Assert-AssetHash -Package $Package
 }
 
+function Invoke-FixtureAssetDownload {
+    param([Parameter(Mandatory = $true)][object]$Package)
+    $installer = Join-Path $Package.Bundle "portable_install.py"
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = @(& $Package.RuntimePython $installer ensure-asset --asset $Package.AssetLock --path $Package.AssetPath --package-root $Package.Root 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $previousPreference }
+    return [pscustomobject]@{ ExitCode=$exitCode; Output=($output -join "`n") }
+}
+
 function Stop-OwnedFixtureProcess {
     param([Parameter(Mandatory = $true)][object]$Owned)
     $process = $Owned.Process
@@ -995,7 +1047,7 @@ function Invoke-PackageAcceptance {
     param([Parameter(Mandatory = $true)][object]$Package)
     $component = [string]$Package.Component
     Start-FixtureAssetServer
-    $Package.AssetUrl = "$FixtureEndpoint/$component.bin"
+    $Package.AssetUrl = if ($component -eq "tts-more") { "$FixtureEndpoint/$($Package.UvAssetName)" } else { "$FixtureEndpoint/$component.bin" }
     Set-FixtureAssetUrl -Package $Package -Url $Package.AssetUrl
     Invoke-Scenario -Component $component -Scenario "path_isolation" -Action { Assert-RestrictedChildPath }
     $ServerProcess.Refresh()
@@ -1023,18 +1075,25 @@ function Invoke-PackageAcceptance {
     $partial = "$interruptedAssetPath.partial"
     Remove-Item -LiteralPath $interruptedAssetPath -Force
     Restart-FixtureAssetServer
-    $Package.AssetUrl = "$FixtureEndpoint/$component.bin"
+    $Package.AssetUrl = if ($component -eq "tts-more") { "$FixtureEndpoint/$($Package.UvAssetName)" } else { "$FixtureEndpoint/$component.bin" }
     Set-FixtureAssetUrl -Package $Package -Url $Package.AssetUrl
     if ($component -eq "tts-more") {
         foreach ($runtimeDirectory in @("runtime\live", "runtime\staging", "runtime\previous")) {
             Remove-Item -LiteralPath (Join-Path $Package.Root $runtimeDirectory) -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
+    if ($component -eq "tts-more") {
+        Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
+    }
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $first = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
+    $first = if ($component -eq "tts-more") {
+        Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
+    } else {
+        Invoke-FixtureAssetDownload -Package $Package
+    }
     $clock.Stop()
-    if ($first.ExitCode -ne 26 -or !(Test-Path -LiteralPath $partial -PathType Leaf) -or (Get-Item -LiteralPath $partial).Length -ne 8) {
+    $expectedFirstExit = if ($component -eq "tts-more") { 26 } else { 1 }
+    if ($first.ExitCode -ne $expectedFirstExit -or !(Test-Path -LiteralPath $partial -PathType Leaf) -or (Get-Item -LiteralPath $partial).Length -ne 8) {
         if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") {
             $ServerProcess.Refresh()
             $partialExists = Test-Path -LiteralPath $partial -PathType Leaf
@@ -1047,6 +1106,10 @@ function Invoke-PackageAcceptance {
     Add-Evidence -Component $component -Scenario "interruption" -Result pass -Duration $clock.Elapsed.TotalSeconds
 
     Invoke-Scenario -Component $component -Scenario "resume" -Action {
+        if ($component -ne "tts-more") {
+            $download = Invoke-FixtureAssetDownload -Package $Package
+            if ($download.ExitCode -ne 0) { Throw-HarnessError "RESUME_FAILED" "worker fixture asset resume failed" }
+        }
         $resumed = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
         if ($resumed.ExitCode -ne 0) {
             if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") {
@@ -1075,7 +1138,23 @@ function Invoke-PackageAcceptance {
     Invoke-Scenario -Component $component -Scenario "duplicate_start" -Action {
         $duplicate = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
         if ($duplicate.ExitCode -ne 0) {
-            if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("DUPLICATE_EXIT=$($duplicate.ExitCode)`n$($duplicate.Output)") }
+            if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") {
+                [Console]::Error.WriteLine("DUPLICATE_EXIT=$($duplicate.ExitCode)`n$($duplicate.Output)")
+                if ($component -eq "tts-more") {
+                    $manifest = Get-Content -LiteralPath (Join-Path $Package.Root "package\tts-more-package.json") -Raw | ConvertFrom-Json
+                    $launcher = Join-Path $Package.Root "scripts\portable_launcher.py"
+                    $backend = Join-Path $Package.Root "app\backend"
+                    $verify = @($launcher, "verify-owned-listener", "--package-root", $Package.Root, "--record-path", $recordPath, "--port", [string]$Package.Port, "--build-id", [string]$manifest.build_id, "--executable", $Package.RuntimePython, "--listener-pid", [string]$initialPid, "--", "-m", "uvicorn", "app.main:app", "--app-dir", $backend, "--host", "127.0.0.1", "--port", [string]$Package.Port)
+                    $previousPreference = $ErrorActionPreference
+                    try {
+                        $ErrorActionPreference = "Continue"
+                        $detail = @(& $Package.RuntimePython @verify 2>&1)
+                        $detailExit = $LASTEXITCODE
+                    }
+                    finally { $ErrorActionPreference = $previousPreference }
+                    [Console]::Error.WriteLine("DUPLICATE_VERIFY_EXIT=$detailExit`n$($detail -join "`n")")
+                }
+            }
             Throw-HarnessError "DUPLICATE_START_FAILED" "duplicate Start.cmd failed"
         }
         $unchanged = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
@@ -1106,7 +1185,12 @@ function Invoke-PackageAcceptance {
                 Remove-Item -LiteralPath (Join-Path $Package.Root $runtimeDirectory) -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
-        Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
+        if ($component -eq "tts-more") {
+            Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
+        } else {
+            $download = Invoke-FixtureAssetDownload -Package $Package
+            if ($download.ExitCode -ne 0) { Throw-HarnessError "REPAIR_FAILED" "worker fixture mirror fallback failed" }
+        }
         $repair = Invoke-RootCommand -Root $Package.Root -Name "Repair.cmd"
         if ($repair.ExitCode -ne 0) {
             if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("FALLBACK_EXIT=$($repair.ExitCode)`n$($repair.Output)") }
@@ -1128,7 +1212,12 @@ function Invoke-PackageAcceptance {
                 Remove-Item -LiteralPath (Join-Path $Package.Root $runtimeDirectory) -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
-        Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
+        if ($component -eq "tts-more") {
+            Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
+        } else {
+            $download = Invoke-FixtureAssetDownload -Package $Package
+            if ($download.ExitCode -ne 0) { Throw-HarnessError "REPAIR_FAILED" "worker fixture corruption repair failed" }
+        }
         $repaired = Invoke-RootCommand -Root $Package.Root -Name "Repair.cmd"
         if ($repaired.ExitCode -ne 0) { Throw-HarnessError "REPAIR_FAILED" "Repair.cmd failed for same-length corruption" }
         Assert-DownloadAssetHash -Package $Package
@@ -1266,13 +1355,14 @@ try {
     $script:ServerRequestLog = Join-Path $WorkRoot "server-requests.jsonl"
     Start-FixtureAssetServer
 
-    foreach ($component in @($inputPackages.Keys | Sort-Object)) {
+    foreach ($component in @($ExpectedComponents | Where-Object { $inputPackages.ContainsKey($_) })) {
         $entry = $inputPackages[$component]
         $destination = Join-Path $WorkRoot ("x-" + $component.Substring(0, [Math]::Min(4, $component.Length)))
         Expand-Archive -LiteralPath $entry.Zip -DestinationPath $destination
         $roots = @(Get-ChildItem -LiteralPath $destination -Directory)
         if ($roots.Count -ne 1) { Throw-HarnessError "PACKAGE_LAYOUT_INVALID" "expanded ZIP does not have one package root" }
-        $root = $roots[0].FullName
+        $root = Join-Path $destination "p"
+        Move-Item -LiteralPath $roots[0].FullName -Destination $root
         & $FixturePython $PortablePackagesScript verify-sha256 --package-root $root *> $null
         if ($LASTEXITCODE -ne 0) { Throw-HarnessError "PACKAGE_HASH_INVALID" "expanded Bootstrap SHA-256 audit failed" }
         Add-Evidence -Component $component -Scenario "package_audit" -Result pass -Duration 0

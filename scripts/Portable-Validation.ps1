@@ -65,7 +65,7 @@ function Assert-PortableV2Manifest {
 
     Assert-PortableJsonProperties -Value $Manifest.runtime -Label "runtime" -Required @("python_version", "device_profiles", "lock", "state_path")
     foreach ($name in @("python_version", "lock", "state_path")) { Assert-PortableJsonString -Value $Manifest.runtime.$name -Label "runtime.$name" }
-    if ([string]$Manifest.runtime.python_version -notin @("3.10", "3.11")) { throw "runtime.python_version is unsupported" }
+    if ([string]$Manifest.runtime.python_version -notin @("3.10", "3.10.11", "3.11", "3.11.9")) { throw "runtime.python_version is unsupported" }
     Assert-PortableJsonStringArray -Value $Manifest.runtime.device_profiles -Label "runtime.device_profiles" -Allowed @("auto", "cu128", "cu126", "cpu")
     Assert-PortableJsonProperties -Value $Manifest.models -Label "models" -Required @("lock", "required")
     Assert-PortableJsonString -Value $Manifest.models.lock -Label "models.lock"
@@ -211,7 +211,12 @@ function Assert-PortableRuntime {
     if (!(Test-Path -LiteralPath $resolvedPython -PathType Leaf)) { throw "package runtime is missing" }
     [void](Assert-PortablePackageRoot -Root $resolvedRoot)
     [void](Resolve-PortablePackagePath -Root $resolvedRoot -RelativePath $relative -Label "package runtime" -MustExist)
-    $versionOutput = @(& $resolvedPython -c "import sys;print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>&1)
+    $versionProbe = if ($ExpectedVersion -match '^\d+\.\d+\.\d+$') {
+        "import platform;print(platform.python_version())"
+    } else {
+        "import sys;print(f'{sys.version_info[0]}.{sys.version_info[1]}')"
+    }
+    $versionOutput = @(& $resolvedPython -c $versionProbe 2>&1)
     if ($LASTEXITCODE -ne 0 -or ($versionOutput -join "").Trim() -ne $ExpectedVersion) {
         throw "package runtime Python version must be $ExpectedVersion"
     }

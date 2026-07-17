@@ -88,7 +88,7 @@ function Assert-PortableNotCancelled {
 
 Assert-PortableNotCancelled
 
-foreach ($required in @($RuntimeLock, $ModelLock, (Join-Path $BackendRoot "uv.lock"), (Join-Path $Root "scripts\portable_install.py"))) {
+foreach ($required in @($RuntimeLock, $ModelLock, (Join-Path $BackendRoot "uv.lock"), (Join-Path $Root "scripts\portable_install.py"), (Join-Path $Root "scripts\portable-python.ps1"))) {
     if (!(Test-Path -LiteralPath $required -PathType Leaf)) { throw "required locked package input is missing: $required" }
 }
 if ($Root.Length -gt 180) { throw "package path is too long for reliable Windows model tooling ($($Root.Length) characters): $Root" }
@@ -125,17 +125,20 @@ $videoControllers = @(Get-CimInstance Win32_VideoController -ErrorAction Silentl
 })
 ConvertTo-Json -InputObject $videoControllers | Set-Content -LiteralPath $controllersPath -Encoding UTF8
 
-$bootstrap = Join-Path $Root "scripts\bootstrap-conda.ps1"
-$Conda = (& $bootstrap -CacheRoot "data/cache/portable/conda" -LockPath "packaging/portable/toolchain.lock.json" -PackageRoot $Root -OperationRoot $OperationRoot -CancelFile $CancelFile -PassThru | Select-Object -Last 1)
-$bootstrapExitCode = if (Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue) { [int]$LASTEXITCODE } else { 0 }
-if ($bootstrapExitCode -eq 20) { exit 20 }
-if ($bootstrapExitCode -ne 0) { throw "private package Conda bootstrap failed with exit code $bootstrapExitCode" }
-if (!(Test-Path -LiteralPath $Conda -PathType Leaf)) { throw "private package Conda bootstrap did not return conda.bat" }
-$CondaRoot = Split-Path -Parent (Split-Path -Parent $Conda)
-$BootstrapPython = Join-Path $CondaRoot "python.exe"
-if (!(Test-Path -LiteralPath $BootstrapPython -PathType Leaf)) { throw "private Miniforge Python is missing: $BootstrapPython" }
+. (Join-Path $Root "scripts\portable-python.ps1")
+if (Test-Path -LiteralPath $Staging) { Remove-Item -LiteralPath $Staging -Recurse -Force }
+$PortableRuntime = Install-PortablePythonRuntime `
+    -PackageRoot $Root `
+    -RuntimeLock $RuntimeLock `
+    -Destination $Staging `
+    -OperationRoot $OperationRoot `
+    -CancelFile $CancelFile
+Assert-PortableNotCancelled
 
-$selected = (& $BootstrapPython (Join-Path $Root "scripts\portable_install.py") select-device --runtime-lock $RuntimeLock --requested $Device.ToLowerInvariant() --controllers $controllersPath).Trim()
+& $PortableRuntime.Python -c "import sys; expected=tuple(map(int,sys.argv[1].split('.'))); raise SystemExit(0 if sys.version_info[:3] == expected else 1)" $ExpectedPython
+if ($LASTEXITCODE -ne 0) { throw "embedded Python patch version does not match runtime lock: $ExpectedPython" }
+
+$selected = (& $PortableRuntime.Python (Join-Path $Root "scripts\portable_install.py") select-device --runtime-lock $RuntimeLock --requested $Device.ToLowerInvariant() --controllers $controllersPath).Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($selected)) { throw "device profile selection failed" }
 Write-Host "Selected device profile: $selected"
 
@@ -145,7 +148,7 @@ foreach ($asset in @($modelLockPayload.assets)) {
     $assetLock = Join-Path $Root "data\cache\portable\locks\$($asset.id).json"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $assetLock) | Out-Null
     $asset | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $assetLock -Encoding UTF8
-    & $BootstrapPython (Join-Path $Root "scripts\portable_install.py") ensure-asset --asset $assetLock --path (Join-Path $Root ([string]$asset.target)) @DownloadArguments
+    & $PortableRuntime.Python (Join-Path $Root "scripts\portable_install.py") ensure-asset --asset $assetLock --path (Join-Path $Root ([string]$asset.target)) @DownloadArguments
     if ($LASTEXITCODE -eq 20) { exit 20 }
     if ($LASTEXITCODE -ne 0) { throw "locked model asset failed: $($asset.id)" }
 }
@@ -155,34 +158,17 @@ foreach ($requiredModelPath in @($modelLockPayload.required_paths)) {
     }
 }
 
-$uvAssetPath = Join-Path $Root "data\cache\portable\assets\$($runtimeLockPayload.assets.uv.id).json"
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $uvAssetPath) | Out-Null
-$runtimeLockPayload.assets.uv | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $uvAssetPath -Encoding UTF8
-$uvWheel = Join-Path $Root "data\cache\portable\assets\$($runtimeLockPayload.assets.uv.id).whl"
-& $BootstrapPython (Join-Path $Root "scripts\portable_install.py") ensure-asset --asset $uvAssetPath --path $uvWheel @DownloadArguments
-if ($LASTEXITCODE -eq 20) { exit 20 }
-if ($LASTEXITCODE -ne 0) { throw "locked uv asset initialization failed" }
-
-if (Test-Path -LiteralPath $Staging) { Remove-Item -LiteralPath $Staging -Recurse -Force }
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Staging) | Out-Null
-& $Conda create --yes --prefix $Staging "python=3.11" pip
-if ($LASTEXITCODE -ne 0) { throw "private Conda failed to create the temporary Python 3.11 runtime" }
-$StagePython = Join-Path $Staging "python.exe"
-& $StagePython -m pip install --no-deps $uvWheel
-if ($LASTEXITCODE -ne 0) { throw "locked uv installation failed" }
-$UvExe = Join-Path $Staging "Scripts\uv.exe"
-
 # Frozen deployment contract: uv lock --check must never update uv.lock.
-& $UvExe lock --check --project $BackendRoot
+& $PortableRuntime.Uv lock --check --project $BackendRoot
 if ($LASTEXITCODE -ne 0) { throw "backend uv.lock drift detected" }
 $requirements = Join-Path $Staging "tts-more-requirements.lock.txt"
-& $UvExe export --frozen --no-dev --no-emit-project --project $BackendRoot --output-file $requirements
+& $PortableRuntime.Uv export --frozen --no-dev --no-emit-project --project $BackendRoot --output-file $requirements
 if ($LASTEXITCODE -ne 0) { throw "failed to export frozen backend dependencies" }
-& $UvExe pip install --python $StagePython --requirement $requirements
+& $PortableRuntime.Uv pip install --python $PortableRuntime.Python --target $PortableRuntime.SitePackages --link-mode copy --requirement $requirements
 if ($LASTEXITCODE -ne 0) { throw "failed to synchronize frozen backend dependencies" }
-& $StagePython -m pip check
-if ($LASTEXITCODE -ne 0) { throw "pip check failed in temporary runtime" }
-& $StagePython -c $ImportProbe
+& $PortableRuntime.Uv pip check --python $PortableRuntime.Python
+if ($LASTEXITCODE -ne 0) { throw "uv pip check failed in temporary runtime" }
+& $PortableRuntime.Python -c $ImportProbe
 if ($LASTEXITCODE -ne 0) { throw "core import probe failed in temporary runtime" }
 
 $backup = Join-Path $Root "runtime\previous"

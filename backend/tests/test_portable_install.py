@@ -561,13 +561,64 @@ def test_initializers_execute_runtime_lock_import_probe() -> None:
     worker = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(encoding="utf-8")
 
     assert '$ImportProbe = if ($RuntimePayload.PSObject.Properties["import_probe"]' in controller
-    assert "& $StagePython -c $ImportProbe" in controller
+    assert "& $PortableRuntime.Python -c $ImportProbe" in controller
     assert 'import fastapi,pydantic,uvicorn; print(' not in controller
     assert "foreach ($asset in @($modelLockPayload.assets))" in controller
     assert "required model asset is missing after locked initialization" in controller
     assert '$importProbe = if ($runtimeLock.PSObject.Properties["import_probe"]' in worker
     assert "& $StagePython -c $importProbe" in worker
     assert "& $StagePython -c ([string]$config.import_probe)" not in worker
+
+
+def test_controller_initializer_uses_only_embedded_python_runtime() -> None:
+    controller = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert '. (Join-Path $Root "scripts\\portable-python.ps1")' in controller
+    assert "$PortableRuntime = Install-PortablePythonRuntime" in controller
+    assert "-Destination $Staging" in controller
+    assert "& $PortableRuntime.Python -c" in controller
+    assert "& $PortableRuntime.Uv lock --check" in controller
+    assert "& $PortableRuntime.Uv export --frozen --no-dev --no-emit-project" in controller
+    assert "--python $PortableRuntime.Python" in controller
+    assert "--target $PortableRuntime.SitePackages" in controller
+    assert "--link-mode copy" in controller
+    assert "& $PortableRuntime.Uv pip check --python $PortableRuntime.Python" in controller
+    forbidden = (
+        "bootstrap-conda.ps1",
+        "$Conda",
+        "conda create",
+        "-m pip",
+        "Scripts\\uv.exe",
+        "$BootstrapPython",
+    )
+    assert not any(token.casefold() in controller.casefold() for token in forbidden)
+
+    python_install = controller.index("Install-PortablePythonRuntime")
+    patch_probe = controller.index("sys.version_info[:3]")
+    device_selection = controller.index("select-device")
+    model_assets = controller.index("foreach ($asset in @($modelLockPayload.assets))")
+    dependency_install = controller.index("pip install")
+    import_probe = controller.index("-c $ImportProbe")
+    atomic_publish = controller.index("Move-Item -LiteralPath $Staging -Destination $Live")
+    assert (
+        python_install
+        < patch_probe
+        < device_selection
+        < model_assets
+        < dependency_install
+        < import_probe
+        < atomic_publish
+    )
+
+
+def test_portable_installer_is_natively_compatible_with_python_310() -> None:
+    installer = (REPO_ROOT / "scripts" / "portable_install.py").read_text(encoding="utf-8")
+
+    assert "from datetime import datetime, timezone" in installer
+    assert "datetime.now(timezone.utc)" in installer
+    assert "from datetime import UTC" not in installer
 
 
 def test_write_install_state_is_atomic_and_records_lock_digests(tmp_path: Path) -> None:
