@@ -36,11 +36,32 @@ while [[ $# -gt 0 ]]; do
 done
 
 run() {
-  echo "[run] $*"
+  printf '[run]'
+  printf ' %q' "$@"
+  printf '\n'
   if [[ "$DRY_RUN" == "1" ]]; then
     return 0
   fi
   "$@"
+}
+
+run_plan() {
+  printf '[plan]'
+  printf ' %q' "$@"
+  printf '\n'
+  "$@"
+}
+
+run_in_repo() {
+  local working_directory="$1"
+  shift
+  printf '[run cwd=%q]' "$working_directory"
+  printf ' %q' "$@"
+  printf '\n'
+  if [[ "$DRY_RUN" == "1" ]]; then
+    return 0
+  fi
+  (cd "$working_directory" && "$@")
 }
 
 run_capture() {
@@ -198,8 +219,8 @@ run_pip_upgrade() {
 prepare_gpt() {
   local repo="$1" repo_path="$2" name="$3"
   [[ "$SKIP_INSTALL" == "1" ]] && { echo "[skip] GPT-SoVITS install for $name"; return; }
-  if ! command -v conda >/dev/null 2>&1; then
-    echo "[warn] conda was not found; GPT-SoVITS official installer requires conda for $name" >&2
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run_with_source_fallback "GPT-SoVITS install for $name" run_gpt_install "$repo_path"
     return
   fi
   if [[ ! -f "$repo_path/install.sh" ]]; then
@@ -224,32 +245,32 @@ prepare_index() {
   fi
   if [[ "$SKIP_INSTALL" != "1" ]]; then
     if [[ -n "$uv_bin" ]]; then
-      (cd "$repo_path" && run_with_package_index_fallback "IndexTTS dependency install" run_uv_sync "$uv_bin")
+      run_with_package_index_fallback "IndexTTS dependency install" run_uv_sync "$repo_path" "$uv_bin"
     else
       local repo_python
       ensure_venv "$repo_path"
       repo_python="$repo_path/.venv/bin/python"
-      (cd "$repo_path" && run_with_package_index_fallback "IndexTTS editable install" run_pip_editable "$repo_python")
+      run_with_package_index_fallback "IndexTTS dependency install" run_pip_editable "$repo_path" "$repo_python"
     fi
   fi
   if [[ "$SKIP_DOWNLOADS" != "1" ]]; then
     local repo_python="$repo_path/.venv/bin/python"
     if [[ ! -x "$repo_python" && -n "$uv_bin" ]]; then
-      (cd "$repo_path" && run_with_package_index_fallback "IndexTTS dependency install" run_uv_sync "$uv_bin")
+      run_with_package_index_fallback "IndexTTS dependency install" run_uv_sync "$repo_path" "$uv_bin"
     fi
     run_with_source_fallback "IndexTTS model download" run_index_download "$repo_path" "$repo_python"
-    (cd "$repo_path" && run "$repo_python" indextts/cli_v2.py config set model_dir checkpoints)
+    run_in_repo "$repo_path" "$repo_python" indextts/cli_v2.py config set model_dir checkpoints
   fi
 }
 
 run_uv_sync() {
-  local uv_bin="$1" candidate="$2"
-  run "$uv_bin" sync --all-extras
+  local repo_path="$1" uv_bin="$2" candidate="$3"
+  run_in_repo "$repo_path" "$uv_bin" sync --all-extras
 }
 
 run_pip_editable() {
-  local repo_python="$1" candidate="$2"
-  run "$repo_python" -m pip install -e .
+  local repo_path="$1" repo_python="$2" candidate="$3"
+  run_in_repo "$repo_path" "$repo_python" -m pip install -e .
 }
 
 run_index_download() {
@@ -261,17 +282,16 @@ run_index_download() {
   else
     unset HF_ENDPOINT
   fi
-  (cd "$repo_path" && run "$repo_python" indextts/cli_v2.py download --source "$source_arg" --model-dir checkpoints)
+  run_in_repo "$repo_path" "$repo_python" indextts/cli_v2.py download --source "$source_arg" --model-dir checkpoints
 }
 
 prepare_cosy() {
   local repo_path="$1"
-  run git -C "$repo_path" submodule update --init --recursive
   local repo_python="$repo_path/.venv/bin/python"
   if [[ "$SKIP_INSTALL" != "1" ]]; then
     ensure_venv "$repo_path"
     repo_python="$repo_path/.venv/bin/python"
-    (cd "$repo_path" && run_with_package_index_fallback "CosyVoice dependency install" run_pip_requirements "$repo_python" requirements.txt)
+    run_with_package_index_fallback "CosyVoice dependency install" run_pip_requirements "$repo_path" "$repo_python" requirements.txt
   fi
   if [[ "$SKIP_DOWNLOADS" != "1" ]]; then
     run_with_source_fallback "CosyVoice model download" run_cosy_download "$repo_path" "$repo_python"
@@ -279,23 +299,46 @@ prepare_cosy() {
 }
 
 run_pip_requirements() {
-  local repo_python="$1" requirements="$2" candidate="$3"
-  run "$repo_python" -m pip install -r "$requirements"
+  local repo_path="$1" repo_python="$2" requirements="$3" candidate="$4"
+  run_in_repo "$repo_path" "$repo_python" -m pip install -r "$requirements"
 }
 
 run_cosy_download() {
   local repo_path="$1" repo_python="$2" candidate="$3"
   if [[ "$candidate" == "ModelScope" ]]; then
     unset HF_ENDPOINT
-    (cd "$repo_path" && run "$repo_python" -c "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')")
+    run_in_repo "$repo_path" "$repo_python" -c "from modelscope import snapshot_download; snapshot_download('iic/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')"
   else
     if [[ "$candidate" == "HF-Mirror" ]]; then
       export HF_ENDPOINT="https://hf-mirror.com"
     else
       unset HF_ENDPOINT
     fi
-    (cd "$repo_path" && run "$repo_python" -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')")
+    run_in_repo "$repo_path" "$repo_python" -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/CosyVoice-300M', local_dir='pretrained_models/CosyVoice-300M')"
   fi
+}
+
+preflight_gpt_conda() {
+  local repo name provider service_id variant
+  [[ "$SKIP_INSTALL" == "1" || "$DRY_RUN" == "1" ]] && return 0
+  while IFS= read -r repo; do
+    [[ -z "$repo" ]] && continue
+    name="$(field "$repo" name)"
+    provider="$(field "$repo" provider_type)"
+    service_id="$(field "$repo" service_id)"
+    variant="$(field "$repo" variant)"
+    target_enabled "$name" "$provider" "$service_id" "$variant" || continue
+    [[ "$provider" == "gpt-sovits" ]] || continue
+    if command -v conda >/dev/null 2>&1 && conda --version >/dev/null 2>&1; then
+      return 0
+    fi
+    if command -v micromamba >/dev/null 2>&1; then
+      echo "[error] micromamba is installed but is not currently supported by the TTS More GPT-SoVITS prepare workflow; install conda or use --skip-install." >&2
+    else
+      echo "[error] supported conda executable was not found; GPT-SoVITS dependency preparation cannot continue. Install conda or use --skip-install." >&2
+    fi
+    return 1
+  done <<< "$REPOSITORIES_JSON"
 }
 
 resolve_network_profile
@@ -305,25 +348,29 @@ if [[ "$SYNC_REPOS" == "1" ]]; then
   [[ -n "$REPO_PATHS" ]] && args+=(--repo-paths "$REPO_PATHS")
   [[ "$CLEAN_REPOS" == "1" ]] && args+=(--clean)
   [[ "$DRY_RUN" == "1" ]] && args+=(--dry-run)
-  run "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" "${args[@]}"
+  run_plan "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" "${args[@]}"
 fi
 
+REPOSITORIES_JSON="$(repo_json)"
+preflight_gpt_conda
+
 while IFS= read -r repo; do
+  [[ -z "$repo" ]] && continue
   name="$(field "$repo" name)"
   provider="$(field "$repo" provider_type)"
   service_id="$(field "$repo" service_id)"
   variant="$(field "$repo" variant)"
-  rel_path="$(field "$repo" path)"
-  repo_path="$ROOT/$rel_path"
+  repo_path="$(field "$repo" absolute_path)"
   target_enabled "$name" "$provider" "$service_id" "$variant" || continue
   case "$provider" in
     gpt-sovits) prepare_gpt "$repo" "$repo_path" "$name" ;;
     indextts) prepare_index "$repo_path" ;;
     cosyvoice) prepare_cosy "$repo_path" ;;
   esac
-done < <(repo_json)
+done <<< "$REPOSITORIES_JSON"
 
-render_args=(render-services --profile local-all --platform posix --service-ids "$TARGETS" --output data/local/services.json)
+render_args=(render-services --profile local-all --platform posix --service-ids "$TARGETS")
 [[ -n "$REPO_PATHS" ]] && render_args+=(--repo-paths "$REPO_PATHS")
-run "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" "${render_args[@]}"
+[[ "$DRY_RUN" != "1" ]] && render_args+=(--output data/local/services.json)
+run_plan "$APP_PY" "$ROOT/scripts/tts_more_deploy.py" "${render_args[@]}"
 echo "Prepared selected TTS repositories. Rendered data/local/services.json."

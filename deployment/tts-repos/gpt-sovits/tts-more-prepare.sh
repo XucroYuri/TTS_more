@@ -8,7 +8,12 @@ SOURCE="${TTS_MORE_MODEL_SOURCE:-Auto}"
 [[ "$SOURCE" == "Auto" ]] && SOURCE="${TTS_MORE_RESOLVED_SOURCE:-ModelScope}"
 
 if ! command -v conda >/dev/null 2>&1; then
-  echo "[warn] conda was not found; GPT-SoVITS upstream installer requires conda or micromamba." >&2
+  if command -v micromamba >/dev/null 2>&1; then
+    echo "[error] micromamba is installed but is not currently supported by the TTS More GPT-SoVITS prepare workflow; install conda." >&2
+  else
+    echo "[error] supported conda executable was not found; GPT-SoVITS dependency preparation cannot continue. Install conda." >&2
+  fi
+  exit 1
 fi
 
 if [[ ! -f "$REPO_ROOT/install.sh" ]]; then

@@ -28,8 +28,26 @@ function Invoke-Logged {
         [string[]]$Arguments,
         [string]$WorkingDirectory = $Root
     )
-    Write-Host "[run] $FilePath $($Arguments -join ' ')" -ForegroundColor Cyan
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[run] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
     if ($DryRun) { return }
+    Push-Location $WorkingDirectory
+    try {
+        & $FilePath @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "Command failed: $FilePath $($Arguments -join ' ')" }
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-Plan {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory = $Root
+    )
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[plan] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
     Push-Location $WorkingDirectory
     try {
         & $FilePath @Arguments
@@ -108,7 +126,7 @@ $targetList = (Get-WorkerServiceIds) -join ","
 $isAppOnly = $Profile -eq "app-only"
 if (-not $isAppOnly) {
     $validateArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "validate-repo-paths", "--service-ids", $targetList)
-    Invoke-Logged $Python $validateArgs
+    Invoke-Plan $Python $validateArgs
 
     if (-not $SkipRepoSync) {
         $syncArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "sync-repos", "--service-ids", $targetList)
@@ -126,18 +144,18 @@ if (-not $isAppOnly) {
             $syncArgs += "--clean"
         }
         if ($DryRun) { $syncArgs += "--dry-run" }
-        Invoke-Logged $Python $syncArgs
+        Invoke-Plan $Python $syncArgs
     } else {
         Write-Host "[skip] repo sync" -ForegroundColor Yellow
     }
 
     $bundleArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "install-repo-bundles", "--service-ids", $targetList)
     if ($DryRun) { $bundleArgs += "--dry-run" }
-    Invoke-Logged $Python $bundleArgs
+    Invoke-Plan $Python $bundleArgs
 
     $updateScriptArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "install-update-scripts", "--service-ids", $targetList)
     if ($DryRun) { $updateScriptArgs += "--dry-run" }
-    Invoke-Logged $Python $updateScriptArgs
+    Invoke-Plan $Python $updateScriptArgs
 
     if (-not $SkipRepoPrepare) {
         $prepareArgs = @("-Source", $Source, "-Device", $Device, "-Profile", $Profile, "-Targets", $targetList)
@@ -149,7 +167,7 @@ if (-not $isAppOnly) {
         if ($DryRun) { $prepareArgs += "-DryRun" }
         $prepareCommandArgs = @("-ExecutionPolicy", "Bypass", "-File", (Join-Path $Root "scripts\prepare-tts-repos.ps1"))
         $prepareCommandArgs += $prepareArgs
-        Invoke-Logged "powershell" $prepareCommandArgs
+        Invoke-Plan "powershell" $prepareCommandArgs
     } else {
         Write-Host "[skip] repo dependency/model prepare" -ForegroundColor Yellow
     }
@@ -157,12 +175,13 @@ if (-not $isAppOnly) {
     Write-Host "[skip] app-only profile does not prepare local TTS repositories" -ForegroundColor Yellow
 }
 
-$renderArgs = Add-TopologyArgs (Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "render-services", "--profile", $Profile, "--platform", "windows", "--service-ids", $targetList, "--output", "data\local\services.json"))
-Invoke-Logged $Python $renderArgs
+$renderArgs = Add-TopologyArgs (Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "render-services", "--profile", $Profile, "--platform", "windows", "--service-ids", $targetList))
+if (-not $DryRun) { $renderArgs += @("--output", "data\local\services.json") }
+Invoke-Plan $Python $renderArgs
 
 if (-not $isAppOnly) {
     $doctorArgs = Add-RepoPathsArg @((Join-Path $Root "scripts\tts_more_deploy.py"), "doctor", "--service-ids", $targetList)
-    Invoke-Logged $Python $doctorArgs
+    Invoke-Plan $Python $doctorArgs
 }
 
 Write-Host "Local TTS deployment workflow complete." -ForegroundColor Green
