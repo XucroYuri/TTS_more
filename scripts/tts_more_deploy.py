@@ -1341,6 +1341,7 @@ def _harden_git_command(
     overrides = [
         ("core.hooksPath", hook_sink),
         ("core.fsmonitor", "false"),
+        ("core.autocrlf", "true" if os.name == "nt" else "input"),
         ("credential.helper", ""),
         ("core.sshCommand", _trusted_ssh_command(trusted_ssh) if trusted_ssh else "tts-more-ssh-disabled"),
         ("protocol.allow", "never"),
@@ -1388,6 +1389,7 @@ def _validate_local_git_config_value(
         "ignorecase": lambda item: item.lower() in boolean_values,
         "precomposeunicode": lambda item: item.lower() in boolean_values,
         "symlinks": lambda item: item.lower() in boolean_values,
+        "autocrlf": lambda item: item.lower() in boolean_values or item.lower() == "input",
     }
     if normalized_section == "core" and normalized_option in core_validators:
         valid = core_validators[normalized_option](value)
@@ -2183,6 +2185,7 @@ def harden_git_command(
     overrides = [
         ("core.hooksPath", str(Path(__file__).resolve(strict=False))),
         ("core.fsmonitor", "false"),
+        ("core.autocrlf", "true" if os.name == "nt" else "input"),
         ("credential.helper", ""),
         ("core.sshCommand", trusted_ssh_command(ssh_executable) if ssh_executable else "tts-more-ssh-disabled"),
         ("protocol.allow", "never"),
@@ -2215,6 +2218,7 @@ def validate_local_git_config_value(section: str, option: str, value: str) -> No
         "ignorecase": lambda item: item.lower() in boolean_values,
         "precomposeunicode": lambda item: item.lower() in boolean_values,
         "symlinks": lambda item: item.lower() in boolean_values,
+        "autocrlf": lambda item: item.lower() in boolean_values or item.lower() == "input",
     }
     if normalized_section == "core" and normalized_option in core_validators:
         valid = core_validators[normalized_option](value)

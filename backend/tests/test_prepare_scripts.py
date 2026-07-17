@@ -516,6 +516,7 @@ def test_prepare_scripts_default_to_release_repositories_and_forward_selection()
 
 @pytest.mark.parametrize("entrypoint", ["prepare", "deploy"])
 @pytest.mark.parametrize("micromamba_only", [False, True], ids=("missing-conda", "micromamba-only"))
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell behavior is covered by Ubuntu CI")
 def test_posix_prepare_and_wrapper_fail_before_gpt_preparation_without_supported_conda(
     tmp_path: Path,
     entrypoint: str,
@@ -641,6 +642,7 @@ def test_docs_explain_gpt_branch_convergence_and_explicit_regression_targets() -
     assert "CUDA" in docs
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell behavior is covered by Ubuntu CI")
 def test_one_click_and_prepare_dry_run_check_dirty_repositories_without_resetting() -> None:
     root = Path(__file__).resolve().parents[2]
     managed_root = root / "repo"
@@ -694,6 +696,7 @@ def test_one_click_and_prepare_dry_run_check_dirty_repositories_without_resettin
             assert dirty_file.read_text(encoding="utf-8") == "local work\n"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell behavior is covered by Ubuntu CI")
 def test_one_click_dry_run_executes_real_plan_without_writes(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
     confirmation = tmp_path / "repo-paths.json"
@@ -732,6 +735,7 @@ def test_one_click_dry_run_executes_real_plan_without_writes(tmp_path: Path) -> 
     assert after == before
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell behavior is covered by Ubuntu CI")
 def test_one_click_dry_run_includes_dependency_and_model_plan_without_writes(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[2]
     plan_root = root / "repo" / f"dry-plan-{tmp_path.name}"

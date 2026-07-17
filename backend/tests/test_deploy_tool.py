@@ -2675,7 +2675,7 @@ def test_generated_updater_rejects_gitdir_file_before_invoking_git(tmp_path: Pat
     repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
     repositories[0]["path"] = "repo/index-tts"
     deploy.install_update_scripts(tmp_path, repositories=repositories)
-    shutil.rmtree(target / ".git")
+    deploy._remove_path(target / ".git")
     (target / ".git").write_text("gitdir: ../../outside\n", encoding="utf-8")
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -3498,6 +3498,8 @@ def test_app_and_generated_updater_use_identical_hardened_git_policy(
     assert Path(app_command[0]).is_absolute()
     assert Path(updater_command[0]).is_absolute()
     assert app_command[1:] == updater_command[1:]
+    expected_autocrlf = "true" if os.name == "nt" else "input"
+    assert f"core.autocrlf={expected_autocrlf}" in app_command
     for key in (
         "GIT_CONFIG_NOSYSTEM",
         "GIT_CONFIG_GLOBAL",
@@ -4107,7 +4109,7 @@ def test_explicit_bundle_adoption_only_anchors_existing_manifest_then_requires_r
     installed.mkdir()
     old_file = installed / "old.sh"
     old_file.write_text("old\n", encoding="utf-8")
-    old_owned = {"old.sh": hashlib.sha256(b"old\n").hexdigest()}
+    old_owned = {"old.sh": hashlib.sha256(old_file.read_bytes()).hexdigest()}
     old_manifest = {
         "schema_version": 3,
         "service_id": "local-indextts",
@@ -4241,7 +4243,7 @@ def test_windows_native_drive_junction_and_gitdir_policy(tmp_path: Path) -> None
         deploy.install_repo_bundles(tmp_path, service_ids={"local-indextts"})
 
     os.rmdir(junction)
-    shutil.rmtree(target / ".git")
+    deploy._remove_path(target / ".git")
     (target / ".git").write_text("gitdir: C:\\outside\\worktree\n", encoding="utf-8")
     with pytest.raises((ValueError, RuntimeError), match="worktree|Git metadata"):
         deploy.sync_repos(tmp_path, dry_run=True, service_ids={"local-indextts"})
