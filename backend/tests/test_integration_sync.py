@@ -660,6 +660,95 @@ def test_external_write_after_rollback_identity_check_is_not_unlinked(
     assert published_path.read_bytes() == b"external-after-rollback-check"
 
 
+def test_prior_claim_is_restored_when_exclusive_publication_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "prior claimed publish failure fork"
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "b" * 40)
+    build = target / "Build-Package.ps1"
+    original = build.read_bytes()
+    original_exclusive = sync._publish_temp_exclusively
+    failed = False
+
+    def fail_first_prior_publish(temporary: Path, destination: Path) -> None:
+        nonlocal failed
+        if not failed and destination == build:
+            failed = True
+            raise OSError("injected after prior claim")
+        original_exclusive(temporary, destination)
+
+    monkeypatch.setattr(sync, "_publish_temp_exclusively", fail_first_prior_publish)
+
+    with pytest.raises(OSError, match="after prior claim"):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "c" * 40)
+
+    assert build.read_bytes() == original
+    assert not list(target.rglob(".tts-more-*-claim-*"))
+
+
+def test_pending_new_is_removed_when_capture_fails_after_exclusive_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "pending new capture failure fork"
+    original_capture = sync._capture_regular_state
+    captured_temp = False
+
+    def fail_destination_capture(path: Path):
+        nonlocal captured_temp
+        if path.name.startswith(".tts-more-sync-"):
+            captured_temp = True
+            return original_capture(path)
+        if captured_temp:
+            raise OSError("injected destination capture failure")
+        return original_capture(path)
+
+    monkeypatch.setattr(sync, "_capture_regular_state", fail_destination_capture)
+
+    with pytest.raises(OSError, match="destination capture failure"):
+        sync.sync_integration(REPO_ROOT, target, "cosyvoice", "d" * 40)
+
+    assert not (target / "Build-Package.ps1").exists()
+    assert not list(target.rglob(".tts-more-*-claim-*"))
+
+
+def test_post_commit_claim_cleanup_failure_keeps_new_manifest_and_rerun_cleans_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "post commit cleanup fork"
+    sync.sync_integration(REPO_ROOT, target, "indextts", "e" * 40)
+    original_payloads = sync._root_entry_payloads
+    original_commit_claims = sync._commit_prior_claims
+
+    def changed_payloads(component: str) -> dict[str, str]:
+        payloads = original_payloads(component)
+        payloads["Start.cmd"] += "rem committed-new-state\n"
+        return payloads
+
+    def fail_cleanup(*args: object, **kwargs: object) -> None:
+        raise OSError("injected post-commit cleanup failure")
+
+    monkeypatch.setattr(sync, "_root_entry_payloads", changed_payloads)
+    monkeypatch.setattr(sync, "_commit_prior_claims", fail_cleanup)
+
+    with pytest.raises(Exception, match="post-commit|cleanup"):
+        sync.sync_integration(REPO_ROOT, target, "indextts", "f" * 40)
+
+    manifest = json.loads(
+        (target / "tts_more" / "integration.manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["source_revision"] == "f" * 40
+    assert b"committed-new-state" in (target / "Start.cmd").read_bytes()
+    assert list(target.rglob(".tts-more-*-claim-*"))
+
+    monkeypatch.setattr(sync, "_commit_prior_claims", original_commit_claims)
+    sync.sync_integration(REPO_ROOT, target, "indextts", "f" * 40)
+
+    assert not list(target.rglob(".tts-more-*-claim-*"))
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
 def test_racing_junction_failure_keeps_outside_and_rolls_back_other_new_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

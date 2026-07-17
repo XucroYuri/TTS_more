@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
@@ -63,10 +64,11 @@ class FileBackup:
 
 
 class PublicationJournal:
-    __slots__ = ("published", "removed", "prior_claims")
+    __slots__ = ("published", "pending_new", "removed", "prior_claims")
 
     def __init__(self) -> None:
         self.published: dict[str, FileState] = {}
+        self.pending_new: dict[str, FileState] = {}
         self.removed: set[str] = set()
         self.prior_claims: dict[str, Path] = {}
 
@@ -83,6 +85,7 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
         raise ValueError(f"unsupported integration component: {component}")
     source_root = source_root.resolve(strict=True)
     target_root = Path(os.path.abspath(target_root))
+    _recover_cleanup_journals(target_root)
     previous_files, previous_manifest = _read_previous_manifest(target_root)
 
     with tempfile.TemporaryDirectory(prefix="tts-more-sync-") as temporary:
@@ -321,6 +324,8 @@ def _publish_transaction(
     target_root.mkdir(parents=True, exist_ok=True)
     journal = PublicationJournal()
     obsolete = previous_files - new_files
+    cleanup_journal_paths: list[Path] = []
+    committed = False
     try:
         for relative in sorted(new_files):
             _publish_file(
@@ -332,6 +337,19 @@ def _publish_transaction(
             )
         for relative in sorted(obsolete, reverse=True):
             _remove_owned_file(target_root, relative, backups[relative], journal)
+        for relative in sorted(new_files):
+            _assert_safe_target_path(
+                target_root,
+                target_root / Path(PurePosixPath(relative)),
+                include_leaf=True,
+            )
+        if journal.prior_claims:
+            cleanup_journal_paths.append(_persist_cleanup_journal(
+                target_root,
+                stage_root / Path(PurePosixPath(manifest_relative)),
+                backups,
+                journal,
+            ))
         _publish_file(
             stage_root / Path(PurePosixPath(manifest_relative)),
             target_root / Path(PurePosixPath(manifest_relative)),
@@ -339,20 +357,30 @@ def _publish_transaction(
             backups.get(manifest_relative),
             journal,
         )
-        for relative in sorted(new_files | {manifest_relative}):
-            _assert_safe_target_path(
+        committed = True
+        if manifest_relative in journal.prior_claims:
+            cleanup_journal_paths.append(_persist_cleanup_journal(
                 target_root,
-                target_root / Path(PurePosixPath(relative)),
-                include_leaf=True,
-            )
-        _commit_prior_claims(target_root, backups, journal)
+                stage_root / Path(PurePosixPath(manifest_relative)),
+                backups,
+                journal,
+            ))
     except BaseException as original:
+        if manifest_relative in journal.published:
+            committed = True
+        if committed:
+            raise RuntimeError(f"post-commit integration error: {original}") from original
         rollback_errors = _rollback_publication(target_root, backups, journal, prior_paths)
         if rollback_errors:
             raise RuntimeError(
                 f"rollback incomplete after {original}: " + "; ".join(rollback_errors)
             ) from original
         raise
+    cleanup_errors = _cleanup_committed_claims(target_root, backups, journal)
+    if cleanup_errors:
+        raise RuntimeError("post-commit cleanup failed: " + "; ".join(cleanup_errors))
+    for cleanup_journal_path in cleanup_journal_paths:
+        cleanup_journal_path.unlink(missing_ok=True)
 
 
 def _rollback_publication(
@@ -362,13 +390,20 @@ def _rollback_publication(
     prior_paths: set[str],
 ) -> list[str]:
     errors: list[str] = []
-    for relative in sorted(set(journal.published) - prior_paths, reverse=True):
+    new_transaction_paths = (set(journal.published) | set(journal.pending_new)) - prior_paths
+    for relative in sorted(new_transaction_paths, reverse=True):
         path = target_root / Path(PurePosixPath(relative))
         try:
             _assert_safe_target_path(target_root, path, include_leaf=True)
             claim = _allocate_claim_path(path.parent, ".tts-more-rollback-claim-")
             _rename_no_replace(path, claim)
-            if not _matches_state(claim, journal.published[relative]):
+            expected = journal.published.get(relative) or journal.pending_new[relative]
+            matches = (
+                _matches_state(claim, expected)
+                if relative in journal.published
+                else _matches_payload(claim, expected)
+            )
+            if not matches:
                 _rename_no_replace(claim, path)
                 raise ValueError(f"published path identity changed before rollback: {relative}")
             claim.unlink()
@@ -380,7 +415,7 @@ def _rollback_publication(
         path = target_root / Path(PurePosixPath(relative))
         try:
             _assert_safe_target_path(target_root, path, include_leaf=True)
-            if relative in journal.published:
+            if relative in journal.prior_claims and relative in journal.published:
                 current_claim = _allocate_claim_path(path.parent, ".tts-more-rollback-current-")
                 _rename_no_replace(path, current_claim)
                 if not _matches_state(current_claim, journal.published[relative]):
@@ -393,7 +428,7 @@ def _rollback_publication(
                 _rename_no_replace(prior_claim, path)
                 if backup.state is None or not _matches_state(path, backup.state):
                     raise RuntimeError(f"restored prior identity differs after rollback: {relative}")
-            elif relative in journal.removed:
+            elif relative in journal.prior_claims and relative in journal.removed:
                 if _lexists(path):
                     raise ValueError(f"removed path was externally recreated before rollback: {relative}")
                 prior_claim = journal.prior_claims.get(relative)
@@ -402,6 +437,12 @@ def _rollback_publication(
                 _rename_no_replace(prior_claim, path)
                 if backup.state is None or not _matches_state(path, backup.state):
                     raise RuntimeError(f"restored removed identity differs after rollback: {relative}")
+            elif relative in journal.prior_claims:
+                if _lexists(path):
+                    raise ValueError(f"claimed prior path was externally recreated: {relative}")
+                _rename_no_replace(journal.prior_claims[relative], path)
+                if backup.state is None or not _matches_state(path, backup.state):
+                    raise RuntimeError(f"restored claimed prior identity differs: {relative}")
             else:
                 _assert_backup_unchanged(path, backup, relative)
             _assert_safe_target_path(target_root, path, include_leaf=True)
@@ -432,6 +473,7 @@ def _publish_file(
             if _lexists(destination):
                 raise FileExistsError(f"target path appeared during publication: {relative}")
             _publish_temp_exclusively(temporary, destination)
+            journal.pending_new[relative] = expected
         else:
             _assert_backup_unchanged(destination, backup, relative)
             claim = _allocate_claim_path(destination.parent, ".tts-more-prior-claim-")
@@ -445,6 +487,7 @@ def _publish_file(
         if actual.size != expected.size or actual.digest != expected.digest:
             raise RuntimeError(f"published file identity differs from staged source: {relative}")
         journal.published[relative] = actual
+        journal.pending_new.pop(relative, None)
         _assert_safe_target_path(target_root, destination, include_leaf=True)
     finally:
         temporary.unlink(missing_ok=True)
@@ -541,6 +584,8 @@ def _commit_prior_claims(
 ) -> None:
     for relative, claim in sorted(journal.prior_claims.items()):
         _assert_safe_target_path(target_root, claim, include_leaf=True)
+        if not _lexists(claim):
+            continue
         backup = backups[relative]
         if backup.state is None or not _matches_state(claim, backup.state):
             raise RuntimeError(f"prior claim changed before commit: {relative}")
@@ -548,6 +593,108 @@ def _commit_prior_claims(
         _assert_safe_target_path(target_root, claim, include_leaf=True)
         if relative in journal.removed:
             _remove_empty_parents(claim.parent, target_root)
+
+
+def _state_payload(state: FileState) -> dict[str, object]:
+    return {name: getattr(state, name) for name in state.__slots__}
+
+
+def _state_from_payload(payload: object) -> FileState:
+    if not isinstance(payload, dict):
+        raise ValueError("cleanup journal state is invalid")
+    return FileState(**{name: payload[name] for name in FileState.__slots__})
+
+
+def _persist_cleanup_journal(
+    target_root: Path,
+    staged_manifest: Path,
+    backups: dict[str, FileBackup],
+    journal: PublicationJournal,
+) -> Path:
+    relative = f"tts_more/.integration-cleanup-{uuid.uuid4().hex}.json"
+    destination = target_root / Path(PurePosixPath(relative))
+    payload = {
+        "schema_version": 1,
+        "manifest_digest": _raw_digest(staged_manifest.read_bytes()),
+        "claims": {
+            owned: {
+                "claim": claim.relative_to(target_root).as_posix(),
+                "state": _state_payload(backups[owned].state),
+            }
+            for owned, claim in sorted(journal.prior_claims.items())
+            if backups[owned].state is not None
+        },
+    }
+    data = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle, name = tempfile.mkstemp(prefix=".tts-more-cleanup-journal-", dir=destination.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+        expected = _capture_regular_state(temporary)
+        _publish_temp_exclusively(temporary, destination)
+        journal.pending_new[relative] = expected
+        actual = _capture_regular_state(destination)
+        if actual.size != expected.size or actual.digest != expected.digest:
+            raise RuntimeError("cleanup journal differs after publication")
+        journal.published[relative] = actual
+        journal.pending_new.pop(relative, None)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def _cleanup_committed_claims(
+    target_root: Path,
+    backups: dict[str, FileBackup],
+    journal: PublicationJournal,
+    attempts: int = 3,
+) -> list[str]:
+    errors: list[str] = []
+    for _ in range(attempts):
+        try:
+            _commit_prior_claims(target_root, backups, journal)
+            return []
+        except BaseException as exc:
+            errors.append(str(exc))
+    return errors[-1:]
+
+
+def _recover_cleanup_journals(target_root: Path) -> None:
+    controlled = target_root / "tts_more"
+    if not _lexists(controlled):
+        return
+    _assert_safe_target_path(target_root, controlled, include_leaf=True)
+    manifest_path = controlled / "integration.manifest.json"
+    for journal_path in sorted(controlled.glob(".integration-cleanup-*.json")):
+        _assert_safe_target_path(target_root, journal_path, include_leaf=True)
+        payload = json.loads(journal_path.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != 1 or not manifest_path.is_file():
+            raise ValueError("cleanup journal is not associated with a committed manifest")
+        if payload.get("manifest_digest") != _raw_digest(manifest_path.read_bytes()):
+            raise ValueError("cleanup journal manifest digest does not match committed manifest")
+        claims = payload.get("claims")
+        if not isinstance(claims, dict):
+            raise ValueError("cleanup journal claims are invalid")
+        backups: dict[str, FileBackup] = {}
+        recovery = PublicationJournal()
+        for owned, entry in claims.items():
+            if owned != "tts_more/integration.manifest.json":
+                _validate_controlled_relative(owned)
+            if not isinstance(entry, dict) or not isinstance(entry.get("claim"), str):
+                raise ValueError("cleanup journal claim is invalid")
+            claim_relative = entry["claim"]
+            _validate_claim_relative(claim_relative)
+            claim = target_root / Path(PurePosixPath(claim_relative))
+            _assert_safe_target_path(target_root, claim, include_leaf=True)
+            state = _state_from_payload(entry.get("state"))
+            backups[owned] = FileBackup(payload=None, state=state)
+            recovery.prior_claims[owned] = claim
+        errors = _cleanup_committed_claims(target_root, backups, recovery)
+        if errors:
+            raise RuntimeError("post-commit cleanup recovery failed: " + "; ".join(errors))
+        journal_path.unlink()
 
 
 def _raw_digest(payload: bytes) -> str:
@@ -600,6 +747,39 @@ def _matches_state(path: Path, expected: FileState) -> bool:
     if os.name != "nt":
         fields += ("mode",)
     return all(getattr(actual, name) == getattr(expected, name) for name in fields)
+
+
+def _matches_payload(path: Path, expected: FileState) -> bool:
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode) or _is_reparse(path):
+            return False
+        payload = path.read_bytes()
+        after = os.lstat(path)
+    except OSError:
+        return False
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+    ):
+        return False
+    return after.st_size == expected.size and _raw_digest(payload) == expected.digest
+
+
+def _validate_claim_relative(relative: str) -> None:
+    pure = PurePosixPath(relative)
+    if (
+        not relative
+        or relative != pure.as_posix()
+        or "\\" in relative
+        or ":" in relative
+        or pure.is_absolute()
+        or any(part in ("", ".", "..") for part in pure.parts)
+        or not pure.name.startswith(".tts-more-")
+    ):
+        raise ValueError(f"invalid cleanup claim path: {relative}")
 
 
 def _assert_backup_unchanged(path: Path, backup: FileBackup, relative: str) -> None:
