@@ -1409,7 +1409,9 @@ def test_worker_package_resolves_package_source_and_bundle_roots_independently(
     assert "SourceRoot = $sourceRoot" in start_controller
     assert 'lock --check --project $SourceRoot' in initializer
     assert 'export --frozen --no-dev --no-emit-project --project $SourceRoot' in initializer
-    assert "ToolchainLockRelative" in initializer
+    assert '. (Join-Path $Bundle "portable-python.ps1")' in initializer
+    assert "Install-PortablePythonRuntime" in initializer
+    assert "ToolchainLockRelative" not in initializer
     assert "-WorkingDirectory $SourceRoot" in worker_start
     assert 'TTS_MORE_GPTSOVITS_REPO = $SourceRoot' in worker_start
     assert "Get-PortableWorkerPaths" in worker_stop

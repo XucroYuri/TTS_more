@@ -179,12 +179,12 @@ def test_harness_initialize_contract_uses_embedded_python_and_uv_fixtures() -> N
     assert "fixture-only" in script.lower()
     assert 'Invoke-RootCommand -Root $Package.Root -Name "Initialize.cmd"' in script
     assert "controller_real_initialize" in script
-    assert "worker_fixture_lifecycle" in script
+    assert "worker_real_initialize" in script
     assert all(
         scenario in script
         for scenario in (
             "controller_real_initialize",
-            "worker_fixture_lifecycle",
+            "worker_real_initialize",
             "interruption",
             "resume",
             "proxy_fallback",
@@ -201,6 +201,9 @@ def test_harness_initialize_contract_uses_embedded_python_and_uv_fixtures() -> N
     assert "Assert-OwnedFixtureProcessesStopped" in script
     assert 'TTS_MORE_FIRST_RUN_DEBUG -ne "1"' not in script
     assert 'TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("DEBUG_WORK_ROOT=' not in script
+    assert "Assert-FixtureNetworkEvidence" in script
+    assert '"bytes=8-"' in script
+    assert "status -eq 503" in script and "status -in @(200, 206)" in script
 
 
 def test_harness_contract_forbids_overwriting_production_control_scripts() -> None:
@@ -231,7 +234,7 @@ def test_harness_evidence_schema_is_allowlisted_and_identity_fields_are_forbidde
     assert "junit" in script.lower() and "acceptance.json" in script
 
 
-def test_harness_truthfully_distinguishes_controller_init_from_worker_fixture_lifecycle() -> None:
+def test_harness_truthfully_reports_real_controller_and_worker_initialization() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
     compact = " ".join(script.split())
 
@@ -240,7 +243,10 @@ def test_harness_truthfully_distinguishes_controller_init_from_worker_fixture_li
     assert "fixture_runtime_preseeded" in script
     assert "direct_downloader" in script
     assert '"controller_real_initialize"' in compact
-    assert '"worker_fixture_lifecycle"' in compact
+    assert '"worker_real_initialize"' in compact
+    assert 'worker_real_initialization = ($Component -ne "tts-more")' in script
+    assert 'fixture_runtime_preseeded = $false' in script
+    assert 'Copy-FixturePythonRuntime -Root $Root -Destination (Join-Path $Root "runtime\\live")' not in script
 
 
 def test_harness_requires_windows_and_rejects_incomplete_package_set(tmp_path: Path) -> None:
@@ -476,7 +482,7 @@ def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_
         "unknown_port",
     }
     for component in {record["component"] for record in records}:
-        initialization = "controller_real_initialize" if component == "tts-more" else "worker_fixture_lifecycle"
+        initialization = "controller_real_initialize" if component == "tts-more" else "worker_real_initialize"
         assert {record["scenario"] for record in records if record["component"] == component} == shared_scenarios | {initialization}
     assert len(records) == 44
     evidence_fields = {
@@ -485,7 +491,9 @@ def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_
         "fixture_runtime_preseeded", "direct_downloader",
     }
     assert all(set(record) == evidence_fields for record in records)
-    assert all(record["worker_real_initialization"] is False for record in records)
+    workers = [record for record in records if record["component"] != "tts-more"]
+    assert workers and all(record["worker_real_initialization"] is True for record in workers)
+    assert all(record["fixture_runtime_preseeded"] is False for record in records)
     assert all(record["result"] == "pass" for record in records)
     serialized = json.dumps(records, ensure_ascii=False)
     assert not any(

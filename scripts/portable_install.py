@@ -15,6 +15,9 @@ from typing import Any, BinaryIO, Callable, Iterable
 from uuid import UUID
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
 class PortableInstallCancelled(RuntimeError):
     pass
 
@@ -362,10 +365,7 @@ def _operation_progress(operation_root: Path, asset_id: str) -> ProgressCallback
         complete = total > 0 and downloaded >= total
         if not complete and now - last_update < 0.25:
             return
-        try:
-            from portable_operations import append_event
-        except ModuleNotFoundError:
-            from scripts.portable_operations import append_event
+        from portable_operations import append_event
 
         percent = downloaded * 100.0 / total if total > 0 else None
         append_event(

@@ -567,7 +567,9 @@ def test_initializers_execute_runtime_lock_import_probe() -> None:
     assert "foreach ($asset in @($modelLockPayload.assets))" in controller
     assert "required model asset is missing after locked initialization" in controller
     assert '$importProbe = if ($runtimeLock.PSObject.Properties["import_probe"]' in worker
-    assert "& $StagePython -c $importProbe" in worker
+    assert "& $PortableRuntime.Python -c $importProbe" in worker
+    assert "& $PortableRuntime.Uv pip check --python $PortableRuntime.Python" in worker
+    assert "--target $PortableRuntime.SitePackages --link-mode copy" in worker
     assert "& $StagePython -c ([string]$config.import_probe)" not in worker
 
 

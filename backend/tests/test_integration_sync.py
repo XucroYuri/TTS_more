@@ -92,6 +92,7 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
         "tts_more/Resolve-PortableBuildPython.ps1",
         "tts_more/build-tools/pyproject.toml",
         "tts_more/build-tools/uv.lock",
+        "tts_more/portable-python.ps1",
     ):
         assert manifest["files"][relative] == sync.sha256_file(target / relative)
     assert manifest["files"][GUIDE_NAME] == sync.sha256_file(target / GUIDE_NAME)
@@ -148,7 +149,8 @@ def test_generated_guide_is_component_aware_and_package_relative(tmp_path: Path)
         assert "路径可能因电脑而异" in guide and "包内相对路径" in guide
         assert "旧版便携包" in guide and "不会自动扫描" in guide
         assert "原包保持不变" in guide and "启动服务之前" in guide
-        assert "data/cache/portable/conda" in guide
+        assert "包内 CPython" in guide and "锁定 uv" in guide
+        assert "data/cache/portable/conda" not in guide
         assert "runtime/live、models、data/user" in guide
 
 

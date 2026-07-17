@@ -71,10 +71,10 @@ function Add-Evidence {
         result = $Result
         duration = [Math]::Round([Math]::Max(0.0, $Duration), 3)
         error_code = $ErrorCode
-        worker_real_initialization = $false
+        worker_real_initialization = ($Component -ne "tts-more")
         controller_real_initialization = ($Component -eq "tts-more" -and $Scenario -eq "controller_real_initialize")
-        fixture_runtime_preseeded = ($Component -ne "tts-more")
-        direct_downloader = ($Component -ne "tts-more" -and $Scenario -in @("interruption", "resume", "proxy_fallback", "corruption_repair"))
+        fixture_runtime_preseeded = $false
+        direct_downloader = $false
     }
     $names = @($record.Keys | Sort-Object)
     $expected = @($AllowedEvidenceFields | Sort-Object)
@@ -776,7 +776,7 @@ function Install-FixtureProtocol {
     $port = Get-RandomLoopbackPort
     $manifest.endpoint.port = $port
     $manifest.endpoint.default_url = "http://127.0.0.1:$port"
-    $manifest.runtime.python_version = if ($Component -eq "tts-more") { "3.11.9" } else { "3.11" }
+    $manifest.runtime.python_version = "3.11.9"
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 12), $Utf8NoBom)
 
     $bundle = if ($Component -eq "tts-more") { Join-Path $Root "scripts" } else { Join-Path $Root "app\tts_more" }
@@ -794,15 +794,13 @@ function Install-FixtureProtocol {
     $assetLock = Join-Path $fixture "asset.lock.json"
     $assetTarget = "data/cache/fixture/payload.dat"
     $assetPath = Join-Path $Root $assetTarget
-    [IO.File]::WriteAllBytes($assetPath, $AssetPayload)
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $assetPath) | Out-Null
+    [IO.File]::WriteAllBytes("$assetPath.partial", $AssetPayload[0..7])
     $asset = [ordered]@{ id="$Component-fixture"; target=$assetTarget; size_bytes=$AssetPayload.Length; sha256=([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($AssetPayload))).Replace("-", "").ToLowerInvariant(); urls=@($AssetUrl) }
     [IO.File]::WriteAllText($assetLock, ($asset | ConvertTo-Json -Depth 6), $Utf8NoBom)
     Write-FixtureService -Path (Join-Path $fixture "fixture-service.py")
 
     $runtimePython = Join-Path $Root "runtime\live\python.exe"
-    if ($Component -ne "tts-more") {
-        Copy-FixturePythonRuntime -Root $Root -Destination (Join-Path $Root "runtime\live")
-    }
 
     $pythonFixture = Join-Path $AssetsRoot "$Component-python-3.11.9-embed.zip"
     New-FixtureEmbeddedPythonZip -Root $Root -Path $pythonFixture
@@ -829,7 +827,7 @@ function Install-FixtureProtocol {
     $runtimePayload = [ordered]@{
         schema_version = 1
         component = $Component
-        python_version = if ($Component -eq "tts-more") { "3.11.9" } else { "3.11" }
+        python_version = "3.11.9"
         import_probe = "import sys"
         required_free_bytes = 1
         dependency_mode = "requirements"
@@ -838,15 +836,13 @@ function Install-FixtureProtocol {
         assets = [ordered]@{ python = $pythonAsset; uv = $uvAsset }
         payloads = @()
     }
-    if ($Component -eq "tts-more") {
-        $pythonPartial = Join-Path $Root "data\cache\portable\assets\$($pythonAsset.id).zip.partial"
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $pythonPartial) | Out-Null
-        $pythonBytes = [IO.File]::ReadAllBytes($pythonFixture)
-        [IO.File]::WriteAllBytes($pythonPartial, $pythonBytes[0..7])
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $uvWheel) | Out-Null
-        $uvBytes = [IO.File]::ReadAllBytes($uvFixture)
-        [IO.File]::WriteAllBytes("$uvWheel.partial", $uvBytes[0..7])
-    }
+    $pythonPartial = Join-Path $Root "data\cache\portable\assets\$($pythonAsset.id).zip.partial"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $pythonPartial) | Out-Null
+    $pythonBytes = [IO.File]::ReadAllBytes($pythonFixture)
+    [IO.File]::WriteAllBytes($pythonPartial, $pythonBytes[0..7])
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $uvWheel) | Out-Null
+    $uvBytes = [IO.File]::ReadAllBytes($uvFixture)
+    [IO.File]::WriteAllBytes("$uvWheel.partial", $uvBytes[0..7])
     $modelPayload = [ordered]@{
         schema_version = 1
         component = $Component
@@ -902,7 +898,7 @@ function Set-FixtureAssetUrls {
         if ($runtime.PSObject.Properties["assets"] -and $runtime.assets.PSObject.Properties["python"]) {
             $runtime.assets.python.urls = @("$FixtureEndpoint/$($Package.PythonAssetName)")
         }
-        if ($runtime.PSObject.Properties["assets"] -and $runtime.assets.PSObject.Properties["uv"]) { $runtime.assets.uv.urls = @($Urls) }
+        if ($runtime.PSObject.Properties["assets"] -and $runtime.assets.PSObject.Properties["uv"]) { $runtime.assets.uv.urls = @("$FixtureEndpoint/$($Package.UvAssetName)") }
         [IO.File]::WriteAllText(([string]$Package.RuntimeLock), ($runtime | ConvertTo-Json -Depth 12), $Utf8NoBom)
     }
     Write-FixtureSha256Manifest -Root $Package.Root
@@ -953,6 +949,31 @@ function Restart-FixtureAssetServer {
     Start-FixtureAssetServer
 }
 
+function Assert-FixtureNetworkEvidence {
+    if (!(Test-Path -LiteralPath $ServerRequestLog -PathType Leaf)) { Throw-HarnessError "NETWORK_EVIDENCE_MISSING" "fixture request log is missing" }
+    $requests = @(
+        foreach ($line in [IO.File]::ReadAllLines($ServerRequestLog)) {
+            if (![string]::IsNullOrWhiteSpace($line)) { $line | ConvertFrom-Json }
+        }
+    )
+    foreach ($component in $ExpectedComponents) {
+        $assetPath = "$component.bin"
+        $componentRequests = @($requests | Where-Object { [string]$_.path -eq $assetPath })
+        $resumed = @($componentRequests | Where-Object { [string]$_.range -eq "bytes=8-" -and [int]$_.status -eq 206 })
+        if ($resumed.Count -eq 0) { Throw-HarnessError "RANGE_EVIDENCE_MISSING" "real package download did not resume from byte 8" }
+        $fallbackProved = $false
+        for ($index = 0; $index -lt $componentRequests.Count; $index++) {
+            if ([int]$componentRequests[$index].status -eq 503) {
+                for ($later = $index + 1; $later -lt $componentRequests.Count; $later++) {
+                    if ([int]$componentRequests[$later].status -in @(200, 206)) { $fallbackProved = $true; break }
+                }
+            }
+            if ($fallbackProved) { break }
+        }
+        if (!$fallbackProved) { Throw-HarnessError "MIRROR_EVIDENCE_MISSING" "real package download did not fall back after HTTP 503" }
+    }
+}
+
 function Assert-AssetHash {
     param([Parameter(Mandatory = $true)][object]$Package)
     if (!(Test-Path -LiteralPath $Package.AssetPath -PathType Leaf)) { Throw-HarnessError "ASSET_MISSING" "fixture asset is missing" }
@@ -962,12 +983,6 @@ function Assert-AssetHash {
 
 function Assert-DownloadAssetHash {
     param([Parameter(Mandatory = $true)][object]$Package)
-    if ([string]$Package.Component -eq "tts-more") {
-        if (!(Test-Path -LiteralPath ([string]$Package.UvAssetPath) -PathType Leaf)) { Throw-HarnessError "ASSET_MISSING" "fixture uv asset is missing" }
-        $actual = Get-PortableFileSha256 -Path ([string]$Package.UvAssetPath)
-        if (![string]::Equals($actual, [string]$Package.UvAssetSha, [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "ASSET_HASH_INVALID" "fixture uv asset hash is invalid" }
-        return
-    }
     Assert-AssetHash -Package $Package
 }
 
@@ -1051,7 +1066,7 @@ function Invoke-PackageAcceptance {
     param([Parameter(Mandatory = $true)][object]$Package)
     $component = [string]$Package.Component
     Start-FixtureAssetServer
-    $Package.AssetUrl = if ($component -eq "tts-more") { "$FixtureEndpoint/$($Package.UvAssetName)" } else { "$FixtureEndpoint/$component.bin" }
+    $Package.AssetUrl = "$FixtureEndpoint/$component.bin"
     Set-FixtureAssetUrl -Package $Package -Url $Package.AssetUrl
     Invoke-Scenario -Component $component -Scenario "path_isolation" -Action { Assert-RestrictedChildPath }
     $ServerProcess.Refresh()
@@ -1066,7 +1081,7 @@ function Invoke-PackageAcceptance {
         else { Throw-HarnessError "FIXTURE_SERVER_FAILED" "fixture asset server proxy probe failed unexpectedly" }
     }
 
-    $initializeScenario = if ($component -eq "tts-more") { "controller_real_initialize" } else { "worker_fixture_lifecycle" }
+    $initializeScenario = if ($component -eq "tts-more") { "controller_real_initialize" } else { "worker_real_initialize" }
     Invoke-Scenario -Component $component -Scenario $initializeScenario -Action {
         $initialized = Invoke-RootCommand -Root $Package.Root -Name "Initialize.cmd"
         if ($initialized.ExitCode -ne 0) {
@@ -1076,11 +1091,11 @@ function Invoke-PackageAcceptance {
         Assert-AssetHash -Package $Package
     }
 
-    $interruptedAssetPath = if ($component -eq "tts-more") { [string]$Package.UvAssetPath } else { [string]$Package.AssetPath }
+    $interruptedAssetPath = [string]$Package.AssetPath
     $partial = "$interruptedAssetPath.partial"
     Remove-Item -LiteralPath $interruptedAssetPath -Force
     Restart-FixtureAssetServer
-    $Package.AssetUrl = if ($component -eq "tts-more") { "$FixtureEndpoint/$($Package.UvAssetName)" } else { "$FixtureEndpoint/$component.bin" }
+    $Package.AssetUrl = "$FixtureEndpoint/$component.bin"
     Set-FixtureAssetUrl -Package $Package -Url $Package.AssetUrl
     if ($component -eq "tts-more") {
         foreach ($runtimeDirectory in @("runtime\live", "runtime\staging", "runtime\previous")) {
@@ -1091,13 +1106,9 @@ function Invoke-PackageAcceptance {
         Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
     }
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $first = if ($component -eq "tts-more") {
-        Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
-    } else {
-        Invoke-FixtureAssetDownload -Package $Package
-    }
+    $first = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
     $clock.Stop()
-    $expectedFirstExit = if ($component -eq "tts-more") { 26 } else { 1 }
+    $expectedFirstExit = 26
     if ($first.ExitCode -ne $expectedFirstExit -or !(Test-Path -LiteralPath $partial -PathType Leaf) -or (Get-Item -LiteralPath $partial).Length -ne 8) {
         if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") {
             $ServerProcess.Refresh()
@@ -1111,10 +1122,6 @@ function Invoke-PackageAcceptance {
     Add-Evidence -Component $component -Scenario "interruption" -Result pass -Duration $clock.Elapsed.TotalSeconds
 
     Invoke-Scenario -Component $component -Scenario "resume" -Action {
-        if ($component -ne "tts-more") {
-            $download = Invoke-FixtureAssetDownload -Package $Package
-            if ($download.ExitCode -ne 0) { Throw-HarnessError "RESUME_FAILED" "worker fixture asset resume failed" }
-        }
         $resumed = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
         if ($resumed.ExitCode -ne 0) {
             if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") {
@@ -1129,10 +1136,8 @@ function Invoke-PackageAcceptance {
             Throw-HarnessError "RESUME_FAILED" "resumed Start.cmd failed"
         }
         Assert-AssetHash -Package $Package
-        if ($component -eq "tts-more") {
-            $uvActual = Get-PortableFileSha256 -Path ([string]$Package.UvAssetPath)
-            if (![string]::Equals($uvActual, [string]$Package.UvAssetSha, [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "ASSET_HASH_INVALID" "fixture uv asset hash is invalid" }
-        }
+        $uvActual = Get-PortableFileSha256 -Path ([string]$Package.UvAssetPath)
+        if (![string]::Equals($uvActual, [string]$Package.UvAssetSha, [StringComparison]::OrdinalIgnoreCase)) { Throw-HarnessError "ASSET_HASH_INVALID" "fixture uv asset hash is invalid" }
         Wait-LoopbackPort -Port $Package.Port -Listening $true
     }
     $recordPath = Join-Path $Package.Root "data\local\run\worker.pid.json"
@@ -1182,7 +1187,7 @@ function Invoke-PackageAcceptance {
     Invoke-Scenario -Component $component -Scenario "proxy_fallback" -Action {
         $proxyUrl = "$($Package.AssetUrl)?mode=proxy-failure"
         Set-FixtureAssetUrls -Package $Package -Urls @($proxyUrl, $Package.AssetUrl)
-        $repairTarget = if ($component -eq "tts-more") { [string]$Package.UvAssetPath } else { [string]$Package.AssetPath }
+        $repairTarget = [string]$Package.AssetPath
         Remove-Item -LiteralPath $repairTarget -Force
         Remove-Item -LiteralPath "$repairTarget.partial" -Force -ErrorAction SilentlyContinue
         if ($component -eq "tts-more") {
@@ -1192,9 +1197,6 @@ function Invoke-PackageAcceptance {
         }
         if ($component -eq "tts-more") {
             Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
-        } else {
-            $download = Invoke-FixtureAssetDownload -Package $Package
-            if ($download.ExitCode -ne 0) { Throw-HarnessError "REPAIR_FAILED" "worker fixture mirror fallback failed" }
         }
         $repair = Invoke-RootCommand -Root $Package.Root -Name "Repair.cmd"
         if ($repair.ExitCode -ne 0) {
@@ -1206,7 +1208,7 @@ function Invoke-PackageAcceptance {
     }
 
     Invoke-Scenario -Component $component -Scenario "corruption_repair" -Action {
-        $repairTarget = if ($component -eq "tts-more") { [string]$Package.UvAssetPath } else { [string]$Package.AssetPath }
+        $repairTarget = [string]$Package.AssetPath
         $bytes = [IO.File]::ReadAllBytes($repairTarget)
         $originalLength = $bytes.Length
         $bytes[0] = $bytes[0] -bxor 0xff
@@ -1219,9 +1221,6 @@ function Invoke-PackageAcceptance {
         }
         if ($component -eq "tts-more") {
             Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
-        } else {
-            $download = Invoke-FixtureAssetDownload -Package $Package
-            if ($download.ExitCode -ne 0) { Throw-HarnessError "REPAIR_FAILED" "worker fixture corruption repair failed" }
         }
         $repaired = Invoke-RootCommand -Root $Package.Root -Name "Repair.cmd"
         if ($repaired.ExitCode -ne 0) { Throw-HarnessError "REPAIR_FAILED" "Repair.cmd failed for same-length corruption" }
@@ -1375,6 +1374,7 @@ try {
         $ExpandedPackages.Add($package)
     }
     foreach ($package in $ExpandedPackages) { Invoke-PackageAcceptance -Package $package }
+    Assert-FixtureNetworkEvidence
 }
 catch {
     $caught = $_
