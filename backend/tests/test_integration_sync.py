@@ -270,10 +270,12 @@ def test_sync_rolls_back_controlled_files_and_manifest_after_publication_failure
         payloads["Start.cmd"] += "rem changed\n"
         return payloads
 
-    def fail_manifest_publish(source: Path, destination: Path, target_root: Path) -> None:
+    def fail_manifest_publish(
+        source: Path, destination: Path, target_root: Path, backup: object, journal: object
+    ) -> None:
         if destination == manifest_path:
             raise OSError("injected manifest publication failure")
-        original_publish(source, destination, target_root)
+        original_publish(source, destination, target_root, backup, journal)
 
     monkeypatch.setattr(sync, "_root_entry_payloads", changed_payloads)
     monkeypatch.setattr(sync, "_publish_file", fail_manifest_publish)
@@ -298,9 +300,11 @@ def test_sync_rolls_back_path_when_publisher_fails_after_atomic_replace(
     original_publish = sync._publish_file
     failed = False
 
-    def fail_after_first_replace(source: Path, destination: Path, target_root: Path) -> None:
+    def fail_after_first_replace(
+        source: Path, destination: Path, target_root: Path, backup: object, journal: object
+    ) -> None:
         nonlocal failed
-        original_publish(source, destination, target_root)
+        original_publish(source, destination, target_root, backup, journal)
         if not failed:
             failed = True
             raise OSError("injected post-replace failure")
@@ -468,6 +472,162 @@ def test_sync_rejects_noncanonical_or_aliased_desired_paths_before_target_mutati
         sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "f" * 40)
 
     assert sentinel.read_bytes() == b"unchanged"
+
+
+def test_racing_new_regular_file_is_not_overwritten_or_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "regular race fork"
+    original_publish = sync._publish_file
+    raced_path: Path | None = None
+
+    def race_publish(
+        source: Path, destination: Path, target_root: Path, backup: object, journal: object
+    ) -> None:
+        nonlocal raced_path
+        if raced_path is None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"external-racer")
+            raced_path = destination
+        original_publish(source, destination, target_root, backup, journal)
+
+    monkeypatch.setattr(sync, "_publish_file", race_publish)
+
+    with pytest.raises(FileExistsError):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "1" * 40)
+
+    assert raced_path is not None
+    assert raced_path.read_bytes() == b"external-racer"
+
+
+def test_publisher_failure_before_publication_does_not_delete_racing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "pre-publication failure fork"
+    raced_path: Path | None = None
+
+    def fail_before_publish(
+        source: Path, destination: Path, target_root: Path, backup: object, journal: object
+    ) -> None:
+        nonlocal raced_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"external-before-failure")
+        raced_path = destination
+        raise OSError("injected before publication")
+
+    monkeypatch.setattr(sync, "_publish_file", fail_before_publish)
+
+    with pytest.raises(OSError, match="injected before publication"):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "2" * 40)
+
+    assert raced_path is not None
+    assert raced_path.read_bytes() == b"external-before-failure"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows no-replace rename semantics")
+def test_new_publication_uses_windows_no_replace_fallback_when_hardlinks_are_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+
+    def unsupported_link(*args: object, **kwargs: object) -> None:
+        raise OSError(50, "hard links are not supported")
+
+    monkeypatch.setattr(sync.os, "link", unsupported_link)
+    target = tmp_path / "no hardlink fork"
+
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "2" * 40)
+
+    assert sync.check_integration(target) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
+def test_racing_junction_failure_keeps_outside_and_rolls_back_other_new_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "junction race fork"
+    outside = tmp_path / "junction race outside"
+    outside.mkdir()
+    sentinel = outside / "keep.bin"
+    sentinel.write_bytes(b"outside")
+    original_publish = sync._publish_file
+    link = target / "tts_more"
+    injected = False
+
+    def race_junction(
+        source: Path, destination: Path, target_root: Path, backup: object, journal: object
+    ) -> None:
+        nonlocal injected
+        if not injected and destination.parent == link:
+            injected = True
+            _make_windows_junction(link, outside)
+            raise OSError("injected junction before publication")
+        original_publish(source, destination, target_root, backup, journal)
+
+    monkeypatch.setattr(sync, "_publish_file", race_junction)
+    try:
+        with pytest.raises(Exception, match="injected junction|rollback"):
+            sync.sync_integration(REPO_ROOT, target, "indextts", "3" * 40)
+        assert sentinel.read_bytes() == b"outside"
+        assert sorted(path.name for path in outside.iterdir()) == ["keep.bin"]
+        assert not (target / "Build-Package.ps1").exists()
+        assert not (target / "Start.cmd").exists()
+    finally:
+        if os.path.lexists(link):
+            os.rmdir(link)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
+def test_rollback_reparse_error_does_not_prevent_other_prior_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "rollback reparse fork"
+    sync.sync_integration(REPO_ROOT, target, "cosyvoice", "4" * 40)
+    start = target / "Start.cmd"
+    original_start = start.read_bytes()
+    app = target / "tts_more" / "app"
+    held_app = target / "tts_more" / "app-held"
+    outside = tmp_path / "rollback outside"
+    outside.mkdir()
+    sentinel = outside / "keep.bin"
+    sentinel.write_bytes(b"outside")
+    original_payloads = sync._root_entry_payloads
+    original_publish = sync._publish_file
+    injected = False
+
+    def changed_payloads(component: str) -> dict[str, str]:
+        payloads = original_payloads(component)
+        payloads["Start.cmd"] += "rem transaction-change\n"
+        return payloads
+
+    def fail_after_app_publish(
+        source: Path, destination: Path, target_root: Path, backup: object, journal: object
+    ) -> None:
+        nonlocal injected
+        original_publish(source, destination, target_root, backup, journal)
+        if not injected and destination == app / "models.py":
+            injected = True
+            app.rename(held_app)
+            _make_windows_junction(app, outside)
+            raise OSError("injected rollback reparse")
+
+    monkeypatch.setattr(sync, "_root_entry_payloads", changed_payloads)
+    monkeypatch.setattr(sync, "_publish_file", fail_after_app_publish)
+    try:
+        with pytest.raises(Exception, match="rollback"):
+            sync.sync_integration(REPO_ROOT, target, "cosyvoice", "5" * 40)
+        assert start.read_bytes() == original_start
+        assert sentinel.read_bytes() == b"outside"
+        assert sorted(path.name for path in outside.iterdir()) == ["keep.bin"]
+    finally:
+        if os.path.lexists(app):
+            os.rmdir(app)
+        if held_app.exists():
+            held_app.rename(app)
 
 
 def test_check_treats_crlf_and_lf_as_the_same_controlled_text(tmp_path: Path) -> None:

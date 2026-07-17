@@ -30,6 +30,43 @@ ROOT_ENTRIES = (
 )
 
 
+class FileState:
+    __slots__ = ("device", "inode", "mode", "size", "modified_ns", "attributes", "digest")
+
+    def __init__(
+        self, device: int, inode: int, mode: int, size: int,
+        modified_ns: int, attributes: int, digest: str,
+    ) -> None:
+        self.device = device
+        self.inode = inode
+        self.mode = mode
+        self.size = size
+        self.modified_ns = modified_ns
+        self.attributes = attributes
+        self.digest = digest
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, FileState):
+            return NotImplemented
+        return all(getattr(self, name) == getattr(other, name) for name in self.__slots__)
+
+
+class FileBackup:
+    __slots__ = ("payload", "state")
+
+    def __init__(self, payload: bytes | None, state: FileState | None) -> None:
+        self.payload = payload
+        self.state = state
+
+
+class PublicationJournal:
+    __slots__ = ("published", "removed")
+
+    def __init__(self) -> None:
+        self.published: dict[str, FileState] = {}
+        self.removed: set[str] = set()
+
+
 def sha256_file(path: Path) -> str:
     # All controlled integration files are text. Hash their canonical LF form
     # so Git's Windows checkout conversion cannot create false mirror drift.
@@ -272,29 +309,31 @@ def _publish_transaction(
 ) -> None:
     manifest_relative = "tts_more/integration.manifest.json"
     prior_paths = previous_files | ({manifest_relative} if previous_manifest is not None else set())
-    backups: dict[str, bytes | None] = {}
+    backups: dict[str, FileBackup] = {}
     for relative in prior_paths:
         path = target_root / Path(PurePosixPath(relative))
         _assert_safe_target_path(target_root, path, include_leaf=True)
-        backups[relative] = path.read_bytes() if _lexists(path) else None
+        backups[relative] = _capture_backup(path)
     target_root.mkdir(parents=True, exist_ok=True)
-    published: set[str] = set()
+    journal = PublicationJournal()
     obsolete = previous_files - new_files
     try:
         for relative in sorted(new_files):
-            published.add(relative)
             _publish_file(
                 stage_root / Path(PurePosixPath(relative)),
                 target_root / Path(PurePosixPath(relative)),
                 target_root,
+                backups.get(relative),
+                journal,
             )
         for relative in sorted(obsolete, reverse=True):
-            _remove_owned_file(target_root, relative)
-        published.add(manifest_relative)
+            _remove_owned_file(target_root, relative, backups[relative], journal)
         _publish_file(
             stage_root / Path(PurePosixPath(manifest_relative)),
             target_root / Path(PurePosixPath(manifest_relative)),
             target_root,
+            backups.get(manifest_relative),
+            journal,
         )
         for relative in sorted(new_files | {manifest_relative}):
             _assert_safe_target_path(
@@ -302,30 +341,66 @@ def _publish_transaction(
                 target_root / Path(PurePosixPath(relative)),
                 include_leaf=True,
             )
-    except BaseException:
-        _rollback_publication(target_root, backups, published, prior_paths)
+    except BaseException as original:
+        rollback_errors = _rollback_publication(target_root, backups, journal, prior_paths)
+        if rollback_errors:
+            raise RuntimeError(
+                f"rollback incomplete after {original}: " + "; ".join(rollback_errors)
+            ) from original
         raise
 
 
 def _rollback_publication(
     target_root: Path,
-    backups: dict[str, bytes | None],
-    published: set[str],
+    backups: dict[str, FileBackup],
+    journal: PublicationJournal,
     prior_paths: set[str],
-) -> None:
-    for relative in sorted(published - prior_paths, reverse=True):
-        _remove_owned_file(target_root, relative)
-    for relative, payload in backups.items():
+) -> list[str]:
+    errors: list[str] = []
+    for relative in sorted(set(journal.published) - prior_paths, reverse=True):
         path = target_root / Path(PurePosixPath(relative))
-        _assert_safe_target_path(target_root, path, include_leaf=True)
-        if payload is None:
-            _remove_owned_file(target_root, relative)
-        else:
-            _write_bytes_atomically(target_root, path, payload)
-        _assert_safe_target_path(target_root, path, include_leaf=True)
+        try:
+            _assert_safe_target_path(target_root, path, include_leaf=True)
+            if not _matches_state(path, journal.published[relative]):
+                raise ValueError(f"published path identity changed before rollback: {relative}")
+            path.unlink()
+            _assert_safe_target_path(target_root, path, include_leaf=True)
+            _remove_empty_parents(path.parent, target_root)
+        except BaseException as exc:
+            errors.append(f"{relative}: {exc}")
+    for relative, backup in backups.items():
+        path = target_root / Path(PurePosixPath(relative))
+        try:
+            _assert_safe_target_path(target_root, path, include_leaf=True)
+            if relative in journal.published:
+                if not _matches_state(path, journal.published[relative]):
+                    raise ValueError(f"published path identity changed before rollback: {relative}")
+                if backup.payload is None:
+                    path.unlink()
+                    _remove_empty_parents(path.parent, target_root)
+                else:
+                    _write_bytes_atomically(target_root, path, backup.payload)
+            elif relative in journal.removed:
+                if _lexists(path):
+                    raise ValueError(f"removed path was externally recreated before rollback: {relative}")
+                if backup.payload is not None:
+                    _write_new_bytes_exclusively(target_root, path, backup.payload)
+            else:
+                _assert_backup_unchanged(path, backup, relative)
+            _assert_safe_target_path(target_root, path, include_leaf=True)
+        except BaseException as exc:
+            errors.append(f"{relative}: {exc}")
+    return errors
 
 
-def _publish_file(source: Path, destination: Path, target_root: Path) -> None:
+def _publish_file(
+    source: Path,
+    destination: Path,
+    target_root: Path,
+    backup: FileBackup | None,
+    journal: PublicationJournal,
+) -> None:
+    relative = destination.relative_to(target_root).as_posix()
     _assert_safe_target_path(target_root, destination, include_leaf=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
     _assert_safe_target_path(target_root, destination, include_leaf=True)
@@ -335,7 +410,15 @@ def _publish_file(source: Path, destination: Path, target_root: Path) -> None:
     try:
         shutil.copy2(source, temporary)
         _assert_safe_target_path(target_root, destination, include_leaf=True)
-        os.replace(temporary, destination)
+        if backup is None:
+            if _lexists(destination):
+                raise FileExistsError(f"target path appeared during publication: {relative}")
+            _publish_temp_exclusively(temporary, destination)
+        else:
+            _assert_backup_unchanged(destination, backup, relative)
+            os.replace(temporary, destination)
+        state = _capture_regular_state(destination)
+        journal.published[relative] = state
         _assert_safe_target_path(target_root, destination, include_leaf=True)
     finally:
         temporary.unlink(missing_ok=True)
@@ -357,13 +440,100 @@ def _write_bytes_atomically(target_root: Path, destination: Path, payload: bytes
         temporary.unlink(missing_ok=True)
 
 
-def _remove_owned_file(target_root: Path, relative: str) -> None:
+def _write_new_bytes_exclusively(target_root: Path, destination: Path, payload: bytes) -> None:
+    _assert_safe_target_path(target_root, destination, include_leaf=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _assert_safe_target_path(target_root, destination, include_leaf=True)
+    handle, temporary_name = tempfile.mkstemp(prefix=".tts-more-rollback-new-", dir=destination.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+        if _lexists(destination):
+            raise FileExistsError(f"target path appeared during rollback: {destination}")
+        _publish_temp_exclusively(temporary, destination)
+        _assert_safe_target_path(target_root, destination, include_leaf=True)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_temp_exclusively(temporary: Path, destination: Path) -> None:
+    try:
+        os.link(temporary, destination, follow_symlinks=False)
+        return
+    except FileExistsError:
+        raise
+    except OSError:
+        if _lexists(destination):
+            raise FileExistsError(f"target path appeared during publication: {destination}")
+        if os.name != "nt":
+            raise
+    # On Windows os.rename maps to MoveFileW without replace-existing flags.
+    # It is atomic on the same volume and fails if a racing destination exists.
+    os.rename(temporary, destination)
+
+
+def _raw_digest(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _capture_regular_state(path: Path) -> FileState:
+    metadata = os.lstat(path)
+    if not stat.S_ISREG(metadata.st_mode) or _is_reparse(path):
+        raise ValueError(f"controlled path is not a regular non-reparse file: {path}")
+    payload = path.read_bytes()
+    return FileState(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        size=metadata.st_size,
+        modified_ns=metadata.st_mtime_ns,
+        attributes=getattr(metadata, "st_file_attributes", 0),
+        digest=_raw_digest(payload),
+    )
+
+
+def _capture_backup(path: Path) -> FileBackup:
+    if not _lexists(path):
+        return FileBackup(payload=None, state=None)
+    payload = path.read_bytes()
+    state = _capture_regular_state(path)
+    if state.digest != _raw_digest(payload):
+        raise ValueError(f"controlled path changed while creating backup: {path}")
+    return FileBackup(payload=payload, state=state)
+
+
+def _matches_state(path: Path, expected: FileState) -> bool:
+    if not _lexists(path):
+        return False
+    try:
+        actual = _capture_regular_state(path)
+    except (OSError, ValueError):
+        return False
+    return actual == expected
+
+
+def _assert_backup_unchanged(path: Path, backup: FileBackup, relative: str) -> None:
+    if backup.state is None:
+        if _lexists(path):
+            raise FileExistsError(f"target path appeared during publication: {relative}")
+        return
+    if not _matches_state(path, backup.state):
+        raise RuntimeError(f"prior controlled file changed during publication: {relative}")
+
+
+def _remove_owned_file(
+    target_root: Path,
+    relative: str,
+    backup: FileBackup,
+    journal: PublicationJournal,
+) -> None:
     path = target_root / Path(PurePosixPath(relative))
     _assert_safe_target_path(target_root, path, include_leaf=True)
-    if _lexists(path):
-        if not stat.S_ISREG(os.lstat(path).st_mode):
-            raise ValueError(f"controlled path is no longer a regular file: {relative}")
+    _assert_backup_unchanged(path, backup, relative)
+    if backup.state is not None:
         path.unlink()
+        journal.removed.add(relative)
     _assert_safe_target_path(target_root, path, include_leaf=True)
     _remove_empty_parents(path.parent, target_root)
 
