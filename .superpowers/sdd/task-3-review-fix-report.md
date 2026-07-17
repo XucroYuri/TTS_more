@@ -2,7 +2,7 @@
 
 Status: DONE
 
-Commit: pending at report creation; see the commit named `fix: certify worker exact Python runtimes`.
+Commit: `d48195c` (`fix: certify worker exact Python runtimes`).
 
 ## Findings fixed
 
