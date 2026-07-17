@@ -26,6 +26,27 @@ owned monitor/service cleanup and evidence collection on both success and failur
 6. Final fail-closed RED reported `5 failed, 28 passed`: direct non-Path option values
    raised `AttributeError`, and duplicate probe nodes were silently overwritten.
 
+## Independent Review Fix
+
+Commit `2f39f19` resolves all three Important findings from the independent review.
+The review regression RED run reported `5 failed, 4 passed`: the executor had no
+run-scoped pinning API, formal roots with spaces passed validation, the orchestrator
+did not switch to a pinned executor after admission, and ambiguous monitor/worker
+starts were omitted from cleanup tracking. The same focused run passed all 9 cases
+after the implementation.
+
+- `WindowsSshExecutor.with_pinned_targets()` creates a fail-closed run-scoped view
+  from the admitted alias-to-target map. PowerShell, SCP upload/download, and pinned
+  host-key lookup reuse the admitted address and reject aliases outside that map.
+  Normal non-run-scoped executor calls retain the existing per-operation DNS
+  resolution and rebinding checks.
+- Monitor and service nodes are recorded before start invocation. An SSH timeout or
+  disconnect after a remote start therefore still reaches the existing idempotent,
+  ownership-aware monitor stop, evidence collection, and service cleanup paths while
+  the manager's run-local ownership state is available.
+- Formal `--remote-root` segments now accept only ASCII letters, digits, dot,
+  underscore, and hyphen; whitespace is rejected before any remote mutation.
+
 ## Current API Adaptation
 
 - `WindowsLanNodeManager.deploy()` remains the only deployment implementation. It
@@ -62,13 +83,14 @@ be copied into logs or evidence.
 
 ## GREEN Verification
 
-- Task 5 focused suite: `34 passed`.
-- Task 5 plus Tasks 1-4 integration suite: `397 passed, 2 skipped`.
-- Full backend suite after the final code cleanup: `970 passed, 6 skipped`.
+- Task 5 focused suite: `37 passed`.
+- SSH/orchestration/node-manager regression suite: `228 passed`.
+- Task 5 plus Tasks 1-4 integration suite: `432 passed, 2 skipped`.
+- Full backend suite after merging current `master`: `1003 passed, 6 skipped`.
 - `python -W error::DeprecationWarning -m compileall -q -f backend
   scripts/run-lan-validation.py`: passed.
 - Python launcher `--help`, POSIX launcher `--help`, and `bash -n` checks: passed.
-- New-file whitespace checks and line-width scan: passed.
+- `git diff --check`: passed.
 
 ## Remaining Integration Boundary
 
