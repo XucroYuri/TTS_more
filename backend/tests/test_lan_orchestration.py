@@ -217,7 +217,13 @@ def test_options_reject_non_path_field_types(tmp_path: Path, field: str) -> None
 
 @pytest.mark.parametrize(
     "remote_root",
-    [r"TTS\TTS_more", r"C:\TTS\..\escape", r"C:\TTS\NUL", "C:\\TTS\\bad\nroot"],
+    [
+        r"TTS\TTS_more",
+        r"C:\TTS\..\escape",
+        r"C:\TTS\NUL",
+        r"C:\TTS Folder\TTS_more",
+        "C:\\TTS\\bad\nroot",
+    ],
 )
 def test_options_reject_unsafe_remote_roots(tmp_path: Path, remote_root: str) -> None:
     with pytest.raises(ValueError, match="remote root"):
@@ -531,6 +537,10 @@ class _FakeExecutor:
         self.events.append(f"ssh-resolve:{node}")
         return SimpleNamespace(hostname=f"{node}.lan", address="192.0.2.20")
 
+    def with_pinned_targets(self, targets: dict[str, SimpleNamespace]) -> "_FakeExecutor":
+        self.events.append("ssh-pin:" + ",".join(sorted(targets)))
+        return self
+
 
 class _FakeManager:
     def __init__(self, events: list[str], *, fail_collect: bool = False) -> None:
@@ -658,6 +668,7 @@ def test_orchestrator_has_no_skip_path_and_cleans_owned_processes(
         "controller-id",
         "ssh-resolve:gpu-worker",
         "network",
+        "ssh-pin:gpu-worker",
         "sync:gpu-worker",
         "deploy:gpu-worker:True",
         "monitor-start:gpu-worker",
@@ -708,6 +719,64 @@ def test_failure_writes_bounded_blocker_without_secret_and_still_cleans_up(
     assert summary.is_file()
     assert summary.stat().st_size < 64 * 1024
     assert json.loads(summary.read_text(encoding="utf-8"))["passed"] is False
+
+
+def test_ambiguous_monitor_start_still_attempts_monitor_stop_and_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    options = _options(tmp_path)
+    events: list[str] = []
+    _patch_orchestration_dependencies(monkeypatch, events, fail_core=False)
+
+    class AmbiguousMonitorManager(_FakeManager):
+        def start_gpu_monitor(self, node: str, remote_root: str, run_id: str) -> None:
+            self.events.append(f"monitor-started-remotely:{node}")
+            raise RuntimeError("SSH disconnected after monitor start")
+
+    manager = AmbiguousMonitorManager(events)
+    orchestrator = LanOrchestrator(
+        options,
+        executor=_FakeExecutor(events),
+        node_manager_factory=lambda *_args, **_kwargs: manager,
+        process_runner=lambda *_args, **_kwargs: None,
+    )
+
+    assert orchestrator.run() == 1
+    assert events[-3:] == [
+        "monitor-started-remotely:gpu-worker",
+        "monitor-stop:gpu-worker",
+        "collect:gpu-worker",
+    ]
+    assert "services-stop:gpu-worker" not in events
+
+
+def test_ambiguous_worker_start_still_attempts_owned_service_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    options = _options(tmp_path)
+    events: list[str] = []
+    _patch_orchestration_dependencies(monkeypatch, events, fail_core=False)
+
+    class AmbiguousWorkerManager(_FakeManager):
+        def start(self, node: str, remote_root: str) -> None:
+            self.events.append(f"worker-started-remotely:{node}")
+            raise RuntimeError("SSH disconnected after worker start")
+
+    manager = AmbiguousWorkerManager(events)
+    orchestrator = LanOrchestrator(
+        options,
+        executor=_FakeExecutor(events),
+        node_manager_factory=lambda *_args, **_kwargs: manager,
+        process_runner=lambda *_args, **_kwargs: None,
+    )
+
+    assert orchestrator.run() == 1
+    assert events[-4:] == [
+        "worker-started-remotely:gpu-worker",
+        "monitor-stop:gpu-worker",
+        "collect:gpu-worker",
+        "services-stop:gpu-worker",
+    ]
 
 
 def test_launchers_are_thin_argument_forwarders() -> None:

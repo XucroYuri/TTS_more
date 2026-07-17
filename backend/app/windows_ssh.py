@@ -15,7 +15,7 @@ import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 
 _SAFE_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -63,6 +63,7 @@ class WindowsSshExecutor:
         self.config_path = Path(os.path.abspath(config_path.expanduser()))
         self.runner = runner
         self.resolver = resolver or self._resolve_addresses
+        self._pinned_targets: dict[str, SshResolvedTarget] | None = None
 
     @staticmethod
     def _resolve_addresses(hostname: str) -> list[str]:
@@ -396,6 +397,11 @@ class WindowsSshExecutor:
 
     def resolve(self, alias: str) -> SshResolvedTarget:
         self._validate_alias(alias)
+        if self._pinned_targets is not None:
+            try:
+                return self._pinned_targets[alias]
+            except KeyError:
+                raise ValueError("SSH alias was not admitted for this run") from None
         settings = self._parse_settings(self._resolved_config_output(alias))
         if self._setting(settings, "batchmode") != "yes":
             raise ValueError("SSH target must set BatchMode yes")
@@ -461,6 +467,25 @@ class WindowsSshExecutor:
             identity_files,
             certificate_files,
         )
+
+    def with_pinned_targets(
+        self, targets: Mapping[str, SshResolvedTarget]
+    ) -> "WindowsSshExecutor":
+        pinned: dict[str, SshResolvedTarget] = {}
+        for alias, target in targets.items():
+            self._validate_alias(alias)
+            if not isinstance(target, SshResolvedTarget) or target.alias != alias:
+                raise ValueError("SSH resolved target does not match its admitted alias")
+            pinned[alias] = target
+        if not pinned:
+            raise ValueError("at least one SSH target must be admitted")
+        executor = WindowsSshExecutor(
+            self.config_path,
+            runner=self.runner,
+            resolver=self.resolver,
+        )
+        executor._pinned_targets = pinned
+        return executor
 
     @staticmethod
     def _connection_arguments(target: SshResolvedTarget) -> list[str]:

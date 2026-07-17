@@ -199,6 +199,39 @@ def test_resolve_does_not_cache_a_validated_target(tmp_path: Path) -> None:
     assert resolver.calls == ["tts-gpt.lan", "tts-gpt.lan"]
 
 
+def test_pinned_targets_reuse_admitted_endpoint_for_all_operations(tmp_path: Path) -> None:
+    config = write_config(tmp_path)
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("tts-gpt.lan ssh-ed25519 AAAA\n", encoding="utf-8")
+    source = tmp_path / "source.txt"
+    source.write_text("payload", encoding="utf-8")
+    runner = FakeRunner(
+        [
+            completed(resolved_settings(known_hosts=str(known_hosts))),
+            completed("ok"),
+            completed(),
+            completed(),
+            completed("tts-gpt.lan ssh-ed25519 AAAA"),
+        ]
+    )
+    resolver = FakeResolver([["192.0.2.10"], ["192.0.2.99"]])
+    executor = WindowsSshExecutor(config, runner=runner, resolver=resolver)
+    admitted = executor.resolve("gpt-worker")
+
+    pinned = executor.with_pinned_targets({"gpt-worker": admitted})
+    assert pinned.run_powershell("gpt-worker", "Get-Date").stdout == "ok"
+    pinned.copy_to("gpt-worker", source, r"C:\TTS\source.txt")
+    pinned.copy_from("gpt-worker", r"C:\TTS\evidence.json", tmp_path / "evidence.json")
+    assert len(pinned.pinned_host_key_sha256("gpt-worker")) == 64
+
+    assert resolver.calls == ["tts-gpt.lan"]
+    for argv in runner.calls[1:4]:
+        assert "HostName=192.0.2.10" in argv
+        assert "HostName=192.0.2.99" not in argv
+    with pytest.raises(ValueError, match="not admitted"):
+        pinned.run_powershell("other-worker", "Get-Date")
+
+
 def test_command_failure_redacts_command_and_sensitive_output(tmp_path: Path) -> None:
     config = write_config(tmp_path)
     encoded_script = "RwBlAHQALQBEAGEAdABlAA=="

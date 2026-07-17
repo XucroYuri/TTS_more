@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _GIT = Path("/usr/bin/git")
 _IOREG = Path("/usr/sbin/ioreg")
 _SAFE_RUN_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
-_SAFE_WINDOWS_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]*\Z")
+_SAFE_WINDOWS_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SAFE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _WINDOWS_RESERVED_NAMES = {
     "aux",
@@ -679,13 +679,14 @@ class LanOrchestrator:
                 policy,
                 ssh_targets=ssh_targets,
             )
+            pinned_executor = self.executor.with_pinned_targets(ssh_targets)
 
             _ensure_output_directory(self.options.output)
             output_created = True
             logger = configure_run_logging(self.options.output)
             token = secrets.token_hex(32)
             os.environ[_ORCHESTRATION_TOKEN_ENV] = token
-            manager = self.node_manager_factory(self.executor, salt=salt)
+            manager = self.node_manager_factory(pinned_executor, salt=salt)
 
             for node in policy.workers:
                 logger.info("sync worker node=%s", node)
@@ -700,16 +701,16 @@ class LanOrchestrator:
                 )
             for node in policy.workers:
                 logger.info("start GPU monitor node=%s", node)
+                monitor_nodes.append(node)
                 manager.start_gpu_monitor(
                     node,
                     self.options.remote_root,
                     self.options.output.name,
                 )
-                monitor_nodes.append(node)
             for node in policy.workers:
                 logger.info("start worker services node=%s", node)
-                manager.start(node, self.options.remote_root)
                 service_nodes.append(node)
+                manager.start(node, self.options.remote_root)
             probes = [
                 manager.inspect(node, self.options.remote_root, commit)
                 for node in policy.workers
