@@ -24,6 +24,16 @@ def _load_sync():
     return module
 
 
+def _make_windows_junction(link: Path, target: Path) -> None:
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def _run_copied_contract_after_mutation(sync, target: Path) -> subprocess.CompletedProcess[str]:
     manifest_path = target / "tts_more" / "integration.manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -260,10 +270,10 @@ def test_sync_rolls_back_controlled_files_and_manifest_after_publication_failure
         payloads["Start.cmd"] += "rem changed\n"
         return payloads
 
-    def fail_manifest_publish(source: Path, destination: Path) -> None:
+    def fail_manifest_publish(source: Path, destination: Path, target_root: Path) -> None:
         if destination == manifest_path:
             raise OSError("injected manifest publication failure")
-        original_publish(source, destination)
+        original_publish(source, destination, target_root)
 
     monkeypatch.setattr(sync, "_root_entry_payloads", changed_payloads)
     monkeypatch.setattr(sync, "_publish_file", fail_manifest_publish)
@@ -288,9 +298,9 @@ def test_sync_rolls_back_path_when_publisher_fails_after_atomic_replace(
     original_publish = sync._publish_file
     failed = False
 
-    def fail_after_first_replace(source: Path, destination: Path) -> None:
+    def fail_after_first_replace(source: Path, destination: Path, target_root: Path) -> None:
         nonlocal failed
-        original_publish(source, destination)
+        original_publish(source, destination, target_root)
         if not failed:
             failed = True
             raise OSError("injected post-replace failure")
@@ -303,6 +313,161 @@ def test_sync_rolls_back_path_when_publisher_fails_after_atomic_replace(
     assert unknown.read_bytes() == b"unknown"
     assert not (target / "Build-Package.ps1").exists()
     assert not (target / "tts_more" / "integration.manifest.json").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
+def test_sync_and_check_reject_tts_more_junction_without_writing_outside(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "junction fork"
+    target.mkdir()
+    root_entry = target / "Start.cmd"
+    root_entry.write_bytes(b"target-root-entry")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_sentinel = outside / "sentinel.bin"
+    outside_sentinel.write_bytes(b"outside")
+    link = target / "tts_more"
+    _make_windows_junction(link, outside)
+    try:
+        with pytest.raises(ValueError, match="reparse"):
+            sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "9" * 40)
+        errors = sync.check_integration(target)
+        assert any("reparse" in error for error in errors)
+        assert root_entry.read_bytes() == b"target-root-entry"
+        assert outside_sentinel.read_bytes() == b"outside"
+        assert sorted(path.name for path in outside.iterdir()) == ["sentinel.bin"]
+    finally:
+        os.rmdir(link)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
+def test_sync_and_check_reject_controlled_ancestor_junction(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "ancestor junction fork"
+    sync.sync_integration(REPO_ROOT, target, "indextts", "a" * 40)
+    root_entry = target / "Start.cmd"
+    root_bytes = root_entry.read_bytes()
+    app = target / "tts_more" / "app"
+    shutil.rmtree(app)
+    outside = tmp_path / "outside app"
+    outside.mkdir()
+    sentinel = outside / "keep.bin"
+    sentinel.write_bytes(b"keep")
+    _make_windows_junction(app, outside)
+    try:
+        with pytest.raises(ValueError, match="reparse"):
+            sync.sync_integration(REPO_ROOT, target, "indextts", "b" * 40)
+        assert any("reparse" in error for error in sync.check_integration(target))
+        assert root_entry.read_bytes() == root_bytes
+        assert sentinel.read_bytes() == b"keep"
+    finally:
+        os.rmdir(app)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
+def test_sync_and_check_reject_broken_junction(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "broken junction fork"
+    target.mkdir()
+    outside = tmp_path / "removed target"
+    outside.mkdir()
+    link = target / "tts_more"
+    _make_windows_junction(link, outside)
+    outside.rmdir()
+    try:
+        assert os.path.lexists(link) and not link.exists()
+        with pytest.raises(ValueError, match="reparse"):
+            sync.sync_integration(REPO_ROOT, target, "cosyvoice", "c" * 40)
+        assert any("reparse" in error for error in sync.check_integration(target))
+    finally:
+        os.rmdir(link)
+
+
+@pytest.mark.parametrize(
+    "bad_relative",
+    (
+        "tts_more//evil.py",
+        "tts_more/./evil.py",
+        "tts_more/../evil.py",
+        "tts_more\\evil.py",
+        "/absolute.py",
+        "tts_more/file:ads",
+        "tts_more/trailing.",
+        "tts_more/trailing ",
+        "tts_more/CON",
+        "tts_more/dir/NUL.txt",
+    ),
+)
+def test_sync_and_check_reject_noncanonical_previous_manifest_paths(
+    tmp_path: Path, bad_relative: str
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "bad manifest fork"
+    manifest_path = target / "tts_more" / "integration.manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps({"schema_version": 1, "files": {bad_relative: "0" * 64}}),
+        encoding="utf-8",
+    )
+    sentinel = target / "sentinel.bin"
+    sentinel.write_bytes(b"unchanged")
+
+    with pytest.raises(ValueError, match="invalid controlled path"):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "d" * 40)
+
+    assert any("invalid controlled path" in error for error in sync.check_integration(target))
+    assert sentinel.read_bytes() == b"unchanged"
+
+
+def test_sync_and_check_reject_casefold_aliases_in_previous_manifest(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "case alias fork"
+    manifest_path = target / "tts_more" / "integration.manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "files": {
+                    "tts_more/A.py": "0" * 64,
+                    "tts_more/a.py": "1" * 64,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="case-insensitive alias"):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "e" * 40)
+
+    assert any("case-insensitive alias" in error for error in sync.check_integration(target))
+
+
+@pytest.mark.parametrize(
+    "desired_files",
+    (
+        {"tts_more//bad.py": "0" * 64},
+        {"tts_more/A.py": "0" * 64, "tts_more/a.py": "1" * 64},
+    ),
+)
+def test_sync_rejects_noncanonical_or_aliased_desired_paths_before_target_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, desired_files: dict[str, str]
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "bad desired fork"
+    sentinel = target / "sentinel.bin"
+    sentinel.parent.mkdir()
+    sentinel.write_bytes(b"unchanged")
+
+    def bad_stage(*args: object, **kwargs: object) -> dict[str, object]:
+        return {"files": desired_files}
+
+    monkeypatch.setattr(sync, "_build_staged_integration", bad_stage)
+
+    with pytest.raises(ValueError):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "f" * 40)
+
+    assert sentinel.read_bytes() == b"unchanged"
 
 
 def test_check_treats_crlf_and_lf_as_the_same_controlled_text(tmp_path: Path) -> None:

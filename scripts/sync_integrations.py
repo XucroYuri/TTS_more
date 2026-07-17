@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
@@ -40,14 +41,14 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
     if component not in COMPONENTS:
         raise ValueError(f"unsupported integration component: {component}")
     source_root = source_root.resolve(strict=True)
-    target_root = target_root.resolve(strict=False)
+    target_root = Path(os.path.abspath(target_root))
     previous_files, previous_manifest = _read_previous_manifest(target_root)
 
     with tempfile.TemporaryDirectory(prefix="tts-more-sync-") as temporary:
         stage_root = Path(temporary) / "stage"
         stage_root.mkdir()
         manifest = _build_staged_integration(source_root, stage_root, component, source_revision)
-        new_files = set(manifest["files"])
+        new_files = _validate_manifest_files(manifest.get("files"))
         _preflight_target(target_root, previous_files, new_files, previous_manifest)
         _publish_transaction(
             stage_root,
@@ -136,40 +137,101 @@ def _build_staged_integration(
 
 def _read_previous_manifest(target_root: Path) -> tuple[set[str], bytes | None]:
     manifest_path = target_root / "tts_more" / "integration.manifest.json"
-    if not manifest_path.exists():
+    _assert_safe_target_path(target_root, target_root / "tts_more", include_leaf=True)
+    _assert_safe_target_path(target_root, manifest_path, include_leaf=True)
+    if not _lexists(manifest_path):
         return set(), None
-    if not manifest_path.is_file():
+    if not stat.S_ISREG(os.lstat(manifest_path).st_mode):
         raise ValueError("previous integration manifest is not a file")
     raw = manifest_path.read_bytes()
     try:
         manifest = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("previous integration manifest is invalid") from exc
-    files = manifest.get("files")
-    if manifest.get("schema_version") != 1 or not isinstance(files, dict):
+    if manifest.get("schema_version") != 1:
         raise ValueError("previous integration manifest is invalid")
+    return _validate_manifest_files(manifest.get("files")), raw
+
+
+def _validate_manifest_files(files: object) -> set[str]:
+    if not isinstance(files, dict):
+        raise ValueError("integration manifest files are invalid")
     owned: set[str] = set()
+    aliases: dict[str, str] = {}
     for relative, digest in files.items():
         if not isinstance(relative, str) or not isinstance(digest, str):
-            raise ValueError("previous integration manifest is invalid")
+            raise ValueError("integration manifest files are invalid")
         _validate_controlled_relative(relative)
         if len(digest) != 64 or any(character not in "0123456789abcdefABCDEF" for character in digest):
-            raise ValueError("previous integration manifest is invalid")
+            raise ValueError("integration manifest files are invalid")
+        alias = relative.casefold()
+        if alias in aliases:
+            raise ValueError(
+                f"case-insensitive alias in integration manifest: {aliases[alias]} and {relative}"
+            )
+        aliases[alias] = relative
         owned.add(relative)
-    return owned, raw
+    return owned
 
 
 def _validate_controlled_relative(relative: str) -> None:
     pure = PurePosixPath(relative)
+    reserved = {"con", "prn", "aux", "nul"} | {
+        f"{prefix}{number}" for prefix in ("com", "lpt") for number in range(1, 10)
+    }
     if (
         not relative
+        or relative != pure.as_posix()
         or "\\" in relative
+        or ":" in relative
         or pure.is_absolute()
         or any(part in ("", ".", "..") for part in pure.parts)
+        or any(part.endswith((".", " ")) for part in pure.parts)
+        or any(part.split(".", 1)[0].casefold() in reserved for part in pure.parts)
         or (relative not in ROOT_ENTRIES and not relative.startswith("tts_more/"))
         or relative == "tts_more/integration.manifest.json"
     ):
         raise ValueError(f"invalid controlled path in integration manifest: {relative}")
+
+
+def _lexists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _is_reparse(path: Path) -> bool:
+    metadata = os.lstat(path)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _assert_safe_target_path(target_root: Path, path: Path, *, include_leaf: bool) -> None:
+    root = Path(os.path.abspath(target_root))
+    candidate = Path(os.path.abspath(path))
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"integration target escapes target root: {candidate}") from exc
+
+    parts = relative.parts if include_leaf else relative.parts[:-1]
+    current = root
+    paths = [root]
+    for part in parts:
+        current /= part
+        paths.append(current)
+    for current in paths:
+        if _lexists(current) and _is_reparse(current):
+            raise ValueError(f"integration target contains a reparse point: {current}")
+
+    resolved_root = os.path.normcase(str(root.resolve(strict=False)))
+    resolved_candidate = os.path.normcase(str(candidate.resolve(strict=False)))
+    try:
+        common = os.path.commonpath((resolved_root, resolved_candidate))
+    except ValueError as exc:
+        raise ValueError(f"integration target escapes resolved target root: {candidate}") from exc
+    if common != resolved_root:
+        raise ValueError(f"integration target escapes resolved target root: {candidate}")
 
 
 def _preflight_target(
@@ -178,22 +240,26 @@ def _preflight_target(
     new_files: set[str],
     previous_manifest: bytes | None,
 ) -> None:
-    if target_root.exists() and not target_root.is_dir():
+    _assert_safe_target_path(target_root, target_root, include_leaf=True)
+    _assert_safe_target_path(target_root, target_root / "tts_more", include_leaf=True)
+    if _lexists(target_root) and not stat.S_ISDIR(os.lstat(target_root).st_mode):
         raise FileExistsError(f"target-owned file collides with integration root: {target_root}")
     manifest_relative = "tts_more/integration.manifest.json"
     owned = previous_files | ({manifest_relative} if previous_manifest is not None else set())
     for relative in sorted(new_files | {manifest_relative}):
         destination = target_root / Path(PurePosixPath(relative))
-        if destination.exists() and relative not in owned:
+        _assert_safe_target_path(target_root, destination, include_leaf=True)
+        if _lexists(destination) and relative not in owned:
             raise FileExistsError(f"target-owned file collides with newly controlled path: {relative}")
         parent = destination.parent
         while parent != target_root:
-            if parent.exists() and not parent.is_dir():
+            if _lexists(parent) and not stat.S_ISDIR(os.lstat(parent).st_mode):
                 raise FileExistsError(f"target-owned file collides with integration directory: {parent}")
             parent = parent.parent
     for relative in previous_files:
         existing = target_root / Path(PurePosixPath(relative))
-        if existing.exists() and not existing.is_file():
+        _assert_safe_target_path(target_root, existing, include_leaf=True)
+        if _lexists(existing) and not stat.S_ISREG(os.lstat(existing).st_mode):
             raise ValueError(f"previous controlled path is not a file: {relative}")
 
 
@@ -209,7 +275,8 @@ def _publish_transaction(
     backups: dict[str, bytes | None] = {}
     for relative in prior_paths:
         path = target_root / Path(PurePosixPath(relative))
-        backups[relative] = path.read_bytes() if path.is_file() else None
+        _assert_safe_target_path(target_root, path, include_leaf=True)
+        backups[relative] = path.read_bytes() if _lexists(path) else None
     target_root.mkdir(parents=True, exist_ok=True)
     published: set[str] = set()
     obsolete = previous_files - new_files
@@ -219,17 +286,22 @@ def _publish_transaction(
             _publish_file(
                 stage_root / Path(PurePosixPath(relative)),
                 target_root / Path(PurePosixPath(relative)),
+                target_root,
             )
         for relative in sorted(obsolete, reverse=True):
-            path = target_root / Path(PurePosixPath(relative))
-            if path.is_file():
-                path.unlink()
-            _remove_empty_parents(path.parent, target_root)
+            _remove_owned_file(target_root, relative)
         published.add(manifest_relative)
         _publish_file(
             stage_root / Path(PurePosixPath(manifest_relative)),
             target_root / Path(PurePosixPath(manifest_relative)),
+            target_root,
         )
+        for relative in sorted(new_files | {manifest_relative}):
+            _assert_safe_target_path(
+                target_root,
+                target_root / Path(PurePosixPath(relative)),
+                include_leaf=True,
+            )
     except BaseException:
         _rollback_publication(target_root, backups, published, prior_paths)
         raise
@@ -242,64 +314,101 @@ def _rollback_publication(
     prior_paths: set[str],
 ) -> None:
     for relative in sorted(published - prior_paths, reverse=True):
-        path = target_root / Path(PurePosixPath(relative))
-        if path.is_file():
-            path.unlink()
-        _remove_empty_parents(path.parent, target_root)
+        _remove_owned_file(target_root, relative)
     for relative, payload in backups.items():
         path = target_root / Path(PurePosixPath(relative))
+        _assert_safe_target_path(target_root, path, include_leaf=True)
         if payload is None:
-            if path.is_file():
-                path.unlink()
-                _remove_empty_parents(path.parent, target_root)
+            _remove_owned_file(target_root, relative)
         else:
-            _write_bytes_atomically(path, payload)
+            _write_bytes_atomically(target_root, path, payload)
+        _assert_safe_target_path(target_root, path, include_leaf=True)
 
 
-def _publish_file(source: Path, destination: Path) -> None:
+def _publish_file(source: Path, destination: Path, target_root: Path) -> None:
+    _assert_safe_target_path(target_root, destination, include_leaf=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    _assert_safe_target_path(target_root, destination, include_leaf=True)
     handle, temporary_name = tempfile.mkstemp(prefix=".tts-more-sync-", dir=destination.parent)
     os.close(handle)
     temporary = Path(temporary_name)
     try:
         shutil.copy2(source, temporary)
+        _assert_safe_target_path(target_root, destination, include_leaf=True)
         os.replace(temporary, destination)
+        _assert_safe_target_path(target_root, destination, include_leaf=True)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def _write_bytes_atomically(destination: Path, payload: bytes) -> None:
+def _write_bytes_atomically(target_root: Path, destination: Path, payload: bytes) -> None:
+    _assert_safe_target_path(target_root, destination, include_leaf=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    _assert_safe_target_path(target_root, destination, include_leaf=True)
     handle, temporary_name = tempfile.mkstemp(prefix=".tts-more-rollback-", dir=destination.parent)
     temporary = Path(temporary_name)
     try:
         with os.fdopen(handle, "wb") as stream:
             stream.write(payload)
+        _assert_safe_target_path(target_root, destination, include_leaf=True)
         os.replace(temporary, destination)
+        _assert_safe_target_path(target_root, destination, include_leaf=True)
     finally:
         temporary.unlink(missing_ok=True)
 
 
+def _remove_owned_file(target_root: Path, relative: str) -> None:
+    path = target_root / Path(PurePosixPath(relative))
+    _assert_safe_target_path(target_root, path, include_leaf=True)
+    if _lexists(path):
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise ValueError(f"controlled path is no longer a regular file: {relative}")
+        path.unlink()
+    _assert_safe_target_path(target_root, path, include_leaf=True)
+    _remove_empty_parents(path.parent, target_root)
+
+
 def _remove_empty_parents(path: Path, stop: Path) -> None:
-    while path != stop and path.is_dir():
+    while path != stop and _lexists(path):
+        _assert_safe_target_path(stop, path, include_leaf=True)
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            break
         try:
             path.rmdir()
         except OSError:
             break
+        _assert_safe_target_path(stop, path, include_leaf=True)
         path = path.parent
 
 
 def check_integration(target_root: Path) -> list[str]:
-    target_root = target_root.resolve(strict=True)
+    target_root = Path(os.path.abspath(target_root))
     manifest_path = target_root / "tts_more" / "integration.manifest.json"
-    if not manifest_path.is_file():
+    try:
+        _assert_safe_target_path(target_root, target_root, include_leaf=True)
+        _assert_safe_target_path(target_root, target_root / "tts_more", include_leaf=True)
+        _assert_safe_target_path(target_root, manifest_path, include_leaf=True)
+    except ValueError as exc:
+        return [str(exc)]
+    if not _lexists(manifest_path):
         return ["integration manifest is missing"]
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    expected = {str(path): str(digest) for path, digest in manifest.get("files", {}).items()}
+    if not stat.S_ISREG(os.lstat(manifest_path).st_mode):
+        return ["integration manifest is not a regular file"]
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected_names = _validate_manifest_files(manifest.get("files"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return [str(exc)]
+    expected = {relative: str(manifest["files"][relative]) for relative in expected_names}
     errors: list[str] = []
     for relative, digest in expected.items():
         path = target_root / relative
-        if not path.is_file():
+        try:
+            _assert_safe_target_path(target_root, path, include_leaf=True)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if not _lexists(path) or not stat.S_ISREG(os.lstat(path).st_mode):
             errors.append(f"missing controlled file: {relative}")
         elif sha256_file(path) != digest:
             errors.append(f"hash mismatch: {relative}")
