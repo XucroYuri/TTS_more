@@ -294,7 +294,6 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       kwjmActivationTitle: "剧本解析服务",
       kwjmActivationHint: "输入 API Key，保存后即可提取台词。",
       providerHint: "只有需要多个解析服务或自定义模型时再打开。",
-      kwjmPresetMeta: "{{model}} · {{baseUrl}}",
       providerName: "名称",
       adapterLabel: "调用适配器",
       adapter: {
@@ -1069,7 +1068,6 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       kwjmActivationTitle: "Script parsing service",
       kwjmActivationHint: "Enter an API key, save, then extract lines.",
       providerHint: "Open only for multiple parser services or a custom model.",
-      kwjmPresetMeta: "{{model}} · {{baseUrl}}",
       providerName: "Name",
       adapterLabel: "Adapter",
       adapter: {

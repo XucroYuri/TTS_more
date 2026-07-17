@@ -506,7 +506,8 @@ def test_layered_status_does_not_mark_stopped_managed_service_ready() -> None:
     assert status["supervisor_state"] == "stopped"
 
 
-def test_generation_preflight_offers_local_fallback_when_primary_is_unavailable(tmp_path: Path) -> None:
+def test_generation_preflight_offers_local_fallback_when_primary_is_unavailable(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("app.services.ServiceRouter._client_ready", lambda *_args: False)
     services_path = tmp_path / "services.json"
     services_path.write_text(
         """
@@ -1372,6 +1373,10 @@ def test_open_source_tts_configure_writes_local_services_without_touching_templa
     assert saved[0]["catalog_provider"] == "cosyvoice"
     assert saved[0]["source_profile"] == "lan_endpoint"
     assert saved[0]["setup_state"] == "endpoint_unreachable"
+    assert saved[0]["api_contract"] == "tts-more-v1"
+    assert "tts-more-worker" in saved[0]["capabilities"]
+    assert "artifact-transfer" in saved[0]["capabilities"]
+    assert "gradio_webui" not in saved[0]["capabilities"]
     assert template_path.read_text(encoding="utf-8") == template_text
 
 
@@ -1575,7 +1580,8 @@ def test_generate_routes_task_to_service_endpoint(tmp_path: Path) -> None:
     assert version["metadata"]["load_verification_level"] == "assumed_after_success"
 
 
-def test_generation_preflight_suggests_local_fallback_without_auto_start(tmp_path: Path) -> None:
+def test_generation_preflight_suggests_local_fallback_without_auto_start(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("app.services.ServiceRouter._client_ready", lambda *_args: False)
     services_path = tmp_path / "services.json"
     services_path.write_text(
         """
@@ -1706,6 +1712,56 @@ def test_generation_preflight_reports_service_load_state(tmp_path: Path) -> None
     assert third["load_state"] == "switch_required"
     assert third["load_match"] is False
     assert third["current_loaded_signature"] == "service_id=mock-gpt|logs_name=other"
+
+
+def test_generation_preflight_blocks_external_worker_without_artifact_transfer(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "legacy-remote-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "api_contract": "tts-more-v1",
+    "base_url": "mock://legacy-remote-gpt",
+    "mode": "external",
+    "network_scope": "lan",
+    "managed": false,
+    "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+
+    response = client.post(
+        "/api/generation/preflight",
+        json={
+            "project_id": "demo",
+            "tasks": [
+                {
+                    "line": {"id": "l001", "character_id": "hero", "text": "你好"},
+                    "engine": "gpt-sovits",
+                    "profile": "hero",
+                    "service_id": "legacy-remote-gpt",
+                    "provider_type": "gpt-sovits",
+                    "required_capabilities": ["trained_weights_voice", "reference_audio_voice"],
+                    "parameters": {
+                        "gpt_weights_path": "remote.ckpt",
+                        "sovits_weights_path": "remote.pth",
+                        "ref_audio_path": "remote.wav",
+                        "prompt_text": "参考文本"
+                    }
+                }
+            ]
+        },
+    )
+
+    item = response.json()["items"][0]
+    assert item["status"] == "blocked"
+    assert "artifact-transfer" in item["reason"]
 
 
 def test_demo_validation_plan_splits_runnable_and_blocked_lines(tmp_path: Path) -> None:

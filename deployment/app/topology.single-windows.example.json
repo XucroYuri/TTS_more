@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "name": "single-windows-cuda",
+  "app_node": "app-controller",
+  "nodes": {
+    "app-controller": {
+      "role": "app",
+      "host": "localhost",
+      "bind_host": "127.0.0.1",
+      "services": [],
+      "resource_group": "app",
+      "capacity": 1
+    },
+    "gpu-worker": {
+      "role": "worker",
+      "host": "localhost",
+      "bind_host": "127.0.0.1",
+      "services": [
+        "local-gpt-sovits-main",
+        "local-indextts",
+        "local-cosyvoice"
+      ],
+      "resource_group": "cuda-0",
+      "capacity": 1
+    }
+  }
+}

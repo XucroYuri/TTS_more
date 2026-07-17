@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import base64
+import hashlib
 import re
 import time
 import uuid
@@ -346,6 +347,14 @@ def build_service_client(endpoint: TTSServiceEndpoint, transport: httpx.BaseTran
     return HttpTTSServiceClient(endpoint, transport=transport)
 
 
+def require_remote_artifact_transfer(endpoint: TTSServiceEndpoint) -> None:
+    if endpoint.mode != "external" or endpoint.network_scope == "localhost":
+        return
+    normalized = {capability.replace("_", "-").casefold() for capability in endpoint.capabilities}
+    if "artifact-transfer" not in normalized:
+        raise RuntimeError(f"external worker {endpoint.service_id} is missing artifact-transfer capability")
+
+
 def _endpoint_can_use_binding(endpoint: TTSServiceEndpoint, binding: VoiceBinding) -> bool:
     params = binding.config or {}
     origin_service_id = str(params.get("path_service_id") or params.get("asset_service_id") or params.get("source_service_id") or "")
@@ -451,6 +460,7 @@ class HttpTTSServiceClient:
     def __init__(self, endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> None:
         self.endpoint = endpoint
         self.transport = transport
+        self._uploaded_references: dict[tuple[str, int, int], tuple[str, float]] = {}
 
     def health(self) -> dict[str, Any]:
         missing = self._missing_env()
@@ -496,31 +506,39 @@ class HttpTTSServiceClient:
         }
 
     def load(self, profile: str, parameters: dict[str, Any] | None = None) -> None:
-        payload = {"profile": profile, "parameters": parameters or {}}
+        if self._uses_artifact_delivery():
+            self._require_artifact_transfer()
+        prepared = self._prepare_remote_parameters(parameters or {}) if self._uses_artifact_delivery() else (parameters or {})
+        payload = {"profile": profile, "parameters": prepared}
         with httpx.Client(timeout=120.0, transport=self.transport) as client:
             response = client.post(self.endpoint.base_url.rstrip("/") + "/load", json=payload, headers=self._headers())
             response.raise_for_status()
 
     def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        artifact_delivery = self._uses_artifact_delivery()
+        if artifact_delivery:
+            self._require_artifact_transfer()
+        parameters = self._prepare_remote_parameters(request.parameters) if artifact_delivery else request.parameters
         payload = {
             "line": request.line.model_dump(mode="json"),
             "profile": request.profile,
             "output_path": str(request.output_path),
-            "parameters": request.parameters,
+            "parameters": parameters,
+            "delivery": "artifact" if artifact_delivery else "path",
         }
         with httpx.Client(timeout=request.parameters.get("timeout_seconds", 600.0), transport=self.transport) as client:
             response = client.post(self.endpoint.base_url.rstrip("/") + "/synthesize", json=payload, headers=self._headers())
             response.raise_for_status()
             data = response.json()
+            if artifact_delivery:
+                self._download_artifact(client, data, request.output_path)
+                return SynthesisResult(audio_path=request.output_path, metadata=data.get("metadata", {}))
         return SynthesisResult(audio_path=Path(data["audio_path"]), metadata=data.get("metadata", {}))
 
     def unload(self) -> None:
-        try:
-            with httpx.Client(timeout=120.0, transport=self.transport) as client:
-                response = client.post(self.endpoint.base_url.rstrip("/") + "/unload", headers=self._headers())
-                response.raise_for_status()
-        except httpx.HTTPError:
-            return
+        with httpx.Client(timeout=120.0, transport=self.transport) as client:
+            response = client.post(self.endpoint.base_url.rstrip("/") + "/unload", headers=self._headers())
+            response.raise_for_status()
 
     def _headers(self) -> dict[str, str]:
         if not self.endpoint.auth_header_env:
@@ -537,6 +555,114 @@ class HttpTTSServiceClient:
         if self.endpoint.auth_header_env:
             keys.append(self.endpoint.auth_header_env)
         return [key for key in keys if not os.environ.get(key)]
+
+    def _uses_remote_artifacts(self) -> bool:
+        return self.endpoint.mode == "external" and self.endpoint.network_scope != "localhost"
+
+    def _uses_artifact_delivery(self) -> bool:
+        return self._uses_remote_artifacts() or str(self.endpoint.default_params.get("delivery") or "path") == "artifact"
+
+    def _require_artifact_transfer(self) -> None:
+        normalized = {capability.replace("_", "-").casefold() for capability in self.endpoint.capabilities}
+        if "artifact-transfer" not in normalized:
+            raise RuntimeError(f"worker {self.endpoint.service_id} is missing artifact-transfer capability")
+
+    def _prepare_remote_parameters(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        prepared = dict(parameters)
+        scalar_fields = {
+            "ref_audio_path",
+            "reference_audio",
+            "voice",
+            "prompt_audio_path",
+            "prompt_audio",
+            "prompt_wav_upload",
+            "emotion_audio",
+            "voice_reference_audio",
+        }
+        for field in scalar_fields:
+            value = prepared.get(field)
+            if isinstance(value, (str, Path)) and self._is_local_upload(value):
+                prepared[field] = self._upload_reference(Path(value))
+        values = prepared.get("aux_ref_audio_paths")
+        if isinstance(values, (list, tuple)):
+            prepared["aux_ref_audio_paths"] = [
+                self._upload_reference(Path(value))
+                if isinstance(value, (str, Path)) and self._is_local_upload(value)
+                else value
+                for value in values
+            ]
+        return prepared
+
+    @staticmethod
+    def _is_local_upload(value: str | Path) -> bool:
+        try:
+            return Path(value).is_file()
+        except OSError:
+            return False
+
+    def _upload_reference(self, path: Path) -> str:
+        resolved = path.resolve(strict=True)
+        stat = resolved.stat()
+        cache_key = (str(resolved), stat.st_mtime_ns, stat.st_size)
+        cached = self._uploaded_references.get(cache_key)
+        try:
+            configured_cache_seconds = float(os.environ.get("TTS_MORE_REFERENCE_UPLOAD_CACHE_SECONDS", "3600"))
+        except ValueError:
+            configured_cache_seconds = 3600.0
+        cache_seconds = min(23 * 60 * 60, max(0.0, configured_cache_seconds))
+        if cached and time.monotonic() - cached[1] < cache_seconds:
+            return cached[0]
+        with httpx.Client(timeout=120.0, transport=self.transport) as client:
+            with resolved.open("rb") as handle:
+                response = client.post(
+                    self.endpoint.base_url.rstrip("/") + "/upload_ref",
+                    files={"file": (resolved.name, handle, "application/octet-stream")},
+                    headers=self._headers(),
+                )
+            response.raise_for_status()
+            remote_path = str(response.json().get("path") or "")
+        if not remote_path:
+            raise RuntimeError(f"worker {self.endpoint.service_id} returned no uploaded reference path")
+        self._uploaded_references[cache_key] = (remote_path, time.monotonic())
+        return remote_path
+
+    def _download_artifact(self, client: httpx.Client, data: dict[str, Any], output_path: Path) -> None:
+        artifact_id = str(data.get("artifact_id") or "")
+        download_url = str(data.get("download_url") or "")
+        expected_hash = str(data.get("sha256") or "").casefold()
+        try:
+            expected_size = int(data["size_bytes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("worker artifact response has invalid size_bytes") from exc
+        expected_path = f"/artifacts/{artifact_id}"
+        if not re.fullmatch(r"[0-9a-f]{32}", artifact_id) or download_url != expected_path:
+            raise RuntimeError("worker artifact response has an invalid download URL")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise RuntimeError("worker artifact response has an invalid sha256")
+        max_bytes = 100 * 1024 * 1024
+        if expected_size < 1 or expected_size > max_bytes:
+            raise RuntimeError("worker artifact exceeds download limit")
+
+        response = client.get(self.endpoint.base_url.rstrip("/") + download_url, headers=self._headers())
+        response.raise_for_status()
+        content = response.content
+        if len(content) != expected_size or len(content) > max_bytes:
+            raise RuntimeError("worker artifact size mismatch")
+        if hashlib.sha256(content).hexdigest() != expected_hash:
+            raise RuntimeError("worker artifact sha256 mismatch")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temp_path.write_bytes(content)
+            os.replace(temp_path, output_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        delete_response = client.delete(
+            self.endpoint.base_url.rstrip("/") + expected_path,
+            headers=self._headers(),
+        )
+        delete_response.raise_for_status()
 
 
 def _gpt_sovits_models_payload_to_catalog(

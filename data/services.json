@@ -45,7 +45,8 @@
       "gpt-weights",
       "sovits-weights",
       "wav_output",
-      "tts-more-worker"
+      "tts-more-worker",
+      "artifact-transfer"
     ]
   },
   {
@@ -94,7 +95,8 @@
       "emotion_text",
       "emotion_audio",
       "wav_output",
-      "tts-more-worker"
+      "tts-more-worker",
+      "artifact-transfer"
     ]
   },
   {
@@ -130,7 +132,7 @@
     "env": {
       "TTS_MORE_COSYVOICE_REPO": "repo/CosyVoice",
       "TTS_MORE_COSYVOICE_PYTHON": "repo/CosyVoice/.venv/Scripts/python.exe",
-      "TTS_MORE_COSYVOICE_MODEL_DIR": "pretrained_models/CosyVoice-300M"
+      "TTS_MORE_COSYVOICE_MODEL_DIR": "repo/CosyVoice/pretrained_models/CosyVoice-300M"
     },
     "health_url": "http://127.0.0.1:9882/health",
     "resource_group": "local-gpu-0",
@@ -143,7 +145,8 @@
       "cross_lingual_voice",
       "style_instruction",
       "wav_output",
-      "tts-more-worker"
+      "tts-more-worker",
+      "artifact-transfer"
     ],
     "default_params": {
       "mode": "zero_shot",

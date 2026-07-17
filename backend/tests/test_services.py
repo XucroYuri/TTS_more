@@ -54,6 +54,251 @@ def test_registry_loads_services_json(tmp_path: Path) -> None:
     assert registry.get("remote-gpt").resource_group == "remote-a-gpu-0"
 
 
+def test_external_worker_uploads_references_and_downloads_artifact(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFFreference")
+    output = tmp_path / "result.wav"
+    audio = b"RIFFgenerated-audio"
+    digest = __import__("hashlib").sha256(audio).hexdigest()
+    calls: list[tuple[str, str]] = []
+
+    endpoint = TTSServiceEndpoint(
+        service_id="remote-gpt",
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://worker-gpt.lan:9880",
+        mode="external",
+        network_scope="lan",
+        managed=False,
+        capabilities=["tts", "artifact-transfer"],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "POST" and request.url.path == "/upload_ref":
+            assert b"RIFFreference" in request.content
+            return httpx.Response(200, json={"artifact_id": "a" * 32, "path": "D:/worker/ref.wav"})
+        if request.method == "POST" and request.url.path == "/synthesize":
+            payload = json.loads(request.content.decode("utf-8"))
+            assert payload["delivery"] == "artifact"
+            assert payload["parameters"]["ref_audio_path"] == "D:/worker/ref.wav"
+            return httpx.Response(
+                200,
+                json={
+                    "audio_path": "D:/worker/out.wav",
+                    "artifact_id": "b" * 32,
+                    "download_url": "/artifacts/" + "b" * 32,
+                    "sha256": digest,
+                    "size_bytes": len(audio),
+                    "metadata": {"service": "gpt"},
+                },
+            )
+        if request.method == "GET" and request.url.path == "/artifacts/" + "b" * 32:
+            return httpx.Response(200, content=audio, headers={"content-type": "audio/wav"})
+        if request.method == "DELETE" and request.url.path == "/artifacts/" + "b" * 32:
+            return httpx.Response(200, json={"deleted": True})
+        return httpx.Response(404)
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+    result = client.synthesize(
+        SynthesisRequest(
+            line=ScriptLine(id="l1", character_id="hero", text="hello"),
+            profile="hero",
+            output_path=output,
+            parameters={"ref_audio_path": str(reference), "prompt_text": "hello"},
+        )
+    )
+
+    assert result.audio_path == output
+    assert output.read_bytes() == audio
+    assert calls == [
+        ("POST", "/upload_ref"),
+        ("POST", "/synthesize"),
+        ("GET", "/artifacts/" + "b" * 32),
+        ("DELETE", "/artifacts/" + "b" * 32),
+    ]
+
+
+def test_external_worker_without_artifact_transfer_fails_before_request(tmp_path: Path) -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="legacy-worker",
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://legacy-worker.lan:9880",
+        mode="external",
+        network_scope="lan",
+        managed=False,
+        capabilities=["tts"],
+    )
+    client = build_service_client(
+        endpoint,
+        transport=httpx.MockTransport(lambda request: (_ for _ in ()).throw(AssertionError("network must not run"))),
+    )
+
+    with __import__("pytest").raises(RuntimeError, match="artifact-transfer"):
+        client.synthesize(
+            SynthesisRequest(
+                line=ScriptLine(id="l1", character_id="hero", text="hello"),
+                profile="hero",
+                output_path=tmp_path / "out.wav",
+                parameters={},
+            )
+        )
+
+
+def test_external_worker_hash_mismatch_preserves_local_file_and_remote_artifact(tmp_path: Path) -> None:
+    import hashlib
+    import pytest
+
+    output = tmp_path / "result.wav"
+    output.write_bytes(b"existing-history")
+    audio = b"RIFFcorrupted"
+    artifact_id = "c" * 32
+    calls: list[tuple[str, str]] = []
+    endpoint = TTSServiceEndpoint(
+        service_id="remote-gpt",
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://worker-gpt.lan:9880",
+        mode="external",
+        network_scope="lan",
+        managed=False,
+        capabilities=["tts", "artifact-transfer"],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "audio_path": "D:/worker/out.wav",
+                    "artifact_id": artifact_id,
+                    "download_url": f"/artifacts/{artifact_id}",
+                    "sha256": hashlib.sha256(b"different").hexdigest(),
+                    "size_bytes": len(audio),
+                },
+            )
+        if request.method == "GET":
+            return httpx.Response(200, content=audio)
+        raise AssertionError("hash mismatch must not delete the remote artifact")
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="sha256 mismatch"):
+        client.synthesize(
+            SynthesisRequest(
+                line=ScriptLine(id="l1", character_id="hero", text="hello"),
+                profile="hero",
+                output_path=output,
+                parameters={},
+            )
+        )
+
+    assert output.read_bytes() == b"existing-history"
+    assert calls == [("POST", "/synthesize"), ("GET", f"/artifacts/{artifact_id}")]
+
+
+def test_local_worker_can_explicitly_validate_artifact_delivery(tmp_path: Path) -> None:
+    import hashlib
+
+    output = tmp_path / "artifact.wav"
+    audio = b"RIFFlocal-artifact"
+    artifact_id = "d" * 32
+    endpoint = TTSServiceEndpoint(
+        service_id="local-gpt",
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://127.0.0.1:9880",
+        mode="local",
+        network_scope="localhost",
+        managed=True,
+        capabilities=["tts", "artifact-transfer"],
+        default_params={"delivery": "artifact"},
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/synthesize":
+            payload = json.loads(request.content.decode("utf-8"))
+            assert payload["delivery"] == "artifact"
+            return httpx.Response(
+                200,
+                json={
+                    "audio_path": "worker.wav",
+                    "artifact_id": artifact_id,
+                    "download_url": f"/artifacts/{artifact_id}",
+                    "sha256": hashlib.sha256(audio).hexdigest(),
+                    "size_bytes": len(audio),
+                },
+            )
+        if request.method == "GET":
+            return httpx.Response(200, content=audio)
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"deleted": True})
+        return httpx.Response(404)
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+    result = client.synthesize(
+        SynthesisRequest(
+            line=ScriptLine(id="l1", character_id="hero", text="hello"),
+            profile="hero",
+            output_path=output,
+            parameters={},
+        )
+    )
+
+    assert result.audio_path == output
+    assert output.read_bytes() == audio
+
+
+def test_standard_worker_unload_failure_is_not_suppressed() -> None:
+    import pytest
+
+    endpoint = TTSServiceEndpoint(
+        service_id="local-gpt",
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://127.0.0.1:9880",
+        mode="local",
+    )
+    client = build_service_client(
+        endpoint,
+        transport=httpx.MockTransport(lambda _request: httpx.Response(500, json={"detail": "still resident"})),
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.unload()
+
+
+def test_uploaded_reference_cache_expires_before_worker_ttl(tmp_path: Path, monkeypatch) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFFreference")
+    endpoint = TTSServiceEndpoint(
+        service_id="remote-gpt",
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://worker.lan:9880",
+        mode="external",
+        network_scope="lan",
+        capabilities=["tts", "artifact-transfer"],
+    )
+    uploads: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        uploads.append(1)
+        return httpx.Response(200, json={"path": f"D:/worker/ref-{len(uploads)}.wav"})
+
+    client = build_service_client(endpoint, transport=httpx.MockTransport(handler))
+    now = [0.0]
+    monkeypatch.setattr("app.services.time.monotonic", lambda: now[0])
+
+    assert client._upload_reference(reference).endswith("ref-1.wav")  # type: ignore[attr-defined]
+    now[0] = 3599.0
+    assert client._upload_reference(reference).endswith("ref-1.wav")  # type: ignore[attr-defined]
+    now[0] = 3601.0
+    assert client._upload_reference(reference).endswith("ref-2.wav")  # type: ignore[attr-defined]
+    assert len(uploads) == 2
+
+
 def test_registry_default_services_use_gradio_endpoints() -> None:
     registry = ServiceRegistry.default_local(repo_root=Path("repo"))
 

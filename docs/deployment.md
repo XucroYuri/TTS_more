@@ -41,7 +41,6 @@ python scripts/tts_more_deploy.py install-repo-bundles --adopt-existing --repo-p
 Submodule 同步发生 **after the final superproject checkout**：latest 模式先完成 branch fast-forward/reset，locked 模式先完成锁定 commit 的 fetch/checkout，之后才读取最终 tree 的 `.gitmodules`。解析器只接受不重复的 `submodule "<name>"`、`path` 和 `url`；unknown/duplicate/unsafe metadata 会 fail closed。**relative submodule URLs are resolved against the validated actual origin**，并且 **every resolved submodule URL must pass the GitHub allowlist**。更新命令使用进程级、已验证 URL override，不把 submodule URL 写入 local config；嵌套 submodule 逐层验证后再更新。**HTTPS-only submodules do not require SSH**；**any SSH submodule requires trusted SSH**。
 
 并发攻击者仍可能在最终 pathname 检查与替换之间交换一般输出目录；**concurrent parent-swap remains a residual threat**。POSIX worker logs 会以 `O_DIRECTORY | O_NOFOLLOW` 打开 `logs_dir` 并通过 dirfd 创建日志，但一般 bundle/output rename 尚未改成完整 `openat`/`renameat` 链，且 **Windows handle-based parent protection is not implemented**。因此当前保证覆盖静态 symlink/reparse 与单文件替换，不宣称跨平台 race-free。
-
 ## 一键本机部署
 
 macOS/Linux：
@@ -112,8 +111,38 @@ Windows：
 ## 部署 profile
 
 - `local-all`：应用本体和选中的 worker 在同一台机器上，生成 `data/local/services.json`，本机可托管启动。
-- `app-only`：只跑 TTS More 应用，`services.json` 指向局域网或云端 worker。
-- `worker-node`：只在某台 CPU/GPU 机器上准备 repo、模型和 worker，不要求启动前端；渲染出来仍是该机器本地可管理的 worker 配置，通常配合 `--service-ids` 只选择本节点负责的服务。
+- `app-only`：只跑 TTS More 应用；配合 topology 时为每个服务生成独立 LAN 地址，远端服务为 `managed:false`。
+- `worker-node`：只在某台 GPU 机器上准备该节点负责的 repo、模型和 worker，不要求启动前端；必须配合 topology 的节点选择使用。
+
+### Topology manifest
+
+Windows CUDA 验收使用 manifest 明确机器、服务和 GPU 资源归属：
+
+- `deployment/app/topology.single-windows.example.json`：单机应用 + 三个 worker，三服务共享 `cuda-0`、`capacity:1`；
+- `deployment/app/topology.four-node-lan.example.json`：一台应用控制节点 + 三台独立 GPU worker。
+
+复制示例为 `deployment/app/topology.<name>.local.json` 并填入真实 LAN hostname/IP；真实文件已被 git ignore。字段和校验规则见 [CUDA 验证契约](cuda-e2e-validation.md#拓扑)。
+
+单机渲染：
+
+```powershell
+.\scripts\deploy-local-tts.ps1 -RepoPaths deployment\app\repo-paths.local.json `
+  -Profile local-all `
+  -Topology deployment\app\topology.single-windows.local.json `
+  -Node gpu-worker `
+  -Device CU128
+```
+
+四机控制节点渲染：
+
+```powershell
+.\scripts\deploy-local-tts.ps1 -RepoPaths deployment\app\repo-paths.local.json `
+  -Profile app-only `
+  -Topology deployment\app\topology.four-node-lan.local.json `
+  -Node app-controller
+```
+
+单个 worker 节点把 profile 改为 `worker-node`，并使用 `-Node gpt-worker|index-worker|cosy-worker`。底层 CLI 对应 `--topology` 和 `--node`。分布式基线只支持可信 LAN；公网、TLS 和反向代理不在当前发布门禁内。
 
 ## Network Auto Mode
 
@@ -231,6 +260,18 @@ bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --source ModelScope
 - IndexTTS：优先 `uv sync --all-extras`，下载 `IndexTeam/IndexTTS-2`，并准备 BigVGAN 辅助模型。
 - CosyVoice：`sync-repos` 在最终 superproject commit/branch 确定后结构化校验 `.gitmodules`，逐层更新 allowlisted submodule；随后准备 Python 3.10 venv、`requirements.txt`，默认下载 `CosyVoice-300M`。
 
+### 便携包构建用私有 Conda
+
+四个离线绿色包的构建不依赖电脑中已安装的 Conda。Windows 构建入口会从 `packaging/portable/toolchain.lock.json` 读取锁定的 Miniforge 下载地址与 SHA-256，将其仅安装到项目的 `data/cache/portable/conda/`，并把包缓存设为该目录下的 `conda-pkgs/`；不会写入用户 PATH、注册表或全局 Conda 环境。
+
+可先预览，不会下载或安装：
+
+```powershell
+.\scripts\bootstrap-conda.ps1 -DryRun
+```
+
+首次构建时运行同一脚本（或由对应 `build-portable-*.ps1` 自动调用）即可创建私有构建工具链。最终 ZIP 已包含可重定位运行环境，解压后启动完全不需要 Conda、Python 或网络。
+
 ## 渲染服务配置
 
 本机默认正式 worker：
@@ -267,7 +308,6 @@ Windows：
 ```powershell
 .\scripts\start-service-workers.ps1 -RepoPaths deployment\app\repo-paths.local.json
 .\scripts\start-service-workers.ps1 -Services local-gpt-sovits-main,local-indextts -RepoPaths deployment\app\repo-paths.local.json
-.\scripts\start-service-workers.ps1 -RepoPaths deployment\app\repo-paths.local.json
 ```
 
 macOS/Linux：
@@ -275,7 +315,6 @@ macOS/Linux：
 ```bash
 ./scripts/start-service-workers.sh --repo-paths deployment/app/repo-paths.local.json
 ./scripts/start-service-workers.sh --services local-gpt-sovits-dev,local-cosyvoice --repo-paths deployment/app/repo-paths.local.json
-./scripts/start-service-workers.sh --repo-paths deployment/app/repo-paths.local.json
 ```
 
 全部 GPT 分支同时启动会占用大量显存；普通验证建议一次启动一个 GPT 分支。
@@ -298,13 +337,15 @@ curl http://127.0.0.1:9881/health
 curl http://127.0.0.1:9882/health
 ```
 
-GPU/真实合成验收需要模型、参考音频和对应硬件：
+聚焦真实合成的 pytest 需要模型、参考音频和对应硬件：
 
 ```bash
 export TTS_MORE_SERVICE_MODE=real
 export TTS_MORE_RUN_REAL_TTS=1
 .venv/bin/python -m pytest backend/tests/test_real_tts_validation.py -q
 ```
+
+本页只解释通用部署接口，不是认证 runbook。Windows 单机的唯一可复制路径见 [单机 Runbook](cuda-e2e-single-node.md)；四机见 [分布式 Runbook](cuda-e2e-distributed.md)；协议和阈值见 [CUDA 验证契约](cuda-e2e-validation.md)。
 
 ## 离线和缓存
 

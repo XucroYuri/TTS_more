@@ -36,6 +36,7 @@ class ServiceGenerationQueue:
         self._manifest_lock = threading.Lock()
         self._loaded_signatures: dict[str, str] = {}
         self._load_states: dict[str, dict[str, Any]] = {}
+        self._active_resource_services: dict[str, tuple[str, Any]] = {}
         self.status_callback: StatusCallback | None = None
 
     def load_state(self, service_id: str) -> dict[str, Any]:
@@ -113,6 +114,16 @@ class ServiceGenerationQueue:
             (_index, first_task, route, _first_cluster) = group[0]
             self._emit(first_task, "loading", 0.05, cluster_key, None, status_callback)
             first_signature = build_load_signature(route.endpoint, first_task.parameters)
+            try:
+                self._evict_other_service(resource_group, route)
+            except Exception as exc:
+                self._mark_load_failed(route.endpoint.service_id, exc)
+                for _failed_index, failed_task, failed_route, failed_cluster_key in group:
+                    version_id = self._append_failed_version(
+                        failed_route, failed_task, manifest, failed_cluster_key, "unloading", exc
+                    )
+                    self._emit(failed_task, "failed", 1.0, failed_cluster_key, version_id, status_callback)
+                raise
             if self._loaded_signatures.get(route.endpoint.service_id) != first_signature:
                 try:
                     route.client.load(first_task.profile, first_task.parameters)
@@ -130,11 +141,21 @@ class ServiceGenerationQueue:
                         self._emit(failed_task, "failed", 1.0, failed_cluster_key, version_id, status_callback)
                     raise
                 self._mark_loaded(route.endpoint.service_id, first_signature, "loaded_unverified")
+            self._active_resource_services[resource_group] = (route.endpoint.service_id, route.client)
             for _index, task, task_route, task_cluster_key in group:
                 # Stop dispatching new lines in this cluster if the job was cancelled.
                 if cancel_check and cancel_check():
                     return
                 task_signature = build_load_signature(task_route.endpoint, task.parameters)
+                try:
+                    self._evict_other_service(resource_group, task_route)
+                except Exception as exc:
+                    self._mark_load_failed(task_route.endpoint.service_id, exc)
+                    version_id = self._append_failed_version(
+                        task_route, task, manifest, task_cluster_key, "unloading", exc
+                    )
+                    self._emit(task, "failed", 1.0, task_cluster_key, version_id, status_callback)
+                    raise
                 if self._loaded_signatures.get(task_route.endpoint.service_id) != task_signature:
                     self._emit(task, "loading", 0.12, task_cluster_key, None, status_callback)
                     try:
@@ -152,6 +173,7 @@ class ServiceGenerationQueue:
                         self._emit(task, "failed", 1.0, task_cluster_key, version_id, status_callback)
                         raise
                     self._mark_loaded(task_route.endpoint.service_id, task_signature, "loaded_unverified")
+                self._active_resource_services[resource_group] = (task_route.endpoint.service_id, task_route.client)
                 self._run_task(task_route, task, manifest, output_dir, task_cluster_key, status_callback)
 
     def _run_task(
@@ -289,6 +311,21 @@ class ServiceGenerationQueue:
             **current,
             "last_error": str(exc),
             "last_error_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _evict_other_service(self, resource_group: str, target_route: ServiceRoute) -> None:
+        active = self._active_resource_services.get(resource_group)
+        if active is None or active[0] == target_route.endpoint.service_id:
+            return
+        active_service_id, active_client = active
+        active_client.unload()
+        self._active_resource_services.pop(resource_group, None)
+        self._loaded_signatures.pop(active_service_id, None)
+        self._load_states[active_service_id] = {
+            "verification_level": "unloaded_after_resource_switch",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "last_error": None,
+            "last_error_at": None,
         }
 
     def _resource_semaphore(self, resource_group: str, capacity: int) -> threading.Semaphore:

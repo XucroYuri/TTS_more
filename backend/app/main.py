@@ -26,7 +26,7 @@ from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluste
 from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
 from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
-from app.services import ServiceRegistry, ServiceRouter, build_load_signature
+from app.services import ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
 from app.storage import ProjectStore
 from app.supervisor import ServiceSupervisor
 
@@ -1345,6 +1345,7 @@ def _preflight_task(router: ServiceRouter, supervisor: ServiceSupervisor, queue:
         }
     try:
         route = router.resolve_task(task)
+        require_remote_artifact_transfer(route.endpoint)
         load_signature = build_load_signature(route.endpoint, task.parameters)
         load_state = queue.load_state(route.endpoint.service_id)
         current_loaded_signature = load_state.get("loaded_signature")

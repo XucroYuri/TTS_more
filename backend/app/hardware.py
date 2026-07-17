@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from typing import Any
 
+from app.subprocess_safety import noninteractive_subprocess_kwargs
+
 
 def collect_local_hardware_status() -> dict[str, Any]:
     return {
@@ -30,6 +32,7 @@ def _nvidia_smi_status() -> dict[str, Any]:
             text=True,
             timeout=2,
             check=False,
+            **noninteractive_subprocess_kwargs(),
         )
     except Exception as exc:
         return {"available": False, "status": "degraded", "error": str(exc)}

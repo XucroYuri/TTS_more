@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 import subprocess
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,25 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.models import GenerationManifest, GenerationVersion, ScriptLine, ScriptProject
 from app.storage import ProjectStore
+
+
+CUDA_PUBLIC_DOCS = (
+    "README.md",
+    "docs/cuda-e2e-single-node.md",
+    "docs/cuda-windows-codex-handoff-prompt.md",
+    "docs/cuda-e2e-validation.md",
+    "docs/cuda-e2e-acceptance-record.md",
+    "docs/ci-architecture.md",
+    "docs/deployment.md",
+    "deployment/app/README.md",
+    "deployment/tts-repos/gpt-sovits/README.md",
+    "deployment/tts-repos/indextts/README.md",
+    "deployment/tts-repos/cosyvoice/README.md",
+)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
 
 def test_committable_templates_do_not_contain_local_runtime_identifiers() -> None:
@@ -298,3 +318,80 @@ def test_delete_generation_version_falls_back_from_revision_uid_to_legacy_line_i
     assert audio.exists() is False
     payload = client.get("/api/projects/demo/manifest").json()
     assert payload["lines"]["l001"]["versions"] == []
+
+
+def test_cuda_docs_separate_controlled_raw_evidence_from_sanitized_shareable_evidence() -> None:
+    root = _repo_root()
+    for relative_path in (
+        "docs/cuda-e2e-single-node.md",
+        "docs/cuda-windows-codex-handoff-prompt.md",
+        "docs/cuda-e2e-validation.md",
+        "docs/cuda-e2e-acceptance-record.md",
+    ):
+        text = (root / relative_path).read_text(encoding="utf-8")
+        assert "受控原始证据" in text, f"{relative_path} must name the private evidence class"
+        assert "脱敏可共享证据" in text, f"{relative_path} must name the shareable evidence class"
+
+    contract = (root / "docs/cuda-e2e-validation.md").read_text(encoding="utf-8")
+    for sensitive_artifact in (
+        "controller.log",
+        "wav/",
+        "worker-logs/",
+        "Playwright trace",
+        "GPU UUID",
+        "审核者身份",
+    ):
+        assert sensitive_artifact in contract
+    assert "不得上传" in contract
+
+
+def test_cuda_acceptance_record_has_separate_raw_and_shareable_locations() -> None:
+    record = (_repo_root() / "docs/cuda-e2e-acceptance-record.md").read_text(encoding="utf-8")
+    assert "受控原始证据位置" in record
+    assert "脱敏可共享证据位置" in record
+    assert "不得提交到公开仓库" in record
+    assert "Playwright JUnit" in record
+    assert "失败 trace/screenshot/video" in record
+
+
+def test_cuda_docs_do_not_claim_an_html_playwright_report() -> None:
+    root = _repo_root()
+    combined = "\n".join((root / path).read_text(encoding="utf-8") for path in CUDA_PUBLIC_DOCS)
+    assert "Playwright report URL" not in combined
+    assert "HTML Playwright" not in combined
+    assert "Playwright HTML" not in combined
+
+
+def test_cuda_document_relative_links_resolve() -> None:
+    root = _repo_root()
+    link_pattern = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+    for relative_path in CUDA_PUBLIC_DOCS:
+        path = root / relative_path
+        text = path.read_text(encoding="utf-8")
+        for match in link_pattern.finditer(text):
+            raw_target = match.group(1)
+            target = raw_target.split("#", maxsplit=1)[0]
+            if not target or "://" in target or target.startswith("mailto:"):
+                continue
+            resolved = (path.parent / target).resolve()
+            line = text.count("\n", 0, match.start()) + 1
+            assert resolved.exists(), f"{relative_path}:{line} links to missing {target}"
+
+
+def test_cuda_public_docs_do_not_contain_real_machine_identifiers() -> None:
+    root = _repo_root()
+    forbidden = (
+        "C:\\Users\\",
+        "D:\\",
+        "E:\\",
+        "F:\\",
+        "/Users/",
+        "/home/",
+        "192.168.0.",
+        "192.168.1.",
+        "10.0.0.",
+    )
+    for relative_path in CUDA_PUBLIC_DOCS:
+        text = (root / relative_path).read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in text, f"{relative_path} contains local/private token {token!r}"
