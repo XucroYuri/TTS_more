@@ -483,6 +483,44 @@ def test_shared_fault_partial_stop_restores_only_confirmed_stops(
     ]
 
 
+def test_fault_recovery_does_not_restart_an_unconfirmed_initial_stop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    options = _options(tmp_path, mode=LanMode.DISTRIBUTED)
+    options.output.mkdir()
+    services = _write_services(options.output / "services.external.json")
+    preflight = options.output / "orchestration-preflight.json"
+    preflight.write_text("{}", encoding="utf-8")
+    policy = LanPolicy(
+        LanMode.DISTRIBUTED,
+        "controller",
+        ("gpt-worker", "index-worker", "cosy-worker"),
+        {
+            "local-gpt-sovits-main": "gpt-worker",
+            "local-indextts": "index-worker",
+            "local-cosyvoice": "cosy-worker",
+        },
+        3,
+        True,
+    )
+
+    class FailedInitialStopManager(_FaultManager):
+        def stop_service(self, node: str, port: int) -> None:
+            self.events.append("initial-stop-failed")
+            raise RuntimeError("initial listener stop failed")
+
+    manager = FailedInitialStopManager()
+    _patch_fault_probes(monkeypatch, manager)
+    monkeypatch.setenv("TTS_MORE_VALIDATION_FAULT_NODE", "gpt-worker")
+
+    with pytest.raises(RuntimeError, match="initial listener stop failed"):
+        run_fault_recovery(
+            options, policy, manager, services, preflight, "private-token"
+        )
+
+    assert manager.events == ["initial-stop-failed"]
+
+
 def test_distributed_fault_keeps_other_workers_ready_and_restarts_selected_node(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1256,7 +1294,7 @@ def test_failure_writes_bounded_blocker_without_secret_and_still_cleans_up(
         "schema_version": 1,
         "core": "failure",
         "playwright": "skipped",
-        "cleanup": "skipped",
+        "cleanup": "failure",
     }
 
 

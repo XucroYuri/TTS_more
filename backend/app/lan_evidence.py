@@ -199,9 +199,9 @@ def write_lan_evidence(path: Path, payload: LanEvidenceManifest) -> None:
 def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
     if left.st_dev != right.st_dev:
         return False
-    if left.st_ino and right.st_ino and left.st_ino != right.st_ino:
+    if not left.st_ino or not right.st_ino:
         return False
-    return True
+    return left.st_ino == right.st_ino
 
 
 def _verify_replaced_file(
@@ -412,13 +412,19 @@ def _junit_passed(path: Path) -> bool:
     def local_name(element: ElementTree.Element) -> str:
         return element.tag.rsplit("}", 1)[-1]
 
-    suites = (
-        [root]
-        if local_name(root) == "testsuite"
-        else [element for element in root.iter() if local_name(element) == "testsuite"]
-    )
+    reporting_elements = [
+        element
+        for element in root.iter()
+        if local_name(element) in {"testsuite", "testsuites"}
+    ]
+    suites = [
+        element for element in reporting_elements if local_name(element) == "testsuite"
+    ]
     testcases = [
-        element for element in root.iter() if local_name(element) == "testcase"
+        element
+        for suite in suites
+        for element in suite.iter()
+        if local_name(element) == "testcase"
     ]
     executed = [
         testcase
@@ -430,9 +436,9 @@ def _junit_passed(path: Path) -> bool:
     )
     try:
         suites_passed = bool(suites) and all(
-            int(suite.attrib.get("failures", "0")) == 0
-            and int(suite.attrib.get("errors", "0")) == 0
-            for suite in suites
+            int(element.attrib.get("failures", "0")) == 0
+            and int(element.attrib.get("errors", "0")) == 0
+            for element in reporting_elements
         )
     except (TypeError, ValueError):
         return False

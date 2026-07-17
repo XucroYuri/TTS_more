@@ -906,8 +906,8 @@ def run_fault_recovery(
     fault_path = options.output / "fault-recovery.json"
     primary_error: BaseException | None = None
     try:
-        stopped_services = (first_service,)
         manager.stop_service(fault_node, _SERVICE_PORTS[first_service])
+        stopped_services = (first_service,)
         report["degraded_within_seconds"] = wait_service_state(
             first_service, ready=False, timeout_seconds=15
         )
@@ -1247,6 +1247,8 @@ class LanOrchestrator:
                         cleanup_errors.append(error)
             os.environ.pop(_ORCHESTRATION_TOKEN_ENV, None)
 
+        if cleanup_errors:
+            stage_outcomes["cleanup"] = "failure"
         if primary_error is None and cleanup_errors:
             primary_error = RuntimeError("owned LAN cleanup failed")
         if (

@@ -13,6 +13,7 @@ from app.lan_evidence import (
     LanNodeEvidence,
     LanNodePreflight,
     LanOrchestrationPreflight,
+    _same_file_identity,
     assert_required_evidence,
     write_lan_evidence,
     write_lan_preflight,
@@ -147,6 +148,17 @@ def test_lan_evidence_writer_detects_destination_replacement(
         write_lan_evidence(path, _manifest())
 
 
+def test_file_identity_fails_closed_when_either_inode_is_unavailable() -> None:
+    class Metadata:
+        def __init__(self, inode: int) -> None:
+            self.st_dev = 7
+            self.st_ino = inode
+
+    assert _same_file_identity(Metadata(11), Metadata(11)) is True  # type: ignore[arg-type]
+    assert _same_file_identity(Metadata(0), Metadata(11)) is False  # type: ignore[arg-type]
+    assert _same_file_identity(Metadata(11), Metadata(0)) is False  # type: ignore[arg-type]
+
+
 def _write_required_bundle(output: Path) -> datetime:
     started_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     output.mkdir()
@@ -250,6 +262,15 @@ def test_required_evidence_accepts_complete_automatic_bundle_without_human_appro
             '<testsuite tests="1" failures="0" errors="0">'
             '<testcase name="gate"><failure>hidden failure</failure></testcase>'
             "</testsuite>"
+        ),
+        (
+            '<testsuites tests="1" failures="1" errors="0">'
+            '<testsuite tests="1" failures="0" errors="0">'
+            '<testcase name="gate"/></testsuite></testsuites>'
+        ),
+        (
+            '<testsuites tests="1" failures="0" errors="0">'
+            '<testcase name="detached"/></testsuites>'
         ),
     ],
 )

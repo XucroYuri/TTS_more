@@ -104,7 +104,7 @@ jobs:
           scripts/run-lan-validation.sh "${arguments[@]}"
           validation_status=$?
           set -e
-          if ! outcome_lines="$(.venv/bin/python scripts/read-lan-workflow-outcomes.py "$RAW_OUTPUT/workflow-outcomes.json")"; then
+          if ! outcome_lines="$(.venv/bin/python scripts/read-lan-workflow-outcomes.py "$RAW_OUTPUT/workflow-outcomes.json" --exit-status "$validation_status")"; then
             validation_status=1
             outcome_lines=$'core_outcome=skipped\nplaywright_outcome=skipped\ncleanup_outcome=skipped'
           fi

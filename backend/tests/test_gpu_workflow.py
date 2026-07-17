@@ -709,6 +709,7 @@ def test_macos_lan_workflow_has_strict_manual_atomic_validation_contract() -> No
     assert 'scripts/run-lan-validation.sh "${arguments[@]}"' in validation_run
     assert 'validation_status=$?' in validation_run
     assert 'scripts/read-lan-workflow-outcomes.py' in validation_run
+    assert '--exit-status "$validation_status"' in validation_run
     assert '>> "$GITHUB_OUTPUT"' in validation_run
     executable_playwright = re.compile(
         r"(?m)^\s*pnpm\s+--dir\s+frontend\s+cuda:e2e(?:\s|$)"
@@ -779,7 +780,13 @@ def test_lan_workflow_outcome_reader_emits_exact_outputs_and_fails_closed(
     )
 
     valid = subprocess.run(
-        [sys.executable, str(LAN_OUTCOME_READER), str(outcomes)],
+        [
+            sys.executable,
+            str(LAN_OUTCOME_READER),
+            str(outcomes),
+            "--exit-status",
+            "1",
+        ],
         text=True,
         capture_output=True,
         check=False,
@@ -794,7 +801,13 @@ def test_lan_workflow_outcome_reader_emits_exact_outputs_and_fails_closed(
 
     outcomes.write_text('{"schema_version":1,"core":"success"}', encoding="utf-8")
     invalid = subprocess.run(
-        [sys.executable, str(LAN_OUTCOME_READER), str(outcomes)],
+        [
+            sys.executable,
+            str(LAN_OUTCOME_READER),
+            str(outcomes),
+            "--exit-status",
+            "1",
+        ],
         text=True,
         capture_output=True,
         check=False,
@@ -802,3 +815,56 @@ def test_lan_workflow_outcome_reader_emits_exact_outputs_and_fails_closed(
 
     assert invalid.returncode != 0
     assert "invalid LAN workflow outcomes" in invalid.stderr
+
+
+@pytest.mark.parametrize(
+    ("payload", "exit_status"),
+    [
+        (
+            '{"schema_version":1,"core":"failure","core":"success",'
+            '"playwright":"success","cleanup":"success"}',
+            0,
+        ),
+        (
+            '{"schema_version":true,"core":"success",'
+            '"playwright":"success","cleanup":"success"}',
+            0,
+        ),
+        (
+            '{"schema_version":1,"core":[],"playwright":"success",'
+            '"cleanup":"success"}',
+            1,
+        ),
+        (
+            '{"schema_version":1,"core":"success","playwright":"success",'
+            '"cleanup":"success"}',
+            1,
+        ),
+        (
+            '{"schema_version":1,"core":"failure","playwright":"skipped",'
+            '"cleanup":"skipped"}',
+            0,
+        ),
+    ],
+)
+def test_lan_workflow_outcome_reader_rejects_ambiguous_or_status_mismatched_input(
+    tmp_path: Path, payload: str, exit_status: int
+) -> None:
+    outcomes = tmp_path / "workflow-outcomes.json"
+    outcomes.write_text(payload, encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LAN_OUTCOME_READER),
+            str(outcomes),
+            "--exit-status",
+            str(exit_status),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "invalid LAN workflow outcomes" in result.stderr

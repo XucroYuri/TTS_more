@@ -358,6 +358,10 @@ def _automatic_gate(
         automatic_result = "失败" if core_outcome == "failure" else "阻塞"
         overall_result = automatic_result
         status = "core_failed" if core_outcome == "failure" else "blocked"
+    elif playwright_outcome == "failure":
+        automatic_result = "失败"
+        overall_result = "失败"
+        status = "core_failed"
     elif cleanup_outcome == "failure":
         automatic_result = "失败"
         overall_result = "失败"
@@ -366,10 +370,6 @@ def _automatic_gate(
         automatic_result = "阻塞"
         overall_result = "阻塞"
         status = "core_passed_ui_pending"
-    elif playwright_outcome == "failure":
-        automatic_result = "失败"
-        overall_result = "失败"
-        status = "core_failed"
     elif playwright_outcome != "success" or not shareable_evidence_complete:
         automatic_result = "阻塞"
         overall_result = "阻塞"

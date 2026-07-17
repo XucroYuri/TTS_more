@@ -767,6 +767,26 @@ def test_cleanup_failure_prevents_automatic_pass(tmp_path: Path) -> None:
     assert summary["certification_status"] == "core_failed"
 
 
+def test_playwright_failure_is_not_demoted_by_skipped_cleanup(tmp_path: Path) -> None:
+    module = _load_module()
+    raw = tmp_path / "raw"
+    _write_malicious_raw_run(raw)
+    output = tmp_path / "sanitized"
+
+    module.sanitize_evidence(
+        raw,
+        output,
+        mode="single-release",
+        core_outcome="success",
+        playwright_outcome="failure",
+        cleanup_outcome="skipped",
+    )
+
+    gate = json.loads((output / "automatic-gate.json").read_text(encoding="utf-8"))
+    assert gate["automatic_result"] == "失败"
+    assert gate["certification_status"] == "core_failed"
+
+
 def test_diagnostic_core_cannot_be_promoted_by_successful_workflow_outcomes(tmp_path: Path) -> None:
     module = _load_module()
     raw = tmp_path / "raw"
