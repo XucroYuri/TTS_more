@@ -609,3 +609,20 @@ def test_playwright_fixture_expansion_precedes_every_validation_api_call() -> No
         "vitest run e2e/cuda-fixture.test.ts"
     )
     assert package["scripts"]["test"] == "vitest run --exclude=e2e/**"
+
+
+def test_playwright_distinguishes_both_lan_modes() -> None:
+    spec = _read(PLAYWRIGHT_SPEC)
+
+    assert '"distributed", "lan-distributed"' in spec
+    assert '"single-clean", "single-release", "lan-shared"' in spec
+
+
+def test_macos_lan_workflow_is_manual_only() -> None:
+    workflow = _read(ROOT / ".github" / "workflows" / "macos-lan-gpu-validation.yml")
+
+    assert "workflow_dispatch:" in workflow
+    assert "release:" not in workflow
+    assert "[self-hosted, macOS, tts-more-lan-controller]" in workflow
+    assert "scripts/run-lan-validation.sh" in workflow
+    assert "--deployment" in workflow

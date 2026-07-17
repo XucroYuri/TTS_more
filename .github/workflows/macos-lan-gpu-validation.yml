@@ -1,0 +1,124 @@
+name: macOS LAN GPU validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: LAN CUDA validation topology mode
+        required: true
+        type: choice
+        options: [lan-shared, lan-distributed]
+      deployment:
+        description: Remote deployment strategy
+        required: true
+        type: choice
+        options: [clean, release]
+      topology:
+        description: Controller-local topology JSON path
+        required: true
+        type: string
+      fixture:
+        description: Controller-local CUDA fixture path
+        required: true
+        type: string
+      ssh_config:
+        description: Controller-local SSH configuration path
+        required: true
+        type: string
+      remote_root:
+        description: Absolute Windows checkout root on every worker
+        required: true
+        type: string
+      require_baseline:
+        description: Require an approved warm-performance baseline
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: [self-hosted, macOS, tts-more-lan-controller]
+    timeout-minutes: 360
+    env:
+      VALIDATION_MODE: ${{ inputs.mode }}
+      DEPLOYMENT: ${{ inputs.deployment }}
+      TOPOLOGY: ${{ inputs.topology }}
+      FIXTURE: ${{ inputs.fixture }}
+      SSH_CONFIG: ${{ inputs.ssh_config }}
+      REMOTE_ROOT: ${{ inputs.remote_root }}
+      REQUIRE_BASELINE: ${{ inputs.require_baseline }}
+      RAW_OUTPUT: ${{ github.workspace }}/artifacts/macos-lan-${{ github.run_id }}-${{ github.run_attempt }}
+      SANITIZED_OUTPUT: ${{ github.workspace }}/artifacts/macos-lan-sanitized-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install controller and browser dependencies
+        shell: bash
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e 'backend[dev]'
+          .venv/bin/python -m pip install faster-whisper
+          pnpm --dir frontend install --frozen-lockfile
+          pnpm --dir frontend cuda:e2e:install
+
+      - name: Run LAN CUDA validation
+        id: validation
+        shell: bash
+        run: |
+          mkdir -p "$(dirname "$RAW_OUTPUT")"
+          arguments=(
+            --mode "$VALIDATION_MODE"
+            --deployment "$DEPLOYMENT"
+            --topology "$TOPOLOGY"
+            --fixture "$FIXTURE"
+            --ssh-config "$SSH_CONFIG"
+            --remote-root "$REMOTE_ROOT"
+            --output "$RAW_OUTPUT"
+          )
+          if [[ "$REQUIRE_BASELINE" == "true" ]]; then
+            arguments+=(--require-baseline)
+          fi
+          scripts/run-lan-validation.sh "${arguments[@]}"
+
+      - name: Finalize sanitized LAN evidence
+        id: finalize-evidence
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          mkdir -p "$(dirname "$SANITIZED_OUTPUT")"
+          .venv/bin/python scripts/sanitize-cuda-evidence.py \
+            --raw "$RAW_OUTPUT" \
+            --output "$SANITIZED_OUTPUT" \
+            --mode "$VALIDATION_MODE" \
+            --core-outcome "${{ steps.validation.outcome }}" \
+            --playwright-outcome "${{ steps.validation.outcome }}"
+          .venv/bin/python scripts/sanitize-cuda-evidence.py \
+            --output "$SANITIZED_OUTPUT" \
+            --verify-only
+
+      - name: Upload sanitized LAN evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-lan-gpu-sanitized-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: ${{ env.SANITIZED_OUTPUT }}

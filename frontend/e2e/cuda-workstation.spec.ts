@@ -115,9 +115,18 @@ test("imports a CUDA validation project and completes a 30-item mixed queue acro
     { timeout: 40 * 60 * 1000, intervals: [1_000, 2_000, 5_000] }
   ).toBe("completed");
 
-  if (process.env.TTS_MORE_CUDA_VALIDATION_MODE === "distributed") {
+  const validationMode = process.env.TTS_MORE_CUDA_VALIDATION_MODE ?? "";
+  const distributedModes = new Set(["distributed", "lan-distributed"]);
+  const serializedModes = new Set(["single-clean", "single-release", "lan-shared"]);
+  expect(
+    distributedModes.has(validationMode) || serializedModes.has(validationMode),
+    `Unsupported CUDA validation mode: ${validationMode}`
+  ).toBe(true);
+
+  if (distributedModes.has(validationMode)) {
     expect(maxSimultaneouslyLoaded).toBeGreaterThanOrEqual(2);
   } else {
+    expect(serializedModes.has(validationMode)).toBe(true);
     expect(maxSimultaneouslyLoaded).toBeLessThanOrEqual(1);
   }
 
