@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.lan_topology import FORMAL_SERVICE_IDS
 
 
-_SAFE_PUBLIC_NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_SAFE_PUBLIC_NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _SAFE_RELATIVE_EVIDENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,255}\Z")
 _MAX_EVIDENCE_BYTES = 64 * 1024 * 1024
 
@@ -171,22 +171,62 @@ def write_lan_evidence(path: Path, payload: LanEvidenceManifest) -> None:
         metadata = path.lstat()
         if _is_link(metadata) or not stat.S_ISREG(metadata.st_mode):
             raise ValueError("LAN evidence destination must be a regular file")
+    serialized = (payload.model_dump_json(indent=2) + "\n").encode("utf-8")
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
     temporary_path = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(payload.model_dump_json(indent=2) + "\n")
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(serialized)
             stream.flush()
             os.fsync(stream.fileno())
+            written_metadata = os.fstat(stream.fileno())
         metadata = temporary_path.lstat()
-        if _is_link(metadata) or not stat.S_ISREG(metadata.st_mode):
+        if (
+            _is_link(metadata)
+            or not stat.S_ISREG(metadata.st_mode)
+            or not _same_file_identity(metadata, written_metadata)
+        ):
             raise ValueError("LAN evidence temporary file identity changed")
         _reject_link_components(path.parent)
         os.replace(temporary_path, path)
+        _verify_replaced_file(path, written_metadata, serialized)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    if left.st_dev != right.st_dev:
+        return False
+    if left.st_ino and right.st_ino and left.st_ino != right.st_ino:
+        return False
+    return True
+
+
+def _verify_replaced_file(
+    path: Path, expected_metadata: os.stat_result, expected: bytes
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise ValueError("LAN evidence destination identity changed") from None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            _is_link(metadata)
+            or not stat.S_ISREG(metadata.st_mode)
+            or not _same_file_identity(metadata, expected_metadata)
+        ):
+            raise ValueError("LAN evidence destination identity changed")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            if stream.read(len(expected) + 1) != expected:
+                raise ValueError("LAN evidence destination identity changed")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def assert_required_evidence(
@@ -194,6 +234,7 @@ def assert_required_evidence(
     service_owners: dict[str, str],
     *,
     started_at: datetime,
+    expected_manifest: LanEvidenceManifest | None = None,
 ) -> None:
     if (
         not isinstance(output, Path)
@@ -280,6 +321,8 @@ def assert_required_evidence(
         else:
             if manifest.service_owners != service_owners:
                 failures.append("distributed-evidence.json:ownership")
+            if expected_manifest is not None and manifest != expected_manifest:
+                failures.append("distributed-evidence.json:manifest")
     if failures:
         raise RuntimeError(
             "LAN validation evidence is incomplete: " + ", ".join(sorted(set(failures)))
@@ -366,12 +409,34 @@ def _junit_passed(path: Path) -> bool:
         root = ElementTree.parse(path).getroot()
     except (OSError, ElementTree.ParseError):
         return False
-    suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
-    return bool(suites) and all(
-        int(suite.attrib.get("failures", "0")) == 0
-        and int(suite.attrib.get("errors", "0")) == 0
-        for suite in suites
+    def local_name(element: ElementTree.Element) -> str:
+        return element.tag.rsplit("}", 1)[-1]
+
+    suites = (
+        [root]
+        if local_name(root) == "testsuite"
+        else [element for element in root.iter() if local_name(element) == "testsuite"]
     )
+    testcases = [
+        element for element in root.iter() if local_name(element) == "testcase"
+    ]
+    executed = [
+        testcase
+        for testcase in testcases
+        if not any(local_name(child) == "skipped" for child in testcase)
+    ]
+    recorded_failures = any(
+        local_name(element) in {"failure", "error"} for element in root.iter()
+    )
+    try:
+        suites_passed = bool(suites) and all(
+            int(suite.attrib.get("failures", "0")) == 0
+            and int(suite.attrib.get("errors", "0")) == 0
+            for suite in suites
+        )
+    except (TypeError, ValueError):
+        return False
+    return suites_passed and not recorded_failures and bool(testcases) and bool(executed)
 
 
 def _fault_report_passed(payload: object) -> bool:

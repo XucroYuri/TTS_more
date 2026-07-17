@@ -100,7 +100,16 @@ jobs:
           if [[ "$REQUIRE_BASELINE" == "true" ]]; then
             arguments+=(--require-baseline)
           fi
+          set +e
           scripts/run-lan-validation.sh "${arguments[@]}"
+          validation_status=$?
+          set -e
+          if ! outcome_lines="$(.venv/bin/python scripts/read-lan-workflow-outcomes.py "$RAW_OUTPUT/workflow-outcomes.json")"; then
+            validation_status=1
+            outcome_lines=$'core_outcome=skipped\nplaywright_outcome=skipped\ncleanup_outcome=skipped'
+          fi
+          printf '%s\n' "$outcome_lines" >> "$GITHUB_OUTPUT"
+          exit "$validation_status"
 
       - name: Finalize sanitized LAN evidence
         id: finalize-evidence
@@ -112,8 +121,9 @@ jobs:
             --raw "$RAW_OUTPUT" \
             --output "$SANITIZED_OUTPUT" \
             --mode "$VALIDATION_MODE" \
-            --core-outcome "${{ steps.validation.outcome }}" \
-            --playwright-outcome "${{ steps.validation.outcome }}"
+            --core-outcome "${{ steps.validation.outputs.core_outcome || 'cancelled' }}" \
+            --playwright-outcome "${{ steps.validation.outputs.playwright_outcome || 'cancelled' }}" \
+            --cleanup-outcome "${{ steps.validation.outputs.cleanup_outcome || 'cancelled' }}"
           .venv/bin/python scripts/sanitize-cuda-evidence.py \
             --output "$SANITIZED_OUTPUT" \
             --verify-only

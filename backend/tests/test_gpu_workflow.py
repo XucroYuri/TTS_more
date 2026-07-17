@@ -29,6 +29,7 @@ CUDA_DISTRIBUTED_CLEANUP = ROOT / "scripts" / "cleanup-distributed-cuda-validati
 CUDA_GPU_MONITOR_START = ROOT / "scripts" / "start-cuda-gpu-monitor.ps1"
 CUDA_GPU_MONITOR_STOP = ROOT / "scripts" / "stop-cuda-gpu-monitor.ps1"
 LAN_ORCHESTRATOR = ROOT / "backend" / "app" / "lan_orchestration.py"
+LAN_OUTCOME_READER = ROOT / "scripts" / "read-lan-workflow-outcomes.py"
 
 
 def _read(path: Path) -> str:
@@ -706,6 +707,9 @@ def test_macos_lan_workflow_has_strict_manual_atomic_validation_contract() -> No
         assert f'{flag} "${variable}"' in validation_run
     assert 'arguments+=(--require-baseline)' in validation_run
     assert 'scripts/run-lan-validation.sh "${arguments[@]}"' in validation_run
+    assert 'validation_status=$?' in validation_run
+    assert 'scripts/read-lan-workflow-outcomes.py' in validation_run
+    assert '>> "$GITHUB_OUTPUT"' in validation_run
     executable_playwright = re.compile(
         r"(?m)^\s*pnpm\s+--dir\s+frontend\s+cuda:e2e(?:\s|$)"
     )
@@ -719,8 +723,16 @@ def test_macos_lan_workflow_has_strict_manual_atomic_validation_contract() -> No
     assert finalizer_run.count("scripts/sanitize-cuda-evidence.py") == 2
     assert '--raw "$RAW_OUTPUT"' in finalizer_run
     assert '--output "$SANITIZED_OUTPUT"' in finalizer_run
-    assert '--core-outcome "${{ steps.validation.outcome }}"' in finalizer_run
-    assert '--playwright-outcome "${{ steps.validation.outcome }}"' in finalizer_run
+    assert '--core-outcome "${{ steps.validation.outputs.core_outcome || \'cancelled\' }}"' in finalizer_run
+    assert '--playwright-outcome "${{ steps.validation.outputs.playwright_outcome || \'cancelled\' }}"' in finalizer_run
+    assert '--cleanup-outcome "${{ steps.validation.outputs.cleanup_outcome || \'cancelled\' }}"' in finalizer_run
+
+    outcome_reader = _read(LAN_OUTCOME_READER)
+    assert '"schema_version": 1' in outcome_reader
+    assert '{"success", "failure", "skipped", "cancelled"}' in outcome_reader
+    assert '"core_outcome"' in outcome_reader
+    assert '"playwright_outcome"' in outcome_reader
+    assert '"cleanup_outcome"' in outcome_reader
 
     uploads = [
         step
@@ -748,3 +760,45 @@ def test_macos_lan_workflow_has_strict_manual_atomic_validation_contract() -> No
     assert control_plane_index < playwright_index < recovery_index
     assert 'junit_path = options.output / "playwright-junit.xml"' in orchestrator
     assert '"PLAYWRIGHT_JUNIT_OUTPUT_FILE": str(junit_path)' in orchestrator
+
+
+def test_lan_workflow_outcome_reader_emits_exact_outputs_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    outcomes = tmp_path / "workflow-outcomes.json"
+    outcomes.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "core": "success",
+                "playwright": "failure",
+                "cleanup": "skipped",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    valid = subprocess.run(
+        [sys.executable, str(LAN_OUTCOME_READER), str(outcomes)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert valid.returncode == 0
+    assert valid.stdout.splitlines() == [
+        "core_outcome=success",
+        "playwright_outcome=failure",
+        "cleanup_outcome=skipped",
+    ]
+
+    outcomes.write_text('{"schema_version":1,"core":"success"}', encoding="utf-8")
+    invalid = subprocess.run(
+        [sys.executable, str(LAN_OUTCOME_READER), str(outcomes)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert invalid.returncode != 0
+    assert "invalid LAN workflow outcomes" in invalid.stderr

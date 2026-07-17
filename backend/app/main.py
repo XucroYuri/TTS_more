@@ -128,6 +128,7 @@ def create_app(
     app.state.writable_services_path = writable_services_file
     app.state.parser_config_path = parser_config_file
     app.state.env_path = env_file
+    app.state.instance_id = os.environ.get("TTS_MORE_INSTANCE_ID")
     # Read at app-creation time so tests/processes can override via env.
     app.state.max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(MAX_UPLOAD_BYTES)))
 
@@ -137,12 +138,16 @@ def create_app(
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
-        return {
+        payload = {
             "status": "ok",
             "repos": _read_repo_lock(),
             "workers": app.state.service_router.health(),
             "reference_audio_root": str(ref_root),
         }
+        instance_id = app.state.instance_id
+        if instance_id:
+            payload["instance_id"] = instance_id
+        return payload
 
     @app.get("/api/services")
     def services() -> dict[str, Any]:

@@ -26,6 +26,7 @@ from app.lan_orchestration import (
     run_workstation_e2e,
     validate_network_identities,
     validate_node_probes,
+    wait_http_ready,
     wait_for_services,
     write_preflight,
 )
@@ -166,10 +167,11 @@ def test_control_plane_uses_exact_argv_and_only_terminates_its_child(
         "app.lan_orchestration._assert_fixed_loopback_port_available",
         lambda port: events.append(f"port-free:{port}"),
     )
-    monkeypatch.setattr(
-        "app.lan_orchestration.wait_http_ready",
-        lambda *_args, **_kwargs: events.append("backend-ready"),
-    )
+    def backend_ready(*_args: object, **kwargs: object) -> None:
+        captured["expected_instance_id"] = kwargs["expected_instance_id"]
+        events.append("backend-ready")
+
+    monkeypatch.setattr("app.lan_orchestration.wait_http_ready", backend_ready)
 
     def popen_factory(argv: list[str], **kwargs: object) -> _FakeAppProcess:
         captured["argv"] = argv
@@ -196,6 +198,7 @@ def test_control_plane_uses_exact_argv_and_only_terminates_its_child(
     assert captured["cwd"] == Path(__file__).resolve().parents[2]
     assert captured["env"]["TTS_MORE_SERVICE_MODE"] == "real"  # type: ignore[index]
     assert captured["env"]["TTS_MORE_SERVICES_PATH"] == str(services)  # type: ignore[index]
+    assert captured["env"]["TTS_MORE_INSTANCE_ID"] == captured["expected_instance_id"]  # type: ignore[index]
     assert events == [
         "port-free:8000",
         "backend-ready",
@@ -254,6 +257,31 @@ def test_control_plane_rejects_health_from_a_process_it_did_not_start(
             pass
 
     assert events == []
+
+
+def test_wait_http_ready_rejects_a_healthy_response_from_the_wrong_instance() -> None:
+    class Response:
+        is_success = True
+
+        def __init__(self, instance_id: str) -> None:
+            self.instance_id = instance_id
+
+        def json(self) -> dict[str, str]:
+            return {"status": "ok", "instance_id": self.instance_id}
+
+    responses = iter((Response("wrong-instance"), Response("expected-instance")))
+    now = [0.0]
+
+    wait_http_ready(
+        "http://127.0.0.1:8000/api/health",
+        timeout_seconds=2,
+        expected_instance_id="expected-instance",
+        http_get=lambda *_args, **_kwargs: next(responses),
+        clock=lambda: now[0],
+        sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    )
+
+    assert now[0] > 0
 
 
 @pytest.mark.parametrize(
@@ -394,7 +422,6 @@ def test_shared_fault_stops_one_then_all_exact_listeners_and_recovers(
         "restart:shared-worker:local-gpt-sovits-main",
         "workers-ready",
         "core:retry",
-        "stop-all:shared-worker",
         "stop:shared-worker:local-gpt-sovits-main",
         "stop:shared-worker:local-indextts",
         "stop:shared-worker:local-cosyvoice",
@@ -405,6 +432,55 @@ def test_shared_fault_stops_one_then_all_exact_listeners_and_recovers(
     assert "private-token" not in (options.output / "fault-recovery.json").read_text(
         encoding="utf-8"
     )
+
+
+def test_shared_fault_partial_stop_restores_only_confirmed_stops(
+    tmp_path: Path, monkeypatch
+) -> None:
+    options = _options(tmp_path)
+    options.output.mkdir()
+    services = _write_services(options.output / "services.external.json")
+    preflight = options.output / "orchestration-preflight.json"
+    preflight.write_text("{}", encoding="utf-8")
+    policy = LanPolicy(
+        LanMode.SHARED,
+        "controller",
+        ("shared-worker",),
+        {
+            "local-gpt-sovits-main": "shared-worker",
+            "local-indextts": "shared-worker",
+            "local-cosyvoice": "shared-worker",
+        },
+        1,
+        False,
+    )
+
+    class PartialStopManager(_FaultManager):
+        def stop_service(self, node: str, port: int) -> None:
+            service_id = {
+                9880: "local-gpt-sovits-main",
+                9881: "local-indextts",
+                9882: "local-cosyvoice",
+            }[port]
+            if service_id == "local-indextts":
+                self.events.append(f"stop-failed:{node}:{service_id}")
+                raise RuntimeError("second listener stop failed")
+            super().stop_service(node, port)
+
+    manager = PartialStopManager()
+    _patch_fault_probes(monkeypatch, manager)
+
+    with pytest.raises(RuntimeError, match="second listener stop failed"):
+        run_fault_recovery(
+            options, policy, manager, services, preflight, "private-token"
+        )
+
+    assert manager.events[-4:] == [
+        "stop:shared-worker:local-gpt-sovits-main",
+        "stop-failed:shared-worker:local-indextts",
+        "restart:shared-worker:local-gpt-sovits-main",
+        "workers-ready",
+    ]
 
 
 def test_distributed_fault_keeps_other_workers_ready_and_restarts_selected_node(
@@ -1131,6 +1207,14 @@ def test_orchestrator_has_no_skip_path_and_cleans_owned_processes(
         "evidence-gate",
     ]
     assert "TTS_MORE_ORCHESTRATION_TOKEN" not in os.environ
+    assert json.loads(
+        (options.output / "workflow-outcomes.json").read_text(encoding="utf-8")
+    ) == {
+        "schema_version": 1,
+        "core": "success",
+        "playwright": "success",
+        "cleanup": "success",
+    }
 
 
 def test_failure_writes_bounded_blocker_without_secret_and_still_cleans_up(
@@ -1166,6 +1250,56 @@ def test_failure_writes_bounded_blocker_without_secret_and_still_cleans_up(
     assert summary.is_file()
     assert summary.stat().st_size < 64 * 1024
     assert json.loads(summary.read_text(encoding="utf-8"))["passed"] is False
+    assert json.loads(
+        (options.output / "workflow-outcomes.json").read_text(encoding="utf-8")
+    ) == {
+        "schema_version": 1,
+        "core": "failure",
+        "playwright": "skipped",
+        "cleanup": "skipped",
+    }
+
+
+@pytest.mark.parametrize(
+    ("failed_stage", "expected"),
+    [
+        (
+            "playwright",
+            {"core": "success", "playwright": "failure", "cleanup": "skipped"},
+        ),
+        (
+            "fault-recovery",
+            {"core": "success", "playwright": "success", "cleanup": "failure"},
+        ),
+    ],
+)
+def test_orchestrator_records_truthful_stage_outcomes(
+    tmp_path: Path, monkeypatch, failed_stage: str, expected: dict[str, str]
+) -> None:
+    options = _options(tmp_path)
+    events: list[str] = []
+    _patch_orchestration_dependencies(monkeypatch, events, fail_core=False)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"{failed_stage} failed")
+
+    target = {
+        "playwright": "run_workstation_e2e",
+        "fault-recovery": "run_fault_recovery",
+    }[failed_stage]
+    monkeypatch.setattr(f"app.lan_orchestration.{target}", fail)
+    orchestrator = LanOrchestrator(
+        options,
+        executor=_FakeExecutor(events),
+        node_manager_factory=lambda *_args, **_kwargs: _FakeManager(events),
+        process_runner=lambda *_args, **_kwargs: None,
+    )
+
+    assert orchestrator.run() == 1
+    outcomes = json.loads(
+        (options.output / "workflow-outcomes.json").read_text(encoding="utf-8")
+    )
+    assert outcomes == {"schema_version": 1, **expected}
 
 
 def test_ambiguous_monitor_start_still_attempts_monitor_stop_and_evidence(

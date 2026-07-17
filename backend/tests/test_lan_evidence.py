@@ -116,6 +116,35 @@ def test_lan_evidence_manifest_is_strict_private_free_and_atomic(tmp_path: Path)
     private_owner["nodes"] = {"192.0.2.10": next(iter(private_owner["nodes"].values()))}
     with pytest.raises(ValidationError):
         LanEvidenceManifest.model_validate(private_owner)
+    dotted_owner = _manifest().model_dump()
+    dotted_owner["service_owners"] = {
+        service_id: "gpu01.corp.internal"
+        for service_id in dotted_owner["service_owners"]
+    }
+    dotted_owner["nodes"] = {
+        "gpu01.corp.internal": next(iter(dotted_owner["nodes"].values()))
+    }
+    with pytest.raises(ValidationError):
+        LanEvidenceManifest.model_validate(dotted_owner)
+
+
+def test_lan_evidence_writer_detects_destination_replacement(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "run" / "distributed-evidence.json"
+    replacement = _manifest().model_copy(update={"deployment": "release"})
+    real_replace = os.replace
+
+    def replace_then_swap(source: object, destination: object) -> None:
+        real_replace(source, destination)
+        attacker = path.parent / "attacker.json"
+        attacker.write_text(replacement.model_dump_json() + "\n", encoding="utf-8")
+        real_replace(attacker, destination)
+
+    monkeypatch.setattr("app.lan_evidence.os.replace", replace_then_swap)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        write_lan_evidence(path, _manifest())
 
 
 def _write_required_bundle(output: Path) -> datetime:
@@ -138,7 +167,11 @@ def _write_required_bundle(output: Path) -> datetime:
         if path.name == "summary.json":
             content = '{"passed":true}\n'
         elif path.suffix == ".xml":
-            content = '<testsuite tests="1" failures="0" errors="0"/>\n'
+            content = (
+                '<testsuite tests="1" failures="0" errors="0">'
+                '<testcase classname="validation" name="gate"/>'
+                "</testsuite>\n"
+            )
         elif path.name == "fault-recovery.json":
             content = json.dumps(
                 {
@@ -188,6 +221,9 @@ def test_required_evidence_accepts_complete_automatic_bundle_without_human_appro
     (output / "human-listening-review.md").write_text(
         "Template only; Decision: PASS / FAIL\n", encoding="utf-8"
     )
+    expected_manifest = LanEvidenceManifest.model_validate_json(
+        (output / "distributed-evidence.json").read_text(encoding="utf-8")
+    )
 
     assert_required_evidence(
         output,
@@ -197,7 +233,63 @@ def test_required_evidence_accepts_complete_automatic_bundle_without_human_appro
             "local-cosyvoice": "shared-worker",
         },
         started_at=started_at,
+        expected_manifest=expected_manifest,
     )
+
+
+@pytest.mark.parametrize(
+    "junit",
+    [
+        '<testsuite tests="0" failures="0" errors="0"/>',
+        '<testsuite tests="1" failures="0" errors="0"/>',
+        (
+            '<testsuite tests="1" failures="0" errors="0">'
+            '<testcase name="gate"><skipped/></testcase></testsuite>'
+        ),
+        (
+            '<testsuite tests="1" failures="0" errors="0">'
+            '<testcase name="gate"><failure>hidden failure</failure></testcase>'
+            "</testsuite>"
+        ),
+    ],
+)
+def test_required_evidence_rejects_empty_or_all_skipped_junit(
+    tmp_path: Path, junit: str
+) -> None:
+    output = tmp_path / "run"
+    started_at = _write_required_bundle(output)
+    (output / "junit.xml").write_text(junit, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="junit.xml:passed"):
+        assert_required_evidence(
+            output,
+            {
+                "local-gpt-sovits-main": "shared-worker",
+                "local-indextts": "shared-worker",
+                "local-cosyvoice": "shared-worker",
+            },
+            started_at=started_at,
+        )
+
+
+def test_required_evidence_rejects_schema_valid_manifest_replacement(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "run"
+    started_at = _write_required_bundle(output)
+    expected = _manifest()
+    replaced = expected.model_copy(update={"deployment": "release"})
+    (output / "distributed-evidence.json").write_text(
+        replaced.model_dump_json(), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="manifest"):
+        assert_required_evidence(
+            output,
+            expected.service_owners,
+            started_at=started_at,
+            expected_manifest=expected,
+        )
 
 
 @pytest.mark.parametrize("failure", ["empty", "stale", "symlink"])

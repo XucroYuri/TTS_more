@@ -30,6 +30,18 @@ def test_health_reports_repos_and_workers(tmp_path: Path) -> None:
     assert {worker["engine"] for worker in payload["workers"]} == {"gpt-sovits", "indextts", "cosyvoice"}
 
 
+def test_health_echoes_control_plane_instance_id_when_configured(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TTS_MORE_INSTANCE_ID", "validation-instance-123")
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["instance_id"] == "validation-instance-123"
+
+
 def test_parse_script_requires_enabled_llm_parser(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path))
 

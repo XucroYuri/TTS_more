@@ -639,6 +639,7 @@ def control_plane(
         **os.environ,
         "TTS_MORE_SERVICE_MODE": "real",
         "TTS_MORE_SERVICES_PATH": str(services_path),
+        "TTS_MORE_INSTANCE_ID": secrets.token_hex(32),
     }
     with _open_private_log(logs / "app-backend.stdout.log") as stdout, _open_private_log(
         logs / "app-backend.stderr.log"
@@ -653,7 +654,9 @@ def control_plane(
         )
         try:
             wait_http_ready(
-                f"http://127.0.0.1:{_APP_PORT}/api/health", timeout_seconds=120
+                f"http://127.0.0.1:{_APP_PORT}/api/health",
+                timeout_seconds=120,
+                expected_instance_id=backend_env["TTS_MORE_INSTANCE_ID"],
             )
             if process.poll() is not None:
                 raise RuntimeError("application backend child exited before ownership confirmation")
@@ -677,6 +680,7 @@ def wait_http_ready(
     url: str,
     *,
     timeout_seconds: int,
+    expected_instance_id: str | None = None,
     http_get: Callable[..., Any] = httpx.get,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
@@ -686,9 +690,19 @@ def wait_http_ready(
     started = clock()
     while clock() - started <= timeout_seconds:
         try:
-            if http_get(url, headers=_api_headers(), timeout=5.0).is_success:
-                return
-        except (httpx.HTTPError, OSError):
+            response = http_get(url, headers=_api_headers(), timeout=5.0)
+            if response.is_success:
+                if expected_instance_id is None:
+                    return
+                payload = response.json()
+                instance_id = (
+                    payload.get("instance_id") if isinstance(payload, dict) else None
+                )
+                if isinstance(instance_id, str) and secrets.compare_digest(
+                    instance_id, expected_instance_id
+                ):
+                    return
+        except (httpx.HTTPError, OSError, TypeError, ValueError):
             pass
         sleeper(min(1.0, max(0.0, timeout_seconds - (clock() - started))))
     raise TimeoutError(f"HTTP endpoint did not become ready: {urlsplit(url).path}")
@@ -927,11 +941,12 @@ def run_fault_recovery(
             )
             report["retry_passed"] = True
             report["retry_seconds"] = time.monotonic() - retry_started
-            stopped_services = fault_services
             all_outage_started = time.monotonic()
-            manager.stop_all_services(
-                fault_node, tuple(_SERVICE_PORTS[item] for item in fault_services)
-            )
+            confirmed_stops: list[str] = []
+            for service_id in fault_services:
+                manager.stop_service(fault_node, _SERVICE_PORTS[service_id])
+                confirmed_stops.append(service_id)
+                stopped_services = tuple(confirmed_stops)
             report["all_services_degraded_within_seconds"] = (
                 _wait_all_services_degraded(
                     fault_services,
@@ -1089,11 +1104,21 @@ class LanOrchestrator:
         evidence_nodes: list[str] = []
         probes: list[NodeProbe] = []
         core_completed = False
+        stage_outcomes = {
+            "schema_version": 1,
+            "core": "skipped",
+            "playwright": "skipped",
+            "cleanup": "skipped",
+        }
         output_created = False
         token: str | None = None
         run_started_at: datetime | None = None
 
         try:
+            _ensure_output_directory(self.options.output)
+            output_created = True
+            run_started_at = datetime.now(timezone.utc)
+            logger = configure_run_logging(self.options.output)
             topology, policy = load_lan_policy(self.options.topology, self.options.mode)
             commit = controller_commit(
                 REPO_ROOT,
@@ -1114,10 +1139,6 @@ class LanOrchestrator:
             )
             pinned_executor = self.executor.with_pinned_targets(ssh_targets)
 
-            _ensure_output_directory(self.options.output)
-            output_created = True
-            run_started_at = datetime.now(timezone.utc)
-            logger = configure_run_logging(self.options.output)
             token = secrets.token_hex(32)
             os.environ[_ORCHESTRATION_TOKEN_ENV] = token
             manager = self.node_manager_factory(pinned_executor, salt=salt)
@@ -1164,6 +1185,7 @@ class LanOrchestrator:
                 probes,
                 token,
             )
+            stage_outcomes["core"] = "failure"
             run_core_cuda_validation(
                 self.options,
                 services_path,
@@ -1173,11 +1195,15 @@ class LanOrchestrator:
                 controller_identity=controller_hash,
             )
             core_completed = True
+            stage_outcomes["core"] = "success"
             with control_plane(services_path, self.options.output):
+                stage_outcomes["playwright"] = "failure"
                 run_workstation_e2e(
                     self.options,
                     runner=self.process_runner,
                 )
+                stage_outcomes["playwright"] = "success"
+                stage_outcomes["cleanup"] = "failure"
                 run_fault_recovery(
                     self.options,
                     policy,
@@ -1270,13 +1296,26 @@ class LanOrchestrator:
                     self.options.output,
                     policy.service_owners,
                     started_at=run_started_at,
+                    expected_manifest=manifest,
                 )
+                stage_outcomes["cleanup"] = "success"
             except BaseException as error:
                 primary_error = error
                 if logger is not None:
                     logger.error(
                         "evidence gate failed error_type=%s", type(error).__name__
                     )
+        try:
+            _atomic_write_json(
+                self.options.output / "workflow-outcomes.json", stage_outcomes
+            )
+        except BaseException as error:
+            if primary_error is None:
+                primary_error = error
+            if logger is not None:
+                logger.error(
+                    "workflow outcomes failed error_type=%s", type(error).__name__
+                )
         if primary_error is not None:
             if not output_created:
                 _ensure_output_directory(self.options.output)
