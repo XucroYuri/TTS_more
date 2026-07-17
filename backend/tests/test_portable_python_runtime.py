@@ -113,7 +113,8 @@ def test_portable_python_helper_contract_and_no_drift() -> None:
     assert "datetime.UTC = getattr(datetime, 'UTC', datetime.timezone.utc)" in controller
     assert "runpy.run_path" in controller
     assert "& $candidatePython -c $portableInstallBootstrap @arguments 2>&1 | Out-Host" in controller
-    assert "uv-0.11.28.data/scripts/uv.exe" in controller
+    assert "$script:DefaultUvArchiveEntry" not in controller
+    assert "uv archive_entry is required" in controller
     assert "Lib\\site-packages" in controller
     assert "import site" in controller
     assert "pyvenv.cfg" in controller
@@ -126,7 +127,15 @@ def test_portable_python_helper_contract_and_no_drift() -> None:
 @pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
 @pytest.mark.parametrize(
     "entry",
-    ("../escape.txt", "/absolute.txt", "C:/drive.txt", "safe/../../escape.txt", "pyvenv.cfg"),
+    (
+        "../escape.txt",
+        "/absolute.txt",
+        "C:/drive.txt",
+        "safe/../../escape.txt",
+        "safe:stream/file.txt",
+        "safe/file.txt:stream",
+        "pyvenv.cfg",
+    ),
 )
 def test_python_zip_rejects_unsafe_entries(helper: Path, entry: str, tmp_path: Path) -> None:
     archive = tmp_path / "python.zip"
@@ -138,6 +147,25 @@ def test_python_zip_rejects_unsafe_entries(helper: Path, entry: str, tmp_path: P
         check=False,
     )
     assert result.returncode != 0
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+@pytest.mark.parametrize("entry", ("safe:stream/file.txt", "safe/file.txt:stream"))
+def test_python_zip_explicitly_rejects_ntfs_ads_segments(helper: Path, entry: str, tmp_path: Path) -> None:
+    archive = tmp_path / "python.zip"
+    destination = tmp_path / "runtime"
+    _write_zip(
+        archive,
+        [("python.exe", b"stub"), ("python311.zip", b"stdlib"), ("python311._pth", b"old"), (entry, b"bad")],
+    )
+    result = _run_ps(
+        helper,
+        f"Expand-PortablePythonArchive -Archive '{archive}' -Destination '{destination}' -ExpectedVersion '3.11.9'",
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "path segment contains a colon" in result.stderr
     assert not destination.exists()
 
 
@@ -226,6 +254,27 @@ def test_uv_wheel_requires_exactly_one_declared_entry(helper: Path, count: int, 
 
 
 @pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_uv_export_atomically_replaces_existing_destination_from_declared_entry(
+    helper: Path, tmp_path: Path
+) -> None:
+    wheel = tmp_path / "uv.whl"
+    destination = tmp_path / "tools" / "uv.exe"
+    expected = b"verified-uv-from-wheel"
+    _write_zip(wheel, [(UV["archive_entry"], expected)])
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"untrusted-existing-uv")
+
+    _run_ps(
+        helper,
+        f"Export-PortableUvExecutable -Wheel '{wheel}' -ArchiveEntry '{UV['archive_entry']}' "
+        f"-Destination '{destination}'",
+    )
+
+    assert destination.read_bytes() == expected
+    assert not list(destination.parent.glob("uv.exe.partial-*"))
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
 def test_python_downloader_resumes_at_eight_bytes_and_falls_back(helper: Path, tmp_path: Path) -> None:
     payload = b"portable-python-asset"
     ranges: list[str | None] = []
@@ -281,6 +330,126 @@ def test_python_downloader_resumes_at_eight_bytes_and_falls_back(helper: Path, t
         assert paths[:2] == ["/first", "/second"]
         assert ranges[:2] == ["bytes=8-", "bytes=8-"]
         assert not partial.exists()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_downloader_rolls_failed_mirror_back_to_partial_baseline(helper: Path, tmp_path: Path) -> None:
+    payload = b"portable-python-asset"
+    corrupt = b"X" * (len(payload) - 8)
+    ranges: list[tuple[str, str | None]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            request_range = self.headers.get("Range")
+            ranges.append((self.path, request_range))
+            if self.path == "/first":
+                body = corrupt
+                self.send_response(206)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Range", f"bytes 8-{len(payload) - 1}/{len(payload)}")
+            else:
+                body = payload[8:]
+                self.send_response(206)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Range", f"bytes 8-{len(payload) - 1}/{len(payload)}")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        destination = tmp_path / "asset.zip"
+        partial = Path(f"{destination}.partial")
+        partial.write_bytes(payload[:8])
+        lock = tmp_path / "asset.json"
+        lock.write_text(
+            json.dumps(
+                {
+                    "id": "fixture",
+                    "urls": [
+                        f"http://127.0.0.1:{server.server_port}/first",
+                        f"http://127.0.0.1:{server.server_port}/second",
+                    ],
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size_bytes": len(payload),
+                }
+            ),
+            encoding="utf-8",
+        )
+        _run_ps(
+            helper,
+            f"$asset = Get-Content -Raw '{lock}' | ConvertFrom-Json; "
+            f"Get-PortableLockedAsset -Asset $asset -Destination '{destination}'",
+        )
+        assert destination.read_bytes() == payload
+        assert ranges == [("/first", "bytes=8-"), ("/second", "bytes=8-")]
+        assert not partial.exists()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+@pytest.mark.parametrize(
+    ("content_range", "body"),
+    (
+        ("bytes 0-12/21", b"bad-response"),
+        ("bytes 8-20/22", b"bad-response"),
+    ),
+)
+def test_downloader_rejects_invalid_resumed_content_range_without_mutating_baseline(
+    helper: Path, content_range: str, body: bytes, tmp_path: Path
+) -> None:
+    payload = b"portable-python-asset"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Range", content_range)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        destination = tmp_path / "asset.zip"
+        partial = Path(f"{destination}.partial")
+        baseline = payload[:8]
+        partial.write_bytes(baseline)
+        lock = tmp_path / "asset.json"
+        lock.write_text(
+            json.dumps(
+                {
+                    "id": "fixture",
+                    "urls": [f"http://127.0.0.1:{server.server_port}/invalid-range"],
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size_bytes": len(payload),
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = _run_ps(
+            helper,
+            f"$asset = Get-Content -Raw '{lock}' | ConvertFrom-Json; "
+            f"Get-PortableLockedAsset -Asset $asset -Destination '{destination}'",
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "Content-Range" in result.stderr
+        assert partial.read_bytes() == baseline
+        assert not destination.exists()
     finally:
         server.shutdown()
         thread.join(timeout=5)

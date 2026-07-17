@@ -4,8 +4,6 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.Net.Http
 
-$script:DefaultUvArchiveEntry = "uv-0.11.28.data/scripts/uv.exe"
-
 function Get-PortablePythonFileSha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -66,10 +64,13 @@ function Get-PortableLockedAsset {
     $errors = New-Object System.Collections.Generic.List[string]
     foreach ($url in @($Asset.urls)) {
         if (Test-PortablePythonCancelled -CancelFile $CancelFile) { throw "portable runtime installation cancelled" }
-        $resumeFrom = if ([System.IO.File]::Exists($partial)) { (Get-Item -LiteralPath $partial).Length } else { 0 }
+        $baselineExisted = [System.IO.File]::Exists($partial)
+        $resumeFrom = if ($baselineExisted) { (Get-Item -LiteralPath $partial).Length } else { 0 }
+        $baselineLength = $resumeFrom
         $client = New-Object System.Net.Http.HttpClient
         $response = $null
         $request = $null
+        $attempt = $null
         try {
             $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, [string]$url)
             if ($resumeFrom -gt 0) {
@@ -79,13 +80,25 @@ function Get-PortableLockedAsset {
             if (!$response.IsSuccessStatusCode) {
                 throw "HTTP $([int]$response.StatusCode)"
             }
-            $append = $resumeFrom -gt 0 -and [int]$response.StatusCode -eq 206
-            if ($resumeFrom -gt 0 -and !$append) {
-                $resumeFrom = 0
+            $statusCode = [int]$response.StatusCode
+            if ($statusCode -eq 206) {
+                $contentRange = [string]$response.Content.Headers.ContentRange
+                if ($contentRange -notmatch '^bytes (\d+)-(\d+)/(\d+)$' -or
+                    [int64]$Matches[1] -ne $resumeFrom -or
+                    [int64]$Matches[2] -lt $resumeFrom -or
+                    [int64]$Matches[2] -ge [int64]$Asset.size_bytes -or
+                    [int64]$Matches[3] -ne [int64]$Asset.size_bytes) {
+                    throw "invalid Content-Range for locked asset: $contentRange"
+                }
             }
+            $append = $resumeFrom -gt 0 -and $statusCode -eq 206
+            if ($resumeFrom -gt 0 -and !$append) {
+                $attempt = "$partial.restart-$([guid]::NewGuid().ToString('N'))"
+            }
+            $writePath = if ($attempt) { $attempt } else { $partial }
             $mode = if ($append) { [System.IO.FileMode]::Append } else { [System.IO.FileMode]::Create }
             $input = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-            $output = New-Object System.IO.FileStream($partial, $mode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $output = New-Object System.IO.FileStream($writePath, $mode, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
             try {
                 $buffer = New-Object byte[] 1048576
                 while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
@@ -98,14 +111,25 @@ function Get-PortableLockedAsset {
                 $output.Dispose()
                 $input.Dispose()
             }
-            if (!(Test-PortableLockedFile -Path $partial -Asset $Asset)) {
+            if (!(Test-PortableLockedFile -Path $writePath -Asset $Asset)) {
                 throw "downloaded asset failed size or SHA-256 validation"
             }
-            [System.IO.File]::Move($partial, $Destination)
+            [System.IO.File]::Move($writePath, $Destination)
+            if ($attempt -and [System.IO.File]::Exists($partial)) { Remove-Item -LiteralPath $partial -Force }
             return $Destination
         }
         catch {
             $errors.Add("$url`: $($_.Exception.Message)")
+            if ($attempt -and [System.IO.File]::Exists($attempt)) { Remove-Item -LiteralPath $attempt -Force }
+            if ([System.IO.File]::Exists($partial)) {
+                if ($baselineExisted) {
+                    $rollback = New-Object System.IO.FileStream($partial, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                    try { $rollback.SetLength($baselineLength) } finally { $rollback.Dispose() }
+                }
+                else {
+                    Remove-Item -LiteralPath $partial -Force
+                }
+            }
             if ($_.Exception.Message -eq "portable runtime installation cancelled") { throw }
         }
         finally {
@@ -168,6 +192,9 @@ function Expand-PortablePythonArchive {
             if ($parts.Count -eq 0 -or $parts -contains '..' -or $parts -contains '.') {
                 throw "ZIP contains path traversal: $($entry.FullName)"
             }
+            if (@($parts | Where-Object { $_.Contains(':') }).Count -gt 0) {
+                throw "ZIP path segment contains a colon: $($entry.FullName)"
+            }
             $normalized = $parts -join '\'
             if (!$targets.Add($normalized)) { throw "ZIP contains a duplicate normalized target: $normalized" }
             if (($entry.ExternalAttributes -band 0x400) -ne 0) { throw "ZIP contains a reparse-point entry: $normalized" }
@@ -225,9 +252,8 @@ function Export-PortableUvExecutable {
     )
 
     $Destination = [System.IO.Path]::GetFullPath($Destination)
-    if ([System.IO.File]::Exists($Destination) -or [System.IO.Directory]::Exists($Destination)) {
-        throw "uv destination already exists: $Destination"
-    }
+    if ([string]::IsNullOrWhiteSpace($ArchiveEntry)) { throw "uv archive_entry is required" }
+    if ([System.IO.Directory]::Exists($Destination)) { throw "uv destination is a directory: $Destination" }
     $zip = [System.IO.Compression.ZipFile]::OpenRead([System.IO.Path]::GetFullPath($Wheel))
     try {
         $matches = @($zip.Entries | Where-Object { $_.FullName -ceq $ArchiveEntry })
@@ -238,7 +264,26 @@ function Export-PortableUvExecutable {
             $input = $matches[0].Open()
             $output = New-Object System.IO.FileStream($temporary, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
             try { $input.CopyTo($output); $output.Flush($true) } finally { $output.Dispose(); $input.Dispose() }
-            [System.IO.File]::Move($temporary, $Destination)
+            if ([System.IO.File]::Exists($Destination)) {
+                $sameLength = (Get-Item -LiteralPath $temporary).Length -eq (Get-Item -LiteralPath $Destination).Length
+                $sameSha = $sameLength -and (Get-PortablePythonFileSha256 -Path $temporary) -eq (Get-PortablePythonFileSha256 -Path $Destination)
+                if ($sameSha) {
+                    Remove-Item -LiteralPath $temporary -Force
+                }
+                else {
+                    $backup = "$Destination.backup-$([guid]::NewGuid().ToString('N'))"
+                    try {
+                        [System.IO.File]::Replace($temporary, $Destination, $backup, $true)
+                        Remove-Item -LiteralPath $backup -Force
+                    }
+                    finally {
+                        if ([System.IO.File]::Exists($backup)) { Remove-Item -LiteralPath $backup -Force }
+                    }
+                }
+            }
+            else {
+                [System.IO.File]::Move($temporary, $Destination)
+            }
         }
         catch {
             if ([System.IO.File]::Exists($temporary)) { Remove-Item -LiteralPath $temporary -Force }
@@ -308,12 +353,11 @@ function Install-PortablePythonRuntime {
         & $candidatePython -c $portableInstallBootstrap @arguments 2>&1 | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "portable_install.py ensure-asset failed for uv" }
 
-        $uvEntry = if ($lock.assets.uv.archive_entry) { [string]$lock.assets.uv.archive_entry } else { $script:DefaultUvArchiveEntry }
+        if ([string]::IsNullOrWhiteSpace([string]$lock.assets.uv.archive_entry)) { throw "uv archive_entry is required" }
+        $uvEntry = [string]$lock.assets.uv.archive_entry
         if ([string]$lock.assets.uv.id -notmatch '^uv-(\d+\.\d+\.\d+)-') { throw "uv asset id does not contain an exact version" }
         $uvPath = Join-Path $cache ("tools\uv-$($Matches[1])\uv.exe")
-        if (![System.IO.File]::Exists($uvPath)) {
-            Export-PortableUvExecutable -Wheel $uvWheel -ArchiveEntry $uvEntry -Destination $uvPath
-        }
+        Export-PortableUvExecutable -Wheel $uvWheel -ArchiveEntry $uvEntry -Destination $uvPath
         [System.IO.Directory]::Move($candidate, $Destination)
         return [pscustomobject]@{
             Python = [System.IO.Path]::GetFullPath((Join-Path $Destination ([string]$lock.assets.python.archive_entry)))
