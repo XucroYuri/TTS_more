@@ -11,7 +11,8 @@ Started: 2026-07-10
 - Task 4: complete (`44a9a00`..`df9da93`; final review approved, 0 findings).
 - Task 5: complete (`a108c9b`, `2f39f19`; final I1/I2 re-review fixes add
   pending-manifest reconciliation and idempotent all-port cleanup aggregation).
-- Task 6: pending.
+- Task 6: complete (`9f492f6`; application loop, shared/distributed recovery,
+  strict evidence completion, and PR #10 cross-platform fixes).
 - Task 7: pending.
 - Task 8: pending.
 
