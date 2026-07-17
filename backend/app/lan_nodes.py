@@ -39,6 +39,7 @@ _MAX_EVIDENCE_FILE_BYTES = 64 * 1024 * 1024
 _MONITOR_MAX_SECONDS = 6 * 60 * 60
 _MONITOR_MAX_ROWS = 200_000
 _MONITOR_MAX_BYTES = 64 * 1024 * 1024
+_USE_DIR_FD_EVIDENCE = os.name != "nt"
 
 
 @dataclass(frozen=True)
@@ -105,8 +106,18 @@ def _reject_symlink_components(path: Path) -> None:
             continue
         except OSError:
             raise ValueError("evidence path component is unavailable") from None
-        if stat.S_ISLNK(metadata.st_mode):
+        if _is_link_or_reparse(metadata):
             raise ValueError("evidence path contains a symlink component")
+
+
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & 0x400
+    )
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
 
 
 def _contained_path(root: Path, candidate: Path) -> Path:
@@ -416,6 +427,33 @@ if ($LASTEXITCODE -ne 0) {{ throw 'Remote deployment failed' }}
         self.executor.run_powershell(node, script, timeout=6 * 60 * 60)
 
     def start(self, node: str, remote_root: str) -> None:
+        self._start_services(node, remote_root, None)
+
+    def restart_services(
+        self,
+        node: str,
+        remote_root: str,
+        service_ids: tuple[str, ...],
+    ) -> None:
+        node = _validate_node(node)
+        root = _validate_remote_root(remote_root)
+        if self._service_roots.get(node) != root:
+            raise ValueError("worker node has no prior manager-owned service start")
+        if (
+            not isinstance(service_ids, tuple)
+            or not service_ids
+            or len(service_ids) != len(set(service_ids))
+            or any(service_id not in FORMAL_SERVICE_IDS for service_id in service_ids)
+        ):
+            raise ValueError("restart services must be unique formal service IDs")
+        self._start_services(node, remote_root, service_ids)
+
+    def _start_services(
+        self,
+        node: str,
+        remote_root: str,
+        service_ids: tuple[str, ...] | None,
+    ) -> None:
         node = _validate_node(node)
         root = _validate_remote_root(remote_root)
         topology = root / "data/local/topology.validation.json"
@@ -437,6 +475,10 @@ if ($LASTEXITCODE -ne 0) {{ throw 'Remote deployment failed' }}
         )
         start_script = root / "scripts/start-service-workers.ps1"
         remote_python = root / ".venv/Scripts/python.exe"
+        selected_services = "*" if service_ids is None else ",".join(service_ids)
+        services_parameter = (
+            "" if service_ids is None else f" -Services {_powershell_literal(selected_services)}"
+        )
         manifest_validator = r"""
 import hashlib, json, os, pathlib, stat, sys
 MAX_BYTES = 1024 * 1024
@@ -447,7 +489,7 @@ def pairs(items):
             raise ValueError("duplicate key")
         value[key] = item
     return value
-if len(sys.argv) != 5:
+if len(sys.argv) != 6:
     raise ValueError("topology-bound manifest validation required")
 root = pathlib.Path(sys.argv[1]).resolve()
 path = pathlib.Path(sys.argv[2])
@@ -507,9 +549,17 @@ if not isinstance(selected, dict) or selected.get("role") != "worker":
 expected_services = selected.get("services")
 if not isinstance(expected_services, list) or any(type(item) is not str for item in expected_services):
     raise ValueError("invalid topology services")
-expected = set(expected_services)
-if not expected or len(expected) != len(expected_services) or not expected.issubset(modules):
+topology_services = set(expected_services)
+if not topology_services or len(topology_services) != len(expected_services) or not topology_services.issubset(modules):
     raise ValueError("invalid topology services")
+if sys.argv[5] == "*":
+    requested_services = expected_services
+else:
+    requested_services = sys.argv[5].split(",")
+if (not requested_services or len(requested_services) != len(set(requested_services)) or
+        any(item not in topology_services for item in requested_services)):
+    raise ValueError("invalid selected services")
+expected = set(requested_services)
 if not seen.issubset(expected):
     raise ValueError("manifest service identities do not match topology")
 result = {
@@ -570,7 +620,7 @@ function Test-OwnedServiceListener {{
   return $owners.Count -eq 1 -and [int]$owners[0] -eq [int]$Entry.pid
 }}
 function Get-StrictServiceSnapshot {{
-  $raw = @(& $python -c $manifestValidator {_powershell_literal(str(root))} {_powershell_literal(str(pid_manifest))} {_powershell_literal(str(topology))} {_powershell_literal(node)}) -join "`n"
+  $raw = @(& $python -c $manifestValidator {_powershell_literal(str(root))} {_powershell_literal(str(pid_manifest))} {_powershell_literal(str(topology))} {_powershell_literal(node)} {_powershell_literal(selected_services)}) -join "`n"
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($raw)) {{
     throw 'strict service manifest rejected; ownership manifest retained'
   }}
@@ -639,7 +689,7 @@ if (Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Le
 }}
 $startFailure = $null
 try {{
-  & {_powershell_literal(str(start_script))} -Topology {_powershell_literal(str(topology))} -Node {_powershell_literal(node)} -RepoPaths {_powershell_literal(str(repo_paths))} -PidManifest {_powershell_literal(str(pid_manifest))} -Detach
+  & {_powershell_literal(str(start_script))} -Topology {_powershell_literal(str(topology))} -Node {_powershell_literal(node)} -RepoPaths {_powershell_literal(str(repo_paths))} -PidManifest {_powershell_literal(str(pid_manifest))}{services_parameter} -Detach
   if ($LASTEXITCODE -ne 0) {{ throw 'Remote start failed' }}
 }} catch {{ $startFailure = $_ }}
 if (!(Test-Path -LiteralPath {_powershell_literal(str(pid_manifest))} -PathType Leaf)) {{
@@ -1256,7 +1306,7 @@ try {{
         node: str,
         root: PureWindowsPath,
         source: PureWindowsPath,
-    ) -> tuple[PureWindowsPath, int, str]:
+    ) -> tuple[PureWindowsPath, int, str, int]:
         token = hashlib.sha256(
             self.salt
             + b"\0evidence-snapshot\0"
@@ -1300,6 +1350,7 @@ Assert-ContainedNoReparsePath $source
 Assert-ContainedNoReparsePath $snapshot
 if (Test-Path -LiteralPath $snapshot) {{ throw 'Remote evidence snapshot already exists' }}
 $sourceItem = Get-Item -LiteralPath $source -Force -ErrorAction Stop
+$sourceMtimeNs = ([int64]$sourceItem.LastWriteTimeUtc.Ticks - 621355968000000000) * 100
 if ($sourceItem.PSIsContainer -or
     ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
     [int64]$sourceItem.Length -lt 0 -or [int64]$sourceItem.Length -gt $maxBytes) {{
@@ -1385,6 +1436,7 @@ if ($snapshotItem.PSIsContainer -or
   snapshot_path = $snapshot.Replace('\\','/')
   size = [int64]$snapshotItem.Length
   sha256 = (Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash.ToLowerInvariant()
+  source_mtime_ns = [int64]$sourceMtimeNs
 }} | ConvertTo-Json -Compress
 """
         result = self.executor.run_powershell(node, script, timeout=600)
@@ -1393,6 +1445,7 @@ if ($snapshotItem.PSIsContainer -or
             "snapshot_path",
             "size",
             "sha256",
+            "source_mtime_ns",
         }:
             raise ValueError("remote evidence snapshot JSON is invalid")
         if (
@@ -1402,9 +1455,16 @@ if ($snapshotItem.PSIsContainer -or
             or not 0 <= payload["size"] <= _MAX_EVIDENCE_FILE_BYTES
             or type(payload["sha256"]) is not str
             or not _SAFE_SHA256.fullmatch(payload["sha256"])
+            or type(payload["source_mtime_ns"]) is not int
+            or not 0 < payload["source_mtime_ns"] <= 9_223_372_036_854_775_807
         ):
             raise ValueError("remote evidence snapshot JSON is invalid")
-        return snapshot, payload["size"], payload["sha256"]
+        return (
+            snapshot,
+            payload["size"],
+            payload["sha256"],
+            payload["source_mtime_ns"],
+        )
 
     def _copy_evidence_atomically(
         self,
@@ -1414,7 +1474,19 @@ if ($snapshotItem.PSIsContainer -or
         evidence_root: Path,
         expected_size: int,
         expected_digest: str,
+        source_mtime_ns: int,
     ) -> None:
+        if not _USE_DIR_FD_EVIDENCE:
+            self._copy_evidence_atomically_portable(
+                node,
+                remote_snapshot,
+                destination,
+                evidence_root,
+                expected_size,
+                expected_digest,
+                source_mtime_ns,
+            )
+            return
         _reject_symlink_components(destination.parent)
         _contained_path(evidence_root, destination.parent)
         if destination.exists() or destination.is_symlink():
@@ -1487,6 +1559,12 @@ if ($snapshotItem.PSIsContainer -or
                 raise ValueError("local evidence size does not match remote snapshot")
             if hashlib.sha256(raw).hexdigest() != expected_digest:
                 raise ValueError("local evidence digest does not match remote snapshot")
+            os.utime(
+                temporary_name,
+                ns=(source_mtime_ns, source_mtime_ns),
+                dir_fd=staging_descriptor,
+                follow_symlinks=False,
+            )
             relative_parent = destination.parent.relative_to(evidence_root)
             destination_descriptor = os.dup(root_descriptor)
             for part in relative_parent.parts:
@@ -1564,6 +1642,114 @@ if ($snapshotItem.PSIsContainer -or
                 finally:
                     os.close(root_descriptor)
 
+    def _copy_evidence_atomically_portable(
+        self,
+        node: str,
+        remote_snapshot: PureWindowsPath,
+        destination: Path,
+        evidence_root: Path,
+        expected_size: int,
+        expected_digest: str,
+        source_mtime_ns: int,
+    ) -> None:
+        _reject_symlink_components(evidence_root)
+        _reject_symlink_components(destination.parent)
+        _contained_path(evidence_root, destination.parent)
+        try:
+            root_identity = evidence_root.lstat()
+            parent_identity = destination.parent.lstat()
+        except OSError:
+            raise ValueError("evidence destination is unavailable") from None
+        if (
+            _is_link_or_reparse(root_identity)
+            or not stat.S_ISDIR(root_identity.st_mode)
+            or _is_link_or_reparse(parent_identity)
+            or not stat.S_ISDIR(parent_identity.st_mode)
+        ):
+            raise ValueError("evidence destination identity is invalid")
+
+        staging = evidence_root / f".lan-evidence-{secrets.token_hex(16)}"
+        temporary = staging / "payload.tmp"
+        try:
+            staging.mkdir(mode=0o700)
+            staging_identity = staging.lstat()
+            if _is_link_or_reparse(staging_identity) or not stat.S_ISDIR(
+                staging_identity.st_mode
+            ):
+                raise ValueError("private evidence staging identity is invalid")
+            create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            descriptor = os.open(temporary, create_flags, 0o600)
+            initial_temp = os.fstat(descriptor)
+            os.close(descriptor)
+
+            self.executor.copy_from(node, remote_snapshot.as_posix(), temporary)
+            try:
+                with temporary.open("rb") as stream:
+                    current_temp = os.fstat(stream.fileno())
+                    if (
+                        _is_link_or_reparse(current_temp)
+                        or not stat.S_ISREG(current_temp.st_mode)
+                        or current_temp.st_nlink != 1
+                        or not _same_identity(current_temp, initial_temp)
+                    ):
+                        raise ValueError(
+                            "private evidence staging temporary was replaced"
+                        )
+                    raw = stream.read(_MAX_EVIDENCE_FILE_BYTES + 1)
+            except OSError:
+                raise ValueError(
+                    "private evidence staging temporary was replaced"
+                ) from None
+            if len(raw) != expected_size or len(raw) > _MAX_EVIDENCE_FILE_BYTES:
+                raise ValueError("local evidence size does not match remote snapshot")
+            if hashlib.sha256(raw).hexdigest() != expected_digest:
+                raise ValueError("local evidence digest does not match remote snapshot")
+            os.utime(
+                temporary,
+                ns=(source_mtime_ns, source_mtime_ns),
+                follow_symlinks=False,
+            )
+
+            _reject_symlink_components(evidence_root)
+            _reject_symlink_components(destination.parent)
+            current_root = evidence_root.lstat()
+            current_parent = destination.parent.lstat()
+            current_temp = temporary.lstat()
+            if (
+                not _same_identity(current_root, root_identity)
+                or not _same_identity(current_parent, parent_identity)
+                or not _same_identity(current_temp, initial_temp)
+                or _is_link_or_reparse(current_temp)
+                or not stat.S_ISREG(current_temp.st_mode)
+            ):
+                raise ValueError("evidence path identity changed before publication")
+            if destination.exists() or destination.is_symlink():
+                existing = destination.lstat()
+                if _is_link_or_reparse(existing) or not stat.S_ISREG(existing.st_mode):
+                    raise ValueError("evidence destination is not a regular file")
+            os.replace(temporary, destination)
+            published = destination.lstat()
+            if (
+                not _same_identity(published, initial_temp)
+                or _is_link_or_reparse(published)
+                or not stat.S_ISREG(published.st_mode)
+            ):
+                raise ValueError("atomic evidence publication identity changed")
+            _contained_path(evidence_root, destination)
+        except OSError:
+            raise ValueError("atomic evidence publication failed") from None
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                staging.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise ValueError("private evidence staging cleanup failed") from None
+
     def collect_evidence(
         self,
         node: str,
@@ -1611,8 +1797,8 @@ if ($snapshotItem.PSIsContainer -or
         for remote_path, local_path in sources:
             remote_snapshot: PureWindowsPath | None = None
             try:
-                remote_snapshot, size, digest = self._prepare_remote_evidence_snapshot(
-                    node, root, remote_path
+                remote_snapshot, size, digest, source_mtime_ns = (
+                    self._prepare_remote_evidence_snapshot(node, root, remote_path)
                 )
                 self._copy_evidence_atomically(
                     node,
@@ -1621,6 +1807,7 @@ if ($snapshotItem.PSIsContainer -or
                     canonical_output,
                     size,
                     digest,
+                    source_mtime_ns,
                 )
             finally:
                 if remote_snapshot is not None:

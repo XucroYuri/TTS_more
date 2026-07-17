@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -81,6 +83,7 @@ def _run_start_manifest_validator(
     root: Path,
     manifest: Path,
     topology: Path,
+    selected_services: str = "*",
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -91,6 +94,7 @@ def _run_start_manifest_validator(
             str(manifest),
             str(topology),
             "gpt-worker",
+            selected_services,
         ],
         capture_output=True,
         text=True,
@@ -105,6 +109,7 @@ class FakeExecutor:
         *,
         evidence_bytes: bytes = b"evidence",
         evidence_digest: str | None = None,
+        evidence_mtime_ns: int | None = None,
     ) -> None:
         self.scripts: list[tuple[str, str, int]] = []
         self.copies_to: list[tuple[str, Path, str]] = []
@@ -119,6 +124,7 @@ class FakeExecutor:
         }
         self.evidence_bytes = evidence_bytes
         self.evidence_digest = evidence_digest
+        self.evidence_mtime_ns = evidence_mtime_ns or time.time_ns()
 
     def run_powershell(
         self, alias: str, script: str, *, timeout: int = 1800
@@ -134,6 +140,7 @@ class FakeExecutor:
                         "snapshot_path": snapshot.group(1).replace("\\", "/"),
                         "size": len(self.evidence_bytes),
                         "sha256": digest,
+                        "source_mtime_ns": self.evidence_mtime_ns,
                     }
                 ),
                 "",
@@ -194,7 +201,8 @@ class ReplaceStagingExecutor(FakeExecutor):
     def copy_from(self, alias: str, remote_path: str, destination: Path) -> None:
         self.copies_from.append((alias, remote_path, destination))
         assert destination.parent.name.startswith(".lan-evidence-")
-        assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
+        if os.name != "nt":
+            assert stat.S_IMODE(destination.parent.stat().st_mode) == 0o700
         destination.unlink()
         destination.symlink_to(self.outside)
         destination.write_bytes(self.evidence_bytes)
@@ -375,6 +383,36 @@ def test_start_uses_real_worker_cli_and_controlled_pid_manifest() -> None:
     assert "-Detach" in script
     assert "Reconcile-ExactServiceProcessSet" in script
     assert "rollback completed; retry required" in script
+
+
+def test_restart_services_starts_only_selected_owned_listeners() -> None:
+    executor = FakeExecutor()
+    manager = WindowsLanNodeManager(executor, salt=b"salt")
+    manager.start("gpt-worker", r"C:\TTS\TTS_more")
+    original_manifest = manager._service_manifests["gpt-worker"][0]
+
+    manager.restart_services(
+        "gpt-worker",
+        r"C:\TTS\TTS_more",
+        ("local-gpt-sovits-main",),
+    )
+
+    script = executor.scripts[-1][1]
+    assert "-Services 'local-gpt-sovits-main'" in script
+    assert "'gpt-worker' 'local-gpt-sovits-main'" in script
+    assert manager._service_manifests["gpt-worker"][0] == original_manifest
+    assert len(manager._service_manifests["gpt-worker"]) == 2
+
+
+def test_restart_services_requires_a_prior_owned_start() -> None:
+    manager = WindowsLanNodeManager(FakeExecutor(), salt=b"salt")
+
+    with pytest.raises(ValueError, match="manager-owned service start"):
+        manager.restart_services(
+            "gpt-worker",
+            r"C:\TTS\TTS_more",
+            ("local-gpt-sovits-main",),
+        )
 
 
 def test_start_rollback_uses_only_strict_snapshot_and_owned_handles() -> None:
@@ -1004,6 +1042,68 @@ def test_collect_evidence_uses_only_controlled_remote_paths(tmp_path: Path) -> N
     assert (destination / "nvidia-smi.csv").read_bytes() == b"evidence"
     assert (destination / "local-gpt-sovits-main.log").read_bytes() == b"evidence"
     assert not list(destination.glob("*.tmp"))
+
+
+def test_collect_evidence_preserves_remote_source_timestamp_for_stale_gate(
+    tmp_path: Path,
+) -> None:
+    remote_mtime_ns = time.time_ns() - 60_000_000_000
+    executor = FakeExecutor(evidence_mtime_ns=remote_mtime_ns)
+    output = tmp_path / "run-20260713"
+    output.mkdir()
+
+    WindowsLanNodeManager(executor, salt=b"salt").collect_evidence(
+        "gpt-worker",
+        r"C:\TTS\TTS_more",
+        output,
+        ("local-gpt-sovits-main",),
+    )
+
+    published = output / "worker-logs" / "gpt-worker" / "nvidia-smi.csv"
+    assert abs(published.stat().st_mtime_ns - remote_mtime_ns) <= 1_000_000
+
+
+def test_collect_evidence_native_windows_fallback_preserves_atomic_checks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    executor = FakeExecutor()
+    output = tmp_path / "run-20260713"
+    output.mkdir()
+    monkeypatch.setattr("app.lan_nodes._USE_DIR_FD_EVIDENCE", False)
+
+    WindowsLanNodeManager(executor, salt=b"salt").collect_evidence(
+        "gpt-worker",
+        r"C:\TTS\TTS_more",
+        output,
+        ("local-gpt-sovits-main",),
+    )
+
+    destination = output / "worker-logs" / "gpt-worker"
+    assert (destination / "nvidia-smi.csv").read_bytes() == b"evidence"
+    assert not list(output.glob(".lan-evidence-*"))
+
+
+def test_native_windows_fallback_rejects_same_principal_staging_replacement(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "run-20260713"
+    output.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"before")
+    monkeypatch.setattr("app.lan_nodes._USE_DIR_FD_EVIDENCE", False)
+
+    with pytest.raises(ValueError, match="temporary|staging"):
+        WindowsLanNodeManager(
+            ReplaceStagingExecutor(outside), salt=b"salt"
+        ).collect_evidence(
+            "gpt-worker",
+            r"C:\TTS\TTS_more",
+            output,
+            ("local-gpt-sovits-main",),
+        )
+
+    assert not (output / "worker-logs" / "gpt-worker" / "nvidia-smi.csv").exists()
+    assert not list(output.glob(".lan-evidence-*"))
 
 
 def test_collect_evidence_rejects_service_and_unsafe_output(tmp_path: Path) -> None:

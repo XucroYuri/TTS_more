@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -12,18 +13,24 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 
 import httpx
 
 from app.cuda_validation import CUDAValidationRunner
 from app.lan_evidence import (
+    LanEvidenceManifest,
+    LanNodeEvidence,
     LanNodePreflight,
     LanOrchestrationPreflight,
+    assert_required_evidence,
+    write_lan_evidence,
     write_lan_preflight,
 )
 from app.lan_nodes import NodeProbe, WindowsLanNodeManager
@@ -53,6 +60,9 @@ _SERVICE_PORTS = {
     "local-indextts": 9881,
     "local-cosyvoice": 9882,
 }
+_APP_PORT = 8000
+_FRONTEND_PORT = 5173
+_MAX_LOCAL_LOG_BYTES = 64 * 1024 * 1024
 
 
 class DeploymentMode(str, Enum):
@@ -569,6 +579,426 @@ def run_core_cuda_validation(
         raise RuntimeError("LAN CUDA core validation failed")
 
 
+def _assert_fixed_loopback_port_available(port: int) -> None:
+    if port not in {_APP_PORT, _FRONTEND_PORT}:
+        raise ValueError("fixed loopback port is not approved")
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError:
+        raise RuntimeError("fixed loopback port is already in use") from None
+    finally:
+        probe.close()
+
+
+def _controlled_logs_directory(output: Path) -> Path:
+    if not output.is_absolute() or not output.is_dir() or _has_symlink_component(output):
+        raise ValueError("run output must be an absolute nonsymlinked directory")
+    logs = output / "logs"
+    if logs.exists() or logs.is_symlink():
+        if logs.is_symlink() or not logs.is_dir():
+            raise ValueError("run logs path is unsafe")
+    else:
+        logs.mkdir(mode=0o700)
+    return logs
+
+
+def _open_private_log(path: Path) -> Any:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError:
+        raise ValueError("controlled run log destination is unavailable") from None
+    return os.fdopen(descriptor, "w", encoding="utf-8")
+
+
+@contextmanager
+def control_plane(
+    services_path: Path,
+    output: Path,
+    *,
+    popen_factory: Callable[..., Any] = subprocess.Popen,
+):
+    _validate_input_file(services_path, "services registry")
+    _assert_fixed_loopback_port_available(_APP_PORT)
+    logs = _controlled_logs_directory(output)
+    backend_argv = [
+        _trusted_executable(Path(sys.executable).resolve(strict=True)),
+        "-m",
+        "uvicorn",
+        "app.main:app",
+        "--app-dir",
+        "backend",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(_APP_PORT),
+    ]
+    backend_env = {
+        **os.environ,
+        "TTS_MORE_SERVICE_MODE": "real",
+        "TTS_MORE_SERVICES_PATH": str(services_path),
+    }
+    with _open_private_log(logs / "app-backend.stdout.log") as stdout, _open_private_log(
+        logs / "app-backend.stderr.log"
+    ) as stderr:
+        process = popen_factory(
+            backend_argv,
+            cwd=REPO_ROOT,
+            env=backend_env,
+            stdout=stdout,
+            stderr=stderr,
+            shell=False,
+        )
+        try:
+            wait_http_ready(
+                f"http://127.0.0.1:{_APP_PORT}/api/health", timeout_seconds=120
+            )
+            if process.poll() is not None:
+                raise RuntimeError("application backend child exited before ownership confirmation")
+            yield process
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=15)
+
+
+def _api_headers() -> dict[str, str]:
+    token = os.environ.get("TTS_MORE_API_TOKEN")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def wait_http_ready(
+    url: str,
+    *,
+    timeout_seconds: int,
+    http_get: Callable[..., Any] = httpx.get,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
+    if not 1 <= timeout_seconds <= 3600:
+        raise ValueError("HTTP readiness timeout is outside the bounded range")
+    started = clock()
+    while clock() - started <= timeout_seconds:
+        try:
+            if http_get(url, headers=_api_headers(), timeout=5.0).is_success:
+                return
+        except (httpx.HTTPError, OSError):
+            pass
+        sleeper(min(1.0, max(0.0, timeout_seconds - (clock() - started))))
+    raise TimeoutError(f"HTTP endpoint did not become ready: {urlsplit(url).path}")
+
+
+def application_ready(*, http_get: Callable[..., Any] = httpx.get) -> bool:
+    try:
+        return bool(
+            http_get(
+                f"http://127.0.0.1:{_APP_PORT}/api/health",
+                headers=_api_headers(),
+                timeout=5.0,
+            ).is_success
+        )
+    except (httpx.HTTPError, OSError):
+        return False
+
+
+def current_service_ready(
+    service_id: str, *, http_get: Callable[..., Any] = httpx.get
+) -> bool:
+    if service_id not in _SERVICE_PORTS:
+        raise ValueError("service readiness requires a formal service ID")
+    try:
+        response = http_get(
+            f"http://127.0.0.1:{_APP_PORT}/api/services/status",
+            headers=_api_headers(),
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        services = response.json()["services"]
+        return isinstance(services, list) and any(
+            isinstance(item, dict)
+            and item.get("service_id") == service_id
+            and item.get("ready") is True
+            for item in services
+        )
+    except (httpx.HTTPError, OSError, KeyError, TypeError, ValueError):
+        return False
+
+
+def wait_service_state(
+    service_id: str,
+    *,
+    ready: bool,
+    timeout_seconds: int,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> float:
+    if not isinstance(ready, bool) or not 1 <= timeout_seconds <= 3600:
+        raise ValueError("service state wait parameters are invalid")
+    started = clock()
+    while clock() - started <= timeout_seconds:
+        if current_service_ready(service_id) is ready:
+            return clock() - started
+        sleeper(min(1.0, max(0.0, timeout_seconds - (clock() - started))))
+    raise TimeoutError(f"service {service_id} did not reach requested readiness")
+
+
+def _wait_all_services_degraded(
+    service_ids: tuple[str, ...],
+    *,
+    started: float,
+    timeout_seconds: int = 15,
+) -> float:
+    deadline = started + timeout_seconds
+    while time.monotonic() <= deadline:
+        if all(not current_service_ready(service_id) for service_id in service_ids):
+            return time.monotonic() - started
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    raise TimeoutError("all selected services did not degrade within the bounded timeout")
+
+
+def run_workstation_e2e(
+    options: LanRunOptions,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    _assert_fixed_loopback_port_available(_FRONTEND_PORT)
+    logs = _controlled_logs_directory(options.output)
+    playwright_root = options.output / "playwright"
+    playwright_root.mkdir(mode=0o700)
+    artifacts = playwright_root / "artifacts"
+    artifacts.mkdir(mode=0o700)
+    junit_path = options.output / "playwright-junit.xml"
+    if junit_path.exists() or junit_path.is_symlink():
+        raise ValueError("Playwright JUnit destination already exists")
+    started_at = time.time()
+    env = {
+        **os.environ,
+        "TTS_MORE_RUN_CUDA_E2E": "1",
+        "TTS_MORE_CUDA_VALIDATION_MODE": options.mode.value,
+        "TTS_MORE_CUDA_FIXTURE": str(options.fixture),
+        "TTS_MORE_CUDA_E2E_PROJECT_ID": f"cuda-e2e-{options.output.name}",
+        "TTS_MORE_E2E_BASE_URL": f"http://127.0.0.1:{_FRONTEND_PORT}",
+        "TTS_MORE_API_TARGET": f"http://127.0.0.1:{_APP_PORT}",
+        "PLAYWRIGHT_JUNIT_OUTPUT_FILE": str(junit_path),
+    }
+    argv = [
+        "pnpm",
+        "--dir",
+        "frontend",
+        "cuda:e2e",
+        "--",
+        "--output",
+        str(artifacts),
+    ]
+    try:
+        with _open_private_log(logs / "playwright.stdout.log") as stdout, _open_private_log(
+            logs / "playwright.stderr.log"
+        ) as stderr:
+            result = runner(
+                argv,
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=stdout,
+                stderr=stderr,
+                timeout=4 * 60 * 60,
+                check=False,
+                shell=False,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError("Playwright LAN closed loop could not complete") from None
+    if result.returncode != 0:
+        raise RuntimeError("Playwright LAN closed loop failed")
+    try:
+        metadata = junit_path.lstat()
+    except OSError:
+        raise RuntimeError("Playwright JUnit output is missing") from None
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or not 0 < metadata.st_size <= _MAX_LOCAL_LOG_BYTES
+        or metadata.st_mtime < started_at
+    ):
+        raise RuntimeError("Playwright JUnit output is invalid")
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
+    temporary = path.parent / f".{path.name}.{secrets.token_hex(16)}.tmp"
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def run_fault_recovery(
+    options: LanRunOptions,
+    policy: LanPolicy,
+    manager: WindowsLanNodeManager,
+    services_path: Path,
+    preflight_path: Path,
+    token: str,
+) -> dict[str, object]:
+    registry = ServiceRegistry.load(services_path)
+    endpoint_ports = {
+        endpoint.service_id: urlsplit(endpoint.base_url).port
+        for endpoint in registry.services
+        if endpoint.service_id in _SERVICE_PORTS
+    }
+    if endpoint_ports != _SERVICE_PORTS:
+        raise ValueError("services registry does not bind exact formal worker ports")
+    fault_node = os.environ.get("TTS_MORE_VALIDATION_FAULT_NODE") or sorted(
+        policy.workers
+    )[0]
+    if fault_node not in policy.workers:
+        raise ValueError("configured fault node is not a topology worker")
+    fault_services = tuple(
+        service_id
+        for service_id in _SERVICE_PORTS
+        if policy.service_owners.get(service_id) == fault_node
+    )
+    first_service = (
+        "local-gpt-sovits-main"
+        if policy.mode is LanMode.SHARED
+        else fault_services[0]
+    )
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "mode": policy.mode.value,
+        "fault_node": fault_node,
+        "service_id": first_service,
+        "degraded_within_seconds": None,
+        "restart_seconds": None,
+        "other_services_ready": False,
+        "all_services_degraded": None,
+        "all_services_degraded_within_seconds": None,
+        "all_services_restart_seconds": None,
+        "application_survived": False,
+        "retry_passed": False,
+        "retry_seconds": None,
+        "recovery_passed": False,
+        "recovery_seconds": None,
+    }
+    stopped_services: tuple[str, ...] = ()
+    fault_path = options.output / "fault-recovery.json"
+    primary_error: BaseException | None = None
+    try:
+        stopped_services = (first_service,)
+        manager.stop_service(fault_node, _SERVICE_PORTS[first_service])
+        report["degraded_within_seconds"] = wait_service_state(
+            first_service, ready=False, timeout_seconds=15
+        )
+        report["other_services_ready"] = all(
+            current_service_ready(service_id)
+            for service_id in policy.service_owners
+            if service_id != first_service
+        )
+        report["application_survived"] = application_ready()
+        if (
+            report["other_services_ready"] is not True
+            or report["application_survived"] is not True
+        ):
+            raise RuntimeError("LAN application fault isolation gate failed")
+        restart_started = time.monotonic()
+        manager.restart_services(
+            fault_node, options.remote_root, stopped_services
+        )
+        stopped_services = ()
+        wait_for_services(services_path, timeout_seconds=600)
+        report["restart_seconds"] = time.monotonic() - restart_started
+
+        if policy.mode is LanMode.SHARED:
+            retry_started = time.monotonic()
+            run_core_cuda_validation(
+                options,
+                services_path,
+                preflight_path,
+                token,
+                output_dir=options.output / "retry",
+            )
+            report["retry_passed"] = True
+            report["retry_seconds"] = time.monotonic() - retry_started
+            stopped_services = fault_services
+            all_outage_started = time.monotonic()
+            manager.stop_all_services(
+                fault_node, tuple(_SERVICE_PORTS[item] for item in fault_services)
+            )
+            report["all_services_degraded_within_seconds"] = (
+                _wait_all_services_degraded(
+                    fault_services,
+                    started=all_outage_started,
+                )
+            )
+            report["all_services_degraded"] = True
+            report["application_survived"] = bool(
+                report["application_survived"] and application_ready()
+            )
+            if (
+                report["all_services_degraded"] is not True
+                or report["application_survived"] is not True
+            ):
+                raise RuntimeError("LAN shared outage gate failed")
+            all_restart_started = time.monotonic()
+            manager.restart_services(
+                fault_node, options.remote_root, stopped_services
+            )
+            stopped_services = ()
+            wait_for_services(services_path, timeout_seconds=600)
+            report["all_services_restart_seconds"] = (
+                time.monotonic() - all_restart_started
+            )
+
+        recovery_started = time.monotonic()
+        run_core_cuda_validation(
+            options,
+            services_path,
+            preflight_path,
+            token,
+            output_dir=options.output / "recovery",
+        )
+        if policy.mode is LanMode.DISTRIBUTED:
+            report["retry_passed"] = True
+        report["recovery_passed"] = True
+        report["recovery_seconds"] = time.monotonic() - recovery_started
+        if policy.mode is LanMode.DISTRIBUTED:
+            report["retry_seconds"] = report["recovery_seconds"]
+        _atomic_write_json(fault_path, report)
+        if not (
+            isinstance(report["degraded_within_seconds"], (int, float))
+            and not isinstance(report["degraded_within_seconds"], bool)
+            and report["degraded_within_seconds"] <= 15
+        ):
+            raise RuntimeError("LAN fault degradation gate failed")
+        return report
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        if stopped_services:
+            try:
+                manager.restart_services(
+                    fault_node, options.remote_root, stopped_services
+                )
+                wait_for_services(services_path, timeout_seconds=600)
+            except BaseException:
+                if primary_error is None:
+                    raise
+        if primary_error is not None and not fault_path.exists():
+            try:
+                _atomic_write_json(fault_path, report)
+            except BaseException:
+                pass
+
+
 def _ensure_output_directory(output: Path) -> None:
     output.mkdir(mode=0o700, parents=False, exist_ok=False)
     output.chmod(0o700)
@@ -656,9 +1086,12 @@ class LanOrchestrator:
         cleanup_errors: list[BaseException] = []
         monitor_nodes: list[str] = []
         service_nodes: list[str] = []
+        evidence_nodes: list[str] = []
+        probes: list[NodeProbe] = []
         core_completed = False
         output_created = False
         token: str | None = None
+        run_started_at: datetime | None = None
 
         try:
             topology, policy = load_lan_policy(self.options.topology, self.options.mode)
@@ -683,10 +1116,12 @@ class LanOrchestrator:
 
             _ensure_output_directory(self.options.output)
             output_created = True
+            run_started_at = datetime.now(timezone.utc)
             logger = configure_run_logging(self.options.output)
             token = secrets.token_hex(32)
             os.environ[_ORCHESTRATION_TOKEN_ENV] = token
             manager = self.node_manager_factory(pinned_executor, salt=salt)
+            evidence_nodes.extend(policy.workers)
 
             for node in policy.workers:
                 logger.info("sync worker node=%s", node)
@@ -738,6 +1173,19 @@ class LanOrchestrator:
                 controller_identity=controller_hash,
             )
             core_completed = True
+            with control_plane(services_path, self.options.output):
+                run_workstation_e2e(
+                    self.options,
+                    runner=self.process_runner,
+                )
+                run_fault_recovery(
+                    self.options,
+                    policy,
+                    manager,
+                    services_path,
+                    preflight_path,
+                    token,
+                )
         except BaseException as error:
             primary_error = error
             if logger is not None:
@@ -753,7 +1201,7 @@ class LanOrchestrator:
                         )
                     except BaseException as error:
                         cleanup_errors.append(error)
-                for node in monitor_nodes:
+                for node in evidence_nodes:
                     try:
                         manager.collect_evidence(
                             node,
@@ -775,6 +1223,60 @@ class LanOrchestrator:
 
         if primary_error is None and cleanup_errors:
             primary_error = RuntimeError("owned LAN cleanup failed")
+        if (
+            primary_error is None
+            and policy is not None
+            and commit is not None
+            and probes
+            and run_started_at is not None
+        ):
+            try:
+                manifest = LanEvidenceManifest(
+                    schema_version=1,
+                    mode=self.options.mode.value,
+                    deployment=self.options.deployment.value,
+                    controller_commit=commit,
+                    topology_sha256=hashlib.sha256(
+                        self.options.topology.read_bytes()
+                    ).hexdigest(),
+                    fixture_sha256=hashlib.sha256(
+                        self.options.fixture.read_bytes()
+                    ).hexdigest(),
+                    service_owners=policy.service_owners,
+                    nodes={
+                        probe.node: LanNodeEvidence(
+                            commit=probe.commit,
+                            host_key_sha256=probe.host_key_sha256,
+                            machine_id_sha256=probe.machine_id_sha256,
+                            gpu_uuid_sha256=list(probe.gpu_uuid_sha256),
+                            gpu_log=f"worker-logs/{probe.node}/nvidia-smi.csv",
+                            service_logs={
+                                service_id: (
+                                    f"worker-logs/{probe.node}/{service_id}.log"
+                                )
+                                for service_id in _service_ids_for_node(
+                                    policy, probe.node
+                                )
+                            },
+                        )
+                        for probe in probes
+                    },
+                    human_review_status="pending",
+                )
+                write_lan_evidence(
+                    self.options.output / "distributed-evidence.json", manifest
+                )
+                assert_required_evidence(
+                    self.options.output,
+                    policy.service_owners,
+                    started_at=run_started_at,
+                )
+            except BaseException as error:
+                primary_error = error
+                if logger is not None:
+                    logger.error(
+                        "evidence gate failed error_type=%s", type(error).__name__
+                    )
         if primary_error is not None:
             if not output_created:
                 _ensure_output_directory(self.options.output)

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,15 +18,18 @@ from app.lan_orchestration import (
     LanRunOptions,
     controller_commit,
     controller_id_sha256,
+    control_plane,
     parse_args,
     render_external_services,
+    run_fault_recovery,
     run_core_cuda_validation,
+    run_workstation_e2e,
     validate_network_identities,
     validate_node_probes,
     wait_for_services,
     write_preflight,
 )
-from app.lan_topology import LanMode, load_lan_policy
+from app.lan_topology import LanMode, LanPolicy, load_lan_policy
 
 
 COMMIT = "a" * 40
@@ -85,6 +89,404 @@ def _options(tmp_path: Path, **overrides: object) -> LanRunOptions:
     }
     values.update(overrides)
     return LanRunOptions(**values)  # type: ignore[arg-type]
+
+
+def _write_services(path: Path) -> Path:
+    providers = {
+        "local-gpt-sovits-main": ("gpt-sovits", "gpt-sovits", 9880),
+        "local-indextts": ("indextts", "indextts", 9881),
+        "local-cosyvoice": ("cosyvoice", "cosyvoice", 9882),
+    }
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "service_id": service_id,
+                    "display_name": service_id,
+                    "engine": engine,
+                    "provider_type": provider,
+                    "api_contract": "tts-more-v1",
+                    "base_url": f"http://worker.example.test:{port}",
+                    "mode": "external",
+                    "network_scope": "lan",
+                    "managed": False,
+                    "enabled": True,
+                    "resource_group": service_id,
+                    "capabilities": ["tts", "artifact-transfer"],
+                }
+                for service_id, (engine, provider, port) in providers.items()
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+class _FakeAppProcess:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        require_kill: bool = False,
+        exit_code: int | None = None,
+    ) -> None:
+        self.events = events
+        self.require_kill = require_kill
+        self.exit_code = exit_code
+        self.wait_calls = 0
+
+    def poll(self) -> int | None:
+        return self.exit_code
+
+    def terminate(self) -> None:
+        self.events.append("terminate-child")
+
+    def kill(self) -> None:
+        self.events.append("kill-child")
+
+    def wait(self, timeout: int) -> int:
+        self.wait_calls += 1
+        self.events.append(f"wait-child:{timeout}")
+        if self.require_kill and self.wait_calls == 1:
+            raise subprocess.TimeoutExpired("uvicorn", timeout)
+        return 0
+
+
+def test_control_plane_uses_exact_argv_and_only_terminates_its_child(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    services = _write_services(tmp_path / "services.json")
+    events: list[str] = []
+    captured: dict[str, object] = {}
+    child = _FakeAppProcess(events, require_kill=True)
+
+    monkeypatch.setattr(
+        "app.lan_orchestration._assert_fixed_loopback_port_available",
+        lambda port: events.append(f"port-free:{port}"),
+    )
+    monkeypatch.setattr(
+        "app.lan_orchestration.wait_http_ready",
+        lambda *_args, **_kwargs: events.append("backend-ready"),
+    )
+
+    def popen_factory(argv: list[str], **kwargs: object) -> _FakeAppProcess:
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return child
+
+    with control_plane(services, output, popen_factory=popen_factory):
+        events.append("application-loop")
+
+    argv = captured["argv"]
+    assert isinstance(argv, list)
+    assert argv[1:] == [
+        "-m",
+        "uvicorn",
+        "app.main:app",
+        "--app-dir",
+        "backend",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+    ]
+    assert captured["shell"] is False
+    assert captured["cwd"] == Path(__file__).resolve().parents[2]
+    assert captured["env"]["TTS_MORE_SERVICE_MODE"] == "real"  # type: ignore[index]
+    assert captured["env"]["TTS_MORE_SERVICES_PATH"] == str(services)  # type: ignore[index]
+    assert events == [
+        "port-free:8000",
+        "backend-ready",
+        "application-loop",
+        "terminate-child",
+        "wait-child:15",
+        "kill-child",
+        "wait-child:15",
+    ]
+
+
+def test_control_plane_refuses_unknown_fixed_port_without_starting_or_killing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    services = _write_services(tmp_path / "services.json")
+    calls: list[str] = []
+
+    def occupied(_port: int) -> None:
+        raise RuntimeError("fixed loopback port is already in use")
+
+    monkeypatch.setattr(
+        "app.lan_orchestration._assert_fixed_loopback_port_available", occupied
+    )
+
+    with pytest.raises(RuntimeError, match="already in use"):
+        with control_plane(
+            services,
+            output,
+            popen_factory=lambda *_args, **_kwargs: calls.append("popen"),
+        ):
+            pass
+    assert calls == []
+
+
+def test_control_plane_rejects_health_from_a_process_it_did_not_start(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "run"
+    output.mkdir()
+    services = _write_services(tmp_path / "services.json")
+    events: list[str] = []
+    child = _FakeAppProcess(events, exit_code=1)
+    monkeypatch.setattr(
+        "app.lan_orchestration._assert_fixed_loopback_port_available", lambda _port: None
+    )
+    monkeypatch.setattr(
+        "app.lan_orchestration.wait_http_ready", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(RuntimeError, match="backend child exited"):
+        with control_plane(
+            services, output, popen_factory=lambda *_args, **_kwargs: child
+        ):
+            pass
+
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_mode"),
+    [
+        (LanMode.SHARED, "lan-shared"),
+        (LanMode.DISTRIBUTED, "lan-distributed"),
+    ],
+)
+def test_workstation_e2e_uses_formal_mode_environment_credentials_and_run_specific_results(
+    tmp_path: Path,
+    monkeypatch,
+    mode: LanMode,
+    expected_mode: str,
+) -> None:
+    options = _options(tmp_path, mode=mode)
+    options.output.mkdir()
+    monkeypatch.setenv("TTS_MORE_API_TOKEN", "private-api-token")
+    checked_ports: list[int] = []
+    monkeypatch.setattr(
+        "app.lan_orchestration._assert_fixed_loopback_port_available",
+        checked_ports.append,
+    )
+    captured: dict[str, object] = {}
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["argv"] = argv
+        captured.update(kwargs)
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        Path(env["PLAYWRIGHT_JUNIT_OUTPUT_FILE"]).write_text(
+            '<testsuite tests="1" failures="0"/>\n', encoding="utf-8"
+        )
+        kwargs["stdout"].write("controlled stdout\n")  # type: ignore[union-attr]
+        kwargs["stderr"].write("controlled stderr\n")  # type: ignore[union-attr]
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    run_workstation_e2e(options, runner=runner)
+
+    argv = captured["argv"]
+    assert isinstance(argv, list)
+    assert argv[:4] == ["pnpm", "--dir", "frontend", "cuda:e2e"]
+    assert "private-api-token" not in " ".join(argv)
+    assert "--output" in argv
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["TTS_MORE_API_TOKEN"] == "private-api-token"
+    assert env["TTS_MORE_CUDA_E2E_PROJECT_ID"] == "cuda-e2e-run-001"
+    assert env["TTS_MORE_CUDA_VALIDATION_MODE"] == expected_mode
+    assert Path(env["PLAYWRIGHT_JUNIT_OUTPUT_FILE"]) == (
+        options.output / "playwright-junit.xml"
+    )
+    assert checked_ports == [5173]
+    assert (options.output / "playwright-junit.xml").is_file()
+
+
+class _FaultManager:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.stopped: set[str] = set()
+
+    def stop_service(self, node: str, port: int) -> None:
+        service_id = {9880: "local-gpt-sovits-main", 9881: "local-indextts", 9882: "local-cosyvoice"}[port]
+        self.events.append(f"stop:{node}:{service_id}")
+        self.stopped.add(service_id)
+
+    def stop_all_services(self, node: str, ports: tuple[int, ...]) -> None:
+        self.events.append(f"stop-all:{node}")
+        for port in ports:
+            self.stop_service(node, port)
+
+    def restart_services(
+        self, node: str, remote_root: str, service_ids: tuple[str, ...]
+    ) -> None:
+        self.events.append(f"restart:{node}:{','.join(service_ids)}")
+        self.stopped.difference_update(service_ids)
+
+
+def _patch_fault_probes(monkeypatch, manager: _FaultManager) -> None:
+    monkeypatch.setattr(
+        "app.lan_orchestration.wait_service_state",
+        lambda service_id, *, ready, timeout_seconds: (
+            1.25 if not ready and service_id in manager.stopped else 0.5
+        ),
+    )
+    monkeypatch.setattr(
+        "app.lan_orchestration.current_service_ready",
+        lambda service_id: service_id not in manager.stopped,
+    )
+    monkeypatch.setattr("app.lan_orchestration.application_ready", lambda: True)
+    monkeypatch.setattr(
+        "app.lan_orchestration.wait_for_services",
+        lambda *_args, **_kwargs: manager.events.append("workers-ready"),
+    )
+    monkeypatch.setattr(
+        "app.lan_orchestration.run_core_cuda_validation",
+        lambda *_args, **kwargs: manager.events.append(
+            f"core:{Path(kwargs['output_dir']).name}"
+        ),
+    )
+
+
+def test_shared_fault_stops_one_then_all_exact_listeners_and_recovers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    options = _options(tmp_path)
+    options.output.mkdir()
+    services = _write_services(options.output / "services.external.json")
+    preflight = options.output / "orchestration-preflight.json"
+    preflight.write_text("{}", encoding="utf-8")
+    policy = LanPolicy(
+        LanMode.SHARED,
+        "controller",
+        ("shared-worker",),
+        {
+            "local-gpt-sovits-main": "shared-worker",
+            "local-indextts": "shared-worker",
+            "local-cosyvoice": "shared-worker",
+        },
+        1,
+        False,
+    )
+    manager = _FaultManager()
+    _patch_fault_probes(monkeypatch, manager)
+
+    report = run_fault_recovery(
+        options, policy, manager, services, preflight, "private-token"
+    )
+
+    assert report["degraded_within_seconds"] == 1.25
+    assert report["other_services_ready"] is True
+    assert report["all_services_degraded"] is True
+    assert report["application_survived"] is True
+    assert report["retry_passed"] is True
+    assert report["recovery_passed"] is True
+    assert manager.events == [
+        "stop:shared-worker:local-gpt-sovits-main",
+        "restart:shared-worker:local-gpt-sovits-main",
+        "workers-ready",
+        "core:retry",
+        "stop-all:shared-worker",
+        "stop:shared-worker:local-gpt-sovits-main",
+        "stop:shared-worker:local-indextts",
+        "stop:shared-worker:local-cosyvoice",
+        "restart:shared-worker:local-gpt-sovits-main,local-indextts,local-cosyvoice",
+        "workers-ready",
+        "core:recovery",
+    ]
+    assert "private-token" not in (options.output / "fault-recovery.json").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_distributed_fault_keeps_other_workers_ready_and_restarts_selected_node(
+    tmp_path: Path, monkeypatch
+) -> None:
+    options = _options(tmp_path, mode=LanMode.DISTRIBUTED)
+    options.output.mkdir()
+    services = _write_services(options.output / "services.external.json")
+    preflight = options.output / "orchestration-preflight.json"
+    preflight.write_text("{}", encoding="utf-8")
+    policy = LanPolicy(
+        LanMode.DISTRIBUTED,
+        "controller",
+        ("gpt-worker", "index-worker", "cosy-worker"),
+        {
+            "local-gpt-sovits-main": "gpt-worker",
+            "local-indextts": "index-worker",
+            "local-cosyvoice": "cosy-worker",
+        },
+        3,
+        True,
+    )
+    manager = _FaultManager()
+    _patch_fault_probes(monkeypatch, manager)
+    monkeypatch.setenv("TTS_MORE_VALIDATION_FAULT_NODE", "gpt-worker")
+
+    report = run_fault_recovery(
+        options, policy, manager, services, preflight, "private-token"
+    )
+
+    assert report["fault_node"] == "gpt-worker"
+    assert report["other_services_ready"] is True
+    assert report["all_services_degraded"] is None
+    assert report["recovery_passed"] is True
+    assert manager.events == [
+        "stop:gpt-worker:local-gpt-sovits-main",
+        "restart:gpt-worker:local-gpt-sovits-main",
+        "workers-ready",
+        "core:recovery",
+    ]
+
+
+def test_fault_gate_failure_restores_only_the_injected_listener(
+    tmp_path: Path, monkeypatch
+) -> None:
+    options = _options(tmp_path, mode=LanMode.DISTRIBUTED)
+    options.output.mkdir()
+    services = _write_services(options.output / "services.external.json")
+    preflight = options.output / "orchestration-preflight.json"
+    preflight.write_text("{}", encoding="utf-8")
+    policy = LanPolicy(
+        LanMode.DISTRIBUTED,
+        "controller",
+        ("gpt-worker", "index-worker", "cosy-worker"),
+        {
+            "local-gpt-sovits-main": "gpt-worker",
+            "local-indextts": "index-worker",
+            "local-cosyvoice": "cosy-worker",
+        },
+        3,
+        True,
+    )
+    manager = _FaultManager()
+    _patch_fault_probes(monkeypatch, manager)
+    monkeypatch.setenv("TTS_MORE_VALIDATION_FAULT_NODE", "gpt-worker")
+    monkeypatch.setattr("app.lan_orchestration.application_ready", lambda: False)
+
+    with pytest.raises(RuntimeError, match="fault isolation"):
+        run_fault_recovery(
+            options, policy, manager, services, preflight, "private-token"
+        )
+
+    assert manager.events == [
+        "stop:gpt-worker:local-gpt-sovits-main",
+        "restart:gpt-worker:local-gpt-sovits-main",
+        "workers-ready",
+    ]
+    report = json.loads(
+        (options.output / "fault-recovery.json").read_text(encoding="utf-8")
+    )
+    assert report["application_survived"] is False
+    assert report["recovery_passed"] is False
 
 
 def test_cli_requires_explicit_deployment_mode(tmp_path: Path) -> None:
@@ -230,9 +632,14 @@ def test_options_reject_unsafe_remote_roots(tmp_path: Path, remote_root: str) ->
         _options(tmp_path, remote_root=remote_root).validate()
 
 
-def test_controller_commit_confirms_complete_clean_repository(tmp_path: Path) -> None:
+def test_controller_commit_confirms_complete_clean_repository(
+    tmp_path: Path, monkeypatch
+) -> None:
     calls: list[list[str]] = []
     outputs = iter([str(tmp_path), COMMIT, ""])
+    monkeypatch.setattr(
+        "app.lan_orchestration._trusted_executable", lambda path: str(path)
+    )
 
     def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
@@ -248,9 +655,14 @@ def test_controller_commit_confirms_complete_clean_repository(tmp_path: Path) ->
     ]
 
 
-def test_controller_commit_rejects_repository_subdirectory(tmp_path: Path) -> None:
+def test_controller_commit_rejects_repository_subdirectory(
+    tmp_path: Path, monkeypatch
+) -> None:
     subdirectory = tmp_path / "backend"
     subdirectory.mkdir()
+    monkeypatch.setattr(
+        "app.lan_orchestration._trusted_executable", lambda path: str(path)
+    )
 
     def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, 0, str(tmp_path), "")
@@ -274,6 +686,9 @@ def test_controller_identity_hashes_raw_uuid_without_exposing_it(monkeypatch) ->
         )
 
     monkeypatch.setattr("app.lan_orchestration.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "app.lan_orchestration._trusted_executable", lambda path: str(path)
+    )
     digest = controller_id_sha256(b"s" * 32, process_runner=runner)
     assert digest == hashlib.sha256(b"s" * 32 + b"\0" + raw_uuid.encode()).hexdigest()
     assert raw_uuid not in digest
@@ -646,6 +1061,32 @@ def _patch_orchestration_dependencies(monkeypatch, events: list[str], *, fail_co
 
     monkeypatch.setattr("app.lan_orchestration.run_core_cuda_validation", core)
 
+    @contextmanager
+    def application(*_args: object, **_kwargs: object):
+        events.append("application-start")
+        try:
+            yield object()
+        finally:
+            events.append("application-stop")
+
+    monkeypatch.setattr("app.lan_orchestration.control_plane", application)
+    monkeypatch.setattr(
+        "app.lan_orchestration.run_workstation_e2e",
+        lambda *_args, **_kwargs: events.append("playwright"),
+    )
+    monkeypatch.setattr(
+        "app.lan_orchestration.run_fault_recovery",
+        lambda *_args, **_kwargs: events.append("fault-recovery") or {"recovery_passed": True},
+    )
+    monkeypatch.setattr(
+        "app.lan_orchestration.write_lan_evidence",
+        lambda *_args, **_kwargs: events.append("evidence-manifest"),
+    )
+    monkeypatch.setattr(
+        "app.lan_orchestration.assert_required_evidence",
+        lambda *_args, **_kwargs: events.append("evidence-gate"),
+    )
+
 
 def test_orchestrator_has_no_skip_path_and_cleans_owned_processes(
     tmp_path: Path, monkeypatch
@@ -679,9 +1120,15 @@ def test_orchestrator_has_no_skip_path_and_cleans_owned_processes(
         "probe-validation",
         "preflight",
         "core",
+        "application-start",
+        "playwright",
+        "fault-recovery",
+        "application-stop",
         "monitor-stop:gpu-worker",
         "collect:gpu-worker",
         "services-stop:gpu-worker",
+        "evidence-manifest",
+        "evidence-gate",
     ]
     assert "TTS_MORE_ORCHESTRATION_TOKEN" not in os.environ
 
@@ -779,6 +1226,32 @@ def test_ambiguous_worker_start_still_attempts_owned_service_cleanup(
     ]
 
 
+def test_sync_failure_still_attempts_evidence_for_every_policy_worker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    options = _options(tmp_path)
+    events: list[str] = []
+    _patch_orchestration_dependencies(monkeypatch, events, fail_core=False)
+
+    class FailedSyncManager(_FakeManager):
+        def sync_checkout(self, node: str, remote_root: str, commit: str) -> None:
+            self.events.append(f"sync-failed:{node}")
+            raise RuntimeError("remote sync failed")
+
+    manager = FailedSyncManager(events)
+    orchestrator = LanOrchestrator(
+        options,
+        executor=_FakeExecutor(events),
+        node_manager_factory=lambda *_args, **_kwargs: manager,
+        process_runner=lambda *_args, **_kwargs: None,
+    )
+
+    assert orchestrator.run() == 1
+    assert "collect:gpu-worker" in events
+    assert "monitor-stop:gpu-worker" not in events
+    assert "services-stop:gpu-worker" not in events
+
+
 def test_launchers_are_thin_argument_forwarders() -> None:
     root = Path(__file__).resolve().parents[2]
     python_launcher = root / "scripts" / "run-lan-validation.py"
@@ -796,5 +1269,6 @@ def test_launchers_are_thin_argument_forwarders() -> None:
     combined = "\n".join((python_text, shell_text, powershell_text)).casefold()
     for forbidden in ("deploy-local-tts", "cleanrepos", "cuda-validationrunner"):
         assert forbidden not in combined
-    assert python_launcher.stat().st_mode & 0o111
-    assert shell_launcher.stat().st_mode & 0o111
+    if os.name != "nt":
+        assert python_launcher.stat().st_mode & 0o111
+        assert shell_launcher.stat().st_mode & 0o111
