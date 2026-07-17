@@ -713,7 +713,7 @@ def test_pending_new_is_removed_when_capture_fails_after_exclusive_publish(
     assert not list(target.rglob(".tts-more-*-claim-*"))
 
 
-def test_post_commit_claim_cleanup_failure_keeps_new_manifest_and_rerun_cleans_claims(
+def test_post_commit_claim_cleanup_failure_keeps_new_manifest_and_rerun_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sync = _load_sync()
@@ -742,11 +742,65 @@ def test_post_commit_claim_cleanup_failure_keeps_new_manifest_and_rerun_cleans_c
     assert manifest["source_revision"] == "f" * 40
     assert b"committed-new-state" in (target / "Start.cmd").read_bytes()
     assert list(target.rglob(".tts-more-*-claim-*"))
+    leftovers = {
+        path.relative_to(target).as_posix(): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file() and (
+            ".tts-more-" in path.name or path.name.startswith(".integration-cleanup-")
+        )
+    }
 
     monkeypatch.setattr(sync, "_commit_prior_claims", original_commit_claims)
-    sync.sync_integration(REPO_ROOT, target, "indextts", "f" * 40)
+    with pytest.raises(RuntimeError, match="manual cleanup"):
+        sync.sync_integration(REPO_ROOT, target, "indextts", "f" * 40)
 
-    assert not list(target.rglob(".tts-more-*-claim-*"))
+    assert {
+        path.relative_to(target).as_posix(): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file() and (
+            ".tts-more-" in path.name or path.name.startswith(".integration-cleanup-")
+        )
+    } == leftovers
+
+
+def test_forged_cleanup_journal_cannot_delete_user_victim(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "forged cleanup journal fork"
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "1" * 40)
+    victim = target / "tts_more" / "data" / "user" / ".tts-more-victim"
+    victim.parent.mkdir(parents=True)
+    victim.write_bytes(b"user-owned-victim")
+    manifest_path = target / "tts_more" / "integration.manifest.json"
+    journal_path = target / "tts_more" / ".integration-cleanup-forged.json"
+    state = sync._capture_regular_state(victim)
+    journal_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "manifest_digest": sync._raw_digest(manifest_path.read_bytes()),
+                "claims": {
+                    "Start.cmd": {
+                        "claim": victim.relative_to(target).as_posix(),
+                        "state": sync._state_payload(state),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    victim_bytes = victim.read_bytes()
+    journal_bytes = journal_path.read_bytes()
+
+    errors = sync.check_integration(target)
+    assert any("manual cleanup" in error for error in errors)
+    assert victim.read_bytes() == victim_bytes
+    assert journal_path.read_bytes() == journal_bytes
+
+    with pytest.raises(RuntimeError, match="manual cleanup"):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "2" * 40)
+
+    assert victim.read_bytes() == victim_bytes
+    assert journal_path.read_bytes() == journal_bytes
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")

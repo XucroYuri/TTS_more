@@ -85,7 +85,7 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
         raise ValueError(f"unsupported integration component: {component}")
     source_root = source_root.resolve(strict=True)
     target_root = Path(os.path.abspath(target_root))
-    _recover_cleanup_journals(target_root)
+    _reject_cleanup_journals(target_root)
     previous_files, previous_manifest = _read_previous_manifest(target_root)
 
     with tempfile.TemporaryDirectory(prefix="tts-more-sync-") as temporary:
@@ -599,12 +599,6 @@ def _state_payload(state: FileState) -> dict[str, object]:
     return {name: getattr(state, name) for name in state.__slots__}
 
 
-def _state_from_payload(payload: object) -> FileState:
-    if not isinstance(payload, dict):
-        raise ValueError("cleanup journal state is invalid")
-    return FileState(**{name: payload[name] for name in FileState.__slots__})
-
-
 def _persist_cleanup_journal(
     target_root: Path,
     staged_manifest: Path,
@@ -661,40 +655,23 @@ def _cleanup_committed_claims(
     return errors[-1:]
 
 
-def _recover_cleanup_journals(target_root: Path) -> None:
+def _reject_cleanup_journals(target_root: Path) -> None:
     controlled = target_root / "tts_more"
     if not _lexists(controlled):
         return
     _assert_safe_target_path(target_root, controlled, include_leaf=True)
-    manifest_path = controlled / "integration.manifest.json"
+    journals: list[Path] = []
     for journal_path in sorted(controlled.glob(".integration-cleanup-*.json")):
         _assert_safe_target_path(target_root, journal_path, include_leaf=True)
-        payload = json.loads(journal_path.read_text(encoding="utf-8"))
-        if payload.get("schema_version") != 1 or not manifest_path.is_file():
-            raise ValueError("cleanup journal is not associated with a committed manifest")
-        if payload.get("manifest_digest") != _raw_digest(manifest_path.read_bytes()):
-            raise ValueError("cleanup journal manifest digest does not match committed manifest")
-        claims = payload.get("claims")
-        if not isinstance(claims, dict):
-            raise ValueError("cleanup journal claims are invalid")
-        backups: dict[str, FileBackup] = {}
-        recovery = PublicationJournal()
-        for owned, entry in claims.items():
-            if owned != "tts_more/integration.manifest.json":
-                _validate_controlled_relative(owned)
-            if not isinstance(entry, dict) or not isinstance(entry.get("claim"), str):
-                raise ValueError("cleanup journal claim is invalid")
-            claim_relative = entry["claim"]
-            _validate_claim_relative(claim_relative)
-            claim = target_root / Path(PurePosixPath(claim_relative))
-            _assert_safe_target_path(target_root, claim, include_leaf=True)
-            state = _state_from_payload(entry.get("state"))
-            backups[owned] = FileBackup(payload=None, state=state)
-            recovery.prior_claims[owned] = claim
-        errors = _cleanup_committed_claims(target_root, backups, recovery)
-        if errors:
-            raise RuntimeError("post-commit cleanup recovery failed: " + "; ".join(errors))
-        journal_path.unlink()
+        if not _lexists(journal_path) or not stat.S_ISREG(os.lstat(journal_path).st_mode):
+            raise ValueError(f"integration cleanup journal is not a regular file: {journal_path.name}")
+        journals.append(journal_path)
+    if journals:
+        names = ", ".join(path.name for path in journals)
+        raise RuntimeError(
+            "integration cleanup journal requires manual cleanup; "
+            f"no journal content was executed: {names}"
+        )
 
 
 def _raw_digest(payload: bytes) -> str:
@@ -768,20 +745,6 @@ def _matches_payload(path: Path, expected: FileState) -> bool:
     return after.st_size == expected.size and _raw_digest(payload) == expected.digest
 
 
-def _validate_claim_relative(relative: str) -> None:
-    pure = PurePosixPath(relative)
-    if (
-        not relative
-        or relative != pure.as_posix()
-        or "\\" in relative
-        or ":" in relative
-        or pure.is_absolute()
-        or any(part in ("", ".", "..") for part in pure.parts)
-        or not pure.name.startswith(".tts-more-")
-    ):
-        raise ValueError(f"invalid cleanup claim path: {relative}")
-
-
 def _assert_backup_unchanged(path: Path, backup: FileBackup, relative: str) -> None:
     if backup.state is None:
         if _lexists(path):
@@ -829,10 +792,11 @@ def check_integration(target_root: Path) -> list[str]:
     target_root = Path(os.path.abspath(target_root))
     manifest_path = target_root / "tts_more" / "integration.manifest.json"
     try:
+        _reject_cleanup_journals(target_root)
         _assert_safe_target_path(target_root, target_root, include_leaf=True)
         _assert_safe_target_path(target_root, target_root / "tts_more", include_leaf=True)
         _assert_safe_target_path(target_root, manifest_path, include_leaf=True)
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         return [str(exc)]
     if not _lexists(manifest_path):
         return ["integration manifest is missing"]
