@@ -1566,7 +1566,7 @@ if ($snapshotItem.PSIsContainer -or
             os.close(temporary_descriptor)
             staging_path = evidence_root / staging_name / temporary_name
             self.executor.copy_from(node, remote_snapshot.as_posix(), staging_path)
-            read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            read_flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
             try:
                 descriptor = os.open(
                     temporary_name, read_flags, dir_fd=staging_descriptor
@@ -1583,7 +1583,12 @@ if ($snapshotItem.PSIsContainer -or
                             "private evidence staging temporary was replaced"
                         )
                     raw = stream.read(_MAX_EVIDENCE_FILE_BYTES + 1)
-                    _set_open_file_timestamp(stream, source_mtime_ns)
+                    try:
+                        _set_open_file_timestamp(stream, source_mtime_ns)
+                    except OSError:
+                        raise ValueError(
+                            "remote evidence timestamp could not be preserved"
+                        ) from None
             except OSError:
                 raise ValueError(
                     "private evidence staging temporary was replaced"
@@ -1711,7 +1716,7 @@ if ($snapshotItem.PSIsContainer -or
 
             self.executor.copy_from(node, remote_snapshot.as_posix(), temporary)
             try:
-                with temporary.open("rb") as stream:
+                with temporary.open("r+b") as stream:
                     current_temp = os.fstat(stream.fileno())
                     if (
                         _is_link_or_reparse(current_temp)
@@ -1723,7 +1728,12 @@ if ($snapshotItem.PSIsContainer -or
                             "private evidence staging temporary was replaced"
                         )
                     raw = stream.read(_MAX_EVIDENCE_FILE_BYTES + 1)
-                    _set_open_file_timestamp(stream, source_mtime_ns)
+                    try:
+                        _set_open_file_timestamp(stream, source_mtime_ns)
+                    except OSError:
+                        raise ValueError(
+                            "remote evidence timestamp could not be preserved"
+                        ) from None
             except OSError:
                 raise ValueError(
                     "private evidence staging temporary was replaced"
