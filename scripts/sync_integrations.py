@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Iterable
@@ -60,11 +63,12 @@ class FileBackup:
 
 
 class PublicationJournal:
-    __slots__ = ("published", "removed")
+    __slots__ = ("published", "removed", "prior_claims")
 
     def __init__(self) -> None:
         self.published: dict[str, FileState] = {}
         self.removed: set[str] = set()
+        self.prior_claims: dict[str, Path] = {}
 
 
 def sha256_file(path: Path) -> str:
@@ -341,6 +345,7 @@ def _publish_transaction(
                 target_root / Path(PurePosixPath(relative)),
                 include_leaf=True,
             )
+        _commit_prior_claims(target_root, backups, journal)
     except BaseException as original:
         rollback_errors = _rollback_publication(target_root, backups, journal, prior_paths)
         if rollback_errors:
@@ -361,9 +366,12 @@ def _rollback_publication(
         path = target_root / Path(PurePosixPath(relative))
         try:
             _assert_safe_target_path(target_root, path, include_leaf=True)
-            if not _matches_state(path, journal.published[relative]):
+            claim = _allocate_claim_path(path.parent, ".tts-more-rollback-claim-")
+            _rename_no_replace(path, claim)
+            if not _matches_state(claim, journal.published[relative]):
+                _rename_no_replace(claim, path)
                 raise ValueError(f"published path identity changed before rollback: {relative}")
-            path.unlink()
+            claim.unlink()
             _assert_safe_target_path(target_root, path, include_leaf=True)
             _remove_empty_parents(path.parent, target_root)
         except BaseException as exc:
@@ -373,18 +381,27 @@ def _rollback_publication(
         try:
             _assert_safe_target_path(target_root, path, include_leaf=True)
             if relative in journal.published:
-                if not _matches_state(path, journal.published[relative]):
+                current_claim = _allocate_claim_path(path.parent, ".tts-more-rollback-current-")
+                _rename_no_replace(path, current_claim)
+                if not _matches_state(current_claim, journal.published[relative]):
+                    _rename_no_replace(current_claim, path)
                     raise ValueError(f"published path identity changed before rollback: {relative}")
-                if backup.payload is None:
-                    path.unlink()
-                    _remove_empty_parents(path.parent, target_root)
-                else:
-                    _write_bytes_atomically(target_root, path, backup.payload)
+                current_claim.unlink()
+                prior_claim = journal.prior_claims.get(relative)
+                if prior_claim is None:
+                    raise RuntimeError(f"prior claim is missing during rollback: {relative}")
+                _rename_no_replace(prior_claim, path)
+                if backup.state is None or not _matches_state(path, backup.state):
+                    raise RuntimeError(f"restored prior identity differs after rollback: {relative}")
             elif relative in journal.removed:
                 if _lexists(path):
                     raise ValueError(f"removed path was externally recreated before rollback: {relative}")
-                if backup.payload is not None:
-                    _write_new_bytes_exclusively(target_root, path, backup.payload)
+                prior_claim = journal.prior_claims.get(relative)
+                if prior_claim is None:
+                    raise RuntimeError(f"removed prior claim is missing during rollback: {relative}")
+                _rename_no_replace(prior_claim, path)
+                if backup.state is None or not _matches_state(path, backup.state):
+                    raise RuntimeError(f"restored removed identity differs after rollback: {relative}")
             else:
                 _assert_backup_unchanged(path, backup, relative)
             _assert_safe_target_path(target_root, path, include_leaf=True)
@@ -409,6 +426,7 @@ def _publish_file(
     temporary = Path(temporary_name)
     try:
         shutil.copy2(source, temporary)
+        expected = _capture_regular_state(temporary)
         _assert_safe_target_path(target_root, destination, include_leaf=True)
         if backup is None:
             if _lexists(destination):
@@ -416,9 +434,17 @@ def _publish_file(
             _publish_temp_exclusively(temporary, destination)
         else:
             _assert_backup_unchanged(destination, backup, relative)
-            os.replace(temporary, destination)
-        state = _capture_regular_state(destination)
-        journal.published[relative] = state
+            claim = _allocate_claim_path(destination.parent, ".tts-more-prior-claim-")
+            _rename_no_replace(destination, claim)
+            if backup.state is None or not _matches_state(claim, backup.state):
+                _rename_no_replace(claim, destination)
+                raise RuntimeError(f"prior controlled file changed during atomic claim: {relative}")
+            journal.prior_claims[relative] = claim
+            _publish_temp_exclusively(temporary, destination)
+        actual = _capture_regular_state(destination)
+        if actual.size != expected.size or actual.digest != expected.digest:
+            raise RuntimeError(f"published file identity differs from staged source: {relative}")
+        journal.published[relative] = actual
         _assert_safe_target_path(target_root, destination, include_leaf=True)
     finally:
         temporary.unlink(missing_ok=True)
@@ -470,7 +496,58 @@ def _publish_temp_exclusively(temporary: Path, destination: Path) -> None:
             raise
     # On Windows os.rename maps to MoveFileW without replace-existing flags.
     # It is atomic on the same volume and fails if a racing destination exists.
-    os.rename(temporary, destination)
+    _rename_no_replace(temporary, destination)
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    if os.name == "nt":
+        os.rename(source, destination)
+        return
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(errno.ENOTSUP, "renameat2(RENAME_NOREPLACE) is unavailable")
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,
+            os.fsencode(source),
+            -100,
+            os.fsencode(destination),
+            1,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            if error == errno.EEXIST:
+                raise FileExistsError(error, os.strerror(error), destination)
+            raise OSError(error, os.strerror(error), source, destination)
+        return
+    raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable on this platform")
+
+
+def _allocate_claim_path(parent: Path, prefix: str) -> Path:
+    handle, name = tempfile.mkstemp(prefix=prefix, dir=parent)
+    os.close(handle)
+    claim = Path(name)
+    claim.unlink()
+    return claim
+
+
+def _commit_prior_claims(
+    target_root: Path,
+    backups: dict[str, FileBackup],
+    journal: PublicationJournal,
+) -> None:
+    for relative, claim in sorted(journal.prior_claims.items()):
+        _assert_safe_target_path(target_root, claim, include_leaf=True)
+        backup = backups[relative]
+        if backup.state is None or not _matches_state(claim, backup.state):
+            raise RuntimeError(f"prior claim changed before commit: {relative}")
+        claim.unlink()
+        _assert_safe_target_path(target_root, claim, include_leaf=True)
+        if relative in journal.removed:
+            _remove_empty_parents(claim.parent, target_root)
 
 
 def _raw_digest(payload: bytes) -> str:
@@ -478,10 +555,19 @@ def _raw_digest(payload: bytes) -> str:
 
 
 def _capture_regular_state(path: Path) -> FileState:
-    metadata = os.lstat(path)
-    if not stat.S_ISREG(metadata.st_mode) or _is_reparse(path):
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or _is_reparse(path):
         raise ValueError(f"controlled path is not a regular non-reparse file: {path}")
     payload = path.read_bytes()
+    metadata = os.lstat(path)
+    if (
+        before.st_dev != metadata.st_dev
+        or before.st_ino != metadata.st_ino
+        or before.st_size != metadata.st_size
+        or before.st_mtime_ns != metadata.st_mtime_ns
+        or getattr(before, "st_file_attributes", 0) != getattr(metadata, "st_file_attributes", 0)
+    ):
+        raise RuntimeError(f"controlled path changed while capturing identity: {path}")
     return FileState(
         device=metadata.st_dev,
         inode=metadata.st_ino,
@@ -510,7 +596,10 @@ def _matches_state(path: Path, expected: FileState) -> bool:
         actual = _capture_regular_state(path)
     except (OSError, ValueError):
         return False
-    return actual == expected
+    fields = ("device", "inode", "size", "modified_ns", "attributes", "digest")
+    if os.name != "nt":
+        fields += ("mode",)
+    return all(getattr(actual, name) == getattr(expected, name) for name in fields)
 
 
 def _assert_backup_unchanged(path: Path, backup: FileBackup, relative: str) -> None:
@@ -532,7 +621,12 @@ def _remove_owned_file(
     _assert_safe_target_path(target_root, path, include_leaf=True)
     _assert_backup_unchanged(path, backup, relative)
     if backup.state is not None:
-        path.unlink()
+        claim = _allocate_claim_path(path.parent, ".tts-more-removed-claim-")
+        _rename_no_replace(path, claim)
+        if not _matches_state(claim, backup.state):
+            _rename_no_replace(claim, path)
+            raise RuntimeError(f"controlled file changed during removal claim: {relative}")
+        journal.prior_claims[relative] = claim
         journal.removed.add(relative)
     _assert_safe_target_path(target_root, path, include_leaf=True)
     _remove_empty_parents(path.parent, target_root)

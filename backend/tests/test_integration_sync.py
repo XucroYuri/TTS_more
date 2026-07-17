@@ -543,6 +543,123 @@ def test_new_publication_uses_windows_no_replace_fallback_when_hardlinks_are_una
     assert sync.check_integration(target) == []
 
 
+def test_external_replacement_after_exclusive_publish_survives_failed_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "post publish replacement fork"
+    original_publish = sync._publish_file
+    external_path: Path | None = None
+
+    def replace_after_publish(
+        source: Path, destination: Path, target_root: Path, backup: object, journal: object
+    ) -> None:
+        nonlocal external_path
+        original_publish(source, destination, target_root, backup, journal)
+        if external_path is None:
+            destination.write_bytes(b"external-after-exclusive-publish")
+            external_path = destination
+            raise OSError("injected after exclusive publication")
+
+    monkeypatch.setattr(sync, "_publish_file", replace_after_publish)
+
+    with pytest.raises(Exception, match="publication|rollback"):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "6" * 40)
+
+    assert external_path is not None
+    assert external_path.read_bytes() == b"external-after-exclusive-publish"
+
+
+def test_external_replacement_survives_rollback_triggered_by_next_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "next publish failure fork"
+    original_publish = sync._publish_file
+    external_path: Path | None = None
+    calls = 0
+
+    def replace_then_fail_next(
+        source: Path, destination: Path, target_root: Path, backup: object, journal: object
+    ) -> None:
+        nonlocal external_path, calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected next publication failure")
+        original_publish(source, destination, target_root, backup, journal)
+        destination.write_bytes(b"external-before-next-failure")
+        external_path = destination
+
+    monkeypatch.setattr(sync, "_publish_file", replace_then_fail_next)
+
+    with pytest.raises(Exception, match="next publication|rollback"):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "7" * 40)
+
+    assert external_path is not None
+    assert external_path.read_bytes() == b"external-before-next-failure"
+
+
+def test_prior_file_changed_after_guard_is_atomically_claimed_and_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "prior guard race fork"
+    sync.sync_integration(REPO_ROOT, target, "indextts", "8" * 40)
+    start = target / "Start.cmd"
+    original_guard = sync._assert_backup_unchanged
+    injected = False
+
+    def change_after_guard(path: Path, backup: object, relative: str) -> None:
+        nonlocal injected
+        original_guard(path, backup, relative)
+        if relative == "Start.cmd" and not injected:
+            injected = True
+            path.write_bytes(b"external-after-prior-guard")
+
+    monkeypatch.setattr(sync, "_assert_backup_unchanged", change_after_guard)
+
+    with pytest.raises(Exception):
+        sync.sync_integration(REPO_ROOT, target, "indextts", "9" * 40)
+
+    assert start.read_bytes() == b"external-after-prior-guard"
+
+
+def test_external_write_after_rollback_identity_check_is_not_unlinked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "rollback post-check race fork"
+    original_publish = sync._publish_file
+    original_matches = sync._matches_state
+    published_path: Path | None = None
+    injected = False
+
+    def fail_after_publish(
+        source: Path, destination: Path, target_root: Path, backup: object, journal: object
+    ) -> None:
+        nonlocal published_path
+        original_publish(source, destination, target_root, backup, journal)
+        published_path = destination
+        raise OSError("trigger rollback post-check race")
+
+    def inject_after_check(path: Path, expected: object) -> bool:
+        nonlocal injected
+        result = original_matches(path, expected)
+        if result and not injected and published_path is not None:
+            injected = True
+            published_path.write_bytes(b"external-after-rollback-check")
+        return result
+
+    monkeypatch.setattr(sync, "_publish_file", fail_after_publish)
+    monkeypatch.setattr(sync, "_matches_state", inject_after_check)
+
+    with pytest.raises(Exception, match="rollback"):
+        sync.sync_integration(REPO_ROOT, target, "cosyvoice", "a" * 40)
+
+    assert published_path is not None
+    assert published_path.read_bytes() == b"external-after-rollback-check"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
 def test_racing_junction_failure_keeps_outside_and_rolls_back_other_new_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
