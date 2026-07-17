@@ -14,6 +14,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "windows-gpu-validation.yml"
+MACOS_LAN_WORKFLOW = ROOT / ".github" / "workflows" / "macos-lan-gpu-validation.yml"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 PLAYWRIGHT_SPEC = ROOT / "frontend" / "e2e" / "cuda-workstation.spec.ts"
 PLAYWRIGHT_FIXTURE_HELPER = ROOT / "frontend" / "e2e" / "cuda-fixture.ts"
@@ -27,6 +28,7 @@ CUDA_REGISTER = ROOT / "scripts" / "register-cuda-validation-process.ps1"
 CUDA_DISTRIBUTED_CLEANUP = ROOT / "scripts" / "cleanup-distributed-cuda-validation-processes.ps1"
 CUDA_GPU_MONITOR_START = ROOT / "scripts" / "start-cuda-gpu-monitor.ps1"
 CUDA_GPU_MONITOR_STOP = ROOT / "scripts" / "stop-cuda-gpu-monitor.ps1"
+LAN_ORCHESTRATOR = ROOT / "backend" / "app" / "lan_orchestration.py"
 
 
 def _read(path: Path) -> str:
@@ -36,6 +38,10 @@ def _read(path: Path) -> str:
 
 def _workflow_payload() -> dict[str, object]:
     return yaml.load(_read(WORKFLOW), Loader=yaml.BaseLoader)
+
+
+def _macos_lan_workflow_payload() -> dict[str, object]:
+    return yaml.load(_read(MACOS_LAN_WORKFLOW), Loader=yaml.BaseLoader)
 
 
 def _powershell_function(source: str, name: str) -> str:
@@ -618,11 +624,127 @@ def test_playwright_distinguishes_both_lan_modes() -> None:
     assert '"single-clean", "single-release", "lan-shared"' in spec
 
 
-def test_macos_lan_workflow_is_manual_only() -> None:
-    workflow = _read(ROOT / ".github" / "workflows" / "macos-lan-gpu-validation.yml")
+def test_macos_lan_workflow_has_strict_manual_atomic_validation_contract() -> None:
+    workflow = _macos_lan_workflow_payload()
+    triggers = workflow["on"]
+    dispatch = triggers["workflow_dispatch"]
+    inputs = dispatch["inputs"]
+    job = workflow["jobs"]["validate"]
 
-    assert "workflow_dispatch:" in workflow
-    assert "release:" not in workflow
-    assert "[self-hosted, macOS, tts-more-lan-controller]" in workflow
-    assert "scripts/run-lan-validation.sh" in workflow
-    assert "--deployment" in workflow
+    assert set(triggers) == {"workflow_dispatch"}
+    assert set(dispatch) == {"inputs"}
+    assert {
+        name: {
+            key: value
+            for key, value in input_definition.items()
+            if key in {"type", "required", "default", "options"}
+        }
+        for name, input_definition in inputs.items()
+    } == {
+        "mode": {
+            "type": "choice",
+            "required": "true",
+            "options": ["lan-shared", "lan-distributed"],
+        },
+        "deployment": {
+            "type": "choice",
+            "required": "true",
+            "options": ["clean", "release"],
+        },
+        "topology": {"type": "string", "required": "true"},
+        "fixture": {"type": "string", "required": "true"},
+        "ssh_config": {"type": "string", "required": "true"},
+        "remote_root": {"type": "string", "required": "true"},
+        "require_baseline": {
+            "type": "boolean",
+            "required": "true",
+            "default": "false",
+        },
+    }
+    assert workflow["concurrency"] == {
+        "group": "macos-lan-gpu-validation-tts-more-cluster",
+        "cancel-in-progress": "false",
+    }
+    assert job["runs-on"] == ["self-hosted", "macOS", "tts-more-lan-controller"]
+    assert {
+        key: job["env"][key]
+        for key in (
+            "VALIDATION_MODE",
+            "DEPLOYMENT",
+            "TOPOLOGY",
+            "FIXTURE",
+            "SSH_CONFIG",
+            "REMOTE_ROOT",
+            "REQUIRE_BASELINE",
+        )
+    } == {
+        "VALIDATION_MODE": "${{ inputs.mode }}",
+        "DEPLOYMENT": "${{ inputs.deployment }}",
+        "TOPOLOGY": "${{ inputs.topology }}",
+        "FIXTURE": "${{ inputs.fixture }}",
+        "SSH_CONFIG": "${{ inputs.ssh_config }}",
+        "REMOTE_ROOT": "${{ inputs.remote_root }}",
+        "REQUIRE_BASELINE": "${{ inputs.require_baseline }}",
+    }
+
+    steps = job["steps"]
+    validation_steps = [step for step in steps if step.get("id") == "validation"]
+    assert len(validation_steps) == 1
+    validation = validation_steps[0]
+    validation_run = validation["run"]
+    assert validation["shell"] == "bash"
+    assert validation_run.count("scripts/run-lan-validation.sh") == 1
+    for flag, variable in (
+        ("--mode", "VALIDATION_MODE"),
+        ("--deployment", "DEPLOYMENT"),
+        ("--topology", "TOPOLOGY"),
+        ("--fixture", "FIXTURE"),
+        ("--ssh-config", "SSH_CONFIG"),
+        ("--remote-root", "REMOTE_ROOT"),
+        ("--output", "RAW_OUTPUT"),
+    ):
+        assert f'{flag} "${variable}"' in validation_run
+    assert 'arguments+=(--require-baseline)' in validation_run
+    assert 'scripts/run-lan-validation.sh "${arguments[@]}"' in validation_run
+    executable_playwright = re.compile(
+        r"(?m)^\s*pnpm\s+--dir\s+frontend\s+cuda:e2e(?:\s|$)"
+    )
+    assert not any(
+        executable_playwright.search(step.get("run", "")) for step in steps
+    )
+
+    finalizer = next(step for step in steps if step.get("id") == "finalize-evidence")
+    finalizer_run = finalizer["run"]
+    assert finalizer["if"] == "${{ always() }}"
+    assert finalizer_run.count("scripts/sanitize-cuda-evidence.py") == 2
+    assert '--raw "$RAW_OUTPUT"' in finalizer_run
+    assert '--output "$SANITIZED_OUTPUT"' in finalizer_run
+    assert '--core-outcome "${{ steps.validation.outcome }}"' in finalizer_run
+    assert '--playwright-outcome "${{ steps.validation.outcome }}"' in finalizer_run
+
+    uploads = [
+        step
+        for step in steps
+        if step.get("uses") == "actions/upload-artifact@v7"
+    ]
+    assert len(uploads) == 1
+    upload = uploads[0]
+    assert upload["if"] == "${{ always() }}"
+    assert upload["with"]["path"] == "${{ env.SANITIZED_OUTPUT }}"
+    assert upload["with"]["retention-days"] == "30"
+    assert "RAW_OUTPUT" not in upload["with"]["path"]
+
+    orchestrator = _read(LAN_ORCHESTRATOR)
+    orchestration_loop = orchestrator[orchestrator.index("class LanOrchestrator:") :]
+    control_plane_index = orchestration_loop.index(
+        "with control_plane(services_path, self.options.output):"
+    )
+    playwright_index = orchestration_loop.index(
+        "run_workstation_e2e(", control_plane_index
+    )
+    recovery_index = orchestration_loop.index(
+        "run_fault_recovery(", playwright_index
+    )
+    assert control_plane_index < playwright_index < recovery_index
+    assert 'junit_path = options.output / "playwright-junit.xml"' in orchestrator
+    assert '"PLAYWRIGHT_JUNIT_OUTPUT_FILE": str(junit_path)' in orchestrator

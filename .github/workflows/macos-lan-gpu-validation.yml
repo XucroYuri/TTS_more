@@ -35,6 +35,10 @@ on:
         default: false
         type: boolean
 
+concurrency:
+  group: macos-lan-gpu-validation-tts-more-cluster
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
