@@ -86,6 +86,41 @@ function Assert-PortableNotCancelled {
     }
 }
 
+function Publish-PortableRuntimeTransaction {
+    param(
+        [Parameter(Mandatory = $true)][string]$Staging,
+        [Parameter(Mandatory = $true)][string]$Live,
+        [Parameter(Mandatory = $true)][string]$Backup,
+        [Parameter(Mandatory = $true)][scriptblock]$CommitState
+    )
+
+    if (Test-Path -LiteralPath $Backup) { Remove-Item -LiteralPath $Backup -Recurse -Force }
+    $previousMoved = $false
+    try {
+        if (Test-Path -LiteralPath $Live) {
+            Move-Item -LiteralPath $Live -Destination $Backup
+            $previousMoved = $true
+        }
+        Move-Item -LiteralPath $Staging -Destination $Live
+        & $CommitState
+    }
+    catch {
+        $failure = $_
+        try {
+            if (Test-Path -LiteralPath $Live) { Remove-Item -LiteralPath $Live -Recurse -Force }
+            if ($previousMoved -and (Test-Path -LiteralPath $Backup)) {
+                Move-Item -LiteralPath $Backup -Destination $Live
+            }
+        }
+        catch { Write-Warning "runtime rollback encountered a secondary failure: $($_.Exception.Message)" }
+        throw $failure
+    }
+    if ($previousMoved -and (Test-Path -LiteralPath $Backup)) {
+        try { Remove-Item -LiteralPath $Backup -Recurse -Force }
+        catch { Write-Warning "committed runtime is valid, but previous runtime cleanup failed: $($_.Exception.Message)" }
+    }
+}
+
 Assert-PortableNotCancelled
 
 foreach ($required in @($RuntimeLock, $ModelLock, (Join-Path $BackendRoot "uv.lock"), (Join-Path $Root "scripts\portable_install.py"), (Join-Path $Root "scripts\portable-python.ps1"))) {
@@ -127,12 +162,17 @@ ConvertTo-Json -InputObject $videoControllers | Set-Content -LiteralPath $contro
 
 . (Join-Path $Root "scripts\portable-python.ps1")
 if (Test-Path -LiteralPath $Staging) { Remove-Item -LiteralPath $Staging -Recurse -Force }
-$PortableRuntime = Install-PortablePythonRuntime `
-    -PackageRoot $Root `
-    -RuntimeLock $RuntimeLock `
-    -Destination $Staging `
-    -OperationRoot $OperationRoot `
-    -CancelFile $CancelFile
+try {
+    $PortableRuntime = Install-PortablePythonRuntime `
+        -PackageRoot $Root `
+        -RuntimeLock $RuntimeLock `
+        -Destination $Staging `
+        -OperationRoot $OperationRoot `
+        -CancelFile $CancelFile
+}
+catch [System.OperationCanceledException] {
+    exit 20
+}
 Assert-PortableNotCancelled
 
 & $PortableRuntime.Python -c "import sys; expected=tuple(map(int,sys.argv[1].split('.'))); raise SystemExit(0 if sys.version_info[:3] == expected else 1)" $ExpectedPython
@@ -171,14 +211,11 @@ if ($LASTEXITCODE -ne 0) { throw "uv pip check failed in temporary runtime" }
 & $PortableRuntime.Python -c $ImportProbe
 if ($LASTEXITCODE -ne 0) { throw "core import probe failed in temporary runtime" }
 
-$backup = Join-Path $Root "runtime\previous"
-if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
-if (Test-Path -LiteralPath $Live) { Move-Item -LiteralPath $Live -Destination $backup }
-Move-Item -LiteralPath $Staging -Destination $Live
-if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
-
 $runtimeSha = Get-PortableFileSha256 -Path $RuntimeLock
 $modelSha = Get-PortableFileSha256 -Path $ModelLock
-& (Join-Path $Live "python.exe") (Join-Path $Root "scripts\portable_install.py") write-state --path $StatePath --component tts-more --build-id $BuildId --profile $selected --runtime-lock-sha256 $runtimeSha --model-lock-sha256 $modelSha
-if ($LASTEXITCODE -ne 0) { throw "failed to commit install-state.json" }
+$backup = Join-Path $Root "runtime\previous"
+Publish-PortableRuntimeTransaction -Staging $Staging -Live $Live -Backup $backup -CommitState {
+    & (Join-Path $Live "python.exe") (Join-Path $Root "scripts\portable_install.py") write-state --path $StatePath --component tts-more --build-id $BuildId --profile $selected --runtime-lock-sha256 $runtimeSha --model-lock-sha256 $modelSha
+    if ($LASTEXITCODE -ne 0) { throw "failed to commit install-state.json" }
+}
 Write-Host "TTS More portable initialization completed."

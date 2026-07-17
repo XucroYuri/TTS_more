@@ -8,7 +8,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $ExpectedComponents = @("tts-more", "gpt-sovits", "indextts", "cosyvoice")
-$AllowedEvidenceFields = @("component", "scenario", "result", "duration", "error_code")
+$AllowedEvidenceFields = @("component", "scenario", "result", "duration", "error_code", "worker_real_initialization", "controller_real_initialization", "fixture_runtime_preseeded", "direct_downloader")
 $ForbiddenEvidenceFields = @("absolute_path", "username", "hostname", "ip_address", "pid", "command", "secret", "token")
 $FixturePython = [string]$env:TTS_MORE_FIRST_RUN_PYTHON
 $FixtureBasePython = ""
@@ -71,6 +71,10 @@ function Add-Evidence {
         result = $Result
         duration = [Math]::Round([Math]::Max(0.0, $Duration), 3)
         error_code = $ErrorCode
+        worker_real_initialization = $false
+        controller_real_initialization = ($Component -eq "tts-more" -and $Scenario -eq "controller_real_initialize")
+        fixture_runtime_preseeded = ($Component -ne "tts-more")
+        direct_downloader = ($Component -ne "tts-more" -and $Scenario -in @("interruption", "resume", "proxy_fallback", "corruption_repair"))
     }
     $names = @($record.Keys | Sort-Object)
     $expected = @($AllowedEvidenceFields | Sort-Object)
@@ -1062,7 +1066,8 @@ function Invoke-PackageAcceptance {
         else { Throw-HarnessError "FIXTURE_SERVER_FAILED" "fixture asset server proxy probe failed unexpectedly" }
     }
 
-    Invoke-Scenario -Component $component -Scenario "initialize" -Action {
+    $initializeScenario = if ($component -eq "tts-more") { "controller_real_initialize" } else { "worker_fixture_lifecycle" }
+    Invoke-Scenario -Component $component -Scenario $initializeScenario -Action {
         $initialized = Invoke-RootCommand -Root $Package.Root -Name "Initialize.cmd"
         if ($initialized.ExitCode -ne 0) {
             if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("INITIALIZE_EXIT=$($initialized.ExitCode)`n$($initialized.Output)") }

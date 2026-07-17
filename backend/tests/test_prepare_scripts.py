@@ -289,7 +289,8 @@ def test_root_windows_portable_lifecycle_is_complete_and_lock_driven() -> None:
     builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
     toolchain = json.loads((REPO_ROOT / "packaging" / "portable" / "toolchain.lock.json").read_text(encoding="utf-8"))
 
-    assert "bootstrap-conda.ps1" in initialize
+    assert "portable-python.ps1" in initialize
+    assert "bootstrap-conda.ps1" not in initialize
     assert "portable_install.py" in initialize
     assert "uv lock --check" in initialize
     assert "runtime\\staging" in initialize

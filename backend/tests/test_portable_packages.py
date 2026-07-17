@@ -2255,6 +2255,29 @@ def test_tts_more_builder_stages_embedded_runtime_helper_and_audits_full_payload
     )
 
 
+def test_tts_more_full_builder_proves_staging_runtime_independence() -> None:
+    builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+
+    assert "$env:UV_CACHE_DIR" in builder
+    assert "Assert-TtsMoreFullStagingReparseBoundary" in builder
+    assert "Assert-TtsMoreFullRuntimeLinkBoundary" in builder
+    assert "GetFileInformationByHandle" in builder
+    assert "NumberOfLinks" in builder
+    assert "Test-TtsMoreFullRuntimeOnOtherVolume" in builder
+    assert "runtime_cross_volume_probe" in builder
+    assert "runtime_hardlink_scan" in builder
+    assert "runtime_reparse_scan" in builder
+
+
+def test_tts_more_full_builder_binary_scans_large_runtime_metadata_for_machine_paths() -> None:
+    builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+
+    assert "Test-PortableBinaryContainsMachinePrefix" in builder
+    assert "Encoding]::Unicode.GetBytes" in builder
+    assert "FileStream" in builder
+    assert '".pyd"' in builder and '".dll"' in builder and '".exe"' in builder
+
+
 def test_public_builders_use_embedded_sha256_helper_instead_of_get_file_hash() -> None:
     controller = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
     worker = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(

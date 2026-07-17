@@ -178,11 +178,13 @@ def test_harness_initialize_contract_uses_embedded_python_and_uv_fixtures() -> N
     assert "SHA256SUMS.txt" in script and "Write-FixtureSha256Manifest" in script
     assert "fixture-only" in script.lower()
     assert 'Invoke-RootCommand -Root $Package.Root -Name "Initialize.cmd"' in script
-    assert '-Scenario "initialize"' in script
+    assert "controller_real_initialize" in script
+    assert "worker_fixture_lifecycle" in script
     assert all(
         scenario in script
         for scenario in (
-            "initialize",
+            "controller_real_initialize",
+            "worker_fixture_lifecycle",
             "interruption",
             "resume",
             "proxy_fallback",
@@ -223,10 +225,22 @@ def test_harness_evidence_schema_is_allowlisted_and_identity_fields_are_forbidde
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
     compact = " ".join(script.split())
     assert "Assert-SanitizedEvidence" in script
-    assert '$AllowedEvidenceFields = @("component", "scenario", "result", "duration", "error_code")' in compact
+    assert "worker_real_initialization" in compact
     forbidden = ("absolute_path", "username", "hostname", "ip_address", "pid", "command", "secret", "token")
     assert all(f'"{name}"' in script for name in forbidden)
     assert "junit" in script.lower() and "acceptance.json" in script
+
+
+def test_harness_truthfully_distinguishes_controller_init_from_worker_fixture_lifecycle() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+    compact = " ".join(script.split())
+
+    assert "worker_real_initialization" in script
+    assert "controller_real_initialization" in script
+    assert "fixture_runtime_preseeded" in script
+    assert "direct_downloader" in script
+    assert '"controller_real_initialize"' in compact
+    assert '"worker_fixture_lifecycle"' in compact
 
 
 def test_harness_requires_windows_and_rejects_incomplete_package_set(tmp_path: Path) -> None:
@@ -449,10 +463,9 @@ def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_
         "indextts",
         "cosyvoice",
     }
-    expected_scenarios = {
+    shared_scenarios = {
         "package_audit",
         "path_isolation",
-        "initialize",
         "interruption",
         "resume",
         "proxy_fallback",
@@ -463,9 +476,16 @@ def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_
         "unknown_port",
     }
     for component in {record["component"] for record in records}:
-        assert {record["scenario"] for record in records if record["component"] == component} == expected_scenarios
+        initialization = "controller_real_initialize" if component == "tts-more" else "worker_fixture_lifecycle"
+        assert {record["scenario"] for record in records if record["component"] == component} == shared_scenarios | {initialization}
     assert len(records) == 44
-    assert all(set(record) == {"component", "scenario", "result", "duration", "error_code"} for record in records)
+    evidence_fields = {
+        "component", "scenario", "result", "duration", "error_code",
+        "worker_real_initialization", "controller_real_initialization",
+        "fixture_runtime_preseeded", "direct_downloader",
+    }
+    assert all(set(record) == evidence_fields for record in records)
+    assert all(record["worker_real_initialization"] is False for record in records)
     assert all(record["result"] == "pass" for record in records)
     serialized = json.dumps(records, ensure_ascii=False)
     assert not any(

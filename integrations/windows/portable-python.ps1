@@ -63,7 +63,7 @@ function Get-PortableLockedAsset {
     }
     $errors = New-Object System.Collections.Generic.List[string]
     foreach ($url in @($Asset.urls)) {
-        if (Test-PortablePythonCancelled -CancelFile $CancelFile) { throw "portable runtime installation cancelled" }
+        if (Test-PortablePythonCancelled -CancelFile $CancelFile) { throw [System.OperationCanceledException]::new("portable runtime installation cancelled") }
         $baselineExisted = [System.IO.File]::Exists($partial)
         $resumeFrom = if ($baselineExisted) { (Get-Item -LiteralPath $partial).Length } else { 0 }
         $baselineLength = $resumeFrom
@@ -102,7 +102,7 @@ function Get-PortableLockedAsset {
             try {
                 $buffer = New-Object byte[] 1048576
                 while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                    if (Test-PortablePythonCancelled -CancelFile $CancelFile) { throw "portable runtime installation cancelled" }
+                    if (Test-PortablePythonCancelled -CancelFile $CancelFile) { throw [System.OperationCanceledException]::new("portable runtime installation cancelled") }
                     $output.Write($buffer, 0, $read)
                 }
                 $output.Flush($true)
@@ -130,7 +130,7 @@ function Get-PortableLockedAsset {
                     Remove-Item -LiteralPath $partial -Force
                 }
             }
-            if ($_.Exception.Message -eq "portable runtime installation cancelled") { throw }
+            if ($_.Exception -is [System.OperationCanceledException]) { throw }
         }
         finally {
             if ($response) { $response.Dispose() }
@@ -351,6 +351,7 @@ function Install-PortablePythonRuntime {
         if ($CancelFile) { $arguments += @('--cancel-file', $CancelFile) }
         $portableInstallBootstrap = "import os,runpy,sys; script=sys.argv[1]; sys.argv=sys.argv[1:]; sys.path.insert(0,os.path.dirname(script)); runpy.run_path(script,run_name='__main__')"
         & $candidatePython -c $portableInstallBootstrap @arguments 2>&1 | Out-Host
+        if ($LASTEXITCODE -eq 20) { throw [System.OperationCanceledException]::new("portable runtime installation cancelled") }
         if ($LASTEXITCODE -ne 0) { throw "portable_install.py ensure-asset failed for uv" }
 
         if ([string]::IsNullOrWhiteSpace([string]$lock.assets.uv.archive_entry)) { throw "uv archive_entry is required" }

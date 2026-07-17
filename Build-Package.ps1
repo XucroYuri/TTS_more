@@ -237,6 +237,31 @@ public static class TtsMorePortableDirectoryHandle
         ulong index = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow;
         return information.VolumeSerialNumber.ToString("X8") + ":" + index.ToString("X16");
     }
+
+    public static uint NumberOfLinks(string path)
+    {
+        const uint FileReadAttributes = 0x00000080;
+        const uint FileShareRead = 0x00000001;
+        const uint FileShareWrite = 0x00000002;
+        const uint FileShareDelete = 0x00000004;
+        const uint OpenExisting = 3;
+        const uint FileFlagOpenReparsePoint = 0x00200000;
+        using (SafeFileHandle handle = CreateFile(path, FileReadAttributes,
+            FileShareRead | FileShareWrite | FileShareDelete, IntPtr.Zero,
+            OpenExisting, FileFlagOpenReparsePoint, IntPtr.Zero))
+        {
+            if (handle.IsInvalid)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot inspect staged file link count: " + path);
+            }
+            ByHandleFileInformation information;
+            if (!GetFileInformationByHandle(handle, out information))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot inspect staged file link count: " + path);
+            }
+            return information.NumberOfLinks;
+        }
+    }
 }
 '@
 }
@@ -317,12 +342,100 @@ function Assert-TtsMoreFullRuntimeBoundary {
     param([Parameter(Mandatory = $true)][string]$PackageRoot)
     $forbiddenNames = @("pyvenv.cfg", "conda-meta", "condabin", "Miniforge")
     foreach ($entry in @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -Force)) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Full package staging contains a reparse point: $($entry.FullName)"
+        }
         foreach ($segment in @($entry.FullName.Substring($PackageRoot.Length).TrimStart("\", "/") -split '[\\/]')) {
             if ($forbiddenNames -contains $segment -or $segment -like "Miniforge*") {
                 throw "Full package staging contains forbidden portable-runtime content: $($entry.FullName)"
             }
         }
     }
+}
+
+function Assert-TtsMoreFullStagingReparseBoundary {
+    param([Parameter(Mandatory = $true)][string]$PackageRoot)
+    foreach ($entry in @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -Force)) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Full package staging contains a reparse point: $($entry.FullName)"
+        }
+    }
+}
+
+function Assert-TtsMoreFullRuntimeLinkBoundary {
+    param([Parameter(Mandatory = $true)][string]$PackageRoot)
+    foreach ($file in @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File -Force)) {
+        if ([TtsMorePortableDirectoryHandle]::NumberOfLinks($file.FullName) -gt 1) {
+            throw "Full package staging contains a multiply-linked file: $($file.FullName)"
+        }
+    }
+}
+
+function Test-TtsMoreFullRuntimeOnOtherVolume {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackageRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedPython,
+        [Parameter(Mandatory = $true)][string]$ImportProbe
+    )
+    $sourceRoot = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($PackageRoot))
+    $candidates = @(Get-PSDrive -PSProvider FileSystem | Where-Object {
+        $_.Root -and ![string]::Equals([IO.Path]::GetPathRoot($_.Root), $sourceRoot, [StringComparison]::OrdinalIgnoreCase)
+    })
+    $probeRoot = $null
+    foreach ($candidate in $candidates) {
+        $candidateRoot = Join-Path $candidate.Root ("tts-more-runtime-probe-" + [Guid]::NewGuid().ToString("N"))
+        try {
+            New-Item -ItemType Directory -Path $candidateRoot -ErrorAction Stop | Out-Null
+            $probeRoot = $candidateRoot
+            break
+        }
+        catch { continue }
+    }
+    if ([string]::IsNullOrWhiteSpace($probeRoot)) { return "not_available" }
+    try {
+        $runtimeCopy = Join-Path $probeRoot "runtime-live"
+        Copy-Item -LiteralPath (Join-Path $PackageRoot "runtime\live") -Destination $runtimeCopy -Recurse
+        $python = Join-Path $runtimeCopy "python.exe"
+        & $python -c "import platform,sys; raise SystemExit(0 if platform.python_version()==sys.argv[1] else 1)" $ExpectedPython
+        if ($LASTEXITCODE -ne 0) { throw "cross-volume embedded Python version probe failed" }
+        & $python -c $ImportProbe
+        if ($LASTEXITCODE -ne 0) { throw "cross-volume embedded Python import probe failed" }
+        return "passed"
+    }
+    finally {
+        if (Test-Path -LiteralPath $probeRoot) { Remove-Item -LiteralPath $probeRoot -Recurse -Force }
+    }
+}
+
+function Test-PortableBinaryContainsMachinePrefix {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string[]]$Prefixes)
+    $patterns = New-Object System.Collections.Generic.List[byte[]]
+    foreach ($prefix in $Prefixes) {
+        $patterns.Add([Text.Encoding]::UTF8.GetBytes($prefix))
+        $patterns.Add([Text.Encoding]::Unicode.GetBytes($prefix))
+    }
+    $maximum = @($patterns | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
+    $stream = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        $buffer = New-Object byte[] (1048576 + $maximum)
+        $carry = 0
+        while (($read = $stream.Read($buffer, $carry, 1048576)) -gt 0) {
+            $length = $carry + $read
+            foreach ($pattern in $patterns) {
+                for ($offset = 0; $offset -le $length - $pattern.Length; $offset++) {
+                    $matched = $true
+                    for ($index = 0; $index -lt $pattern.Length; $index++) {
+                        if ($buffer[$offset + $index] -ne $pattern[$index]) { $matched = $false; break }
+                    }
+                    if ($matched) { return $true }
+                }
+            }
+            $carry = [Math]::Min($maximum - 1, $length)
+            if ($carry -gt 0) { [Array]::Copy($buffer, $length - $carry, $buffer, 0, $carry) }
+        }
+        return $false
+    }
+    finally { $stream.Dispose() }
 }
 
 function Assert-TtsMoreFullArchiveBoundary {
@@ -449,10 +562,23 @@ $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $stag
 @{ schema_version = 1; component = "tts-more"; packages = @(); upstream_repositories = @("GPT-SoVITS", "IndexTTS", "CosyVoice") } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json") -Encoding UTF8
 
 if ($Profile -eq "Full") {
-    & (Join-Path $stage "scripts\initialize-portable.ps1") -Device CPU
-    if ($LASTEXITCODE -ne 0) { throw "full package initialization failed" }
+    $previousUvCache = $env:UV_CACHE_DIR
+    $isolatedUvCache = Join-Path $work "uv-cache"
+    try {
+        $env:UV_CACHE_DIR = $isolatedUvCache
+        & (Join-Path $stage "scripts\initialize-portable.ps1") -Device CPU
+        if ($LASTEXITCODE -ne 0) { throw "full package initialization failed" }
+    }
+    finally {
+        $env:UV_CACHE_DIR = $previousUvCache
+        if (Test-Path -LiteralPath $isolatedUvCache) { Remove-Item -LiteralPath $isolatedUvCache -Recurse -Force }
+    }
     Assert-TtsMoreFullPayloadBoundary -PackageRoot $stage
     Assert-TtsMoreFullRuntimeBoundary -PackageRoot $stage
+    Assert-TtsMoreFullStagingReparseBoundary -PackageRoot $stage
+    Assert-TtsMoreFullRuntimeLinkBoundary -PackageRoot $stage
+    $runtimeLockForProbe = Get-Content -LiteralPath (Join-Path $stage "packaging\portable\runtime.lock.json") -Raw | ConvertFrom-Json
+    $runtimeCrossVolumeProbe = Test-TtsMoreFullRuntimeOnOtherVolume -PackageRoot $stage -ExpectedPython ([string]$runtimeLockForProbe.python_version) -ImportProbe ([string]$runtimeLockForProbe.import_probe)
 }
 
 $sumPath = Join-Path $stage "SHA256SUMS.txt"
@@ -474,11 +600,19 @@ $machinePaths = @(
 ) | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) -and ([string]$_).Length -ge 4 } | Select-Object -Unique
 $machineNames = @($env:USERNAME, $env:COMPUTERNAME) | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) -and ([string]$_).Length -ge 4 } | Select-Object -Unique
 $machinePathLeak = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Length -lt 5MB } | Select-String -SimpleMatch -Pattern $machinePaths -ErrorAction SilentlyContinue)
+$runtimeBinaryLeak = @()
+if ($Profile -eq "Full") {
+    $runtimeMetadata = @(Get-ChildItem -LiteralPath (Join-Path $stage "runtime\live") -Recurse -File -Force | Where-Object {
+        $_.Extension -in @(".pyd", ".dll", ".exe", ".cfg", ".ini", ".json", ".toml", ".pth", "._pth", ".txt", ".py") -or $_.Name -like "*._pth"
+    })
+    $runtimeBinaryLeak = @($runtimeMetadata | Where-Object { Test-PortableBinaryContainsMachinePrefix -Path $_.FullName -Prefixes $machinePaths })
+}
 $generatedMetadata = @((Join-Path $stage "package\tts-more-package.json"), (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json"))
 $generatedMetadata = @($generatedMetadata | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
 $machineNameLeak = @()
 if (@($machineNames).Count -gt 0 -and $generatedMetadata.Count -gt 0) { $machineNameLeak = @(Select-String -LiteralPath $generatedMetadata -SimpleMatch -Pattern $machineNames -ErrorAction SilentlyContinue) }
 if ($machinePathLeak.Count -gt 0) { throw "package contains build-machine identity or path data: $($machinePathLeak[0].Path)" }
+if ($runtimeBinaryLeak.Count -gt 0) { throw "package runtime metadata contains build-machine path data: $($runtimeBinaryLeak[0].FullName)" }
 if ($machineNameLeak.Count -gt 0) { throw "package metadata contains build-machine identity data: $($machineNameLeak[0].Path)" }
 
 if ($Profile -eq "Full") {
@@ -527,7 +661,12 @@ if ($Profile -eq "Full") { $licenseDelivery.resolved_profile = "cpu" }
 $licenseSidecar | Add-Member -NotePropertyName delivery -NotePropertyValue $licenseDelivery -Force
 $licenseSidecar | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath "$zip.licenses.json" -Encoding UTF8
 $acceptance = [ordered]@{ schema_version=1; component="tts-more"; version=$Version; profile=$profileName; source_revision=$revision; sha256=$zipSha; manifest_valid=$true; schema_audit=$true; path_audit=$true; sha256_manifest_audit=$true; bootstrap_audit=$auditPassed; machine_path_scan=$true; generated_at=[DateTime]::UtcNow.ToString("o") }
-if ($Profile -eq "Full") { $acceptance.resolved_profile = "cpu" }
+if ($Profile -eq "Full") {
+    $acceptance.resolved_profile = "cpu"
+    $acceptance.runtime_reparse_scan = $true
+    $acceptance.runtime_hardlink_scan = $true
+    $acceptance.runtime_cross_volume_probe = $runtimeCrossVolumeProbe
+}
 $acceptance | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$zip.acceptance.json" -Encoding UTF8
 Write-Host "Created $Profile package: $zip"
 }

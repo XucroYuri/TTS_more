@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import urllib.error
 from pathlib import Path
 from uuid import UUID
@@ -601,7 +602,7 @@ def test_controller_initializer_uses_only_embedded_python_runtime() -> None:
     model_assets = controller.index("foreach ($asset in @($modelLockPayload.assets))")
     dependency_install = controller.index("pip install")
     import_probe = controller.index("-c $ImportProbe")
-    atomic_publish = controller.index("Move-Item -LiteralPath $Staging -Destination $Live")
+    atomic_publish = controller.rindex("Publish-PortableRuntimeTransaction -Staging $Staging")
     assert (
         python_install
         < patch_probe
@@ -611,6 +612,88 @@ def test_controller_initializer_uses_only_embedded_python_runtime() -> None:
         < import_probe
         < atomic_publish
     )
+
+
+def test_controller_preserves_typed_cancellation_from_python_and_uv_downloads() -> None:
+    helper = (REPO_ROOT / "scripts" / "portable-python.ps1").read_text(encoding="utf-8")
+    mirror = (REPO_ROOT / "integrations" / "windows" / "portable-python.ps1").read_text(
+        encoding="utf-8"
+    )
+    controller = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert helper == mirror
+    assert "[System.OperationCanceledException]" in helper
+    assert "if ($LASTEXITCODE -eq 20)" in helper
+    assert "throw [System.OperationCanceledException]::new" in helper
+    assert "catch [System.OperationCanceledException]" in controller
+    assert "exit 20" in controller
+
+
+def test_controller_runtime_publish_restores_previous_after_staging_move_failure() -> None:
+    controller = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "function Publish-PortableRuntimeTransaction" in controller
+    assert "catch" in controller
+    assert "Remove-Item -LiteralPath $Live -Recurse -Force" in controller
+    assert "Move-Item -LiteralPath $Backup -Destination $Live" in controller
+    assert "throw" in controller
+
+
+def test_controller_runtime_publish_keeps_previous_until_state_commit() -> None:
+    controller = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "function Publish-PortableRuntimeTransaction" in controller
+    assert controller.index("& $CommitState") < controller.rindex(
+        "Remove-Item -LiteralPath $Backup -Recurse -Force"
+    )
+    assert "TTS_MORE_TEST_FAIL" not in controller
+
+
+@pytest.mark.skipif(os.name != "nt", reason="runtime transaction uses Windows PowerShell filesystem semantics")
+@pytest.mark.parametrize("failure", ("move", "state"))
+def test_controller_runtime_publish_rolls_back_real_move_and_state_failures(
+    tmp_path: Path, failure: str
+) -> None:
+    root = tmp_path / failure
+    live = root / "live"
+    staging = root / "staging"
+    backup = root / "previous"
+    state = root / "install-state.json"
+    live.mkdir(parents=True)
+    (live / "sentinel.txt").write_text("previous", encoding="utf-8")
+    state.write_text("previous-state", encoding="utf-8")
+    if failure == "state":
+        staging.mkdir()
+        (staging / "sentinel.txt").write_text("candidate", encoding="utf-8")
+
+    initializer = REPO_ROOT / "scripts" / "initialize-portable.ps1"
+    commit = "{ throw 'state write failed' }" if failure == "state" else "{ throw 'must not run' }"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{initializer}',[ref]$tokens,[ref]$errors)
+$fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Publish-PortableRuntimeTransaction'}},$true)
+. ([scriptblock]::Create($fn.Extent.Text))
+try {{ Publish-PortableRuntimeTransaction -Staging '{staging}' -Live '{live}' -Backup '{backup}' -CommitState {commit}; exit 91 }} catch {{ $message=$_.Exception.Message }}
+if (!(Test-Path -LiteralPath '{live / 'sentinel.txt'}') -or (Get-Content -Raw '{live / 'sentinel.txt'}') -ne 'previous') {{ exit 92 }}
+if (Test-Path -LiteralPath '{backup}') {{ exit 93 }}
+if ((Get-Content -Raw '{state}') -ne 'previous-state') {{ exit 94 }}
+    if ($message -notmatch '{'state write failed' if failure == 'state' else 'Cannot move item'}') {{ exit 95 }}
+exit 0
+"""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_portable_installer_is_natively_compatible_with_python_310() -> None:
