@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 
@@ -38,12 +40,30 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
     if component not in COMPONENTS:
         raise ValueError(f"unsupported integration component: {component}")
     source_root = source_root.resolve(strict=True)
-    target_root.mkdir(parents=True, exist_ok=True)
-    controlled = target_root / "tts_more"
-    if controlled.exists():
-        shutil.rmtree(controlled)
-    controlled.mkdir(parents=True)
+    target_root = target_root.resolve(strict=False)
+    previous_files, previous_manifest = _read_previous_manifest(target_root)
 
+    with tempfile.TemporaryDirectory(prefix="tts-more-sync-") as temporary:
+        stage_root = Path(temporary) / "stage"
+        stage_root.mkdir()
+        manifest = _build_staged_integration(source_root, stage_root, component, source_revision)
+        new_files = set(manifest["files"])
+        _preflight_target(target_root, previous_files, new_files, previous_manifest)
+        _publish_transaction(
+            stage_root,
+            target_root,
+            previous_files,
+            new_files,
+            previous_manifest,
+        )
+    return manifest
+
+
+def _build_staged_integration(
+    source_root: Path, stage_root: Path, component: str, source_revision: str
+) -> dict[str, object]:
+    controlled = stage_root / "tts_more"
+    controlled.mkdir(parents=True)
     _copy_tree(source_root / "integrations" / "tts_more_worker", controlled / "tts_more_worker")
     _copy_tree(source_root / "integrations" / "contract_tests", controlled / "tests")
     _copy_tree(source_root / "integrations" / "build_tools", controlled / "build-tools")
@@ -97,11 +117,11 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
     (controlled / "component.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     root_payloads = _root_entry_payloads(component)
     for name, content in root_payloads.items():
-        (target_root / name).write_text(content, encoding="utf-8", newline="\r\n" if name.endswith(".cmd") else "\n")
+        (stage_root / name).write_text(content, encoding="utf-8", newline="\r\n" if name.endswith(".cmd") else "\n")
 
     files = {}
-    for path in _tracked_paths(target_root):
-        relative = path.relative_to(target_root).as_posix()
+    for path in _tracked_paths(stage_root):
+        relative = path.relative_to(stage_root).as_posix()
         files[relative] = sha256_file(path)
     manifest = {
         "schema_version": 1,
@@ -112,6 +132,161 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
     }
     (controlled / "integration.manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
+
+
+def _read_previous_manifest(target_root: Path) -> tuple[set[str], bytes | None]:
+    manifest_path = target_root / "tts_more" / "integration.manifest.json"
+    if not manifest_path.exists():
+        return set(), None
+    if not manifest_path.is_file():
+        raise ValueError("previous integration manifest is not a file")
+    raw = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("previous integration manifest is invalid") from exc
+    files = manifest.get("files")
+    if manifest.get("schema_version") != 1 or not isinstance(files, dict):
+        raise ValueError("previous integration manifest is invalid")
+    owned: set[str] = set()
+    for relative, digest in files.items():
+        if not isinstance(relative, str) or not isinstance(digest, str):
+            raise ValueError("previous integration manifest is invalid")
+        _validate_controlled_relative(relative)
+        if len(digest) != 64 or any(character not in "0123456789abcdefABCDEF" for character in digest):
+            raise ValueError("previous integration manifest is invalid")
+        owned.add(relative)
+    return owned, raw
+
+
+def _validate_controlled_relative(relative: str) -> None:
+    pure = PurePosixPath(relative)
+    if (
+        not relative
+        or "\\" in relative
+        or pure.is_absolute()
+        or any(part in ("", ".", "..") for part in pure.parts)
+        or (relative not in ROOT_ENTRIES and not relative.startswith("tts_more/"))
+        or relative == "tts_more/integration.manifest.json"
+    ):
+        raise ValueError(f"invalid controlled path in integration manifest: {relative}")
+
+
+def _preflight_target(
+    target_root: Path,
+    previous_files: set[str],
+    new_files: set[str],
+    previous_manifest: bytes | None,
+) -> None:
+    if target_root.exists() and not target_root.is_dir():
+        raise FileExistsError(f"target-owned file collides with integration root: {target_root}")
+    manifest_relative = "tts_more/integration.manifest.json"
+    owned = previous_files | ({manifest_relative} if previous_manifest is not None else set())
+    for relative in sorted(new_files | {manifest_relative}):
+        destination = target_root / Path(PurePosixPath(relative))
+        if destination.exists() and relative not in owned:
+            raise FileExistsError(f"target-owned file collides with newly controlled path: {relative}")
+        parent = destination.parent
+        while parent != target_root:
+            if parent.exists() and not parent.is_dir():
+                raise FileExistsError(f"target-owned file collides with integration directory: {parent}")
+            parent = parent.parent
+    for relative in previous_files:
+        existing = target_root / Path(PurePosixPath(relative))
+        if existing.exists() and not existing.is_file():
+            raise ValueError(f"previous controlled path is not a file: {relative}")
+
+
+def _publish_transaction(
+    stage_root: Path,
+    target_root: Path,
+    previous_files: set[str],
+    new_files: set[str],
+    previous_manifest: bytes | None,
+) -> None:
+    manifest_relative = "tts_more/integration.manifest.json"
+    prior_paths = previous_files | ({manifest_relative} if previous_manifest is not None else set())
+    backups: dict[str, bytes | None] = {}
+    for relative in prior_paths:
+        path = target_root / Path(PurePosixPath(relative))
+        backups[relative] = path.read_bytes() if path.is_file() else None
+    target_root.mkdir(parents=True, exist_ok=True)
+    published: set[str] = set()
+    obsolete = previous_files - new_files
+    try:
+        for relative in sorted(new_files):
+            published.add(relative)
+            _publish_file(
+                stage_root / Path(PurePosixPath(relative)),
+                target_root / Path(PurePosixPath(relative)),
+            )
+        for relative in sorted(obsolete, reverse=True):
+            path = target_root / Path(PurePosixPath(relative))
+            if path.is_file():
+                path.unlink()
+            _remove_empty_parents(path.parent, target_root)
+        published.add(manifest_relative)
+        _publish_file(
+            stage_root / Path(PurePosixPath(manifest_relative)),
+            target_root / Path(PurePosixPath(manifest_relative)),
+        )
+    except BaseException:
+        _rollback_publication(target_root, backups, published, prior_paths)
+        raise
+
+
+def _rollback_publication(
+    target_root: Path,
+    backups: dict[str, bytes | None],
+    published: set[str],
+    prior_paths: set[str],
+) -> None:
+    for relative in sorted(published - prior_paths, reverse=True):
+        path = target_root / Path(PurePosixPath(relative))
+        if path.is_file():
+            path.unlink()
+        _remove_empty_parents(path.parent, target_root)
+    for relative, payload in backups.items():
+        path = target_root / Path(PurePosixPath(relative))
+        if payload is None:
+            if path.is_file():
+                path.unlink()
+                _remove_empty_parents(path.parent, target_root)
+        else:
+            _write_bytes_atomically(path, payload)
+
+
+def _publish_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(prefix=".tts-more-sync-", dir=destination.parent)
+    os.close(handle)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_bytes_atomically(destination: Path, payload: bytes) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(prefix=".tts-more-rollback-", dir=destination.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _remove_empty_parents(path: Path, stop: Path) -> None:
+    while path != stop and path.is_dir():
+        try:
+            path.rmdir()
+        except OSError:
+            break
+        path = path.parent
 
 
 def check_integration(target_root: Path) -> list[str]:
@@ -128,13 +303,6 @@ def check_integration(target_root: Path) -> list[str]:
             errors.append(f"missing controlled file: {relative}")
         elif sha256_file(path) != digest:
             errors.append(f"hash mismatch: {relative}")
-    expected_controlled = {name for name in expected if name.startswith("tts_more/")}
-    for path in (target_root / "tts_more").rglob("*"):
-        if not path.is_file() or path == manifest_path or "__pycache__" in path.parts:
-            continue
-        relative = path.relative_to(target_root).as_posix()
-        if relative not in expected_controlled:
-            errors.append(f"unexpected controlled file: {relative}")
     return errors
 
 

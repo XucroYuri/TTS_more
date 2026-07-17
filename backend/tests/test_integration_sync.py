@@ -168,7 +168,7 @@ def test_check_detects_generated_guide_drift_and_removal(tmp_path: Path) -> None
     assert f"missing controlled file: {GUIDE_NAME}" in sync.check_integration(target)
 
 
-def test_check_detects_manual_drift_and_unexpected_controlled_files(tmp_path: Path) -> None:
+def test_check_detects_manual_drift_but_allows_target_owned_extras(tmp_path: Path) -> None:
     sync = _load_sync()
     target = tmp_path / "Index fork"
     sync.sync_integration(REPO_ROOT, target, "indextts", "b" * 40)
@@ -178,7 +178,131 @@ def test_check_detects_manual_drift_and_unexpected_controlled_files(tmp_path: Pa
     errors = sync.check_integration(target)
 
     assert any("hash mismatch: Start.cmd" in error for error in errors)
-    assert any("unexpected controlled file: tts_more/unexpected.txt" in error for error in errors)
+    assert not any("unexpected controlled file" in error for error in errors)
+
+
+def test_sync_preserves_nested_target_owned_assets_byte_for_byte(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "asset fork"
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "1" * 40)
+    sentinels = {
+        "tts_more/__pycache__/worker.cpython-311.pyc": b"\x00pyc\xff",
+        "tts_more/models/custom/model.bin": b"model-bytes\x00\xff",
+        "tts_more/data/user/settings.json": b'{"user":true}\n',
+        "tts_more/data/cache/download.partial": b"partial-cache",
+    }
+    for relative, payload in sentinels.items():
+        path = target / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "2" * 40)
+
+    assert {relative: (target / relative).read_bytes() for relative in sentinels} == sentinels
+    assert sync.check_integration(target) == []
+
+
+def test_sync_fails_before_mutation_when_unknown_file_collides(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "collision fork"
+    collision = target / "tts_more" / "component.json"
+    collision.parent.mkdir(parents=True)
+    collision.write_bytes(b"target-owned")
+    sentinel = target / "tts_more" / "models" / "keep.bin"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_bytes(b"keep")
+
+    with pytest.raises(FileExistsError, match="target-owned file collides"):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "3" * 40)
+
+    assert collision.read_bytes() == b"target-owned"
+    assert sentinel.read_bytes() == b"keep"
+    assert not (target / "Start.cmd").exists()
+    assert not (target / "tts_more" / "integration.manifest.json").exists()
+
+
+def test_sync_removes_files_owned_only_by_previous_manifest(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "removed file fork"
+    sync.sync_integration(REPO_ROOT, target, "indextts", "4" * 40)
+    obsolete = target / "tts_more" / "obsolete" / "old.txt"
+    obsolete.parent.mkdir(parents=True)
+    obsolete.write_bytes(b"old controlled bytes")
+    manifest_path = target / "tts_more" / "integration.manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["tts_more/obsolete/old.txt"] = sync.sha256_file(obsolete)
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    sync.sync_integration(REPO_ROOT, target, "indextts", "5" * 40)
+
+    assert not obsolete.exists()
+    assert not obsolete.parent.exists()
+
+
+def test_sync_rolls_back_controlled_files_and_manifest_after_publication_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "rollback fork"
+    sync.sync_integration(REPO_ROOT, target, "cosyvoice", "6" * 40)
+    start = target / "Start.cmd"
+    manifest_path = target / "tts_more" / "integration.manifest.json"
+    old_start = start.read_bytes()
+    old_manifest = manifest_path.read_bytes()
+    unknown = target / "tts_more" / "models" / "keep.bin"
+    unknown.parent.mkdir(parents=True)
+    unknown.write_bytes(b"unknown")
+    original_payloads = sync._root_entry_payloads
+    original_publish = sync._publish_file
+
+    def changed_payloads(component: str) -> dict[str, str]:
+        payloads = original_payloads(component)
+        payloads["Start.cmd"] += "rem changed\n"
+        return payloads
+
+    def fail_manifest_publish(source: Path, destination: Path) -> None:
+        if destination == manifest_path:
+            raise OSError("injected manifest publication failure")
+        original_publish(source, destination)
+
+    monkeypatch.setattr(sync, "_root_entry_payloads", changed_payloads)
+    monkeypatch.setattr(sync, "_publish_file", fail_manifest_publish)
+
+    with pytest.raises(OSError, match="injected manifest publication failure"):
+        sync.sync_integration(REPO_ROOT, target, "cosyvoice", "7" * 40)
+
+    assert start.read_bytes() == old_start
+    assert manifest_path.read_bytes() == old_manifest
+    assert unknown.read_bytes() == b"unknown"
+    assert sync.check_integration(target) == []
+
+
+def test_sync_rolls_back_path_when_publisher_fails_after_atomic_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync = _load_sync()
+    target = tmp_path / "post replace failure fork"
+    unknown = target / "tts_more" / "models" / "keep.bin"
+    unknown.parent.mkdir(parents=True)
+    unknown.write_bytes(b"unknown")
+    original_publish = sync._publish_file
+    failed = False
+
+    def fail_after_first_replace(source: Path, destination: Path) -> None:
+        nonlocal failed
+        original_publish(source, destination)
+        if not failed:
+            failed = True
+            raise OSError("injected post-replace failure")
+
+    monkeypatch.setattr(sync, "_publish_file", fail_after_first_replace)
+
+    with pytest.raises(OSError, match="injected post-replace failure"):
+        sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "8" * 40)
+
+    assert unknown.read_bytes() == b"unknown"
+    assert not (target / "Build-Package.ps1").exists()
+    assert not (target / "tts_more" / "integration.manifest.json").exists()
 
 
 def test_check_treats_crlf_and_lf_as_the_same_controlled_text(tmp_path: Path) -> None:
