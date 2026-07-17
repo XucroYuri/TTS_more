@@ -168,6 +168,24 @@ class FailStartOnceExecutor(FakeExecutor):
         return SshCommandResult("", "")
 
 
+class FailFirstServiceCleanupExecutor(FakeExecutor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    def run_powershell(
+        self, alias: str, script: str, *, timeout: int = 1800
+    ) -> SshCommandResult:
+        self.scripts.append((alias, script, timeout))
+        if (
+            "Get-NetTCPConnection -State Listen -LocalPort 9880" in script
+            and not self.failed
+        ):
+            self.failed = True
+            raise RuntimeError("injected first-port cleanup failure")
+        return SshCommandResult("", "")
+
+
 class ReplaceStagingExecutor(FakeExecutor):
     def __init__(self, outside: Path) -> None:
         super().__init__()
@@ -620,7 +638,7 @@ def test_stop_service_verifies_listener_process_identity_before_stopping() -> No
     assert ".Handle" in script
     assert ".Kill()" in script
     assert "Stop-Process" not in script
-    second_snapshot = script.rindex("Get-CimInstance Win32_Process")
+    second_snapshot = script.index("$second = Get-CimInstance Win32_Process")
     assert second_snapshot < script.index(".Kill()", second_snapshot)
 
 
@@ -629,6 +647,99 @@ def test_stop_service_fails_closed_without_a_manager_owned_start() -> None:
 
     with pytest.raises(ValueError, match="owned service manifest"):
         manager.stop_service("gpt-worker", 9880)
+
+
+def test_ambiguous_start_pending_manifest_drives_remote_service_reconciliation() -> None:
+    executor = FailStartOnceExecutor()
+    manager = WindowsLanNodeManager(executor, salt=b"salt")
+
+    with pytest.raises(RuntimeError, match="ambiguous start failure"):
+        manager.start("gpt-worker", r"C:\TTS\TTS_more")
+
+    pending = manager._pending_service_starts["gpt-worker"]
+    assert manager._service_manifests.get("gpt-worker", []) == []
+    calls_before_cleanup = len(executor.scripts)
+
+    manager.stop_all_services("gpt-worker", (9880, 9881, 9882))
+
+    cleanup_scripts = executor.scripts[calls_before_cleanup:]
+    assert len(cleanup_scripts) == 3
+    assert all(str(pending) in script for _, script, _ in cleanup_scripts)
+    assert manager._pending_service_starts["gpt-worker"] == pending
+
+
+def test_stop_all_services_attempts_every_port_and_aggregates_failures() -> None:
+    executor = FailFirstServiceCleanupExecutor()
+    manager = WindowsLanNodeManager(executor, salt=b"salt")
+    manager.start("gpt-worker", r"C:\TTS\TTS_more")
+    executor.scripts.clear()
+
+    with pytest.raises(RuntimeError, match="1 of 3 owned service cleanup attempts failed"):
+        manager.stop_all_services("gpt-worker", (9880, 9881, 9882))
+
+    assert len(executor.scripts) == 3
+    for port, (_, script, _) in zip((9880, 9881, 9882), executor.scripts):
+        assert f"Get-NetTCPConnection -State Listen -LocalPort {port}" in script
+
+    executor.scripts.clear()
+    manager.stop_all_services("gpt-worker", (9880, 9881, 9882))
+    assert len(executor.scripts) == 3
+
+
+def test_stop_service_reconciliation_is_idempotent_without_weakening_identity() -> None:
+    executor = FakeExecutor()
+    manager = WindowsLanNodeManager(executor, salt=b"salt")
+    manager.start("gpt-worker", r"C:\TTS\TTS_more")
+    executor.scripts.clear()
+
+    manager.stop_service("gpt-worker", 9880)
+
+    script = executor.scripts[-1][1]
+    validator_call = script.index("$validated = @(& $python -c $manifestValidator")
+    absent_reconciliation = script.index("$snapshot.state -eq 'absent'")
+    process_lookup = script.index("Get-CimInstance Win32_Process")
+    assert validator_call < absent_reconciliation < process_lookup
+    assert "$null -eq $entry" in script[validator_call:process_lookup]
+    assert "$null -eq $first" in script[process_lookup:]
+    assert "$null -eq $ownedProcess" in script[process_lookup:]
+    assert "$null -eq $second" in script[process_lookup:]
+    assert "$remaining = Get-CimInstance Win32_Process" in script[process_lookup:]
+    assert "$listeners.Count -gt 0" in script
+    assert "[int]$entry.pid" in script
+    assert script.count("Get-CimInstance Win32_Process") >= 2
+    assert ".Handle" in script
+    assert ".Kill()" in script
+    assert "Stop-Process" not in script
+
+
+def test_stop_manifest_validator_distinguishes_absent_from_invalid_artifact(
+    tmp_path: Path,
+) -> None:
+    executor = FakeExecutor()
+    manager = WindowsLanNodeManager(executor, salt=b"salt")
+    manager.start("gpt-worker", r"C:\TTS\TTS_more")
+    manager.stop_service("gpt-worker", 9880)
+    validator = _embedded_python(executor.scripts[-1][1])
+    root = tmp_path / "root"
+    root.mkdir()
+    missing = tmp_path / "missing.json"
+    args = [
+        sys.executable,
+        "-c",
+        validator,
+        str(missing),
+        str(root),
+        "local-gpt-sovits-main",
+        SERVICE_MODULES["local-gpt-sovits-main"],
+    ]
+
+    absent = subprocess.run(args, capture_output=True, text=True, check=False)
+    assert absent.returncode == 0
+    assert json.loads(absent.stdout) == {"state": "absent"}
+
+    missing.mkdir()
+    invalid = subprocess.run(args, capture_output=True, text=True, check=False)
+    assert invalid.returncode != 0
 
 
 def test_monitor_is_bounded_failure_atomic_and_retry_reconciled() -> None:

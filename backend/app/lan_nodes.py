@@ -1041,10 +1041,35 @@ Remove-Item -LiteralPath {_powershell_literal(str(manifest_path))} -Force
         if isinstance(port, bool) or not isinstance(port, int) or port not in _FORMAL_PORT_MODULES:
             raise ValueError("fault injection port is not a formal worker port")
         root = self._service_roots.get(node)
-        manifests = self._service_manifests.get(node, [])
+        manifests: list[PureWindowsPath] = []
+        pending = self._pending_service_starts.get(node)
+        if pending is not None:
+            manifests.append(pending)
+        for manifest in reversed(self._service_manifests.get(node, [])):
+            if manifest not in manifests:
+                manifests.append(manifest)
         if root is None or not manifests:
             raise ValueError("worker node has no manager-owned service manifest")
-        manifest = manifests[-1]
+
+        failures: list[Exception] = []
+        for manifest in manifests:
+            try:
+                self._stop_service_manifest(node, port, root, manifest)
+            except Exception as error:
+                failures.append(error)
+        if failures:
+            error = RuntimeError(
+                f"{len(failures)} of {len(manifests)} owned service cleanup attempts failed"
+            )
+            raise error from failures[0]
+
+    def _stop_service_manifest(
+        self,
+        node: str,
+        port: int,
+        root: PureWindowsPath,
+        manifest: PureWindowsPath,
+    ) -> None:
         module = _FORMAL_PORT_MODULES[port]
         service_id = {
             9880: "local-gpt-sovits-main",
@@ -1063,7 +1088,11 @@ def pairs(items):
         value[key] = item
     return value
 path = pathlib.Path(sys.argv[1])
-metadata = os.lstat(path)
+try:
+    metadata = os.lstat(path)
+except FileNotFoundError:
+    print(json.dumps({"state": "absent"}, separators=(",", ":")))
+    raise SystemExit(0)
 if not stat.S_ISREG(metadata.st_mode) or metadata.st_size < 1 or metadata.st_size > MAX_BYTES:
     raise ValueError("invalid manifest file")
 with open(path, "rb") as stream:
@@ -1103,9 +1132,13 @@ for process in payload["processes"]:
     pathlib.Path(process["executable_path"]).resolve().relative_to(pathlib.Path(sys.argv[2]).resolve())
     if service_id == sys.argv[3]:
         matches.append(process)
-if len(matches) != 1 or matches[0]["worker_module"] != sys.argv[4]:
+if len(matches) > 1 or (matches and matches[0]["worker_module"] != sys.argv[4]):
     raise ValueError("owned service identity is ambiguous")
-result = {"snapshot_sha256": hashlib.sha256(raw).hexdigest(), "process": matches[0]}
+result = {
+    "state": "present",
+    "snapshot_sha256": hashlib.sha256(raw).hexdigest(),
+    "process": matches[0] if matches else None,
+}
 print(json.dumps(result, separators=(",", ":")))
 """.strip()
         script = f"""
@@ -1120,7 +1153,13 @@ $validated = @(& $python -c $manifestValidator {_powershell_literal(str(manifest
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($validated)) {{
   throw 'Worker process identity mismatch'
 }}
-$entry = ($validated | ConvertFrom-Json).process
+try {{ $snapshot = $validated | ConvertFrom-Json }} catch {{
+  throw 'Worker process identity mismatch'
+}}
+if ([string]$snapshot.state -eq 'absent') {{ return }}
+if ([string]$snapshot.state -ne 'present') {{ throw 'Worker process identity mismatch' }}
+$entry = $snapshot.process
+if ($null -eq $entry) {{ return }}
 function Test-ExactCommandToken {{
   param([string]$CommandLine, [string]$Token)
   if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Token)) {{ return $false }}
@@ -1147,23 +1186,41 @@ function Test-ServiceSnapshot {{
     (Test-ExactPortTokens ([string]$Snapshot.CommandLine) {port})
   )
 }}
-$listeners = @(Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction Stop)
-if ($listeners.Count -eq 0) {{ throw 'No listener on validation port' }}
-$processIds = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
-if ($processIds.Count -ne 1 -or [int]$processIds[0] -ne [int]$entry.pid) {{
+function Test-ServiceListenerOwnership {{
+  $listeners = @(Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction Stop)
+  if ($listeners.Count -gt 0) {{
+    $processIds = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
+    return $processIds.Count -eq 1 -and [int]$processIds[0] -eq [int]$entry.pid
+  }}
+  return $true
+}}
+$processId = [int]$entry.pid
+$first = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+if ($null -eq $first) {{ return }}
+if (-not (Test-ServiceSnapshot $first) -or -not (Test-ServiceListenerOwnership)) {{
   throw 'Worker process identity mismatch'
 }}
-foreach ($processId in $processIds) {{
-  $first = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
-  if (-not (Test-ServiceSnapshot $first)) {{ throw 'Worker process identity mismatch' }}
-  $ownedProcess = Get-Process -Id $processId -ErrorAction Stop
+$ownedProcess = Get-Process -Id $processId -ErrorAction SilentlyContinue
+if ($null -eq $ownedProcess) {{ return }}
+try {{
   $null = $ownedProcess.Handle
-  $second = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
-  if (-not (Test-ServiceSnapshot $second)) {{ throw 'Worker process identity changed' }}
-  try {{
-    $ownedProcess.Kill()
-    if (-not $ownedProcess.WaitForExit(10000)) {{ throw 'Worker process did not exit' }}
-  }} catch {{ throw 'Worker process termination failed after ownership verification' }}
+}} catch {{
+  $afterHandleFailure = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+  if ($null -eq $afterHandleFailure) {{ return }}
+  throw 'Worker process handle binding failed'
+}}
+$second = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+if ($null -eq $second) {{ return }}
+if (-not (Test-ServiceSnapshot $second) -or -not (Test-ServiceListenerOwnership)) {{
+  throw 'Worker process identity changed'
+}}
+try {{
+  $ownedProcess.Kill()
+  if (-not $ownedProcess.WaitForExit(10000)) {{ throw 'Worker process did not exit' }}
+}} catch {{
+  $remaining = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction SilentlyContinue
+  if ($null -eq $remaining) {{ return }}
+  throw 'Worker process termination failed after ownership verification'
 }}
 """
         self.executor.run_powershell(node, script)
@@ -1182,8 +1239,17 @@ foreach ($processId in $processIds) {{
             )
         ):
             raise ValueError("service ports must be unique formal worker ports")
+        failures: list[Exception] = []
         for port in ports:
-            self.stop_service(node, port)
+            try:
+                self.stop_service(node, port)
+            except Exception as error:
+                failures.append(error)
+        if failures:
+            error = RuntimeError(
+                f"{len(failures)} of {len(ports)} owned service cleanup attempts failed"
+            )
+            raise error from failures[0]
 
     def _prepare_remote_evidence_snapshot(
         self,

@@ -25,6 +25,14 @@ owned monitor/service cleanup and evidence collection on both success and failur
    supplied identity provider, and the core helper had no in-memory identity input.
 6. Final fail-closed RED reported `5 failed, 28 passed`: direct non-Path option values
    raised `AttributeError`, and duplicate probe nodes were silently overwritten.
+7. Final re-review I1/I2 RED reported `3 failed, 56 deselected`: an ambiguous
+   production-manager start made no remote cleanup call, the first port failure
+   aborted cleanup, and the generated stop protocol had no idempotent absence path.
+8. A follow-up validator RED reported `1 failed, 59 deselected`: a missing cleanup
+   manifest raised from `os.lstat` instead of producing a distinct safe no-op state.
+9. Final process-exit race RED reported `1 failed, 59 deselected`: cleanup did not
+   yet reconcile an exact owned process exiting between snapshot, handle binding,
+   and termination. Those windows now return safely only after absence is observed.
 
 ## Independent Review Fix
 
@@ -46,6 +54,30 @@ after the implementation.
   the manager's run-local ownership state is available.
 - Formal `--remote-root` segments now accept only ASCII letters, digits, dot,
   underscore, and hyphen; whitespace is rejected before any remote mutation.
+
+## Final Re-review Fix
+
+The final re-review's two Important findings are resolved in the production node
+manager without changing orchestration ordering or weakening process ownership.
+
+- Service cleanup reconciles both the pending deterministic manifest path retained
+  after an ambiguous SSH start and every completed manager-owned manifest path. A
+  true missing artifact is an idempotent success; any present artifact is bounded,
+  regular-file checked, strictly parsed, root confined, and identity validated.
+- A missing validated service entry or an already-exited validated process is a safe
+  no-op. A live process is selected only from the validated manifest PID, checked
+  against creation time, executable, project root, exact worker module, exact port
+  arguments, and any current listener owner, then re-snapshotted after binding its
+  process handle immediately before termination. Listener enumeration never supplies
+  a kill candidate.
+- Ownership artifacts and manager state are retained on validation, transport,
+  identity, or termination failure, allowing a repeat cleanup attempt. Pending and
+  completed manifest attempts are independently isolated so one failure cannot block
+  another owned generation.
+- `stop_all_services()` validates the full requested port set before mutation,
+  attempts every expected port, and raises one bounded aggregate failure only after
+  all attempts finish. Repeating cleanup is safe when artifacts, manifest entries,
+  listeners, or exact owned processes are already absent.
 
 ## Current API Adaptation
 
@@ -83,13 +115,12 @@ be copied into logs or evidence.
 
 ## GREEN Verification
 
-- Task 5 focused suite: `37 passed`.
-- SSH/orchestration/node-manager regression suite: `228 passed`.
-- Task 5 plus Tasks 1-4 integration suite: `432 passed, 2 skipped`.
-- Full backend suite after merging current `master`: `1003 passed, 6 skipped`.
+- Final I1/I2 TDD regressions: `4 passed, 56 deselected`.
+- Focused LAN node-manager/orchestrator suite: `97 passed`.
+- Tasks 1-5 integration and regression suite: `558 passed, 4 skipped`.
+- Full backend suite: `1007 passed, 6 skipped`.
 - `python -W error::DeprecationWarning -m compileall -q -f backend
   scripts/run-lan-validation.py`: passed.
-- Python launcher `--help`, POSIX launcher `--help`, and `bash -n` checks: passed.
 - `git diff --check`: passed.
 
 ## Remaining Integration Boundary
