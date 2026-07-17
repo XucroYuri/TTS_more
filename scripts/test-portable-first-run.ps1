@@ -8,7 +8,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $ExpectedComponents = @("tts-more", "gpt-sovits", "indextts", "cosyvoice")
-$AllowedEvidenceFields = @("component", "scenario", "result", "duration", "error_code", "worker_real_initialization", "controller_real_initialization", "fixture_runtime_preseeded", "direct_downloader")
+$AllowedEvidenceFields = @("component", "scenario", "result", "duration", "error_code", "worker_real_initialization", "controller_real_initialization", "fixture_runtime_preseeded", "direct_downloader", "operation_progress_python")
 $ForbiddenEvidenceFields = @("absolute_path", "username", "hostname", "ip_address", "pid", "command", "secret", "token")
 $FixturePython = [string]$env:TTS_MORE_FIRST_RUN_PYTHON
 $FixtureBasePython = ""
@@ -19,6 +19,8 @@ $FixtureServerScript = Join-Path $PSScriptRoot "serve-portable-fixtures.py"
 $SystemPath = "$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
 $OriginalPath = $env:PATH
 $Evidence = [Collections.Generic.List[object]]::new()
+$WorkerLifecycleSucceeded = @{}
+$LockedPythonAssetCache = @{}
 $ExpandedPackages = [Collections.Generic.List[object]]::new()
 $OwnedProcesses = [Collections.Generic.List[object]]::new()
 $OwnedProcessKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -71,10 +73,11 @@ function Add-Evidence {
         result = $Result
         duration = [Math]::Round([Math]::Max(0.0, $Duration), 3)
         error_code = $ErrorCode
-        worker_real_initialization = ($Component -ne "tts-more")
+        worker_real_initialization = $false
         controller_real_initialization = ($Component -eq "tts-more" -and $Scenario -eq "controller_real_initialize")
         fixture_runtime_preseeded = $false
         direct_downloader = $false
+        operation_progress_python = ""
     }
     $names = @($record.Keys | Sort-Object)
     $expected = @($AllowedEvidenceFields | Sort-Object)
@@ -83,6 +86,19 @@ function Add-Evidence {
         if ($record.Contains($name)) { Throw-HarnessError "EVIDENCE_SCHEMA" "acceptance record contains a forbidden field" }
     }
     $Evidence.Add([pscustomobject]$record)
+}
+
+function Finalize-WorkerInitializationEvidence {
+    foreach ($component in @("gpt-sovits", "indextts", "cosyvoice")) {
+        if (!$script:WorkerLifecycleSucceeded.ContainsKey($component)) {
+            Throw-HarnessError "WORKER_ACCEPTANCE_INCOMPLETE" "worker lifecycle acceptance is incomplete"
+        }
+        $result = $script:WorkerLifecycleSucceeded[$component]
+        foreach ($record in @($Evidence | Where-Object { $_.component -eq $component })) {
+            $record.worker_real_initialization = $true
+            $record.operation_progress_python = [string]$result.OperationProgressPython
+        }
+    }
 }
 
 function Invoke-Scenario {
@@ -489,6 +505,11 @@ using System.IO;
 using System.Linq;
 
 public static class FixtureUv {
+  private static void CopyTree(string source, string destination) {
+    Directory.CreateDirectory(destination);
+    foreach (string file in Directory.GetFiles(source)) File.Copy(file, Path.Combine(destination, Path.GetFileName(file)), true);
+    foreach (string directory in Directory.GetDirectories(source)) CopyTree(directory, Path.Combine(destination, Path.GetFileName(directory)));
+  }
   public static int Main(string[] args) {
     if (args.Length == 0) return 0;
     string command = args[0].ToLowerInvariant();
@@ -503,7 +524,13 @@ public static class FixtureUv {
       }
       return 2;
     }
-    if (command == "pip" && args.Length > 1 && args[1].ToLowerInvariant() == "install") return 0;
+    if (command == "pip" && args.Length > 1 && args[1].ToLowerInvariant() == "install") {
+      string source = Environment.GetEnvironmentVariable("TTS_MORE_FIXTURE_PACKAGES");
+      int targetIndex = Array.IndexOf(args, "--target");
+      if (String.IsNullOrWhiteSpace(source) || targetIndex < 0 || targetIndex + 1 >= args.Length || !Directory.Exists(source)) return 3;
+      CopyTree(source, args[targetIndex + 1]);
+      return 0;
+    }
     return 0;
   }
 }
@@ -590,149 +617,55 @@ class BaseModel:
 '@, $Utf8NoBom)
 }
 
-function Copy-FixtureDirectoryFiltered {
-    param(
-        [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Destination,
-        [string[]]$SkipDirectories = @(),
-        [switch]$Optional
-    )
-    $sourceRoot = [IO.Path]::GetFullPath($Source)
-    if (!(Test-Path -LiteralPath $sourceRoot -PathType Container)) {
-        if ($Optional) { return }
-        Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base runtime directory is missing"
+function Get-LockedEmbeddedPythonAsset {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $manifest = Get-Content -LiteralPath (Join-Path $Root "package\tts-more-package.json") -Raw | ConvertFrom-Json
+    $runtimeLockPath = Join-Path $Root ([string]$manifest.runtime.lock)
+    $runtime = Get-Content -LiteralPath $runtimeLockPath -Raw | ConvertFrom-Json
+    $version = [string]$runtime.python_version
+    $known = @{
+        "3.11.9" = [pscustomobject]@{ Url="https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"; Sha256="009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b"; Size=11249023; Stdlib="python311.zip"; Pth="python311._pth" }
+        "3.10.11" = [pscustomobject]@{ Url="https://www.python.org/ftp/python/3.10.11/python-3.10.11-embed-amd64.zip"; Sha256="608619f8619075629c9c69f361352a0da6ed7e62f83a0e19c63e0ea32eb7629d"; Size=8629277; Stdlib="python310.zip"; Pth="python310._pth" }
     }
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    $stack = [Collections.Generic.Stack[string]]::new()
-    $stack.Push($sourceRoot)
-    while ($stack.Count -gt 0) {
-        $current = $stack.Pop()
-        $relative = $current.Substring($sourceRoot.Length).TrimStart('\', '/')
-        $targetDirectory = if ([string]::IsNullOrWhiteSpace($relative)) { $Destination } else { Join-Path $Destination $relative }
-        New-Item -ItemType Directory -Force -Path $targetDirectory | Out-Null
-        foreach ($file in @(Get-ChildItem -LiteralPath $current -File -Force)) {
-            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $targetDirectory $file.Name) -Force
-        }
-        foreach ($directory in @(Get-ChildItem -LiteralPath $current -Directory -Force)) {
-            if ($directory.Name -in $SkipDirectories) { continue }
-            $stack.Push($directory.FullName)
-        }
-    }
+    if (!$known.ContainsKey($version)) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "component runtime lock has an unsupported exact Python version" }
+    $expected = $known[$version]
+    $asset = $runtime.assets.python
+    if (
+        [string]$asset.sha256 -ne $expected.Sha256 -or
+        [int64]$asset.size_bytes -ne [int64]$expected.Size -or
+        [string]$asset.archive_entry -ne "python.exe" -or
+        @($asset.urls) -notcontains $expected.Url
+    ) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "component runtime lock does not pin the official embeddable Python asset" }
+    return [pscustomobject]@{ Version=$version; Url=$expected.Url; Sha256=$expected.Sha256; Size=[int64]$expected.Size; Stdlib=$expected.Stdlib; Pth=$expected.Pth; RuntimeLock=$runtimeLockPath }
 }
 
-function Copy-FixturePythonStdlib {
-    param([Parameter(Mandatory = $true)][string]$Destination)
-    $libRoot = Join-Path $FixtureBasePrefix "Lib"
-    if (!(Test-Path -LiteralPath $libRoot -PathType Container)) {
-        Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base runtime stdlib is missing"
-    }
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    foreach ($file in @(Get-ChildItem -LiteralPath $libRoot -File -Force)) {
-        if ($file.Extension -in @(".py", ".txt")) {
-            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $Destination $file.Name) -Force
-        }
-    }
-    foreach ($directory in @("collections", "ctypes", "email", "encodings", "html", "http", "importlib", "json", "re", "urllib", "xml")) {
-        Copy-FixtureDirectoryFiltered -Source (Join-Path $libRoot $directory) -Destination (Join-Path $Destination $directory) -SkipDirectories @("__pycache__", "test", "tests")
-    }
-}
-
-function Copy-FixturePythonExtensions {
-    param([Parameter(Mandatory = $true)][string]$Destination)
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    $sourceRoot = [IO.Path]::GetFullPath($FixtureBasePrefix)
-    foreach ($extension in @(Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Force -Filter "*.pyd" -ErrorAction SilentlyContinue)) {
-        $relative = [IO.Path]::GetFullPath($extension.FullName).Substring($sourceRoot.Length).TrimStart('\', '/').Replace('\', '/')
-        if ($relative -match '^(Lib/)?site-packages/' -or $relative -match '(^|/)(test|tests)/') { continue }
-        Copy-Item -LiteralPath $extension.FullName -Destination (Join-Path $Destination $extension.Name) -Force
-    }
-}
-
-function Copy-FixturePythonRuntime {
-    param(
-        [Parameter(Mandatory = $true)][string]$Root,
-        [Parameter(Mandatory = $true)][string]$Destination
-    )
-    $seed = Join-Path $Root "data\local\fixture\python-seed"
+function Get-OrDownloadLockedAsset {
+    param([Parameter(Mandatory = $true)][object]$Asset)
+    $cacheKey = [string]$Asset.Sha256
+    if ($script:LockedPythonAssetCache.ContainsKey($cacheKey)) { return [string]$script:LockedPythonAssetCache[$cacheKey] }
+    $destination = Join-Path $AssetsRoot ("official-python-" + $cacheKey + ".zip")
+    $partial = "$destination.partial"
     try {
-        if (!(Test-Path -LiteralPath (Join-Path $seed "python.exe") -PathType Leaf)) {
-            if (Test-Path -LiteralPath $seed) { Remove-Item -LiteralPath $seed -Recurse -Force }
-            New-Item -ItemType Directory -Force -Path $seed | Out-Null
-            $baseExecutableName = Split-Path -Leaf $FixtureBasePython
-            Copy-Item -LiteralPath $FixtureBasePython -Destination (Join-Path $seed "python.exe") -Force
-            if (![string]::Equals($baseExecutableName, "python.exe", [StringComparison]::OrdinalIgnoreCase)) {
-                Copy-Item -LiteralPath $FixtureBasePython -Destination (Join-Path $seed $baseExecutableName) -Force
-            }
-            $pythonDlls = @(
-                Get-ChildItem -LiteralPath $FixtureBasePrefix -Filter "python*.dll" -File -ErrorAction SilentlyContinue
-            )
-            if ($pythonDlls.Count -eq 0) {
-                Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture base runtime Python DLLs are missing"
-            }
-            foreach ($runtimeFile in $pythonDlls) {
-                Copy-Item -LiteralPath $runtimeFile.FullName -Destination (Join-Path $seed $runtimeFile.Name) -Force
-            }
-            foreach ($pattern in @("*.dll", "*.pyd")) {
-                foreach ($runtimeFile in @(Get-ChildItem -LiteralPath $FixtureBasePrefix -Filter $pattern -File -ErrorAction SilentlyContinue)) {
-                    Copy-Item -LiteralPath $runtimeFile.FullName -Destination (Join-Path $seed $runtimeFile.Name) -Force
-                }
-            }
-            Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "DLLs") -Destination (Join-Path $seed "DLLs") -SkipDirectories @("__pycache__") -Optional
-            Copy-FixturePythonExtensions -Destination (Join-Path $seed "DLLs")
-            Copy-FixturePythonStdlib -Destination (Join-Path $seed "Lib")
-            Write-FixturePythonPackages -RuntimeRoot $seed
-            & (Join-Path $seed "python.exe") -c "import urllib.request, email.parser, http.client"
-            if ($LASTEXITCODE -ne 0) { Throw-HarnessError "FIXTURE_RUNTIME_IMPORT_FAILED" "fixture Python seed is missing required stdlib or extension modules" }
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $client = New-Object Net.WebClient
+        try { $client.DownloadFile([string]$Asset.Url, $partial) } finally { $client.Dispose() }
+        if ((Get-Item -LiteralPath $partial).Length -ne [int64]$Asset.Size -or (Get-PortableFileSha256 -Path $partial) -ne [string]$Asset.Sha256) {
+            Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "downloaded official Python asset failed its immutable lock"
         }
-    }
-    catch {
-        if ((Get-ErrorCode -ErrorRecord $_) -ne "HARNESS_FAILURE") { throw }
-        Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed could not be copied or validated"
-    }
-    if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
-    Copy-Item -LiteralPath $seed -Destination $Destination -Recurse -Force
-}
-
-function New-FixtureEmbeddedPythonZip {
-    param(
-        [Parameter(Mandatory = $true)][string]$Root,
-        [Parameter(Mandatory = $true)][string]$Path
-    )
-    $source = Join-Path $Root "data\local\fixture\embedded-python"
-    Copy-FixturePythonRuntime -Root $Root -Destination $source
-    Remove-Item -LiteralPath (Join-Path $source "Scripts") -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $source "pyvenv.cfg") -Force -ErrorAction SilentlyContinue
-    foreach ($extension in @(Get-ChildItem -LiteralPath (Join-Path $source "DLLs") -Filter "*.pyd" -File -ErrorAction SilentlyContinue)) {
-        Copy-Item -LiteralPath $extension.FullName -Destination (Join-Path $source $extension.Name) -Force
-    }
-    foreach ($dependency in @(Get-ChildItem -LiteralPath (Join-Path $source "DLLs") -Filter "*.dll" -File -ErrorAction SilentlyContinue)) {
-        Copy-Item -LiteralPath $dependency.FullName -Destination (Join-Path $source $dependency.Name) -Force
-    }
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $stdlibArchive = Join-Path $source "python311.zip"
-    $stdlibStream = [IO.File]::Open($stdlibArchive, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try {
-        $stdlibZip = New-Object IO.Compression.ZipArchive($stdlibStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        Move-Item -LiteralPath $partial -Destination $destination -Force
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [IO.Compression.ZipFile]::OpenRead($destination)
         try {
-            $lib = Join-Path $source "Lib"
-            foreach ($file in @(Get-ChildItem -LiteralPath $lib -Recurse -File -Force | Where-Object { $_.FullName -notlike (Join-Path $lib "site-packages\*") })) {
-                $relative = $file.FullName.Substring($lib.Length).TrimStart("\", "/").Replace("\", "/")
-                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($stdlibZip, $file.FullName, $relative, [IO.Compression.CompressionLevel]::Optimal) | Out-Null
+            $names = @($archive.Entries | ForEach-Object { $_.FullName })
+            if ($names -notcontains "python.exe" -or $names -notcontains [string]$Asset.Stdlib -or $names -notcontains [string]$Asset.Pth) {
+                Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "official Python archive does not match its exact-version layout"
             }
         }
-        finally { $stdlibZip.Dispose() }
+        finally { $archive.Dispose() }
     }
-    finally { $stdlibStream.Dispose() }
-    foreach ($item in @(Get-ChildItem -LiteralPath (Join-Path $source "Lib") -Force | Where-Object { $_.Name -ne "site-packages" })) {
-        Remove-Item -LiteralPath $item.FullName -Recurse -Force
-    }
-    [IO.File]::WriteAllText(
-        (Join-Path $source "python311._pth"),
-        "python311.zip`n.`nLib\site-packages`nimport site`n",
-        [Text.Encoding]::ASCII
-    )
-    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
-    [IO.Compression.ZipFile]::CreateFromDirectory($source, $Path, [IO.Compression.CompressionLevel]::Optimal, $false)
+    finally { Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue }
+    $script:LockedPythonAssetCache[$cacheKey] = $destination
+    return $destination
 }
 
 function New-FixtureUvWheel {
@@ -773,10 +706,11 @@ function Install-FixtureProtocol {
         if (!(Test-Path -LiteralPath (Join-Path $Root $rootLauncher) -PathType Leaf)) { Throw-HarnessError "PACKAGE_CORRUPT" "required root launcher is missing" }
     }
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $lockedPython = Get-LockedEmbeddedPythonAsset -Root $Root
+    $officialPython = Get-OrDownloadLockedAsset -Asset $lockedPython
     $port = Get-RandomLoopbackPort
     $manifest.endpoint.port = $port
     $manifest.endpoint.default_url = "http://127.0.0.1:$port"
-    $manifest.runtime.python_version = "3.11.9"
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 12), $Utf8NoBom)
 
     $bundle = if ($Component -eq "tts-more") { Join-Path $Root "scripts" } else { Join-Path $Root "app\tts_more" }
@@ -799,11 +733,15 @@ function Install-FixtureProtocol {
     $asset = [ordered]@{ id="$Component-fixture"; target=$assetTarget; size_bytes=$AssetPayload.Length; sha256=([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($AssetPayload))).Replace("-", "").ToLowerInvariant(); urls=@($AssetUrl) }
     [IO.File]::WriteAllText($assetLock, ($asset | ConvertTo-Json -Depth 6), $Utf8NoBom)
     Write-FixtureService -Path (Join-Path $fixture "fixture-service.py")
+    $fixturePackageRuntime = Join-Path $fixture "uv-install-source"
+    Write-FixturePythonPackages -RuntimeRoot $fixturePackageRuntime
+    $fixturePackages = Join-Path $fixturePackageRuntime "Lib\site-packages"
 
     $runtimePython = Join-Path $Root "runtime\live\python.exe"
 
-    $pythonFixture = Join-Path $AssetsRoot "$Component-python-3.11.9-embed.zip"
-    New-FixtureEmbeddedPythonZip -Root $Root -Path $pythonFixture
+    $pythonFixtureName = "$Component-python-$($lockedPython.Version)-embed.zip"
+    $pythonFixture = Join-Path $AssetsRoot $pythonFixtureName
+    Copy-Item -LiteralPath $officialPython -Destination $pythonFixture -Force
     $uvFixture = Join-Path $AssetsRoot "$Component-uv-0.11.28.whl"
     New-FixtureUvWheel -Path $uvFixture
     $uvId = "uv-0.11.28-$Component-fixture"
@@ -813,7 +751,7 @@ function Install-FixtureProtocol {
         id = "$Component-python-fixture"
         size_bytes = (Get-Item -LiteralPath $pythonFixture).Length
         sha256 = Get-PortableFileSha256 -Path $pythonFixture
-        urls = @("$FixtureEndpoint/$Component-python-3.11.9-embed.zip")
+        urls = @("$FixtureEndpoint/$pythonFixtureName")
         archive_entry = "python.exe"
     }
     $uvAsset = [ordered]@{
@@ -827,7 +765,7 @@ function Install-FixtureProtocol {
     $runtimePayload = [ordered]@{
         schema_version = 1
         component = $Component
-        python_version = "3.11.9"
+        python_version = [string]$lockedPython.Version
         import_probe = "import sys"
         required_free_bytes = 1
         dependency_mode = "requirements"
@@ -860,7 +798,7 @@ function Install-FixtureProtocol {
     }
     Write-FixtureSha256Manifest -Root $Root
     Test-FixtureSha256Manifest -Root $Root
-    return [pscustomobject]@{ Root=$Root; Component=$Component; Port=$port; AssetLock=$assetLock; AssetPath=$assetPath; AssetSha=[string]$asset.sha256; AssetUrl=$AssetUrl; PythonAssetName="$Component-python-3.11.9-embed.zip"; UvAssetName="$Component-uv-0.11.28.whl"; Bundle=$bundle; Service=(Join-Path $fixture "fixture-service.py"); RuntimePython=$runtimePython; RuntimeLock=$runtimeLock; ModelLock=$modelLock; UvAssetPath=$uvWheel; UvAssetSha=$uvAsset.sha256 }
+    return [pscustomobject]@{ Root=$Root; Component=$Component; Port=$port; AssetLock=$assetLock; AssetPath=$assetPath; AssetSha=[string]$asset.sha256; AssetUrl=$AssetUrl; PythonAssetName=$pythonFixtureName; PythonVersion=[string]$lockedPython.Version; UvAssetName="$Component-uv-0.11.28.whl"; Bundle=$bundle; Service=(Join-Path $fixture "fixture-service.py"); FixturePackages=$fixturePackages; RuntimePython=$runtimePython; RuntimeLock=$runtimeLock; ModelLock=$modelLock; UvAssetPath=$uvWheel; UvAssetSha=$uvAsset.sha256 }
 }
 
 function Invoke-RootCommand {
@@ -1062,6 +1000,29 @@ function Assert-OwnedFixtureProcessesStopped {
     }
 }
 
+function New-FixtureManagedOperation {
+    param([Parameter(Mandatory = $true)][object]$Package)
+    $manifest = Get-Content -LiteralPath (Join-Path $Package.Root "package\tts-more-package.json") -Raw | ConvertFrom-Json
+    $operations = Join-Path $Package.Root ([string]$manifest.data.operations)
+    $operationId = [guid]::NewGuid().ToString()
+    $operation = Join-Path $operations $operationId
+    New-Item -ItemType Directory -Force -Path $operation | Out-Null
+    $payload = [ordered]@{ operation_id=$operationId; component=[string]$Package.Component; action="initialize"; initiator="portable-first-run"; started_at=[DateTime]::UtcNow.ToString("o"); status="installing"; exit_code=$null }
+    [IO.File]::WriteAllText((Join-Path $operation "operation.json"), ($payload | ConvertTo-Json -Depth 4), $Utf8NoBom)
+    return $operation
+}
+
+function Assert-ManagedOperationProgress {
+    param([Parameter(Mandatory = $true)][object]$Package, [Parameter(Mandatory = $true)][string]$OperationRoot)
+    $eventsPath = Join-Path $OperationRoot "events.jsonl"
+    if (!(Test-Path -LiteralPath $eventsPath -PathType Leaf)) { Throw-HarnessError "OPERATION_PROGRESS_MISSING" "managed initialization did not emit operation progress" }
+    $events = @([IO.File]::ReadAllLines($eventsPath) | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+    if (@($events | Where-Object { $_.phase -eq "downloading" }).Count -eq 0) { Throw-HarnessError "OPERATION_PROGRESS_MISSING" "managed initialization did not emit download progress" }
+    $actual = (@(& $Package.RuntimePython -c "import platform;print(platform.python_version())" 2>&1) -join "").Trim()
+    if ($LASTEXITCODE -ne 0 -or $actual -ne [string]$Package.PythonVersion) { Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "managed operation progress did not run with the component's exact package Python" }
+    return $actual
+}
+
 function Invoke-PackageAcceptance {
     param([Parameter(Mandatory = $true)][object]$Package)
     $component = [string]$Package.Component
@@ -1083,12 +1044,23 @@ function Invoke-PackageAcceptance {
 
     $initializeScenario = if ($component -eq "tts-more") { "controller_real_initialize" } else { "worker_real_initialize" }
     Invoke-Scenario -Component $component -Scenario $initializeScenario -Action {
-        $initialized = Invoke-RootCommand -Root $Package.Root -Name "Initialize.cmd"
+        $env:TTS_MORE_FIXTURE_PACKAGES = [string]$Package.FixturePackages
+        $initializeArguments = @()
+        $managedOperation = ""
+        if ($component -ne "tts-more") {
+            $managedOperation = New-FixtureManagedOperation -Package $Package
+            $initializeArguments = @("-OperationRoot", $managedOperation, "-CancelFile", (Join-Path $managedOperation "cancel.requested"))
+        }
+        $initialized = Invoke-RootCommand -Root $Package.Root -Name "Initialize.cmd" -Arguments $initializeArguments
         if ($initialized.ExitCode -ne 0) {
             if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("INITIALIZE_EXIT=$($initialized.ExitCode)`n$($initialized.Output)") }
             Throw-HarnessError "INITIALIZE_FAILED" "Initialize.cmd failed"
         }
         Assert-AssetHash -Package $Package
+        if ($component -ne "tts-more") {
+            $actualProgressPython = Assert-ManagedOperationProgress -Package $Package -OperationRoot $managedOperation
+            $Package | Add-Member -NotePropertyName OperationProgressPython -NotePropertyValue $actualProgressPython -Force
+        }
     }
 
     $interruptedAssetPath = [string]$Package.AssetPath
@@ -1269,7 +1241,16 @@ function Invoke-PackageAcceptance {
         if (Test-Path -LiteralPath $recordPath -PathType Leaf) { Throw-HarnessError "STALE_PID_RECORD" "Stop.cmd left a PID record" }
         Start-Sleep -Milliseconds 300
         foreach ($knownPid in $knownPids) { if (Get-Process -Id $knownPid -ErrorAction SilentlyContinue) { Throw-HarnessError "CHILD_PROCESS_REMAINED" "an owned process survived Stop.cmd" } }
-        $descendants = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { [int]$_.ParentProcessId -in $knownPids })
+        $packagePrefix = [IO.Path]::GetFullPath($Package.Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        $descendants = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            if ([int]$_.ParentProcessId -notin $knownPids) { return $false }
+            $executable = [string]$_.ExecutablePath
+            $commandLine = [string]$_.CommandLine
+            return (
+                (![string]::IsNullOrWhiteSpace($executable) -and [IO.Path]::GetFullPath($executable).StartsWith($packagePrefix, [StringComparison]::OrdinalIgnoreCase)) -or
+                (![string]::IsNullOrWhiteSpace($commandLine) -and $commandLine.IndexOf([IO.Path]::GetFullPath($Package.Root), [StringComparison]::OrdinalIgnoreCase) -ge 0)
+            )
+        })
         if ($descendants.Count -gt 0) { Throw-HarnessError "CHILD_PROCESS_REMAINED" "an owned child process survived Stop.cmd" }
     }
 
@@ -1288,6 +1269,9 @@ function Invoke-PackageAcceptance {
             Stop-OwnedFixtureProcess -Owned $owned
             Wait-LoopbackPort -Port $Package.Port -Listening $false
         }
+    }
+    if ($component -ne "tts-more") {
+        $script:WorkerLifecycleSucceeded[$component] = [pscustomobject]@{ OperationProgressPython=[string]$Package.OperationProgressPython }
     }
 }
 
@@ -1335,7 +1319,6 @@ $caught = $null
 try {
     Assert-FixturePython
     $inputPackages = Assert-InputPackages
-    Assert-RestrictedChildPath
     $runRoot = Join-Path ([IO.Path]::GetTempPath()) "tts-fr"
     New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
     $WorkRoot = Join-Path $runRoot $WorkIdentity
@@ -1373,8 +1356,10 @@ try {
         $package = Install-FixtureProtocol -Root $root -Component $component -AssetUrl "$FixtureEndpoint/$component.bin" -AssetPayload $assetPayloads[$component]
         $ExpandedPackages.Add($package)
     }
+    Assert-RestrictedChildPath
     foreach ($package in $ExpandedPackages) { Invoke-PackageAcceptance -Package $package }
     Assert-FixtureNetworkEvidence
+    Finalize-WorkerInitializationEvidence
 }
 catch {
     $caught = $_

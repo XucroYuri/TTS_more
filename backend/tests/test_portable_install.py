@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import urllib.error
 from pathlib import Path
 from uuid import UUID
@@ -32,6 +33,46 @@ def _load_installer():
 
 
 installer = _load_installer()
+
+
+def test_installer_loads_sibling_operations_by_exact_path_without_sys_path_shadowing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "portable_install.py").write_bytes(
+        (REPO_ROOT / "scripts" / "portable_install.py").read_bytes()
+    )
+    (bundle / "portable_operations.py").write_bytes(
+        (REPO_ROOT / "scripts" / "portable_operations.py").read_bytes()
+    )
+    shadow = tmp_path / "shadow"
+    shadow.mkdir()
+    (shadow / "portable_operations.py").write_text(
+        "raise RuntimeError('shadow module selected')\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(shadow))
+    before = list(sys.path)
+    spec = importlib.util.spec_from_file_location("copied_portable_install", bundle / "portable_install.py")
+    assert spec is not None and spec.loader is not None
+    copied = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(copied)
+    assert sys.path == before
+
+    package_root = tmp_path / "package"
+    operations = package_root / "data/local/operations"
+    operation_id = "11111111-1111-4111-8111-111111111111"
+    sibling_spec = importlib.util.spec_from_file_location(
+        "expected_sibling_operations", bundle / "portable_operations.py"
+    )
+    assert sibling_spec is not None and sibling_spec.loader is not None
+    sibling = importlib.util.module_from_spec(sibling_spec)
+    sibling_spec.loader.exec_module(sibling)
+    sibling.create_operation(operations, operation_id, "cosyvoice", "initialize", "test")
+    callback = copied._operation_progress(operations / operation_id, "python-runtime")
+    callback(1, 4, "fixture")
+    _, events = sibling.read_operation(operations, operation_id)
+    assert events[-1]["phase"] == "downloading"
 
 
 def _runtime_lock() -> dict[str, object]:

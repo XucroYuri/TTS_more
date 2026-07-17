@@ -5,6 +5,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.request
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,9 @@ from scripts.sync_integrations import sync_integration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OPERATION_ID = "11111111-1111-4111-8111-111111111111"
+PYTHON_310_URL = "https://www.python.org/ftp/python/3.10.11/python-3.10.11-embed-amd64.zip"
+PYTHON_310_SHA256 = "608619f8619075629c9c69f361352a0da6ed7e62f83a0e19c63e0ea32eb7629d"
+PYTHON_310_SIZE = 8629277
 
 
 APPEND_WORKER = r"""
@@ -40,6 +45,58 @@ while not gate_path.exists():
 for event_index in range(event_count):
     append_event(root, operation_id, "checking", f"worker-{worker_id}-event-{event_index}")
 """
+
+
+def test_operation_progress_runs_under_official_python_31011_embeddable(tmp_path: Path) -> None:
+    archive = tmp_path / "python-3.10.11-embed-amd64.zip"
+    with urllib.request.urlopen(PYTHON_310_URL, timeout=120) as response:
+        archive.write_bytes(response.read())
+    assert archive.stat().st_size == PYTHON_310_SIZE
+    import hashlib
+
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == PYTHON_310_SHA256
+    runtime = tmp_path / "runtime"
+    with zipfile.ZipFile(archive) as payload:
+        payload.extractall(runtime)
+    (runtime / "python310._pth").write_text(
+        "python310.zip\n.\nLib/site-packages\nimport site\n", encoding="ascii"
+    )
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "portable_operations.py").write_bytes(
+        (REPO_ROOT / "scripts" / "portable_operations.py").read_bytes()
+    )
+    (bundle / "portable_launcher.py").write_bytes(
+        (REPO_ROOT / "scripts" / "portable_launcher.py").read_bytes()
+    )
+    operation_root = tmp_path / "operations"
+    code = """
+import platform, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from portable_operations import append_event, create_operation, read_operation
+import portable_launcher
+root = Path(sys.argv[2])
+operation_id = sys.argv[3]
+create_operation(root, operation_id, 'cosyvoice', 'initialize', 'acceptance')
+append_event(root, operation_id, 'downloading', 'cosy progress', percent=25)
+_, events = read_operation(root, operation_id)
+assert platform.python_version() == '3.10.11'
+assert events[-1]['percent'] == 25.0
+assert portable_launcher._normalize_process_creation_time('2026-07-17T00:00:00.1234567+00:00').tzinfo is not None
+print(platform.python_version())
+"""
+    completed = subprocess.run(
+        [str(runtime / "python.exe"), "-c", code, str(bundle), str(operation_root), OPERATION_ID],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip() == "3.10.11"
 
 
 LOCK_HOLDER = r"""

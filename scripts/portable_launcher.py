@@ -4,12 +4,13 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -93,7 +94,7 @@ def write_process_record(
         "parent_pid": int(parent_pid),
         "child_pids": [int(child) for child in child_pids],
         "process_created_at": process_created_at,
-        "recorded_at": datetime.now(UTC).isoformat(),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
         "executable_path": str(executable),
         "command_sha256": command_digest,
         "port": int(port),
@@ -282,6 +283,7 @@ def _inspect_process(pid: int) -> dict[str, object] | None:
         "-NoProfile",
         "-NonInteractive",
         "-Command",
+        "[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false);"
         "$ErrorActionPreference='Stop';"
         "$queryPid=[int]::Parse($env:TTS_MORE_PORTABLE_QUERY_PID,"
         "[Globalization.CultureInfo]::InvariantCulture);"
@@ -299,7 +301,13 @@ def _inspect_process(pid: int) -> dict[str, object] | None:
     expected_keys = {"pid", "parent_pid", "created_at", "executable_path", "command_line"}
     for attempt in range(3):
         completed = subprocess.run(
-            command, check=False, capture_output=True, text=True, env=environment
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
         )
         if completed.returncode != 0 or completed.stderr.strip():
             raise RuntimeError("unable to verify process ownership")
@@ -357,10 +365,11 @@ def _normalize_process_creation_time(value: str) -> datetime:
     if not isinstance(value, str) or not value:
         raise ValueError("process creation time is missing")
     normalized = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
+    normalized = re.sub(r"(\.\d{6})\d+(?=[+-]\d{2}:\d{2}$)", r"\1", normalized)
     parsed = datetime.fromisoformat(normalized)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("process creation time must include an offset")
-    return parsed.astimezone(UTC)
+    return parsed.astimezone(timezone.utc)
 
 
 def _same_process_creation_time(left: str, right: str) -> bool:
@@ -413,6 +422,7 @@ def _listener_pids_for_port(port: int) -> set[int]:
         "-NoProfile",
         "-NonInteractive",
         "-Command",
+        "[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false);"
         "$ErrorActionPreference='Stop';"
         "$queryPort=[uint16]::Parse($env:TTS_MORE_PORTABLE_QUERY_PORT,"
         "[Globalization.CultureInfo]::InvariantCulture);"
@@ -421,7 +431,13 @@ def _listener_pids_for_port(port: int) -> set[int]:
         "[ordered]@{listener_pids=[object[]]$owners}|ConvertTo-Json -Compress",
     ]
     completed = subprocess.run(
-        command, check=False, capture_output=True, text=True, env=environment
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
     )
     if completed.returncode != 0 or completed.stderr.strip():
         raise RuntimeError("unable to verify port ownership")

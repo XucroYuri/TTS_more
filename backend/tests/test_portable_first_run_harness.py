@@ -139,37 +139,30 @@ def test_harness_accepts_json_integer_width_differences_from_powershell_hosts() 
     assert "TryParse([string]$manifest.schema_version" in script
 
 
-def test_harness_treats_python_dlls_directory_as_optional_for_hosted_runtimes() -> None:
+def test_harness_does_not_copy_host_python_dlls_into_package_runtime() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
 
-    assert "Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix \"DLLs\")" in script
-    assert "-SkipDirectories @(\"__pycache__\") -Optional" in script
+    assert "Copy-FixtureDirectoryFiltered" not in script
+    assert 'Get-ChildItem -LiteralPath $FixtureBasePrefix -Filter "python*.dll"' not in script
+    assert "Get-OrDownloadLockedAsset" in script
 
 
-def test_harness_builds_micro_python_stdlib_seed_instead_of_copying_full_lib() -> None:
+def test_harness_uses_locked_official_embeddable_python_instead_of_host_runtime_seed() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
 
-    assert "function Copy-FixturePythonStdlib" in script
-    assert "function Copy-FixturePythonExtensions" in script
-    assert "sys._base_executable" in script
-    assert '@("python.exe", "python3.exe")' in script
-    assert 'foreach ($directory in @("collections", "ctypes", "email", "encodings", "html", "http", "importlib", "json", "re", "urllib", "xml"))' in script
-    assert 'Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Force -Filter "*.pyd"' in script
-    assert 'Copy-FixturePythonExtensions -Destination (Join-Path $seed "DLLs")' in script
-    assert 'Copy-Item -LiteralPath $FixtureBasePython -Destination (Join-Path $seed "python.exe")' in script
-    assert 'Get-ChildItem -LiteralPath $FixtureBasePrefix -Filter "python*.dll" -File' in script
-    assert 'foreach ($file in @("python.exe", "python311.dll"))' not in script
-    assert 'Copy-FixtureDirectoryFiltered -Source (Join-Path $FixtureBasePrefix "Lib")' not in script
-    assert 'Throw-HarnessError "FIXTURE_RUNTIME_INVALID" "fixture Python seed could not be copied or validated"' in script
-    assert 'Throw-HarnessError "FIXTURE_RUNTIME_IMPORT_FAILED" "fixture Python seed is missing required stdlib or extension modules"' in script
-    assert 'Get-ChildItem -LiteralPath (Join-Path $source "DLLs") -Filter "*.dll"' in script
-    assert 'Copy-Item -LiteralPath $dependency.FullName -Destination (Join-Path $source $dependency.Name)' in script
+    assert "function Get-LockedEmbeddedPythonAsset" in script
+    assert "function Get-OrDownloadLockedAsset" in script
+    assert "Copy-FixturePythonRuntime" not in script
+    assert "Copy-FixturePythonStdlib" not in script
+    assert "Copy-FixturePythonExtensions" not in script
+    assert "New-FixtureEmbeddedPythonZip" not in script
 
 
 def test_harness_initialize_contract_uses_embedded_python_and_uv_fixtures() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
     assert all(name in script for name in ("Start.cmd", "Stop.cmd", "Repair.cmd", "Initialize.cmd"))
-    assert "New-FixtureEmbeddedPythonZip" in script
+    assert "Get-LockedEmbeddedPythonAsset" in script
+    assert "Get-OrDownloadLockedAsset" in script
     assert "New-FixtureUvWheel" in script
     assert "uv-0.11.28.data/scripts/uv.exe" in script
     assert "Install-FixtureCondaAdapter" not in script
@@ -244,9 +237,66 @@ def test_harness_truthfully_reports_real_controller_and_worker_initialization() 
     assert "direct_downloader" in script
     assert '"controller_real_initialize"' in compact
     assert '"worker_real_initialize"' in compact
-    assert 'worker_real_initialization = ($Component -ne "tts-more")' in script
+    assert '$script:WorkerLifecycleSucceeded' in script
+    assert 'worker_real_initialization = $false' in script
+    assert '$script:WorkerLifecycleSucceeded[$component]' in script
+    assert 'Finalize-WorkerInitializationEvidence' in script
+    assert compact.index('Finalize-WorkerInitializationEvidence') < compact.rindex('Write-AcceptanceEvidence')
     assert 'fixture_runtime_preseeded = $false' in script
     assert 'Copy-FixturePythonRuntime -Root $Root -Destination (Join-Path $Root "runtime\\live")' not in script
+
+
+def test_harness_preserves_component_exact_python_locks_and_official_archives() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+    compact = " ".join(script.split())
+
+    assert '$manifest.runtime.python_version = "3.11.9"' not in script
+    assert 'python_version = "3.11.9"' not in script
+    assert 'New-FixtureEmbeddedPythonZip' not in script
+    assert 'Get-LockedEmbeddedPythonAsset' in script
+    assert 'Get-OrDownloadLockedAsset' in script
+    assert 'python310.zip' in script and 'python310._pth' in script
+    assert 'python311.zip' in script and 'python311._pth' in script
+    assert "608619f8619075629c9c69f361352a0da6ed7e62f83a0e19c63e0ea32eb7629d" in script
+    assert "009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b" in script
+    assert compact.rindex("Get-OrDownloadLockedAsset -Asset") < compact.rindex("Assert-RestrictedChildPath")
+    assert 'OperationRoot' in script
+    assert 'operation_progress_python' in script
+
+
+@pytest.mark.skipif(os.name != "nt" or POWERSHELL is None, reason="PowerShell evidence contract")
+def test_harness_failed_run_keeps_worker_initialization_false_until_finalization(tmp_path: Path) -> None:
+    probe = tmp_path / "probe.ps1"
+    probe.write_text(
+        f"""
+$content = Get-Content -LiteralPath '{str(HARNESS_SCRIPT).replace("'", "''")}' -Raw
+$start = $content.IndexOf('Set-StrictMode')
+$end = $content.IndexOf('$caught = $null')
+$defs = $content.Substring($start, $end - $start).Replace('$PSScriptRoot', "'{str(HARNESS_SCRIPT.parent).replace("'", "''")}'")
+Invoke-Expression $defs
+Add-Evidence -Component 'cosyvoice' -Scenario 'worker_real_initialize' -Result pass -Duration 0
+$before = @($Evidence)[0].worker_real_initialization
+$script:WorkerLifecycleSucceeded['cosyvoice'] = [pscustomobject]@{{ OperationProgressPython='3.10.11' }}
+$script:WorkerLifecycleSucceeded['gpt-sovits'] = [pscustomobject]@{{ OperationProgressPython='3.11.9' }}
+$script:WorkerLifecycleSucceeded['indextts'] = [pscustomobject]@{{ OperationProgressPython='3.11.9' }}
+Finalize-WorkerInitializationEvidence
+$after = @($Evidence)[0].worker_real_initialization
+$version = @($Evidence)[0].operation_progress_python
+[pscustomobject]@{{ Before=$before; After=$after; Version=$version }} | ConvertTo-Json -Compress
+""",
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(probe)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert payload == {"Before": False, "After": True, "Version": "3.10.11"}
 
 
 def test_harness_requires_windows_and_rejects_incomplete_package_set(tmp_path: Path) -> None:
@@ -488,11 +538,13 @@ def test_real_micro_four_package_fixture_harness_is_sanitized_and_cleans_up(tmp_
     evidence_fields = {
         "component", "scenario", "result", "duration", "error_code",
         "worker_real_initialization", "controller_real_initialization",
-        "fixture_runtime_preseeded", "direct_downloader",
+        "fixture_runtime_preseeded", "direct_downloader", "operation_progress_python",
     }
     assert all(set(record) == evidence_fields for record in records)
     workers = [record for record in records if record["component"] != "tts-more"]
     assert workers and all(record["worker_real_initialization"] is True for record in workers)
+    cosy = [record for record in workers if record["component"] == "cosyvoice"]
+    assert cosy and all(record["operation_progress_python"] == "3.10.11" for record in cosy)
     assert all(record["fixture_runtime_preseeded"] is False for record in records)
     assert all(record["result"] == "pass" for record in records)
     serialized = json.dumps(records, ensure_ascii=False)

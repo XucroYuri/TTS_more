@@ -801,8 +801,10 @@ class PortableIntegrationContractTests(unittest.TestCase):
 
     def test_portable_installer_operation_progress_is_bundle_relative(self) -> None:
         installer = ((BUNDLE if BUNDLE.is_dir() else ROOT / "scripts") / "portable_install.py").read_text(encoding="utf-8")
-        self.assertIn("sys.path.insert(0, str(Path(__file__).resolve().parent))", installer)
-        self.assertIn("from portable_operations import append_event", installer)
+        self.assertNotIn("sys.path.insert(0, str(Path(__file__).resolve().parent))", installer)
+        self.assertIn('Path(__file__).resolve().with_name("portable_operations.py")', installer)
+        self.assertIn("importlib.util.spec_from_file_location", installer)
+        self.assertIn("append_event = operations.append_event", installer)
         self.assertNotIn("from scripts.portable_operations import append_event", installer)
 
     def test_bootstrap_builder_removes_and_rejects_t7_model_weights(self) -> None:
