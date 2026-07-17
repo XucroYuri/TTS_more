@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -9,7 +10,7 @@ import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import Any, BinaryIO
 
 from app.lan_topology import FORMAL_SERVICE_IDS, LanTopology
 from app.windows_ssh import WindowsSshExecutor
@@ -118,6 +119,37 @@ def _is_link_or_reparse(metadata: os.stat_result) -> bool:
 
 def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
     return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _set_open_file_timestamp(stream: BinaryIO, timestamp_ns: int) -> None:
+    if os.name != "nt":
+        os.utime(stream.fileno(), ns=(timestamp_ns, timestamp_ns))
+        return
+
+    import msvcrt
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    windows_epoch_100ns = 116_444_736_000_000_000
+    ticks = timestamp_ns // 100 + windows_epoch_100ns
+    file_time = FileTime(ticks & 0xFFFFFFFF, ticks >> 32)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileTime.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel32.SetFileTime.restype = ctypes.c_int
+    handle = msvcrt.get_osfhandle(stream.fileno())
+    if handle == -1 or not kernel32.SetFileTime(
+        handle,
+        None,
+        ctypes.byref(file_time),
+        ctypes.byref(file_time),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _contained_path(root: Path, candidate: Path) -> Path:
@@ -1551,6 +1583,7 @@ if ($snapshotItem.PSIsContainer -or
                             "private evidence staging temporary was replaced"
                         )
                     raw = stream.read(_MAX_EVIDENCE_FILE_BYTES + 1)
+                    _set_open_file_timestamp(stream, source_mtime_ns)
             except OSError:
                 raise ValueError(
                     "private evidence staging temporary was replaced"
@@ -1559,12 +1592,6 @@ if ($snapshotItem.PSIsContainer -or
                 raise ValueError("local evidence size does not match remote snapshot")
             if hashlib.sha256(raw).hexdigest() != expected_digest:
                 raise ValueError("local evidence digest does not match remote snapshot")
-            os.utime(
-                temporary_name,
-                ns=(source_mtime_ns, source_mtime_ns),
-                dir_fd=staging_descriptor,
-                follow_symlinks=False,
-            )
             relative_parent = destination.parent.relative_to(evidence_root)
             destination_descriptor = os.dup(root_descriptor)
             for part in relative_parent.parts:
@@ -1696,6 +1723,7 @@ if ($snapshotItem.PSIsContainer -or
                             "private evidence staging temporary was replaced"
                         )
                     raw = stream.read(_MAX_EVIDENCE_FILE_BYTES + 1)
+                    _set_open_file_timestamp(stream, source_mtime_ns)
             except OSError:
                 raise ValueError(
                     "private evidence staging temporary was replaced"
@@ -1704,12 +1732,6 @@ if ($snapshotItem.PSIsContainer -or
                 raise ValueError("local evidence size does not match remote snapshot")
             if hashlib.sha256(raw).hexdigest() != expected_digest:
                 raise ValueError("local evidence digest does not match remote snapshot")
-            os.utime(
-                temporary,
-                ns=(source_mtime_ns, source_mtime_ns),
-                follow_symlinks=False,
-            )
-
             _reject_symlink_components(evidence_root)
             _reject_symlink_components(destination.parent)
             current_root = evidence_root.lstat()

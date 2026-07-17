@@ -763,9 +763,14 @@ def test_controller_commit_confirms_complete_clean_repository(
 
     assert controller_commit(tmp_path, process_runner=runner) == COMMIT
     assert calls == [
-        ["/usr/bin/git", "rev-parse", "--show-toplevel"],
-        ["/usr/bin/git", "rev-parse", "HEAD"],
-        ["/usr/bin/git", "status", "--porcelain", "--untracked-files=all"],
+        [str(Path("/usr/bin/git")), "rev-parse", "--show-toplevel"],
+        [str(Path("/usr/bin/git")), "rev-parse", "HEAD"],
+        [
+            str(Path("/usr/bin/git")),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ],
     ]
 
 
@@ -806,7 +811,9 @@ def test_controller_identity_hashes_raw_uuid_without_exposing_it(monkeypatch) ->
     digest = controller_id_sha256(b"s" * 32, process_runner=runner)
     assert digest == hashlib.sha256(b"s" * 32 + b"\0" + raw_uuid.encode()).hexdigest()
     assert raw_uuid not in digest
-    assert calls == [["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"]]
+    assert calls == [
+        [str(Path("/usr/sbin/ioreg")), "-rd1", "-c", "IOPlatformExpertDevice"]
+    ]
 
 
 def test_network_and_probe_identities_are_distinct(tmp_path: Path) -> None:
