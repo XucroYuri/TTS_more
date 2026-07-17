@@ -31,6 +31,21 @@ jobs:
           HTTP_PROXY: ""
           HTTPS_PROXY: ""
         run: pytest backend -q
+      - name: Native Windows deployment validation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $requiredShells = @("powershell.exe", "pwsh.exe")
+          foreach ($shell in $requiredShells) {
+            if (-not (Get-Command $shell -ErrorAction SilentlyContinue)) {
+              throw "Required native deployment shell is missing: $shell"
+            }
+          }
+          python -m pytest `
+            "backend/tests/test_deploy_tool.py::test_windows_native_powershell_launchers_reject_unsafe_remote" `
+            "backend/tests/test_deploy_tool.py::test_windows_native_drive_junction_and_gitdir_policy" `
+            "backend/tests/test_prepare_scripts.py::test_windows_native_prepare_and_wrapper_fail_without_supported_conda" `
+            -q
 
   frontend:
     name: Frontend (vitest + build)

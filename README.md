@@ -77,13 +77,15 @@ make dev        # 或 scripts/start-dev.sh
 应用本体和服务 repo 都以 GitHub 为更新来源。普通更新：
 
 ```bash
-scripts/update.sh
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
+scripts/update.sh --repo-paths deployment/app/repo-paths.local.json
 ```
 
 Windows：
 
 ```powershell
-.\scripts\update.ps1
+Copy-Item deployment\app\repo-paths.example.json deployment\app\repo-paths.local.json
+.\scripts\update.ps1 --repo-paths deployment\app\repo-paths.local.json
 ```
 
 这会快进应用本体当前分支，安全更新 `repo.lock.json` 中的 TTS 服务 repo，并在已存在的服务 repo 内写入可复制的 `tts-more-update.sh` / `tts-more-update.ps1`。如果某个服务 repo 有本地未提交改动，普通更新会拒绝继续，避免丢改动。若 `data/local/services.json` 不存在，它会生成一份本机服务配置；已有本机配置默认保留。
@@ -91,19 +93,19 @@ Windows：
 只预览不写入：
 
 ```bash
-scripts/update.sh --dry-run
+scripts/update.sh --dry-run --repo-paths deployment/app/repo-paths.local.json
 ```
 
 确实要重写本机服务配置时，再显式加：
 
 ```bash
-scripts/update.sh --force-render-services
+scripts/update.sh --force-render-services --repo-paths deployment/app/repo-paths.local.json
 ```
 
 确实要把服务 repo 硬重置到远端分支时，再显式加：
 
 ```bash
-scripts/update.sh --force-reset-repos
+scripts/update.sh --force-reset-repos --repo-paths deployment/app/repo-paths.local.json
 ```
 
 ### 5. 接入 TTS 服务
@@ -114,28 +116,25 @@ TTS More 推荐 worker-first 架构：优先接入 `tts-more-v1` worker；已有
 
 本地完整部署推荐使用一键脚本。它会安装应用本体依赖，按 `repo.lock.json` 中的 `default_selected` 同步 GPT-SoVITS `main`、IndexTTS、CosyVoice，把 `deployment/tts-repos/<provider>` 下的附加脚本复制到对应服务 repo 的 `tts-more/` 目录，准备依赖/模型，并渲染 `data/local/services.json`：
 
+所有本机托管命令都要求显式的 repo 路径确认文件，即使实际路径与锁文件一致。先复制模板并核对本次选择的每个 `service_id`：
+
 ```bash
-scripts/deploy-local-tts.sh --device CU128
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
+scripts/deploy-local-tts.sh --device CU128 --repo-paths deployment/app/repo-paths.local.json
 ```
 
 Windows：
 
 ```powershell
-.\scripts\deploy-local-tts.ps1 -Device CU128
+Copy-Item deployment\app\repo-paths.example.json deployment\app\repo-paths.local.json
+.\scripts\deploy-local-tts.ps1 -Device CU128 -RepoPaths deployment\app\repo-paths.local.json
 ```
 
 GPT-SoVITS `dev` 只用于显式回归，旧 `proplus-hc-dev` 只用于收敛审计。需要时使用：
 
 ```bash
-scripts/deploy-local-tts.sh --targets dev
-scripts/deploy-local-tts.sh --targets all
-```
-
-如果本机 repo 路径不同，先复制并编辑路径确认文件：
-
-```bash
-cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
-scripts/deploy-local-tts.sh --repo-paths deployment/app/repo-paths.local.json
+scripts/deploy-local-tts.sh --targets dev --repo-paths deployment/app/repo-paths.local.json
+scripts/deploy-local-tts.sh --targets all --repo-paths deployment/app/repo-paths.local.json
 ```
 
 应用本体部署资料位于 `deployment/app/`；可复制到上游 TTS repo 的附加脚本位于 `deployment/tts-repos/gpt-sovits/`、`deployment/tts-repos/indextts/`、`deployment/tts-repos/cosyvoice/`。
@@ -143,15 +142,15 @@ scripts/deploy-local-tts.sh --repo-paths deployment/app/repo-paths.local.json
 也可以只运行 manifest 驱动的 repo 准备脚本。默认同样只拉取正式服务；通过 `--targets dev` 或 `--targets all` 才包含回归分支：
 
 ```powershell
-.\scripts\tts-more.ps1 sync-repos --clean
-.\scripts\prepare-tts-repos.ps1 -SyncRepos -CleanRepos -Device CU128
+.\scripts\tts-more.ps1 sync-repos --clean --repo-paths deployment\app\repo-paths.local.json
+.\scripts\prepare-tts-repos.ps1 -SyncRepos -CleanRepos -Device CU128 -RepoPaths deployment\app\repo-paths.local.json
 ```
 
 macOS/Linux：
 
 ```bash
-./scripts/tts-more.sh sync-repos --clean
-bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --device CU128
+./scripts/tts-more.sh sync-repos --clean --repo-paths deployment/app/repo-paths.local.json
+bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --device CU128 --repo-paths deployment/app/repo-paths.local.json
 ```
 
 准备脚本默认走 `Auto`：先跑 `probe-network`，优先选择中国大陆可达且健康的源，例如 ModelScope 或 HF Mirror，必要时再回退到全球 Hugging Face / PyPI 路线。默认安装只准备 full-quality baseline models，quantized、distilled、simplified、small、low-memory 这些都只是手动 manual 的高级选项。

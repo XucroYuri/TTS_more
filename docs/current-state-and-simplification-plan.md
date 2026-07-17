@@ -31,22 +31,28 @@ flowchart TD
 
 默认路径只保留三个动作：
 
-1. 更新：`scripts/update.sh` 或 `scripts/update.ps1`
-2. 准备服务 repo、依赖和模型：`scripts/prepare-tts-repos.sh --sync-repos` 或 `scripts/prepare-tts-repos.ps1 -SyncRepos`
-3. 启动应用和 worker：`make dev`、`scripts/start-service-workers.sh`
+先创建并核对完整确认文件；即使路径与 lock 默认值相同也必须提供：
+
+```bash
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
+```
+
+1. 更新：`scripts/update.sh --repo-paths deployment/app/repo-paths.local.json` 或 `scripts/update.ps1 --repo-paths deployment/app/repo-paths.local.json`
+2. 准备服务 repo、依赖和模型：`scripts/prepare-tts-repos.sh --sync-repos --repo-paths deployment/app/repo-paths.local.json` 或 `scripts/prepare-tts-repos.ps1 -SyncRepos -RepoPaths deployment/app/repo-paths.local.json`
+3. 启动应用和 worker：`make dev`、`scripts/start-service-workers.sh --repo-paths deployment/app/repo-paths.local.json`
 
 服务 repo 内还可以写入可复制的轻量更新脚本：
 
 ```bash
-scripts/tts-more.sh install-update-scripts
+scripts/tts-more.sh install-update-scripts --repo-paths deployment/app/repo-paths.local.json
 ```
 
-生成的 `tts-more-update.sh` / `tts-more-update.ps1` 可以复制到单独的 TTS 服务部署设备上。它只做一件事：从 GitHub fast-forward 当前服务 repo 到对应分支最新版；如需回到锁定提交，可加 `--pinned`。
+生成的 `tts-more-update.sh`、`tts-more-update.ps1`、`tts-more-update.py`、`tts-more-update.json` 必须作为一个 portable updater bundle 一起复制到单独的 TTS 服务部署设备上。**repositories with submodules do not receive the standalone updater**；它们 **must be updated from TTS More managed sync-repos**，因为 standalone updater 不处理 submodule，安装命令会报告 managed-sync-only 且不写入四个文件。sidecar **does not store installer-host absolute executable paths**；运行时 **resolves Git independently on the destination device**，使用固定安装目录或目标机显式 `TTS_MORE_TRUSTED_GIT`。updater 先验证 actual origin identity，再由 actual transport 决定 SSH；**sidecar transport does not override the actual origin transport**。因此实际 HTTPS origin 不要求 SSH，实际 SSH/scp origin 需要目标机 trusted SSH，可由 `TTS_MORE_TRUSTED_SSH` 指定。updater 从 GitHub fast-forward 当前服务 repo 到对应分支最新版；如需回到锁定提交，可加 `--pinned`。
 
 ## 当前已具备的能力
 
 - `repo.lock.json` 锁定五个可选部署目标的远端、分支、提交、端口、服务 id 和 `default_selected`；默认只选择三个正式服务。
-- `scripts/tts_more_deploy.py sync-repos` 可以拉取或重置服务 repo。
+- `scripts/tts_more_deploy.py sync-repos --repo-paths deployment/app/repo-paths.local.json` 可以拉取或重置服务 repo；submodule 只在最终 superproject state 后解析，relative URL 基于 validated actual origin，并逐个通过 GitHub allowlist 后更新。HTTPS-only submodules 不需要 SSH，任一 SSH submodule 都需要 trusted SSH。
 - `probe-network` 会选择 ModelScope、HF Mirror、Hugging Face、PyPI 镜像等下载源，并把缓存路径集中到 `data/cache`。
 - `render-services` 会从 repo 清单生成 `data/local/services.json`，避免手写服务配置。
 - worker 统一暴露 `tts-more-v1`，应用本体只需要看统一 API，而不是每个模型仓库的内部调用细节。
@@ -95,7 +101,7 @@ scripts/tts-more.sh install-update-scripts
 已改进：
 - 新增 `tts_more_deploy.py update`，默认保护已有 `data/local/services.json`，并拒绝更新有本地改动的服务 repo；需要重写服务配置时显式加 `--force-render-services`，需要硬重置服务 repo 时显式加 `--force-reset-repos`。
 - 新增 `scripts/update.sh` 和 `scripts/update.ps1`。
-- 新增 `install-update-scripts`，向服务 repo 写入轻量更新脚本。
+- 新增 `install-update-scripts`，向不含 submodule 的服务 repo 写入四文件轻量 updater；含 submodule 的 repo 只报告必须走 managed `sync-repos`，不安装 standalone updater。
 
 剩余风险：
 - 真实服务 repo 尚未全部克隆，无法在本机验证服务 repo 内脚本实际执行。
@@ -105,10 +111,10 @@ scripts/tts-more.sh install-update-scripts
 
 ### P0：保持更新和部署入口稳定
 
-- 保留 `scripts/update.*` 作为应用本体更新入口。
-- 保留 `scripts/tts-more.*` 作为部署工具入口。
+- 保留 `scripts/update.* --repo-paths deployment/app/repo-paths.local.json` 作为应用本体更新入口。
+- 保留 `scripts/tts-more.* --repo-paths deployment/app/repo-paths.local.json` 作为部署工具入口。
 - 所有服务 repo 同步继续从 `repo.lock.json` 读取，不新增第二份清单。
-- 验收：`tts_more_deploy.py update --dry-run`、`sync-repos --dry-run`、`doctor` 均可运行。
+- 验收：`tts_more_deploy.py update --dry-run --repo-paths deployment/app/repo-paths.local.json`、`sync-repos --dry-run --repo-paths deployment/app/repo-paths.local.json`、`doctor --repo-paths deployment/app/repo-paths.local.json` 均可运行。
 
 ### P1：压缩默认 UI 文案和入口
 
@@ -141,4 +147,4 @@ scripts/tts-more.sh install-update-scripts
 
 - 后续发布提交需同时核对 GitHub 与 Gitee 组织仓库的目标分支 SHA，保持双远端记录一致。
 - 在目标 GPU 上完成 GPT-SoVITS 收敛分支 CUDA 门禁；通过后合入 fork `main`，首个稳定版本发布后删除远端 proplus 分支并永久保留归档标签。
-- 在目标 GPU 设备上确认模型下载源、CUDA/conda/micromamba 路线和真实音频验收样本。
+- 在目标 GPU 设备上确认模型下载源、CUDA/conda 路线和真实音频验收样本；managed prepare 当前不支持 micromamba。

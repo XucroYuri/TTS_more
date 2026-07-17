@@ -692,4 +692,3 @@ Push GitHub, push Gitee, and verify local/GitHub/Gitee full SHAs are identical. 
 - [ ] **Step 5: Record only irreducible wake-up items**
 
 The final wake-up list may contain only: three real reference audio files, four private GPT/SoVITS weight files, any missing protected runner variables, confirmation to stop unrelated GPU workloads before baseline measurement, two real listening reviewers, and approval of the first complete warm p95 baseline.
-

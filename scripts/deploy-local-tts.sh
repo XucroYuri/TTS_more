@@ -36,10 +36,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 run() {
-  echo "[run] $*"
+  printf '[run]'
+  printf ' %q' "$@"
+  printf '\n'
   if [[ "$DRY_RUN" == "1" ]]; then
     return 0
   fi
+  "$@"
+}
+
+run_plan() {
+  printf '[plan]'
+  printf ' %q' "$@"
+  printf '\n'
   "$@"
 }
 
@@ -71,14 +80,14 @@ refresh_python
 
 validate_args=(validate-repo-paths --service-ids "$TARGETS")
 [[ -n "$REPO_PATHS" ]] && validate_args+=(--repo-paths "$REPO_PATHS")
-run "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${validate_args[@]}"
+run_plan "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${validate_args[@]}"
 
 if [[ "$SKIP_REPO_SYNC" != "1" ]]; then
   sync_args=(sync-repos --service-ids "$TARGETS")
   [[ -n "$REPO_PATHS" ]] && sync_args+=(--repo-paths "$REPO_PATHS")
   [[ "$CLEAN_REPOS" == "1" ]] && sync_args+=(--clean)
   [[ "$DRY_RUN" == "1" ]] && sync_args+=(--dry-run)
-  run "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${sync_args[@]}"
+  run_plan "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${sync_args[@]}"
 else
   echo "[skip] repo sync"
 fi
@@ -86,12 +95,12 @@ fi
 bundle_args=(install-repo-bundles --service-ids "$TARGETS")
 [[ -n "$REPO_PATHS" ]] && bundle_args+=(--repo-paths "$REPO_PATHS")
 [[ "$DRY_RUN" == "1" ]] && bundle_args+=(--dry-run)
-run "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${bundle_args[@]}"
+run_plan "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${bundle_args[@]}"
 
 update_script_args=(install-update-scripts --service-ids "$TARGETS")
 [[ -n "$REPO_PATHS" ]] && update_script_args+=(--repo-paths "$REPO_PATHS")
 [[ "$DRY_RUN" == "1" ]] && update_script_args+=(--dry-run)
-run "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${update_script_args[@]}"
+run_plan "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${update_script_args[@]}"
 
 if [[ "$SKIP_REPO_PREPARE" != "1" ]]; then
   prepare_args=(--source "$SOURCE" --device "$DEVICE" --targets "$TARGETS")
@@ -99,17 +108,18 @@ if [[ "$SKIP_REPO_PREPARE" != "1" ]]; then
   [[ "$SKIP_INSTALL" == "1" ]] && prepare_args+=(--skip-install)
   [[ "$SKIP_DOWNLOADS" == "1" ]] && prepare_args+=(--skip-downloads)
   [[ "$DRY_RUN" == "1" ]] && prepare_args+=(--dry-run)
-  run bash "$ROOT/scripts/prepare-tts-repos.sh" "${prepare_args[@]}"
+  run_plan bash "$ROOT/scripts/prepare-tts-repos.sh" "${prepare_args[@]}"
 else
   echo "[skip] repo dependency/model prepare"
 fi
 
-render_args=(render-services --profile local-all --platform posix --service-ids "$TARGETS" --output data/local/services.json)
+render_args=(render-services --profile local-all --platform posix --service-ids "$TARGETS")
 [[ -n "$REPO_PATHS" ]] && render_args+=(--repo-paths "$REPO_PATHS")
-run "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${render_args[@]}"
+[[ "$DRY_RUN" != "1" ]] && render_args+=(--output data/local/services.json)
+run_plan "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${render_args[@]}"
 
 doctor_args=(doctor --service-ids "$TARGETS")
 [[ -n "$REPO_PATHS" ]] && doctor_args+=(--repo-paths "$REPO_PATHS")
-run "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${doctor_args[@]}"
+run_plan "$PYTHON" "$ROOT/scripts/tts_more_deploy.py" "${doctor_args[@]}"
 
 echo "Local TTS deployment workflow complete."

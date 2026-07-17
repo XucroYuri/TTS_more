@@ -43,19 +43,19 @@ worker 从配置的 GPT-SoVITS repo 根目录推导 `GPT_SoVITS`、`ffmpeg-share
 先在目标机器检查准备状态：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\tts_more_deploy.py doctor --service-ids local-gpt-sovits-main
+.\.venv\Scripts\python.exe scripts\tts_more_deploy.py doctor --service-ids local-gpt-sovits-main --repo-paths deployment/app/repo-paths.local.json
 ```
 
 Windows 的 `worker_prerequisites` 会分别报告：GPT package、官方安装器所需的 `conda`，以及 `ffmpeg-shared/bin` 中的 full-shared FFmpeg DLL。缺少任意一项时，运行准备脚本：
 
 ```powershell
-.\scripts\prepare-tts-repos.ps1 -Targets local-gpt-sovits-main -Device CU128
+.\scripts\prepare-tts-repos.ps1 -Targets local-gpt-sovits-main -Device CU128 -RepoPaths deployment\app\repo-paths.local.json
 ```
 
 该脚本会使用锁文件中的相对 repo 路径准备环境、安装 worker 依赖，固定 `onnxruntime-gpu==1.26.0`（CUDA 12.8 兼容）、下载 full-shared FFmpeg，并在结束前实际 import GPT-SoVITS 和调用 `torchaudio.load` 读取临时 WAV；因此不会把“模型可加载”误判为“能读取参考音频”。先预览所有步骤但不要求本机已安装 Conda：
 
 ```powershell
-.\scripts\prepare-tts-repos.ps1 -Targets local-gpt-sovits-main -SkipDownloads -DryRun
+.\scripts\prepare-tts-repos.ps1 -Targets local-gpt-sovits-main -SkipDownloads -DryRun -RepoPaths deployment\app\repo-paths.local.json
 ```
 
 正式执行时缺少 Conda 会 fail-fast，并给出安装前置提示；安装器不会替每台机器选择或写死 Conda 安装位置。
