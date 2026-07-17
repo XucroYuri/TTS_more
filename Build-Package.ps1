@@ -262,6 +262,43 @@ public static class TtsMorePortableDirectoryHandle
             return information.NumberOfLinks;
         }
     }
+
+    public static bool ContainsAnyPrefix(string path, string[] prefixes)
+    {
+        var patterns = new System.Collections.Generic.List<byte[]>();
+        foreach (string prefix in prefixes)
+        {
+            if (String.IsNullOrEmpty(prefix)) { continue; }
+            patterns.Add(System.Text.Encoding.UTF8.GetBytes(prefix));
+            patterns.Add(System.Text.Encoding.Unicode.GetBytes(prefix));
+        }
+        if (patterns.Count == 0) { return false; }
+        int maximum = 1;
+        foreach (byte[] pattern in patterns) { maximum = Math.Max(maximum, pattern.Length); }
+        byte[] buffer = new byte[1048576 + maximum - 1];
+        using (var stream = new System.IO.FileStream(path, System.IO.FileMode.Open,
+            System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete))
+        {
+            int carry = 0;
+            int read;
+            while ((read = stream.Read(buffer, carry, 1048576)) > 0)
+            {
+                int length = carry + read;
+                foreach (byte[] pattern in patterns)
+                {
+                    for (int offset = 0; offset <= length - pattern.Length; offset++)
+                    {
+                        int index = 0;
+                        while (index < pattern.Length && buffer[offset + index] == pattern[index]) { index++; }
+                        if (index == pattern.Length) { return true; }
+                    }
+                }
+                carry = Math.Min(maximum - 1, length);
+                if (carry > 0) { Buffer.BlockCopy(buffer, length - carry, buffer, 0, carry); }
+            }
+        }
+        return false;
+    }
 }
 '@
 }
@@ -346,10 +383,29 @@ function Assert-TtsMoreFullRuntimeBoundary {
             throw "Full package staging contains a reparse point: $($entry.FullName)"
         }
         foreach ($segment in @($entry.FullName.Substring($PackageRoot.Length).TrimStart("\", "/") -split '[\\/]')) {
+            if ($segment -eq "__pycache__" -or $segment.EndsWith(".pyc", [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Full package staging contains Python bytecode: $($entry.FullName)"
+            }
             if ($forbiddenNames -contains $segment -or $segment -like "Miniforge*") {
                 throw "Full package staging contains forbidden portable-runtime content: $($entry.FullName)"
             }
         }
+    }
+}
+
+function Remove-TtsMoreFullRuntimeBytecode {
+    param([Parameter(Mandatory = $true)][string]$PackageRoot)
+    $runtimeRoot = [IO.Path]::GetFullPath((Join-Path $PackageRoot "runtime\live"))
+    foreach ($directory in @(Get-ChildItem -LiteralPath $runtimeRoot -Directory -Recurse -Force | Where-Object { $_.Name -eq "__pycache__" } | Sort-Object FullName -Descending)) {
+        if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Full runtime bytecode cleanup refused a reparse point" }
+        Remove-Item -LiteralPath $directory.FullName -Recurse -Force
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath $runtimeRoot -File -Recurse -Force -Filter "*.pyc")) {
+        if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Full runtime bytecode cleanup refused a reparse point" }
+        Remove-Item -LiteralPath $file.FullName -Force
+    }
+    if (@(Get-ChildItem -LiteralPath $runtimeRoot -Recurse -Force | Where-Object { $_.Name -eq "__pycache__" -or $_.Name -like "*.pyc" }).Count -gt 0) {
+        throw "Full package staging contains Python bytecode after cleanup"
     }
 }
 
@@ -409,33 +465,7 @@ function Test-TtsMoreFullRuntimeOnOtherVolume {
 
 function Test-PortableBinaryContainsMachinePrefix {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string[]]$Prefixes)
-    $patterns = New-Object System.Collections.Generic.List[byte[]]
-    foreach ($prefix in $Prefixes) {
-        $patterns.Add([Text.Encoding]::UTF8.GetBytes($prefix))
-        $patterns.Add([Text.Encoding]::Unicode.GetBytes($prefix))
-    }
-    $maximum = @($patterns | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
-    $stream = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-    try {
-        $buffer = New-Object byte[] (1048576 + $maximum)
-        $carry = 0
-        while (($read = $stream.Read($buffer, $carry, 1048576)) -gt 0) {
-            $length = $carry + $read
-            foreach ($pattern in $patterns) {
-                for ($offset = 0; $offset -le $length - $pattern.Length; $offset++) {
-                    $matched = $true
-                    for ($index = 0; $index -lt $pattern.Length; $index++) {
-                        if ($buffer[$offset + $index] -ne $pattern[$index]) { $matched = $false; break }
-                    }
-                    if ($matched) { return $true }
-                }
-            }
-            $carry = [Math]::Min($maximum - 1, $length)
-            if ($carry -gt 0) { [Array]::Copy($buffer, $length - $carry, $buffer, 0, $carry) }
-        }
-        return $false
-    }
-    finally { $stream.Dispose() }
+    return [TtsMorePortableDirectoryHandle]::ContainsAnyPrefix($Path, $Prefixes)
 }
 
 function Assert-TtsMoreFullArchiveBoundary {
@@ -447,6 +477,9 @@ function Assert-TtsMoreFullArchiveBoundary {
         try {
             foreach ($entry in $archive.Entries) {
                 foreach ($segment in @($entry.FullName -split '[/\\]')) {
+                    if ($segment -eq "__pycache__" -or $segment.EndsWith(".pyc", [StringComparison]::OrdinalIgnoreCase)) {
+                        throw "Full package archive contains Python bytecode: $($entry.FullName)"
+                    }
                     if ($segment -in @("pyvenv.cfg", "conda-meta", "condabin", "Miniforge") -or $segment -like "Miniforge*") {
                         throw "Full package archive contains forbidden portable-runtime content: $($entry.FullName)"
                     }
@@ -505,6 +538,7 @@ $createdWorkHandle = $null
 $createdWorkIdentity = $null
 $workCreated = $false
 $workBaseHandle = $null
+$isolatedUvCache = ""
 try {
 New-Item -ItemType Directory -Force -Path $workBase | Out-Null
 [void](Assert-PortableWorkPath -CandidatePath $workBase)
@@ -573,9 +607,10 @@ if ($Profile -eq "Full") {
         $env:UV_CACHE_DIR = $previousUvCache
         if (Test-Path -LiteralPath $isolatedUvCache) { Remove-Item -LiteralPath $isolatedUvCache -Recurse -Force }
     }
+    Assert-TtsMoreFullStagingReparseBoundary -PackageRoot $stage
+    Remove-TtsMoreFullRuntimeBytecode -PackageRoot $stage
     Assert-TtsMoreFullPayloadBoundary -PackageRoot $stage
     Assert-TtsMoreFullRuntimeBoundary -PackageRoot $stage
-    Assert-TtsMoreFullStagingReparseBoundary -PackageRoot $stage
     Assert-TtsMoreFullRuntimeLinkBoundary -PackageRoot $stage
     $runtimeLockForProbe = Get-Content -LiteralPath (Join-Path $stage "packaging\portable\runtime.lock.json") -Raw | ConvertFrom-Json
     $runtimeCrossVolumeProbe = Test-TtsMoreFullRuntimeOnOtherVolume -PackageRoot $stage -ExpectedPython ([string]$runtimeLockForProbe.python_version) -ImportProbe ([string]$runtimeLockForProbe.import_probe)
@@ -598,14 +633,26 @@ $machinePaths = @(
     $env:USERPROFILE,
     "$($env:HOMEDRIVE)$($env:HOMEPATH)"
 ) | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) -and ([string]$_).Length -ge 4 } | Select-Object -Unique
+$fullRuntimeMachinePrefixes = @($machinePaths) + @(
+    $work,
+    $stage,
+    $workBase,
+    $isolatedUvCache,
+    [IO.Path]::GetTempPath(),
+    $env:TEMP,
+    $env:TMP
+) | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) -and ([string]$_).Length -ge 3 } | Select-Object -Unique
 $machineNames = @($env:USERNAME, $env:COMPUTERNAME) | Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) -and ([string]$_).Length -ge 4 } | Select-Object -Unique
-$machinePathLeak = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $_.Length -lt 5MB } | Select-String -SimpleMatch -Pattern $machinePaths -ErrorAction SilentlyContinue)
+$portableTextExtensions = @(".json", ".toml", ".txt", ".md", ".py", ".ps1", ".cmd", ".cfg", ".ini", ".pth", "._pth", ".lock", ".yaml", ".yml")
+$runtimeLiveRoot = [IO.Path]::GetFullPath((Join-Path $stage "runtime\live"))
+$machinePathLeak = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object {
+    !$_.FullName.StartsWith($runtimeLiveRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and
+    $_.Length -lt 5MB -and ($_.Extension -in $portableTextExtensions -or $_.Name -like "*._pth")
+} | Select-String -SimpleMatch -Pattern $fullRuntimeMachinePrefixes -ErrorAction SilentlyContinue)
 $runtimeBinaryLeak = @()
 if ($Profile -eq "Full") {
-    $runtimeMetadata = @(Get-ChildItem -LiteralPath (Join-Path $stage "runtime\live") -Recurse -File -Force | Where-Object {
-        $_.Extension -in @(".pyd", ".dll", ".exe", ".cfg", ".ini", ".json", ".toml", ".pth", "._pth", ".txt", ".py") -or $_.Name -like "*._pth"
-    })
-    $runtimeBinaryLeak = @($runtimeMetadata | Where-Object { Test-PortableBinaryContainsMachinePrefix -Path $_.FullName -Prefixes $machinePaths })
+    $runtimeMetadata = @(Get-ChildItem -LiteralPath $runtimeLiveRoot -Recurse -File -Force)
+    $runtimeBinaryLeak = @($runtimeMetadata | Where-Object { Test-PortableBinaryContainsMachinePrefix -Path $_.FullName -Prefixes $fullRuntimeMachinePrefixes })
 }
 $generatedMetadata = @((Join-Path $stage "package\tts-more-package.json"), (Join-Path $stage "licenses\THIRD_PARTY_NOTICES.json"))
 $generatedMetadata = @($generatedMetadata | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })

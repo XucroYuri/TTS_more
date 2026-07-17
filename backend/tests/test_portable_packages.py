@@ -2273,9 +2273,48 @@ def test_tts_more_full_builder_binary_scans_large_runtime_metadata_for_machine_p
     builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
 
     assert "Test-PortableBinaryContainsMachinePrefix" in builder
-    assert "Encoding]::Unicode.GetBytes" in builder
+    assert "Encoding.Unicode.GetBytes" in builder
     assert "FileStream" in builder
-    assert '".pyd"' in builder and '".dll"' in builder and '".exe"' in builder
+    assert "$runtimeMetadata = @(Get-ChildItem -LiteralPath $runtimeLiveRoot -Recurse -File -Force)" in builder
+
+
+def test_tts_more_full_builder_scans_actual_build_and_initialization_roots() -> None:
+    builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+
+    assert "$work" in builder and "$stage" in builder and "$workBase" in builder
+    assert "$isolatedUvCache" in builder
+    assert "GetTempPath" in builder
+    assert "Encoding.UTF8.GetBytes" in builder
+    assert "Encoding.Unicode.GetBytes" in builder
+    assert "fullRuntimeMachinePrefixes" in builder
+
+
+def test_tts_more_full_builder_removes_and_rejects_python_bytecode() -> None:
+    builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+
+    assert "Remove-TtsMoreFullRuntimeBytecode" in builder
+    assert '"__pycache__"' in builder
+    assert '"*.pyc"' in builder
+    assert "Full package staging contains Python bytecode" in builder
+    assert "Full package archive contains Python bytecode" in builder
+    assert builder.index("Remove-TtsMoreFullRuntimeBytecode") < builder.index(
+        "create-zip --package-root"
+    )
+
+
+def test_tts_more_full_builder_scans_every_runtime_file_with_bounded_native_streaming() -> None:
+    builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+
+    assert "ContainsAnyPrefix" in builder
+    assert "FileStream" in builder
+    runtime_scan = builder.split("$runtimeBinaryLeak = @()", maxsplit=1)[1].split(
+        "$generatedMetadata", maxsplit=1
+    )[0]
+    assert "Get-ChildItem" in runtime_scan
+    assert "-Recurse -File -Force" in runtime_scan
+    assert ".Extension" not in runtime_scan
+    assert "5MB" not in runtime_scan
+    assert "$portableTextExtensions" in builder
 
 
 def test_public_builders_use_embedded_sha256_helper_instead_of_get_file_hash() -> None:
