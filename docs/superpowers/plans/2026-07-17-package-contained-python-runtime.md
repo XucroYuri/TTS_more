@@ -28,14 +28,18 @@
 - Create: `integrations/windows/portable-python.ps1`
 - Create: `backend/tests/test_portable_python_runtime.py`
 - Modify: `backend/tests/test_prepare_scripts.py`
+- Modify: `scripts/sync_integrations.py`
 - Modify: `packaging/portable/runtime.lock.json`
+- Modify: `integrations/components/gpt-sovits/component-source.json`
+- Modify: `integrations/components/indextts/component-source.json`
+- Modify: `integrations/components/cosyvoice/component-source.json`
 - Modify: `integrations/components/gpt-sovits/runtime.lock.json`
 - Modify: `integrations/components/indextts/runtime.lock.json`
 - Modify: `integrations/components/cosyvoice/runtime.lock.json`
 
 **Interfaces:**
 - Produces: `Install-PortablePythonRuntime -PackageRoot -RuntimeLock -Destination [-OperationRoot] [-CancelFile]` returning one object with `Python`, `Uv`, and `SitePackages` absolute paths.
-- Consumes: existing `portable_install.py ensure-asset` command and existing operation/cancellation arguments.
+- Consumes: a PowerShell bootstrap downloader for the Python ZIP, then existing `portable_install.py ensure-asset` for uv after staging Python is runnable.
 
 - [ ] **Step 1: Write failing lock and script contract tests**
 
@@ -58,7 +62,7 @@ def test_runtime_locks_pin_embeddable_python_and_uv() -> None:
     assert controller["assets"]["python"] | PY311 == controller["assets"]["python"]
     for component, expected in (("gpt-sovits", PY311), ("indextts", PY311), ("cosyvoice", PY310)):
         lock = json.loads((REPO_ROOT / f"integrations/components/{component}/runtime.lock.json").read_text())
-        assert lock["assets"]["python"] | expected == lock["assets"]["python"]
+        assert lock["assets"]["python"] == expected | {"urls": lock["assets"]["python"]["urls"], "archive_entry": lock["assets"]["python"]["archive_entry"]}
         assert lock["assets"]["uv"]["sha256"] == "f4fcf2c8d9f1444b900e6b8dbbb828825fb76eca01acd18aeaa5c90240408cda"
 
 def test_portable_python_helper_is_zip_safe_and_has_no_conda_dependency() -> None:
@@ -73,7 +77,7 @@ def test_portable_python_helper_is_zip_safe_and_has_no_conda_dependency() -> Non
     assert "conda create" not in text
 ```
 
-Add synthetic ZIP tests that invoke PowerShell functions and prove absolute paths, `..`, duplicate normalized targets, reparse destinations, missing/duplicate uv entries and unexpected `_pth` layouts fail before publication.
+Use exact assertions for URL, size, SHA-256, Python archive entry, uv wheel entry and absence of mutable-version fields. Add synthetic ZIP tests parameterized over both helper copies that prove absolute paths, `..`, duplicate normalized targets, reparse destinations, missing/duplicate uv entries and unexpected `_pth` layouts fail before publication. Require exactly one `python311._pth`/`python310._pth` and exactly four effective entries.
 
 - [ ] **Step 2: Run RED**
 
@@ -87,7 +91,7 @@ Expected: FAIL because the helper and `assets.python` entries do not exist.
 
 - [ ] **Step 3: Implement the minimal helper and locks**
 
-Use .NET `ZipArchive` and normalized destination checks. The helper must configure the single expected `_pth` file as:
+Use .NET `HttpClient`/file streams for the first Python download and prove interrupted eight-byte transfer resumes with `Range: bytes=8-`; prove the first mirror returning 503 falls back to the second identical-hash asset. Only after staging Python passes the exact patch-version probe may the helper use `portable_install.py ensure-asset` for uv. Use .NET `ZipArchive` and normalized destination checks. The helper must configure the single expected `_pth` file as:
 
 ```text
 python311.zip   # or python310.zip
@@ -96,7 +100,7 @@ Lib\site-packages
 import site
 ```
 
-Extract only the exact uv entry declared in the lock (default `uv-0.11.28.data/scripts/uv.exe`). Download locks are materialized beneath `data/cache/portable/locks`; archives remain beneath `data/cache/portable/assets`. Reject an existing destination and publish only a completely validated temporary extraction directory.
+Extract only the exact uv entry declared in the lock (default `uv-0.11.28.data/scripts/uv.exe`). Download locks are materialized beneath `data/cache/portable/locks`; archives remain beneath `data/cache/portable/assets`. Reject an existing destination and publish only a completely validated temporary extraction directory. Update `python_version` and component sources to exact patch versions and teach `scripts/sync_integrations.py` to generate the same values.
 
 - [ ] **Step 4: Run GREEN and real relocation smoke**
 
@@ -107,7 +111,7 @@ Run the focused pytest command, PowerShell 5.1 AST parsing for both helpers, the
 & $uv pip check --python $python
 ```
 
-Copy the runtime to a different path containing Chinese characters and spaces; both `sys.prefix` and `sys.base_prefix` must resolve to the copied directory and `import packaging` must succeed.
+Copy the runtime to a different path containing Chinese characters and spaces; both `sys.prefix` and `sys.base_prefix` must resolve to the copied directory, `importlib.metadata.version("packaging")`, `import packaging`, and `uv pip check --python` must succeed.
 
 - [ ] **Step 5: Commit**
 
@@ -126,6 +130,7 @@ git commit -m "feat: add package-contained Python runtime"
 - Modify: `backend/tests/test_portable_install.py`
 - Modify: `backend/tests/test_portable_packages.py`
 - Modify: `backend/tests/test_portable_first_run_harness.py`
+- Modify: `scripts/test-portable-first-run.ps1`
 
 **Interfaces:**
 - Consumes: `Install-PortablePythonRuntime` from Task 1.
@@ -135,7 +140,7 @@ git commit -m "feat: add package-contained Python runtime"
 
 Require the controller initializer to dot-source `portable-python.ps1`, call `Install-PortablePythonRuntime`, use the returned paths, install with `--target $PortableRuntime.SitePackages --link-mode copy`, and run `uv pip check --python`. Explicitly assert the initializer does not contain `bootstrap-conda.ps1`, `$Conda`, `conda create`, `-m pip`, or `Scripts\uv.exe`.
 
-Extend the Full package audit fixture to fail if the archive contains `pyvenv.cfg`, `conda-meta`, `condabin`, `Miniforge`, a build-machine prefix, or any hardlink outside the package root.
+Extend the Full package audit fixture to fail if staging or the archive contains `pyvenv.cfg`, `conda-meta`, `condabin`, `Miniforge` or a build-machine prefix. Before compression, isolate the uv cache and copy staging to another volume to prove runtime files are independent; do not attempt to infer NTFS hardlinks from ZIP metadata. Change `scripts/test-portable-first-run.ps1` to synthesize a locked embeddable Python ZIP and a wheel containing the exact uv entry under restricted PATH, and remove `Install-FixtureCondaAdapter` plus `runtime/Scripts/uv.exe` assumptions.
 
 - [ ] **Step 2: Run RED**
 
@@ -147,7 +152,7 @@ Expected: FAIL because the current controller initializer invokes package Conda.
 
 - [ ] **Step 3: Implement the controller flow**
 
-Move Python preparation before device selection. Run `portable_install.py select-device` with staging Python. Preserve `uv lock --check` and `uv export --frozen --no-dev --no-emit-project`; replace pip installation with:
+The tested order is exact: Python install -> patch-version probe -> device selection -> runtime/model assets -> uv dependency install -> probes -> atomic publish. Run `portable_install.py select-device` with staging Python. Preserve `uv lock --check` and `uv export --frozen --no-dev --no-emit-project`; replace pip installation with:
 
 ```powershell
 & $PortableRuntime.Uv pip install `
@@ -158,7 +163,7 @@ Move Python preparation before device selection. Run `portable_install.py select
 & $PortableRuntime.Uv pip check --python $PortableRuntime.Python
 ```
 
-Preserve import probe, atomic `staging -> live`, lock hashes and install-state write. Full builder still invokes the real staged initializer.
+Preserve import probe, atomic `staging -> live`, lock hashes and install-state write. `Build-Package.ps1` must copy `scripts/portable-python.ps1` into controller staging. Full builder still invokes the real staged initializer.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -178,6 +183,7 @@ git commit -m "fix: build controller runtime without package Conda"
 - Modify: `integrations/windows/Build-Package.ps1`
 - Modify: `integrations/contract_tests/test_portable_integration.py`
 - Modify: `scripts/tts_more_deploy.py`
+- Modify: `scripts/sync_integrations.py`
 - Modify: `backend/tests/test_integration_sync.py`
 - Modify: generated integration manifests/bundles produced by the repository sync command
 
@@ -187,7 +193,7 @@ git commit -m "fix: build controller runtime without package Conda"
 
 - [ ] **Step 1: Write failing worker contract tests**
 
-Require worker `Initialize.ps1` to use the helper, retain exact profile selection and payload/model download ordering, install the selected requirements lock with uv `--target`/`--link-mode copy`, and run the existing component import probe. Require sync manifests to include `portable-python.ps1` with its SHA-256.
+Require worker `Initialize.ps1` to use the helper with the exact order Python -> patch probe -> select-device -> runtime payload -> model payload -> uv install -> probes -> atomic publish, install the selected requirements lock with uv `--target`/`--link-mode copy`, and run the existing component import probe. Require sync manifests and worker package staging to include `portable-python.ps1` with its SHA-256.
 
 - [ ] **Step 2: Run RED**
 
@@ -199,11 +205,11 @@ Expected: FAIL because the worker initializer invokes Conda and manifests omit t
 
 - [ ] **Step 3: Implement and regenerate controlled mirrors**
 
-Prepare embedded Python before selecting the device. Use staging Python for `portable_install.py`, preserve runtime payloads, locked model downloads and all probes, and replace only environment creation/install/check commands. Add the helper to source-copy rules and regenerate integration manifests with the existing sync command; do not hand-edit manifest hashes.
+Prepare embedded Python before selecting the device. Use staging Python for `portable_install.py`, preserve runtime payloads, locked model downloads and all probes, and replace only environment creation/install/check commands. Add the helper to `scripts/sync_integrations.py` source-copy rules and update generated ordinary-user guidance so it describes Python/uv assets rather than `data/cache/portable/conda`. Do not generate fork manifests until the canonical TTS More implementation is committed.
 
 - [ ] **Step 4: Verify and commit**
 
-Run integration contracts, sync `--check`, worker package tests, all PowerShell AST checks and full backend focused gate.
+Run integration contracts, canonical sync generation tests, worker package tests, all PowerShell AST checks and full backend focused gate. Commit the canonical TTS More implementation first; its exact SHA becomes the integration source revision used by Task 4.
 
 ```powershell
 git add integrations scripts/tts_more_deploy.py backend/tests/test_integration_sync.py

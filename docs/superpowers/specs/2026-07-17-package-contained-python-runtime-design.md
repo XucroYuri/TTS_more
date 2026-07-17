@@ -47,14 +47,14 @@ Install-PortablePythonRuntime `
 该函数执行：
 
 1. 从 runtime lock 读取 `assets.python` 和 `assets.uv`。
-2. 使用现有 `portable_install.py ensure-asset` 下载到包内 `data/cache/portable/assets`，保持 `.partial`、Range 续传、镜像回退、大小和 SHA-256 约束。
+2. 在 Python 尚不存在的 bootstrap 边界，由 PowerShell/.NET 下载器获取 Python ZIP；该下载器必须复用现有锁格式并实现相同的 `.partial`、`Range: bytes=N-`、有序镜像回退、大小、SHA-256、取消和原子发布约束，不得调用系统 Python。
 3. 将 Python ZIP 解压到同级临时目录，不覆盖现有 `runtime/live`。
 4. 验证 ZIP 只包含相对安全路径，不允许绝对路径、盘符、`..`、reparse point 或重复目标。
 5. 将 `<major><minor>._pth` 配置为 `pythonXY.zip`、`.`、`Lib\site-packages` 和 `import site`，不得生成 `pyvenv.cfg`。
-6. 用 .NET `ZipArchive` 从 uv wheel 提取唯一、精确路径的 `uv.exe` 到包内 `data/cache/portable/tools/uv-0.11.28/uv.exe`；拒绝缺失、重复或路径漂移。
+6. staging Python 可执行后，用现有 `portable_install.py ensure-asset` 获取 uv wheel，再用 .NET `ZipArchive` 从 wheel 提取唯一、精确路径的 `uv.exe` 到包内 `data/cache/portable/tools/uv-0.11.28/uv.exe`；拒绝缺失、重复或路径漂移。
 7. 创建 `Lib/site-packages`，运行 Python 版本探针，返回 `python.exe`、`uv.exe` 和 site-packages 路径。
 
-函数不读取系统 Python、Conda、pip、tar、7-Zip 或用户级 uv。PowerShell 与 .NET ZIP API 是 Windows 包唯一外部基础条件。
+函数不读取系统 Python、Conda、pip、tar、7-Zip 或用户级 uv。PowerShell 与 .NET ZIP API 是 Windows 包唯一外部基础条件。四个 runtime lock 的 `python_version` 必须是精确 patch 版本 `3.11.9` 或 `3.10.11`；`component-source.json`、生成的 `component.json`、运行时探针和 manifest 必须保持一致，并在依赖安装前精确比较 patch 版本。
 
 ## 4. 初始化数据流
 
@@ -62,9 +62,10 @@ Install-PortablePythonRuntime `
 
 ```text
 锁/空间/取消预检
-  -> 下载并校验 Python ZIP 与 uv wheel
-  -> Install-PortablePythonRuntime(runtime/staging)
+  -> PowerShell 下载并校验 Python ZIP
+  -> 解压并精确验证 staging Python patch 版本
   -> 用 staging Python 运行 portable_install.py
+  -> 下载并校验 uv wheel、提取精确 uv.exe entry
   -> 选择设备 profile 与下载锁定 runtime/model payload
   -> uv lock --check / export（适用时）
   -> uv pip install --python staging/python.exe --target staging/Lib/site-packages
@@ -95,10 +96,11 @@ Full ZIP 不得包含 Miniforge 安装目录、Conda package cache、`pyvenv.cfg
 - `integrations/windows/portable-python.ps1`
 - `integrations/windows/Initialize.ps1`
 - worker runtime locks 与集成 manifest
+- `scripts/sync_integrations.py` 中的受控文件列表、组件 Python patch 版本和普通用户说明生成规则
 
 同步器把这些文件复制到三个 fork 的 `tts_more/`，更新逐文件 SHA-256。TTS More 控制器使用 `scripts/portable-python.ps1`；其实现必须与 integration helper 的安全和事务语义一致，允许目录布局差异但不允许算法漂移。
 
-三个 fork 的正式 Python 版本分别由 `component.json` 与 runtime lock 共同约束：GPT/Index 为 3.11.9，CosyVoice 为 3.10.11。版本不匹配必须在依赖安装前失败。
+三个 fork 的正式 Python 版本分别由 `component-source.json`、生成的 `component.json` 与 runtime lock 共同约束：GPT/Index 为 3.11.9，CosyVoice 为 3.10.11。版本不匹配必须在依赖安装前失败。TTS More 规范源必须先提交，三个 fork 的 integration manifest 才能绑定该提交 SHA；fork 提交后再更新 `repo.lock.json`。
 
 ## 7. 验收门禁
 
@@ -109,8 +111,11 @@ Full ZIP 不得包含 Miniforge 安装目录、Conda package cache、`pyvenv.cfg
 - Python ZIP 路径穿越、重复文件、错误 `_pth`、错误版本和损坏哈希失败关闭；
 - uv wheel 只接受精确的 `uv.exe` entry；
 - 无系统 Python/Conda/uv 的 fixture 初始化仍通过；
+- first-run harness 合成受控 Python embeddable ZIP 与含精确 uv entry 的 wheel，不再注入 Conda adapter，并在受限 PATH 下执行；
 - runtime 中没有 `pyvenv.cfg`、外部 `base_prefix`、Conda 目录或机器绝对路径；
 - runtime 复制到中文、空格、不同盘符和随机目录后，核心 import 与 `uv pip check` 通过；
+- 两份 helper 必须通过相同的恶意 ZIP、`_pth`、Range 续传和镜像回退参数化测试；`_pth` 必须恰好一个且只有 Python zip、`.`、`Lib\site-packages`、`import site` 四个有效条目；
+- 压缩前检查 staging 无外部 hardlink 依赖，隔离 uv cache 后复制到另一卷验证；ZIP 审计只验证内容、路径、机器前缀和锁覆盖；
 - 四个 Full ZIP 真实构建产生 4x6 组件资产及兼容矩阵、provenance；
 - 随机路径断网执行 `Start.cmd -> Stop.cmd -> Repair.cmd`，三个 worker 完成真实短音频合成。
 
