@@ -6,6 +6,8 @@ import re
 import subprocess
 from typing import Any
 
+from app.subprocess_safety import noninteractive_subprocess_kwargs
+
 
 _DEVICE_UUID_CACHE: dict[int | str, str | None] = {}
 
@@ -79,6 +81,7 @@ def _cuda_device_uuid(index: int) -> str | None:
             text=True,
             timeout=5,
             check=True,
+            **noninteractive_subprocess_kwargs(),
         )
         for line in completed.stdout.splitlines():
             raw_index, separator, raw_uuid = line.partition(",")

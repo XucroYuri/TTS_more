@@ -203,7 +203,50 @@ def test_render_local_all_services_from_repo_lock(tmp_path: Path) -> None:
     assert gpt_main["env"]["TTS_MORE_GPTSOVITS_REPO"] == "repo/GPT-SoVITS-main"
     assert gpt_main["start_command"][0] == "repo/GPT-SoVITS-main/.venv/Scripts/python.exe"
     assert services[1]["env"]["TTS_MORE_INDEXTTS_MODEL_DIR"] == "repo/index-tts/checkpoints"
-    assert services[2]["env"]["TTS_MORE_COSYVOICE_MODEL_DIR"] == "pretrained_models/CosyVoice-300M"
+    assert (
+        services[2]["env"]["TTS_MORE_COSYVOICE_MODEL_DIR"]
+        == "repo/CosyVoice/pretrained_models/CosyVoice-300M"
+    )
+
+
+def test_cosyvoice_worker_env_qualifies_repo_relative_model_dir() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    repo = {
+        "provider_type": "cosyvoice",
+        "path": "vendors/custom-cosyvoice",
+        "model_dir": "models/CosyVoice-300M",
+    }
+
+    env = deploy._worker_env(repo, "windows")
+
+    assert (
+        env["TTS_MORE_COSYVOICE_MODEL_DIR"]
+        == "vendors/custom-cosyvoice/models/CosyVoice-300M"
+    )
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "model_dir"),
+    [
+        ("windows", r"D:\Models\CosyVoice-300M"),
+        ("posix", "/srv/models/CosyVoice-300M"),
+    ],
+)
+def test_cosyvoice_worker_env_preserves_target_absolute_model_dir(
+    platform_name: str, model_dir: str
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    repo = {
+        "provider_type": "cosyvoice",
+        "path": "repo/CosyVoice",
+        "model_dir": model_dir,
+    }
+
+    env = deploy._worker_env(repo, platform_name)
+
+    assert env["TTS_MORE_COSYVOICE_MODEL_DIR"] == model_dir
 
 
 @pytest.mark.parametrize(
@@ -1339,6 +1382,38 @@ def test_doctor_reports_network_profile_and_cache_paths(tmp_path: Path) -> None:
     assert report["cache_paths"]["cache_root"] == "data/cache"
 
 
+def test_doctor_reports_missing_gpt_worker_prerequisites(tmp_path: Path, monkeypatch) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    monkeypatch.setattr(deploy, "_platform_name", lambda: "windows")
+    monkeypatch.setattr(deploy.shutil, "which", lambda _name: None)
+    _write_repo_lock(tmp_path)
+    gpt_repo = tmp_path / "repo" / "GPT-SoVITS-main"
+    (gpt_repo / "GPT_SoVITS").mkdir(parents=True)
+    metadata = gpt_repo / ".venv" / "Lib" / "site-packages" / "onnxruntime_gpu-1.27.0.dist-info"
+    metadata.mkdir(parents=True)
+    (metadata / "METADATA").write_text("Metadata-Version: 2.1\nVersion: 1.27.0\n", encoding="utf-8")
+
+    report = deploy.doctor(tmp_path)
+    gpt_report = next(item for item in report["repositories"] if item["name"] == "GPT-SoVITS-main")
+
+    prerequisites = gpt_report["worker_prerequisites"]
+    assert prerequisites["ready"] is False
+    assert {check["id"] for check in prerequisites["checks"]} >= {
+        "gpt_package_dir",
+        "ffmpeg_shared_dll",
+        "conda_executable",
+        "onnxruntime_cuda12_compatible",
+    }
+    onnxruntime_check = next(
+        check for check in prerequisites["checks"] if check["id"] == "onnxruntime_cuda12_compatible"
+    )
+    assert onnxruntime_check["passed"] is False
+    assert "1.27.0" in onnxruntime_check["message"]
+    assert "prepare-tts-repos.ps1" in prerequisites["next_action"]
+    assert "Install Conda" in prerequisites["next_action"]
+
+
 def test_sync_repos_latest_dry_run_skips_locked_commit_checkout(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     deploy = _load_deploy_module(repo_root)
@@ -1440,6 +1515,10 @@ def test_install_repo_bundles_copies_provider_helpers_and_excludes_them(tmp_path
     bundle.mkdir(parents=True)
     (bundle / "tts-more-prepare.sh").write_text("#!/usr/bin/env bash\necho prepare\n", encoding="utf-8")
     (bundle / "README.md").write_text("IndexTTS helper\n", encoding="utf-8")
+    launchers = bundle / "launchers"
+    launchers.mkdir()
+    (launchers / "Start.cmd").write_text("@echo off\nstart\n", encoding="utf-8")
+    (launchers / "Stop.cmd").write_text("@echo off\nstop\n", encoding="utf-8")
     target = tmp_path / "repo" / "index-tts"
     (target / ".git").mkdir(parents=True)
 
@@ -1448,12 +1527,17 @@ def test_install_repo_bundles_copies_provider_helpers_and_excludes_them(tmp_path
     copied = target / "tts-more" / "tts-more-prepare.sh"
     manifest = json.loads((target / "tts-more" / "tts-more-repo.json").read_text(encoding="utf-8"))
     assert reports[0]["installed"] is True
+    assert reports[0]["launchers"] == ["repo/index-tts/Start.cmd", "repo/index-tts/Stop.cmd"]
     assert copied.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash")
+    assert (target / "Start.cmd").read_text(encoding="utf-8").splitlines() == ["@echo off", "start"]
+    assert (target / "Stop.cmd").read_text(encoding="utf-8").splitlines() == ["@echo off", "stop"]
     if os.name != "nt":
         assert copied.stat().st_mode & stat.S_IXUSR
     assert manifest["service_id"] == "local-indextts"
     exclude = (target / ".git" / "info" / "exclude").read_text(encoding="utf-8")
     assert "tts-more/" in exclude
+    assert "Start.cmd" in exclude
+    assert "Stop.cmd" in exclude
 
 
 def test_update_project_dry_run_reports_app_and_repo_actions_without_writes(

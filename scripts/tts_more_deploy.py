@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from urllib.error import URLError
@@ -1047,6 +1047,7 @@ def install_repo_bundles(
             "exists": repo_path.exists(),
             "bundle": str(bundle_path.relative_to(root)) if bundle_path.exists() else "",
             "target": str(target_path.relative_to(root)),
+            "launchers": [],
             "installed": False,
         }
         reports.append(report)
@@ -1056,6 +1057,16 @@ def install_repo_bundles(
         if dry_run or not repo_path.exists():
             continue
         _copy_tree_contents(bundle_path, target_path)
+        installed_launchers: list[str] = []
+        launcher_templates = bundle_path / "launchers"
+        for launcher_name in ("Start.cmd", "Stop.cmd"):
+            source = launcher_templates / launcher_name
+            if not source.is_file():
+                continue
+            destination = repo_path / launcher_name
+            shutil.copy2(source, destination)
+            installed_launchers.append(destination.relative_to(root).as_posix())
+        report["launchers"] = installed_launchers
         manifest = {
             "schema_version": 1,
             "installed_at": _isoformat(_utc_now()),
@@ -1069,7 +1080,10 @@ def install_repo_bundles(
         }
         write_json(target_path / "tts-more-repo.json", manifest)
         _chmod_shell_scripts(target_path)
-        _exclude_local_helper_paths(repo_path, ["tts-more/"])
+        _exclude_local_helper_paths(
+            repo_path,
+            ["tts-more/", *[Path(path).name for path in installed_launchers]],
+        )
         report["installed"] = True
     return reports
 
@@ -1213,19 +1227,20 @@ def doctor(
         path = root / str(repo["path"])
         branch = _git_output(["git", "-C", str(path), "branch", "--show-current"]) if (path / ".git").exists() else ""
         head = _git_output(["git", "-C", str(path), "rev-parse", "HEAD"]) if (path / ".git").exists() else ""
-        reports.append(
-            {
-                "name": repo.get("name"),
-                "path": repo.get("path"),
-                "exists": path.exists(),
-                "branch": branch,
-                "expected_branch": repo.get("branch"),
-                "head": head,
-                "expected_commit": repo.get("commit"),
-                "venv_python": _python_path(repo, _platform_name()),
-                "venv_python_exists": (root / _python_path(repo, _platform_name())).exists(),
-            }
-        )
+        report = {
+            "name": repo.get("name"),
+            "path": repo.get("path"),
+            "exists": path.exists(),
+            "branch": branch,
+            "expected_branch": repo.get("branch"),
+            "head": head,
+            "expected_commit": repo.get("commit"),
+            "venv_python": _python_path(repo, _platform_name()),
+            "venv_python_exists": (root / _python_path(repo, _platform_name())).exists(),
+        }
+        if str(repo.get("provider_type")) == "gpt-sovits":
+            report["worker_prerequisites"] = _gpt_worker_prerequisites(root, repo)
+        reports.append(report)
     repo_root = root / "repo"
     extra_dirs = []
     if repo_root.exists():
@@ -1433,6 +1448,14 @@ def _start_command(
     ]
 
 
+def _repo_scoped_model_dir(repo_path: str, model_dir: str, platform_name: str) -> str:
+    path_type = PureWindowsPath if platform_name == "windows" else PurePosixPath
+    target_model_dir = path_type(model_dir)
+    if target_model_dir.is_absolute():
+        return model_dir
+    return (path_type(repo_path) / target_model_dir).as_posix()
+
+
 def _worker_env(repo: dict[str, Any], platform_name: str) -> dict[str, str]:
     provider = str(repo["provider_type"])
     path = str(repo["path"])
@@ -1450,7 +1473,8 @@ def _worker_env(repo: dict[str, Any], platform_name: str) -> dict[str, str]:
     elif provider == "cosyvoice":
         env["TTS_MORE_COSYVOICE_REPO"] = path
         env["TTS_MORE_COSYVOICE_PYTHON"] = _python_path(repo, platform_name)
-        env["TTS_MORE_COSYVOICE_MODEL_DIR"] = str(repo.get("model_dir") or "pretrained_models/CosyVoice-300M")
+        model_dir = str(repo.get("model_dir") or "pretrained_models/CosyVoice-300M")
+        env["TTS_MORE_COSYVOICE_MODEL_DIR"] = _repo_scoped_model_dir(path, model_dir, platform_name)
     return env
 
 
@@ -1763,6 +1787,93 @@ def _inspect_host_gpu(
         "max_total_mib": max_total_mib,
         "driver_versions": driver_versions,
     }
+
+
+def _gpt_worker_prerequisites(root: Path, repo: dict[str, Any]) -> dict[str, Any]:
+    """Report portable, static prerequisites for the non-invasive GPT worker."""
+    repo_path = _resolve_project_path(root, str(repo["path"]))
+    package_dir = repo_path / "GPT_SoVITS"
+    ffmpeg_bin = repo_path / "ffmpeg-shared" / "bin"
+    if _platform_name() == "windows":
+        media_runtime_ready = any(ffmpeg_bin.glob("avcodec-*.dll"))
+        media_runtime_message = "full-shared FFmpeg DLLs are available"
+    else:
+        media_runtime_ready = (ffmpeg_bin / "ffmpeg").is_file()
+        media_runtime_message = "bundled FFmpeg executable is available"
+    checks = [
+        {
+            "id": "gpt_package_dir",
+            "passed": package_dir.is_dir(),
+            "message": "GPT_SoVITS package directory is available",
+        },
+        {
+            "id": "ffmpeg_shared_dll",
+            "passed": media_runtime_ready,
+            "message": media_runtime_message,
+        },
+    ]
+    if _platform_name() == "windows":
+        onnxruntime_version = _venv_package_version(repo_path, "onnxruntime-gpu")
+        cuda12_compatible = _is_cuda12_compatible_onnxruntime(onnxruntime_version)
+        checks.append(
+            {
+                "id": "conda_executable",
+                "passed": shutil.which("conda") is not None,
+                "message": "Conda is available for the GPT-SoVITS official installer",
+            }
+        )
+        checks.append(
+            {
+                "id": "onnxruntime_cuda12_compatible",
+                "passed": cuda12_compatible,
+                "message": (
+                    f"onnxruntime-gpu {onnxruntime_version} is compatible with CUDA 12"
+                    if cuda12_compatible
+                    else f"onnxruntime-gpu {onnxruntime_version or 'is not installed'} must be pinned to 1.26.0 for CUDA 12"
+                ),
+            }
+        )
+    ready = all(bool(check["passed"]) for check in checks)
+    failed_checks = {str(check["id"]) for check in checks if not check["passed"]}
+    if "conda_executable" in failed_checks:
+        next_action = "Install Conda for the GPT-SoVITS official installer, then run scripts/prepare-tts-repos.ps1."
+    elif failed_checks:
+        next_action = "Run scripts/prepare-tts-repos.ps1 for the selected GPT-SoVITS checkout."
+    else:
+        next_action = "GPT worker static prerequisites are present."
+    return {
+        "ready": ready,
+        "checks": checks,
+        "next_action": next_action,
+    }
+
+
+def _venv_package_version(repo_path: Path, package: str) -> str | None:
+    """Read a package version from the configured repo venv without importing it."""
+    if _platform_name() == "windows":
+        site_packages = repo_path / ".venv" / "Lib" / "site-packages"
+    else:
+        candidates = sorted((repo_path / ".venv" / "lib").glob("python*/site-packages"))
+        site_packages = candidates[-1] if candidates else repo_path / ".venv" / "lib" / "site-packages"
+    normalized = package.replace("-", "_")
+    for metadata in sorted(site_packages.glob(f"{normalized}-*.dist-info")):
+        try:
+            for line in (metadata / "METADATA").read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("Version: "):
+                    return line.removeprefix("Version: ").strip() or None
+        except OSError:
+            continue
+    return None
+
+
+def _is_cuda12_compatible_onnxruntime(version: str | None) -> bool:
+    if not version:
+        return False
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", version)
+    if match is None:
+        return False
+    major, minor, patch = (int(value or 0) for value in match.groups())
+    return (major, minor, patch) >= (1, 19, 0) and (major, minor, patch) < (1, 27, 0)
 
 
 def _inspect_ctranslate2(
