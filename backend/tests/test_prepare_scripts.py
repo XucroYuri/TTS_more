@@ -524,6 +524,9 @@ def test_posix_prepare_and_wrapper_fail_before_gpt_preparation_without_supported
     root, repo_paths, prepare_marker, render_marker = _write_prepare_failure_fixture(tmp_path)
     fake_bin = root / "test-bin"
     fake_bin.mkdir()
+    unusable_conda = fake_bin / "conda"
+    unusable_conda.write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
+    unusable_conda.chmod(0o755)
     if micromamba_only:
         micromamba = fake_bin / "micromamba"
         micromamba.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -756,6 +759,11 @@ def test_one_click_dry_run_includes_dependency_and_model_plan_without_writes(tmp
             "--dry-run",
         ],
         cwd=root,
+        env={
+            **os.environ,
+            "PATH": os.pathsep.join(("/usr/bin", "/bin")),
+            "TTS_MORE_BASE_PYTHON": sys.executable,
+        },
         capture_output=True,
         text=True,
         check=False,

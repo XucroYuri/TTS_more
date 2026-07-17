@@ -250,7 +250,7 @@ prepare_index() {
       local repo_python
       ensure_venv "$repo_path"
       repo_python="$repo_path/.venv/bin/python"
-      run_with_package_index_fallback "IndexTTS editable install" run_pip_editable "$repo_path" "$repo_python"
+      run_with_package_index_fallback "IndexTTS dependency install" run_pip_editable "$repo_path" "$repo_python"
     fi
   fi
   if [[ "$SKIP_DOWNLOADS" != "1" ]]; then
@@ -329,7 +329,7 @@ preflight_gpt_conda() {
     variant="$(field "$repo" variant)"
     target_enabled "$name" "$provider" "$service_id" "$variant" || continue
     [[ "$provider" == "gpt-sovits" ]] || continue
-    if command -v conda >/dev/null 2>&1; then
+    if command -v conda >/dev/null 2>&1 && conda --version >/dev/null 2>&1; then
       return 0
     fi
     if command -v micromamba >/dev/null 2>&1; then
