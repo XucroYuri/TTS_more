@@ -25,12 +25,19 @@ WINDOWS_RESERVED_NAMES = {
     *(f"COM{index}" for index in range(1, 10)),
     *(f"LPT{index}" for index in range(1, 10)),
 }
+_ATOMIC_REPLACE_LOCKS = tuple(threading.Lock() for _ in range(64))
+
+
+def _atomic_replace_lock(path: Path) -> threading.Lock:
+    normalized = os.path.normcase(
+        os.path.realpath(os.path.abspath(os.fspath(path)))
+    )
+    return _ATOMIC_REPLACE_LOCKS[hash(normalized) % len(_ATOMIC_REPLACE_LOCKS)]
 
 
 class ProjectStore:
     def __init__(self, root: Path) -> None:
         self.root = root
-        self._replace_lock = threading.Lock()
 
     def project_dir(self, project_id: str) -> Path:
         safe_id = self._safe_project_id(project_id)
@@ -196,7 +203,7 @@ class ProjectStore:
         temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
             temp_path.write_text(text, encoding="utf-8")
-            with self._replace_lock:
+            with _atomic_replace_lock(path):
                 temp_path.replace(path)
         finally:
             try:

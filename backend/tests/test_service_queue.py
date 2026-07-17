@@ -754,8 +754,12 @@ def test_generation_job_manager_allows_different_project_transactions_in_paralle
 
 
 def test_project_store_atomic_writes_use_unique_temp_paths_under_concurrency(tmp_path: Path, monkeypatch) -> None:
-    store = ProjectStore(tmp_path)
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    lexical_root = alias_parent / ".."
+    stores = (ProjectStore(tmp_path), ProjectStore(lexical_root))
     target = tmp_path / "state.json"
+    targets = (target, lexical_root / "state.json")
     write_barrier = threading.Barrier(2)
     temp_paths: list[Path] = []
     errors: list[BaseException] = []
@@ -767,7 +771,11 @@ def test_project_store_atomic_writes_use_unique_temp_paths_under_concurrency(tmp
 
     def synchronized_write_text(path: Path, text: str, *args, **kwargs):
         result = original_write_text(path, text, *args, **kwargs)
-        if path.parent == target.parent and path.name.startswith(f".{target.name}.") and path.name.endswith(".tmp"):
+        if (
+            path.parent.resolve() == target.parent.resolve()
+            and path.name.startswith(f".{target.name}.")
+            and path.name.endswith(".tmp")
+        ):
             with paths_lock:
                 temp_paths.append(path)
             write_barrier.wait(2)
@@ -785,15 +793,20 @@ def test_project_store_atomic_writes_use_unique_temp_paths_under_concurrency(tmp
             with paths_lock:
                 active_replaces -= 1
 
-    def write_payload(payload: str) -> None:
+    def write_payload(store: ProjectStore, write_target: Path, payload: str) -> None:
         try:
-            store._write_text(target, payload)
+            store._write_text(write_target, payload)
         except BaseException as exc:
             errors.append(exc)
 
     monkeypatch.setattr(Path, "write_text", synchronized_write_text)
     monkeypatch.setattr(Path, "replace", monitored_replace)
-    workers = [threading.Thread(target=write_payload, args=(payload,)) for payload in ("first", "second")]
+    workers = [
+        threading.Thread(target=write_payload, args=(store, write_target, payload))
+        for store, write_target, payload in zip(
+            stores, targets, ("first", "second"), strict=True
+        )
+    ]
     for worker in workers:
         worker.start()
     for worker in workers:
