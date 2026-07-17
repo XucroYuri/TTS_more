@@ -11,9 +11,9 @@ from typing import Iterable
 
 INTEGRATION_VERSION = "2.0.0"
 COMPONENTS = {
-    "gpt-sovits": {"module": "tts_more_worker.gpt_sovits:app", "port": 9880, "python": "3.11"},
-    "indextts": {"module": "tts_more_worker.indextts:app", "port": 9881, "python": "3.11"},
-    "cosyvoice": {"module": "tts_more_worker.cosyvoice:app", "port": 9882, "python": "3.10"},
+    "gpt-sovits": {"module": "tts_more_worker.gpt_sovits:app", "port": 9880, "python": "3.11.9"},
+    "indextts": {"module": "tts_more_worker.indextts:app", "port": 9881, "python": "3.11.9"},
+    "cosyvoice": {"module": "tts_more_worker.cosyvoice:app", "port": 9882, "python": "3.10.11"},
 }
 GUIDE_NAME = "使用说明-先看这里.txt"
 ROOT_ENTRIES = (
@@ -74,6 +74,7 @@ def sync_integration(source_root: Path, target_root: Path, component: str, sourc
         _copy_file(source_root / "scripts" / name, controlled / name)
     for name in (
         "Initialize.ps1",
+        "portable-python.ps1",
         "Start-Worker.ps1",
         "Stop-Worker.ps1",
         "Repair.ps1",

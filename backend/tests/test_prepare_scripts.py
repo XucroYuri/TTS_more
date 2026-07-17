@@ -231,6 +231,18 @@ def test_portable_first_run_powershell_scripts_do_not_depend_on_get_file_hash() 
         assert "Get-FileHash" not in script
 
 
+def test_portable_python_helpers_are_part_of_the_preparation_contract() -> None:
+    for relative in (
+        "scripts/portable-python.ps1",
+        "integrations/windows/portable-python.ps1",
+    ):
+        script = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        assert "Install-PortablePythonRuntime" in script
+        assert "System.IO.Compression" in script
+        assert "bootstrap-conda" not in script.casefold()
+        assert "conda create" not in script.casefold()
+
+
 def test_portable_runtime_powershell_entrypoints_are_ascii_only_for_winps51() -> None:
     for relative in (
         "scripts/Invoke-PortableStart.ps1",
