@@ -2271,6 +2271,32 @@ def test_tts_more_full_builder_proves_staging_runtime_independence() -> None:
     assert "runtime_reparse_scan" in builder
 
 
+def test_worker_full_uv_cache_fits_real_four_pack_path_budget_and_is_handle_owned() -> None:
+    work_root = PureWindowsPath(r"I:\TTS-More-Full-Packages\.tmw-27372-9149935044b36174")
+    old_cache = work_root / "tts-more-worker-27372-f895417727cc" / "uv-cache"
+    short_cache = work_root / "u-0123"
+    deepest_sdist = PureWindowsPath(
+        r"sdists-v9\pypi\aliyun-python-sdk-core\2.16.0\LDFsKoHdLIOE3O_a\src\build\lib"
+        r"\aliyunsdkcore\vendored\requests\packages\urllib3\packages\ssl_match_hostname\_implementation.py"
+    )
+
+    assert len(str(old_cache / deepest_sdist)) == 269
+    assert len(str(short_cache / deepest_sdist)) == 232
+    assert len(str(short_cache / deepest_sdist)) <= 240
+
+    builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(encoding="utf-8")
+    for token in (
+        "New-WorkerUvCacheLeaf",
+        "CreateDirectoryRelative",
+        "$isolatedUvCacheHandle",
+        "$isolatedUvCacheIdentity",
+        "Remove-WorkerOwnedDirectoryContents",
+        "MarkDirectoryForDeletion",
+    ):
+        assert token in builder
+    assert 'Join-Path $work "uv-cache"' not in builder
+
+
 def test_tts_more_full_builder_binary_scans_large_runtime_metadata_for_machine_paths() -> None:
     builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
 
