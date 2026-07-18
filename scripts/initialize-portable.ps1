@@ -160,11 +160,11 @@ $BuildId = if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) { [string](G
 $RuntimePayload = Get-Content -LiteralPath $RuntimeLock -Raw | ConvertFrom-Json
 $ExpectedPython = if ([string]::IsNullOrWhiteSpace([string]$RuntimePayload.python_version)) { "3.11" } else { [string]$RuntimePayload.python_version }
 $ImportProbe = if ($RuntimePayload.PSObject.Properties["import_probe"] -and ![string]::IsNullOrWhiteSpace([string]$RuntimePayload.import_probe)) { [string]$RuntimePayload.import_probe } else { "import fastapi,pydantic,uvicorn" }
-if (Test-PortableInstallStateComplete -Root $Root -StatePath $StatePath -Component "tts-more" -BuildId $BuildId -RuntimeLock $RuntimeLock -ModelLock $ModelLock -ExpectedPython $ExpectedPython -ImportProbe $ImportProbe -ValidateAssets) {
+if (Test-PortableInstallStateComplete -Root $Root -SourceRoot $BackendRoot -StatePath $StatePath -Component "tts-more" -BuildId $BuildId -RuntimeLock $RuntimeLock -ModelLock $ModelLock -ExpectedPython $ExpectedPython -ImportProbe $ImportProbe -ValidateAssets) {
     Write-Host "TTS More package runtime is already verified."
     exit 0
 }
-if ((Test-PortableLockedAssets -Root $Root -ModelLock $ModelLock) -and (Test-PortableRuntime -Root $Root -PythonPath (Join-Path $Live "python.exe") -ExpectedVersion $ExpectedPython -ImportProbe $ImportProbe)) {
+if ((Test-PortableLockedAssets -Root $Root -ModelLock $ModelLock) -and (Test-PortableRuntime -Root $Root -SourceRoot $BackendRoot -PythonPath (Join-Path $Live "python.exe") -ExpectedVersion $ExpectedPython -ImportProbe $ImportProbe)) {
     $ExistingState = if (Test-Path -LiteralPath $StatePath -PathType Leaf) { try { Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json } catch { $null } } else { $null }
     $RequestedProfile = if ($ExistingState -and ![string]::IsNullOrWhiteSpace([string]$ExistingState.profile)) { [string]$ExistingState.profile } else { "" }
     $Profile = Resolve-PortableSupportedProfile -RuntimeLockPayload $RuntimePayload -RequestedProfile $RequestedProfile
@@ -172,7 +172,7 @@ if ((Test-PortableLockedAssets -Root $Root -ModelLock $ModelLock) -and (Test-Por
     $ModelSha = Get-PortableFileSha256 -Path $ModelLock
     & (Join-Path $Live "python.exe") (Join-Path $Root "scripts\portable_install.py") write-state --path $StatePath --component tts-more --build-id $BuildId --profile $Profile --runtime-lock-sha256 $RuntimeSha --model-lock-sha256 $ModelSha
     if ($LASTEXITCODE -ne 0) { throw "failed to repair stale install-state.json" }
-    if (!(Test-PortableInstallStateComplete -Root $Root -StatePath $StatePath -Component "tts-more" -BuildId $BuildId -RuntimeLock $RuntimeLock -ModelLock $ModelLock -ExpectedPython $ExpectedPython -ImportProbe $ImportProbe -ValidateAssets)) { throw "repaired install-state.json failed complete validation" }
+    if (!(Test-PortableInstallStateComplete -Root $Root -SourceRoot $BackendRoot -StatePath $StatePath -Component "tts-more" -BuildId $BuildId -RuntimeLock $RuntimeLock -ModelLock $ModelLock -ExpectedPython $ExpectedPython -ImportProbe $ImportProbe -ValidateAssets)) { throw "repaired install-state.json failed complete validation" }
     Write-Host "TTS More package install state was repaired from verified package-private assets."
     exit 0
 }
@@ -234,8 +234,7 @@ if ($LASTEXITCODE -ne 0) { throw "failed to synchronize frozen backend dependenc
 if ($LASTEXITCODE -ne 0) { throw "uv pip check failed in temporary runtime" }
 & $PortableRuntime.Python (Join-Path $Root "scripts\portable_install.py") prune-console-launchers --site-packages $PortableRuntime.SitePackages
 if ($LASTEXITCODE -ne 0) { throw "failed to prune non-relocatable dependency launchers" }
-& $PortableRuntime.Python -c $ImportProbe
-if ($LASTEXITCODE -ne 0) { throw "core import probe failed in temporary runtime" }
+Invoke-PortablePythonSourceProbe -Root $Root -SourceRoot $BackendRoot -PythonPath $PortableRuntime.Python -ImportProbe $ImportProbe
 
 $runtimeSha = Get-PortableFileSha256 -Path $RuntimeLock
 $modelSha = Get-PortableFileSha256 -Path $ModelLock

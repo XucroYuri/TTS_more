@@ -46,7 +46,7 @@ $runtimeLock = Get-Content -LiteralPath $runtimeLockPath -Raw | ConvertFrom-Json
 $expectedPython = [string]$runtimeLock.python_version
 if ($expectedPython -notin @("3.11", "3.11.9")) { throw "TTS More runtime lock must require Python 3.11" }
 $Python = Join-Path $Root "runtime\live\python.exe"
-[void](Assert-PortableRuntime -Root $Root -PythonPath $Python -ExpectedVersion $expectedPython -ImportProbe "")
+[void](Assert-PortableRuntime -Root $Root -SourceRoot $Root -PythonPath $Python -ExpectedVersion $expectedPython -ImportProbe "")
 $Launcher = Resolve-PortablePackagePath -Root $Root -RelativePath "scripts\portable_launcher.py" -Label "portable launcher" -MustExist
 & $Python $Launcher stop-worker --package-root $Root
 if ($LASTEXITCODE -eq 2) {

@@ -452,10 +452,14 @@ function Test-TtsMoreFullRuntimeOnOtherVolume {
         $runtimeCopy = Join-Path $probeRoot "runtime-live"
         Copy-Item -LiteralPath (Join-Path $PackageRoot "runtime\live") -Destination $runtimeCopy -Recurse
         $python = Join-Path $runtimeCopy "python.exe"
+        $probeSourceRoot = [IO.Path]::GetFullPath((Join-Path $PackageRoot "app\backend"))
         & $python -c "import platform,sys; raise SystemExit(0 if platform.python_version()==sys.argv[1] else 1)" $ExpectedPython
         if ($LASTEXITCODE -ne 0) { throw "cross-volume embedded Python version probe failed" }
-        & $python -c $ImportProbe
-        if ($LASTEXITCODE -ne 0) { throw "cross-volume embedded Python import probe failed" }
+        try {
+            Invoke-PortablePythonSourceProbe -Root $PackageRoot -SourceRoot $probeSourceRoot -RuntimeRoot $probeRoot -PythonPath $python -ImportProbe $ImportProbe
+        } catch {
+            throw "cross-volume embedded Python import probe failed: $($_.Exception.Message)"
+        }
         return "passed"
     }
     finally {
@@ -492,6 +496,9 @@ function Assert-TtsMoreFullArchiveBoundary {
 }
 
 $Root = [System.IO.Path]::GetFullPath($PSScriptRoot)
+$ValidationScript = Join-Path $Root "scripts\Portable-Validation.ps1"
+if (!(Test-Path -LiteralPath $ValidationScript -PathType Leaf)) { throw "Portable-Validation.ps1 is missing" }
+. $ValidationScript
 $profileName = $Profile.ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) { $OutputRoot = Join-Path $Root "artifacts\portable\$profileName" }
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)

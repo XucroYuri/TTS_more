@@ -213,7 +213,7 @@ class FakePython {{
     if (joined.Contains("platform.python_version")) {{ Console.WriteLine("{version}"); return 0; }}
     if (joined.Contains("version_info")) {{ Console.WriteLine("{'.'.join(version.split('.')[:2])}"); return 0; }}
     if (joined.Contains("definitely_missing") || {str(not imports_ok).lower()}) return 1;
-    if (joined.Contains(" plan ")) {{
+    if (args.Length > 1 && args[1] == "plan") {{
       string order = Environment.GetEnvironmentVariable("A4_ORDER_MARKER");
       if (!String.IsNullOrEmpty(order)) File.AppendAllText(order, "plan" + Environment.NewLine);
       string cancelRoot = Environment.GetEnvironmentVariable("A4_CANCEL_AFTER_PLAN_ROOT");
@@ -239,7 +239,7 @@ class FakePython {{
       Console.WriteLine("{{\"plan_digest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"old_root\":\"C:\\\\PRIVATE-OLD-PATH\",\"new_root\":\"C:\\\\PRIVATE-NEW-PATH\",\"user_file_count\":2,\"user_bytes\":17,\"reusable_assets\":[\"models/asset-00.bin\",\"models/asset-01.bin\",\"models/asset-02.bin\",\"models/asset-03.bin\",\"models/asset-04.bin\",\"models/asset-05.bin\",\"models/asset-06.bin\",\"models/asset-07.bin\",\"models/asset-08.bin\",\"models/asset-09.bin\",\"models/asset-10.bin\",\"models/asset-11.bin\",\"models/asset-12.bin\",\"models/asset-13.bin\",\"models/asset-14.bin\",\"models/asset-15.bin\",\"models/asset-16.bin\",\"models/asset-17.bin\",\"models/asset-18.bin\",\"models/asset-19.bin\",\"models/asset-20.bin\"],\"reusable_asset_bytes\":23,\"skipped_assets\":[\"models/PRIVATE-SKIPPED-00.bin\",\"models/PRIVATE-SKIPPED-01.bin\"],\"already_present\":[\"models/PRIVATE-ALREADY-00.bin\"],\"old_package_preserved\":true}}");
       return 0;
     }}
-    if (joined.Contains(" apply ")) {{
+    if (args.Length > 1 && args[1] == "apply") {{
       string order = Environment.GetEnvironmentVariable("A4_ORDER_MARKER");
       if (!String.IsNullOrEmpty(order)) File.AppendAllText(order, "apply" + Environment.NewLine);
       if (Environment.GetEnvironmentVariable("A4_FAIL_APPLY") == "1") {{ Console.Error.WriteLine("PRIVATE-APPLY-ERROR"); return 8; }}
@@ -2001,7 +2001,7 @@ def test_runtime_validation_enforces_exact_patch_and_reads_legacy_versions(
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            ". $env:A4_VALIDATION; Assert-PortableRuntime -Root $env:A4_ROOT -PythonPath $env:A4_PYTHON -ExpectedVersion $env:A4_EXPECTED -ImportProbe 'import sys' | Out-Null",
+            ". $env:A4_VALIDATION; Assert-PortableRuntime -Root $env:A4_ROOT -SourceRoot $env:A4_ROOT -PythonPath $env:A4_PYTHON -ExpectedVersion $env:A4_EXPECTED -ImportProbe 'import sys' | Out-Null",
         ],
         env=environment,
         text=True,

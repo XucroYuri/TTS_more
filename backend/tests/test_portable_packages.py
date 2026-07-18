@@ -2284,6 +2284,9 @@ def test_tts_more_builder_stages_embedded_runtime_helper_and_audits_full_payload
 
 def test_tts_more_full_builder_proves_staging_runtime_independence() -> None:
     builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+    cross_volume = builder.split("function Test-TtsMoreFullRuntimeOnOtherVolume", maxsplit=1)[
+        1
+    ].split("function Test-PortableBinaryContainsMachinePrefix", maxsplit=1)[0]
 
     assert "$env:UV_CACHE_DIR" in builder
     assert "Assert-TtsMoreFullStagingReparseBoundary" in builder
@@ -2294,6 +2297,11 @@ def test_tts_more_full_builder_proves_staging_runtime_independence() -> None:
     assert "runtime_cross_volume_probe" in builder
     assert "runtime_hardlink_scan" in builder
     assert "runtime_reparse_scan" in builder
+    assert 'Join-Path $PackageRoot "app\\backend"' in cross_volume
+    assert "Invoke-PortablePythonSourceProbe" in cross_volume
+    assert "-SourceRoot $probeSourceRoot" in cross_volume
+    assert "-RuntimeRoot $probeRoot" in cross_volume
+    assert "& $python -c $ImportProbe" not in cross_volume
 
 
 def test_worker_full_uv_cache_fits_real_four_pack_path_budget_and_is_handle_owned() -> None:
@@ -2322,35 +2330,50 @@ def test_worker_full_uv_cache_fits_real_four_pack_path_budget_and_is_handle_owne
     assert 'Join-Path $work "uv-cache"' not in builder
 
 
-@pytest.mark.skipif(os.name != "nt", reason="worker probe context uses Windows PowerShell")
-def test_worker_initializer_runs_source_import_probe_from_external_cwd_without_env_leak(
+@pytest.mark.skipif(os.name != "nt", reason="embedded Python _pth isolation is Windows-specific")
+def test_runtime_import_probe_handles_cpython_embeddable_pth_isolation(
     tmp_path: Path,
 ) -> None:
-    source_root = tmp_path / "package with spaces 中文" / "app"
-    package = source_root / "GPT_SoVITS"
-    outside = tmp_path / "outside"
-    package.mkdir(parents=True)
-    outside.mkdir()
-    (package / "__init__.py").write_text("PROBE_VALUE = 'ready'\n", encoding="utf-8")
-    initializer = REPO_ROOT / "integrations" / "windows" / "Initialize.ps1"
-    command = f"""
-$tokens=$null; $errors=$null
-$ErrorActionPreference='Stop'
-$ast=[Management.Automation.Language.Parser]::ParseFile('{initializer}',[ref]$tokens,[ref]$errors)
-$fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-PortableWorkerSourceContext'}},$true)
-if ($null -eq $fn) {{ exit 91 }}
-. ([scriptblock]::Create($fn.Extent.Text))
-Set-Location -LiteralPath '{outside}'
-$before=(Get-Location).Path
-$env:PYTHONPATH='preserve-this-value'
-Invoke-PortableWorkerSourceContext -SourceRoot '{source_root}' -Action {{
-    & '{Path(sys.executable).resolve()}' -c "import GPT_SoVITS; assert GPT_SoVITS.PROBE_VALUE == 'ready'"
-    if ($LASTEXITCODE -ne 0) {{ throw 'fixture import probe failed' }}
-}}
-if ((Get-Location).Path -ne $before) {{ exit 92 }}
-if ($env:PYTHONPATH -ne 'preserve-this-value') {{ exit 93 }}
-exit 0
-"""
+    package_root = tmp_path / "package with spaces 中文"
+    source_root = package_root / "app"
+    runtime = package_root / "runtime" / "live"
+    source_root.mkdir(parents=True)
+    runtime.mkdir(parents=True)
+    (source_root / "portable_source_probe.py").write_text("PROBE_VALUE = 'ready'\n", encoding="utf-8")
+
+    base_python = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+    version_tag = f"{sys.version_info.major}{sys.version_info.minor}"
+    python_dll = base_python.parent / f"python{version_tag}.dll"
+    if not python_dll.is_file():
+        pytest.skip(f"base interpreter DLL is unavailable: {python_dll}")
+    portable_python = runtime / "python.exe"
+    shutil.copy2(base_python, portable_python)
+    shutil.copy2(python_dll, runtime / python_dll.name)
+    stdlib = Path(os.__file__).resolve().parent
+    (runtime / f"python{version_tag}._pth").write_text(f"{stdlib}\n.\n", encoding="ascii")
+
+    direct_environment = {**os.environ, "PYTHONPATH": str(source_root)}
+    direct = subprocess.run(
+        [str(portable_python), "-c", "import portable_source_probe"],
+        cwd=source_root,
+        env=direct_environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert direct.returncode != 0
+    assert "ModuleNotFoundError" in direct.stderr
+
+    environment = {
+        **os.environ,
+        "A4_ROOT": str(package_root),
+        "A4_SOURCE": str(source_root),
+        "A4_PYTHON": str(portable_python),
+        "A4_VALIDATION": str(REPO_ROOT / "scripts" / "Portable-Validation.ps1"),
+        "A4_EXPECTED": f"{sys.version_info.major}.{sys.version_info.minor}",
+    }
     completed = subprocess.run(
         [
             "powershell.exe",
@@ -2359,9 +2382,10 @@ exit 0
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            command,
+            "$ErrorActionPreference='Stop'; . $env:A4_VALIDATION; Assert-PortableRuntime -Root $env:A4_ROOT -SourceRoot $env:A4_SOURCE -PythonPath $env:A4_PYTHON -ExpectedVersion $env:A4_EXPECTED -ImportProbe \"import sys; sys.stderr.write('fixture warning\\n'); import portable_source_probe; assert portable_source_probe.PROBE_VALUE == 'ready'\" | Out-Null",
         ],
-        cwd=outside,
+        cwd=tmp_path,
+        env=environment,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -2370,6 +2394,83 @@ exit 0
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    outside_source = tmp_path / "outside source"
+    outside_source.mkdir()
+    rejected_environment = {**environment, "A4_SOURCE": str(outside_source)}
+    rejected = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ". $env:A4_VALIDATION; Assert-PortableRuntime -Root $env:A4_ROOT -SourceRoot $env:A4_SOURCE -PythonPath $env:A4_PYTHON -ExpectedVersion $env:A4_EXPECTED -ImportProbe 'import sys' | Out-Null",
+        ],
+        cwd=tmp_path,
+        env=rejected_environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert "runtime source root must be inside the package" in rejected.stderr
+
+    failed_probe = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "$ErrorActionPreference='Stop'; . $env:A4_VALIDATION; Assert-PortableRuntime -Root $env:A4_ROOT -SourceRoot $env:A4_SOURCE -PythonPath $env:A4_PYTHON -ExpectedVersion $env:A4_EXPECTED -ImportProbe \"import sys; sys.stderr.write('bounded-probe-evidence-' + ('x' * 100000)); raise SystemExit(9)\" | Out-Null",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    failed_output = failed_probe.stdout + failed_probe.stderr
+    assert failed_probe.returncode != 0
+    assert "bounded-probe-evidence" in failed_output
+    assert len(failed_output) < 20_000
+
+
+def test_runtime_validation_callers_thread_package_bounded_source_root() -> None:
+    scripts = (
+        REPO_ROOT / "scripts" / "Portable-Validation.ps1",
+        REPO_ROOT / "scripts" / "initialize-portable.ps1",
+        REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1",
+        REPO_ROOT / "scripts" / "start-production.ps1",
+        REPO_ROOT / "scripts" / "stop-production.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Initialize.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Start-Worker.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Stop-Worker.ps1",
+    )
+    runtime_calls = re.compile(
+        r"\b(?:Assert-PortableRuntime|Test-PortableRuntime|Test-PortableInstallStateComplete)\b"
+    )
+    for script_path in scripts:
+        for line in script_path.read_text(encoding="utf-8").splitlines():
+            if runtime_calls.search(line) and not line.lstrip().startswith("function "):
+                assert "-SourceRoot" in line, f"SourceRoot is not threaded by {script_path}: {line}"
+
+    initializer = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert initializer.count("Invoke-PortablePythonSourceProbe") >= 2
+    assert "& $PortableRuntime.Python -c $importProbe" not in initializer
+    worker_start = (REPO_ROOT / "integrations" / "windows" / "Start-Worker.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "$env:PYTHONPATH" not in worker_start
 
 
 @pytest.mark.skipif(os.name != "nt", reason="stale worker state repair uses Windows PowerShell")
@@ -2413,7 +2514,7 @@ with open(path, 'w', encoding='utf-8') as stream:
 $tokens=$null; $errors=$null
 $ErrorActionPreference='Stop'
 $ast=[Management.Automation.Language.Parser]::ParseFile('{initializer}',[ref]$tokens,[ref]$errors)
-foreach ($name in @('Invoke-PortableWorkerSourceContext','Repair-PortableWorkerStaleState')) {{
+foreach ($name in @('Repair-PortableWorkerStaleState')) {{
     $fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}},$true)
     if ($null -eq $fn) {{ exit 91 }}
     . ([scriptblock]::Create($fn.Extent.Text))
@@ -2421,12 +2522,10 @@ foreach ($name in @('Invoke-PortableWorkerSourceContext','Repair-PortableWorkerS
 function Resolve-PortableSupportedProfile {{ return 'cpu' }}
 function Get-PortableFileSha256 {{ return ('a' * 64) }}
 function Test-PortableInstallStateComplete {{
-    param($Root,$StatePath,$Component,$BuildId,$RuntimeLock,$ModelLock,$ExpectedPython,$ImportProbe,[switch]$ValidateAssets)
+    param($Root,$SourceRoot,$StatePath,$Component,$BuildId,$RuntimeLock,$ModelLock,$ExpectedPython,$ImportProbe,[switch]$ValidateAssets)
     $payload=Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
     if (!$payload.ready) {{ return $false }}
-    & '{base_python}' -c $ImportProbe
-    if ($LASTEXITCODE -ne 0) {{ return $false }}
-    [ordered]@{{ cwd=(Get-Location).Path; pythonpath=$env:PYTHONPATH; imported=$true }} | ConvertTo-Json | Set-Content -LiteralPath '{marker}' -Encoding UTF8
+    [ordered]@{{ cwd=(Get-Location).Path; pythonpath=$env:PYTHONPATH; source_root=$SourceRoot }} | ConvertTo-Json | Set-Content -LiteralPath '{marker}' -Encoding UTF8
     return $true
 }}
 Set-Location -LiteralPath '{outside}'
@@ -2454,12 +2553,12 @@ exit 0
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert json.loads(state.read_text(encoding="utf-8"))["ready"] is True
     validation = json.loads(marker.read_text(encoding="utf-8-sig"))
-    assert Path(validation["cwd"]) == source_root
-    assert Path(validation["pythonpath"]) == source_root
-    assert validation["imported"] is True
+    assert Path(validation["cwd"]) == outside
+    assert validation["pythonpath"] == "preserve-this-value"
+    assert Path(validation["source_root"]) == source_root
 
 
-def test_worker_cross_volume_probe_uses_staged_app_as_cwd_for_complete_import_probe() -> None:
+def test_worker_cross_volume_probe_uses_package_bounded_source_bootstrap() -> None:
     builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
         encoding="utf-8"
     )
@@ -2468,9 +2567,10 @@ def test_worker_cross_volume_probe_uses_staged_app_as_cwd_for_complete_import_pr
     )[0]
 
     assert 'Join-Path $PackageRoot "app"' in function
-    assert "Push-Location" in function and "Pop-Location" in function
-    assert "finally" in function
-    assert "& $python -c $ImportProbe" in function
+    assert "Invoke-PortablePythonSourceProbe" in function
+    assert "-SourceRoot $probeSourceRoot" in function
+    assert "-RuntimeRoot $probeRoot" in function
+    assert "& $python -c $ImportProbe" not in function
     gpt_probe = json.loads(
         (REPO_ROOT / "integrations" / "components" / "gpt-sovits" / "runtime.lock.json").read_text(
             encoding="utf-8"
@@ -2525,6 +2625,19 @@ exit 0
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_worker_owned_cache_file_cleanup_tolerates_file_and_parent_races() -> None:
+    builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+    function = builder.split("function Remove-WorkerOwnedDirectoryContents", maxsplit=1)[1].split(
+        "$Bundle =", maxsplit=1
+    )[0]
+
+    assert "try { [IO.File]::Delete($currentChild.FullName) }" in function
+    assert "catch [IO.FileNotFoundException] { continue }" in function
+    assert function.count("catch [IO.DirectoryNotFoundException] { continue }") >= 2
 
 
 def test_tts_more_full_builder_binary_scans_large_runtime_metadata_for_machine_paths() -> None:

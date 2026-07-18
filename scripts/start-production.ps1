@@ -59,7 +59,7 @@ $RuntimeLockPath = Join-Path $Root "packaging\portable\runtime.lock.json"
 $RuntimeLock = Get-Content -LiteralPath $RuntimeLockPath -Raw | ConvertFrom-Json
 $ExpectedPython = if ([string]::IsNullOrWhiteSpace([string]$RuntimeLock.python_version)) { "3.11" } else { [string]$RuntimeLock.python_version }
 $ImportProbe = if ($RuntimeLock.PSObject.Properties["import_probe"] -and ![string]::IsNullOrWhiteSpace([string]$RuntimeLock.import_probe)) { [string]$RuntimeLock.import_probe } else { "import fastapi,pydantic,uvicorn" }
-[void](Assert-PortableRuntime -Root $Root -PythonPath $Python -ExpectedVersion $ExpectedPython -ImportProbe $ImportProbe)
+[void](Assert-PortableRuntime -Root $Root -SourceRoot $BackendRoot -PythonPath $Python -ExpectedVersion $ExpectedPython -ImportProbe $ImportProbe)
 $manifestPath = Join-Path $Root "package\tts-more-package.json"
 $buildId = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { [string](Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).build_id } else { "source-checkout" }
 $arguments = @("-m", "uvicorn", "app.main:app", "--app-dir", $BackendRoot, "--host", "127.0.0.1", "--port", [string]$Port)
