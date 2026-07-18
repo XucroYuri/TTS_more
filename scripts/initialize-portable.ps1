@@ -24,6 +24,12 @@ $Live = Join-Path $Root "runtime\live"
 $Staging = Join-Path $Root "runtime\staging"
 $BackendRoot = if (Test-Path -LiteralPath (Join-Path $Root "backend\uv.lock")) { Join-Path $Root "backend" } else { Join-Path $Root "app\backend" }
 
+Assert-PortableMutableTreeBoundary -Root $Root -RelativePath "data\local" -Label "portable local data"
+Assert-PortableMutableTreeBoundary -Root $Root -RelativePath "data\cache" -Label "portable cache"
+Assert-PortableMutableTreeBoundary -Root $Root -RelativePath "runtime\live" -Label "portable live runtime"
+Assert-PortableMutableTreeBoundary -Root $Root -RelativePath "runtime\staging" -Label "portable staging runtime"
+Assert-PortableMutableTreeBoundary -Root $Root -RelativePath "runtime\previous" -Label "portable previous runtime"
+
 function Get-ControllerRequiredModelPaths {
     param([Parameter(Mandatory = $true)][object]$ModelLockPayload)
 
@@ -119,29 +125,35 @@ function Publish-PortableRuntimeTransaction {
         [Parameter(Mandatory = $true)][scriptblock]$CommitState
     )
 
-    if (Test-Path -LiteralPath $Backup) { Remove-Item -LiteralPath $Backup -Recurse -Force }
+    $transactionRoot = [IO.Path]::GetFullPath((Split-Path -Parent (Split-Path -Parent $Live)))
+    if (![string]::Equals([IO.Path]::GetFullPath($Staging), (Join-Path $transactionRoot "runtime\staging"), [StringComparison]::OrdinalIgnoreCase) -or
+        ![string]::Equals([IO.Path]::GetFullPath($Live), (Join-Path $transactionRoot "runtime\live"), [StringComparison]::OrdinalIgnoreCase) -or
+        ![string]::Equals([IO.Path]::GetFullPath($Backup), (Join-Path $transactionRoot "runtime\previous"), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "runtime transaction paths must be fixed package-private directories"
+    }
+    if (Test-Path -LiteralPath $Backup) { Remove-PortableMutableDirectory -Root $transactionRoot -RelativePath "runtime\previous" -Label "portable previous runtime" }
     $previousMoved = $false
     try {
         if (Test-Path -LiteralPath $Live) {
-            Move-Item -LiteralPath $Live -Destination $Backup
+            Move-PortableMutableDirectory -Root $transactionRoot -SourceRelativePath "runtime\live" -DestinationRelativePath "runtime\previous" -Label "portable runtime backup"
             $previousMoved = $true
         }
-        Move-Item -LiteralPath $Staging -Destination $Live
+        Move-PortableMutableDirectory -Root $transactionRoot -SourceRelativePath "runtime\staging" -DestinationRelativePath "runtime\live" -Label "portable runtime publish"
         & $CommitState
     }
     catch {
         $failure = $_
         try {
-            if (Test-Path -LiteralPath $Live) { Remove-Item -LiteralPath $Live -Recurse -Force }
+            if (Test-Path -LiteralPath $Live) { Remove-PortableMutableDirectory -Root $transactionRoot -RelativePath "runtime\live" -Label "failed portable runtime" }
             if ($previousMoved -and (Test-Path -LiteralPath $Backup)) {
-                Move-Item -LiteralPath $Backup -Destination $Live
+                Move-PortableMutableDirectory -Root $transactionRoot -SourceRelativePath "runtime\previous" -DestinationRelativePath "runtime\live" -Label "portable runtime rollback"
             }
         }
         catch { Write-Warning "runtime rollback encountered a secondary failure: $($_.Exception.Message)" }
         throw $failure
     }
     if ($previousMoved -and (Test-Path -LiteralPath $Backup)) {
-        try { Remove-Item -LiteralPath $Backup -Recurse -Force }
+        try { Remove-PortableMutableDirectory -Root $transactionRoot -RelativePath "runtime\previous" -Label "portable previous runtime" }
         catch { Write-Warning "committed runtime is valid, but previous runtime cleanup failed: $($_.Exception.Message)" }
     }
 }
@@ -186,7 +198,7 @@ $videoControllers = @(Get-CimInstance Win32_VideoController -ErrorAction Silentl
 ConvertTo-Json -InputObject $videoControllers | Set-Content -LiteralPath $controllersPath -Encoding UTF8
 
 . (Join-Path $Root "scripts\portable-python.ps1")
-if (Test-Path -LiteralPath $Staging) { Remove-Item -LiteralPath $Staging -Recurse -Force }
+if (Test-Path -LiteralPath $Staging) { Remove-PortableMutableDirectory -Root $Root -RelativePath "runtime\staging" -Label "portable staging runtime" }
 try {
     $PortableRuntime = Install-PortablePythonRuntime `
         -PackageRoot $Root `

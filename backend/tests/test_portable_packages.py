@@ -2412,6 +2412,151 @@ def test_worker_package_root_path_budget_accepts_short_unicode_and_rejects_deep_
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="mutable portable path guards require Windows junctions")
+def test_portable_mutable_tree_guard_rejects_cache_junction_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    assert POWERSHELL is not None
+    package_root = tmp_path / "便携 包"
+    data_root = package_root / "data"
+    outside = tmp_path / "outside"
+    cache_link = data_root / "cache"
+    sentinel = outside / "preserve.txt"
+    data_root.mkdir(parents=True)
+    outside.mkdir()
+    sentinel.write_text("preserve\n", encoding="utf-8")
+    _create_windows_junction(cache_link, outside)
+    validation = REPO_ROOT / "scripts" / "Portable-Validation.ps1"
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        f". '{validation}'; "
+        "Assert-PortableMutableTreeBoundary -Root $env:A4_ROOT "
+        "-RelativePath 'data\\cache' -Label 'portable cache'"
+    )
+    env = os.environ.copy()
+    env["A4_ROOT"] = str(package_root)
+    try:
+        completed = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            check=False,
+        )
+    finally:
+        _remove_windows_junction(cache_link)
+
+    assert completed.returncode != 0
+    assert "reparse" in (completed.stdout + completed.stderr).lower()
+    assert sentinel.read_text(encoding="utf-8") == "preserve\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="safe portable cleanup requires Windows junctions")
+def test_portable_mutable_cleanup_preflights_entire_tree_before_deleting(
+    tmp_path: Path,
+) -> None:
+    assert POWERSHELL is not None
+    package_root = tmp_path / "package"
+    staging = package_root / "runtime" / "staging"
+    ordinary = staging / "ordinary.txt"
+    outside = tmp_path / "outside"
+    junction = staging / "escape"
+    sentinel = outside / "preserve.txt"
+    staging.mkdir(parents=True)
+    outside.mkdir()
+    ordinary.write_text("keep until preflight succeeds\n", encoding="utf-8")
+    sentinel.write_text("outside\n", encoding="utf-8")
+    _create_windows_junction(junction, outside)
+    validation = REPO_ROOT / "scripts" / "Portable-Validation.ps1"
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        f". '{validation}'; "
+        "Remove-PortableMutableDirectory -Root $env:A4_ROOT "
+        "-RelativePath 'runtime\\staging' -Label 'portable staging runtime'"
+    )
+    env = os.environ.copy()
+    env["A4_ROOT"] = str(package_root)
+    try:
+        rejected = subprocess.run(
+            [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            check=False,
+        )
+        assert rejected.returncode != 0
+        assert "reparse" in (rejected.stdout + rejected.stderr).lower()
+        assert ordinary.read_text(encoding="utf-8") == "keep until preflight succeeds\n"
+        assert sentinel.read_text(encoding="utf-8") == "outside\n"
+    finally:
+        _remove_windows_junction(junction)
+
+    removed = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        check=False,
+    )
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not staging.exists()
+    assert sentinel.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_initializers_guard_mutable_trees_before_state_repair_or_recursive_cleanup() -> None:
+    controller = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(
+        encoding="utf-8"
+    )
+    worker = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(
+        encoding="utf-8"
+    )
+    portable_python = (REPO_ROOT / "scripts" / "portable-python.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    for initializer, state_probe in (
+        (controller, "Test-PortableInstallStateComplete"),
+        (worker, "Test-PortableRequestedProfileMatchesState"),
+    ):
+        for relative in (r"data\local", r"data\cache", r"runtime\live", r"runtime\staging", r"runtime\previous"):
+            token = f'Assert-PortableMutableTreeBoundary -Root $Root -RelativePath "{relative}"'
+            assert token in initializer
+            assert initializer.index(token) < initializer.index(state_probe)
+        assert "Remove-PortableMutableDirectory" in initializer
+
+    cache_guard = (
+        'Assert-PortableMutableTreeBoundary -Root $PackageRoot '
+        '-RelativePath "data\\cache"'
+    )
+    assert cache_guard in portable_python
+    assert portable_python.index(cache_guard) < portable_python.index(
+        "[System.IO.Directory]::CreateDirectory($assets)"
+    )
+
+
+def test_worker_runtime_payload_extraction_uses_guarded_package_relative_transactions() -> None:
+    worker = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(
+        encoding="utf-8"
+    )
+    payload_block = worker.split("foreach ($asset in $payloads)", maxsplit=1)[1].split(
+        "foreach ($asset in @($modelLock.assets))", maxsplit=1
+    )[0]
+
+    assert 'Assert-PortableMutableTreeBoundary -Root $Root -RelativePath $destinationRelative' in payload_block
+    assert 'Assert-PortableMutableTreeBoundary -Root $Root -RelativePath $extractStageRelative' in payload_block
+    assert "Remove-PortableMutableDirectory" in payload_block
+    assert "Move-PortableMutableDirectory" in payload_block
+    assert "Remove-Item -LiteralPath $extractStage -Recurse -Force" not in payload_block
+    assert "Remove-Item -LiteralPath $destination -Recurse -Force" not in payload_block
+    assert "Move-Item -LiteralPath $payloadRoot -Destination $destination" not in payload_block
+
+
 def test_gpt_worker_import_probe_adds_upstream_source_root_before_imports() -> None:
     runtime_lock = json.loads(
         (REPO_ROOT / "integrations" / "components" / "gpt-sovits" / "runtime.lock.json").read_text(
@@ -3956,6 +4101,7 @@ def _write_full_package_candidate(
     sidecar_sha: str | None = None,
     provenance_source: str | None = None,
     inner_sha_valid: bool = True,
+    extra_entries: dict[str, bytes] | None = None,
 ) -> Path:
     packages = _load_portable_packages()
     filename = (
@@ -4002,6 +4148,7 @@ def _write_full_package_candidate(
         manifest["licenses"],
     ):
         entries[str(relative)] = b"fixture\n"
+    entries.update(extra_entries or {})
     sums = "".join(
         f"{hashlib.sha256(payload).hexdigest()}  {relative}\n"
         for relative, payload in sorted(entries.items())
@@ -4136,6 +4283,86 @@ def test_select_full_package_reads_manifest_state_and_verifies_sha_sidecars(tmp_
     assert report["valid"] is True
     assert report["resolved_profile"] == "cu128"
     assert report["filename"] == archive_path.name
+
+
+def test_select_full_package_hashes_large_archive_and_member_with_bounded_streams(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    packages = _load_portable_packages()
+    large_relative = "runtime/large-payload.bin"
+    large_payload = b"large portable payload\n" * 200_000
+    archive_path = _write_full_package_candidate(
+        tmp_path,
+        extra_entries={large_relative: large_payload},
+    )
+    archive_path = archive_path.resolve()
+    raw_large_name = f"{archive_path.name.removesuffix('.zip')}/{large_relative}"
+    archive_read_sizes: list[int] = []
+    member_read_sizes: list[int] = []
+
+    class _BoundedArchiveReader:
+        def __init__(self, stream) -> None:
+            self._stream = stream
+
+        def __enter__(self):
+            self._stream.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return self._stream.__exit__(exc_type, exc, traceback)
+
+        def read(self, size: int = -1):
+            archive_read_sizes.append(size)
+            assert size == packages.HASH_CHUNK_SIZE
+            return self._stream.read(size)
+
+        def __getattr__(self, name: str):
+            return getattr(self._stream, name)
+
+    original_path_open = Path.open
+    original_path_read_bytes = Path.read_bytes
+    original_zip_read = zipfile.ZipFile.read
+    original_member_read = zipfile.ZipExtFile.read
+
+    def guarded_path_open(self: Path, mode: str = "r", *args, **kwargs):
+        stream = original_path_open(self, mode, *args, **kwargs)
+        if self.resolve() == archive_path and mode == "rb":
+            return _BoundedArchiveReader(stream)
+        return stream
+
+    def reject_archive_read_bytes(self: Path) -> bytes:
+        if self.resolve() == archive_path:
+            raise AssertionError("full archive must not be loaded with Path.read_bytes")
+        return original_path_read_bytes(self)
+
+    def reject_large_zip_read(self: zipfile.ZipFile, name, *args, **kwargs):
+        member_name = name.filename if isinstance(name, zipfile.ZipInfo) else str(name)
+        if member_name == raw_large_name:
+            raise AssertionError("large ZIP member must not be loaded with ZipFile.read")
+        return original_zip_read(self, name, *args, **kwargs)
+
+    def bounded_member_read(self: zipfile.ZipExtFile, size: int = -1):
+        if self.name == raw_large_name:
+            member_read_sizes.append(size)
+            assert size == packages.HASH_CHUNK_SIZE
+        return original_member_read(self, size)
+
+    monkeypatch.setattr(Path, "open", guarded_path_open)
+    monkeypatch.setattr(Path, "read_bytes", reject_archive_read_bytes)
+    monkeypatch.setattr(zipfile.ZipFile, "read", reject_large_zip_read)
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", bounded_member_read)
+
+    report = packages.select_full_package(
+        [archive_path],
+        expected_component="gpt-sovits",
+        expected_version="0.2.0",
+        requested_profile="auto",
+        expected_source_revision="f8a5865000000000000000000000000000000000",
+    )
+
+    assert report["valid"] is True, report["errors"]
+    assert len(archive_read_sizes) >= 2
+    assert len(member_read_sizes) >= 2
 
 
 @pytest.mark.parametrize(

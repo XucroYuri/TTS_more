@@ -1285,8 +1285,8 @@ def test_controller_runtime_publish_restores_previous_after_staging_move_failure
 
     assert "function Publish-PortableRuntimeTransaction" in controller
     assert "catch" in controller
-    assert "Remove-Item -LiteralPath $Live -Recurse -Force" in controller
-    assert "Move-Item -LiteralPath $Backup -Destination $Live" in controller
+    assert 'Remove-PortableMutableDirectory -Root $transactionRoot -RelativePath "runtime\\live"' in controller
+    assert '-SourceRelativePath "runtime\\previous" -DestinationRelativePath "runtime\\live"' in controller
     assert "throw" in controller
 
 
@@ -1297,7 +1297,7 @@ def test_controller_runtime_publish_keeps_previous_until_state_commit() -> None:
 
     assert "function Publish-PortableRuntimeTransaction" in controller
     assert controller.index("& $CommitState") < controller.rindex(
-        "Remove-Item -LiteralPath $Backup -Recurse -Force"
+        'Remove-PortableMutableDirectory -Root $transactionRoot -RelativePath "runtime\\previous"'
     )
     assert "TTS_MORE_TEST_FAIL" not in controller
 
@@ -1308,22 +1308,25 @@ def test_controller_runtime_publish_rolls_back_real_move_and_state_failures(
     tmp_path: Path, failure: str
 ) -> None:
     root = tmp_path / failure
-    live = root / "live"
-    staging = root / "staging"
-    backup = root / "previous"
-    state = root / "install-state.json"
+    live = root / "runtime" / "live"
+    staging = root / "runtime" / "staging"
+    backup = root / "runtime" / "previous"
+    state = root / "data" / "local" / "install-state.json"
     live.mkdir(parents=True)
     (live / "sentinel.txt").write_text("previous", encoding="utf-8")
+    state.parent.mkdir(parents=True)
     state.write_text("previous-state", encoding="utf-8")
     if failure == "state":
         staging.mkdir()
         (staging / "sentinel.txt").write_text("candidate", encoding="utf-8")
 
     initializer = REPO_ROOT / "scripts" / "initialize-portable.ps1"
+    validation = REPO_ROOT / "scripts" / "Portable-Validation.ps1"
     commit = "{ throw 'state write failed' }" if failure == "state" else "{ throw 'must not run' }"
     command = f"""
 $tokens=$null; $errors=$null
 $ErrorActionPreference='Stop'
+. '{validation}'
 $ast=[Management.Automation.Language.Parser]::ParseFile('{initializer}',[ref]$tokens,[ref]$errors)
 $fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Publish-PortableRuntimeTransaction'}},$true)
 . ([scriptblock]::Create($fn.Extent.Text))
@@ -1331,7 +1334,7 @@ try {{ Publish-PortableRuntimeTransaction -Staging '{staging}' -Live '{live}' -B
 if (!(Test-Path -LiteralPath '{live / 'sentinel.txt'}') -or (Get-Content -Raw '{live / 'sentinel.txt'}') -ne 'previous') {{ exit 92 }}
 if (Test-Path -LiteralPath '{backup}') {{ exit 93 }}
 if ((Get-Content -Raw '{state}') -ne 'previous-state') {{ exit 94 }}
-    if ($message -notmatch '{'state write failed' if failure == 'state' else 'Cannot move item'}') {{ exit 95 }}
+    if ($message -notmatch '{'state write failed' if failure == 'state' else 'missing'}') {{ exit 95 }}
 exit 0
 """
     completed = subprocess.run(

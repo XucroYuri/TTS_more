@@ -352,6 +352,9 @@ def test_portable_python_helper_contract_and_no_drift() -> None:
     assert "System.IO.Compression" in controller
     assert "portable_install.py" in controller
     assert "ensure-asset" in controller
+    assert "function Remove-PortablePythonOwnedDirectory" in controller
+    assert "Remove-Item -LiteralPath $temporary -Recurse -Force" not in controller
+    assert "Remove-Item -LiteralPath $candidate -Recurse -Force" not in controller
     assert "datetime.UTC" not in controller
     assert "sys.path.insert(0,os.path.dirname(script))" in controller
     assert "runpy.run_path" in controller
