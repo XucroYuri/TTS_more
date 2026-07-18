@@ -178,6 +178,77 @@ def test_ensure_locked_asset_resumes_partial_and_promotes_only_after_hash(tmp_pa
     assert not partial.exists()
 
 
+def test_ensure_locked_asset_retries_same_url_and_resumes_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = _load_installer()
+    payload = b"0123456789-portable-model"
+    destination = tmp_path / "model.bin"
+    calls: list[tuple[str, int]] = []
+    sleeps: list[float] = []
+    url = "https://primary.invalid/model.bin"
+
+    def download(source: str, target: Path, resume_from: int, _progress, _cancelled) -> None:
+        calls.append((source, resume_from))
+        if len(calls) == 1:
+            target.write_bytes(payload[:8])
+            raise OSError("connection reset")
+        with target.open("ab") as handle:
+            handle.write(payload[resume_from:])
+
+    monkeypatch.setattr(installer.time, "sleep", sleeps.append)
+    report = installer.ensure_locked_asset(
+        {
+            "id": "model",
+            "urls": [url, "https://fallback.invalid/model.bin"],
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+        },
+        destination,
+        downloader=download,
+    )
+
+    assert report["source"] == url
+    assert calls == [(url, 0), (url, 8)]
+    assert sleeps == [1.0]
+    assert destination.read_bytes() == payload
+
+
+def test_ensure_locked_asset_exhausts_primary_retries_before_mirror_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer = _load_installer()
+    payload = b"mirror-fallback-payload"
+    destination = tmp_path / "model.bin"
+    primary = "https://primary.invalid/model.bin"
+    fallback = "https://fallback.invalid/model.bin"
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def download(source: str, target: Path, _resume_from: int, _progress, _cancelled) -> None:
+        calls.append(source)
+        if source == primary:
+            raise OSError("HTTP 503")
+        target.write_bytes(payload)
+
+    monkeypatch.setattr(installer.time, "sleep", sleeps.append)
+    report = installer.ensure_locked_asset(
+        {
+            "id": "model",
+            "urls": [primary, fallback],
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+        },
+        destination,
+        downloader=download,
+    )
+
+    assert report["source"] == fallback
+    assert calls == [primary, primary, primary, fallback]
+    assert sleeps == [1.0, 2.0]
+    assert destination.read_bytes() == payload
+
+
 def test_complete_valid_partial_is_promoted_without_network(tmp_path: Path) -> None:
     installer = _load_installer()
     payload = b"complete-valid-partial"
@@ -717,13 +788,15 @@ def test_initializers_execute_runtime_lock_import_probe() -> None:
     worker = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(encoding="utf-8")
 
     assert '$ImportProbe = if ($RuntimePayload.PSObject.Properties["import_probe"]' in controller
-    assert "& $PortableRuntime.Python -c $ImportProbe" in controller
+    assert "Invoke-PortablePythonSourceProbe -Root $Root -SourceRoot $BackendRoot" in controller
+    assert "-PythonPath $PortableRuntime.Python -ImportProbe $ImportProbe" in controller
     assert 'import fastapi,pydantic,uvicorn; print(' not in controller
     assert "foreach ($asset in @($modelLockPayload.assets))" in controller
     assert "Get-ControllerRequiredModelPaths -ModelLockPayload $modelLockPayload" in controller
     assert 'Resolve-PortablePackagePath -Root $Root -RelativePath ([string]$requiredModelPath) -Label "required model asset" -MustExist' in controller
     assert '$importProbe = if ($runtimeLock.PSObject.Properties["import_probe"]' in worker
-    assert "& $PortableRuntime.Python -c $importProbe" in worker
+    assert "Invoke-PortablePythonSourceProbe -Root $Root -SourceRoot $SourceRoot" in worker
+    assert "-PythonPath $PortableRuntime.Python -ImportProbe $importProbe" in worker
     assert "& $PortableRuntime.Uv pip check --python $PortableRuntime.Python" in worker
     assert "--target $PortableRuntime.SitePackages --link-mode copy" in worker
     assert "& $StagePython -c ([string]$config.import_probe)" not in worker
@@ -740,9 +813,13 @@ def test_initializers_prune_declared_launchers_after_check_before_import_probe()
     assert controller.count("prune-console-launchers") == 1
     assert worker.count("prune-console-launchers") == 1
     assert controller.index("pip check") < controller.index("prune-console-launchers")
-    assert controller.index("prune-console-launchers") < controller.index("-c $ImportProbe")
+    assert controller.index("prune-console-launchers") < controller.index(
+        "Invoke-PortablePythonSourceProbe"
+    )
     assert worker.index("pip check") < worker.index("prune-console-launchers")
-    assert worker.index("prune-console-launchers") < worker.index("-c $importProbe")
+    assert worker.index("prune-console-launchers") < worker.index(
+        "Invoke-PortablePythonSourceProbe"
+    )
     assert (
         '& $PortableRuntime.Python (Join-Path $Root "scripts\\portable_install.py") '
         "prune-console-launchers --site-packages $PortableRuntime.SitePackages"
@@ -1096,7 +1173,7 @@ def test_controller_initializer_uses_only_embedded_python_runtime() -> None:
     device_selection = controller.index("select-device")
     model_assets = controller.index("foreach ($asset in @($modelLockPayload.assets))")
     dependency_install = controller.index("pip install")
-    import_probe = controller.index("-c $ImportProbe")
+    import_probe = controller.index("Invoke-PortablePythonSourceProbe")
     atomic_publish = controller.rindex("Publish-PortableRuntimeTransaction -Staging $Staging")
     assert (
         python_install
