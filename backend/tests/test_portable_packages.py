@@ -2330,6 +2330,27 @@ def test_worker_full_uv_cache_fits_real_four_pack_path_budget_and_is_handle_owne
     assert 'Join-Path $work "uv-cache"' not in builder
 
 
+def test_gpt_worker_import_probe_adds_upstream_source_root_before_imports() -> None:
+    runtime_lock = json.loads(
+        (REPO_ROOT / "integrations" / "components" / "gpt-sovits" / "runtime.lock.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    component_source = json.loads(
+        (
+            REPO_ROOT
+            / "integrations"
+            / "components"
+            / "gpt-sovits"
+            / "component-source.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    for probe in (runtime_lock["import_probe"], component_source["import_probe"]):
+        assert "pathlib.Path.cwd() / 'GPT_SoVITS'" in probe
+        assert probe.index("sys.path.insert") < probe.index("from GPT_SoVITS")
+
+
 @pytest.mark.skipif(os.name != "nt", reason="embedded Python _pth isolation is Windows-specific")
 def test_runtime_import_probe_handles_cpython_embeddable_pth_isolation(
     tmp_path: Path,

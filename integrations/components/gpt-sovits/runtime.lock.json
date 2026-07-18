@@ -2,7 +2,7 @@
   "schema_version": 1,
   "component": "gpt-sovits",
   "python_version": "3.11.9",
-  "import_probe": "import fastapi,gradio,onnxruntime,torch,torchaudio; from GPT_SoVITS.TTS_infer_pack.TTS import TTS,TTS_Config",
+  "import_probe": "import sys,pathlib; sys.path.insert(0,str(pathlib.Path.cwd() / 'GPT_SoVITS')); import fastapi,gradio,onnxruntime,torch,torchaudio; from GPT_SoVITS.TTS_infer_pack.TTS import TTS,TTS_Config",
   "dependency_mode": "requirements",
   "required_free_bytes": 21474836480,
   "auto_order": ["cu128", "cu126", "cpu"],
