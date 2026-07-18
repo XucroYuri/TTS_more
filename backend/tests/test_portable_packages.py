@@ -2672,6 +2672,50 @@ exit 0
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.skipif(os.name != "nt", reason="worker cache cleanup uses Windows PowerShell")
+def test_worker_owned_cache_cleanup_confirms_empty_after_eighth_pass(tmp_path: Path) -> None:
+    cache = tmp_path / "owned-cache"
+    cache.mkdir()
+    (cache / "_implementation.py").write_text("fixture", encoding="utf-8")
+    builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{builder}',[ref]$tokens,[ref]$errors)
+$helper=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-WorkerOwnedMissingPathFailure'}},$true)
+$fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-WorkerOwnedDirectoryContents'}},$true)
+. ([scriptblock]::Create($helper.Extent.Text))
+. ([scriptblock]::Create($fn.Extent.Text))
+$script:rootEnumerations=0
+$injectedPath=[IO.Path]::GetFullPath('{cache}')
+function Get-ChildItem {{
+    [CmdletBinding()]
+    param([string]$LiteralPath,[switch]$Force)
+    if ([IO.Path]::GetFullPath($LiteralPath) -eq $injectedPath) {{
+        $script:rootEnumerations++
+        if ($script:rootEnumerations -le 7) {{
+            throw [IO.FileNotFoundException]::new("Could not find a part of the path '_implementation.py'.")
+        }}
+    }}
+    Microsoft.PowerShell.Management\\Get-ChildItem @PSBoundParameters
+}}
+Remove-WorkerOwnedDirectoryContents -Path '{cache}'
+if ($script:rootEnumerations -ne 9) {{ exit 93 }}
+if (@(Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath '{cache}' -Force).Count -ne 0) {{ exit 94 }}
+exit 0
+"""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_worker_owned_cache_file_cleanup_tolerates_file_and_parent_races() -> None:
     builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
         encoding="utf-8"
@@ -2726,6 +2770,8 @@ if ($null -eq $helper) {{ exit 91 }}
 foreach($exception in @(
     [Management.Automation.ItemNotFoundException]::new('missing item'),
     [IO.FileNotFoundException]::new('missing file'),
+    [Management.Automation.RuntimeException]::new('wrapped missing file',[IO.FileNotFoundException]::new('missing file')),
+    [Management.Automation.MethodInvocationException]::new('wrapped missing directory',[IO.DirectoryNotFoundException]::new('missing directory')),
     [Reflection.TargetInvocationException]::new([IO.DirectoryNotFoundException]::new('missing directory'))
 )) {{
     $failure=[Management.Automation.ErrorRecord]::new($exception,'fixture',[Management.Automation.ErrorCategory]::ObjectNotFound,$null)
@@ -2734,7 +2780,9 @@ foreach($exception in @(
 foreach($exception in @(
     [UnauthorizedAccessException]::new('denied'),
     [IO.IOException]::new('ordinary io failure'),
-    [Management.Automation.RuntimeException]::new('reparse point rejected')
+    [Management.Automation.RuntimeException]::new('reparse point rejected'),
+    [UnauthorizedAccessException]::new('denied with misleading inner',[IO.FileNotFoundException]::new('missing file')),
+    [IO.IOException]::new('ordinary io failure with misleading inner',[IO.DirectoryNotFoundException]::new('missing directory'))
 )) {{
     $failure=[Management.Automation.ErrorRecord]::new($exception,'fixture',[Management.Automation.ErrorCategory]::NotSpecified,$null)
     if (Test-WorkerOwnedMissingPathFailure -Failure $failure) {{ exit 93 }}

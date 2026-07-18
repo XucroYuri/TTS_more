@@ -368,6 +368,18 @@ function Test-WorkerOwnedMissingPathFailure {
         ) {
             return $true
         }
+        if (
+            $exception -is [UnauthorizedAccessException] -or
+            $exception -is [IO.IOException]
+        ) {
+            return $false
+        }
+        if (
+            $exception -isnot [Management.Automation.RuntimeException] -and
+            $exception -isnot [Reflection.TargetInvocationException]
+        ) {
+            return $false
+        }
         $exception = $exception.InnerException
     }
     return $false
@@ -413,6 +425,18 @@ function Remove-WorkerOwnedDirectoryContents {
         }
     }
 
+    try { $remainingChildren = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop) }
+    catch {
+        if (
+            (Test-WorkerOwnedMissingPathFailure -Failure $_) -and
+            $AllowMissing -and
+            ![IO.Directory]::Exists($Path)
+        ) {
+            return
+        }
+        throw
+    }
+    if ($remainingChildren.Count -eq 0) { return }
     throw "worker-owned directory remained non-empty after $maximumPasses cleanup passes: $Path"
 }
 
