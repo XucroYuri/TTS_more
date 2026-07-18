@@ -659,10 +659,38 @@ Assert-Contract ($argumentStrings -ccontains "-m" -and $argumentStrings -ccontai
 Assert-Contract (Test-ContractContainsMemberPath $argumentAssignments[0].Right "config.module") "worker arguments do not use the configured worker module"
 
 $processAssignments = @(Get-ContractAssignments $worker "process")
-Assert-Contract ($processAssignments.Count -eq 1 -and (Test-ContractTopLevelAssignment $processAssignments[0])) "worker process assignment is not an active top-level statement"
-Assert-Contract ($processAssignments[0].Right -is [System.Management.Automation.Language.PipelineAst]) "worker process assignment is not a direct executable pipeline"
-$startProcesses = @(Get-ContractCommands $processAssignments[0].Right "Start-Process")
-Assert-Contract ($startProcesses.Count -eq 1) "worker must start exactly one service process from the top-level process assignment"
+$startAssignments = @($processAssignments | Where-Object { @(Get-ContractCommands $_.Right "Start-Process").Count -eq 1 })
+$nullAssignments = @($processAssignments | Where-Object {
+    (Test-ContractTopLevelAssignment $_) -and
+    (Test-ContractVariable (Get-ContractExactExpression $_.Right) "null")
+})
+Assert-Contract (
+    $processAssignments.Count -eq 2 -and
+    $startAssignments.Count -eq 1 -and
+    $nullAssignments.Count -eq 1
+) "worker process identity is not initialized once and started once"
+$startupAssignment = $startAssignments[0]
+Assert-Contract ($startupAssignment.Right -is [System.Management.Automation.Language.PipelineAst]) "worker process assignment is not a direct executable pipeline"
+$startupTryBody = $startupAssignment.Parent
+$startupTry = $startupTryBody.Parent
+Assert-Contract (
+    $startupTryBody -is [System.Management.Automation.Language.StatementBlockAst] -and
+    $startupTry -is [System.Management.Automation.Language.TryStatementAst] -and
+    [object]::ReferenceEquals($startupTry.Parent, $worker.EndBlock)
+) "worker process assignment is not directly guarded by one top-level startup transaction"
+$rollbackLiterals = @($startupTry.CatchClauses | ForEach-Object {
+    $_.Body.FindAll(
+        {
+            param($node)
+            $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+            [string]$node.Value -ceq "rollback-started-process"
+        },
+        $true
+    )
+})
+Assert-Contract ($rollbackLiterals.Count -eq 1) "worker startup transaction does not contain one rollback command"
+$startProcesses = @(Get-ContractCommands $startupAssignment.Right "Start-Process")
+Assert-Contract ($startProcesses.Count -eq 1) "worker must start exactly one service process from the guarded process assignment"
 $filePath = Get-ContractParameterArgument $startProcesses[0] "FilePath"
 $argumentList = Get-ContractParameterArgument $startProcesses[0] "ArgumentList"
 $workingDirectory = Get-ContractParameterArgument $startProcesses[0] "WorkingDirectory"
