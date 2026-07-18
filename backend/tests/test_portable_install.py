@@ -675,9 +675,19 @@ def test_prune_console_launchers_removes_only_declared_safe_entry_points(
         "[console_scripts]\nknown = fixture:main\n\n[gui_scripts]\nwindow = fixture:gui\n",
     )
     (launchers / "known.exe").write_bytes(b"known launcher")
+    (launchers / "known.py").write_text(
+        f"#!{tmp_path / 'runtime' / 'staging' / 'python.exe'}\nprint('known')\n",
+        encoding="utf-8",
+    )
     (launchers / "window.exe").write_bytes(b"gui launcher")
+    (launchers / "window.py").write_text(
+        f"#!{tmp_path / 'runtime' / 'staging' / 'python.exe'}\nprint('window')\n",
+        encoding="utf-8",
+    )
     unknown = launchers / "keep.exe"
     unknown.write_bytes(b"unknown machine-specific file")
+    unknown_python = launchers / "keep.py"
+    unknown_python.write_text("print('package data')\n", encoding="utf-8")
     scripts_unknown = site_packages / "Scripts" / "known.exe"
     scripts_unknown.parent.mkdir()
     scripts_unknown.write_bytes(b"outside the uv target launcher directory")
@@ -685,12 +695,15 @@ def test_prune_console_launchers_removes_only_declared_safe_entry_points(
     report = installer.prune_console_launchers(site_packages)
 
     assert report == {
-        "preserved_unknown": ["bin/keep.exe"],
-        "removed": ["bin/known.exe", "bin/window.exe"],
+        "preserved_unknown": ["bin/keep.exe", "bin/keep.py"],
+        "removed": ["bin/known.exe", "bin/known.py", "bin/window.exe", "bin/window.py"],
     }
     assert not (launchers / "known.exe").exists()
+    assert not (launchers / "known.py").exists()
     assert not (launchers / "window.exe").exists()
+    assert not (launchers / "window.py").exists()
     assert unknown.read_bytes() == b"unknown machine-specific file"
+    assert unknown_python.read_text(encoding="utf-8") == "print('package data')\n"
     assert scripts_unknown.read_bytes() == b"outside the uv target launcher directory"
 
 
