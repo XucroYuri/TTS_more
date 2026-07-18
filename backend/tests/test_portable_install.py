@@ -615,12 +615,103 @@ def test_initializers_execute_runtime_lock_import_probe() -> None:
     assert "& $PortableRuntime.Python -c $ImportProbe" in controller
     assert 'import fastapi,pydantic,uvicorn; print(' not in controller
     assert "foreach ($asset in @($modelLockPayload.assets))" in controller
-    assert "required model asset is missing after locked initialization" in controller
+    assert "Get-ControllerRequiredModelPaths -ModelLockPayload $modelLockPayload" in controller
+    assert 'Resolve-PortablePackagePath -Root $Root -RelativePath ([string]$requiredModelPath) -Label "required model asset" -MustExist' in controller
     assert '$importProbe = if ($runtimeLock.PSObject.Properties["import_probe"]' in worker
     assert "& $PortableRuntime.Python -c $importProbe" in worker
     assert "& $PortableRuntime.Uv pip check --python $PortableRuntime.Python" in worker
     assert "--target $PortableRuntime.SitePackages --link-mode copy" in worker
     assert "& $StagePython -c ([string]$config.import_probe)" not in worker
+
+
+@pytest.mark.skipif(os.name != "nt", reason="controller initializer contract requires Windows PowerShell 5.1")
+def test_controller_optional_model_lock_required_paths_are_safe_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    valid = REPO_ROOT / "packaging" / "portable" / "models.lock.json"
+    legacy_complete = tmp_path / "legacy-complete-model-lock.json"
+    scalar = tmp_path / "scalar-required-paths.json"
+    required_missing = tmp_path / "required-model-lock-without-paths.json"
+    production_lock = json.loads(valid.read_text(encoding="utf-8"))
+    assert production_lock["required"] is False
+    assert production_lock["assets"] == []
+    assert "required_paths" not in production_lock
+    legacy_complete.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "component": "fixture-worker",
+                "complete": True,
+                "assets": [],
+                "licenses": [],
+                "required_paths": ["models/fixture.bin"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    scalar.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "component": "tts-more",
+                "revision": "none",
+                "required": False,
+                "assets": [],
+                "licenses": [],
+                "required_paths": "models/escape.bin",
+            }
+        ),
+        encoding="utf-8",
+    )
+    required_missing.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "component": "tts-more",
+                "revision": "locked",
+                "required": True,
+                "assets": [],
+                "licenses": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    initializer = REPO_ROOT / "scripts" / "initialize-portable.ps1"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{initializer}',[ref]$tokens,[ref]$errors)
+$fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ControllerRequiredModelPaths'}},$true)
+if ($null -eq $fn) {{ exit 81 }}
+. ([scriptblock]::Create($fn.Extent.Text))
+$optional=Get-Content -LiteralPath '{valid}' -Raw | ConvertFrom-Json
+if (@(Get-ControllerRequiredModelPaths -ModelLockPayload $optional).Count -ne 0) {{ exit 82 }}
+$legacy=Get-Content -LiteralPath '{legacy_complete}' -Raw | ConvertFrom-Json
+$legacyPaths=@(Get-ControllerRequiredModelPaths -ModelLockPayload $legacy)
+if ($legacyPaths.Count -ne 1 -or $legacyPaths[0] -ne 'models/fixture.bin') {{ exit 85 }}
+foreach ($path in @('{scalar}', '{required_missing}')) {{
+    $payload=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    try {{ [void](Get-ControllerRequiredModelPaths -ModelLockPayload $payload); exit 83 }}
+    catch {{ if ($_.Exception.Message -notmatch 'required_paths') {{ exit 84 }} }}
+}}
+exit 0
+"""
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_controller_initializer_uses_only_embedded_python_runtime() -> None:

@@ -24,6 +24,31 @@ $Live = Join-Path $Root "runtime\live"
 $Staging = Join-Path $Root "runtime\staging"
 $BackendRoot = if (Test-Path -LiteralPath (Join-Path $Root "backend\uv.lock")) { Join-Path $Root "backend" } else { Join-Path $Root "app\backend" }
 
+function Get-ControllerRequiredModelPaths {
+    param([Parameter(Mandatory = $true)][object]$ModelLockPayload)
+
+    $requiredProperty = $ModelLockPayload.PSObject.Properties["required"]
+    if ($null -ne $requiredProperty -and $requiredProperty.Value -isnot [bool]) {
+        throw "model lock required must be boolean"
+    }
+    $pathsProperty = $ModelLockPayload.PSObject.Properties["required_paths"]
+    if ($null -eq $pathsProperty) {
+        if ($null -eq $requiredProperty -or [bool]$requiredProperty.Value) {
+            throw "model lock required_paths may be omitted only when required is explicitly false"
+        }
+        return @()
+    }
+    if ($null -eq $pathsProperty.Value -or $pathsProperty.Value.GetType().FullName -ne "System.Object[]") {
+        throw "model lock required_paths must be an array"
+    }
+    foreach ($requiredPath in @($pathsProperty.Value)) {
+        if ($requiredPath -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$requiredPath)) {
+            throw "model lock required_paths items must be non-empty strings"
+        }
+    }
+    return @($pathsProperty.Value)
+}
+
 function Resolve-OperationContract {
     param([string]$PackageRoot, [string]$OperationRoot = "", [string]$CancelFile = "")
 
@@ -184,6 +209,7 @@ Write-Host "Selected device profile: $selected"
 
 $runtimeLockPayload = Get-Content -LiteralPath $RuntimeLock -Raw | ConvertFrom-Json
 $modelLockPayload = Get-Content -LiteralPath $ModelLock -Raw | ConvertFrom-Json
+$requiredModelPaths = @(Get-ControllerRequiredModelPaths -ModelLockPayload $modelLockPayload)
 foreach ($asset in @($modelLockPayload.assets)) {
     $assetLock = Join-Path $Root "data\cache\portable\locks\$($asset.id).json"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $assetLock) | Out-Null
@@ -192,10 +218,8 @@ foreach ($asset in @($modelLockPayload.assets)) {
     if ($LASTEXITCODE -eq 20) { exit 20 }
     if ($LASTEXITCODE -ne 0) { throw "locked model asset failed: $($asset.id)" }
 }
-foreach ($requiredModelPath in @($modelLockPayload.required_paths)) {
-    if (!(Test-Path -LiteralPath (Join-Path $Root ([string]$requiredModelPath)))) {
-        throw "required model asset is missing after locked initialization: $requiredModelPath"
-    }
+foreach ($requiredModelPath in $requiredModelPaths) {
+    [void](Resolve-PortablePackagePath -Root $Root -RelativePath ([string]$requiredModelPath) -Label "required model asset" -MustExist)
 }
 
 # Frozen deployment contract: uv lock --check must never update uv.lock.
