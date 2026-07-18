@@ -955,9 +955,9 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
         ),
         (
             "tts_more/Start-Worker.ps1",
-            '$process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru',
-            '$process = Start-Process -FilePath "python.exe" -ArgumentList $arguments -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru\n'
-            '# $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru',
+            '$process = Start-Process -FilePath $Python -ArgumentList $startArgumentLine -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru',
+            '$process = Start-Process -FilePath "python.exe" -ArgumentList $startArgumentLine -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru\n'
+            '# $process = Start-Process -FilePath $Python -ArgumentList $startArgumentLine -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru',
         ),
         (
             "tts_more/Invoke-PortableStart.ps1",
@@ -984,8 +984,8 @@ def test_component_templates_preserve_native_webui_separately(tmp_path: Path) ->
         ),
         (
             "tts_more/Start-Worker.ps1",
-            '$process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru',
-            'if ($false) { $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru }',
+            '$process = Start-Process -FilePath $Python -ArgumentList $startArgumentLine -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru',
+            'if ($false) { $process = Start-Process -FilePath $Python -ArgumentList $startArgumentLine -WorkingDirectory $SourceRoot -WindowStyle Hidden -PassThru }',
         ),
         (
             "Start.cmd",

@@ -132,6 +132,16 @@ def test_harness_contract_limits_path_audits_before_expand_and_covers_exact_comp
     assert "Get-Command" in script and "COMMAND_LEAK" in script
 
 
+def test_harness_runs_real_packages_below_spaced_unicode_temp_root() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert 'Join-Path ([IO.Path]::GetTempPath()) "TTS More 中文"' in script
+    assert 'Join-Path ([IO.Path]::GetTempPath()) "tts-fr"' not in script
+    assert '. (Join-Path $PSScriptRoot "Portable-Validation.ps1")' in script
+    assert "$serverArgumentLine = ConvertTo-PortableWindowsArgumentLine -Arguments $serverArguments" in script
+    assert "-ArgumentList $serverArgumentLine" in script
+
+
 def test_harness_accepts_json_integer_width_differences_from_powershell_hosts() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
 

@@ -6,6 +6,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "Portable-Validation.ps1")
 
 $ExpectedComponents = @("tts-more", "gpt-sovits", "indextts", "cosyvoice")
 $AllowedEvidenceFields = @("component", "scenario", "result", "duration", "error_code", "worker_real_initialization", "controller_real_initialization", "fixture_runtime_preseeded", "direct_downloader", "operation_progress_python")
@@ -805,11 +806,10 @@ function Invoke-RootCommand {
     param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string]$Name, [string[]]$Arguments=@())
     $launcher = Join-Path $Root $Name
     if (!(Test-Path -LiteralPath $launcher -PathType Leaf)) { Throw-HarnessError "PACKAGE_CORRUPT" "root launcher is missing" }
-    $cmd = Join-Path $env:SystemRoot "System32\cmd.exe"
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $output = @(& $cmd /d /c $launcher @Arguments 2>&1)
+        $output = @(& $launcher @Arguments 2>&1)
         $exitCode = $LASTEXITCODE
     }
     finally { $ErrorActionPreference = $previousPreference }
@@ -863,7 +863,8 @@ function Start-FixtureAssetServer {
     )
     $stdout = Join-Path $WorkRoot ("server-$ServerRestartIndex.stdout.log")
     $stderr = Join-Path $WorkRoot ("server-$ServerRestartIndex.stderr.log")
-    $script:ServerProcess = Start-Process -FilePath $FixtureBasePython -ArgumentList $serverArguments -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+    $serverArgumentLine = ConvertTo-PortableWindowsArgumentLine -Arguments $serverArguments
+    $script:ServerProcess = Start-Process -FilePath $FixtureBasePython -ArgumentList $serverArgumentLine -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
     $OwnedProcesses.Add([pscustomobject]@{ Process=$ServerProcess; Executable=$FixtureBasePython; StartedAt=$ServerProcess.StartTime.ToUniversalTime(); Port=0 })
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     while (!(Test-Path -LiteralPath $readyFile -PathType Leaf) -and [DateTime]::UtcNow -lt $deadline) {
@@ -1279,7 +1280,7 @@ function Remove-OwnedFixtureRoot {
     param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string]$Identity)
     if ([string]::IsNullOrWhiteSpace($Root) -or !(Test-Path -LiteralPath $Root -PathType Container)) { return }
     $resolved = [IO.Path]::GetFullPath($Root)
-    $runRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) "tts-fr")).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $runRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) "TTS More 中文")).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
     $marker = Join-Path $resolved ".fixture-owner.json"
     $payload = if (Test-Path -LiteralPath $marker -PathType Leaf) { try { Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json } catch { $null } } else { $null }
     if (
@@ -1319,7 +1320,7 @@ $caught = $null
 try {
     Assert-FixturePython
     $inputPackages = Assert-InputPackages
-    $runRoot = Join-Path ([IO.Path]::GetTempPath()) "tts-fr"
+    $runRoot = Join-Path ([IO.Path]::GetTempPath()) "TTS More 中文"
     New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
     $WorkRoot = Join-Path $runRoot $WorkIdentity
     New-Item -ItemType Directory -Path $WorkRoot | Out-Null

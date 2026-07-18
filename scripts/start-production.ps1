@@ -91,8 +91,9 @@ $env:TTS_MORE_STATIC_ROOT = $StaticRoot
 $env:PATH = "$(Split-Path -Parent $Python);$env:PATH"
 $process = $null
 $processCreatedAt = ""
+$startArgumentLine = ConvertTo-PortableWindowsArgumentLine -Arguments $arguments
 try {
-    $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+    $process = Start-Process -FilePath $Python -ArgumentList $startArgumentLine -WorkingDirectory $Root -WindowStyle Hidden -PassThru
     $processCreatedAt = $process.StartTime.ToUniversalTime().ToString("o")
     & $Python $Launcher write-process-record `
         --package-root $Root --record-path $recordPath --pid $process.Id --parent-pid $PID `

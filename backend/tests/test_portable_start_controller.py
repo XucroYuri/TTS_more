@@ -7,6 +7,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -1878,6 +1879,91 @@ def test_portable_start_scripts_roll_back_failed_start_and_require_strict_worker
     assert "$health.ready -eq $true" in worker_start
     assert "if ($null -ne $health.ready)" not in worker_start
     assert "worker health endpoint did not report ready=true" in worker_start
+
+
+def test_portable_start_scripts_serialize_only_the_spawn_command_line() -> None:
+    for path in (
+        REPO_ROOT / "scripts" / "start-production.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Start-Worker.ps1",
+    ):
+        script = path.read_text(encoding="utf-8")
+        assert "$startArgumentLine = ConvertTo-PortableWindowsArgumentLine -Arguments $arguments" in script
+        assert "-ArgumentList $startArgumentLine" in script
+        assert "-ArgumentList $arguments" not in script
+        assert "write-process-record" in script and "-- @arguments" in script
+        assert '"rollback-started-process"' in script and ") + $arguments" in script
+
+
+@pytest.mark.skipif(not POWERSHELL, reason="Windows PowerShell is unavailable")
+def test_windows_argument_serializer_round_trips_real_python_argv_under_spaced_unicode_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "TTS More 中文" / "argv probe"
+    root.mkdir(parents=True)
+    probe = root / "probe script.py"
+    output = root / "argv output.json"
+    payload = root / "logical arguments.json"
+    serialized = root / "serialized command line.txt"
+    cases = [
+        "",
+        "plain",
+        "contains space",
+        "contains\ttab",
+        'contains"quote',
+        'backslash-before-quote\\"tail',
+        "one-trailing-backslash\\",
+        "two-trailing-backslashes\\\\",
+        "C:\\Program Files\\TTS More 中文\\",
+    ]
+    probe.write_text(
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:], ensure_ascii=False), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    payload.write_text(
+        json.dumps([str(probe), str(output), *cases], ensure_ascii=False), encoding="utf-8"
+    )
+    environment = {
+        **os.environ,
+        "A5_VALIDATION": str(REPO_ROOT / "scripts" / "Portable-Validation.ps1"),
+        "A5_ARGUMENTS": str(payload),
+        "A5_PYTHON": sys.executable,
+        "A5_SERIALIZED": str(serialized),
+    }
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            (
+                ". $env:A5_VALIDATION; "
+                "$parsed = Get-Content -LiteralPath $env:A5_ARGUMENTS -Raw | ConvertFrom-Json; "
+                "$logical = @($parsed | ForEach-Object { $_ }); "
+                "$line = ConvertTo-PortableWindowsArgumentLine -Arguments $logical; "
+                "[IO.File]::WriteAllText($env:A5_SERIALIZED, $line, (New-Object Text.UTF8Encoding($false))); "
+                "$process = Start-Process -FilePath $env:A5_PYTHON -ArgumentList $line -Wait -PassThru -WindowStyle Hidden; "
+                "exit $process.ExitCode"
+            ),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(output.read_text(encoding="utf-8")) == cases
+    command_line = serialized.read_text(encoding="utf-8")
+    assert '""' in command_line
+    assert '\\\"' in command_line
+    assert command_line.endswith('\\\\"')
 
 
 @pytest.mark.parametrize(
