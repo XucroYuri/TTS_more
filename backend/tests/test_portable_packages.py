@@ -2607,12 +2607,57 @@ def test_worker_owned_cache_cleanup_tolerates_a_disappearing_deep_child(tmp_path
 $tokens=$null; $errors=$null
 $ErrorActionPreference='Stop'
 $ast=[Management.Automation.Language.Parser]::ParseFile('{builder}',[ref]$tokens,[ref]$errors)
+$helper=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-WorkerOwnedMissingPathFailure'}},$true)
 $fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-WorkerOwnedDirectoryContents'}},$true)
+. ([scriptblock]::Create($helper.Extent.Text))
 . ([scriptblock]::Create($fn.Extent.Text))
 $remover=Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile','-NonInteractive','-Command',"Start-Sleep -Milliseconds 40; Remove-Item -LiteralPath '{disappearing.parent.parent}' -Recurse -Force")
 try {{ Remove-WorkerOwnedDirectoryContents -Path '{cache}' }}
 finally {{ $remover.WaitForExit() }}
 if (@(Get-ChildItem -LiteralPath '{cache}' -Force).Count -ne 0) {{ exit 94 }}
+exit 0
+"""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="worker cache cleanup uses Windows PowerShell")
+def test_worker_owned_cache_cleanup_retries_after_recursive_missing_file(tmp_path: Path) -> None:
+    cache = tmp_path / "owned-cache"
+    child = cache / "sdist" / "ssl_match_hostname"
+    child.mkdir(parents=True)
+    (child / "_implementation.py").write_text("fixture", encoding="utf-8")
+    builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{builder}',[ref]$tokens,[ref]$errors)
+$helper=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-WorkerOwnedMissingPathFailure'}},$true)
+$fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-WorkerOwnedDirectoryContents'}},$true)
+. ([scriptblock]::Create($helper.Extent.Text))
+. ([scriptblock]::Create($fn.Extent.Text))
+$script:injectedMissingFile=$false
+$injectedPath=[IO.Path]::GetFullPath('{child}')
+function Get-ChildItem {{
+    [CmdletBinding()]
+    param([string]$LiteralPath,[switch]$Force)
+    if (!$script:injectedMissingFile -and [IO.Path]::GetFullPath($LiteralPath) -eq $injectedPath) {{
+        $script:injectedMissingFile=$true
+        throw [IO.FileNotFoundException]::new("Could not find a part of the path '_implementation.py'.")
+    }}
+    Microsoft.PowerShell.Management\\Get-ChildItem @PSBoundParameters
+}}
+Remove-WorkerOwnedDirectoryContents -Path '{cache}'
+if (!$script:injectedMissingFile) {{ exit 93 }}
+if (@(Microsoft.PowerShell.Management\\Get-ChildItem -LiteralPath '{cache}' -Force).Count -ne 0) {{ exit 94 }}
 exit 0
 """
     completed = subprocess.run(
@@ -2635,9 +2680,77 @@ def test_worker_owned_cache_file_cleanup_tolerates_file_and_parent_races() -> No
         "$Bundle =", maxsplit=1
     )[0]
 
-    assert "try { [IO.File]::Delete($currentChild.FullName) }" in function
-    assert "catch [IO.FileNotFoundException] { continue }" in function
-    assert function.count("catch [IO.DirectoryNotFoundException] { continue }") >= 2
+    assert "[IO.File]::Delete($childPath)" in function
+    assert "Test-WorkerOwnedMissingPathFailure -Failure $_" in function
+
+
+@pytest.mark.skipif(os.name != "nt", reason="worker cache cleanup uses Windows PowerShell")
+def test_worker_owned_cache_cleanup_wraps_each_child_lifecycle_in_one_try() -> None:
+    builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{builder}',[ref]$tokens,[ref]$errors)
+$fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-WorkerOwnedDirectoryContents'}},$true)
+$loop=$fn.Body.Find({{param($node) $node -is [Management.Automation.Language.ForEachStatementAst]}},$true)
+$statements=@($loop.Body.Statements)
+if ($statements.Count -ne 1 -or $statements[0] -isnot [Management.Automation.Language.TryStatementAst]) {{ exit 91 }}
+$body=$statements[0].Body.Extent.Text
+foreach($token in @('[IO.File]::GetAttributes','[IO.FileAttributes]::ReparsePoint','[IO.FileAttributes]::Directory','Remove-WorkerOwnedDirectoryContents','[IO.Directory]::Delete','[IO.File]::Delete')) {{
+    if (!$body.Contains($token)) {{ exit 92 }}
+}}
+exit 0
+"""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="worker cache cleanup uses Windows PowerShell")
+def test_worker_owned_cache_cleanup_unwraps_only_missing_path_failures() -> None:
+    builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{builder}',[ref]$tokens,[ref]$errors)
+$helper=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-WorkerOwnedMissingPathFailure'}},$true)
+if ($null -eq $helper) {{ exit 91 }}
+. ([scriptblock]::Create($helper.Extent.Text))
+foreach($exception in @(
+    [Management.Automation.ItemNotFoundException]::new('missing item'),
+    [IO.FileNotFoundException]::new('missing file'),
+    [Reflection.TargetInvocationException]::new([IO.DirectoryNotFoundException]::new('missing directory'))
+)) {{
+    $failure=[Management.Automation.ErrorRecord]::new($exception,'fixture',[Management.Automation.ErrorCategory]::ObjectNotFound,$null)
+    if (!(Test-WorkerOwnedMissingPathFailure -Failure $failure)) {{ exit 92 }}
+}}
+foreach($exception in @(
+    [UnauthorizedAccessException]::new('denied'),
+    [IO.IOException]::new('ordinary io failure'),
+    [Management.Automation.RuntimeException]::new('reparse point rejected')
+)) {{
+    $failure=[Management.Automation.ErrorRecord]::new($exception,'fixture',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+    if (Test-WorkerOwnedMissingPathFailure -Failure $failure) {{ exit 93 }}
+}}
+exit 0
+"""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_tts_more_full_builder_binary_scans_large_runtime_metadata_for_machine_paths() -> None:
