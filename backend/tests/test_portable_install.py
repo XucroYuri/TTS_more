@@ -684,6 +684,21 @@ def test_prune_console_launchers_removes_only_declared_safe_entry_points(
         f"#!{tmp_path / 'runtime' / 'staging' / 'python.exe'}\nprint('window')\n",
         encoding="utf-8",
     )
+    legacy = launchers / "legacy.py"
+    legacy.write_text(
+        f"#!{tmp_path / 'runtime' / 'staging' / 'python.exe'}\nprint('legacy')\n",
+        encoding="utf-8",
+    )
+    legacy_tool = launchers / "legacy-tool"
+    legacy_tool.write_text(
+        f"#!{tmp_path / 'runtime' / 'staging' / 'python.exe'}\nprint('legacy tool')\n",
+        encoding="utf-8",
+    )
+    metadata = site_packages / "fixture_launchers-1.0.dist-info"
+    (metadata / "RECORD").write_text(
+        "bin/legacy.py,,\nbin/legacy-tool,,\n",
+        encoding="utf-8",
+    )
     unknown = launchers / "keep.exe"
     unknown.write_bytes(b"unknown machine-specific file")
     unknown_python = launchers / "keep.py"
@@ -696,12 +711,21 @@ def test_prune_console_launchers_removes_only_declared_safe_entry_points(
 
     assert report == {
         "preserved_unknown": ["bin/keep.exe", "bin/keep.py"],
-        "removed": ["bin/known.exe", "bin/known.py", "bin/window.exe", "bin/window.py"],
+        "removed": [
+            "bin/known.exe",
+            "bin/known.py",
+            "bin/legacy-tool",
+            "bin/legacy.py",
+            "bin/window.exe",
+            "bin/window.py",
+        ],
     }
     assert not (launchers / "known.exe").exists()
     assert not (launchers / "known.py").exists()
     assert not (launchers / "window.exe").exists()
     assert not (launchers / "window.py").exists()
+    assert not legacy.exists()
+    assert not legacy_tool.exists()
     assert unknown.read_bytes() == b"unknown machine-specific file"
     assert unknown_python.read_text(encoding="utf-8") == "print('package data')\n"
     assert scripts_unknown.read_bytes() == b"outside the uv target launcher directory"

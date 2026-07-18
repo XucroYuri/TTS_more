@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Callable, Iterable
 from uuid import UUID
 
@@ -52,6 +52,7 @@ def prune_console_launchers(site_packages: Path) -> dict[str, object]:
 
     entry_point_names: set[str] = set()
     casefolded_names: dict[str, str] = {}
+    recorded_launcher_names: set[str] = set()
     for distribution in importlib_metadata.distributions(path=[str(site_packages)]):
         for entry_point in distribution.entry_points:
             if entry_point.group not in {"console_scripts", "gui_scripts"}:
@@ -65,6 +66,18 @@ def prune_console_launchers(site_packages: Path) -> dict[str, object]:
                 raise ValueError(f"ambiguous console entry-point names: {previous!r}, {name!r}")
             casefolded_names[folded] = name
             entry_point_names.add(name)
+        for installed_file in distribution.files or ():
+            relative = PurePosixPath(str(installed_file).replace("\\", "/"))
+            if (
+                relative.is_absolute()
+                or len(relative.parts) != 2
+                or relative.parts[0].casefold() != "bin"
+            ):
+                continue
+            filename = relative.parts[1]
+            if not ENTRY_POINT_NAME_PATTERN.fullmatch(filename):
+                raise ValueError(f"unsafe recorded launcher name: {filename!r}")
+            recorded_launcher_names.add(filename)
 
     launcher_root = site_packages / "bin"
     if not os.path.lexists(launcher_root):
@@ -72,11 +85,19 @@ def prune_console_launchers(site_packages: Path) -> dict[str, object]:
     if not launcher_root.is_dir() or _is_reparse_point(launcher_root):
         raise ValueError("console launcher root must be a real directory")
 
-    candidates = [
-        launcher_root / f"{name}{suffix}"
+    candidate_filenames = recorded_launcher_names | {
+        f"{name}{suffix}"
         for name in sorted(entry_point_names)
         for suffix in (".exe", ".py")
-    ]
+    }
+    casefolded_candidates: dict[str, str] = {}
+    for filename in sorted(candidate_filenames):
+        folded = filename.casefold()
+        previous = casefolded_candidates.get(folded)
+        if previous is not None and previous != filename:
+            raise ValueError(f"ambiguous recorded launcher names: {previous!r}, {filename!r}")
+        casefolded_candidates[folded] = filename
+    candidates = [launcher_root / filename for filename in sorted(candidate_filenames)]
     existing_candidates = [candidate for candidate in candidates if os.path.lexists(candidate)]
     for candidate in existing_candidates:
         if _is_reparse_point(candidate):
