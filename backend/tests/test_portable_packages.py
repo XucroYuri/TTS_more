@@ -2322,6 +2322,124 @@ def test_worker_full_uv_cache_fits_real_four_pack_path_budget_and_is_handle_owne
     assert 'Join-Path $work "uv-cache"' not in builder
 
 
+@pytest.mark.skipif(os.name != "nt", reason="worker probe context uses Windows PowerShell")
+def test_worker_initializer_runs_source_import_probe_from_external_cwd_without_env_leak(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "package with spaces 中文" / "app"
+    package = source_root / "GPT_SoVITS"
+    outside = tmp_path / "outside"
+    package.mkdir(parents=True)
+    outside.mkdir()
+    (package / "__init__.py").write_text("PROBE_VALUE = 'ready'\n", encoding="utf-8")
+    initializer = REPO_ROOT / "integrations" / "windows" / "Initialize.ps1"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{initializer}',[ref]$tokens,[ref]$errors)
+$fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-PortableWorkerSourceContext'}},$true)
+if ($null -eq $fn) {{ exit 91 }}
+. ([scriptblock]::Create($fn.Extent.Text))
+Set-Location -LiteralPath '{outside}'
+$before=(Get-Location).Path
+$env:PYTHONPATH='preserve-this-value'
+Invoke-PortableWorkerSourceContext -SourceRoot '{source_root}' -Action {{
+    & '{Path(sys.executable).resolve()}' -c "import GPT_SoVITS; assert GPT_SoVITS.PROBE_VALUE == 'ready'"
+    if ($LASTEXITCODE -ne 0) {{ throw 'fixture import probe failed' }}
+}}
+if ((Get-Location).Path -ne $before) {{ exit 92 }}
+if ($env:PYTHONPATH -ne 'preserve-this-value') {{ exit 93 }}
+exit 0
+"""
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        cwd=outside,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_worker_cross_volume_probe_uses_staged_app_as_cwd_for_complete_import_probe() -> None:
+    builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+    function = builder.split("function Test-WorkerFullRuntimeOnOtherVolume", maxsplit=1)[1].split(
+        "function Test-WorkerBinaryContainsMachinePrefix", maxsplit=1
+    )[0]
+
+    assert 'Join-Path $PackageRoot "app"' in function
+    assert "Push-Location" in function and "Pop-Location" in function
+    assert "finally" in function
+    assert "& $python -c $ImportProbe" in function
+    gpt_probe = json.loads(
+        (REPO_ROOT / "integrations" / "components" / "gpt-sovits" / "runtime.lock.json").read_text(
+            encoding="utf-8"
+        )
+    )["import_probe"]
+    assert "TTS" in gpt_probe and "TTS_Config" in gpt_probe
+
+
+def test_worker_full_initialization_preserves_primary_and_cleanup_failures() -> None:
+    builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "$primaryFailure = $null" in builder
+    assert "$uvCleanupFailure = $null" in builder
+    assert "catch { $primaryFailure = $_ }" in builder
+    assert "catch { $uvCleanupFailure = $_ }" in builder
+    assert "full package initialization failed:" in builder
+    assert "worker uv cache cleanup also failed:" in builder
+
+
+@pytest.mark.skipif(os.name != "nt", reason="worker cache cleanup uses Windows PowerShell")
+def test_worker_owned_cache_cleanup_tolerates_a_disappearing_deep_child(tmp_path: Path) -> None:
+    cache = tmp_path / "owned-cache"
+    for index in range(700):
+        leaf = cache / f"a{index:04d}" / "nested"
+        leaf.mkdir(parents=True)
+        (leaf / "payload.txt").write_text("fixture", encoding="utf-8")
+    disappearing = cache / "zz-disappears" / "deep" / "child"
+    disappearing.mkdir(parents=True)
+    (disappearing / "_implementation.py").write_text("fixture", encoding="utf-8")
+    builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{builder}',[ref]$tokens,[ref]$errors)
+$fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-WorkerOwnedDirectoryContents'}},$true)
+. ([scriptblock]::Create($fn.Extent.Text))
+$remover=Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @('-NoProfile','-NonInteractive','-Command',"Start-Sleep -Milliseconds 40; Remove-Item -LiteralPath '{disappearing.parent.parent}' -Recurse -Force")
+try {{ Remove-WorkerOwnedDirectoryContents -Path '{cache}' }}
+finally {{ $remover.WaitForExit() }}
+if (@(Get-ChildItem -LiteralPath '{cache}' -Force).Count -ne 0) {{ exit 94 }}
+exit 0
+"""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_tts_more_full_builder_binary_scans_large_runtime_metadata_for_machine_paths() -> None:
     builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
 
