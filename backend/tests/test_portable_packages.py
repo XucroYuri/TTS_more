@@ -2330,6 +2330,30 @@ def test_worker_full_uv_cache_fits_real_four_pack_path_budget_and_is_handle_owne
     assert 'Join-Path $work "uv-cache"' not in builder
 
 
+def test_worker_full_staging_fits_transformers_generated_path_on_real_four_pack_root() -> None:
+    work_base = PureWindowsPath(r"I:\TTS-More-Full-Packages\.tmw-27372-9149935044b36174")
+    old_stage = (
+        work_base
+        / "tts-more-worker-27372-f895417727cc"
+        / "gpt-sovits-0.2.0-auto-windows-x64-full-staging"
+    )
+    short_stage = work_base / "w-27372-f895417727cc" / "s"
+    generated_module = PureWindowsPath(
+        r"runtime\staging\Lib\site-packages\transformers\utils"
+        r"\dummy_essentia_and_librosa_and_pretty_midi_and_scipy_and_torch_objects.py"
+    )
+
+    assert len(str(old_stage / generated_module)) == 262
+    assert len(str(short_stage / generated_module)) <= 240
+
+    builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert '$workIdentity = "w-$PID-' in builder
+    assert '$stage = Join-Path $work "s"' in builder
+    assert "dummy_essentia_and_librosa_and_pretty_midi_and_scipy_and_torch_objects.py" in builder
+
+
 def test_gpt_worker_import_probe_adds_upstream_source_root_before_imports() -> None:
     runtime_lock = json.loads(
         (REPO_ROOT / "integrations" / "components" / "gpt-sovits" / "runtime.lock.json").read_text(
