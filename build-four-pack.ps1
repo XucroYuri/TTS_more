@@ -47,6 +47,18 @@ function Get-ZipSnapshot {
     return $snapshot
 }
 
+function Test-PathIsWithin {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Parent
+    )
+    $candidate = [System.IO.Path]::GetFullPath($Path)
+    $container = [System.IO.Path]::GetFullPath($Parent)
+    if ($candidate.Equals($container, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $containerPrefix = $container.TrimEnd([char[]]@('\', '/')) + [System.IO.Path]::DirectorySeparatorChar
+    return $candidate.StartsWith($containerPrefix, [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Resolve-MetadataPython {
     if ($env:TTS_MORE_BUILD_PYTHON) { return [pscustomobject]@{ command=$env:TTS_MORE_BUILD_PYTHON; prefix=@() } }
     foreach ($candidate in @(
@@ -184,14 +196,36 @@ if ([string]::IsNullOrWhiteSpace($outputParent)) { throw "OutputRoot must have a
 New-Item -ItemType Directory -Force -Path $outputParent | Out-Null
 $parentIdentity = [string](@(Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("directory-identity", "--path", $outputParent) -Failure "four-pack output parent identity capture failed")[0])
 $transactionRoot = Join-Path $outputParent (".tts-more-four-pack-transaction-$PID-" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $transactionRoot | Out-Null
-$transactionIdentity = [string](@(Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("directory-identity", "--path", $transactionRoot) -Failure "four-pack transaction identity capture failed")[0])
+$workLeaf = ".tts-more-four-pack-work-$PID-" + [Guid]::NewGuid().ToString("N")
+$workParent = $outputParent
+while ($true) {
+    $workTransactionRoot = Join-Path $workParent $workLeaf
+    $containingSource = @($targets | Where-Object { Test-PathIsWithin -Path $workTransactionRoot -Parent ([string]$_.root) } | Select-Object -First 1)
+    if ($containingSource.Count -eq 0) { break }
+    $nextWorkParent = [System.IO.Path]::GetDirectoryName(([System.IO.Path]::GetFullPath([string]$containingSource[0].root)).TrimEnd([char[]]@('\', '/')))
+    if ([string]::IsNullOrWhiteSpace($nextWorkParent) -or $nextWorkParent.Equals($workParent, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "four-pack could not place its work transaction outside all source roots"
+    }
+    $workParent = $nextWorkParent
+}
+$workPathArguments = @("validate-transaction-paths", "--output-root", $workTransactionRoot, "--controller-root", $Root)
+foreach ($target in $targets) { $workPathArguments += @("--source-root", [string]$target.root) }
+Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments $workPathArguments -Failure "four-pack WorkRoot/source-root safety validation failed" | Out-Null
+
+$transactionIdentity = ""
+$workTransactionIdentity = ""
 $published = $false
+$primaryFailure = $null
+$cleanupFailures = @()
 try {
+    New-Item -ItemType Directory -Path $workTransactionRoot | Out-Null
+    $workTransactionIdentity = [string](@(Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("directory-identity", "--path", $workTransactionRoot) -Failure "four-pack work transaction identity capture failed")[0])
+    New-Item -ItemType Directory -Path $transactionRoot | Out-Null
+    $transactionIdentity = [string](@(Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("directory-identity", "--path", $transactionRoot) -Failure "four-pack transaction identity capture failed")[0])
     $builtPackages = @()
     foreach ($target in $targets) {
         $before = Get-ZipSnapshot -Directory $transactionRoot
-        & (Join-Path $target.root "Build-Package.ps1") -Profile Full -Device $target.device -Version $Version -OutputRoot $transactionRoot
+        & (Join-Path $target.root "Build-Package.ps1") -Profile Full -Device $target.device -Version $Version -OutputRoot $transactionRoot -WorkRoot $workTransactionRoot
         if ($LASTEXITCODE -ne 0) { throw "$($target.component) full package build failed" }
         $after = Get-ZipSnapshot -Directory $transactionRoot
         $changed = @(Get-ChildItem -LiteralPath $transactionRoot -Filter "*.zip" -File | Where-Object {
@@ -253,8 +287,29 @@ try {
     $published = $true
     Write-Host "Created local full four-pack: $OutputRoot"
 }
+catch {
+    $primaryFailure = $_
+}
 finally {
-    if (!$published -and (Test-Path -LiteralPath $transactionRoot)) {
-        Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("cleanup-directory", "--path", $transactionRoot, "--expected-identity", $transactionIdentity) -Failure "four-pack transaction cleanup refused because directory identity changed" | Out-Null
+    if ($workTransactionIdentity -and (Test-Path -LiteralPath $workTransactionRoot)) {
+        try {
+            Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("cleanup-directory", "--path", $workTransactionRoot, "--expected-identity", $workTransactionIdentity) -Failure "four-pack work transaction cleanup refused because directory identity changed" | Out-Null
+        }
+        catch { $cleanupFailures += $_.Exception.Message }
     }
+    if (!$published -and $transactionIdentity -and (Test-Path -LiteralPath $transactionRoot)) {
+        try {
+            Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("cleanup-directory", "--path", $transactionRoot, "--expected-identity", $transactionIdentity) -Failure "four-pack transaction cleanup refused because directory identity changed" | Out-Null
+        }
+        catch { $cleanupFailures += $_.Exception.Message }
+    }
+}
+if ($primaryFailure) {
+    if ($cleanupFailures.Count -ne 0) {
+        throw (([string]$primaryFailure) + [Environment]::NewLine + "Four-pack cleanup failures:" + [Environment]::NewLine + ($cleanupFailures -join [Environment]::NewLine))
+    }
+    throw $primaryFailure
+}
+if ($cleanupFailures.Count -ne 0) {
+    throw ($cleanupFailures -join [Environment]::NewLine)
 }

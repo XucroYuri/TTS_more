@@ -3488,6 +3488,8 @@ def test_four_pack_plan_only_records_device_intentions_without_machine_paths(tmp
     assert str(fixture) not in serialized
     assert str(output) not in serialized
     assert not output.exists()
+    assert not list(tmp_path.glob(".tts-more-four-pack-transaction-*"))
+    assert not list(tmp_path.glob(".tts-more-four-pack-work-*"))
     assert not list(fixture.rglob("planonly-invoked"))
 
 
@@ -3638,8 +3640,16 @@ if args.mode == "replace-transaction":
 def _write_fake_full_builder(root: Path, component: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "Build-Package.ps1").write_text(
-        f'''param([string]$Profile, [string]$Device, [string]$Version, [string]$OutputRoot)
+        f'''param([string]$Profile, [string]$Device, [string]$Version, [string]$OutputRoot, [string]$WorkRoot)
 "{component}:$Device" | Add-Content -LiteralPath $env:TTS_MORE_FIXTURE_LOG -Encoding UTF8
+[ordered]@{{ component="{component}"; work_root=$WorkRoot }} | ConvertTo-Json -Compress | Add-Content -LiteralPath $env:TTS_MORE_FIXTURE_WORK_LOG -Encoding UTF8
+if ($WorkRoot) {{ "{component}" | Set-Content -LiteralPath (Join-Path $WorkRoot "fixture-{component}.txt") -Encoding UTF8 }}
+if ($env:TTS_MORE_FIXTURE_REPLACE_WORK_COMPONENT -eq "{component}") {{
+    Move-Item -LiteralPath $WorkRoot -Destination "${{WorkRoot}}-owned"
+    New-Item -ItemType Directory -Path $WorkRoot | Out-Null
+    "replacement" | Set-Content -LiteralPath (Join-Path $WorkRoot "replacement-sentinel.txt") -Encoding UTF8
+    throw "fixture primary component failure"
+}}
 if ($env:TTS_MORE_FIXTURE_FAIL_COMPONENT -eq "{component}") {{ throw "fixture component failure" }}
 $mode = if ($env:TTS_MORE_FIXTURE_MODE_COMPONENT -eq "{component}") {{ $env:TTS_MORE_FIXTURE_MODE }} else {{ "ok" }}
 $revision = if (Test-Path -LiteralPath (Join-Path $PSScriptRoot ".git")) {{ (& git -C $PSScriptRoot rev-parse HEAD).Trim() }} else {{ "e" * 40 }}
@@ -3682,11 +3692,13 @@ def _run_executable_four_pack_fixture(
 ) -> subprocess.CompletedProcess[str]:
     assert POWERSHELL is not None
     log = fixture / "routing.log"
+    work_log = fixture / "work-root.log"
     env = _local_full_builder_env(
         {
             "TTS_MORE_BUILD_PYTHON": str(Path(sys.executable).resolve()),
             "TTS_MORE_FIXTURE_MAKER": str(fixture / "make-full-package.py"),
             "TTS_MORE_FIXTURE_LOG": str(log),
+            "TTS_MORE_FIXTURE_WORK_LOG": str(work_log),
             "TTS_MORE_FIXTURE_FINAL_OUTPUT": str(output),
             **(extra_env or {}),
         }
@@ -3701,6 +3713,13 @@ def _run_executable_four_pack_fixture(
         errors="replace",
         check=False,
     )
+
+
+def _read_fixture_work_roots(fixture: Path) -> list[dict[str, str]]:
+    return [
+        json.loads(line)
+        for line in (fixture / "work-root.log").read_text(encoding="utf-8-sig").splitlines()
+    ]
 
 
 def test_four_pack_fake_build_routes_cpu_and_publishes_only_after_all_verified(tmp_path: Path) -> None:
@@ -3720,6 +3739,48 @@ def test_four_pack_fake_build_routes_cpu_and_publishes_only_after_all_verified(t
     assert len(list(output.glob("*-full-cu126.zip"))) == 3
     assert (output / "compatibility-matrix.json").is_file()
     assert (output / "four-pack.provenance.json").is_file()
+    assert len(list(output.iterdir())) == 26
+    assert all(path.is_file() for path in output.iterdir())
+    work_records = _read_fixture_work_roots(fixture)
+    assert [record["component"] for record in work_records] == [
+        "tts-more", "gpt-sovits", "indextts", "cosyvoice"
+    ]
+    assert all(record["work_root"] for record in work_records), "four-pack omitted component WorkRoot"
+    work_roots = {Path(record["work_root"]).resolve() for record in work_records}
+    assert len(work_roots) == 1
+    work_root = work_roots.pop()
+    assert work_root.parent == output.parent.resolve()
+    assert work_root != output.resolve()
+    assert work_root != fixture.resolve()
+    assert all(work_root != worker.resolve() for worker in workers.values())
+    assert not work_root.exists()
+    assert not list(output.glob(".tts-more-four-pack-work-*"))
+
+
+def test_four_pack_work_root_stays_outside_controller_source_tree(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("four-pack execution contract requires PowerShell")
+    fixture, workers = _write_executable_four_pack_fixture(tmp_path / "f")
+    output = fixture / "artifacts" / "portable" / "full-four" / "x"
+
+    completed = _run_executable_four_pack_fixture(
+        fixture,
+        workers,
+        output,
+        extra_env={"TTS_MORE_FIXTURE_FAIL_COMPONENT": "tts-more"},
+    )
+
+    assert completed.returncode != 0
+    work_records = _read_fixture_work_roots(fixture)
+    assert all(record["work_root"] for record in work_records), "four-pack omitted component WorkRoot"
+    work_roots = {Path(record["work_root"]).resolve() for record in work_records}
+    assert len(work_roots) == 1
+    work_root = work_roots.pop()
+    assert work_root.parent == fixture.parent.resolve()
+    assert not work_root.is_relative_to(fixture.resolve())
+    assert work_root.anchor == output.resolve().anchor
+    assert not work_root.exists()
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(("mode_component", "mode"), [("gpt-sovits", "duplicate"), ("gpt-sovits", "stale")])
@@ -3753,6 +3814,11 @@ def test_four_pack_component_failure_leaves_final_output_untouched(tmp_path: Pat
     sentinel = previous / "delivery.zip"
     sentinel.write_bytes(b"previous delivery must remain byte-identical")
     sentinel_sha = hashlib.sha256(sentinel.read_bytes()).hexdigest()
+    preexisting_work_like = tmp_path / ".tts-more-four-pack-work-existing"
+    preexisting_work_like.mkdir()
+    work_sentinel = preexisting_work_like / "sentinel.txt"
+    work_sentinel.write_bytes(b"pre-existing directory is not controller-owned")
+    work_sentinel_sha = hashlib.sha256(work_sentinel.read_bytes()).hexdigest()
 
     completed = _run_executable_four_pack_fixture(
         fixture,
@@ -3766,6 +3832,16 @@ def test_four_pack_component_failure_leaves_final_output_untouched(tmp_path: Pat
     assert hashlib.sha256(sentinel.read_bytes()).hexdigest() == sentinel_sha
     assert list(previous.iterdir()) == [sentinel]
     assert not list(tmp_path.glob(".tts-more-four-pack-transaction-*"))
+    work_records = _read_fixture_work_roots(fixture)
+    assert all(record["work_root"] for record in work_records), "four-pack omitted component WorkRoot"
+    work_roots = {Path(record["work_root"]).resolve() for record in work_records}
+    assert len(work_roots) == 1
+    owned_work_root = work_roots.pop()
+    assert owned_work_root.parent == output.parent.resolve()
+    assert not owned_work_root.exists()
+    assert hashlib.sha256(work_sentinel.read_bytes()).hexdigest() == work_sentinel_sha
+    assert list(preexisting_work_like.iterdir()) == [work_sentinel]
+    assert list(tmp_path.glob(".tts-more-four-pack-work-*")) == [preexisting_work_like]
     assert (fixture / "routing.log").read_text(encoding="utf-8-sig").splitlines() == [
         "tts-more:CPU", "gpt-sovits:CU126"
     ]
@@ -4146,6 +4222,35 @@ def test_four_pack_cleanup_refuses_replaced_transaction_identity(tmp_path: Path)
     replacements = list(tmp_path.glob(".tts-more-four-pack-transaction-*/replacement-sentinel.txt"))
     assert len(replacements) == 1
     assert replacements[0].read_text(encoding="utf-8") == "replacement"
+    assert not output.exists()
+
+
+def test_four_pack_cleanup_refuses_replaced_work_identity_and_preserves_primary_failure(
+    tmp_path: Path,
+) -> None:
+    if POWERSHELL is None:
+        pytest.skip("four-pack execution contract requires PowerShell")
+    fixture, workers = _write_executable_four_pack_fixture(tmp_path / "four-pack")
+    output = tmp_path / "published"
+
+    completed = _run_executable_four_pack_fixture(
+        fixture,
+        workers,
+        output,
+        extra_env={"TTS_MORE_FIXTURE_REPLACE_WORK_COMPONENT": "tts-more"},
+    )
+
+    assert completed.returncode != 0
+    failure = completed.stdout + completed.stderr
+    assert "fixture primary component failure" in failure
+    assert "work transaction cleanup refused because directory identity changed" in failure
+    replacements = list(tmp_path.glob(".tts-more-four-pack-work-*/replacement-sentinel.txt"))
+    assert len(replacements) == 1
+    assert replacements[0].read_text(encoding="utf-8-sig").strip() == "replacement"
+    owned_roots = list(tmp_path.glob(".tts-more-four-pack-work-*-owned"))
+    assert len(owned_roots) == 1
+    assert (owned_roots[0] / "fixture-tts-more.txt").is_file()
+    assert not list(tmp_path.glob(".tts-more-four-pack-transaction-*"))
     assert not output.exists()
 
 
