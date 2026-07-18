@@ -4725,3 +4725,19 @@ def test_local_start_launchers_allow_non_destructive_port_overrides() -> None:
     assert "$model = Join-Path $root 'pretrained_models\\CosyVoice-300M'" in cosy_launcher
     assert "CosyVoice-300M model directory is missing" in cosy_launcher
     assert "'--model_dir', $model" in cosy_launcher
+
+
+def test_gpt_full_package_ffmpeg_layout_is_exported_to_worker_runtime() -> None:
+    runtime_lock = json.loads(
+        (REPO_ROOT / "integrations" / "components" / "gpt-sovits" / "runtime.lock.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    ffmpeg = next(payload for payload in runtime_lock["payloads"] if payload["id"].startswith("ffmpeg-"))
+    start_worker = (REPO_ROOT / "integrations" / "windows" / "Start-Worker.ps1").read_text(encoding="utf-8")
+    worker = (REPO_ROOT / "backend" / "app" / "workers" / "gpt_sovits_worker.py").read_text(encoding="utf-8")
+
+    assert ffmpeg["extract_to"] == "ffmpeg-shared"
+    assert '$env:TTS_MORE_PACKAGE_ROOT = $Root' in start_worker
+    assert 'os.environ.get("TTS_MORE_PACKAGE_ROOT")' in worker
+    assert '"ffmpeg-shared" / "bin"' in worker

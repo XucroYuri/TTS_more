@@ -1864,6 +1864,22 @@ def test_portable_start_scripts_reject_external_python_fallbacks_before_spawn() 
         assert "listener_is_owned" in script or "verify-owned-listener" in script
 
 
+def test_portable_start_scripts_roll_back_failed_start_and_require_strict_worker_readiness() -> None:
+    app_start = (REPO_ROOT / "scripts" / "start-production.ps1").read_text(encoding="utf-8")
+    worker_start = (REPO_ROOT / "integrations" / "windows" / "Start-Worker.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    for script in (app_start, worker_start):
+        assert "rollback-started-process" in script
+        assert "Rollback failed" in script
+        assert "write-process-record" in script
+        assert script.index("write-process-record") < script.index("rollback-started-process")
+    assert "$health.ready -eq $true" in worker_start
+    assert "if ($null -ne $health.ready)" not in worker_start
+    assert "worker health endpoint did not report ready=true" in worker_start
+
+
 @pytest.mark.parametrize(
     ("expected", "actual", "accepted"),
     (

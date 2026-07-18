@@ -89,7 +89,6 @@ MODELS = {
             "hift.pt",
             "llm.pt",
             "speech_tokenizer_v1.onnx",
-            "README.md",
         },
         "target": lambda path: f"pretrained_models/CosyVoice-300M/{path}",
         "required_paths": [
@@ -100,11 +99,23 @@ MODELS = {
             "pretrained_models/CosyVoice-300M/campplus.onnx",
             "pretrained_models/CosyVoice-300M/speech_tokenizer_v1.onnx",
         ],
+        "documentation_provenance": {
+            "license": "Apache-2.0",
+            "runtime_required": False,
+            "sha256": "97b420f4afcbbce667623a882439d5ee1a64a2f33d5023a942bc411862cccf0c",
+            "size_bytes": 10116,
+            "source_path": "README.md",
+            "source_revision": "d979372752f86be76f2b798435a0f1593bfddb4e",
+            "source_url": (
+                "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/"
+                "d979372752f86be76f2b798435a0f1593bfddb4e/README.md"
+            ),
+        },
     },
 }
 
 
-def resolve(component: str) -> dict[str, Any]:
+def resolve(component: str, previous: dict[str, Any] | None = None) -> dict[str, Any]:
     config = MODELS[component]
     model_id = str(config["modelscope"])
     assets = []
@@ -118,6 +129,7 @@ def resolve(component: str) -> dict[str, Any]:
             auxiliary["target"],
         )
     _append_pinned_assets(assets, component, config.get("pinned_assets", []))
+    _retain_verified_mirrors(assets, previous)
     assets.sort(key=lambda asset: str(asset["target"]))
     material = "\n".join(
         f"{asset['source_path']}\0{asset['source_revision']}\0{asset['sha256']}\0{asset['size_bytes']}"
@@ -126,7 +138,7 @@ def resolve(component: str) -> dict[str, Any]:
     snapshot = hashlib.sha256(material.encode()).hexdigest()
     targets = {str(asset["target"]) for asset in assets}
     missing = [path for path in config["required_paths"] if path not in targets]
-    return {
+    payload = {
         "schema_version": 1,
         "component": component,
         "upstream_repository": config["upstream"],
@@ -141,6 +153,34 @@ def resolve(component: str) -> dict[str, Any]:
         "required_paths": config["required_paths"],
         "assets": assets,
     }
+    if "documentation_provenance" in config:
+        payload["documentation_provenance"] = config["documentation_provenance"]
+    return payload
+
+
+def _retain_verified_mirrors(
+    assets: list[dict[str, Any]], previous: dict[str, Any] | None
+) -> None:
+    """Retain audited mirrors only while their locked byte identity is unchanged."""
+    if not previous:
+        return
+    previous_by_target = {
+        str(asset.get("target") or ""): asset for asset in previous.get("assets", [])
+    }
+    for asset in assets:
+        prior = previous_by_target.get(str(asset["target"]))
+        if not prior:
+            continue
+        if (
+            str(prior.get("sha256") or "").lower() != asset["sha256"]
+            or int(prior.get("size_bytes") or 0) != asset["size_bytes"]
+        ):
+            continue
+        urls = asset["urls"]
+        for url in prior.get("urls", []):
+            value = str(url)
+            if value not in urls:
+                urls.append(value)
 
 
 def _append_assets(
@@ -208,8 +248,11 @@ def main(argv: list[str] | None = None) -> int:
     components = MODELS if args.component == "all" else [args.component]
     incomplete = []
     for component in components:
-        payload = resolve(component)
         output = args.output_root / component / "models.lock.json"
+        previous = (
+            json.loads(output.read_text(encoding="utf-8")) if output.is_file() else None
+        )
+        payload = resolve(component, previous)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"{component}: {len(payload['assets'])} assets, snapshot {payload['snapshot_revision']}")

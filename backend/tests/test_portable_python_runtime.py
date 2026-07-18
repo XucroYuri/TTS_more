@@ -20,14 +20,20 @@ HELPERS = (
 )
 PY311 = {
     "id": "cpython-3.11.9-embed-amd64",
-    "urls": ["https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"],
+    "urls": [
+        "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip",
+        "https://download.qt.io/development_releases/prebuilt/python/python-3.11.9-embed-amd64.zip",
+    ],
     "sha256": "009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b",
     "size_bytes": 11249023,
     "archive_entry": "python.exe",
 }
 PY310 = {
     "id": "cpython-3.10.11-embed-amd64",
-    "urls": ["https://www.python.org/ftp/python/3.10.11/python-3.10.11-embed-amd64.zip"],
+    "urls": [
+        "https://www.python.org/ftp/python/3.10.11/python-3.10.11-embed-amd64.zip",
+        "https://repo.huaweicloud.com/python/3.10.11/python-3.10.11-embed-amd64.zip",
+    ],
     "sha256": "608619f8619075629c9c69f361352a0da6ed7e62f83a0e19c63e0ea32eb7629d",
     "size_bytes": 8629277,
     "archive_entry": "python.exe",
@@ -35,7 +41,8 @@ PY310 = {
 UV = {
     "id": "uv-0.11.28-windows-x64",
     "urls": [
-        "https://files.pythonhosted.org/packages/40/bc/d67b18cddd54c503c7bad2b189a47fd7a1d07ea10b9212624f892b985498/uv-0.11.28-py3-none-win_amd64.whl"
+        "https://files.pythonhosted.org/packages/40/bc/d67b18cddd54c503c7bad2b189a47fd7a1d07ea10b9212624f892b985498/uv-0.11.28-py3-none-win_amd64.whl",
+        "https://mirrors.aliyun.com/pypi/packages/40/bc/d67b18cddd54c503c7bad2b189a47fd7a1d07ea10b9212624f892b985498/uv-0.11.28-py3-none-win_amd64.whl",
     ],
     "sha256": "f4fcf2c8d9f1444b900e6b8dbbb828825fb76eca01acd18aeaa5c90240408cda",
     "size_bytes": 27603677,
@@ -79,6 +86,21 @@ def test_runtime_locks_pin_exact_embeddable_python_and_uv() -> None:
         assert lock["assets"]["uv"] == UV
         assert "version" not in lock["assets"]["python"]
         assert "version" not in lock["assets"]["uv"]
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_powershell_downloader_requests_binary_github_release_asset(helper: Path) -> None:
+    result = _run_ps(
+        helper,
+        "$request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, "
+        "'https://api.github.com/repos/GyanD/codexffmpeg/releases/assets/459521355'); "
+        "Set-PortableDownloadHeaders -Request $request -Url ([string]$request.RequestUri); "
+        "[Console]::WriteLine(([string]$request.Headers.Accept)); "
+        "[Console]::WriteLine(([string]$request.Headers.UserAgent))",
+    )
+
+    assert "application/octet-stream" in result.stdout
+    assert "tts-more-portable-installer" in result.stdout
 
 
 def test_component_sources_and_generator_use_exact_patch_versions() -> None:
@@ -391,6 +413,85 @@ def test_downloader_rolls_failed_mirror_back_to_partial_baseline(helper: Path, t
         )
         assert destination.read_bytes() == payload
         assert ranges == [("/first", "bytes=8-"), ("/second", "bytes=8-")]
+        assert not partial.exists()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_downloader_publishes_valid_equal_length_partial_without_network(helper: Path, tmp_path: Path) -> None:
+    payload = b"complete-verified-partial"
+    destination = tmp_path / "asset.zip"
+    partial = Path(f"{destination}.partial")
+    partial.write_bytes(payload)
+    lock = tmp_path / "asset.json"
+    lock.write_text(
+        json.dumps(
+            {
+                "id": "fixture",
+                "urls": ["http://127.0.0.1:1/network-must-not-run"],
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _run_ps(
+        helper,
+        f"$asset = Get-Content -Raw '{lock}' | ConvertFrom-Json; "
+        f"Get-PortableLockedAsset -Asset $asset -Destination '{destination}'",
+    )
+
+    assert destination.read_bytes() == payload
+    assert not partial.exists()
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_downloader_restarts_corrupt_equal_length_partial_from_zero(helper: Path, tmp_path: Path) -> None:
+    payload = b"complete-verified-partial"
+    ranges: list[str | None] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            ranges.append(self.headers.get("Range"))
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        destination = tmp_path / "asset.zip"
+        partial = Path(f"{destination}.partial")
+        partial.write_bytes(b"X" * len(payload))
+        lock = tmp_path / "asset.json"
+        lock.write_text(
+            json.dumps(
+                {
+                    "id": "fixture",
+                    "urls": [f"http://127.0.0.1:{server.server_port}/asset"],
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size_bytes": len(payload),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        _run_ps(
+            helper,
+            f"$asset = Get-Content -Raw '{lock}' | ConvertFrom-Json; "
+            f"Get-PortableLockedAsset -Asset $asset -Destination '{destination}'",
+        )
+
+        assert destination.read_bytes() == payload
+        assert ranges == [None]
         assert not partial.exists()
     finally:
         server.shutdown()

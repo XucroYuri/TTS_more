@@ -89,28 +89,43 @@ if ($listeners.Count -gt 0) {
 
 $env:TTS_MORE_STATIC_ROOT = $StaticRoot
 $env:PATH = "$(Split-Path -Parent $Python);$env:PATH"
-$process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru
-$processCreatedAt = $process.StartTime.ToUniversalTime().ToString("o")
-& $Python $Launcher write-process-record `
-    --package-root $Root --record-path $recordPath --pid $process.Id --parent-pid $PID `
-    --process-created-at $processCreatedAt --executable $Python --port $Port --build-id $buildId -- @arguments
-if ($LASTEXITCODE -ne 0) {
-    throw "failed to persist TTS More process ownership record"
-}
+$process = $null
+$processCreatedAt = ""
+try {
+    $process = Start-Process -FilePath $Python -ArgumentList $arguments -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+    $processCreatedAt = $process.StartTime.ToUniversalTime().ToString("o")
+    & $Python $Launcher write-process-record `
+        --package-root $Root --record-path $recordPath --pid $process.Id --parent-pid $PID `
+        --process-created-at $processCreatedAt --executable $Python --port $Port --build-id $buildId -- @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to persist TTS More process ownership record"
+    }
 
-$deadline = [DateTime]::UtcNow.AddSeconds(60)
-do {
-    if ($process.HasExited) {
-        throw "TTS More exited during startup with code $($process.ExitCode)"
-    }
-    try {
-        $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2
-        if ($health.status -eq "ok") {
-            Write-Host "TTS More ready: http://127.0.0.1:$Port"
-            exit 0
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    do {
+        if ($process.HasExited) {
+            throw "TTS More exited during startup with code $($process.ExitCode)"
         }
-    } catch {
+        try {
+            $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2
+            if ($health.status -eq "ok") {
+                Write-Host "TTS More ready: http://127.0.0.1:$Port"
+                exit 0
+            }
+        } catch { }
         Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "TTS More did not become healthy within 60 seconds; run Stop.cmd and inspect the console log."
+} catch {
+    $startupFailure = $_.Exception.Message
+    if ($null -ne $process -and ![string]::IsNullOrWhiteSpace($processCreatedAt)) {
+        $rollbackArguments = @($Launcher, "rollback-started-process", "--package-root", $Root, "--pid", [string]$process.Id, "--parent-pid", [string]$PID, "--process-created-at", $processCreatedAt, "--executable", $Python, "--port", [string]$Port, "--build-id", $buildId, "--") + $arguments
+        $rollbackOutput = @(& $Python @rollbackArguments 2>&1) -join [Environment]::NewLine
+        $rollbackExitCode = $LASTEXITCODE
+        if ($rollbackExitCode -ne 0) {
+            throw "$startupFailure Rollback failed with exit code $rollbackExitCode. Evidence: $rollbackOutput"
+        }
+        throw "$startupFailure Startup process rollback completed."
     }
-} while ([DateTime]::UtcNow -lt $deadline)
-throw "TTS More did not become healthy within 60 seconds; run Stop.cmd and inspect the console log."
+    throw
+}

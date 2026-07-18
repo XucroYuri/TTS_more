@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 import io
@@ -7,6 +8,7 @@ import subprocess
 import wave
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.workers import discovery
@@ -46,6 +48,32 @@ def test_gpt_sovits_bootstrap_derives_upstream_package_and_ffmpeg_paths(tmp_path
 
     assert sys.path[:2] == [str(package), str(repo)]
     assert worker.os.environ["PATH"].split(worker.os.pathsep)[0] == str(ffmpeg_bin)
+
+
+def test_gpt_sovits_bootstrap_uses_packaged_ffmpeg_bin_for_path_and_dll_loading(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    package_root = tmp_path / "GPT-SoVITS-package"
+    repo = package_root / "app"
+    upstream_package = repo / "GPT_SoVITS"
+    ffmpeg_bin = package_root / "ffmpeg-shared" / "bin"
+    upstream_package.mkdir(parents=True)
+    ffmpeg_bin.mkdir(parents=True)
+    dll_paths: list[str] = []
+    monkeypatch.setattr(worker, "REPO_DIR", repo)
+    monkeypatch.setattr(worker, "_dll_directories", [])
+    monkeypatch.setattr(worker, "_dll_directory_paths", set())
+    monkeypatch.setattr(sys, "path", [str(tmp_path)])
+    monkeypatch.setenv("TTS_MORE_PACKAGE_ROOT", str(package_root))
+    monkeypatch.setenv("PATH", "system-path")
+    monkeypatch.setattr(worker.os, "add_dll_directory", lambda path: dll_paths.append(path) or object(), raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    worker._bootstrap_repo()
+
+    assert sys.path[:2] == [str(upstream_package), str(repo)]
+    assert worker.os.environ["PATH"].split(worker.os.pathsep)[0] == str(ffmpeg_bin)
+    assert dll_paths == [str(ffmpeg_bin)]
 
 
 def test_gpt_worker_artifact_store_uses_configured_tts_more_data_root(tmp_path: Path, monkeypatch) -> None:
@@ -365,6 +393,58 @@ def test_gpt_sovits_worker_accepts_generator_pipeline_output(tmp_path: Path, mon
     assert writes == [([0.0, 0.25, -0.25], 32000, tmp_path / "out.wav", "wav")]
 
 
+def test_gpt_sovits_worker_rejects_non_wav_media_before_loading_pipeline(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "_ensure_pipeline",
+        lambda: (_ for _ in ()).throw(AssertionError("unsupported media must be rejected before pipeline loading")),
+    )
+    monkeypatch.setenv("TTS_MORE_WORKER_ALLOW_PATH_DELIVERY", "1")
+
+    response = TestClient(gpt_app).post(
+        "/synthesize",
+        json={
+            "line": {"id": "l1", "character_id": "narrator", "text": "hello"},
+            "profile": "demo",
+            "output_path": str(tmp_path / "out.mp3"),
+            "parameters": {"media_type": "mp3"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "GPT-SoVITS worker supports WAV output only"
+    assert not (tmp_path / "out.mp3").exists()
+
+
+def test_gpt_sovits_worker_rejects_non_wav_output_extension_before_loading_pipeline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "_ensure_pipeline",
+        lambda: (_ for _ in ()).throw(AssertionError("invalid output extension must be rejected before loading")),
+    )
+    monkeypatch.setenv("TTS_MORE_WORKER_ALLOW_PATH_DELIVERY", "1")
+
+    response = TestClient(gpt_app).post(
+        "/synthesize",
+        json={
+            "line": {"id": "l1", "character_id": "narrator", "text": "hello"},
+            "profile": "demo",
+            "output_path": str(tmp_path / "out.ogg"),
+            "parameters": {"media_type": "wav"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "GPT-SoVITS path delivery requires a .wav output path"
+    assert not (tmp_path / "out.ogg").exists()
+
+
 def test_gpt_worker_upload_randomizes_safe_audio_names(tmp_path: Path, monkeypatch) -> None:
     import app.workers.gpt_sovits_worker as worker
 
@@ -508,13 +588,79 @@ def test_cosyvoice_worker_health_and_capabilities() -> None:
     assert health["pipeline_loaded"] is False
     caps = client.get("/capabilities").json()["capabilities"]
     assert "zero-shot-voice" in caps
-    assert "style-instruction" in caps
+    assert "cross-lingual-voice" in caps
+    assert "sft-voice" not in caps
+    assert "style-instruction" not in caps
 
 
 def test_cosyvoice_worker_defaults_to_cosyvoice_300m_model_dir() -> None:
     import app.workers.cosyvoice_worker as worker
 
     assert worker.MODEL_DIR == "pretrained_models/CosyVoice-300M"
+
+
+def test_cosyvoice_locked_default_metadata_is_cosyvoice1_without_sft_speakers() -> None:
+    root = Path(__file__).resolve().parents[2]
+    lock = json.loads(
+        (root / "integrations" / "components" / "cosyvoice" / "models.lock.json").read_text(encoding="utf-8")
+    )
+    required = set(lock["required_paths"])
+    targets = {asset["target"] for asset in lock["assets"]}
+
+    assert lock["upstream_repository"].endswith("/FunAudioLLM/CosyVoice-300M")
+    assert "pretrained_models/CosyVoice-300M/cosyvoice.yaml" in required
+    assert not any(path.endswith("cosyvoice2.yaml") for path in required | targets)
+    assert not any(path.endswith("spk2info.pt") for path in required | targets)
+    worker_source = (root / "backend" / "app" / "workers" / "cosyvoice_worker.py").read_text(encoding="utf-8")
+    assert "from cosyvoice.cli.cosyvoice import CosyVoice" in worker_source
+    assert "inference_instruct2" not in worker_source
+    assert "inference_sft" not in worker_source
+
+
+@pytest.mark.parametrize("mode", ("sft", "instruct", "预训练音色", "自然语言控制", "unsupported"))
+def test_cosyvoice_rejects_modes_unsupported_by_locked_default_before_pipeline_loading(
+    mode: str, tmp_path: Path, monkeypatch
+) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "_ensure_pipeline",
+        lambda: (_ for _ in ()).throw(AssertionError("unsupported mode must be rejected before pipeline loading")),
+    )
+    response = TestClient(cosyvoice_app).post(
+        "/synthesize",
+        json={
+            "line": {"id": "l1", "character_id": "narrator", "text": "hello"},
+            "profile": "demo",
+            "output_path": str(tmp_path / "out.wav"),
+            "parameters": {"mode": mode},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        f"CosyVoice-300M does not support mode '{mode}'; supported modes: zero_shot, cross_lingual"
+    )
+
+
+def test_cosyvoice_load_rejects_mode_unsupported_by_locked_default_before_pipeline_loading(monkeypatch) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "_ensure_pipeline",
+        lambda: (_ for _ in ()).throw(AssertionError("unsupported load mode must be rejected before pipeline loading")),
+    )
+    response = TestClient(cosyvoice_app).post(
+        "/load",
+        json={"profile": "demo", "parameters": {"mode": "sft"}},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "CosyVoice-300M does not support mode 'sft'; supported modes: zero_shot, cross_lingual"
+    )
 
 
 def test_cosyvoice_bootstrap_adds_matcha_tts_to_python_path(tmp_path: Path, monkeypatch) -> None:
@@ -613,7 +759,7 @@ def test_cosyvoice_chunk_to_wav_flattens_single_batch_dimension(monkeypatch) -> 
     assert observed == {"sample_rate": 24_000, "shape": (3,)}
 
 
-def test_cosyvoice_ensure_pipeline_uses_auto_model(tmp_path: Path, monkeypatch) -> None:
+def test_cosyvoice_ensure_pipeline_uses_exact_upstream_cosyvoice1_class(tmp_path: Path, monkeypatch) -> None:
     import app.workers.cosyvoice_worker as worker
 
     created: list[str] = []
@@ -622,11 +768,11 @@ def test_cosyvoice_ensure_pipeline_uses_auto_model(tmp_path: Path, monkeypatch) 
     class FakePipeline:
         pass
 
-    def fake_auto_model(**kwargs):
-        created.append(kwargs["model_dir"])
+    def fake_cosyvoice(model_dir: str):
+        created.append(model_dir)
         return FakePipeline()
 
-    fake_module.AutoModel = fake_auto_model
+    fake_module.CosyVoice = fake_cosyvoice
     monkeypatch.setitem(sys.modules, "cosyvoice", types.ModuleType("cosyvoice"))
     monkeypatch.setitem(sys.modules, "cosyvoice.cli", types.ModuleType("cosyvoice.cli"))
     monkeypatch.setitem(sys.modules, "cosyvoice.cli.cosyvoice", fake_module)

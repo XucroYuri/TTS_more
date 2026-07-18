@@ -4,6 +4,7 @@ import ast
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -15,6 +16,17 @@ LOCAL_COMPONENT_MODULES = {
     "indextts": {"indextts"},
     "cosyvoice": {"cosyvoice"},
 }
+
+
+def _url_routes(urls: list[str]) -> set[tuple[str, ...]]:
+    routes: set[tuple[str, ...]] = set()
+    for url in urls:
+        parsed = urlsplit(url)
+        host = str(parsed.hostname or "").lower()
+        parts = [part for part in parsed.path.split("/") if part]
+        repository = tuple(parts[:2]) if host in {"huggingface.co", "hf-mirror.com"} else ()
+        routes.add((host, *repository))
+    return routes
 
 
 def _canonical_distribution_name(value: str) -> str:
@@ -60,10 +72,48 @@ def test_model_locks_are_complete_immutable_and_hash_pinned() -> None:
             assert re.fullmatch(r"[0-9a-f]{40}", asset["source_revision"])
             assert re.fullmatch(r"[0-9a-f]{64}", asset["sha256"])
             assert asset["size_bytes"] > 0
-            assert asset["urls"]
+            assert len(asset["urls"]) >= 2
+            assert len(_url_routes(asset["urls"])) >= 2
+            assert any(asset["source_revision"] in url for url in asset["urls"])
             for url in asset["urls"]:
-                assert asset["source_revision"] in url
+                assert re.search(r"/resolve/[0-9a-f]{40}/", url)
                 assert "/main/" not in url and "/master/" not in url
+
+
+def test_cosyvoice_readme_is_vendored_provenance_not_a_runtime_download() -> None:
+    lock_path = REPO_ROOT / "integrations" / "components" / "cosyvoice" / "models.lock.json"
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+
+    assert "README.md" not in {asset["source_path"] for asset in payload["assets"]}
+    assert payload["documentation_provenance"] == {
+        "license": "Apache-2.0",
+        "runtime_required": False,
+        "sha256": "97b420f4afcbbce667623a882439d5ee1a64a2f33d5023a942bc411862cccf0c",
+        "size_bytes": 10116,
+        "source_path": "README.md",
+        "source_revision": "d979372752f86be76f2b798435a0f1593bfddb4e",
+        "source_url": (
+            "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/"
+            "d979372752f86be76f2b798435a0f1593bfddb4e/README.md"
+        ),
+    }
+
+
+def test_every_production_runtime_asset_has_two_independent_download_routes() -> None:
+    runtime_locks = (
+        REPO_ROOT / "packaging" / "portable" / "runtime.lock.json",
+        *(
+            REPO_ROOT / "integrations" / "components" / component / "runtime.lock.json"
+            for component in COMPONENTS
+        ),
+    )
+    for lock_path in runtime_locks:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        assets = list(lock["assets"].values()) + list(lock.get("payloads", []))
+        for asset in assets:
+            urls = asset["urls"]
+            assert len(urls) >= 2, f"{lock_path}:{asset['id']}"
+            assert len(_url_routes(urls)) >= 2, f"{lock_path}:{asset['id']}"
 
 
 def test_every_device_requirements_lock_is_exact_and_hash_pinned() -> None:

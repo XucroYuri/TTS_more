@@ -22,7 +22,8 @@
       "source_path": "pretrained_models/chinese-hubert-base/config.json",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-hubert-base/config.json"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-hubert-base/config.json",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/chinese-hubert-base/config.json"
       ],
       "sha256": "c3e5060a1277e0f078cc6be9da4528a605dba6ece93018981fe2c820e5c7b103",
       "size_bytes": 1449,
@@ -33,7 +34,8 @@
       "source_path": "pretrained_models/chinese-hubert-base/preprocessor_config.json",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-hubert-base/preprocessor_config.json"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-hubert-base/preprocessor_config.json",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/chinese-hubert-base/preprocessor_config.json"
       ],
       "sha256": "dcd684124d06722947939d41ea6ae58dbf10968c60a11a29f23ddc602c64a29b",
       "size_bytes": 212,
@@ -44,7 +46,8 @@
       "source_path": "pretrained_models/chinese-hubert-base/pytorch_model.bin",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-hubert-base/pytorch_model.bin"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-hubert-base/pytorch_model.bin",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/chinese-hubert-base/pytorch_model.bin"
       ],
       "sha256": "24164f129c66499d1346e2aa55f183250c223161ec2770c0da3d3b08cf432d3c",
       "size_bytes": 188811417,
@@ -55,7 +58,8 @@
       "source_path": "pretrained_models/chinese-roberta-wwm-ext-large/config.json",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-roberta-wwm-ext-large/config.json"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-roberta-wwm-ext-large/config.json",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/chinese-roberta-wwm-ext-large/config.json"
       ],
       "sha256": "3d57de2fd7e80d0e5c8ff194f0bbb6baa10df7e43fc262a0cc71298a78b0a3e5",
       "size_bytes": 963,
@@ -66,7 +70,8 @@
       "source_path": "pretrained_models/chinese-roberta-wwm-ext-large/pytorch_model.bin",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-roberta-wwm-ext-large/pytorch_model.bin"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-roberta-wwm-ext-large/pytorch_model.bin",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/chinese-roberta-wwm-ext-large/pytorch_model.bin"
       ],
       "sha256": "e53a693acc59ace251d143d068096ae0d7b79e4b1b503fa84c9dcf576448c1d8",
       "size_bytes": 651225145,
@@ -77,7 +82,8 @@
       "source_path": "pretrained_models/chinese-roberta-wwm-ext-large/tokenizer.json",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-roberta-wwm-ext-large/tokenizer.json"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/chinese-roberta-wwm-ext-large/tokenizer.json",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/chinese-roberta-wwm-ext-large/tokenizer.json"
       ],
       "sha256": "173796956820ea27bd14f76bf28162607ff4254807e2948253eb5b46f5bb643b",
       "size_bytes": 268962,
@@ -88,7 +94,8 @@
       "source_path": "pretrained_models/fast_langdetect/lid.176.bin",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/fast_langdetect/lid.176.bin"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/fast_langdetect/lid.176.bin",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/fast_langdetect/lid.176.bin"
       ],
       "sha256": "7e69ec5451bc261cc7844e49e4792a85d7f09c06789ec800fc4a44aec362764e",
       "size_bytes": 131266198,
@@ -99,7 +106,8 @@
       "source_path": "pretrained_models/fast_langdetect/lid.176.ftz",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/fast_langdetect/lid.176.ftz"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/fast_langdetect/lid.176.ftz",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/fast_langdetect/lid.176.ftz"
       ],
       "sha256": "8f3472cfe8738a7b6099e8e999c3cbfae0dcd15696aac7d7738a8039db603e83",
       "size_bytes": 938013,
@@ -110,7 +118,8 @@
       "source_path": "pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch%3D12-step%3D369668.ckpt"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch%3D12-step%3D369668.ckpt",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch%3D12-step%3D369668.ckpt"
       ],
       "sha256": "732f94e63b148066e24c7f9d2637f3374083e637635f07fbdb695dee20ddbe1f",
       "size_bytes": 155315150,
@@ -121,7 +130,8 @@
       "source_path": "pretrained_models/gsv-v2final-pretrained/s2D2333k.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/gsv-v2final-pretrained/s2D2333k.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/gsv-v2final-pretrained/s2D2333k.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/gsv-v2final-pretrained/s2D2333k.pth"
       ],
       "sha256": "8ae7fe8dd8c8f2e718de359e00edac88b0c71ab2fd10b07ad4cc45070eb8a836",
       "size_bytes": 93534164,
@@ -132,7 +142,8 @@
       "source_path": "pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"
       ],
       "sha256": "924fdccaa3c574bf139c25c9759aa1ed3b3f99e19a7c529ee996c2bc17663695",
       "size_bytes": 106035259,
@@ -143,7 +154,8 @@
       "source_path": "pretrained_models/gsv-v4-pretrained/s2Gv4.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/gsv-v4-pretrained/s2Gv4.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"
       ],
       "sha256": "906fe22f48c3e037a389df291d4d32a9414e15dbb8f9628643e83aaced109ea4",
       "size_bytes": 769025545,
@@ -154,7 +166,8 @@
       "source_path": "pretrained_models/gsv-v4-pretrained/vocoder.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/gsv-v4-pretrained/vocoder.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/gsv-v4-pretrained/vocoder.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/gsv-v4-pretrained/vocoder.pth"
       ],
       "sha256": "4d611913df7b12d49e8976c944558d2d096816365edfc6c35a9e85b67dd14ed9",
       "size_bytes": 57781109,
@@ -165,7 +178,8 @@
       "source_path": "pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/bigvgan_generator.pt",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/bigvgan_generator.pt"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/bigvgan_generator.pt",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/bigvgan_generator.pt"
       ],
       "sha256": "6f9c5715550c9d0f11159ceb8935638da5aeb19e27d1e63677632df095e376f5",
       "size_bytes": 450088331,
@@ -176,7 +190,8 @@
       "source_path": "pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/config.json",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/config.json"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/config.json",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/models--nvidia--bigvgan_v2_24khz_100band_256x/config.json"
       ],
       "sha256": "d77e2c96583ca2296ac112a56ec7cc6bd5da4bf7681ceff18448bedc4fcf6512",
       "size_bytes": 1402,
@@ -187,7 +202,8 @@
       "source_path": "pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/s1bert25hz-2kh-longer-epoch%3D68e-step%3D50232.ckpt"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/s1bert25hz-2kh-longer-epoch%3D68e-step%3D50232.ckpt",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/s1bert25hz-2kh-longer-epoch%3D68e-step%3D50232.ckpt"
       ],
       "sha256": "b1c1e17e9c99547a89388f72048cd6e1b41b5a18b170e86a46dfde0324d63eb1",
       "size_bytes": 155093966,
@@ -198,7 +214,8 @@
       "source_path": "pretrained_models/s1v3.ckpt",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/s1v3.ckpt"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/s1v3.ckpt",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/s1v3.ckpt"
       ],
       "sha256": "87133414860ea14ff6620c483a3db5ed07b44be42e2c3fcdad65523a729a745a",
       "size_bytes": 155284856,
@@ -209,7 +226,8 @@
       "source_path": "pretrained_models/s2D488k.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/s2D488k.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/s2D488k.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/s2D488k.pth"
       ],
       "sha256": "fc579c1db3c1e21b721001cf99d7a584214280df19b002e200b630a34fa06eb8",
       "size_bytes": 93533667,
@@ -220,7 +238,8 @@
       "source_path": "pretrained_models/s2G488k.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/s2G488k.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/s2G488k.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/s2G488k.pth"
       ],
       "sha256": "020a014e1e01e550e510f2f61fae5e5f5b6aab40f15c22f1f12f724df507e835",
       "size_bytes": 105973721,
@@ -231,7 +250,8 @@
       "source_path": "pretrained_models/s2Gv3.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/s2Gv3.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/s2Gv3.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/s2Gv3.pth"
       ],
       "sha256": "f33abb1920076d988e1711d5f41b5c9c6d7f92575b4acf0ad4fae6a4ebf0cf19",
       "size_bytes": 769035145,
@@ -242,7 +262,8 @@
       "source_path": "pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt"
       ],
       "sha256": "4f5a0bf73c61eb41b174e1bb54e7ee3c83233892be8e0af1f187024e8e581a35",
       "size_bytes": 107528697,
@@ -253,7 +274,8 @@
       "source_path": "pretrained_models/v2Pro/s2Dv2Pro.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/v2Pro/s2Dv2Pro.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/v2Pro/s2Dv2Pro.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/v2Pro/s2Dv2Pro.pth"
       ],
       "sha256": "257a7f36ae49e9ff08790d2cd3d398592530852caba810197f8606e884a52c54",
       "size_bytes": 126431971,
@@ -264,7 +286,8 @@
       "source_path": "pretrained_models/v2Pro/s2Dv2ProPlus.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/v2Pro/s2Dv2ProPlus.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/v2Pro/s2Dv2ProPlus.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/v2Pro/s2Dv2ProPlus.pth"
       ],
       "sha256": "635cd84bf6f7f9b8d41c88c7106f81d782c794c61f931845214ea037b0c5bef2",
       "size_bytes": 126432639,
@@ -275,7 +298,8 @@
       "source_path": "pretrained_models/v2Pro/s2Gv2Pro.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/v2Pro/s2Gv2Pro.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/v2Pro/s2Gv2Pro.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/v2Pro/s2Gv2Pro.pth"
       ],
       "sha256": "0f8ead815234365edf045c6d86370ed6e4f440e8195be77ff0ea72684ad406a5",
       "size_bytes": 162303657,
@@ -286,7 +310,8 @@
       "source_path": "pretrained_models/v2Pro/s2Gv2ProPlus.pth",
       "source_revision": "08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f",
       "urls": [
-        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
+        "https://www.modelscope.cn/models/XXXXRT/GPT-SoVITS-Pretrained/resolve/08e1d5ab71d4b1d592eb7ab688bdaa1a8313851f/pretrained_models/v2Pro/s2Gv2ProPlus.pth",
+        "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/1a5190ae4b307702f0b52c4bece3f5eeaf133c95/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
       ],
       "sha256": "d42a22bbbf65fb2bbdd45ad6a66841156977db45c7aabe0a6992ff378d9c7d3b",
       "size_bytes": 200125741,

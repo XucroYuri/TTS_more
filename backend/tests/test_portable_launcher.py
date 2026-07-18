@@ -232,6 +232,131 @@ def test_stop_worker_never_terminates_when_port_has_unknown_owner(tmp_path: Path
     assert record_path.exists()
 
 
+def test_rollback_started_process_terminates_owned_child_tree_and_waits_for_port_release(
+    tmp_path: Path,
+) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    executable = root / "runtime" / "live" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python")
+    record_path = root / "data" / "local" / "run" / "worker.pid.json"
+    launcher.write_process_record(
+        record_path,
+        pid=4242,
+        parent_pid=100,
+        child_pids=[],
+        process_created_at="2026-07-14T01:02:03.000000+00:00",
+        executable_path=executable,
+        command=DEFAULT_COMMAND,
+        port=9880,
+        package_root=root,
+        build_id="source-checkout",
+    )
+    process = {
+        "pid": 4242,
+        "parent_pid": 100,
+        "created_at": "2026-07-14T01:02:03.000000+00:00",
+        "executable_path": str(executable),
+        "command_args": DEFAULT_COMMAND,
+    }
+    inspections = iter([process, process, None])
+    port_owners = iter([{4243}, {4243}, set()])
+    terminated: list[int] = []
+
+    result = launcher.rollback_started_process(
+        root,
+        pid=4242,
+        parent_pid=100,
+        process_created_at="2026-07-14T01:02:03.000000+00:00",
+        executable_path=executable,
+        command=DEFAULT_COMMAND,
+        port=9880,
+        build_id="source-checkout",
+        inspector=lambda _pid: next(inspections),
+        descendant_inspector=lambda _pid: {4243},
+        terminator=lambda pid: terminated.append(pid),
+        port_owner_inspector=lambda _port: next(port_owners),
+        sleep=lambda _seconds: None,
+        timeout_seconds=1,
+    )
+
+    assert result == 0
+    assert terminated == [4242]
+    assert not record_path.exists()
+
+
+def test_rollback_started_process_succeeds_when_ownership_record_write_failed(
+    tmp_path: Path,
+) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    executable = root / "runtime" / "live" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python")
+    process = {
+        "pid": 4242,
+        "parent_pid": 100,
+        "created_at": "2026-07-14T01:02:03.000000+00:00",
+        "executable_path": str(executable),
+        "command_args": DEFAULT_COMMAND,
+    }
+    inspections = iter([process, None])
+    terminated: list[int] = []
+
+    result = launcher.rollback_started_process(
+        root,
+        pid=4242,
+        parent_pid=100,
+        process_created_at="2026-07-14T01:02:03.000000+00:00",
+        executable_path=executable,
+        command=DEFAULT_COMMAND,
+        port=9880,
+        build_id="source-checkout",
+        inspector=lambda _pid: next(inspections),
+        descendant_inspector=lambda _pid: set(),
+        terminator=lambda pid: terminated.append(pid),
+        port_owner_inspector=lambda _port: set(),
+        sleep=lambda _seconds: None,
+        timeout_seconds=1,
+    )
+
+    assert result == 0
+    assert terminated == [4242]
+    assert not (root / "data" / "local" / "run" / "worker.pid.json").exists()
+
+
+def test_rollback_started_process_preserves_unknown_port_owner(tmp_path: Path) -> None:
+    launcher = _load_launcher()
+    root = tmp_path / "package"
+    executable = root / "runtime" / "live" / "python.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python")
+    process = {
+        "pid": 4242,
+        "parent_pid": 100,
+        "created_at": "2026-07-14T01:02:03.000000+00:00",
+        "executable_path": str(executable),
+        "command_args": DEFAULT_COMMAND,
+    }
+
+    with pytest.raises(RuntimeError, match="unknown port owner"):
+        launcher.rollback_started_process(
+            root,
+            pid=4242,
+            parent_pid=100,
+            process_created_at="2026-07-14T01:02:03.000000+00:00",
+            executable_path=executable,
+            command=DEFAULT_COMMAND,
+            port=9880,
+            build_id="source-checkout",
+            inspector=lambda _pid: process,
+            descendant_inspector=lambda _pid: {4243},
+            terminator=lambda _pid: pytest.fail("unknown owner must prevent termination"),
+            port_owner_inspector=lambda _port: {9999},
+        )
+
+
 def test_stop_worker_validates_build_and_command_identity_before_termination(tmp_path: Path) -> None:
     launcher = _load_launcher()
     root = tmp_path / "package"

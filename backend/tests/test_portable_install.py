@@ -261,6 +261,15 @@ def test_http_resume_appends_only_matching_206(tmp_path: Path, monkeypatch: pyte
     assert progress[-1] == (10, 10)
 
 
+def test_github_release_asset_api_requests_binary_content() -> None:
+    request = installer._http_request(
+        "https://api.github.com/repos/GyanD/codexffmpeg/releases/assets/459521355", 0
+    )
+
+    assert request.headers["Accept"] == "application/octet-stream"
+    assert request.headers["User-agent"] == "tts-more-portable-installer"
+
+
 @pytest.mark.parametrize(
     "bad_headers",
     [

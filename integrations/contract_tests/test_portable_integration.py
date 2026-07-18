@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 from unittest import mock
 
 
@@ -869,7 +870,34 @@ class PortableIntegrationContractTests(unittest.TestCase):
             self.assertRegex(asset["source_revision"], r"^[0-9a-f]{40}$")
             self.assertRegex(asset["sha256"], r"^[0-9a-f]{64}$")
             self.assertGreater(asset["size_bytes"], 0)
-            self.assertTrue(all(asset["source_revision"] in url for url in asset["urls"]))
+            self.assertGreaterEqual(len(asset["urls"]), 2)
+            routes = set()
+            for url in asset["urls"]:
+                parsed = urlsplit(url)
+                host = str(parsed.hostname or "").lower()
+                parts = [part for part in parsed.path.split("/") if part]
+                repository = tuple(parts[:2]) if host in {"huggingface.co", "hf-mirror.com"} else ()
+                routes.add((host, *repository))
+            self.assertGreaterEqual(len(routes), 2)
+            self.assertTrue(any(asset["source_revision"] in url for url in asset["urls"]))
+            self.assertTrue(all(re.search(r"/resolve/[0-9a-f]{40}/", url) for url in asset["urls"]))
+        if model_lock["component"] == "cosyvoice":
+            self.assertNotIn("README.md", {asset["source_path"] for asset in model_lock["assets"]})
+            self.assertEqual(
+                {
+                    "license": "Apache-2.0",
+                    "runtime_required": False,
+                    "sha256": "97b420f4afcbbce667623a882439d5ee1a64a2f33d5023a942bc411862cccf0c",
+                    "size_bytes": 10116,
+                    "source_path": "README.md",
+                    "source_revision": "d979372752f86be76f2b798435a0f1593bfddb4e",
+                    "source_url": (
+                        "https://www.modelscope.cn/models/iic/CosyVoice-300M/resolve/"
+                        "d979372752f86be76f2b798435a0f1593bfddb4e/README.md"
+                    ),
+                },
+                model_lock["documentation_provenance"],
+            )
         for profile in ("cpu", "cu126", "cu128"):
             contents = (BUNDLE / "locks" / f"requirements-{profile}.lock.txt").read_text(encoding="utf-8")
             starts = list(re.finditer(r"(?m)^[A-Za-z0-9_.-]+==[^\s\\]+", contents))
@@ -877,6 +905,20 @@ class PortableIntegrationContractTests(unittest.TestCase):
             for index, start in enumerate(starts):
                 end = starts[index + 1].start() if index + 1 < len(starts) else len(contents)
                 self.assertIn("--hash=sha256:", contents[start.start():end], start.group(0))
+
+    def test_runtime_lock_assets_have_two_independent_download_routes(self) -> None:
+        runtime_lock = json.loads((BUNDLE / "locks" / "runtime.lock.json").read_text(encoding="utf-8"))
+        assets = list(runtime_lock["assets"].values()) + list(runtime_lock.get("payloads", []))
+        for asset in assets:
+            self.assertGreaterEqual(len(asset["urls"]), 2, asset["id"])
+            routes = set()
+            for url in asset["urls"]:
+                parsed = urlsplit(url)
+                host = str(parsed.hostname or "").lower()
+                parts = [part for part in parsed.path.split("/") if part]
+                repository = tuple(parts[:2]) if host in {"huggingface.co", "hf-mirror.com"} else ()
+                routes.add((host, *repository))
+            self.assertGreaterEqual(len(routes), 2, asset["id"])
 
     def test_full_release_is_fail_closed_in_github_actions(self) -> None:
         builder = (BUNDLE / "Build-Package.ps1").read_text(encoding="utf-8")
