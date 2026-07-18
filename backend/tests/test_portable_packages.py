@@ -2372,6 +2372,19 @@ exit 0
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_worker_initializer_revalidates_repaired_stale_state_from_source_context() -> None:
+    initializer = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(
+        encoding="utf-8"
+    )
+    repair_branch = initializer.split(
+        "if ($lockedAssetsComplete -and $runtimeComplete)", maxsplit=1
+    )[1].split("if ($Repair)", maxsplit=1)[0]
+
+    assert "$repairedStateComplete = Invoke-PortableWorkerSourceContext" in repair_branch
+    assert "Test-PortableInstallStateComplete" in repair_branch
+    assert "if (!$repairedStateComplete)" in repair_branch
+
+
 def test_worker_cross_volume_probe_uses_staged_app_as_cwd_for_complete_import_probe() -> None:
     builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
         encoding="utf-8"
