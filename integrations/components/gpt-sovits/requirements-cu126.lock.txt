@@ -643,6 +643,47 @@ cycler==0.12.1 \
     --hash=sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30 \
     --hash=sha256:88bb128f02ba341da8ef447245a9e138fae777f6a23943da4540077d3601eb1c
     # via matplotlib
+cython==3.2.8 \
+    --hash=sha256:0961ba91f59492d1bef974cc6b45993c743162776188bcb79e029b442d5d4fcc \
+    --hash=sha256:0d78205f525287de94effa2f2fab6b9edafdab44ef8c58ecf52fcb1013225d68 \
+    --hash=sha256:1034facc082cb882e1e5beb61e136ae8e282df2eafa11e9771e9b0a15c860801 \
+    --hash=sha256:127bc4039be48c6eebe7f1d68c33d23eb3a0c5ae95e1d730bdd048837751438b \
+    --hash=sha256:1c3a33c2ff250d0277d0ee8b080ba0a0391a00e48af4a96fb09dbebbd1ac4b0e \
+    --hash=sha256:1c7f4143d0f9fb7b26444e00ebf7c8845f585d56f37b73bd3fb3dac269af8732 \
+    --hash=sha256:2d6858eb212b9272c5daed9d76e1c82b857e4963b2b892acf7ece4f8bb22aee6 \
+    --hash=sha256:3142407b9d63f233c766e17000e2aac782411bf0409b9adc97cb7c320aecd199 \
+    --hash=sha256:3fd6464433d925cba66ae31bf5780c8a469a06da1d109180cffb39ee3c88ae20 \
+    --hash=sha256:41c118fd91d320cd72af26e29232ff3f1a0a170c47d477c9a176d766067a4718 \
+    --hash=sha256:474d9c5378032c0237b70c7af4d2122eb00719fec2cab296ddc9cf2907d55d58 \
+    --hash=sha256:4e9447d9b652396a285cdfbd4f9f0721842c63c6df281720e87dcc4b9ea65af5 \
+    --hash=sha256:4f1bbec7a7bd2c3836314e84f68e3f9a4c20e11cd164a01990a9ca34f595d5dd \
+    --hash=sha256:51a1d2df1545c480f377f1bb2aea514e28956c87908f351bedc3772b3737c598 \
+    --hash=sha256:61767412d252558104f14c006bc89eefe00496d4f57dd951dd13666bda2ff43b \
+    --hash=sha256:6335c6e8737a39734e20d25f89f425bf3274c104fc7efc05aacc7ed1a4858c9d \
+    --hash=sha256:6c9bf89ac1d43a9e1c3bfee61e7b4dd8d1ef7a610001aa7779f0cb824bad8ae7 \
+    --hash=sha256:6f788a2fec204bdd9291d5d542a4856db101dba59f8d83789d3f1eb2895971a0 \
+    --hash=sha256:70db7a0c5fe5aebf272a56ddfc177bf608d6355571fd714b38f5ce14cba3b17c \
+    --hash=sha256:75770f79cf67f89f7d0b08590ffc114c7a1b47352ef0ee5a3494d5fc098299f0 \
+    --hash=sha256:7cae933e6b82c198b42e934472a41d2a14c5e115da6ea794c33039c2694ce4e5 \
+    --hash=sha256:8297efe129e6421c34ddbeb09ed5627ef6c0fc4868bf7f9bdf6c147f595ccaed \
+    --hash=sha256:84def174fbf8886fb026e04716908276c074d8c231e66db803abd04afcdcb998 \
+    --hash=sha256:8896ff6b133f346ebcf22aa23706c4031e8d9d5ae184433dfc67dc1053318b69 \
+    --hash=sha256:89b0fdc2ca0b502afedc4dd4ddbc4f9cb5a135245afacf9483e556e8ad3ada3b \
+    --hash=sha256:a134a19bba6ce7b1dd21dedc5cb2d4ea39a4177e42e535e333786eb9d0ba61a7 \
+    --hash=sha256:a7761e1a97081b707a9ea4fb7c8ecdeddcc6b5ae00dda0f0b7bbf933c1b599f9 \
+    --hash=sha256:ab1fe11ebd61e497a848622cdd157a4324ac06e7935b1219715408844e15dd13 \
+    --hash=sha256:ad9a80e5dda71cf30b9c9577902f0c080aa14a215d7c178d669cda21cf5ab801 \
+    --hash=sha256:c85c2ceb6bc6d3bc442241038c4e8bdd9883a3afd655a9b47e1222e10fe9edf1 \
+    --hash=sha256:d497b1048c61a94cff61baaa1db1c441254935671311f9fb0f84c8912e532d60 \
+    --hash=sha256:d63a43813fef3f3e8fb14502b8526d9bb9ad2eabd0c899b22f6409c4a97d265f \
+    --hash=sha256:e2221be06b6aa92486d7c3644c18cb3643b3e794600f0d6c8555a523e959a069 \
+    --hash=sha256:e480ae9f195cd29e5ce334e3d434c83dbac0783c0cc88f2407e31ba997724192 \
+    --hash=sha256:eb25b2afedc6a3585c5ae50db79ba0c3d6277ee8e1d6ce0223528db2c4981d9b \
+    --hash=sha256:f2547a31fbd3b1610a8859a16edee2a141f7781691cb98a2c6fd54870c5f7541 \
+    --hash=sha256:f3bce1f079734753649f8a3d3a95832297207feb120d0ef4fd5db4c813cc6c04 \
+    --hash=sha256:f4f23a56b25221a06f91817fe8f3114ab8b48a4fac73187dbb64bc2c4a87961f \
+    --hash=sha256:f635e113677666de13a2ec2979e9b1d5b90617cdfd1a691d3559be81e2dd6cb9
+    # via openjtalk
 decorator==5.3.1 \
     --hash=sha256:4cbcdd55a6efadb9dbea26b858f4fb3264567b52d69ca0d25b721b553f60ea82 \
     --hash=sha256:f47fe6fdbd2edd623ecfe36875d37aba411624e2670dd395dddae1358689bb3c
@@ -1525,9 +1566,6 @@ jieba==0.42.1 \
     # via
     #   -r requirements.in
     #   funasr
-jieba-fast==0.53 \
-    --hash=sha256:e92089d52faa91d51b6a7c1e6e4c4c85064a0e36f6a29257af2254b9e558ddd0
-    # via -r requirements.in
 jinja2==3.1.6 \
     --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
     # via
@@ -2155,9 +2193,9 @@ numpy==1.26.4 \
     #   numba
     #   onnxruntime
     #   onnxruntime-gpu
+    #   openjtalk
     #   pandas
     #   peft
-    #   pyopenjtalk
     #   scikit-learn
     #   scipy
     #   soundfile
@@ -2239,6 +2277,19 @@ opencc==1.4.1 \
     --hash=sha256:f3bf198aae95e21fe46bb2f86e2fc3e005cca02208d958ae5738aa2f1788fe07 \
     --hash=sha256:f44ae128b3ae69651a171a918d2c707a9388838dc791d23935fed2f0066d7ce2 \
     --hash=sha256:f7ae7ea361d27ba14d7725420cc2217b8986416473537b4b79f32b2e203d12c8
+    # via -r requirements.in
+openjtalk==0.3.0.dev3 \
+    --hash=sha256:0f03a09ef6daa461aba469270b508c0a76a9dcdf3ede73949e538dc949c68a6c \
+    --hash=sha256:16de222e7fd0e16e8a9f1cb228dcab7e8635927e51f2f31dfdcd34dd083fa391 \
+    --hash=sha256:18b824705aafb7ef3a67b9c897b5196b478789f87b6ec3dd5a7adf468fa23bcc \
+    --hash=sha256:44698ad23c39d4f2efceacd86e10b00622c5872fa5a36e2bd3f0d48c77605961 \
+    --hash=sha256:4b57e80367a0dcfa25c3f0339cdf419158a211226b2bfa77cc8f44c25e63f729 \
+    --hash=sha256:5cc67a123aed2ea25e4bd6e894fb4e73f47f7ca21ac2033d625b19029f583085 \
+    --hash=sha256:852609e579c379489a1239d81ad3690363337b077dd0c1dac644cfcb0fa1f949 \
+    --hash=sha256:9bf62a99bb069e658e49613159924e7463764ddc5cc0af754503f4aeeebd14ad \
+    --hash=sha256:d3ee9ef6df3c796797774451ddace99871727818c54e193d7cd8ef04fc89d787 \
+    --hash=sha256:f4bade3531e08cc4588ec1983f6bb6c3acf0260081e28b8c5663d9855c9a2a49 \
+    --hash=sha256:f5508acb589b82a03db5a01a138031d5e8e2da87e862fbfc27c74bf541d26bf1
     # via -r requirements.in
 orjson==3.11.9 \
     --hash=sha256:011382e2a60fda9d46f1cdee31068cfc52ffe952b587d683ec0463002802a0f4 \
@@ -2836,9 +2887,6 @@ pynndescent==0.6.0 \
     --hash=sha256:7ffde0fb5b400741e055a9f7d377e3702e02250616834231f6c209e39aac24f5 \
     --hash=sha256:dc8c74844e4c7f5cbd1e0cd6909da86fdc789e6ff4997336e344779c3d5538ef
     # via umap-learn
-pyopenjtalk==0.4.1 \
-    --hash=sha256:d5ada46f7fc2b52c1c79c273eb9668ff6ad7ab276a8db9d8be119ef93440f0dc
-    # via -r requirements.in
 pyparsing==3.3.2 \
     --hash=sha256:850ba148bd908d7e2411587e247a1e4f0327839c40e2e5e6d05a007ecc69911d \
     --hash=sha256:c777f4d763f140633dcb6d8a3eda953bf7a214dc4eff598413c070bcdc117cbc
@@ -3782,7 +3830,6 @@ tqdm==4.68.4 \
     #   modelscope-hub
     #   nltk
     #   peft
-    #   pyopenjtalk
     #   pytorch-lightning
     #   robust-downloader
     #   transformers

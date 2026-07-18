@@ -162,6 +162,31 @@ def test_controller_guide_explains_explicit_prestart_previous_version_import() -
     assert "runtime/live、models、data/user" in guide
 
 
+def test_gpt_windows_locks_use_wheel_backed_japanese_frontend_and_pure_python_jieba() -> None:
+    component = REPO_ROOT / "integrations" / "components" / "gpt-sovits"
+    requirements_in = (component / "requirements.in").read_text(encoding="utf-8")
+    normalized_input = {
+        line.strip().lower().replace("_", "-")
+        for line in requirements_in.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    assert "jieba-fast" not in normalized_input
+    assert "jieba" in normalized_input
+    assert "openjtalk==0.3.0.dev3" in normalized_input
+    assert "pyopenjtalk>=0.4.1" not in normalized_input
+    notice = (REPO_ROOT / "NOTICE").read_text(encoding="utf-8")
+    assert "openjtalk 0.3.0.dev3" in notice and "MIT License" in notice
+
+    for lock_path in sorted(component.glob("requirements-*.lock.txt")):
+        lock_text = lock_path.read_text(encoding="utf-8").lower().replace("_", "-")
+        assert "\njieba-fast==" not in f"\n{lock_text}"
+        assert "\njieba==" in f"\n{lock_text}"
+        assert "\npyopenjtalk==" not in f"\n{lock_text}"
+        assert "\nopenjtalk==0.3.0.dev3 \\\n" in f"\n{lock_text}"
+        assert "--hash=sha256:f4bade3531e08cc4588ec1983f6bb6c3acf0260081e28b8c5663d9855c9a2a49" in lock_text
+
+
 def _copy_controller_builder_fixture(root: Path) -> None:
     root.mkdir(parents=True)
     (root / ".gitignore").write_text("frontend/dist/\n.test-bin/\n", encoding="utf-8")

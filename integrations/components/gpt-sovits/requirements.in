@@ -10,7 +10,7 @@ tqdm
 funasr>=1.3.7
 cn2an
 pypinyin
-pyopenjtalk>=0.4.1
+openjtalk==0.3.0.dev3
 g2p_en
 torch==2.11.0
 torchaudio==2.11.0
@@ -22,7 +22,6 @@ peft<0.18.0
 chardet
 PyYAML
 psutil
-jieba_fast
 jieba
 split-lang
 fast_langdetect>=0.3.1
