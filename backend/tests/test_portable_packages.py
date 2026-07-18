@@ -3161,6 +3161,65 @@ def test_tts_more_full_builder_removes_and_rejects_python_bytecode() -> None:
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="worker Full boundary uses Windows PowerShell")
+def test_worker_full_boundary_allows_upstream_miniforge_named_source_files(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "package"
+    allowed_source = package_root / "app" / "Docker" / "miniforge_install.sh"
+    allowed_source.parent.mkdir(parents=True)
+    allowed_source.write_text("#!/bin/sh\n", encoding="utf-8")
+    forbidden_runtime = package_root / "runtime" / "live" / "Miniforge3"
+
+    allowed_archive = tmp_path / "allowed.zip"
+    forbidden_archive = tmp_path / "forbidden.zip"
+    with zipfile.ZipFile(allowed_archive, "w") as archive:
+        archive.writestr("Package/app/Docker/miniforge_install.sh", "#!/bin/sh\n")
+    with zipfile.ZipFile(forbidden_archive, "w") as archive:
+        archive.writestr("Package/runtime/live/Miniforge3/python.exe", b"fixture")
+
+    builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
+    command = f"""
+$ErrorActionPreference='Stop'
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile('{builder}',[ref]$tokens,[ref]$errors)
+foreach ($name in @('Assert-WorkerFullRuntimeBoundary','Assert-WorkerFullArchiveBoundary')) {{
+    $fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}},$true)
+    if ($null -eq $fn) {{ exit 91 }}
+    . ([scriptblock]::Create($fn.Extent.Text))
+}}
+Add-Type -TypeDefinition 'public static class TtsMorePortableDirectoryHandle {{ public static uint NumberOfLinks(string path) {{ return 1; }} }}'
+Assert-WorkerFullRuntimeBoundary -PackageRoot '{package_root}'
+Assert-WorkerFullArchiveBoundary -ArchivePath '{allowed_archive}'
+New-Item -ItemType Directory -Force -Path '{forbidden_runtime}' | Out-Null
+Set-Content -LiteralPath (Join-Path '{forbidden_runtime}' 'python.exe') -Value 'fixture'
+$stagingRejected=$false
+try {{ Assert-WorkerFullRuntimeBoundary -PackageRoot '{package_root}' }} catch {{ $stagingRejected=$true }}
+if (!$stagingRejected) {{ exit 92 }}
+$archiveRejected=$false
+try {{ Assert-WorkerFullArchiveBoundary -ArchivePath '{forbidden_archive}' }} catch {{ $archiveRejected=$true }}
+if (!$archiveRejected) {{ exit 93 }}
+"""
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_tts_more_full_builder_scans_every_runtime_file_with_bounded_native_streaming() -> None:
     builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
 
