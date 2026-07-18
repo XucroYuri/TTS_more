@@ -3055,6 +3055,52 @@ def test_worker_full_runtime_and_staging_cleanup_reuse_owned_tree_remover() -> N
     assert "Get-ChildItem" not in work_completion
 
 
+@pytest.mark.skipif(os.name != "nt", reason="worker Full bytecode cleanup uses Windows PowerShell")
+def test_worker_full_bytecode_cleanup_covers_generated_source_import_artifacts(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "package"
+    generated = package_root / "app" / "GPT_SoVITS" / "__pycache__" / "module.pyc"
+    runtime_generated = package_root / "runtime" / "live" / "pkg" / "__pycache__" / "module.pyc"
+    stray = package_root / "app" / "generated.pyc"
+    for path in (generated, runtime_generated, stray):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+
+    builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
+    command = f"""
+$ErrorActionPreference='Stop'
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile('{builder}',[ref]$tokens,[ref]$errors)
+foreach ($name in @('Test-WorkerOwnedMissingPathFailure','Remove-WorkerOwnedDirectoryContents','Remove-WorkerFullRuntimeBytecode')) {{
+    $fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}},$true)
+    if ($null -eq $fn) {{ exit 91 }}
+    . ([scriptblock]::Create($fn.Extent.Text))
+}}
+Remove-WorkerFullRuntimeBytecode -PackageRoot '{package_root}'
+if (@(Get-ChildItem -LiteralPath '{package_root}' -Directory -Recurse -Force | Where-Object {{ $_.Name -eq '__pycache__' }}).Count -ne 0) {{ exit 92 }}
+if (@(Get-ChildItem -LiteralPath '{package_root}' -File -Recurse -Force -Filter '*.pyc').Count -ne 0) {{ exit 93 }}
+"""
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.skipif(os.name != "nt", reason="worker cache cleanup uses Windows PowerShell")
 def test_worker_owned_cache_cleanup_wraps_each_child_lifecycle_in_one_try() -> None:
     builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
