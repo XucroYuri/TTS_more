@@ -583,6 +583,110 @@ def test_cli_rejects_invalid_operation_contract_before_asset_io(tmp_path: Path) 
         )
 
 
+def _write_launcher_distribution(site_packages: Path, entry_points: str) -> None:
+    metadata = site_packages / "fixture_launchers-1.0.dist-info"
+    metadata.mkdir(parents=True)
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: fixture-launchers\nVersion: 1.0\n",
+        encoding="utf-8",
+    )
+    (metadata / "entry_points.txt").write_text(entry_points, encoding="utf-8")
+
+
+def test_prune_console_launchers_removes_only_declared_safe_entry_points(
+    tmp_path: Path,
+) -> None:
+    site_packages = tmp_path / "TTS More 中文" / "Lib" / "site-packages"
+    launchers = site_packages / "bin"
+    launchers.mkdir(parents=True)
+    _write_launcher_distribution(
+        site_packages,
+        "[console_scripts]\nknown = fixture:main\n\n[gui_scripts]\nwindow = fixture:gui\n",
+    )
+    (launchers / "known.exe").write_bytes(b"known launcher")
+    (launchers / "window.exe").write_bytes(b"gui launcher")
+    unknown = launchers / "keep.exe"
+    unknown.write_bytes(b"unknown machine-specific file")
+    scripts_unknown = site_packages / "Scripts" / "known.exe"
+    scripts_unknown.parent.mkdir()
+    scripts_unknown.write_bytes(b"outside the uv target launcher directory")
+
+    report = installer.prune_console_launchers(site_packages)
+
+    assert report == {
+        "preserved_unknown": ["bin/keep.exe"],
+        "removed": ["bin/known.exe", "bin/window.exe"],
+    }
+    assert not (launchers / "known.exe").exists()
+    assert not (launchers / "window.exe").exists()
+    assert unknown.read_bytes() == b"unknown machine-specific file"
+    assert scripts_unknown.read_bytes() == b"outside the uv target launcher directory"
+
+
+def test_prune_console_launchers_rejects_unsafe_name_without_escaping_bin(
+    tmp_path: Path,
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+    _write_launcher_distribution(
+        site_packages,
+        "[console_scripts]\n../escape = fixture:main\n",
+    )
+    outside = site_packages / "escape.exe"
+    outside.write_bytes(b"must survive")
+
+    with pytest.raises(ValueError, match="unsafe console entry-point name"):
+        installer.prune_console_launchers(site_packages)
+
+    assert outside.read_bytes() == b"must survive"
+
+
+def test_prune_console_launchers_preflights_hardlinks_before_deleting_anything(
+    tmp_path: Path,
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    launchers = site_packages / "bin"
+    launchers.mkdir(parents=True)
+    _write_launcher_distribution(
+        site_packages,
+        "[console_scripts]\nalpha = fixture:alpha\nbeta = fixture:beta\n",
+    )
+    alpha = launchers / "alpha.exe"
+    alpha.write_bytes(b"safe launcher")
+    beta = launchers / "beta.exe"
+    beta.write_bytes(b"hardlinked launcher")
+    os.link(beta, tmp_path / "hardlink-peer.exe")
+
+    with pytest.raises(ValueError, match="hardlinked console launcher"):
+        installer.prune_console_launchers(site_packages)
+
+    assert alpha.read_bytes() == b"safe launcher"
+    assert beta.read_bytes() == b"hardlinked launcher"
+
+
+def test_prune_console_launchers_preflights_reparse_candidates_before_deleting_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    launchers = site_packages / "bin"
+    launchers.mkdir(parents=True)
+    _write_launcher_distribution(
+        site_packages,
+        "[console_scripts]\nalpha = fixture:alpha\nbeta = fixture:beta\n",
+    )
+    alpha = launchers / "alpha.exe"
+    beta = launchers / "beta.exe"
+    alpha.write_bytes(b"safe launcher")
+    beta.write_bytes(b"reparse launcher")
+    monkeypatch.setattr(installer, "_is_reparse_point", lambda path: path == beta)
+
+    with pytest.raises(ValueError, match="reparse-point console launcher"):
+        installer.prune_console_launchers(site_packages)
+
+    assert alpha.read_bytes() == b"safe launcher"
+    assert beta.read_bytes() == b"reparse launcher"
+
+
 def test_initializers_forward_operation_and_cancel_contract_to_downloads() -> None:
     controller = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(encoding="utf-8")
     worker = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(encoding="utf-8")
@@ -623,6 +727,32 @@ def test_initializers_execute_runtime_lock_import_probe() -> None:
     assert "& $PortableRuntime.Uv pip check --python $PortableRuntime.Python" in worker
     assert "--target $PortableRuntime.SitePackages --link-mode copy" in worker
     assert "& $StagePython -c ([string]$config.import_probe)" not in worker
+
+
+def test_initializers_prune_declared_launchers_after_check_before_import_probe() -> None:
+    controller = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(
+        encoding="utf-8"
+    )
+    worker = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert controller.count("prune-console-launchers") == 1
+    assert worker.count("prune-console-launchers") == 1
+    assert controller.index("pip check") < controller.index("prune-console-launchers")
+    assert controller.index("prune-console-launchers") < controller.index("-c $ImportProbe")
+    assert worker.index("pip check") < worker.index("prune-console-launchers")
+    assert worker.index("prune-console-launchers") < worker.index("-c $importProbe")
+    assert (
+        '& $PortableRuntime.Python (Join-Path $Root "scripts\\portable_install.py") '
+        "prune-console-launchers --site-packages $PortableRuntime.SitePackages"
+    ) in controller
+    assert (
+        '& $PortableRuntime.Python (Join-Path $Bundle "portable_install.py") '
+        "prune-console-launchers --site-packages $PortableRuntime.SitePackages"
+    ) in worker
+    worker_export = next(line for line in worker.splitlines() if "Uv export" in line)
+    assert "--no-header" in worker_export
 
 
 @pytest.mark.skipif(os.name != "nt", reason="controller initializer contract requires Windows PowerShell 5.1")
@@ -794,6 +924,146 @@ def test_controller_locked_uv_export_omits_machine_path_header_under_unicode_roo
     assert "--no-header" in initializer
     assert "fastapi==" in exported
     assert "--hash=sha256:" in exported
+
+
+@pytest.mark.skipif(os.name != "nt", reason="locked uv executable is Windows x64")
+def test_locked_uv_target_launchers_are_inventory_driven_and_relocatable(
+    tmp_path: Path,
+) -> None:
+    wheel = (
+        REPO_ROOT
+        / "data"
+        / "cache"
+        / "portable"
+        / "build-tools"
+        / "assets"
+        / "uv-0.11.28-py3-none-win_amd64.whl"
+    )
+    assert wheel.is_file(), "the exact locked uv 0.11.28 wheel is required"
+    evidence_root = tmp_path / "TTS More 中文" / "runtime target"
+    tool_root = evidence_root / "locked uv tool"
+    with zipfile.ZipFile(wheel) as archive:
+        executable_member = next(
+            name for name in archive.namelist() if name.endswith(".data/scripts/uv.exe")
+        )
+        archive.extract(executable_member, tool_root)
+    uv = tool_root / Path(executable_member)
+    runtime = evidence_root / "python runtime"
+    created = subprocess.run(
+        [sys.executable, "-m", "venv", str(runtime)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+    runtime_python = runtime / "Scripts" / "python.exe"
+    site_packages = runtime / "Lib" / "site-packages"
+    requirements = evidence_root / "controller-requirements.lock.txt"
+    environment = {
+        **os.environ,
+        "UV_CACHE_DIR": str(evidence_root / "uv cache"),
+    }
+    exported = subprocess.run(
+        [
+            str(uv),
+            "export",
+            "--frozen",
+            "--no-dev",
+            "--no-emit-project",
+            "--no-header",
+            "--project",
+            str(REPO_ROOT / "backend"),
+            "--output-file",
+            str(requirements),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        env=environment,
+    )
+    assert exported.returncode == 0, exported.stdout + exported.stderr
+    installed = subprocess.run(
+        [
+            str(uv),
+            "pip",
+            "install",
+            "--python",
+            str(runtime_python),
+            "--target",
+            str(site_packages),
+            "--link-mode",
+            "copy",
+            "--requirement",
+            str(requirements),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        env=environment,
+    )
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    generated = sorted(
+        path.relative_to(site_packages).as_posix()
+        for directory in (site_packages / "bin", site_packages / "Scripts")
+        if directory.is_dir()
+        for path in directory.iterdir()
+        if path.is_file()
+    )
+    assert generated == [
+        "bin/dotenv.exe",
+        "bin/fastapi.exe",
+        "bin/httpx.exe",
+        "bin/idna.exe",
+        "bin/jsonschema.exe",
+        "bin/uvicorn.exe",
+        "bin/watchfiles.exe",
+        "bin/websockets.exe",
+    ]
+    interpreter_prefix = str(runtime_python).encode("utf-8")
+    assert all(interpreter_prefix in (site_packages / path).read_bytes() for path in generated)
+
+    pruned = subprocess.run(
+        [
+            str(runtime_python),
+            str(REPO_ROOT / "scripts" / "portable_install.py"),
+            "prune-console-launchers",
+            "--site-packages",
+            str(site_packages),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert pruned.returncode == 0, pruned.stdout + pruned.stderr
+    report = json.loads(pruned.stdout)
+    assert report == {"preserved_unknown": [], "removed": generated}
+    assert not any((site_packages / path).exists() for path in generated)
+
+    checked = subprocess.run(
+        [str(uv), "pip", "check", "--python", str(runtime_python)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    for arguments in (
+        ["-c", "import fastapi,pydantic,uvicorn"],
+        ["-m", "uvicorn", "--help"],
+    ):
+        probe = subprocess.run(
+            [str(runtime_python), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert probe.returncode == 0, probe.stdout + probe.stderr
 
 
 def test_controller_initializer_uses_only_embedded_python_runtime() -> None:

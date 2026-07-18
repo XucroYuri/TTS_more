@@ -232,6 +232,8 @@ if ($LASTEXITCODE -ne 0) { throw "failed to export frozen backend dependencies" 
 if ($LASTEXITCODE -ne 0) { throw "failed to synchronize frozen backend dependencies" }
 & $PortableRuntime.Uv pip check --python $PortableRuntime.Python
 if ($LASTEXITCODE -ne 0) { throw "uv pip check failed in temporary runtime" }
+& $PortableRuntime.Python (Join-Path $Root "scripts\portable_install.py") prune-console-launchers --site-packages $PortableRuntime.SitePackages
+if ($LASTEXITCODE -ne 0) { throw "failed to prune non-relocatable dependency launchers" }
 & $PortableRuntime.Python -c $ImportProbe
 if ($LASTEXITCODE -ne 0) { throw "core import probe failed in temporary runtime" }
 

@@ -1408,7 +1408,7 @@ def test_worker_package_resolves_package_source_and_bundle_roots_independently(
     assert "Get-PortableWorkerPaths" in start_controller
     assert "SourceRoot = $sourceRoot" in start_controller
     assert 'lock --check --project $SourceRoot' in initializer
-    assert 'export --frozen --no-dev --no-emit-project --project $SourceRoot' in initializer
+    assert 'export --frozen --no-dev --no-emit-project --no-header --project $SourceRoot' in initializer
     assert '. (Join-Path $Bundle "portable-python.ps1")' in initializer
     assert "Install-PortablePythonRuntime" in initializer
     assert "ToolchainLockRelative" not in initializer
