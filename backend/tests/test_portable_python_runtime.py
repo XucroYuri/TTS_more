@@ -82,6 +82,25 @@ def _long_unicode_space_parent(tmp_path: Path, target_length: int = 141) -> Path
     return parent
 
 
+def _force_owned_sibling_collision(prefix: str, collision: Path) -> str:
+    nonces = {
+        "px": "11" * 16,
+        "pi": "22" * 16,
+        "pu": "33" * 16,
+        "pb": "44" * 16,
+    }
+    fallback = "; ".join(f"'{key}' {{ '{value}' }}" for key, value in nonces.items())
+    return (
+        "$script:ownedSiblingCollisionCalls = 0; "
+        "function New-PortableOwnedSiblingPath { param([string]$Destination, [string]$Prefix); "
+        f"if ($Prefix -eq '{prefix}') {{ $script:ownedSiblingCollisionCalls++; "
+        f"if ($script:ownedSiblingCollisionCalls -eq 1) {{ return '{collision}' }} }}; "
+        "$parent = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Destination)); "
+        f"$nonce = switch ($Prefix) {{ {fallback} }}; "
+        'return Join-Path $parent ".$Prefix-$nonce" }; '
+    )
+
+
 def test_portable_python_owned_sibling_path_model_fits_real_four_pack_budget() -> None:
     stage = PureWindowsPath(
         r"I:\TTS-More-Full-Packages\.tmw-48168-e6189b21a4147d1b"
@@ -151,6 +170,92 @@ def test_python_zip_expands_on_long_unicode_space_runtime_parent(helper: Path, t
     assert result.returncode == 0, result.stdout + result.stderr
     assert (destination / "python.exe").read_bytes() == b"stub"
     assert (destination / "Lib" / "site-packages").is_dir()
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_python_expand_retries_px_collision_without_touching_foreign_directory(
+    helper: Path, tmp_path: Path
+) -> None:
+    archive = tmp_path / "python.zip"
+    destination = tmp_path / "runtime" / "live"
+    collision = destination.parent / f".px-{'0' * 32}"
+    collision.mkdir(parents=True)
+    sentinel = collision / "foreign.txt"
+    sentinel.write_bytes(b"foreign-px")
+    _write_zip(archive, [("python.exe", b"stub"), ("python311.zip", b"stdlib"), ("python311._pth", b"old")])
+
+    _run_ps(
+        helper,
+        _force_owned_sibling_collision("px", collision)
+        + f"Expand-PortablePythonArchive -Archive '{archive}' -Destination '{destination}' -ExpectedVersion '3.11.9'",
+    )
+
+    assert sentinel.read_bytes() == b"foreign-px"
+    assert (destination / "python.exe").read_bytes() == b"stub"
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_python_candidate_retries_pi_collision_without_touching_foreign_directory(
+    helper: Path, tmp_path: Path
+) -> None:
+    archive = tmp_path / "python.zip"
+    final_destination = tmp_path / "runtime" / "live"
+    collision = final_destination.parent / f".pi-{'0' * 32}"
+    collision.mkdir(parents=True)
+    sentinel = collision / "foreign.txt"
+    sentinel.write_bytes(b"foreign-pi")
+    candidate_file = tmp_path / "candidate.txt"
+    _write_zip(archive, [("python.exe", b"stub"), ("python311.zip", b"stdlib"), ("python311._pth", b"old")])
+
+    _run_ps(
+        helper,
+        _force_owned_sibling_collision("pi", collision)
+        + f"$candidate = New-PortableExpandedPythonCandidate -Archive '{archive}' -Destination '{final_destination}' "
+        f"-ExpectedVersion '3.11.9'; [System.IO.File]::WriteAllText('{candidate_file}', $candidate)",
+    )
+
+    candidate = Path(candidate_file.read_text(encoding="utf-8"))
+    assert sentinel.read_bytes() == b"foreign-pi"
+    assert (candidate / "python.exe").read_bytes() == b"stub"
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_uv_export_retries_pu_collision_without_touching_foreign_file(helper: Path, tmp_path: Path) -> None:
+    wheel = tmp_path / "uv.whl"
+    destination = tmp_path / "tools" / "uv.exe"
+    collision = destination.parent / f".pu-{'0' * 32}"
+    collision.parent.mkdir(parents=True)
+    collision.write_bytes(b"foreign-pu")
+    _write_zip(wheel, [(UV["archive_entry"], b"new-uv")])
+
+    _run_ps(
+        helper,
+        _force_owned_sibling_collision("pu", collision)
+        + f"Export-PortableUvExecutable -Wheel '{wheel}' -ArchiveEntry '{UV['archive_entry']}' -Destination '{destination}'",
+    )
+
+    assert collision.read_bytes() == b"foreign-pu"
+    assert destination.read_bytes() == b"new-uv"
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_uv_export_retries_pb_collision_without_touching_foreign_file(helper: Path, tmp_path: Path) -> None:
+    wheel = tmp_path / "uv.whl"
+    destination = tmp_path / "tools" / "uv.exe"
+    collision = destination.parent / f".pb-{'0' * 32}"
+    collision.parent.mkdir(parents=True)
+    collision.write_bytes(b"foreign-pb")
+    destination.write_bytes(b"old-uv")
+    _write_zip(wheel, [(UV["archive_entry"], b"new-uv")])
+
+    _run_ps(
+        helper,
+        _force_owned_sibling_collision("pb", collision)
+        + f"Export-PortableUvExecutable -Wheel '{wheel}' -ArchiveEntry '{UV['archive_entry']}' -Destination '{destination}'",
+    )
+
+    assert collision.read_bytes() == b"foreign-pb"
+    assert destination.read_bytes() == b"new-uv"
 
 
 def test_runtime_locks_pin_exact_embeddable_python_and_uv() -> None:
@@ -375,7 +480,8 @@ def test_uv_export_atomically_replaces_existing_destination_from_declared_entry(
     )
 
     assert destination.read_bytes() == expected
-    assert not list(destination.parent.glob("uv.exe.partial-*"))
+    assert not list(destination.parent.glob(".pu-*"))
+    assert not list(destination.parent.glob(".pb-*"))
 
 
 @pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
