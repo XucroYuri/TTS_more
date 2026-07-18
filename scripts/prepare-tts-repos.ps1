@@ -14,6 +14,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$TargetItems = @($Targets | ForEach-Object { $_ -split "," } | Where-Object { $_ } | ForEach-Object { $_.Trim() })
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
@@ -44,7 +45,8 @@ function Invoke-Logged {
         [string]$WorkingDirectory
     )
     $line = "$FilePath $($Arguments -join ' ')"
-    Write-Host "[run] $line" -ForegroundColor Cyan
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[run] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
     if ($DryRun) { return }
     Push-Location $WorkingDirectory
     try {
@@ -62,6 +64,24 @@ function Invoke-Logged {
     }
 }
 
+function Invoke-Plan {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory
+    )
+    $line = "$FilePath $($Arguments -join ' ')"
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[plan] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
+    Push-Location $WorkingDirectory
+    try {
+        & $FilePath @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "Command failed: $line" }
+    } finally {
+        Pop-Location
+    }
+}
+
 function Invoke-Captured {
     param(
         [string]$FilePath,
@@ -69,7 +89,8 @@ function Invoke-Captured {
         [string]$WorkingDirectory
     )
     $line = "$FilePath $($Arguments -join ' ')"
-    Write-Host "[run] $line" -ForegroundColor Cyan
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[run] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
     if ($DryRun) { return "{}" }
     Push-Location $WorkingDirectory
     try {
@@ -194,6 +215,25 @@ function Test-Target {
         $TargetItems -contains $Repo.service_id -or
         ($Repo.variant -and $TargetItems -contains $Repo.variant)
     )
+}
+
+function Assert-SupportedCondaForSelectedGPT {
+    param([object[]]$Repositories)
+    if ($SkipInstall -or $DryRun) { return }
+    $requiresConda = $false
+    foreach ($repo in $Repositories) {
+        if ($repo.provider_type -ne "gpt-sovits") { continue }
+        if (Test-Target $repo) {
+            $requiresConda = $true
+            break
+        }
+    }
+    if (-not $requiresConda) { return }
+    if (Get-Command conda -ErrorAction SilentlyContinue) { return }
+    if (Get-Command micromamba -ErrorAction SilentlyContinue) {
+        throw "micromamba is installed but is not currently supported by the TTS More GPT-SoVITS prepare workflow; install conda or use -SkipInstall."
+    }
+    throw "supported conda executable was not found; GPT-SoVITS dependency preparation cannot continue. Install conda or use -SkipInstall."
 }
 
 function Resolve-RepoPython {
@@ -340,9 +380,28 @@ print("GPT-SoVITS worker import and media runtime probe passed")
 
 function Prepare-GPTSoVITS {
     param($Repo)
-    $repoPath = Join-Path $Root $Repo.path
+    $repoPath = [string]$Repo.absolute_path
     if ($SkipInstall) {
         Write-Host "[skip] GPT-SoVITS install for $($Repo.name)"
+        return
+    }
+    if ($DryRun) {
+        if ($IsWindows -or $env:OS -eq "Windows_NT") {
+            $repoPython = Resolve-RepoPython $repoPath
+            Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "GPT-SoVITS torchcodec bootstrap" -Action {
+                param($IndexUrl)
+                Invoke-Logged $repoPython @("-m", "pip", "install", "--no-deps", "torchcodec==0.13") $repoPath
+            }
+            Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
+                param($CandidateSource)
+                Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", (Join-Path $repoPath "install.ps1"), "-Device", $Device, "-Source", $CandidateSource) $repoPath
+            }
+        } else {
+            Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
+                param($CandidateSource)
+                Invoke-Logged "bash" @((Join-Path $repoPath "install.sh"), "--device", $Device, "--source", $CandidateSource) $repoPath
+            }
+        }
         return
     }
     $installPs1 = Join-Path $repoPath "install.ps1"
@@ -350,11 +409,8 @@ function Prepare-GPTSoVITS {
     $repoPython = Ensure-Venv $repoPath
     if ($IsWindows -or $env:OS -eq "Windows_NT") {
         if (!(Test-Path -LiteralPath $installPs1)) { throw "Missing GPT-SoVITS installer: $installPs1" }
-        if ($DryRun -and !(Get-Command conda -ErrorAction SilentlyContinue)) {
-            Write-Host "[prerequisite] GPT-SoVITS official installer requires conda; install conda before running without -DryRun." -ForegroundColor Yellow
-        }
         if (!$DryRun -and !(Get-Command conda -ErrorAction SilentlyContinue)) {
-            throw "conda was not found; GPT-SoVITS official installer requires conda for $($Repo.name)."
+            throw "supported conda executable was not found; GPT-SoVITS dependency preparation cannot continue. Install conda or use -SkipInstall."
         }
         Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "GPT-SoVITS torchcodec bootstrap" -Action {
             param($IndexUrl)
@@ -376,10 +432,6 @@ function Prepare-GPTSoVITS {
         }
     } else {
         if (!(Test-Path -LiteralPath $installSh)) { throw "Missing GPT-SoVITS installer: $installSh" }
-        if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
-            Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
-            return
-        }
         Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
             param($CandidateSource)
             Invoke-Logged "bash" @($installSh, "--device", $Device, "--source", $CandidateSource) $repoPath
@@ -444,7 +496,7 @@ for repo_id, remote_file, destination, expected_hash in resources:
 
 function Prepare-IndexTTS {
     param($Repo)
-    $repoPath = Join-Path $Root $Repo.path
+    $repoPath = [string]$Repo.absolute_path
     $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
     $repoUv = Join-Path $repoPath ".uv-bootstrap\Scripts\uv.exe"
     if (-not $uv -and (Test-Path -LiteralPath $repoUv)) { $uv = $repoUv }
@@ -506,8 +558,7 @@ function Get-CosyVoiceRequirementsWithoutTorch {
 
 function Prepare-CosyVoice {
     param($Repo)
-    $repoPath = Join-Path $Root $Repo.path
-    Invoke-Logged "git" @("-C", $repoPath, "submodule", "update", "--init", "--recursive") $Root
+    $repoPath = [string]$Repo.absolute_path
     $repoPython = Resolve-RepoPython $repoPath
     if (-not $SkipInstall) {
         $repoPython = Ensure-Venv $repoPath
@@ -555,7 +606,7 @@ if ($SyncRepos) {
     if ($RepoPaths) { $syncArgs += @("--repo-paths", $RepoPaths) }
     if ($CleanRepos) { $syncArgs += "--clean" }
     if ($DryRun) { $syncArgs += "--dry-run" }
-    Invoke-Logged $Python $syncArgs $Root
+    Invoke-Plan $Python $syncArgs $Root
 }
 
 $NetworkProfile = Resolve-NetworkProfile
@@ -566,19 +617,16 @@ $SourceFallbacks = Get-SourceFallbacks $ResolvedSource
 $PackageIndexFallbacks = Get-PackageIndexFallbacks ([string]$NetworkProfile.pip_index_url)
 Write-Host "[network] source=$ResolvedSource cache=$($NetworkProfile.cache_root)" -ForegroundColor Cyan
 
-if ($RepoPaths) {
-    $repoArgs = @((Join-Path $Root "scripts\tts_more_deploy.py"), "--root", $Root, "list-repos", "--service-ids", ($TargetItems -join ","), "--repo-paths", $RepoPaths)
-    $reposJson = & $Python @repoArgs
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    $parsedRepositories = $reposJson | ConvertFrom-Json
-    $repositories = @($parsedRepositories)
-} else {
-    $lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json
-    $repositories = @($lock.repositories)
-}
+$repoArgs = @((Join-Path $Root "scripts\tts_more_deploy.py"), "--root", $Root, "list-repos", "--service-ids", ($TargetItems -join ","))
+if ($RepoPaths) { $repoArgs += @("--repo-paths", $RepoPaths) }
+$reposJson = & $Python @repoArgs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$parsedRepositories = $reposJson | ConvertFrom-Json
+$repositories = @($parsedRepositories)
+Assert-SupportedCondaForSelectedGPT $repositories
 foreach ($repo in $repositories) {
     if (-not (Test-Target $repo)) { continue }
-    $repoPath = Join-Path $Root $repo.path
+    $repoPath = [string]$repo.absolute_path
     switch ($repo.provider_type) {
         "gpt-sovits" { Prepare-GPTSoVITS $repo }
         "indextts" { Prepare-IndexTTS $repo }
@@ -587,9 +635,10 @@ foreach ($repo in $repositories) {
     Install-WorkerRuntime $repoPath
 }
 
-$renderArgs = @("scripts\tts_more_deploy.py", "render-services", "--profile", $Profile, "--platform", "windows", "--service-ids", ($TargetItems -join ","), "--output", "data\local\services.json")
+$renderArgs = @("scripts\tts_more_deploy.py", "render-services", "--profile", $Profile, "--platform", "windows", "--service-ids", ($TargetItems -join ","))
 if ($RepoPaths) { $renderArgs += @("--repo-paths", $RepoPaths) }
 if ($Topology) { $renderArgs += @("--topology", $Topology) }
 if ($Node) { $renderArgs += @("--node", $Node) }
-Invoke-Logged $Python $renderArgs $Root
+if (-not $DryRun) { $renderArgs += @("--output", "data\local\services.json") }
+Invoke-Plan $Python $renderArgs $Root
 Write-Host "Prepared selected TTS repositories. Rendered data\local\services.json." -ForegroundColor Green

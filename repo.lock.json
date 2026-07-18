@@ -44,7 +44,8 @@
       "branch": "main",
       "commit": "4faf851ad31e94c96386193b4d5803223f943680",
       "service_id": "local-indextts",
-      "port": 9881
+      "port": 9881,
+      "default_selected": true
     },
     {
       "name": "CosyVoice",
@@ -55,6 +56,7 @@
       "commit": "fbf485f951075c7b2b992a7d336ce1bb616f5de3",
       "service_id": "local-cosyvoice",
       "port": 9882,
+      "default_selected": true,
       "submodules": true,
       "model_dir": "pretrained_models/CosyVoice-300M"
     }

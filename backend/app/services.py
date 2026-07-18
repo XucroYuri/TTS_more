@@ -691,7 +691,7 @@ class HttpTTSServiceClient:
         return [key for key in keys if not os.environ.get(key)]
 
     def _uses_remote_artifacts(self) -> bool:
-        return self.endpoint.mode == "external" and self.endpoint.network_scope != "localhost"
+        return self.endpoint.mode == "external"
 
     def _uses_artifact_delivery(self) -> bool:
         return self._uses_remote_artifacts() or str(self.endpoint.default_params.get("delivery") or "path") == "artifact"
