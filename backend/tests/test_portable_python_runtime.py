@@ -8,7 +8,7 @@ import threading
 import warnings
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -70,6 +70,87 @@ def _write_zip(path: Path, entries: list[tuple[str, bytes]]) -> None:
         with zipfile.ZipFile(path, "w") as archive:
             for name, payload in entries:
                 archive.writestr(name, payload)
+
+
+def _long_unicode_space_parent(tmp_path: Path, target_length: int = 141) -> Path:
+    prefix = tmp_path / "含 中文 空格"
+    padding = target_length - len(str(prefix)) - 1
+    assert padding >= 4, (str(prefix), len(str(prefix)))
+    parent = prefix / ("路" * padding)
+    parent.mkdir(parents=True)
+    assert len(str(parent)) == target_length
+    return parent
+
+
+def test_portable_python_owned_sibling_path_model_fits_real_four_pack_budget() -> None:
+    stage = PureWindowsPath(
+        r"I:\TTS-More-Full-Packages\.tmw-48168-e6189b21a4147d1b"
+        r"\tts-more-controller-48168-67c31e1c7fb7\TTS-More-0.2.0-windows-x64-full-staging"
+    )
+    runtime_parent = stage / "runtime"
+    nonce = "0123456789abcdef0123456789abcdef"
+    destination = runtime_parent / "live"
+    old_install = runtime_parent / f".{destination.name}.install-{nonce}"
+    old_extract = runtime_parent / f".{old_install.name}.extract-{nonce}" / "Lib" / "site-packages"
+    uv_destination = stage / "data" / "cache" / "portable" / "tools" / "uv-0.11.28" / "uv.exe"
+    old_uv_temporary = PureWindowsPath(f"{uv_destination}.partial-{nonce}")
+    old_uv_backup = PureWindowsPath(f"{uv_destination}.backup-{nonce}")
+    assert {
+        "install": len(str(old_install)),
+        "extract": len(str(old_extract)),
+        "uv_temporary": len(str(old_uv_temporary)),
+        "uv_backup": len(str(old_uv_backup)),
+    } == {"install": 187, "extract": 247, "uv_temporary": 217, "uv_backup": 216}
+
+    intended = {
+        "install": runtime_parent / f".pi-{nonce}",
+        "extract": runtime_parent / f".px-{nonce}" / "Lib" / "site-packages",
+        "uv_temporary": uv_destination.parent / f".pu-{nonce}",
+        "uv_backup": uv_destination.parent / f".pb-{nonce}",
+    }
+    assert {name: len(str(path)) for name, path in intended.items()} == {
+        "install": 177,
+        "extract": 195,
+        "uv_temporary": 206,
+        "uv_backup": 206,
+    }
+    assert max(len(str(path)) for path in intended.values()) <= 240
+
+    for helper in HELPERS:
+        source = helper.read_text(encoding="utf-8")
+        assert "function New-PortableOwnedSiblingPath" in source
+        for prefix in ("px", "pi", "pu", "pb"):
+            assert f"'{prefix}'" in source
+        assert 'GetFileName($Destination) + ".extract-"' not in source
+        assert 'GetFileName($Destination) + ".install-"' not in source
+        assert '"$Destination.partial-' not in source
+        assert '"$Destination.backup-' not in source
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_python_zip_expands_on_long_unicode_space_runtime_parent(helper: Path, tmp_path: Path) -> None:
+    archive = tmp_path / "python.zip"
+    parent = _long_unicode_space_parent(tmp_path)
+    destination = parent / f".live.install-{'a' * 32}"
+    sentinel = parent / "existing sentinel.txt"
+    sentinel.write_bytes(b"must remain byte-identical")
+    _write_zip(
+        archive,
+        [("python.exe", b"stub"), ("python311.zip", b"stdlib"), ("python311._pth", b"old")],
+    )
+
+    result = _run_ps(
+        helper,
+        f"Expand-PortablePythonArchive -Archive '{archive}' -Destination '{destination}' -ExpectedVersion '3.11.9'",
+        check=False,
+    )
+
+    assert sentinel.read_bytes() == b"must remain byte-identical"
+    assert not list(parent.glob(".*.extract-*"))
+    assert not list(parent.glob(".px-*"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (destination / "python.exe").read_bytes() == b"stub"
+    assert (destination / "Lib" / "site-packages").is_dir()
 
 
 def test_runtime_locks_pin_exact_embeddable_python_and_uv() -> None:
