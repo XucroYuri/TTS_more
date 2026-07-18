@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -3489,7 +3489,7 @@ def test_four_pack_plan_only_records_device_intentions_without_machine_paths(tmp
     assert str(output) not in serialized
     assert not output.exists()
     assert not list(tmp_path.glob(".tts-more-four-pack-transaction-*"))
-    assert not list(tmp_path.glob(".tts-more-four-pack-work-*"))
+    assert not list(tmp_path.glob(".tmw-*"))
     assert not list(fixture.rglob("planonly-invoked"))
 
 
@@ -3754,7 +3754,37 @@ def test_four_pack_fake_build_routes_cpu_and_publishes_only_after_all_verified(t
     assert work_root != fixture.resolve()
     assert all(work_root != worker.resolve() for worker in workers.values())
     assert not work_root.exists()
-    assert not list(output.glob(".tts-more-four-pack-work-*"))
+    assert not list(output.glob(".tmw-*"))
+
+
+def test_four_pack_work_leaf_fits_real_controller_staging_path_budget(tmp_path: Path) -> None:
+    if POWERSHELL is None:
+        pytest.skip("four-pack execution contract requires PowerShell")
+    fixture, workers = _write_executable_four_pack_fixture(tmp_path / "four-pack")
+    output = tmp_path / "TTS-More-Full-Packages" / "published"
+
+    completed = _run_executable_four_pack_fixture(fixture, workers, output)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    work_records = _read_fixture_work_roots(fixture)
+    work_roots = {Path(record["work_root"]).resolve() for record in work_records}
+    assert len(work_roots) == 1
+    work_leaf = work_roots.pop().name
+    realistic_parent = PureWindowsPath(r"I:\TTS-More-Full-Packages")
+    controller_deep_relative = PureWindowsPath(
+        "tts-more-controller-37468-df0262841624",
+        "TTS-More-0.2.0-windows-x64-full-staging",
+        "app",
+        "backend",
+        "app",
+        "workers",
+        "__pycache__",
+        "indextts_line_launcher.cpython-311.pyc",
+    )
+    projected = realistic_parent / work_leaf / controller_deep_relative
+    assert len(str(projected)) <= 240, f"projected staging path is {len(str(projected))}: {projected}"
+    assert len(work_leaf) <= 32
+    assert re.fullmatch(r"\.tmw-\d{1,10}-[0-9a-f]{16}", work_leaf)
 
 
 def test_four_pack_work_root_stays_outside_controller_source_tree(tmp_path: Path) -> None:
@@ -3814,7 +3844,7 @@ def test_four_pack_component_failure_leaves_final_output_untouched(tmp_path: Pat
     sentinel = previous / "delivery.zip"
     sentinel.write_bytes(b"previous delivery must remain byte-identical")
     sentinel_sha = hashlib.sha256(sentinel.read_bytes()).hexdigest()
-    preexisting_work_like = tmp_path / ".tts-more-four-pack-work-existing"
+    preexisting_work_like = tmp_path / ".tmw-existing"
     preexisting_work_like.mkdir()
     work_sentinel = preexisting_work_like / "sentinel.txt"
     work_sentinel.write_bytes(b"pre-existing directory is not controller-owned")
@@ -3841,7 +3871,7 @@ def test_four_pack_component_failure_leaves_final_output_untouched(tmp_path: Pat
     assert not owned_work_root.exists()
     assert hashlib.sha256(work_sentinel.read_bytes()).hexdigest() == work_sentinel_sha
     assert list(preexisting_work_like.iterdir()) == [work_sentinel]
-    assert list(tmp_path.glob(".tts-more-four-pack-work-*")) == [preexisting_work_like]
+    assert list(tmp_path.glob(".tmw-*")) == [preexisting_work_like]
     assert (fixture / "routing.log").read_text(encoding="utf-8-sig").splitlines() == [
         "tts-more:CPU", "gpt-sovits:CU126"
     ]
@@ -4244,10 +4274,10 @@ def test_four_pack_cleanup_refuses_replaced_work_identity_and_preserves_primary_
     failure = completed.stdout + completed.stderr
     assert "fixture primary component failure" in failure
     assert "work transaction cleanup refused because directory identity changed" in failure
-    replacements = list(tmp_path.glob(".tts-more-four-pack-work-*/replacement-sentinel.txt"))
+    replacements = list(tmp_path.glob(".tmw-*/replacement-sentinel.txt"))
     assert len(replacements) == 1
     assert replacements[0].read_text(encoding="utf-8-sig").strip() == "replacement"
-    owned_roots = list(tmp_path.glob(".tts-more-four-pack-work-*-owned"))
+    owned_roots = list(tmp_path.glob(".tmw-*-owned"))
     assert len(owned_roots) == 1
     assert (owned_roots[0] / "fixture-tts-more.txt").is_file()
     assert not list(tmp_path.glob(".tts-more-four-pack-transaction-*"))

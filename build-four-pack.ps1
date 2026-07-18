@@ -196,7 +196,12 @@ if ([string]::IsNullOrWhiteSpace($outputParent)) { throw "OutputRoot must have a
 New-Item -ItemType Directory -Force -Path $outputParent | Out-Null
 $parentIdentity = [string](@(Invoke-MetadataPython -MetadataPython $metadataPython -PortablePackages $portablePackages -Arguments @("directory-identity", "--path", $outputParent) -Failure "four-pack output parent identity capture failed")[0])
 $transactionRoot = Join-Path $outputParent (".tts-more-four-pack-transaction-$PID-" + [Guid]::NewGuid().ToString("N"))
-$workLeaf = ".tts-more-four-pack-work-$PID-" + [Guid]::NewGuid().ToString("N")
+$workNonceBytes = New-Object byte[] 8
+$workNonceGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try { $workNonceGenerator.GetBytes($workNonceBytes) }
+finally { $workNonceGenerator.Dispose() }
+$workNonce = ([BitConverter]::ToString($workNonceBytes)).Replace("-", "").ToLowerInvariant()
+$workLeaf = ".tmw-$PID-$workNonce"
 $workParent = $outputParent
 while ($true) {
     $workTransactionRoot = Join-Path $workParent $workLeaf
