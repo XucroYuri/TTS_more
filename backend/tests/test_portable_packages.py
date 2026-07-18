@@ -2592,6 +2592,49 @@ def test_worker_full_initialization_preserves_primary_and_cleanup_failures() -> 
     assert "worker uv cache cleanup also failed:" in builder
 
 
+@pytest.mark.skipif(os.name != "nt", reason="worker failure composition uses PowerShell")
+def test_worker_package_build_preserves_primary_and_staging_cleanup_failures() -> None:
+    builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{builder}',[ref]$tokens,[ref]$errors)
+$fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Complete-WorkerPackageBuildOutcome'}},$true)
+if ($null -eq $fn) {{ exit 90 }}
+. ([scriptblock]::Create($fn.Extent.Text))
+$primaryException=[InvalidOperationException]::new('PRIMARY_FAILURE')
+$cleanupException=[IO.IOException]::new('CLEANUP_FAILURE')
+$primary=[Management.Automation.ErrorRecord]::new($primaryException,'primary',[Management.Automation.ErrorCategory]::InvalidOperation,$null)
+$cleanup=[Management.Automation.ErrorRecord]::new($cleanupException,'cleanup',[Management.Automation.ErrorCategory]::WriteError,$null)
+Complete-WorkerPackageBuildOutcome -WorkerBuildFailure $null -WorkerCleanupFailure $null
+try {{ Complete-WorkerPackageBuildOutcome -WorkerBuildFailure $primary -WorkerCleanupFailure $null; exit 91 }}
+catch {{
+    if ($_.Exception.Message -ne 'PRIMARY_FAILURE') {{ exit 92 }}
+}}
+try {{ Complete-WorkerPackageBuildOutcome -WorkerBuildFailure $null -WorkerCleanupFailure $cleanup; exit 93 }}
+catch {{
+    if ($_.Exception.Message -ne 'CLEANUP_FAILURE') {{ exit 94 }}
+}}
+try {{ Complete-WorkerPackageBuildOutcome -WorkerBuildFailure $primary -WorkerCleanupFailure $cleanup; exit 95 }}
+catch {{
+    if (!$_.Exception.Message.Contains('worker package build failed: PRIMARY_FAILURE')) {{ exit 96 }}
+    if (!$_.Exception.Message.Contains('worker package staging cleanup also failed: CLEANUP_FAILURE')) {{ exit 97 }}
+    if ($null -eq $_.Exception.InnerException -or $_.Exception.InnerException.Message -ne 'PRIMARY_FAILURE') {{ exit 98 }}
+}}
+exit 0
+"""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.skipif(os.name != "nt", reason="worker cache cleanup uses Windows PowerShell")
 def test_worker_owned_cache_cleanup_tolerates_a_disappearing_deep_child(tmp_path: Path) -> None:
     cache = tmp_path / "owned-cache"
@@ -2629,6 +2672,42 @@ exit 0
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+@pytest.mark.skipif(os.name != "nt", reason="worker long-path cleanup is Windows-specific")
+def test_worker_owned_cache_cleanup_supports_a_long_deep_child(tmp_path: Path) -> None:
+    cache = tmp_path / "owned-cache"
+    child = cache
+    while len(str(child / "_implementation.py")) <= 280:
+        child /= "aliyun-sdk-long-segment"
+    os.makedirs("\\\\?\\" + str(child))
+    payload = child / "_implementation.py"
+    with open("\\\\?\\" + str(payload), "w", encoding="utf-8") as fixture_file:
+        fixture_file.write("fixture")
+    assert len(str(payload)) > 260
+    builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{builder}',[ref]$tokens,[ref]$errors)
+$helper=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-WorkerOwnedMissingPathFailure'}},$true)
+$fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Remove-WorkerOwnedDirectoryContents'}},$true)
+. ([scriptblock]::Create($helper.Extent.Text))
+. ([scriptblock]::Create($fn.Extent.Text))
+Remove-WorkerOwnedDirectoryContents -Path '{cache}'
+if (@(Get-ChildItem -LiteralPath '{cache}' -Force).Count -ne 0) {{ exit 94 }}
+exit 0
+"""
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.skipif(os.name != "nt", reason="worker cache cleanup uses Windows PowerShell")
 def test_worker_owned_cache_cleanup_retries_after_recursive_missing_file(tmp_path: Path) -> None:
     cache = tmp_path / "owned-cache"
@@ -2649,7 +2728,8 @@ $injectedPath=[IO.Path]::GetFullPath('{child}')
 function Get-ChildItem {{
     [CmdletBinding()]
     param([string]$LiteralPath,[switch]$Force)
-    if (!$script:injectedMissingFile -and [IO.Path]::GetFullPath($LiteralPath) -eq $injectedPath) {{
+    $normalizedLiteral=[IO.Path]::GetFullPath($LiteralPath.TrimStart([char[]]"\\\\?"))
+    if (!$script:injectedMissingFile -and $normalizedLiteral -eq $injectedPath) {{
         $script:injectedMissingFile=$true
         throw [IO.FileNotFoundException]::new("Could not find a part of the path '_implementation.py'.")
     }}
@@ -2691,7 +2771,8 @@ $injectedPath=[IO.Path]::GetFullPath('{cache}')
 function Get-ChildItem {{
     [CmdletBinding()]
     param([string]$LiteralPath,[switch]$Force)
-    if ([IO.Path]::GetFullPath($LiteralPath) -eq $injectedPath) {{
+    $normalizedLiteral=[IO.Path]::GetFullPath($LiteralPath.TrimStart([char[]]"\\\\?"))
+    if ($normalizedLiteral -eq $injectedPath) {{
         $script:rootEnumerations++
         if ($script:rootEnumerations -le 7) {{
             throw [IO.FileNotFoundException]::new("Could not find a part of the path '_implementation.py'.")
@@ -2724,7 +2805,7 @@ def test_worker_owned_cache_file_cleanup_tolerates_file_and_parent_races() -> No
         "$Bundle =", maxsplit=1
     )[0]
 
-    assert "[IO.File]::Delete($childPath)" in function
+    assert "[IO.File]::Delete($childIoPath)" in function
     assert "Test-WorkerOwnedMissingPathFailure -Failure $_" in function
 
 
@@ -2741,7 +2822,7 @@ def test_worker_full_runtime_and_staging_cleanup_reuse_owned_tree_remover() -> N
         "Remove-WorkerOwnedDirectoryContents -Path $directory.FullName -AllowMissing"
         in bytecode_cleanup
     )
-    assert "[IO.Directory]::Delete($directory.FullName, $false)" in bytecode_cleanup
+    assert "[IO.Directory]::Delete($directoryIoPath, $false)" in bytecode_cleanup
     assert "Remove-Item -LiteralPath $directory.FullName -Recurse -Force" not in bytecode_cleanup
     assert "Remove-WorkerOwnedDirectoryContents -Path $resolvedWork" in staging_cleanup
     assert "Remove-Item -LiteralPath $child.FullName -Recurse -Force" not in staging_cleanup
