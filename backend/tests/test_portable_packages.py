@@ -2372,17 +2372,91 @@ exit 0
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_worker_initializer_revalidates_repaired_stale_state_from_source_context() -> None:
-    initializer = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(
-        encoding="utf-8"
+@pytest.mark.skipif(os.name != "nt", reason="stale worker state repair uses Windows PowerShell")
+def test_worker_initializer_executes_stale_state_repair_from_external_cwd(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "portable package 中文"
+    source_root = package_root / "app"
+    bundle = source_root / "tts_more"
+    runtime_parent = package_root / "runtime"
+    live = runtime_parent / "live"
+    outside = tmp_path / "outside"
+    gpt_package = source_root / "GPT_SoVITS"
+    state = package_root / "data" / "local" / "install-state.json"
+    marker = tmp_path / "final-validation.json"
+    runtime_lock = bundle / "locks" / "runtime.lock.json"
+    model_lock = bundle / "locks" / "models.lock.json"
+    bundle.mkdir(parents=True)
+    runtime_parent.mkdir(parents=True)
+    outside.mkdir()
+    gpt_package.mkdir()
+    state.parent.mkdir(parents=True)
+    (gpt_package / "__init__.py").write_text("PROBE_VALUE = 'ready'\n", encoding="utf-8")
+    state.write_text(json.dumps({"ready": False, "profile": "cpu"}), encoding="utf-8")
+    runtime_lock.parent.mkdir()
+    runtime_lock.write_text("{}\n", encoding="utf-8")
+    model_lock.write_text("{}\n", encoding="utf-8")
+    (bundle / "portable_install.py").write_text(
+        """import json, sys
+path = sys.argv[sys.argv.index('--path') + 1]
+with open(path, 'w', encoding='utf-8') as stream:
+    json.dump({'ready': True, 'profile': 'cpu'}, stream)
+""",
+        encoding="utf-8",
     )
-    repair_branch = initializer.split(
-        "if ($lockedAssetsComplete -and $runtimeComplete)", maxsplit=1
-    )[1].split("if ($Repair)", maxsplit=1)[0]
+    base_python = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+    _create_windows_junction(live, base_python.parent)
+    initializer = REPO_ROOT / "integrations" / "windows" / "Initialize.ps1"
+    import_probe = "import GPT_SoVITS; assert GPT_SoVITS.PROBE_VALUE == 'ready'"
+    command = f"""
+$tokens=$null; $errors=$null
+$ErrorActionPreference='Stop'
+$ast=[Management.Automation.Language.Parser]::ParseFile('{initializer}',[ref]$tokens,[ref]$errors)
+foreach ($name in @('Invoke-PortableWorkerSourceContext','Repair-PortableWorkerStaleState')) {{
+    $fn=$ast.Find({{param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}},$true)
+    if ($null -eq $fn) {{ exit 91 }}
+    . ([scriptblock]::Create($fn.Extent.Text))
+}}
+function Resolve-PortableSupportedProfile {{ return 'cpu' }}
+function Get-PortableFileSha256 {{ return ('a' * 64) }}
+function Test-PortableInstallStateComplete {{
+    param($Root,$StatePath,$Component,$BuildId,$RuntimeLock,$ModelLock,$ExpectedPython,$ImportProbe,[switch]$ValidateAssets)
+    $payload=Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+    if (!$payload.ready) {{ return $false }}
+    & '{base_python}' -c $ImportProbe
+    if ($LASTEXITCODE -ne 0) {{ return $false }}
+    [ordered]@{{ cwd=(Get-Location).Path; pythonpath=$env:PYTHONPATH; imported=$true }} | ConvertTo-Json | Set-Content -LiteralPath '{marker}' -Encoding UTF8
+    return $true
+}}
+Set-Location -LiteralPath '{outside}'
+$before=(Get-Location).Path
+$env:PYTHONPATH='preserve-this-value'
+$runtimePayload=[pscustomobject]@{{ profiles=[pscustomobject]@{{ cpu=[pscustomobject]@{{}} }} }}
+Repair-PortableWorkerStaleState -SourceRoot '{source_root}' -Root '{package_root}' -StatePath '{state}' -LivePath '{live}' -BundleRoot '{bundle}' -Component 'gpt-sovits' -BuildId 'fixture-build' -RuntimeLockPath '{runtime_lock}' -ModelLockPath '{model_lock}' -ExpectedPython '{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}' -ImportProbe "{import_probe}" -RuntimeLockPayload $runtimePayload
+if ((Get-Location).Path -ne $before) {{ exit 92 }}
+if ($env:PYTHONPATH -ne 'preserve-this-value') {{ exit 93 }}
+exit 0
+"""
+    try:
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+            cwd=outside,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    finally:
+        _remove_windows_junction(live)
 
-    assert "$repairedStateComplete = Invoke-PortableWorkerSourceContext" in repair_branch
-    assert "Test-PortableInstallStateComplete" in repair_branch
-    assert "if (!$repairedStateComplete)" in repair_branch
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert json.loads(state.read_text(encoding="utf-8"))["ready"] is True
+    validation = json.loads(marker.read_text(encoding="utf-8-sig"))
+    assert Path(validation["cwd"]) == source_root
+    assert Path(validation["pythonpath"]) == source_root
+    assert validation["imported"] is True
 
 
 def test_worker_cross_volume_probe_uses_staged_app_as_cwd_for_complete_import_probe() -> None:
