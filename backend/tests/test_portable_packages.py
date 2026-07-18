@@ -2746,6 +2746,15 @@ def test_worker_full_runtime_and_staging_cleanup_reuse_owned_tree_remover() -> N
     assert "Remove-WorkerOwnedDirectoryContents -Path $resolvedWork" in staging_cleanup
     assert "Remove-Item -LiteralPath $child.FullName -Recurse -Force" not in staging_cleanup
 
+    uv_completion = builder.split(
+        "Remove-WorkerOwnedDirectoryContents -Path $resolvedUvCache", maxsplit=1
+    )[1].split("MarkDirectoryForDeletion($isolatedUvCacheHandle)", maxsplit=1)[0]
+    work_completion = builder.split(
+        "Remove-WorkerOwnedDirectoryContents -Path $resolvedWork", maxsplit=1
+    )[1].split("MarkDirectoryForDeletion($createdWorkHandle)", maxsplit=1)[0]
+    assert "Get-ChildItem" not in uv_completion
+    assert "Get-ChildItem" not in work_completion
+
 
 @pytest.mark.skipif(os.name != "nt", reason="worker cache cleanup uses Windows PowerShell")
 def test_worker_owned_cache_cleanup_wraps_each_child_lifecycle_in_one_try() -> None:
