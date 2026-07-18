@@ -2448,7 +2448,7 @@ def test_runtime_import_probe_handles_cpython_embeddable_pth_isolation(
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
-            "$ErrorActionPreference='Stop'; . $env:A4_VALIDATION; Assert-PortableRuntime -Root $env:A4_ROOT -SourceRoot $env:A4_SOURCE -PythonPath $env:A4_PYTHON -ExpectedVersion $env:A4_EXPECTED -ImportProbe \"import sys; sys.stderr.write('bounded-probe-evidence-' + ('x' * 100000)); raise SystemExit(9)\" | Out-Null",
+            "$ErrorActionPreference='Stop'; . $env:A4_VALIDATION; Assert-PortableRuntime -Root $env:A4_ROOT -SourceRoot $env:A4_SOURCE -PythonPath $env:A4_PYTHON -ExpectedVersion $env:A4_EXPECTED -ImportProbe \"import sys; sys.stderr.write('bounded-probe-head\\n' + ('noise\\n' * 20) + 'bounded-probe-root-cause\\n' + ('x' * 100000)); raise SystemExit(9)\" | Out-Null",
         ],
         cwd=tmp_path,
         env=environment,
@@ -2460,7 +2460,8 @@ def test_runtime_import_probe_handles_cpython_embeddable_pth_isolation(
     )
     failed_output = failed_probe.stdout + failed_probe.stderr
     assert failed_probe.returncode != 0
-    assert "bounded-probe-evidence" in failed_output
+    assert "bounded-probe-head" in failed_output
+    assert "bounded-probe-root-cause" in failed_output
     assert len(failed_output) < 20_000
 
 
