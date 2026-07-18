@@ -20,6 +20,7 @@ $Bundle = $paths.BundleRoot
 $Root = $paths.PackageRoot
 $SourceRoot = $paths.SourceRoot
 $config = $paths.Config
+Assert-PortablePackageRootPathBudget -Root $Root
 $runtimeLockPath = Join-Path $Bundle "locks\runtime.lock.json"
 $modelLockPath = Join-Path $Bundle "locks\models.lock.json"
 $runtimeLock = Get-Content -LiteralPath $runtimeLockPath -Raw | ConvertFrom-Json
@@ -249,7 +250,7 @@ if ($runtimeLock.dependency_mode -eq "uv-project") {
     if ($LASTEXITCODE -ne 0) { throw "failed to export frozen upstream dependencies" }
     & $PortableRuntime.Uv pip install --python $PortableRuntime.Python --target $PortableRuntime.SitePackages --link-mode copy --requirement $requirements
 } else {
-    $installArguments = @("pip", "install", "--python", $PortableRuntime.Python, "--target", $PortableRuntime.SitePackages, "--link-mode", "copy", "--requirement", (Join-Path $Bundle "locks\$([string]$profile.dependency_lock)"))
+    $installArguments = @("pip", "install", "--python", $PortableRuntime.Python, "--target", $PortableRuntime.SitePackages, "--link-mode", "copy", "--index-strategy", "unsafe-best-match", "--requirement", (Join-Path $Bundle "locks\$([string]$profile.dependency_lock)"))
     $buildConstraint = Join-Path $Bundle "locks\build-constraints.lock.txt"
     if (Test-Path -LiteralPath $buildConstraint) { $installArguments += @("--build-constraint", $buildConstraint) }
     & $PortableRuntime.Uv @installArguments

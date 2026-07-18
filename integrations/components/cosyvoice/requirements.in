@@ -25,8 +25,6 @@ rich==13.7.1
 setuptools==80.9.0
 soundfile==0.12.1
 tensorboard==2.14.0
-torch==2.11.0
-torchaudio==2.11.0
 transformers==4.51.3
 x-transformers==2.11.24
 uvicorn==0.30.0

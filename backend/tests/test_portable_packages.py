@@ -2354,6 +2354,64 @@ def test_worker_full_staging_fits_transformers_generated_path_on_real_four_pack_
     assert "dummy_essentia_and_librosa_and_pretty_midi_and_scipy_and_torch_objects.py" in builder
 
 
+@pytest.mark.skipif(os.name != "nt", reason="portable path budget uses Windows path semantics")
+def test_worker_package_root_path_budget_accepts_short_unicode_and_rejects_deep_root_without_writes(
+    tmp_path: Path,
+) -> None:
+    assert POWERSHELL is not None
+    validation = REPO_ROOT / "scripts" / "Portable-Validation.ps1"
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        f". '{validation}'; "
+        "Assert-PortablePackageRootPathBudget -Root $env:TTS_MORE_TEST_PACKAGE_ROOT; "
+        "Write-Output 'PATH_BUDGET_OK'"
+    )
+
+    short_root = tmp_path / "中文 空格" / "GPT"
+    short_env = os.environ.copy()
+    short_env["TTS_MORE_TEST_PACKAGE_ROOT"] = str(short_root)
+    short = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        env=short_env,
+        check=False,
+    )
+    assert short.returncode == 0, short.stdout + short.stderr
+    assert "PATH_BUDGET_OK" in short.stdout
+    assert not short_root.exists()
+
+    deep_root = Path("C:/") / ("x" * 118)
+    deep_env = os.environ.copy()
+    deep_env["TTS_MORE_TEST_PACKAGE_ROOT"] = str(deep_root)
+    deep = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        env=deep_env,
+        check=False,
+    )
+    failure = deep.stdout + deep.stderr
+    assert deep.returncode != 0
+    assert "Move the package to a shorter directory" in failure
+    assert not deep_root.exists()
+
+    initializer = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(
+        encoding="utf-8"
+    )
+    starter = (REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1").read_text(encoding="utf-8")
+    assert initializer.index("Assert-PortablePackageRootPathBudget") < initializer.index(
+        "$runtimeLock = Get-Content"
+    )
+    assert starter.index("Assert-PortablePackageRootPathBudget") < starter.index(
+        "$manifestPath = Join-Path"
+    )
+
+
 def test_gpt_worker_import_probe_adds_upstream_source_root_before_imports() -> None:
     runtime_lock = json.loads(
         (REPO_ROOT / "integrations" / "components" / "gpt-sovits" / "runtime.lock.json").read_text(
@@ -2373,6 +2431,55 @@ def test_gpt_worker_import_probe_adds_upstream_source_root_before_imports() -> N
     for probe in (runtime_lock["import_probe"], component_source["import_probe"]):
         assert "pathlib.Path.cwd() / 'GPT_SoVITS'" in probe
         assert probe.index("sys.path.insert") < probe.index("from GPT_SoVITS")
+
+
+@pytest.mark.parametrize(
+    ("component", "torch_version"),
+    (("gpt-sovits", "2.11.0"), ("indextts", "2.8.0"), ("cosyvoice", "2.11.0")),
+)
+@pytest.mark.parametrize("profile", ("cu128", "cu126"))
+def test_worker_gpu_dependency_locks_select_the_declared_pytorch_backend(
+    component: str, torch_version: str, profile: str
+) -> None:
+    lock = (
+        REPO_ROOT
+        / "integrations"
+        / "components"
+        / component
+        / f"requirements-{profile}.lock.txt"
+    ).read_text(encoding="utf-8")
+
+    assert f"https://download.pytorch.org/whl/{profile}" in lock
+    assert f"torch=={torch_version}+{profile}" in lock
+    assert f"torchaudio=={torch_version}+{profile}" in lock
+
+
+def test_worker_locked_dependency_install_uses_the_lock_generation_index_strategy() -> None:
+    initializer = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(
+        encoding="utf-8"
+    )
+    install = initializer.split('$installArguments = @("pip", "install"', maxsplit=1)[1].split(
+        "& $PortableRuntime.Uv @installArguments", maxsplit=1
+    )[0]
+    assert '"--index-strategy", "unsafe-best-match"' in install
+
+
+def test_worker_dependency_locks_do_not_disclose_build_machine_paths() -> None:
+    drive_path = re.compile(r"(?<![A-Za-z])[A-Za-z]:[\\/]")
+    forbidden_markers = ("codex-worktrees", "xuyu_", "file:///")
+
+    for component in ("gpt-sovits", "indextts", "cosyvoice"):
+        for profile in ("cu128", "cu126", "cpu"):
+            lock_path = (
+                REPO_ROOT
+                / "integrations"
+                / "components"
+                / component
+                / f"requirements-{profile}.lock.txt"
+            )
+            lock = lock_path.read_text(encoding="utf-8")
+            assert drive_path.search(lock) is None, lock_path
+            assert not any(marker in lock.lower() for marker in forbidden_markers), lock_path
 
 
 @pytest.mark.skipif(os.name != "nt", reason="embedded Python _pth isolation is Windows-specific")

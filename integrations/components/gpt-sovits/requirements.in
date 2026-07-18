@@ -12,9 +12,6 @@ cn2an
 pypinyin
 openjtalk==0.3.0.dev3
 g2p_en
-torch==2.11.0
-torchaudio==2.11.0
-torchcodec==0.13.0
 modelscope
 sentencepiece
 transformers>=4.43,<=4.50

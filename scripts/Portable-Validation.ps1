@@ -1,5 +1,22 @@
 Set-StrictMode -Version Latest
 
+function Assert-PortablePackageRootPathBudget {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [ValidateRange(1, 32767)][int]$SafeWindowsPathBudget = 240
+    )
+
+    $resolvedRoot = [IO.Path]::GetFullPath($Root).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    $generatedRuntimePath = Join-Path $resolvedRoot "runtime\staging\Lib\site-packages\transformers\utils\dummy_essentia_and_librosa_and_pretty_midi_and_scipy_and_torch_objects.py"
+    if ($generatedRuntimePath.Length -gt $SafeWindowsPathBudget) {
+        throw "Portable package path is too deep for the bundled runtime (projected path length $($generatedRuntimePath.Length) exceeds $SafeWindowsPathBudget). Move the package to a shorter directory such as D:\TTS\GPT and run again."
+    }
+}
+
 function ConvertTo-PortableWindowsArgumentLine {
     [CmdletBinding()]
     param(
