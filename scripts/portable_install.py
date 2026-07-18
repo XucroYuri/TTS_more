@@ -27,6 +27,14 @@ CancelCheck = Callable[[], bool]
 Downloader = Callable[[str, Path, int, ProgressCallback | None, CancelCheck | None], None]
 CONTENT_RANGE_PATTERN = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
 ENTRY_POINT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+WINDOWS_RESERVED_NAMES = {
+    "AUX",
+    "CON",
+    "NUL",
+    "PRN",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 DOWNLOAD_ATTEMPTS_PER_URL = 3
 DOWNLOAD_RETRY_DELAYS = (1.0, 2.0)
 
@@ -40,6 +48,12 @@ def _is_reparse_point(path: Path) -> bool:
     file_attributes = getattr(path.lstat(), "st_file_attributes", 0)
     reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return path.is_symlink() or bool(file_attributes & reparse_attribute)
+
+
+def _is_safe_windows_launcher_name(name: str) -> bool:
+    if not ENTRY_POINT_NAME_PATTERN.fullmatch(name) or name.endswith((" ", ".")):
+        return False
+    return name.split(".", 1)[0].upper() not in WINDOWS_RESERVED_NAMES
 
 
 def prune_console_launchers(site_packages: Path) -> dict[str, object]:
@@ -58,7 +72,7 @@ def prune_console_launchers(site_packages: Path) -> dict[str, object]:
             if entry_point.group not in {"console_scripts", "gui_scripts"}:
                 continue
             name = entry_point.name
-            if not ENTRY_POINT_NAME_PATTERN.fullmatch(name):
+            if not _is_safe_windows_launcher_name(name):
                 raise ValueError(f"unsafe console entry-point name: {name!r}")
             folded = name.casefold()
             previous = casefolded_names.get(folded)
@@ -71,11 +85,11 @@ def prune_console_launchers(site_packages: Path) -> dict[str, object]:
             if (
                 relative.is_absolute()
                 or len(relative.parts) != 2
-                or relative.parts[0].casefold() != "bin"
+                or relative.parts[0] != "bin"
             ):
                 continue
             filename = relative.parts[1]
-            if not ENTRY_POINT_NAME_PATTERN.fullmatch(filename):
+            if not _is_safe_windows_launcher_name(filename):
                 raise ValueError(f"unsafe recorded launcher name: {filename!r}")
             recorded_launcher_names.add(filename)
 
@@ -97,7 +111,12 @@ def prune_console_launchers(site_packages: Path) -> dict[str, object]:
         if previous is not None and previous != filename:
             raise ValueError(f"ambiguous recorded launcher names: {previous!r}, {filename!r}")
         casefolded_candidates[folded] = filename
-    candidates = [launcher_root / filename for filename in sorted(candidate_filenames)]
+    entries_by_exact_name = {entry.name: entry for entry in launcher_root.iterdir()}
+    candidates = [
+        entries_by_exact_name[filename]
+        for filename in sorted(candidate_filenames)
+        if filename in entries_by_exact_name
+    ]
     existing_candidates = [candidate for candidate in candidates if os.path.lexists(candidate)]
     for candidate in existing_candidates:
         if _is_reparse_point(candidate):
@@ -108,11 +127,11 @@ def prune_console_launchers(site_packages: Path) -> dict[str, object]:
         if metadata.st_nlink != 1:
             raise ValueError(f"hardlinked console launcher is not removable: {candidate.name}")
 
-    candidate_names = {candidate.name.casefold() for candidate in candidates}
+    candidate_names = {candidate.name for candidate in candidates}
     preserved_unknown = sorted(
         f"bin/{entry.name}"
         for entry in launcher_root.iterdir()
-        if entry.name.casefold() not in candidate_names
+        if entry.name not in candidate_names
     )
     removed: list[str] = []
     for candidate in existing_candidates:

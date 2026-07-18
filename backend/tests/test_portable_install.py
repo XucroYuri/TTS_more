@@ -749,6 +749,44 @@ def test_prune_console_launchers_rejects_unsafe_name_without_escaping_bin(
     assert outside.read_bytes() == b"must survive"
 
 
+@pytest.mark.parametrize("recorded_name", ["keep.py.", "keep.py ", "CON", "nul.txt", "COM1.py"])
+def test_prune_console_launchers_rejects_windows_alias_records_before_deletion(
+    tmp_path: Path,
+    recorded_name: str,
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    launchers = site_packages / "bin"
+    launchers.mkdir(parents=True)
+    _write_launcher_distribution(site_packages, "")
+    metadata = site_packages / "fixture_launchers-1.0.dist-info"
+    (metadata / "RECORD").write_text(f"bin/{recorded_name},,\n", encoding="utf-8")
+    unknown = launchers / "keep.py"
+    unknown.write_text("print('must survive')\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsafe recorded launcher name"):
+        installer.prune_console_launchers(site_packages)
+
+    assert unknown.read_text(encoding="utf-8") == "print('must survive')\n"
+
+
+def test_prune_console_launchers_requires_exact_lowercase_bin_record_prefix(
+    tmp_path: Path,
+) -> None:
+    site_packages = tmp_path / "site-packages"
+    launchers = site_packages / "bin"
+    launchers.mkdir(parents=True)
+    _write_launcher_distribution(site_packages, "")
+    metadata = site_packages / "fixture_launchers-1.0.dist-info"
+    (metadata / "RECORD").write_text("BIN/keep.py,,\n", encoding="utf-8")
+    unknown = launchers / "keep.py"
+    unknown.write_text("print('must survive')\n", encoding="utf-8")
+
+    report = installer.prune_console_launchers(site_packages)
+
+    assert report == {"preserved_unknown": ["bin/keep.py"], "removed": []}
+    assert unknown.read_text(encoding="utf-8") == "print('must survive')\n"
+
+
 def test_prune_console_launchers_preflights_hardlinks_before_deleting_anything(
     tmp_path: Path,
 ) -> None:
