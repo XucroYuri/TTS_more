@@ -2691,6 +2691,20 @@ def test_runtime_validation_callers_thread_package_bounded_source_root() -> None
     assert "$env:PYTHONPATH" not in worker_start
 
 
+def test_worker_builder_loads_portable_validation_before_cross_volume_probe() -> None:
+    builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    validation_path = '$ValidationScript = Join-Path $PSScriptRoot "Portable-Validation.ps1"'
+    validation_load = ". $ValidationScript"
+    cross_volume_probe = "function Test-WorkerFullRuntimeOnOtherVolume"
+
+    assert validation_path in builder
+    assert validation_load in builder
+    assert builder.index(validation_load) < builder.index(cross_volume_probe)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="stale worker state repair uses Windows PowerShell")
 def test_worker_initializer_executes_stale_state_repair_from_external_cwd(
     tmp_path: Path,
