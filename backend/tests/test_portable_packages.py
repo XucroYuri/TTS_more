@@ -2728,6 +2728,25 @@ def test_worker_owned_cache_file_cleanup_tolerates_file_and_parent_races() -> No
     assert "Test-WorkerOwnedMissingPathFailure -Failure $_" in function
 
 
+def test_worker_full_runtime_and_staging_cleanup_reuse_owned_tree_remover() -> None:
+    builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+    bytecode_cleanup = builder.split(
+        "function Remove-WorkerFullRuntimeBytecode", maxsplit=1
+    )[1].split("function Assert-WorkerFullRuntimeBoundary", maxsplit=1)[0]
+    staging_cleanup = builder.split("finally {", maxsplit=1)[-1]
+
+    assert (
+        "Remove-WorkerOwnedDirectoryContents -Path $directory.FullName -AllowMissing"
+        in bytecode_cleanup
+    )
+    assert "[IO.Directory]::Delete($directory.FullName, $false)" in bytecode_cleanup
+    assert "Remove-Item -LiteralPath $directory.FullName -Recurse -Force" not in bytecode_cleanup
+    assert "Remove-WorkerOwnedDirectoryContents -Path $resolvedWork" in staging_cleanup
+    assert "Remove-Item -LiteralPath $child.FullName -Recurse -Force" not in staging_cleanup
+
+
 @pytest.mark.skipif(os.name != "nt", reason="worker cache cleanup uses Windows PowerShell")
 def test_worker_owned_cache_cleanup_wraps_each_child_lifecycle_in_one_try() -> None:
     builder = REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1"
