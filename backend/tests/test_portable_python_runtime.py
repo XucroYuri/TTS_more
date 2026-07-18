@@ -72,6 +72,16 @@ def _write_zip(path: Path, entries: list[tuple[str, bytes]]) -> None:
                 archive.writestr(name, payload)
 
 
+def _write_zip_with_unsupported_compression(path: Path, entry: str, payload: bytes) -> None:
+    _write_zip(path, [(entry, payload)])
+    data = bytearray(path.read_bytes())
+    local_header = data.index(b"PK\x03\x04")
+    central_header = data.index(b"PK\x01\x02")
+    data[local_header + 8 : local_header + 10] = (99).to_bytes(2, "little")
+    data[central_header + 10 : central_header + 12] = (99).to_bytes(2, "little")
+    path.write_bytes(data)
+
+
 def _long_unicode_space_parent(tmp_path: Path, target_length: int = 141) -> Path:
     prefix = tmp_path / "含 中文 空格"
     padding = target_length - len(str(prefix)) - 1
@@ -256,6 +266,30 @@ def test_uv_export_retries_pb_collision_without_touching_foreign_file(helper: Pa
 
     assert collision.read_bytes() == b"foreign-pb"
     assert destination.read_bytes() == b"new-uv"
+
+
+@pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+def test_uv_export_unsupported_compression_leaves_no_owned_pu_file_and_preserves_foreign(
+    helper: Path, tmp_path: Path
+) -> None:
+    wheel = tmp_path / "corrupt-uv.whl"
+    destination = tmp_path / "tools" / "uv.exe"
+    collision = destination.parent / f".pu-{'0' * 32}"
+    collision.parent.mkdir(parents=True)
+    collision.write_bytes(b"foreign-pu")
+    _write_zip_with_unsupported_compression(wheel, UV["archive_entry"], b"invalid-compression")
+
+    result = _run_ps(
+        helper,
+        _force_owned_sibling_collision("pu", collision)
+        + f"Export-PortableUvExecutable -Wheel '{wheel}' -ArchiveEntry '{UV['archive_entry']}' -Destination '{destination}'",
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert collision.read_bytes() == b"foreign-pu"
+    assert list(destination.parent.glob(".pu-*")) == [collision]
+    assert not destination.exists()
 
 
 def test_runtime_locks_pin_exact_embeddable_python_and_uv() -> None:
