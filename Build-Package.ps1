@@ -621,6 +621,8 @@ if ($Profile -eq "Full") {
     Assert-TtsMoreFullRuntimeLinkBoundary -PackageRoot $stage
     $runtimeLockForProbe = Get-Content -LiteralPath (Join-Path $stage "packaging\portable\runtime.lock.json") -Raw | ConvertFrom-Json
     $runtimeCrossVolumeProbe = Test-TtsMoreFullRuntimeOnOtherVolume -PackageRoot $stage -ExpectedPython ([string]$runtimeLockForProbe.python_version) -ImportProbe ([string]$runtimeLockForProbe.import_probe)
+    Remove-TtsMoreFullRuntimeBytecode -PackageRoot $stage
+    Assert-TtsMoreFullRuntimeBoundary -PackageRoot $stage
 }
 
 $sumPath = Join-Path $stage "SHA256SUMS.txt"

@@ -2811,6 +2811,59 @@ def test_worker_cross_volume_probe_uses_package_bounded_source_bootstrap() -> No
     assert "TTS" in gpt_probe and "TTS_Config" in gpt_probe
 
 
+def test_portable_source_probe_disables_python_bytecode_writes(tmp_path: Path) -> None:
+    validation = (REPO_ROOT / "scripts" / "Portable-Validation.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "& $resolvedPython -B -c $bootstrap" in validation
+
+    source_root = tmp_path / "source"
+    package = source_root / "bytecode_probe_package"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 'ready'\n", encoding="utf-8")
+    bootstrap = (
+        "import os,sys; source_root=os.path.abspath(sys.argv[1]); "
+        "os.chdir(source_root); sys.path.insert(0,source_root); "
+        "exec(compile(sys.argv[2],'<portable-import-probe>','exec'),"
+        "{'__name__':'__main__'})"
+    )
+    env = os.environ.copy()
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", bootstrap, str(source_root), "import bytecode_probe_package"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert not list(source_root.rglob("__pycache__"))
+    assert not list(source_root.rglob("*.pyc"))
+
+
+def test_full_builders_reclean_bytecode_after_cross_volume_probe() -> None:
+    workers = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+    worker_probe = workers.index("$runtimeCrossVolumeProbe = Test-WorkerFullRuntimeOnOtherVolume")
+    worker_cleanup = workers.index("Remove-WorkerFullRuntimeBytecode -PackageRoot $stage", worker_probe)
+    worker_boundary = workers.index("Assert-WorkerFullRuntimeBoundary -PackageRoot $stage", worker_cleanup)
+    assert worker_probe < worker_cleanup < worker_boundary
+
+    controller = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+    controller_probe = controller.index("$runtimeCrossVolumeProbe = Test-TtsMoreFullRuntimeOnOtherVolume")
+    controller_cleanup = controller.index(
+        "Remove-TtsMoreFullRuntimeBytecode -PackageRoot $stage", controller_probe
+    )
+    controller_boundary = controller.index(
+        "Assert-TtsMoreFullRuntimeBoundary -PackageRoot $stage", controller_cleanup
+    )
+    assert controller_probe < controller_cleanup < controller_boundary
+
+
 def test_worker_full_initialization_preserves_primary_and_cleanup_failures() -> None:
     builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
         encoding="utf-8"
