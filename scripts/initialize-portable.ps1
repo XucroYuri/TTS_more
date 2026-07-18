@@ -226,7 +226,7 @@ foreach ($requiredModelPath in $requiredModelPaths) {
 & $PortableRuntime.Uv lock --check --project $BackendRoot
 if ($LASTEXITCODE -ne 0) { throw "backend uv.lock drift detected" }
 $requirements = Join-Path $Staging "tts-more-requirements.lock.txt"
-& $PortableRuntime.Uv export --frozen --no-dev --no-emit-project --project $BackendRoot --output-file $requirements
+& $PortableRuntime.Uv export --frozen --no-dev --no-emit-project --no-header --project $BackendRoot --output-file $requirements
 if ($LASTEXITCODE -ne 0) { throw "failed to export frozen backend dependencies" }
 & $PortableRuntime.Uv pip install --python $PortableRuntime.Python --target $PortableRuntime.SitePackages --link-mode copy --requirement $requirements
 if ($LASTEXITCODE -ne 0) { throw "failed to synchronize frozen backend dependencies" }

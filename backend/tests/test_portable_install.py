@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import urllib.error
+import zipfile
 from pathlib import Path
 from uuid import UUID
 
@@ -712,6 +713,87 @@ exit 0
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="locked uv executable is Windows x64")
+def test_controller_locked_uv_export_omits_machine_path_header_under_unicode_root(
+    tmp_path: Path,
+) -> None:
+    wheel = (
+        REPO_ROOT
+        / "data"
+        / "cache"
+        / "portable"
+        / "build-tools"
+        / "assets"
+        / "uv-0.11.28-py3-none-win_amd64.whl"
+    )
+    assert wheel.is_file(), "the exact locked uv 0.11.28 wheel is required"
+    tool_root = tmp_path / "TTS More 中文" / "locked uv tool"
+    with zipfile.ZipFile(wheel) as archive:
+        executable_member = next(
+            name for name in archive.namelist() if name.endswith(".data/scripts/uv.exe")
+        )
+        archive.extract(executable_member, tool_root)
+    uv = tool_root / Path(executable_member)
+    version = subprocess.run(
+        [str(uv), "--version"], capture_output=True, text=True, check=False
+    )
+    assert version.returncode == 0
+    assert version.stdout.startswith("uv 0.11.28 ")
+
+    project = tmp_path / "TTS More 中文" / "source project" / "backend"
+    project.mkdir(parents=True)
+    for name in ("pyproject.toml", "uv.lock", ".python-version"):
+        (project / name).write_bytes((REPO_ROOT / "backend" / name).read_bytes())
+    output = (
+        tmp_path
+        / "TTS More 中文"
+        / "runtime staging"
+        / "tts-more-requirements.lock.txt"
+    )
+    output.parent.mkdir(parents=True)
+    initializer = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(
+        encoding="utf-8"
+    )
+    export_arguments = [
+        str(uv),
+        "export",
+        "--frozen",
+        "--no-dev",
+        "--no-emit-project",
+    ]
+    if "--no-header" in initializer:
+        export_arguments.append("--no-header")
+    export_arguments.extend(
+        ["--project", str(project), "--output-file", str(output)]
+    )
+    completed = subprocess.run(
+        export_arguments,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        env={
+            **os.environ,
+            "UV_CACHE_DIR": str(tmp_path / "TTS More 中文" / "uv cache"),
+        },
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    exported = output.read_text(encoding="utf-8")
+    machine_prefixes = (
+        project,
+        output.parent,
+        tmp_path,
+        Path.home(),
+        Path(os.environ["TEMP"]),
+    )
+    leaked = [str(path) for path in machine_prefixes if str(path).casefold() in exported.casefold()]
+    assert leaked == [], f"Full runtime metadata audit would reject: {leaked}"
+    assert "--no-header" in initializer
+    assert "fastapi==" in exported
+    assert "--hash=sha256:" in exported
 
 
 def test_controller_initializer_uses_only_embedded_python_runtime() -> None:
