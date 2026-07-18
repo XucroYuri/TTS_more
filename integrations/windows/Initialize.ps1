@@ -162,13 +162,14 @@ $manifestPath = Join-Path $Root "package\tts-more-package.json"
 $buildId = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { [string](Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json).build_id } else { "source-checkout" }
 $expectedPython = if ([string]::IsNullOrWhiteSpace([string]$runtimeLock.python_version)) { [string]$config.python } else { [string]$runtimeLock.python_version }
 $importProbe = if ($runtimeLock.PSObject.Properties["import_probe"] -and ![string]::IsNullOrWhiteSpace([string]$runtimeLock.import_probe)) { [string]$runtimeLock.import_probe } else { [string]$config.import_probe }
+$requestedProfileMatchesState = Test-PortableRequestedProfileMatchesState -RuntimeLockPayload $runtimeLock -RequestedProfile $Device -StatePath $state
 $installStateComplete = Test-PortableInstallStateComplete -Root $Root -SourceRoot $SourceRoot -StatePath $state -Component ([string]$config.component) -BuildId $buildId -RuntimeLock $runtimeLockPath -ModelLock $modelLockPath -ExpectedPython $expectedPython -ImportProbe $importProbe -ValidateAssets
-if ($installStateComplete) { Write-Host "verified runtime and install state already exist"; exit 0 }
+if ($requestedProfileMatchesState -and $installStateComplete) { Write-Host "verified runtime and install state already exist"; exit 0 }
 $lockedAssetsComplete = Test-PortableLockedAssets -Root $Root -ModelLock $modelLockPath
 $runtimeComplete = if ($lockedAssetsComplete) {
     Test-PortableRuntime -Root $Root -SourceRoot $SourceRoot -PythonPath (Join-Path $live "python.exe") -ExpectedVersion $expectedPython -ImportProbe $importProbe
 } else { $false }
-if ($lockedAssetsComplete -and $runtimeComplete) {
+if ($requestedProfileMatchesState -and $lockedAssetsComplete -and $runtimeComplete) {
     Repair-PortableWorkerStaleState -SourceRoot $SourceRoot -Root $Root -StatePath $state -LivePath $live -BundleRoot $Bundle -Component ([string]$config.component) -BuildId $buildId -RuntimeLockPath $runtimeLockPath -ModelLockPath $modelLockPath -ExpectedPython $expectedPython -ImportProbe $importProbe -RuntimeLockPayload $runtimeLock
     Write-Host "verified package-private assets and repaired stale install state"
     exit 0

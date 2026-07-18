@@ -2437,7 +2437,7 @@ def test_gpt_worker_import_probe_adds_upstream_source_root_before_imports() -> N
     ("component", "torch_version"),
     (("gpt-sovits", "2.11.0"), ("indextts", "2.8.0"), ("cosyvoice", "2.11.0")),
 )
-@pytest.mark.parametrize("profile", ("cu128", "cu126"))
+@pytest.mark.parametrize("profile", ("cu128", "cu126", "cpu"))
 def test_worker_gpu_dependency_locks_select_the_declared_pytorch_backend(
     component: str, torch_version: str, profile: str
 ) -> None:
@@ -2452,6 +2452,24 @@ def test_worker_gpu_dependency_locks_select_the_declared_pytorch_backend(
     assert f"https://download.pytorch.org/whl/{profile}" in lock
     assert f"torch=={torch_version}+{profile}" in lock
     assert f"torchaudio=={torch_version}+{profile}" in lock
+
+
+@pytest.mark.parametrize(
+    ("profile", "torchcodec_version"),
+    (("cu128", "0.13.0"), ("cu126", "0.13.0+cu126"), ("cpu", "0.13.0+cpu")),
+)
+def test_gpt_dependency_locks_select_the_declared_torchcodec_backend(
+    profile: str, torchcodec_version: str
+) -> None:
+    lock = (
+        REPO_ROOT
+        / "integrations"
+        / "components"
+        / "gpt-sovits"
+        / f"requirements-{profile}.lock.txt"
+    ).read_text(encoding="utf-8")
+
+    assert f"torchcodec=={torchcodec_version} " in lock
 
 
 def test_worker_locked_dependency_install_uses_the_lock_generation_index_strategy() -> None:
@@ -2480,6 +2498,53 @@ def test_worker_dependency_locks_do_not_disclose_build_machine_paths() -> None:
             lock = lock_path.read_text(encoding="utf-8")
             assert drive_path.search(lock) is None, lock_path
             assert not any(marker in lock.lower() for marker in forbidden_markers), lock_path
+
+
+@pytest.mark.skipif(os.name != "nt", reason="worker device state validation uses Windows PowerShell")
+def test_worker_initializer_does_not_reuse_a_different_explicit_device_profile(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "install-state.json"
+    state.write_text(json.dumps({"ready": True, "profile": "cpu"}), encoding="utf-8")
+    validation = REPO_ROOT / "scripts" / "Portable-Validation.ps1"
+    command = f"""
+$ErrorActionPreference='Stop'
+. '{validation}'
+$runtimeLock=[pscustomobject]@{{profiles=[pscustomobject]@{{cpu=[pscustomobject]@{{}};cu128=[pscustomobject]@{{}}}}}}
+if (!(Test-PortableRequestedProfileMatchesState -RuntimeLockPayload $runtimeLock -RequestedProfile 'auto' -StatePath '{state}')) {{ exit 91 }}
+if (!(Test-PortableRequestedProfileMatchesState -RuntimeLockPayload $runtimeLock -RequestedProfile 'cpu' -StatePath '{state}')) {{ exit 92 }}
+if (Test-PortableRequestedProfileMatchesState -RuntimeLockPayload $runtimeLock -RequestedProfile 'cu128' -StatePath '{state}') {{ exit 93 }}
+$unsupportedRejected=$false
+try {{ Test-PortableRequestedProfileMatchesState -RuntimeLockPayload $runtimeLock -RequestedProfile 'cu126' -StatePath '{state}' | Out-Null }} catch {{ $unsupportedRejected=$true }}
+if (!$unsupportedRejected) {{ exit 94 }}
+"""
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    initializer = (REPO_ROOT / "integrations" / "windows" / "Initialize.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "if ($requestedProfileMatchesState -and $installStateComplete)" in initializer
+    assert (
+        "if ($requestedProfileMatchesState -and $lockedAssetsComplete -and $runtimeComplete)"
+        in initializer
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="embedded Python _pth isolation is Windows-specific")

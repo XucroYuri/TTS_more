@@ -385,6 +385,25 @@ function Resolve-PortableSupportedProfile {
     throw "runtime lock has no deterministic supported fallback profile"
 }
 
+function Test-PortableRequestedProfileMatchesState {
+    param(
+        [Parameter(Mandatory = $true)][object]$RuntimeLockPayload,
+        [Parameter(Mandatory = $true)][string]$RequestedProfile,
+        [Parameter(Mandatory = $true)][string]$StatePath
+    )
+    $requested = $RequestedProfile.Trim().ToLowerInvariant()
+    if ($requested -eq "auto") { return $true }
+    if (!$RuntimeLockPayload.PSObject.Properties["profiles"]) { throw "runtime lock profiles are missing" }
+    Assert-PortableJsonObject -Value $RuntimeLockPayload.profiles -Label "runtime lock profiles"
+    if (!$RuntimeLockPayload.profiles.PSObject.Properties[$requested]) {
+        throw "requested device profile is not supported by this package: $requested"
+    }
+    if (!(Test-Path -LiteralPath $StatePath -PathType Leaf)) { return $false }
+    try { $existingState = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json }
+    catch { return $false }
+    return [string]::Equals([string]$existingState.profile, $requested, [StringComparison]::OrdinalIgnoreCase)
+}
+
 function Test-PortableLockedAssets {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
