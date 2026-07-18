@@ -7,7 +7,7 @@
       "path": "repo/GPT-SoVITS-main",
       "remote": "https://github.com/XucroYuri/GPT-SoVITS.git",
       "branch": "main",
-      "commit": "a644ca3c72b0403fc4919fd72adf9e30f5c7f5d5",
+      "commit": "0777087ab9cb214d39532c138bfa241754edde57",
       "service_id": "local-gpt-sovits-main",
       "port": 9880,
       "default_selected": true
