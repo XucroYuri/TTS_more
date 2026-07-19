@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -11,7 +12,7 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -407,9 +408,18 @@ def test_windows_ci_uses_short_pytest_base_temp_without_weakening_package_path_g
     )
 
     assert "runner.os == 'Windows'" in ci_workflow
-    assert "--basetemp={0}/pytest-{1}" in ci_workflow
+    assert '--basetemp="{0}/pytest-{1}"' in ci_workflow
     assert "runner.temp" in ci_workflow
-    assert "--basetemp=${{ runner.temp }}/portable-" in portable_workflow
+    assert '--basetemp="${{ runner.temp }}/portable-' in portable_workflow
+    for addopts in (
+        r'--basetemp="D:\a\_temp/pytest-123"',
+        r'--basetemp="D:\a\_temp/portable-123"',
+    ):
+        parsed = shlex.split(addopts, posix=True)
+        assert len(parsed) == 1
+        base_temp = parsed[0].split("=", 1)[1]
+        assert base_temp.startswith(r"D:\a\_temp")
+        assert PureWindowsPath(base_temp).is_absolute()
     assert "PACKAGE_PATH_TOO_DEEP" in start_controller
 
 
