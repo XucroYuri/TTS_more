@@ -113,6 +113,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "capabilities": [
             "tts",
+            "reference_audio_voice",
             "zero-shot-voice",
             "zero_shot_voice",
             "cross-lingual-voice",

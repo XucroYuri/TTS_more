@@ -4024,20 +4024,33 @@ def test_v2_builders_emit_completed_identity_protocol_and_data_contract() -> Non
         ) in builder
 
 
-def test_cosyvoice_package_manifest_only_advertises_locked_model_capabilities() -> None:
+def test_worker_package_manifests_advertise_controller_canonical_capabilities() -> None:
     worker_builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
         encoding="utf-8"
     )
-    cosyvoice_mapping = next(
-        line.strip()
-        for line in worker_builder.splitlines()
-        if line.strip().startswith('"cosyvoice" { @(')
-    )
+    mappings = {
+        component: next(
+            line.strip()
+            for line in worker_builder.splitlines()
+            if line.strip().startswith(f'"{component}" {{ @(')
+        )
+        for component in ("gpt-sovits", "indextts", "cosyvoice")
+    }
 
-    assert cosyvoice_mapping == (
-        '"cosyvoice" { @("tts", "reference_audio_voice", "zero_shot_voice", '
-        '"cross_lingual_voice", "artifact-transfer") }'
-    )
+    assert mappings == {
+        "gpt-sovits": (
+            '"gpt-sovits" { @("tts", "trained_weights_voice", "reference_audio_voice", '
+            '"artifact-transfer") }'
+        ),
+        "indextts": (
+            '"indextts" { @("tts", "reference_audio_voice", "emotion_text", '
+            '"artifact-transfer") }'
+        ),
+        "cosyvoice": (
+            '"cosyvoice" { @("tts", "reference_audio_voice", "zero_shot_voice", '
+            '"cross_lingual_voice", "artifact-transfer") }'
+        ),
+    }
 
 
 def test_portable_release_workflow_sanitizes_pr_ref_names() -> None:

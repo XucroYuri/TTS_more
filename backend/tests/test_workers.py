@@ -110,6 +110,32 @@ def test_reference_worker_artifact_store_uses_configured_portable_data_root(
     assert worker._artifact_store().root == artifact_root.resolve()
 
 
+@pytest.mark.parametrize(
+    ("module_name", "component"),
+    (
+        ("app.workers.indextts_worker", "indextts"),
+        ("app.workers.cosyvoice_worker", "cosyvoice"),
+    ),
+)
+def test_reference_worker_artifact_store_resolves_relative_root_from_project(
+    module_name: str,
+    component: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    worker = __import__(module_name, fromlist=["_artifact_store"])
+    project_root = tmp_path / "tts-more"
+    monkeypatch.setattr(worker, "PROJECT_ROOT", project_root)
+    monkeypatch.setenv("TTS_MORE_ARTIFACT_ROOT", "data/local/artifacts")
+
+    assert worker._artifact_store().root == (project_root / "data" / "local" / "artifacts").resolve()
+
+    monkeypatch.delenv("TTS_MORE_ARTIFACT_ROOT")
+    assert worker._artifact_store().root == (
+        project_root / "data" / "runtime" / "worker-artifacts" / component
+    ).resolve()
+
+
 def test_gpt_sovits_worker_models_empty_without_repo(tmp_path: Path, monkeypatch) -> None:
     """Discovery must not require the resident pipeline or torch."""
     monkeypatch.setattr("app.workers.gpt_sovits_worker.REPO_DIR", tmp_path)
@@ -145,6 +171,20 @@ def test_all_workers_expose_artifact_transfer_contract() -> None:
         assert "/upload_ref" in paths
         assert "/artifacts/{artifact_id}" in paths
         assert "artifact-transfer" in capabilities
+
+
+@pytest.mark.parametrize(
+    ("worker_app", "required"),
+    (
+        (gpt_app, {"trained_weights_voice", "reference_audio_voice"}),
+        (indextts_app, {"reference_audio_voice", "emotion_text"}),
+        (cosyvoice_app, {"reference_audio_voice", "zero_shot_voice", "cross_lingual_voice"}),
+    ),
+)
+def test_worker_capabilities_include_controller_canonical_names(worker_app, required: set[str]) -> None:
+    capabilities = set(TestClient(worker_app).get("/capabilities").json()["capabilities"])
+
+    assert required <= capabilities
 
 
 def test_all_worker_health_reports_tts_more_commit(monkeypatch) -> None:

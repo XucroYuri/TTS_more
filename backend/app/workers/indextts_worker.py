@@ -65,7 +65,16 @@ def health() -> dict[str, Any]:
 
 @app.get("/capabilities")
 def capabilities() -> dict[str, Any]:
-    return {"capabilities": ["tts", "reference-audio", "emotion-text", "artifact-transfer"]}
+    return {
+        "capabilities": [
+            "tts",
+            "reference_audio_voice",
+            "emotion_text",
+            "reference-audio",
+            "emotion-text",
+            "artifact-transfer",
+        ]
+    }
 
 
 @app.post("/load")
