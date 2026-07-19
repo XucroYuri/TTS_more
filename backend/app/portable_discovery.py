@@ -304,7 +304,7 @@ def endpoint_from_portable_package(
         source_profile="local_repo",
         catalog_provider=descriptor.component,
         setup_state="ready" if descriptor.initialized else "env_missing",
-        default_params={"delivery": "path"},
+        default_params={"delivery": "artifact"},
         control_kind="portable-package",
         portable_locator=PortableServiceLocator(
             component=descriptor.component,

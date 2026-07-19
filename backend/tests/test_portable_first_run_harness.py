@@ -181,6 +181,20 @@ def test_harness_treats_pid_and_creation_time_as_the_process_identity() -> None:
     ) in script
 
 
+def test_harness_reads_every_pid_record_as_strict_utf8_json() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert "function Read-StrictUtf8JsonFile" in script
+    assert "function Read-WorkerPidRecord" in script
+    assert "Text.UTF8Encoding($false, $true)" in script
+    assert "[IO.File]::ReadAllText($Path, $StrictUtf8)" in script
+    assert "ConvertFrom-Json -ErrorAction Stop" in script
+    assert script.count("Read-WorkerPidRecord -Path $recordPath") == 6
+    assert "Read-StrictUtf8JsonFile -Path $marker" in script
+    assert "Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json" not in script
+    assert "Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json" not in script
+
+
 def test_harness_accepts_json_integer_width_differences_from_powershell_hosts() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
 

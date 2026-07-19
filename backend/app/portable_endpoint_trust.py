@@ -114,6 +114,12 @@ def trust_resolved_portable_endpoint(
         and sanitized.api_contract == "tts-more-v1"
         and descriptor.manageable
     )
+    default_params = dict(sanitized.default_params)
+    if trusted:
+        # The portable-package controller launches the package's root Start.cmd,
+        # whose safe default refuses host paths. Artifact transfer is therefore
+        # the only delivery mode that is valid for this managed control kind.
+        default_params["delivery"] = "artifact"
     return sanitized.model_copy(
         update={
             "base_url": descriptor.default_url if trusted else sanitized.base_url,
@@ -128,6 +134,7 @@ def trust_resolved_portable_endpoint(
             if trusted and include_runner
             else [],
             "start_cwd": "." if trusted and include_runner else None,
+            "default_params": default_params,
             "setup_state": (
                 "ready" if descriptor.initialized else "env_missing"
             )

@@ -946,6 +946,22 @@ def test_resolved_factory_never_trusts_nonlocal_or_wrong_contract_endpoint(
     assert trusted.start_cwd is None
 
 
+def test_resolved_portable_endpoint_migrates_legacy_path_delivery_to_artifact(
+    tmp_path: Path,
+) -> None:
+    from app.portable_endpoint_trust import trust_resolved_portable_endpoint
+
+    package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")
+    descriptor = read_portable_package(package)
+    endpoint = _endpoint(_locator("gpt-sovits", "gpt-main", package)).model_copy(
+        update={"default_params": {"delivery": "path", "timeout_seconds": 45}}
+    )
+
+    trusted = trust_resolved_portable_endpoint(endpoint, descriptor)
+
+    assert trusted.default_params == {"delivery": "artifact", "timeout_seconds": 45}
+
+
 @pytest.mark.parametrize("schema_version", (True, "2", 2.0))
 def test_manifest_schema_version_requires_exact_json_integer_two(tmp_path: Path, schema_version: object) -> None:
     package = _write_package(tmp_path / "GPT", component="gpt-sovits", package_id="gpt-main")

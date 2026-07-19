@@ -1941,7 +1941,8 @@ def test_windows_argument_serializer_round_trips_real_python_argv_under_spaced_u
             "-Command",
             (
                 ". $env:A5_VALIDATION; "
-                "$parsed = Get-Content -LiteralPath $env:A5_ARGUMENTS -Raw | ConvertFrom-Json; "
+                "$strictUtf8 = New-Object Text.UTF8Encoding($false, $true); "
+                "$parsed = [IO.File]::ReadAllText($env:A5_ARGUMENTS, $strictUtf8) | ConvertFrom-Json -ErrorAction Stop; "
                 "$logical = @($parsed | ForEach-Object { $_ }); "
                 "$line = ConvertTo-PortableWindowsArgumentLine -Arguments $logical; "
                 "[IO.File]::WriteAllText($env:A5_SERIALIZED, $line, (New-Object Text.UTF8Encoding($false))); "

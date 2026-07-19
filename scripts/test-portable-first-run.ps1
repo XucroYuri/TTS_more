@@ -34,6 +34,7 @@ $WorkRoot = ""
 $WorkIdentity = [guid]::NewGuid().ToString("N")
 $OwnerStartedAt = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString("o")
 $Utf8NoBom = New-Object Text.UTF8Encoding($false)
+$StrictUtf8 = New-Object Text.UTF8Encoding($false, $true)
 
 function Get-PortableFileSha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -49,6 +50,21 @@ function Get-PortableFileSha256 {
 function Throw-HarnessError {
     param([Parameter(Mandatory = $true)][string]$Code, [Parameter(Mandatory = $true)][string]$Message)
     throw "${Code}: $Message"
+}
+
+function Read-StrictUtf8JsonFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return ([IO.File]::ReadAllText($Path, $StrictUtf8) | ConvertFrom-Json -ErrorAction Stop)
+}
+
+function Read-WorkerPidRecord {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        return Read-StrictUtf8JsonFile -Path $Path
+    }
+    catch {
+        Throw-HarnessError "PID_RECORD_INVALID" "worker ownership record is not valid UTF-8 JSON"
+    }
 }
 
 function Get-ErrorCode {
@@ -992,7 +1008,7 @@ function Register-PackageOwnedProcess {
     param([Parameter(Mandatory = $true)][object]$Package)
     $recordPath = Join-Path $Package.Root "data\local\run\worker.pid.json"
     if (!(Test-Path -LiteralPath $recordPath -PathType Leaf)) { return }
-    $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+    $record = Read-WorkerPidRecord -Path $recordPath
     $processId = [int]$record.pid
     $createdAt = [DateTime]::Parse([string]$record.process_created_at, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
     $expectedExecutable = Resolve-FixtureCanonicalPath -Path (Join-Path $Package.Root "runtime\live\python.exe")
@@ -1176,7 +1192,7 @@ function Invoke-PackageAcceptance {
         Wait-LoopbackPort -Port $Package.Port -Listening $true
     }
     $recordPath = Join-Path $Package.Root "data\local\run\worker.pid.json"
-    $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+    $record = Read-WorkerPidRecord -Path $recordPath
     $initialPid = [int]$record.pid
     Register-PackageOwnedProcess -Package $Package
 
@@ -1202,7 +1218,7 @@ function Invoke-PackageAcceptance {
             }
             Throw-HarnessError "DUPLICATE_START_FAILED" "duplicate Start.cmd failed"
         }
-        $unchanged = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+        $unchanged = Read-WorkerPidRecord -Path $recordPath
         if ([int]$unchanged.pid -ne $initialPid) { Throw-HarnessError "DUPLICATE_PROCESS" "duplicate Start.cmd created another listener" }
     }
 
@@ -1269,7 +1285,7 @@ function Invoke-PackageAcceptance {
             Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "Start.cmd did not start after Repair.cmd validation"
         }
         Wait-LoopbackPort -Port $Package.Port -Listening $true
-        $runningRecord = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+        $runningRecord = Read-WorkerPidRecord -Path $recordPath
         $initialPid = [int]$runningRecord.pid
         $initialCreatedAt = [DateTime]::Parse([string]$runningRecord.process_created_at, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
         Register-PackageOwnedProcess -Package $Package
@@ -1289,12 +1305,12 @@ function Invoke-PackageAcceptance {
             if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") { [Console]::Error.WriteLine("STALE_RESTART_COMPONENT=$component EXIT=$($restarted.ExitCode)`n$($restarted.Output)") }
             Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "Start.cmd did not recover stale PID evidence"
         }
-        $replacement = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+        $replacement = Read-WorkerPidRecord -Path $recordPath
         $replacementCreatedAt = [DateTime]::Parse([string]$replacement.process_created_at, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
         if ([int]$replacement.pid -eq $initialPid -and $replacementCreatedAt -eq $initialCreatedAt) { Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "recovery did not create a fresh process identity" }
         Register-PackageOwnedProcess -Package $Package
     }
-    $replacementRecord = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+    $replacementRecord = Read-WorkerPidRecord -Path $recordPath
     $knownPids = @($initialPid, [int]$replacementRecord.pid)
 
     Invoke-Scenario -Component $component -Scenario "clean_stop" -Action {
@@ -1353,7 +1369,7 @@ function Remove-OwnedFixtureRoot {
     $resolved = [IO.Path]::GetFullPath($Root)
     $runRoot = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) "TTS More 中文")).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
     $marker = Join-Path $resolved ".fixture-owner.json"
-    $payload = if (Test-Path -LiteralPath $marker -PathType Leaf) { try { Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json } catch { $null } } else { $null }
+    $payload = if (Test-Path -LiteralPath $marker -PathType Leaf) { try { Read-StrictUtf8JsonFile -Path $marker } catch { $null } } else { $null }
     if (
         !$resolved.StartsWith($runRoot, [StringComparison]::OrdinalIgnoreCase) -or
         ((Get-Item -LiteralPath $resolved -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
