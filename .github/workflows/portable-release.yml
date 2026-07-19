@@ -21,8 +21,6 @@ jobs:
     runs-on: windows-latest
     env:
       PACKAGE_VERSION: ${{ inputs.version || github.ref_name }}
-      # GitHub's default workspace + pytest temp path can exceed the supported package budget.
-      PYTEST_ADDOPTS: --basetemp="${{ runner.temp }}/portable-${{ github.run_id }}"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -41,6 +39,9 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
       - name: Check immutable locks
+        env:
+          # This step can use runner.temp; job-level env cannot access the runner context.
+          PYTEST_ADDOPTS: ${{ format('--basetemp="{0}/portable-{1}"', runner.temp, github.run_id) }}
         shell: pwsh
         run: |
           uv lock --check --project backend

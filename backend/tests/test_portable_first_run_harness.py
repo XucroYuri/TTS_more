@@ -410,7 +410,12 @@ def test_windows_ci_uses_short_pytest_base_temp_without_weakening_package_path_g
     assert "runner.os == 'Windows'" in ci_workflow
     assert '--basetemp="{0}/pytest-{1}"' in ci_workflow
     assert "runner.temp" in ci_workflow
-    assert '--basetemp="${{ runner.temp }}/portable-' in portable_workflow
+    bootstrap_job_header = portable_workflow.split("    steps:", 1)[0]
+    immutable_locks_step = portable_workflow.split("- name: Check immutable locks", 1)[1]
+    immutable_locks_step = immutable_locks_step.split("- name:", 1)[0]
+    assert "PYTEST_ADDOPTS" not in bootstrap_job_header
+    assert '--basetemp="{0}/portable-{1}"' in immutable_locks_step
+    assert "runner.temp" in immutable_locks_step
     for addopts in (
         r'--basetemp="D:\a\_temp/pytest-123"',
         r'--basetemp="D:\a\_temp/portable-123"',
