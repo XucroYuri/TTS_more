@@ -1,4 +1,5 @@
-import type { Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
+import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LocalPortableServicesResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, PortableActionResponse, PortableActionStatusResponse, PortableDiscoveryResponse, PortableFolderSelectionResponse, PortableImportApplyResponse, PortableImportPlanResult, PortableOperationLogsResponse, PortableOperationResponse, PortableRegistrationRequest, PortableRegistrationResponse, PortableServiceAction, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
+import { validatePortableProxyUrl } from "./lib/portableProxy";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -54,6 +55,63 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export class PortableApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.name = "PortableApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+async function portableRequest<T>(url: string, init?: RequestInit, allowBlocked = false): Promise<T> {
+  const response = await fetch(url, withAuthHeader(init));
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+  if (response.status === 401) {
+    window.dispatchEvent(new CustomEvent("tts-more:auth-required"));
+  }
+  if (!response.ok) {
+    const detail = payload && typeof payload === "object" && "detail" in payload
+      ? (payload as { detail?: unknown }).detail
+      : null;
+    const code = detail && typeof detail === "object" && "code" in detail && typeof detail.code === "string"
+      ? detail.code
+      : `HTTP_${response.status}`;
+    const message = detail && typeof detail === "object" && "message" in detail && typeof detail.message === "string"
+      ? detail.message
+      : response.statusText || "Portable service request failed";
+    throw new PortableApiError(response.status, code, message);
+  }
+  if (!allowBlocked && payload && typeof payload === "object") {
+    const semantic = payload as { status?: unknown; error_code?: unknown; reason?: unknown };
+    if (semantic.status === "blocked" || typeof semantic.error_code === "string") {
+      const code = typeof semantic.error_code === "string"
+        ? semantic.error_code
+        : "LOCAL_CONTROL_ACTION_FAILED";
+      const message = typeof semantic.reason === "string"
+        ? semantic.reason
+        : "Portable service action failed";
+      throw new PortableApiError(response.status, code, message);
+    }
+  }
+  return payload as T;
+}
+
+function portableHeaders(token: string, includeJson = false): Headers {
+  const headers = new Headers();
+  headers.set("X-TTS-More-Control", token);
+  if (includeJson) headers.set("Content-Type", "application/json");
+  return headers;
+}
+
 export async function fetchHealth(): Promise<{ status: string; workers: WorkerHealth[] }> {
   return request("/api/health");
 }
@@ -82,8 +140,172 @@ export async function testService(serviceId: string): Promise<{ service_id: stri
   return request(`/api/services/${encodeURIComponent(serviceId)}/test`, { method: "POST" });
 }
 
-export async function fetchServicesStatus(): Promise<{ services: WorkerHealth[]; hardware: Record<string, unknown> }> {
-  return request("/api/services/status");
+export async function fetchServicesStatus(signal?: AbortSignal): Promise<{ services: WorkerHealth[]; hardware: Record<string, unknown> }> {
+  return request("/api/services/status", { signal });
+}
+
+export async function fetchLocalControlToken(signal?: AbortSignal): Promise<string> {
+  const payload = await portableRequest<{ token: string }>("/api/local-control/token", {
+    cache: "no-store",
+    referrerPolicy: "no-referrer",
+    signal,
+  });
+  if (!payload || typeof payload.token !== "string" || !payload.token) {
+    throw new PortableApiError(502, "LOCAL_CONTROL_INVALID_RESPONSE", "The local control token response is invalid");
+  }
+  return payload.token;
+}
+
+export async function fetchLocalPortableServices(token: string, signal?: AbortSignal): Promise<LocalPortableServicesResponse> {
+  return portableRequest("/api/local-portable-services", {
+    headers: portableHeaders(token),
+    signal,
+  });
+}
+
+export async function discoverLocalPortableServices(token: string, roots: string[] = [], signal?: AbortSignal): Promise<PortableDiscoveryResponse> {
+  return portableRequest("/api/local-portable-services/discover", {
+    method: "POST",
+    headers: portableHeaders(token, true),
+    body: JSON.stringify({ roots }),
+    signal,
+  });
+}
+
+export async function selectLocalPortableFolder(
+  component: CatalogProvider,
+  token: string,
+  packageId?: string,
+  signal?: AbortSignal,
+): Promise<PortableFolderSelectionResponse> {
+  return portableRequest("/api/local-portable-services/select-folder", {
+    method: "POST",
+    headers: portableHeaders(token, true),
+    body: JSON.stringify(packageId ? { component, package_id: packageId } : { component }),
+    signal,
+  });
+}
+
+export async function registerLocalPortableService(
+  payload: PortableRegistrationRequest,
+  token: string,
+  signal?: AbortSignal,
+): Promise<PortableRegistrationResponse> {
+  const body: PortableRegistrationRequest = {
+    component: payload.component,
+    package_id: payload.package_id,
+    path: payload.path,
+    ...(payload.port_override === undefined ? {} : { port_override: payload.port_override }),
+  };
+  return portableRequest("/api/local-portable-services/register", {
+    method: "POST",
+    headers: portableHeaders(token, true),
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+export async function planLocalPortableImport(
+  component: CatalogProvider,
+  token: string,
+  signal?: AbortSignal,
+): Promise<PortableImportPlanResult> {
+  return portableRequest(`/api/local-portable-services/${encodeURIComponent(component)}/imports/plan`, {
+    method: "POST",
+    headers: portableHeaders(token, true),
+    body: JSON.stringify({}),
+    signal,
+  });
+}
+
+export async function applyLocalPortableImport(
+  component: CatalogProvider,
+  planId: string,
+  planDigest: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<PortableImportApplyResponse> {
+  return portableRequest(
+    `/api/local-portable-services/${encodeURIComponent(component)}/imports/${encodeURIComponent(planId)}/apply`,
+    {
+      method: "POST",
+      headers: portableHeaders(token, true),
+      body: JSON.stringify({ confirmed: true, plan_digest: planDigest }),
+      signal,
+    },
+  );
+}
+
+export async function portableServiceAction(
+  component: CatalogProvider,
+  action: PortableServiceAction,
+  token: string,
+  options: { port_override?: number; proxy_url?: string } = {},
+  signal?: AbortSignal,
+): Promise<PortableActionResponse> {
+  if (options.port_override !== undefined && action !== "start") {
+    throw new RangeError("port_override is supported only by start");
+  }
+  if (options.proxy_url !== undefined && action !== "repair") {
+    throw new RangeError("proxy_url is supported only by repair");
+  }
+  if (options.proxy_url !== undefined && !validatePortableProxyUrl(options.proxy_url)) {
+    throw new RangeError("proxy_url must be a valid HTTP(S) proxy URL");
+  }
+  const body = {
+    ...(options.port_override === undefined ? {} : { port_override: options.port_override }),
+    ...(options.proxy_url === undefined ? {} : { proxy_url: options.proxy_url }),
+  };
+  const hasBody = Object.keys(body).length > 0;
+  return portableRequest(`/api/local-portable-services/${encodeURIComponent(component)}/${action}`, {
+    method: "POST",
+    headers: portableHeaders(token, hasBody),
+    ...(hasBody ? { body: JSON.stringify(body) } : {}),
+    signal,
+  });
+}
+
+export async function fetchPortableActionStatus(
+  component: CatalogProvider,
+  actionId: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<PortableActionStatusResponse> {
+  return portableRequest(
+    `/api/local-portable-services/${encodeURIComponent(component)}/actions/${encodeURIComponent(actionId)}`,
+    { headers: portableHeaders(token), signal },
+  );
+}
+
+export async function fetchPortableOperation(
+  component: CatalogProvider,
+  operationId: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<PortableOperationResponse> {
+  return portableRequest(
+    `/api/local-portable-services/${encodeURIComponent(component)}/operations/${encodeURIComponent(operationId)}`,
+    { headers: portableHeaders(token), signal },
+    true,
+  );
+}
+
+export async function fetchPortableOperationLogs(
+  component: CatalogProvider,
+  operationId: string,
+  token: string,
+  afterSeq = 0,
+  limit = 100,
+  signal?: AbortSignal,
+): Promise<PortableOperationLogsResponse> {
+  if (!Number.isInteger(afterSeq) || afterSeq < 0) throw new RangeError("afterSeq must be a non-negative integer");
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new RangeError("limit must be between 1 and 500");
+  const query = new URLSearchParams({ after_seq: String(afterSeq), limit: String(limit) });
+  return portableRequest(
+    `/api/local-portable-services/${encodeURIComponent(component)}/operations/${encodeURIComponent(operationId)}/logs?${query.toString()}`,
+    { headers: portableHeaders(token), signal },
+    true,
+  );
 }
 
 export async function fetchOpenSourceTTSCatalog(): Promise<{ providers: OpenSourceTTSCatalogItem[] }> {

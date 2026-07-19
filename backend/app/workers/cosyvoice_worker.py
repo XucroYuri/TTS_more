@@ -12,16 +12,12 @@ Start it (from the project root, using the CosyVoice venv):
         --app-dir backend --host 127.0.0.1 --port 9882
 
 CosyVoice modes (set via ``parameters.mode`` on /synthesize):
-  - sft          : pretrained speaker voice (needs sft_voice name)
   - zero_shot    : clone from a reference audio (needs ref_audio_path + prompt_text)
   - cross_lingual: clone across languages (needs ref_audio_path)
-  - instruct     : natural-language style control (needs instruct_text)
 
-NOTE: The exact upstream import path (cosyvoice.cli.cosyvoice.CosyVoice) and the
-inference method signature need final confirmation against the deployed
-CosyVoice build on a GPU machine. The discovery/contract surface is stable and
-testable without GPU; the model load + synthesize paths are marked for
-environment validation.
+The locked default is the original ``CosyVoice-300M`` model. It has
+``cosyvoice.yaml`` and no SFT speaker metadata, so SFT and instruction modes
+are deliberately rejected instead of being advertised as available.
 """
 
 from __future__ import annotations
@@ -31,7 +27,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from app.workers.artifacts import ArtifactStore, artifact_output, artifact_response, register_artifact_routes
 from app.workers.contracts import LoadRequest, SynthesizeRequest
@@ -39,6 +35,7 @@ from app.workers.runtime import release_cuda_memory, worker_runtime_status
 
 REPO_DIR = Path(os.environ.get("TTS_MORE_COSYVOICE_REPO", "repo/CosyVoice")).resolve(strict=False)
 MODEL_DIR = os.environ.get("TTS_MORE_COSYVOICE_MODEL_DIR", "pretrained_models/CosyVoice-300M")
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 _pipeline: Any = None
 _loaded_mode: str | None = None
@@ -47,14 +44,10 @@ _loaded_mode: str | None = None
 # The orchestrator historically used Chinese mode labels (Gradio legacy); the
 # worker accepts both the English and Chinese forms.
 _MODE_MAP = {
-    "sft": "sft",
     "zero_shot": "zero_shot",
     "cross_lingual": "cross_lingual",
-    "instruct": "instruct",
-    "预训练音色": "sft",
     "3s极速复刻": "zero_shot",
     "跨语种复刻": "cross_lingual",
-    "自然语言控制": "instruct",
 }
 
 
@@ -80,11 +73,11 @@ def _ensure_pipeline() -> Any:
         raise RuntimeError(f"CosyVoice repo not found at {REPO_DIR}")
     _bootstrap_repo()
     try:
-        from cosyvoice.cli.cosyvoice import AutoModel  # type: ignore
+        from cosyvoice.cli.cosyvoice import CosyVoice  # type: ignore
     except Exception as exc:  # pragma: no cover - requires torch/GPU env
         raise RuntimeError(f"failed to import CosyVoice pipeline: {exc}") from exc
     model_path = REPO_DIR / MODEL_DIR if not Path(MODEL_DIR).is_absolute() else Path(MODEL_DIR)
-    _pipeline = AutoModel(model_dir=str(model_path))
+    _pipeline = CosyVoice(model_dir=str(model_path))
     return _pipeline
 
 
@@ -92,7 +85,13 @@ app = FastAPI(title="TTS More CosyVoice Worker", version="0.1.0")
 
 
 def _artifact_store() -> ArtifactStore:
-    return ArtifactStore(REPO_DIR / "uploaded_ref")
+    configured_root = os.environ.get("TTS_MORE_ARTIFACT_ROOT")
+    artifact_root = Path(configured_root).expanduser() if configured_root else (
+        PROJECT_ROOT / "data" / "runtime" / "worker-artifacts" / "cosyvoice"
+    )
+    if not artifact_root.is_absolute():
+        artifact_root = PROJECT_ROOT / artifact_root
+    return ArtifactStore(artifact_root)
 
 
 register_artifact_routes(app, _artifact_store)
@@ -114,14 +113,11 @@ def capabilities() -> dict[str, Any]:
     return {
         "capabilities": [
             "tts",
-            "sft-voice",
-            "sft_voice",
+            "reference_audio_voice",
             "zero-shot-voice",
             "zero_shot_voice",
             "cross-lingual-voice",
             "cross_lingual_voice",
-            "style-instruction",
-            "style_instruction",
             "artifact-transfer",
         ]
     }
@@ -133,17 +129,19 @@ def load(request: LoadRequest) -> dict[str, Any]:
     GPT-SoVITS; /load simply ensures the pipeline is resident. The mode is
     chosen per-synthesis from parameters.mode."""
     global _loaded_mode
+    raw_mode = str(request.parameters.get("mode", "zero_shot")) if request.parameters else "zero_shot"
+    mode = _resolve_mode(raw_mode)
     _ensure_pipeline()
-    _loaded_mode = request.parameters.get("mode", "zero_shot") if request.parameters else "zero_shot"
+    _loaded_mode = mode
     return {"status": "loaded", "profile": request.profile, "mode": _loaded_mode}
 
 
 @app.post("/synthesize")
 def synthesize(request: SynthesizeRequest) -> dict[str, Any]:
-    pipeline = _ensure_pipeline()
     params = request.parameters or {}
     raw_mode = str(params.get("mode", "zero_shot"))
-    mode = _MODE_MAP.get(raw_mode, "zero_shot")
+    mode = _resolve_mode(raw_mode)
+    pipeline = _ensure_pipeline()
     text = request.line.text
     store = _artifact_store()
     output_path, artifact_id = artifact_output(store, request.delivery, Path(request.output_path), ".wav")
@@ -190,22 +188,30 @@ def _run_cosyvoice(pipeline: Any, mode: str, text: str, params: dict[str, Any]) 
     'tts_speech' numpy array; this helper collects and encodes to wav bytes.
     """
     speed = float(params.get("speed", 1.0))
-    if mode == "sft":
-        sft_voice = str(params.get("sft_voice") or "")
-        gen = pipeline.inference_sft(text, sft_voice, stream=False, speed=speed)
-    elif mode == "cross_lingual":
+    if mode == "cross_lingual":
         ref_audio = _reference_audio_path(params)
         gen = pipeline.inference_cross_lingual(text, _load_audio(ref_audio), stream=False, speed=speed)
-    elif mode == "instruct":
-        instruct_text = str(params.get("instruct_text") or "")
-        ref_audio = _reference_audio_path(params)
-        gen = pipeline.inference_instruct2(text, instruct_text, _load_audio(ref_audio), stream=False, speed=speed)
-    else:  # zero_shot
+    elif mode == "zero_shot":
         ref_audio = _reference_audio_path(params)
         prompt_text = str(params.get("prompt_text") or "")
         gen = pipeline.inference_zero_shot(text, prompt_text, _load_audio(ref_audio), stream=False, speed=speed)
+    else:
+        raise RuntimeError(f"unsupported CosyVoice-300M mode reached inference: {mode}")
     sample_rate = int(getattr(pipeline, "sample_rate", 22050) or 22050)
     return [_chunk_to_wav(chunk, sample_rate=sample_rate) for chunk in gen]
+
+
+def _resolve_mode(raw_mode: str) -> str:
+    mode = _MODE_MAP.get(raw_mode)
+    if mode is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"CosyVoice-300M does not support mode '{raw_mode}'; "
+                "supported modes: zero_shot, cross_lingual"
+            ),
+        )
+    return mode
 
 
 def _reference_audio_path(params: dict[str, Any]) -> str:
@@ -274,7 +280,7 @@ def _wav_format_and_data(payload: bytes) -> tuple[bytes, bytes]:
     data: bytes | None = None
     offset = 12
     while offset + 8 <= len(payload):
-        chunk_id = payload[offset : offset + 4]
+        chunk_id = payload[offset:offset + 4]
         chunk_size = struct.unpack_from("<I", payload, offset + 4)[0]
         start = offset + 8
         end = start + chunk_size

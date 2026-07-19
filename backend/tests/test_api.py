@@ -1,11 +1,14 @@
 import json
 from pathlib import Path
+import subprocess
 import time
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+import app.main as main_module
 from app.models import Character, ScriptLine
-from app.main import _layer_service_status, create_app
+from app.main import _layer_service_status, _portable_controller_root, _resolve_repo_lock_path, create_app
 from app.parser import ParsedScriptDraft, ParserProviderUnavailable, ParserQualityError
 
 
@@ -504,6 +507,30 @@ def test_layered_status_does_not_mark_stopped_managed_service_ready() -> None:
     assert status["state"] == "partial"
     assert status["severity"] == "attention"
     assert status["supervisor_state"] == "stopped"
+
+
+def test_layered_status_uses_live_health_for_portable_runtime_with_untrusted_pid_record() -> None:
+    status = _layer_service_status(
+        {
+            "service_id": "portable-gpt",
+            "enabled": True,
+            "ready": True,
+            "network_scope": "localhost",
+            "control_kind": "portable-package",
+            "health": {
+                "ready": True,
+                "port_reachable": True,
+                "config_ok": True,
+                "required_api_ok": True,
+            },
+        },
+        {"manageable": True, "running": None},
+    )
+
+    assert status["ready"] is True
+    assert status["state"] == "ready"
+    assert status["supervisor_state"] == "running"
+    assert status["can_start"] is False
 
 
 def test_generation_preflight_offers_local_fallback_when_primary_is_unavailable(tmp_path: Path, monkeypatch) -> None:
@@ -1530,6 +1557,70 @@ def test_startup_checks_include_hardware_and_service_diagnostics(tmp_path: Path)
     assert "hardware" in payload
     assert "services" in payload
     assert payload["service_mode"] in {"mock", "real"}
+
+
+def test_status_endpoints_never_launch_nvidia_smi(tmp_path: Path, monkeypatch) -> None:
+    from app import hardware
+
+    powershell = tmp_path / "powershell.exe"
+    powershell.touch()
+    commands: list[list[str]] = []
+
+    def guarded_run(command, **_kwargs):
+        commands.append(command)
+        executable = Path(str(command[0])).name.casefold()
+        if executable in {"nvidia-smi", "nvidia-smi.exe"}:
+            raise AssertionError("status endpoints must not launch nvidia-smi")
+        return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(hardware, "sys", SimpleNamespace(platform="win32"), raising=False)
+    monkeypatch.setattr(hardware, "_video_controllers_cache_path", lambda: tmp_path / "missing.json", raising=False)
+    monkeypatch.setattr(hardware, "_fixed_windows_powershell_path", lambda: powershell, raising=False)
+    monkeypatch.setattr(hardware, "shutil", SimpleNamespace(which=lambda _name: "nvidia-smi.exe"), raising=False)
+    monkeypatch.setattr(hardware.subprocess, "run", guarded_run)
+    client = TestClient(create_app(data_root=tmp_path))
+
+    assert client.get("/api/services/status").status_code == 200
+    assert client.get("/api/startup/checks").status_code == 200
+    assert all(Path(str(command[0])).name.casefold() not in {"nvidia-smi", "nvidia-smi.exe"} for command in commands)
+
+
+def test_staged_controller_status_reads_hardware_cache_from_package_root(tmp_path: Path, monkeypatch) -> None:
+    from app import hardware
+
+    package_root = tmp_path / "portable package"
+    packaged_main = package_root / "app" / "backend" / "app" / "main.py"
+    packaged_main.parent.mkdir(parents=True)
+    packaged_main.touch()
+    (package_root / "package").mkdir()
+    (package_root / "package" / "tts-more-package.json").write_text("{}\n", encoding="utf-8")
+    (package_root / "scripts").mkdir()
+    (package_root / "scripts" / "select-portable-folder.ps1").touch()
+    cache = package_root / "data" / "cache" / "portable" / "video-controllers.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_text(
+        json.dumps([{"name": "NVIDIA staged GPU", "driver_version": "32.0.15.9186"}]),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main_module, "__file__", str(packaged_main))
+    original_run = subprocess.run
+
+    def reject_gpu_probe(command, **kwargs):
+        executable = Path(str(command[0])).name.casefold()
+        if executable in {"nvidia-smi", "nvidia-smi.exe", "powershell.exe", "pwsh.exe"}:
+            raise AssertionError("staged controller status must use the package-root cache")
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(hardware.subprocess, "run", reject_gpu_probe)
+    client = TestClient(create_app(data_root=tmp_path / "test-data"))
+
+    for endpoint in ("/api/services/status", "/api/startup/checks"):
+        response = client.get(endpoint)
+        assert response.status_code == 200
+        gpu = response.json()["hardware"]["gpu"]
+        assert gpu["source"] == "portable-cache"
+        assert gpu["devices"][0]["name"] == "NVIDIA staged GPU"
 
 
 def test_generate_routes_task_to_service_endpoint(tmp_path: Path) -> None:
@@ -3088,3 +3179,91 @@ def test_generate_rejects_unmatched_project_character_without_binding(tmp_path: 
 
     assert response.status_code == 400
     assert "needs a voice binding" in response.json()["detail"]
+
+
+def test_portable_controller_root_does_not_accept_an_environment_script_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source_root = tmp_path / "trusted source"
+    source_root.mkdir()
+    attacker = tmp_path / "attacker controlled"
+    attacker.mkdir()
+    monkeypatch.setenv("TTS_MORE_PACKAGE_ROOT", str(attacker))
+    monkeypatch.chdir(tmp_path)
+
+    resolved = _portable_controller_root(Path("data"), source_root)
+
+    assert resolved == source_root
+
+
+def test_portable_controller_root_is_derived_from_packaged_module_layout(tmp_path: Path) -> None:
+    package = tmp_path / "TTS More package"
+    packaged_app = package / "app"
+    (package / "package").mkdir(parents=True)
+    (package / "package/tts-more-package.json").write_text("{}", encoding="utf-8")
+    (package / "scripts").mkdir()
+    (package / "scripts/select-portable-folder.ps1").write_text("# fixed", encoding="utf-8")
+    packaged_app.mkdir()
+
+    resolved = _portable_controller_root(Path("data"), packaged_app)
+
+    assert resolved == package
+
+
+def test_repo_lock_path_resolves_checkout_and_staged_controller_layouts(tmp_path: Path) -> None:
+    checkout_main = tmp_path / "checkout" / "backend" / "app" / "main.py"
+    checkout_main.parent.mkdir(parents=True)
+    checkout_lock = tmp_path / "checkout" / "repo.lock.json"
+    checkout_lock.write_text("{}\n", encoding="utf-8")
+    staged_main = tmp_path / "package" / "app" / "backend" / "app" / "main.py"
+    staged_main.parent.mkdir(parents=True)
+    staged_lock = tmp_path / "package" / "package" / "repo.lock.json"
+    staged_lock.parent.mkdir(parents=True)
+    staged_lock.write_text("{}\n", encoding="utf-8")
+    (staged_lock.parent / "tts-more-package.json").write_text("{}\n", encoding="utf-8")
+
+    assert _resolve_repo_lock_path(checkout_main) == checkout_lock
+    assert _resolve_repo_lock_path(staged_main) == staged_lock
+
+
+def test_staged_controller_discovers_sibling_packages_from_package_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    package = tmp_path / "TTS More package"
+    packaged_main = package / "app" / "backend" / "app" / "main.py"
+    packaged_main.parent.mkdir(parents=True)
+    (package / "package").mkdir(parents=True)
+    (package / "package" / "tts-more-package.json").write_text("{}\n", encoding="utf-8")
+    (package / "scripts").mkdir()
+    (package / "scripts" / "select-portable-folder.ps1").write_text("# fixed\n", encoding="utf-8")
+    observed: list[Path] = []
+
+    def fake_discover(base_root: Path, _roots: list[Path], *, include_siblings: bool):
+        assert include_siblings is True
+        observed.append(base_root)
+        return []
+
+    monkeypatch.setattr(main_module, "__file__", str(packaged_main))
+    monkeypatch.setattr(main_module, "discover_portable_packages", fake_discover)
+    client = TestClient(main_module.create_app(data_root=package / "data"))
+
+    response = client.post(
+        "/api/portable-packages/discover",
+        json={"roots": [], "include_siblings": True},
+    )
+
+    assert response.status_code == 200
+    assert observed == [package]
+
+
+def test_create_app_wires_one_portable_controller_root_to_both_resolution_layers(tmp_path: Path) -> None:
+    controller_root = tmp_path / "moved suite"
+    controller_root.mkdir()
+
+    app = create_app(
+        data_root=tmp_path / "data",
+        controller_root=controller_root,
+    )
+
+    assert app.state.local_control_root == controller_root.resolve()
+    assert app.state.supervisor.portable_controller_root == controller_root.resolve()

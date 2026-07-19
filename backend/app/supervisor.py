@@ -4,11 +4,21 @@ import json
 import os
 import signal
 import subprocess
+import threading
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
-from app.models import TTSServiceEndpoint
+from app.models import PortableComponent, TTSServiceEndpoint
+from app.portable_control import (
+    PortableControlError,
+    PortablePackageController,
+    windows_creation_flags,
+)
+from app.portable_endpoint_trust import trust_resolved_portable_endpoint
+from app.portable_services import resolve_locator
 
 
 def _is_windows() -> bool:
@@ -16,23 +26,6 @@ def _is_windows() -> bool:
     mutating the global ``os`` module (which would corrupt ``pathlib.Path``
     on non-Windows hosts)."""
     return os.name == "nt"
-
-
-def windows_creation_flags() -> int:
-    """Return Windows subprocess creation flags, or 0 on non-Windows / missing constants.
-
-    Uses ``hasattr`` guards so importing this module never references Windows-only
-    ``subprocess`` attributes on POSIX. Composed of ``CREATE_NEW_PROCESS_GROUP``
-    (0x00000200) and ``CREATE_NO_WINDOW`` (0x08000000) when available.
-    """
-    if not _is_windows():
-        return 0
-    flags = 0
-    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-        flags |= subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    if hasattr(subprocess, "CREATE_NO_WINDOW"):
-        flags |= subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-    return flags
 
 
 # Bare executable names that may be invoked as start_command[0] without being
@@ -58,13 +51,39 @@ def _allowed_executables() -> set[str]:
 
 
 class ServiceSupervisor:
-    def __init__(self, project_root: Path, runtime_root: Path) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        runtime_root: Path,
+        *,
+        portable_controller_root: Path | None = None,
+        portable_controller: PortablePackageController | None = None,
+        portable_resolver=None,
+    ) -> None:
         self.project_root = project_root.resolve()
+        self.portable_controller_root = (portable_controller_root or project_root).resolve()
         self.runtime_root = runtime_root
         self.records_dir = runtime_root / "services"
         self.logs_dir = runtime_root / "logs"
+        self._portable_controller = portable_controller or PortablePackageController()
+        self._portable_resolver = portable_resolver or resolve_locator
+        self._portable_locks_guard = threading.Lock()
+        self._portable_locks: dict[str, threading.RLock] = {}
+        self._portable_service_identities: dict[str, tuple[str, str]] = {}
+        self._portable_start_invalidator: Callable[[PortableComponent], None] | None = None
 
-    def status(self, endpoint: TTSServiceEndpoint) -> dict[str, Any]:
+    def status(
+        self,
+        endpoint: TTSServiceEndpoint,
+        *,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        if endpoint.control_kind == "portable-package":
+            return self._portable_action(
+                endpoint,
+                "status",
+                operation_id=operation_id,
+            )
         record = self._read_record(endpoint.service_id)
         return {
             "service_id": endpoint.service_id,
@@ -73,7 +92,18 @@ class ServiceSupervisor:
             "running": self._is_pid_running(record.get("pid")) if record else False,
         }
 
-    def start(self, endpoint: TTSServiceEndpoint) -> dict[str, Any]:
+    def start(
+        self,
+        endpoint: TTSServiceEndpoint,
+        *,
+        operation_id: str | None = None,
+    ) -> dict[str, Any]:
+        if endpoint.control_kind == "portable-package":
+            return self._portable_action(
+                endpoint,
+                "start",
+                operation_id=operation_id or str(uuid.uuid4()),
+            )
         if endpoint.mode != "local" or not endpoint.managed:
             return {"status": "not manageable", "reason": f"{endpoint.service_id} is {endpoint.mode}"}
         if not endpoint.start_command:
@@ -117,7 +147,20 @@ class ServiceSupervisor:
         self._record_path(endpoint.service_id).write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
         return {"status": "started", **record}
 
-    def stop(self, service_id: str) -> dict[str, Any]:
+    def stop(
+        self,
+        service_id: str | TTSServiceEndpoint,
+        *,
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(service_id, TTSServiceEndpoint):
+            if service_id.control_kind == "portable-package":
+                return self._portable_action(
+                    service_id,
+                    "stop",
+                    action_id=action_id or str(uuid.uuid4()),
+                )
+            service_id = service_id.service_id
         record = self._read_record(service_id)
         if not record:
             return {"status": "not running", "service_id": service_id}
@@ -133,7 +176,29 @@ class ServiceSupervisor:
         self._record_path(service_id).unlink(missing_ok=True)
         return {"status": "stopped", "service_id": service_id, "pid": pid}
 
-    def logs(self, service_id: str, lines: int = 120) -> dict[str, Any]:
+    def logs(
+        self,
+        service_id: str | TTSServiceEndpoint,
+        lines: int = 120,
+        *,
+        operation_id: str | None = None,
+        after_seq: int = 0,
+    ) -> dict[str, Any]:
+        if isinstance(service_id, TTSServiceEndpoint):
+            if service_id.control_kind == "portable-package":
+                if operation_id is None:
+                    return {
+                        "status": "not manageable",
+                        "reason": "portable operation_id is required for logs",
+                    }
+                return self._portable_action(
+                    service_id,
+                    "logs",
+                    operation_id=operation_id,
+                    after_seq=after_seq,
+                    limit=lines,
+                )
+            service_id = service_id.service_id
         record = self._read_record(service_id)
         if not record:
             return {"status": "missing", "service_id": service_id, "lines": []}
@@ -142,6 +207,185 @@ class ServiceSupervisor:
             return {"status": "missing log", "service_id": service_id, "lines": []}
         content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         return {"status": "ok", "service_id": service_id, "log_path": str(log_path), "lines": content[-max(1, lines):]}
+
+    def repair(
+        self,
+        endpoint: TTSServiceEndpoint,
+        *,
+        proxy_url: str | None = None,
+        action_id: str | None = None,
+    ) -> dict[str, Any]:
+        if endpoint.control_kind != "portable-package":
+            return {"status": "not manageable", "reason": "repair is only available for portable packages"}
+        return self._portable_action(
+            endpoint,
+            "repair",
+            proxy_url=proxy_url,
+            action_id=action_id or str(uuid.uuid4()),
+        )
+
+    def action_status(
+        self,
+        endpoint: TTSServiceEndpoint,
+        *,
+        action_id: str,
+    ) -> dict[str, Any]:
+        if endpoint.control_kind != "portable-package":
+            return {"status": "not manageable", "reason": "action status is only available for portable packages"}
+        return self._portable_action(endpoint, "action_status", action_id=action_id)
+
+    def open_folder(self, endpoint: TTSServiceEndpoint) -> dict[str, Any]:
+        if endpoint.control_kind != "portable-package":
+            return {"status": "not manageable", "reason": "folder access is only available for portable packages"}
+        return self._portable_action(endpoint, "open_folder")
+
+    @contextmanager
+    def portable_lifecycle_guard(self, component: PortableComponent) -> Iterator[None]:
+        """Serialize all lifecycle and import work for one worker component."""
+
+        if component not in {"gpt-sovits", "indextts", "cosyvoice"}:
+            raise PortableControlError(
+                "PORTABLE_NOT_MANAGEABLE", "portable component is not manageable"
+            )
+        with self._portable_lock(component):
+            yield
+
+    def set_portable_start_invalidator(
+        self, invalidator: Callable[[PortableComponent], None]
+    ) -> None:
+        if not callable(invalidator):
+            raise TypeError("portable start invalidator must be callable")
+        with self._portable_locks_guard:
+            self._portable_start_invalidator = invalidator
+
+    def require_portable_stopped(self, endpoint: TTSServiceEndpoint):
+        """Freshly resolve a trusted endpoint and prove its PID record is absent."""
+
+        locator = endpoint.portable_locator
+        if (
+            locator is None
+            or not endpoint.managed
+            or endpoint.mode != "local"
+            or endpoint.network_scope != "localhost"
+            or endpoint.api_contract != "tts-more-v1"
+            or endpoint.control_kind != "portable-package"
+        ):
+            raise PortableControlError(
+                "PORTABLE_NOT_MANAGEABLE", "portable endpoint is not locally manageable"
+            )
+        identity = (locator.component, locator.package_id)
+        with self.portable_lifecycle_guard(locator.component):
+            descriptor = self._portable_resolver(self.portable_controller_root, locator, [])
+            if (
+                descriptor is None
+                or not descriptor.manageable
+                or descriptor.component != locator.component
+                or descriptor.package_id != locator.package_id
+            ):
+                raise PortableControlError(
+                    "PORTABLE_NOT_MANAGEABLE", "portable package could not be freshly resolved"
+                )
+            trusted = trust_resolved_portable_endpoint(endpoint, descriptor)
+            if not trusted.managed or not self._bind_portable_service_identity(
+                endpoint.service_id, identity
+            ):
+                raise PortableControlError(
+                    "PORTABLE_NOT_MANAGEABLE", "portable endpoint identity is unavailable"
+                )
+            self._portable_controller.require_stopped(descriptor)
+            return descriptor
+
+    def _portable_action(
+        self,
+        endpoint: TTSServiceEndpoint,
+        action: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        locator = endpoint.portable_locator
+        if (
+            locator is None
+            or not endpoint.managed
+            or endpoint.mode != "local"
+            or endpoint.network_scope != "localhost"
+            or endpoint.api_contract != "tts-more-v1"
+        ):
+            return {
+                "status": "not manageable",
+                "manageable": False,
+                "reason": "portable endpoint is not trusted local tts-more-v1",
+            }
+        identity = (locator.component, locator.package_id)
+        lock = self._portable_lock(locator.component)
+        with lock:
+            try:
+                descriptor = self._portable_resolver(self.portable_controller_root, locator, [])
+                if (
+                    descriptor is None
+                    or not descriptor.manageable
+                    or descriptor.component != locator.component
+                    or descriptor.package_id != locator.package_id
+                ):
+                    return {
+                        "status": "not manageable",
+                        "manageable": False,
+                        "reason": "portable package could not be freshly resolved",
+                    }
+                trusted = trust_resolved_portable_endpoint(endpoint, descriptor)
+                if not trusted.managed:
+                    return {
+                        "status": "not manageable",
+                        "manageable": False,
+                        "reason": "portable endpoint trust validation failed",
+                    }
+                if not self._bind_portable_service_identity(endpoint.service_id, identity):
+                    return {
+                        "status": "not manageable",
+                        "manageable": False,
+                        "reason": "portable service identity changed during this supervisor lifetime",
+                    }
+                method = getattr(self._portable_controller, action)
+                if action == "start":
+                    kwargs["port_override"] = locator.port_override
+                result = method(descriptor, **kwargs)
+                if (
+                    action == "start"
+                    and result.get("status") not in {"blocked", "not manageable"}
+                    and not result.get("error_code")
+                ):
+                    with self._portable_locks_guard:
+                        invalidator = self._portable_start_invalidator
+                    if invalidator is not None:
+                        invalidator(locator.component)
+                if action == "status":
+                    result.setdefault("manageable", True)
+                return result
+            except PortableControlError as exc:
+                return {
+                    "status": "blocked",
+                    "manageable": False,
+                    "error_code": exc.code,
+                    "reason": str(exc),
+                }
+            except (OSError, ValueError) as exc:
+                return {
+                    "status": "not manageable",
+                    "manageable": False,
+                    "reason": f"portable package validation failed: {type(exc).__name__}",
+                }
+
+    def _portable_lock(self, component: str) -> threading.RLock:
+        with self._portable_locks_guard:
+            return self._portable_locks.setdefault(component, threading.RLock())
+
+    def _bind_portable_service_identity(
+        self, service_id: str, identity: tuple[str, str]
+    ) -> bool:
+        with self._portable_locks_guard:
+            existing = self._portable_service_identities.get(service_id)
+            if existing is not None and existing != identity:
+                return False
+            self._portable_service_identities[service_id] = identity
+            return True
 
     def _manageable(self, endpoint: TTSServiceEndpoint) -> bool:
         return endpoint.mode == "local" and endpoint.managed and bool(endpoint.start_command)

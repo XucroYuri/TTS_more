@@ -11,13 +11,20 @@ from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 import httpx
 
 from app.adapters.base import SynthesisRequest, SynthesisResult
 from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
 from app.net_guard import scrub_error
+from app.portable_endpoint_trust import (
+    preflight_service_endpoints,
+    require_unique_service_identities,
+    sanitize_portable_endpoint,
+)
+from app.portable_locator_mutations import require_managed_portable_locators_unchanged
+from app.service_store_io import ServiceDocument, read_service_document, update_service_document
 
 
 class TTSServiceClient(Protocol):
@@ -46,24 +53,151 @@ class ServiceRoute:
     binding: VoiceBinding | None = None
 
 
+def _require_unique_service_ids(services: list[TTSServiceEndpoint]) -> None:
+    require_unique_service_identities(services)
+
+
+def _merge_service_delta(
+    current: list[TTSServiceEndpoint],
+    baseline: list[TTSServiceEndpoint] | None,
+    desired: list[TTSServiceEndpoint],
+    *,
+    restore_missing_baseline: bool = False,
+) -> list[TTSServiceEndpoint]:
+    if baseline is None:
+        return preflight_service_endpoints(desired)
+    current_by_id = {service.service_id: service for service in current}
+    baseline_by_id = {
+        service.service_id: sanitize_portable_endpoint(service) for service in baseline
+    }
+    desired_by_id = {
+        service.service_id: sanitize_portable_endpoint(service) for service in desired
+    }
+    for service_id in baseline_by_id.keys() - desired_by_id.keys():
+        current_by_id.pop(service_id, None)
+    for service_id, service in desired_by_id.items():
+        previous = baseline_by_id.get(service_id)
+        if (
+            restore_missing_baseline
+            or previous is None
+            or service.model_dump(mode="json") != previous.model_dump(mode="json")
+        ):
+            current_by_id[service_id] = service
+    merged = sorted(current_by_id.values(), key=lambda item: item.service_id)
+    return preflight_service_endpoints(merged)
+
+
 class ServiceRegistry:
-    def __init__(self, services: list[TTSServiceEndpoint]) -> None:
+    def __init__(
+        self,
+        services: list[TTSServiceEndpoint],
+        *,
+        store_schema_version: int | None = None,
+        _baseline: list[TTSServiceEndpoint] | None = None,
+        _baseline_was_missing: bool = False,
+    ) -> None:
+        _require_unique_service_ids(services)
         self.services = services
         self._by_id = {service.service_id: service for service in services}
+        self.store_schema_version = store_schema_version
+        self._baseline = _baseline
+        self._baseline_was_missing = _baseline_was_missing
 
     @classmethod
     def load(cls, path: Path) -> "ServiceRegistry":
         if not path.exists():
-            return cls.default_local(repo_root=Path("repo"))
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        return cls([TTSServiceEndpoint.model_validate(item) for item in raw])
-
-    def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps([service.model_dump(mode="json") for service in self.services], ensure_ascii=False, indent=2),
-            encoding="utf-8",
+            registry = cls.default_local(repo_root=Path("repo"))
+            registry._baseline = list(registry.services)
+            registry._baseline_was_missing = True
+            return registry
+        document = read_service_document(path)
+        endpoints = [TTSServiceEndpoint.model_validate(item) for item in document.services]
+        _require_unique_service_ids(endpoints)
+        sanitized = [sanitize_portable_endpoint(endpoint) for endpoint in endpoints]
+        return cls(
+            sanitized,
+            store_schema_version=document.schema_version,
+            _baseline=sanitized,
         )
+
+    def with_services(self, services: list[TTSServiceEndpoint]) -> "ServiceRegistry":
+        baseline = self._baseline
+        if baseline is None:
+            baseline = list(self.services)
+        return ServiceRegistry(
+            services,
+            store_schema_version=self.store_schema_version,
+            _baseline=baseline,
+            _baseline_was_missing=self._baseline_was_missing,
+        )
+
+    def save(
+        self,
+        path: Path,
+        *,
+        publish: Callable[["ServiceRegistry"], None] | None = None,
+    ) -> None:
+        desired = [sanitize_portable_endpoint(service) for service in self.services]
+        _require_unique_service_ids(desired)
+
+        def merge(current: ServiceDocument) -> ServiceDocument:
+            current_endpoints = [TTSServiceEndpoint.model_validate(item) for item in current.services]
+            _require_unique_service_ids(current_endpoints)
+            merged = _merge_service_delta(
+                current_endpoints,
+                self._baseline,
+                desired,
+                restore_missing_baseline=self._baseline_was_missing,
+            )
+            require_managed_portable_locators_unchanged(current_endpoints, merged)
+            # A publishing save must also agree with the registry that is live in
+            # the app. Non-publishing saves may legitimately merge a portable
+            # locator concurrently added by PortableServiceStore in another
+            # process; the disk-current comparison above still prevents them
+            # from changing that locator themselves.
+            if publish is not None and self._baseline is not None:
+                require_managed_portable_locators_unchanged(
+                    self._baseline,
+                    merged,
+                )
+            schema_version = self.store_schema_version
+            if schema_version is None:
+                schema_version = current.schema_version
+            return ServiceDocument(
+                schema_version,
+                [service.model_dump(mode="json") for service in merged],
+            )
+
+        def publish_written(document: ServiceDocument) -> None:
+            if publish is None:
+                return
+            published = [
+                sanitize_portable_endpoint(TTSServiceEndpoint.model_validate(item))
+                for item in document.services
+            ]
+            publish(
+                ServiceRegistry(
+                    published,
+                    store_schema_version=document.schema_version,
+                    _baseline=published,
+                )
+            )
+
+        updated = update_service_document(
+            path,
+            merge,
+            default_schema_version=self.store_schema_version,
+            after_write=publish_written if publish is not None else None,
+        )
+        merged = [
+            sanitize_portable_endpoint(TTSServiceEndpoint.model_validate(item))
+            for item in updated.services
+        ]
+        require_unique_service_identities(merged)
+        self.services = merged
+        self._by_id = {service.service_id: service for service in merged}
+        self._baseline = list(merged)
+        self._baseline_was_missing = False
 
     @classmethod
     def default_local(cls, repo_root: Path) -> "ServiceRegistry":

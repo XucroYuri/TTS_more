@@ -7883,3 +7883,341 @@ h3 {
   font-size: 13px;
 }
 .token-gate-actions button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
+.local-portable-services-panel {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--border, #d8dee8);
+  border-radius: 16px;
+  background: var(--panel, #fff);
+}
+
+.local-portable-services-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.local-portable-services-head h2,
+.local-portable-card h3,
+.portable-event-log h4 {
+  margin: 0;
+}
+
+.local-portable-services-head p,
+.local-portable-card-head p {
+  margin: 4px 0 0;
+  color: var(--text-muted, #667085);
+}
+
+.portable-panel-live {
+  min-height: 1.25rem;
+  color: var(--text-muted, #667085);
+  font-size: 0.85rem;
+}
+
+.local-portable-services-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+
+.local-portable-card {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border, #d8dee8);
+  border-radius: 14px;
+  background: var(--surface, #f8fafc);
+  box-shadow: inset 3px 0 0 #98a2b3;
+}
+
+.local-portable-card.phase-ready { box-shadow: inset 3px 0 0 #15803d; }
+.local-portable-card.phase-blocked,
+.local-portable-card.phase-repairable { box-shadow: inset 3px 0 0 #b45309; }
+.local-portable-card.phase-checking,
+.local-portable-card.phase-downloading,
+.local-portable-card.phase-installing,
+.local-portable-card.phase-validating,
+.local-portable-card.phase-starting { box-shadow: inset 3px 0 0 #2563eb; }
+
+.local-portable-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.portable-status-badge {
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  color: #475467;
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+
+.portable-status-badge[data-phase="ready"] { color: #15803d; }
+.portable-status-badge[data-phase="blocked"],
+.portable-status-badge[data-phase="repairable"] { color: #b45309; }
+.portable-status-badge[data-phase="checking"],
+.portable-status-badge[data-phase="downloading"],
+.portable-status-badge[data-phase="installing"],
+.portable-status-badge[data-phase="validating"],
+.portable-status-badge[data-phase="starting"] { color: #1d4ed8; }
+
+.portable-service-facts,
+.portable-technical-details dl {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  min-width: 0;
+}
+
+.portable-service-facts div,
+.portable-technical-details dl div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+}
+
+.portable-service-facts dt,
+.portable-technical-details dt {
+  color: var(--text-muted, #667085);
+  font-size: 0.78rem;
+}
+
+.portable-service-facts dd,
+.portable-technical-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 0.78rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.portable-disabled-reason,
+.portable-busy-reason,
+.portable-error,
+.portable-proxy-guidance,
+.portable-next-action {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: #f2f4f7;
+  color: #475467;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.portable-error { background: #fff1f0; color: #b42318; }
+.portable-proxy-guidance {
+  display: grid;
+  gap: 6px;
+  background: #fffaeb;
+  color: #93370d;
+}
+
+.portable-proxy-guidance p { margin: 0; }
+
+.portable-proxy-guidance input {
+  min-width: 0;
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 9px;
+  border: 1px solid #f79009;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text, #101828);
+}
+
+.portable-progress-wrap {
+  display: grid;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--text-muted, #667085);
+}
+
+.portable-progress-wrap progress { width: 100%; }
+
+.portable-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.portable-card-actions button,
+.portable-card-actions a,
+.local-portable-services-head button {
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid var(--border, #d0d5dd);
+  border-radius: 9px;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+  font-size: 0.78rem;
+  line-height: 1.3;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.portable-card-actions button:focus-visible,
+.portable-card-actions a:focus-visible,
+.local-portable-services-head button:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.35);
+  outline-offset: 2px;
+}
+
+.portable-card-actions button:disabled,
+.local-portable-services-head button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.portable-technical-details {
+  min-width: 0;
+  font-size: 0.78rem;
+}
+
+.portable-technical-details summary { cursor: pointer; }
+.portable-technical-details p { overflow-wrap: anywhere; }
+
+.portable-import-disabled,
+.portable-import-status,
+.portable-import-error,
+.portable-import-preserved {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.portable-import-disabled,
+.portable-import-status { background: #f2f4f7; color: #475467; }
+.portable-import-error { background: #fff1f0; color: #b42318; }
+.portable-import-success { background: #ecfdf3; color: #027a48; }
+.portable-import-preserved { background: #fffaeb; color: #7a2e0e; }
+
+.portable-import-confirmation,
+.portable-import-result {
+  display: grid;
+  min-width: 0;
+  gap: 9px;
+}
+
+.portable-import-confirmation {
+  padding: 10px;
+  border: 1px solid rgba(37, 99, 235, 0.22);
+  border-radius: 10px;
+  background: rgba(239, 246, 255, 0.45);
+}
+
+.portable-import-ready {
+  margin: 0;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.portable-import-ready:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.35);
+  outline-offset: 2px;
+}
+
+.portable-import-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.portable-import-summary div,
+.portable-import-summary dt { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+
+.portable-import-assets { min-width: 0; font-size: 0.78rem; }
+.portable-import-assets summary { cursor: pointer; }
+.portable-import-assets ul { display: grid; gap: 3px; margin: 6px 0 0; padding-left: 20px; }
+.portable-import-assets li { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+
+.portable-import-confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.portable-import-confirm-actions button,
+.portable-import-result button {
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid var(--border, #d0d5dd);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  color: inherit;
+  cursor: pointer;
+}
+
+.portable-import-confirm-actions button.primary { border-color: #2563eb; background: #2563eb; color: #fff; }
+.portable-import-confirm-actions button:focus-visible,
+.portable-import-result button:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.35);
+  outline-offset: 2px;
+}
+.portable-import-result button:disabled { cursor: not-allowed; opacity: 0.5; }
+
+.portable-event-log {
+  min-width: 0;
+  max-height: 230px;
+  padding: 10px;
+  overflow: auto;
+  border-radius: 10px;
+  background: #101828;
+  color: #f2f4f7;
+}
+
+.portable-event-log ol {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.portable-event-log li {
+  display: grid;
+  grid-template-columns: 2rem minmax(0, 1fr);
+  gap: 2px 8px;
+  min-width: 0;
+  font-size: 0.75rem;
+}
+
+.portable-event-log li p {
+  grid-column: 2;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #d0d5dd;
+}
+
+@media (max-width: 980px) {
+  .local-portable-services-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 540px) {
+  .local-portable-services-panel { padding: 12px; }
+  .local-portable-services-head { align-items: stretch; flex-direction: column; }
+  .local-portable-card-head { align-items: stretch; flex-direction: column; }
+  .portable-status-badge { align-self: flex-start; }
+  .portable-card-actions > * { flex: 1 1 calc(50% - 7px); text-align: center; }
+  .portable-import-summary { grid-template-columns: 1fr; }
+  .portable-import-confirm-actions > *,
+  .portable-import-result button { width: 100%; }
+}

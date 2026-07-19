@@ -2827,6 +2827,7 @@ def test_update_sidecar_uses_exact_portable_https_policy_without_host_paths(tmp_
     target = tmp_path / "repo" / "index-tts"
     _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
     repositories = [repo for repo in deploy.load_repo_lock(repo_root) if repo["service_id"] == "local-indextts"]
+    locked_commit = repositories[0]["commit"]
     repositories[0]["path"] = "repo/index-tts"
 
     deploy.install_update_scripts(tmp_path, repositories=repositories)
@@ -2840,7 +2841,7 @@ def test_update_sidecar_uses_exact_portable_https_policy_without_host_paths(tmp_
         "name": "index-tts",
         "remote": "https://github.com/XucroYuri/index-tts.git",
         "branch": "main",
-        "commit": "7264ce2a9a0924becb6b8da3f60725f7663de089",
+        "commit": locked_commit,
     }
 
 

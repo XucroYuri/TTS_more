@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -119,6 +119,8 @@ def configure_open_source_tts(
     registry: ServiceRegistry,
     writable_path: Path,
     project_root: Path,
+    *,
+    publish: Callable[[ServiceRegistry], None] | None = None,
 ) -> tuple[ServiceRegistry, TTSServiceEndpoint, dict[str, Any]]:
     catalog_item = _catalog_item(request.provider_type)
     api_contract = _gradio_contract(catalog_item, request.api_contract)
@@ -161,8 +163,8 @@ def configure_open_source_tts(
     services = [service for service in registry.services if service.service_id != endpoint.service_id]
     services.append(endpoint)
     services.sort(key=lambda service: (service.priority, service.service_id))
-    updated = ServiceRegistry(services)
-    updated.save(writable_path)
+    updated = registry.with_services(services)
+    updated.save(writable_path, publish=publish)
     return updated, endpoint, detect_payload
 
 

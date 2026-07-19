@@ -34,6 +34,13 @@ def _read_repo_text(relative_path: str) -> str:
     return (REPO_ROOT / relative_path).read_text(encoding="utf-8")
 
 
+def test_prepare_models_uses_cim_instead_of_nvidia_smi_for_gpu_preflight() -> None:
+    script = _read_repo_text("scripts/prepare-models.ps1")
+
+    assert "Get-CimInstance Win32_VideoController" in script
+    assert "nvidia-smi" not in script.casefold()
+
+
 def _powershell_blocks(relative_path: str) -> list[tuple[int, str]]:
     text = _read_repo_text(relative_path)
     blocks = []
@@ -309,10 +316,54 @@ def test_portable_conda_bootstrap_uses_locked_archive_and_never_requires_system_
     script = script_path.read_text(encoding="utf-8")
 
     assert "function Ensure-BuildConda" in script
-    assert "Get-FileHash" in script
+    assert "function Get-PortableFileSha256" in script
+    assert "Get-FileHash" not in script
     assert "toolchain.lock.json" in script
     assert "CONDA_PKGS_DIRS" in script
     assert "Get-Command conda" not in script
+    assert ".partial" in script
+    assert 'Range = "bytes=$resumeFrom-"' in script
+    assert "Move-Item -LiteralPath $partial -Destination $archive" in script
+
+
+def test_portable_first_run_powershell_scripts_do_not_depend_on_get_file_hash() -> None:
+    for relative in (
+        "scripts/initialize-portable.ps1",
+        "integrations/windows/Initialize.ps1",
+        "scripts/Portable-Validation.ps1",
+        "scripts/bootstrap-conda.ps1",
+        "scripts/Resolve-PortableBuildPython.ps1",
+    ):
+        script = (REPO_ROOT / relative).read_text(encoding="utf-8-sig")
+
+        assert (
+            "function Get-PortableFileSha256" in script
+            or '. $ValidationScript' in script
+        )
+        assert "Get-FileHash" not in script
+
+
+def test_portable_python_helpers_are_part_of_the_preparation_contract() -> None:
+    for relative in (
+        "scripts/portable-python.ps1",
+        "integrations/windows/portable-python.ps1",
+    ):
+        script = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        assert "Install-PortablePythonRuntime" in script
+        assert "System.IO.Compression" in script
+        assert "bootstrap-conda" not in script.casefold()
+        assert "conda create" not in script.casefold()
+
+
+def test_portable_runtime_powershell_entrypoints_are_ascii_only_for_winps51() -> None:
+    for relative in (
+        "scripts/Invoke-PortableStart.ps1",
+        "scripts/Show-PortableProgress.ps1",
+    ):
+        script = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        non_ascii = sorted({character for character in script if ord(character) > 127})
+
+        assert non_ascii == []
 
 
 def test_portable_conda_bootstrap_can_return_its_private_conda_path_to_a_builder() -> None:
@@ -320,6 +371,56 @@ def test_portable_conda_bootstrap_can_return_its_private_conda_path_to_a_builder
 
     assert "[switch]$PassThru" in script
     assert "Write-Output $privateConda" in script
+
+
+def test_root_windows_launchers_separate_production_and_development_modes() -> None:
+    start = (REPO_ROOT / "Start.cmd").read_text(encoding="utf-8")
+    start_dev = (REPO_ROOT / "Start-Dev.cmd").read_text(encoding="utf-8")
+    stop = (REPO_ROOT / "Stop.cmd").read_text(encoding="utf-8")
+    production = (REPO_ROOT / "scripts" / "start-production.ps1").read_text(encoding="utf-8")
+
+    assert "Invoke-PortableStart.ps1" in start
+    assert "start-production.ps1" not in start
+    assert "start-dev.ps1" in start_dev
+    assert "stop-production.ps1" in stop
+    assert "TTS_MORE_STATIC_ROOT" in production
+    assert "portable_launcher.py" in production
+    assert "Get-NetTCPConnection" in production
+    assert "OwningProcess" in production
+    assert "--reload" not in production
+    assert "pnpm" not in production.lower()
+    assert "vite" not in production.lower()
+    assert "taskkill" not in production.lower()
+
+
+def test_root_windows_portable_lifecycle_is_complete_and_lock_driven() -> None:
+    for filename in ("Initialize.cmd", "Start.cmd", "Stop.cmd", "Repair.cmd", "Build-Package.ps1"):
+        assert (REPO_ROOT / filename).is_file(), f"missing root lifecycle entry: {filename}"
+    initialize = (REPO_ROOT / "scripts" / "initialize-portable.ps1").read_text(encoding="utf-8")
+    repair = (REPO_ROOT / "scripts" / "repair-portable.ps1").read_text(encoding="utf-8")
+    builder = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+    toolchain = json.loads((REPO_ROOT / "packaging" / "portable" / "toolchain.lock.json").read_text(encoding="utf-8"))
+
+    assert "portable-python.ps1" in initialize
+    assert "bootstrap-conda.ps1" not in initialize
+    assert "portable_install.py" in initialize
+    assert "uv lock --check" in initialize
+    assert "runtime\\staging" in initialize
+    assert "runtime\\live" in initialize
+    assert "install-state.json" in initialize
+    assert "-Repair" in repair
+    assert "Bootstrap" in builder and "Full" in builder
+    assert "CU128" in builder and "CU126" in builder and "CPU" in builder and "Auto" in builder
+    assert toolchain["uv"]["version"]
+    assert len(toolchain["uv"]["sha256"]) == 64
+
+
+def test_tts_more_backend_portable_runtime_is_python_311_only() -> None:
+    pyproject = (REPO_ROOT / "backend" / "pyproject.toml").read_text(encoding="utf-8")
+    python_version = (REPO_ROOT / "backend" / ".python-version").read_text(encoding="utf-8").strip()
+
+    assert 'requires-python = ">=3.11,<3.12"' in pyproject
+    assert python_version == "3.11"
 
 
 def test_windows_prepare_provisions_shared_ffmpeg_and_verifies_gpt_worker_runtime() -> None:
