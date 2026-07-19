@@ -106,7 +106,8 @@ function Add-Evidence {
 }
 
 function Finalize-WorkerInitializationEvidence {
-    foreach ($component in @("gpt-sovits", "indextts", "cosyvoice")) {
+    param([Parameter(Mandatory = $true)][string[]]$Components)
+    foreach ($component in @($Components | Where-Object { $_ -ne "tts-more" })) {
         if (!$script:WorkerLifecycleSucceeded.ContainsKey($component)) {
             Throw-HarnessError "WORKER_ACCEPTANCE_INCOMPLETE" "worker lifecycle acceptance is incomplete"
         }
@@ -905,13 +906,14 @@ function Restart-FixtureAssetServer {
 }
 
 function Assert-FixtureNetworkEvidence {
+    param([Parameter(Mandatory = $true)][string[]]$Components)
     if (!(Test-Path -LiteralPath $ServerRequestLog -PathType Leaf)) { Throw-HarnessError "NETWORK_EVIDENCE_MISSING" "fixture request log is missing" }
     $requests = @(
         foreach ($line in [IO.File]::ReadAllLines($ServerRequestLog)) {
             if (![string]::IsNullOrWhiteSpace($line)) { $line | ConvertFrom-Json }
         }
     )
-    foreach ($component in $ExpectedComponents) {
+    foreach ($component in $Components) {
         $assetPath = "$component.bin"
         $componentRequests = @($requests | Where-Object { [string]$_.path -eq $assetPath })
         $resumed = @($componentRequests | Where-Object { [string]$_.range -eq "bytes=8-" -and [int]$_.status -eq 206 })
@@ -1446,8 +1448,8 @@ try {
     }
     Assert-RestrictedChildPath
     foreach ($package in $ExpandedPackages) { Invoke-PackageAcceptance -Package $package }
-    Assert-FixtureNetworkEvidence
-    Finalize-WorkerInitializationEvidence
+    Assert-FixtureNetworkEvidence -Components @($inputPackages.Keys)
+    Finalize-WorkerInitializationEvidence -Components @($inputPackages.Keys)
 }
 catch {
     $caught = $_

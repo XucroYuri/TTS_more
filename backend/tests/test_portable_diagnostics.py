@@ -71,6 +71,8 @@ def _directory_link(link: Path, target: Path) -> None:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if completed.returncode != 0:
             pytest.skip(f"junction creation is not available: {completed.stderr}")

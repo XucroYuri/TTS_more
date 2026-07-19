@@ -154,6 +154,25 @@ def test_harness_binds_resume_evidence_to_only_fresh_ordered_request_log_entries
     assert "[string]$_.Request.content_range -eq $expectedContentRange" in script
 
 
+def test_harness_limits_final_network_evidence_to_the_input_package_set() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+    evidence_function = script.split("function Assert-FixtureNetworkEvidence", 1)[1].split(
+        "function Assert-AssetHash", 1
+    )[0]
+
+    assert "[string[]]$Components" in evidence_function
+    assert "foreach ($component in $Components)" in evidence_function
+    assert "foreach ($component in $ExpectedComponents)" not in evidence_function
+    assert "Assert-FixtureNetworkEvidence -Components @($inputPackages.Keys)" in script
+
+    finalize_function = script.split("function Finalize-WorkerInitializationEvidence", 1)[1].split(
+        "function Invoke-Scenario", 1
+    )[0]
+    assert "[string[]]$Components" in finalize_function
+    assert "$Components | Where-Object { $_ -ne \"tts-more\" }" in finalize_function
+    assert "Finalize-WorkerInitializationEvidence -Components @($inputPackages.Keys)" in script
+
+
 def test_harness_canonicalizes_pid_executables_across_runner_junctions() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
     register = script.split("function Register-PackageOwnedProcess", 1)[1].split(
@@ -342,7 +361,7 @@ $before = @($Evidence)[0].worker_real_initialization
 $script:WorkerLifecycleSucceeded['cosyvoice'] = [pscustomobject]@{{ OperationProgressPython='3.10.11' }}
 $script:WorkerLifecycleSucceeded['gpt-sovits'] = [pscustomobject]@{{ OperationProgressPython='3.11.9' }}
 $script:WorkerLifecycleSucceeded['indextts'] = [pscustomobject]@{{ OperationProgressPython='3.11.9' }}
-Finalize-WorkerInitializationEvidence
+Finalize-WorkerInitializationEvidence -Components @('gpt-sovits', 'indextts', 'cosyvoice')
 $after = @($Evidence)[0].worker_real_initialization
 $version = @($Evidence)[0].operation_progress_python
 [pscustomobject]@{{ Before=$before; After=$after; Version=$version }} | ConvertTo-Json -Compress

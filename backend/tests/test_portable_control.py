@@ -842,7 +842,7 @@ def test_real_windows_known_failure_job_kills_powershell_descendant(tmp_path: Pa
     child_pid_file = package / "job-child.pid"
     (package / "spawn-child.ps1").write_text(
         "$child = Start-Process -FilePath \"$env:SystemRoot\\System32\\cmd.exe\" "
-        "-ArgumentList @('/d','/c','ping.exe -n 31 127.0.0.1 > nul') -PassThru\n"
+        "-ArgumentList @('/d','/c','ping.exe -n 121 127.0.0.1 > nul') -PassThru\n"
         "[System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'job-child.pid'), [string]$child.Id)\n"
         "exit 9\n",
         encoding="utf-8",
@@ -864,6 +864,13 @@ def test_real_windows_known_failure_job_kills_powershell_descendant(tmp_path: Pa
         assert failure.code == "PORTABLE_LAUNCH_EXITED"
     else:
         assert result["status"] == "stopping"
+        launch_deadline = time.monotonic() + 30
+        while not child_pid_file.is_file() and time.monotonic() < launch_deadline:
+            status = controller.action_status(descriptor, action_id=action_id)
+            if status["status"] == "blocked":
+                break
+            assert status["status"] == "stopping"
+            time.sleep(0.05)
         deadline = time.monotonic() + 30
         while True:
             status = controller.action_status(descriptor, action_id=action_id)
