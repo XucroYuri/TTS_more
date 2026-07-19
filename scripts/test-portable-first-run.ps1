@@ -946,11 +946,12 @@ function Stop-OwnedFixtureProcess {
     $actual = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
     if (!$actual) { return }
     try {
-        $actualPath = [IO.Path]::GetFullPath($actual.Path)
+        $actualPath = Resolve-FixtureCanonicalPath -Path $actual.Path
+        $ownedPath = Resolve-FixtureCanonicalPath -Path $Owned.Executable
         $actualStartedAt = $actual.StartTime.ToUniversalTime()
     }
     catch { return }
-    if (![string]::Equals($actualPath, [IO.Path]::GetFullPath($Owned.Executable), [StringComparison]::OrdinalIgnoreCase) -or $actualStartedAt -ne $Owned.StartedAt) { return }
+    if (![string]::Equals($actualPath, $ownedPath, [StringComparison]::OrdinalIgnoreCase) -or $actualStartedAt -ne $Owned.StartedAt) { return }
     if ($Owned.PSObject.Properties.Name -contains "Port" -and [int]$Owned.Port -gt 0) {
         $owners = @(Get-NetTCPConnection -State Listen -LocalPort ([int]$Owned.Port) -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
         if ($owners.Count -gt 0 -and ($owners.Count -ne 1 -or [int]$owners[0] -ne [int]$process.Id)) {
@@ -961,6 +962,15 @@ function Stop-OwnedFixtureProcess {
     if (!$process.WaitForExit(10000)) { Throw-HarnessError "OWNED_PROCESS_STUCK" "owned fixture process did not stop" }
 }
 
+function Resolve-FixtureCanonicalPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $output = @(& $FixtureBasePython -c "import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))" $Path 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1 -or ![IO.Path]::IsPathRooted([string]$output[0])) {
+        Throw-HarnessError "PATH_IDENTITY_INVALID" "fixture path could not be resolved to its stable filesystem identity"
+    }
+    return [IO.Path]::GetFullPath([string]$output[0])
+}
+
 function Register-PackageOwnedProcess {
     param([Parameter(Mandatory = $true)][object]$Package)
     $recordPath = Join-Path $Package.Root "data\local\run\worker.pid.json"
@@ -968,14 +978,15 @@ function Register-PackageOwnedProcess {
     $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
     $processId = [int]$record.pid
     $createdAt = [DateTime]::Parse([string]$record.process_created_at, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
-    $expectedExecutable = [IO.Path]::GetFullPath((Join-Path $Package.Root "runtime\live\python.exe"))
-    $recordedExecutable = [IO.Path]::GetFullPath([string]$record.executable_path)
+    $expectedExecutable = Resolve-FixtureCanonicalPath -Path (Join-Path $Package.Root "runtime\live\python.exe")
+    $recordedExecutable = Resolve-FixtureCanonicalPath -Path ([string]$record.executable_path)
     if ($processId -le 0 -or ![string]::Equals($recordedExecutable, $expectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
         Throw-HarnessError "OWNED_PROCESS_INVALID" "fixture package PID record has an invalid executable identity"
     }
     $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
     if (!$process) { return }
-    if (![string]::Equals([IO.Path]::GetFullPath($process.Path), $expectedExecutable, [StringComparison]::OrdinalIgnoreCase) -or $process.StartTime.ToUniversalTime() -ne $createdAt) {
+    $actualExecutable = Resolve-FixtureCanonicalPath -Path $process.Path
+    if (![string]::Equals($actualExecutable, $expectedExecutable, [StringComparison]::OrdinalIgnoreCase) -or $process.StartTime.ToUniversalTime() -ne $createdAt) {
         Throw-HarnessError "UNKNOWN_PROCESS_REFUSED" "fixture package PID record resolves to another process"
     }
     $key = "$processId|$($createdAt.ToString('o'))"
@@ -991,11 +1002,12 @@ function Assert-OwnedFixtureProcessesStopped {
         $actual = Get-Process -Id $owned.Process.Id -ErrorAction SilentlyContinue
         if (!$actual) { continue }
         try {
-            $actualPath = [IO.Path]::GetFullPath($actual.Path)
+            $actualPath = Resolve-FixtureCanonicalPath -Path $actual.Path
+            $ownedPath = Resolve-FixtureCanonicalPath -Path $owned.Executable
             $actualStartedAt = $actual.StartTime.ToUniversalTime()
         }
         catch { continue }
-        if ([string]::Equals($actualPath, [IO.Path]::GetFullPath($owned.Executable), [StringComparison]::OrdinalIgnoreCase) -and $actualStartedAt -eq $owned.StartedAt) {
+        if ([string]::Equals($actualPath, $ownedPath, [StringComparison]::OrdinalIgnoreCase) -and $actualStartedAt -eq $owned.StartedAt) {
             Throw-HarnessError "OWNED_PROCESS_REMAINED" "an owned fixture process survived cleanup"
         }
     }
@@ -1245,8 +1257,9 @@ function Invoke-PackageAcceptance {
         Register-PackageOwnedProcess -Package $Package
         $crashProcess = Get-Process -Id $initialPid -ErrorAction SilentlyContinue
         if (!$crashProcess) { Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "owned worker process was missing before crash injection" }
-        $expectedExecutable = [IO.Path]::GetFullPath((Join-Path $Package.Root "runtime\live\python.exe"))
-        if (![string]::Equals([IO.Path]::GetFullPath($crashProcess.Path), $expectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
+        $expectedExecutable = Resolve-FixtureCanonicalPath -Path (Join-Path $Package.Root "runtime\live\python.exe")
+        $crashExecutable = Resolve-FixtureCanonicalPath -Path $crashProcess.Path
+        if (![string]::Equals($crashExecutable, $expectedExecutable, [StringComparison]::OrdinalIgnoreCase)) {
             Throw-HarnessError "UNKNOWN_PROCESS_REFUSED" "stale PID crash injection refused a non-package process"
         }
         Stop-Process -Id $initialPid -Force
@@ -1275,14 +1288,20 @@ function Invoke-PackageAcceptance {
         if (Test-Path -LiteralPath $recordPath -PathType Leaf) { Throw-HarnessError "STALE_PID_RECORD" "Stop.cmd left a PID record" }
         Start-Sleep -Milliseconds 300
         foreach ($knownPid in $knownPids) { if (Get-Process -Id $knownPid -ErrorAction SilentlyContinue) { Throw-HarnessError "CHILD_PROCESS_REMAINED" "an owned process survived Stop.cmd" } }
-        $packagePrefix = [IO.Path]::GetFullPath($Package.Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        $lexicalPackageRoot = [IO.Path]::GetFullPath($Package.Root)
+        $packagePrefix = (Resolve-FixtureCanonicalPath -Path $Package.Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
         $descendants = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
             if ([int]$_.ParentProcessId -notin $knownPids) { return $false }
             $executable = [string]$_.ExecutablePath
             $commandLine = [string]$_.CommandLine
+            $canonicalExecutable = if (![string]::IsNullOrWhiteSpace($executable) -and (Test-Path -LiteralPath $executable -PathType Leaf)) {
+                Resolve-FixtureCanonicalPath -Path $executable
+            } else {
+                ""
+            }
             return (
-                (![string]::IsNullOrWhiteSpace($executable) -and [IO.Path]::GetFullPath($executable).StartsWith($packagePrefix, [StringComparison]::OrdinalIgnoreCase)) -or
-                (![string]::IsNullOrWhiteSpace($commandLine) -and $commandLine.IndexOf([IO.Path]::GetFullPath($Package.Root), [StringComparison]::OrdinalIgnoreCase) -ge 0)
+                (![string]::IsNullOrWhiteSpace($canonicalExecutable) -and $canonicalExecutable.StartsWith($packagePrefix, [StringComparison]::OrdinalIgnoreCase)) -or
+                (![string]::IsNullOrWhiteSpace($commandLine) -and $commandLine.IndexOf($lexicalPackageRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0)
             )
         })
         if ($descendants.Count -gt 0) { Throw-HarnessError "CHILD_PROCESS_REMAINED" "an owned child process survived Stop.cmd" }

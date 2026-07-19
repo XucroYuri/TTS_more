@@ -152,6 +152,19 @@ def test_harness_binds_resume_evidence_to_only_fresh_ordered_request_log_entries
     assert "[string]$_.Request.content_range -eq $expectedContentRange" in script
 
 
+def test_harness_canonicalizes_pid_executables_across_runner_junctions() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+    register = script.split("function Register-PackageOwnedProcess", 1)[1].split(
+        "function Assert-OwnedFixtureProcessesStopped", 1
+    )[0]
+
+    assert "function Resolve-FixtureCanonicalPath" in script
+    assert "pathlib.Path(sys.argv[1]).resolve(strict=True)" in script
+    assert "Resolve-FixtureCanonicalPath -Path (Join-Path $Package.Root" in register
+    assert "Resolve-FixtureCanonicalPath -Path ([string]$record.executable_path)" in register
+    assert "Resolve-FixtureCanonicalPath -Path $process.Path" in register
+
+
 def test_harness_accepts_json_integer_width_differences_from_powershell_hosts() -> None:
     script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
 
