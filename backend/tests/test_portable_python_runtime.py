@@ -51,6 +51,8 @@ UV = {
 
 
 def _run_ps(helper: Path, body: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    if os.name != "nt":
+        pytest.skip("Windows PowerShell 5.1 portable-runtime contract")
     command = f". '{helper}'; $ErrorActionPreference = 'Stop'; {body}"
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],

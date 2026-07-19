@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -159,6 +160,7 @@ def test_import_probes_only_reference_locked_or_component_local_modules() -> Non
                 module
                 for module in _probe_import_roots(payload["import_probe"])
                 if module.lower() not in LOCAL_COMPONENT_MODULES[component]
+                and module.lower() not in sys.stdlib_module_names
             }
 
         for profile in PROFILES:

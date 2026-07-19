@@ -79,12 +79,11 @@ def test_fixture_server_preserves_partial_then_resumes_with_strict_range(tmp_pat
     }
     with module.PortableFixtureServer(tmp_path, interrupt_after=8) as server:
         asset["urls"] = [server.url("runtime.bin")]
-        with pytest.raises(RuntimeError, match="asset download failed"):
-            installer.ensure_locked_asset(asset, destination)
-        assert destination.with_name("runtime.bin.partial").read_bytes() == payload[:8]
         report = installer.ensure_locked_asset(asset, destination)
         assert report["reused"] is False
         assert destination.read_bytes() == payload
+        assert not destination.with_name("runtime.bin.partial").exists()
+        assert server.requests[0]["interrupted"] is True
         range_requests = [entry for entry in server.requests if entry.get("range")]
         assert range_requests[-1]["range"] == "bytes=8-"
         assert range_requests[-1]["status"] == 206
@@ -140,6 +139,17 @@ def test_harness_runs_real_packages_below_spaced_unicode_temp_root() -> None:
     assert '. (Join-Path $PSScriptRoot "Portable-Validation.ps1")' in script
     assert "$serverArgumentLine = ConvertTo-PortableWindowsArgumentLine -Arguments $serverArguments" in script
     assert "-ArgumentList $serverArgumentLine" in script
+
+
+def test_harness_binds_resume_evidence_to_only_fresh_ordered_request_log_entries() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert "$requestLogBaseline" in script
+    assert "Select-Object -Skip $requestLogBaseline" in script
+    assert "$_.Index -gt $interruptionEvidence[0].Index" in script
+    assert "[bool]$_.Request.interrupted" in script
+    assert '[string]$_.Request.range -eq "bytes=8-"' in script
+    assert "[string]$_.Request.content_range -eq $expectedContentRange" in script
 
 
 def test_harness_accepts_json_integer_width_differences_from_powershell_hosts() -> None:
@@ -380,7 +390,7 @@ def _fixture_runtime_processes() -> set[int]:
         return set()
     command = (
         "$items=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue|"
-        "Where-Object {$_.ExecutablePath -match '\\\\tts-fr\\\\[^\\\\]+\\\\.*\\\\runtime\\\\live\\\\python\\.exe$'}|"
+        "Where-Object {$_.ExecutablePath -match '\\\\TTS More 中文\\\\[^\\\\]+\\\\.*\\\\runtime\\\\live\\\\python\\.exe$'}|"
         "Select-Object -ExpandProperty ProcessId); @($items)|ConvertTo-Json -Compress"
     )
     completed = subprocess.run(
@@ -399,7 +409,7 @@ def _fixture_runtime_processes() -> set[int]:
 
 
 def _first_run_directories() -> set[Path]:
-    root = Path(os.environ["TEMP"]) / "tts-fr"
+    root = Path(os.environ["TEMP"]) / "TTS More 中文"
     if not root.exists():
         return set()
     return {path.resolve() for path in root.glob("*") if path.is_dir()}

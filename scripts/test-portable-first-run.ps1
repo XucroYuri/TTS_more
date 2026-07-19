@@ -1078,35 +1078,68 @@ function Invoke-PackageAcceptance {
     if ($component -eq "tts-more") {
         Remove-Item -LiteralPath (Join-Path $Package.Root "data\local\install-state.json") -Force -ErrorAction SilentlyContinue
     }
+    $requestLogBaseline = if (Test-Path -LiteralPath $ServerRequestLog -PathType Leaf) {
+        @([IO.File]::ReadAllLines($ServerRequestLog)).Count
+    } else {
+        0
+    }
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $first = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
     $clock.Stop()
-    $expectedFirstExit = 26
-    if ($first.ExitCode -ne $expectedFirstExit -or !(Test-Path -LiteralPath $partial -PathType Leaf) -or (Get-Item -LiteralPath $partial).Length -ne 8) {
+    $newRequestEvidence = @()
+    if (Test-Path -LiteralPath $ServerRequestLog -PathType Leaf) {
+        $newRequestLines = @([IO.File]::ReadAllLines($ServerRequestLog) | Select-Object -Skip $requestLogBaseline)
+        $newRequestEvidence = @(
+            for ($requestIndex = 0; $requestIndex -lt $newRequestLines.Count; $requestIndex += 1) {
+                $line = $newRequestLines[$requestIndex]
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                $request = $line | ConvertFrom-Json
+                [pscustomobject]@{ Index=$requestIndex; Request=$request }
+            }
+        )
+    }
+    $interruptionEvidence = @($newRequestEvidence | Where-Object {
+        [string]$_.Request.path -eq "$component.bin" -and
+        [string]::IsNullOrWhiteSpace([string]$_.Request.range) -and
+        [int]$_.Request.status -eq 200 -and
+        [bool]$_.Request.interrupted
+    } | Select-Object -First 1)
+    $assetLength = (Get-Item -LiteralPath (Join-Path $AssetsRoot "$component.bin")).Length
+    $expectedContentRange = "bytes 8-$($assetLength - 1)/$assetLength"
+    $resumeEvidence = if ($interruptionEvidence.Count -gt 0) {
+        @($newRequestEvidence | Where-Object {
+            $_.Index -gt $interruptionEvidence[0].Index -and
+            [string]$_.Request.path -eq "$component.bin" -and
+            [string]$_.Request.range -eq "bytes=8-" -and
+            [int]$_.Request.status -eq 206 -and
+            [string]$_.Request.content_range -eq $expectedContentRange
+        } | Select-Object -First 1)
+    } else {
+        @()
+    }
+    $resumeEvidence = @($resumeEvidence)
+    if (
+        $interruptionEvidence.Count -eq 0
+    ) {
         if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") {
             $ServerProcess.Refresh()
             $partialExists = Test-Path -LiteralPath $partial -PathType Leaf
             $partialLength = if ($partialExists) { (Get-Item -LiteralPath $partial).Length } else { -1 }
-            [Console]::Error.WriteLine("FIRST_EXIT=$($first.ExitCode) SERVER_EXITED=$($ServerProcess.HasExited) PARTIAL_EXISTS=$partialExists PARTIAL_LENGTH=$partialLength PARTIAL=$partial`n$($first.Output)")
+            [Console]::Error.WriteLine("FIRST_EXIT=$($first.ExitCode) SERVER_EXITED=$($ServerProcess.HasExited) PARTIAL_EXISTS=$partialExists PARTIAL_LENGTH=$partialLength INTERRUPTION_COUNT=$($interruptionEvidence.Count) RESUME_COUNT=$($resumeEvidence.Count) PARTIAL=$partial`n$($first.Output)")
         }
         Add-Evidence -Component $component -Scenario "interruption" -Result fail -Duration $clock.Elapsed.TotalSeconds -ErrorCode "INTERRUPTION_NOT_PRESERVED"
-        Throw-HarnessError "INTERRUPTION_NOT_PRESERVED" "first start did not retain an eight-byte partial"
+        Throw-HarnessError "INTERRUPTION_NOT_PRESERVED" "first start did not record the fresh interrupted response"
     }
     Add-Evidence -Component $component -Scenario "interruption" -Result pass -Duration $clock.Elapsed.TotalSeconds
 
     Invoke-Scenario -Component $component -Scenario "resume" -Action {
-        $resumed = Invoke-RootCommand -Root $Package.Root -Name "Start.cmd" -Arguments @("-ManagedBy", "portable-first-run", "-NoUi", "-PortOverride", [string]$Package.Port)
-        if ($resumed.ExitCode -ne 0) {
-            if ([string]$env:TTS_MORE_FIRST_RUN_DEBUG -eq "1") {
-                [Console]::Error.WriteLine("RESUME_EXIT=$($resumed.ExitCode)`n$($resumed.Output)")
-                if ([string]$env:TTS_MORE_FIRST_RUN_KEEP -eq "1") {
-                    $snapshot = Join-Path ([IO.Path]::GetTempPath()) ("tts-fr-failed-" + $component + "-" + $WorkIdentity)
-                    if (Test-Path -LiteralPath $snapshot) { Remove-Item -LiteralPath $snapshot -Recurse -Force -ErrorAction SilentlyContinue }
-                    Copy-Item -LiteralPath $Package.Root -Destination $snapshot -Recurse -Force -ErrorAction SilentlyContinue
-                    [Console]::Error.WriteLine("RESUME_SNAPSHOT=$snapshot")
-                }
-            }
-            Throw-HarnessError "RESUME_FAILED" "resumed Start.cmd failed"
+        if (
+            $first.ExitCode -ne 0 -or
+            (Test-Path -LiteralPath $partial) -or
+            !(Test-Path -LiteralPath $interruptedAssetPath -PathType Leaf) -or
+            $resumeEvidence.Count -eq 0
+        ) {
+            Throw-HarnessError "RANGE_EVIDENCE_MISSING" "first start did not resume the fresh interrupted response from byte 8 with a valid Content-Range"
         }
         Assert-AssetHash -Package $Package
         $uvActual = Get-PortableFileSha256 -Path ([string]$Package.UvAssetPath)

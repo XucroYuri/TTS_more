@@ -47,6 +47,7 @@ for event_index in range(event_count):
 """
 
 
+@pytest.mark.skipif(os.name != "nt", reason="official Windows embeddable Python runtime contract")
 def test_operation_progress_runs_under_official_python_31011_embeddable(tmp_path: Path) -> None:
     archive = tmp_path / "python-3.10.11-embed-amd64.zip"
     with urllib.request.urlopen(PYTHON_310_URL, timeout=120) as response:

@@ -36,6 +36,38 @@ def _load_installer():
 installer = _load_installer()
 
 
+@pytest.fixture(scope="session")
+def locked_uv_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    lock = json.loads(
+        (REPO_ROOT / "packaging" / "portable" / "runtime.lock.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    asset = lock["assets"]["uv"]
+    cached = (
+        REPO_ROOT
+        / "data"
+        / "cache"
+        / "portable"
+        / "build-tools"
+        / "assets"
+        / "uv-0.11.28-py3-none-win_amd64.whl"
+    )
+    expected_size = int(asset["size_bytes"])
+    expected_hash = str(asset["sha256"])
+    if (
+        cached.is_file()
+        and cached.stat().st_size == expected_size
+        and hashlib.sha256(cached.read_bytes()).hexdigest() == expected_hash
+    ):
+        return cached
+    destination = tmp_path_factory.mktemp("locked-uv-wheel") / cached.name
+    installer.ensure_locked_asset(asset, destination)
+    assert destination.stat().st_size == expected_size
+    assert hashlib.sha256(destination.read_bytes()).hexdigest() == expected_hash
+    return destination
+
+
 def test_installer_loads_sibling_operations_by_exact_path_without_sys_path_shadowing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1000,17 +1032,9 @@ exit 0
 @pytest.mark.skipif(os.name != "nt", reason="locked uv executable is Windows x64")
 def test_controller_locked_uv_export_omits_machine_path_header_under_unicode_root(
     tmp_path: Path,
+    locked_uv_wheel: Path,
 ) -> None:
-    wheel = (
-        REPO_ROOT
-        / "data"
-        / "cache"
-        / "portable"
-        / "build-tools"
-        / "assets"
-        / "uv-0.11.28-py3-none-win_amd64.whl"
-    )
-    assert wheel.is_file(), "the exact locked uv 0.11.28 wheel is required"
+    wheel = locked_uv_wheel
     tool_root = tmp_path / "TTS More 中文" / "locked uv tool"
     with zipfile.ZipFile(wheel) as archive:
         executable_member = next(
@@ -1081,17 +1105,9 @@ def test_controller_locked_uv_export_omits_machine_path_header_under_unicode_roo
 @pytest.mark.skipif(os.name != "nt", reason="locked uv executable is Windows x64")
 def test_locked_uv_target_launchers_are_inventory_driven_and_relocatable(
     tmp_path: Path,
+    locked_uv_wheel: Path,
 ) -> None:
-    wheel = (
-        REPO_ROOT
-        / "data"
-        / "cache"
-        / "portable"
-        / "build-tools"
-        / "assets"
-        / "uv-0.11.28-py3-none-win_amd64.whl"
-    )
-    assert wheel.is_file(), "the exact locked uv 0.11.28 wheel is required"
+    wheel = locked_uv_wheel
     evidence_root = tmp_path / "TTS More 中文" / "runtime target"
     tool_root = evidence_root / "locked uv tool"
     with zipfile.ZipFile(wheel) as archive:
