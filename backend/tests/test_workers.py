@@ -94,6 +94,22 @@ def test_gpt_worker_artifact_store_defaults_outside_upstream_repo(tmp_path: Path
     assert worker._artifact_store().root == (tmp_path / "tts-more" / "data" / "runtime" / "worker-artifacts" / "gpt-sovits").resolve()
 
 
+@pytest.mark.parametrize(
+    "module_name",
+    ("app.workers.indextts_worker", "app.workers.cosyvoice_worker"),
+)
+def test_reference_worker_artifact_store_uses_configured_portable_data_root(
+    module_name: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    worker = __import__(module_name, fromlist=["_artifact_store"])
+    artifact_root = tmp_path / "portable-data" / "artifacts"
+    monkeypatch.setenv("TTS_MORE_ARTIFACT_ROOT", str(artifact_root))
+
+    assert worker._artifact_store().root == artifact_root.resolve()
+
+
 def test_gpt_sovits_worker_models_empty_without_repo(tmp_path: Path, monkeypatch) -> None:
     """Discovery must not require the resident pipeline or torch."""
     monkeypatch.setattr("app.workers.gpt_sovits_worker.REPO_DIR", tmp_path)

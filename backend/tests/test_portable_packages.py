@@ -1439,6 +1439,7 @@ def test_worker_package_resolves_package_source_and_bundle_roots_independently(
     assert "ToolchainLockRelative" not in initializer
     assert "-WorkingDirectory $SourceRoot" in worker_start
     assert 'TTS_MORE_GPTSOVITS_REPO = $SourceRoot' in worker_start
+    assert 'TTS_MORE_ARTIFACT_ROOT = (Join-Path $Root "data\\local\\artifacts")' in worker_start
     assert "Get-PortableWorkerPaths" in worker_stop
     assert 'RelativePath "tts_more\\locks\\runtime.lock.json"' not in worker_stop
 
@@ -4021,6 +4022,22 @@ def test_v2_builders_emit_completed_identity_protocol_and_data_contract() -> Non
             'data = @{ user = "data/user"; local = "data/local"; cache = "data/cache"; '
             'operations = "data/local/operations" }'
         ) in builder
+
+
+def test_cosyvoice_package_manifest_only_advertises_locked_model_capabilities() -> None:
+    worker_builder = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
+        encoding="utf-8"
+    )
+    cosyvoice_mapping = next(
+        line.strip()
+        for line in worker_builder.splitlines()
+        if line.strip().startswith('"cosyvoice" { @(')
+    )
+
+    assert cosyvoice_mapping == (
+        '"cosyvoice" { @("tts", "reference_audio_voice", "zero_shot_voice", '
+        '"cross_lingual_voice", "artifact-transfer") }'
+    )
 
 
 def test_portable_release_workflow_sanitizes_pr_ref_names() -> None:
