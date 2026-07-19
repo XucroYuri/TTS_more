@@ -407,8 +407,9 @@ def test_windows_ci_uses_short_pytest_base_temp_without_weakening_package_path_g
     )
 
     assert "runner.os == 'Windows'" in ci_workflow
-    assert "--basetemp=D:/t/pytest-" in ci_workflow
-    assert "--basetemp=D:/t/portable-" in portable_workflow
+    assert "--basetemp={0}/pytest-{1}" in ci_workflow
+    assert "runner.temp" in ci_workflow
+    assert "--basetemp=${{ runner.temp }}/portable-" in portable_workflow
     assert "PACKAGE_PATH_TOO_DEEP" in start_controller
 
 
