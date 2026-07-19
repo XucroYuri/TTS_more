@@ -783,6 +783,7 @@ def test_downloader_rejects_invalid_resumed_content_range_without_mutating_basel
         thread.join(timeout=5)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell 5.1 parser contract")
 @pytest.mark.parametrize("helper", HELPERS, ids=lambda path: str(path.relative_to(REPO_ROOT)))
 def test_helper_parses_in_windows_powershell_51(helper: Path) -> None:
     result = subprocess.run(
