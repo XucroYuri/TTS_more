@@ -21,6 +21,8 @@ jobs:
     runs-on: windows-latest
     env:
       PACKAGE_VERSION: ${{ inputs.version || github.ref_name }}
+      # GitHub's default workspace + pytest temp path can exceed the supported package budget.
+      PYTEST_ADDOPTS: --basetemp=D:/t/portable-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6

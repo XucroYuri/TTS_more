@@ -20,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SERVER_SCRIPT = REPO_ROOT / "scripts" / "serve-portable-fixtures.py"
 HARNESS_SCRIPT = REPO_ROOT / "scripts" / "test-portable-first-run.ps1"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "portable-release.yml"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")
 
 
@@ -160,9 +161,23 @@ def test_harness_canonicalizes_pid_executables_across_runner_junctions() -> None
 
     assert "function Resolve-FixtureCanonicalPath" in script
     assert "pathlib.Path(sys.argv[1]).resolve(strict=True)" in script
+    assert "base64.b64encode" in script
+    assert "[Convert]::FromBase64String" in script
+    assert '$env:PYTHONIOENCODING = "utf-8"' in script
     assert "Resolve-FixtureCanonicalPath -Path (Join-Path $Package.Root" in register
     assert "Resolve-FixtureCanonicalPath -Path ([string]$record.executable_path)" in register
     assert "Resolve-FixtureCanonicalPath -Path $process.Path" in register
+
+
+def test_harness_treats_pid_and_creation_time_as_the_process_identity() -> None:
+    script = HARNESS_SCRIPT.read_text(encoding="utf-8-sig")
+
+    assert "$initialCreatedAt" in script
+    assert "$replacementCreatedAt" in script
+    assert (
+        "[int]$replacement.pid -eq $initialPid -and "
+        "$replacementCreatedAt -eq $initialCreatedAt"
+    ) in script
 
 
 def test_harness_accepts_json_integer_width_differences_from_powershell_hosts() -> None:
@@ -382,6 +397,19 @@ def test_portable_release_workflow_runs_harness_unit_tests_and_single_package_sm
     assert workflow.index("test-portable-first-run.ps1") < workflow.index(
         "portable-first-run-smoke-evidence"
     )
+
+
+def test_windows_ci_uses_short_pytest_base_temp_without_weakening_package_path_guard() -> None:
+    ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    portable_workflow = WORKFLOW.read_text(encoding="utf-8")
+    start_controller = (REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "runner.os == 'Windows'" in ci_workflow
+    assert "--basetemp=D:/t/pytest-" in ci_workflow
+    assert "--basetemp=D:/t/portable-" in portable_workflow
+    assert "PACKAGE_PATH_TOO_DEEP" in start_controller
 
 
 def test_first_run_harness_uses_embedded_sha256_helper_instead_of_get_file_hash() -> None:

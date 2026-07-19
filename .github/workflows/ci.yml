@@ -30,6 +30,8 @@ jobs:
           ALL_PROXY: ""
           HTTP_PROXY: ""
           HTTPS_PROXY: ""
+          # Keep Windows tmp_path below the production portable-package path budget.
+          PYTEST_ADDOPTS: ${{ runner.os == 'Windows' && format('--basetemp=D:/t/pytest-{0}', github.run_id) || '' }}
         run: pytest backend -q
       - name: Native Windows deployment validation
         if: runner.os == 'Windows'

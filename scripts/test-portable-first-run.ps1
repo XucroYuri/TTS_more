@@ -964,11 +964,28 @@ function Stop-OwnedFixtureProcess {
 
 function Resolve-FixtureCanonicalPath {
     param([Parameter(Mandatory = $true)][string]$Path)
-    $output = @(& $FixtureBasePython -c "import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))" $Path 2>&1)
-    if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1 -or ![IO.Path]::IsPathRooted([string]$output[0])) {
+    $previousPythonIoEncoding = [Environment]::GetEnvironmentVariable("PYTHONIOENCODING", "Process")
+    try {
+        $env:PYTHONIOENCODING = "utf-8"
+        $output = @(& $FixtureBasePython -c "import base64,pathlib,sys; print(base64.b64encode(str(pathlib.Path(sys.argv[1]).resolve(strict=True)).encode('utf-8')).decode('ascii'))" $Path 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable("PYTHONIOENCODING", $previousPythonIoEncoding, "Process")
+    }
+    if ($exitCode -ne 0 -or $output.Count -ne 1) {
         Throw-HarnessError "PATH_IDENTITY_INVALID" "fixture path could not be resolved to its stable filesystem identity"
     }
-    return [IO.Path]::GetFullPath([string]$output[0])
+    try {
+        $resolved = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$output[0]))
+    }
+    catch {
+        Throw-HarnessError "PATH_IDENTITY_INVALID" "fixture path identity transport is invalid"
+    }
+    if (![IO.Path]::IsPathRooted($resolved)) {
+        Throw-HarnessError "PATH_IDENTITY_INVALID" "fixture path identity is not absolute"
+    }
+    return [IO.Path]::GetFullPath($resolved)
 }
 
 function Register-PackageOwnedProcess {
@@ -1254,6 +1271,7 @@ function Invoke-PackageAcceptance {
         Wait-LoopbackPort -Port $Package.Port -Listening $true
         $runningRecord = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
         $initialPid = [int]$runningRecord.pid
+        $initialCreatedAt = [DateTime]::Parse([string]$runningRecord.process_created_at, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
         Register-PackageOwnedProcess -Package $Package
         $crashProcess = Get-Process -Id $initialPid -ErrorAction SilentlyContinue
         if (!$crashProcess) { Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "owned worker process was missing before crash injection" }
@@ -1272,7 +1290,8 @@ function Invoke-PackageAcceptance {
             Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "Start.cmd did not recover stale PID evidence"
         }
         $replacement = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
-        if ([int]$replacement.pid -eq $initialPid) { Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "recovery did not create a fresh process identity" }
+        $replacementCreatedAt = [DateTime]::Parse([string]$replacement.process_created_at, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        if ([int]$replacement.pid -eq $initialPid -and $replacementCreatedAt -eq $initialCreatedAt) { Throw-HarnessError "STALE_PID_RECOVERY_FAILED" "recovery did not create a fresh process identity" }
         Register-PackageOwnedProcess -Package $Package
     }
     $replacementRecord = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
