@@ -1558,7 +1558,9 @@ def test_full_package_validates_models_runtime_version_and_imports_before_servic
     assert not (package_root / "start-count.log").exists()
 
 
-@pytest.mark.parametrize("integrity_case", ("python-uncovered", "python-hash", "model-hash"))
+@pytest.mark.parametrize(
+    "integrity_case", ("python-uncovered", "python-hash", "model-hash", "runtime-extra")
+)
 def test_full_package_never_executes_runtime_before_all_integrity_checks_pass(
     tmp_path: Path, integrity_case: str
 ) -> None:
@@ -1573,8 +1575,10 @@ def test_full_package_never_executes_runtime_before_all_integrity_checks_pass(
     elif integrity_case == "python-hash":
         lines = [f"{'0' * 64}  {python_suffix}" if line.endswith(python_suffix) else line for line in lines]
         _write_text(sums, "\n".join(lines) + "\n")
-    else:
+    elif integrity_case == "model-hash":
         (package_root / "models" / "voice.bin").write_bytes(b"tampered-model")
+    else:
+        _write_text(package_root / "runtime" / "live" / "__pycache__" / "unexpected.pyc", "unsigned")
     marker = package_root / "runtime-executed.marker"
 
     result = _run_controller(

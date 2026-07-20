@@ -109,6 +109,16 @@ def test_sync_writes_controlled_bundle_root_entries_and_hash_manifest(tmp_path: 
     assert sync.check_integration(target) == []
 
 
+def test_copied_contract_accepts_canonical_controlled_mirror(tmp_path: Path) -> None:
+    sync = _load_sync()
+    target = tmp_path / "canonical GPT fork"
+    sync.sync_integration(REPO_ROOT, target, "gpt-sovits", "a" * 40)
+
+    result = _run_copied_contract_after_mutation(sync, target)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     "relative",
     (

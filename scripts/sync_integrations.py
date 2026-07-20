@@ -123,6 +123,7 @@ def _build_staged_integration(
         "portable_launcher.py",
         "portable_operations.py",
         "portable_packages.py",
+        "portable_package_runner.py",
         "verify-release-asset-set.py",
         "import_portable_data.py",
         "import-portable-data.py",

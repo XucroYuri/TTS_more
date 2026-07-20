@@ -1395,10 +1395,12 @@ def test_worker_package_resolves_package_source_and_bundle_roots_independently(
     bundle_root = source_root / "tts_more"
     assert cwd == source_root
     assert command[0] == str(runtime_python)
+    assert command[1] == "-B"
     assert command[command.index("--app-dir") + 1] == str(bundle_root)
     assert environment["TTS_MORE_PACKAGE_ROOT"] == str(package_root)
     assert environment["TTS_MORE_GPTSOVITS_REPO"] == str(source_root)
     assert environment["PYTHONPATH"] == str(source_root)
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
     assert environment["TTS_MORE_ARTIFACT_ROOT"] == str(
         package_root / "data" / "local" / "artifacts"
     )
@@ -1537,7 +1539,7 @@ def test_staged_gpt_webui_uses_only_package_private_python_and_requires_initiali
     webui_script = stage / "app" / "tts_more" / "Start-WebUI.ps1"
     script = webui_script.read_text(encoding="utf-8")
     assert 'Join-Path $Root "runtime\\live\\python.exe"' in script
-    assert '@("-I", (Join-Path $SourceRoot "webui.py"), "zh_CN")' in script
+    assert '@("-I", "-B", (Join-Path $SourceRoot "webui.py"), "zh_CN")' in script
     assert "go-webui.bat" in script
     completed = subprocess.run(
         [
@@ -2988,6 +2990,31 @@ def test_portable_source_probe_disables_python_bytecode_writes(tmp_path: Path) -
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert not list(source_root.rglob("__pycache__"))
     assert not list(source_root.rglob("*.pyc"))
+
+
+def test_package_private_python_entrypoints_disable_bytecode_writes() -> None:
+    entrypoints = (
+        REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1",
+        REPO_ROOT / "scripts" / "initialize-portable.ps1",
+        REPO_ROOT / "scripts" / "start-production.ps1",
+        REPO_ROOT / "scripts" / "stop-production.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Initialize.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Start-Worker.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Stop-Worker.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Start-WebUI.ps1",
+    )
+
+    for entrypoint in entrypoints:
+        script = entrypoint.read_text(encoding="utf-8")
+        assert '$env:PYTHONDONTWRITEBYTECODE = "1"' in script, entrypoint
+
+
+def test_gpt_isolated_portable_webui_disables_bytecode_writes() -> None:
+    webui = (REPO_ROOT / "integrations" / "windows" / "Start-WebUI.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert '$arguments = @("-I", "-B", (Join-Path $SourceRoot "webui.py"), "zh_CN")' in webui
 
 
 def test_full_builders_reclean_bytecode_after_cross_volume_probe() -> None:
