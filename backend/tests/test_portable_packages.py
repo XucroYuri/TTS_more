@@ -1930,6 +1930,59 @@ def test_package_sha256_gate_requires_exact_coverage_and_rejects_tampering(tmp_p
     assert any("exact coverage" in error for error in uncovered["errors"])
 
 
+def test_verify_sha256_cli_does_not_require_jsonschema_runtime_dependency(tmp_path: Path) -> None:
+    root = tmp_path / "package"
+    payload = root / "Start.cmd"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"@echo off\r\n")
+    (root / "SHA256SUMS.txt").write_text(
+        f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  Start.cmd\n",
+        encoding="utf-8",
+    )
+    blocker = tmp_path / "blocker"
+    blocker.mkdir()
+    (blocker / "sitecustomize.py").write_text(
+        """
+import importlib.abc
+import sys
+
+
+class BlockJsonschema(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "jsonschema" or fullname.startswith("jsonschema."):
+            raise ModuleNotFoundError("blocked jsonschema for runtime smoke")
+        return None
+
+
+sys.meta_path.insert(0, BlockJsonschema())
+""".lstrip(),
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(blocker) + os.pathsep + env.get("PYTHONPATH", "")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "portable_packages.py"),
+            "verify-sha256",
+            "--package-root",
+            str(root),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = json.loads(completed.stdout.splitlines()[-1])
+    assert report["valid"] is True
+
+
 def test_release_audit_accepts_bootstrap_and_rejects_full_or_runtime_assets(tmp_path: Path) -> None:
     packages = _load_portable_packages()
 
