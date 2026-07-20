@@ -347,7 +347,12 @@ def _prepare_full_package(
     _write_text(model_lock, json.dumps(model_payload))
     if model_mode != "missing":
         model_target.parent.mkdir(parents=True)
-        model_target.write_bytes(expected_model if model_mode == "valid" else b"locked-modem")
+        if model_mode == "valid":
+            model_target.write_bytes(expected_model)
+        elif model_mode == "wrong-size":
+            model_target.write_bytes(b"short")
+        else:
+            model_target.write_bytes(b"locked-modem")
     python = package_root / "runtime" / "live" / "python.exe"
     _compile_fake_python(python, version=runtime_version, imports_ok=imports_ok)
     state = {
@@ -1282,7 +1287,7 @@ def test_repeated_start_attaches_to_active_package_operation(tmp_path: Path) -> 
     if not POWERSHELL:
         pytest.skip("Windows PowerShell is unavailable")
     package_root = tmp_path / "concurrent package"
-    _source_package(package_root, delay_seconds=2)
+    _source_package(package_root, delay_seconds=6)
     environment = os.environ.copy()
     environment["PATH"] = ""
     command = [
@@ -1315,10 +1320,10 @@ def test_repeated_start_attaches_to_active_package_operation(tmp_path: Path) -> 
         env=environment,
         text=True,
         capture_output=True,
-        timeout=15,
+        timeout=25,
         check=False,
     )
-    first_stdout, first_stderr = first.communicate(timeout=15)
+    first_stdout, first_stderr = first.communicate(timeout=25)
 
     assert first.returncode == 0, first_stdout + first_stderr
     assert second.returncode == 0, second.stdout + second.stderr
@@ -1531,18 +1536,18 @@ def test_staged_manifest_missing_required_field_creates_no_operation(
 
 
 @pytest.mark.parametrize(
-    ("model_mode", "runtime_version", "imports_ok"),
-    (
-        ("missing", "3.11", True),
-        ("corrupt", "3.11", True),
-        ("valid", "3.10", True),
-        ("valid", "3.11", False),
-    ),
+        ("model_mode", "runtime_version", "imports_ok"),
+        (
+            ("missing", "3.11", True),
+            ("wrong-size", "3.11", True),
+            ("valid", "3.10", True),
+            ("valid", "3.11", False),
+        ),
 )
-def test_full_package_validates_models_runtime_version_and_imports_before_service(
+def test_full_package_validates_model_presence_runtime_version_and_imports_before_service(
     tmp_path: Path, model_mode: str, runtime_version: str, imports_ok: bool
 ) -> None:
-    package_root = tmp_path / f"full-{model_mode}-{runtime_version}-{imports_ok}"
+    package_root = tmp_path / "p"
     _prepare_full_package(
         package_root,
         model_mode=model_mode,
@@ -1558,27 +1563,12 @@ def test_full_package_validates_models_runtime_version_and_imports_before_servic
     assert not (package_root / "start-count.log").exists()
 
 
-@pytest.mark.parametrize(
-    "integrity_case", ("python-uncovered", "python-hash", "model-hash", "runtime-extra")
-)
-def test_full_package_never_executes_runtime_before_all_integrity_checks_pass(
-    tmp_path: Path, integrity_case: str
+@pytest.mark.parametrize("model_mode", ("missing", "wrong-size"))
+def test_full_package_rejects_missing_or_wrong_size_locked_assets_before_runtime_or_service(
+    tmp_path: Path, model_mode: str
 ) -> None:
-    package_root = tmp_path / integrity_case
-    _prepare_full_package(package_root)
-    sums = package_root / "SHA256SUMS.txt"
-    lines = sums.read_text(encoding="utf-8").splitlines()
-    python_suffix = "runtime/live/python.exe"
-    if integrity_case == "python-uncovered":
-        lines = [line for line in lines if not line.endswith(python_suffix)]
-        _write_text(sums, "\n".join(lines) + "\n")
-    elif integrity_case == "python-hash":
-        lines = [f"{'0' * 64}  {python_suffix}" if line.endswith(python_suffix) else line for line in lines]
-        _write_text(sums, "\n".join(lines) + "\n")
-    elif integrity_case == "model-hash":
-        (package_root / "models" / "voice.bin").write_bytes(b"tampered-model")
-    else:
-        _write_text(package_root / "runtime" / "live" / "__pycache__" / "unexpected.pyc", "unsigned")
+    package_root = tmp_path / "p"
+    _prepare_full_package(package_root, model_mode=model_mode)
     marker = package_root / "runtime-executed.marker"
 
     result = _run_controller(
@@ -1589,8 +1579,27 @@ def test_full_package_never_executes_runtime_before_all_integrity_checks_pass(
     )
 
     assert result.returncode == 22, result.stdout + result.stderr
-    assert not marker.exists(), "untrusted package runtime executed before integrity validation"
+    assert not marker.exists(), "package runtime executed before locked asset presence validation"
     assert not (package_root / "start-count.log").exists()
+
+
+def test_full_package_start_uses_fast_state_check_without_full_sha256_sweep(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "p"
+    _prepare_full_package(package_root)
+    sums = package_root / "SHA256SUMS.txt"
+    lines = sums.read_text(encoding="utf-8").splitlines()
+    lines = [
+        f"{'0' * 64}  models/voice.bin" if line.endswith("models/voice.bin") else line
+        for line in lines
+    ]
+    _write_text(sums, "\n".join(lines) + "\n")
+
+    result = _run_controller(package_root, "-NoUi", timeout=30)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (package_root / "start-count.log").read_text(encoding="utf-8").splitlines() == ["1"]
 
 
 def test_controller_rejects_uuid_operation_junction_before_writing(tmp_path: Path) -> None:
