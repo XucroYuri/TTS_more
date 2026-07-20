@@ -3122,10 +3122,36 @@ def test_full_builders_reclean_bytecode_after_cross_volume_probe() -> None:
     workers = (REPO_ROOT / "integrations" / "windows" / "Build-Package.ps1").read_text(
         encoding="utf-8"
     )
+    worker_initial_cache_cleanup = workers.index(
+        "Remove-WorkerFullMutableCaches -PackageRoot $stage"
+    )
     worker_probe = workers.index("$runtimeCrossVolumeProbe = Test-WorkerFullRuntimeOnOtherVolume")
-    worker_cleanup = workers.index("Remove-WorkerFullRuntimeBytecode -PackageRoot $stage", worker_probe)
-    worker_boundary = workers.index("Assert-WorkerFullRuntimeBoundary -PackageRoot $stage", worker_cleanup)
-    assert worker_probe < worker_cleanup < worker_boundary
+    worker_cache_cleanup = workers.index(
+        "Remove-WorkerFullMutableCaches -PackageRoot $stage", worker_probe
+    )
+    worker_bytecode_cleanup = workers.index(
+        "Remove-WorkerFullRuntimeBytecode -PackageRoot $stage", worker_cache_cleanup
+    )
+    worker_boundary = workers.index(
+        "Assert-WorkerFullRuntimeBoundary -PackageRoot $stage", worker_bytecode_cleanup
+    )
+    worker_machine_audit = workers.index("$machinePrefixes = @(", worker_boundary)
+    assert (
+        worker_initial_cache_cleanup
+        < worker_probe
+        < worker_cache_cleanup
+        < worker_bytecode_cleanup
+        < worker_boundary
+        < worker_machine_audit
+    )
+    assert "OpenDirectoryRelative" in workers
+    assert 'OpenDirectoryRelative($packageHandle, "data"' in workers
+    assert 'OpenDirectoryRelative($dataHandle, "cache"' in workers
+    assert 'OpenDirectoryRelative($cacheHandle, "numba"' in workers
+    assert "Full package mutable cache parent chain contains a reparse point" in workers
+    assert "Full package mutable cache handle identity changed unexpectedly" in workers
+    assert "Remove-WorkerOwnedDirectoryContents -Path $cacheRoot" in workers
+    assert "MarkDirectoryForDeletion($numbaHandle)" in workers
 
     controller = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
     controller_probe = controller.index("$runtimeCrossVolumeProbe = Test-TtsMoreFullRuntimeOnOtherVolume")
