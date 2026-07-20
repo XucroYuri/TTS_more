@@ -400,6 +400,7 @@ def test_managed_runner_uses_only_the_worker_packages_private_runtime(tmp_path: 
 
     assert command == [
         str(runtime_python),
+        "-B",
         "-m",
         "uvicorn",
         "tts_more_worker.gpt_sovits:app",
@@ -413,3 +414,4 @@ def test_managed_runner_uses_only_the_worker_packages_private_runtime(tmp_path: 
     assert cwd == package_root
     assert environment["TTS_MORE_GPTSOVITS_REPO"] == str(package_root)
     assert environment["TTS_MORE_WORKER_ALLOW_PATH_DELIVERY"] == "1"
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"

@@ -7,6 +7,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$env:PYTHONDONTWRITEBYTECODE = "1"
 
 function Assert-PortablePackageRootChain {
     param([Parameter(Mandatory = $true)][string]$Root)

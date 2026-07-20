@@ -100,6 +100,7 @@ def build_worker_process(
     worker_env["TTS_MORE_PACKAGE_ROOT"] = str(root)
     worker_env["TTS_MORE_ARTIFACT_ROOT"] = str(root / "data" / "local" / "artifacts")
     worker_env["PYTHONPATH"] = str(source_root)
+    worker_env["PYTHONDONTWRITEBYTECODE"] = "1"
     if trusted_lan:
         worker_env.pop("TTS_MORE_WORKER_ALLOW_PATH_DELIVERY", None)
     else:
@@ -117,6 +118,7 @@ def build_worker_process(
 
     command = [
         str(runtime_python),
+        "-B",
         "-m",
         "uvicorn",
         module,
