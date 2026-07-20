@@ -3154,6 +3154,7 @@ def test_full_builders_reclean_bytecode_after_cross_volume_probe() -> None:
     assert "MarkDirectoryForDeletion($numbaHandle)" in workers
 
     controller = (REPO_ROOT / "Build-Package.ps1").read_text(encoding="utf-8")
+    assert "public static SafeFileHandle OpenDirectoryRelative" in controller
     controller_probe = controller.index("$runtimeCrossVolumeProbe = Test-TtsMoreFullRuntimeOnOtherVolume")
     controller_cleanup = controller.index(
         "Remove-TtsMoreFullRuntimeBytecode -PackageRoot $stage", controller_probe

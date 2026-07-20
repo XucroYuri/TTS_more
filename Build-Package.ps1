@@ -206,6 +206,76 @@ public static class TtsMorePortableDirectoryHandle
         }
     }
 
+    public static SafeFileHandle OpenDirectoryRelative(
+        SafeFileHandle parent,
+        string name,
+        bool shareDelete,
+        bool childAccess)
+    {
+        if (String.IsNullOrEmpty(name) || name == "." || name == ".." || name.Contains("\\") || name.Contains("/"))
+        {
+            throw new ArgumentException("Unsafe controller staging directory name", "name");
+        }
+        IntPtr nameBuffer = IntPtr.Zero;
+        IntPtr unicodePointer = IntPtr.Zero;
+        try
+        {
+            nameBuffer = Marshal.StringToHGlobalUni(name);
+            UnicodeString unicode = new UnicodeString();
+            unicode.Length = checked((ushort)(name.Length * 2));
+            unicode.MaximumLength = checked((ushort)((name.Length + 1) * 2));
+            unicode.Buffer = nameBuffer;
+            unicodePointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+            Marshal.StructureToPtr(unicode, unicodePointer, false);
+            ObjectAttributes attributes = new ObjectAttributes();
+            attributes.Length = Marshal.SizeOf(typeof(ObjectAttributes));
+            attributes.RootDirectory = parent.DangerousGetHandle();
+            attributes.ObjectName = unicodePointer;
+            attributes.Attributes = 0x00000040;
+            IoStatusBlock ioStatus;
+            IntPtr rawHandle;
+            const uint Synchronize = 0x00100000;
+            const uint Delete = 0x00010000;
+            const uint FileReadAttributes = 0x00000080;
+            const uint FileListDirectory = 0x00000001;
+            const uint FileAddSubdirectory = 0x00000004;
+            const uint ShareRead = 0x00000001;
+            const uint ShareWrite = 0x00000002;
+            const uint ShareDelete = 0x00000004;
+            const uint FileOpen = 1;
+            const uint FileDirectoryFile = 0x00000001;
+            const uint FileSynchronousIoNonalert = 0x00000020;
+            const uint FileOpenReparsePoint = 0x00200000;
+            uint desiredAccess = Synchronize | Delete | FileReadAttributes | FileListDirectory;
+            if (childAccess) { desiredAccess |= FileAddSubdirectory; }
+            uint share = ShareRead | ShareWrite | (shareDelete ? ShareDelete : 0);
+            int status = NtCreateFile(
+                out rawHandle,
+                desiredAccess,
+                ref attributes,
+                out ioStatus,
+                IntPtr.Zero,
+                0x00000010,
+                share,
+                FileOpen,
+                FileDirectoryFile | FileSynchronousIoNonalert | FileOpenReparsePoint,
+                IntPtr.Zero,
+                0);
+            if (status < 0)
+            {
+                throw new Win32Exception(
+                    unchecked((int)RtlNtStatusToDosError(status)),
+                    "Cannot open controller staging directory by parent handle: " + name);
+            }
+            return new SafeFileHandle(rawHandle, true);
+        }
+        finally
+        {
+            if (unicodePointer != IntPtr.Zero) { Marshal.FreeHGlobal(unicodePointer); }
+            if (nameBuffer != IntPtr.Zero) { Marshal.FreeHGlobal(nameBuffer); }
+        }
+    }
+
     public static void MarkDirectoryForDeletion(SafeFileHandle handle)
     {
         FileDispositionInformation information = new FileDispositionInformation();
