@@ -1030,6 +1030,41 @@ function Register-PackageOwnedProcess {
     }
 }
 
+function Test-FixtureProcessIdentityAlive {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][DateTime]$CreatedAt,
+        [Parameter(Mandatory = $true)][string]$Executable
+    )
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if (!$process) { return $false }
+    try {
+        $actualExecutable = Resolve-FixtureCanonicalPath -Path $process.Path
+        $actualStartedAt = $process.StartTime.ToUniversalTime()
+    }
+    catch {
+        return $false
+    }
+    return (
+        [string]::Equals($actualExecutable, $Executable, [StringComparison]::OrdinalIgnoreCase) -and
+        $actualStartedAt -eq $CreatedAt.ToUniversalTime()
+    )
+}
+
+function Wait-FixtureProcessIdentityStopped {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [Parameter(Mandatory = $true)][DateTime]$CreatedAt,
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [int]$TimeoutSeconds = 15
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ((Test-FixtureProcessIdentityAlive -ProcessId $ProcessId -CreatedAt $CreatedAt -Executable $Executable) -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    return !(Test-FixtureProcessIdentityAlive -ProcessId $ProcessId -CreatedAt $CreatedAt -Executable $Executable)
+}
+
 function Assert-OwnedFixtureProcessesStopped {
     foreach ($owned in $OwnedProcesses) {
         try { $owned.Process.Refresh() } catch { continue }
@@ -1196,6 +1231,8 @@ function Invoke-PackageAcceptance {
     $recordPath = Join-Path $Package.Root "data\local\run\worker.pid.json"
     $record = Read-WorkerPidRecord -Path $recordPath
     $initialPid = [int]$record.pid
+    $initialCreatedAt = [DateTime]::Parse([string]$record.process_created_at, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+    $expectedExecutable = Resolve-FixtureCanonicalPath -Path (Join-Path $Package.Root "runtime\live\python.exe")
     Register-PackageOwnedProcess -Package $Package
 
     Invoke-Scenario -Component $component -Scenario "duplicate_start" -Action {
@@ -1230,11 +1267,7 @@ function Invoke-PackageAcceptance {
         Throw-HarnessError "STOP_FAILED" "Stop.cmd failed before Repair.cmd validation"
     }
     Wait-LoopbackPort -Port $Package.Port -Listening $false
-    $preRepairDeadline = [DateTime]::UtcNow.AddSeconds(15)
-    while ((Get-Process -Id $initialPid -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $preRepairDeadline) {
-        Start-Sleep -Milliseconds 100
-    }
-    if (Get-Process -Id $initialPid -ErrorAction SilentlyContinue) { Throw-HarnessError "CHILD_PROCESS_REMAINED" "an owned process survived the pre-Repair Stop.cmd" }
+    if (!(Wait-FixtureProcessIdentityStopped -ProcessId $initialPid -CreatedAt $initialCreatedAt -Executable $expectedExecutable)) { Throw-HarnessError "CHILD_PROCESS_REMAINED" "an owned process survived the pre-Repair Stop.cmd" }
     Start-Sleep -Milliseconds 500
 
     Invoke-Scenario -Component $component -Scenario "proxy_fallback" -Action {
@@ -1313,7 +1346,13 @@ function Invoke-PackageAcceptance {
         Register-PackageOwnedProcess -Package $Package
     }
     $replacementRecord = Read-WorkerPidRecord -Path $recordPath
-    $knownPids = @($initialPid, [int]$replacementRecord.pid)
+    $replacementPid = [int]$replacementRecord.pid
+    $replacementCreatedAt = [DateTime]::Parse([string]$replacementRecord.process_created_at, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+    $knownProcessIdentities = @(
+        [pscustomobject]@{ Pid=$initialPid; CreatedAt=$initialCreatedAt; Executable=$expectedExecutable },
+        [pscustomobject]@{ Pid=$replacementPid; CreatedAt=$replacementCreatedAt; Executable=$expectedExecutable }
+    )
+    $knownPids = @($knownProcessIdentities | ForEach-Object { [int]$_.Pid })
 
     Invoke-Scenario -Component $component -Scenario "clean_stop" -Action {
         $stopped = Invoke-RootCommand -Root $Package.Root -Name "Stop.cmd"
@@ -1324,7 +1363,11 @@ function Invoke-PackageAcceptance {
         Wait-LoopbackPort -Port $Package.Port -Listening $false
         if (Test-Path -LiteralPath $recordPath -PathType Leaf) { Throw-HarnessError "STALE_PID_RECORD" "Stop.cmd left a PID record" }
         Start-Sleep -Milliseconds 300
-        foreach ($knownPid in $knownPids) { if (Get-Process -Id $knownPid -ErrorAction SilentlyContinue) { Throw-HarnessError "CHILD_PROCESS_REMAINED" "an owned process survived Stop.cmd" } }
+        foreach ($identity in $knownProcessIdentities) {
+            if (Test-FixtureProcessIdentityAlive -ProcessId ([int]$identity.Pid) -CreatedAt ([DateTime]$identity.CreatedAt) -Executable ([string]$identity.Executable)) {
+                Throw-HarnessError "CHILD_PROCESS_REMAINED" "an owned process survived Stop.cmd"
+            }
+        }
         $lexicalPackageRoot = [IO.Path]::GetFullPath($Package.Root)
         $packagePrefix = (Resolve-FixtureCanonicalPath -Path $Package.Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
         $descendants = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
