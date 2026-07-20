@@ -1401,6 +1401,8 @@ def test_worker_package_resolves_package_source_and_bundle_roots_independently(
     assert environment["TTS_MORE_GPTSOVITS_REPO"] == str(source_root)
     assert environment["PYTHONPATH"] == str(source_root)
     assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert environment["NUMBA_CACHE_DIR"] == str(package_root / "data" / "cache" / "numba")
+    assert (package_root / "data" / "cache" / "numba").is_dir()
     assert environment["TTS_MORE_ARTIFACT_ROOT"] == str(
         package_root / "data" / "local" / "artifacts"
     )
@@ -3007,6 +3009,105 @@ def test_package_private_python_entrypoints_disable_bytecode_writes() -> None:
     for entrypoint in entrypoints:
         script = entrypoint.read_text(encoding="utf-8")
         assert '$env:PYTHONDONTWRITEBYTECODE = "1"' in script, entrypoint
+
+
+def test_worker_entrypoints_route_numba_cache_to_mutable_package_data() -> None:
+    entrypoints = (
+        REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Initialize.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Start-Worker.ps1",
+        REPO_ROOT / "integrations" / "windows" / "Start-WebUI.ps1",
+    )
+
+    for entrypoint in entrypoints:
+        script = entrypoint.read_text(encoding="utf-8")
+        assert "Set-PortableWorkerMutableCacheEnvironment" in script, entrypoint
+
+    controller = entrypoints[0].read_text(encoding="utf-8")
+    cache_setup = controller.index(
+        "Set-PortableWorkerMutableCacheEnvironment -PackageRoot $workerPaths.PackageRoot"
+    )
+    first_install_check = controller.index("$installed = Test-InstallState")
+    assert cache_setup < first_install_check
+
+    worker_stop = (
+        REPO_ROOT / "integrations" / "windows" / "Stop-Worker.ps1"
+    ).read_text(encoding="utf-8")
+    assert "Set-PortableWorkerMutableCacheEnvironment" not in worker_stop
+    assert r'RelativePath "data\local\run\worker.pid.json"' in worker_stop
+    assert "stop-worker --package-root $Root" in worker_stop
+
+
+def test_worker_mutable_cache_environment_stays_outside_signed_trees(
+    clean_portable_builds: dict[str, object],
+) -> None:
+    stage = Path(clean_portable_builds["worker_stage"])
+    paths_script = stage / "app" / "tts_more" / "Portable-Paths.ps1"
+    completed = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            (
+                f". '{paths_script}'; "
+                f"[void](Set-PortableWorkerMutableCacheEnvironment -PackageRoot '{stage}'); "
+                "[pscustomobject]@{cache=$env:NUMBA_CACHE_DIR;exists=(Test-Path -LiteralPath $env:NUMBA_CACHE_DIR -PathType Container)} | ConvertTo-Json -Compress"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout.strip())
+    expected = stage / "data" / "cache" / "numba"
+    assert Path(payload["cache"]) == expected
+    assert payload["exists"] is True
+    assert expected.is_relative_to(stage / "data")
+    assert not expected.is_relative_to(stage / "app")
+    assert not expected.is_relative_to(stage / "runtime" / "live")
+
+
+def test_worker_mutable_cache_environment_rejects_file_collision(
+    clean_portable_builds: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    stage = tmp_path / "worker"
+    shutil.copytree(Path(clean_portable_builds["worker_stage"]), stage)
+    paths_script = stage / "app" / "tts_more" / "Portable-Paths.ps1"
+    cache_parent = stage / "data" / "cache"
+    cache_parent.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(cache_parent / "numba", ignore_errors=True)
+    (cache_parent / "numba").write_text("not a directory", encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            (
+                f". '{paths_script}'; "
+                f"Set-PortableWorkerMutableCacheEnvironment -PackageRoot '{stage}'"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "portable mutable cache path is not a directory" in completed.stderr
 
 
 def test_gpt_isolated_portable_webui_disables_bytecode_writes() -> None:
