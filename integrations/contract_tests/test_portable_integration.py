@@ -1026,7 +1026,11 @@ class PortableIntegrationContractTests(unittest.TestCase):
         for name, path in entrypoints.items():
             script = path.read_text(encoding="utf-8")
             self.assertIn('$env:PYTHONDONTWRITEBYTECODE = "1"', script, name)
-            self.assertIn("Set-PortableWorkerMutableCacheEnvironment", script, name)
+            if name == "Stop-Worker.ps1":
+                self.assertNotIn("Set-PortableWorkerMutableCacheEnvironment", script, name)
+                self.assertIn("stop-worker --package-root $Root", script, name)
+            else:
+                self.assertIn("Set-PortableWorkerMutableCacheEnvironment", script, name)
 
         controller = entrypoints["Invoke-PortableStart.ps1"].read_text(encoding="utf-8")
         self.assertLess(

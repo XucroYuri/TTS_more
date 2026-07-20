@@ -3016,7 +3016,6 @@ def test_worker_entrypoints_route_numba_cache_to_mutable_package_data() -> None:
         REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1",
         REPO_ROOT / "integrations" / "windows" / "Initialize.ps1",
         REPO_ROOT / "integrations" / "windows" / "Start-Worker.ps1",
-        REPO_ROOT / "integrations" / "windows" / "Stop-Worker.ps1",
         REPO_ROOT / "integrations" / "windows" / "Start-WebUI.ps1",
     )
 
@@ -3030,6 +3029,13 @@ def test_worker_entrypoints_route_numba_cache_to_mutable_package_data() -> None:
     )
     first_install_check = controller.index("$installed = Test-InstallState")
     assert cache_setup < first_install_check
+
+    worker_stop = (
+        REPO_ROOT / "integrations" / "windows" / "Stop-Worker.ps1"
+    ).read_text(encoding="utf-8")
+    assert "Set-PortableWorkerMutableCacheEnvironment" not in worker_stop
+    assert r'RelativePath "data\local\run\worker.pid.json"' in worker_stop
+    assert "stop-worker --package-root $Root" in worker_stop
 
 
 def test_worker_mutable_cache_environment_stays_outside_signed_trees(
