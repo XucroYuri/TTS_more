@@ -1,5 +1,25 @@
 # 变更记录
 
+## 2026-07-22 — ComfyUI TTS 后端集成
+
+新增 ComfyUI 作为统一 TTS 运行载体，通过 TTS-Audio-Suite 插件同时支持 GPT-SoVITS、IndexTTS-2、CosyVoice3 三引擎。
+
+### 新增
+- `backend/app/comfyui/` — ComfyUI HTTP API 客户端 + 工作流构建器
+  - `client.py`：ComfyUI 标准 API 封装（/prompt, /history, /view, /free）
+  - `workflow_builder.py`：三引擎工作流 JSON 模板（匹配实际 ComfyUI 节点 schema）
+- `ProviderType.COMFYUI` / `EngineName.COMFYUI` — 新枚举值
+- `ComfyUITTSClient` — 实现 TTSServiceClient 协议，接入 `build_service_client` 工厂
+- `build_cluster_key()` COMFYUI 分支 — 支持 model_path / reference_audio 聚类
+- `scrub_error` 包裹 ComfyUI 错误输出（安全脱敏）
+- 20 个单元测试 + 30 个对抗性审计测试
+- 文档：[ComfyUI 接入指南](comfyui-integration.md)
+
+### 设计决策
+- 每台 ComfyUI 实例 = 独立 resource_group，多机并行调度
+- CosyVoice 无参考音频时 fallback 到内置中文语音（避免静音输出）
+- 模型通过 `model_path` 指定，支持内置名和 `local:` 外部路径前缀
+
 ## 2026-07-09 — 非侵入式 TTS worker 架构 + 分支合并 + 跨平台优化
 
 架构转向：从"Gradio scrape / fork 深度改造"转向"非侵入式嵌入式 worker 脚本"。三个开源 TTS 服务（GPT-SoVITS、IndexTTS、CosyVoice）现在通过在上游 repo 进程内 import 模型的 FastAPI worker 接入，暴露统一 `tts-more-v1` 契约 + 发现端点，**不改上游任何文件**，对上游官方版本也兼容。Gradio 保留为能力有限的兜底。

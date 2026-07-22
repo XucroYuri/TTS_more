@@ -12,6 +12,7 @@ dependencies = [
   "jsonschema>=4.26.0,<5",
   "python-dotenv>=1.0.0",
   "python-multipart>=0.0.9",
+  "soundfile>=0.13.0",
 ]
 
 [project.optional-dependencies]

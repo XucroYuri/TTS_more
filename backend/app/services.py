@@ -4,6 +4,7 @@ import json
 import os
 import base64
 import hashlib
+import io
 import re
 import time
 import uuid
@@ -464,6 +465,8 @@ class ServiceRouter:
 def build_service_client(endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> TTSServiceClient:
     if endpoint.base_url.startswith("mock://"):
         return MockServiceClient(endpoint)
+    if endpoint.api_contract == "comfyui-tts-v1":
+        return ComfyUITTSClient(endpoint, transport=transport)
     if endpoint.api_contract == "tts-more-v1":
         return HttpTTSServiceClient(endpoint, transport=transport)
     if endpoint.api_contract.startswith("gradio-"):
@@ -1837,6 +1840,117 @@ def _extract_gemini_audio(data: dict[str, Any]) -> bytes:
             if inline and inline.get("data"):
                 return base64.b64decode(inline["data"])
     raise RuntimeError("Gemini response did not include inline audio data")
+
+
+class ComfyUITTSClient:
+    def __init__(self, endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> None:
+        from app.comfyui.client import ComfyUIAPIClient
+        from app.comfyui.workflow_builder import build_workflow as _build_workflow
+
+        self.endpoint = endpoint
+        self.transport = transport
+        self.api = ComfyUIAPIClient(endpoint.base_url, transport=transport)
+        self._build_workflow = _build_workflow
+
+    def health(self) -> dict[str, Any]:
+        stats = self.api.system_stats()
+        stats["engine"] = self.endpoint.engine.value if self.endpoint.engine else "comfyui"
+        return stats
+
+    def capabilities(self) -> dict[str, Any]:
+        return self.api.bridge_capabilities()
+
+    def load(self, profile: str, parameters: dict[str, Any] | None = None) -> None:
+        return
+
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        try:
+            return self._synthesize_impl(request)
+        except Exception as exc:
+            raise RuntimeError(scrub_error(exc, self.endpoint.base_url)) from exc
+
+    def _synthesize_impl(self, request: SynthesisRequest) -> SynthesisResult:
+        engine_value = request.parameters.get("engine") or (
+            self.endpoint.engine.value if self.endpoint.engine else "cosyvoice"
+        )
+        params = {**self.endpoint.default_params, **request.parameters}
+        params["text"] = request.line.text
+        reference_path = next(
+            (
+                str(params[key])
+                for key in ("reference_audio", "ref_audio_path", "prompt_audio_path")
+                if params.get(key)
+            ),
+            "",
+        )
+        asset_id: str | None = None
+        synthesis_error: Exception | None = None
+        result: SynthesisResult | None = None
+        try:
+            if reference_path:
+                upload = self.api.upload_audio(reference_path)
+                asset_id = str(upload["asset_id"])
+                params["asset_id"] = asset_id
+
+            workflow = self._build_workflow(engine_value, params)
+            prompt_id = self.api.submit_workflow(workflow)
+            timeout = float(params.get("timeout_seconds", 600.0))
+            poll_interval = float(params.get("poll_interval", 2.0))
+            history_entry = self.api.poll_until_done(
+                prompt_id, poll_interval=poll_interval, max_wait=timeout
+            )
+            output_files = self.api._extract_output_filenames(history_entry)
+            if not output_files:
+                raise RuntimeError(
+                    f"ComfyUI prompt {prompt_id} completed but produced no output files"
+                )
+            first_output = output_files[0]
+            audio_bytes = self.api.download_output(
+                filename=first_output["filename"],
+                subfolder=first_output["subfolder"],
+                folder_type=first_output["type"],
+            )
+            _write_wav(request.output_path, audio_bytes)
+            result = SynthesisResult(
+                audio_path=request.output_path,
+                metadata={
+                    "service_id": self.endpoint.service_id,
+                    "prompt_id": prompt_id,
+                    "engine": engine_value,
+                    "resource_id": params["resource_id"],
+                    "comfyui_output_files": output_files,
+                },
+            )
+        except Exception as exc:
+            synthesis_error = exc
+        cleanup_error: Exception | None = None
+        if asset_id:
+            try:
+                self.api.delete_audio(asset_id)
+            except Exception as exc:
+                cleanup_error = exc
+        if synthesis_error is not None:
+            raise synthesis_error
+        if cleanup_error is not None:
+            raise cleanup_error
+        assert result is not None
+        return result
+
+    def unload(self) -> None:
+        resource_id = str(self.endpoint.default_params.get("resource_id", "")).strip()
+        self.api.release_runtime(resource_id=resource_id or None)
+        self.api.free_memory()
+
+
+def _write_wav(output_path: Path, audio_bytes: bytes) -> None:
+    """Decode ComfyUI's FLAC output and persist the WAV contract used by TTS More."""
+    import soundfile
+
+    samples, sample_rate = soundfile.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
+    if sample_rate <= 0 or samples.size == 0:
+        raise ValueError("ComfyUI returned empty audio")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    soundfile.write(str(output_path), samples, sample_rate, format="WAV", subtype="PCM_16")
 
 
 def _tiny_wav_bytes() -> bytes:

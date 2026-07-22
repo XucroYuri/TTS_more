@@ -13,6 +13,7 @@ class EngineName(str, Enum):
     INDEX_TTS = "indextts"
     COSYVOICE = "cosyvoice"
     VIBEVOICE = "vibevoice"
+    COMFYUI = "comfyui"
     COMMERCIAL = "commercial"
 
 
@@ -21,6 +22,7 @@ class ProviderType(str, Enum):
     INDEX_TTS = "indextts"
     COSYVOICE = "cosyvoice"
     VIBEVOICE = "vibevoice"
+    COMFYUI = "comfyui"
     OPENAI = "openai"
     GEMINI = "gemini"
     XAI = "xai"
@@ -127,6 +129,7 @@ PROVIDER_ENGINE_DEFAULTS: dict[ProviderType, EngineName] = {
     ProviderType.INDEX_TTS: EngineName.INDEX_TTS,
     ProviderType.COSYVOICE: EngineName.COSYVOICE,
     ProviderType.VIBEVOICE: EngineName.VIBEVOICE,
+    ProviderType.COMFYUI: EngineName.COMFYUI,
     ProviderType.OPENAI: EngineName.COMMERCIAL,
     ProviderType.GEMINI: EngineName.COMMERCIAL,
     ProviderType.XAI: EngineName.COMMERCIAL,
@@ -257,6 +260,7 @@ class TTSServiceEndpoint(BaseModel):
                 ProviderType.INDEX_TTS: "gradio-indextts2-webui",
                 ProviderType.COSYVOICE: "gradio-cosyvoice-webui",
                 ProviderType.VIBEVOICE: "tts-more-v1",
+                ProviderType.COMFYUI: "comfyui-tts-v1",
                 ProviderType.OPENAI: "openai-speech-v1",
                 ProviderType.GEMINI: "gemini-tts-v1",
                 ProviderType.XAI: "xai-tts-v1",

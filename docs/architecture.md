@@ -9,9 +9,11 @@ flowchart LR
     Browser[浏览器<br/>React 工作台] -- HTTP /api --> Backend[FastAPI 编排后端<br/>backend/app]
     Backend -- 调度/合成 --> LocalRepo[本地仓库工作器<br/>GPT-SoVITS / index-tts]
     Backend -- 调度/合成 --> Remote[远端 HTTP 服务<br/>Gradio / 商业 API]
+    Backend -- 调度/合成 --> ComfyUI[ComfyUI 集群<br/>TTS-Audio-Suite 插件<br/>GPT-SoVITS + IndexTTS-2 + CosyVoice3]
     Backend -- 读写 --> Data[(data/<br/>项目 / 角色 / 配置)]
     LocalRepo -- 产出音频 --> Data
     Remote -- 回传音频 --> Backend
+    ComfyUI -- 回传音频 --> Backend
 ```
 
 三个核心边界：
@@ -34,6 +36,7 @@ flowchart TD
     main --> auth[auth.py<br/>可选 Token 中间件]
     main --> net[net_guard.py<br/>SSRF 防护 + 脱敏]
     services --> models[models.py<br/>Pydantic 数据模型]
+    services --> comfyui[comfyui/<br/>ComfyUI HTTP Client + Workflow Builder]
     queue --> services
     parser --> parser_config[parser_config.py]
     supervisor --> models
