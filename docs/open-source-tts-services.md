@@ -56,6 +56,7 @@ GPT-SoVITS `main` 是产品目标，`dev` 是回归目标，`proplus-hc-dev` 是
 - GPT-SoVITS：优先 `tts-more-v1` worker；兼容 `gradio-gpt-sovits-webui`
 - IndexTTS：优先 `tts-more-v1` worker；兼容 `gradio-indextts2-webui`
 - CosyVoice：优先 `tts-more-v1` worker；兼容 `gradio-cosyvoice-webui`
+- **ComfyUI**：`comfyui-tts-v1` — 统一 TTS 运行载体，通过 TTS-Audio-Suite 插件同时承载 GPT-SoVITS、IndexTTS-2、CosyVoice3。详见 [ComfyUI 接入指南](comfyui-integration.md)。
 
 配置保存到 `data/local/services.json`。不要把局域网 IP、生成音频或真实角色配置写入 `data/templates/`。
 
