@@ -24,7 +24,7 @@ def _base_workflow(engine: str, params: dict[str, Any], engine_inputs: dict[str,
         "TTS_engine": ["1", 0],
         "text": str(params.get("text", "")),
         "narrator_voice": "none",
-        "seed": int(params.get("seed", -1)),
+        "seed": max(0, int(params.get("seed", 0))),
     }
     workflow: dict[str, Any] = {
         "1": {"class_type": _ENGINE_NODES[engine], "inputs": engine_inputs},
