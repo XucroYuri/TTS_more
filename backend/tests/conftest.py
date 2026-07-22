@@ -9,6 +9,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LEGACY_PORTABLE_TEST_MODULES = {
+    "test_prepare_scripts.py",
     "test_integration_sync.py",
     "test_portable_control.py",
     "test_portable_diagnostics.py",
