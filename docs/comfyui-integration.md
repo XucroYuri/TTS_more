@@ -202,3 +202,160 @@ ComfyUITTSClient 封装了与 ComfyUI 的交互逻辑：
 
 - **错误脱敏**: 系统使用 `scrub_error` 对敏感信息进行脱敏处理。
 - **访问控制**: ComfyUI 默认不带认证机制。建议将其绑定至 `127.0.0.1`，或通过反向代理（如 Nginx）增加认证层。
+
+## 从零部署指南
+
+以下是从空白机器到完整可用的一站式部署步骤。共涉及 3 个 GitHub 项目。
+
+### 项目清单
+
+| 项目 | GitHub 地址 | 用途 | 必需 |
+|:---|:---|:---|:---:|
+| **TTS More** | `XucroYuri/TTS_more` (分支 `dev-xu/comfyui-integration`) | TTS 编排后端 + React 工作台 | 是 |
+| **ComfyUI** | `Comfy-Org/ComfyUI` | TTS 运行载体，提供 HTTP API 和工作流引擎 | 是 |
+| **TTS-Audio-Suite** | `diodiogod/TTS-Audio-Suite` | ComfyUI 插件，整合 GPT-SoVITS / IndexTTS-2 / CosyVoice3 及 15+ 引擎 | 是 |
+| **GPT-SoVITS** | `XucroYuri/GPT-SoVITS` | GPT-SoVITS 模型权重来源（传统 worker 路径；ComfyUI 路径下可选） | 否 |
+| **IndexTTS** | `XucroYuri/index-tts` | IndexTTS 模型权重来源（传统 worker 路径；ComfyUI 路径下可选） | 否 |
+| **CosyVoice** | `XucroYuri/CosyVoice` | CosyVoice 模型权重来源（传统 worker 路径；ComfyUI 路径下可选） | 否 |
+
+> ComfyUI 路径下，TTS-Audio-Suite 会自动下载所需模型（首次使用）。GPT-SoVITS / IndexTTS / CosyVoice 三个 repo 仅在传统 worker 模式或模型分离模式下需要。
+
+### 架构关系
+
+```mermaid
+flowchart TD
+    TM["XucroYuri/TTS_more<br/>TTS 编排层"] -- "HTTP API" --> CF["Comfy-Org/ComfyUI<br/>工作流引擎"]
+    CF -- "插件加载" --> TAS["diodiogod/TTS-Audio-Suite<br/>TTS 节点插件"]
+    TAS -- "引擎调用" --> M["模型层<br/>CosyVoice3 / IndexTTS-2 / GPT-SoVITS"]
+    M -- "自动下载" --> DL["HuggingFace / ModelScope<br/>模型权重"]
+    TM -. "传统路径 (可选)" .-> GS["XucroYuri/GPT-SoVITS"]
+    TM -. "传统路径 (可选)" .-> IT["XucroYuri/index-tts"]
+    TM -. "传统路径 (可选)" .-> CV["XucroYuri/CosyVoice"]
+```
+
+### 部署步骤
+
+#### 第一步：安装 ComfyUI
+
+```powershell
+# 克隆 ComfyUI
+git clone https://github.com/Comfy-Org/ComfyUI.git
+cd ComfyUI
+
+# 创建虚拟环境并安装依赖
+python -m venv .venv
+.venv\Scripts\pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+.venv\Scripts\pip install -r requirements.txt
+```
+
+macOS / Linux：
+```bash
+git clone https://github.com/Comfy-Org/ComfyUI.git
+cd ComfyUI
+python3 -m venv .venv
+.venv/bin/pip install torch torchvision torchaudio
+.venv/bin/pip install -r requirements.txt
+```
+
+#### 第二步：安装 TTS-Audio-Suite 插件
+
+```powershell
+cd ComfyUI/custom_nodes
+git clone https://github.com/diodiogod/TTS-Audio-Suite.git
+cd TTS-Audio-Suite
+..\..\.venv\Scripts\pip install -r requirements.txt
+```
+
+> 也可在 ComfyUI 启动后通过 ComfyUI Manager 搜索 "TTS Audio Suite" 一键安装。
+
+#### 第三步：启动 ComfyUI
+
+```powershell
+cd ComfyUI
+.venv\Scripts\python main.py --listen 0.0.0.0 --port 8188
+```
+
+验证：浏览器打开 `http://127.0.0.1:8188`，在节点列表搜索 "CosyVoice" 确认插件已加载。
+
+#### 第四步：安装 TTS More
+
+```powershell
+git clone https://github.com/XucroYuri/TTS_more.git
+cd TTS_more
+git checkout dev-xu/comfyui-integration
+
+# 安装依赖
+python -m venv .venv
+.venv\Scripts\pip install -e 'backend[dev]'
+cd frontend && pnpm install && cd ..
+```
+
+#### 第五步：配置 ComfyUI 服务端点
+
+创建 `data/local/services.json`：
+
+```json
+[
+  {
+    "service_id": "comfyui-cosyvoice",
+    "display_name": "ComfyUI - CosyVoice3",
+    "provider_type": "comfyui",
+    "api_contract": "comfyui-tts-v1",
+    "engine": "cosyvoice",
+    "base_url": "http://127.0.0.1:8188",
+    "mode": "external",
+    "network_scope": "localhost",
+    "resource_group": "local-gpu-0",
+    "capacity": 3,
+    "priority": 10,
+    "capabilities": ["tts", "cosyvoice", "wav_output", "reference_audio_voice"]
+  },
+  {
+    "service_id": "comfyui-indextts",
+    "display_name": "ComfyUI - IndexTTS-2",
+    "provider_type": "comfyui",
+    "api_contract": "comfyui-tts-v1",
+    "engine": "indextts",
+    "base_url": "http://127.0.0.1:8188",
+    "mode": "external",
+    "network_scope": "localhost",
+    "resource_group": "local-gpu-0",
+    "capacity": 3,
+    "priority": 20,
+    "capabilities": ["tts", "indextts", "wav_output", "emotion_text", "emotion_audio"]
+  }
+]
+```
+
+#### 第六步：启动 TTS More
+
+```powershell
+# 启动后端
+.venv\Scripts\python -m uvicorn app.main:create_app --host 127.0.0.1 --port 8000
+
+# 另开终端，启动前端
+cd frontend && pnpm dev
+```
+
+打开 `http://127.0.0.1:5173`，进入 `接入 → TTS 服务`，确认 ComfyUI 端点状态为 "ready"。
+
+#### 第七步：首次合成测试
+
+在工作台创建项目 → 添加台词 → 选择 CosyVoice 引擎 → 点击生成。首次使用会自动下载 CosyVoice3 模型（~5.4GB），后续合成约 3 秒/条。
+
+### 多机扩展
+
+每增加一台 GPU 机器，只需：
+
+1. 在该机器上完成第一、二、三步（安装 ComfyUI + TTS-Audio-Suite）
+2. 在 TTS More 的 `services.json` 中添加新的端点，使用不同的 `resource_group`：
+```json
+{
+  "service_id": "comfyui-gpu1-cosyvoice",
+  "base_url": "http://192.168.1.11:8188",
+  "resource_group": "comfyui-gpu-1",
+  ...
+}
+```
+
+不同 `resource_group` 的任务由 TTS More 自动并行调度，无需额外配置。
