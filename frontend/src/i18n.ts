@@ -294,7 +294,6 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       kwjmActivationTitle: "剧本解析服务",
       kwjmActivationHint: "输入 API Key，保存后即可提取台词。",
       providerHint: "只有需要多个解析服务或自定义模型时再打开。",
-      kwjmPresetMeta: "{{model}} · {{baseUrl}}",
       providerName: "名称",
       adapterLabel: "调用适配器",
       adapter: {
@@ -789,6 +788,105 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       uploadingReference: "正在上传参考音频…",
       referenceUploaded: "参考音频已保存到当前项目",
       referenceUploadFailed: "参考音频上传失败"
+    },
+    portableServices: {
+      title: "本地便携 TTS 服务",
+      description: "维护三个独立便携包的路径，并按需逐个启动。这里不会自动批量启动服务。",
+      loading: "正在读取本地服务…",
+      path: "路径",
+      endpoint: "服务地址",
+      notConfiguredPath: "尚未选择便携包目录",
+      operationDetails: "技术详情",
+      nextAction: "下一步",
+      progress: "初始化进度 {{percent}}%",
+      logsTitle: "操作记录",
+      noLogs: "暂无操作记录",
+      selected: "已更新 {{component}} 的本地目录",
+      selectionCancelled: "未更改目录",
+      actionFailed: "操作未完成",
+      manualProxyGuidance: "所有锁定的自动下载源均已耗尽。可临时填写 HTTP(S) 代理后再次修复；代理只传给本次修复子进程，不会保存。",
+      manualProxyLabel: "本次修复使用的临时代理",
+      manualProxyInvalid: "请输入不含路径、查询参数或片段的 HTTP(S) 代理地址",
+      import: {
+        action: "从旧版本导入",
+        planning: "正在等待选择旧版本…",
+        ready: "已准备好导入，请确认安全摘要。",
+        cancelled: "已取消选择，未执行导入。",
+        preservedStopped: "旧版本便携包将保留，绝不会删除或修改。导入期间，此服务必须保持已停止。",
+        userFiles: "用户文件：{{count}} 个（{{bytes}} 字节）",
+        reusableAssets: "可复用资源：{{count}} 个（{{bytes}} 字节）",
+        skippedAssets: "跳过资源：{{count}} 个",
+        alreadyPresent: "已存在：{{count}} 个",
+        assetDetails: "查看可复用资源名称（最多 20 个）",
+        confirm: "确认并导入",
+        cancel: "取消",
+        applying: "正在导入，请保持服务已停止…",
+        success: "导入完成。已复制 {{copied}} 个用户文件，复用 {{reused}} 个资源，跳过 {{skipped}} 个，已有 {{present}} 个。",
+        retry: "重新选择旧版本",
+        disabled: {
+          busy: "当前服务正在执行操作，完成后才能导入。",
+          unconfigured: "请先选择并注册本机便携包。",
+          lan: "局域网服务不能导入本机旧版本数据。",
+          external: "外部服务不能导入本机旧版本数据。",
+          incompatible: "当前包身份与本机便携导入不兼容。",
+          notInstalled: "请先完成当前便携包的安装或修复。",
+          running: "请先停止服务，再导入旧版本数据。",
+          runtimeUnknown: "无法确认服务已停止，暂不能导入。"
+        },
+        error: {
+          planFailed: "无法读取所选旧版本，请重新选择。",
+          planUnavailable: "导入确认已过期或失效，请重新选择旧版本。",
+          blocked: "服务状态或包身份已变化，请重新选择旧版本。",
+          failed: "导入未完成，请重新选择旧版本。",
+          changed: "服务状态或包身份已变化，请重新选择旧版本。",
+          controlChanged: "本机控制会话已更新，请重新选择旧版本。",
+          unknown: "导入未完成，请重新选择旧版本。"
+        }
+      },
+      action: {
+        browse: "选择目录",
+        start: "启动",
+        stop: "停止",
+        repair: "修复",
+        openFolder: "打开目录",
+        openService: "打开服务",
+        logs: "查看记录",
+        closeLogs: "收起记录"
+      },
+      phase: {
+        notConfigured: "未配置",
+        notInitialized: "等待初始化",
+        checking: "正在检查",
+        downloading: "正在下载必要文件",
+        installing: "正在安装运行环境",
+        validating: "正在验证运行环境",
+        starting: "正在启动服务",
+        stopping: "正在停止服务",
+        repairing: "正在修复环境",
+        ready: "可用",
+        stopped: "已停止",
+        repairable: "需要修复",
+        blocked: "需要处理"
+      },
+      disabled: {
+        lan: "局域网服务只能使用，不能从这里启动、停止或修复。",
+        external: "外部服务地址可继续使用，但不包含可由本机工作台控制的便携包。",
+        incompatible: "已找到本地包，但版本或包身份与当前控制器不兼容。",
+        busy: "当前服务正在执行操作，请等待完成。"
+      },
+      error: {
+        allSourcesExhausted: "自动下载源均不可用",
+        cudaProbeFailed: "显卡运行环境验证失败",
+        diskSpaceInsufficient: "包所在磁盘空间不足",
+        downloadInterrupted: "下载因网络问题中断，可修复后续传",
+        controlExpired: "本机控制会话已更新，正在重新连接",
+        identityMismatch: "所选目录不是这个服务的便携包",
+        invalidPackage: "所选目录不是完整的便携包",
+        notManageable: "当前服务不能由本机工作台控制",
+        portInUse: "服务端口已被其他程序占用",
+        statusTimeout: "未在限定时间内确认操作完成，请按当前状态重试或查看技术详情",
+        unknown: "操作未完成，请查看技术详情"
+      }
     }
   },
   "en-US": {
@@ -1069,7 +1167,6 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       kwjmActivationTitle: "Script parsing service",
       kwjmActivationHint: "Enter an API key, save, then extract lines.",
       providerHint: "Open only for multiple parser services or a custom model.",
-      kwjmPresetMeta: "{{model}} · {{baseUrl}}",
       providerName: "Name",
       adapterLabel: "Adapter",
       adapter: {
@@ -1564,6 +1661,105 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       uploadingReference: "Uploading reference audio…",
       referenceUploaded: "Reference audio saved to this project",
       referenceUploadFailed: "Reference audio upload failed"
+    },
+    portableServices: {
+      title: "Local portable TTS services",
+      description: "Maintain the three independent package paths and start each service only when needed. Services are never started in bulk.",
+      loading: "Loading local services…",
+      path: "Path",
+      endpoint: "Service URL",
+      notConfiguredPath: "No portable package folder selected",
+      operationDetails: "Technical details",
+      nextAction: "Next step",
+      progress: "Initialization progress {{percent}}%",
+      logsTitle: "Operation log",
+      noLogs: "No operation events yet",
+      selected: "Updated the local folder for {{component}}",
+      selectionCancelled: "Folder was not changed",
+      actionFailed: "The operation did not complete",
+      manualProxyGuidance: "All locked download sources are exhausted. Enter a temporary HTTP(S) proxy and run Repair again. It is passed only to this repair child process and is never saved.",
+      manualProxyLabel: "Temporary proxy for this repair",
+      manualProxyInvalid: "Enter an HTTP(S) proxy URL without a path, query, or fragment",
+      import: {
+        action: "Import previous version",
+        planning: "Waiting for a previous version selection…",
+        ready: "Ready to import. Review the safe summary and confirm.",
+        cancelled: "Selection cancelled. Nothing was imported.",
+        preservedStopped: "The previous package is preserved and will never be deleted or modified. This worker must remain stopped during import.",
+        userFiles: "User files: {{count}} ({{bytes}} bytes)",
+        reusableAssets: "Reusable assets: {{count}} ({{bytes}} bytes)",
+        skippedAssets: "Skipped assets: {{count}}",
+        alreadyPresent: "Already present: {{count}}",
+        assetDetails: "Show reusable asset names (up to 20)",
+        confirm: "Confirm import",
+        cancel: "Cancel",
+        applying: "Importing. Keep this worker stopped…",
+        success: "Import complete. Copied {{copied}} user files, reused {{reused}} assets, skipped {{skipped}}, and found {{present}} already present.",
+        retry: "Choose previous version again",
+        disabled: {
+          busy: "This service is busy. Wait for it to finish before importing.",
+          unconfigured: "Choose and register a local portable package first.",
+          lan: "LAN services cannot import data from a local previous version.",
+          external: "External services cannot import data from a local previous version.",
+          incompatible: "This package identity is incompatible with local portable import.",
+          notInstalled: "Finish installing or repairing the current portable package first.",
+          running: "Stop this worker before importing previous-version data.",
+          runtimeUnknown: "The worker's stopped state cannot be confirmed, so import is unavailable."
+        },
+        error: {
+          planFailed: "The selected previous version could not be read. Choose it again.",
+          planUnavailable: "This import confirmation expired or became unavailable. Choose the previous version again.",
+          blocked: "The worker state or package identity changed. Choose the previous version again.",
+          failed: "The import did not complete. Choose the previous version again.",
+          changed: "The worker state or package identity changed. Choose the previous version again.",
+          controlChanged: "The local control session changed. Choose the previous version again.",
+          unknown: "The import did not complete. Choose the previous version again."
+        }
+      },
+      action: {
+        browse: "Choose folder",
+        start: "Start",
+        stop: "Stop",
+        repair: "Repair",
+        openFolder: "Open folder",
+        openService: "Open service",
+        logs: "Show log",
+        closeLogs: "Hide log"
+      },
+      phase: {
+        notConfigured: "Not configured",
+        notInitialized: "Waiting for initialization",
+        checking: "Checking",
+        downloading: "Downloading required files",
+        installing: "Installing runtime",
+        validating: "Validating runtime",
+        starting: "Starting service",
+        stopping: "Stopping service",
+        repairing: "Repairing runtime",
+        ready: "Ready",
+        stopped: "Stopped",
+        repairable: "Repair needed",
+        blocked: "Action needed"
+      },
+      disabled: {
+        lan: "LAN services can be used, but cannot be started, stopped, or repaired from this workstation.",
+        external: "The external service URL remains usable, but it is not a local portable package this workstation can control.",
+        incompatible: "A local package was found, but its version or identity is incompatible with this controller.",
+        busy: "This service is busy. Wait for the current operation to finish."
+      },
+      error: {
+        allSourcesExhausted: "All automatic download sources are unavailable",
+        cudaProbeFailed: "GPU runtime validation failed",
+        diskSpaceInsufficient: "The package drive does not have enough free space",
+        downloadInterrupted: "The download was interrupted and can resume after repair",
+        controlExpired: "The local control session changed; reconnecting",
+        identityMismatch: "The selected folder is not this service's package",
+        invalidPackage: "The selected folder is not a complete portable package",
+        notManageable: "This service cannot be controlled by the local workstation",
+        portInUse: "The service port is owned by another program",
+        statusTimeout: "The operation could not be confirmed in time. Retry from the current state or open technical details.",
+        unknown: "The operation did not complete; open technical details"
+      }
     }
   }
 };

@@ -146,6 +146,57 @@ def test_external_worker_without_artifact_transfer_fails_before_request(tmp_path
         )
 
 
+def test_external_loopback_worker_uses_artifact_delivery(tmp_path: Path) -> None:
+    import hashlib
+
+    output = tmp_path / "portable.wav"
+    audio = b"RIFFportable"
+    artifact_id = "e" * 32
+    endpoint = TTSServiceEndpoint(
+        service_id="portable-gpt",
+        provider_type="gpt-sovits",
+        api_contract="tts-more-v1",
+        base_url="http://127.0.0.1:9883",
+        mode="external",
+        network_scope="localhost",
+        managed=False,
+        source_profile="local_endpoint",
+        capabilities=["tts", "artifact-transfer"],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/synthesize":
+            assert json.loads(request.content)["delivery"] == "artifact"
+            return httpx.Response(
+                200,
+                json={
+                    "artifact_id": artifact_id,
+                    "download_url": f"/artifacts/{artifact_id}",
+                    "sha256": hashlib.sha256(audio).hexdigest(),
+                    "size_bytes": len(audio),
+                },
+            )
+        if request.method == "GET":
+            return httpx.Response(200, content=audio)
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"deleted": True})
+        return httpx.Response(404)
+
+    result = build_service_client(
+        endpoint, transport=httpx.MockTransport(handler)
+    ).synthesize(
+        SynthesisRequest(
+            line=ScriptLine(id="l1", character_id="hero", text="hello"),
+            profile="hero",
+            output_path=output,
+            parameters={},
+        )
+    )
+
+    assert result.audio_path == output
+    assert output.read_bytes() == audio
+
+
 def test_external_worker_hash_mismatch_preserves_local_file_and_remote_artifact(tmp_path: Path) -> None:
     import hashlib
     import pytest

@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import time
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from app.models import EngineName, TTSServiceEndpoint
+from app.models import EngineName, PortableServiceLocator, TTSServiceEndpoint
 from app.supervisor import ServiceSupervisor
 
 
@@ -250,3 +254,313 @@ def test_supervisor_tail_logs_reads_last_lines(tmp_path: Path) -> None:
 
     assert result["status"] == "ok"
     assert result["lines"] == ["two", "three"]
+
+
+class FakePortableController:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, object, dict[str, object]]] = []
+
+    def start(self, descriptor, **kwargs):
+        self.calls.append(("start", descriptor, kwargs))
+        return {"status": "starting", "operation_id": kwargs["operation_id"]}
+
+    def stop(self, descriptor, **kwargs):
+        self.calls.append(("stop", descriptor, kwargs))
+        return {"status": "stopping"}
+
+    def repair(self, descriptor, **kwargs):
+        self.calls.append(("repair", descriptor, kwargs))
+        return {"status": "repairing"}
+
+    def logs(self, descriptor, **kwargs):
+        self.calls.append(("logs", descriptor, kwargs))
+        return {"status": "ok", "events": []}
+
+    def status(self, descriptor, **kwargs):
+        self.calls.append(("status", descriptor, kwargs))
+        return {"status": "ready"}
+
+    def open_folder(self, descriptor, **kwargs):
+        self.calls.append(("open_folder", descriptor, kwargs))
+        return {"status": "opened"}
+
+
+def _portable_endpoint(**updates) -> TTSServiceEndpoint:
+    values = {
+        "service_id": "portable-gpt-main",
+        "engine": EngineName.GPT_SOVITS,
+        "base_url": "http://127.0.0.1:9880",
+        "mode": "local",
+        "network_scope": "localhost",
+        "managed": True,
+        "api_contract": "tts-more-v1",
+        "control_kind": "portable-package",
+        "portable_locator": PortableServiceLocator(
+            component="gpt-sovits",
+            package_id="gpt-main",
+            absolute_path_last_seen="C:/portable/GPT",
+            port_override=9980,
+        ),
+        # Forged legacy fields must be ignored rather than invoked.
+        "repo_path": "C:/evil",
+        "start_command": ["evil.exe", "&", "whoami"],
+        "start_cwd": "C:/evil",
+    }
+    values.update(updates)
+    return TTSServiceEndpoint(**values)
+
+
+def _descriptor(**updates):
+    values = {
+        "component": "gpt-sovits",
+        "package_id": "gpt-main",
+        "package_root": "C:/portable/GPT",
+        "default_url": "http://127.0.0.1:9980",
+        "manageable": True,
+        "initialized": True,
+    }
+    values.update(updates)
+    return SimpleNamespace(**values)
+
+
+def test_supervisor_routes_every_portable_action_through_fresh_resolver(tmp_path: Path) -> None:
+    controller = FakePortableController()
+    resolved = _descriptor()
+    resolutions: list[object] = []
+
+    def resolver(_root, locator, _search):
+        resolutions.append(locator)
+        return resolved
+
+    supervisor = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=controller,
+        portable_resolver=resolver,
+    )
+    endpoint = _portable_endpoint()
+
+    started = supervisor.start(endpoint, operation_id="11111111-1111-4111-8111-111111111111")
+    supervisor.stop(endpoint)
+    supervisor.repair(endpoint)
+    supervisor.logs(endpoint, operation_id="11111111-1111-4111-8111-111111111111", lines=7)
+    supervisor.status(endpoint, operation_id="11111111-1111-4111-8111-111111111111")
+    supervisor.open_folder(endpoint)
+
+    assert started["status"] == "starting"
+    assert [call[0] for call in controller.calls] == ["start", "stop", "repair", "logs", "status", "open_folder"]
+    assert len(resolutions) == 6
+    assert controller.calls[0][2]["port_override"] == 9980
+    assert all(call[1] is resolved for call in controller.calls)
+
+
+def test_supervisor_successful_start_notifies_process_local_plan_invalidator(
+    tmp_path: Path,
+) -> None:
+    invalidated: list[str] = []
+    supervisor = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=FakePortableController(),
+        portable_resolver=lambda *_args: _descriptor(),
+    )
+    supervisor.set_portable_start_invalidator(invalidated.append)
+
+    result = supervisor.start(
+        _portable_endpoint(),
+        operation_id="11111111-1111-4111-8111-111111111111",
+    )
+
+    assert result["status"] == "starting"
+    assert invalidated == ["gpt-sovits"]
+
+    class BlockedController(FakePortableController):
+        def start(self, descriptor, **kwargs):
+            return {"status": "blocked", "error_code": "START_FAILED"}
+
+    blocked = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".blocked-runtime",
+        portable_controller=BlockedController(),
+        portable_resolver=lambda *_args: _descriptor(),
+    )
+    blocked.set_portable_start_invalidator(invalidated.append)
+    failed = blocked.start(
+        _portable_endpoint(service_id="portable-gpt-blocked"),
+        operation_id="22222222-2222-4222-8222-222222222222",
+    )
+    assert failed["status"] == "blocked"
+    assert invalidated == ["gpt-sovits"]
+
+
+def test_supervisor_passes_ephemeral_proxy_only_to_repair_controller(tmp_path: Path) -> None:
+    controller = FakePortableController()
+    supervisor = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=controller,
+        portable_resolver=lambda *_args: _descriptor(),
+    )
+    endpoint = _portable_endpoint()
+    proxy = "http://user:password@127.0.0.1:10808"
+
+    result = supervisor.repair(endpoint, proxy_url=proxy)
+
+    assert result["status"] == "repairing"
+    assert controller.calls[0][0] == "repair"
+    assert controller.calls[0][2]["proxy_url"] == proxy
+    assert str(uuid.UUID(str(controller.calls[0][2]["action_id"]))) == controller.calls[0][2]["action_id"]
+
+
+def test_supervisor_uses_independent_portable_controller_root_for_every_resolution(tmp_path: Path) -> None:
+    legacy_project_root = tmp_path / "moved suite" / "app"
+    portable_controller_root = legacy_project_root.parent
+    resolution_roots: list[Path] = []
+
+    def resolver(root, _locator, _search):
+        resolution_roots.append(root)
+        return _descriptor(package_root=str(portable_controller_root / "GPT-SoVITS"))
+
+    supervisor = ServiceSupervisor(
+        project_root=legacy_project_root,
+        portable_controller_root=portable_controller_root,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=FakePortableController(),
+        portable_resolver=resolver,
+    )
+    endpoint = _portable_endpoint()
+
+    assert supervisor.start(
+        endpoint,
+        operation_id="11111111-1111-4111-8111-111111111111",
+    )["status"] == "starting"
+    assert supervisor.status(endpoint)["status"] == "ready"
+    assert resolution_roots == [portable_controller_root.resolve()] * 2
+    assert supervisor.project_root == legacy_project_root.resolve()
+    assert supervisor.portable_controller_root == portable_controller_root.resolve()
+
+
+@pytest.mark.parametrize(
+    "endpoint,resolved",
+    [
+        (_portable_endpoint(mode="external", network_scope="lan", base_url="http://192.168.1.2:9880"), _descriptor()),
+        (_portable_endpoint(network_scope="lan"), _descriptor()),
+        (_portable_endpoint(api_contract="legacy"), _descriptor()),
+        (_portable_endpoint(), None),
+        (_portable_endpoint(), _descriptor(manageable=False)),
+        (_portable_endpoint(), _descriptor(component="indextts")),
+    ],
+)
+def test_supervisor_never_falls_back_to_legacy_for_untrusted_portable_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: TTSServiceEndpoint, resolved
+) -> None:
+    monkeypatch.setattr("app.supervisor.subprocess.Popen", lambda *_args, **_kwargs: pytest.fail("legacy spawn must not run"))
+    controller = FakePortableController()
+    supervisor = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=controller,
+        portable_resolver=lambda *_args: resolved,
+    )
+
+    result = supervisor.start(endpoint, operation_id="11111111-1111-4111-8111-111111111111")
+
+    assert result["status"] == "not manageable"
+    assert controller.calls == []
+
+
+def test_supervisor_ignores_forged_portable_commands_but_preserves_legacy_behavior(tmp_path: Path, monkeypatch) -> None:
+    portable = FakePortableController()
+    supervisor = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=portable,
+        portable_resolver=lambda *_args: _descriptor(),
+    )
+    portable_result = supervisor.start(_portable_endpoint(), operation_id="11111111-1111-4111-8111-111111111111")
+    assert portable_result["status"] == "starting"
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "app.supervisor.subprocess.Popen",
+        lambda command, **_kwargs: calls.append(command) or FakePopen(),
+    )
+    legacy = TTSServiceEndpoint(
+        service_id="legacy-local", engine=EngineName.INDEX_TTS,
+        base_url="http://127.0.0.1:9881", mode="local",
+        start_command=["python", "-m", "uvicorn"], start_cwd=".",
+    )
+    assert supervisor.start(legacy)["status"] == "started"
+    assert calls == [["python", "-m", "uvicorn"]]
+
+
+def test_supervisor_serializes_racing_actions_for_one_portable_identity(tmp_path: Path) -> None:
+    entered = threading.Event()
+    released = threading.Event()
+    order: list[str] = []
+
+    class BlockingController(FakePortableController):
+        def start(self, descriptor, **kwargs):
+            order.append("start-enter")
+            entered.set()
+            assert released.wait(3)
+            order.append("start-exit")
+            return {"status": "starting", "operation_id": kwargs["operation_id"]}
+
+        def stop(self, descriptor, **kwargs):
+            order.append("stop")
+            return {"status": "stopping"}
+
+    supervisor = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=BlockingController(),
+        portable_resolver=lambda *_args: _descriptor(),
+    )
+    endpoint = _portable_endpoint()
+    start_thread = threading.Thread(
+        target=lambda: supervisor.start(endpoint, operation_id="11111111-1111-4111-8111-111111111111")
+    )
+    stop_thread = threading.Thread(target=lambda: supervisor.stop(endpoint))
+    start_thread.start()
+    assert entered.wait(2)
+    stop_thread.start()
+    time.sleep(0.05)
+    assert order == ["start-enter"]
+    released.set()
+    start_thread.join(3)
+    stop_thread.join(3)
+    assert order == ["start-enter", "start-exit", "stop"]
+
+
+def test_supervisor_never_rebinds_one_service_id_to_a_different_portable_identity(tmp_path: Path) -> None:
+    controller = FakePortableController()
+
+    def resolver(_root, locator, _search):
+        return _descriptor(
+            component=locator.component,
+            package_id=locator.package_id,
+            package_root=locator.absolute_path_last_seen,
+        )
+
+    supervisor = ServiceSupervisor(
+        project_root=tmp_path,
+        runtime_root=tmp_path / ".runtime",
+        portable_controller=controller,
+        portable_resolver=resolver,
+    )
+    first = _portable_endpoint()
+    second = _portable_endpoint(
+        portable_locator=PortableServiceLocator(
+            component="indextts",
+            package_id="index-main",
+            absolute_path_last_seen="C:/portable/Index",
+        )
+    )
+
+    assert supervisor.start(first, operation_id="11111111-1111-4111-8111-111111111111")["status"] == "starting"
+    refused = supervisor.start(second, operation_id="22222222-2222-4222-8222-222222222222")
+
+    assert refused["status"] == "not manageable"
+    assert "identity" in refused["reason"]
+    assert len(controller.calls) == 1

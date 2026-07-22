@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
@@ -31,7 +31,14 @@ def public_service_settings(registry: ServiceRegistry, env_path: Path) -> dict[s
     }
 
 
-def save_service_settings(path: Path, env_path: Path, payload: ServiceSettingsUpdate) -> ServiceRegistry:
+def save_service_settings(
+    path: Path,
+    env_path: Path,
+    payload: ServiceSettingsUpdate,
+    *,
+    registry: ServiceRegistry | None = None,
+    publish: Callable[[ServiceRegistry], None] | None = None,
+) -> ServiceRegistry:
     services: list[TTSServiceEndpoint] = []
     for record in payload.services:
         for key, value in record.secrets.items():
@@ -39,9 +46,9 @@ def save_service_settings(path: Path, env_path: Path, payload: ServiceSettingsUp
                 set_env_value(env_path, key, value)
         data = record.model_dump(mode="python", exclude={"secrets"})
         services.append(TTSServiceEndpoint.model_validate(data))
-    registry = ServiceRegistry(services)
-    registry.save(path)
-    return registry
+    updated = (registry or ServiceRegistry.load(path)).with_services(services)
+    updated.save(path, publish=publish)
+    return updated
 
 
 def _service_key_configured(service: TTSServiceEndpoint, env_path: Path) -> bool:

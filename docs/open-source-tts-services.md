@@ -32,9 +32,12 @@ git clone https://github.com/XucroYuri/TTS_more.git
 
 如果还没有可用 TTS 服务，推荐先用部署脚本准备 repo 和 worker；已有 Gradio 服务也可以作为兼容端点接入。
 
+完整 repo 确认文件是 mandatory even when the lock paths are unchanged：
+
 ```bash
-python scripts/tts_more_deploy.py sync-repos --clean
-python scripts/tts_more_deploy.py render-services --profile local-all --output data/local/services.json
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
+python scripts/tts_more_deploy.py sync-repos --clean --repo-paths deployment/app/repo-paths.local.json
+python scripts/tts_more_deploy.py render-services --profile local-all --output data/local/services.json --repo-paths deployment/app/repo-paths.local.json
 ```
 
 `repo.lock.json` 会保留 GPT-SoVITS `main`、`dev`、`xucroyuri/proplus-hc-dev` 三个分支，以及 IndexTTS、CosyVoice。默认只拉取标记为 `default_selected` 的 GPT-SoVITS `main`、IndexTTS、CosyVoice；`dev` 与 `proplus-hc-dev` 需要显式选择。详见 [部署方案](deployment.md)。

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 import io
+import subprocess
 import wave
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.workers import discovery
@@ -25,6 +28,112 @@ def test_gpt_sovits_worker_health_and_capabilities() -> None:
     caps = client.get("/capabilities").json()["capabilities"]
     assert "tts" in caps
     assert "gpt-weights" in caps
+
+
+def test_gpt_sovits_bootstrap_derives_upstream_package_and_ffmpeg_paths(tmp_path: Path, monkeypatch) -> None:
+    """A configured checkout must be importable without machine-specific PYTHONPATH."""
+    import app.workers.gpt_sovits_worker as worker
+
+    repo = tmp_path / "custom-gpt-sovits"
+    package = repo / "GPT_SoVITS"
+    ffmpeg_bin = repo / "ffmpeg-shared" / "bin"
+    package.mkdir(parents=True)
+    ffmpeg_bin.mkdir(parents=True)
+    monkeypatch.setattr(worker, "REPO_DIR", repo)
+    monkeypatch.setattr(sys, "path", [str(tmp_path)])
+    monkeypatch.setenv("PATH", "system-path")
+    monkeypatch.chdir(tmp_path)
+
+    worker._bootstrap_repo()
+
+    assert sys.path[:2] == [str(package), str(repo)]
+    assert worker.os.environ["PATH"].split(worker.os.pathsep)[0] == str(ffmpeg_bin)
+
+
+def test_gpt_sovits_bootstrap_uses_packaged_ffmpeg_bin_for_path_and_dll_loading(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    package_root = tmp_path / "GPT-SoVITS-package"
+    repo = package_root / "app"
+    upstream_package = repo / "GPT_SoVITS"
+    ffmpeg_bin = package_root / "ffmpeg-shared" / "bin"
+    upstream_package.mkdir(parents=True)
+    ffmpeg_bin.mkdir(parents=True)
+    dll_paths: list[str] = []
+    monkeypatch.setattr(worker, "REPO_DIR", repo)
+    monkeypatch.setattr(worker, "_dll_directories", [])
+    monkeypatch.setattr(worker, "_dll_directory_paths", set())
+    monkeypatch.setattr(sys, "path", [str(tmp_path)])
+    monkeypatch.setenv("TTS_MORE_PACKAGE_ROOT", str(package_root))
+    monkeypatch.setenv("PATH", "system-path")
+    monkeypatch.setattr(worker.os, "add_dll_directory", lambda path: dll_paths.append(path) or object(), raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    worker._bootstrap_repo()
+
+    assert sys.path[:2] == [str(upstream_package), str(repo)]
+    assert worker.os.environ["PATH"].split(worker.os.pathsep)[0] == str(ffmpeg_bin)
+    assert dll_paths == [str(ffmpeg_bin)]
+
+
+def test_gpt_worker_artifact_store_uses_configured_tts_more_data_root(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    artifact_root = tmp_path / "runtime-artifacts"
+    monkeypatch.setenv("TTS_MORE_ARTIFACT_ROOT", str(artifact_root))
+
+    assert worker._artifact_store().root == artifact_root.resolve()
+
+
+def test_gpt_worker_artifact_store_defaults_outside_upstream_repo(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    monkeypatch.delenv("TTS_MORE_ARTIFACT_ROOT", raising=False)
+    monkeypatch.setattr(worker, "PROJECT_ROOT", tmp_path / "tts-more")
+
+    assert worker._artifact_store().root == (tmp_path / "tts-more" / "data" / "runtime" / "worker-artifacts" / "gpt-sovits").resolve()
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ("app.workers.indextts_worker", "app.workers.cosyvoice_worker"),
+)
+def test_reference_worker_artifact_store_uses_configured_portable_data_root(
+    module_name: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    worker = __import__(module_name, fromlist=["_artifact_store"])
+    artifact_root = tmp_path / "portable-data" / "artifacts"
+    monkeypatch.setenv("TTS_MORE_ARTIFACT_ROOT", str(artifact_root))
+
+    assert worker._artifact_store().root == artifact_root.resolve()
+
+
+@pytest.mark.parametrize(
+    ("module_name", "component"),
+    (
+        ("app.workers.indextts_worker", "indextts"),
+        ("app.workers.cosyvoice_worker", "cosyvoice"),
+    ),
+)
+def test_reference_worker_artifact_store_resolves_relative_root_from_project(
+    module_name: str,
+    component: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    worker = __import__(module_name, fromlist=["_artifact_store"])
+    project_root = tmp_path / "tts-more"
+    monkeypatch.setattr(worker, "PROJECT_ROOT", project_root)
+    monkeypatch.setenv("TTS_MORE_ARTIFACT_ROOT", "data/local/artifacts")
+
+    assert worker._artifact_store().root == (project_root / "data" / "local" / "artifacts").resolve()
+
+    monkeypatch.delenv("TTS_MORE_ARTIFACT_ROOT")
+    assert worker._artifact_store().root == (
+        project_root / "data" / "runtime" / "worker-artifacts" / component
+    ).resolve()
 
 
 def test_gpt_sovits_worker_models_empty_without_repo(tmp_path: Path, monkeypatch) -> None:
@@ -62,6 +171,20 @@ def test_all_workers_expose_artifact_transfer_contract() -> None:
         assert "/upload_ref" in paths
         assert "/artifacts/{artifact_id}" in paths
         assert "artifact-transfer" in capabilities
+
+
+@pytest.mark.parametrize(
+    ("worker_app", "required"),
+    (
+        (gpt_app, {"trained_weights_voice", "reference_audio_voice"}),
+        (indextts_app, {"reference_audio_voice", "emotion_text"}),
+        (cosyvoice_app, {"reference_audio_voice", "zero_shot_voice", "cross_lingual_voice"}),
+    ),
+)
+def test_worker_capabilities_include_controller_canonical_names(worker_app, required: set[str]) -> None:
+    capabilities = set(TestClient(worker_app).get("/capabilities").json()["capabilities"])
+
+    assert required <= capabilities
 
 
 def test_all_worker_health_reports_tts_more_commit(monkeypatch) -> None:
@@ -127,6 +250,11 @@ def test_worker_runtime_reports_and_releases_cuda_memory(monkeypatch) -> None:
             return 1024, 2048
 
         @staticmethod
+        def get_device_properties(index: int):
+            assert index == 1
+            return types.SimpleNamespace(uuid="GPU-logical-one")
+
+        @staticmethod
         def empty_cache() -> None:
             calls.append("empty_cache")
 
@@ -140,11 +268,9 @@ def test_worker_runtime_reports_and_releases_cuda_memory(monkeypatch) -> None:
         types.SimpleNamespace(cuda=FakeCuda(), version=types.SimpleNamespace(cuda="12.8")),
     )
     monkeypatch.setattr(
-        runtime.subprocess,
+        subprocess,
         "run",
-        lambda *args, **kwargs: __import__("subprocess").CompletedProcess(
-            args[0], 0, stdout="0, GPU-zero\n1, GPU-one\n", stderr=""
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker status must not spawn nvidia-smi")),
     )
     runtime._DEVICE_UUID_CACHE.clear()
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -155,7 +281,7 @@ def test_worker_runtime_reports_and_releases_cuda_memory(monkeypatch) -> None:
 
     assert payload == {
         "device": "cuda:1",
-        "device_uuid": "GPU-one",
+        "device_uuid": "GPU-logical-one",
         "cuda_runtime": "12.8",
         "loaded": True,
         "model": "demo",
@@ -169,7 +295,36 @@ def test_worker_runtime_reports_and_releases_cuda_memory(monkeypatch) -> None:
     assert calls == ["gc", "empty_cache", "ipc_collect"]
 
 
-def test_worker_runtime_maps_visible_and_explicit_cuda_devices_to_physical_uuid(monkeypatch) -> None:
+def test_worker_uuid_probe_uses_torch_properties_without_spawning(monkeypatch) -> None:
+    from app.workers import runtime
+
+    class FakeCuda:
+        is_available = staticmethod(lambda: True)
+        current_device = staticmethod(lambda: 0)
+        memory_allocated = staticmethod(lambda _index: 0)
+        memory_reserved = staticmethod(lambda _index: 0)
+        mem_get_info = staticmethod(lambda _index: (1024, 2048))
+        get_device_properties = staticmethod(lambda index: types.SimpleNamespace(uuid=f"GPU-logical-{index}"))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(cuda=FakeCuda(), version=types.SimpleNamespace(cuda="12.8")),
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker status must not spawn nvidia-smi")),
+    )
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    runtime._DEVICE_UUID_CACHE.clear()
+
+    status = runtime.worker_runtime_status(loaded=False, model=None)
+
+    assert status["device_uuid"] == "GPU-logical-0"
+
+
+def test_worker_runtime_maps_visible_devices_by_torch_logical_index_without_spawning(monkeypatch) -> None:
     from app.workers import runtime
 
     class FakeCuda:
@@ -184,6 +339,7 @@ def test_worker_runtime_maps_visible_and_explicit_cuda_devices_to_physical_uuid(
         memory_allocated = staticmethod(lambda _index: 0)
         memory_reserved = staticmethod(lambda _index: 0)
         mem_get_info = staticmethod(lambda _index: (1024, 2048))
+        get_device_properties = staticmethod(lambda index: types.SimpleNamespace(uuid=f"GPU-logical-{index}"))
 
     monkeypatch.setitem(
         sys.modules,
@@ -192,22 +348,20 @@ def test_worker_runtime_maps_visible_and_explicit_cuda_devices_to_physical_uuid(
     )
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
     monkeypatch.setattr(
-        runtime.subprocess,
+        subprocess,
         "run",
-        lambda *args, **kwargs: __import__("subprocess").CompletedProcess(
-            args[0], 0, stdout="1, GPU-one\n3, GPU-three\n", stderr=""
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker status must not spawn nvidia-smi")),
     )
     runtime._DEVICE_UUID_CACHE.clear()
 
     current = runtime.worker_runtime_status(loaded=False, model=None)
     hinted = runtime.worker_runtime_status(loaded=False, model=None, device_hint="cuda:1")
 
-    assert current["device_uuid"] == "GPU-three"
-    assert hinted["device_uuid"] == "GPU-one"
+    assert current["device_uuid"] == "GPU-logical-0"
+    assert hinted["device_uuid"] == "GPU-logical-1"
 
 
-def test_worker_runtime_expands_visible_gpu_uuid_prefix(monkeypatch) -> None:
+def test_worker_runtime_uses_visible_gpu_uuid_prefix_when_torch_properties_are_unavailable(monkeypatch) -> None:
     from app.workers import runtime
 
     class FakeCuda:
@@ -216,6 +370,7 @@ def test_worker_runtime_expands_visible_gpu_uuid_prefix(monkeypatch) -> None:
         memory_allocated = staticmethod(lambda _index: 0)
         memory_reserved = staticmethod(lambda _index: 0)
         mem_get_info = staticmethod(lambda _index: (1024, 2048))
+        get_device_properties = staticmethod(lambda _index: (_ for _ in ()).throw(RuntimeError("unavailable")))
 
     monkeypatch.setitem(
         sys.modules,
@@ -224,17 +379,15 @@ def test_worker_runtime_expands_visible_gpu_uuid_prefix(monkeypatch) -> None:
     )
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abcdef")
     monkeypatch.setattr(
-        runtime.subprocess,
+        subprocess,
         "run",
-        lambda *args, **kwargs: __import__("subprocess").CompletedProcess(
-            args[0], 0, stdout="0, GPU-abcdef1234567890\n", stderr=""
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker status must not spawn nvidia-smi")),
     )
     runtime._DEVICE_UUID_CACHE.clear()
 
     status = runtime.worker_runtime_status(loaded=False, model=None)
 
-    assert status["device_uuid"] == "GPU-abcdef1234567890"
+    assert status["device_uuid"] == "GPU-abcdef"
 
 
 def test_gpt_unloaded_status_preserves_cuda_runtime_device(monkeypatch) -> None:
@@ -296,11 +449,65 @@ def test_gpt_sovits_worker_accepts_generator_pipeline_output(tmp_path: Path, mon
     assert writes == [([0.0, 0.25, -0.25], 32000, tmp_path / "out.wav", "wav")]
 
 
+def test_gpt_sovits_worker_rejects_non_wav_media_before_loading_pipeline(tmp_path: Path, monkeypatch) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "_ensure_pipeline",
+        lambda: (_ for _ in ()).throw(AssertionError("unsupported media must be rejected before pipeline loading")),
+    )
+    monkeypatch.setenv("TTS_MORE_WORKER_ALLOW_PATH_DELIVERY", "1")
+
+    response = TestClient(gpt_app).post(
+        "/synthesize",
+        json={
+            "line": {"id": "l1", "character_id": "narrator", "text": "hello"},
+            "profile": "demo",
+            "output_path": str(tmp_path / "out.mp3"),
+            "parameters": {"media_type": "mp3"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "GPT-SoVITS worker supports WAV output only"
+    assert not (tmp_path / "out.mp3").exists()
+
+
+def test_gpt_sovits_worker_rejects_non_wav_output_extension_before_loading_pipeline(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import app.workers.gpt_sovits_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "_ensure_pipeline",
+        lambda: (_ for _ in ()).throw(AssertionError("invalid output extension must be rejected before loading")),
+    )
+    monkeypatch.setenv("TTS_MORE_WORKER_ALLOW_PATH_DELIVERY", "1")
+
+    response = TestClient(gpt_app).post(
+        "/synthesize",
+        json={
+            "line": {"id": "l1", "character_id": "narrator", "text": "hello"},
+            "profile": "demo",
+            "output_path": str(tmp_path / "out.ogg"),
+            "parameters": {"media_type": "wav"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "GPT-SoVITS path delivery requires a .wav output path"
+    assert not (tmp_path / "out.ogg").exists()
+
+
 def test_gpt_worker_upload_randomizes_safe_audio_names(tmp_path: Path, monkeypatch) -> None:
     import app.workers.gpt_sovits_worker as worker
 
+    artifact_root = tmp_path / "worker-artifacts"
     monkeypatch.setattr(worker, "REPO_DIR", tmp_path)
     monkeypatch.setenv("TTS_MORE_MAX_UPLOAD_BYTES", "8")
+    monkeypatch.setenv("TTS_MORE_ARTIFACT_ROOT", str(artifact_root))
     client = TestClient(gpt_app)
 
     first = client.post("/upload_ref", files={"file": ("../../ref.wav", b"123", "audio/wav")})
@@ -310,8 +517,8 @@ def test_gpt_worker_upload_randomizes_safe_audio_names(tmp_path: Path, monkeypat
     assert second.status_code == 200
     first_path = Path(first.json()["path"])
     second_path = Path(second.json()["path"])
-    assert first_path.parent == tmp_path / "uploaded_ref"
-    assert second_path.parent == tmp_path / "uploaded_ref"
+    assert first_path.parent == artifact_root
+    assert second_path.parent == artifact_root
     assert first_path != second_path
     assert ".." not in first_path.name
     assert first_path.read_bytes() == b"123"
@@ -437,13 +644,79 @@ def test_cosyvoice_worker_health_and_capabilities() -> None:
     assert health["pipeline_loaded"] is False
     caps = client.get("/capabilities").json()["capabilities"]
     assert "zero-shot-voice" in caps
-    assert "style-instruction" in caps
+    assert "cross-lingual-voice" in caps
+    assert "sft-voice" not in caps
+    assert "style-instruction" not in caps
 
 
 def test_cosyvoice_worker_defaults_to_cosyvoice_300m_model_dir() -> None:
     import app.workers.cosyvoice_worker as worker
 
     assert worker.MODEL_DIR == "pretrained_models/CosyVoice-300M"
+
+
+def test_cosyvoice_locked_default_metadata_is_cosyvoice1_without_sft_speakers() -> None:
+    root = Path(__file__).resolve().parents[2]
+    lock = json.loads(
+        (root / "integrations" / "components" / "cosyvoice" / "models.lock.json").read_text(encoding="utf-8")
+    )
+    required = set(lock["required_paths"])
+    targets = {asset["target"] for asset in lock["assets"]}
+
+    assert lock["upstream_repository"].endswith("/FunAudioLLM/CosyVoice-300M")
+    assert "pretrained_models/CosyVoice-300M/cosyvoice.yaml" in required
+    assert not any(path.endswith("cosyvoice2.yaml") for path in required | targets)
+    assert not any(path.endswith("spk2info.pt") for path in required | targets)
+    worker_source = (root / "backend" / "app" / "workers" / "cosyvoice_worker.py").read_text(encoding="utf-8")
+    assert "from cosyvoice.cli.cosyvoice import CosyVoice" in worker_source
+    assert "inference_instruct2" not in worker_source
+    assert "inference_sft" not in worker_source
+
+
+@pytest.mark.parametrize("mode", ("sft", "instruct", "预训练音色", "自然语言控制", "unsupported"))
+def test_cosyvoice_rejects_modes_unsupported_by_locked_default_before_pipeline_loading(
+    mode: str, tmp_path: Path, monkeypatch
+) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "_ensure_pipeline",
+        lambda: (_ for _ in ()).throw(AssertionError("unsupported mode must be rejected before pipeline loading")),
+    )
+    response = TestClient(cosyvoice_app).post(
+        "/synthesize",
+        json={
+            "line": {"id": "l1", "character_id": "narrator", "text": "hello"},
+            "profile": "demo",
+            "output_path": str(tmp_path / "out.wav"),
+            "parameters": {"mode": mode},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        f"CosyVoice-300M does not support mode '{mode}'; supported modes: zero_shot, cross_lingual"
+    )
+
+
+def test_cosyvoice_load_rejects_mode_unsupported_by_locked_default_before_pipeline_loading(monkeypatch) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "_ensure_pipeline",
+        lambda: (_ for _ in ()).throw(AssertionError("unsupported load mode must be rejected before pipeline loading")),
+    )
+    response = TestClient(cosyvoice_app).post(
+        "/load",
+        json={"profile": "demo", "parameters": {"mode": "sft"}},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "CosyVoice-300M does not support mode 'sft'; supported modes: zero_shot, cross_lingual"
+    )
 
 
 def test_cosyvoice_bootstrap_adds_matcha_tts_to_python_path(tmp_path: Path, monkeypatch) -> None:
@@ -488,7 +761,61 @@ def test_cosyvoice_zero_shot_uses_upstream_positional_signature_and_prompt_audio
     assert chunks == [b"RIFFdemo"]
 
 
-def test_cosyvoice_ensure_pipeline_uses_auto_model(tmp_path: Path, monkeypatch) -> None:
+def test_cosyvoice_load_audio_defers_to_upstream(monkeypatch) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    def fail_load(_path: str):
+        raise AssertionError("the upstream CosyVoice frontend must load the reference audio")
+
+    monkeypatch.setitem(sys.modules, "torchaudio", types.SimpleNamespace(load=fail_load))
+
+    assert worker._load_audio("ref.wav") == "ref.wav"
+
+
+def test_cosyvoice_chunk_to_wav_flattens_single_batch_dimension(monkeypatch) -> None:
+    import app.workers.cosyvoice_worker as worker
+
+    observed: dict[str, object] = {}
+
+    class FakeArray:
+        shape = (1, 3)
+
+        def reshape(self, *shape: int):
+            assert shape == (-1,)
+            self.shape = (3,)
+            return self
+
+    numpy_module = types.ModuleType("numpy")
+    numpy_module.float32 = object()
+
+    def fake_asarray(value, dtype):
+        assert value == [[0.0, 0.25, -0.25]]
+        assert dtype is numpy_module.float32
+        return FakeArray()
+
+    numpy_module.asarray = fake_asarray
+    monkeypatch.setitem(sys.modules, "numpy", numpy_module)
+
+    def fake_write(buffer, sample_rate: int, data) -> None:
+        observed.update(sample_rate=sample_rate, shape=data.shape)
+        buffer.write(b"RIFFdemo")
+
+    scipy_module = types.ModuleType("scipy")
+    scipy_io_module = types.ModuleType("scipy.io")
+    scipy_io_module.wavfile = types.SimpleNamespace(write=fake_write)
+    scipy_module.io = scipy_io_module
+    monkeypatch.setitem(sys.modules, "scipy", scipy_module)
+    monkeypatch.setitem(sys.modules, "scipy.io", scipy_io_module)
+
+    encoded = worker._chunk_to_wav(
+        {"tts_speech": [[0.0, 0.25, -0.25]], "sample_rate": 24_000}
+    )
+
+    assert encoded == b"RIFFdemo"
+    assert observed == {"sample_rate": 24_000, "shape": (3,)}
+
+
+def test_cosyvoice_ensure_pipeline_uses_exact_upstream_cosyvoice1_class(tmp_path: Path, monkeypatch) -> None:
     import app.workers.cosyvoice_worker as worker
 
     created: list[str] = []
@@ -497,11 +824,11 @@ def test_cosyvoice_ensure_pipeline_uses_auto_model(tmp_path: Path, monkeypatch) 
     class FakePipeline:
         pass
 
-    def fake_auto_model(**kwargs):
-        created.append(kwargs["model_dir"])
+    def fake_cosyvoice(model_dir: str):
+        created.append(model_dir)
         return FakePipeline()
 
-    fake_module.AutoModel = fake_auto_model
+    fake_module.CosyVoice = fake_cosyvoice
     monkeypatch.setitem(sys.modules, "cosyvoice", types.ModuleType("cosyvoice"))
     monkeypatch.setitem(sys.modules, "cosyvoice.cli", types.ModuleType("cosyvoice.cli"))
     monkeypatch.setitem(sys.modules, "cosyvoice.cli.cosyvoice", fake_module)

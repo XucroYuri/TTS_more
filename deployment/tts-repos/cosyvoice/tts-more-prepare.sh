@@ -9,7 +9,6 @@ BASE_PYTHON="${TTS_MORE_BASE_PYTHON:-python3}"
 
 cd "$REPO_ROOT"
 
-git submodule update --init --recursive
 if [[ ! -x ".venv/bin/python" ]]; then
   "$BASE_PYTHON" -m venv .venv
 fi

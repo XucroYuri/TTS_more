@@ -1,0 +1,34 @@
+TTS More Windows 便携版使用说明
+
+第一次使用
+1. 请先把整个压缩包完整解压到普通文件夹，不要直接在压缩包内运行。
+2. 路径可以放在任意硬盘；为兼容未启用 Windows 长路径的电脑，建议直接解压到 D:\TTS\TTS-More 这类简短目录，并保留至少 30 GB 可用空间。
+3. Bootstrap 版首次运行需要联网。双击 Start.cmd 后会自动补齐包内运行环境；完成后可离线启动。
+4. Full 版已经包含构建机上验证过的运行资产，解压后可直接双击 Start.cmd。
+
+常用入口
+- Start.cmd：初始化（如有需要）并启动 TTS More，默认打开 http://127.0.0.1:8000。
+- Stop.cmd：只停止由当前便携包启动的服务，不会结束未知进程。
+- Repair.cmd：校验并重新获取缺失或损坏的资产，不删除用户数据。
+- Initialize.cmd：只执行初始化和校验，不启动服务。
+
+导入旧版便携包
+- 直接双击当前包的 Start.cmd 时，启动器会在启动服务之前询问是否导入；由工作台管理或自动化启动时不会询问。
+- 启动器不会自动扫描旧包。确认需要导入后，只会打开固定的文件夹选择器，由你明确选择旧版 TTS More、GPT-SoVITS、IndexTTS 或 CosyVoice 包。
+- 启动器先显示仅含数量、大小和相对模型名的摘要；再次确认后才复制数据。旧版原包保持不变。
+- 选择旧目录后、确认摘要前，Bootstrap 包可能只在 data/cache/portable/conda 下载或复用受锁定的包内 Miniforge 来生成计划；此步骤不会写入 runtime/live、models、data/user。
+- 当前构建默认只询问一次；如需再次选择，可从 PowerShell 启动时传入 -OfferImport。
+
+本机组合部署
+- TTS More、GPT-SoVITS、IndexTTS、CosyVoice 四个包可以分别解压、分别启动。
+- 在 TTS More 工作台中维护另外三个包的路径后，可以使用快捷按钮启动对应 worker。
+- 移动文件夹后，在工作台重新选择新路径即可；不要手工填写其他电脑上的绝对路径。
+- 如果启动器提示 PACKAGE_PATH_TOO_DEEP，请把整个组件文件夹移动到更短目录后重新运行 Start.cmd；无需重新安装或重新下载已完整的资产。
+
+数据和故障处理
+- 个人项目和配置位于 data/user；本机状态位于 data/local；下载缓存位于 data/cache。
+- 请勿把 Full 包或 data 目录上传到 GitHub。
+- 遇到端口占用时，启动器只报告占用者，不会自动结束未知程序。可关闭占用程序，或配置本机端口覆盖后重试。
+- 若首次下载中断，重新运行 Start.cmd 会继续或修复下载；仍失败时运行 Repair.cmd。
+
+Build-Package.ps1 仅供源码仓库构建交付包。已交付的便携包不能从自身重新构建，请使用对应的源码仓库。

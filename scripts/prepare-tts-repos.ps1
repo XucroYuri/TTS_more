@@ -14,6 +14,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$TargetItems = @($Targets | ForEach-Object { $_ -split "," } | Where-Object { $_ } | ForEach-Object { $_.Trim() })
 
 $Root = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
@@ -44,7 +45,8 @@ function Invoke-Logged {
         [string]$WorkingDirectory
     )
     $line = "$FilePath $($Arguments -join ' ')"
-    Write-Host "[run] $line" -ForegroundColor Cyan
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[run] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
     if ($DryRun) { return }
     Push-Location $WorkingDirectory
     try {
@@ -62,6 +64,24 @@ function Invoke-Logged {
     }
 }
 
+function Invoke-Plan {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory
+    )
+    $line = "$FilePath $($Arguments -join ' ')"
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[plan] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
+    Push-Location $WorkingDirectory
+    try {
+        & $FilePath @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "Command failed: $line" }
+    } finally {
+        Pop-Location
+    }
+}
+
 function Invoke-Captured {
     param(
         [string]$FilePath,
@@ -69,7 +89,8 @@ function Invoke-Captured {
         [string]$WorkingDirectory
     )
     $line = "$FilePath $($Arguments -join ' ')"
-    Write-Host "[run] $line" -ForegroundColor Cyan
+    $record = [ordered]@{ file = $FilePath; arguments = @($Arguments); working_directory = $WorkingDirectory }
+    Write-Host "[run] $($record | ConvertTo-Json -Compress)" -ForegroundColor Cyan
     if ($DryRun) { return "{}" }
     Push-Location $WorkingDirectory
     try {
@@ -196,6 +217,25 @@ function Test-Target {
     )
 }
 
+function Assert-SupportedCondaForSelectedGPT {
+    param([object[]]$Repositories)
+    if ($SkipInstall -or $DryRun) { return }
+    $requiresConda = $false
+    foreach ($repo in $Repositories) {
+        if ($repo.provider_type -ne "gpt-sovits") { continue }
+        if (Test-Target $repo) {
+            $requiresConda = $true
+            break
+        }
+    }
+    if (-not $requiresConda) { return }
+    if (Get-Command conda -ErrorAction SilentlyContinue) { return }
+    if (Get-Command micromamba -ErrorAction SilentlyContinue) {
+        throw "micromamba is installed but is not currently supported by the TTS More GPT-SoVITS prepare workflow; install conda or use -SkipInstall."
+    }
+    throw "supported conda executable was not found; GPT-SoVITS dependency preparation cannot continue. Install conda or use -SkipInstall."
+}
+
 function Resolve-RepoPython {
     param([string]$RepoPath)
     return Join-Path $RepoPath ".venv\Scripts\python.exe"
@@ -252,11 +292,116 @@ function Install-CU128TorchRuntime {
     Invoke-Logged $RepoPython @("-c", $probe) $RepoPath
 }
 
+function Ensure-GPTSharedFFmpeg {
+    param([string]$RepoPath)
+    $sharedBin = Join-Path $RepoPath "ffmpeg-shared\bin"
+    $ffmpeg = Join-Path $sharedBin "ffmpeg.exe"
+    $ffprobe = Join-Path $sharedBin "ffprobe.exe"
+    $sharedDll = Get-ChildItem -Path $sharedBin -Filter "avcodec-*.dll" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ((Test-Path -LiteralPath $ffmpeg) -and (Test-Path -LiteralPath $ffprobe) -and $sharedDll) {
+        return
+    }
+    if ($DryRun) {
+        Write-Host "[run] provision full-shared FFmpeg in $sharedBin" -ForegroundColor Cyan
+        return
+    }
+
+    $archive = Join-Path $RepoPath "ffmpeg-full-shared.zip"
+    $extractDir = Join-Path $RepoPath ".tts-more-ffmpeg-tmp"
+    try {
+        Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "[download] GPT-SoVITS full-shared FFmpeg runtime" -ForegroundColor Cyan
+        Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/GyanD/codexffmpeg/releases/download/8.1.2/ffmpeg-8.1.2-full_build-shared.zip" -OutFile $archive -TimeoutSec 900
+        Expand-Archive -LiteralPath $archive -DestinationPath $extractDir -Force
+        $sourceBin = Get-ChildItem -LiteralPath $extractDir -Directory -Recurse |
+            Where-Object { $_.Name -eq "bin" -and (Test-Path -LiteralPath (Join-Path $_.FullName "ffmpeg.exe")) } |
+            Select-Object -First 1
+        if ($null -eq $sourceBin) {
+            throw "full-shared FFmpeg archive does not contain a bin directory"
+        }
+        New-Item -ItemType Directory -Path $sharedBin -Force | Out-Null
+        Copy-Item -Path (Join-Path $sourceBin.FullName "*") -Destination $sharedBin -Recurse -Force
+        foreach ($tool in @("ffmpeg.exe", "ffprobe.exe")) {
+            Copy-Item -LiteralPath (Join-Path $sharedBin $tool) -Destination (Join-Path $RepoPath $tool) -Force
+        }
+        $sharedDll = Get-ChildItem -Path $sharedBin -Filter "avcodec-*.dll" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $sharedDll) {
+            throw "full-shared FFmpeg DLLs were not found in $sharedBin"
+        }
+    } finally {
+        Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-GPTWorkerRuntime {
+    param(
+        [string]$RepoPython,
+        [string]$RepoPath
+    )
+    $probe = @'
+import os
+import sys
+import tempfile
+import wave
+from importlib.metadata import version as package_version
+from pathlib import Path
+
+repo = Path(sys.argv[1]).resolve()
+package = repo / "GPT_SoVITS"
+ffmpeg_bin = repo / "ffmpeg-shared" / "bin"
+if not package.is_dir():
+    raise RuntimeError(f"missing GPT_SoVITS package: {package}")
+if not any(ffmpeg_bin.glob("avcodec-*.dll")):
+    raise RuntimeError(f"missing full-shared FFmpeg DLLs: {ffmpeg_bin}")
+if package_version("onnxruntime-gpu") != "1.26.0":
+    raise RuntimeError("onnxruntime-gpu must be pinned to 1.26.0 for CUDA 12")
+os.environ["PATH"] = str(ffmpeg_bin) + os.pathsep + os.environ.get("PATH", "")
+if hasattr(os, "add_dll_directory"):
+    dll_directory = os.add_dll_directory(str(ffmpeg_bin))
+sys.path[:0] = [str(package), str(repo)]
+
+from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
+import torchaudio
+
+with tempfile.TemporaryDirectory(prefix="tts-more-gpt-probe-") as temporary:
+    sample = Path(temporary) / "probe.wav"
+    with wave.open(str(sample), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(16000)
+        stream.writeframes(b"\x00\x00" * 1600)
+    waveform, sample_rate = torchaudio.load(str(sample))
+    assert sample_rate == 16000 and waveform.numel() > 0
+print("GPT-SoVITS worker import and media runtime probe passed")
+'@
+    Invoke-Logged $RepoPython @("-c", $probe, $RepoPath) $RepoPath
+}
+
 function Prepare-GPTSoVITS {
     param($Repo)
-    $repoPath = Join-Path $Root ([string]$Repo.path)
+    $repoPath = [string]$Repo.absolute_path
     if ($SkipInstall) {
         Write-Host "[skip] GPT-SoVITS install for $($Repo.name)"
+        return
+    }
+    if ($DryRun) {
+        if ($IsWindows -or $env:OS -eq "Windows_NT") {
+            $repoPython = Resolve-RepoPython $repoPath
+            Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "GPT-SoVITS torchcodec bootstrap" -Action {
+                param($IndexUrl)
+                Invoke-Logged $repoPython @("-m", "pip", "install", "--no-deps", "torchcodec==0.13") $repoPath
+            }
+            Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
+                param($CandidateSource)
+                Invoke-Logged "powershell" @("-ExecutionPolicy", "Bypass", "-File", (Join-Path $repoPath "install.ps1"), "-Device", $Device, "-Source", $CandidateSource) $repoPath
+            }
+        } else {
+            Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
+                param($CandidateSource)
+                Invoke-Logged "bash" @((Join-Path $repoPath "install.sh"), "--device", $Device, "--source", $CandidateSource) $repoPath
+            }
+        }
         return
     }
     $installPs1 = Join-Path $repoPath "install.ps1"
@@ -264,8 +409,8 @@ function Prepare-GPTSoVITS {
     $repoPython = Ensure-Venv $repoPath
     if ($IsWindows -or $env:OS -eq "Windows_NT") {
         if (!(Test-Path -LiteralPath $installPs1)) { throw "Missing GPT-SoVITS installer: $installPs1" }
-        if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
-            throw "conda was not found; GPT-SoVITS official installer requires conda for $($Repo.name)."
+        if (!$DryRun -and !(Get-Command conda -ErrorAction SilentlyContinue)) {
+            throw "supported conda executable was not found; GPT-SoVITS dependency preparation cannot continue. Install conda or use -SkipInstall."
         }
         Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "GPT-SoVITS torchcodec bootstrap" -Action {
             param($IndexUrl)
@@ -281,16 +426,20 @@ function Prepare-GPTSoVITS {
         } finally {
             $env:PATH = $previousPath
         }
+        Invoke-WithPackageIndexFallback -Indexes $PackageIndexFallbacks -Description "GPT-SoVITS ONNX Runtime CUDA 12 pin" -Action {
+            param($IndexUrl)
+            Invoke-Logged $repoPython @("-m", "pip", "install", "--upgrade", "--force-reinstall", "--no-deps", "onnxruntime-gpu==1.26.0") $repoPath
+        }
     } else {
         if (!(Test-Path -LiteralPath $installSh)) { throw "Missing GPT-SoVITS installer: $installSh" }
-        if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
-            Write-Warning "conda was not found; GPT-SoVITS official installer requires conda. Install conda/micromamba or run upstream install manually for $($Repo.name)."
-            return
-        }
         Invoke-WithSourceFallback -Sources $SourceFallbacks -Description "GPT-SoVITS install for $($Repo.name)" -Action {
             param($CandidateSource)
             Invoke-Logged "bash" @($installSh, "--device", $Device, "--source", $CandidateSource) $repoPath
         }
+    }
+    if ($IsWindows -or $env:OS -eq "Windows_NT") {
+        Ensure-GPTSharedFFmpeg $repoPath
+        Test-GPTWorkerRuntime $repoPython $repoPath
     }
 }
 
@@ -347,7 +496,7 @@ for repo_id, remote_file, destination, expected_hash in resources:
 
 function Prepare-IndexTTS {
     param($Repo)
-    $repoPath = Join-Path $Root ([string]$Repo.path)
+    $repoPath = [string]$Repo.absolute_path
     $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
     $repoUv = Join-Path $repoPath ".uv-bootstrap\Scripts\uv.exe"
     if (-not $uv -and (Test-Path -LiteralPath $repoUv)) { $uv = $repoUv }
@@ -409,8 +558,7 @@ function Get-CosyVoiceRequirementsWithoutTorch {
 
 function Prepare-CosyVoice {
     param($Repo)
-    $repoPath = Join-Path $Root ([string]$Repo.path)
-    Invoke-Logged "git" @("-C", $repoPath, "submodule", "update", "--init", "--recursive") $Root
+    $repoPath = [string]$Repo.absolute_path
     $repoPython = Resolve-RepoPython $repoPath
     if (-not $SkipInstall) {
         $repoPython = Ensure-Venv $repoPath
@@ -458,7 +606,7 @@ if ($SyncRepos) {
     if ($RepoPaths) { $syncArgs += @("--repo-paths", $RepoPaths) }
     if ($CleanRepos) { $syncArgs += "--clean" }
     if ($DryRun) { $syncArgs += "--dry-run" }
-    Invoke-Logged $Python $syncArgs $Root
+    Invoke-Plan $Python $syncArgs $Root
 }
 
 $NetworkProfile = Resolve-NetworkProfile
@@ -469,19 +617,16 @@ $SourceFallbacks = Get-SourceFallbacks $ResolvedSource
 $PackageIndexFallbacks = Get-PackageIndexFallbacks ([string]$NetworkProfile.pip_index_url)
 Write-Host "[network] source=$ResolvedSource cache=$($NetworkProfile.cache_root)" -ForegroundColor Cyan
 
-if ($RepoPaths) {
-    $repoArgs = @((Join-Path $Root "scripts\tts_more_deploy.py"), "--root", $Root, "list-repos", "--service-ids", ($TargetItems -join ","), "--repo-paths", $RepoPaths)
-    $reposJson = & $Python @repoArgs
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    $parsedRepositories = $reposJson | ConvertFrom-Json
-    $repositories = @($parsedRepositories)
-} else {
-    $lock = Get-Content -Raw (Join-Path $Root "repo.lock.json") | ConvertFrom-Json
-    $repositories = @($lock.repositories)
-}
+$repoArgs = @((Join-Path $Root "scripts\tts_more_deploy.py"), "--root", $Root, "list-repos", "--service-ids", ($TargetItems -join ","))
+if ($RepoPaths) { $repoArgs += @("--repo-paths", $RepoPaths) }
+$reposJson = & $Python @repoArgs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$parsedRepositories = $reposJson | ConvertFrom-Json
+$repositories = @($parsedRepositories)
+Assert-SupportedCondaForSelectedGPT $repositories
 foreach ($repo in $repositories) {
     if (-not (Test-Target $repo)) { continue }
-    $repoPath = Join-Path $Root ([string]$repo.path)
+    $repoPath = [string]$repo.absolute_path
     switch ($repo.provider_type) {
         "gpt-sovits" { Prepare-GPTSoVITS $repo }
         "indextts" { Prepare-IndexTTS $repo }
@@ -490,9 +635,10 @@ foreach ($repo in $repositories) {
     Install-WorkerRuntime $repoPath
 }
 
-$renderArgs = @("scripts\tts_more_deploy.py", "render-services", "--profile", $Profile, "--platform", "windows", "--service-ids", ($TargetItems -join ","), "--output", "data\local\services.json")
+$renderArgs = @("scripts\tts_more_deploy.py", "render-services", "--profile", $Profile, "--platform", "windows", "--service-ids", ($TargetItems -join ","))
 if ($RepoPaths) { $renderArgs += @("--repo-paths", $RepoPaths) }
 if ($Topology) { $renderArgs += @("--topology", $Topology) }
 if ($Node) { $renderArgs += @("--node", $Node) }
-Invoke-Logged $Python $renderArgs $Root
+if (-not $DryRun) { $renderArgs += @("--output", "data\local\services.json") }
+Invoke-Plan $Python $renderArgs $Root
 Write-Host "Prepared selected TTS repositories. Rendered data\local\services.json." -ForegroundColor Green

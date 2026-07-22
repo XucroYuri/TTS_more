@@ -1,0 +1,8 @@
+{
+  "upstream_repository": "https://github.com/XucroYuri/GPT-SoVITS.git",
+  "branch": "main",
+  "worker_module": "tts_more_worker.gpt_sovits:app",
+  "python": "3.11.9",
+  "port": 9880,
+  "import_probe": "import sys,pathlib; sys.path.insert(0,str(pathlib.Path.cwd() / 'GPT_SoVITS')); import fastapi,gradio,onnxruntime,torch,torchcodec; from GPT_SoVITS.TTS_infer_pack.TTS import TTS,TTS_Config; print('GPT-SoVITS imports passed')"
+}

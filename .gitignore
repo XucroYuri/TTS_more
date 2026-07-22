@@ -27,6 +27,10 @@ data/real-validation/
 data/validation/
 data/parser_providers.json
 data/cache/
+data/cache/portable/
+data/runtime/portable/
+artifacts/portable/
+packaging/portable/work/
 data/models/
 data/characters.json
 data/characters.local.json

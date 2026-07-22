@@ -574,7 +574,14 @@ Write-Ok "Base Python: $BasePython"
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw "git is required" }
 if (-not (Get-Command git-lfs -ErrorAction SilentlyContinue)) { Write-Warn "git-lfs not found; some model downloads may fail" }
 if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { Write-Warn "ffmpeg not on PATH; GPT-SoVITS local ffmpeg.exe will be downloaded" }
-try { nvidia-smi | Out-Host } catch { Write-Warn "nvidia-smi unavailable; GPU readiness cannot be confirmed" }
+$NvidiaControllers = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object {
+    ([string]$_.Name) -match "NVIDIA" -or ([string]$_.AdapterCompatibility) -match "NVIDIA"
+})
+if ($NvidiaControllers.Count -gt 0) {
+    Write-Ok "NVIDIA video controller detected through Windows CIM"
+} else {
+    Write-Warn "NVIDIA video controller not detected through Windows CIM; GPU readiness will be confirmed by the package runtime"
+}
 
 foreach ($port in 9880, 9881) {
     $busy = Test-NetConnection -ComputerName 127.0.0.1 -Port $port -InformationLevel Quiet

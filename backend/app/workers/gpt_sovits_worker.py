@@ -33,11 +33,13 @@ The pipeline is constructed once at startup and held resident for low latency;
 from __future__ import annotations
 
 import os
+import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 # The standard worker request schemas.
 from app.workers.artifacts import ArtifactStore, artifact_output, artifact_response, register_artifact_routes
@@ -45,6 +47,7 @@ from app.workers.contracts import LoadRequest, SynthesizeRequest
 from app.workers.runtime import release_cuda_memory, worker_runtime_status
 
 # --- repo bootstrap: put the upstream GPT-SoVITS repo on the path and chdir ---
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 REPO_DIR = Path(os.environ.get("TTS_MORE_GPTSOVITS_REPO", "repo/GPT-SoVITS")).resolve(strict=False)
 CONFIG_YAML = os.environ.get("TTS_MORE_GPTSOVITS_CONFIG", "GPT_SoVITS/configs/tts_infer.yaml")
 
@@ -55,15 +58,45 @@ _pipeline: Any = None
 _config: Any = None
 _loaded_profile: str | None = None
 _weight_roots: list[Path] = []
+_dll_directories: list[Any] = []
+_dll_directory_paths: set[str] = set()
 
 
 def _bootstrap_repo() -> None:
-    """Make the upstream GPT-SoVITS package importable."""
+    """Make the configured upstream checkout importable on any host path."""
     if not REPO_DIR.exists():
         return  # will surface as a health error; lets the app still import
-    repo_str = str(REPO_DIR)
-    if repo_str not in sys.path:
-        sys.path.insert(0, repo_str)
+    package_dir = REPO_DIR / "GPT_SoVITS"
+    for directory in (REPO_DIR, package_dir):
+        directory_str = str(directory)
+        if directory_str not in sys.path:
+            sys.path.insert(0, directory_str)
+
+    # Upstream modules mix package imports (``GPT_SoVITS.*``) with top-level
+    # imports (``AR``, ``TTS_infer_pack``, ``config``).  Both directories must
+    # therefore be present; deriving them from REPO_DIR avoids machine-specific
+    # PYTHONPATH configuration.
+    configured_package_root = os.environ.get("TTS_MORE_PACKAGE_ROOT")
+    packaged_ffmpeg_bin = (
+        Path(configured_package_root).resolve(strict=False) / "ffmpeg-shared" / "bin"
+        if configured_package_root
+        else None
+    )
+    ffmpeg_bin = (
+        packaged_ffmpeg_bin
+        if packaged_ffmpeg_bin is not None and packaged_ffmpeg_bin.is_dir()
+        else REPO_DIR / "ffmpeg-shared" / "bin"
+    )
+    if ffmpeg_bin.is_dir():
+        ffmpeg_str = str(ffmpeg_bin)
+        path_entries = os.environ.get("PATH", "").split(os.pathsep)
+        if ffmpeg_str not in path_entries:
+            os.environ["PATH"] = os.pathsep.join([ffmpeg_str, *path_entries])
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        normalized = os.path.normcase(os.path.normpath(ffmpeg_str))
+        if add_dll_directory is not None and normalized not in _dll_directory_paths:
+            _dll_directories.append(add_dll_directory(ffmpeg_str))
+            _dll_directory_paths.add(normalized)
     try:
         os.chdir(REPO_DIR)
     except OSError:
@@ -164,7 +197,13 @@ app = FastAPI(title="TTS More GPT-SoVITS Worker", version="0.1.0")
 def _artifact_store() -> ArtifactStore:
     configured_limit = os.environ.get("GPT_SOVITS_MAX_UPLOAD_BYTES")
     max_upload_bytes = int(configured_limit) if configured_limit else None
-    return ArtifactStore(REPO_DIR / "uploaded_ref", max_upload_bytes=max_upload_bytes)
+    configured_root = os.environ.get("TTS_MORE_ARTIFACT_ROOT")
+    artifact_root = Path(configured_root).expanduser() if configured_root else (
+        PROJECT_ROOT / "data" / "runtime" / "worker-artifacts" / "gpt-sovits"
+    )
+    if not artifact_root.is_absolute():
+        artifact_root = PROJECT_ROOT / artifact_root
+    return ArtifactStore(artifact_root, max_upload_bytes=max_upload_bytes)
 
 
 register_artifact_routes(app, _artifact_store)
@@ -192,6 +231,8 @@ def capabilities() -> dict[str, Any]:
     return {
         "capabilities": [
             "tts",
+            "trained_weights_voice",
+            "reference_audio_voice",
             "trained-weights-voice",
             "reference-audio-voice",
             "gpt-weights",
@@ -224,8 +265,13 @@ def load(request: LoadRequest) -> dict[str, Any]:
 
 @app.post("/synthesize")
 def synthesize(request: SynthesizeRequest) -> dict[str, Any]:
-    pipeline = _ensure_pipeline()
     params = request.parameters or {}
+    media_type = str(params.get("media_type", "wav")).strip().casefold()
+    if media_type != "wav":
+        raise HTTPException(status_code=400, detail="GPT-SoVITS worker supports WAV output only")
+    if request.delivery == "path" and request.output_path.suffix.casefold() != ".wav":
+        raise HTTPException(status_code=400, detail="GPT-SoVITS path delivery requires a .wav output path")
+    pipeline = _ensure_pipeline()
     inputs: dict[str, Any] = {
         "text": request.line.text,
         "text_lang": params.get("text_lang", "zh"),
@@ -234,7 +280,7 @@ def synthesize(request: SynthesizeRequest) -> dict[str, Any]:
         "prompt_lang": params.get("prompt_lang", "zh"),
         "text_split_method": params.get("text_split_method", "cut1"),
         "speed_factor": params.get("speed_factor", 1.0),
-        "media_type": params.get("media_type", "wav"),
+        "media_type": media_type,
         "streaming_mode": False,
         "return_fragment": True,
     }

@@ -4,6 +4,19 @@ TTS More 通过**非侵入式 worker** 接入三个开源 TTS 服务（GPT-SoVIT
 
 主路径是 worker-first：工作台只需要一个“服务地址”，不要求用户理解上游 WebUI、repo 路径或模型内部目录。已有 Gradio 服务仍可作为兼容端点接入，但不要把 Gradio 写成唯一方案。
 
+## 本机四仓工作台与 LAN 边界
+
+Windows 便携交付仍然是四个可独立启动的文件夹，不是把三个 worker 合并进 TTS More 进程：
+
+1. 将 `TTS-More`、`GPT-SoVITS`、`IndexTTS`、`CosyVoice` 解压到任意可写目录，建议四个文件夹同级放置。
+2. 双击实际需要运行的组件 `Start.cmd`；或者先启动 TTS More，在“本地便携 TTS 服务”三张卡片中选择对应文件夹，再逐个启动。
+3. 工作台没有“全部启动”行为，不会自动批量启动三个 TTS。GPT-SoVITS、IndexTTS、CosyVoice 的启动、停止、修复和日志始终相互独立。
+4. 本机 loopback 用户可以维护包路径并执行本地控制。LAN worker 只通过注册地址参与健康检查、加载、合成与工件传输，必须保持 `mode:external`、`network_scope:lan`、`managed:false`；不能远程浏览目录、启动、停止或修复 Windows 包。
+5. `bootstrap` 首次启动联网补齐并校验锁定资产，成功后可离线；`full` 只在本地构建，包含运行条件，解压后离线运行，禁止作为 GitHub Release 资产上传。
+6. 路径跟随每台电脑和盘符变化。worker 配置不能写死 Conda、Python、模型或仓库绝对路径；同级包优先用相对 locator 解析，本机绝对路径只作为 `data/local/services.json` 中的最后发现提示。
+
+本地控制 token 由当前 TTS More 后端进程生成，前端只保存在当前页面内存中，不写入本地存储、URL 或日志；工作台 API 不接受 UI 传入的命令、工作目录或环境变量，也不会终止未知端口所有者。普通用户的完整初始化与修复步骤见 [部署方案](deployment.md#普通用户windows-四包解压即用)。
+
 ## 架构
 
 ```mermaid
@@ -72,17 +85,22 @@ flowchart LR
 
 ```bash
 # macOS / Linux
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
 make workers
-# 或：scripts/start-service-workers.sh --services local-gpt-sovits-main,local-indextts
+# 或：scripts/start-service-workers.sh --services local-gpt-sovits-main,local-indextts --repo-paths deployment/app/repo-paths.local.json
 
 # Windows
-.\scripts\start-service-workers.ps1 -Services local-gpt-sovits-main,local-indextts
+Copy-Item deployment\app\repo-paths.example.json deployment\app\repo-paths.local.json
+.\scripts\start-service-workers.ps1 -Services local-gpt-sovits-main,local-indextts -RepoPaths deployment\app\repo-paths.local.json
 ```
 
 worker 启动信息来自 `repo.lock.json`，由 `scripts/tts_more_deploy.py` 渲染。每个 worker 在其 repo 的 venv 里运行（torch/CUDA 解析）。如需生成本机服务配置：
 
+完整 repo 确认文件是 mandatory even when the lock paths are unchanged：
+
 ```bash
-python scripts/tts_more_deploy.py render-services --profile local-all --output data/local/services.json
+cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
+python scripts/tts_more_deploy.py render-services --profile local-all --output data/local/services.json --repo-paths deployment/app/repo-paths.local.json
 ```
 
 普通验证使用默认 GPT-SoVITS `main`。分支回归时通过 `--service-ids dev` 或 `--service-ids all` 显式生成配置，并且一次只启动一个 GPT-SoVITS 分支，避免同时加载多个大模型占满显存。
@@ -106,9 +124,10 @@ python scripts/tts_more_deploy.py render-services --profile local-all --output d
 worker 可部署在可信 LAN GPU 机器上，本机 TTS More 通过 `services.json` 的 `base_url` 远程调用（`mode: external`、`network_scope: lan`、`managed: false`）。当前 CUDA 发布门禁不覆盖公网、TLS 或反向代理。远端机器只需：
 
 1. 保留轻量 TTS More checkout，获得锁文件、部署脚本和 worker；
-2. 只准备本节点负责的一个上游 repo、torch/CUDA 和模型；
-3. 以 `worker-node --topology ... --node ...` 启动服务；
-4. 应用节点以 `app-only` 渲染每个服务的独立 LAN 地址。
+2. 复制 `deployment/app/repo-paths.example.json`，核对完整 `service_id` 与绝对路径映射；
+3. 只准备本节点负责的上游 repo、torch/CUDA 和模型；
+4. 运行 `scripts/start-service-workers.sh --repo-paths deployment/app/repo-paths.local.json --topology deployment/app/topology.four-node-lan.local.json --node <worker>` 启动服务；
+5. 应用节点以 `app-only` 渲染每个服务的独立 LAN 地址。
 
 `SynthesizeRequest.delivery` 支持 `path` 和 `artifact`。`path` 默认关闭，部署器仅在 loopback bind 的本机 worker 上设置 `TTS_MORE_WORKER_ALLOW_PATH_DELIVERY=1`；LAN worker 即使收到恶意绝对路径也拒绝写入。外部 worker 强制使用 `artifact`，并且必须声明 `artifact-transfer`。应用把本地参考音频上传到 worker，远端返回 `artifact_id`、`download_url`、`sha256`、`size_bytes`；应用校验大小和 SHA-256 后原子写入本地历史，再删除远端工件。worker 使用 UUID 文件名，未取走工件按 24 小时 TTL 清理；应用侧参考音频上传缓存会在 worker TTL 前失效并重新上传。缺少 capability 时预检失败，不假设共享文件系统。
 

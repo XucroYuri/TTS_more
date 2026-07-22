@@ -12,14 +12,19 @@ from typing import Any
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from app.hardware import collect_local_hardware_status
 from app.auth import auth_status_endpoint, install_token_middleware
+from app.local_control import install_local_control
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
+from app.portable_discovery import PortablePackageDiscoverRequest, PortablePackageRegisterRequest, discover_portable_packages, endpoint_from_portable_package, read_portable_package
+from app.portable_locator_mutations import ManagedPortableLocatorMutationError
+from app.portable_services import PortableServiceStore
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
@@ -29,11 +34,22 @@ from app.service_config import ServiceSettingsUpdate, public_service_settings, s
 from app.services import ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
 from app.storage import ProjectStore
 from app.supervisor import ServiceSupervisor
+from app.service_store_io import ServicePostCommitError
 
 DEFAULT_REFERENCE_AUDIO_ROOT = Path("data") / "local" / "reference-audio"
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_ROOT = Path("data") / ".runtime"
-REPO_LOCK_PATH = Path(__file__).resolve().parents[2] / "repo.lock.json"
+
+
+def _resolve_repo_lock_path(module_file: Path = Path(__file__)) -> Path:
+    project_root = Path(module_file).resolve().parents[2]
+    package_root = project_root.parent
+    if (package_root / "package" / "tts-more-package.json").is_file():
+        return package_root / "package" / "repo.lock.json"
+    return project_root / "repo.lock.json"
+
+
+REPO_LOCK_PATH = _resolve_repo_lock_path()
 AUDIO_UPLOAD_SUFFIXES = AUDIO_SUFFIXES | {".webm", ".aac", ".opus"}
 # Maximum accepted upload size for avatar / reference-audio endpoints.
 MAX_UPLOAD_BYTES = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
@@ -88,6 +104,8 @@ def create_app(
     runtime_root: Path | str | None = None,
     parser_config_path: Path | str | None = None,
     env_path: Path | str | None = None,
+    static_root: Path | str | None = None,
+    controller_root: Path | str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="TTS More Orchestrator", version="0.1.0")
     app.add_middleware(
@@ -114,7 +132,13 @@ def create_app(
     queue = ServiceGenerationQueue(service_router)
     job_manager = GenerationJobManager(queue, store)
     ref_root = Path(reference_audio_root)
-    supervisor = ServiceSupervisor(project_root=project_root, runtime_root=Path(runtime_root) if runtime_root else Path(data_root) / ".runtime")
+    portable_controller_root = Path(controller_root) if controller_root is not None else _portable_controller_root(Path(data_root), project_root)
+    hardware_controller_cache = portable_controller_root / "data" / "cache" / "portable" / "video-controllers.json"
+    supervisor = ServiceSupervisor(
+        project_root=project_root,
+        portable_controller_root=portable_controller_root,
+        runtime_root=Path(runtime_root) if runtime_root else Path(data_root) / ".runtime",
+    )
 
     app.state.store = store
     app.state.parser = parser
@@ -130,6 +154,12 @@ def create_app(
     app.state.env_path = env_file
     # Read at app-creation time so tests/processes can override via env.
     app.state.max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(MAX_UPLOAD_BYTES)))
+
+    install_local_control(
+        app,
+        controller_root=portable_controller_root,
+        refresh_services=lambda endpoints: _apply_registry(app, ServiceRegistry(list(endpoints)), store),
+    )
 
     @app.get("/api/auth/status")
     def auth_status() -> dict[str, Any]:
@@ -154,22 +184,53 @@ def create_app(
 
     @app.put("/api/settings/services")
     def put_service_settings(request: ServiceSettingsUpdate) -> dict[str, Any]:
-        registry = save_service_settings(app.state.writable_services_path, env_file, request)
-        if _service_mode() == "mock":
+        mock_mode = _service_mode() == "mock"
+
+        def publish_settings(candidate: ServiceRegistry) -> None:
+            _apply_registry(app, _mocked_registry(candidate) if mock_mode else candidate, store)
+
+        def save_settings(published_registry: ServiceRegistry) -> ServiceRegistry:
+            return save_service_settings(
+                app.state.writable_services_path,
+                env_file,
+                request,
+                registry=published_registry,
+                publish=publish_settings,
+            )
+
+        try:
+            registry = app.state.portable_locator_mutations.run_generic_transaction(
+                current_published=lambda: app.state.service_registry,
+                transaction=save_settings,
+            )
+        except ManagedPortableLocatorMutationError as exc:
+            raise _managed_portable_locator_mutation_http_error() from exc
+        if mock_mode:
             registry = _mocked_registry(registry)
-        _apply_registry(app, registry, store)
         app.state.services_path = app.state.writable_services_path
         return public_service_settings(registry, env_file)
 
     @app.post("/api/settings/services/reload")
     def reload_service_settings() -> dict[str, Any]:
         try:
-            if services_path is None:
-                app.state.services_path, app.state.writable_services_path = _resolve_service_settings_paths(store.root, None)
-            registry = _load_service_registry(app.state.services_path)
+            def load_candidate() -> ServiceRegistry:
+                if services_path is None:
+                    (
+                        app.state.services_path,
+                        app.state.writable_services_path,
+                    ) = _resolve_service_settings_paths(store.root, None)
+                return _load_service_registry(app.state.services_path)
+
+            registry = app.state.portable_locator_mutations.publish_without_locator_changes(
+                current_services=lambda: tuple(app.state.service_registry.services),
+                load_candidate=load_candidate,
+                candidate_services=lambda candidate: tuple(candidate.services),
+                publish=lambda candidate: _apply_registry(app, candidate, store),
+            )
+        except ManagedPortableLocatorMutationError as exc:
+            raise _managed_portable_locator_mutation_http_error() from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"failed to reload services: {exc}") from exc
-        _apply_registry(app, registry, store)
         return public_service_settings(registry, env_file)
 
     @app.get("/api/open-source-tts/catalog")
@@ -182,17 +243,122 @@ def create_app(
 
     @app.post("/api/open-source-tts/configure")
     def open_source_tts_configure(request: OpenSourceTTSConfigureRequest) -> dict[str, Any]:
-        registry, endpoint, detect_payload = configure_open_source_tts(
-            request,
-            app.state.service_registry,
-            app.state.writable_services_path,
-            project_root,
-        )
-        _apply_registry(app, registry, store)
+        def configure(
+            published_registry: ServiceRegistry,
+        ) -> tuple[ServiceRegistry, Any, dict[str, Any]]:
+            return configure_open_source_tts(
+                request,
+                published_registry,
+                app.state.writable_services_path,
+                project_root,
+                publish=lambda candidate: _apply_registry(app, candidate, store),
+            )
+
+        try:
+            registry, endpoint, detect_payload = (
+                app.state.portable_locator_mutations.run_generic_transaction(
+                    current_published=lambda: app.state.service_registry,
+                    transaction=configure,
+                )
+            )
+        except ManagedPortableLocatorMutationError as exc:
+            raise _managed_portable_locator_mutation_http_error() from exc
         app.state.services_path = app.state.writable_services_path
         return {
             "service": endpoint.model_dump(mode="json"),
             "detect": detect_payload,
+            "settings": public_service_settings(registry, env_file),
+        }
+
+    @app.post("/api/portable-packages/discover")
+    def portable_packages_discover(request: PortablePackageDiscoverRequest) -> dict[str, Any]:
+        packages = discover_portable_packages(
+            portable_controller_root,
+            request.roots,
+            include_siblings=request.include_siblings,
+        )
+        return {"packages": [package.model_dump(mode="json") for package in packages]}
+
+    @app.post("/api/portable-packages/register")
+    def portable_package_register(request: PortablePackageRegisterRequest) -> dict[str, Any]:
+        try:
+            descriptor = read_portable_package(Path(request.package_root))
+            endpoint = endpoint_from_portable_package(descriptor, request)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        def persist_managed_and_publish() -> ServiceRegistry:
+            portable_store = PortableServiceStore(
+                portable_controller_root,
+                services_path=app.state.writable_services_path,
+            )
+            initial_services = (
+                tuple(app.state.service_registry.services)
+                if not portable_store.path.exists()
+                else ()
+            )
+            services = portable_store.replace_component(
+                endpoint,
+                initial_services=initial_services,
+                publish=lambda published: _apply_registry(
+                    app,
+                    ServiceRegistry(list(published)),
+                    store,
+                ),
+            )
+            app.state.services_path = app.state.writable_services_path
+            return ServiceRegistry(list(services))
+
+        def persist_external_and_publish(
+            published_registry: ServiceRegistry,
+        ) -> ServiceRegistry:
+            services = [
+                service
+                for service in published_registry.services
+                if service.service_id != endpoint.service_id
+            ]
+            services.append(endpoint)
+            services.sort(key=lambda service: (service.priority, service.service_id))
+            registry = published_registry.with_services(services)
+            registry.save(
+                app.state.writable_services_path,
+                publish=lambda candidate: _apply_registry(app, candidate, store),
+            )
+            app.state.services_path = app.state.writable_services_path
+            return registry
+
+        try:
+            if endpoint.portable_locator is None:
+                registry = app.state.portable_locator_mutations.run_generic_transaction(
+                    current_published=lambda: app.state.service_registry,
+                    transaction=persist_external_and_publish,
+                )
+            else:
+                registry = app.state.portable_locator_mutations.mutate_component(
+                    descriptor.component,
+                    persist_managed_and_publish,
+                )
+        except ManagedPortableLocatorMutationError as exc:
+            raise _managed_portable_locator_mutation_http_error() from exc
+        except ServicePostCommitError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "PORTABLE_REGISTRATION_PUBLICATION_FAILED",
+                    "message": "portable package registration was persisted but publication failed",
+                },
+            ) from exc
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PORTABLE_REGISTRATION_STORE_FAILED",
+                    "message": "portable package registration settings are unavailable",
+                },
+            ) from exc
+        return {
+            "package": descriptor.model_dump(mode="json"),
+            "service": endpoint.model_dump(mode="json"),
             "settings": public_service_settings(registry, env_file),
         }
 
@@ -209,7 +375,7 @@ def create_app(
     def services_status() -> dict[str, Any]:
         return {
             "services": _service_health_with_supervisor(app.state.service_router, supervisor, app.state.queue),
-            "hardware": collect_local_hardware_status(),
+            "hardware": collect_local_hardware_status(controller_cache_path=hardware_controller_cache),
         }
 
     @app.get("/api/startup/checks")
@@ -232,7 +398,7 @@ def create_app(
             },
             "services": _service_health_with_supervisor(app.state.service_router, supervisor),
             "resources": resources,
-            "hardware": collect_local_hardware_status(),
+            "hardware": collect_local_hardware_status(controller_cache_path=hardware_controller_cache),
         }
 
     @app.get("/api/runtime/mode")
@@ -1145,6 +1311,33 @@ def create_app(
         media_type = _image_media_type(image_path)
         return FileResponse(image_path, media_type=media_type)
 
+    configured_static_root = static_root or os.environ.get("TTS_MORE_STATIC_ROOT")
+    if configured_static_root:
+        frontend_root = Path(configured_static_root).resolve(strict=False)
+        index_path = frontend_root / "index.html"
+        if not index_path.is_file():
+            raise RuntimeError(f"frontend static assets are missing: {index_path}")
+        assets_root = frontend_root / "assets"
+        if assets_root.is_dir():
+            app.mount("/assets", StaticFiles(directory=assets_root), name="frontend-assets")
+
+        @app.get("/", include_in_schema=False)
+        def frontend_index() -> FileResponse:
+            return FileResponse(index_path)
+
+        @app.get("/{frontend_path:path}", include_in_schema=False)
+        def frontend_spa(frontend_path: str) -> FileResponse:
+            if frontend_path == "api" or frontend_path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="API route not found")
+            candidate = (frontend_root / frontend_path).resolve(strict=False)
+            try:
+                candidate.relative_to(frontend_root)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail="frontend asset not found") from exc
+            if candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(index_path)
+
     return app
 
 
@@ -1182,6 +1375,16 @@ def _apply_registry(app: FastAPI, registry: ServiceRegistry, store: ProjectStore
     app.state.job_manager = GenerationJobManager(queue, store)
 
 
+def _managed_portable_locator_mutation_http_error() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "MANAGED_PORTABLE_LOCATOR_MUTATION_FORBIDDEN",
+            "message": "managed portable locators must use a portable registration route",
+        },
+    )
+
+
 def _resolve_service_settings_paths(data_root: Path, explicit_path: Path | None) -> tuple[Path, Path]:
     if explicit_path is not None:
         return explicit_path, explicit_path
@@ -1196,6 +1399,17 @@ def _resolve_service_settings_paths(data_root: Path, explicit_path: Path | None)
         if candidate.exists():
             return candidate, local_path
     return local_path, local_path
+
+
+def _portable_controller_root(data_root: Path, project_root: Path) -> Path:
+    del data_root  # The executable/module layout, not process environment or cwd, is authoritative.
+    packaged_root = project_root.parent
+    if (
+        (packaged_root / "package" / "tts-more-package.json").is_file()
+        and (packaged_root / "scripts" / "select-portable-folder.ps1").is_file()
+    ):
+        return packaged_root
+    return project_root
 
 
 def _resolve_manifest_history_for_version(manifest: GenerationManifest, line_key: str, version_id: str) -> tuple[str, Any | None]:
@@ -1242,7 +1456,18 @@ def _service_health_with_supervisor(
 def _layer_service_status(service: dict[str, Any], supervisor_state: dict[str, Any]) -> dict[str, Any]:
     health = service.get("health") or {}
     setup_state = _effective_setup_state(service, health)
-    managed_local_stopped = bool(supervisor_state.get("manageable") and not supervisor_state.get("running") and service.get("network_scope") == "localhost")
+    reported_running = supervisor_state.get("running")
+    portable_health_running = bool(
+        service.get("control_kind") == "portable-package"
+        and reported_running is None
+        and service.get("ready")
+    )
+    effective_running = bool(reported_running is True or portable_health_running)
+    managed_local_stopped = bool(
+        supervisor_state.get("manageable")
+        and not effective_running
+        and service.get("network_scope") == "localhost"
+    )
     hard_blocked_setup = setup_state in {"not_configured", "repo_missing", "env_missing", "endpoint_unreachable"}
     if service.get("enabled") is False:
         state = "disabled"
@@ -1282,8 +1507,8 @@ def _layer_service_status(service: dict[str, Any], supervisor_state: dict[str, A
         "config_ok": bool(health.get("config_ok", service.get("ready", False))),
         "required_api_ok": bool(health.get("required_api_ok", service.get("ready", False))),
         "auth_ok": bool(health.get("auth_ok", True)),
-        "can_start": bool(supervisor_state.get("manageable") and not supervisor_state.get("running")),
-        "supervisor_state": "running" if supervisor_state.get("running") else "stopped",
+        "can_start": bool(supervisor_state.get("manageable") and not effective_running),
+        "supervisor_state": "running" if effective_running else "stopped",
         "source_profile": service.get("source_profile"),
         "catalog_provider": service.get("catalog_provider"),
         "setup_state": setup_state,

@@ -9,7 +9,10 @@ if ($Source -eq "Auto") {
 }
 
 if (!(Get-Command conda -ErrorAction SilentlyContinue)) {
-    Write-Warning "conda was not found; GPT-SoVITS upstream installer requires conda or micromamba."
+    if (Get-Command micromamba -ErrorAction SilentlyContinue) {
+        throw "micromamba is installed but is not currently supported by the TTS More GPT-SoVITS prepare workflow; install conda."
+    }
+    throw "supported conda executable was not found; GPT-SoVITS dependency preparation cannot continue. Install conda."
 }
 
 $InstallPs1 = Join-Path $RepoRoot "install.ps1"
