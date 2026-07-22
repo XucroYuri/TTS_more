@@ -10,9 +10,10 @@ Covers:
   P5 - Stress & reliability (rapid succession, cancellation, recovery)
 """
 
+import json
+import os
 import threading
 import time
-import json
 from pathlib import Path
 
 import httpx
@@ -35,6 +36,11 @@ from app.services import (
     ServiceRoute,
     ServiceRouter,
     build_service_client,
+)
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("TTS_MORE_LIVE_COMFYUI") != "1",
+    reason="requires a live ComfyUI + TTS-Audio-Suite runtime",
 )
 
 COMFYUI_URL = "http://127.0.0.1:8188"
