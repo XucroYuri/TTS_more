@@ -213,7 +213,7 @@ ComfyUITTSClient 封装了与 ComfyUI 的交互逻辑：
 |:---|:---|:---|:---:|
 | **TTS More** | `XucroYuri/TTS_more` (分支 `dev-xu/comfyui-integration`) | TTS 编排后端 + React 工作台 | 是 |
 | **ComfyUI** | `Comfy-Org/ComfyUI` | TTS 运行载体，提供 HTTP API 和工作流引擎 | 是 |
-| **TTS-Audio-Suite** | `diodiogod/TTS-Audio-Suite` | ComfyUI 插件，整合 GPT-SoVITS / IndexTTS-2 / CosyVoice3 及 15+ 引擎 | 是 |
+| **TTS-Audio-Suite** | `XucroYuri/TTS-Audio-Suite` | 基于上游完整架构扩展的正式 fork；保留 15+ 引擎并提供 TTS More API bridge | 是 |
 | **GPT-SoVITS** | `XucroYuri/GPT-SoVITS` | GPT-SoVITS 模型权重来源（传统 worker 路径；ComfyUI 路径下可选） | 否 |
 | **IndexTTS** | `XucroYuri/index-tts` | IndexTTS 模型权重来源（传统 worker 路径；ComfyUI 路径下可选） | 否 |
 | **CosyVoice** | `XucroYuri/CosyVoice` | CosyVoice 模型权重来源（传统 worker 路径；ComfyUI 路径下可选） | 否 |
@@ -225,7 +225,7 @@ ComfyUITTSClient 封装了与 ComfyUI 的交互逻辑：
 ```mermaid
 flowchart TD
     TM["XucroYuri/TTS_more<br/>TTS 编排层"] -- "HTTP API" --> CF["Comfy-Org/ComfyUI<br/>工作流引擎"]
-    CF -- "插件加载" --> TAS["diodiogod/TTS-Audio-Suite<br/>TTS 节点插件"]
+    CF -- "插件加载" --> TAS["XucroYuri/TTS-Audio-Suite<br/>完整上游节点 + API bridge"]
     TAS -- "引擎调用" --> M["模型层<br/>CosyVoice3 / IndexTTS-2 / GPT-SoVITS"]
     M -- "自动下载" --> DL["HuggingFace / ModelScope<br/>模型权重"]
     TM -. "传统路径 (可选)" .-> GS["XucroYuri/GPT-SoVITS"]
@@ -261,12 +261,12 @@ python3 -m venv .venv
 
 ```powershell
 cd ComfyUI/custom_nodes
-git clone https://github.com/diodiogod/TTS-Audio-Suite.git
+git clone https://github.com/XucroYuri/TTS-Audio-Suite.git
 cd TTS-Audio-Suite
 ..\..\.venv\Scripts\pip install -r requirements.txt
 ```
 
-> 也可在 ComfyUI 启动后通过 ComfyUI Manager 搜索 "TTS Audio Suite" 一键安装。
+创建仅保存在本机的 `resources.yaml`，为三个引擎配置稳定 `resource_id` 与本地源码/模型路径；启动 ComfyUI 前设置 `TTS_AUDIO_SUITE_RESOURCES` 指向该文件。TTS More 只读取资源 ID，不接收这些私有路径。
 
 #### 第三步：启动 ComfyUI
 
@@ -308,7 +308,8 @@ cd frontend && pnpm install && cd ..
     "resource_group": "local-gpu-0",
     "capacity": 3,
     "priority": 10,
-    "capabilities": ["tts", "cosyvoice", "wav_output", "reference_audio_voice"]
+    "capabilities": ["tts", "cosyvoice", "wav_output", "reference_audio_voice"],
+    "default_params": {"resource_id": "cosyvoice-local"}
   },
   {
     "service_id": "comfyui-indextts",
@@ -322,7 +323,8 @@ cd frontend && pnpm install && cd ..
     "resource_group": "local-gpu-0",
     "capacity": 3,
     "priority": 20,
-    "capabilities": ["tts", "indextts", "wav_output", "emotion_text", "emotion_audio"]
+    "capabilities": ["tts", "indextts", "wav_output", "emotion_text", "emotion_audio"],
+    "default_params": {"resource_id": "indextts-local"}
   }
 ]
 ```

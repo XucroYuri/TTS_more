@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import io
+import wave
 from pathlib import Path
 
 import httpx
@@ -32,7 +34,18 @@ def _cosyvoice_endpoint(base_url: str = "http://127.0.0.1:8188") -> TTSServiceEn
         capacity=3,
         priority=10,
         capabilities=["tts", "cosyvoice", "wav_output"],
+        default_params={"resource_id": "cosy-main"},
     )
+
+
+def _audio_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        output.writeframes(b"\x00\x00" * 160)
+    return buffer.getvalue()
 
 
 class TestComfyUIAPIClient:
@@ -126,28 +139,31 @@ class TestComfyUIAPIClient:
 
 class TestWorkflowBuilder:
     def test_cosyvoice_workflow_basic(self):
-        w = build_cosyvoice_workflow({"text": "Hello", "speed": 1.0})
+        w = build_cosyvoice_workflow({"text": "Hello", "speed": 1.0, "resource_id": "cosy-main"})
         assert len(w) == 3
-        assert w["1"]["class_type"] == "CosyVoiceEngineNode"
+        assert w["1"]["class_type"] == "TTSExternalCosyVoiceEngine"
+        assert w["1"]["inputs"]["resource_id"] == "cosy-main"
         assert w["3"]["class_type"] == "UnifiedTTSTextNode"
         assert w["3"]["inputs"]["text"] == "Hello"
-        assert w["3"]["inputs"]["narrator_voice"] == "voices_examples/higgs_audio/zh_man_sichuan.wav"
+        assert w["3"]["inputs"]["narrator_voice"] == "none"
         assert w["4"]["class_type"] == "SaveAudio"
 
     def test_cosyvoice_workflow_with_reference_audio(self):
         w = build_cosyvoice_workflow({
             "text": "Hello",
-            "reference_audio": "/data/ref.wav",
+            "resource_id": "cosy-main",
+            "asset_id": "asset-1",
             "prompt_text": "Hello there",
         })
         assert len(w) == 4
-        assert w["2"]["class_type"] == "LoadAudio"
-        assert w["2"]["inputs"]["audio"] == "/data/ref.wav"
+        assert w["2"]["class_type"] == "TTSExternalAudioAsset"
+        assert w["2"]["inputs"]["asset_id"] == "asset-1"
         assert w["3"]["inputs"]["opt_narrator"] == ["2", 0]
 
     def test_cosyvoice_workflow_with_instruct(self):
         w = build_cosyvoice_workflow({
             "text": "Hello",
+            "resource_id": "cosy-main",
             "instruct_text": "Speak with excitement",
         })
         assert w["1"]["inputs"]["instruct_text"] == "Speak with excitement"
@@ -155,12 +171,13 @@ class TestWorkflowBuilder:
     def test_indextts_workflow_basic(self):
         w = build_indextts_workflow({
             "text": "Hello world",
+            "resource_id": "index-main",
             "do_sample": True,
             "top_p": 0.8,
             "temperature": 0.8,
         })
         assert len(w) == 3
-        assert w["1"]["class_type"] == "IndexTTSEngineNode"
+        assert w["1"]["class_type"] == "TTSExternalIndexTTSEngine"
         assert w["1"]["inputs"]["do_sample"] is True
         assert w["3"]["class_type"] == "UnifiedTTSTextNode"
         assert w["3"]["inputs"]["text"] == "Hello world"
@@ -169,15 +186,17 @@ class TestWorkflowBuilder:
     def test_indextts_workflow_with_emotion_audio(self):
         w = build_indextts_workflow({
             "text": "Hello",
-            "emotion_audio": "/data/emotion.wav",
+            "resource_id": "index-main",
+            "asset_id": "asset-emotion",
         })
-        assert len(w) == 3
-        assert w["1"]["inputs"]["emotion_audio"] == "/data/emotion.wav"
+        assert len(w) == 4
+        assert w["2"]["inputs"]["asset_id"] == "asset-emotion"
 
     def test_indextts_workflow_with_emotion_vector(self):
         vector = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
         w = build_indextts_workflow({
             "text": "Hello",
+            "resource_id": "index-main",
             "emotion_vector": vector,
         })
         assert w["1"]["inputs"]["emotion_alpha"] == 1.0
@@ -185,23 +204,22 @@ class TestWorkflowBuilder:
     def test_gpt_sovits_workflow(self):
         w = build_gpt_sovits_workflow({
             "text": "Hello",
-            "gpt_weights_path": "/weights/gpt.pth",
-            "sovits_weights_path": "/weights/sovits.pth",
+            "resource_id": "gpt-main",
         })
         assert len(w) == 3
-        assert w["1"]["class_type"] == "GPTSovitsEngineNode"
+        assert w["1"]["class_type"] == "TTSExternalGPTSovitsEngine"
         assert w["4"]["class_type"] == "SaveAudio"
-        assert "/weights/gpt.pth /weights/sovits.pth" in str(w["1"]["inputs"]["weight_pair"])
+        assert w["1"]["inputs"]["resource_id"] == "gpt-main"
 
     def test_build_workflow_dispatcher(self):
-        w = build_workflow("cosyvoice", {"text": "Hi"})
-        assert w["1"]["class_type"] == "CosyVoiceEngineNode"
+        w = build_workflow("cosyvoice", {"text": "Hi", "resource_id": "cosy-main"})
+        assert w["1"]["class_type"] == "TTSExternalCosyVoiceEngine"
 
-        w = build_workflow("indextts", {"text": "Hi"})
-        assert w["1"]["class_type"] == "IndexTTSEngineNode"
+        w = build_workflow("indextts", {"text": "Hi", "resource_id": "index-main"})
+        assert w["1"]["class_type"] == "TTSExternalIndexTTSEngine"
 
-        w = build_workflow("gpt-sovits", {"text": "Hi"})
-        assert w["1"]["class_type"] == "GPTSovitsEngineNode"
+        w = build_workflow("gpt-sovits", {"text": "Hi", "resource_id": "gpt-main"})
+        assert w["1"]["class_type"] == "TTSExternalGPTSovitsEngine"
 
     def test_build_workflow_unknown_engine(self):
         with pytest.raises(ValueError, match="Unsupported"):
@@ -229,11 +247,15 @@ class TestComfyUITTSClient:
 
     def test_synthesize_mocked(self, tmp_path: Path):
         prompt_id = "test-pid-001"
-        wav_content = b"RIFF\x24\x00\x00\x00WAVEsynthesized"
+        wav_content = _audio_bytes()
         call_log: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             call_log.append(f"{request.method} {request.url.path}")
+            if request.url.path == "/api/tts-audio-suite/v1/assets/audio" and request.method == "POST":
+                return httpx.Response(201, json={"asset_id": "asset-1"})
+            if request.url.path == "/api/tts-audio-suite/v1/assets/audio/asset-1" and request.method == "DELETE":
+                return httpx.Response(200, json={"asset_id": "asset-1", "deleted": True})
             if request.url.path == "/prompt":
                 return httpx.Response(200, json={"prompt_id": prompt_id})
             if "/history/" in request.url.path:
@@ -261,12 +283,19 @@ class TestComfyUITTSClient:
 
         endpoint = _cosyvoice_endpoint()
         output_path = tmp_path / "result.wav"
+        reference_path = tmp_path / "reference.wav"
+        reference_path.write_bytes(_audio_bytes())
         line = ScriptLine(id="line-1", character_id="char-1", text="Hello world")
         request = SynthesisRequest(
             line=line,
             profile="default",
             output_path=output_path,
-            parameters={"engine": "cosyvoice", "text": "Hello world", "speed": 1.0},
+            parameters={
+                "engine": "cosyvoice",
+                "text": "Hello world",
+                "speed": 1.0,
+                "reference_audio": str(reference_path),
+            },
         )
 
         with httpx.Client(transport=httpx.MockTransport(handler)) as mock_client:
@@ -275,30 +304,40 @@ class TestComfyUITTSClient:
             result = client.synthesize(request)
 
         assert output_path.exists()
-        assert output_path.read_bytes() == wav_content
+        assert output_path.read_bytes().startswith(b"RIFF")
         assert isinstance(result, SynthesisResult)
         assert result.audio_path == output_path
         assert result.metadata["prompt_id"] == prompt_id
         assert result.metadata["engine"] == "cosyvoice"
+        assert result.metadata["resource_id"] == "cosy-main"
+        assert "POST /api/tts-audio-suite/v1/assets/audio" in call_log
+        assert "DELETE /api/tts-audio-suite/v1/assets/audio/asset-1" in call_log
 
     def test_unload(self):
+        calls: list[tuple[str, dict | None]] = []
+
         def handler(request: httpx.Request) -> httpx.Response:
+            calls.append((request.url.path, json.loads(request.content) if request.content else None))
             return httpx.Response(200, json={"status": "ok"})
 
         endpoint = _cosyvoice_endpoint()
         with httpx.Client(transport=httpx.MockTransport(handler)) as mock_client:
             client = ComfyUITTSClient(endpoint, transport=mock_client._transport)
             client.unload()
+        assert calls == [
+            ("/api/tts-audio-suite/v1/runtime/release", {"resource_id": "cosy-main"}),
+            ("/free", {"unload_models": True, "free_memory": True}),
+        ]
 
     def test_capabilities(self):
         def handler(request: httpx.Request) -> httpx.Response:
-            if "/object_info" in request.url.path:
+            if request.url.path == "/api/tts-audio-suite/v1/capabilities":
                 return httpx.Response(
                     200,
                     json={
-                        "CosyVoiceEngineNode": {"input": {"required": {}}},
-                        "UnifiedTTSTextNode": {"input": {"required": {}}},
-                        "SaveAudio": {"input": {"required": {}}},
+                        "protocol_version": 1,
+                        "nodes": {"cosyvoice": "TTSExternalCosyVoiceEngine"},
+                        "resources": [{"resource_id": "cosy-main", "engine": "cosyvoice", "ready": True}],
                     },
                 )
             return httpx.Response(404)
@@ -307,6 +346,5 @@ class TestComfyUITTSClient:
         with httpx.Client(transport=httpx.MockTransport(handler)) as mock_client:
             client = ComfyUITTSClient(endpoint, transport=mock_client._transport)
             result = client.capabilities()
-            assert "capabilities" in result
-            assert "available_nodes" in result
-            assert "CosyVoiceEngineNode" in result["available_nodes"]
+            assert result["protocol_version"] == 1
+            assert result["resources"][0]["resource_id"] == "cosy-main"
