@@ -403,6 +403,18 @@ def build_cluster_key(task: GenerationTask, route: ServiceRoute) -> str:
             f"seed={params.get('seed', '')}",
         ]
         return "|".join(parts)
+    if provider == ProviderType.COMFYUI or task.engine == EngineName.COMFYUI:
+        effective_engine = str(params.get("engine", task.engine.value))
+        parts = [
+            f"provider=comfyui",
+            f"engine={effective_engine}",
+            f"service_id={service_id}",
+            f"model_path={params.get('model_path', '')}",
+            f"reference_audio={params.get('reference_audio', params.get('prompt_audio_path', ''))}",
+            f"speed={params.get('speed', '')}",
+            f"seed={params.get('seed', '')}",
+        ]
+        return "|".join(parts)
     parts = [
         f"provider={provider.value if provider else task.engine.value}",
         f"service_id={service_id}",
