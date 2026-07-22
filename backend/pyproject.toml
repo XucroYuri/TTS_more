@@ -26,3 +26,6 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+  "legacy_portable: retired Windows portable-package tests; run only by explicit maintenance request",
+]
