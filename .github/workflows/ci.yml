@@ -30,6 +30,7 @@ jobs:
           ALL_PROXY: ""
           HTTP_PROXY: ""
           HTTPS_PROXY: ""
+          TTS_MORE_SKIP_LEGACY_PORTABLE: "1"
           # Keep Windows tmp_path below the production portable-package path budget.
           PYTEST_ADDOPTS: ${{ runner.os == 'Windows' && format('--basetemp="{0}/pytest-{1}"', runner.temp, github.run_id) || '' }}
         run: pytest backend -q

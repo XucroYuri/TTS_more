@@ -8,9 +8,42 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+LEGACY_PORTABLE_TEST_MODULES = {
+    "test_prepare_scripts.py",
+    "test_integration_sync.py",
+    "test_portable_control.py",
+    "test_portable_diagnostics.py",
+    "test_portable_discovery.py",
+    "test_portable_file_io.py",
+    "test_portable_first_run_harness.py",
+    "test_portable_install.py",
+    "test_portable_launcher.py",
+    "test_portable_locks.py",
+    "test_portable_migration.py",
+    "test_portable_operations.py",
+    "test_portable_packages.py",
+    "test_portable_python_runtime.py",
+    "test_portable_services.py",
+    "test_portable_start_controller.py",
+}
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Keep retired portable-package coverage out of the default product gate."""
+    for item in items:
+        if Path(str(item.fspath)).name in LEGACY_PORTABLE_TEST_MODULES:
+            item.add_marker(pytest.mark.legacy_portable)
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:
+    """Avoid importing retired portable-package tests in the default CI gate."""
+    return (
+        os.environ.get("TTS_MORE_SKIP_LEGACY_PORTABLE") == "1"
+        and collection_path.name in LEGACY_PORTABLE_TEST_MODULES
+    )
 
 
 @pytest.fixture(autouse=True)

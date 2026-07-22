@@ -9,14 +9,17 @@ TTS More 是一个**剧本配音工作台**：在 GPT-SoVITS、IndexTTS、CosyVo
 ```mermaid
 flowchart LR
     Browser["浏览器<br/>React 工作台"] -- "HTTP /api" --> Backend["FastAPI 编排后端"]
-    Backend -- "调度/合成" --> Local["本地工作器<br/>GPT-SoVITS / index-tts"]
-    Backend -- "调度/合成" --> Remote["远端服务<br/>Gradio / 商业 API"]
+    Backend -- "调度/合成" --> ComfyUI["ComfyUI<br/>任务队列 / TTS-Audio-Suite"]
+    ComfyUI --> Models["GPT-SoVITS / IndexTTS / CosyVoice<br/>模型与数据资源"]
+    Backend -- "调度/合成" --> Remote["远端服务<br/>商业 API"]
     Backend -- "读写" --> Data[("data/<br/>项目/角色/配置")]
-    Local -- "产出音频" --> Data
+    ComfyUI -- "产出音频" --> Data
     Remote -- "回传音频" --> Backend
 ```
 
 主路径固定为：`剧本 → 提取台词 → 角色音色 → TTS 接入 → 生成台词 → 试听历史`。工作台左侧处理剧本，中间处理台词生成，右侧只处理当前台词的音色、参考资源和生成动作。中英双语 i18n，中文兜底。
+
+当前正式本地运行路径为 TTS More 调用 ComfyUI HTTP API，由 `XucroYuri/TTS-Audio-Suite` 承载 TTS 引擎与真实任务队列；三个上游 TTS 项目仅保留为模型和数据资源来源。完整步骤见 [ComfyUI 部署指南](docs/comfyui-integration.md#从零部署指南)。
 
 更多见 [架构文档](docs/architecture.md) 与 [安全模型](docs/security.md)。
 
