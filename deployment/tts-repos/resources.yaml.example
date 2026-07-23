@@ -1,0 +1,32 @@
+# TTS Audio Suite Bridge API — Resource Registry
+# =================================================
+# Set TTS_AUDIO_SUITE_RESOURCES env var pointing to this file.
+# ComfyUI reads it at startup to register TTS resources for external API access.
+#
+# Format: version 1, resources keyed by resource_id.
+# After editing, restart ComfyUI and verify:
+#   curl http://127.0.0.1:8188/api/tts-audio-suite/v1/capabilities
+
+version: 1
+resources:
+  # ── CosyVoice3 Example ──────────────────────────────────────────
+  # cosyvoice-fun-0.5b-rl:
+  #   engine: cosyvoice
+  #   source_root: /path/to/CosyVoice-project-root
+  #   model_dir: /path/to/CosyVoice/pretrained_models/CosyVoice-300M
+  #
+  # ── IndexTTS-2 Example ──────────────────────────────────────────
+  # indextts-v2:
+  #   engine: index_tts
+  #   source_root: /path/to/index-tts-project-root
+  #   model_dir: /path/to/index-tts/checkpoints
+  #
+  # ── GPT-SoVITS Example ──────────────────────────────────────────
+  # gpt-sovits-v2pro:
+  #   engine: gpt_sovits
+  #   source_root: /path/to/GPT-SoVITS-project-root
+  #   gpt_weight: /path/to/GPT-SoVITS/GPT_weights/xxx-e15-s100.pth
+  #   sovits_weight: /path/to/GPT-SoVITS/SoVITS_weights/xxx_e8_s200.pth
+  #   cnhubert_path: /path/to/GPT-SoVITS/GPT_SoVITS/pretrained_models/chinese-hubert-base
+  #   bert_path: /path/to/GPT-SoVITS/GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+  #   version: v2ProPlus
