@@ -13,6 +13,7 @@ Covers:
 import threading
 import time
 import json
+import os
 from pathlib import Path
 
 import httpx
@@ -37,8 +38,9 @@ from app.services import (
     build_service_client,
 )
 
-COMFYUI_URL = "http://127.0.0.1:8188"
-TEST_OUTPUT = Path("D:/TTS/TTS_more-comfyui/data/test_output/audit")
+COMFYUI_URL = os.environ.get("TTS_MORE_COMFYUI_URL", "http://127.0.0.1:8188")
+_TEST_BASE = Path(os.environ.get("TTS_MORE_TEST_OUTPUT", str(Path(__file__).resolve().parent / "test_output")))
+TEST_OUTPUT = _TEST_BASE / "audit"
 TEST_OUTPUT.mkdir(parents=True, exist_ok=True)
 
 
