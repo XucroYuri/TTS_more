@@ -187,6 +187,18 @@ export TTS_MORE_RUN_REAL_TTS=1
 
 真实 TTS pytest 不能替代正式 CUDA 认证。Windows 单机只从 [单机 CUDA Runbook](docs/cuda-e2e-single-node.md) 复制命令；四机可信 LAN 见 [分布式 Runbook](docs/cuda-e2e-distributed.md)；门禁和证据语义见 [CUDA 验证契约](docs/cuda-e2e-validation.md)。macOS 和普通 hosted CI 不能签发 Windows CUDA 认证。
 
+### 开发者环境变量
+
+运行 ComfyUI 相关测试和部署时可能需要设置以下环境变量：
+
+| 变量 | 用途 | 示例 |
+|------|------|------|
+| `TTS_AUDIO_SUITE_RESOURCES` | ComfyUI Bridge API 资源注册文件路径 | `D:\path\to\resources.yaml` |
+| `TTS_MORE_COMFYUI_URL` | 测试目标 ComfyUI 地址（默认 `127.0.0.1:8188`） | `http://192.168.1.10:8188` |
+| `TTS_MORE_TEST_OUTPUT` | 测试输出目录（默认 `backend/tests/test_output/`） | `/tmp/tts-more-tests` |
+
+编辑 `resources.yaml` 模板后设置环境变量并重启 ComfyUI。首次部署指南详见 [ComfyUI 接入指南](docs/comfyui-integration.md)。
+
 ## 服务模式
 
 默认真实网络 endpoint 模式：本地和远端服务都通过 `data/services.json` 里的 `base_url` 调用；未启动的服务显示为未就绪，不会被调度。商业 TSS（OpenAI/Gemini/xAI/火山）作为一等服务，key 只存在 `.env.local`，`services.json` 只引用 env 变量名。
