@@ -60,3 +60,8 @@ data/projects/*/audio/
 *.log
 *.egg-info/
 .zcode/
+# ComfyUI Bridge API — local resource configuration (paths, model dirs)
+resources.yaml
+# Test artifacts
+data/test_output/
+backend/tests/test_output/

@@ -25,8 +25,32 @@ flowchart TD
 ## 前置条件
 
 1. ComfyUI 已安装并运行，默认端口为 8188。
-2. TTS-Audio-Suite 插件已安装。用户可以在 ComfyUI Manager 中搜索 "TTS Audio Suite" 进行一键安装。
-3. CosyVoice3 模型已准备就绪。首次使用时系统会自动下载约 5.4GB 的模型文件。
+2. TTS-Audio-Suite 插件已安装（v5.5.2+，需支持 Bridge API）。用户可以在 ComfyUI Manager 中搜索 "TTS Audio Suite" 进行一键安装。
+3. Bridge API 资源配置完毕。需创建 `resources.yaml` 并设置环境变量 `TTS_AUDIO_SUITE_RESOURCES`。
+
+### Bridge API 资源配置
+
+TTS-Audio-Suite 的 Bridge API 通过 `resources.yaml` 声明可用的 TTS 资源。首次部署需：
+
+```powershell
+# 1. 从模板创建 resources.yaml
+copy deployment\tts-repos\resources.yaml.example resources.yaml
+
+# 2. 编辑 resources.yaml，填写实际的模型路径
+
+# 3. 设置环境变量（Windows — 永久生效）
+[Environment]::SetEnvironmentVariable("TTS_AUDIO_SUITE_RESOURCES", "D:\path\to\resources.yaml", "User")
+
+# Linux / macOS
+export TTS_AUDIO_SUITE_RESOURCES=/path/to/resources.yaml
+```
+
+4. 重启 ComfyUI，验证 Bridge API：
+```bash
+curl http://127.0.0.1:8188/api/tts-audio-suite/v1/capabilities
+```
+
+5. CosyVoice3 模型已准备就绪。首次使用时系统会自动下载约 5.4GB 的模型文件。
 
 ## 快速开始
 
@@ -46,6 +70,7 @@ flowchart TD
   "priority": 10,
   "capabilities": ["tts", "cosyvoice", "wav_output", "reference_audio_voice"],
   "default_params": {
+    "resource_id": "cosyvoice-fun-0.5b-rl",
     "poll_interval": 2.0,
     "timeout_seconds": 600
   }
@@ -266,7 +291,20 @@ cd TTS-Audio-Suite
 ..\..\.venv\Scripts\pip install -r requirements.txt
 ```
 
-创建仅保存在本机的 `resources.yaml`，为三个引擎配置稳定 `resource_id` 与本地源码/模型路径；启动 ComfyUI 前设置 `TTS_AUDIO_SUITE_RESOURCES` 指向该文件。TTS More 只读取资源 ID，不接收这些私有路径。
+创建仅保存在本机的 `resources.yaml`，为引擎配置稳定的 `resource_id` 与模型路径。模板参考 `deployment/tts-repos/resources.yaml.example`。启动 ComfyUI 前设置环境变量：
+
+```powershell
+# Windows
+copy deployment\tts-repos\resources.yaml.example resources.yaml
+# 编辑 resources.yaml 填入实际路径
+[Environment]::SetEnvironmentVariable("TTS_AUDIO_SUITE_RESOURCES", "D:\absolute\path\to\resources.yaml", "User")
+
+# Linux / macOS
+cp deployment/tts-repos/resources.yaml.example resources.yaml
+export TTS_AUDIO_SUITE_RESOURCES=/absolute/path/to/resources.yaml
+```
+
+TTS More 只读取资源 ID，不接收这些私有路径。
 
 #### 第三步：启动 ComfyUI
 
