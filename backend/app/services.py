@@ -16,6 +16,8 @@ from typing import Any, Protocol
 import httpx
 
 from app.adapters.base import SynthesisRequest, SynthesisResult
+from app.comfyui_tts_audio_suite import API_CONTRACT as COMFYUI_TTS_AUDIO_SUITE_CONTRACT
+from app.comfyui_tts_audio_suite import ComfyUITTSAudioSuiteClient
 from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
 from app.net_guard import scrub_error
 
@@ -70,54 +72,59 @@ class ServiceRegistry:
         return cls(
             [
                 TTSServiceEndpoint(
-                    service_id="local-gpt-sovits",
-                    display_name="GPT-SoVITS Gradio",
+                    service_id="comfyui-gpt-sovits",
+                    display_name="ComfyUI TTS-Audio-Suite (GPT-SoVITS)",
                     service_kind="tts",
                     engine=EngineName.GPT_SOVITS,
                     provider_type=ProviderType.GPT_SOVITS,
-                    api_contract="gradio-gpt-sovits-webui",
-                    base_url="http://127.0.0.1:9872",
-                    network_scope="localhost",
-                    mode="external",
-                    managed=False,
-                    source_profile="local_endpoint",
-                    resource_group="gradio-gpu-0",
-                    priority=10,
-                    capabilities=["tts", "trained_weights_voice", "reference_audio_voice", "gpt-weights", "sovits-weights", "wav_output", "gradio_webui"],
-                ),
-                TTSServiceEndpoint(
-                    service_id="local-indextts",
-                    display_name="IndexTTS Gradio",
-                    service_kind="tts",
-                    engine=EngineName.INDEX_TTS,
-                    provider_type=ProviderType.INDEX_TTS,
-                    api_contract="gradio-indextts2-webui",
-                    base_url="http://127.0.0.1:7860",
-                    network_scope="localhost",
-                    mode="external",
-                    managed=False,
-                    source_profile="local_endpoint",
-                    resource_group="gradio-gpu-0",
-                    priority=20,
-                    capabilities=["tts", "reference_audio_voice", "emotion_text", "emotion_audio", "wav_output", "gradio_webui"],
-                ),
-                TTSServiceEndpoint(
-                    service_id="local-cosyvoice",
-                    display_name="CosyVoice Gradio",
-                    service_kind="tts",
-                    engine=EngineName.COSYVOICE,
-                    provider_type=ProviderType.COSYVOICE,
-                    api_contract="gradio-cosyvoice-webui",
-                    base_url="http://127.0.0.1:50000",
+                    api_contract=COMFYUI_TTS_AUDIO_SUITE_CONTRACT,
+                    base_url="http://127.0.0.1:8188",
                     network_scope="localhost",
                     mode="external",
                     managed=False,
                     enabled=False,
                     source_profile="local_endpoint",
-                    resource_group="gradio-gpu-0",
+                    setup_state="not_configured",
+                    resource_group="comfyui-prompt-queue",
+                    priority=10,
+                    capabilities=["tts", "comfyui", "tts-audio-suite", "reference_audio_voice", "trained_weights_voice", "wav_output"],
+                ),
+                TTSServiceEndpoint(
+                    service_id="comfyui-indextts",
+                    display_name="ComfyUI TTS-Audio-Suite (IndexTTS)",
+                    service_kind="tts",
+                    engine=EngineName.INDEX_TTS,
+                    provider_type=ProviderType.INDEX_TTS,
+                    api_contract=COMFYUI_TTS_AUDIO_SUITE_CONTRACT,
+                    base_url="http://127.0.0.1:8188",
+                    network_scope="localhost",
+                    mode="external",
+                    managed=False,
+                    enabled=False,
+                    source_profile="local_endpoint",
+                    setup_state="not_configured",
+                    resource_group="comfyui-prompt-queue",
+                    priority=20,
+                    capabilities=["tts", "comfyui", "tts-audio-suite", "reference_audio_voice", "emotion_text", "emotion_audio", "wav_output"],
+                ),
+                TTSServiceEndpoint(
+                    service_id="comfyui-cosyvoice",
+                    display_name="ComfyUI TTS-Audio-Suite (CosyVoice)",
+                    service_kind="tts",
+                    engine=EngineName.COSYVOICE,
+                    provider_type=ProviderType.COSYVOICE,
+                    api_contract=COMFYUI_TTS_AUDIO_SUITE_CONTRACT,
+                    base_url="http://127.0.0.1:8188",
+                    network_scope="localhost",
+                    mode="external",
+                    managed=False,
+                    enabled=False,
+                    source_profile="local_endpoint",
+                    setup_state="not_configured",
+                    resource_group="comfyui-prompt-queue",
                     priority=30,
-                    capabilities=["tts", "reference_audio_voice", "zero_shot_voice", "cross_lingual_voice", "style_instruction", "wav_output", "gradio_webui"],
-                    default_params={"mode": "zero_shot", "response_format": "wav"},
+                    capabilities=["tts", "comfyui", "tts-audio-suite", "reference_audio_voice", "zero_shot_voice", "cross_lingual_voice", "style_instruction", "wav_output"],
+                    default_params={"mode": "zero_shot"},
                 ),
             ]
         )
@@ -139,6 +146,18 @@ class ServiceRegistry:
 
 
 def build_load_signature(endpoint: TTSServiceEndpoint, parameters: dict[str, Any]) -> str:
+    if endpoint.api_contract == COMFYUI_TTS_AUDIO_SUITE_CONTRACT:
+        parts = [
+            f"service_id={endpoint.service_id}",
+            f"provider={endpoint.provider_type.value if endpoint.provider_type else ''}",
+            f"resource_id={parameters.get('resource_id', endpoint.default_params.get('resource_id', ''))}",
+            f"ref_audio_path={parameters.get('ref_audio_path', parameters.get('reference_audio', parameters.get('voice', '')))}",
+            f"prompt_audio_path={parameters.get('prompt_audio_path', parameters.get('prompt_audio', ''))}",
+            f"prompt_text={parameters.get('prompt_text', parameters.get('reference_text', ''))}",
+            f"instruct_text={parameters.get('instruct_text', parameters.get('instruction', ''))}",
+            f"seed={parameters.get('seed', '')}",
+        ]
+        return "|".join(parts)
     if endpoint.provider_type == ProviderType.GPT_SOVITS or endpoint.engine == EngineName.GPT_SOVITS:
         parts = [
             f"service_id={endpoint.service_id}",
@@ -330,6 +349,8 @@ class ServiceRouter:
 def build_service_client(endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> TTSServiceClient:
     if endpoint.base_url.startswith("mock://"):
         return MockServiceClient(endpoint)
+    if endpoint.api_contract == COMFYUI_TTS_AUDIO_SUITE_CONTRACT:
+        return ComfyUITTSAudioSuiteClient(endpoint, transport=transport)
     if endpoint.api_contract == "tts-more-v1":
         return HttpTTSServiceClient(endpoint, transport=transport)
     if endpoint.api_contract.startswith("gradio-"):
@@ -348,6 +369,8 @@ def build_service_client(endpoint: TTSServiceEndpoint, transport: httpx.BaseTran
 
 
 def require_remote_artifact_transfer(endpoint: TTSServiceEndpoint) -> None:
+    if endpoint.api_contract == COMFYUI_TTS_AUDIO_SUITE_CONTRACT:
+        return
     if endpoint.mode != "external" or endpoint.network_scope == "localhost":
         return
     normalized = {capability.replace("_", "-").casefold() for capability in endpoint.capabilities}

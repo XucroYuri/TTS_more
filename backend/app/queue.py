@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.adapters.base import SynthesisRequest
+from app.comfyui_tts_audio_suite import API_CONTRACT as COMFYUI_TTS_AUDIO_SUITE_CONTRACT
 from app.models import EngineName, GenerationJob, GenerationManifest, GenerationQueueItem, GenerationStatus, GenerationTask, GenerationVersion, ProviderType
 from app.services import ServiceRoute, build_load_signature
 
-StatusCallback = Callable[[GenerationTask, GenerationStatus, float, str | None, str | None], None]
+ExternalStatusUpdate = dict[str, Any]
+StatusCallback = Callable[[GenerationTask, GenerationStatus, float, str | None, str | None, ExternalStatusUpdate | None], None]
 
 logger = logging.getLogger(__name__)
 
@@ -201,12 +203,20 @@ class ServiceGenerationQueue:
         revision_context = _revision_context(task)
         binding_snapshot = route.binding.model_dump(mode="json") if route.binding else None
         try:
+            def progress_callback(update: ExternalStatusUpdate) -> None:
+                external_progress = update.get("progress")
+                progress = 0.45
+                if isinstance(external_progress, (int, float)):
+                    progress = max(0.35, min(0.88, float(external_progress)))
+                self._emit(task, "running", progress, cluster_key, None, status_callback, update)
+
             result = route.client.synthesize(
                 SynthesisRequest(
                     line=task.line,
                     profile=task.profile,
                     output_path=output_path,
                     parameters=task.parameters,
+                    progress_callback=progress_callback,
                 )
             )
             self._emit(task, "finalizing", 0.9, cluster_key, version_id, status_callback)
@@ -342,16 +352,28 @@ class ServiceGenerationQueue:
         cluster_key: str | None,
         version_id: str | None,
         status_callback: StatusCallback | None = None,
+        external_update: ExternalStatusUpdate | None = None,
     ) -> None:
         callback = status_callback or self.status_callback
         if callback:
-            callback(task, status, progress, cluster_key, version_id)
+            callback(task, status, progress, cluster_key, version_id, external_update)
 
 
 def build_cluster_key(task: GenerationTask, route: ServiceRoute) -> str:
     provider = route.endpoint.provider_type or task.provider_type
     service_id = route.endpoint.service_id
     params = task.parameters
+    if route.endpoint.api_contract == COMFYUI_TTS_AUDIO_SUITE_CONTRACT:
+        parts = [
+            f"provider=comfyui",
+            f"service_id={service_id}",
+            f"resource_id={params.get('resource_id', route.endpoint.default_params.get('resource_id', ''))}",
+            f"provider_type={provider.value if provider else task.engine.value}",
+            f"ref_audio_path={params.get('ref_audio_path', params.get('reference_audio', params.get('voice', '')))}",
+            f"prompt_audio_path={params.get('prompt_audio_path', params.get('prompt_audio', ''))}",
+            f"prompt_text={params.get('prompt_text', params.get('reference_text', ''))}",
+        ]
+        return "|".join(parts)
     if provider == ProviderType.GPT_SOVITS or task.engine == EngineName.GPT_SOVITS:
         parts = [
             f"provider=gpt-sovits",
@@ -570,8 +592,8 @@ class GenerationJobManager:
                 runnable_tasks,
                 manifest,
                 output_dir=output_dir,
-                status_callback=lambda task, status, progress, cluster_key, version_id: self._update_item(
-                    job_id, task, status, progress, cluster_key, version_id
+                status_callback=lambda task, status, progress, cluster_key, version_id, external_update: self._update_item(
+                    job_id, task, status, progress, cluster_key, version_id, external_update
                 ),
                 cancel_check=lambda: self._is_cancelled(job_id),
             )
@@ -650,6 +672,7 @@ class GenerationJobManager:
         progress: float,
         cluster_key: str | None,
         version_id: str | None,
+        external_update: ExternalStatusUpdate | None = None,
     ) -> None:
         with self._lock:
             job = self._jobs[job_id]
@@ -660,6 +683,13 @@ class GenerationJobManager:
                     item.cluster_key = cluster_key or item.cluster_key
                     item.service_id = task.service_id or item.service_id
                     item.version_id = version_id or item.version_id
+                    if external_update is not None:
+                        external_job_id = external_update.get("external_job_id")
+                        external_status = external_update.get("external_status")
+                        if external_job_id is not None:
+                            item.external_job_id = str(external_job_id)
+                        if external_status is not None:
+                            item.external_status = str(external_status)
                     if item.load_signature is None:
                         try:
                             route = self.queue.router.resolve_task(task)

@@ -350,26 +350,28 @@ def test_uploaded_reference_cache_expires_before_worker_ttl(tmp_path: Path, monk
     assert len(uploads) == 2
 
 
-def test_registry_default_services_use_gradio_endpoints() -> None:
+def test_registry_default_services_use_comfyui_bridge_endpoints() -> None:
     registry = ServiceRegistry.default_local(repo_root=Path("repo"))
 
     assert {service.service_id for service in registry.services} == {
-        "local-gpt-sovits",
-        "local-indextts",
-        "local-cosyvoice",
+        "comfyui-gpt-sovits",
+        "comfyui-indextts",
+        "comfyui-cosyvoice",
     }
-    assert {service.resource_group for service in registry.services} == {"gradio-gpu-0"}
+    assert {service.resource_group for service in registry.services} == {"comfyui-prompt-queue"}
     assert all(service.capacity == 1 for service in registry.services)
-    assert all(service.base_url.startswith("http://") for service in registry.services)
+    assert {service.base_url for service in registry.services} == {"http://127.0.0.1:8188"}
     assert all(service.service_kind == "tts" for service in registry.services)
     assert all(service.network_scope == "localhost" for service in registry.services)
     assert all(service.mode == "external" for service in registry.services)
     assert all(service.managed is False for service in registry.services)
     assert all(service.repo_path is None for service in registry.services)
-    cosyvoice = registry.get("local-cosyvoice")
+    assert all(service.enabled is False for service in registry.services)
+    assert {service.api_contract for service in registry.services} == {"comfyui-tts-audio-suite-v1"}
+    cosyvoice = registry.get("comfyui-cosyvoice")
     assert cosyvoice.enabled is False
     assert cosyvoice.provider_type.value == "cosyvoice"
-    assert cosyvoice.api_contract == "gradio-cosyvoice-webui"
+    assert cosyvoice.api_contract == "comfyui-tts-audio-suite-v1"
 
 
 def test_registry_keeps_external_vibevoice_only_as_generic_http() -> None:

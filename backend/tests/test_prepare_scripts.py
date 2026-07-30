@@ -608,7 +608,7 @@ def test_deployment_assets_separate_app_and_provider_repo_scripts() -> None:
         assert (provider_dir / "tts-more-prepare.ps1").exists()
 
 
-def test_committed_manifests_default_to_product_gpt_main() -> None:
+def test_committed_services_default_to_comfyui_bridge() -> None:
     import json
 
     lock = json.loads((REPO_ROOT / "repo.lock.json").read_text(encoding="utf-8"))["repositories"]
@@ -619,10 +619,12 @@ def test_committed_manifests_default_to_product_gpt_main() -> None:
     assert gpt["dev"]["default_selected"] is False
     assert gpt["proplus-hc-dev"]["default_selected"] is False
     assert [service["service_id"] for service in services] == [
-        "local-gpt-sovits-main",
-        "local-indextts",
-        "local-cosyvoice",
+        "comfyui-gpt-sovits",
+        "comfyui-indextts",
+        "comfyui-cosyvoice",
     ]
+    assert {service["base_url"] for service in services} == {"http://127.0.0.1:8188"}
+    assert {service["api_contract"] for service in services} == {"comfyui-tts-audio-suite-v1"}
 
 
 def test_docs_explain_gpt_branch_convergence_and_explicit_regression_targets() -> None:

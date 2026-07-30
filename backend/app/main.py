@@ -1739,6 +1739,8 @@ def _validate_generation_tasks(tasks: list[GenerationTask]) -> None:
 def _assert_generation_inputs(task: GenerationTask) -> None:
     provider = task.provider_type.value if task.provider_type is not None else task.engine.value
     params = task.parameters
+    if provider in {"gpt-sovits", "indextts", "cosyvoice"} and _has_text(params.get("resource_id")):
+        return
     if provider == "gpt-sovits":
         missing = []
         if not _has_text(params.get("gpt_weights_path") or params.get("gpt_weights")):

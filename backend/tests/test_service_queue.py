@@ -30,6 +30,15 @@ class RecordingServiceClient:
         self.calls.append("unload")
 
 
+class PromptProgressServiceClient(RecordingServiceClient):
+    def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+        if request.progress_callback is not None:
+            request.progress_callback({"external_job_id": "prompt-abc", "external_status": "queued", "progress": 0.1})
+            request.progress_callback({"external_job_id": "prompt-abc", "external_status": "running", "progress": 0.45})
+            request.progress_callback({"external_job_id": "prompt-abc", "external_status": "completed", "progress": 1.0})
+        return super().synthesize(request)
+
+
 class BlockingServiceClient(RecordingServiceClient):
     def __init__(self, endpoint: TTSServiceEndpoint, release: threading.Event) -> None:
         super().__init__(endpoint)
@@ -346,6 +355,19 @@ def test_generation_job_manager_copies_synthesis_errors_to_job_items(tmp_path: P
     assert store.manifest.lines["a1"].versions[0].error == "synthesis backend returned 500"
 
 
+def test_generation_job_manager_records_external_prompt_status(tmp_path: Path) -> None:
+    client = PromptProgressServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), MemoryStore(tmp_path))
+
+    created = manager.submit("demo", [gpt_task("a1", "a.wav")])
+    final = _wait_for_manager_job(manager, created.job_id)
+
+    assert final.status == "completed"
+    assert final.items[0].external_job_id == "prompt-abc"
+    assert final.items[0].external_status == "completed"
+    assert final.items[0].status == "completed"
+
+
 def test_service_queue_records_provider_and_binding_metadata(tmp_path: Path) -> None:
     commercial_endpoint = TTSServiceEndpoint(
         service_id="openai-tts",
@@ -550,7 +572,7 @@ def _run_queue_with_callback(
             tasks,
             manifest,
             output_dir=output_dir,
-            status_callback=lambda task, status, _progress, _cluster_key, _version_id: events.append(f"{task.line.id}:{status}"),
+            status_callback=lambda task, status, _progress, _cluster_key, _version_id, _external_update: events.append(f"{task.line.id}:{status}"),
         )
     except BaseException as exc:
         errors.append(exc)
