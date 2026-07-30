@@ -1,6 +1,6 @@
 # TTS More
 
-TTS More 是一个**剧本配音工作台**：在 GPT-SoVITS、IndexTTS、CosyVoice 等开源 TTS 与商业 HTTP 服务之上，提供统一的剧本解析、角色音色配置、任务队列和生成历史管理。它不重写模型，只做编排。
+TTS More 是一个**剧本配音工作台**：应用本体负责剧本解析、角色音色配置、批量任务分发和生成历史管理；开源 TTS 推理主路径交给 ComfyUI + [TTS-Audio-Suite](https://github.com/XucroYuri/TTS-Audio-Suite)。它不重写模型，只做编排。
 
 本地优先：默认绑 `127.0.0.1`，单用户零配置即可跑起来。
 
@@ -9,10 +9,10 @@ TTS More 是一个**剧本配音工作台**：在 GPT-SoVITS、IndexTTS、CosyVo
 ```mermaid
 flowchart LR
     Browser["浏览器<br/>React 工作台"] -- "HTTP /api" --> Backend["FastAPI 编排后端"]
-    Backend -- "调度/合成" --> Local["本地工作器<br/>GPT-SoVITS / index-tts"]
+    Backend -- "capabilities / assets / prompt / history" --> ComfyUI["ComfyUI<br/>TTS-Audio-Suite"]
     Backend -- "调度/合成" --> Remote["远端服务<br/>Gradio / 商业 API"]
     Backend -- "读写" --> Data[("data/<br/>项目/角色/配置")]
-    Local -- "产出音频" --> Data
+    ComfyUI -- "SaveAudio 输出" --> Backend
     Remote -- "回传音频" --> Backend
 ```
 
@@ -110,11 +110,11 @@ scripts/update.sh --force-reset-repos --repo-paths deployment/app/repo-paths.loc
 
 ### 5. 接入 TTS 服务
 
-在工作台打开 `接入 → TTS 服务`，选择 GPT-SoVITS / IndexTTS / CosyVoice，粘贴服务地址并执行“检测并保存”。`127.0.0.1`、`localhost`、局域网或远端 worker 地址都可以接入；向导写入 `data/local/services.json`，不污染可提交模板。
+推荐路径是启动 ComfyUI，并安装 `https://github.com/XucroYuri/TTS-Audio-Suite` 插件；TTS More 通过 `comfyui-tts-audio-suite-v1` support routes 发现可用 `resource_id`，上传参考音频，再把每条台词提交为 ComfyUI workflow prompt。运行时切换会先调用插件的 `/api/tts-audio-suite/v1/runtime/release`，再调用 ComfyUI `/free` 释放模型和显存。提交态 `data/services.json` 已提供三个逻辑服务端点，默认都指向 `http://127.0.0.1:8188`，分别覆盖 GPT-SoVITS、IndexTTS、CosyVoice provider 路由。
 
-TTS More 推荐 worker-first 架构：优先接入 `tts-more-v1` worker；已有 Gradio 服务也可以作为兼容端点接入。
+旧 `tts-more-v1` worker、Gradio WebUI 直连和三套模型 fork 部署脚本已经转为 legacy 兼容路径；需要旧部署细节时见 [legacy 归档](docs/legacy-webui-fork-archive.md)。
 
-本地完整部署推荐使用一键脚本。它会安装应用本体依赖，按 `repo.lock.json` 中的 `default_selected` 同步 GPT-SoVITS `main`、IndexTTS、CosyVoice，把 `deployment/tts-repos/<provider>` 下的附加脚本复制到对应服务 repo 的 `tts-more/` 目录，准备依赖/模型，并渲染 `data/local/services.json`：
+本地完整部署脚本仍保留，用于 legacy worker/fork 路线。它会安装应用本体依赖，按 `repo.lock.json` 中的 `default_selected` 同步 GPT-SoVITS `main`、IndexTTS、CosyVoice，把 `deployment/tts-repos/<provider>` 下的附加脚本复制到对应服务 repo 的 `tts-more/` 目录，准备依赖/模型，并渲染 `data/local/services.json`：
 
 所有本机托管命令都要求显式的 repo 路径确认文件，即使实际路径与锁文件一致。先复制模板并核对本次选择的每个 `service_id`：
 
@@ -186,7 +186,7 @@ export TTS_MORE_RUN_REAL_TTS=1
 
 ## 服务模式
 
-默认真实网络 endpoint 模式：本地和远端服务都通过 `data/services.json` 里的 `base_url` 调用；未启动的服务显示为未就绪，不会被调度。商业 TSS（OpenAI/Gemini/xAI/火山）作为一等服务，key 只存在 `.env.local`，`services.json` 只引用 env 变量名。
+默认真实网络 endpoint 模式：开源 TTS 通过 `data/services.json` 里的 ComfyUI `base_url` 调用；未启动或未配置 `resource_id` 的服务显示为未就绪，不会被调度。商业 TTS（OpenAI/Gemini/xAI/火山）作为一等服务，key 只存在 `.env.local`，`services.json` 只引用 env 变量名。
 
 provider 优先级：`GPT-SoVITS → IndexTTS → CosyVoice → 商业/通用 HTTP`。
 
@@ -203,7 +203,7 @@ flowchart TD
 
 - 同资源组按 `capacity` 限制并发；不同资源组并行。
 - 同一已加载 cluster 有待执行任务时优先继续；否则选待执行最多的 cluster。
-- 生成前计算加载签名（service + logs_name + 权重 + 参考音频 + 文本），签名一致可复用加载状态。
+- ComfyUI 路线按 `service_id + resource_id + 参考音频 + prompt_text` 聚合，队列视图显示本地任务状态和 ComfyUI prompt 状态。
 
 ## 项目与历史
 

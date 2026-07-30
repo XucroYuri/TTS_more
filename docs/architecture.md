@@ -1,16 +1,16 @@
 # 架构
 
-TTS More 是一个 TTS 编排层：它不自带模型推理，而是把本地仓库（GPT-SoVITS、index-tts）和外部/商业 HTTP 服务统一成一套调度模型，再通过一个 React 工作台暴露脚本配音流程。
+TTS More 是一个 TTS 编排层：它不自带模型推理。开源 TTS 主路径是把 GPT-SoVITS、IndexTTS、CosyVoice 等模型资源交给 ComfyUI + TTS-Audio-Suite，TTS More 负责剧本处理、角色资源绑定、ComfyUI prompt 分发、队列状态和生成历史。
 
 ## 整体结构
 
 ```mermaid
 flowchart LR
     Browser[浏览器<br/>React 工作台] -- HTTP /api --> Backend[FastAPI 编排后端<br/>backend/app]
-    Backend -- 调度/合成 --> LocalRepo[本地仓库工作器<br/>GPT-SoVITS / index-tts]
-    Backend -- 调度/合成 --> Remote[远端 HTTP 服务<br/>Gradio / 商业 API]
+    Backend -- capabilities/assets/prompt/history --> ComfyUI[ComfyUI<br/>TTS-Audio-Suite]
+    Backend -- 调度/合成 --> Remote[商业 API / legacy HTTP 服务]
     Backend -- 读写 --> Data[(data/<br/>项目 / 角色 / 配置)]
-    LocalRepo -- 产出音频 --> Data
+    ComfyUI -- SaveAudio 输出 --> Backend
     Remote -- 回传音频 --> Backend
 ```
 
@@ -18,7 +18,7 @@ flowchart LR
 
 - **前端** (`frontend/`)：单页 React 应用。主路径是 `剧本 → 提取台词 → 角色音色 → TTS 接入 → 生成台词 → 试听历史`；左侧处理剧本，中间处理台词生成，右侧只处理当前台词。中英双语 i18n，中文兜底。
 - **后端** (`backend/app`)：FastAPI，负责项目/角色库存储、解析器、服务路由、生成队列、服务监管。默认绑 `127.0.0.1:8000`。
-- **工作器/外部服务**：本地仓库工作器（Gradio WebUI 或标准 worker 契约）和商业 API，都通过 `data/services.json` 里登记的 `base_url` 调用。
+- **外部服务**：ComfyUI/TTS-Audio-Suite 是开源 TTS 的主服务面；商业 API 和旧 Gradio/worker 直连保留为 legacy 兼容端点。所有端点都通过 `data/services.json` 里登记的 `base_url` 调用。
 
 ## 后端模块依赖
 
@@ -27,6 +27,7 @@ flowchart TD
     main[main.py<br/>FastAPI app + 路由]
     main --> storage[storage.py<br/>项目/清单/角色存储]
     main --> services[services.py<br/>服务注册 + 路由 + 各 client]
+    services --> comfy[comfyui_tts_audio_suite.py<br/>ComfyUI bridge client]
     main --> queue[queue.py<br/>生成队列 + 作业管理]
     main --> parser[parser.py<br/>多提供方脚本解析]
     main --> supervisor[supervisor.py<br/>本地服务启停]
@@ -54,8 +55,13 @@ sequenceDiagram
     M->>Q: submit(tasks)
     Q->>Q: 诊断 + 入队 (有界)
     Q->>R: queue.run(tasks)
-    R->>S: load / synthesize (按资源组串行/并行)
-    S-->>R: 音频 + 元数据
+    R->>S: GET capabilities + POST assets/audio
+    R->>S: POST /prompt
+    R->>S: GET /history/{prompt_id}
+    S-->>R: SaveAudio 引用
+    R->>S: GET /view
+    S-->>R: 音频 bytes + prompt 元数据
+    R->>S: runtime/release 后按需 POST /free
     R-->>Q: 状态回调
     Q-->>U: 轮询 /api/jobs/{id} 直到完成
 ```

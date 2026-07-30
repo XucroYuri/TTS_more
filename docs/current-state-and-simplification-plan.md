@@ -2,34 +2,33 @@
 
 本文面向两类读者：正在使用工作台的人，以及接下来继续开发的 Agent。目标是先把项目边界讲清楚，再列出哪些设计需要删减、合并或后移。
 
+> 2026-07-30 更新：开源 TTS 主路径已经收敛为 **TTS More + ComfyUI + TTS-Audio-Suite**。TTS More 只负责剧本处理、角色资源绑定、批量队列和 ComfyUI prompt 分发；模型运行、插件节点、排队执行和音频保存交给 ComfyUI。旧 `tts-more-v1` worker、Gradio WebUI 直连和三套模型 fork 部署规划进入 legacy 归档。
+
 ## 一句话状态
 
-TTS More 是应用本体。它不直接改写模型仓库，而是把 GPT-SoVITS、IndexTTS、CosyVoice 三类 TTS 服务接成统一的 `tts-more-v1` worker，再由工作台完成剧本解析、角色音色、队列调度和生成历史。
+TTS More 是应用本体。它不直接改写模型仓库，也不再把 GPT-SoVITS、IndexTTS、CosyVoice 接成默认本地 worker；默认方向是把角色绑定映射到 TTS-Audio-Suite 的 `resource_id`，上传参考音频，按台词生成 ComfyUI workflow JSON，并提交给 ComfyUI `/prompt`。工作台继续负责剧本解析、角色音色、队列状态和生成历史。
 
 ## 仓库结构
 
 ```mermaid
 flowchart TD
-    App["TTS_more 应用本体<br/>FastAPI + React + 本地数据"] --> Lock["repo.lock.json<br/>唯一 repo 清单"]
-    Lock --> GptMain["repo/GPT-SoVITS-main<br/>GPT-SoVITS main 分支"]
-    Lock --> GptDev["repo/GPT-SoVITS-dev<br/>GPT-SoVITS dev 分支"]
-    Lock --> GptPro["repo/GPT-SoVITS-proplus-hc-dev<br/>GPT-SoVITS proplus 分支"]
-    Lock --> Index["repo/index-tts<br/>IndexTTS"]
-    Lock --> Cosy["repo/CosyVoice<br/>CosyVoice"]
-
-    App --> Workers["backend/app/workers/*<br/>统一 worker API"]
-    Workers --> GptMain
-    Workers --> GptDev
-    Workers --> GptPro
-    Workers --> Index
-    Workers --> Cosy
+    App["TTS_more 应用本体<br/>FastAPI + React + 本地数据"] --> Comfy["ComfyUI<br/>官方本体"]
+    Comfy --> Suite["TTS-Audio-Suite<br/>custom node 插件"]
+    Suite --> Resources["resources.yaml<br/>GPT-SoVITS / IndexTTS / CosyVoice resource_id"]
+    App --> Jobs["ComfyUI prompt<br/>/prompt + /history + /view"]
+    Jobs --> Comfy
+    App --> Legacy["legacy worker/fork 资料<br/>只作兼容和历史审计"]
 ```
 
-这里有一个容易混淆的点：用户侧说“三个 TTS 服务”，指的是三类引擎：GPT-SoVITS、IndexTTS、CosyVoice。锁文件有五个可选目标，但默认部署只有三个：GPT-SoVITS main、IndexTTS、CosyVoice。GPT-SoVITS dev 和 proplus-hc-dev 只用于显式回归与旧功能审计。
+这里有一个容易混淆的点：用户侧说“三个 TTS 服务”，现在指的是 ComfyUI 插件内的三类资源：GPT-SoVITS、IndexTTS、CosyVoice。TTS More 仍保留 provider 路由字段，但提交态服务清单是三个逻辑端点共用一个 ComfyUI `base_url`，用于把现有角色绑定路由到对应 `resource_id`。
 
 ## 推荐部署路径
 
-默认路径只保留三个动作：
+当前推荐路径是：启动 ComfyUI，安装 TTS-Audio-Suite，把模型资源写入插件的 `resources.yaml`，再在 TTS More 中启用 `comfyui-*-` 逻辑端点并把角色绑定到对应 `resource_id`。模型资源释放顺序跟随插件契约：先调用 `/api/tts-audio-suite/v1/runtime/release`，再调用 ComfyUI `/free` 释放模型和显存。
+
+以下命令属于 legacy worker/fork 路线，只在需要复现旧部署、迁移数据或审计旧分支时使用。默认产品开发不再继续扩展这条路线。
+
+Legacy 路径只保留三个动作：
 
 先创建并核对完整确认文件；即使路径与 lock 默认值相同也必须提供：
 
