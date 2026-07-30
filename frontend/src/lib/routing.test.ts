@@ -174,6 +174,50 @@ describe("routing helpers", () => {
     });
   });
 
+  it("preserves ComfyUI resource ids from voice binding config", () => {
+    const comfyCharacters: Character[] = [
+      {
+        id: "alice",
+        name: "Alice",
+        aliases: [],
+        notes: "",
+        default_engine: "gpt-sovits",
+        default_profile: "alice-comfy",
+        fallback_profiles: [],
+        profiles: [
+          {
+            id: "alice-comfy",
+            name: "Alice Comfy",
+            engine: "gpt-sovits",
+            service_id: "comfyui-gpt-sovits",
+            fallback_services: [],
+            bindings: [
+              {
+                binding_id: "alice-comfy",
+                provider_type: "gpt-sovits",
+                service_id: "comfyui-gpt-sovits",
+                fallback_services: [],
+                capabilities: ["tts", "tts-audio-suite"],
+                config: { resource_id: "hero-main", prompt_text: "参考文本" }
+              }
+            ],
+            config: {}
+          }
+        ]
+      }
+    ];
+
+    const line: ScriptLine = { id: "l-comfy", character_id: "alice", text: "hello", note: "" };
+
+    expect(buildGenerationTask(line, comfyCharacters)).toMatchObject({
+      service_id: "comfyui-gpt-sovits",
+      provider_type: "gpt-sovits",
+      binding_id: "alice-comfy",
+      required_capabilities: ["tts", "tts-audio-suite"],
+      parameters: { resource_id: "hero-main", prompt_text: "参考文本" }
+    });
+  });
+
   it("uses a line binding override when one profile has multiple bindings", () => {
     const line: ScriptLine = { id: "l4", character_id: "alice", text: "hello", note: "", binding_override: "alice-openai" };
 

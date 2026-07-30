@@ -691,6 +691,10 @@ export default function App() {
   }, [activeJob]);
   const activeRouteServices = useMemo(() => routableProviderServices(visibleServices, activeProvider), [activeProvider, visibleServices]);
   const activeSelectedServiceUnavailable = Boolean(activeServiceId && !activeRouteServices.some((service) => service.service_id === activeServiceId));
+  const activeComfyResourceId = stringConfig(activeBindingConfig.resource_id);
+  const activeOpenSourceProvider = activeProvider === "gpt-sovits" || activeProvider === "indextts" || activeProvider === "cosyvoice";
+  const activeRouteOnlyComfyBridge = activeRouteServices.length > 0 && activeRouteServices.every(isComfyUITTSAudioSuiteService);
+  const activeComfyResourceVisible = activeOpenSourceProvider && Boolean(activeComfyResourceId || (activeService ? isComfyUITTSAudioSuiteService(activeService) : activeRouteOnlyComfyBridge));
   const selectedOpenSourceCatalog = useMemo(
     () => openSourceCatalog.find((item) => item.provider_type === selectedOpenSourceProvider) ?? openSourceCatalog[0],
     [openSourceCatalog, selectedOpenSourceProvider]
@@ -2341,6 +2345,7 @@ export default function App() {
                                   <div className="queue-job-list">
                                     {queueJobs.slice(0, 5).map((job) => {
                                       const jobPercent = Math.round(Math.max(0, Math.min(1, job.progress)) * 100);
+                                      const promptItem = job.items.find((item) => item.external_status || item.external_job_id);
                                       return (
                                         <article className={`queue-job-card state-${queueStatusTone(job.status)}`} key={job.job_id}>
                                           <div>
@@ -2349,6 +2354,11 @@ export default function App() {
                                           </div>
                                           <div className="queue-job-meta">
                                             <StatusPill tone={queueStatusTone(job.status)} label={statusText(job.status, t)} />
+                                            {promptItem?.external_status && (
+                                              <span className="line-meta-chip neutral" title={promptItem.external_job_id ?? ""}>
+                                                {t("queue.promptStatus", { status: statusText(promptItem.external_status, t) })}
+                                              </span>
+                                            )}
                                             <span>{jobPercent}%</span>
                                           </div>
                                         </article>
@@ -2979,6 +2989,11 @@ export default function App() {
                         </span>
                       )}
                       {queueItem?.queue_position && <span className="line-meta-chip neutral">{t("queue.position", { position: queueItem.queue_position })}</span>}
+                      {queueItem?.external_status && (
+                        <span className="line-meta-chip neutral" title={queueItem.external_job_id ?? ""}>
+                          {t("queue.promptStatus", { status: statusText(queueItem.external_status, t) })}
+                        </span>
+                      )}
                       {queueItem?.cluster_size && queueItem.cluster_size > 1 && (
                         <span className="line-meta-chip ok" title={queueItem.cluster_key}>
                           {t("queue.cluster", { current: queueItem.cluster_position ?? 1, total: queueItem.cluster_size })}
@@ -3236,6 +3251,17 @@ export default function App() {
                       </div>
                     ) : null}
 
+                    {activeComfyResourceVisible && (
+                      <label className="resource-field comfy-resource-field">
+                        <span>{t("inspector.comfyResourceId")}</span>
+                        <input
+                          value={activeComfyResourceId}
+                          onChange={(event) => updateActiveBindingConfig({ resource_id: event.target.value || undefined })}
+                          placeholder={t("inspector.comfyResourcePlaceholder")}
+                        />
+                      </label>
+                    )}
+
                     {activeProvider === "gpt-sovits" && (
                       <>
                         <div className="gpt-reference-compact">
@@ -3249,6 +3275,12 @@ export default function App() {
                               <strong>{activeServiceLabel}</strong>
                               <small title={activeServiceContract}>{activeServiceContract}</small>
                             </div>
+                            {activeComfyResourceVisible && (
+                              <div>
+                                <span>{t("inspector.comfyResourceId")}</span>
+                                <strong title={activeComfyResourceId}>{activeComfyResourceId || t("status.unset")}</strong>
+                              </div>
+                            )}
                             <div>
                               <span>{t("inspector.currentReference")}</span>
                               <strong>{activeLogsReferenceSample?.display_label ?? shortPath(stringConfig(activeBindingConfig.ref_audio_path)) ?? t("status.unset")}</strong>
@@ -4424,6 +4456,10 @@ function isGptSovitsApiV2Service(service: WorkerHealth | undefined): boolean {
   if (!service) return false;
   return service.api_contract === "gpt-sovits-api-v2"
     || Boolean(service.capabilities?.some((capability) => capability === "gpt-sovits-api-v2" || capability === "model_catalog"));
+}
+
+function isComfyUITTSAudioSuiteService(service: WorkerHealth): boolean {
+  return service.api_contract === "comfyui-tts-audio-suite-v1" || Boolean(service.capabilities?.includes("tts-audio-suite"));
 }
 
 function serviceHealthText(service: WorkerHealth, t: Translate, runtimeMode?: string): string {

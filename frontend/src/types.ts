@@ -447,6 +447,8 @@ export interface GenerationQueueItem {
   load_signature?: string | null;
   service_id?: string | null;
   resource_group?: string | null;
+  external_job_id?: string | null;
+  external_status?: string | null;
   error?: string | null;
   version_id?: string | null;
 }

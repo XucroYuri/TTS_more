@@ -508,6 +508,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       promptPlaceholder: "输入参考音频对应文本",
       currentPreset: "当前预设",
       currentReference: "当前参考",
+      comfyResourceId: "ComfyUI resource_id",
+      comfyResourcePlaceholder: "例如 hero-main",
       selectedReferenceAudio: "当前参考音频",
       noReferenceCandidates: "暂无可用资源",
       commercialResourceHint: "API 配音使用当前音色绑定里的 voice、instructions 或厂商参数；通常不需要参考音频。",
@@ -725,6 +727,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       itemCount: "{{count}} 条",
       noJobs: "暂无队列任务",
       position: "排队 #{{position}}",
+      promptStatus: "Prompt {{status}}",
       cluster: "同簇 {{current}}/{{total}}",
       routeError: "路由错误"
     },
@@ -1282,6 +1285,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       promptPlaceholder: "Transcript for the reference audio",
       currentPreset: "Current preset",
       currentReference: "Current reference",
+      comfyResourceId: "ComfyUI resource_id",
+      comfyResourcePlaceholder: "For example hero-main",
       selectedReferenceAudio: "Current reference audio",
       noReferenceCandidates: "No resources available",
       commercialResourceHint: "API dubbing uses voice, instructions, or vendor parameters from the current voice binding. Reference audio is usually not needed.",
@@ -1499,6 +1504,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       itemCount: "{{count}} items",
       noJobs: "No queue jobs",
       position: "Queue #{{position}}",
+      promptStatus: "Prompt {{status}}",
       cluster: "Cluster {{current}}/{{total}}",
       routeError: "Route error"
     },
