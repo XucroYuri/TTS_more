@@ -4,7 +4,6 @@ import json
 import os
 import base64
 import hashlib
-import io
 import re
 import time
 import uuid
@@ -17,6 +16,7 @@ from typing import Any, Callable, Protocol, Sequence
 import httpx
 
 from app.adapters.base import SynthesisRequest, SynthesisResult
+from app.comfyui.output import publish_wav_atomic
 from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
 from app.net_guard import scrub_error
 from app.portable_endpoint_trust import (
@@ -1950,7 +1950,7 @@ class ComfyUITTSClient:
                 subfolder=first_output["subfolder"],
                 folder_type=first_output["type"],
             )
-            _write_wav(request.output_path, audio_bytes)
+            audio_metadata = publish_wav_atomic(request.output_path, audio_bytes)
             result = SynthesisResult(
                 audio_path=request.output_path,
                 metadata={
@@ -1961,6 +1961,7 @@ class ComfyUITTSClient:
                     "engine": engine_value,
                     "resource_id": params["resource_id"],
                     "comfyui_output_files": output_files,
+                    **audio_metadata,
                 },
             )
         except Exception as exc:
@@ -1983,21 +1984,6 @@ class ComfyUITTSClient:
         resource_id = str(self.endpoint.default_params.get("resource_id", "")).strip()
         self.api.release_runtime(resource_id=resource_id or None)
         self.api.free_memory()
-
-
-def _write_wav(output_path: Path, audio_bytes: bytes) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if audio_bytes.startswith(b"RIFF") and audio_bytes[8:12] == b"WAVE":
-        output_path.write_bytes(audio_bytes)
-        return
-
-    import soundfile
-
-    samples, sample_rate = soundfile.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
-    if sample_rate <= 0 or samples.size == 0:
-        raise ValueError("ComfyUI returned empty audio")
-    soundfile.write(str(output_path), samples, sample_rate, format="WAV", subtype="PCM_16")
-
 
 def _tiny_wav_bytes() -> bytes:
     return (

@@ -54,7 +54,7 @@ def _audio_bytes() -> bytes:
         output.setnchannels(1)
         output.setsampwidth(2)
         output.setframerate(16000)
-        output.writeframes(b"\x00\x00" * 160)
+        output.writeframes(b"\x00\x10" * 160)
     return buffer.getvalue()
 
 
@@ -986,8 +986,63 @@ class TestComfyUITTSClient:
         assert result.metadata["prompt_id"] == prompt_id
         assert result.metadata["engine"] == "cosyvoice"
         assert result.metadata["resource_id"] == "cosy-main"
+        assert result.metadata["sample_rate"] == 16000
+        assert result.metadata["frames"] == 160
+        assert result.metadata["peak"] > 0.1
         assert "POST /api/tts-audio-suite/v1/assets/audio" in call_log
         assert "DELETE /api/tts-audio-suite/v1/assets/audio/asset-1" in call_log
+
+    def test_synthesize_preserves_existing_output_when_downloaded_riff_is_corrupt(
+        self,
+        tmp_path: Path,
+    ):
+        prompt_id = "corrupt-output-001"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/prompt":
+                return httpx.Response(200, json={"prompt_id": prompt_id})
+            if request.url.path == f"/history/{prompt_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        prompt_id: {
+                            "outputs": {
+                                "4": {
+                                    "audio": [
+                                        {
+                                            "filename": "corrupt.wav",
+                                            "subfolder": "",
+                                            "type": "output",
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                )
+            if request.url.path == "/view":
+                return httpx.Response(
+                    200,
+                    content=b"RIFF\x08\x00\x00\x00WAVEcorrupt",
+                )
+            return httpx.Response(404)
+
+        output_path = tmp_path / "result.wav"
+        output_path.write_bytes(b"existing output")
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-1", character_id="char-1", text="Hello world"),
+            profile="default",
+            output_path=output_path,
+            parameters={"engine": "cosyvoice"},
+        )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as mock_client:
+            client = ComfyUITTSClient(_cosyvoice_endpoint(), transport=mock_client._transport)
+            with pytest.raises(RuntimeError, match="decode"):
+                client.synthesize(request)
+
+        assert output_path.read_bytes() == b"existing output"
+        assert list(tmp_path.glob(".result.wav.*.tmp")) == []
 
     def test_synthesize_reports_prompt_status_updates(self, tmp_path: Path):
         prompt_id = "prompt-status-001"
