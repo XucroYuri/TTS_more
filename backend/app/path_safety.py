@@ -61,22 +61,16 @@ def encode_windows_component(
         raise ValueError("Windows component budget is too small for collision-safe encoding")
     raw_value = str(value)
     encoded = WINDOWS_INVALID_COMPONENT.sub("_", raw_value).strip(" .")
-    changed = encoded != raw_value
     if not encoded or encoded in {".", ".."}:
         encoded = fallback
-        changed = True
     if is_windows_reserved_name(encoded):
         encoded = f"_{encoded}"
-        changed = True
-    if windows_utf16_units(encoded) > max_units:
-        changed = True
-    if changed:
-        digest = hashlib.sha256(raw_value.encode("utf-8")).hexdigest()[:16]
-        suffix = f"-{digest}"
-        prefix = _truncate_utf16(encoded, max_units - windows_utf16_units(suffix)).rstrip(" .")
-        if not prefix:
-            prefix = _truncate_utf16(fallback, max_units - windows_utf16_units(suffix)).rstrip(" .")
-        encoded = f"{prefix}{suffix}"
+    digest = hashlib.sha256(raw_value.encode("utf-8")).hexdigest()[:16]
+    suffix = f"-{digest}"
+    prefix = _truncate_utf16(encoded, max_units - windows_utf16_units(suffix)).rstrip(" .")
+    if not prefix:
+        prefix = _truncate_utf16(fallback, max_units - windows_utf16_units(suffix)).rstrip(" .")
+    encoded = f"{prefix}{suffix}"
     validate_windows_component(encoded, label="encoded path component", max_units=max_units)
     return encoded
 

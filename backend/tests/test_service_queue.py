@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ntpath
 import threading
 import time
 from pathlib import Path
@@ -1519,6 +1520,76 @@ def test_fix_round_3_long_same_prefix_output_components_are_bounded_and_collisio
     assert len(str(second_path)) <= 259
     assert first_path.is_file()
     assert second_path.is_file()
+
+
+@pytest.mark.parametrize(
+    (
+        "first_line",
+        "second_line",
+        "first_service",
+        "second_service",
+        "first_profile",
+        "second_profile",
+    ),
+    [
+        pytest.param("Line", "line", "shared-service", "shared-service", "shared-profile", "shared-profile", id="line-case"),
+        pytest.param("shared-line", "shared-line", "Service", "service", "shared-profile", "shared-profile", id="service-case"),
+        pytest.param("shared-line", "shared-line", "shared-service", "shared-service", "Profile", "profile", id="profile-case"),
+        pytest.param("caf\u00e9", "cafe\u0301", "shared-service", "shared-service", "shared-profile", "shared-profile", id="unicode-normalization"),
+    ],
+)
+def test_fix_round_4_output_components_keep_logical_variants_in_distinct_windows_paths(
+    tmp_path: Path,
+    first_line: str,
+    second_line: str,
+    first_service: str,
+    second_service: str,
+    first_profile: str,
+    second_profile: str,
+) -> None:
+    class EvidenceClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            marker = f"{self.endpoint.service_id}|{request.profile}|{request.line.id}".encode("utf-8")
+            request.output_path.parent.mkdir(parents=True, exist_ok=True)
+            request.output_path.write_bytes(marker)
+            return SynthesisResult(audio_path=request.output_path, metadata={"marker": marker.decode("utf-8")})
+
+    first_client = EvidenceClient(endpoint(first_service, EngineName.GPT_SOVITS, "gpu-a"))
+    second_client = EvidenceClient(endpoint(second_service, EngineName.GPT_SOVITS, "gpu-b"))
+    queue = ServiceGenerationQueue(StaticRouter({"first-route": first_client, "second-route": second_client}))
+    output_root = tmp_path / "project-audio"
+    first_manifest = GenerationManifest(project_id="demo")
+    second_manifest = GenerationManifest(project_id="demo")
+
+    queue.run(
+        [task(first_line, EngineName.GPT_SOVITS, first_profile, "first-route")],
+        first_manifest,
+        output_root,
+    )
+    queue.run(
+        [task(second_line, EngineName.GPT_SOVITS, second_profile, "second-route")],
+        second_manifest,
+        output_root,
+    )
+
+    first_version = next(iter(first_manifest.lines.values())).versions[0]
+    second_version = next(iter(second_manifest.lines.values())).versions[0]
+    first_path = Path(first_version.audio_path or "")
+    second_path = Path(second_version.audio_path or "")
+    first_marker = f"{first_service}|{first_profile}|{first_line}".encode("utf-8")
+    second_marker = f"{second_service}|{second_profile}|{second_line}".encode("utf-8")
+    assert first_version.line_uid == first_line
+    assert first_version.service_id == first_service
+    assert first_version.profile == first_profile
+    assert second_version.line_uid == second_line
+    assert second_version.service_id == second_service
+    assert second_version.profile == second_profile
+    assert first_path.is_file()
+    assert second_path.is_file()
+    assert first_path.samefile(second_path) is False
+    assert ntpath.normcase(str(first_path)) != ntpath.normcase(str(second_path))
+    assert first_path.read_bytes() == first_marker
+    assert second_path.read_bytes() == second_marker
 
 
 def test_fix_round_3_output_path_fails_before_synthesis_when_root_exhausts_windows_budget(tmp_path: Path) -> None:

@@ -1003,8 +1003,13 @@ def test_generate_writes_audio_manifest_under_project_output(tmp_path: Path) -> 
     assert response.status_code == 200
     version = response.json()["lines"]["parse-r001:l001"]["versions"][0]
     audio_path = Path(version["audio_path"])
-    assert "output" in audio_path.parts
-    assert audio_path.parts[-4:-1] == ("gpt-sovits", "mock-gpt", "line-temp-gpt")
+    project_audio_root = tmp_path / "Project" / "剧本 Demo" / "output" / "audio"
+    audio_path.resolve(strict=True).relative_to(project_audio_root.resolve(strict=True))
+    assert version["engine"] == "gpt-sovits"
+    assert version["service_id"] == "mock-gpt"
+    assert version["profile"] == "line-temp-gpt"
+    assert version["binding_id"] == "line-temp-gpt"
+    assert audio_path.is_file()
     assert (tmp_path / "Project" / "剧本 Demo" / "output" / "manifest.json").is_file()
 
 

@@ -63,6 +63,80 @@ def test_fix_round_3_project_store_case_aliases_share_identity_across_store_inst
     assert first.project_dir("Demo-Valid_01").samefile(second.project_dir("demo-valid_01"))
 
 
+def test_fix_round_4_project_lock_identity_uses_windows_case_rules_without_unicode_casefold(tmp_path: Path) -> None:
+    first = ProjectStore(tmp_path)
+    second = ProjectStore(tmp_path)
+
+    assert first._manifest_lock("Demo") is second._manifest_lock("demo")
+    assert first._manifest_lock("Stra\u00dfe") is not second._manifest_lock("STRASSE")
+
+
+def test_fix_round_4_unicode_project_ids_keep_distinct_directories_markers_and_listing(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path)
+    store.save_project(
+        "Stra\u00dfe",
+        ScriptProject(title="shared-title", default_language="de", lines=[]),
+    )
+    first_dir = store.project_dir("Stra\u00dfe")
+
+    store.save_project(
+        "STRASSE",
+        ScriptProject(title="shared-title", default_language="en", lines=[]),
+    )
+    second_dir = store.project_dir("STRASSE")
+
+    assert first_dir.samefile(second_dir) is False
+    assert (first_dir / ".project-id").read_text(encoding="utf-8") == "Stra\u00dfe"
+    assert (second_dir / ".project-id").read_text(encoding="utf-8") == "STRASSE"
+    assert store.load_project("Stra\u00dfe").default_language == "de"
+    assert store.load_project("STRASSE").default_language == "en"
+    listed = {entry["project_id"]: entry["default_language"] for entry in store.list_projects()}
+    assert listed == {"Stra\u00dfe": "de", "STRASSE": "en"}
+
+
+@pytest.mark.parametrize(
+    "project_id",
+    [
+        pytest.param("p" * 121, id="121-ascii-units"),
+        pytest.param("p" * 255, id="255-ascii-units"),
+        pytest.param(("p" * 253) + "\U0001f600", id="255-units-with-surrogate-pair"),
+    ],
+)
+def test_fix_round_4_project_ids_through_255_utf16_units_persist_without_rewriting(
+    tmp_path: Path, project_id: str
+) -> None:
+    store = ProjectStore(tmp_path)
+    replacement = ProjectStore(tmp_path)
+
+    assert store._manifest_lock(project_id) is replacement._manifest_lock(project_id)
+    store.save_manifest(GenerationManifest(project_id=project_id))
+
+    project_dir = store.project_dir(project_id)
+    assert project_dir.name == project_id
+    assert (project_dir / ".project-id").read_text(encoding="utf-8") == project_id
+    assert replacement.load_manifest(project_id).project_id == project_id
+
+
+@pytest.mark.parametrize(
+    "project_id",
+    [
+        pytest.param("p" * 256, id="256-ascii-units"),
+        pytest.param(("p" * 254) + "\U0001f600", id="256-units-with-surrogate-pair"),
+    ],
+)
+def test_fix_round_4_project_ids_over_255_utf16_units_are_rejected_before_allocation(
+    tmp_path: Path, project_id: str
+) -> None:
+    store = ProjectStore(tmp_path)
+
+    with pytest.raises(ValueError, match="component length"):
+        store._manifest_lock(project_id)
+    with pytest.raises(ValueError, match="component length"):
+        store.save_manifest(GenerationManifest(project_id=project_id))
+
+    assert store.writable_projects_root().exists() is False
+
+
 @pytest.mark.parametrize("project_id", ["../escape", "..\\escape", "/absolute", "C:\\temp\\escape", ""])
 def test_project_store_rejects_delete_project_ids_that_escape_data_root(tmp_path: Path, project_id: str) -> None:
     store = ProjectStore(tmp_path)
@@ -469,6 +543,47 @@ def test_fix_round_3_delete_reports_scrubbed_audio_cleanup_warning_after_manifes
     assert audio_path.is_file()
     assert store.load_manifest("demo").lines["locked-line"].versions == []
     assert client.delete("/api/projects/demo/manifest/lines/locked-line/versions/v001").status_code == 404
+
+
+def test_fix_round_4_delete_treats_legacy_nul_audio_path_as_post_commit_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ProjectStore(tmp_path)
+    legacy_audio_path = str(store.project_audio_dir("demo") / "password=delete-secret\x00.wav")
+    manifest = GenerationManifest(project_id="demo")
+    manifest.append_version(
+        "legacy-line",
+        GenerationVersion(
+            version_id="v001",
+            line_uid="legacy-line",
+            engine="gpt-sovits",
+            profile="default",
+            status="completed",
+            audio_path=legacy_audio_path,
+        ),
+    )
+    store.save_manifest(manifest)
+    original_resolve = Path.resolve
+
+    def reject_legacy_nul(path: Path, *args, **kwargs):
+        if "\x00" in str(path):
+            raise ValueError("legacy NUL audio path password=delete-secret")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", reject_legacy_nul)
+    client = TestClient(create_app(data_root=tmp_path), raise_server_exceptions=False)
+
+    response = client.delete("/api/projects/demo/manifest/lines/legacy-line/versions/v001")
+
+    assert store.load_manifest("demo").lines["legacy-line"].versions == []
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "deleted"
+    assert payload["audio_deleted"] is False
+    assert "audio cleanup failed" in payload["warning"]
+    assert "password=***" in payload["warning"]
+    assert "delete-secret" not in str(payload)
+    assert client.delete("/api/projects/demo/manifest/lines/legacy-line/versions/v001").status_code == 404
 
 
 def test_fix_round_2_delete_then_manager_append_does_not_resurrect_deleted_version(tmp_path: Path) -> None:

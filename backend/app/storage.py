@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -15,10 +16,33 @@ import yaml
 from pydantic import BaseModel
 
 from app.models import Character, GenerationManifest, ScriptProject
-from app.path_safety import WINDOWS_RESERVED_NAMES, validate_windows_component
+from app.path_safety import WINDOWS_RESERVED_NAMES, validate_windows_component, windows_utf16_units
 
 T = TypeVar("T", bound=BaseModel)
 R = TypeVar("R")
+
+WINDOWS_LEGACY_DIRECTORY_PATH_UNITS = 248
+
+
+def _windows_filesystem_path(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    raw_path = os.path.abspath(os.fspath(path))
+    if raw_path.startswith("\\\\?\\"):
+        return Path(raw_path)
+    if raw_path.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{raw_path[2:]}")
+    return Path(f"\\\\?\\{raw_path}")
+
+
+def _usable_project_directory(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    absolute_path = os.path.abspath(os.fspath(path))
+    if windows_utf16_units(absolute_path) < WINDOWS_LEGACY_DIRECTORY_PATH_UNITS:
+        return path
+    return _windows_filesystem_path(path)
+
 
 class ProjectStore:
     _manifest_locks_guard = threading.Lock()
@@ -33,19 +57,21 @@ class ProjectStore:
         for root in self.read_project_roots():
             candidate = root / safe_id
             if self._is_project_dir(candidate) and self._project_dir_matches_id(candidate, safe_id):
-                return candidate
+                return _usable_project_directory(candidate)
             marked = self._find_project_dir_by_id(root, safe_id)
             if marked is not None:
-                return marked
+                return _usable_project_directory(marked)
         return self.writable_project_dir(safe_id)
 
     def writable_project_dir(self, project_id: str) -> Path:
         safe_id = self._safe_project_id(project_id)
         direct = self.writable_projects_root() / safe_id
         marker = self._read_project_marker(direct)
-        if not direct.exists() or marker is None or self._same_project_id(marker, safe_id):
-            return direct
-        return self._unique_project_dir_for_title(self.writable_projects_root(), safe_id, safe_id)
+        if not _windows_filesystem_path(direct).exists() or marker is None or self._same_project_id(marker, safe_id):
+            return _usable_project_directory(direct)
+        return _usable_project_directory(
+            self._unique_project_dir_for_title(self.writable_projects_root(), safe_id, safe_id)
+        )
 
     def project_path(self, project_id: str) -> Path:
         return self.project_dir(project_id) / "project.json"
@@ -207,23 +233,23 @@ class ProjectStore:
             return lock
 
     def _manifest_lock_key(self, project_id: str) -> str:
-        stable_project_path = self.writable_projects_root() / self._project_id_identity(project_id)
-        key = os.path.normcase(str(stable_project_path.resolve(strict=False)))
+        safe_project_id = self._safe_project_id(project_id)
+        key = ntpath.normcase(str(self.writable_projects_root().resolve(strict=False)))
         if key.startswith("\\\\?\\unc\\"):
             key = f"\\\\{key[8:]}"
         elif key.startswith("\\\\?\\"):
             key = key[4:]
-        return os.path.normpath(key)
+        return ntpath.normcase(ntpath.normpath(ntpath.join(key, safe_project_id)))
 
     def _save_manifest_unlocked(self, manifest: GenerationManifest) -> None:
         self._write_text(self.project_dir(manifest.project_id) / ".project-id", self._safe_project_id(manifest.project_id))
         self._write_model(self.manifest_path(manifest.project_id), manifest)
 
     def _load_manifest_unlocked(self, project_id: str) -> GenerationManifest:
-        path = self.manifest_path(project_id)
+        path = _windows_filesystem_path(self.manifest_path(project_id))
         if path.exists():
             return self._read_model(path, GenerationManifest)
-        legacy_path = self.legacy_manifest_path(project_id)
+        legacy_path = _windows_filesystem_path(self.legacy_manifest_path(project_id))
         if legacy_path.exists():
             return self._read_model(legacy_path, GenerationManifest)
         return GenerationManifest(project_id=project_id)
@@ -245,6 +271,7 @@ class ProjectStore:
         self._write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def _write_text(self, path: Path, text: str) -> None:
+        path = _windows_filesystem_path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         operation_id = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
         temp_path = path.with_name(f".{path.name}.{operation_id}.tmp")
@@ -258,6 +285,7 @@ class ProjectStore:
         return model_type.model_validate(self._read_structured(path))
 
     def _read_structured(self, path: Path) -> object:
+        path = _windows_filesystem_path(path)
         text = path.read_text(encoding="utf-8")
         if path.suffix.lower() in {".yaml", ".yml"}:
             return yaml.safe_load(text)
@@ -326,6 +354,7 @@ class ProjectStore:
         return None
 
     def _is_project_dir(self, path: Path) -> bool:
+        path = _windows_filesystem_path(path)
         return (
             path.is_dir()
             and (
@@ -346,7 +375,7 @@ class ProjectStore:
         return marker is None or self._same_project_id(marker, project_id)
 
     def _read_project_marker(self, path: Path) -> str | None:
-        marker_path = path / ".project-id"
+        marker_path = _windows_filesystem_path(path / ".project-id")
         if not marker_path.exists():
             return None
         try:
@@ -355,10 +384,10 @@ class ProjectStore:
             return None
 
     def _safe_project_id(self, project_id: str) -> str:
-        return validate_windows_component(project_id, label="project id", max_units=120)
+        return validate_windows_component(project_id, label="project id", max_units=255)
 
     def _project_id_identity(self, project_id: str) -> str:
-        return self._safe_project_id(project_id).casefold()
+        return ntpath.normcase(self._safe_project_id(project_id))
 
     def _same_project_id(self, left: str, right: str) -> bool:
         return self._project_id_identity(left) == self._project_id_identity(right)

@@ -1132,20 +1132,19 @@ def create_app(
         audio_deleted = False
         warning: str | None = None
         if target_audio_path:
-            resolved = _resolve_project_audio_file(
-                store.project_audio_dir(project_id), Path(app.state.store.root), target_audio_path
-            )
-            if resolved is None:
-                warning = "audio path is outside project audio directory"
-            elif resolved.exists():
-                try:
+            try:
+                resolved = _resolve_project_audio_file(
+                    store.project_audio_dir(project_id), Path(app.state.store.root), target_audio_path
+                )
+                if resolved is None:
+                    warning = "audio path is outside project audio directory"
+                elif resolved.exists():
                     resolved.unlink()
-                except OSError as exc:
-                    warning = f"audio cleanup failed: {scrub_error(exc)}"
-                else:
                     audio_deleted = True
-            else:
-                warning = "audio file not found"
+                else:
+                    warning = "audio file not found"
+            except (OSError, ValueError) as exc:
+                warning = f"audio cleanup failed: {scrub_error(exc)}"
         return {
             "status": "deleted",
             "project_id": project_id,
