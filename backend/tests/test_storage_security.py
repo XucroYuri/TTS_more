@@ -1,10 +1,11 @@
+import threading
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.models import GenerationManifest, GenerationVersion, ScriptProject
+from app.models import GenerationManifest, GenerationTask, GenerationVersion, ScriptProject
 from app.storage import ProjectStore
 
 
@@ -57,6 +58,112 @@ def test_manifest_uses_output_directory_and_reads_legacy_manifest(tmp_path: Path
 
     assert loaded.lines["line-1"].versions[0].version_id == "v001"
     assert (legacy_dir / "output" / "manifest.json").is_file()
+
+
+def test_fix_round_2_manifest_transaction_does_not_save_callback_exception(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path)
+    original = GenerationManifest(project_id="demo")
+    original.append_version(
+        "original-line",
+        GenerationVersion(
+            version_id="v001",
+            line_uid="original-line",
+            engine="gpt-sovits",
+            profile="default",
+            status="cancelled",
+        ),
+    )
+    store.save_manifest(original)
+
+    def mutate_then_fail(manifest: GenerationManifest) -> None:
+        manifest.append_version(
+            "uncommitted-line",
+            GenerationVersion(
+                version_id="v001",
+                line_uid="uncommitted-line",
+                engine="gpt-sovits",
+                profile="default",
+                status="completed",
+            ),
+        )
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        store.update_manifest("demo", mutate_then_fail)
+
+    durable = store.load_manifest("demo")
+    assert set(durable.lines) == {"original-line"}
+    assert durable.lines["original-line"].versions[0].status == "cancelled"
+
+
+def test_fix_round_2_manifest_temp_files_are_unique_for_concurrent_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ProjectStore(tmp_path)
+    store.save_manifest(GenerationManifest(project_id="demo"))
+    replace_guard = threading.Lock()
+    manifest_temp_paths: list[Path] = []
+    errors: list[BaseException] = []
+    original_replace = Path.replace
+
+    def interleaved_replace(path: Path, target: Path):
+        if target.name == "manifest.json":
+            with replace_guard:
+                manifest_temp_paths.append(path)
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", interleaved_replace)
+
+    def save(line_id: str) -> None:
+        try:
+            manifest = GenerationManifest(project_id="demo")
+            manifest.append_version(
+                line_id,
+                GenerationVersion(
+                    version_id="v001",
+                    line_uid=line_id,
+                    engine="gpt-sovits",
+                    profile="default",
+                    status="completed",
+                ),
+            )
+            store.save_manifest(manifest)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=save, args=("first-line",), name="manifest-writer-1")
+    second = threading.Thread(target=save, args=("second-line",), name="manifest-writer-2")
+    first.start()
+    second.start()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(set(manifest_temp_paths)) == 2
+    assert errors == []
+    assert store.load_manifest("demo").lines.keys() in ({"first-line"}, {"second-line"})
+    assert not list(store.manifest_path("demo").parent.glob(".manifest.json.*.tmp"))
+
+
+def test_fix_round_2_failed_atomic_replace_cleans_operation_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ProjectStore(tmp_path)
+    store.save_manifest(GenerationManifest(project_id="demo"))
+    original_replace = Path.replace
+
+    def fail_manifest_replace(path: Path, target: Path):
+        if target.name == "manifest.json":
+            raise PermissionError("replace denied")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_manifest_replace)
+
+    with pytest.raises(PermissionError, match="replace denied"):
+        store.save_manifest(GenerationManifest(project_id="demo"))
+
+    assert not list(store.manifest_path("demo").parent.glob(".manifest.json.*.tmp"))
 
 
 def test_title_named_project_directory_does_not_alias_different_project_id(tmp_path: Path) -> None:
@@ -195,6 +302,92 @@ def test_delete_generation_version_removes_manifest_and_project_audio_only(tmp_p
     assert outside_audio.exists() is True
     payload = client.get("/api/projects/demo/manifest").json()
     assert payload["lines"]["line-uid-001"]["versions"] == []
+
+
+def test_fix_round_2_delete_then_manager_append_does_not_resurrect_deleted_version(tmp_path: Path) -> None:
+    from app.queue import GenerationJobManager
+
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "mock-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "base_url": "mock://gpt",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    app = create_app(data_root=tmp_path, services_path=services_path)
+    client = TestClient(app)
+    store = app.state.store
+    original_audio = store.project_audio_dir("demo") / "original.wav"
+    original_audio.parent.mkdir(parents=True, exist_ok=True)
+    original_audio.write_bytes(b"RIFForiginal")
+    manifest = GenerationManifest(project_id="demo")
+    manifest.append_version(
+        "shared-line",
+        GenerationVersion(
+            version_id="v001",
+            line_uid="shared-line",
+            engine="gpt-sovits",
+            profile="default",
+            service_id="mock-gpt",
+            status="completed",
+            audio_path=str(original_audio),
+        ),
+    )
+    store.save_manifest(manifest)
+    manager_snapshot_loaded = threading.Event()
+    release_manager = threading.Event()
+    manager_finished = threading.Event()
+    original_queue = app.state.queue
+
+    class BlockingQueue:
+        router = original_queue.router
+
+        def run(self, *args, **kwargs):
+            manager_snapshot_loaded.set()
+            assert release_manager.wait(3)
+            return original_queue.run(*args, **kwargs)
+
+    class ObservedManager(GenerationJobManager):
+        def _finish_job(self, job_id: str) -> None:
+            super()._finish_job(job_id)
+            manager_finished.set()
+
+    manager = ObservedManager(BlockingQueue(), store)
+    task = GenerationTask.model_validate(
+        {
+            "line": {"id": "shared-line", "character_id": "role", "text": "new"},
+            "engine": "gpt-sovits",
+            "profile": "default",
+            "service_id": "mock-gpt",
+            "parameters": {
+                "gpt_weights_path": "voice.ckpt",
+                "sovits_weights_path": "voice.pth",
+                "ref_audio_path": "voice.wav",
+                "prompt_text": "参考文本",
+            },
+        }
+    )
+    created = manager.submit("demo", [task])
+    assert manager_snapshot_loaded.wait(3)
+
+    deleted = client.delete("/api/projects/demo/manifest/lines/shared-line/versions/v001")
+    assert deleted.status_code == 200
+    release_manager.set()
+    assert manager_finished.wait(3)
+    assert manager.get(created.job_id).status == "completed"
+
+    versions = store.load_manifest("demo").lines["shared-line"].versions
+    assert [(version.version_id, version.status) for version in versions] == [("v002", "completed")]
+    assert original_audio.exists() is False
 
 
 def test_audio_endpoint_rejects_logs_root_outside_project(tmp_path: Path, monkeypatch) -> None:

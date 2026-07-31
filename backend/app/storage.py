@@ -4,9 +4,12 @@ import json
 import os
 import re
 import shutil
+import threading
+import uuid
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypeVar
+from typing import Callable, TypeVar
 
 import yaml
 from pydantic import BaseModel
@@ -14,6 +17,7 @@ from pydantic import BaseModel
 from app.models import Character, GenerationManifest, ScriptProject
 
 T = TypeVar("T", bound=BaseModel)
+R = TypeVar("R")
 
 WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -26,6 +30,9 @@ WINDOWS_RESERVED_NAMES = {
 
 
 class ProjectStore:
+    _manifest_locks_guard = threading.Lock()
+    _manifest_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
+
     def __init__(self, root: Path) -> None:
         self.root = root
 
@@ -160,10 +167,44 @@ class ProjectStore:
         return self.default_projects_root()
 
     def save_manifest(self, manifest: GenerationManifest) -> None:
+        project_id = self._safe_project_id(manifest.project_id)
+        with self._manifest_lock(project_id):
+            self._save_manifest_unlocked(manifest)
+
+    def load_manifest(self, project_id: str) -> GenerationManifest:
+        return self._load_manifest_unlocked(self._safe_project_id(project_id))
+
+    def update_manifest(
+        self,
+        project_id: str,
+        mutation: Callable[[GenerationManifest], R],
+    ) -> R:
+        safe_project_id = self._safe_project_id(project_id)
+        with self._manifest_lock(safe_project_id):
+            manifest = self._load_manifest_unlocked(safe_project_id).model_copy(deep=True)
+            if manifest.project_id != safe_project_id:
+                raise ValueError("manifest project id does not match transaction project")
+            result = mutation(manifest)
+            if manifest.project_id != safe_project_id:
+                raise ValueError("manifest transaction changed project id")
+            self._save_manifest_unlocked(manifest)
+            return result
+
+    def _manifest_lock(self, project_id: str) -> threading.RLock:
+        stable_project_path = self.writable_projects_root() / self._safe_project_id(project_id)
+        key = os.path.normcase(str(stable_project_path.resolve(strict=False)))
+        with self._manifest_locks_guard:
+            lock = self._manifest_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._manifest_locks[key] = lock
+            return lock
+
+    def _save_manifest_unlocked(self, manifest: GenerationManifest) -> None:
         self._write_text(self.project_dir(manifest.project_id) / ".project-id", self._safe_project_id(manifest.project_id))
         self._write_model(self.manifest_path(manifest.project_id), manifest)
 
-    def load_manifest(self, project_id: str) -> GenerationManifest:
+    def _load_manifest_unlocked(self, project_id: str) -> GenerationManifest:
         path = self.manifest_path(project_id)
         if path.exists():
             return self._read_model(path, GenerationManifest)
@@ -186,16 +227,17 @@ class ProjectStore:
         self._write_json(path, model.model_dump(mode="json"))
 
     def _write_json(self, path: Path, payload: object) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp_path.replace(path)
+        self._write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def _write_text(self, path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temp_path.write_text(text, encoding="utf-8")
-        temp_path.replace(path)
+        operation_id = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+        temp_path = path.with_name(f".{path.name}.{operation_id}.tmp")
+        try:
+            temp_path.write_text(text, encoding="utf-8")
+            temp_path.replace(path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def _read_model(self, path: Path, model_type: type[T]) -> T:
         return model_type.model_validate(self._read_structured(path))

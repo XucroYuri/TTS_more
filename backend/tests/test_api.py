@@ -11,7 +11,7 @@ import pytest
 
 import app.main as main_module
 from app.adapters.base import SynthesisCancelled
-from app.models import Character, ScriptLine
+from app.models import Character, GenerationTask, ScriptLine
 from app.main import _layer_service_status, _portable_controller_root, _resolve_repo_lock_path, create_app
 from app.open_source_tts import OpenSourceTTSConfigureRequest
 from app.parser import ParsedScriptDraft, ParserProviderUnavailable, ParserQualityError
@@ -1765,6 +1765,162 @@ def test_generate_routes_task_to_service_endpoint(tmp_path: Path) -> None:
     assert version["requested_load_signature"].endswith("ref_audio_path=sample.wav|prompt_text=参考文本|prompt_lang=|text_lang=")
     assert version["verified_load_signature"] == version["requested_load_signature"]
     assert version["metadata"]["load_verification_level"] == "assumed_after_success"
+
+
+def test_fix_round_2_sync_generate_preserves_manager_commit_from_stale_snapshot(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "mock-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "base_url": "mock://gpt",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    app = create_app(data_root=tmp_path, services_path=services_path)
+    client = TestClient(app)
+    original_queue = app.state.queue
+    sync_snapshot_loaded = threading.Event()
+    release_sync = threading.Event()
+
+    class BlockingSyncQueue:
+        def run(self, *args, **kwargs):
+            sync_snapshot_loaded.set()
+            assert release_sync.wait(3)
+            return original_queue.run(*args, **kwargs)
+
+    app.state.queue = BlockingSyncQueue()
+    common_parameters = {
+        "gpt_weights_path": "voice.ckpt",
+        "sovits_weights_path": "voice.pth",
+        "ref_audio_path": "voice.wav",
+        "prompt_text": "参考文本",
+    }
+    sync_payload = {
+        "project_id": "demo",
+        "tasks": [
+            {
+                "line": {"id": "sync-line", "character_id": "role", "text": "同步生成"},
+                "engine": "gpt-sovits",
+                "profile": "sync-profile",
+                "service_id": "mock-gpt",
+                "parameters": common_parameters,
+            }
+        ],
+    }
+    response_holder: list = []
+
+    def run_sync_generate() -> None:
+        response_holder.append(client.post("/api/generate", json=sync_payload))
+
+    sync_thread = threading.Thread(target=run_sync_generate, name="sync-generate-route")
+    sync_thread.start()
+    assert sync_snapshot_loaded.wait(3)
+
+    async_task = GenerationTask.model_validate(
+        {
+            "line": {"id": "async-line", "character_id": "role", "text": "异步生成"},
+            "engine": "gpt-sovits",
+            "profile": "async-profile",
+            "service_id": "mock-gpt",
+            "parameters": common_parameters,
+        }
+    )
+    async_job = app.state.job_manager.submit("demo", [async_task])
+    assert _wait_for_job(client, async_job.job_id)["status"] == "completed"
+    release_sync.set()
+    sync_thread.join(5)
+
+    assert not sync_thread.is_alive()
+    assert len(response_holder) == 1
+    assert response_holder[0].status_code == 200
+    assert set(response_holder[0].json()["lines"]) == {"async-line", "sync-line"}
+    assert set(app.state.store.load_manifest("demo").lines) == {"async-line", "sync-line"}
+
+
+def test_fix_round_2_concurrent_sync_generate_keeps_distinct_audio_evidence(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "mock-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "base_url": "mock://gpt",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    app = create_app(data_root=tmp_path, services_path=services_path)
+    client = TestClient(app)
+    original_queue = app.state.queue
+    both_snapshots_loaded = threading.Event()
+    release_generates = threading.Event()
+    guard = threading.Lock()
+    arrivals = 0
+
+    class ConcurrentSyncQueue:
+        def run(self, *args, **kwargs):
+            nonlocal arrivals
+            with guard:
+                arrivals += 1
+                if arrivals == 2:
+                    both_snapshots_loaded.set()
+            assert both_snapshots_loaded.wait(3)
+            assert release_generates.wait(3)
+            return original_queue.run(*args, **kwargs)
+
+    app.state.queue = ConcurrentSyncQueue()
+    payload = {
+        "project_id": "demo",
+        "tasks": [
+            {
+                "line": {"id": "shared-line", "character_id": "role", "text": "并发同步生成"},
+                "engine": "gpt-sovits",
+                "profile": "shared-profile",
+                "service_id": "mock-gpt",
+                "parameters": {
+                    "gpt_weights_path": "voice.ckpt",
+                    "sovits_weights_path": "voice.pth",
+                    "ref_audio_path": "voice.wav",
+                    "prompt_text": "参考文本",
+                },
+            }
+        ],
+    }
+    responses: list = []
+
+    def generate() -> None:
+        responses.append(client.post("/api/generate", json=payload))
+
+    first = threading.Thread(target=generate, name="sync-generate-1")
+    second = threading.Thread(target=generate, name="sync-generate-2")
+    first.start()
+    second.start()
+    assert both_snapshots_loaded.wait(3)
+    release_generates.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert [response.status_code for response in responses] == [200, 200]
+    versions = app.state.store.load_manifest("demo").lines["shared-line"].versions
+    audio_paths = [Path(version.audio_path or "") for version in versions]
+    assert [version.version_id for version in versions] == ["v001", "v002"]
+    assert len(set(audio_paths)) == 2
+    assert all(path.is_file() for path in audio_paths)
 
 
 def test_generation_preflight_suggests_local_fallback_without_auto_start(tmp_path: Path, monkeypatch) -> None:

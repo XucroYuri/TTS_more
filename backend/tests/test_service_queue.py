@@ -11,6 +11,7 @@ from app.adapters.base import SynthesisCancelled, SynthesisRequest, SynthesisRes
 from app.models import EngineName, GenerationManifest, GenerationTask, GenerationVersion, ProviderType, ScriptLine, TTSServiceEndpoint
 from app.queue import GenerationJobManager, ServiceGenerationQueue
 from app.services import ServiceRoute
+from app.storage import ProjectStore
 
 
 class RecordingServiceClient:
@@ -96,6 +97,7 @@ class MemoryStore:
         self.root = root
         self.manifest = GenerationManifest(project_id="demo")
         self.save_calls = 0
+        self._manifest_transaction_lock = threading.RLock()
 
     def load_manifest(self, _project_id: str) -> GenerationManifest:
         return self.manifest
@@ -113,6 +115,13 @@ class MemoryStore:
     def save_manifest(self, manifest: GenerationManifest) -> None:
         self.save_calls += 1
         self.manifest = manifest
+
+    def update_manifest(self, project_id: str, mutation):
+        with self._manifest_transaction_lock:
+            manifest = self.load_manifest(project_id).model_copy(deep=True)
+            result = mutation(manifest)
+            self.save_manifest(manifest)
+            return result
 
 
 class SnapshotStore(MemoryStore):
@@ -892,8 +901,12 @@ def test_cancel_wins_completion_race_and_discards_uncommitted_output(tmp_path: P
 
 def test_cancel_at_finalizing_boundary_prevents_completed_manifest_commit(tmp_path: Path) -> None:
     class CancelAtFinalizingManager(GenerationJobManager):
-        def _update_item(self, job_id, task, status, progress, cluster_key, version_id, external_update=None):
-            super()._update_item(job_id, task, status, progress, cluster_key, version_id, external_update)
+        def _update_item(
+            self, job_id, task, status, progress, cluster_key, version_id, external_update=None, target_task_id=None
+        ):
+            super()._update_item(
+                job_id, task, status, progress, cluster_key, version_id, external_update, target_task_id
+            )
             if status == "finalizing":
                 self.cancel(job_id)
 
@@ -1257,3 +1270,173 @@ def test_fix_round_1_concurrent_same_service_same_line_outputs_do_not_overwrite(
     assert [version.version_id for version in versions] == ["v001", "v002"]
     assert len(set(audio_paths)) == 2
     assert {path.read_bytes() for path in audio_paths} == {b"RIFF-first", b"RIFF-second"}
+
+
+def test_fix_round_2_replacement_managers_preserve_cancelled_and_completed_histories(tmp_path: Path) -> None:
+    cancel_started = threading.Event()
+    complete_started = threading.Event()
+    release_cancel = threading.Event()
+    release_complete = threading.Event()
+
+    class InterleavedProjectStore(ProjectStore):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self._observation_lock = threading.Lock()
+            self._loads_by_thread: dict[int, int] = {}
+            self._persistence_order: dict[int, int] = {}
+            self._both_persistence_snapshots_loaded = threading.Event()
+            self._first_save_finished = threading.Event()
+
+        def load_manifest(self, project_id: str) -> GenerationManifest:
+            snapshot = super().load_manifest(project_id)
+            thread_id = threading.get_ident()
+            if not threading.current_thread().name.startswith("tts-job"):
+                return snapshot
+            with self._observation_lock:
+                load_count = self._loads_by_thread.get(thread_id, 0) + 1
+                self._loads_by_thread[thread_id] = load_count
+                if load_count == 2:
+                    order = len(self._persistence_order) + 1
+                    self._persistence_order[thread_id] = order
+                    if order == 2:
+                        self._both_persistence_snapshots_loaded.set()
+            if load_count == 2:
+                assert self._both_persistence_snapshots_loaded.wait(3)
+            return snapshot
+
+        def save_manifest(self, manifest: GenerationManifest) -> None:
+            order = self._persistence_order.get(threading.get_ident())
+            if order == 2:
+                assert self._first_save_finished.wait(3)
+            super().save_manifest(manifest)
+            if order == 1:
+                self._first_save_finished.set()
+
+    class CancelClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            cancel_started.set()
+            assert release_cancel.wait(3)
+            raise SynthesisCancelled(
+                "cancelled after replacement",
+                details={"prompt_id": "prompt-replacement", "converged": True},
+            )
+
+    class CompleteClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            complete_started.set()
+            assert release_complete.wait(3)
+            return super().synthesize(request)
+
+    store = InterleavedProjectStore(tmp_path)
+    cancel_manager = GenerationJobManager(
+        ServiceGenerationQueue(
+            StaticRouter({"cancel-service": CancelClient(endpoint("cancel-service", EngineName.GPT_SOVITS, "gpu-a"))})
+        ),
+        store,
+    )
+    complete_manager = GenerationJobManager(
+        ServiceGenerationQueue(
+            StaticRouter(
+                {"complete-service": CompleteClient(endpoint("complete-service", EngineName.INDEX_TTS, "gpu-b"))}
+            )
+        ),
+        store,
+    )
+
+    cancelled = cancel_manager.submit(
+        "demo", [task("cancel-line", EngineName.GPT_SOVITS, "cancel-profile", "cancel-service")]
+    )
+    completed = complete_manager.submit(
+        "demo", [task("complete-line", EngineName.INDEX_TTS, "complete-profile", "complete-service")]
+    )
+    assert cancel_started.wait(3)
+    assert complete_started.wait(3)
+    assert cancel_manager.cancel(cancelled.job_id).status == "cancelling"
+    release_cancel.set()
+    release_complete.set()
+
+    assert _wait_for_manager_job(cancel_manager, cancelled.job_id).status == "cancelled"
+    assert _wait_for_manager_job(complete_manager, completed.job_id).status == "completed"
+    durable = store.load_manifest("demo")
+    assert durable.lines["cancel-line"].versions[0].status == "cancelled"
+    assert durable.lines["cancel-line"].versions[0].metadata["control_details"]["prompt_id"] == "prompt-replacement"
+    assert durable.lines["complete-line"].versions[0].status == "completed"
+
+
+def test_fix_round_2_long_output_namespaces_are_bounded_and_collision_free(tmp_path: Path) -> None:
+    first_manifest = GenerationManifest(project_id="demo")
+    second_manifest = GenerationManifest(project_id="demo")
+    client = RecordingServiceClient(endpoint("shared-service", EngineName.GPT_SOVITS, "shared-gpu"))
+    queue = ServiceGenerationQueue(StaticRouter({"shared-service": client}))
+    common_prefix = "namespace-" + ("x" * 400)
+
+    queue.run(
+        [task("shared-line", EngineName.GPT_SOVITS, "shared-profile", "shared-service")],
+        first_manifest,
+        tmp_path,
+        output_namespace=common_prefix + "-first",
+    )
+    queue.run(
+        [task("shared-line", EngineName.GPT_SOVITS, "shared-profile", "shared-service")],
+        second_manifest,
+        tmp_path,
+        output_namespace=common_prefix + "-second",
+    )
+
+    first_path = Path(first_manifest.lines["shared-line"].versions[0].audio_path or "")
+    second_path = Path(second_manifest.lines["shared-line"].versions[0].audio_path or "")
+    assert first_manifest.lines["shared-line"].versions[0].status == "completed"
+    assert second_manifest.lines["shared-line"].versions[0].status == "completed"
+    assert first_path != second_path
+    assert len(first_path.name) <= 240
+    assert len(second_path.name) <= 240
+    assert first_path.is_file()
+    assert second_path.is_file()
+
+
+def test_fix_round_2_duplicate_same_line_items_keep_distinct_status_identity(tmp_path: Path) -> None:
+    first_release = threading.Event()
+    second_release = threading.Event()
+    first_completed = threading.Event()
+
+    class FirstClient(BlockingServiceClient):
+        pass
+
+    class SecondClient(BlockingServiceClient):
+        pass
+
+    class ObservedManager(GenerationJobManager):
+        def _update_item(
+            self, job_id, task, status, progress, cluster_key, version_id, external_update=None, target_task_id=None
+        ):
+            super()._update_item(
+                job_id, task, status, progress, cluster_key, version_id, external_update, target_task_id
+            )
+            if task.service_id == "first-service" and status == "completed":
+                first_completed.set()
+
+    first_client = FirstClient(endpoint("first-service", EngineName.GPT_SOVITS, "gpu-a"), first_release)
+    second_client = SecondClient(endpoint("second-service", EngineName.INDEX_TTS, "gpu-b"), second_release)
+    manager = ObservedManager(
+        ServiceGenerationQueue(StaticRouter({"first-service": first_client, "second-service": second_client})),
+        SnapshotStore(tmp_path),
+    )
+    created = manager.submit(
+        "demo",
+        [
+            task("duplicate-line", EngineName.GPT_SOVITS, "first-profile", "first-service"),
+            task("duplicate-line", EngineName.INDEX_TTS, "second-profile", "second-service"),
+        ],
+    )
+    assert first_client.started.wait(3)
+    assert second_client.started.wait(3)
+    first_release.set()
+    assert first_completed.wait(3)
+    second_release.set()
+
+    final = _wait_for_manager_job(manager, created.job_id)
+    assert final.status == "completed"
+    assert [(item.service_id, item.version_id) for item in final.items] == [
+        ("first-service", "v001"),
+        ("second-service", "v002"),
+    ]

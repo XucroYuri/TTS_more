@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -7,6 +8,7 @@ import threading
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -31,7 +33,73 @@ def _safe_line_output_stem(task: GenerationTask) -> str:
 
 
 def _safe_output_namespace(value: str) -> str:
-    return re.sub(r"[^0-9A-Za-z._-]+", "_", value).strip("._-") or "job"
+    safe_value = re.sub(r"[^0-9A-Za-z._-]+", "_", value).strip("._-") or "job"
+    return _bounded_name_part(safe_value, 48)
+
+
+def _bounded_name_part(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return f"{value[: max_length - len(digest) - 1]}-{digest}"
+
+
+def _output_filename(task: GenerationTask, version_id: str, output_namespace: str | None) -> str:
+    suffix = f"_{version_id}.wav"
+    if output_namespace is not None:
+        suffix = f"_{_safe_output_namespace(output_namespace)}{suffix}"
+    line_stem = _bounded_name_part(_safe_line_output_stem(task), 240 - len(suffix))
+    return f"{line_stem}{suffix}"
+
+
+@dataclass(frozen=True)
+class ManifestVersionIdAssignment:
+    line_key: str
+    provisional_id: str
+    actual_id: str
+
+
+@dataclass(frozen=True)
+class ManifestPersistenceResult:
+    manifest: GenerationManifest
+    assignments: tuple[ManifestVersionIdAssignment, ...]
+
+
+def persist_manifest_delta(
+    store: Any,
+    baseline: GenerationManifest,
+    updated: GenerationManifest,
+) -> ManifestPersistenceResult:
+    if baseline.project_id != updated.project_id:
+        raise RuntimeError("manifest delta project ids do not match")
+
+    def merge(current: GenerationManifest) -> ManifestPersistenceResult:
+        assignments: list[ManifestVersionIdAssignment] = []
+        for line_key, updated_history in updated.lines.items():
+            baseline_history = baseline.lines.get(line_key)
+            baseline_versions = baseline_history.versions if baseline_history else []
+            if len(updated_history.versions) < len(baseline_versions):
+                raise RuntimeError(f"manifest line {line_key} removed baseline generation versions")
+            if updated_history.versions[: len(baseline_versions)] != baseline_versions:
+                raise RuntimeError(f"manifest line {line_key} changed baseline generation versions")
+            for version in updated_history.versions[len(baseline_versions) :]:
+                provisional_id = version.version_id
+                current.append_version(updated_history.line_id, version)
+                current_history = current.history_for_line(updated_history.line_id, version.line_uid)
+                actual_id = current_history.versions[-1].version_id if current_history else provisional_id
+                assignments.append(
+                    ManifestVersionIdAssignment(
+                        line_key=line_key,
+                        provisional_id=provisional_id,
+                        actual_id=actual_id,
+                    )
+                )
+        return ManifestPersistenceResult(
+            manifest=current.model_copy(deep=True),
+            assignments=tuple(assignments),
+        )
+
+    return store.update_manifest(updated.project_id, merge)
 
 
 class ServiceGenerationQueue:
@@ -230,15 +298,12 @@ class ServiceGenerationQueue:
             history = manifest.history_for_line(task.line.id, _task_line_uid(task))
             version_number = len(history.versions) + 1 if history else 1
             version_id = f"v{version_number:03d}"
-        versioned_stem = f"{_safe_line_output_stem(task)}_{version_id}"
-        if output_namespace is not None:
-            versioned_stem = f"{_safe_line_output_stem(task)}_{_safe_output_namespace(output_namespace)}_{version_id}"
         output_path = (
             output_dir
             / task.engine.value
             / route.endpoint.service_id
             / task.profile
-            / f"{versioned_stem}.wav"
+            / _output_filename(task, version_id, output_namespace)
         )
         requested_load_signature = build_load_signature(route.endpoint, task.parameters)
         revision_context = _revision_context(task)
@@ -737,11 +802,10 @@ class GenerationJobManager:
         self.store = store
         self._jobs: "OrderedDict[str, GenerationJob]" = OrderedDict()
         self._lock = threading.Lock()
-        self._project_persistence_locks: dict[str, threading.Lock] = {}
-        self._project_persistence_guard = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=self.MAX_ACTIVE_JOBS, thread_name_prefix="tts-job")
 
     def submit(self, project_id: str, tasks: list[GenerationTask]) -> GenerationJob:
+        tasks = [task.model_copy(deep=True) for task in tasks]
         job_id = f"job-{uuid.uuid4().hex[:12]}"
         diagnostics = self._task_diagnostics(tasks)
         items = [
@@ -884,12 +948,24 @@ class GenerationJobManager:
             output_dir = self.store.project_audio_dir(project_id)
             self._record_prefailed_items(job_id, tasks, manifest)
             runnable_tasks = self._runnable_tasks(job_id, tasks)
+            with self._lock:
+                task_ids = {
+                    id(task): item.task_id
+                    for task, item in zip(tasks, self._jobs[job_id].items, strict=True)
+                }
             self.queue.run(
                 runnable_tasks,
                 manifest,
                 output_dir=output_dir,
                 status_callback=lambda task, status, progress, cluster_key, version_id, external_update: self._update_item(
-                    job_id, task, status, progress, cluster_key, version_id, external_update
+                    job_id,
+                    task,
+                    status,
+                    progress,
+                    cluster_key,
+                    version_id,
+                    external_update,
+                    target_task_id=task_ids[id(task)],
                 ),
                 cancel_check=lambda: self._is_cancelled(job_id),
                 output_namespace=job_id,
@@ -914,55 +990,34 @@ class GenerationJobManager:
                 failure_message = f"manifest persistence failed: {failure_message}"
             self._fail_job(job_id, failure_message, persistence_failed=persistence_failed)
 
-    def _project_persistence_lock(self, project_id: str) -> threading.Lock:
-        with self._project_persistence_guard:
-            return self._project_persistence_locks.setdefault(project_id, threading.Lock())
-
     def _persist_manifest_delta(
         self,
         job_id: str,
         baseline: GenerationManifest,
         updated: GenerationManifest,
     ) -> None:
-        project_id = updated.project_id
-        with self._project_persistence_lock(project_id):
-            current = self.store.load_manifest(project_id).model_copy(deep=True)
-            for line_key, updated_history in updated.lines.items():
-                baseline_history = baseline.lines.get(line_key)
-                baseline_versions = baseline_history.versions if baseline_history else []
-                if len(updated_history.versions) < len(baseline_versions):
-                    raise RuntimeError(f"manifest line {line_key} removed baseline generation versions")
-                if updated_history.versions[: len(baseline_versions)] != baseline_versions:
-                    raise RuntimeError(f"manifest line {line_key} changed baseline generation versions")
-                for version in updated_history.versions[len(baseline_versions) :]:
-                    provisional_id = version.version_id
-                    current.append_version(updated_history.line_id, version)
-                    current_history = current.history_for_line(updated_history.line_id, version.line_uid)
-                    actual_id = current_history.versions[-1].version_id if current_history else provisional_id
-                    if actual_id != provisional_id:
-                        self._replace_item_version_id(
-                            job_id,
-                            line_id=updated_history.line_id,
-                            line_uid=version.line_uid,
-                            provisional_id=provisional_id,
-                            actual_id=actual_id,
-                        )
-            self.store.save_manifest(current)
+        result = persist_manifest_delta(self.store, baseline, updated)
+        for assignment in result.assignments:
+            if assignment.actual_id != assignment.provisional_id:
+                self._replace_item_version_id(
+                    job_id,
+                    line_key=assignment.line_key,
+                    provisional_id=assignment.provisional_id,
+                    actual_id=assignment.actual_id,
+                )
 
     def _replace_item_version_id(
         self,
         job_id: str,
         *,
-        line_id: str,
-        line_uid: str | None,
+        line_key: str,
         provisional_id: str,
         actual_id: str,
     ) -> None:
         with self._lock:
             for item in self._jobs[job_id].items:
                 if (
-                    item.line_id == line_id
-                    and (item.line_uid or item.line_id) == (line_uid or line_id)
+                    (item.line_uid or item.line_id) == line_key
                     and item.version_id == provisional_id
                 ):
                     item.version_id = actual_id
@@ -983,15 +1038,15 @@ class GenerationJobManager:
             job.progress = 1.0
 
     def _record_prefailed_items(self, job_id: str, tasks: list[GenerationTask], manifest: GenerationManifest) -> None:
-        tasks_by_key = {(task.line.id, _task_line_uid(task)): task for task in tasks}
         with self._lock:
             job = self._jobs[job_id]
-            failed_items = [item for item in job.items if item.status == "failed" and item.error and item.version_id is None]
+            failed_items = [
+                (item, task)
+                for item, task in zip(job.items, tasks, strict=True)
+                if item.status == "failed" and item.error and item.version_id is None
+            ]
 
-        for item in failed_items:
-            task = tasks_by_key.get((item.line_id, item.line_uid or item.line_id))
-            if task is None:
-                continue
+        for item, task in failed_items:
             history = manifest.history_for_line(item.line_id, item.line_uid)
             version_id = f"v{(len(history.versions) if history else 0) + 1:03d}"
             revision_context = _revision_context(task)
@@ -1025,8 +1080,11 @@ class GenerationJobManager:
             job = self._jobs[job_id]
             if job.status in {"cancelling", "cancelled"}:
                 return []
-            skipped = {(item.line_id, item.line_uid or item.line_id) for item in job.items if item.status in {"cancelled", "failed"}}
-        return [task for task in tasks if (task.line.id, _task_line_uid(task)) not in skipped]
+            return [
+                task
+                for task, item in zip(tasks, job.items, strict=True)
+                if item.status not in {"cancelled", "failed"}
+            ]
 
     def _update_item(
         self,
@@ -1037,10 +1095,13 @@ class GenerationJobManager:
         cluster_key: str | None,
         version_id: str | None,
         external_update: ExternalStatusUpdate | None = None,
+        target_task_id: str | None = None,
     ) -> None:
         with self._lock:
             job = self._jobs[job_id]
             for item in job.items:
+                if target_task_id is not None and item.task_id != target_task_id:
+                    continue
                 if item.line_id == task.line.id and (item.line_uid or item.line_id) == _task_line_uid(task):
                     if item.status == "cancelling" and status not in {"cancelled", "failed"}:
                         item.progress = max(item.progress, progress)

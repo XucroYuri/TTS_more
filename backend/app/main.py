@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,7 @@ from app.portable_locator_mutations import ManagedPortableLocatorMutationError
 from app.portable_services import PortableServiceStore
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
-from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key
+from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key, persist_manifest_delta
 from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
 from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
@@ -1117,18 +1118,23 @@ def create_app(
 
     @app.delete("/api/projects/{project_id}/manifest/lines/{line_key}/versions/{version_id}")
     def delete_generation_version(project_id: str, line_key: str, version_id: str) -> dict[str, Any]:
-        manifest = store.load_manifest(project_id)
-        resolved_line_key, history = _resolve_manifest_history_for_version(manifest, line_key, version_id)
-        if history is None:
-            raise HTTPException(status_code=404, detail="line history not found")
-        target = next((version for version in history.versions if version.version_id == version_id), None)
-        if target is None:
-            raise HTTPException(status_code=404, detail="generation version not found")
-        history.versions = [version for version in history.versions if version.version_id != version_id]
+        def remove_version(manifest: GenerationManifest) -> tuple[str, str | None]:
+            resolved_line_key, history = _resolve_manifest_history_for_version(manifest, line_key, version_id)
+            if history is None:
+                raise HTTPException(status_code=404, detail="line history not found")
+            target = next((version for version in history.versions if version.version_id == version_id), None)
+            if target is None:
+                raise HTTPException(status_code=404, detail="generation version not found")
+            history.versions = [version for version in history.versions if version.version_id != version_id]
+            return resolved_line_key, target.audio_path
+
+        resolved_line_key, target_audio_path = store.update_manifest(project_id, remove_version)
         audio_deleted = False
         warning: str | None = None
-        if target.audio_path:
-            resolved = _resolve_project_audio_file(store.project_audio_dir(project_id), Path(app.state.store.root), target.audio_path)
+        if target_audio_path:
+            resolved = _resolve_project_audio_file(
+                store.project_audio_dir(project_id), Path(app.state.store.root), target_audio_path
+            )
             if resolved is None:
                 warning = "audio path is outside project audio directory"
             elif resolved.exists():
@@ -1136,7 +1142,6 @@ def create_app(
                 audio_deleted = True
             else:
                 warning = "audio file not found"
-        store.save_manifest(manifest)
         return {
             "status": "deleted",
             "project_id": project_id,
@@ -1153,11 +1158,17 @@ def create_app(
             _validate_generation_tasks(tasks, app.state.service_registry)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        manifest = store.load_manifest(request.project_id)
+        baseline = store.load_manifest(request.project_id)
+        manifest = baseline.model_copy(deep=True)
         output_dir = store.project_audio_dir(request.project_id)
-        app.state.queue.run(tasks, manifest, output_dir=output_dir)
-        store.save_manifest(manifest)
-        return manifest.model_dump(mode="json")
+        app.state.queue.run(
+            tasks,
+            manifest,
+            output_dir=output_dir,
+            output_namespace=f"sync-{uuid.uuid4().hex}",
+        )
+        persisted = persist_manifest_delta(store, baseline, manifest)
+        return persisted.manifest.model_dump(mode="json")
 
     @app.post("/api/jobs/generation")
     def create_generation_job(request: GenerateRequest) -> dict[str, Any]:
@@ -1207,11 +1218,20 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if _service_mode() == "real":
             _reject_mock_validation_services(tasks, app.state.service_registry)
-        manifest = store.load_manifest(request.project_id)
+        baseline = store.load_manifest(request.project_id)
+        manifest = baseline.model_copy(deep=True)
         output_dir = store.project_audio_dir(request.project_id)
-        app.state.queue.run(tasks, manifest, output_dir=output_dir)
-        store.save_manifest(manifest)
-        return {"summary": _manifest_summary(manifest), "manifest": manifest.model_dump(mode="json")}
+        app.state.queue.run(
+            tasks,
+            manifest,
+            output_dir=output_dir,
+            output_namespace=f"validation-{uuid.uuid4().hex}",
+        )
+        persisted = persist_manifest_delta(store, baseline, manifest)
+        return {
+            "summary": _manifest_summary(persisted.manifest),
+            "manifest": persisted.manifest.model_dump(mode="json"),
+        }
 
     @app.get("/api/validation/demo-plan")
     def demo_validation_plan(project_id: str = "demo", limit: int = 30, repeats: int = 1) -> dict[str, Any]:
