@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.adapters.base import SynthesisRequest, SynthesisResult
+from app.adapters.base import SynthesisCancelled, SynthesisRequest, SynthesisResult, SynthesisTimeout
 from app.models import EngineName, GenerationManifest, GenerationTask, ProviderType, ScriptLine, TTSServiceEndpoint
 from app.queue import GenerationJobManager, ServiceGenerationQueue
 from app.services import ServiceRoute
@@ -637,3 +637,298 @@ def test_generation_job_cancel_stops_dispatching_remaining_lines(tmp_path: Path)
     # and should be cancelled, never synthesized.
     assert any("synthesize:l1" in c for c in client.calls)
     assert not any("synthesize:l2" in c for c in client.calls)
+
+
+def test_generation_cancel_transitions_inflight_item_through_cancelling_and_preserves_progress_identity(tmp_path: Path) -> None:
+    started = threading.Event()
+    send_progress = threading.Event()
+    progress_sent = threading.Event()
+    release = threading.Event()
+
+    class CancelAwareClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            started.set()
+            assert request.cancel_check is not None
+            assert send_progress.wait(3)
+            assert request.progress_callback is not None
+            request.progress_callback(
+                {"external_job_id": "prompt-1", "external_status": "cancelling", "progress": 0.7}
+            )
+            progress_sent.set()
+            assert release.wait(3)
+            if request.cancel_check():
+                raise SynthesisCancelled(
+                    "cancelled by operator",
+                    details={"prompt_id": "prompt-1", "converged": True, "diagnostic": "prompt no longer active"},
+                )
+            return super().synthesize(request)
+
+    service_endpoint = endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0")
+    manager = GenerationJobManager(
+        ServiceGenerationQueue(StaticRouter({"local-gpt": CancelAwareClient(service_endpoint)})),
+        MemoryStore(tmp_path),
+    )
+
+    job = manager.submit("demo", [gpt_task("line-1", "reference.wav")])
+    assert started.wait(3)
+    cancelling = manager.cancel(job.job_id)
+    assert cancelling.status == "cancelling"
+    assert cancelling.items[0].status == "cancelling"
+
+    send_progress.set()
+    assert progress_sent.wait(3)
+    after_progress = manager.get(job.job_id)
+    assert after_progress.items[0].status == "cancelling"
+    assert after_progress.items[0].external_job_id == "prompt-1"
+    assert after_progress.items[0].external_status == "cancelling"
+
+    release.set()
+    final = _wait_for_manager_job(manager, job.job_id)
+    assert final.status == "cancelled"
+    assert final.progress == 1.0
+    assert final.items[0].status == "cancelled"
+    assert final.items[0].progress == 1.0
+    version = manager.store.manifest.lines["line-1"].versions[0]
+    assert version.status == "cancelled"
+    assert version.audio_path is None
+    assert version.metadata["control_code"] == "cancelled"
+    assert version.metadata["control_details"]["prompt_id"] == "prompt-1"
+    assert "failure_stage" not in version.metadata
+
+
+def test_generation_cancel_before_dispatch_and_repeated_cancel_are_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(GenerationJobManager, "MAX_ACTIVE_JOBS", 1)
+    release = threading.Event()
+    client = BlockingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"), release)
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), MemoryStore(tmp_path))
+    active = manager.submit("demo", [gpt_task("active", "active.wav")])
+    assert client.started.wait(3)
+
+    queued = manager.submit("demo", [gpt_task("queued", "queued.wav")])
+    first_cancel = manager.cancel(queued.job_id)
+    first_payload = first_cancel.model_dump(mode="json")
+    second_cancel = manager.cancel(queued.job_id)
+
+    assert first_cancel.status == "cancelled"
+    assert first_cancel.items[0].status == "cancelled"
+    assert second_cancel.model_dump(mode="json") == first_payload
+    release.set()
+    assert _wait_for_manager_job(manager, active.job_id).status == "completed"
+    assert _wait_for_manager_job(manager, queued.job_id).status == "cancelled"
+    assert not any("synthesize:queued" in call for call in client.calls)
+
+
+def test_generation_cancel_keeps_completed_job_terminal_truth(tmp_path: Path) -> None:
+    client = RecordingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), MemoryStore(tmp_path))
+    created = manager.submit("demo", [gpt_task("done", "done.wav")])
+    completed = _wait_for_manager_job(manager, created.job_id)
+
+    after_cancel = manager.cancel(created.job_id)
+
+    assert completed.status == "completed"
+    assert after_cancel.status == "completed"
+    assert after_cancel.items[0].status == "completed"
+    assert manager.store.manifest.lines["done"].versions[0].status == "completed"
+
+
+def test_nonconverged_cancellation_fails_job_and_persists_sanitized_cleanup_evidence(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class NonConvergingClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            started.set()
+            assert request.cancel_check is not None
+            assert release.wait(3)
+            raise SynthesisCancelled(
+                "cancellation cleanup failed",
+                details={
+                    "prompt_id": "prompt-stuck",
+                    "converged": False,
+                    "diagnostic": "process exit could not be verified Authorization: Bearer cleanup-secret",
+                    "cleanup": {"runner": "still-active"},
+                },
+            )
+
+    client = NonConvergingClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), MemoryStore(tmp_path))
+    created = manager.submit("demo", [gpt_task("stuck", "stuck.wav"), gpt_task("never-run", "later.wav")])
+    assert started.wait(3)
+    manager.cancel(created.job_id)
+    release.set()
+
+    final = _wait_for_manager_job(manager, created.job_id)
+    assert final.status == "failed"
+    assert final.progress == 1.0
+    assert final.items[0].status == "failed"
+    assert final.items[1].status == "cancelled"
+    version = manager.store.manifest.lines["stuck"].versions[0]
+    assert version.status == "failed"
+    assert version.audio_path is None
+    assert version.metadata["failure_stage"] == "cancellation_cleanup"
+    assert version.metadata["control_code"] == "cancelled"
+    assert version.metadata["control_details"]["converged"] is False
+    assert version.metadata["control_details"]["cleanup"] == {"runner": "still-active"}
+    rendered = str(version.metadata)
+    assert "cleanup-secret" not in rendered
+    assert "Authorization: Bearer ***" in rendered
+
+
+def test_synthesis_timeout_persists_timeout_stage_and_sanitized_control_details(tmp_path: Path) -> None:
+    class TimingOutClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            raise SynthesisTimeout(
+                "prompt timed out",
+                details={
+                    "prompt_id": "prompt-timeout",
+                    "cancellation": {"converged": False, "diagnostic": "runner still active"},
+                    "cleanup_error": "password=timeout-secret",
+                },
+            )
+
+    client = TimingOutClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), MemoryStore(tmp_path))
+    final = _wait_for_manager_job(manager, manager.submit("demo", [gpt_task("timeout", "timeout.wav")]).job_id)
+
+    assert final.status == "failed"
+    version = manager.store.manifest.lines["timeout"].versions[0]
+    assert version.status == "failed"
+    assert version.audio_path is None
+    assert version.metadata["failure_stage"] == "timeout"
+    assert version.metadata["control_code"] == "timeout"
+    assert version.metadata["control_details"]["prompt_id"] == "prompt-timeout"
+    assert version.metadata["control_details"]["cancellation"]["converged"] is False
+    assert "timeout-secret" not in str(version.metadata)
+    assert "password=***" in str(version.metadata)
+
+
+def test_generic_exception_after_cancel_is_failed_not_false_cancelled(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class CrashingClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            started.set()
+            assert release.wait(3)
+            raise RuntimeError("runner crashed during cancellation")
+
+    client = CrashingClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), MemoryStore(tmp_path))
+    created = manager.submit("demo", [gpt_task("crash", "crash.wav")])
+    assert started.wait(3)
+    assert manager.cancel(created.job_id).status == "cancelling"
+    release.set()
+
+    final = _wait_for_manager_job(manager, created.job_id)
+    assert final.status == "failed"
+    assert final.items[0].status == "failed"
+    version = manager.store.manifest.lines["crash"].versions[0]
+    assert version.status == "failed"
+    assert version.metadata["failure_stage"] == "synthesis"
+
+
+def test_cancel_wins_completion_race_and_discards_uncommitted_output(tmp_path: Path) -> None:
+    output_written = threading.Event()
+    release = threading.Event()
+
+    class CompletingClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            assert request.cancel_check is not None
+            assert request.progress_callback is not None
+            request.progress_callback(
+                {"external_job_id": "prompt-race", "external_status": "running", "progress": 0.8}
+            )
+            request.output_path.parent.mkdir(parents=True, exist_ok=True)
+            request.output_path.write_bytes(b"RIFFuncommitted")
+            output_written.set()
+            assert release.wait(3)
+            return SynthesisResult(audio_path=request.output_path, metadata={"prompt_id": "prompt-race"})
+
+    client = CompletingClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    store = MemoryStore(tmp_path)
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), store)
+    created = manager.submit("demo", [gpt_task("race", "race.wav")])
+    assert output_written.wait(3)
+    assert manager.cancel(created.job_id).status == "cancelling"
+    release.set()
+
+    final = _wait_for_manager_job(manager, created.job_id)
+    assert final.status == "cancelled"
+    assert final.items[0].status == "cancelled"
+    version = store.manifest.lines["race"].versions[0]
+    assert version.status == "cancelled"
+    assert version.audio_path is None
+    assert version.metadata["control_details"]["prompt_id"] == "prompt-race"
+    assert not list(store.project_audio_dir("demo").rglob("*.wav"))
+
+
+def test_cancel_at_finalizing_boundary_prevents_completed_manifest_commit(tmp_path: Path) -> None:
+    class CancelAtFinalizingManager(GenerationJobManager):
+        def _update_item(self, job_id, task, status, progress, cluster_key, version_id, external_update=None):
+            super()._update_item(job_id, task, status, progress, cluster_key, version_id, external_update)
+            if status == "finalizing":
+                self.cancel(job_id)
+
+    client = RecordingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    store = MemoryStore(tmp_path)
+    manager = CancelAtFinalizingManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), store)
+    created = manager.submit("demo", [gpt_task("finalizing-race", "race.wav")])
+
+    final = _wait_for_manager_job(manager, created.job_id)
+
+    assert final.status == "cancelled"
+    assert final.items[0].status == "cancelled"
+    version = store.manifest.lines["finalizing-race"].versions[0]
+    assert version.status == "cancelled"
+    assert version.audio_path is None
+    assert not list(store.project_audio_dir("demo").rglob("*.wav"))
+
+
+def test_cancel_fails_closed_when_uncommitted_output_cannot_be_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class OutputThenCancelledClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            request.output_path.parent.mkdir(parents=True, exist_ok=True)
+            request.output_path.write_bytes(b"RIFFlocked")
+            started.set()
+            assert release.wait(3)
+            raise SynthesisCancelled(
+                "external prompt converged",
+                details={"prompt_id": "prompt-locked-output", "converged": True},
+            )
+
+    original_unlink = Path.unlink
+
+    def reject_wav_unlink(path: Path, *args, **kwargs):
+        if path.suffix == ".wav":
+            raise PermissionError("output is still locked password=local-secret")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", reject_wav_unlink)
+    client = OutputThenCancelledClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), MemoryStore(tmp_path))
+    created = manager.submit("demo", [gpt_task("locked-output", "locked.wav")])
+    assert started.wait(3)
+    assert manager.cancel(created.job_id).status == "cancelling"
+    release.set()
+
+    final = _wait_for_manager_job(manager, created.job_id)
+
+    assert final.status == "failed"
+    assert final.items[0].status == "failed"
+    assert "output cleanup failed" in (final.items[0].error or "")
+    version = manager.store.manifest.lines["locked-output"].versions[0]
+    assert version.status == "failed"
+    assert version.audio_path is None
+    assert version.metadata["failure_stage"] == "cancellation_cleanup"
+    assert version.metadata["control_code"] == "cancelled"
+    assert version.metadata["control_details"]["prompt_id"] == "prompt-locked-output"
+    assert "local-secret" not in str(version.metadata)
+    assert "password=***" in version.metadata["control_details"]["output_cleanup_error"]

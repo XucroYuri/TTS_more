@@ -483,7 +483,7 @@ class TTSIntent(BaseModel):
     output_format: str = "wav"
 
 
-GenerationStatus = Literal["queued", "loading", "running", "finalizing", "completed", "failed", "cancelled"]
+GenerationStatus = Literal["queued", "loading", "running", "finalizing", "cancelling", "completed", "failed", "cancelled"]
 
 
 class GenerationVersion(BaseModel):

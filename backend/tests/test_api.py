@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import subprocess
+import threading
 import time
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import httpx
 import pytest
 
 import app.main as main_module
+from app.adapters.base import SynthesisCancelled
 from app.models import Character, ScriptLine
 from app.main import _layer_service_status, _portable_controller_root, _resolve_repo_lock_path, create_app
 from app.open_source_tts import OpenSourceTTSConfigureRequest
@@ -2088,6 +2090,96 @@ def test_generation_job_api_runs_in_background_and_reports_status(tmp_path: Path
 
     assert queue_status.status_code == 200
     assert queue_status.json()["queued"] == 0
+
+
+def test_generation_job_cancel_api_serializes_cancelling_then_persists_cancelled_prompt_version(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "mock-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "base_url": "mock://gpt",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts", "trained_weights_voice"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    started = threading.Event()
+    release = threading.Event()
+    app = create_app(data_root=tmp_path, services_path=services_path)
+    original = app.state.service_router.clients["mock-gpt"]
+
+    class ApiCancelClient:
+        endpoint = original.endpoint
+
+        def health(self):
+            return original.health()
+
+        def load(self, profile, parameters=None):
+            return original.load(profile, parameters)
+
+        def unload(self):
+            return original.unload()
+
+        def synthesize(self, request):
+            started.set()
+            assert request.cancel_check is not None
+            assert release.wait(3)
+            if request.cancel_check():
+                raise SynthesisCancelled(
+                    "cancelled through API",
+                    details={"prompt_id": "prompt-api-cancel", "converged": True},
+                )
+            return original.synthesize(request)
+
+    app.state.service_router.clients["mock-gpt"] = ApiCancelClient()
+    client = TestClient(app)
+    created = client.post(
+        "/api/jobs/generation",
+        json={
+            "project_id": "demo",
+            "tasks": [
+                {
+                    "line": {"id": "cancel-line", "character_id": "alice", "text": "你好"},
+                    "engine": "gpt-sovits",
+                    "profile": "alice-gpt",
+                    "service_id": "mock-gpt",
+                    "provider_type": "gpt-sovits",
+                    "required_capabilities": ["trained_weights_voice"],
+                    "parameters": {
+                        "gpt_weights_path": "a.ckpt",
+                        "sovits_weights_path": "a.pth",
+                        "ref_audio_path": "a.wav",
+                        "prompt_text": "参考文本",
+                    },
+                }
+            ],
+        },
+    )
+    assert created.status_code == 200
+    job_id = created.json()["job_id"]
+    assert started.wait(3)
+
+    cancelling = client.post(f"/api/jobs/{job_id}/cancel")
+
+    assert cancelling.status_code == 200
+    assert cancelling.json()["status"] == "cancelling"
+    assert cancelling.json()["items"][0]["status"] == "cancelling"
+    release.set()
+    final = _wait_for_job(client, job_id)
+    assert final["status"] == "cancelled"
+    assert final["items"][0]["status"] == "cancelled"
+    manifest = client.get("/api/projects/demo/manifest")
+    assert manifest.status_code == 200
+    version = manifest.json()["lines"]["cancel-line"]["versions"][0]
+    assert version["status"] == "cancelled"
+    assert version["audio_path"] is None
+    assert version["metadata"]["control_details"]["prompt_id"] == "prompt-api-cancel"
 
 
 def test_registered_comfyui_gpt_endpoint_allows_registry_owned_weights_in_preflight_and_job(tmp_path: Path) -> None:
