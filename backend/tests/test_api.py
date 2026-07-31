@@ -10,6 +10,7 @@ import httpx
 import app.main as main_module
 from app.models import Character, ScriptLine
 from app.main import _layer_service_status, _portable_controller_root, _resolve_repo_lock_path, create_app
+from app.open_source_tts import OpenSourceTTSConfigureRequest
 from app.parser import ParsedScriptDraft, ParserProviderUnavailable, ParserQualityError
 
 
@@ -1297,6 +1298,60 @@ def test_open_source_tts_catalog_lists_core_providers_in_priority_order(tmp_path
     assert providers[2]["api_contracts"] == ["comfyui-tts-audio-suite-v1", "tts-more-v1", "gradio-cosyvoice-webui"]
     assert providers[2]["default_resource_id"] == "cosyvoice-local"
     assert providers[2]["priority"] == 30
+
+
+def test_open_source_comfyui_request_defaults_to_single_gpu_capacity() -> None:
+    request = OpenSourceTTSConfigureRequest(
+        provider_type="indextts",
+        base_url="http://127.0.0.1:8188",
+        resource_id="indextts-local",
+    )
+
+    assert request.capacity == 1
+    assert request.resource_group == "comfyui-local-0"
+
+
+def test_open_source_comfyui_api_defaults_persist_single_gpu_capacity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def _fake_get(self, url, *args, **kwargs):
+        del self, args, kwargs
+        if url.endswith("/system_stats"):
+            return httpx.Response(200, json={"system": {"cuda": True}})
+        if url.endswith("/api/tts-audio-suite/v1/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol_version": 1,
+                    "resources": [
+                        {"resource_id": "indextts-local", "engine": "indextts", "ready": True}
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    monkeypatch.setattr("httpx.Client.get", _fake_get)
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.post(
+        "/api/open-source-tts/configure",
+        json={
+            "provider_type": "indextts",
+            "service_id": "comfyui-indextts-default",
+            "base_url": "http://127.0.0.1:8188",
+            "api_contract": "comfyui-tts-audio-suite-v1",
+            "resource_id": "indextts-local",
+        },
+    )
+
+    assert response.status_code == 200
+    service = response.json()["service"]
+    assert service["capacity"] == 1
+    assert service["resource_group"] == "comfyui-local-0"
+    saved = json.loads((tmp_path / "local" / "services.json").read_text(encoding="utf-8"))
+    saved_service = next(item for item in saved if item["service_id"] == "comfyui-indextts-default")
+    assert saved_service["capacity"] == 1
+    assert saved_service["resource_group"] == "comfyui-local-0"
 
 
 def test_open_source_tts_detect_ignores_repo_path_for_gradio_endpoint_onboarding(tmp_path: Path, monkeypatch) -> None:

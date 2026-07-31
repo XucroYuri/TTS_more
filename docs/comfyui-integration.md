@@ -42,7 +42,7 @@ flowchart TD
   "engine": "cosyvoice",
   "base_url": "http://127.0.0.1:8188",
   "resource_group": "local-gpu-0",
-  "capacity": 3,
+  "capacity": 1,
   "priority": 10,
   "capabilities": ["tts", "cosyvoice", "wav_output", "reference_audio_voice"],
   "default_params": {
@@ -63,7 +63,7 @@ flowchart TD
 | `engine` | 指定 TTS-Audio-Suite 工作流引擎，可选 `cosyvoice`、`indextts` 或 `gpt-sovits`。 |
 | `base_url` | ComfyUI 实例的访问地址。 |
 | `resource_group` | 资源组名称。同一实例的不同引擎应使用相同的资源组以确保 GPU 串行。 |
-| `capacity` | 并发容量。建议设置为 3，利用 ComfyUI 内部队列堆积任务。 |
+| `capacity` | 单 GPU 资源组的并发容量，默认设置为 1，避免同时装载多个重模型。 |
 | `priority` | 调度优先级，数值越小优先级越高。 |
 | `capabilities` | 服务能力列表。 |
 | `default_params` | 默认合成参数。 |
@@ -82,7 +82,7 @@ flowchart TD
     "engine": "cosyvoice",
     "base_url": "http://192.168.1.10:8188",
     "resource_group": "comfyui-gpu-0",
-    "capacity": 3,
+    "capacity": 1,
     "priority": 10,
     "capabilities": ["tts", "cosyvoice", "wav_output", "reference_audio_voice", "zero_shot_voice"]
   },
@@ -94,7 +94,7 @@ flowchart TD
     "engine": "indextts",
     "base_url": "http://192.168.1.10:8188",
     "resource_group": "comfyui-gpu-0",
-    "capacity": 3,
+    "capacity": 1,
     "priority": 20,
     "capabilities": ["tts", "indextts", "wav_output", "emotion_text", "emotion_audio"]
   },
@@ -106,7 +106,7 @@ flowchart TD
     "engine": "cosyvoice",
     "base_url": "http://192.168.1.11:8188",
     "resource_group": "comfyui-gpu-1",
-    "capacity": 3,
+    "capacity": 1,
     "priority": 10,
     "capabilities": ["tts", "cosyvoice", "wav_output"]
   }
@@ -148,7 +148,7 @@ flowchart TD
 
 - **拓扑示例**: 部署 3 台 GPU 机器，每台机器运行一个 ComfyUI 实例。
 - **分配策略**: 为每个实例分配唯一的 `resource_group`（如 `gpu-node-1`、`gpu-node-2`）。
-- **容量建议**: 建议设置 `capacity=3`。ComfyUI 内部队列可以处理积压任务，提高吞吐量。
+- **容量建议**: 每个单 GPU `resource_group` 设置 `capacity=1`。通过增加 ComfyUI 实例并使用不同资源组扩展并行能力。
 - **共享资源**: 单机多引擎共享资源组时，调度器会确保任务按序进入 GPU，防止显存溢出。
 
 ## 模型分离模式
@@ -307,7 +307,7 @@ cd frontend && pnpm install && cd ..
     "mode": "external",
     "network_scope": "localhost",
     "resource_group": "local-gpu-0",
-    "capacity": 3,
+    "capacity": 1,
     "priority": 10,
     "capabilities": ["tts", "cosyvoice", "wav_output", "reference_audio_voice"],
     "default_params": {"resource_id": "cosyvoice-local"}
@@ -322,7 +322,7 @@ cd frontend && pnpm install && cd ..
     "mode": "external",
     "network_scope": "localhost",
     "resource_group": "local-gpu-0",
-    "capacity": 3,
+    "capacity": 1,
     "priority": 20,
     "capabilities": ["tts", "indextts", "wav_output", "emotion_text", "emotion_audio"],
     "default_params": {"resource_id": "indextts-local"}

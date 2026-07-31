@@ -35,7 +35,7 @@ class OpenSourceTTSConfigureRequest(BaseModel):
     managed: bool = False
     enabled: bool = True
     resource_group: str = "comfyui-local-0"
-    capacity: int = Field(default=3, ge=1)
+    capacity: int = Field(default=1, ge=1)
     resource_id: str | None = None
     start_command: list[str] = Field(default_factory=list)
     start_cwd: str | None = None
