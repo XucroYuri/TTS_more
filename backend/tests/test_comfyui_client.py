@@ -246,6 +246,95 @@ class TestComfyUIAPIClient:
         assert result.converged is False
         assert requests.count(("POST", "/interrupt")) == 1
 
+    def test_cancel_prompt_caps_max_wait_at_thirty_seconds(
+        self,
+        monkeypatch,
+    ):
+        clock = {"now": 0.0}
+        requests: list[tuple[str, str]] = []
+        request_timeouts: list[float] = []
+        state = {"running": True}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            request_timeouts.append(request.extensions["timeout"]["connect"])
+            if request.url.path == "/queue":
+                running = [[1, "prompt-capped", {}, {}, []]] if state["running"] else []
+                clock["now"] = 30.0
+                return httpx.Response(
+                    200,
+                    json={"queue_running": running, "queue_pending": []},
+                )
+            if request.url.path == "/interrupt":
+                state["running"] = False
+                return httpx.Response(200, json={})
+            if request.url.path == "/history/prompt-capped":
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        monkeypatch.setattr("app.comfyui.client.time.monotonic", lambda: clock["now"])
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+
+        result = client.cancel_prompt("prompt-capped", max_wait=90.0)
+
+        assert requests == [("GET", "/queue")]
+        assert request_timeouts == [30.0]
+        assert result.converged is False
+        assert result.diagnostic == "ComfyUI cancellation deadline exhausted"
+
+    def test_cancel_prompt_passes_remaining_budget_to_each_http_request(
+        self,
+        monkeypatch,
+    ):
+        clock = {"now": 0.0}
+        state = {"running": True}
+        observed: list[tuple[str, str, float]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            observed.append(
+                (
+                    request.method,
+                    request.url.path,
+                    request.extensions["timeout"]["connect"],
+                )
+            )
+            if request.url.path == "/queue":
+                running = [[1, "prompt-budget", {}, {}, []]] if state["running"] else []
+                clock["now"] += 1.0
+                return httpx.Response(
+                    200,
+                    json={"queue_running": running, "queue_pending": []},
+                )
+            if request.url.path == "/interrupt":
+                state["running"] = False
+                clock["now"] += 1.0
+                return httpx.Response(200, json={})
+            if request.url.path == "/history/prompt-budget":
+                clock["now"] += 2.0
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        monkeypatch.setattr("app.comfyui.client.time.monotonic", lambda: clock["now"])
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+
+        result = client.cancel_prompt("prompt-budget", max_wait=5.0)
+
+        assert observed == [
+            ("GET", "/queue", 5.0),
+            ("POST", "/interrupt", 4.0),
+            ("GET", "/queue", 3.0),
+            ("GET", "/history/prompt-budget", 2.0),
+        ]
+        assert result.converged is False
+        assert result.final_state == "absent"
+        assert result.diagnostic == "ComfyUI cancellation deadline exhausted"
+
     def test_cancel_prompt_preserves_sanitized_post_interrupt_execution_error(self):
         prompt_id = "prompt-6"
         state = {"running": True}
@@ -468,6 +557,32 @@ class TestComfyUIAPIClient:
             "diagnostic": "cleanup failed",
         }
 
+    def test_poll_until_done_preserves_cancelled_type_when_cancel_prompt_raises(
+        self,
+        monkeypatch,
+    ):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+
+        def fail_cancel(prompt_id: str, max_wait: float = 30.0):
+            raise httpx.ConnectError(
+                "cleanup request failed?api_key=super-secret",
+            )
+
+        monkeypatch.setattr(client, "cancel_prompt", fail_cancel)
+
+        with pytest.raises(SynthesisCancelled) as caught:
+            client.poll_until_done(
+                "p-cancel-error",
+                max_wait=1.0,
+                cancel_check=lambda: True,
+            )
+
+        cancellation = caught.value.details["cancellation"]
+        assert cancellation["converged"] is False
+        assert cancellation["final_state"] == "error"
+        assert "super-secret" not in cancellation["diagnostic"]
+
     def test_poll_timeout_cancels_before_raising_timeout(self, monkeypatch):
         client = ComfyUIAPIClient("http://127.0.0.1:8188")
         monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
@@ -519,6 +634,33 @@ class TestComfyUIAPIClient:
         assert caught.value.code == "timeout"
         assert caught.value.details["cancellation"]["converged"] is False
         assert caught.value.details["cancellation"]["diagnostic"] == "cleanup failed"
+
+    def test_poll_timeout_preserves_timeout_type_when_cancel_prompt_raises(
+        self,
+        monkeypatch,
+    ):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+
+        def fail_cancel(prompt_id: str, max_wait: float = 30.0):
+            raise httpx.ConnectError(
+                "cleanup request failed password=super-secret",
+            )
+
+        monkeypatch.setattr(client, "cancel_prompt", fail_cancel)
+
+        with pytest.raises(SynthesisTimeout) as caught:
+            client.poll_until_done(
+                "p-timeout-error",
+                poll_interval=0.001,
+                max_wait=0.001,
+            )
+
+        cancellation = caught.value.details["cancellation"]
+        assert caught.value.code == "timeout"
+        assert cancellation["converged"] is False
+        assert cancellation["final_state"] == "error"
+        assert "super-secret" not in cancellation["diagnostic"]
 
     def test_poll_until_done_raises_comfyui_execution_error_when_completed_is_false(self):
         prompt_id = "e0e0579f-fc34-4397-a182-66bc0786e943"

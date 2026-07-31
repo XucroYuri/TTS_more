@@ -15,6 +15,13 @@ from app.adapters.base import (
 from app.net_guard import scrub_error
 
 
+_MAX_CANCELLATION_WAIT_SECONDS = 30.0
+
+
+class _CancellationDeadlineExceeded(TimeoutError):
+    pass
+
+
 @dataclass(frozen=True)
 class PromptCancellationResult:
     prompt_id: str
@@ -101,17 +108,31 @@ class ComfyUIAPIClient:
             prompt_id: str = data["prompt_id"]
             return prompt_id
 
-    def get_history(self, prompt_id: str) -> dict[str, Any]:
-        with httpx.Client(timeout=10.0, transport=self.transport) as client:
+    def get_history(
+        self,
+        prompt_id: str,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        with httpx.Client(timeout=timeout, transport=self.transport) as client:
             response = client.get(f"{self.base_url}/history/{prompt_id}")
             response.raise_for_status()
             return response.json()
 
-    def get_queue(self) -> dict[str, Any]:
-        with httpx.Client(timeout=10.0, transport=self.transport) as client:
+    def get_queue(self, *, timeout: float = 10.0) -> dict[str, Any]:
+        with httpx.Client(timeout=timeout, transport=self.transport) as client:
             response = client.get(f"{self.base_url}/queue")
             response.raise_for_status()
             return response.json()
+
+    @staticmethod
+    def _remaining_cancellation_budget(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _CancellationDeadlineExceeded(
+                "ComfyUI cancellation deadline exhausted"
+            )
+        return remaining
 
     @staticmethod
     def _queue_state(queue: dict[str, Any], prompt_id: str) -> str:
@@ -167,89 +188,127 @@ class ComfyUIAPIClient:
         max_wait: float = 30.0,
     ) -> PromptCancellationResult:
         started = time.monotonic()
-        initial_queue_state = self._queue_state(self.get_queue(), prompt_id)
+        deadline = started + min(
+            _MAX_CANCELLATION_WAIT_SECONDS,
+            max(0.0, max_wait),
+        )
+        initial_queue_state = "unknown"
+        final_queue_state = "unknown"
         actions: tuple[str, ...] = ()
 
-        if initial_queue_state == "absent":
-            terminal_state, diagnostic = self._history_state(
-                self.get_history(prompt_id),
-                prompt_id,
+        try:
+            initial_queue = self.get_queue(
+                timeout=self._remaining_cancellation_budget(deadline)
             )
-            final_state = terminal_state or "absent"
+            initial_queue_state = self._queue_state(initial_queue, prompt_id)
+            final_queue_state = initial_queue_state
+            self._remaining_cancellation_budget(deadline)
+
+            if initial_queue_state == "absent":
+                history = self.get_history(
+                    prompt_id,
+                    timeout=self._remaining_cancellation_budget(deadline),
+                )
+                self._remaining_cancellation_budget(deadline)
+                terminal_state, diagnostic = self._history_state(
+                    history,
+                    prompt_id,
+                )
+                final_state = terminal_state or "absent"
+                return PromptCancellationResult(
+                    prompt_id=prompt_id,
+                    initial_state=final_state,
+                    final_state=final_state,
+                    actions=actions,
+                    duration_seconds=time.monotonic() - started,
+                    converged=True,
+                    diagnostic=diagnostic,
+                )
+
+            action_timeout = self._remaining_cancellation_budget(deadline)
+            if initial_queue_state == "running":
+                actions = ("interrupt",)
+                action_path = "/interrupt"
+                action_payload = {"prompt_id": prompt_id}
+            else:
+                actions = ("delete",)
+                action_path = "/queue"
+                action_payload = {"delete": [prompt_id]}
+            with httpx.Client(
+                timeout=action_timeout,
+                transport=self.transport,
+            ) as client:
+                response = client.post(
+                    f"{self.base_url}{action_path}",
+                    json=action_payload,
+                )
+                response.raise_for_status()
+            self._remaining_cancellation_budget(deadline)
+
+            diagnostic: str | None = None
+            while True:
+                queue = self.get_queue(
+                    timeout=self._remaining_cancellation_budget(deadline)
+                )
+                final_queue_state = self._queue_state(queue, prompt_id)
+                self._remaining_cancellation_budget(deadline)
+                history = self.get_history(
+                    prompt_id,
+                    timeout=self._remaining_cancellation_budget(deadline),
+                )
+                self._remaining_cancellation_budget(deadline)
+                terminal_state, diagnostic = self._history_state(history, prompt_id)
+                if terminal_state == "error":
+                    return PromptCancellationResult(
+                        prompt_id,
+                        initial_queue_state,
+                        "error",
+                        actions,
+                        time.monotonic() - started,
+                        False,
+                        diagnostic,
+                    )
+                if final_queue_state == "absent":
+                    if terminal_state == "completed":
+                        final_state = "completed"
+                        converged = False
+                    else:
+                        final_state = (
+                            "interrupted"
+                            if actions == ("interrupt",)
+                            else "dequeued"
+                        )
+                        converged = terminal_state in (None, "interrupted")
+                    return PromptCancellationResult(
+                        prompt_id,
+                        initial_queue_state,
+                        final_state,
+                        actions,
+                        time.monotonic() - started,
+                        converged,
+                        diagnostic,
+                    )
+                now = time.monotonic()
+                if now >= deadline:
+                    raise _CancellationDeadlineExceeded(
+                        "ComfyUI cancellation deadline exhausted"
+                    )
+                time.sleep(min(0.25, deadline - now))
+        except Exception as exc:
+            final_state = (
+                final_queue_state
+                if isinstance(exc, _CancellationDeadlineExceeded)
+                else "error"
+            )
             return PromptCancellationResult(
                 prompt_id=prompt_id,
-                initial_state=final_state,
+                initial_state=initial_queue_state,
                 final_state=final_state,
                 actions=actions,
                 duration_seconds=time.monotonic() - started,
-                converged=True,
-                diagnostic=diagnostic,
+                converged=False,
+                diagnostic=scrub_error(exc, self.base_url),
             )
-
-        with httpx.Client(timeout=10.0, transport=self.transport) as client:
-            if initial_queue_state == "running":
-                response = client.post(
-                    f"{self.base_url}/interrupt",
-                    json={"prompt_id": prompt_id},
-                )
-                actions = ("interrupt",)
-            else:
-                response = client.post(
-                    f"{self.base_url}/queue",
-                    json={"delete": [prompt_id]},
-                )
-                actions = ("delete",)
-            response.raise_for_status()
-
-        deadline = started + max(0.0, max_wait)
-        final_queue_state = initial_queue_state
-        diagnostic: str | None = None
-        while True:
-            final_queue_state = self._queue_state(self.get_queue(), prompt_id)
-            terminal_state, diagnostic = self._history_state(
-                self.get_history(prompt_id),
-                prompt_id,
-            )
-            if terminal_state == "error":
-                return PromptCancellationResult(
-                    prompt_id,
-                    initial_queue_state,
-                    "error",
-                    actions,
-                    time.monotonic() - started,
-                    False,
-                    diagnostic,
-                )
-            if final_queue_state == "absent":
-                if terminal_state == "completed":
-                    final_state = "completed"
-                    converged = False
-                else:
-                    final_state = (
-                        "interrupted" if actions == ("interrupt",) else "dequeued"
-                    )
-                    converged = terminal_state in (None, "interrupted")
-                return PromptCancellationResult(
-                    prompt_id,
-                    initial_queue_state,
-                    final_state,
-                    actions,
-                    time.monotonic() - started,
-                    converged,
-                    diagnostic,
-                )
-            now = time.monotonic()
-            if now >= deadline:
-                return PromptCancellationResult(
-                    prompt_id,
-                    initial_queue_state,
-                    final_queue_state,
-                    actions,
-                    now - started,
-                    False,
-                    diagnostic,
-                )
-            time.sleep(min(0.25, deadline - now))
 
     def download_output(
         self,
@@ -291,7 +350,23 @@ class ComfyUIAPIClient:
         deadline = time.monotonic() + max_wait
 
         def cancellation_details() -> dict[str, Any]:
-            return asdict(self.cancel_prompt(prompt_id, max_wait=cancel_wait))
+            bounded_wait = min(
+                _MAX_CANCELLATION_WAIT_SECONDS,
+                max(0.0, cancel_wait),
+            )
+            try:
+                result = self.cancel_prompt(prompt_id, max_wait=bounded_wait)
+            except Exception as exc:
+                result = PromptCancellationResult(
+                    prompt_id=prompt_id,
+                    initial_state="unknown",
+                    final_state="error",
+                    actions=(),
+                    duration_seconds=0.0,
+                    converged=False,
+                    diagnostic=scrub_error(exc, self.base_url),
+                )
+            return asdict(result)
 
         def raise_cancelled() -> None:
             raise SynthesisCancelled(
