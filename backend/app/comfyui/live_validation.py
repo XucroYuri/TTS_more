@@ -16,6 +16,9 @@ from app.models import EngineName, ProviderType, ScriptLine, TTSServiceEndpoint
 from app.services import TTSServiceClient, build_service_client
 
 
+_MANDATED_COMFYUI_BASE_URL = "http://127.0.0.1:8188"
+
+
 @dataclass(frozen=True)
 class LiveValidationConfig:
     engine: Literal["gpt-sovits", "indextts", "cosyvoice"]
@@ -27,6 +30,10 @@ class LiveValidationConfig:
     output_path: Path
     evidence_path: Path
     timeout_seconds: float = 900.0
+
+    def __post_init__(self) -> None:
+        if self.base_url != _MANDATED_COMFYUI_BASE_URL:
+            raise ValueError(f"live validation must use {_MANDATED_COMFYUI_BASE_URL}")
 
 
 @dataclass

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,15 @@ def test_build_live_endpoint_uses_audio_suite_and_capacity_one(tmp_path):
     assert endpoint.default_params["resource_id"] == "indextts-local"
     assert endpoint.default_params["poll_interval"] == 2.0
     assert endpoint.default_params["timeout_seconds"] == config.timeout_seconds
+
+
+@pytest.mark.parametrize("base_url", ["http://127.0.0.1:8189", "http://192.168.1.10:8188"])
+def test_live_validation_config_requires_mandated_comfyui_url(tmp_path, base_url):
+    config = make_config(tmp_path)
+
+    assert config.base_url == "http://127.0.0.1:8188"
+    with pytest.raises(ValueError, match="must use http://127.0.0.1:8188"):
+        replace(config, base_url=base_url)
 
 
 def test_validate_audio_file_rejects_silence(tmp_path):
