@@ -161,6 +161,53 @@ class TestComfyUIAPIClient:
 
         assert str(error.value) == f"ComfyUI prompt failed: {exception_message}"
 
+    def test_poll_until_done_rejects_terminal_error_even_when_outputs_exist(self):
+        prompt_id = "prompt-with-stale-output"
+        exception_message = "IndexTTS subprocess timed out after producing a stale preview"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == f"/history/{prompt_id}"
+            return httpx.Response(
+                200,
+                json={
+                    prompt_id: {
+                        "outputs": {
+                            "4": {
+                                "audio": [
+                                    {
+                                        "filename": "stale.flac",
+                                        "subfolder": "",
+                                        "type": "output",
+                                    }
+                                ]
+                            }
+                        },
+                        "status": {
+                            "status_str": "error",
+                            "completed": False,
+                            "messages": [
+                                [
+                                    "execution_error",
+                                    {
+                                        "prompt_id": prompt_id,
+                                        "node_id": "3",
+                                        "node_type": "UnifiedTTSTextNode",
+                                        "exception_message": exception_message,
+                                    },
+                                ]
+                            ],
+                        },
+                    }
+                },
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            api = ComfyUIAPIClient("http://127.0.0.1:8188", transport=client._transport)
+            with pytest.raises(RuntimeError) as error:
+                api.poll_until_done(prompt_id, poll_interval=0.0, max_wait=0.01)
+
+        assert str(error.value) == f"ComfyUI prompt failed: {exception_message}"
+
     def test_download_output(self):
         wav_content = b"RIFF\x24\x00\x00\x00WAVEfake"
 
