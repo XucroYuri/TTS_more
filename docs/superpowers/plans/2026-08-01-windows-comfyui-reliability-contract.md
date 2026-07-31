@@ -299,38 +299,31 @@ git commit -m "feat: make external runner waits interruptible"
 - Consumes: `_communicate_with_control(process, engine_label)` from Task 1.
 - Produces: all three registered engine constructors initialize `interrupt_check`, all three subprocess paths have identical interruption/timeout semantics, and none retains a full-duration direct `communicate()` call.
 
-- [ ] **Step 1: Write one failing delegation test per engine**
+- [ ] **Step 1: Write one failing interrupt-behavior test per engine**
 
-Parameterize the source-level/behavior check so each proxy calls the shared method with its stable label:
+Use the existing `_prepare_external_index_runtime()`, GPT-SoVITS runtime, and CosyVoice runtime helpers to construct each real proxy with an injected `interrupt_check` that returns `False` once and then `True`. Replace only `subprocess.Popen` with a process double whose `communicate(timeout=...)` records every timeout, raises `TimeoutExpired` while running, and returns after the existing tree-termination path sets `returncode=-9`. Invoke the real public inference path for each engine and assert:
 
 ```python
-@pytest.mark.parametrize(
-    ("loader", "class_name", "method_name", "label"),
-    (
-        (_load_external_index_subprocess_module, "ExternalIndexTTSSubprocessProxy", "infer", "IndexTTS"),
-        (_load_external_gpt_subprocess_module, "ExternalGPTSovitsSubprocessProxy", "run", "GPT-SoVITS"),
-        (_load_external_cosyvoice_subprocess_module, "ExternalCosyVoiceSubprocessProxy", "_run", "CosyVoice"),
-    ),
-)
-def test_registered_external_engines_use_shared_controlled_wait(loader, class_name, method_name, label):
-    module = loader()
-    proxy_class = getattr(module, class_name)
-    source = inspect.getsource(getattr(proxy_class, method_name))
-    constructor_source = inspect.getsource(proxy_class.__init__)
-    assert "interrupt_check" in inspect.signature(proxy_class).parameters
-    assert "self.interrupt_check = interrupt_check or _comfyui_interrupt_requested" in constructor_source
-    assert f'_communicate_with_control(process, "{label}")' in source
-    assert "process.communicate(timeout=self.timeout_seconds)" not in source
+with pytest.raises(InterruptedError, match=engine_label):
+    invoke_real_engine(proxy)
+
+assert communicate_timeouts
+assert all(0 < timeout <= 0.25 for timeout in communicate_timeouts)
+assert terminated_processes == [created_process]
+assert created_process.returncode == -9
+assert not list(temp_root.iterdir())
 ```
+
+Name the three tests `test_registered_index_interrupts_during_sliced_wait`, `test_registered_gpt_sovits_interrupts_during_sliced_wait`, and `test_registered_cosyvoice_interrupts_during_sliced_wait`. The doubles isolate the external interpreter only; assertions target the real proxy's exception category, bounded wait slices, process-tree cleanup, and request-temp cleanup. Do not inspect or grep source text.
 
 - [ ] **Step 2: Run the delegation test and verify RED**
 
 ```powershell
 $env:COMFYUI_TESTING = '1'
-& F:\TTS-More\runtime\py312\python.exe -m pytest tests/unit/test_api_bridge_engine_nodes.py -k 'shared_controlled_wait' -q
+& F:\TTS-More\runtime\py312\python.exe -m pytest tests/unit/test_api_bridge_engine_nodes.py -k 'registered_ and sliced_wait' -q
 ```
 
-Expected: all three cases fail on the old direct wait.
+Expected: all three cases fail because the old direct waits ignore `interrupt_check`, use the full engine timeout, and raise `TimeoutError` instead of an interruption outcome.
 
 - [ ] **Step 3: Initialize each subclass callback and replace each direct wait**
 
