@@ -15,7 +15,13 @@ from typing import Any, Callable, Protocol, Sequence
 
 import httpx
 
-from app.adapters.base import SynthesisRequest, SynthesisResult
+from app.adapters.base import (
+    SynthesisCancelled,
+    SynthesisControlError,
+    SynthesisRequest,
+    SynthesisResult,
+    SynthesisTimeout,
+)
 from app.comfyui.output import publish_wav_atomic
 from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
 from app.net_guard import scrub_error
@@ -1888,6 +1894,8 @@ class ComfyUITTSClient:
     def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
         try:
             return self._synthesize_impl(request)
+        except SynthesisControlError:
+            raise
         except Exception as exc:
             raise RuntimeError(scrub_error(exc, self.endpoint.base_url)) from exc
 
@@ -1923,6 +1931,7 @@ class ComfyUITTSClient:
             "",
         )
         asset_id: str | None = None
+        prompt_id: str | None = None
         synthesis_error: Exception | None = None
         result: SynthesisResult | None = None
         try:
@@ -1937,7 +1946,10 @@ class ComfyUITTSClient:
             timeout = float(params.get("timeout_seconds", 600.0))
             poll_interval = float(params.get("poll_interval", 2.0))
             history_entry = self.api.poll_until_done(
-                prompt_id, poll_interval=poll_interval, max_wait=timeout
+                prompt_id,
+                poll_interval=poll_interval,
+                max_wait=timeout,
+                cancel_check=request.cancel_check,
             )
             output_files = self.api._extract_output_filenames(history_entry)
             if not output_files:
@@ -1966,6 +1978,8 @@ class ComfyUITTSClient:
             )
         except Exception as exc:
             synthesis_error = exc
+            if isinstance(exc, SynthesisCancelled) and prompt_id is not None:
+                self._emit_prompt_progress(request, prompt_id, "cancelling", 0.1)
         cleanup_error: Exception | None = None
         if asset_id:
             try:
@@ -1973,6 +1987,42 @@ class ComfyUITTSClient:
             except Exception as exc:
                 cleanup_error = exc
         if synthesis_error is not None:
+            if isinstance(synthesis_error, SynthesisControlError):
+                if cleanup_error is not None:
+                    synthesis_error.details["cleanup_error"] = scrub_error(
+                        cleanup_error,
+                        self.endpoint.base_url,
+                    )
+                control_prompt_id = str(
+                    synthesis_error.details.get("prompt_id") or prompt_id or ""
+                )
+                if isinstance(synthesis_error, SynthesisCancelled):
+                    self._emit_prompt_progress(
+                        request,
+                        control_prompt_id,
+                        "cancelled",
+                        0.1,
+                    )
+                elif isinstance(synthesis_error, SynthesisTimeout):
+                    self._emit_prompt_progress(
+                        request,
+                        control_prompt_id,
+                        "timeout",
+                        0.1,
+                    )
+                raise synthesis_error
+            if cleanup_error is not None:
+                primary_diagnostic = scrub_error(
+                    synthesis_error,
+                    self.endpoint.base_url,
+                )
+                cleanup_diagnostic = scrub_error(
+                    cleanup_error,
+                    self.endpoint.base_url,
+                )
+                raise RuntimeError(
+                    f"{primary_diagnostic}; asset cleanup failed: {cleanup_diagnostic}"
+                ) from synthesis_error
             raise synthesis_error
         if cleanup_error is not None:
             raise cleanup_error

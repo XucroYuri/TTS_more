@@ -992,6 +992,208 @@ class TestComfyUITTSClient:
         assert "POST /api/tts-audio-suite/v1/assets/audio" in call_log
         assert "DELETE /api/tts-audio-suite/v1/assets/audio/asset-1" in call_log
 
+    def test_comfy_service_preserves_cancel_type_and_deletes_asset_after_convergence(
+        self,
+        tmp_path: Path,
+    ):
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(_audio_bytes())
+        updates: list[dict[str, object]] = []
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-1", character_id="role", text="cancel me"),
+            profile="cosy-main",
+            output_path=tmp_path / "cancelled.wav",
+            parameters={
+                "engine": "cosyvoice",
+                "resource_id": "cosy-main",
+                "reference_audio": str(reference),
+            },
+            progress_callback=updates.append,
+            cancel_check=lambda: True,
+        )
+        client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint())
+        client._build_workflow = lambda _engine, _params: {
+            "1": {"class_type": "TestNode", "inputs": {}}
+        }
+        events: list[str] = []
+        client.api.upload_audio = lambda _path: {"asset_id": "asset-1"}
+        client.api.submit_workflow = lambda _workflow: "prompt-1"
+        cancellation = SynthesisCancelled(
+            "cancelled",
+            details={
+                "prompt_id": "prompt-1",
+                "cancellation": {"converged": True},
+            },
+        )
+
+        def poll_until_cancelled(
+            prompt_id: str,
+            poll_interval: float,
+            max_wait: float,
+            *,
+            cancel_check,
+        ):
+            assert poll_interval == 2.0
+            assert max_wait == 600.0
+            assert cancel_check is request.cancel_check
+            events.append(f"poll:{prompt_id}")
+            assert cancel_check()
+            events.append(f"cancel:{prompt_id}")
+            events.append(f"converged:{prompt_id}")
+            raise cancellation
+
+        client.api.poll_until_done = poll_until_cancelled
+        client.api.delete_audio = lambda asset_id: events.append(f"delete:{asset_id}")
+
+        with pytest.raises(SynthesisCancelled) as caught:
+            client.synthesize(request)
+
+        assert caught.value is cancellation
+        assert caught.value.code == "cancelled"
+        assert caught.value.details == {
+            "prompt_id": "prompt-1",
+            "cancellation": {"converged": True},
+        }
+        assert events == [
+            "poll:prompt-1",
+            "cancel:prompt-1",
+            "converged:prompt-1",
+            "delete:asset-1",
+        ]
+        assert [update["external_status"] for update in updates] == [
+            "queued",
+            "cancelling",
+            "cancelled",
+        ]
+
+    def test_comfy_service_cleanup_order_preserves_timeout_when_asset_delete_fails(
+        self,
+        tmp_path: Path,
+    ):
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(_audio_bytes())
+        updates: list[dict[str, object]] = []
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-2", character_id="role", text="time out"),
+            profile="cosy-main",
+            output_path=tmp_path / "timeout.wav",
+            parameters={
+                "engine": "cosyvoice",
+                "resource_id": "cosy-main",
+                "reference_audio": str(reference),
+                "timeout_seconds": 1.0,
+            },
+            progress_callback=updates.append,
+            cancel_check=lambda: False,
+        )
+        client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint())
+        client._build_workflow = lambda _engine, _params: {
+            "1": {"class_type": "TestNode", "inputs": {}}
+        }
+        events: list[str] = []
+        client.api.upload_audio = lambda _path: {"asset_id": "asset-timeout"}
+        client.api.submit_workflow = lambda _workflow: "prompt-timeout"
+        timeout = SynthesisTimeout(
+            "timed out",
+            details={
+                "prompt_id": "prompt-timeout",
+                "cancellation": {"converged": True},
+            },
+        )
+
+        def poll_until_timeout(
+            prompt_id: str,
+            poll_interval: float,
+            max_wait: float,
+            *,
+            cancel_check,
+        ):
+            assert poll_interval == 2.0
+            assert max_wait == 1.0
+            assert cancel_check is request.cancel_check
+            events.append(f"poll:{prompt_id}")
+            events.append(f"cancel:{prompt_id}")
+            events.append(f"converged:{prompt_id}")
+            raise timeout
+
+        def fail_delete(asset_id: str) -> None:
+            events.append(f"delete:{asset_id}")
+            raise RuntimeError("cleanup Authorization: Bearer cleanup-secret")
+
+        client.api.poll_until_done = poll_until_timeout
+        client.api.delete_audio = fail_delete
+
+        with pytest.raises(SynthesisTimeout) as caught:
+            client.synthesize(request)
+
+        assert caught.value is timeout
+        assert caught.value.code == "timeout"
+        assert caught.value.details["prompt_id"] == "prompt-timeout"
+        assert caught.value.details["cancellation"] == {"converged": True}
+        assert caught.value.details["cleanup_error"] == (
+            "cleanup Authorization: Bearer ***"
+        )
+        assert events == [
+            "poll:prompt-timeout",
+            "cancel:prompt-timeout",
+            "converged:prompt-timeout",
+            "delete:asset-timeout",
+        ]
+        assert [update["external_status"] for update in updates] == [
+            "queued",
+            "timeout",
+        ]
+
+    def test_comfy_service_cleanup_order_retains_scrubbed_primary_and_cleanup_diagnostics(
+        self,
+        tmp_path: Path,
+    ):
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(_audio_bytes())
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-3", character_id="role", text="fail"),
+            profile="cosy-main",
+            output_path=tmp_path / "failed.wav",
+            parameters={
+                "engine": "cosyvoice",
+                "resource_id": "cosy-main",
+                "reference_audio": str(reference),
+            },
+        )
+        client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint())
+        client._build_workflow = lambda _engine, _params: {
+            "1": {"class_type": "TestNode", "inputs": {}}
+        }
+        events: list[str] = []
+        client.api.upload_audio = lambda _path: {"asset_id": "asset-failed"}
+        client.api.submit_workflow = lambda _workflow: "prompt-failed"
+
+        def poll_until_failed(*_args, **_kwargs):
+            events.append("poll:prompt-failed")
+            events.append("converged:prompt-failed")
+            raise RuntimeError("primary Authorization: Bearer primary-secret")
+
+        def fail_delete(asset_id: str) -> None:
+            events.append(f"delete:{asset_id}")
+            raise RuntimeError("cleanup Authorization: Bearer cleanup-secret")
+
+        client.api.poll_until_done = poll_until_failed
+        client.api.delete_audio = fail_delete
+
+        with pytest.raises(RuntimeError) as caught:
+            client.synthesize(request)
+
+        diagnostic = str(caught.value)
+        assert "primary Authorization: Bearer ***" in diagnostic
+        assert "cleanup Authorization: Bearer ***" in diagnostic
+        assert "primary-secret" not in diagnostic
+        assert "cleanup-secret" not in diagnostic
+        assert events == [
+            "poll:prompt-failed",
+            "converged:prompt-failed",
+            "delete:asset-failed",
+        ]
+
     def test_synthesize_preserves_existing_output_when_downloaded_riff_is_corrupt(
         self,
         tmp_path: Path,
