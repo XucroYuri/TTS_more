@@ -4,6 +4,7 @@ import re
 import subprocess
 
 from fastapi.testclient import TestClient
+import yaml
 
 from app.main import create_app
 from app.models import GenerationManifest, GenerationVersion, ScriptLine, ScriptProject
@@ -129,6 +130,9 @@ def test_local_runtime_paths_are_gitignored() -> None:
         ".omc/state/example",
         ".omo/run-continuation/example",
         ".omx/state/example",
+        "resources.yaml",
+        "data/test_output/example.wav",
+        "backend/tests/test_output/example.wav",
     ]
 
     result = subprocess.run(
@@ -142,6 +146,27 @@ def test_local_runtime_paths_are_gitignored() -> None:
 
     assert result.returncode == 0
     assert ignored_paths == set(runtime_paths)
+
+
+def test_comfyui_bridge_template_and_live_audit_are_machine_neutral() -> None:
+    repo_root = _repo_root()
+    template_path = repo_root / "deployment" / "tts-repos" / "resources.yaml.example"
+    template_text = template_path.read_text(encoding="utf-8")
+    payload = yaml.safe_load(template_text)
+
+    assert payload == {"version": 1, "resources": {}}
+    assert re.search(r"[A-Za-z]:[\\/]", template_text) is None
+    assert "/home/" not in template_text
+    assert "/Users/" not in template_text
+
+    audit_text = (repo_root / "backend" / "tests" / "test_comfyui_adversarial_audit.py").read_text(
+        encoding="utf-8"
+    )
+    assert "TTS_MORE_LIVE_COMFYUI" in audit_text
+    assert "pytest.mark.skipif" in audit_text
+    assert "TTS_MORE_COMFYUI_URL" in audit_text
+    assert "TTS_MORE_TEST_OUTPUT" in audit_text
+    assert 'Path("D:/' not in audit_text
 
 
 def test_committable_character_template_is_empty() -> None:

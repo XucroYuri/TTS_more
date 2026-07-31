@@ -43,8 +43,13 @@ pytestmark = pytest.mark.skipif(
     reason="requires a live ComfyUI + TTS-Audio-Suite runtime",
 )
 
-COMFYUI_URL = "http://127.0.0.1:8188"
-TEST_OUTPUT = Path("D:/TTS/TTS_more-comfyui/data/test_output/audit")
+COMFYUI_URL = os.environ.get("TTS_MORE_COMFYUI_URL", "http://127.0.0.1:8188")
+TEST_OUTPUT = Path(
+    os.environ.get(
+        "TTS_MORE_TEST_OUTPUT",
+        str(Path(__file__).resolve().parent / "test_output"),
+    )
+) / "audit"
 TEST_OUTPUT.mkdir(parents=True, exist_ok=True)
 
 
@@ -59,7 +64,7 @@ def _endpoint(**overrides) -> TTSServiceEndpoint:
         "mode": "external",
         "network_scope": "localhost",
         "resource_group": "audit-gpu-0",
-        "capacity": 3,
+        "capacity": 1,
         "priority": 10,
         "default_params": {"poll_interval": 1.0},
         "capabilities": ["tts", "cosyvoice", "wav_output"],

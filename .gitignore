@@ -60,3 +60,7 @@ data/projects/*/audio/
 *.log
 *.egg-info/
 .zcode/
+# Machine-local TTS-Audio-Suite bridge registry and live-test outputs.
+resources.yaml
+data/test_output/
+backend/tests/test_output/

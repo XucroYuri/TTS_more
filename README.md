@@ -144,6 +144,18 @@ export TTS_MORE_RUN_REAL_TTS=1
 
 真实 TTS pytest 不能替代正式 CUDA 认证。Windows 单机只从 [单机 CUDA Runbook](docs/cuda-e2e-single-node.md) 复制命令；四机可信 LAN 见 [分布式 Runbook](docs/cuda-e2e-distributed.md)；门禁和证据语义见 [CUDA 验证契约](docs/cuda-e2e-validation.md)。macOS 和普通 hosted CI 不能签发 Windows CUDA 认证。
 
+### ComfyUI 开发与验证变量
+
+| 变量 | 用途 | 示例 |
+| :--- | :--- | :--- |
+| `TTS_AUDIO_SUITE_INSTALL_PROFILE` | 安装 TTS More 所需的精简插件依赖 | `tts_more_targets` |
+| `TTS_AUDIO_SUITE_RESOURCES` | 指向本机的 TTS-Audio-Suite 资源注册文件 | `<workspace>/resources.yaml` |
+| `TTS_MORE_LIVE_COMFYUI` | 显式启用需要真实 ComfyUI 与模型的 live pytest | `1` |
+| `TTS_MORE_COMFYUI_URL` | 覆盖 live pytest 的 ComfyUI 地址 | `http://127.0.0.1:8188` |
+| `TTS_MORE_TEST_OUTPUT` | 覆盖 live pytest 的输出根目录 | `<temp>/tts-more-tests` |
+
+从 [`deployment/tts-repos/resources.yaml.example`](deployment/tts-repos/resources.yaml.example) 复制本机 `resources.yaml`，填写官方 TTS checkout 与模型路径后再启动 ComfyUI。该文件包含机器私有路径并已被 Git 忽略。
+
 ## 服务模式
 
 默认真实网络 endpoint 模式：本地和远端服务都通过 `data/services.json` 里的 `base_url` 调用；未启动的服务显示为未就绪，不会被调度。商业 TSS（OpenAI/Gemini/xAI/火山）作为一等服务，key 只存在 `.env.local`，`services.json` 只引用 env 变量名。

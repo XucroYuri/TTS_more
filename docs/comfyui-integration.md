@@ -2,7 +2,7 @@
 
 ## 概述
 
-ComfyUI 在 TTS More 体系中被定位为统一的 TTS 运行载体。通过集成 TTS-Audio-Suite 插件，ComfyUI 能够整合 GPT-SoVITS、IndexTTS-2 和 CosyVoice3 等多种引擎。这种架构使用 ComfyUI 内置的任务队列实现多引擎并行调度，为复杂的工作流提供稳定的推理环境。
+ComfyUI 在 TTS More 体系中被定位为统一的 TTS 运行载体。通过集成 TTS-Audio-Suite 插件，ComfyUI 能够整合 GPT-SoVITS、IndexTTS-2 和 CosyVoice 等多种引擎。这种架构使用 ComfyUI 内置的任务队列执行工作流；TTS More 在单 GPU `resource_group` 上保持 `capacity=1`，避免多个重模型并发争用显存。
 
 ## 架构
 
@@ -17,7 +17,7 @@ flowchart TD
     Plugin --> Engines["TTS 引擎"]
     Engines --> GS["GPT-SoVITS"]
     Engines --> IT["IndexTTS-2"]
-    Engines --> CV["CosyVoice3"]
+    Engines --> CV["CosyVoice"]
 ```
 
 每个 ComfyUI 实例对应一个 `resource_group`。系统支持多设备并行执行，通过调度器将任务分发至不同的 GPU 资源。
@@ -25,8 +25,29 @@ flowchart TD
 ## 前置条件
 
 1. ComfyUI 已安装并运行，默认端口为 8188。
-2. TTS-Audio-Suite 插件已安装。用户可以在 ComfyUI Manager 中搜索 "TTS Audio Suite" 进行一键安装。
-3. CosyVoice3 模型已准备就绪。首次使用时系统会自动下载约 5.4GB 的模型文件。
+2. 已从 `XucroYuri/TTS-Audio-Suite` 安装包含 TTS More API bridge 的 v5.6.2 或更新版本；上游同名插件不包含这个 fork 专用契约。
+3. GPT-SoVITS、IndexTTS 和 CosyVoice 的官方 checkout、兼容的 checkout-local Python 环境及模型均已准备就绪。TTS More 只通过资源注册表引用它们，不修改三个上游项目。
+4. 已创建本机 `resources.yaml` 并设置 `TTS_AUDIO_SUITE_RESOURCES`，或将文件放入 ComfyUI 用户目录的 `tts_audio_suite/resources.yaml`。
+
+### Bridge API 资源配置
+
+从 TTS More 根目录复制模板并把 `resources: {}` 替换为本机实际资源：
+
+```powershell
+Copy-Item deployment\tts-repos\resources.yaml.example .\resources.yaml
+$env:TTS_AUDIO_SUITE_RESOURCES = (Resolve-Path .\resources.yaml).Path
+```
+
+```bash
+cp deployment/tts-repos/resources.yaml.example ./resources.yaml
+export TTS_AUDIO_SUITE_RESOURCES="$(pwd)/resources.yaml"
+```
+
+资源 ID 是 TTS More 与插件之间的稳定模型标识。源码路径、权重路径和解释器路径只存在于本机注册文件中，不写入 `services.json`，也不得提交。修改注册文件后重启 ComfyUI，然后验证：
+
+```bash
+curl http://127.0.0.1:8188/api/tts-audio-suite/v1/capabilities
+```
 
 ## 快速开始
 
@@ -76,11 +97,11 @@ flowchart TD
 [
   {
     "service_id": "comfyui-gpu0-cosyvoice",
-    "display_name": "ComfyUI GPU0 - CosyVoice3",
+    "display_name": "ComfyUI GPU0 - CosyVoice",
     "provider_type": "cosyvoice",
     "api_contract": "comfyui-tts-audio-suite-v1",
     "engine": "cosyvoice",
-    "base_url": "http://192.168.1.10:8188",
+    "base_url": "http://<gpu-host-0>:8188",
     "resource_group": "comfyui-gpu-0",
     "capacity": 1,
     "priority": 10,
@@ -92,7 +113,7 @@ flowchart TD
     "provider_type": "indextts",
     "api_contract": "comfyui-tts-audio-suite-v1",
     "engine": "indextts",
-    "base_url": "http://192.168.1.10:8188",
+    "base_url": "http://<gpu-host-0>:8188",
     "resource_group": "comfyui-gpu-0",
     "capacity": 1,
     "priority": 20,
@@ -100,11 +121,11 @@ flowchart TD
   },
   {
     "service_id": "comfyui-gpu1-cosyvoice",
-    "display_name": "ComfyUI GPU1 - CosyVoice3",
+    "display_name": "ComfyUI GPU1 - CosyVoice",
     "provider_type": "cosyvoice",
     "api_contract": "comfyui-tts-audio-suite-v1",
     "engine": "cosyvoice",
-    "base_url": "http://192.168.1.11:8188",
+    "base_url": "http://<gpu-host-1>:8188",
     "resource_group": "comfyui-gpu-1",
     "capacity": 1,
     "priority": 10,
@@ -153,13 +174,11 @@ flowchart TD
 
 ## 模型分离模式
 
-系统支持模型存放位置与 ComfyUI 运行载体分离，方便管理大规模模型库。
+模型、官方推理源码和 ComfyUI 可以位于不同目录。`resources.yaml` 中的 `source_root` 指向官方 TTS checkout，`model_dir` 或权重字段指向现有模型。插件把官方项目当作推理库调用，不需要启动它们的 WebUI，也不修改这些项目。
 
-- `model_path`: 支持内置模型名（如 `Fun-CosyVoice3-0.5B-RL`）或本地路径（格式为 `local:ModelName`）。
-- 可选参数: `cosyvoice_home`、`index_tts_home` 和 `gpt_sovits_home` 可指向外部模型目录。
-
-示例配置：
-将 CosyVoice 模型放置在 `D:\CosyVoice\pretrained_models\`，并在配置中指定该路径。
+- CosyVoice / IndexTTS：配置 `source_root` 与 `model_dir`。
+- GPT-SoVITS：配置 `source_root`、GPT/SoVITS 权重以及 BERT/CNHuBERT 模型目录。
+- 默认使用各 checkout 的 `.venv`；GPT-SoVITS 也可通过私有 `python_executable` 字段指定兼容解释器。
 
 ## 参考音频与音色克隆
 
@@ -194,11 +213,11 @@ ComfyUITTSClient 封装了与 ComfyUI 的交互逻辑：
 
 ## 故障排查
 
-- **静音输出**: CosyVoice 需要参考音频才能生成有声音频。检查 `reference_audio` 参数是否正确配置，文件是否存在于 ComfyUI `input` 目录。如果未提供参考音频，系统会自动 fallback 到内置中文语音，若仍静音请检查 TTS-Audio-Suite 插件版本是否包含该语音文件。
+- **静音输出**: CosyVoice 零样本模式需要有效参考音频和对应文本。确认资产上传成功、`resource_id` 正确，并检查 `/history/{prompt_id}` 的节点错误。
 - **超时错误**: 默认超时时间为 600 秒（`timeout_seconds`）。`lowvram` 模式下模型加载较慢，连续高并发请求可能触发超时，建议适当增大超时或降低并发。
 - **性能下降**: 在 `--lowvram` 模式下，每次请求会重新加载模型。避免连续发送大量高并发请求，可通过 ComfyUI 启动参数 `--highvram` 或 `--normalvram` 改善。
 - **崩溃恢复**: ComfyUI 进程崩溃后需手动重启。TTS More 会在下次请求时检测到连接失败并报错，不会自动重启 ComfyUI 进程。
-- **模型下载**: 首次使用某引擎时，TTS-Audio-Suite 会自动下载模型（如 CosyVoice3 ~5.4GB）。下载期间请求会挂起，请耐心等待或提前下载模型到 `ComfyUI/models/TTS/` 目录。
+- **资源未就绪**: 调用 capabilities 端点检查三个 `resource_id` 是否 `ready`。Bridge 模式不会替你启动三个项目的 WebUI；缺失的 checkout-local 环境或模型路径会在 ComfyUI 启动/执行日志中明确报错。
 
 ## 安全
 
@@ -216,11 +235,11 @@ ComfyUITTSClient 封装了与 ComfyUI 的交互逻辑：
 | **TTS More** | `XucroYuri/TTS_more` (`master`) | TTS 编排后端 + React 工作台 | 是 |
 | **ComfyUI** | `Comfy-Org/ComfyUI` | TTS 运行载体，提供 HTTP API 和工作流引擎 | 是 |
 | **TTS-Audio-Suite** | `XucroYuri/TTS-Audio-Suite` | 基于上游完整架构扩展的正式 fork；保留 15+ 引擎并提供 TTS More API bridge | 是 |
-| **GPT-SoVITS** | `XucroYuri/GPT-SoVITS` | GPT-SoVITS 模型权重来源（传统 worker 路径；ComfyUI 路径下可选） | 否 |
-| **IndexTTS** | `XucroYuri/index-tts` | IndexTTS 模型权重来源（传统 worker 路径；ComfyUI 路径下可选） | 否 |
-| **CosyVoice** | `XucroYuri/CosyVoice` | CosyVoice 模型权重来源（传统 worker 路径；ComfyUI 路径下可选） | 否 |
+| **GPT-SoVITS 官方 checkout + 模型** | 官方架构 | 仅在启用 GPT-SoVITS 资源时需要；作为推理库和模型来源，不启动 WebUI | 按引擎 |
+| **IndexTTS 官方 checkout + 模型** | 官方架构 | 仅在启用 IndexTTS 资源时需要；作为推理库和模型来源，不启动 WebUI | 按引擎 |
+| **CosyVoice 官方 checkout + 模型** | 官方架构 | 仅在启用 CosyVoice 资源时需要；作为推理库和模型来源，不启动 WebUI | 按引擎 |
 
-> ComfyUI 路径下，TTS-Audio-Suite 会自动下载所需模型（首次使用）。GPT-SoVITS / IndexTTS / CosyVoice 三个 repo 仅在传统 worker 模式或模型分离模式下需要。
+> 三个 TTS checkout 的代码保持官方状态；TTS More 和 TTS-Audio-Suite 只通过稳定路径调用它们。仅有模型文件通常不足以复现官方预处理与推理流程，因此保留 checkout-local 推理环境，但无需三个 WebUI 服务。
 
 ### 架构关系
 
@@ -228,11 +247,8 @@ ComfyUITTSClient 封装了与 ComfyUI 的交互逻辑：
 flowchart TD
     TM["XucroYuri/TTS_more<br/>TTS 编排层"] -- "HTTP API" --> CF["Comfy-Org/ComfyUI<br/>工作流引擎"]
     CF -- "插件加载" --> TAS["XucroYuri/TTS-Audio-Suite<br/>完整上游节点 + API bridge"]
-    TAS -- "引擎调用" --> M["模型层<br/>CosyVoice3 / IndexTTS-2 / GPT-SoVITS"]
-    M -- "自动下载" --> DL["HuggingFace / ModelScope<br/>模型权重"]
-    TM -. "传统路径 (可选)" .-> GS["XucroYuri/GPT-SoVITS"]
-    TM -. "传统路径 (可选)" .-> IT["XucroYuri/index-tts"]
-    TM -. "传统路径 (可选)" .-> CV["XucroYuri/CosyVoice"]
+    TAS -- "读取本机资源注册表" --> RR["resources.yaml<br/>稳定 resource_id"]
+    RR --> M["官方 checkout + 模型<br/>CosyVoice / IndexTTS-2 / GPT-SoVITS"]
 ```
 
 ### 部署步骤
@@ -244,9 +260,8 @@ flowchart TD
 git clone https://github.com/Comfy-Org/ComfyUI.git
 cd ComfyUI
 
-# 创建虚拟环境并安装依赖
+# 创建虚拟环境；PyTorch/CUDA 组合按 ComfyUI 官方说明和本机驱动选择
 python -m venv .venv
-.venv\Scripts\pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 .venv\Scripts\pip install -r requirements.txt
 ```
 
@@ -255,7 +270,6 @@ macOS / Linux：
 git clone https://github.com/Comfy-Org/ComfyUI.git
 cd ComfyUI
 python3 -m venv .venv
-.venv/bin/pip install torch torchvision torchaudio
 .venv/bin/pip install -r requirements.txt
 ```
 
@@ -265,19 +279,23 @@ python3 -m venv .venv
 cd ComfyUI/custom_nodes
 git clone https://github.com/XucroYuri/TTS-Audio-Suite.git
 cd TTS-Audio-Suite
-..\..\.venv\Scripts\pip install -r requirements.txt
+$env:TTS_AUDIO_SUITE_INSTALL_PROFILE = "tts_more_targets"
+..\..\.venv\Scripts\python.exe install.py
 ```
 
-创建仅保存在本机的 `resources.yaml`，为三个引擎配置稳定 `resource_id` 与本地源码/模型路径；启动 ComfyUI 前设置 `TTS_AUDIO_SUITE_RESOURCES` 指向该文件。TTS More 只读取资源 ID，不接收这些私有路径。
+`tts_more_targets` 只安装并注册 TTS More 工作流所需的桥接节点，降低 ComfyUI 主环境的依赖冲突面；完整插件源码和上游引擎仍保留。安装器完成后运行 `..\..\.venv\Scripts\python.exe -m pip check`。
 
 #### 第三步：启动 ComfyUI
 
 ```powershell
 cd ComfyUI
-.venv\Scripts\python main.py --listen 0.0.0.0 --port 8188
+$env:TTS_AUDIO_SUITE_RESOURCES = "<absolute-path-to-resources.yaml>"
+.venv\Scripts\python main.py --listen 127.0.0.1 --port 8188
 ```
 
-验证：浏览器打开 `http://127.0.0.1:8188`，在节点列表搜索 "CosyVoice" 确认插件已加载。
+验证 capabilities 返回目标资源且 `ready=true`，并确认 ComfyUI `/object_info` 包含 `TTSExternalGPTSovitsEngine`、`TTSExternalIndexTTSEngine`、`TTSExternalCosyVoiceEngine`、`TTSExternalAudioAsset`、`UnifiedTTSTextNode` 和 `SaveAudio`。
+
+只有确实需要局域网访问时才改用 `--listen 0.0.0.0`，并同时配置主机防火墙、可信网段和反向代理认证；ComfyUI 原生端点不应直接暴露到公网。
 
 #### 第四步：安装 TTS More
 
@@ -299,7 +317,7 @@ cd frontend && pnpm install && cd ..
 [
   {
     "service_id": "comfyui-cosyvoice",
-    "display_name": "ComfyUI - CosyVoice3",
+    "display_name": "ComfyUI - CosyVoice",
     "provider_type": "cosyvoice",
     "api_contract": "comfyui-tts-audio-suite-v1",
     "engine": "cosyvoice",
@@ -344,7 +362,7 @@ cd frontend && pnpm dev
 
 #### 第七步：首次合成测试
 
-在工作台创建项目 → 添加台词 → 选择 CosyVoice 引擎 → 点击生成。首次使用会自动下载 CosyVoice3 模型（~5.4GB），后续合成约 3 秒/条。
+在工作台创建项目 → 添加台词 → 选择 CosyVoice 引擎 → 点击生成。验收至少包括：ComfyUI prompt 成功、前端历史出现记录、下载到非空 WAV，并在结束后确认插件 runtime 与临时资产均已释放。不要用 `/health` 或 capabilities 单独代替真实合成证据。
 
 ### 多机扩展
 
@@ -355,7 +373,7 @@ cd frontend && pnpm dev
 ```json
 {
   "service_id": "comfyui-gpu1-cosyvoice",
-  "base_url": "http://192.168.1.11:8188",
+  "base_url": "http://<gpu-host>:8188",
   "resource_group": "comfyui-gpu-1",
   ...
 }

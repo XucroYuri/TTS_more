@@ -1,9 +1,10 @@
 # ComfyUI local TTS validation report
 
-> Final status (Task 9, 2026-08-01): deterministic gates, the fresh direct CLI
-> rerun, the visible browser rerun, and the post-release browser rerun are
-> complete on the recorded local source/runtime. This is a functional and
-> lifecycle validation, subject to the limitations at the end of this report.
+> Current final status (2026-08-01): the original Task 9 deterministic/direct/
+> browser validation and the later TTS-Audio-Suite upstream 5.6.2 integration
+> refresh are complete. The refresh adds six fresh direct runs and a merged,
+> four-platform-green plugin PR. This is a functional and lifecycle validation,
+> subject to the limitations at the end of this report.
 
 ## Result boundary
 
@@ -36,8 +37,8 @@ its application/job/history/audio evidence is recorded below.
 
 | Component | Revision / runtime | Final state |
 | --- | --- | --- |
-| TTS More | `e546f8da5bb000b160084386cc1ee2933a8e6c28` | validated product source; the final report was committed afterward as a documentation-only change |
-| TTS-Audio-Suite | `372066c735084ff22b157f270ae05353b643e0c7` | clean; 15 commits ahead of the existing local `origin/main` tracking ref |
+| TTS More | `9cc86ceaa78d4e6f2133143af84bb40662722ba0` | upstream-5.6.2 refresh source; prior browser validation used `e546f8d`; report/governance changes followed |
+| TTS-Audio-Suite | `107213edf6fcbebabfa56a3e0284fec8f2cf9b55` | merged `main` from PR #3; live synthesis used product-equivalent `4537b42` before the final CI/test-only commits |
 | official ComfyUI | `5cc026f5b81b3f01fe7a1438a0fd4131d2ebda25` | clean; local tracking divergence `0/0` |
 | official GPT-SoVITS checkout | `f8a5865c472c0d21c204965a9bb6e002aceb36fe` | exactly two pre-existing metadata-dirty files preserved; 64 behind the existing tracking ref |
 | official IndexTTS checkout | `3c7c3dee516800511bb9ea3dccef22a1e710c05b` | pre-existing untracked configuration/data/reference paths preserved; 66 behind |
@@ -46,6 +47,53 @@ its application/job/history/audio evidence is recorded below.
 Remote refs were not fetched during the final boundary capture; ahead/behind
 values above describe the already-present local tracking refs, not a claim
 about current remote tips.
+
+## Upstream 5.6.2 integration refresh
+
+The plugin refresh merged upstream `Version 5.6.2` while retaining the TTS More
+three-engine resource bridge, the target install profile, the FFmpeg/FFprobe
+preflight, and dynamic ComfyUI `TTS` model-path discovery. The merged pull
+request is `XucroYuri/TTS-Audio-Suite#3`, merge commit `107213e`. Official
+ComfyUI and the three official TTS checkouts were not modified.
+
+The exact product code at plugin commit `4537b42` completed two fresh requests
+per engine. The later merge commit only adds CI dependency coverage and
+cross-platform test corrections, so these results apply to the merged product
+code without claiming that test-only changes were separately synthesized.
+
+| Engine / run | Prompt | Result |
+| --- | --- | --- |
+| GPT-SoVITS 1 | `16dbbb0a-b1e7-4b34-99a5-6623aa90a6e7` | 352,044-byte WAV; 32,000 Hz; 176,000 frames; peak 0.89746; 39.75 s |
+| GPT-SoVITS 2 | `5b2db6e4-da17-4e45-8d1f-3d797458f1d1` | 410,924-byte WAV; 32,000 Hz; 205,440 frames; peak 0.90137; 39.64 s |
+| IndexTTS 1 | `ed9cee0b-c6f9-4a66-8154-bf98cf059ee3` | 356,396-byte WAV; 22,050 Hz; 178,176 frames; peak 0.76141; 134.80 s |
+| IndexTTS 2 | `d78e34ad-0192-4ba8-b90c-309b7ada5a7f` | 292,396-byte WAV; 22,050 Hz; 146,176 frames; peak 0.82773; 47.30 s |
+| CosyVoice 1 | `74327325-b5e4-4963-911d-cc3e0a9170f6` | 318,252-byte WAV; 24,000 Hz; 159,104 frames; peak 0.57471; 104.54 s |
+| CosyVoice 2 | `b80941ec-4361-41e1-bd81-b136f63e7933` | 260,852-byte WAV; 24,000 Hz; 130,404 frames; peak 0.52350; 32.05 s |
+
+All six evidence files report `status=passed` and `cleanup_error=null`; the
+queue and Bridge runtime registry were empty afterward. Evidence remains under
+the machine-private `2026-08-01-remote-integration` validation directory and is
+not committed.
+
+Additional issues found during the refresh:
+
+- The existing portable ComfyUI runtime failed under `PYTHONNOUSERSITE=1` with
+  missing SQLAlchemy. It is therefore not considered self-contained. The
+  authoritative runs used the isolated ComfyUI venv, whose target-profile
+  install and `pip check` passed.
+- An initial GPT wrapper timed out before its outer deadline, although ComfyUI
+  later completed the prompt. It was excluded; the two tabled GPT runs used a
+  corrected outer timeout.
+- Minimal CI initially omitted the declared `psutil` process-cleanup
+  dependency, hiding Qwen3/RVC node registration. After installing it, CI
+  exposed Windows-only interpreter fixtures and an exact floating-point timing
+  assertion. CI now installs the core dependency, uses platform-native venv
+  paths, and checks a bounded grace interval.
+- The final plugin gate is 326 passed / 2 skipped locally, and the PR passed
+  Ubuntu and Windows on Python 3.12 and 3.13.
+- Draft Audio8/VoxCPM work found on other remote branches was deliberately not
+  merged: it is outside the validated three-engine bridge and needs a separate
+  architecture and model-runtime acceptance cycle.
 
 The validated host used an NVIDIA GeForce RTX 4060 Ti with driver 591.86.
 ComfyUI used Python 3.12.3, PyTorch 2.7.1+cu128, and CUDA 12.8. TTS More and the
