@@ -75,6 +75,20 @@ queue and Bridge runtime registry were empty afterward. Evidence remains under
 the machine-private `2026-08-01-remote-integration` validation directory and is
 not committed.
 
+After PR #3 merged, the ComfyUI custom-node link was restored to local plugin
+`main` at `107213e` and one final fresh request per engine was executed:
+
+| Engine | Prompt | Merged-main result |
+| --- | --- | --- |
+| GPT-SoVITS | `413a78fd-620f-443e-86ba-8f1a384f435e` | 49,964-byte WAV; 32,000 Hz; 24,960 frames; peak 0.37915; 38.82 s |
+| IndexTTS | `c828019e-3454-4a9c-a467-33f129136824` | 264,748-byte WAV; 22,050 Hz; 132,352 frames; peak 0.67816; 66.07 s |
+| CosyVoice | `3ea96713-38f2-40a5-92f4-f2808c5533be` | 259,736-byte WAV; 24,000 Hz; 129,846 frames; peak 0.56506; 38.48 s |
+
+All three merged-main evidence files passed with no cleanup error; the final
+ComfyUI queue and Bridge runtime registry were empty. This is the authoritative
+post-merge smoke regression, while the earlier six-run set remains the stronger
+repeatability evidence.
+
 Additional issues found during the refresh:
 
 - The existing portable ComfyUI runtime failed under `PYTHONNOUSERSITE=1` with
