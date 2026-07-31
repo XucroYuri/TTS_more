@@ -3,11 +3,12 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
 from app.adapters.base import SynthesisCancelled, SynthesisRequest, SynthesisResult, SynthesisTimeout
-from app.models import EngineName, GenerationManifest, GenerationTask, ProviderType, ScriptLine, TTSServiceEndpoint
+from app.models import EngineName, GenerationManifest, GenerationTask, GenerationVersion, ProviderType, ScriptLine, TTSServiceEndpoint
 from app.queue import GenerationJobManager, ServiceGenerationQueue
 from app.services import ServiceRoute
 
@@ -112,6 +113,30 @@ class MemoryStore:
     def save_manifest(self, manifest: GenerationManifest) -> None:
         self.save_calls += 1
         self.manifest = manifest
+
+
+class SnapshotStore(MemoryStore):
+    """Production-faithful manifest store: every load/save crosses a copy boundary."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self._store_lock = threading.Lock()
+        self._line_saved_events: dict[str, threading.Event] = {}
+
+    def line_saved_event(self, line_key: str) -> threading.Event:
+        with self._store_lock:
+            return self._line_saved_events.setdefault(line_key, threading.Event())
+
+    def load_manifest(self, _project_id: str) -> GenerationManifest:
+        with self._store_lock:
+            return self.manifest.model_copy(deep=True)
+
+    def save_manifest(self, manifest: GenerationManifest) -> None:
+        with self._store_lock:
+            self.save_calls += 1
+            self.manifest = manifest.model_copy(deep=True)
+            for line_key in self.manifest.lines:
+                self._line_saved_events.setdefault(line_key, threading.Event()).set()
 
 
 def endpoint(service_id: str, engine: EngineName, resource_group: str) -> TTSServiceEndpoint:
@@ -932,3 +957,303 @@ def test_cancel_fails_closed_when_uncommitted_output_cannot_be_removed(
     assert version.metadata["control_details"]["prompt_id"] == "prompt-locked-output"
     assert "local-secret" not in str(version.metadata)
     assert "password=***" in version.metadata["control_details"]["output_cleanup_error"]
+
+
+def test_fix_round_1_concurrent_snapshot_saves_preserve_cancelled_and_completed_lines(tmp_path: Path) -> None:
+    cancel_started = threading.Event()
+    cancel_release = threading.Event()
+    complete_started = threading.Event()
+    complete_release = threading.Event()
+
+    class CancelClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            cancel_started.set()
+            assert request.cancel_check is not None
+            assert cancel_release.wait(3)
+            raise SynthesisCancelled(
+                "cancelled after prompt convergence",
+                details={"prompt_id": "prompt-snapshot-a", "converged": True},
+            )
+
+    class CompleteClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            complete_started.set()
+            assert complete_release.wait(3)
+            return super().synthesize(request)
+
+    cancel_client = CancelClient(endpoint("cancel-service", EngineName.GPT_SOVITS, "gpu-a"))
+    complete_client = CompleteClient(endpoint("complete-service", EngineName.INDEX_TTS, "gpu-b"))
+    store = SnapshotStore(tmp_path)
+    manager = GenerationJobManager(
+        ServiceGenerationQueue(StaticRouter({"cancel-service": cancel_client, "complete-service": complete_client})),
+        store,
+    )
+    cancelled_job = manager.submit("demo", [task("cancel-line", EngineName.GPT_SOVITS, "cancel-profile", "cancel-service")])
+    assert cancel_started.wait(3)
+    completed_job = manager.submit("demo", [task("complete-line", EngineName.INDEX_TTS, "complete-profile", "complete-service")])
+    assert complete_started.wait(3)
+
+    assert manager.cancel(cancelled_job.job_id).status == "cancelling"
+    cancel_release.set()
+    assert _wait_for_manager_job(manager, cancelled_job.job_id).status == "cancelled"
+    assert store.line_saved_event("cancel-line").wait(3)
+    complete_release.set()
+    assert _wait_for_manager_job(manager, completed_job.job_id).status == "completed"
+
+    durable = store.load_manifest("demo")
+    assert durable.lines["cancel-line"].versions[0].status == "cancelled"
+    assert durable.lines["cancel-line"].versions[0].metadata["control_details"]["prompt_id"] == "prompt-snapshot-a"
+    assert durable.lines["complete-line"].versions[0].status == "completed"
+
+
+def test_fix_round_1_concurrent_same_line_snapshots_merge_as_distinct_versions(tmp_path: Path) -> None:
+    first_started = threading.Event()
+    first_release = threading.Event()
+    second_started = threading.Event()
+    second_release = threading.Event()
+
+    class FirstClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            first_started.set()
+            assert first_release.wait(3)
+            return super().synthesize(request)
+
+    class SecondClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            second_started.set()
+            assert second_release.wait(3)
+            return super().synthesize(request)
+
+    first_client = FirstClient(endpoint("first-service", EngineName.GPT_SOVITS, "gpu-a"))
+    second_client = SecondClient(endpoint("second-service", EngineName.INDEX_TTS, "gpu-b"))
+    store = SnapshotStore(tmp_path)
+    manager = GenerationJobManager(
+        ServiceGenerationQueue(StaticRouter({"first-service": first_client, "second-service": second_client})),
+        store,
+    )
+    first = manager.submit("demo", [task("shared-line", EngineName.GPT_SOVITS, "first-profile", "first-service")])
+    assert first_started.wait(3)
+    second = manager.submit("demo", [task("shared-line", EngineName.INDEX_TTS, "second-profile", "second-service")])
+    assert second_started.wait(3)
+
+    first_release.set()
+    assert _wait_for_manager_job(manager, first.job_id).status == "completed"
+    assert store.line_saved_event("shared-line").wait(3)
+    second_release.set()
+    assert _wait_for_manager_job(manager, second.job_id).status == "completed"
+
+    versions = store.load_manifest("demo").lines["shared-line"].versions
+    assert [version.version_id for version in versions] == ["v001", "v002"]
+    assert {version.service_id for version in versions} == {"first-service", "second-service"}
+    assert all(version.status == "completed" for version in versions)
+
+
+def test_fix_round_1_cancellation_reconciliation_removes_actual_renumbered_version_only(tmp_path: Path) -> None:
+    task_appended = threading.Event()
+    allow_append_return = threading.Event()
+
+    class ConcurrentInsertManifest(GenerationManifest):
+        inserted: ClassVar[bool] = False
+
+        def append_version(self, line_id: str, version: GenerationVersion) -> None:
+            if version.status == "completed" and version.service_id == "local-gpt" and not type(self).inserted:
+                type(self).inserted = True
+                producer = version.model_copy(
+                    update={
+                        "version_id": "v001",
+                        "service_id": "other-producer",
+                        "audio_path": "other-producer.wav",
+                        "metadata": {"producer": "other"},
+                    }
+                )
+                super().append_version(line_id, producer)
+                super().append_version(line_id, version)
+                task_appended.set()
+                assert allow_append_return.wait(3)
+                return
+            super().append_version(line_id, version)
+
+    ConcurrentInsertManifest.inserted = False
+    client = RecordingServiceClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    store = MemoryStore(tmp_path)
+    store.manifest = ConcurrentInsertManifest(project_id="demo")
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), store)
+    created = manager.submit("demo", [gpt_task("renumbered-line", "race.wav")])
+    assert task_appended.wait(3)
+
+    assert manager.cancel(created.job_id).status == "cancelling"
+    allow_append_return.set()
+    final = _wait_for_manager_job(manager, created.job_id)
+
+    assert final.status == "cancelled"
+    history = store.manifest.lines["renumbered-line"].versions
+    assert [(version.version_id, version.service_id, version.status) for version in history] == [
+        ("v001", "other-producer", "completed"),
+        ("v002", "local-gpt", "cancelled"),
+    ]
+    assert all(not (version.service_id == "local-gpt" and version.status == "completed") for version in history)
+
+
+def test_fix_round_1_manifest_save_failure_terminalizes_accepted_cancellation(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class AlwaysFailingSnapshotStore(SnapshotStore):
+        def save_manifest(self, manifest: GenerationManifest) -> None:
+            self.save_calls += 1
+            raise PermissionError("manifest write denied password=persistence-secret")
+
+    class CancelClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            started.set()
+            assert release.wait(3)
+            raise SynthesisCancelled(
+                "cancelled after prompt convergence",
+                details={"prompt_id": "prompt-save-failure", "converged": True},
+            )
+
+    store = AlwaysFailingSnapshotStore(tmp_path)
+    client = CancelClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), store)
+    created = manager.submit("demo", [gpt_task("save-failure", "failure.wav")])
+    assert started.wait(3)
+    assert manager.cancel(created.job_id).status == "cancelling"
+    release.set()
+
+    final = _wait_for_manager_job(manager, created.job_id, timeout_seconds=1.0)
+
+    assert final.status == "failed"
+    assert final.progress == 1.0
+    assert final.items[0].progress == 1.0
+    assert "manifest persistence failed" in (final.error or "")
+    assert "password=***" in (final.error or "")
+    assert "persistence-secret" not in str(final.model_dump(mode="json"))
+    assert store.save_calls == 1
+
+
+def test_fix_round_1_cancelled_semaphore_waiter_never_loads_or_evicts_service(tmp_path: Path) -> None:
+    first_release = threading.Event()
+
+    class ObservedSemaphore:
+        def __init__(self) -> None:
+            self._semaphore = threading.Semaphore(1)
+            self._guard = threading.Lock()
+            self._attempts = 0
+            self._local = threading.local()
+            self.second_waiting = threading.Event()
+            self.second_released = threading.Event()
+
+        def __enter__(self):
+            with self._guard:
+                self._attempts += 1
+                attempt = self._attempts
+            self._local.attempt = attempt
+            if attempt == 2:
+                self.second_waiting.set()
+            self._semaphore.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._semaphore.release()
+            if self._local.attempt == 2:
+                self.second_released.set()
+
+    first_client = BlockingServiceClient(endpoint("service-a", EngineName.GPT_SOVITS, "shared-gpu"), first_release)
+    second_client = RecordingServiceClient(endpoint("service-b", EngineName.GPT_SOVITS, "shared-gpu"))
+    queue = ServiceGenerationQueue(StaticRouter({"service-a": first_client, "service-b": second_client}))
+    observed = ObservedSemaphore()
+    queue._resource_semaphores["shared-gpu"] = observed  # type: ignore[assignment]
+    manager = GenerationJobManager(queue, SnapshotStore(tmp_path))
+    first = manager.submit("project-a", [task("line-a", EngineName.GPT_SOVITS, "profile-a", "service-a")])
+    assert first_client.started.wait(3)
+    second = manager.submit("project-b", [task("line-b", EngineName.GPT_SOVITS, "profile-b", "service-b")])
+    assert observed.second_waiting.wait(3)
+
+    assert manager.cancel(second.job_id).status == "cancelled"
+    first_release.set()
+    assert observed.second_released.wait(3)
+    assert _wait_for_manager_job(manager, first.job_id).status == "completed"
+
+    assert "unload" not in first_client.calls
+    assert not any(call.startswith("load:profile-b") for call in second_client.calls)
+    assert not any(call.startswith("synthesize:line-b") for call in second_client.calls)
+
+
+def test_fix_round_1_generic_synthesis_failure_persists_locked_output_cleanup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class OutputThenCrashClient(RecordingServiceClient):
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            request.output_path.parent.mkdir(parents=True, exist_ok=True)
+            request.output_path.write_bytes(b"RIFFlocked-generic")
+            raise RuntimeError("engine crashed")
+
+    original_unlink = Path.unlink
+
+    def reject_wav_unlink(path: Path, *args, **kwargs):
+        if path.suffix == ".wav":
+            raise PermissionError("generic output locked password=generic-secret")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", reject_wav_unlink)
+    client = OutputThenCrashClient(endpoint("local-gpt", EngineName.GPT_SOVITS, "local-gpu-0"))
+    store = SnapshotStore(tmp_path)
+    manager = GenerationJobManager(ServiceGenerationQueue(StaticRouter({"local-gpt": client})), store)
+    final = _wait_for_manager_job(manager, manager.submit("demo", [gpt_task("generic-locked", "locked.wav")]).job_id)
+
+    assert final.status == "failed"
+    version = store.load_manifest("demo").lines["generic-locked"].versions[0]
+    assert version.metadata["failure_stage"] == "synthesis"
+    assert "password=***" in version.metadata["output_cleanup_error"]
+    assert "generic-secret" not in str(version.metadata)
+
+
+def test_fix_round_1_concurrent_same_service_same_line_outputs_do_not_overwrite(tmp_path: Path) -> None:
+    first_release = threading.Event()
+    second_release = threading.Event()
+
+    class MarkedBlockingClient(RecordingServiceClient):
+        def __init__(
+            self,
+            service_endpoint: TTSServiceEndpoint,
+            release: threading.Event,
+            marker: bytes,
+        ) -> None:
+            super().__init__(service_endpoint)
+            self.started = threading.Event()
+            self.release = release
+            self.marker = marker
+
+        def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
+            self.started.set()
+            assert self.release.wait(3)
+            request.output_path.parent.mkdir(parents=True, exist_ok=True)
+            request.output_path.write_bytes(self.marker)
+            return SynthesisResult(audio_path=request.output_path, metadata={"marker": self.marker.decode()})
+
+    shared_endpoint = endpoint("shared-service", EngineName.GPT_SOVITS, "shared-gpu").model_copy(
+        update={"capacity": 2}
+    )
+    first_client = MarkedBlockingClient(shared_endpoint, first_release, b"RIFF-first")
+    second_client = MarkedBlockingClient(shared_endpoint, second_release, b"RIFF-second")
+    store = SnapshotStore(tmp_path)
+    manager = GenerationJobManager(
+        ServiceGenerationQueue(StaticRouter({"route-a": first_client, "route-b": second_client})),
+        store,
+    )
+
+    first = manager.submit("demo", [task("shared-line", EngineName.GPT_SOVITS, "shared-profile", "route-a")])
+    assert first_client.started.wait(3)
+    second = manager.submit("demo", [task("shared-line", EngineName.GPT_SOVITS, "shared-profile", "route-b")])
+    assert second_client.started.wait(3)
+
+    first_release.set()
+    assert _wait_for_manager_job(manager, first.job_id).status == "completed"
+    second_release.set()
+    assert _wait_for_manager_job(manager, second.job_id).status == "completed"
+
+    versions = store.load_manifest("demo").lines["shared-line"].versions
+    audio_paths = [Path(version.audio_path or "") for version in versions]
+    assert [version.version_id for version in versions] == ["v001", "v002"]
+    assert len(set(audio_paths)) == 2
+    assert {path.read_bytes() for path in audio_paths} == {b"RIFF-first", b"RIFF-second"}

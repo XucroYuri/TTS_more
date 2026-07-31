@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import uuid
-import re
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -28,6 +28,10 @@ def _task_line_uid(task: GenerationTask) -> str:
 
 def _safe_line_output_stem(task: GenerationTask) -> str:
     return re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", _task_line_uid(task)).strip("._-") or task.line.id
+
+
+def _safe_output_namespace(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", value).strip("._-") or "job"
 
 
 class ServiceGenerationQueue:
@@ -61,6 +65,7 @@ class ServiceGenerationQueue:
         output_dir: Path,
         status_callback: StatusCallback | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        output_namespace: str | None = None,
     ) -> GenerationManifest:
         grouped: "OrderedDict[str, OrderedDict[str, list[tuple[int, GenerationTask, ServiceRoute, str]]]]" = OrderedDict()
         for index, task in enumerate(tasks):
@@ -80,7 +85,16 @@ class ServiceGenerationQueue:
 
         with ThreadPoolExecutor(max_workers=len(work_items)) as executor:
             futures = [
-                executor.submit(self._run_resource_clusters, resource_group, clusters, manifest, output_dir, status_callback, cancel_check)
+                executor.submit(
+                    self._run_resource_clusters,
+                    resource_group,
+                    clusters,
+                    manifest,
+                    output_dir,
+                    status_callback,
+                    cancel_check,
+                    output_namespace,
+                )
                 for resource_group, clusters in work_items
             ]
             for future in futures:
@@ -95,11 +109,21 @@ class ServiceGenerationQueue:
         output_dir: Path,
         status_callback: StatusCallback | None,
         cancel_check: Callable[[], bool] | None = None,
+        output_namespace: str | None = None,
     ) -> None:
         for cluster_key, group in clusters:
             if cancel_check and cancel_check():
                 return
-            self._run_service_cluster(resource_group, cluster_key, group, manifest, output_dir, status_callback, cancel_check)
+            self._run_service_cluster(
+                resource_group,
+                cluster_key,
+                group,
+                manifest,
+                output_dir,
+                status_callback,
+                cancel_check,
+                output_namespace,
+            )
 
     def _run_service_cluster(
         self,
@@ -110,9 +134,12 @@ class ServiceGenerationQueue:
         output_dir: Path,
         status_callback: StatusCallback | None,
         cancel_check: Callable[[], bool] | None = None,
+        output_namespace: str | None = None,
     ) -> None:
         semaphore = self._resource_semaphore(resource_group, capacity=group[0][2].endpoint.capacity)
         with semaphore:
+            if cancel_check and cancel_check():
+                return
             (_index, first_task, route, _first_cluster) = group[0]
             self._emit(first_task, "loading", 0.05, cluster_key, None, status_callback)
             first_signature = build_load_signature(route.endpoint, first_task.parameters)
@@ -176,7 +203,16 @@ class ServiceGenerationQueue:
                         raise
                     self._mark_loaded(task_route.endpoint.service_id, task_signature, "loaded_unverified")
                 self._active_resource_services[resource_group] = (task_route.endpoint.service_id, task_route.client)
-                self._run_task(task_route, task, manifest, output_dir, task_cluster_key, status_callback, cancel_check)
+                self._run_task(
+                    task_route,
+                    task,
+                    manifest,
+                    output_dir,
+                    task_cluster_key,
+                    status_callback,
+                    cancel_check,
+                    output_namespace,
+                )
 
     def _run_task(
         self,
@@ -187,18 +223,22 @@ class ServiceGenerationQueue:
         cluster_key: str | None = None,
         status_callback: StatusCallback | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        output_namespace: str | None = None,
     ) -> None:
         self._emit(task, "running", 0.35, cluster_key, None, status_callback)
         with self._manifest_lock:
             history = manifest.history_for_line(task.line.id, _task_line_uid(task))
             version_number = len(history.versions) + 1 if history else 1
             version_id = f"v{version_number:03d}"
+        versioned_stem = f"{_safe_line_output_stem(task)}_{version_id}"
+        if output_namespace is not None:
+            versioned_stem = f"{_safe_line_output_stem(task)}_{_safe_output_namespace(output_namespace)}_{version_id}"
         output_path = (
             output_dir
             / task.engine.value
             / route.endpoint.service_id
             / task.profile
-            / f"{_safe_line_output_stem(task)}_{version_id}.wav"
+            / f"{versioned_stem}.wav"
         )
         requested_load_signature = build_load_signature(route.endpoint, task.parameters)
         revision_context = _revision_context(task)
@@ -315,7 +355,7 @@ class ServiceGenerationQueue:
             self._emit(task, "failed", 1.0, cluster_key, failed_version_id, status_callback)
             return
         except Exception as exc:
-            self._discard_uncommitted_output(output_path)
+            cleanup_errors = self._discard_uncommitted_output(output_path)
             failed_version_id = self._append_failed_version(
                 route,
                 task,
@@ -323,15 +363,18 @@ class ServiceGenerationQueue:
                 cluster_key,
                 "synthesis",
                 exc,
+                extra_metadata=self._with_output_cleanup_errors({}, cleanup_errors),
             )
             self._emit(task, "failed", 1.0, cluster_key, failed_version_id, status_callback)
             return
         with self._manifest_lock:
             manifest.append_version(task.line.id, version)
+            history = manifest.history_for_line(task.line.id, _task_line_uid(task))
+            committed_version_id = history.versions[-1].version_id if history else version_id
         if version.status == "completed":
-            self._emit(task, "completed", 1.0, cluster_key, version_id, status_callback)
+            self._emit(task, "completed", 1.0, cluster_key, committed_version_id, status_callback)
             if cancel_check and cancel_check():
-                self._remove_manifest_version(manifest, task, version_id)
+                self._remove_manifest_version(manifest, task, committed_version_id)
                 self._record_cancelled_outcome(
                     route,
                     task,
@@ -353,6 +396,7 @@ class ServiceGenerationQueue:
         *,
         control_code: str | None = None,
         control_details: dict[str, Any] | None = None,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> str:
         requested_load_signature = build_load_signature(route.endpoint, task.parameters)
         revision_context = _revision_context(task)
@@ -369,6 +413,8 @@ class ServiceGenerationQueue:
                 metadata["control_code"] = control_code
             if control_details is not None:
                 metadata["control_details"] = self._sanitize_control_details(control_details)
+            if extra_metadata:
+                metadata.update(self._sanitize_control_details(extra_metadata))
             manifest.append_version(
                 task.line.id,
                 GenerationVersion(
@@ -390,7 +436,8 @@ class ServiceGenerationQueue:
                     error=scrub_error(exc, route.endpoint.base_url),
                 ),
             )
-        return version_id
+            history = manifest.history_for_line(task.line.id, _task_line_uid(task))
+            return history.versions[-1].version_id if history else version_id
 
     def _append_cancelled_version(
         self,
@@ -434,7 +481,8 @@ class ServiceGenerationQueue:
                     error=scrub_error(error, route.endpoint.base_url) if error is not None else None,
                 ),
             )
-        return version_id
+            history = manifest.history_for_line(task.line.id, _task_line_uid(task))
+            return history.versions[-1].version_id if history else version_id
 
     def _record_cancelled_outcome(
         self,
@@ -689,6 +737,8 @@ class GenerationJobManager:
         self.store = store
         self._jobs: "OrderedDict[str, GenerationJob]" = OrderedDict()
         self._lock = threading.Lock()
+        self._project_persistence_locks: dict[str, threading.Lock] = {}
+        self._project_persistence_guard = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=self.MAX_ACTIVE_JOBS, thread_name_prefix="tts-job")
 
     def submit(self, project_id: str, tasks: list[GenerationTask]) -> GenerationJob:
@@ -818,6 +868,8 @@ class GenerationJobManager:
 
     def _run_job(self, job_id: str, tasks: list[GenerationTask]) -> None:
         manifest: GenerationManifest | None = None
+        baseline: GenerationManifest | None = None
+        persistence_attempted = False
         try:
             with self._lock:
                 job = self._jobs[job_id]
@@ -825,8 +877,11 @@ class GenerationJobManager:
                     return
                 job.status = "running"
                 job.updated_at = datetime.now(timezone.utc)
-            manifest = self.store.load_manifest(self.get(job_id).project_id)
-            output_dir = self.store.project_audio_dir(self.get(job_id).project_id)
+            project_id = self.get(job_id).project_id
+            loaded_manifest = self.store.load_manifest(project_id)
+            baseline = loaded_manifest.model_copy(deep=True)
+            manifest = loaded_manifest.model_copy(deep=True)
+            output_dir = self.store.project_audio_dir(project_id)
             self._record_prefailed_items(job_id, tasks, manifest)
             runnable_tasks = self._runnable_tasks(job_id, tasks)
             self.queue.run(
@@ -837,27 +892,95 @@ class GenerationJobManager:
                     job_id, task, status, progress, cluster_key, version_id, external_update
                 ),
                 cancel_check=lambda: self._is_cancelled(job_id),
+                output_namespace=job_id,
             )
             self._sync_item_errors_from_manifest(job_id, manifest)
-            self.store.save_manifest(manifest)
+            persistence_attempted = True
+            self._persist_manifest_delta(job_id, baseline, manifest)
             self._finish_job(job_id)
         except Exception as exc:
-            if manifest is not None:
-                self.store.save_manifest(manifest)
-            failed_at = datetime.now(timezone.utc)
-            with self._lock:
-                job = self._jobs[job_id]
-                if job.status == "cancelled":
-                    return
-                job.status = "failed"
-                job.error = str(exc)
-                job.updated_at = failed_at
-                for item in job.items:
-                    if item.status not in {"completed", "failed", "cancelled"}:
-                        item.status = "failed"
-                        item.progress = 1.0
-                        item.error = item.error or str(exc)
-                job.progress = 1.0
+            failure_message = scrub_error(exc)
+            persistence_failed = persistence_attempted
+            if manifest is not None and baseline is not None and not persistence_attempted:
+                try:
+                    persistence_attempted = True
+                    self._persist_manifest_delta(job_id, baseline, manifest)
+                except Exception as persistence_exc:
+                    persistence_failed = True
+                    failure_message = (
+                        f"{failure_message}; manifest persistence failed: {scrub_error(persistence_exc)}"
+                    )
+            elif persistence_failed:
+                failure_message = f"manifest persistence failed: {failure_message}"
+            self._fail_job(job_id, failure_message, persistence_failed=persistence_failed)
+
+    def _project_persistence_lock(self, project_id: str) -> threading.Lock:
+        with self._project_persistence_guard:
+            return self._project_persistence_locks.setdefault(project_id, threading.Lock())
+
+    def _persist_manifest_delta(
+        self,
+        job_id: str,
+        baseline: GenerationManifest,
+        updated: GenerationManifest,
+    ) -> None:
+        project_id = updated.project_id
+        with self._project_persistence_lock(project_id):
+            current = self.store.load_manifest(project_id).model_copy(deep=True)
+            for line_key, updated_history in updated.lines.items():
+                baseline_history = baseline.lines.get(line_key)
+                baseline_versions = baseline_history.versions if baseline_history else []
+                if len(updated_history.versions) < len(baseline_versions):
+                    raise RuntimeError(f"manifest line {line_key} removed baseline generation versions")
+                if updated_history.versions[: len(baseline_versions)] != baseline_versions:
+                    raise RuntimeError(f"manifest line {line_key} changed baseline generation versions")
+                for version in updated_history.versions[len(baseline_versions) :]:
+                    provisional_id = version.version_id
+                    current.append_version(updated_history.line_id, version)
+                    current_history = current.history_for_line(updated_history.line_id, version.line_uid)
+                    actual_id = current_history.versions[-1].version_id if current_history else provisional_id
+                    if actual_id != provisional_id:
+                        self._replace_item_version_id(
+                            job_id,
+                            line_id=updated_history.line_id,
+                            line_uid=version.line_uid,
+                            provisional_id=provisional_id,
+                            actual_id=actual_id,
+                        )
+            self.store.save_manifest(current)
+
+    def _replace_item_version_id(
+        self,
+        job_id: str,
+        *,
+        line_id: str,
+        line_uid: str | None,
+        provisional_id: str,
+        actual_id: str,
+    ) -> None:
+        with self._lock:
+            for item in self._jobs[job_id].items:
+                if (
+                    item.line_id == line_id
+                    and (item.line_uid or item.line_id) == (line_uid or line_id)
+                    and item.version_id == provisional_id
+                ):
+                    item.version_id = actual_id
+
+    def _fail_job(self, job_id: str, message: str, *, persistence_failed: bool) -> None:
+        failed_at = datetime.now(timezone.utc)
+        with self._lock:
+            job = self._jobs[job_id]
+            job.status = "failed"
+            job.error = message
+            job.updated_at = failed_at
+            for item in job.items:
+                if item.status not in {"completed", "failed", "cancelled"}:
+                    item.status = "failed"
+                item.progress = 1.0
+                if persistence_failed or item.status == "failed":
+                    item.error = item.error or message
+            job.progress = 1.0
 
     def _record_prefailed_items(self, job_id: str, tasks: list[GenerationTask], manifest: GenerationManifest) -> None:
         tasks_by_key = {(task.line.id, _task_line_uid(task)): task for task in tasks}
