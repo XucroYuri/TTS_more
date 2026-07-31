@@ -8,8 +8,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app.adapters.base import SynthesisRequest, SynthesisResult
-from app.comfyui.client import ComfyUIAPIClient
+from app.adapters.base import (
+    SynthesisCancelled,
+    SynthesisRequest,
+    SynthesisResult,
+    SynthesisTimeout,
+)
+from app.comfyui.client import ComfyUIAPIClient, PromptCancellationResult
 from app.comfyui.workflow_builder import (
     build_workflow,
     build_cosyvoice_workflow,
@@ -69,6 +74,230 @@ def test_synthesis_request_carries_cancel_check_and_control_details(tmp_path):
 
 
 class TestComfyUIAPIClient:
+    def test_cancel_prompt_interrupts_only_the_targeted_running_prompt(self):
+        state = {"running": True}
+        requests: list[tuple[str, str, bytes]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path, request.content))
+            if request.url.path == "/queue":
+                running = [[1, "prompt-1", {}, {}, []]] if state["running"] else []
+                return httpx.Response(
+                    200,
+                    json={"queue_running": running, "queue_pending": []},
+                )
+            if request.url.path == "/interrupt":
+                assert json.loads(request.content) == {"prompt_id": "prompt-1"}
+                state["running"] = False
+                return httpx.Response(200, json={})
+            if request.url.path == "/history/prompt-1":
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt("prompt-1", max_wait=1.0)
+
+        assert result.initial_state == "running"
+        assert result.final_state == "interrupted"
+        assert result.converged is True
+        assert result.actions == ("interrupt",)
+        assert all(
+            body != b"{}"
+            for _method, path, body in requests
+            if path == "/interrupt"
+        )
+
+    def test_cancel_prompt_deletes_only_the_targeted_pending_prompt(self):
+        state = {"pending": True}
+        requests: list[tuple[str, str, bytes]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path, request.content))
+            if request.url.path == "/queue" and request.method == "GET":
+                pending = [[2, "prompt-2", {}, {}, []]] if state["pending"] else []
+                return httpx.Response(
+                    200,
+                    json={"queue_running": [], "queue_pending": pending},
+                )
+            if request.url.path == "/queue" and request.method == "POST":
+                assert json.loads(request.content) == {"delete": ["prompt-2"]}
+                state["pending"] = False
+                return httpx.Response(200, json={})
+            if request.url.path == "/history/prompt-2":
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt("prompt-2", max_wait=1.0)
+
+        assert result.initial_state == "pending"
+        assert result.final_state == "dequeued"
+        assert result.converged is True
+        assert result.actions == ("delete",)
+        assert all(path != "/interrupt" for _method, path, _body in requests)
+
+    def test_cancel_prompt_is_idempotent_when_prompt_is_already_absent(self):
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            if request.url.path == "/queue":
+                return httpx.Response(
+                    200,
+                    json={"queue_running": [], "queue_pending": []},
+                )
+            if request.url.path == "/history/prompt-3":
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt("prompt-3")
+
+        assert result.initial_state == "absent"
+        assert result.final_state == "absent"
+        assert result.actions == ()
+        assert result.converged is True
+        assert requests == [("GET", "/queue"), ("GET", "/history/prompt-3")]
+
+    def test_cancel_prompt_is_idempotent_when_prompt_is_already_terminal(self):
+        prompt_id = "prompt-4"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/queue":
+                return httpx.Response(
+                    200,
+                    json={"queue_running": [], "queue_pending": []},
+                )
+            if request.url.path == f"/history/{prompt_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        prompt_id: {
+                            "outputs": {"4": {"audio": [{"filename": "done.wav"}]}},
+                            "status": {
+                                "status_str": "success",
+                                "completed": True,
+                                "messages": [["execution_success", {"prompt_id": prompt_id}]],
+                            },
+                        }
+                    },
+                )
+            raise AssertionError(request.url)
+
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt(prompt_id)
+
+        assert result.initial_state == "completed"
+        assert result.final_state == "completed"
+        assert result.actions == ()
+        assert result.converged is True
+
+    def test_cancel_prompt_reports_failure_when_target_does_not_leave_queue(
+        self,
+        monkeypatch,
+    ):
+        clock = {"now": 0.0}
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            if request.url.path == "/queue":
+                return httpx.Response(
+                    200,
+                    json={
+                        "queue_running": [[1, "prompt-5", {}, {}, []]],
+                        "queue_pending": [],
+                    },
+                )
+            if request.url.path == "/interrupt":
+                return httpx.Response(200, json={})
+            if request.url.path == "/history/prompt-5":
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        def fake_sleep(seconds: float) -> None:
+            assert seconds <= 0.25
+            clock["now"] += 30.0
+
+        monkeypatch.setattr("app.comfyui.client.time.monotonic", lambda: clock["now"])
+        monkeypatch.setattr("app.comfyui.client.time.sleep", fake_sleep)
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt("prompt-5", max_wait=30.0)
+
+        assert result.initial_state == "running"
+        assert result.final_state == "running"
+        assert result.actions == ("interrupt",)
+        assert result.duration_seconds == 30.0
+        assert result.converged is False
+        assert requests.count(("POST", "/interrupt")) == 1
+
+    def test_cancel_prompt_preserves_sanitized_post_interrupt_execution_error(self):
+        prompt_id = "prompt-6"
+        state = {"running": True}
+        exception_message = (
+            "IndexTTS interruption cleanup failed: process exit could not be verified"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/queue":
+                running = [[1, prompt_id, {}, {}, []]] if state["running"] else []
+                return httpx.Response(
+                    200,
+                    json={"queue_running": running, "queue_pending": []},
+                )
+            if request.url.path == "/interrupt":
+                assert json.loads(request.content) == {"prompt_id": prompt_id}
+                state["running"] = False
+                return httpx.Response(200, json={})
+            if request.url.path == f"/history/{prompt_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        prompt_id: {
+                            "outputs": {},
+                            "status": {
+                                "status_str": "error",
+                                "completed": False,
+                                "messages": [
+                                    [
+                                        "execution_error",
+                                        {
+                                            "prompt_id": prompt_id,
+                                            "exception_message": exception_message,
+                                        },
+                                    ]
+                                ],
+                            },
+                        }
+                    },
+                )
+            raise AssertionError(request.url)
+
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt(prompt_id, max_wait=1.0)
+
+        assert result.final_state == "error"
+        assert result.converged is False
+        assert result.diagnostic == exception_message
+
     def test_system_stats_ready(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"system": {"cuda": True}})
@@ -135,6 +364,161 @@ class TestComfyUIAPIClient:
             result = api.poll_until_done(prompt_id, poll_interval=0.01, max_wait=5.0)
             assert "outputs" in result
             assert result["outputs"]["4"]["audio"][0]["filename"] == "tts_more_cosyvoice_00001.flac"
+
+    def test_poll_until_done_cancels_prompt_when_requested(self, monkeypatch):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        history_calls: list[str] = []
+        monkeypatch.setattr(
+            client,
+            "get_history",
+            lambda prompt_id: history_calls.append(prompt_id) or {},
+        )
+        monkeypatch.setattr(
+            client,
+            "cancel_prompt",
+            lambda prompt_id, max_wait=30.0: PromptCancellationResult(
+                prompt_id,
+                "running",
+                "absent",
+                ("interrupt",),
+                0.1,
+                True,
+            ),
+        )
+
+        with pytest.raises(SynthesisCancelled) as caught:
+            client.poll_until_done(
+                "p1",
+                poll_interval=0.01,
+                max_wait=1.0,
+                cancel_check=lambda: True,
+            )
+
+        assert caught.value.details["prompt_id"] == "p1"
+        assert caught.value.details["cancellation"]["converged"] is True
+        assert history_calls == []
+
+    def test_poll_until_done_checks_cancellation_during_long_poll_sleep(
+        self,
+        monkeypatch,
+    ):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        checks = iter([False, True])
+        sleeps: list[float] = []
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+        monkeypatch.setattr(
+            client,
+            "cancel_prompt",
+            lambda prompt_id, max_wait=30.0: PromptCancellationResult(
+                prompt_id,
+                "running",
+                "interrupted",
+                ("interrupt",),
+                0.1,
+                True,
+            ),
+        )
+        monkeypatch.setattr(
+            "app.comfyui.client.time.sleep",
+            lambda seconds: sleeps.append(seconds),
+        )
+
+        with pytest.raises(SynthesisCancelled):
+            client.poll_until_done(
+                "p-sleep",
+                poll_interval=2.0,
+                max_wait=1.0,
+                cancel_check=lambda: next(checks),
+            )
+
+        assert sleeps
+        assert max(sleeps) <= 0.25
+
+    def test_poll_until_done_preserves_failed_cancellation_result(self, monkeypatch):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+        monkeypatch.setattr(
+            client,
+            "cancel_prompt",
+            lambda prompt_id, max_wait=30.0: PromptCancellationResult(
+                prompt_id,
+                "running",
+                "error",
+                ("interrupt",),
+                0.1,
+                False,
+                "cleanup failed",
+            ),
+        )
+
+        with pytest.raises(SynthesisCancelled) as caught:
+            client.poll_until_done(
+                "p-failed-cancel",
+                max_wait=1.0,
+                cancel_check=lambda: True,
+            )
+
+        assert caught.value.details["cancellation"] == {
+            "prompt_id": "p-failed-cancel",
+            "initial_state": "running",
+            "final_state": "error",
+            "actions": ("interrupt",),
+            "duration_seconds": 0.1,
+            "converged": False,
+            "diagnostic": "cleanup failed",
+        }
+
+    def test_poll_timeout_cancels_before_raising_timeout(self, monkeypatch):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+        cancelled: list[str] = []
+        monkeypatch.setattr(
+            client,
+            "cancel_prompt",
+            lambda prompt_id, max_wait=30.0: cancelled.append(prompt_id)
+            or PromptCancellationResult(
+                prompt_id,
+                "running",
+                "absent",
+                ("interrupt",),
+                0.1,
+                True,
+            ),
+        )
+
+        with pytest.raises(SynthesisTimeout) as caught:
+            client.poll_until_done("p2", poll_interval=0.001, max_wait=0.001)
+
+        assert cancelled == ["p2"]
+        assert caught.value.details["prompt_id"] == "p2"
+        assert caught.value.details["cancellation"]["converged"] is True
+
+    def test_poll_timeout_remains_primary_when_cancellation_cleanup_fails(
+        self,
+        monkeypatch,
+    ):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+        monkeypatch.setattr(
+            client,
+            "cancel_prompt",
+            lambda prompt_id, max_wait=30.0: PromptCancellationResult(
+                prompt_id,
+                "running",
+                "error",
+                ("interrupt",),
+                0.1,
+                False,
+                "cleanup failed",
+            ),
+        )
+
+        with pytest.raises(SynthesisTimeout) as caught:
+            client.poll_until_done("p3", poll_interval=0.001, max_wait=0.001)
+
+        assert caught.value.code == "timeout"
+        assert caught.value.details["cancellation"]["converged"] is False
+        assert caught.value.details["cancellation"]["diagnostic"] == "cleanup failed"
 
     def test_poll_until_done_raises_comfyui_execution_error_when_completed_is_false(self):
         prompt_id = "e0e0579f-fc34-4397-a182-66bc0786e943"
