@@ -79,6 +79,42 @@ def test_publish_wav_atomic_rejects_non_finite_audio_and_cleans_temporary_file(
     assert _temporary_siblings(output) == []
 
 
+@pytest.mark.parametrize("format", ["AU", "CAF"])
+@pytest.mark.parametrize("sample", [float("nan"), float("inf"), float("-inf")])
+def test_publish_wav_atomic_rejects_non_finite_source_before_transcoding(
+    tmp_path: Path,
+    format: str,
+    sample: float,
+):
+    output = tmp_path / f"non-finite-{format.lower()}.wav"
+    output.write_bytes(b"existing")
+    audio_bytes = _audio_bytes(
+        [0.2, sample],
+        format=format,
+        subtype="FLOAT",
+    )
+
+    with pytest.raises(ValueError, match="finite"):
+        publish_wav_atomic(output, audio_bytes)
+
+    assert output.read_bytes() == b"existing"
+    assert _temporary_siblings(output) == []
+
+
+def test_publish_wav_atomic_rejects_zero_frame_wav_without_replacing_output(
+    tmp_path: Path,
+):
+    output = tmp_path / "empty.wav"
+    output.write_bytes(b"existing")
+    audio_bytes = _audio_bytes([])
+
+    with pytest.raises(ValueError, match="empty"):
+        publish_wav_atomic(output, audio_bytes)
+
+    assert output.read_bytes() == b"existing"
+    assert _temporary_siblings(output) == []
+
+
 def test_publish_wav_atomic_transcodes_supported_audio_to_wav(tmp_path: Path):
     output = tmp_path / "nested" / "voice.wav"
     audio_bytes = _audio_bytes([0.25] * 800, sample_rate=8000, format="FLAC")
