@@ -128,13 +128,25 @@ class ComfyUIAPIClient:
         while time.monotonic() < deadline:
             history = self.get_history(prompt_id)
             entry = history.get(prompt_id)
-            if entry is not None and entry.get("outputs"):
-                return entry
             if entry is not None:
                 status = entry.get("status") or {}
-                if status.get("completed") is True:
+                if status.get("status_str") == "error":
                     messages = status.get("messages") or []
-                    raise RuntimeError(f"ComfyUI prompt failed: {messages[-1] if messages else 'no output'}")
+                    message: Any = messages[-1] if messages else "no output"
+                    for item in reversed(messages):
+                        if (
+                            isinstance(item, (list, tuple))
+                            and len(item) == 2
+                            and item[0] == "execution_error"
+                            and isinstance(item[1], dict)
+                        ):
+                            message = item[1].get("exception_message") or item[1]
+                            break
+                    raise RuntimeError(f"ComfyUI prompt failed: {message}")
+                if entry.get("outputs"):
+                    return entry
+                if status.get("completed") is True:
+                    raise RuntimeError("ComfyUI prompt failed: no output")
             time.sleep(poll_interval)
         raise TimeoutError(
             f"ComfyUI prompt {prompt_id} did not complete within {max_wait}s"

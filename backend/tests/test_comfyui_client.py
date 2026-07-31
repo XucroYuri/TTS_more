@@ -121,6 +121,93 @@ class TestComfyUIAPIClient:
             assert "outputs" in result
             assert result["outputs"]["4"]["audio"][0]["filename"] == "tts_more_cosyvoice_00001.flac"
 
+    def test_poll_until_done_raises_comfyui_execution_error_when_completed_is_false(self):
+        prompt_id = "e0e0579f-fc34-4397-a182-66bc0786e943"
+        exception_message = (
+            "IndexTTS-2 generation failed: IndexTTS-2 dependencies not available. "
+            "Error: No module named 'omegaconf'"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == f"/history/{prompt_id}"
+            return httpx.Response(
+                200,
+                json={
+                    prompt_id: {
+                        "outputs": {},
+                        "status": {
+                            "status_str": "error",
+                            "completed": False,
+                            "messages": [
+                                [
+                                    "execution_error",
+                                    {
+                                        "prompt_id": prompt_id,
+                                        "node_id": "3",
+                                        "node_type": "UnifiedTTSTextNode",
+                                        "exception_message": exception_message,
+                                    },
+                                ]
+                            ],
+                        },
+                    }
+                },
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            api = ComfyUIAPIClient("http://127.0.0.1:8188", transport=client._transport)
+            with pytest.raises(RuntimeError, match="No module named 'omegaconf'") as error:
+                api.poll_until_done(prompt_id, poll_interval=0.0, max_wait=0.01)
+
+        assert str(error.value) == f"ComfyUI prompt failed: {exception_message}"
+
+    def test_poll_until_done_rejects_terminal_error_even_when_outputs_exist(self):
+        prompt_id = "prompt-with-stale-output"
+        exception_message = "IndexTTS subprocess timed out after producing a stale preview"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == f"/history/{prompt_id}"
+            return httpx.Response(
+                200,
+                json={
+                    prompt_id: {
+                        "outputs": {
+                            "4": {
+                                "audio": [
+                                    {
+                                        "filename": "stale.flac",
+                                        "subfolder": "",
+                                        "type": "output",
+                                    }
+                                ]
+                            }
+                        },
+                        "status": {
+                            "status_str": "error",
+                            "completed": False,
+                            "messages": [
+                                [
+                                    "execution_error",
+                                    {
+                                        "prompt_id": prompt_id,
+                                        "node_id": "3",
+                                        "node_type": "UnifiedTTSTextNode",
+                                        "exception_message": exception_message,
+                                    },
+                                ]
+                            ],
+                        },
+                    }
+                },
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            api = ComfyUIAPIClient("http://127.0.0.1:8188", transport=client._transport)
+            with pytest.raises(RuntimeError) as error:
+                api.poll_until_done(prompt_id, poll_interval=0.0, max_wait=0.01)
+
+        assert str(error.value) == f"ComfyUI prompt failed: {exception_message}"
+
     def test_download_output(self):
         wav_content = b"RIFF\x24\x00\x00\x00WAVEfake"
 
@@ -215,6 +302,43 @@ class TestWorkflowBuilder:
         assert w["1"]["class_type"] == "TTSExternalGPTSovitsEngine"
         assert w["4"]["class_type"] == "SaveAudio"
         assert w["1"]["inputs"]["resource_id"] == "gpt-main"
+
+    @pytest.mark.parametrize(
+        ("legacy_value", "expected_value"),
+        [
+            ("cut0", "不切"),
+            ("cut1", "凑四句一切"),
+            ("cut2", "凑50字一切"),
+            ("cut3", "按中文句号。切"),
+            ("cut4", "按英文句号.切"),
+            ("cut5", "按标点符号切"),
+        ],
+    )
+    def test_gpt_sovits_workflow_normalizes_legacy_cut_method_for_comfyui(
+        self,
+        legacy_value: str,
+        expected_value: str,
+    ):
+        workflow = build_gpt_sovits_workflow(
+            {
+                "text": "Hello",
+                "resource_id": "gpt-main",
+                "text_split_method": legacy_value,
+            }
+        )
+
+        assert workflow["1"]["inputs"]["how_to_cut"] == expected_value
+
+    def test_gpt_sovits_workflow_preserves_valid_comfyui_cut_method(self):
+        workflow = build_gpt_sovits_workflow(
+            {
+                "text": "Hello",
+                "resource_id": "gpt-main",
+                "how_to_cut": "按标点符号切",
+            }
+        )
+
+        assert workflow["1"]["inputs"]["how_to_cut"] == "按标点符号切"
 
     def test_build_workflow_dispatcher(self):
         w = build_workflow("cosyvoice", {"text": "Hi", "resource_id": "cosy-main"})

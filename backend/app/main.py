@@ -31,7 +31,7 @@ from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluste
 from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
 from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
-from app.services import ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
+from app.services import COMFYUI_TTS_AUDIO_SUITE_CONTRACT, ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
 from app.storage import ProjectStore
 from app.supervisor import ServiceSupervisor
 from app.service_store_io import ServicePostCommitError
@@ -1149,8 +1149,8 @@ def create_app(
     @app.post("/api/generate")
     def generate(request: GenerateRequest) -> dict[str, Any]:
         try:
-            tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks)
-            _validate_generation_tasks(tasks)
+            tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks, app.state.service_registry)
+            _validate_generation_tasks(tasks, app.state.service_registry)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         manifest = store.load_manifest(request.project_id)
@@ -1161,14 +1161,14 @@ def create_app(
 
     @app.post("/api/jobs/generation")
     def create_generation_job(request: GenerateRequest) -> dict[str, Any]:
-        tasks = _prepare_tasks_for_async_job(store, request.project_id, request.tasks)
+        tasks = _prepare_tasks_for_async_job(store, request.project_id, request.tasks, app.state.service_registry)
         job = app.state.job_manager.submit(request.project_id, tasks)
         return job.model_dump(mode="json")
 
     @app.post("/api/generation/preflight")
     def generation_preflight(request: GenerateRequest) -> dict[str, Any]:
         try:
-            tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks)
+            tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks, app.state.service_registry)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         items = [_preflight_task(app.state.service_router, supervisor, app.state.queue, task) for task in tasks]
@@ -1201,8 +1201,8 @@ def create_app(
     @app.post("/api/validation/real-tts/run")
     def run_real_tts_validation(request: GenerateRequest) -> dict[str, Any]:
         try:
-            tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks)
-            _validate_generation_tasks(tasks)
+            tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks, app.state.service_registry)
+            _validate_generation_tasks(tasks, app.state.service_registry)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if _service_mode() == "real":
@@ -1232,7 +1232,7 @@ def create_app(
                 parameters={},
             )
             try:
-                runnable.append(_enrich_tasks_for_project(store, project_id, [base_task])[0])
+                runnable.append(_enrich_tasks_for_project(store, project_id, [base_task], app.state.service_registry)[0])
             except ValueError as exc:
                 blocked.append({"line_id": line.id, "line_uid": line.line_uid or line.id, "character_id": line.character_id, "reason": str(exc)})
         tasks = [task for _ in range(repeat_count) for task in runnable]
@@ -1552,7 +1552,7 @@ def _repo_path_exists(raw_path: Any) -> bool | None:
 
 def _preflight_task(router: ServiceRouter, supervisor: ServiceSupervisor, queue: ServiceGenerationQueue, task: GenerationTask) -> dict[str, Any]:
     try:
-        _assert_generation_inputs(task)
+        _assert_generation_inputs(task, router.registry)
     except ValueError as exc:
         return {
             "line_id": task.line.id,
@@ -1852,7 +1852,12 @@ def _load_all_projects(store: ProjectStore) -> list[tuple[str, ScriptProject]]:
     return projects
 
 
-def _enrich_tasks_for_project(store: ProjectStore, project_id: str, tasks: list[GenerationTask]) -> list[GenerationTask]:
+def _enrich_tasks_for_project(
+    store: ProjectStore,
+    project_id: str,
+    tasks: list[GenerationTask],
+    service_registry: ServiceRegistry,
+) -> list[GenerationTask]:
     try:
         project = store.load_project(project_id)
     except FileNotFoundError:
@@ -1895,7 +1900,7 @@ def _enrich_tasks_for_project(store: ProjectStore, project_id: str, tasks: list[
                     "required_capabilities": task.required_capabilities or binding.capabilities,
                 }
             )
-            _assert_generation_inputs(enriched)
+            _assert_generation_inputs(enriched, service_registry)
             output.append(enriched)
             continue
         character = by_id.get(line.character_id)
@@ -1929,22 +1934,27 @@ def _enrich_tasks_for_project(store: ProjectStore, project_id: str, tasks: list[
                 "required_capabilities": task.required_capabilities or (binding.capabilities if binding else []),
             }
         )
-        _assert_generation_inputs(enriched)
+        _assert_generation_inputs(enriched, service_registry)
         output.append(enriched)
     return output
 
 
-def _prepare_tasks_for_async_job(store: ProjectStore, project_id: str, tasks: list[GenerationTask]) -> list[GenerationTask]:
+def _prepare_tasks_for_async_job(
+    store: ProjectStore,
+    project_id: str,
+    tasks: list[GenerationTask],
+    service_registry: ServiceRegistry,
+) -> list[GenerationTask]:
     output: list[GenerationTask] = []
     for task in tasks:
         try:
-            enriched_tasks = _enrich_tasks_for_project(store, project_id, [task])
+            enriched_tasks = _enrich_tasks_for_project(store, project_id, [task], service_registry)
         except ValueError as exc:
             output.append(_prefailed_task(task, str(exc)))
             continue
         for enriched in enriched_tasks:
             try:
-                _assert_generation_inputs(enriched)
+                _assert_generation_inputs(enriched, service_registry)
             except ValueError as exc:
                 output.append(_prefailed_task(enriched, str(exc)))
             else:
@@ -1956,20 +1966,21 @@ def _prefailed_task(task: GenerationTask, error: str) -> GenerationTask:
     return task.model_copy(update={"parameters": {**task.parameters, "_prefail_error": error}})
 
 
-def _validate_generation_tasks(tasks: list[GenerationTask]) -> None:
+def _validate_generation_tasks(tasks: list[GenerationTask], service_registry: ServiceRegistry) -> None:
     for task in tasks:
-        _assert_generation_inputs(task)
+        _assert_generation_inputs(task, service_registry)
 
 
-def _assert_generation_inputs(task: GenerationTask) -> None:
+def _assert_generation_inputs(task: GenerationTask, service_registry: ServiceRegistry) -> None:
     provider = task.provider_type.value if task.provider_type is not None else task.engine.value
     params = task.parameters
     if provider == "gpt-sovits":
         missing = []
-        if not _has_text(params.get("gpt_weights_path") or params.get("gpt_weights")):
-            missing.append("gpt_weights_path")
-        if not _has_text(params.get("sovits_weights_path") or params.get("sovits_weights")):
-            missing.append("sovits_weights_path")
+        if not _uses_registered_comfyui_resource(task, service_registry):
+            if not _has_text(params.get("gpt_weights_path") or params.get("gpt_weights")):
+                missing.append("gpt_weights_path")
+            if not _has_text(params.get("sovits_weights_path") or params.get("sovits_weights")):
+                missing.append("sovits_weights_path")
         if not _has_text(params.get("ref_audio_path") or params.get("reference_audio") or params.get("voice")):
             missing.append("ref_audio_path")
         if not _has_text(params.get("prompt_text")):
@@ -1978,6 +1989,26 @@ def _assert_generation_inputs(task: GenerationTask) -> None:
             raise ValueError(f"line {task.line.id} GPT-SoVITS binding is incomplete: missing {', '.join(missing)}")
     if provider == "indextts" and not _has_text(params.get("voice") or params.get("ref_audio_path") or params.get("reference_audio")):
         raise ValueError(f"line {task.line.id} IndexTTS binding is incomplete: missing voice reference audio")
+
+
+def _uses_registered_comfyui_resource(task: GenerationTask, service_registry: ServiceRegistry) -> bool:
+    service_id = task.service_id or task.line.service_override
+    if not service_id:
+        return False
+    try:
+        endpoint = service_registry.get(service_id)
+    except KeyError:
+        return False
+    if endpoint.api_contract != COMFYUI_TTS_AUDIO_SUITE_CONTRACT:
+        return False
+    if endpoint.provider_type != task.provider_type or endpoint.engine != task.engine:
+        return False
+    registered_resource_id = str(endpoint.default_params.get("resource_id", "")).strip()
+    requested_resource_id = str(task.parameters.get("resource_id", "")).strip()
+    return bool(
+        registered_resource_id
+        and (not requested_resource_id or requested_resource_id == registered_resource_id)
+    )
 
 
 def _has_text(value: Any) -> bool:

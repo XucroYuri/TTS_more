@@ -6,10 +6,12 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import httpx
+import pytest
 
 import app.main as main_module
 from app.models import Character, ScriptLine
 from app.main import _layer_service_status, _portable_controller_root, _resolve_repo_lock_path, create_app
+from app.open_source_tts import OpenSourceTTSConfigureRequest
 from app.parser import ParsedScriptDraft, ParserProviderUnavailable, ParserQualityError
 
 
@@ -1299,6 +1301,60 @@ def test_open_source_tts_catalog_lists_core_providers_in_priority_order(tmp_path
     assert providers[2]["priority"] == 30
 
 
+def test_open_source_comfyui_request_defaults_to_single_gpu_capacity() -> None:
+    request = OpenSourceTTSConfigureRequest(
+        provider_type="indextts",
+        base_url="http://127.0.0.1:8188",
+        resource_id="indextts-local",
+    )
+
+    assert request.capacity == 1
+    assert request.resource_group == "comfyui-local-0"
+
+
+def test_open_source_comfyui_api_defaults_persist_single_gpu_capacity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def _fake_get(self, url, *args, **kwargs):
+        del self, args, kwargs
+        if url.endswith("/system_stats"):
+            return httpx.Response(200, json={"system": {"cuda": True}})
+        if url.endswith("/api/tts-audio-suite/v1/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol_version": 1,
+                    "resources": [
+                        {"resource_id": "indextts-local", "engine": "indextts", "ready": True}
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    monkeypatch.setattr("httpx.Client.get", _fake_get)
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.post(
+        "/api/open-source-tts/configure",
+        json={
+            "provider_type": "indextts",
+            "service_id": "comfyui-indextts-default",
+            "base_url": "http://127.0.0.1:8188",
+            "api_contract": "comfyui-tts-audio-suite-v1",
+            "resource_id": "indextts-local",
+        },
+    )
+
+    assert response.status_code == 200
+    service = response.json()["service"]
+    assert service["capacity"] == 1
+    assert service["resource_group"] == "comfyui-local-0"
+    saved = json.loads((tmp_path / "local" / "services.json").read_text(encoding="utf-8"))
+    saved_service = next(item for item in saved if item["service_id"] == "comfyui-indextts-default")
+    assert saved_service["capacity"] == 1
+    assert saved_service["resource_group"] == "comfyui-local-0"
+
+
 def test_open_source_tts_detect_ignores_repo_path_for_gradio_endpoint_onboarding(tmp_path: Path, monkeypatch) -> None:
     client = TestClient(create_app(data_root=tmp_path))
 
@@ -2032,6 +2088,178 @@ def test_generation_job_api_runs_in_background_and_reports_status(tmp_path: Path
 
     assert queue_status.status_code == 200
     assert queue_status.json()["queued"] == 0
+
+
+def test_registered_comfyui_gpt_endpoint_allows_registry_owned_weights_in_preflight_and_job(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps(
+            [
+                {
+                    "service_id": "comfyui-gpt",
+                    "engine": "gpt-sovits",
+                    "provider_type": "gpt-sovits",
+                    "api_contract": "comfyui-tts-audio-suite-v1",
+                    "base_url": "mock://comfyui-gpt",
+                    "resource_group": "comfyui-local-0",
+                    "capacity": 1,
+                    "capabilities": [
+                        "tts",
+                        "trained_weights_voice",
+                        "reference_audio_voice",
+                        "comfyui",
+                        "tts-audio-suite",
+                    ],
+                    "default_params": {
+                        "engine": "gpt-sovits",
+                        "resource_id": "gpt-sovits-local",
+                    },
+                    "setup_state": "ready",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+    request = {
+        "project_id": "comfy-project",
+        "tasks": [
+            {
+                "line": {"id": "gpt-line", "character_id": "gpt-role", "text": "真实 ComfyUI GPT 验证"},
+                "engine": "gpt-sovits",
+                "profile": "line-temp-gpt-sovits",
+                "service_id": "comfyui-gpt",
+                "provider_type": "gpt-sovits",
+                "required_capabilities": ["trained_weights_voice", "reference_audio_voice"],
+                "parameters": {
+                    "ref_audio_path": "paired-reference.wav",
+                    "prompt_text": "配对参考文本",
+                },
+            }
+        ],
+    }
+
+    preflight = client.post("/api/generation/preflight", json=request)
+    created = client.post("/api/jobs/generation", json=request)
+
+    assert preflight.status_code == 200
+    assert preflight.json()["status"] == "ready"
+    assert preflight.json()["items"][0]["selected_service_id"] == "comfyui-gpt"
+    assert "resource_id=gpt-sovits-local" in preflight.json()["items"][0]["load_signature"]
+    assert created.status_code == 200
+    assert created.json()["items"][0]["status"] == "queued"
+    final = _wait_for_job(client, created.json()["job_id"])
+    assert final["status"] == "completed"
+    assert final["items"][0]["status"] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("parameters", "expected_reason"),
+    [
+        (
+            {"prompt_text": "配对参考文本"},
+            "line gpt-line GPT-SoVITS binding is incomplete: missing ref_audio_path",
+        ),
+        (
+            {"ref_audio_path": "paired-reference.wav"},
+            "line gpt-line GPT-SoVITS binding is incomplete: missing prompt_text",
+        ),
+    ],
+)
+def test_registered_comfyui_gpt_endpoint_still_requires_paired_reference_inputs(
+    tmp_path: Path,
+    parameters: dict[str, str],
+    expected_reason: str,
+) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps(
+            [
+                {
+                    "service_id": "comfyui-gpt",
+                    "engine": "gpt-sovits",
+                    "provider_type": "gpt-sovits",
+                    "api_contract": "comfyui-tts-audio-suite-v1",
+                    "base_url": "mock://comfyui-gpt",
+                    "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice"],
+                    "default_params": {"resource_id": "gpt-sovits-local"},
+                    "setup_state": "ready",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+
+    response = client.post(
+        "/api/generation/preflight",
+        json={
+            "project_id": "comfy-project",
+            "tasks": [
+                {
+                    "line": {"id": "gpt-line", "character_id": "gpt-role", "text": "真实 ComfyUI GPT 验证"},
+                    "engine": "gpt-sovits",
+                    "profile": "line-temp-gpt-sovits",
+                    "service_id": "comfyui-gpt",
+                    "provider_type": "gpt-sovits",
+                    "parameters": parameters,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "blocked"
+    assert response.json()["items"][0]["reason"] == expected_reason
+
+
+def test_non_comfy_gpt_endpoint_rejects_missing_weights_even_when_task_spoofs_bridge_fields(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps(
+            [
+                {
+                    "service_id": "legacy-gpt",
+                    "engine": "gpt-sovits",
+                    "provider_type": "gpt-sovits",
+                    "api_contract": "tts-more-v1",
+                    "base_url": "mock://legacy-gpt",
+                    "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice", "comfyui", "tts-audio-suite"],
+                    "setup_state": "ready",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+
+    response = client.post(
+        "/api/generation/preflight",
+        json={
+            "project_id": "legacy-project",
+            "tasks": [
+                {
+                    "line": {"id": "legacy-line", "character_id": "legacy-role", "text": "不能伪造 Bridge 身份"},
+                    "engine": "gpt-sovits",
+                    "profile": "spoofed-binding",
+                    "service_id": "legacy-gpt",
+                    "provider_type": "gpt-sovits",
+                    "required_capabilities": ["comfyui", "tts-audio-suite"],
+                    "parameters": {
+                        "resource_id": "gpt-sovits-local",
+                        "ref_audio_path": "paired-reference.wav",
+                        "prompt_text": "配对参考文本",
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "blocked"
+    assert response.json()["items"][0]["reason"] == (
+        "line legacy-line GPT-SoVITS binding is incomplete: missing gpt_weights_path, sovits_weights_path"
+    )
 
 
 def test_generation_job_accepts_mixed_valid_and_invalid_lines(tmp_path: Path) -> None:
