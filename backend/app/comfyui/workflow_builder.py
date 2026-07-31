@@ -10,6 +10,15 @@ _ENGINE_NODES = {
     "gpt-sovits": "TTSExternalGPTSovitsEngine",
 }
 
+_GPT_SOVITS_CUT_METHODS = {
+    "cut0": "不切",
+    "cut1": "凑四句一切",
+    "cut2": "凑50字一切",
+    "cut3": "按中文句号。切",
+    "cut4": "按英文句号.切",
+    "cut5": "按标点符号切",
+}
+
 
 def _resource_id(params: dict[str, Any]) -> str:
     value = str(params.get("resource_id", "")).strip()
@@ -86,13 +95,14 @@ def build_indextts_workflow(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_gpt_sovits_workflow(params: dict[str, Any]) -> dict[str, Any]:
+    cut_method = str(params.get("how_to_cut", params.get("text_split_method", "凑四句一切")))
     inputs = {
         "resource_id": _resource_id(params),
         "device": str(params.get("device", "auto")),
         "use_fp16": bool(params.get("use_fp16", True)),
         "text_language": str(params.get("text_lang", params.get("text_language", "zh"))),
         "ref_language": str(params.get("prompt_lang", params.get("ref_language", "zh"))),
-        "how_to_cut": str(params.get("how_to_cut", params.get("text_split_method", "凑四句一切"))),
+        "how_to_cut": _GPT_SOVITS_CUT_METHODS.get(cut_method, cut_method),
         "speed": float(params.get("speed", params.get("speed_factor", 1.0))),
         "top_k": int(params.get("top_k", 15)),
         "top_p": float(params.get("top_p", 1.0)),

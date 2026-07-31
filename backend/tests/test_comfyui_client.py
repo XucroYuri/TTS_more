@@ -303,6 +303,43 @@ class TestWorkflowBuilder:
         assert w["4"]["class_type"] == "SaveAudio"
         assert w["1"]["inputs"]["resource_id"] == "gpt-main"
 
+    @pytest.mark.parametrize(
+        ("legacy_value", "expected_value"),
+        [
+            ("cut0", "不切"),
+            ("cut1", "凑四句一切"),
+            ("cut2", "凑50字一切"),
+            ("cut3", "按中文句号。切"),
+            ("cut4", "按英文句号.切"),
+            ("cut5", "按标点符号切"),
+        ],
+    )
+    def test_gpt_sovits_workflow_normalizes_legacy_cut_method_for_comfyui(
+        self,
+        legacy_value: str,
+        expected_value: str,
+    ):
+        workflow = build_gpt_sovits_workflow(
+            {
+                "text": "Hello",
+                "resource_id": "gpt-main",
+                "text_split_method": legacy_value,
+            }
+        )
+
+        assert workflow["1"]["inputs"]["how_to_cut"] == expected_value
+
+    def test_gpt_sovits_workflow_preserves_valid_comfyui_cut_method(self):
+        workflow = build_gpt_sovits_workflow(
+            {
+                "text": "Hello",
+                "resource_id": "gpt-main",
+                "how_to_cut": "按标点符号切",
+            }
+        )
+
+        assert workflow["1"]["inputs"]["how_to_cut"] == "按标点符号切"
+
     def test_build_workflow_dispatcher(self):
         w = build_workflow("cosyvoice", {"text": "Hi", "resource_id": "cosy-main"})
         assert w["1"]["class_type"] == "TTSExternalCosyVoiceEngine"
