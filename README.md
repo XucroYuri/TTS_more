@@ -113,54 +113,11 @@ scripts/update.sh --force-reset-repos --repo-paths deployment/app/repo-paths.loc
 
 ### 5. 接入 TTS 服务
 
-在工作台打开 `接入 → TTS 服务`，选择 GPT-SoVITS / IndexTTS / CosyVoice，粘贴服务地址并执行“检测并保存”。`127.0.0.1`、`localhost`、局域网或远端 worker 地址都可以接入；向导写入 `data/local/services.json`，不污染可提交模板。
+先启动 ComfyUI，并安装 `XucroYuri/TTS-Audio-Suite` custom node。然后在工作台打开 `接入 → TTS 服务`，启用对应的 GPT-SoVITS / IndexTTS / CosyVoice ComfyUI 端点，填写 ComfyUI 地址和 TTS-Audio-Suite `resource_id` 后保存。`127.0.0.1`、`localhost`、局域网或远端 ComfyUI 地址都可以接入；本机修改写入 `data/local/services.json`，不污染可提交模板。
 
-TTS More 推荐 worker-first 架构：优先接入 `tts-more-v1` worker；已有 Gradio 服务也可以作为兼容端点接入。
+旧的 `tts-more-v1` worker、Gradio WebUI 和 portable package 路线只作为历史迁移路径保留，不是当前推荐部署方式。完整 ComfyUI 部署步骤见 [ComfyUI 部署指南](docs/comfyui-integration.md#从零部署指南)。
 
-本地完整部署推荐使用一键脚本。它会安装应用本体依赖，按 `repo.lock.json` 中的 `default_selected` 同步 GPT-SoVITS `main`、IndexTTS、CosyVoice，把 `deployment/tts-repos/<provider>` 下的附加脚本复制到对应服务 repo 的 `tts-more/` 目录，准备依赖/模型，并渲染 `data/local/services.json`：
-
-所有本机托管命令都要求显式的 repo 路径确认文件，即使实际路径与锁文件一致。先复制模板并核对本次选择的每个 `service_id`：
-
-```bash
-cp deployment/app/repo-paths.example.json deployment/app/repo-paths.local.json
-scripts/deploy-local-tts.sh --device CU128 --repo-paths deployment/app/repo-paths.local.json
-```
-
-Windows：
-
-```powershell
-Copy-Item deployment\app\repo-paths.example.json deployment\app\repo-paths.local.json
-.\scripts\deploy-local-tts.ps1 -Device CU128 -RepoPaths deployment\app\repo-paths.local.json
-```
-
-GPT-SoVITS `dev` 只用于显式回归，旧 `proplus-hc-dev` 只用于收敛审计。需要时使用：
-
-```bash
-scripts/deploy-local-tts.sh --targets dev --repo-paths deployment/app/repo-paths.local.json
-scripts/deploy-local-tts.sh --targets all --repo-paths deployment/app/repo-paths.local.json
-```
-
-应用本体部署资料位于 `deployment/app/`；可复制到上游 TTS repo 的附加脚本位于 `deployment/tts-repos/gpt-sovits/`、`deployment/tts-repos/indextts/`、`deployment/tts-repos/cosyvoice/`。
-
-也可以只运行 manifest 驱动的 repo 准备脚本。默认同样只拉取正式服务；通过 `--targets dev` 或 `--targets all` 才包含回归分支：
-
-```powershell
-.\scripts\tts-more.ps1 sync-repos --clean --repo-paths deployment\app\repo-paths.local.json
-.\scripts\prepare-tts-repos.ps1 -SyncRepos -CleanRepos -Device CU128 -RepoPaths deployment\app\repo-paths.local.json
-```
-
-macOS/Linux：
-
-```bash
-./scripts/tts-more.sh sync-repos --clean --repo-paths deployment/app/repo-paths.local.json
-bash scripts/prepare-tts-repos.sh --sync-repos --clean-repos --device CU128 --repo-paths deployment/app/repo-paths.local.json
-```
-
-准备脚本默认走 `Auto`：先跑 `probe-network`，优先选择中国大陆可达且健康的源，例如 ModelScope 或 HF Mirror，必要时再回退到全球 Hugging Face / PyPI 路线。默认安装只准备 full-quality baseline models，quantized、distilled、simplified、small、low-memory 这些都只是手动 manual 的高级选项。
-
-详细拓扑、远端 worker、离线缓存和模型下载策略见 [部署方案](docs/deployment.md)。Windows 单机认证命令只见 [单机 CUDA Runbook](docs/cuda-e2e-single-node.md)；四机命令见 [分布式 Runbook](docs/cuda-e2e-distributed.md)；跨拓扑规则见 [CUDA 验证契约](docs/cuda-e2e-validation.md)。
-GPT-SoVITS 三分支职责、收敛顺序和合并门禁见 [GPT-SoVITS 分支收敛](docs/gpt-sovits-branch-convergence.md)。
-当前阶段边界、设计不足和任务拆分见 [当前阶段说明与简化计划](docs/current-state-and-simplification-plan.md)。
+当前阶段边界、理论验证和剩余真实机器验收项见 [当前阶段说明与简化计划](docs/current-state-and-simplification-plan.md) 与 [理论可用性验证](docs/theoretical-usability-validation.md)。
 
 ## 验证
 

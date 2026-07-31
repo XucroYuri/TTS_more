@@ -27,6 +27,9 @@ from app.portable_endpoint_trust import (
 from app.portable_locator_mutations import require_managed_portable_locators_unchanged
 from app.service_store_io import ServiceDocument, read_service_document, update_service_document
 
+COMFYUI_TTS_AUDIO_SUITE_CONTRACT = "comfyui-tts-audio-suite-v1"
+COMFYUI_TTS_CONTRACTS = {"comfyui-tts-v1", COMFYUI_TTS_AUDIO_SUITE_CONTRACT}
+
 
 class TTSServiceClient(Protocol):
     endpoint: TTSServiceEndpoint
@@ -274,6 +277,25 @@ class ServiceRegistry:
 
 
 def build_load_signature(endpoint: TTSServiceEndpoint, parameters: dict[str, Any]) -> str:
+    if endpoint.api_contract in COMFYUI_TTS_CONTRACTS:
+        reference_audio = parameters.get(
+            "reference_audio",
+            parameters.get("ref_audio_path", parameters.get("prompt_audio_path", "")),
+        )
+        engine = parameters.get("engine") or (endpoint.engine.value if endpoint.engine else "")
+        provider = endpoint.provider_type.value if endpoint.provider_type else ""
+        parts = [
+            f"service_id={endpoint.service_id}",
+            f"provider={provider}",
+            f"engine={engine}",
+            f"resource_id={parameters.get('resource_id', endpoint.default_params.get('resource_id', ''))}",
+            f"reference_audio={reference_audio}",
+            f"prompt_text={parameters.get('prompt_text', '')}",
+            f"instruct_text={parameters.get('instruct_text', parameters.get('instruction', ''))}",
+            f"speed={parameters.get('speed', '')}",
+            f"seed={parameters.get('seed', '')}",
+        ]
+        return "|".join(parts)
     if endpoint.provider_type == ProviderType.GPT_SOVITS or endpoint.engine == EngineName.GPT_SOVITS:
         parts = [
             f"service_id={endpoint.service_id}",
@@ -465,7 +487,7 @@ class ServiceRouter:
 def build_service_client(endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> TTSServiceClient:
     if endpoint.base_url.startswith("mock://"):
         return MockServiceClient(endpoint)
-    if endpoint.api_contract == "comfyui-tts-v1":
+    if endpoint.api_contract in COMFYUI_TTS_CONTRACTS:
         return ComfyUITTSClient(endpoint, transport=transport)
     if endpoint.api_contract == "tts-more-v1":
         return HttpTTSServiceClient(endpoint, transport=transport)
@@ -1869,6 +1891,23 @@ class ComfyUITTSClient:
         except Exception as exc:
             raise RuntimeError(scrub_error(exc, self.endpoint.base_url)) from exc
 
+    def _emit_prompt_progress(
+        self,
+        request: SynthesisRequest,
+        prompt_id: str,
+        status: str,
+        progress: float,
+    ) -> None:
+        if request.progress_callback is None:
+            return
+        request.progress_callback(
+            {
+                "external_job_id": prompt_id,
+                "external_status": status,
+                "progress": progress,
+            }
+        )
+
     def _synthesize_impl(self, request: SynthesisRequest) -> SynthesisResult:
         engine_value = request.parameters.get("engine") or (
             self.endpoint.engine.value if self.endpoint.engine else "cosyvoice"
@@ -1894,6 +1933,7 @@ class ComfyUITTSClient:
 
             workflow = self._build_workflow(engine_value, params)
             prompt_id = self.api.submit_workflow(workflow)
+            self._emit_prompt_progress(request, prompt_id, "queued", 0.1)
             timeout = float(params.get("timeout_seconds", 600.0))
             poll_interval = float(params.get("poll_interval", 2.0))
             history_entry = self.api.poll_until_done(
@@ -1915,7 +1955,9 @@ class ComfyUITTSClient:
                 audio_path=request.output_path,
                 metadata={
                     "service_id": self.endpoint.service_id,
+                    "api_contract": self.endpoint.api_contract,
                     "prompt_id": prompt_id,
+                    "prompt_status": "completed",
                     "engine": engine_value,
                     "resource_id": params["resource_id"],
                     "comfyui_output_files": output_files,
@@ -1934,6 +1976,7 @@ class ComfyUITTSClient:
         if cleanup_error is not None:
             raise cleanup_error
         assert result is not None
+        self._emit_prompt_progress(request, str(result.metadata["prompt_id"]), "completed", 1.0)
         return result
 
     def unload(self) -> None:
@@ -1943,13 +1986,16 @@ class ComfyUITTSClient:
 
 
 def _write_wav(output_path: Path, audio_bytes: bytes) -> None:
-    """Decode ComfyUI's FLAC output and persist the WAV contract used by TTS More."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if audio_bytes.startswith(b"RIFF") and audio_bytes[8:12] == b"WAVE":
+        output_path.write_bytes(audio_bytes)
+        return
+
     import soundfile
 
     samples, sample_rate = soundfile.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
     if sample_rate <= 0 or samples.size == 0:
         raise ValueError("ComfyUI returned empty audio")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     soundfile.write(str(output_path), samples, sample_rate, format="WAV", subtype="PCM_16")
 
 

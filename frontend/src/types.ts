@@ -205,6 +205,7 @@ export interface OpenSourceTTSCatalogItem {
   capabilities: string[];
   priority: number;
   resource_group: string;
+  default_resource_id?: string;
   recommended_clone_command: string;
   start_hint: string;
 }
@@ -241,6 +242,7 @@ export interface OpenSourceTTSConfigureRequest {
   enabled?: boolean;
   resource_group?: string;
   capacity?: number;
+  resource_id?: string | null;
   start_command?: string[];
   start_cwd?: string | null;
 }
@@ -589,6 +591,8 @@ export interface GenerationQueueItem {
   load_signature?: string | null;
   service_id?: string | null;
   resource_group?: string | null;
+  external_job_id?: string | null;
+  external_status?: string | null;
   error?: string | null;
   version_id?: string | null;
 }

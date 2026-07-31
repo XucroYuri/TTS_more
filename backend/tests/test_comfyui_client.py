@@ -38,6 +38,11 @@ def _cosyvoice_endpoint(base_url: str = "http://127.0.0.1:8188") -> TTSServiceEn
     )
 
 
+def _cosyvoice_audio_suite_endpoint(base_url: str = "http://127.0.0.1:8188") -> TTSServiceEndpoint:
+    endpoint = _cosyvoice_endpoint(base_url)
+    return endpoint.model_copy(update={"api_contract": "comfyui-tts-audio-suite-v1"})
+
+
 def _audio_bytes() -> bytes:
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as output:
@@ -233,6 +238,12 @@ class TestComfyUITTSClient:
         assert isinstance(client, ComfyUITTSClient)
         assert client.endpoint == endpoint
 
+    def test_build_client_via_audio_suite_contract(self):
+        endpoint = _cosyvoice_audio_suite_endpoint()
+        client = build_service_client(endpoint)
+        assert isinstance(client, ComfyUITTSClient)
+        assert client.endpoint == endpoint
+
     def test_health_mocked(self):
         def handler(request: httpx.Request) -> httpx.Response:
             if "/system_stats" in request.url.path:
@@ -312,6 +323,55 @@ class TestComfyUITTSClient:
         assert result.metadata["resource_id"] == "cosy-main"
         assert "POST /api/tts-audio-suite/v1/assets/audio" in call_log
         assert "DELETE /api/tts-audio-suite/v1/assets/audio/asset-1" in call_log
+
+    def test_synthesize_reports_prompt_status_updates(self, tmp_path: Path):
+        prompt_id = "prompt-status-001"
+        wav_content = _audio_bytes()
+        updates: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/prompt":
+                return httpx.Response(200, json={"prompt_id": prompt_id})
+            if request.url.path == f"/history/{prompt_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        prompt_id: {
+                            "outputs": {
+                                "4": {
+                                    "audio": [
+                                        {
+                                            "filename": "tts_more_cosyvoice_00001.flac",
+                                            "subfolder": "",
+                                            "type": "output",
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                )
+            if request.url.path == "/view":
+                return httpx.Response(200, content=wav_content)
+            return httpx.Response(404)
+
+        output_path = tmp_path / "result.wav"
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-1", character_id="char-1", text="Hello world"),
+            profile="default",
+            output_path=output_path,
+            parameters={"engine": "cosyvoice"},
+            progress_callback=updates.append,
+        )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as mock_client:
+            client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint(), transport=mock_client._transport)
+            result = client.synthesize(request)
+
+        assert result.metadata["api_contract"] == "comfyui-tts-audio-suite-v1"
+        assert result.metadata["prompt_status"] == "completed"
+        assert [item["external_status"] for item in updates] == ["queued", "completed"]
+        assert all(item["external_job_id"] == prompt_id for item in updates)
 
     def test_unload(self):
         calls: list[tuple[str, dict | None]] = []

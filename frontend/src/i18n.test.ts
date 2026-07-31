@@ -37,7 +37,7 @@ describe("i18n configuration", () => {
     expect(tText(resources["zh-CN"], "characters.bindToProjectRole")).toBe("用于当前项目");
     expect(tText(resources["zh-CN"], "services.ttsAccessTitle")).toBe("添加 TTS 服务");
     expect(tText(resources["zh-CN"], "services.openSourceDetect")).toBe("检测连接");
-    expect(tText(resources["zh-CN"], "services.openSourceBaseUrl")).toBe("服务地址");
+    expect(tText(resources["zh-CN"], "services.openSourceBaseUrl")).toBe("ComfyUI 地址");
     expect(tText(resources["zh-CN"], "services.llmApiTitle")).toBe("剧本解析");
     expect(tText(resources["zh-CN"], "parser.advancedConfig")).toBe("高级服务");
     expect(tText(resources["zh-CN"], "parser.activateKwjm")).toBe("保存并检查");
@@ -60,7 +60,7 @@ describe("i18n configuration", () => {
     expect(tText(resources["en-US"], "characters.bindToProjectRole")).toBe("Use in this project");
     expect(tText(resources["en-US"], "services.ttsAccessTitle")).toBe("Add TTS service");
     expect(tText(resources["en-US"], "services.openSourceDetect")).toBe("Test connection");
-    expect(tText(resources["en-US"], "services.openSourceBaseUrl")).toBe("Service URL");
+    expect(tText(resources["en-US"], "services.openSourceBaseUrl")).toBe("ComfyUI URL");
     expect(tText(resources["en-US"], "topbar.ttsConfig")).toBe("Access");
     expect(tText(resources["en-US"], "services.llmApiTitle")).toBe("Script parser");
     expect(tText(resources["en-US"], "parser.advancedConfig")).toBe("Advanced services");

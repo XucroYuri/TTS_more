@@ -95,7 +95,7 @@ import { filterAndSortProjectSummaries, nextProjectAfterDelete } from "./lib/scr
 import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
-import { buildGradioEndpointRequest, gradioContractForProvider } from "./lib/ttsAccess";
+import { buildComfyUIEndpointRequest, ttsAudioSuiteContractForProvider } from "./lib/ttsAccess";
 import { createToast, inferToastLevel, shouldToastNotice, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
 import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, lineWorkbenchControlsState, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
@@ -212,8 +212,9 @@ export default function App() {
   const [openSourceCatalog, setOpenSourceCatalog] = useState<OpenSourceTTSCatalogItem[]>([]);
   const [selectedOpenSourceProvider, setSelectedOpenSourceProvider] = useState<CatalogProvider>("gpt-sovits");
   const [openSourceBaseUrl, setOpenSourceBaseUrl] = useState("");
-  const [openSourceResourceGroup, setOpenSourceResourceGroup] = useState("gradio-gpu-0");
-  const [openSourceCapacity, setOpenSourceCapacity] = useState(1);
+  const [openSourceResourceGroup, setOpenSourceResourceGroup] = useState("comfyui-local-0");
+  const [openSourceCapacity, setOpenSourceCapacity] = useState(3);
+  const [openSourceResourceId, setOpenSourceResourceId] = useState("");
   const [openSourceDisplayName, setOpenSourceDisplayName] = useState("");
   const [openSourceDetectResult, setOpenSourceDetectResult] = useState<OpenSourceTTSDetectResponse | null>(null);
   const [isDetectingOpenSource, setIsDetectingOpenSource] = useState(false);
@@ -880,7 +881,7 @@ export default function App() {
         provider_type: selectedOpenSourceProvider,
         repo_path: null,
         base_url: openSourceBaseUrl || null,
-        api_contract: gradioContractForProvider(selectedOpenSourceProvider)
+        api_contract: ttsAudioSuiteContractForProvider(selectedOpenSourceProvider)
       });
       setOpenSourceDetectResult(payload);
       setNotice(t("services.openSourceDetectDone", { state: setupStateLabel(payload.setup_state, t) }));
@@ -895,12 +896,13 @@ export default function App() {
     setIsConfiguringOpenSource(true);
     try {
       const payload = await configureOpenSourceTTS({
-        ...buildGradioEndpointRequest({
+        ...buildComfyUIEndpointRequest({
           provider_type: selectedOpenSourceProvider,
           display_name: openSourceDisplayName || null,
           base_url: openSourceBaseUrl,
           resource_group: openSourceResourceGroup,
           capacity: openSourceCapacity,
+          resource_id: openSourceResourceId || selectedOpenSourceCatalog?.default_resource_id || null,
           enabled: openSourceDetectResult ? ["partial", "ready"].includes(openSourceDetectResult.setup_state) : false,
         })
       });
@@ -922,7 +924,7 @@ export default function App() {
         provider_type: selectedOpenSourceProvider,
         repo_path: null,
         base_url: openSourceBaseUrl || null,
-        api_contract: gradioContractForProvider(selectedOpenSourceProvider)
+        api_contract: ttsAudioSuiteContractForProvider(selectedOpenSourceProvider)
       });
       setOpenSourceDetectResult(detectPayload);
       if (!["partial", "ready"].includes(detectPayload.setup_state)) {
@@ -930,12 +932,13 @@ export default function App() {
         return;
       }
       const payload = await configureOpenSourceTTS({
-        ...buildGradioEndpointRequest({
+        ...buildComfyUIEndpointRequest({
           provider_type: selectedOpenSourceProvider,
           display_name: openSourceDisplayName || null,
           base_url: openSourceBaseUrl,
           resource_group: openSourceResourceGroup,
           capacity: openSourceCapacity,
+          resource_id: openSourceResourceId || selectedOpenSourceCatalog?.default_resource_id || null,
           enabled: true,
         })
       });
@@ -1862,7 +1865,10 @@ export default function App() {
                                   <button
                                     className={`open-source-mode-card ${selectedOpenSourceProvider === item.provider_type ? "active" : ""}`}
                                     key={item.provider_type}
-                                    onClick={() => setSelectedOpenSourceProvider(item.provider_type)}
+                                    onClick={() => {
+                                      setSelectedOpenSourceProvider(item.provider_type);
+                                      setOpenSourceResourceId("");
+                                    }}
                                     type="button"
                                   >
                                     <strong>{item.display_name}</strong>
@@ -1874,6 +1880,10 @@ export default function App() {
                                 <label className="wide">
                                   <span>{t("services.openSourceBaseUrl")}</span>
                                   <input value={openSourceBaseUrl} onChange={(event) => setOpenSourceBaseUrl(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_base_url} />
+                                </label>
+                                <label>
+                                  <span>{t("services.openSourceResourceId")}</span>
+                                  <input value={openSourceResourceId} onChange={(event) => setOpenSourceResourceId(event.target.value)} placeholder={selectedOpenSourceCatalog?.default_resource_id} />
                                 </label>
                               </div>
                               <div className="open-source-actions">
@@ -2343,6 +2353,7 @@ export default function App() {
                                   <div className="queue-job-list">
                                     {queueJobs.slice(0, 5).map((job) => {
                                       const jobPercent = Math.round(Math.max(0, Math.min(1, job.progress)) * 100);
+                                      const promptItem = job.items.find((item) => item.external_status || item.external_job_id);
                                       return (
                                         <article className={`queue-job-card state-${queueStatusTone(job.status)}`} key={job.job_id}>
                                           <div>
@@ -2351,6 +2362,11 @@ export default function App() {
                                           </div>
                                           <div className="queue-job-meta">
                                             <StatusPill tone={queueStatusTone(job.status)} label={statusText(job.status, t)} />
+                                            {promptItem?.external_status && (
+                                              <span className="line-meta-chip neutral" title={promptItem.external_job_id ?? ""}>
+                                                {t("queue.promptStatus", { status: statusText(promptItem.external_status, t) })}
+                                              </span>
+                                            )}
                                             <span>{jobPercent}%</span>
                                           </div>
                                         </article>
@@ -2981,6 +2997,11 @@ export default function App() {
                         </span>
                       )}
                       {queueItem?.queue_position && <span className="line-meta-chip neutral">{t("queue.position", { position: queueItem.queue_position })}</span>}
+                      {queueItem?.external_status && (
+                        <span className="line-meta-chip neutral" title={queueItem.external_job_id ?? ""}>
+                          {t("queue.promptStatus", { status: statusText(queueItem.external_status, t) })}
+                        </span>
+                      )}
                       {queueItem?.cluster_size && queueItem.cluster_size > 1 && (
                         <span className="line-meta-chip ok" title={queueItem.cluster_key}>
                           {t("queue.cluster", { current: queueItem.cluster_position ?? 1, total: queueItem.cluster_size })}

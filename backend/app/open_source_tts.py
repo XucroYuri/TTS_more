@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from app.models import EngineName, ProviderType, TTSServiceEndpoint
 from app.net_guard import EgressError, scrub_error, validate_egress_url
-from app.services import ServiceRegistry
+from app.services import COMFYUI_TTS_AUDIO_SUITE_CONTRACT, ServiceRegistry
 
 OpenSourceProvider = Literal["gpt-sovits", "indextts", "cosyvoice"]
 SourceProfile = Literal["local_repo", "local_endpoint", "lan_endpoint", "cloud_endpoint", "api_placeholder"]
@@ -34,8 +34,9 @@ class OpenSourceTTSConfigureRequest(BaseModel):
     network_scope: Literal["localhost", "lan", "public", "commercial"] | None = None
     managed: bool = False
     enabled: bool = True
-    resource_group: str = "gradio-gpu-0"
-    capacity: int = Field(default=1, ge=1)
+    resource_group: str = "comfyui-local-0"
+    capacity: int = Field(default=3, ge=1)
+    resource_id: str | None = None
     start_command: list[str] = Field(default_factory=list)
     start_cwd: str | None = None
 
@@ -46,42 +47,45 @@ CATALOG: list[dict[str, Any]] = [
         "display_name": "GPT-SoVITS",
         "clone_url": "https://github.com/XucroYuri/GPT-SoVITS.git",
         "default_repo_path": "repo/GPT-SoVITS-main",
-        "default_base_url": "http://127.0.0.1:9880",
-        "default_ports": [9880, 9872],
-        "api_contracts": ["tts-more-v1", "gradio-gpt-sovits-webui"],
-        "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice", "gpt-weights", "sovits-weights", "wav_output", "gradio_webui"],
+        "default_base_url": "http://127.0.0.1:8188",
+        "default_ports": [8188, 9880, 9872],
+        "api_contracts": [COMFYUI_TTS_AUDIO_SUITE_CONTRACT, "tts-more-v1", "gradio-gpt-sovits-webui"],
+        "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice", "gpt-weights", "sovits-weights", "wav_output", "comfyui", "tts-audio-suite", "gradio_webui"],
         "priority": 10,
-        "resource_group": "gradio-gpu-0",
+        "resource_group": "comfyui-local-0",
+        "default_resource_id": "gpt-sovits-local",
         "recommended_clone_command": "python scripts/tts_more_deploy.py sync-repos --clean",
-        "start_hint": "推荐先启动 TTS More GPT-SoVITS worker，并粘贴 http://127.0.0.1:9880 或局域网 worker 地址；已有 Gradio WebUI 可作为兼容路径接入。",
+        "start_hint": "推荐先启动 ComfyUI 并安装 TTS-Audio-Suite，然后粘贴 http://127.0.0.1:8188 或局域网 ComfyUI 地址；已有 Gradio WebUI 可作为显式兼容路径接入。",
     },
     {
         "provider_type": "indextts",
         "display_name": "IndexTTS",
         "clone_url": "https://github.com/XucroYuri/index-tts.git",
         "default_repo_path": "repo/index-tts",
-        "default_base_url": "http://127.0.0.1:9881",
-        "default_ports": [9881, 7860],
-        "api_contracts": ["tts-more-v1", "gradio-indextts2-webui"],
-        "capabilities": ["tts", "reference_audio_voice", "emotion_text", "emotion_audio", "wav_output", "gradio_webui"],
+        "default_base_url": "http://127.0.0.1:8188",
+        "default_ports": [8188, 9881, 7860],
+        "api_contracts": [COMFYUI_TTS_AUDIO_SUITE_CONTRACT, "tts-more-v1", "gradio-indextts2-webui"],
+        "capabilities": ["tts", "reference_audio_voice", "emotion_text", "emotion_audio", "wav_output", "comfyui", "tts-audio-suite", "gradio_webui"],
         "priority": 20,
-        "resource_group": "gradio-gpu-0",
+        "resource_group": "comfyui-local-0",
+        "default_resource_id": "indextts-local",
         "recommended_clone_command": "python scripts/tts_more_deploy.py sync-repos --service-ids local-indextts",
-        "start_hint": "推荐先启动 TTS More IndexTTS worker，并粘贴 http://127.0.0.1:9881 或局域网 worker 地址；已有 Gradio WebUI 可作为兼容路径接入。",
+        "start_hint": "推荐先启动 ComfyUI 并安装 TTS-Audio-Suite，然后粘贴 http://127.0.0.1:8188 或局域网 ComfyUI 地址；已有 Gradio WebUI 可作为显式兼容路径接入。",
     },
     {
         "provider_type": "cosyvoice",
         "display_name": "CosyVoice",
         "clone_url": "https://github.com/XucroYuri/CosyVoice.git",
         "default_repo_path": "repo/CosyVoice",
-        "default_base_url": "http://127.0.0.1:9882",
-        "default_ports": [9882, 50000],
-        "api_contracts": ["tts-more-v1", "gradio-cosyvoice-webui"],
-        "capabilities": ["tts", "reference_audio_voice", "zero_shot_voice", "cross_lingual_voice", "style_instruction", "wav_output", "gradio_webui"],
+        "default_base_url": "http://127.0.0.1:8188",
+        "default_ports": [8188, 9882, 50000],
+        "api_contracts": [COMFYUI_TTS_AUDIO_SUITE_CONTRACT, "tts-more-v1", "gradio-cosyvoice-webui"],
+        "capabilities": ["tts", "reference_audio_voice", "zero_shot_voice", "cross_lingual_voice", "style_instruction", "wav_output", "comfyui", "tts-audio-suite", "gradio_webui"],
         "priority": 30,
-        "resource_group": "gradio-gpu-0",
+        "resource_group": "comfyui-local-0",
+        "default_resource_id": "cosyvoice-local",
         "recommended_clone_command": "python scripts/tts_more_deploy.py sync-repos --service-ids local-cosyvoice",
-        "start_hint": "推荐先启动 TTS More CosyVoice worker，并粘贴 http://127.0.0.1:9882 或局域网 worker 地址；已有 Gradio WebUI 可作为兼容路径接入。",
+        "start_hint": "推荐先启动 ComfyUI 并安装 TTS-Audio-Suite，然后粘贴 http://127.0.0.1:8188 或局域网 ComfyUI 地址；已有 Gradio WebUI 可作为显式兼容路径接入。",
     },
 ]
 
@@ -96,7 +100,7 @@ def open_source_catalog(project_root: Path) -> list[dict[str, Any]]:
 
 def detect_open_source_tts(request: OpenSourceTTSDetectRequest, project_root: Path) -> dict[str, Any]:
     catalog_item = _catalog_item(request.provider_type)
-    api_contract = _gradio_contract(catalog_item, request.api_contract)
+    api_contract = _endpoint_contract(catalog_item, request.api_contract)
     repo_path = None
     repo_found = False
     endpoint_report = _probe_endpoint(request.base_url, api_contract)
@@ -110,7 +114,7 @@ def detect_open_source_tts(request: OpenSourceTTSDetectRequest, project_root: Pa
         "api_contract_ok": endpoint_report["api_contract_ok"],
         "health": endpoint_report["health"],
         "setup_state": setup_state,
-        "env_hint": _env_hint(catalog_item, setup_state),
+        "env_hint": _env_hint(catalog_item, setup_state, api_contract),
     }
 
 
@@ -123,7 +127,7 @@ def configure_open_source_tts(
     publish: Callable[[ServiceRegistry], None] | None = None,
 ) -> tuple[ServiceRegistry, TTSServiceEndpoint, dict[str, Any]]:
     catalog_item = _catalog_item(request.provider_type)
-    api_contract = _gradio_contract(catalog_item, request.api_contract)
+    api_contract = _endpoint_contract(catalog_item, request.api_contract)
     source_profile = _source_profile_for_endpoint(request.base_url)
     detect_payload = detect_open_source_tts(
         OpenSourceTTSDetectRequest(
@@ -158,7 +162,7 @@ def configure_open_source_tts(
         source_profile=source_profile,
         catalog_provider=request.provider_type,
         setup_state=detect_payload["setup_state"],
-        default_params={"response_format": "wav"} if request.provider_type == "cosyvoice" else {},
+        default_params=_default_params_for_contract(catalog_item, request, api_contract),
     )
     services = [service for service in registry.services if service.service_id != endpoint.service_id]
     services.append(endpoint)
@@ -176,8 +180,10 @@ def _catalog_item(provider_type: OpenSourceProvider) -> dict[str, Any]:
 
 
 def _capabilities_for_contract(catalog_item: dict[str, Any], api_contract: str) -> list[str]:
-    markers = {"gradio_webui", "tts-more-worker", "artifact-transfer"}
+    markers = {"comfyui", "tts-audio-suite", "gradio_webui", "tts-more-worker", "artifact-transfer"}
     capabilities = [item for item in catalog_item["capabilities"] if item not in markers]
+    if api_contract == COMFYUI_TTS_AUDIO_SUITE_CONTRACT:
+        return [*capabilities, "comfyui", "tts-audio-suite"]
     if api_contract == "tts-more-v1":
         return [*capabilities, "tts-more-worker", "artifact-transfer"]
     if api_contract.startswith("gradio-"):
@@ -185,16 +191,12 @@ def _capabilities_for_contract(catalog_item: dict[str, Any], api_contract: str) 
     return capabilities
 
 
-def _gradio_contract(catalog_item: dict[str, Any], requested_contract: str | None = None) -> str:
-    """Resolve the API contract for a provider.
-
-    Preference order: the requested contract if it matches a declared one,
-    then the non-invasive tts-more-v1 worker contract (primary path), then any
-    gradio- contract (fallback for users running the upstream Gradio WebUI).
-    """
+def _endpoint_contract(catalog_item: dict[str, Any], requested_contract: str | None = None) -> str:
     declared = [str(c) for c in catalog_item["api_contracts"]]
     if requested_contract and requested_contract in declared:
         return requested_contract
+    if COMFYUI_TTS_AUDIO_SUITE_CONTRACT in declared:
+        return COMFYUI_TTS_AUDIO_SUITE_CONTRACT
     if "tts-more-v1" in declared:
         return "tts-more-v1"
     for contract in declared:
@@ -203,6 +205,24 @@ def _gradio_contract(catalog_item: dict[str, Any], requested_contract: str | Non
     if requested_contract and requested_contract.startswith("gradio-"):
         return requested_contract
     raise ValueError(f"{catalog_item['provider_type']} does not declare a contract")
+
+
+def _default_params_for_contract(
+    catalog_item: dict[str, Any],
+    request: OpenSourceTTSConfigureRequest,
+    api_contract: str,
+) -> dict[str, Any]:
+    if api_contract != COMFYUI_TTS_AUDIO_SUITE_CONTRACT:
+        return {"response_format": "wav"} if request.provider_type == "cosyvoice" else {}
+    params: dict[str, Any] = {
+        "engine": request.provider_type,
+        "resource_id": request.resource_id or str(catalog_item["default_resource_id"]),
+        "poll_interval": 2.0,
+        "timeout_seconds": 600,
+    }
+    if request.provider_type == "cosyvoice":
+        params["mode"] = "zero_shot"
+    return params
 
 
 def _resolve_path(raw_path: str | None, project_root: Path) -> Path:
@@ -231,8 +251,17 @@ def _probe_endpoint(base_url: str | None, api_contract: str) -> dict[str, Any]:
     # ``ImportError: Using SOCKS proxy, but the 'socksio' package is not installed``
     # before the request even leaves the process, which masks the real
     # endpoint-unreachable diagnostic we want to surface.
+    if api_contract == COMFYUI_TTS_AUDIO_SUITE_CONTRACT:
+        probes = [
+            ("/system_stats", False),
+            ("/api/tts-audio-suite/v1/capabilities", True),
+        ]
+    elif api_contract.startswith("gradio-"):
+        probes = [("/config", True)]
+    else:
+        probes = [("/health", True), ("/config", False)]
     with httpx.Client(timeout=timeout, trust_env=False) as client:
-        for suffix in ("/health", "/config"):
+        for suffix, marks_contract in probes:
             try:
                 response = client.get(f"{base_url.rstrip('/')}{suffix}")
             except Exception as exc:
@@ -240,9 +269,9 @@ def _probe_endpoint(base_url: str | None, api_contract: str) -> dict[str, Any]:
                 continue
             reachable = True
             health[suffix] = {"ok": response.is_success, "status_code": response.status_code}
-            if response.is_success and (suffix == "/config" or not api_contract.startswith("gradio-")):
+            if response.is_success and marks_contract:
                 contract_ok = True
-        if reachable and not contract_ok and not api_contract.startswith("gradio-"):
+        if reachable and not contract_ok and api_contract == "tts-more-v1":
             contract_ok = True
     return {"endpoint_reachable": reachable, "api_contract_ok": contract_ok, "health": health}
 
@@ -261,14 +290,15 @@ def _setup_state(repo_path: Path | None, repo_found: bool, base_url: str | None,
     return "not_configured"
 
 
-def _env_hint(catalog_item: dict[str, Any], setup_state: str) -> str:
+def _env_hint(catalog_item: dict[str, Any], setup_state: str, api_contract: str) -> str:
+    runtime_name = "ComfyUI + TTS-Audio-Suite" if api_contract == COMFYUI_TTS_AUDIO_SUITE_CONTRACT else "Gradio WebUI"
     if setup_state == "endpoint_unreachable":
-        return f"检查 Gradio WebUI 是否已启动、地址是否可从本机访问。{catalog_item['start_hint']}"
+        return f"检查 {runtime_name} 是否已启动、地址是否可从本机访问。{catalog_item['start_hint']}"
     if setup_state == "partial":
-        return "端口可达，但 Gradio config 或 api_name 未完全匹配；请确认粘贴的是推理 WebUI 地址。"
+        return f"端口可达，但 {runtime_name} 合同未完全匹配；请确认粘贴的是正确服务地址。"
     if setup_state == "ready":
-        return "Gradio WebUI 可用，可以保存为生成 endpoint。"
-    return f"启动推理 WebUI 后粘贴 Gradio 地址。{catalog_item['start_hint']}"
+        return f"{runtime_name} 可用，可以保存为生成 endpoint。"
+    return f"启动 {runtime_name} 后粘贴服务地址。{catalog_item['start_hint']}"
 
 
 def _source_profile_for_endpoint(base_url: str) -> Literal["local_endpoint", "lan_endpoint", "cloud_endpoint"]:

@@ -37,8 +37,8 @@ flowchart TD
 ```json
 {
   "service_id": "comfyui-local-cosyvoice",
-  "provider_type": "comfyui",
-  "api_contract": "comfyui-tts-v1",
+  "provider_type": "cosyvoice",
+  "api_contract": "comfyui-tts-audio-suite-v1",
   "engine": "cosyvoice",
   "base_url": "http://127.0.0.1:8188",
   "resource_group": "local-gpu-0",
@@ -46,6 +46,7 @@ flowchart TD
   "priority": 10,
   "capabilities": ["tts", "cosyvoice", "wav_output", "reference_audio_voice"],
   "default_params": {
+    "resource_id": "cosyvoice-local",
     "poll_interval": 2.0,
     "timeout_seconds": 600
   }
@@ -57,9 +58,9 @@ flowchart TD
 | 字段 | 说明 |
 | :--- | :--- |
 | `service_id` | 服务的唯一标识符。 |
-| `provider_type` | 固定为 `comfyui`。 |
-| `api_contract` | 固定为 `comfyui-tts-v1`。 |
-| `engine` | 指定引擎类型，可选 `cosyvoice`、`indextts-2` 或 `gpt-sovits`。 |
+| `provider_type` | 逻辑 TTS 提供方，使用 `cosyvoice`、`indextts` 或 `gpt-sovits`，以便角色绑定继续按引擎路由。 |
+| `api_contract` | 固定为 `comfyui-tts-audio-suite-v1`。 |
+| `engine` | 指定 TTS-Audio-Suite 工作流引擎，可选 `cosyvoice`、`indextts` 或 `gpt-sovits`。 |
 | `base_url` | ComfyUI 实例的访问地址。 |
 | `resource_group` | 资源组名称。同一实例的不同引擎应使用相同的资源组以确保 GPU 串行。 |
 | `capacity` | 并发容量。建议设置为 3，利用 ComfyUI 内部队列堆积任务。 |
@@ -76,8 +77,8 @@ flowchart TD
   {
     "service_id": "comfyui-gpu0-cosyvoice",
     "display_name": "ComfyUI GPU0 - CosyVoice3",
-    "provider_type": "comfyui",
-    "api_contract": "comfyui-tts-v1",
+    "provider_type": "cosyvoice",
+    "api_contract": "comfyui-tts-audio-suite-v1",
     "engine": "cosyvoice",
     "base_url": "http://192.168.1.10:8188",
     "resource_group": "comfyui-gpu-0",
@@ -88,8 +89,8 @@ flowchart TD
   {
     "service_id": "comfyui-gpu0-indextts",
     "display_name": "ComfyUI GPU0 - IndexTTS-2",
-    "provider_type": "comfyui",
-    "api_contract": "comfyui-tts-v1",
+    "provider_type": "indextts",
+    "api_contract": "comfyui-tts-audio-suite-v1",
     "engine": "indextts",
     "base_url": "http://192.168.1.10:8188",
     "resource_group": "comfyui-gpu-0",
@@ -100,8 +101,8 @@ flowchart TD
   {
     "service_id": "comfyui-gpu1-cosyvoice",
     "display_name": "ComfyUI GPU1 - CosyVoice3",
-    "provider_type": "comfyui",
-    "api_contract": "comfyui-tts-v1",
+    "provider_type": "cosyvoice",
+    "api_contract": "comfyui-tts-audio-suite-v1",
     "engine": "cosyvoice",
     "base_url": "http://192.168.1.11:8188",
     "resource_group": "comfyui-gpu-1",
@@ -121,24 +122,25 @@ flowchart TD
 **CosyVoice**:
 | TTS More 参数 | ComfyUI 节点输入 | 说明 |
 |:---|:---|:---|
-| `model_path` | `CosyVoiceEngineNode.model_path` | 模型名，如 `Fun-CosyVoice3-0.5B-RL` |
-| `speed` | `CosyVoiceEngineNode.speed` | 语速，0.5~2.0 |
-| `instruct_text` | `CosyVoiceEngineNode.instruct_text` | 自然语言指令控制风格 |
-| `reference_audio` | `LoadAudio` → `UnifiedTTSTextNode.opt_narrator` | 参考音频（需放在 ComfyUI input 目录） |
-| `prompt_text` | `UnifiedTTSTextNode` | 参考音频对应的文本 |
+| `resource_id` | `TTSExternalCosyVoiceEngine.resource_id` | TTS-Audio-Suite `resources.yaml` 中的资源 ID |
+| `speed` | `TTSExternalCosyVoiceEngine.speed` | 语速，0.5~2.0 |
+| `instruct_text` | `TTSExternalCosyVoiceEngine.instruct_text` | 自然语言指令控制风格 |
+| `reference_audio` | `TTSExternalAudioAsset.asset_id` → `UnifiedTTSTextNode.opt_narrator` | TTS More 上传参考音频后传入 asset id |
+| `prompt_text` | `TTSExternalAudioAsset.reference_text` | 参考音频对应的文本 |
 
 **IndexTTS-2**:
 | TTS More 参数 | ComfyUI 节点输入 | 说明 |
 |:---|:---|:---|
-| `model_path` | `IndexTTSEngineNode.model_path` | 模型名，如 `IndexTTS-2` |
-| `temperature` / `top_p` / `top_k` | `IndexTTSEngineNode.*` | 采样参数 |
-| `emotion_audio` | `IndexTTSEngineNode.emotion_audio` | 情绪参考音频 |
+| `resource_id` | `TTSExternalIndexTTSEngine.resource_id` | TTS-Audio-Suite `resources.yaml` 中的资源 ID |
+| `temperature` / `top_p` / `top_k` | `TTSExternalIndexTTSEngine.*` | 采样参数 |
+| `reference_audio` | `TTSExternalAudioAsset.asset_id` → `UnifiedTTSTextNode.opt_narrator` | TTS More 上传参考音频后传入 asset id |
 
 **GPT-SoVITS**:
 | TTS More 参数 | ComfyUI 节点输入 | 说明 |
 |:---|:---|:---|
-| `gpt_weights_path` + `sovits_weights_path` | `GPTSovitsEngineNode.weight_pair` | 权重文件路径对 |
-| `prompt_lang` / `text_lang` | `GPTSovitsEngineNode.ref_language` / `text_language` | 语言设置 |
+| `resource_id` | `TTSExternalGPTSovitsEngine.resource_id` | TTS-Audio-Suite `resources.yaml` 中的资源 ID，权重路径由资源配置持有 |
+| `prompt_lang` / `text_lang` | `TTSExternalGPTSovitsEngine.ref_language` / `text_language` | 语言设置 |
+| `top_k` / `top_p` / `temperature` | `TTSExternalGPTSovitsEngine.*` | 采样参数 |
 
 ## 多设备分布式部署
 
@@ -169,7 +171,7 @@ CosyVoice 等引擎需要参考音频才能生成声音。如果 `narrator_voice
 2. **内置音色**: 使用 `narrator_voice` 下拉选项选择示例语音，例如 `voices_examples/higgs_audio/zh_man_sichuan.wav`。
 3. **指令控制**: 通过 `instruct_text` 使用自然语言指令控制情绪或风格。
 
-参考音频文件需要放置在 ComfyUI 的 `input` 目录下。
+TTS More 会通过 TTS-Audio-Suite 资产接口上传参考音频，并在合成结束后删除临时资产；服务端点需要允许 ComfyUI 实例访问 TTS More 上传的音频内容。
 
 ## API 契约
 
@@ -211,7 +213,7 @@ ComfyUITTSClient 封装了与 ComfyUI 的交互逻辑：
 
 | 项目 | GitHub 地址 | 用途 | 必需 |
 |:---|:---|:---|:---:|
-| **TTS More** | `XucroYuri/TTS_more` (分支 `dev-xu/comfyui-integration`) | TTS 编排后端 + React 工作台 | 是 |
+| **TTS More** | `XucroYuri/TTS_more` (`master`) | TTS 编排后端 + React 工作台 | 是 |
 | **ComfyUI** | `Comfy-Org/ComfyUI` | TTS 运行载体，提供 HTTP API 和工作流引擎 | 是 |
 | **TTS-Audio-Suite** | `XucroYuri/TTS-Audio-Suite` | 基于上游完整架构扩展的正式 fork；保留 15+ 引擎并提供 TTS More API bridge | 是 |
 | **GPT-SoVITS** | `XucroYuri/GPT-SoVITS` | GPT-SoVITS 模型权重来源（传统 worker 路径；ComfyUI 路径下可选） | 否 |
@@ -282,7 +284,6 @@ cd ComfyUI
 ```powershell
 git clone https://github.com/XucroYuri/TTS_more.git
 cd TTS_more
-git checkout dev-xu/comfyui-integration
 
 # 安装依赖
 python -m venv .venv
@@ -299,8 +300,8 @@ cd frontend && pnpm install && cd ..
   {
     "service_id": "comfyui-cosyvoice",
     "display_name": "ComfyUI - CosyVoice3",
-    "provider_type": "comfyui",
-    "api_contract": "comfyui-tts-v1",
+    "provider_type": "cosyvoice",
+    "api_contract": "comfyui-tts-audio-suite-v1",
     "engine": "cosyvoice",
     "base_url": "http://127.0.0.1:8188",
     "mode": "external",
@@ -314,8 +315,8 @@ cd frontend && pnpm install && cd ..
   {
     "service_id": "comfyui-indextts",
     "display_name": "ComfyUI - IndexTTS-2",
-    "provider_type": "comfyui",
-    "api_contract": "comfyui-tts-v1",
+    "provider_type": "indextts",
+    "api_contract": "comfyui-tts-audio-suite-v1",
     "engine": "indextts",
     "base_url": "http://127.0.0.1:8188",
     "mode": "external",

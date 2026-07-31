@@ -1,5 +1,11 @@
 import type { CatalogProvider, OpenSourceTTSConfigureRequest, SourceProfile, WorkerHealth } from "../types";
 
+export const TTS_AUDIO_SUITE_CONTRACT = "comfyui-tts-audio-suite-v1";
+
+export function ttsAudioSuiteContractForProvider(_provider: CatalogProvider): string {
+  return TTS_AUDIO_SUITE_CONTRACT;
+}
+
 export function gradioContractForProvider(provider: CatalogProvider): string {
   return {
     "gpt-sovits": "gradio-gpt-sovits-webui",
@@ -50,6 +56,36 @@ export function buildGradioEndpointRequest(options: {
     enabled: options.enabled,
     resource_group: options.resource_group,
     capacity: options.capacity,
+    start_command: [],
+    start_cwd: null,
+  };
+}
+
+export function buildComfyUIEndpointRequest(options: {
+  provider_type: CatalogProvider;
+  display_name?: string | null;
+  base_url: string;
+  resource_group: string;
+  capacity: number;
+  enabled: boolean;
+  resource_id?: string | null;
+  service_id?: string | null;
+}): OpenSourceTTSConfigureRequest {
+  const sourceProfile = sourceProfileForEndpointUrl(options.base_url);
+  return {
+    provider_type: options.provider_type,
+    service_id: options.service_id ?? null,
+    display_name: options.display_name || null,
+    source_profile: sourceProfile,
+    repo_path: null,
+    base_url: options.base_url,
+    api_contract: ttsAudioSuiteContractForProvider(options.provider_type),
+    network_scope: networkScopeForSourceProfile(sourceProfile),
+    managed: false,
+    enabled: options.enabled,
+    resource_group: options.resource_group,
+    capacity: options.capacity,
+    resource_id: options.resource_id || null,
     start_command: [],
     start_cwd: null,
   };

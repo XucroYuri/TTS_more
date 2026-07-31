@@ -5,6 +5,7 @@ import time
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import httpx
 
 import app.main as main_module
 from app.models import Character, ScriptLine
@@ -1290,12 +1291,11 @@ def test_open_source_tts_catalog_lists_core_providers_in_priority_order(tmp_path
     assert [item["provider_type"] for item in providers] == ["gpt-sovits", "indextts", "cosyvoice"]
     assert providers[0]["clone_url"] == "https://github.com/XucroYuri/GPT-SoVITS.git"
     assert providers[1]["default_repo_path"].endswith("repo/index-tts")
-    # The worker (tts-more-v1) is now the primary contract and default port;
-    # the Gradio contract remains as a fallback.
-    assert providers[0]["default_base_url"] == "http://127.0.0.1:9880"
-    assert providers[0]["api_contracts"] == ["tts-more-v1", "gradio-gpt-sovits-webui"]
-    assert providers[1]["api_contracts"] == ["tts-more-v1", "gradio-indextts2-webui"]
-    assert providers[2]["api_contracts"] == ["tts-more-v1", "gradio-cosyvoice-webui"]
+    assert providers[0]["default_base_url"] == "http://127.0.0.1:8188"
+    assert providers[0]["api_contracts"] == ["comfyui-tts-audio-suite-v1", "tts-more-v1", "gradio-gpt-sovits-webui"]
+    assert providers[1]["api_contracts"] == ["comfyui-tts-audio-suite-v1", "tts-more-v1", "gradio-indextts2-webui"]
+    assert providers[2]["api_contracts"] == ["comfyui-tts-audio-suite-v1", "tts-more-v1", "gradio-cosyvoice-webui"]
+    assert providers[2]["default_resource_id"] == "cosyvoice-local"
     assert providers[2]["priority"] == 30
 
 
@@ -1324,6 +1324,41 @@ def test_open_source_tts_detect_ignores_repo_path_for_gradio_endpoint_onboarding
     assert payload["api_contract_ok"] is False
     assert payload["setup_state"] == "endpoint_unreachable"
     assert "Gradio WebUI" in payload["env_hint"]
+
+
+def test_open_source_tts_detect_checks_comfyui_audio_suite_contract(tmp_path: Path, monkeypatch) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    requested_urls: list[str] = []
+
+    def _fake_get(self, url, *args, **kwargs):
+        del self, args, kwargs
+        requested_urls.append(url)
+        if url.endswith("/system_stats"):
+            return httpx.Response(200, json={"system": {"cuda": True}})
+        if url.endswith("/api/tts-audio-suite/v1/capabilities"):
+            return httpx.Response(200, json={"protocol_version": 1, "resources": []})
+        return httpx.Response(404)
+
+    monkeypatch.setattr("httpx.Client.get", _fake_get)
+
+    response = client.post(
+        "/api/open-source-tts/detect",
+        json={
+            "provider_type": "cosyvoice",
+            "base_url": "http://127.0.0.1:8188",
+            "api_contract": "comfyui-tts-audio-suite-v1",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["endpoint_reachable"] is True
+    assert payload["api_contract_ok"] is True
+    assert payload["setup_state"] == "ready"
+    assert requested_urls == [
+        "http://127.0.0.1:8188/system_stats",
+        "http://127.0.0.1:8188/api/tts-audio-suite/v1/capabilities",
+    ]
 
 
 def test_open_source_tts_detect_blocks_cloud_metadata_url(tmp_path: Path) -> None:
@@ -1400,9 +1435,12 @@ def test_open_source_tts_configure_writes_local_services_without_touching_templa
     assert saved[0]["catalog_provider"] == "cosyvoice"
     assert saved[0]["source_profile"] == "lan_endpoint"
     assert saved[0]["setup_state"] == "endpoint_unreachable"
-    assert saved[0]["api_contract"] == "tts-more-v1"
-    assert "tts-more-worker" in saved[0]["capabilities"]
-    assert "artifact-transfer" in saved[0]["capabilities"]
+    assert saved[0]["api_contract"] == "comfyui-tts-audio-suite-v1"
+    assert saved[0]["default_params"]["resource_id"] == "cosyvoice-local"
+    assert "comfyui" in saved[0]["capabilities"]
+    assert "tts-audio-suite" in saved[0]["capabilities"]
+    assert "tts-more-worker" not in saved[0]["capabilities"]
+    assert "artifact-transfer" not in saved[0]["capabilities"]
     assert "gradio_webui" not in saved[0]["capabilities"]
     assert template_path.read_text(encoding="utf-8") == template_text
 

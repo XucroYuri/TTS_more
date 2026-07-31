@@ -522,6 +522,8 @@ class GenerationQueueItem(BaseModel):
     load_signature: str | None = None
     service_id: str | None = None
     resource_group: str | None = None
+    external_job_id: str | None = None
+    external_status: str | None = None
     error: str | None = None
     version_id: str | None = None
 
