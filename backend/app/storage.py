@@ -15,23 +15,15 @@ import yaml
 from pydantic import BaseModel
 
 from app.models import Character, GenerationManifest, ScriptProject
+from app.path_safety import WINDOWS_RESERVED_NAMES, validate_windows_component
 
 T = TypeVar("T", bound=BaseModel)
 R = TypeVar("R")
 
-WINDOWS_RESERVED_NAMES = {
-    "CON",
-    "PRN",
-    "AUX",
-    "NUL",
-    *(f"COM{index}" for index in range(1, 10)),
-    *(f"LPT{index}" for index in range(1, 10)),
-}
-
-
 class ProjectStore:
     _manifest_locks_guard = threading.Lock()
     _manifest_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
+    _manifest_update_state = threading.local()
 
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -51,7 +43,7 @@ class ProjectStore:
         safe_id = self._safe_project_id(project_id)
         direct = self.writable_projects_root() / safe_id
         marker = self._read_project_marker(direct)
-        if not direct.exists() or marker is None or marker == safe_id:
+        if not direct.exists() or marker is None or self._same_project_id(marker, safe_id):
             return direct
         return self._unique_project_dir_for_title(self.writable_projects_root(), safe_id, safe_id)
 
@@ -104,7 +96,8 @@ class ProjectStore:
                     continue
                 project = self._read_model(project_path, ScriptProject)
                 project_id = self._project_id_for_dir(path)
-                if project_id in seen:
+                project_identity = self._project_id_identity(project_id)
+                if project_identity in seen:
                     continue
                 projects.append(
                     {
@@ -118,7 +111,7 @@ class ProjectStore:
                         "updated_at": datetime.fromtimestamp(project_path.stat().st_mtime, timezone.utc).isoformat(),
                     }
                 )
-                seen.add(project_id)
+                seen.add(project_identity)
         return projects
 
     def delete_project(self, project_id: str) -> Path:
@@ -180,25 +173,47 @@ class ProjectStore:
         mutation: Callable[[GenerationManifest], R],
     ) -> R:
         safe_project_id = self._safe_project_id(project_id)
+        project_key = self._manifest_lock_key(safe_project_id)
+        active_project_keys = getattr(self._manifest_update_state, "project_keys", [])
+        if project_key in active_project_keys:
+            raise RuntimeError("nested manifest transaction for the same project is not allowed")
+        if active_project_keys and project_key < active_project_keys[-1]:
+            raise RuntimeError("nested manifest transaction violates project lock ordering")
         with self._manifest_lock(safe_project_id):
-            manifest = self._load_manifest_unlocked(safe_project_id).model_copy(deep=True)
-            if manifest.project_id != safe_project_id:
-                raise ValueError("manifest project id does not match transaction project")
-            result = mutation(manifest)
-            if manifest.project_id != safe_project_id:
-                raise ValueError("manifest transaction changed project id")
-            self._save_manifest_unlocked(manifest)
-            return result
+            active_project_keys.append(project_key)
+            self._manifest_update_state.project_keys = active_project_keys
+            try:
+                manifest = self._load_manifest_unlocked(safe_project_id).model_copy(deep=True)
+                if not self._same_project_id(manifest.project_id, safe_project_id):
+                    raise ValueError("manifest project id does not match transaction project")
+                original_project_id = manifest.project_id
+                result = mutation(manifest)
+                if manifest.project_id != original_project_id:
+                    raise ValueError("manifest transaction changed project id")
+                self._save_manifest_unlocked(manifest)
+                return result
+            finally:
+                active_project_keys.pop()
+                if not active_project_keys:
+                    del self._manifest_update_state.project_keys
 
     def _manifest_lock(self, project_id: str) -> threading.RLock:
-        stable_project_path = self.writable_projects_root() / self._safe_project_id(project_id)
-        key = os.path.normcase(str(stable_project_path.resolve(strict=False)))
+        key = self._manifest_lock_key(project_id)
         with self._manifest_locks_guard:
             lock = self._manifest_locks.get(key)
             if lock is None:
                 lock = threading.RLock()
                 self._manifest_locks[key] = lock
             return lock
+
+    def _manifest_lock_key(self, project_id: str) -> str:
+        stable_project_path = self.writable_projects_root() / self._project_id_identity(project_id)
+        key = os.path.normcase(str(stable_project_path.resolve(strict=False)))
+        if key.startswith("\\\\?\\unc\\"):
+            key = f"\\\\{key[8:]}"
+        elif key.startswith("\\\\?\\"):
+            key = key[4:]
+        return os.path.normpath(key)
 
     def _save_manifest_unlocked(self, manifest: GenerationManifest) -> None:
         self._write_text(self.project_dir(manifest.project_id) / ".project-id", self._safe_project_id(manifest.project_id))
@@ -290,7 +305,7 @@ class ProjectStore:
             if not candidate.exists():
                 return candidate
             marker = self._read_project_marker(candidate)
-            if marker == project_id:
+            if marker is not None and self._same_project_id(marker, project_id):
                 return candidate
         raise ValueError("unable to allocate project directory")
 
@@ -298,14 +313,15 @@ class ProjectStore:
         direct = root / project_id
         if self._is_project_dir(direct):
             marker = self._read_project_marker(direct)
-            if marker is None or marker == project_id:
+            if marker is None or self._same_project_id(marker, project_id):
                 return direct
         if not root.exists():
             return None
         for path in sorted(root.iterdir(), key=lambda item: item.name.lower()):
             if not path.is_dir() or path == direct:
                 continue
-            if self._read_project_marker(path) == project_id:
+            marker = self._read_project_marker(path)
+            if marker is not None and self._same_project_id(marker, project_id):
                 return path
         return None
 
@@ -327,26 +343,25 @@ class ProjectStore:
 
     def _project_dir_matches_id(self, path: Path, project_id: str) -> bool:
         marker = self._read_project_marker(path)
-        return marker is None or marker == project_id
+        return marker is None or self._same_project_id(marker, project_id)
 
     def _read_project_marker(self, path: Path) -> str | None:
         marker_path = path / ".project-id"
         if not marker_path.exists():
             return None
         try:
-            return self._safe_project_id(marker_path.read_text(encoding="utf-8").strip())
+            return self._safe_project_id(marker_path.read_text(encoding="utf-8"))
         except ValueError:
             return None
 
     def _safe_project_id(self, project_id: str) -> str:
-        value = project_id.strip()
-        if not value:
-            raise ValueError("project id is required")
-        if value in {".", ".."} or any(separator in value for separator in ("/", "\\")):
-            raise ValueError("project id must be a single path segment")
-        if ":" in value or Path(value).is_absolute():
-            raise ValueError("project id must be relative")
-        return value
+        return validate_windows_component(project_id, label="project id", max_units=120)
+
+    def _project_id_identity(self, project_id: str) -> str:
+        return self._safe_project_id(project_id).casefold()
+
+    def _same_project_id(self, left: str, right: str) -> bool:
+        return self._project_id_identity(left) == self._project_id_identity(right)
 
     def _safe_project_title(self, title: str) -> str:
         value = title.strip()

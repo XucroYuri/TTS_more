@@ -17,6 +17,52 @@ def test_project_store_rejects_project_ids_that_escape_data_root(tmp_path: Path,
         store.project_dir(project_id)
 
 
+@pytest.mark.parametrize(
+    "project_id",
+    [
+        " demo",
+        "demo ",
+        "demo.",
+        "CON",
+        "con.txt",
+        "NUL.json",
+        "COM1.log",
+        "LPT9.backup",
+        "COM¹.txt",
+        "CONIN$",
+        "bad?.id",
+        "bad|id",
+        "control\x01id",
+    ],
+)
+def test_fix_round_3_project_store_rejects_windows_alias_ids_before_filesystem_creation(
+    tmp_path: Path, project_id: str
+) -> None:
+    store = ProjectStore(tmp_path)
+
+    with pytest.raises(ValueError):
+        store.project_dir(project_id)
+    with pytest.raises(ValueError):
+        store.load_manifest(project_id)
+    with pytest.raises(ValueError):
+        store.update_manifest(project_id, lambda _manifest: None)
+
+    assert store.writable_projects_root().exists() is False
+
+
+def test_fix_round_3_project_store_case_aliases_share_identity_across_store_instances(tmp_path: Path) -> None:
+    first = ProjectStore(tmp_path)
+    second = ProjectStore(Path(f"\\\\?\\{tmp_path}"))
+    lock_before_project_creation = first._manifest_lock("Demo-Valid_01")
+    assert lock_before_project_creation is second._manifest_lock("demo-valid_01")
+    first.save_manifest(GenerationManifest(project_id="Demo-Valid_01"))
+
+    loaded = second.load_manifest("demo-valid_01")
+
+    assert loaded.project_id == "Demo-Valid_01"
+    assert first.project_dir("Demo-Valid_01").samefile(second.project_dir("demo-valid_01"))
+
+
 @pytest.mark.parametrize("project_id", ["../escape", "..\\escape", "/absolute", "C:\\temp\\escape", ""])
 def test_project_store_rejects_delete_project_ids_that_escape_data_root(tmp_path: Path, project_id: str) -> None:
     store = ProjectStore(tmp_path)
@@ -94,6 +140,83 @@ def test_fix_round_2_manifest_transaction_does_not_save_callback_exception(tmp_p
     durable = store.load_manifest("demo")
     assert set(durable.lines) == {"original-line"}
     assert durable.lines["original-line"].versions[0].status == "cancelled"
+
+
+def test_fix_round_3_same_project_nested_manifest_transaction_is_rejected_and_guard_recovers(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path)
+    replacement_store = ProjectStore(tmp_path)
+    store.save_manifest(GenerationManifest(project_id="demo"))
+    inner_called = False
+
+    def append(line_id: str):
+        def mutation(manifest: GenerationManifest) -> None:
+            manifest.append_version(
+                line_id,
+                GenerationVersion(
+                    version_id="v001",
+                    line_uid=line_id,
+                    engine="gpt-sovits",
+                    profile="default",
+                    status="completed",
+                ),
+            )
+
+        return mutation
+
+    def outer(manifest: GenerationManifest) -> None:
+        nonlocal inner_called
+
+        def inner(inner_manifest: GenerationManifest) -> None:
+            nonlocal inner_called
+            inner_called = True
+            append("inner-line")(inner_manifest)
+
+        replacement_store.update_manifest("DEMO", inner)
+        append("outer-line")(manifest)
+
+    with pytest.raises(RuntimeError, match="nested manifest transaction"):
+        store.update_manifest("demo", outer)
+
+    assert inner_called is False
+    assert store.load_manifest("demo").lines == {}
+
+    store.update_manifest("demo", append("recovered-line"))
+    assert set(store.load_manifest("demo").lines) == {"recovered-line"}
+
+
+def test_fix_round_3_different_project_nested_manifest_transaction_remains_supported(tmp_path: Path) -> None:
+    store = ProjectStore(tmp_path)
+    replacement_store = ProjectStore(tmp_path)
+
+    def inner(second_manifest: GenerationManifest) -> None:
+        second_manifest.append_version(
+            "second-line",
+            GenerationVersion(
+                version_id="v001",
+                line_uid="second-line",
+                engine="gpt-sovits",
+                profile="default",
+                status="completed",
+            ),
+        )
+
+    def outer(first_manifest: GenerationManifest) -> None:
+        replacement_store.update_manifest("second-project", inner)
+        first_manifest.append_version(
+            "first-line",
+            GenerationVersion(
+                version_id="v001",
+                line_uid="first-line",
+                engine="gpt-sovits",
+                profile="default",
+                status="completed",
+            ),
+        )
+
+    store.update_manifest("first-project", outer)
+
+    assert set(store.load_manifest("first-project").lines) == {"first-line"}
+    assert set(store.load_manifest("second-project").lines) == {"second-line"}
 
 
 def test_fix_round_2_manifest_temp_files_are_unique_for_concurrent_writes(
@@ -302,6 +425,50 @@ def test_delete_generation_version_removes_manifest_and_project_audio_only(tmp_p
     assert outside_audio.exists() is True
     payload = client.get("/api/projects/demo/manifest").json()
     assert payload["lines"]["line-uid-001"]["versions"] == []
+
+
+def test_fix_round_3_delete_reports_scrubbed_audio_cleanup_warning_after_manifest_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ProjectStore(tmp_path)
+    audio_path = store.project_audio_dir("demo") / "locked.wav"
+    audio_path.parent.mkdir(parents=True)
+    audio_path.write_bytes(b"RIFFlocked")
+    manifest = GenerationManifest(project_id="demo")
+    manifest.append_version(
+        "locked-line",
+        GenerationVersion(
+            version_id="v001",
+            line_uid="locked-line",
+            engine="gpt-sovits",
+            profile="default",
+            status="completed",
+            audio_path=str(audio_path),
+        ),
+    )
+    store.save_manifest(manifest)
+    original_unlink = Path.unlink
+
+    def reject_locked_audio(path: Path, *args, **kwargs):
+        if path.resolve(strict=False) == audio_path.resolve(strict=False):
+            raise PermissionError("audio sharing violation password=delete-secret")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", reject_locked_audio)
+    client = TestClient(create_app(data_root=tmp_path), raise_server_exceptions=False)
+
+    response = client.delete("/api/projects/demo/manifest/lines/locked-line/versions/v001")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "deleted"
+    assert payload["audio_deleted"] is False
+    assert "audio cleanup failed" in payload["warning"]
+    assert "password=***" in payload["warning"]
+    assert "delete-secret" not in str(payload)
+    assert audio_path.is_file()
+    assert store.load_manifest("demo").lines["locked-line"].versions == []
+    assert client.delete("/api/projects/demo/manifest/lines/locked-line/versions/v001").status_code == 404
 
 
 def test_fix_round_2_delete_then_manager_append_does_not_resurrect_deleted_version(tmp_path: Path) -> None:

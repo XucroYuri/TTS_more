@@ -1138,8 +1138,12 @@ def create_app(
             if resolved is None:
                 warning = "audio path is outside project audio directory"
             elif resolved.exists():
-                resolved.unlink()
-                audio_deleted = True
+                try:
+                    resolved.unlink()
+                except OSError as exc:
+                    warning = f"audio cleanup failed: {scrub_error(exc)}"
+                else:
+                    audio_deleted = True
             else:
                 warning = "audio file not found"
         return {

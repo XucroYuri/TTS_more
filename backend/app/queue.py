@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
-import re
 import threading
 import uuid
 from collections import OrderedDict
@@ -16,6 +14,7 @@ from typing import Any, Callable
 from app.adapters.base import SynthesisCancelled, SynthesisRequest, SynthesisTimeout
 from app.models import EngineName, GenerationJob, GenerationManifest, GenerationQueueItem, GenerationStatus, GenerationTask, GenerationVersion, ProviderType
 from app.net_guard import scrub_error
+from app.path_safety import encode_windows_component, windows_utf16_units
 from app.services import COMFYUI_TTS_CONTRACTS, ServiceRoute, build_load_signature
 
 ExternalStatusUpdate = dict[str, Any]
@@ -28,28 +27,74 @@ def _task_line_uid(task: GenerationTask) -> str:
     return task.line.line_uid or task.line.id
 
 
-def _safe_line_output_stem(task: GenerationTask) -> str:
-    return re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", _task_line_uid(task)).strip("._-") or task.line.id
+WINDOWS_MAX_OUTPUT_PATH_UNITS = 259
+OUTPUT_DIRECTORY_COMPONENT_UNITS = 22
+OUTPUT_NAMESPACE_UNITS = 18
+OUTPUT_FILENAME_MAX_UNITS = 120
 
 
-def _safe_output_namespace(value: str) -> str:
-    safe_value = re.sub(r"[^0-9A-Za-z._-]+", "_", value).strip("._-") or "job"
-    return _bounded_name_part(safe_value, 48)
+def _generation_output_path(
+    output_dir: Path,
+    task: GenerationTask,
+    route: ServiceRoute,
+    version_id: str,
+    output_namespace: str | None,
+) -> Path:
+    engine_component = encode_windows_component(
+        task.engine.value,
+        max_units=OUTPUT_DIRECTORY_COMPONENT_UNITS,
+        fallback="engine",
+    )
+    service_component = encode_windows_component(
+        route.endpoint.service_id,
+        max_units=OUTPUT_DIRECTORY_COMPONENT_UNITS,
+        fallback="service",
+    )
+    profile_component = encode_windows_component(
+        task.profile,
+        max_units=OUTPUT_DIRECTORY_COMPONENT_UNITS,
+        fallback="profile",
+    )
+    parent = output_dir / engine_component / service_component / profile_component
+    root_resolved = output_dir.resolve(strict=False)
+    parent_resolved = parent.resolve(strict=False)
+    try:
+        parent_resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError("generation output path escapes the configured output root") from exc
 
-
-def _bounded_name_part(value: str, max_length: int) -> str:
-    if len(value) <= max_length:
-        return value
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
-    return f"{value[: max_length - len(digest) - 1]}-{digest}"
-
-
-def _output_filename(task: GenerationTask, version_id: str, output_namespace: str | None) -> str:
     suffix = f"_{version_id}.wav"
     if output_namespace is not None:
-        suffix = f"_{_safe_output_namespace(output_namespace)}{suffix}"
-    line_stem = _bounded_name_part(_safe_line_output_stem(task), 240 - len(suffix))
-    return f"{line_stem}{suffix}"
+        namespace_component = encode_windows_component(
+            output_namespace,
+            max_units=OUTPUT_NAMESPACE_UNITS,
+            fallback="job",
+        )
+        suffix = f"_{namespace_component}{suffix}"
+
+    remaining_path_units = (
+        WINDOWS_MAX_OUTPUT_PATH_UNITS
+        - windows_utf16_units(str(parent_resolved))
+        - windows_utf16_units(os.sep)
+    )
+    filename_units = min(OUTPUT_FILENAME_MAX_UNITS, remaining_path_units)
+    line_units = filename_units - windows_utf16_units(suffix)
+    if line_units < 18:
+        raise ValueError("output root exhausts the Windows path budget")
+    line_component = encode_windows_component(
+        _task_line_uid(task),
+        max_units=line_units,
+        fallback="line",
+    )
+    output_path = parent / f"{line_component}{suffix}"
+    output_resolved = output_path.resolve(strict=False)
+    try:
+        output_resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError("generation output path escapes the configured output root") from exc
+    if windows_utf16_units(str(output_resolved)) > WINDOWS_MAX_OUTPUT_PATH_UNITS:
+        raise ValueError("generation output exceeds the Windows path budget")
+    return output_path
 
 
 @dataclass(frozen=True)
@@ -298,13 +343,7 @@ class ServiceGenerationQueue:
             history = manifest.history_for_line(task.line.id, _task_line_uid(task))
             version_number = len(history.versions) + 1 if history else 1
             version_id = f"v{version_number:03d}"
-        output_path = (
-            output_dir
-            / task.engine.value
-            / route.endpoint.service_id
-            / task.profile
-            / _output_filename(task, version_id, output_namespace)
-        )
+        output_path = _generation_output_path(output_dir, task, route, version_id, output_namespace)
         requested_load_signature = build_load_signature(route.endpoint, task.parameters)
         revision_context = _revision_context(task)
         binding_snapshot = route.binding.model_dump(mode="json") if route.binding else None

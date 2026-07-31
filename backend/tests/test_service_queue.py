@@ -1440,3 +1440,100 @@ def test_fix_round_2_duplicate_same_line_items_keep_distinct_status_identity(tmp
         ("first-service", "v001"),
         ("second-service", "v002"),
     ]
+
+
+def test_fix_round_3_output_path_encodes_malicious_components_and_preserves_logical_ids(tmp_path: Path) -> None:
+    output_root = tmp_path / "project-audio"
+    logical_service_id = str(tmp_path / "outside-service")
+    logical_profile = "..\\unsafe-profile"
+    logical_line_id = "../CON"
+    client = RecordingServiceClient(endpoint(logical_service_id, EngineName.GPT_SOVITS, "gpu-a"))
+    queue = ServiceGenerationQueue(StaticRouter({"route": client}))
+    manifest = GenerationManifest(project_id="demo")
+    generation_task = task(logical_line_id, EngineName.GPT_SOVITS, logical_profile, "route")
+
+    queue.run(
+        [generation_task],
+        manifest,
+        output_root,
+        output_namespace="..\\AUX. ",
+    )
+
+    version = manifest.lines[logical_line_id].versions[0]
+    audio_path = Path(version.audio_path or "").resolve(strict=False)
+    relative = audio_path.relative_to(output_root.resolve(strict=False))
+    assert version.status == "completed"
+    assert version.service_id == logical_service_id
+    assert version.profile == logical_profile
+    assert version.line_uid == logical_line_id
+    assert len(relative.parts) == 4
+    for component in relative.parts:
+        assert component not in {".", ".."}
+        assert not component.endswith((" ", "."))
+        assert not any(character in component for character in '<>:"/\\|?*')
+        assert not any(ord(character) < 32 for character in component)
+        assert component.split(".", 1)[0].upper() not in {"CON", "PRN", "AUX", "NUL", "COM1", "LPT1"}
+    assert not (tmp_path / "unsafe-profile").exists()
+
+
+def test_fix_round_3_long_same_prefix_output_components_are_bounded_and_collision_safe(tmp_path: Path) -> None:
+    common_service = "service-" + ("s" * 300)
+    common_profile = "profile-" + ("p" * 300)
+    common_line = "line-" + ("l" * 300)
+    common_namespace = "namespace-" + ("n" * 300)
+    first_service = common_service + "-first"
+    second_service = common_service + "-second"
+    first_client = RecordingServiceClient(endpoint(first_service, EngineName.GPT_SOVITS, "gpu-a"))
+    second_client = RecordingServiceClient(endpoint(second_service, EngineName.GPT_SOVITS, "gpu-b"))
+    queue = ServiceGenerationQueue(StaticRouter({"route-a": first_client, "route-b": second_client}))
+    output_root = tmp_path / "project-audio"
+    first_manifest = GenerationManifest(project_id="demo")
+    second_manifest = GenerationManifest(project_id="demo")
+
+    queue.run(
+        [task(common_line + "-first", EngineName.GPT_SOVITS, common_profile + "-first", "route-a")],
+        first_manifest,
+        output_root,
+        output_namespace=common_namespace + "-first",
+    )
+    queue.run(
+        [task(common_line + "-second", EngineName.GPT_SOVITS, common_profile + "-second", "route-b")],
+        second_manifest,
+        output_root,
+        output_namespace=common_namespace + "-second",
+    )
+
+    first_version = next(iter(first_manifest.lines.values())).versions[0]
+    second_version = next(iter(second_manifest.lines.values())).versions[0]
+    first_path = Path(first_version.audio_path or "").resolve(strict=False)
+    second_path = Path(second_version.audio_path or "").resolve(strict=False)
+    first_parts = first_path.relative_to(output_root.resolve(strict=False)).parts
+    second_parts = second_path.relative_to(output_root.resolve(strict=False)).parts
+    assert first_version.status == "completed"
+    assert second_version.status == "completed"
+    assert first_parts[1] != second_parts[1]
+    assert first_parts[2] != second_parts[2]
+    assert first_parts[3] != second_parts[3]
+    assert all(len(part.encode("utf-16-le")) // 2 <= 120 for part in (*first_parts, *second_parts))
+    assert len(str(first_path)) <= 259
+    assert len(str(second_path)) <= 259
+    assert first_path.is_file()
+    assert second_path.is_file()
+
+
+def test_fix_round_3_output_path_fails_before_synthesis_when_root_exhausts_windows_budget(tmp_path: Path) -> None:
+    output_root = tmp_path
+    while len(str(output_root.resolve(strict=False))) < 250:
+        output_root = output_root / "budget-segment"
+    client = RecordingServiceClient(endpoint("safe-service", EngineName.GPT_SOVITS, "gpu-a"))
+    queue = ServiceGenerationQueue(StaticRouter({"safe-service": client}))
+
+    with pytest.raises(ValueError, match="Windows path budget"):
+        queue.run(
+            [task("safe-line", EngineName.GPT_SOVITS, "safe-profile", "safe-service")],
+            GenerationManifest(project_id="demo"),
+            output_root,
+            output_namespace="safe-job",
+        )
+
+    assert not any(call.startswith("synthesize:") for call in client.calls)

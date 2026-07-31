@@ -1923,6 +1923,62 @@ def test_fix_round_2_concurrent_sync_generate_keeps_distinct_audio_evidence(tmp_
     assert all(path.is_file() for path in audio_paths)
 
 
+@pytest.mark.parametrize("route", ["/api/generate", "/api/validation/real-tts/run"])
+def test_fix_round_3_sync_routes_confine_malicious_service_and_profile_paths(
+    tmp_path: Path, route: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TTS_MORE_SERVICE_MODE", "mock")
+    logical_service_id = str(tmp_path / "outside-service")
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps(
+            [
+                {
+                    "service_id": logical_service_id,
+                    "engine": "gpt-sovits",
+                    "provider_type": "gpt-sovits",
+                    "base_url": "mock://gpt",
+                    "resource_group": "local-gpu-0",
+                    "capabilities": ["tts"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    app = create_app(data_root=tmp_path, services_path=services_path)
+    client = TestClient(app)
+    response = client.post(
+        route,
+        json={
+            "project_id": "demo",
+            "tasks": [
+                {
+                    "line": {"id": "sync-line", "character_id": "role", "text": "路径约束"},
+                    "engine": "gpt-sovits",
+                    "profile": "..\\unsafe-profile",
+                    "service_id": logical_service_id,
+                    "parameters": {
+                        "gpt_weights_path": "voice.ckpt",
+                        "sovits_weights_path": "voice.pth",
+                        "ref_audio_path": "voice.wav",
+                        "prompt_text": "参考文本",
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    manifest = payload["manifest"] if route.endswith("/real-tts/run") else payload
+    version = manifest["lines"]["sync-line"]["versions"][0]
+    audio_path = Path(version["audio_path"]).resolve(strict=False)
+    audio_path.relative_to(app.state.store.project_audio_dir("demo").resolve(strict=False))
+    assert version["service_id"] == logical_service_id
+    assert version["profile"] == "..\\unsafe-profile"
+    assert audio_path.is_file()
+
+
 def test_generation_preflight_suggests_local_fallback_without_auto_start(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("app.services.ServiceRouter._client_ready", lambda *_args: False)
     services_path = tmp_path / "services.json"
