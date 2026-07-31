@@ -53,6 +53,21 @@ def _audio_bytes() -> bytes:
     return buffer.getvalue()
 
 
+def test_synthesis_request_carries_cancel_check_and_control_details(tmp_path):
+    from app.adapters.base import SynthesisCancelled, SynthesisRequest
+
+    request = SynthesisRequest(
+        line=ScriptLine(id="l1", character_id="c1", text="hello"),
+        profile="voice",
+        output_path=tmp_path / "out.wav",
+        cancel_check=lambda: True,
+    )
+    error = SynthesisCancelled("cancelled", details={"prompt_id": "p1"})
+    assert request.cancel_check is not None and request.cancel_check()
+    assert error.code == "cancelled"
+    assert error.details == {"prompt_id": "p1"}
+
+
 class TestComfyUIAPIClient:
     def test_system_stats_ready(self):
         def handler(request: httpx.Request) -> httpx.Response:
