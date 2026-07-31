@@ -121,6 +121,46 @@ class TestComfyUIAPIClient:
             assert "outputs" in result
             assert result["outputs"]["4"]["audio"][0]["filename"] == "tts_more_cosyvoice_00001.flac"
 
+    def test_poll_until_done_raises_comfyui_execution_error_when_completed_is_false(self):
+        prompt_id = "e0e0579f-fc34-4397-a182-66bc0786e943"
+        exception_message = (
+            "IndexTTS-2 generation failed: IndexTTS-2 dependencies not available. "
+            "Error: No module named 'omegaconf'"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == f"/history/{prompt_id}"
+            return httpx.Response(
+                200,
+                json={
+                    prompt_id: {
+                        "outputs": {},
+                        "status": {
+                            "status_str": "error",
+                            "completed": False,
+                            "messages": [
+                                [
+                                    "execution_error",
+                                    {
+                                        "prompt_id": prompt_id,
+                                        "node_id": "3",
+                                        "node_type": "UnifiedTTSTextNode",
+                                        "exception_message": exception_message,
+                                    },
+                                ]
+                            ],
+                        },
+                    }
+                },
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            api = ComfyUIAPIClient("http://127.0.0.1:8188", transport=client._transport)
+            with pytest.raises(RuntimeError, match="No module named 'omegaconf'") as error:
+                api.poll_until_done(prompt_id, poll_interval=0.0, max_wait=0.01)
+
+        assert str(error.value) == f"ComfyUI prompt failed: {exception_message}"
+
     def test_download_output(self):
         wav_content = b"RIFF\x24\x00\x00\x00WAVEfake"
 
