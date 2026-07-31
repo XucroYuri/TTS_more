@@ -16,6 +16,7 @@
 - GPT-SoVITS, IndexTTS, and CosyVoice repositories must not be modified or started as WebUIs/workers.
 - ComfyUI must bind to `127.0.0.1:8188`.
 - All three logical endpoints share `resource_group=comfyui-local-0` and use `capacity=1`.
+- Set `TTS_AUDIO_SUITE_INSTALL_PROFILE=tts_more_targets` for plugin installation and the ComfyUI process. This deployment profile installs and registers only the GPT-SoVITS, IndexTTS, and CosyVoice API Bridge configuration surface; mutually incompatible optional engines are out of scope for this shared venv.
 - Private absolute model paths belong only in `F:\TTS-More\config\tts-audio-suite-resources.yaml`.
 - Raw logs, evidence JSON, and generated audio belong under `F:\TTS-More\validation\2026-07-31-comfyui-live` and must not be committed.
 - Record the original failure before changing code or dependencies.
@@ -304,7 +305,7 @@ Append a JSON object to the external issue evidence with stage `resource_registr
 - TTS-Audio-Suite source changes are allowed only after a reproduced plugin failure.
 
 **Interfaces:**
-- Produces: an updated official ComfyUI runtime and a dependency-complete plugin environment.
+- Produces: an updated official ComfyUI runtime and a dependency-clean `tts_more_targets` API Bridge environment. This is configuration-ready only; live model readiness is proved in Tasks 5–7.
 - Consumes: `F:\venvs\comfyui-tts`.
 
 - [ ] **Step 1: Prove both worktrees are clean**
@@ -346,11 +347,12 @@ F:\venvs\comfyui-tts\Scripts\python.exe -m pip install -r F:\Code\Github\ComfyUI
 
 ```powershell
 Set-Location F:\Code\Github\TTS-Audio-Suite
+$env:TTS_AUDIO_SUITE_INSTALL_PROFILE='tts_more_targets'
 F:\venvs\comfyui-tts\Scripts\python.exe install.py
 F:\venvs\comfyui-tts\Scripts\python.exe -m pip check
 ```
 
-Expected: installer exits `0`; `pip check` reports no broken requirements.
+Expected: target-profile installer exits `0`; `pip check` reports no broken requirements; only the four API Bridge configuration nodes are registered. The default all-engine installer is not an acceptance path for this shared venv.
 
 - [ ] **Step 6: Run the API Bridge unit suite**
 
@@ -380,6 +382,7 @@ Store the command, exit code, failing test names, exception summary, and full lo
 
 ```powershell
 $env:TTS_AUDIO_SUITE_RESOURCES='F:\TTS-More\config\tts-audio-suite-resources.yaml'
+$env:TTS_AUDIO_SUITE_INSTALL_PROFILE='tts_more_targets'
 $process = Start-Process `
   -FilePath 'F:\venvs\comfyui-tts\Scripts\python.exe' `
   -ArgumentList @('main.py','--listen','127.0.0.1','--port','8188') `
