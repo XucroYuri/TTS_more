@@ -20,10 +20,12 @@ TTS More live-validation CLI
 
 Each Task 9 request created a fresh ComfyUI prompt, completed with history
 `status_str=success`, reported `execution_cached.nodes=[]`, produced a decoded
-non-silent WAV, and converged to an empty ComfyUI queue, zero Bridge runtimes,
-zero external runners, and zero request temporary directories. The official
-ComfyUI and model repositories were not cleaned, patched, or updated during the
-rerun.
+non-silent WAV, and converged to an empty ComfyUI queue, zero target-engine
+runtimes, zero external runners, and zero request temporary directories. A
+pre-existing idle CosyVoice runtime remained during the GPT-SoVITS and IndexTTS
+checks; the full three-engine sequence ended with zero Bridge runtimes. The
+official ComfyUI and model repositories were not cleaned, patched, or updated
+during the rerun.
 
 This proves the direct Bridge path on the recorded machine. A subsequent fresh
 visible TTS More browser workflow on the same product source also completed all
@@ -34,7 +36,7 @@ its application/job/history/audio evidence is recorded below.
 
 | Component | Revision / runtime | Final state |
 | --- | --- | --- |
-| TTS More | `e546f8da5bb000b160084386cc1ee2933a8e6c28` | validation branch; report draft is the only intended new tracked-path change |
+| TTS More | `e546f8da5bb000b160084386cc1ee2933a8e6c28` | validated product source; the final report was committed afterward as a documentation-only change |
 | TTS-Audio-Suite | `372066c735084ff22b157f270ae05353b643e0c7` | clean; 15 commits ahead of the existing local `origin/main` tracking ref |
 | official ComfyUI | `5cc026f5b81b3f01fe7a1438a0fd4131d2ebda25` | clean; local tracking divergence `0/0` |
 | official GPT-SoVITS checkout | `f8a5865c472c0d21c204965a9bb6e002aceb36fe` | exactly two pre-existing metadata-dirty files preserved; 64 behind the existing tracking ref |
