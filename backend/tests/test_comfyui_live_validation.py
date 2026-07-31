@@ -10,6 +10,7 @@ import soundfile
 from app.adapters.base import SynthesisResult
 from app.comfyui.live_validation import (
     LiveValidationConfig,
+    _parse_args,
     build_live_endpoint,
     validate_audio_file,
     validate_live_engine,
@@ -79,6 +80,31 @@ def test_build_live_endpoint_uses_audio_suite_and_capacity_one(tmp_path):
     assert endpoint.default_params["resource_id"] == "indextts-local"
     assert endpoint.default_params["poll_interval"] == 2.0
     assert endpoint.default_params["timeout_seconds"] == config.timeout_seconds
+
+
+def test_parse_args_accepts_powershell_elided_empty_reference_text(tmp_path):
+    config = _parse_args(
+        [
+            "--engine",
+            "indextts",
+            "--resource-id",
+            "indextts-local",
+            "--base-url",
+            "http://127.0.0.1:8188",
+            "--reference-audio",
+            str(tmp_path / "voice.wav"),
+            "--reference-text",
+            "--text",
+            "这是 IndexTTS 的真实验证。",
+            "--output",
+            str(tmp_path / "out.wav"),
+            "--evidence",
+            str(tmp_path / "evidence.json"),
+        ]
+    )
+
+    assert config.reference_text == ""
+    assert config.text == "这是 IndexTTS 的真实验证。"
 
 
 @pytest.mark.parametrize("base_url", ["http://127.0.0.1:8189", "http://192.168.1.10:8188"])

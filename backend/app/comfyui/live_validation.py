@@ -196,7 +196,7 @@ def _parse_args(argv: list[str] | None = None) -> LiveValidationConfig:
     parser.add_argument("--resource-id", required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--reference-audio", type=Path, required=True)
-    parser.add_argument("--reference-text", required=True)
+    parser.add_argument("--reference-text", nargs="?", const="", required=True)
     parser.add_argument("--text", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
