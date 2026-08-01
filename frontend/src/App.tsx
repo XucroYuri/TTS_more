@@ -83,7 +83,7 @@ import { ScriptManagerModal } from "./components/ScriptManagerModal";
 import { WaveformPlayer } from "./components/WaveformPlayer";
 import { TokenGate } from "./components/TokenGate";
 import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
-import { generationStatusCounts, generationStatusKey, generationStatusTone, isTerminalGenerationStatus, type GenerationStatusTone } from "./lib/generationStatus";
+import { generationStatusCounts, generationStatusKey, generationStatusTone, generationTerminalNotice, isTerminalGenerationStatus, reconcileGenerationJobSnapshot, type GenerationStatusTone } from "./lib/generationStatus";
 import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./lib/gptSovitsReference";
 import { formatScriptNote } from "./lib/lineNote";
 import { firstReferenceSampleFromModel, gptSovitsProjectBindingFromModel } from "./lib/modelCatalog";
@@ -249,7 +249,7 @@ export default function App() {
   const [activeLibraryCharacterId, setActiveLibraryCharacterId] = useState<string | null>(null);
   const [activeRoleCandidateId, setActiveRoleCandidateId] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
-  const generationAbortRef = useRef(false);
+  const generationCancellationJobIdRef = useRef<string | null>(null);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [preflightResult, setPreflightResult] = useState<GenerationPreflightResponse | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -727,6 +727,13 @@ export default function App() {
   const queueProgressPercent = Math.round(Math.max(0, Math.min(1, queueProgressRatio)) * 100);
   const queueHasWork = queueTotalItems > 0 || queueJobs.length > 0;
   const queueTopbarEntryVisible = queueHasWork || Boolean(queueActiveJob);
+  const activeJobCancellationRequested = Boolean(
+    activeJob
+    && (
+      generationCancellationJobIdRef.current === activeJob.job_id
+      || activeJob.status === "cancelling"
+    ),
+  );
   const queueSyncLabel = isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced");
   const queueVisibleStatusLabel = queueActiveJob ? t(generationStatusKey(queueActiveJob.status)) : queueSyncLabel;
   const queueVisibleTone = queueActiveJob ? generationStatusTone(queueActiveJob.status) : isRefreshingTopology ? "running" : "idle";
@@ -1208,7 +1215,7 @@ export default function App() {
       return;
     }
     setIsGenerating(true);
-    generationAbortRef.current = false;
+    generationCancellationJobIdRef.current = null;
     setNotice(t("notice.generating"));
     try {
       const { tasks, blocked } = buildRunnableTasks(lines, resolvedCharacters);
@@ -1222,20 +1229,23 @@ export default function App() {
       setActiveJob(job);
       setNotice(t("notice.jobQueued", { job: job.job_id }));
       const finalJob = await pollGenerationJob(job.job_id);
-      setActiveJob(finalJob);
+      setActiveJob((current) => reconcileGenerationJobSnapshot(
+        current,
+        finalJob,
+        generationCancellationJobIdRef.current === finalJob.job_id,
+      ));
       const nextManifest = await fetchManifest(currentProjectId);
       setManifest(nextManifest);
-      if (generationAbortRef.current || finalJob.status === "cancelled") {
-        setNotice(t("notice.generationCancelled"), { level: "warning" });
-      } else {
-        setNotice(finalJob.status === "completed" ? t("notice.generated") : t("notice.generationFailed"));
+      const terminalNotice = generationTerminalNotice(finalJob.status);
+      if (terminalNotice) {
+        setNotice(t(terminalNotice.key), { level: terminalNotice.level });
       }
       await refreshTopology();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.generationFailed"));
     } finally {
       setIsGenerating(false);
-      generationAbortRef.current = false;
+      generationCancellationJobIdRef.current = null;
     }
   }
 
@@ -1313,7 +1323,11 @@ export default function App() {
   async function pollGenerationJob(jobId: string): Promise<GenerationJob> {
     for (let attempt = 0; attempt < 240; attempt += 1) {
       const job = await fetchGenerationJob(jobId);
-      setActiveJob(job);
+      setActiveJob((current) => reconcileGenerationJobSnapshot(
+        current,
+        job,
+        generationCancellationJobIdRef.current === jobId,
+      ));
       if (isTerminalGenerationStatus(job.status)) return job;
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
     }
@@ -1322,12 +1336,24 @@ export default function App() {
 
   async function cancelGeneration() {
     const jobId = activeJob?.job_id;
-    if (!jobId || generationAbortRef.current || isTerminalGenerationStatus(activeJob.status)) return;
+    if (!jobId || generationCancellationJobIdRef.current === jobId || isTerminalGenerationStatus(activeJob.status)) return;
     try {
       const cancelled = await cancelGenerationJob(jobId);
-      generationAbortRef.current = cancelled.status === "cancelling" || cancelled.status === "cancelled";
-      setActiveJob(cancelled);
-      setNotice(t("notice.generationCancelling"), { level: "warning" });
+      const cancellationAccepted = cancelled.status === "cancelling" || cancelled.status === "cancelled";
+      generationCancellationJobIdRef.current = cancellationAccepted ? jobId : null;
+      setActiveJob((current) => reconcileGenerationJobSnapshot(
+        current,
+        cancelled,
+        cancellationAccepted,
+      ));
+      if (cancellationAccepted) {
+        setNotice(t("notice.generationCancelling"), { level: "warning" });
+      } else {
+        const terminalNotice = generationTerminalNotice(cancelled.status);
+        if (terminalNotice) {
+          setNotice(t(terminalNotice.key), { level: terminalNotice.level });
+        }
+      }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.generationFailed"));
     }
@@ -2897,13 +2923,13 @@ export default function App() {
                 )}
                 {isGenerating && activeJob ? (
                   <button
-                    aria-label={activeJob.status === "cancelling" ? t("status.cancelling") : t("actions.cancel")}
+                    aria-label={activeJobCancellationRequested ? t("status.cancelling") : t("actions.cancel")}
                     className="secondary-button cancel-button"
-                    disabled={generationAbortRef.current || activeJob.status === "cancelling" || isTerminalGenerationStatus(activeJob.status)}
+                    disabled={activeJobCancellationRequested || isTerminalGenerationStatus(activeJob.status)}
                     onClick={() => void cancelGeneration()}
-                    title={activeJob.status === "cancelling" ? t("status.cancelling") : t("actions.cancel")}
+                    title={activeJobCancellationRequested ? t("status.cancelling") : t("actions.cancel")}
                   >
-                    <X size={15} /> {activeJob.status === "cancelling" ? t("status.cancelling") : t("actions.cancel")}
+                    <X size={15} /> {activeJobCancellationRequested ? t("status.cancelling") : t("actions.cancel")}
                   </button>
                 ) : (
                   <button className="primary-button" onClick={() => void runSelectedQueue()} disabled={isGenerating || filteredLines.length === 0}>

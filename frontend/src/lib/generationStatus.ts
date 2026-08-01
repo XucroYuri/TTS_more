@@ -1,4 +1,4 @@
-import type { GenerationStatus } from "../types";
+import type { GenerationJob, GenerationStatus, QueueItemStatus } from "../types";
 
 export type GenerationStatusTone =
   | "idle"
@@ -17,6 +17,11 @@ export interface GenerationStatusCounts {
   processed: number;
   total: number;
 }
+
+export type GenerationTerminalNotice =
+  | { key: "notice.generated"; level: "success" }
+  | { key: "notice.generationFailed"; level: "error" }
+  | { key: "notice.generationCancelled"; level: "warning" };
 
 export const terminalGenerationStatuses = new Set<GenerationStatus>([
   "completed",
@@ -43,6 +48,56 @@ export function generationStatusKey(status: GenerationStatus): `status.${Generat
   return `status.${status}`;
 }
 
+export function generationTerminalNotice(
+  status: GenerationStatus,
+): GenerationTerminalNotice | null {
+  if (status === "completed") return { key: "notice.generated", level: "success" };
+  if (status === "failed") return { key: "notice.generationFailed", level: "error" };
+  if (status === "cancelled") {
+    return { key: "notice.generationCancelled", level: "warning" };
+  }
+  return null;
+}
+
+export function reconcileGenerationJobSnapshot(
+  current: GenerationJob | null,
+  incoming: GenerationJob,
+  cancellationRequested: boolean,
+): GenerationJob {
+  if (
+    current
+    && current.job_id === incoming.job_id
+    && isTerminalGenerationStatus(current.status)
+    && !isTerminalGenerationStatus(incoming.status)
+  ) {
+    return current;
+  }
+  if (
+    !current
+    || current.job_id !== incoming.job_id
+    || !cancellationRequested
+    || isTerminalGenerationStatus(incoming.status)
+  ) {
+    return incoming;
+  }
+
+  const currentItems = new Map(current.items.map((item) => [item.task_id, item]));
+  return {
+    ...incoming,
+    status: cancellationProtectedStatus(current.status, incoming.status),
+    progress: Math.max(current.progress, incoming.progress),
+    items: incoming.items.map((item) => {
+      const currentItem = currentItems.get(item.task_id);
+      if (!currentItem) return item;
+      return {
+        ...item,
+        status: cancellationProtectedStatus(currentItem.status, item.status),
+        progress: Math.max(currentItem.progress, item.progress),
+      };
+    }),
+  };
+}
+
 export function generationStatusCounts(
   statuses: readonly GenerationStatus[],
 ): GenerationStatusCounts {
@@ -65,4 +120,17 @@ export function generationStatusCounts(
   }
   counts.processed = counts.completed + counts.failed + counts.cancelled;
   return counts;
+}
+
+function cancellationProtectedStatus(
+  current: QueueItemStatus,
+  incoming: QueueItemStatus,
+): QueueItemStatus {
+  if (
+    (current === "cancelling" || current === "cancelled")
+    && !isTerminalGenerationStatus(incoming)
+  ) {
+    return current;
+  }
+  return incoming;
 }
