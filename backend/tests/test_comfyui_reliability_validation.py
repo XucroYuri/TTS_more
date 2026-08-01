@@ -700,6 +700,109 @@ def test_fix_round_3_public_evidence_rejects_uri_userinfo_credentials_without_ec
     assert target.exists() is False
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://public-user@example.invalid/path",
+        "https://public-user%3Auri-secret-sentinel@example.invalid/path",
+        "https://public-user%40uri-secret-sentinel@example.invalid/path",
+        "https://public-user%3Auri-secret-sentinel%40example.invalid/path",
+        "https://public-user:uri%2Fsecret-sentinel@example.invalid/path",
+        "//public-user:uri-secret-sentinel@example.invalid/path",
+        "diagnostic: request failed at https://public-user:uri-secret-sentinel@example.invalid/path after retry",
+        "diagnostic: request failed at //[public-user%3Auri-secret-sentinel%40example.invalid]/path",
+        "https://public-user:uri-secret-sentinel@[2001:db8::1]/path",
+    ],
+)
+def test_fix_round_4_public_evidence_rejects_any_uri_authority_userinfo_without_echo(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    target = tmp_path / "summary.json"
+
+    with pytest.raises(ValueError, match="^unsafe evidence$") as exc_info:
+        write_atomic_json(target, {"diagnostic": value})
+
+    assert "uri-secret-sentinel" not in str(exc_info.value)
+    assert value not in str(exc_info.value)
+    assert target.exists() is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "public-user@example.invalid",
+        "https://example.invalid/path",
+        "https://example.invalid/users/public-user@example.invalid",
+        "https://example.invalid/path?email=public-user@example.invalid",
+        "https://example.invalid/path//public-user@example.invalid/resource",
+        "https://example.invalid/path?next=//public-user@example.invalid/resource",
+        "//example.invalid/path",
+        "https://[2001:db8::1]/path",
+        "diagnostic: ordinary email public-user@example.invalid after retry",
+    ],
+)
+def test_fix_round_4_public_evidence_allows_email_and_uri_without_authority_userinfo(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    target = tmp_path / "summary.json"
+
+    write_atomic_json(target, {"diagnostic": value})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"diagnostic": value}
+
+
+@pytest.mark.parametrize("container_kind", ["dict", "list"])
+def test_fix_round_4_public_evidence_rejects_self_referential_containers_without_echo(
+    tmp_path: Path,
+    container_kind: str,
+) -> None:
+    target = tmp_path / "summary.json"
+    sentinel = "cycle-private-sentinel"
+    if container_kind == "dict":
+        payload: object = {"label": sentinel}
+        payload["self"] = payload  # type: ignore[index]
+    else:
+        payload = [sentinel]
+        payload.append(payload)  # type: ignore[union-attr]
+
+    with pytest.raises(ValueError, match="^unsafe evidence$") as exc_info:
+        write_atomic_json(target, {"payload": payload})
+
+    assert sentinel not in str(exc_info.value)
+    assert target.exists() is False
+
+
+def test_fix_round_4_public_evidence_rejects_mutually_recursive_dict_and_list_without_echo(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "summary.json"
+    sentinel = "mutual-cycle-private-sentinel"
+    mapping: dict[str, object] = {"label": sentinel}
+    sequence: list[object] = [mapping]
+    mapping["sequence"] = sequence
+
+    with pytest.raises(ValueError, match="^unsafe evidence$") as exc_info:
+        write_atomic_json(target, {"payload": mapping})
+
+    assert sentinel not in str(exc_info.value)
+    assert target.exists() is False
+
+
+def test_fix_round_4_public_evidence_allows_repeated_shared_noncyclic_values(tmp_path: Path) -> None:
+    target = tmp_path / "summary.json"
+    shared = {"label": "shared-neutral-value"}
+    payload = {"first": shared, "second": shared}
+
+    write_atomic_json(target, payload)
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "first": {"label": "shared-neutral-value"},
+        "second": {"label": "shared-neutral-value"},
+    }
+
+
 def test_fix_round_3_model_copy_secret_is_scanned_before_serializer_warning(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -796,6 +899,36 @@ def test_fix_round_3_queue_empty_requires_globally_empty_after_snapshot() -> Non
     result = validate_case(case.model_copy(update={"comfyui": contradictory}))
     assert result.valid is False
     assert "ComfyUI queue/history proof is incomplete" in result.diagnostics
+
+
+@pytest.mark.parametrize("field", ["queue_before_prompt_ids", "history_prompt_ids"])
+def test_fix_round_4_queue_history_rejects_duplicate_unrelated_prompt_ids(field: str) -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    queue_document = case.comfyui.model_dump()
+    queue_document[field] = [case.prompt_id, "unrelated-prompt", "unrelated-prompt"]
+
+    with pytest.raises(ValidationError, match="queue/history proof"):
+        ComfyQueueEvidence.model_validate(queue_document)
+
+    duplicated = case.comfyui.model_copy(update={field: queue_document[field]})
+    result = validate_case(case.model_copy(update={"comfyui": duplicated}))
+    assert result.valid is False
+    assert result.diagnostics == ["ComfyUI queue/history proof is incomplete"]
+
+
+@pytest.mark.parametrize("field", ["queue_before_prompt_ids", "history_prompt_ids"])
+def test_fix_round_4_queue_history_rejects_duplicate_target_prompt_ids(field: str) -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    queue_document = case.comfyui.model_dump()
+    queue_document[field] = [case.prompt_id, case.prompt_id]
+
+    with pytest.raises(ValidationError, match="queue/history proof"):
+        ComfyQueueEvidence.model_validate(queue_document)
+
+    duplicated = case.comfyui.model_copy(update={field: queue_document[field]})
+    result = validate_case(case.model_copy(update={"comfyui": duplicated}))
+    assert result.valid is False
+    assert result.diagnostics == ["ComfyUI queue/history proof is incomplete"]
 
 
 def test_fix_round_3_process_rejects_self_parent_identity() -> None:

@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar
+from urllib.parse import unquote, urlsplit
 
 import soundfile
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, field_validator, model_validator
@@ -39,6 +40,8 @@ _SENSITIVE_KEYS = {
     "token",
 }
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_SCHEME_URI_PATTERN = re.compile(r"(?i)(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s<>\"']+")
+_NETWORK_URI_PATTERN = re.compile(r"(?<![:/])//[^\s<>\"']+")
 ModelT = TypeVar("ModelT", bound="_StrictModel")
 
 
@@ -169,6 +172,9 @@ class ComfyQueueEvidence(_StrictModel):
         if (
             not self.queue_empty
             or not self.history_present
+            or not _prompt_ids_are_unique(self.queue_before_prompt_ids)
+            or not _prompt_ids_are_unique(self.queue_after_prompt_ids)
+            or not _prompt_ids_are_unique(self.history_prompt_ids)
             or self.queue_before_prompt_ids.count(self.prompt_id) != 1
             or self.queue_after_prompt_ids
             or self.history_prompt_ids.count(self.prompt_id) != 1
@@ -460,11 +466,11 @@ def _queue_proof_valid(case: CaseEvidence) -> bool:
             queue.queue_empty is True
             and queue.history_present is True
             and queue.prompt_id == case.prompt_id
-            and isinstance(queue.queue_before_prompt_ids, list)
+            and _prompt_ids_are_unique(queue.queue_before_prompt_ids)
             and queue.queue_before_prompt_ids.count(case.prompt_id) == 1
-            and isinstance(queue.queue_after_prompt_ids, list)
+            and _prompt_ids_are_unique(queue.queue_after_prompt_ids)
             and not queue.queue_after_prompt_ids
-            and isinstance(queue.history_prompt_ids, list)
+            and _prompt_ids_are_unique(queue.history_prompt_ids)
             and queue.history_prompt_ids.count(case.prompt_id) == 1
             and queue.terminal_history_status == case.actual
         )
@@ -897,24 +903,36 @@ def _required_cases(value: Sequence[RequiredCase]) -> dict[str, RequiredCase]:
     return {case_id: output[case_id] for case_id in sorted(output)}
 
 
-def _assert_public_evidence(value: Any) -> None:
-    if isinstance(value, BaseModel):
-        _assert_public_evidence(vars(value))
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            key_text = str(key)
-            if _is_sensitive_key(key_text) and _contains_private_value(item):
-                raise ValueError("unsafe evidence")
-            _assert_public_string(key_text)
-            _assert_public_evidence(item)
-        return
-    if isinstance(value, (list, tuple, set)):
-        for item in value:
-            _assert_public_evidence(item)
-        return
-    if isinstance(value, str):
-        _assert_public_string(value)
+def _assert_public_evidence(value: Any, active: set[int] | None = None) -> None:
+    if active is None:
+        active = set()
+    tracked = isinstance(value, (BaseModel, dict, list, tuple, set))
+    identity = id(value)
+    if tracked and identity in active:
+        raise ValueError("unsafe evidence")
+    if tracked:
+        active.add(identity)
+    try:
+        if isinstance(value, BaseModel):
+            _assert_public_evidence(vars(value), active)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_text = str(key)
+                if _is_sensitive_key(key_text) and _contains_private_value(item):
+                    raise ValueError("unsafe evidence")
+                _assert_public_string(key_text)
+                _assert_public_evidence(item, active)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                _assert_public_evidence(item, active)
+            return
+        if isinstance(value, str):
+            _assert_public_string(value)
+    finally:
+        if tracked:
+            active.remove(identity)
 
 
 def _assert_public_string(value: str) -> None:
@@ -926,7 +944,7 @@ def _assert_public_string(value: str) -> None:
         or re.search(r"(?:^|[\s\"'=(:,;])/(?!/)[^\s]+", value)
     )
     contains_secret = bool(
-        re.search(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/?#@]+:[^\s/?#@]+@[^\s/?#]+", value)
+        _contains_uri_userinfo(value)
         or
         re.search(
             r"(?:\bbearer\s+\S+|\b(?:access[_-]?key|access[_-]?token|api[_-]?key|authorization|client[_-]?secret|password|private[_-]?key|refresh[_-]?token|secret|token)\s*[:=]\s*\S+)",
@@ -935,6 +953,33 @@ def _assert_public_string(value: str) -> None:
     )
     if contains_path or contains_secret:
         raise ValueError("unsafe evidence")
+
+
+def _contains_uri_userinfo(value: str) -> bool:
+    scheme_matches = list(_SCHEME_URI_PATTERN.finditer(value))
+    scheme_spans = [match.span() for match in scheme_matches]
+    candidates = [match.group(0) for match in scheme_matches]
+    candidates.extend(
+        match.group(0)
+        for match in _NETWORK_URI_PATTERN.finditer(value)
+        if not any(start <= match.start() < end for start, end in scheme_spans)
+    )
+    for candidate in candidates:
+        try:
+            authority = urlsplit(candidate).netloc
+        except ValueError:
+            authority = re.split(r"[/?#]", candidate.split("//", 1)[1], maxsplit=1)[0]
+        if "@" in unquote(authority):
+            return True
+    return False
+
+
+def _prompt_ids_are_unique(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and all(isinstance(item, str) for item in value)
+        and len(value) == len(set(value))
+    )
 
 
 def _contains_private_value(value: Any) -> bool:
