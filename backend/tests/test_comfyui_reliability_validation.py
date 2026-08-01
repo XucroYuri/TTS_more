@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+import app.comfyui.reliability_validation as reliability_validation
 
 from app.comfyui.reliability_validation import (
     AudioProof,
@@ -62,17 +63,18 @@ def _case(case_id: str, engine: str, *, phase: str = "steady", expected: str = "
         finished_at=datetime.now(timezone.utc),
         audio=audio,
         cleanup=CleanupEvidence(ok=cleanup_ok, owned_processes_stopped=True, temp_paths_removed=True),
-        processes=[ProcessEvidence(pid=123, ownership="validator-owned", command_hash="a" * 64)],
-        comfyui=ComfyQueueEvidence(queue_empty=True, history_present=True, prompt_id=f"prompt-{case_id}"),
+        processes=[ProcessEvidence(pid=123, ownership="validator-owned", command_hash="a" * 64, creation_time=datetime.now(timezone.utc), parent_pid=1, parent_creation_time=datetime.now(timezone.utc), executable_name="python.exe", executable_hash="a" * 64, ownership_hash="b" * 64, started=True, stopped=True, descendants_stopped=True, alive_after=False)],
+        comfyui=ComfyQueueEvidence(queue_empty=True, history_present=True, prompt_id=f"prompt-{case_id}", queue_before_prompt_ids=[f"prompt-{case_id}"], queue_after_prompt_ids=[], history_prompt_ids=[f"prompt-{case_id}"], terminal_history_status=actual),
         gpu_before=GpuSnapshot(used_mib=1, free_mib=2),
+        gpu_peak=GpuSnapshot(used_mib=2, free_mib=1),
         gpu_after=GpuSnapshot(used_mib=1, free_mib=2),
         boundary=BoundaryEvidence(
             before_hash="b" * 64,
             after_hash="b" * 64,
             private_registry_hash="c" * 64,
             reference_hashes={"reference": "d" * 64},
-            repositories_before=[RepositorySnapshot(label="tts-more", head="a" * 40, branch="feature", porcelain_hash="f" * 64)],
-            repositories_after=[RepositorySnapshot(label="tts-more", head="a" * 40, branch="feature", porcelain_hash="f" * 64)],
+            repositories_before=[RepositorySnapshot(label=label, head="a" * 40, branch="feature", porcelain_hash="f" * 64) for label in ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")],
+            repositories_after=[RepositorySnapshot(label=label, head="a" * 40, branch="feature", porcelain_hash="f" * 64) for label in ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")],
             private_registry_before_hash="c" * 64,
             private_registry_after_hash="c" * 64,
             reference_hashes_before={"reference": "d" * 64},
@@ -165,14 +167,15 @@ def test_finalize_run_requires_exact_successful_steady_matrix_and_named_cases() 
         _case("cancel-index", "indextts", phase="fault", expected="cancelled", actual="cancelled"),
         _case("restart-cosy", "cosyvoice", phase="recovery"),
     ])
-    passed = finalize_run(fixture, cases, required_case_ids={"cancel-index", "restart-cosy"})
+    required = {"cancel-index": {"phase": "fault", "expected": "cancelled"}, "restart-cosy": {"phase": "recovery", "expected": "completed"}}
+    passed = finalize_run(fixture, cases, required_case_ids=required)
     assert passed.status == "passed"
 
-    duplicate = finalize_run(fixture, cases + [_case("steady-gpt-sovits-01", "gpt-sovits")], required_case_ids={"cancel-index", "restart-cosy"})
+    duplicate = finalize_run(fixture, cases + [_case("steady-gpt-sovits-01", "gpt-sovits")], required_case_ids=required)
     assert duplicate.status == "failed"
     assert duplicate.duplicate_case_ids == ["steady-gpt-sovits-01"]
 
-    failed = finalize_run(fixture, [_case("steady-gpt-01", "gpt-sovits"), _case("cancel-index", "indextts", phase="fault", expected="cancelled", actual="cancelled", cleanup_ok=False)], required_case_ids={"cancel-index", "restart-cosy"})
+    failed = finalize_run(fixture, [_case("steady-gpt-01", "gpt-sovits"), _case("cancel-index", "indextts", phase="fault", expected="cancelled", actual="cancelled", cleanup_ok=False)], required_case_ids=required)
     assert failed.status == "failed"
     assert failed.missing_cases == ["restart-cosy"]
     assert failed.cleanup_failures == ["cancel-index"]
@@ -192,3 +195,48 @@ def test_atomic_evidence_preserves_prior_file_when_replace_fails(tmp_path: Path,
     assert target.read_bytes() == original
     assert list(tmp_path.glob(".summary.json.*.tmp")) == []
     assert json.loads(target.read_text(encoding="utf-8")) == {"status": "passed"}
+
+
+def test_atomic_evidence_rolls_back_prior_file_when_directory_fsync_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "summary.json"
+    write_atomic_json(target, {"status": "passed"})
+    original = target.read_bytes()
+    monkeypatch.setattr(reliability_validation, "_fsync_directory", lambda _directory: (_ for _ in ()).throw(OSError("fsync failed")))
+    with pytest.raises(OSError, match="fsync failed"):
+        write_atomic_json(target, {"status": "failed"})
+    assert target.read_bytes() == original
+    assert list(tmp_path.glob(".summary.json.*.tmp")) == []
+    assert list(tmp_path.glob(".summary.json.*.bak")) == []
+
+
+def test_fix_round_1_required_case_contract_rejects_steady_recovery_and_extra_steady_case() -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    cases = [
+        _case(f"steady-{engine}-{index:02d}", engine)
+        for engine in ("gpt-sovits", "indextts", "cosyvoice")
+        for index in range(1, 11)
+    ]
+    cases.append(_case("recover-cosy", "cosyvoice", phase="steady"))
+    summary = finalize_run(
+        fixture,
+        cases,
+        required_case_ids={"recover-cosy": {"phase": "recovery", "expected": "completed"}},
+    )
+    assert summary.status == "failed"
+    assert "required case recover-cosy has wrong phase" in summary.validation_failures
+
+    extra = finalize_run(
+        fixture,
+        cases + [_case("steady-gpt-extra", "gpt-sovits", expected="failed", actual="failed", audio=None)],
+        required_case_ids={},
+    )
+    assert extra.status == "failed"
+    assert "steady gpt-sovits count is 11, expected 10" in extra.validation_failures
+
+
+def test_fix_round_1_raw_payload_safety_rejects_nested_private_values(tmp_path: Path) -> None:
+    target = tmp_path / "summary.json"
+    with pytest.raises(ValueError, match="unsafe evidence") as exc_info:
+        write_atomic_json(target, {"nested": [r"C:\Users\private", {"authorization": "Bearer private-token"}]})
+    assert "private-token" not in str(exc_info.value)
+    assert target.exists() is False

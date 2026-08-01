@@ -8,7 +8,7 @@ import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Mapping, Sequence
 
 import soundfile
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, field_validator, model_validator
@@ -18,10 +18,17 @@ Engine = Literal["gpt-sovits", "indextts", "cosyvoice"]
 Outcome = Literal["completed", "cancelled", "failed", "timeout"]
 Phase = Literal["steady", "fault", "recovery"]
 SHA256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+REQUIRED_BOUNDARY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")
 
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _public_values_only(cls, value: Any) -> Any:
+        _assert_public_evidence(value)
+        return value
 
 
 class FixtureResource(_StrictModel):
@@ -72,12 +79,26 @@ class ProcessEvidence(_StrictModel):
     pid: StrictInt = Field(gt=0)
     ownership: Literal["validator-owned", "pre-existing"]
     command_hash: SHA256
+    creation_time: datetime
+    parent_pid: StrictInt = Field(ge=0)
+    parent_creation_time: datetime
+    executable_name: str = Field(min_length=1)
+    executable_hash: SHA256
+    ownership_hash: SHA256
+    started: StrictBool
+    stopped: StrictBool
+    descendants_stopped: StrictBool
+    alive_after: StrictBool
 
 
 class ComfyQueueEvidence(_StrictModel):
     queue_empty: StrictBool
     history_present: StrictBool
     prompt_id: str = Field(min_length=1)
+    queue_before_prompt_ids: list[str]
+    queue_after_prompt_ids: list[str]
+    history_prompt_ids: list[str]
+    terminal_history_status: Outcome
 
 
 class GpuSnapshot(_StrictModel):
@@ -121,6 +142,7 @@ class CaseEvidence(_StrictModel):
     processes: list[ProcessEvidence] = Field(min_length=1)
     comfyui: ComfyQueueEvidence
     gpu_before: GpuSnapshot
+    gpu_peak: GpuSnapshot
     gpu_after: GpuSnapshot
     boundary: BoundaryEvidence
 
@@ -164,6 +186,19 @@ class ReliabilityRunSummary(_StrictModel):
     validation_failures: list[str] = Field(default_factory=list)
     steady_counts: dict[Engine, StrictInt]
 
+    @model_validator(mode="after")
+    def _consistent_status(self) -> "ReliabilityRunSummary":
+        failures = self.missing_cases or self.duplicate_case_ids or self.cleanup_failures or self.validation_failures
+        if self.status == "passed" and (failures or any(count != self.rounds for count in self.steady_counts.values())):
+            raise ValueError("passed summary contains failed evidence")
+        return self
+
+
+class RequiredCase(_StrictModel):
+    case_id: str = Field(min_length=1)
+    phase: Literal["fault", "recovery"]
+    expected: Outcome
+
 
 def validate_case(case: CaseEvidence, *, wav_path: Path | None = None) -> CaseValidation:
     diagnostics: list[str] = []
@@ -172,8 +207,12 @@ def validate_case(case: CaseEvidence, *, wav_path: Path | None = None) -> CaseVa
         diagnostics.append("expected outcome does not match actual outcome")
     if not case.cleanup.ok or not case.cleanup.owned_processes_stopped or not case.cleanup.temp_paths_removed:
         diagnostics.append("cleanup proof is incomplete")
-    if not case.comfyui.queue_empty or not case.comfyui.history_present or case.comfyui.prompt_id != case.prompt_id:
+    if (not case.comfyui.queue_empty or not case.comfyui.history_present or case.comfyui.prompt_id != case.prompt_id or case.prompt_id in case.comfyui.queue_after_prompt_ids or case.prompt_id not in case.comfyui.history_prompt_ids or case.comfyui.terminal_history_status != case.actual):
         diagnostics.append("ComfyUI queue/history proof is incomplete")
+    if any(process.alive_after or not process.stopped or not process.descendants_stopped or process.ownership != "validator-owned" for process in case.processes):
+        diagnostics.append("process ownership/cleanup proof is incomplete")
+    if case.gpu_peak.used_mib < max(case.gpu_before.used_mib, case.gpu_after.used_mib) or case.gpu_after.used_mib - case.gpu_before.used_mib > 1024:
+        diagnostics.append("GPU memory did not recover")
     boundary = case.boundary
     repository_before = {snapshot.label: snapshot for snapshot in boundary.repositories_before}
     repository_after = {snapshot.label: snapshot for snapshot in boundary.repositories_after}
@@ -186,6 +225,8 @@ def validate_case(case: CaseEvidence, *, wav_path: Path | None = None) -> CaseVa
         or not boundary.reference_hashes_after
     ):
         diagnostics.append("boundary observations are incomplete")
+    if (set(repository_before) != set(REQUIRED_BOUNDARY_LABELS) or set(repository_after) != set(REQUIRED_BOUNDARY_LABELS) or len(repository_before) != len(boundary.repositories_before) or len(repository_after) != len(boundary.repositories_after)):
+        diagnostics.append("boundary repository set is incomplete or duplicated")
     if (
         boundary.before_hash != boundary.after_hash
         or repository_before != repository_after
@@ -212,11 +253,12 @@ def finalize_run(
     fixture: ReliabilityFixture,
     cases: list[CaseEvidence],
     *,
-    required_case_ids: set[str],
+    required_case_ids: Mapping[str, Mapping[str, str] | RequiredCase] | Sequence[RequiredCase] | set[str],
 ) -> ReliabilityRunSummary:
+    required = _required_cases(required_case_ids)
     duplicate_case_ids = sorted(_duplicates(case.case_id for case in cases))
     present = {case.case_id for case in cases}
-    missing_cases = sorted(required_case_ids - present)
+    missing_cases = sorted(set(required) - present)
     validations = [validate_case(case) for case in cases]
     validation_failures = sorted(
         f"{validation.evidence.case_id}: {diagnostic}"
@@ -229,19 +271,20 @@ def finalize_run(
         if not case.cleanup.ok or not case.cleanup.owned_processes_stopped or not case.cleanup.temp_paths_removed
     )
     steady_counts: dict[Engine, int] = {"gpt-sovits": 0, "indextts": 0, "cosyvoice": 0}
+    raw_steady_counts: dict[Engine, int] = {"gpt-sovits": 0, "indextts": 0, "cosyvoice": 0}
     for validation in validations:
         case = validation.evidence
+        if case.phase == "steady": raw_steady_counts[case.engine] += 1
         if case.phase == "steady" and validation.valid and case.expected == "completed" and case.actual == "completed":
             steady_counts[case.engine] += 1
     for engine, count in steady_counts.items():
-        if count != fixture.rounds:
-            validation_failures.append(f"steady {engine} count is {count}, expected {fixture.rounds}")
-    required_failures = sorted(
-        case.case_id
-        for case in cases
-        if case.case_id in required_case_ids and not validate_case(case).valid
-    )
-    validation_failures.extend(f"required case failed: {case_id}" for case_id in required_failures)
+        if raw_steady_counts[engine] != fixture.rounds or count != fixture.rounds:
+            validation_failures.append(f"steady {engine} count is {raw_steady_counts[engine]}, expected {fixture.rounds}")
+    for case in cases:
+        spec = required.get(case.case_id)
+        if case.phase != "steady" and spec is None: validation_failures.append(f"extra required case: {case.case_id}")
+        if spec is not None and (case.phase != spec.phase or case.actual != spec.expected or not validate_case(case).valid):
+            validation_failures.append(f"required case {case.case_id} has wrong phase" if case.phase != spec.phase else f"required case failed: {case.case_id}")
     validation_failures = sorted(set(validation_failures))
     failed = bool(duplicate_case_ids or missing_cases or cleanup_failures or validation_failures)
     return ReliabilityRunSummary(
@@ -258,20 +301,36 @@ def finalize_run(
 
 
 def write_atomic_json(path: Path, payload: ReliabilityRunSummary | dict[str, Any]) -> None:
+    _assert_public_evidence(payload.model_dump(mode="json") if isinstance(payload, ReliabilityRunSummary) else payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     document = payload.model_dump(mode="json") if isinstance(payload, ReliabilityRunSummary) else payload
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
+    backup = path.with_name(f".{path.name}.{next(tempfile._get_candidate_names())}.bak")
+    had_prior = path.exists()
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(document, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        if had_prior:
+            os.replace(path, backup)
+        try:
+            os.replace(temporary, path)
+            _fsync_directory(path.parent)
+        except BaseException:
+            if had_prior and backup.exists():
+                os.replace(backup, path)
+                try: _fsync_directory(path.parent)
+                except OSError: pass
+            elif path.exists():
+                path.unlink(missing_ok=True)
+            raise
+        backup.unlink(missing_ok=True)
     except BaseException:
         temporary.unlink(missing_ok=True)
+        backup.unlink(missing_ok=True)
         raise
 
 
@@ -304,6 +363,34 @@ def _duplicates(values: Any) -> set[str]:
             duplicates.add(value)
         seen.add(value)
     return duplicates
+
+
+def _required_cases(value: Mapping[str, Mapping[str, str] | RequiredCase] | Sequence[RequiredCase] | set[str]) -> dict[str, RequiredCase]:
+    if isinstance(value, set):
+        return {case_id: RequiredCase(case_id=case_id, phase="fault", expected="completed") for case_id in value}
+    if isinstance(value, Mapping):
+        return {case_id: item if isinstance(item, RequiredCase) else RequiredCase(case_id=case_id, **item) for case_id, item in value.items()}
+    output: dict[str, RequiredCase] = {}
+    for item in value:
+        if item.case_id in output:
+            raise ValueError("duplicate required case IDs")
+        output[item.case_id] = item
+    return output
+
+
+def _assert_public_evidence(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _assert_public_evidence(str(key))
+            _assert_public_evidence(item)
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value: _assert_public_evidence(item)
+        return
+    if not isinstance(value, str): return
+    lowered = value.lower()
+    if (re.match(r"^[a-z]:[\\/]", lowered) or lowered.startswith("\\\\") or lowered.startswith("/home/") or lowered.startswith("/users/") or re.search(r"(?:bearer\s+|token\s*[:=]|password\s*[:=]|api[_-]?key\s*[:=]|authorization)", lowered)):
+        raise ValueError("unsafe evidence")
 
 
 def _fsync_directory(directory: Path) -> None:
