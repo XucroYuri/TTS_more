@@ -3415,6 +3415,245 @@ def test_task_10_native_final_cleanup_detects_residue_in_configured_runner_temp_
     assert system.final_cleanup_state((temp_root,)) == (True, True)
 
 
+def test_task_12_powershell_process_helpers_accept_current_process_identity() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Get-PortOwnerPid',
+    'Get-ProcessRecord',
+    'Test-ProcessAbsent',
+    'Wait-ProcessRecord',
+    'Wait-ExactPortOwner'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+
+$record = Get-ProcessRecord $PID
+if ([int] $record.pid -ne $PID) {
+    throw 'Get-ProcessRecord did not return the current process identity'
+}
+if (Test-ProcessAbsent $PID) {
+    throw 'Test-ProcessAbsent reported the current process absent'
+}
+$waited = Wait-ProcessRecord $PID 2
+if ([int] $waited.pid -ne $PID) {
+    throw 'Wait-ProcessRecord did not return the current process identity'
+}
+
+$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+$listener.Start()
+try {
+    $port = [int] ([Net.IPEndPoint] $listener.LocalEndpoint).Port
+    Wait-ExactPortOwner $port $PID 10
+    if ((Get-PortOwnerPid $port) -ne $PID) {
+        throw 'Wait-ExactPortOwner did not preserve exact current-process ownership'
+    }
+} finally {
+    $listener.Stop()
+}
+Write-Output 'PROCESS_HELPER_CURRENT_PID_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "PROCESS_HELPER_CURRENT_PID_OK" in completed.stdout
+
+
+def test_task_12_wrapper_cleans_owned_empty_temp_after_launcher_identity_failure(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    repository_root = Path(__file__).resolve().parents[2]
+    script_path = repository_root / "scripts" / "run-windows-comfyui-reliability.ps1"
+    output_root = tmp_path / "validation output"
+    output_root.mkdir()
+    sentinel_directory = output_root / "unrelated sentinel directory"
+    sentinel_directory.mkdir()
+    sentinel_file = output_root / "unrelated-sentinel.txt"
+    sentinel_file.write_text("retain-exactly", encoding="utf-8")
+
+    fixture_root = tmp_path / "fixture"
+    reference_root = fixture_root / "references"
+    reference_root.mkdir(parents=True)
+    resources: dict[str, dict[str, str]] = {}
+    for engine in ("gpt-sovits", "indextts", "cosyvoice"):
+        reference = reference_root / f"{engine}.wav"
+        reference.write_bytes(b"reference")
+        resources[engine] = {
+            "reference_audio": f"references/{engine}.wav",
+        }
+    fixture_path = fixture_root / "fixture.json"
+    fixture_path.write_text(json.dumps({"resources": resources}), encoding="utf-8")
+
+    comfy_root = tmp_path / "ComfyUI"
+    (comfy_root / "custom_nodes" / "TTS-Audio-Suite").mkdir(parents=True)
+    fake_comfy_python = tmp_path / "never-started-comfy-python.exe"
+    fake_comfy_python.write_bytes(b"not executable")
+    registry_path = tmp_path / "resources.yaml"
+    registry_path.write_text("resources: {}\n", encoding="utf-8")
+    engine_roots: dict[str, Path] = {}
+    for engine in ("gpt-sovits", "indextts", "cosyvoice"):
+        engine_root = tmp_path / f"{engine}-root"
+        engine_root.mkdir()
+        engine_roots[engine] = engine_root
+
+    command = r"""
+function Get-PortOwners {
+    param([int] $Port)
+    return @(
+        Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            Sort-Object
+    )
+}
+function Get-MatchingProcessIdentities {
+    return @(
+        CimCmdlets\Get-CimInstance Win32_Process -ErrorAction Stop |
+            Where-Object {
+                $_.ExecutablePath -and
+                [IO.Path]::GetFullPath([string] $_.ExecutablePath).Equals(
+                    [IO.Path]::GetFullPath($env:TTS_MORE_TEST_COMFY_PYTHON),
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            } |
+            ForEach-Object {
+                '{0}:{1}' -f $_.ProcessId, $_.CreationDate.ToUniversalTime().Ticks
+            } |
+            Sort-Object
+    )
+}
+
+$port8000Before = @(Get-PortOwners 8000)
+$port8188Before = @(Get-PortOwners 8188)
+$matchingBefore = @(Get-MatchingProcessIdentities)
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    $ownedRoots = @(
+        Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_OUTPUT -Directory `
+            -Filter 'reliability-temp-*'
+    )
+    $ownerMarkers = @(
+        Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_OUTPUT -File `
+            -Filter '.request-temp-*.owner.json'
+    )
+    if ($ownedRoots.Count -ne 1 -or $ownerMarkers.Count -ne 1) {
+        throw 'launcher identity failure was not injected after owned artifacts existed'
+    }
+    $owner = Get-Content -LiteralPath $ownerMarkers[0].FullName -Raw |
+        ConvertFrom-Json
+    if (
+        $owner.temp_root -ne $ownedRoots[0].FullName -or
+        @(Get-ChildItem -LiteralPath $ownedRoots[0].FullName -Recurse -File).Count -ne 0
+    ) { throw 'launcher identity failure did not observe the exact empty owned temp tree' }
+    throw 'injected launcher identity failure'
+}
+
+$caught = $null
+try {
+    & $env:TTS_MORE_RELIABILITY_SCRIPT `
+        -Fixture $env:TTS_MORE_TEST_FIXTURE `
+        -OutputRoot $env:TTS_MORE_TEST_OUTPUT `
+        -ComfyUiRoot $env:TTS_MORE_TEST_COMFY_ROOT `
+        -ComfyPython $env:TTS_MORE_TEST_COMFY_PYTHON `
+        -TtsMoreRoot $env:TTS_MORE_TEST_TTS_ROOT `
+        -PreflightOnly
+} catch {
+    $caught = $_
+}
+
+if ($null -eq $caught -or $caught.Exception.Message -ne 'injected launcher identity failure') {
+    throw ('Expected injected launcher identity failure, got: {0}' -f $caught)
+}
+if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_OUTPUT -Directory -Filter 'reliability-temp-*').Count -ne 0) {
+    throw 'run-owned temp root survived early launcher identity failure'
+}
+if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_OUTPUT -File -Filter '.request-temp-*.owner.json').Count -ne 0) {
+    throw 'run-owned temp marker survived early launcher identity failure'
+}
+if (
+    -not (Test-Path -LiteralPath $env:TTS_MORE_TEST_SENTINEL_DIRECTORY -PathType Container) -or
+    (Get-Content -LiteralPath $env:TTS_MORE_TEST_SENTINEL_FILE -Raw) -ne 'retain-exactly'
+) { throw 'unrelated output-root sentinels changed' }
+if (
+    (@(Get-PortOwners 8000) -join ',') -ne ($port8000Before -join ',') -or
+    (@(Get-PortOwners 8188) -join ',') -ne ($port8188Before -join ',')
+) { throw 'launcher identity failure changed port ownership' }
+if ((@(Get-MatchingProcessIdentities) -join ',') -ne ($matchingBefore -join ',')) {
+    throw 'launcher identity failure changed the configured child-process set'
+}
+Write-Output 'EARLY_LAUNCHER_FAILURE_CLEANUP_OK'
+"""
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
+            "TTS_MORE_TEST_FIXTURE": str(fixture_path),
+            "TTS_MORE_TEST_OUTPUT": str(output_root),
+            "TTS_MORE_TEST_COMFY_ROOT": str(comfy_root),
+            "TTS_MORE_TEST_COMFY_PYTHON": str(fake_comfy_python),
+            "TTS_MORE_TEST_TTS_ROOT": str(repository_root),
+            "TTS_MORE_TEST_SENTINEL_DIRECTORY": str(sentinel_directory),
+            "TTS_MORE_TEST_SENTINEL_FILE": str(sentinel_file),
+            "TTS_MORE_RELIABILITY_GPT_SOVITS_ROOT": str(
+                engine_roots["gpt-sovits"]
+            ),
+            "TTS_MORE_RELIABILITY_INDEXTTS_ROOT": str(engine_roots["indextts"]),
+            "TTS_MORE_RELIABILITY_COSYVOICE_ROOT": str(engine_roots["cosyvoice"]),
+            "TTS_AUDIO_SUITE_RESOURCES": str(registry_path),
+        }
+    )
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "EARLY_LAUNCHER_FAILURE_CLEANUP_OK" in completed.stdout
+
+
 def test_task_10_powershell_identity_timestamps_compare_utc_instants_not_spelling() -> None:
     powershell = shutil.which("powershell.exe")
     if powershell is None:

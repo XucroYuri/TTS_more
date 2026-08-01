@@ -33,8 +33,8 @@ function Get-PortOwnerPid {
 }
 
 function Get-ProcessRecord {
-    param([int] $Pid)
-    $process = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $Pid) -ErrorAction Stop
+    param([int] $ProcessId)
+    $process = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop
     $parent = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $process.ParentProcessId) -ErrorAction Stop
     if (-not $process.ExecutablePath -or -not $process.CommandLine) {
         throw 'Process identity is incomplete'
@@ -69,9 +69,9 @@ function Test-RecordedIdentity {
 }
 
 function Test-ProcessAbsent {
-    param([int] $Pid)
+    param([int] $ProcessId)
     try {
-        $null = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $Pid) -ErrorAction Stop
+        $null = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop
         return $false
     } catch {
         return $true
@@ -88,10 +88,10 @@ function Get-UtcTicks {
 }
 
 function Wait-ProcessRecord {
-    param([int] $Pid, [int] $TimeoutSeconds = 10)
+    param([int] $ProcessId, [int] $TimeoutSeconds = 10)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
-        try { return Get-ProcessRecord -Pid $Pid } catch { Start-Sleep -Milliseconds 100 }
+        try { return Get-ProcessRecord -ProcessId $ProcessId } catch { Start-Sleep -Milliseconds 100 }
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'Started process identity could not be recorded'
 }
@@ -377,7 +377,7 @@ function Write-RunControlState {
 
 function Stop-ProvisionalStartedProcess {
     param([object] $Token)
-    if (Test-ProcessAbsent -Pid ([int] $Token.pid)) { return $true }
+    if (Test-ProcessAbsent -ProcessId ([int] $Token.pid)) { return $true }
     try {
         $current = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int] $Token.pid)) -ErrorAction Stop
         $parent = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int] $current.ParentProcessId)) -ErrorAction Stop
@@ -400,13 +400,13 @@ function Stop-ProvisionalStartedProcess {
         Stop-Process -Id ([int] $Token.pid) -Force -ErrorAction Stop
         $deadline = [DateTime]::UtcNow.AddSeconds(30)
         do {
-            if (Test-ProcessAbsent -Pid ([int] $Token.pid)) { return $true }
+            if (Test-ProcessAbsent -ProcessId ([int] $Token.pid)) { return $true }
             Start-Sleep -Milliseconds 100
         } while ([DateTime]::UtcNow -lt $deadline)
         Write-Warning 'Provisional process did not stop; preserving its temp root'
         return $false
     } catch {
-        if (Test-ProcessAbsent -Pid ([int] $Token.pid)) { return $true }
+        if (Test-ProcessAbsent -ProcessId ([int] $Token.pid)) { return $true }
         Write-Warning 'Provisional process could not be proven owned; preserving the current PID'
         return $false
     }
@@ -565,10 +565,10 @@ function Start-ProvisionallyTrackedProcess {
 }
 
 function Wait-ExactPortOwner {
-    param([int] $Port, [int] $Pid, [int] $TimeoutSeconds = 180)
+    param([int] $Port, [int] $ProcessId, [int] $TimeoutSeconds = 180)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
-        if ((Get-PortOwnerPid -Port $Port) -eq $Pid) { return }
+        if ((Get-PortOwnerPid -Port $Port) -eq $ProcessId) { return }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Owned process did not acquire port $Port"
@@ -576,7 +576,7 @@ function Wait-ExactPortOwner {
 
 function Stop-RecordedTree {
     param([object] $Record)
-    if (Test-ProcessAbsent -Pid ([int] $Record.pid)) { return $true }
+    if (Test-ProcessAbsent -ProcessId ([int] $Record.pid)) { return $true }
     if (-not (Test-RecordedIdentity -Record $Record)) {
         Write-Warning 'Recorded process identity no longer matches; preserving the current PID'
         return $false
@@ -589,7 +589,7 @@ function Stop-RecordedTree {
         foreach ($parentPid in $frontier) {
             foreach ($child in @($all | Where-Object { [int] $_.ParentProcessId -eq $parentPid })) {
                 if (-not $descendants.ContainsKey([int] $child.ProcessId)) {
-                    $childRecord = Get-ProcessRecord -Pid ([int] $child.ProcessId)
+                    $childRecord = Get-ProcessRecord -ProcessId ([int] $child.ProcessId)
                     $descendants[[int] $child.ProcessId] = $childRecord
                     $next += [int] $child.ProcessId
                 }
@@ -611,7 +611,7 @@ function Stop-RecordedTree {
     do {
         $allAbsent = $true
         foreach ($candidate in $records) {
-            if (Test-ProcessAbsent -Pid ([int] $candidate.pid)) { continue }
+            if (Test-ProcessAbsent -ProcessId ([int] $candidate.pid)) { continue }
             $allAbsent = $false
             if (-not (Test-RecordedIdentity -Record $candidate)) {
                 Write-Warning 'A stopped PID was reused or changed; preserving the temp root'
@@ -762,8 +762,8 @@ $comfyRecord = $null
 $backendRecord = $null
 $startedProcesses = [System.Collections.Generic.List[object]]::new()
 $provisionalCleanupFailed = $false
-$launcherRecord = Get-ProcessRecord -Pid $PID
 try {
+    $launcherRecord = Get-ProcessRecord -ProcessId $PID
     foreach ($port in @(8000, 8188)) {
         if ($null -ne (Get-PortOwnerPid -Port $port)) {
             throw "Port $port is already occupied by a process not owned by this validation run"
@@ -784,7 +784,7 @@ try {
         -BackendRecord $backendRecord -ComfyRecord $comfyRecord
     $comfyProcess = $comfyStart.process
     try {
-        $comfyRecord = Wait-ProcessRecord -Pid $comfyProcess.Id
+        $comfyRecord = Wait-ProcessRecord -ProcessId $comfyProcess.Id
         Write-RunControlState -Path $controlStatePath -RunId $runId `
             -BackendRecord $backendRecord -ComfyRecord $comfyRecord
     } catch {
@@ -793,7 +793,7 @@ try {
         }
         throw
     }
-    Wait-ExactPortOwner -Port 8188 -Pid $comfyProcess.Id
+    Wait-ExactPortOwner -Port 8188 -ProcessId $comfyProcess.Id
 
     $backendLaunchMarker = "tts_more_reliability_run=$runId-tts-more"
     $backendArguments = @(
@@ -808,7 +808,7 @@ try {
         -BackendRecord $backendRecord -ComfyRecord $comfyRecord
     $backendProcess = $backendStart.process
     try {
-        $backendRecord = Wait-ProcessRecord -Pid $backendProcess.Id
+        $backendRecord = Wait-ProcessRecord -ProcessId $backendProcess.Id
         Write-RunControlState -Path $controlStatePath -RunId $runId `
             -BackendRecord $backendRecord -ComfyRecord $comfyRecord
     } catch {
@@ -817,7 +817,7 @@ try {
         }
         throw
     }
-    Wait-ExactPortOwner -Port 8000 -Pid $backendProcess.Id
+    Wait-ExactPortOwner -Port 8000 -ProcessId $backendProcess.Id
 
     $hostManifest = [ordered]@{
         version = 1
