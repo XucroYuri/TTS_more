@@ -4,6 +4,7 @@ import json
 import math
 import os
 import struct
+import warnings
 import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -99,6 +100,13 @@ def _required_cases() -> list[RequiredCase]:
     return [
         RequiredCase(case_id="cancel-index", engine="indextts", phase="fault", expected="cancelled"),
         RequiredCase(case_id="restart-cosy", engine="cosyvoice", phase="recovery", expected="completed"),
+    ]
+
+
+def _complete_cases() -> list[CaseEvidence]:
+    return _steady_cases() + [
+        _case("cancel-index", "indextts", phase="fault", expected="cancelled", actual="cancelled"),
+        _case("restart-cosy", "cosyvoice", phase="recovery"),
     ]
 
 
@@ -222,6 +230,7 @@ def test_atomic_existing_publish_replace_failure_never_moves_live_target(
         replace_calls.append((Path(source), Path(destination)))
         raise OSError(f"injected-sentinel replace failure at {target}")
 
+    monkeypatch.setattr(os, "link", lambda *_args, **_kwargs: pytest.fail("existing write must not link"))
     monkeypatch.setattr(os, "replace", fail_replace)
     with pytest.raises(OSError) as exc_info:
         write_atomic_json(target, {"status": "failed"})
@@ -321,29 +330,124 @@ def test_atomic_committed_backup_cleanup_failure_returns_success_and_keeps_new_t
     assert _atomic_artifacts(target, "tmp") == []
 
 
-def test_atomic_first_write_replace_failure_leaves_no_target_or_owned_artifact(
+def test_atomic_first_write_link_failure_leaves_no_target_or_owned_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "summary.json"
     unrelated = tmp_path / ".summary.json.unrelated.tmp"
     unrelated.write_bytes(b"unrelated")
-    replace_calls: list[tuple[Path, Path]] = []
+    link_calls: list[tuple[Path, Path]] = []
 
-    def fail_replace(source: object, destination: object) -> None:
-        replace_calls.append((Path(source), Path(destination)))
-        raise OSError(f"injected-sentinel replace failure at {target}")
+    def fail_link(source: object, destination: object) -> None:
+        link_calls.append((Path(source), Path(destination)))
+        raise OSError(f"injected-sentinel link failure at {target}")
 
-    monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(os, "link", fail_link)
+    monkeypatch.setattr(os, "replace", lambda *_args, **_kwargs: pytest.fail("first write must not replace"))
     with pytest.raises(OSError) as exc_info:
         write_atomic_json(target, {"status": "passed"})
     _assert_scrubbed_atomic_error(exc_info.value, target)
-    assert len(replace_calls) == 1
-    assert replace_calls[0][1] == target
+    assert len(link_calls) == 1
+    assert link_calls[0][0].parent == target.parent
+    assert link_calls[0][1] == target
     assert target.exists() is False
     assert [path for path in _atomic_artifacts(target, "tmp") if path != unrelated] == []
     assert _atomic_artifacts(target, "bak") == []
     assert unrelated.read_bytes() == b"unrelated"
+
+
+def test_fix_round_3_atomic_first_write_never_clobbers_a_concurrent_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "summary.json"
+    racing_bytes = b'{"status":"racing-writer"}\n'
+    real_link = os.link
+    link_calls: list[tuple[Path, Path]] = []
+
+    def install_racer_then_link(source: object, destination: object) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        link_calls.append((source_path, destination_path))
+        destination_path.write_bytes(racing_bytes)
+        real_link(source_path, destination_path)
+
+    monkeypatch.setattr(os, "link", install_racer_then_link)
+    monkeypatch.setattr(os, "replace", lambda *_args, **_kwargs: pytest.fail("first write must not replace"))
+
+    with pytest.raises(OSError) as exc_info:
+        write_atomic_json(target, {"status": "passed"})
+
+    _assert_scrubbed_atomic_error(exc_info.value, target)
+    assert "publication conflict" in str(exc_info.value)
+    assert len(link_calls) == 1
+    assert link_calls[0][0].parent == target.parent
+    assert link_calls[0][1] == target
+    assert target.read_bytes() == racing_bytes
+    assert _atomic_artifacts(target, "tmp") == []
+    assert _atomic_artifacts(target, "bak") == []
+
+
+def test_fix_round_3_atomic_first_write_fsyncs_before_link_then_syncs_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "summary.json"
+    real_fsync = os.fsync
+    real_link = os.link
+    events: list[str] = []
+    link_paths: list[tuple[Path, Path]] = []
+
+    def record_fsync(descriptor: int) -> None:
+        events.append("fsync")
+        real_fsync(descriptor)
+
+    def record_link(source: object, destination: object) -> None:
+        events.append("link")
+        source_path = Path(source)
+        destination_path = Path(destination)
+        link_paths.append((source_path, destination_path))
+        real_link(source_path, destination_path)
+
+    def record_directory_sync(_directory: Path) -> None:
+        events.append("dirsync")
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "link", record_link)
+    monkeypatch.setattr(os, "replace", lambda *_args, **_kwargs: pytest.fail("first write must not replace"))
+    monkeypatch.setattr(reliability_validation, "_fsync_directory", record_directory_sync)
+
+    write_atomic_json(target, {"status": "passed"})
+
+    assert events.index("fsync") < events.index("link") < events.index("dirsync")
+    assert link_paths[0][0].parent == link_paths[0][1].parent == target.parent
+    assert link_paths[0][1] == target
+    assert json.loads(target.read_text(encoding="utf-8")) == {"status": "passed"}
+    assert _atomic_artifacts(target, "tmp") == []
+
+
+def test_fix_round_3_atomic_first_write_tolerates_post_link_temp_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "summary.json"
+    real_unlink = Path.unlink
+
+    def retain_published_temp(path: Path, missing_ok: bool = False) -> None:
+        if path.suffix == ".tmp":
+            raise PermissionError(f"injected-sentinel cleanup failure at {target}")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", retain_published_temp)
+    monkeypatch.setattr(os, "replace", lambda *_args, **_kwargs: pytest.fail("first write must not replace"))
+
+    write_atomic_json(target, {"status": "passed"})
+
+    assert json.loads(target.read_text(encoding="utf-8")) == {"status": "passed"}
+    retained = _atomic_artifacts(target, "tmp")
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == target.read_bytes()
 
 
 def test_atomic_first_write_dirsync_failure_retains_complete_target_when_removal_is_unproven(
@@ -576,6 +680,55 @@ def test_fix_round_2_public_evidence_allows_neutral_authorization_and_relative_l
     assert json.loads(target.read_text(encoding="utf-8")) == payload
 
 
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://public-user:uri-secret-sentinel@example.invalid/path",
+        "ssh://public-user:uri-secret-sentinel@example.invalid/repository",
+        "custom+tls://public-user:uri-secret-sentinel@example.invalid/resource",
+    ],
+)
+def test_fix_round_3_public_evidence_rejects_uri_userinfo_credentials_without_echo(
+    tmp_path: Path,
+    uri: str,
+) -> None:
+    target = tmp_path / "summary.json"
+    with pytest.raises(ValueError, match="unsafe evidence") as exc_info:
+        write_atomic_json(target, {"nested": [{"endpoint": uri}]})
+    assert "uri-secret-sentinel" not in str(exc_info.value)
+    assert uri not in str(exc_info.value)
+    assert target.exists() is False
+
+
+def test_fix_round_3_model_copy_secret_is_scanned_before_serializer_warning(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    cases = _steady_cases() + [
+        _case("cancel-index", "indextts", phase="fault", expected="cancelled", actual="cancelled"),
+        _case("restart-cosy", "cosyvoice", phase="recovery"),
+    ]
+    summary = finalize_run(fixture, cases, required_cases=_required_cases())
+    secret = "https://public-user:model-copy-secret-sentinel@example.invalid/path"
+    poisoned_case = summary.cases[0].model_copy(update={"job_id": [secret]})
+    poisoned_summary = summary.model_copy(update={"cases": [poisoned_case, *summary.cases[1:]]})
+    target = tmp_path / "summary.json"
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError, match="unsafe evidence") as exc_info:
+            write_atomic_json(target, poisoned_summary)
+
+    streams = capsys.readouterr()
+    emitted = "\n".join(str(item.message) for item in caught)
+    combined = "\n".join((str(exc_info.value), streams.out, streams.err, emitted))
+    assert "model-copy-secret-sentinel" not in combined
+    assert secret not in combined
+    assert caught == []
+    assert target.exists() is False
+
+
 def test_fix_round_2_model_validation_redacts_nested_secret_values() -> None:
     document = _case("steady-gpt-01", "gpt-sovits").model_dump()
     document["boundary"]["reference_hashes"] = {"token": "model-secret-sentinel"}  # type: ignore[index]
@@ -632,6 +785,240 @@ def test_fix_round_2_validate_case_requires_exact_queue_history_observation() ->
         assert "ComfyUI queue/history proof is incomplete" in result.diagnostics
 
 
+def test_fix_round_3_queue_empty_requires_globally_empty_after_snapshot() -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    queue_document = case.comfyui.model_dump()
+    queue_document["queue_after_prompt_ids"] = ["unrelated-prompt"]
+    with pytest.raises(ValidationError, match="queue/history proof"):
+        ComfyQueueEvidence.model_validate(queue_document)
+
+    contradictory = case.comfyui.model_copy(update={"queue_after_prompt_ids": ["unrelated-prompt"]})
+    result = validate_case(case.model_copy(update={"comfyui": contradictory}))
+    assert result.valid is False
+    assert "ComfyUI queue/history proof is incomplete" in result.diagnostics
+
+
+def test_fix_round_3_process_rejects_self_parent_identity() -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    process_document = case.processes[0].model_dump()
+    process_document["parent_pid"] = process_document["pid"]
+    with pytest.raises(ValidationError, match="parent"):
+        ProcessEvidence.model_validate(process_document)
+
+    self_parent = case.processes[0].model_copy(update={"parent_pid": case.processes[0].pid})
+    result = validate_case(case.model_copy(update={"processes": [self_parent]}))
+    assert result.valid is False
+    assert "process identity/lifecycle proof is incomplete" in result.diagnostics
+
+
+@pytest.mark.parametrize("second_created_seconds", [3, 4])
+def test_fix_round_3_same_pid_reuse_rejects_overlapping_or_touching_lifetimes(
+    second_created_seconds: int,
+) -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    first = case.processes[0].model_dump()
+    first["stopped_at"] = case.started_at + timedelta(seconds=4)
+    second = {
+        **first,
+        "creation_time": case.started_at + timedelta(seconds=second_created_seconds),
+        "stopped_at": case.started_at + timedelta(seconds=8),
+    }
+    document = case.model_dump()
+    document["processes"] = [first, second]
+    with pytest.raises(ValidationError, match="PID lifetimes"):
+        CaseEvidence.model_validate(document)
+
+
+def test_fix_round_3_validate_case_rechecks_same_pid_lifetime_overlap() -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    first = case.processes[0].model_copy(update={"stopped_at": case.started_at + timedelta(seconds=6)})
+    second = case.processes[0].model_copy(
+        update={
+            "creation_time": case.started_at + timedelta(seconds=5),
+            "stopped_at": case.started_at + timedelta(seconds=8),
+        }
+    )
+    result = validate_case(case.model_copy(update={"processes": [first, second]}))
+    assert result.valid is False
+    assert "process identity/lifecycle proof is incomplete" in result.diagnostics
+
+
+def test_fix_round_3_same_pid_reuse_allows_strictly_separated_lifetimes() -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    first = case.processes[0].model_dump()
+    first["stopped_at"] = case.started_at + timedelta(seconds=4)
+    second = {
+        **first,
+        "creation_time": case.started_at + timedelta(seconds=5),
+        "stopped_at": case.started_at + timedelta(seconds=8),
+    }
+    document = case.model_dump()
+    document["processes"] = [first, second]
+    evidence = CaseEvidence.model_validate(document)
+    assert validate_case(evidence).valid is True
+
+
+@pytest.mark.parametrize(
+    ("nested_field", "invalid_value"),
+    [
+        ("audio_peak", float("nan")),
+        ("audio_peak", float("inf")),
+        ("audio_size_bytes", "1600"),
+        ("cleanup_ok", 1),
+    ],
+)
+def test_fix_round_3_validate_case_revalidates_nested_model_copy_values(
+    nested_field: str,
+    invalid_value: object,
+) -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    if nested_field == "cleanup_ok":
+        poisoned = case.model_copy(update={"cleanup": case.cleanup.model_copy(update={"ok": invalid_value})})
+    else:
+        assert case.audio is not None
+        audio_field = "peak" if nested_field == "audio_peak" else "size_bytes"
+        poisoned = case.model_copy(
+            update={"audio": case.audio.model_copy(update={audio_field: invalid_value})},
+        )
+
+    result = validate_case(poisoned)
+
+    assert result.valid is False
+
+
+@pytest.mark.parametrize("peak", [float("nan"), float("inf"), float("-inf")])
+def test_fix_round_3_audio_proof_rejects_nonfinite_peak(peak: float) -> None:
+    with pytest.raises(ValidationError):
+        AudioProof(
+            sha256="e" * 64,
+            size_bytes=1600,
+            sample_rate=16000,
+            frames=800,
+            peak=peak,
+        )
+
+
+def test_fix_round_3_finalize_revalidates_poisoned_nested_model_copy() -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    cases = _complete_cases()
+    poisoned_cleanup = cases[0].cleanup.model_copy(update={"ok": 1})
+    cases[0] = cases[0].model_copy(update={"cleanup": poisoned_cleanup})
+
+    with pytest.raises(ValueError, match="invalid case evidence"):
+        finalize_run(fixture, cases, required_cases=_required_cases())
+
+
+def test_fix_round_3_write_revalidates_nested_model_copy_before_serializer_warning(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    summary = finalize_run(fixture, _complete_cases(), required_cases=_required_cases())
+    sentinel = "nested-invalid-type-sentinel"
+    case = next(item for item in summary.cases if item.audio is not None)
+    assert case.audio is not None
+    poisoned_audio = case.audio.model_copy(update={"size_bytes": sentinel})
+    poisoned_case = case.model_copy(update={"audio": poisoned_audio})
+    poisoned_summary = summary.model_copy(
+        update={"cases": [poisoned_case if item is case else item for item in summary.cases]},
+    )
+    target = tmp_path / "summary.json"
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError) as exc_info:
+            write_atomic_json(target, poisoned_summary)
+
+    streams = capsys.readouterr()
+    emitted = "\n".join(str(item.message) for item in caught)
+    combined = "\n".join((str(exc_info.value), streams.out, streams.err, emitted))
+    assert sentinel not in combined
+    assert caught == []
+    assert target.exists() is False
+
+
+def test_fix_round_3_raw_json_rejects_nonfinite_numbers(tmp_path: Path) -> None:
+    target = tmp_path / "summary.json"
+
+    with pytest.raises(OSError, match="atomic evidence preparation failed"):
+        write_atomic_json(target, {"peak": float("nan")})
+
+    assert target.exists() is False
+    assert _atomic_artifacts(target, "tmp") == []
+
+
+def test_fix_round_3_passed_summary_requires_matching_required_case_specs() -> None:
+    cases = sorted(
+        _complete_cases(),
+        key=lambda case: (case.case_id, case.engine, case.phase, case.expected, case.actual),
+    )
+    summary = ReliabilityRunSummary(
+        status="passed",
+        fixture_version=1,
+        rounds=10,
+        required_cases=list(reversed(_required_cases())),
+        cases=cases,
+        missing_cases=[],
+        duplicate_case_ids=[],
+        cleanup_failures=[],
+        validation_failures=[],
+        boundary_failures=[],
+        steady_counts={engine: 10 for engine in ("gpt-sovits", "indextts", "cosyvoice")},
+    )
+
+    assert [required.case_id for required in summary.required_cases] == ["cancel-index", "restart-cosy"]
+
+
+def test_fix_round_3_direct_steady_only_passed_summary_is_rejected() -> None:
+    cases = sorted(
+        _steady_cases(),
+        key=lambda case: (case.case_id, case.engine, case.phase, case.expected, case.actual),
+    )
+    with pytest.raises(ValidationError, match="passed summary contains failed evidence"):
+        ReliabilityRunSummary(
+            status="passed",
+            fixture_version=1,
+            rounds=10,
+            required_cases=[],
+            cases=cases,
+            missing_cases=[],
+            duplicate_case_ids=[],
+            cleanup_failures=[],
+            validation_failures=[],
+            boundary_failures=[],
+            steady_counts={engine: 10 for engine in ("gpt-sovits", "indextts", "cosyvoice")},
+        )
+
+
+def test_fix_round_3_passed_summary_rejects_duplicate_required_specs() -> None:
+    cases = sorted(
+        _complete_cases(),
+        key=lambda case: (case.case_id, case.engine, case.phase, case.expected, case.actual),
+    )
+    required = _required_cases()
+    with pytest.raises(ValidationError, match="required case specifications"):
+        ReliabilityRunSummary(
+            status="passed",
+            fixture_version=1,
+            rounds=10,
+            required_cases=[required[0], required[0], required[1]],
+            cases=cases,
+            missing_cases=[],
+            duplicate_case_ids=[],
+            cleanup_failures=[],
+            validation_failures=[],
+            boundary_failures=[],
+            steady_counts={engine: 10 for engine in ("gpt-sovits", "indextts", "cosyvoice")},
+        )
+
+
+def test_fix_round_3_evidence_models_are_frozen() -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+
+    with pytest.raises(ValidationError):
+        case.case_id = "changed"  # type: ignore[misc]
+
+
 def test_fix_round_2_validate_case_rechecks_gpu_observation_and_recovery() -> None:
     case = _case("steady-gpt-01", "gpt-sovits")
     invalid_snapshots = [
@@ -676,6 +1063,7 @@ def test_fix_round_2_direct_passed_summary_cannot_bypass_validation() -> None:
             status="passed",
             fixture_version=1,
             rounds=10,
+            required_cases=[],
             cases=[],
             missing_cases=[],
             duplicate_case_ids=[],

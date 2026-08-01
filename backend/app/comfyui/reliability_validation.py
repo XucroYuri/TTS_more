@@ -7,10 +7,11 @@ import os
 import re
 import secrets
 import shutil
+import warnings
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
 
 import soundfile
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, field_validator, model_validator
@@ -38,10 +39,18 @@ _SENSITIVE_KEYS = {
     "token",
 }
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+ModelT = TypeVar("ModelT", bound="_StrictModel")
 
 
 class _StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        hide_input_in_errors=True,
+        frozen=True,
+        revalidate_instances="always",
+        allow_inf_nan=False,
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -128,6 +137,8 @@ class ProcessEvidence(_StrictModel):
     def _complete_lifecycle(self) -> "ProcessEvidence":
         if self.parent_creation_time > self.creation_time or self.creation_time > self.stopped_at:
             raise ValueError("process timestamps are not ordered")
+        if self.parent_pid == self.pid:
+            raise ValueError("process parent_pid must differ from pid")
         if (
             self.ownership != "validator-owned"
             or not self.started
@@ -159,7 +170,7 @@ class ComfyQueueEvidence(_StrictModel):
             not self.queue_empty
             or not self.history_present
             or self.queue_before_prompt_ids.count(self.prompt_id) != 1
-            or self.prompt_id in self.queue_after_prompt_ids
+            or self.queue_after_prompt_ids
             or self.history_prompt_ids.count(self.prompt_id) != 1
         ):
             raise ValueError("ComfyUI queue/history proof is incomplete")
@@ -266,6 +277,8 @@ class CaseEvidence(_StrictModel):
             process_identities.add(identity)
             if process.creation_time < self.started_at or process.stopped_at > self.finished_at:
                 raise ValueError("process timestamps fall outside the case observation")
+        if not _pid_lifetimes_are_disjoint(self.processes):
+            raise ValueError("same-PID lifetimes must be strictly ordered and non-overlapping")
         if not _queue_proof_valid(self):
             raise ValueError("ComfyUI queue/history proof is incomplete")
         if not _gpu_proof_valid(self):
@@ -279,10 +292,26 @@ class CaseValidation(_StrictModel):
     diagnostics: list[str]
 
 
+class RequiredCase(_StrictModel):
+    case_id: str = Field(min_length=1)
+    engine: Engine
+    phase: Literal["fault", "recovery"]
+    expected: Outcome
+
+    @model_validator(mode="after")
+    def _phase_outcome_contract(self) -> "RequiredCase":
+        if self.phase == "recovery" and self.expected != "completed":
+            raise ValueError("recovery cases must expect completed")
+        if self.phase == "fault" and self.expected == "completed":
+            raise ValueError("fault cases must expect a non-completed outcome")
+        return self
+
+
 class ReliabilityRunSummary(_StrictModel):
     status: Literal["passed", "failed"]
     fixture_version: Literal[1]
     rounds: StrictInt
+    required_cases: list[RequiredCase]
     cases: list[CaseEvidence]
     missing_cases: list[str] = Field(default_factory=list)
     duplicate_case_ids: list[str] = Field(default_factory=list)
@@ -306,6 +335,17 @@ class ReliabilityRunSummary(_StrictModel):
     @classmethod
     def _ordered_steady_counts(cls, value: dict[Engine, int]) -> dict[Engine, int]:
         return {engine: value[engine] for engine in ENGINE_ORDER if engine in value}
+
+    @field_validator("required_cases")
+    @classmethod
+    def _sorted_unique_required_cases(cls, value: list[RequiredCase]) -> list[RequiredCase]:
+        case_ids = [required.case_id for required in value]
+        if len(case_ids) != len(set(case_ids)):
+            raise ValueError("required case specifications must be unique")
+        return sorted(
+            value,
+            key=lambda required: (required.case_id, required.engine, required.phase, required.expected),
+        )
 
     @model_validator(mode="after")
     def _consistent_status(self) -> "ReliabilityRunSummary":
@@ -338,10 +378,21 @@ class ReliabilityRunSummary(_StrictModel):
             engine: sum(case.phase == "steady" and case.engine == engine for case in self.cases)
             for engine in ENGINE_ORDER
         }
-        invalid_nonsteady = any(
-            (case.phase == "recovery" and (case.expected != "completed" or case.actual != "completed"))
-            or (case.phase == "fault" and (case.expected == "completed" or case.actual != case.expected))
-            for case in self.cases
+        required_by_id = {required.case_id: required for required in self.required_cases}
+        nonsteady_cases = [case for case in self.cases if case.phase != "steady"]
+        nonsteady_ids = [case.case_id for case in nonsteady_cases]
+        required_match = (
+            {required.phase for required in self.required_cases} == {"fault", "recovery"}
+            and len(nonsteady_cases) == len(self.required_cases)
+            and set(nonsteady_ids) == set(required_by_id)
+            and all(
+                case.engine == required_by_id[case.case_id].engine
+                and case.phase == required_by_id[case.case_id].phase
+                and case.expected == required_by_id[case.case_id].expected
+                and case.actual == required_by_id[case.case_id].expected
+                and validate_case(case).valid
+                for case in nonsteady_cases
+            )
         )
         if (
             self.rounds != 10
@@ -351,33 +402,18 @@ class ReliabilityRunSummary(_StrictModel):
             or raw_counts != expected_counts
             or len(case_ids) != len(set(case_ids))
             or any(not validate_case(case).valid for case in self.cases)
-            or invalid_nonsteady
+            or not required_match
         ):
             raise ValueError("passed summary contains failed evidence")
         return self
 
 
-class RequiredCase(_StrictModel):
-    case_id: str = Field(min_length=1)
-    engine: Engine
-    phase: Literal["fault", "recovery"]
-    expected: Outcome
-
-    @model_validator(mode="after")
-    def _phase_outcome_contract(self) -> "RequiredCase":
-        if self.phase == "recovery" and self.expected != "completed":
-            raise ValueError("recovery cases must expect completed")
-        if self.phase == "fault" and self.expected == "completed":
-            raise ValueError("fault cases must expect a non-completed outcome")
-        return self
-
-
 def _process_proof_valid(case: CaseEvidence) -> bool:
-    identities: set[tuple[int, datetime]] = set()
-    if not case.processes:
-        return False
-    for process in case.processes:
-        try:
+    try:
+        identities: set[tuple[int, datetime]] = set()
+        if not isinstance(case.processes, list) or not case.processes:
+            return False
+        for process in case.processes:
             identity = (process.pid, process.creation_time)
             if identity in identities:
                 return False
@@ -389,72 +425,157 @@ def _process_proof_valid(case: CaseEvidence) -> bool:
                 <= case.finished_at
                 and case.started_at <= process.creation_time
             )
-        except (AttributeError, TypeError):
-            return False
-        if (
-            isinstance(process.pid, bool)
-            or not isinstance(process.pid, int)
-            or process.pid <= 0
-            or isinstance(process.parent_pid, bool)
-            or not isinstance(process.parent_pid, int)
-            or process.parent_pid <= 0
-            or process.ownership != "validator-owned"
-            or not _is_sha256(process.command_hash)
-            or not _is_sha256(process.executable_hash)
-            or not _is_sha256(process.ownership_hash)
-            or not _is_neutral_basename(process.executable_name)
-            or not _is_utc(process.parent_creation_time)
-            or not _is_utc(process.creation_time)
-            or not _is_utc(process.stopped_at)
-            or not ordered
-            or process.started is not True
-            or process.stopped is not True
-            or process.descendants_stopped is not True
-            or process.alive_after is not False
-        ):
-            return False
-    return True
+            if (
+                isinstance(process.pid, bool)
+                or not isinstance(process.pid, int)
+                or process.pid <= 0
+                or isinstance(process.parent_pid, bool)
+                or not isinstance(process.parent_pid, int)
+                or process.parent_pid <= 0
+                or process.parent_pid == process.pid
+                or process.ownership != "validator-owned"
+                or not _is_sha256(process.command_hash)
+                or not _is_sha256(process.executable_hash)
+                or not _is_sha256(process.ownership_hash)
+                or not _is_neutral_basename(process.executable_name)
+                or not _is_utc(process.parent_creation_time)
+                or not _is_utc(process.creation_time)
+                or not _is_utc(process.stopped_at)
+                or not ordered
+                or process.started is not True
+                or process.stopped is not True
+                or process.descendants_stopped is not True
+                or process.alive_after is not False
+            ):
+                return False
+        return _pid_lifetimes_are_disjoint(case.processes)
+    except (AttributeError, TypeError):
+        return False
 
 
 def _queue_proof_valid(case: CaseEvidence) -> bool:
-    queue = case.comfyui
-    return (
-        queue.queue_empty is True
-        and queue.history_present is True
-        and queue.prompt_id == case.prompt_id
-        and isinstance(queue.queue_before_prompt_ids, list)
-        and queue.queue_before_prompt_ids.count(case.prompt_id) == 1
-        and isinstance(queue.queue_after_prompt_ids, list)
-        and case.prompt_id not in queue.queue_after_prompt_ids
-        and isinstance(queue.history_prompt_ids, list)
-        and queue.history_prompt_ids.count(case.prompt_id) == 1
-        and queue.terminal_history_status == case.actual
-    )
+    try:
+        queue = case.comfyui
+        return (
+            queue.queue_empty is True
+            and queue.history_present is True
+            and queue.prompt_id == case.prompt_id
+            and isinstance(queue.queue_before_prompt_ids, list)
+            and queue.queue_before_prompt_ids.count(case.prompt_id) == 1
+            and isinstance(queue.queue_after_prompt_ids, list)
+            and not queue.queue_after_prompt_ids
+            and isinstance(queue.history_prompt_ids, list)
+            and queue.history_prompt_ids.count(case.prompt_id) == 1
+            and queue.terminal_history_status == case.actual
+        )
+    except (AttributeError, TypeError):
+        return False
+
+
+def _pid_lifetimes_are_disjoint(processes: Sequence[ProcessEvidence]) -> bool:
+    try:
+        ordered = sorted(processes, key=lambda process: (process.pid, process.creation_time))
+    except (AttributeError, TypeError):
+        return False
+    previous_stopped_by_pid: dict[int, datetime] = {}
+    for process in ordered:
+        previous_stopped = previous_stopped_by_pid.get(process.pid)
+        if previous_stopped is not None and process.creation_time <= previous_stopped:
+            return False
+        previous_stopped_by_pid[process.pid] = process.stopped_at
+    return True
 
 
 def _gpu_proof_valid(case: CaseEvidence) -> bool:
-    snapshots = (case.gpu_before, case.gpu_peak, case.gpu_after)
-    if any(
-        isinstance(value, bool) or not isinstance(value, int) or value < 0
-        for snapshot in snapshots
-        for value in (snapshot.used_mib, snapshot.free_mib)
-    ):
+    try:
+        snapshots = (case.gpu_before, case.gpu_peak, case.gpu_after)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for snapshot in snapshots
+            for value in (snapshot.used_mib, snapshot.free_mib)
+        ):
+            return False
+        totals = [snapshot.used_mib + snapshot.free_mib for snapshot in snapshots]
+        return (
+            case.gpu_peak.used_mib >= max(case.gpu_before.used_mib, case.gpu_after.used_mib)
+            and case.gpu_after.used_mib - case.gpu_before.used_mib <= 1024
+            and case.gpu_before.free_mib - case.gpu_after.free_mib <= 1024
+            and max(totals) - min(totals) <= 1024
+        )
+    except (AttributeError, TypeError):
         return False
-    totals = [snapshot.used_mib + snapshot.free_mib for snapshot in snapshots]
-    return (
-        case.gpu_peak.used_mib >= max(case.gpu_before.used_mib, case.gpu_after.used_mib)
-        and case.gpu_after.used_mib - case.gpu_before.used_mib <= 1024
-        and case.gpu_before.free_mib - case.gpu_after.free_mib <= 1024
-        and max(totals) - min(totals) <= 1024
-    )
+
+
+def _cleanup_proof_valid(case: CaseEvidence) -> bool:
+    try:
+        cleanup = case.cleanup
+        return (
+            cleanup.ok is True
+            and cleanup.owned_processes_stopped is True
+            and cleanup.temp_paths_removed is True
+        )
+    except AttributeError:
+        return False
+
+
+def _audio_proof_valid(audio: AudioProof | None) -> bool:
+    if audio is None:
+        return False
+    try:
+        return (
+            _is_sha256(audio.sha256)
+            and isinstance(audio.size_bytes, int)
+            and not isinstance(audio.size_bytes, bool)
+            and audio.size_bytes > 0
+            and isinstance(audio.sample_rate, int)
+            and not isinstance(audio.sample_rate, bool)
+            and audio.sample_rate > 0
+            and isinstance(audio.frames, int)
+            and not isinstance(audio.frames, bool)
+            and audio.frames > 0
+            and isinstance(audio.peak, float)
+            and math.isfinite(audio.peak)
+            and 1e-5 < audio.peak <= 1.0
+        )
+    except (AttributeError, TypeError):
+        return False
+
+
+def _revalidate_model(value: Any, expected: type[ModelT]) -> ModelT:
+    _assert_public_evidence(value)
+    raw = dict(vars(value)) if isinstance(value, BaseModel) else value
+    return expected.model_validate(raw)
 
 
 def validate_case(case: CaseEvidence, *, wav_path: Path | None = None) -> CaseValidation:
+    try:
+        case = _revalidate_model(case, CaseEvidence)
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        diagnostics: list[str] = []
+        if not _cleanup_proof_valid(case):
+            diagnostics.append("cleanup proof is incomplete")
+        if not _queue_proof_valid(case):
+            diagnostics.append("ComfyUI queue/history proof is incomplete")
+        if not _process_proof_valid(case):
+            diagnostics.append("process identity/lifecycle proof is incomplete")
+        if not _gpu_proof_valid(case):
+            diagnostics.append("GPU memory observation/recovery proof is incomplete")
+        try:
+            if case.actual == "completed" and not _audio_proof_valid(case.audio):
+                diagnostics.append("WAV proof is invalid")
+            elif case.actual != "completed" and case.audio is not None:
+                diagnostics.append("non-completed case must not publish WAV proof")
+        except AttributeError:
+            diagnostics.append("case evidence failed schema validation")
+        if not diagnostics:
+            diagnostics.append("case evidence failed schema validation")
+        return CaseValidation.model_construct(evidence=case, valid=False, diagnostics=diagnostics)
+
     diagnostics: list[str] = []
     evidence = case
     if case.expected != case.actual:
         diagnostics.append("expected outcome does not match actual outcome")
-    if not case.cleanup.ok or not case.cleanup.owned_processes_stopped or not case.cleanup.temp_paths_removed:
+    if not _cleanup_proof_valid(case):
         diagnostics.append("cleanup proof is incomplete")
     if not _queue_proof_valid(case):
         diagnostics.append("ComfyUI queue/history proof is incomplete")
@@ -493,11 +614,11 @@ def validate_case(case: CaseEvidence, *, wav_path: Path | None = None) -> CaseVa
                 evidence = case.model_copy(update={"audio": proof})
         if evidence.audio is None:
             diagnostics.append("completed case is missing WAV proof")
+        elif not _audio_proof_valid(evidence.audio):
+            diagnostics.append("WAV proof is invalid")
     elif case.audio is not None:
         diagnostics.append("non-completed case must not publish WAV proof")
-    # Invalid evidence can originate from observation collectors using model_copy();
-    # return the controlled diagnostics without revalidating that nested instance.
-    return CaseValidation.model_construct(evidence=evidence, valid=not diagnostics, diagnostics=diagnostics)
+    return CaseValidation(evidence=evidence, valid=not diagnostics, diagnostics=diagnostics)
 
 
 def finalize_run(
@@ -506,6 +627,15 @@ def finalize_run(
     *,
     required_cases: Sequence[RequiredCase],
 ) -> ReliabilityRunSummary:
+    try:
+        fixture = _revalidate_model(fixture, ReliabilityFixture)
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        raise ValueError("invalid fixture evidence") from None
+    try:
+        case_snapshot = tuple(cases)
+        cases = tuple(_revalidate_model(case, CaseEvidence) for case in case_snapshot)
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        raise ValueError("invalid case evidence") from None
     required = _required_cases(required_cases)
     duplicate_case_ids = sorted(_duplicates(case.case_id for case in cases))
     present = {case.case_id for case in cases}
@@ -530,7 +660,7 @@ def finalize_run(
     cleanup_failures = sorted(
         case.case_id
         for case in cases
-        if not case.cleanup.ok or not case.cleanup.owned_processes_stopped or not case.cleanup.temp_paths_removed
+        if not _cleanup_proof_valid(case)
     )
     steady_counts: dict[Engine, int] = {engine: 0 for engine in ENGINE_ORDER}
     raw_steady_counts: dict[Engine, int] = {engine: 0 for engine in ENGINE_ORDER}
@@ -568,6 +698,7 @@ def finalize_run(
         status="failed" if failed else "passed",
         fixture_version=fixture.version,
         rounds=fixture.rounds,
+        required_cases=list(required.values()),
         cases=output_cases,
         missing_cases=missing_cases,
         duplicate_case_ids=duplicate_case_ids,
@@ -579,8 +710,19 @@ def finalize_run(
 
 
 def write_atomic_json(path: Path, payload: ReliabilityRunSummary | dict[str, Any]) -> None:
-    _assert_public_evidence(payload.model_dump(mode="json") if isinstance(payload, ReliabilityRunSummary) else payload)
-    document = payload.model_dump(mode="json") if isinstance(payload, ReliabilityRunSummary) else payload
+    _assert_public_evidence(payload)
+    if isinstance(payload, ReliabilityRunSummary):
+        try:
+            payload = _revalidate_model(payload, ReliabilityRunSummary)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                document = payload.model_dump(mode="json", warnings="error")
+            if caught:
+                raise ValueError("serializer warning")
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            raise ValueError("invalid reliability summary") from None
+    else:
+        document = payload
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = _write_reserved_json(path, document)
@@ -598,13 +740,24 @@ def write_atomic_json(path: Path, payload: ReliabilityRunSummary | dict[str, Any
             _best_effort_unlink(backup)
             raise OSError("atomic evidence preparation failed; live evidence is unchanged") from None
 
-    try:
-        os.replace(temporary, path)
-    except Exception:
+    if had_prior:
+        try:
+            os.replace(temporary, path)
+        except Exception:
+            _best_effort_unlink(temporary)
+            if backup is not None:
+                _best_effort_unlink(backup)
+            raise OSError("atomic evidence publication failed before commit") from None
+    else:
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            _best_effort_unlink(temporary)
+            raise OSError("atomic evidence publication conflict; concurrent evidence is unchanged") from None
+        except Exception:
+            _best_effort_unlink(temporary)
+            raise OSError("atomic evidence publication failed before commit") from None
         _best_effort_unlink(temporary)
-        if backup is not None:
-            _best_effort_unlink(backup)
-        raise OSError("atomic evidence publication failed before commit") from None
 
     try:
         _fsync_directory(path.parent)
@@ -623,7 +776,7 @@ def _write_reserved_json(path: Path, document: dict[str, Any]) -> Path:
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             handle_opened = True
-            json.dump(document, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(document, handle, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -737,16 +890,16 @@ def _required_cases(value: Sequence[RequiredCase]) -> dict[str, RequiredCase]:
     for item in value:
         if not isinstance(item, RequiredCase):
             raise ValueError("required_cases must be an ordered RequiredCase sequence")
-        validated = RequiredCase.model_validate(item.model_dump())
+        validated = _revalidate_model(item, RequiredCase)
         if validated.case_id in output:
             raise ValueError("duplicate required case specification")
         output[validated.case_id] = validated
-    return output
+    return {case_id: output[case_id] for case_id in sorted(output)}
 
 
 def _assert_public_evidence(value: Any) -> None:
     if isinstance(value, BaseModel):
-        _assert_public_evidence(value.model_dump(mode="json"))
+        _assert_public_evidence(vars(value))
         return
     if isinstance(value, dict):
         for key, item in value.items():
@@ -773,6 +926,8 @@ def _assert_public_string(value: str) -> None:
         or re.search(r"(?:^|[\s\"'=(:,;])/(?!/)[^\s]+", value)
     )
     contains_secret = bool(
+        re.search(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/?#@]+:[^\s/?#@]+@[^\s/?#]+", value)
+        or
         re.search(
             r"(?:\bbearer\s+\S+|\b(?:access[_-]?key|access[_-]?token|api[_-]?key|authorization|client[_-]?secret|password|private[_-]?key|refresh[_-]?token|secret|token)\s*[:=]\s*\S+)",
             lowered,
