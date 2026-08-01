@@ -6260,4 +6260,146 @@ Write-Output 'LISTENER_PROMOTION_AND_CLEANUP_FAIL_CLOSED_OK'
     assert "LISTENER_PROMOTION_AND_CLEANUP_FAIL_CLOSED_OK" in completed.stdout
 
 
+def test_task_12_recorded_tree_rejects_stale_parent_pid_edges_without_stopping_orphans() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Get-ProcessRecord',
+    'Test-RecordDocumentMatches',
+    'Test-RecordedIdentity',
+    'Test-ProcessAbsent',
+    'Stop-RecordedTree',
+    'Stop-RecordedProcessPair'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+function New-Row {
+    param([int] $ProcessId, [int] $ParentProcessId, [string] $Created)
+    return [pscustomobject]@{
+        ProcessId = $ProcessId
+        ParentProcessId = $ParentProcessId
+        CreationDate = [DateTime]::Parse($Created).ToUniversalTime()
+        ExecutablePath = ('C:\controlled\python-{0}.exe' -f $ProcessId)
+        CommandLine = ('python-{0}.exe controlled.py' -f $ProcessId)
+        Name = ('python-{0}.exe' -f $ProcessId)
+    }
+}
+function New-RootRecord {
+    return [pscustomobject]@{
+        pid = 100
+        creation_time = '2026-08-01T00:00:10Z'
+        executable_path = 'C:\controlled\python-100.exe'
+        command_line = 'python-100.exe controlled.py'
+        parent_pid = 50
+        parent_creation_time = '2026-08-01T00:00:00Z'
+    }
+}
+$script:inventory = @()
+$script:stopped = [System.Collections.Generic.List[int]]::new()
+$script:queryErrorPid = 0
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    if (-not $Filter) { return @($script:inventory) }
+    $candidatePid = [int] ([regex]::Match($Filter, '\d+').Value)
+    if ($candidatePid -eq $script:queryErrorPid) {
+        throw 'injected descendant identity query failure'
+    }
+    return @($script:inventory | Where-Object {
+        [int] $_.ProcessId -eq $candidatePid
+    }) | Select-Object -First 1
+}
+function Stop-Process {
+    param([int] $Id, [switch] $Force, [object] $ErrorAction)
+    $script:stopped.Add($Id)
+    $script:inventory = @($script:inventory | Where-Object {
+        [int] $_.ProcessId -ne $Id
+    })
+}
+function Set-Inventory {
+    param([object[]] $Rows)
+    $script:inventory = @($Rows)
+    $script:stopped.Clear()
+    $script:queryErrorPid = 0
+}
+$parent = New-Row 50 4 '2026-08-01T00:00:00Z'
+$root = New-Row 100 50 '2026-08-01T00:00:10Z'
+$rootRecord = New-RootRecord
+$failures = [System.Collections.Generic.List[string]]::new()
+
+$staleDirect = New-Row 200 100 '2026-08-01T00:00:05Z'
+Set-Inventory @($parent, $root, $staleDirect)
+if (Stop-RecordedProcessPair -LaunchRootRecord $rootRecord -ListenerRecord $rootRecord) {
+    $failures.Add('stale direct numeric-parent edge was cleanup-proven')
+}
+if ($script:stopped.Count -ne 0) {
+    $failures.Add('stale direct orphan or root was stopped before ancestry proof completed')
+}
+
+$validChild = New-Row 200 100 '2026-08-01T00:00:11Z'
+$staleGrandchild = New-Row 300 200 '2026-08-01T00:00:10.500Z'
+Set-Inventory @($parent, $root, $validChild, $staleGrandchild)
+if (Stop-RecordedProcessPair -LaunchRootRecord $rootRecord -ListenerRecord $rootRecord) {
+    $failures.Add('stale multi-generation numeric-parent edge was cleanup-proven')
+}
+if ($script:stopped.Count -ne 0) {
+    $failures.Add('multi-generation anomaly stopped a process before full tree proof')
+}
+
+Set-Inventory @($parent, $root, $validChild)
+$script:queryErrorPid = 200
+if (Stop-RecordedProcessPair -LaunchRootRecord $rootRecord -ListenerRecord $rootRecord) {
+    $failures.Add('descendant identity query failure was cleanup-proven')
+}
+if ($script:stopped.Count -ne 0) {
+    $failures.Add('descendant query failure stopped a process')
+}
+
+$validGrandchild = New-Row 300 200 '2026-08-01T00:00:12Z'
+Set-Inventory @($parent, $root, $validChild, $validGrandchild)
+if (-not (Stop-RecordedProcessPair -LaunchRootRecord $rootRecord -ListenerRecord $rootRecord)) {
+    $failures.Add('fully ordered multi-generation tree did not cleanup-converge')
+}
+if ((@($script:stopped) -join ',') -ne '300,200,100') {
+    $failures.Add('ordered multi-generation tree did not stop only its exact members')
+}
+if ($failures.Count -ne 0) { throw ($failures -join '; ') }
+Write-Output 'RECORDED_TREE_EDGE_ORDERING_OK'
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "TTS_MORE_RELIABILITY_SCRIPT": str(script_path)},
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "RECORDED_TREE_EDGE_ORDERING_OK" in completed.stdout
+
+
 REPOSITORY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")

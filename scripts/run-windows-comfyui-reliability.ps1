@@ -51,13 +51,18 @@ function Get-ProcessRecord {
     if ($null -eq $parentCreation -or $null -eq $parentCreation.Value) {
         throw 'Parent process identity is incomplete'
     }
+    $processCreationUtc = $process.CreationDate.ToUniversalTime()
+    $parentCreationUtc = $parent.CreationDate.ToUniversalTime()
+    if ($processCreationUtc.Ticks -lt $parentCreationUtc.Ticks) {
+        throw 'Process identity predates its current parent'
+    }
     return [ordered]@{
         pid = [int] $process.ProcessId
-        creation_time = $process.CreationDate.ToUniversalTime().ToString('o')
+        creation_time = $processCreationUtc.ToString('o')
         executable_path = [IO.Path]::GetFullPath([string] $process.ExecutablePath)
         command_line = [string] $process.CommandLine
         parent_pid = [int] $process.ParentProcessId
-        parent_creation_time = $parent.CreationDate.ToUniversalTime().ToString('o')
+        parent_creation_time = $parentCreationUtc.ToString('o')
     }
 }
 
