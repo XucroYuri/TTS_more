@@ -35,9 +35,20 @@ function Get-PortOwnerPid {
 function Get-ProcessRecord {
     param([int] $ProcessId)
     $process = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop
+    if ($null -eq $process) { throw 'Process identity is absent' }
+    foreach ($field in @(
+        'ProcessId', 'CreationDate', 'ExecutablePath', 'CommandLine', 'ParentProcessId'
+    )) {
+        $property = $process.PSObject.Properties[$field]
+        if ($null -eq $property -or $null -eq $property.Value) {
+            throw 'Process identity is incomplete'
+        }
+    }
     $parent = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $process.ParentProcessId) -ErrorAction Stop
-    if (-not $process.ExecutablePath -or -not $process.CommandLine) {
-        throw 'Process identity is incomplete'
+    if ($null -eq $parent) { throw 'Parent process identity is absent' }
+    $parentCreation = $parent.PSObject.Properties['CreationDate']
+    if ($null -eq $parentCreation -or $null -eq $parentCreation.Value) {
+        throw 'Parent process identity is incomplete'
     }
     return [ordered]@{
         pid = [int] $process.ProcessId
@@ -53,29 +64,32 @@ function Test-RecordedIdentity {
     param([object] $Record)
     try {
         $current = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int] $Record.pid)) -ErrorAction Stop
-    } catch { return $false }
-    if (
-        [int] $current.ProcessId -ne [int] $Record.pid -or
-        $current.CreationDate.ToUniversalTime().Ticks -ne (Get-UtcTicks -Value $Record.creation_time) -or
-        [IO.Path]::GetFullPath([string] $current.ExecutablePath) -ne [string] $Record.executable_path -or
-        [string] $current.CommandLine -ne [string] $Record.command_line -or
-        [int] $current.ParentProcessId -ne [int] $Record.parent_pid
-    ) { return $false }
-    $parent = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int] $Record.parent_pid)) -ErrorAction SilentlyContinue
-    if ($null -ne $parent) {
+        if ($null -eq $current) { return $false }
+        foreach ($field in @(
+            'ProcessId', 'CreationDate', 'ExecutablePath', 'CommandLine', 'ParentProcessId'
+        )) {
+            $property = $current.PSObject.Properties[$field]
+            if ($null -eq $property -or $null -eq $property.Value) { return $false }
+        }
+        if (
+            [int] $current.ProcessId -ne [int] $Record.pid -or
+            $current.CreationDate.ToUniversalTime().Ticks -ne (Get-UtcTicks -Value $Record.creation_time) -or
+            [IO.Path]::GetFullPath([string] $current.ExecutablePath) -ne [string] $Record.executable_path -or
+            [string] $current.CommandLine -ne [string] $Record.command_line -or
+            [int] $current.ParentProcessId -ne [int] $Record.parent_pid
+        ) { return $false }
+        $parent = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int] $Record.parent_pid)) -ErrorAction Stop
+        if ($null -eq $parent) { return $true }
+        $parentCreation = $parent.PSObject.Properties['CreationDate']
+        if ($null -eq $parentCreation -or $null -eq $parentCreation.Value) { return $false }
         return $parent.CreationDate.ToUniversalTime().Ticks -eq (Get-UtcTicks -Value $Record.parent_creation_time)
-    }
-    return $true
+    } catch { return $false }
 }
 
 function Test-ProcessAbsent {
     param([int] $ProcessId)
-    try {
-        $null = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop
-        return $false
-    } catch {
-        return $true
-    }
+    $current = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop
+    return $null -eq $current
 }
 
 function Get-UtcTicks {
@@ -380,7 +394,12 @@ function Stop-ProvisionalStartedProcess {
     if (Test-ProcessAbsent -ProcessId ([int] $Token.pid)) { return $true }
     try {
         $current = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int] $Token.pid)) -ErrorAction Stop
+        if ($null -eq $current) { return $true }
         $parent = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int] $current.ParentProcessId)) -ErrorAction Stop
+        if ($null -eq $parent) {
+            Write-Warning 'Provisional parent identity is absent; preserving the current PID'
+            return $false
+        }
         $createdAt = $current.CreationDate.ToUniversalTime()
         if (
             [int] $current.ProcessId -ne [int] $Token.pid -or
@@ -492,7 +511,9 @@ function Start-ProvisionallyTrackedProcess {
         [ValidateSet('tts-more', 'comfyui')] [string] $ProcessLabel,
         [string] $LaunchMarker,
         [object] $BackendRecord,
-        [object] $ComfyRecord
+        [object] $ComfyRecord,
+        [string] $StandardOutputPath,
+        [string] $StandardErrorPath
     )
     if ($LaunchMarker -notmatch '^tts_more_reliability_run=[0-9a-f]{32}-(tts-more|comfyui)$') {
         throw 'Launch marker is invalid'
@@ -532,11 +553,31 @@ function Start-ProvisionallyTrackedProcess {
             ConvertTo-WindowsCommandLineArgument -Argument $argument
         }
     )) -join ' '
+    if ([bool] $StandardOutputPath -ne [bool] $StandardErrorPath) {
+        throw 'Child stdout and stderr sidecars must be configured together'
+    }
+    if (
+        $StandardOutputPath -and
+        [IO.Path]::GetFullPath($StandardOutputPath).Equals(
+            [IO.Path]::GetFullPath($StandardErrorPath),
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    ) { throw 'Child stdout and stderr sidecars must be distinct' }
     try {
         $env:TEMP = $ChildTempRoot
         $env:TMP = $ChildTempRoot
-        $process = Start-Process -FilePath $FilePath -ArgumentList $encodedArgumentList `
-            -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -PassThru
+        $startParameters = @{
+            FilePath = $FilePath
+            ArgumentList = $encodedArgumentList
+            WorkingDirectory = $WorkingDirectory
+            WindowStyle = 'Hidden'
+            PassThru = $true
+        }
+        if ($StandardOutputPath) {
+            $startParameters.RedirectStandardOutput = [IO.Path]::GetFullPath($StandardOutputPath)
+            $startParameters.RedirectStandardError = [IO.Path]::GetFullPath($StandardErrorPath)
+        }
+        $process = Start-Process @startParameters
         $token = [pscustomobject]@{
             pid = [int] $process.Id
             executable_path = [IO.Path]::GetFullPath($FilePath)
@@ -565,9 +606,18 @@ function Start-ProvisionallyTrackedProcess {
 }
 
 function Wait-ExactPortOwner {
-    param([int] $Port, [int] $ProcessId, [int] $TimeoutSeconds = 180)
+    param(
+        [int] $Port,
+        [int] $ProcessId,
+        [int] $TimeoutSeconds = 180,
+        [object] $Process
+    )
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
+        if ($null -ne $Process -and $Process.HasExited) {
+            $Process.WaitForExit()
+            throw "Owned process exited before acquiring port $Port; inspect the private child logs"
+        }
         if ((Get-PortOwnerPid -Port $Port) -eq $ProcessId) { return }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -578,6 +628,7 @@ function Stop-RecordedTree {
     param([object] $Record)
     if (Test-ProcessAbsent -ProcessId ([int] $Record.pid)) { return $true }
     if (-not (Test-RecordedIdentity -Record $Record)) {
+        if (Test-ProcessAbsent -ProcessId ([int] $Record.pid)) { return $true }
         Write-Warning 'Recorded process identity no longer matches; preserving the current PID'
         return $false
     }
@@ -737,6 +788,15 @@ foreach ($engine in @('gpt-sovits', 'indextts', 'cosyvoice')) {
 }
 
 $runId = [Guid]::NewGuid().ToString('N')
+$comfyStdoutPath = Join-Path $outputRootPath (".comfyui-{0}.stdout.log" -f $runId)
+$comfyStderrPath = Join-Path $outputRootPath (".comfyui-{0}.stderr.log" -f $runId)
+$backendStdoutPath = Join-Path $outputRootPath (".tts-more-{0}.stdout.log" -f $runId)
+$backendStderrPath = Join-Path $outputRootPath (".tts-more-{0}.stderr.log" -f $runId)
+foreach ($sidecarPath in @(
+    $comfyStdoutPath, $comfyStderrPath, $backendStdoutPath, $backendStderrPath
+)) {
+    New-Item -ItemType File -Path $sidecarPath -ErrorAction Stop | Out-Null
+}
 $tempRoot = Join-Path $outputRootPath ("reliability-temp-{0}" -f $runId)
 $runnerTempRoot = Join-Path $tempRoot 'runner'
 $comfyTempBase = Join-Path $tempRoot 'comfyui'
@@ -781,7 +841,8 @@ try {
         -ChildTempRoot $runnerTempRoot -LauncherRecord $launcherRecord `
         -StartedProcesses $startedProcesses -ControlStatePath $controlStatePath `
         -RunId $runId -ProcessLabel 'comfyui' -LaunchMarker $comfyLaunchMarker `
-        -BackendRecord $backendRecord -ComfyRecord $comfyRecord
+        -BackendRecord $backendRecord -ComfyRecord $comfyRecord `
+        -StandardOutputPath $comfyStdoutPath -StandardErrorPath $comfyStderrPath
     $comfyProcess = $comfyStart.process
     try {
         $comfyRecord = Wait-ProcessRecord -ProcessId $comfyProcess.Id
@@ -793,7 +854,7 @@ try {
         }
         throw
     }
-    Wait-ExactPortOwner -Port 8188 -ProcessId $comfyProcess.Id
+    Wait-ExactPortOwner -Port 8188 -ProcessId $comfyProcess.Id -Process $comfyProcess
 
     $backendLaunchMarker = "tts_more_reliability_run=$runId-tts-more"
     $backendArguments = @(
@@ -805,7 +866,8 @@ try {
         -ChildTempRoot $runnerTempRoot -LauncherRecord $launcherRecord `
         -StartedProcesses $startedProcesses -ControlStatePath $controlStatePath `
         -RunId $runId -ProcessLabel 'tts-more' -LaunchMarker $backendLaunchMarker `
-        -BackendRecord $backendRecord -ComfyRecord $comfyRecord
+        -BackendRecord $backendRecord -ComfyRecord $comfyRecord `
+        -StandardOutputPath $backendStdoutPath -StandardErrorPath $backendStderrPath
     $backendProcess = $backendStart.process
     try {
         $backendRecord = Wait-ProcessRecord -ProcessId $backendProcess.Id
@@ -817,7 +879,7 @@ try {
         }
         throw
     }
-    Wait-ExactPortOwner -Port 8000 -ProcessId $backendProcess.Id
+    Wait-ExactPortOwner -Port 8000 -ProcessId $backendProcess.Id -Process $backendProcess
 
     $hostManifest = [ordered]@{
         version = 1

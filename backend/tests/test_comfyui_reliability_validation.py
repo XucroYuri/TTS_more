@@ -3654,6 +3654,382 @@ Write-Output 'EARLY_LAUNCHER_FAILURE_CLEANUP_OK'
     assert "EARLY_LAUNCHER_FAILURE_CLEANUP_OK" in completed.stdout
 
 
+def test_task_12_powershell_absent_cim_result_is_not_a_query_failure() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+Set-StrictMode -Version Latest
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Get-ProcessRecord',
+    'Test-RecordedIdentity',
+    'Test-ProcessAbsent',
+    'Stop-ProvisionalStartedProcess',
+    'Stop-RecordedTree'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+
+$script:cimMode = 'absent'
+$script:cimFilters = New-Object 'System.Collections.Generic.List[string]'
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    if ($Filter) { $script:cimFilters.Add($Filter) }
+    if ($script:cimMode -eq 'error') {
+        throw 'injected exact-filter CIM query failure'
+    }
+    if ($script:cimMode -eq 'incomplete' -and $Filter -eq 'ProcessId = 4242') {
+        return [pscustomobject]@{ ProcessId = 4242 }
+    }
+    if ($script:cimMode -eq 'parent-absent' -and $Filter -eq 'ProcessId = 4242') {
+        return [pscustomobject]@{
+            ProcessId = 4242
+            CreationDate = [DateTime]::Parse('2026-08-01T00:00:00Z').ToUniversalTime()
+            ExecutablePath = 'C:\controlled\python.exe'
+            CommandLine = 'python.exe controlled.py'
+            ParentProcessId = 111
+        }
+    }
+    return $null
+}
+function Stop-Process { throw 'an absent PID must never be stopped' }
+
+$record = [pscustomobject]@{
+    pid = 4242
+    creation_time = '2026-08-01T00:00:00Z'
+    executable_path = 'C:\controlled\python.exe'
+    command_line = 'python.exe controlled.py'
+    parent_pid = 111
+    parent_creation_time = '2026-07-31T23:59:00Z'
+}
+$token = [pscustomobject]@{
+    pid = 4242
+    executable_path = 'C:\controlled\python.exe'
+    parent_pid = 111
+    parent_creation_time = '2026-07-31T23:59:00Z'
+    started_after = '2026-07-31T23:59:59Z'
+    started_before = '2026-08-01T00:00:01Z'
+}
+$failures = New-Object 'System.Collections.Generic.List[string]'
+
+try {
+    if (-not (Test-ProcessAbsent -ProcessId 4242)) {
+        $failures.Add('successful null exact-filter result was not absent')
+    }
+} catch { $failures.Add('absent predicate accessed a null property: ' + $_.Exception.Message) }
+try {
+    if (Test-RecordedIdentity -Record $record) {
+        $failures.Add('missing process matched a recorded identity')
+    }
+} catch { $failures.Add('record matcher accessed a null property: ' + $_.Exception.Message) }
+try {
+    $null = Get-ProcessRecord -ProcessId 4242
+    $failures.Add('missing process unexpectedly produced a full record')
+} catch {
+    if ($_.Exception.Message -ne 'Process identity is absent') {
+        $failures.Add('missing process did not produce the bounded absent error: ' + $_.Exception.Message)
+    }
+}
+try {
+    if (-not (Stop-ProvisionalStartedProcess -Token $token)) {
+        $failures.Add('already-absent provisional identity was not cleanup-proven')
+    }
+} catch { $failures.Add('provisional cleanup accessed a null property: ' + $_.Exception.Message) }
+try {
+    if (-not (Stop-RecordedTree -Record $record)) {
+        $failures.Add('already-absent full identity was not cleanup-proven')
+    }
+} catch { $failures.Add('full cleanup accessed a null property: ' + $_.Exception.Message) }
+
+$script:cimMode = 'incomplete'
+try {
+    if (Test-RecordedIdentity -Record $record) {
+        $failures.Add('incomplete live process matched a recorded identity')
+    }
+} catch { $failures.Add('record matcher accessed a missing property: ' + $_.Exception.Message) }
+try {
+    $null = Get-ProcessRecord -ProcessId 4242
+    $failures.Add('incomplete live process unexpectedly produced a full record')
+} catch {
+    if ($_.Exception.Message -ne 'Process identity is incomplete') {
+        $failures.Add('incomplete process did not produce the bounded error: ' + $_.Exception.Message)
+    }
+}
+
+$script:cimMode = 'parent-absent'
+try {
+    $null = Get-ProcessRecord -ProcessId 4242
+    $failures.Add('missing parent unexpectedly produced a full record')
+} catch {
+    if ($_.Exception.Message -ne 'Parent process identity is absent') {
+        $failures.Add('missing parent did not produce the bounded absent error: ' + $_.Exception.Message)
+    }
+}
+
+$script:cimMode = 'error'
+$queryError = $null
+try { $null = Test-ProcessAbsent -ProcessId 4242 } catch { $queryError = $_ }
+if (
+    $null -eq $queryError -or
+    $queryError.Exception.Message -ne 'injected exact-filter CIM query failure'
+) { $failures.Add('CIM query error was incorrectly converted to absence') }
+
+if (@($script:cimFilters | Where-Object { $_ -notmatch '^ProcessId = \d+$' }).Count -ne 0) {
+    $failures.Add('process helper issued a non-exact CIM filter')
+}
+if ($failures.Count -ne 0) { throw ($failures -join '; ') }
+Write-Output 'NULL_CIM_ABSENCE_SEMANTICS_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "NULL_CIM_ABSENCE_SEMANTICS_OK" in completed.stdout
+
+
+def test_task_12_port_readiness_rejects_reused_pid_after_tracked_child_exit() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+$function = $ast.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Wait-ExactPortOwner'
+}, $true)
+if ($null -eq $function) { throw 'Wait-ExactPortOwner is missing' }
+Invoke-Expression $function.Extent.Text
+
+function Get-PortOwnerPid { param([int] $Port) return 4242 }
+$script:waitCalls = 0
+$exited = [pscustomobject]@{ HasExited = $true }
+$exited | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+    $script:waitCalls += 1
+}
+$caught = $null
+try {
+    Wait-ExactPortOwner -Port 8188 -ProcessId 4242 -TimeoutSeconds 1 `
+        -Process $exited
+} catch { $caught = $_ }
+if (
+    $null -eq $caught -or
+    $caught.Exception.Message -notlike 'Owned process exited before acquiring port 8188*'
+) { throw 'reused numeric port-owner PID was accepted after the tracked child exited' }
+if ($script:waitCalls -ne 1) {
+    throw 'tracked exited process was not reaped before readiness failed'
+}
+Write-Output 'EXITED_PROCESS_PID_REUSE_REJECTED_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "EXITED_PROCESS_PID_REUSE_REJECTED_OK" in completed.stdout
+
+
+def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    repository_root = Path(__file__).resolve().parents[2]
+    script_path = repository_root / "scripts" / "run-windows-comfyui-reliability.ps1"
+    output_root = tmp_path / "private evidence"
+    output_root.mkdir()
+    fixture_root = tmp_path / "fixture"
+    reference_root = fixture_root / "references"
+    reference_root.mkdir(parents=True)
+    resources: dict[str, dict[str, str]] = {}
+    for engine in ("gpt-sovits", "indextts", "cosyvoice"):
+        reference = reference_root / f"{engine}.wav"
+        reference.write_bytes(b"reference")
+        resources[engine] = {"reference_audio": f"references/{engine}.wav"}
+    fixture_path = fixture_root / "fixture.json"
+    fixture_path.write_text(json.dumps({"resources": resources}), encoding="utf-8")
+
+    comfy_root = tmp_path / "controlled ComfyUI"
+    (comfy_root / "custom_nodes" / "TTS-Audio-Suite").mkdir(parents=True)
+    argv_capture = tmp_path / "controlled-child-argv.json"
+    (comfy_root / "main.py").write_text(
+        "import json, os, sys, time\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['TTS_MORE_CONTROLLED_ARGV']).write_text(\n"
+        "    json.dumps(sys.argv[1:]), encoding='utf-8'\n"
+        ")\n"
+        "sys.stdout.write('CONTROLLED_COMFY_STDOUT')\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.write('CONTROLLED_COMFY_STDERR')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(1.0)\n"
+        "raise SystemExit(23)\n",
+        encoding="utf-8",
+    )
+    registry_path = tmp_path / "resources.yaml"
+    registry_path.write_text("resources: {}\n", encoding="utf-8")
+    engine_roots: dict[str, Path] = {}
+    for engine in ("gpt-sovits", "indextts", "cosyvoice"):
+        engine_root = tmp_path / f"{engine}-root"
+        engine_root.mkdir()
+        engine_roots[engine] = engine_root
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TTS_MORE_CONTROLLED_ARGV": str(argv_capture),
+            "TTS_MORE_RELIABILITY_GPT_SOVITS_ROOT": str(
+                engine_roots["gpt-sovits"]
+            ),
+            "TTS_MORE_RELIABILITY_INDEXTTS_ROOT": str(engine_roots["indextts"]),
+            "TTS_MORE_RELIABILITY_COSYVOICE_ROOT": str(engine_roots["cosyvoice"]),
+            "TTS_AUDIO_SUITE_RESOURCES": str(registry_path),
+        }
+    )
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(script_path),
+            "-Fixture",
+            str(fixture_path),
+            "-OutputRoot",
+            str(output_root),
+            "-ComfyUiRoot",
+            str(comfy_root),
+            "-ComfyPython",
+            str(Path(os.sys.executable).resolve()),
+            "-TtsMoreRoot",
+            str(repository_root),
+            "-PreflightOnly",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+        timeout=15,
+    )
+
+    assert completed.returncode != 0
+    combined_output = completed.stdout + completed.stderr
+    assert "Owned process exited before acquiring port 8188" in combined_output
+    assert "property 'ProcessId'" not in combined_output
+    assert "Provisional process could not be proven owned" not in combined_output
+
+    sidecars = list(output_root.glob(".*-*.log"))
+    assert len(sidecars) == 4
+    comfy_stdout = next(output_root.glob(".comfyui-*.stdout.log"))
+    comfy_stderr = next(output_root.glob(".comfyui-*.stderr.log"))
+    backend_stdout = next(output_root.glob(".tts-more-*.stdout.log"))
+    backend_stderr = next(output_root.glob(".tts-more-*.stderr.log"))
+    run_ids = {
+        path.name.removeprefix(".comfyui-")
+        .removeprefix(".tts-more-")
+        .split(".", 1)[0]
+        for path in sidecars
+    }
+    assert len(run_ids) == 1
+    (run_id,) = run_ids
+    assert len(run_id) == 32 and all(character in "0123456789abcdef" for character in run_id)
+    assert comfy_stdout.read_bytes() == b"CONTROLLED_COMFY_STDOUT"
+    assert comfy_stderr.read_bytes() == b"CONTROLLED_COMFY_STDERR"
+    assert backend_stdout.read_bytes() == b""
+    assert backend_stderr.read_bytes() == b""
+
+    semantic_argv = json.loads(argv_capture.read_text(encoding="utf-8"))
+    assert semantic_argv == [
+        "--listen",
+        "127.0.0.1",
+        "--port",
+        "8188",
+        "--temp-directory",
+        str(output_root / f"reliability-temp-{run_id}" / "comfyui"),
+    ]
+    assert all(str(path) not in semantic_argv for path in sidecars)
+    assert not list(output_root.glob("reliability-temp-*"))
+    assert not list(output_root.glob(".request-temp-*.owner.json"))
+    assert not list(output_root.glob(".host-manifest-*.private.json*"))
+
+    inventory = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "@(CimCmdlets\\Get-CimInstance Win32_Process | Where-Object { "
+            "$_.CommandLine -and $_.CommandLine.Contains($env:TTS_MORE_TEST_RUN_ID) "
+            "}).Count",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**environment, "TTS_MORE_TEST_RUN_ID": run_id},
+        check=False,
+        timeout=30,
+    )
+    assert inventory.returncode == 0, inventory.stderr
+    assert inventory.stdout.strip() == "0"
+
+
 def test_task_10_powershell_identity_timestamps_compare_utc_instants_not_spelling() -> None:
     powershell = shutil.which("powershell.exe")
     if powershell is None:
