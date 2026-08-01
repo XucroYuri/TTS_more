@@ -6,9 +6,10 @@ import math
 import os
 import re
 import tempfile
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal, Mapping, Sequence
+from typing import Annotated, Any, Literal
 
 import soundfile
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, field_validator, model_validator
@@ -19,10 +20,27 @@ Outcome = Literal["completed", "cancelled", "failed", "timeout"]
 Phase = Literal["steady", "fault", "recovery"]
 SHA256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 REQUIRED_BOUNDARY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")
+ENGINE_ORDER: tuple[Engine, ...] = ("gpt-sovits", "indextts", "cosyvoice")
+_SENSITIVE_KEYS = {
+    "access_key",
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "client_secret",
+    "password",
+    "private",
+    "refresh_token",
+    "secret",
+    "token",
+}
+_HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class _StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
 
     @model_validator(mode="before")
     @classmethod
@@ -80,8 +98,9 @@ class ProcessEvidence(_StrictModel):
     ownership: Literal["validator-owned", "pre-existing"]
     command_hash: SHA256
     creation_time: datetime
-    parent_pid: StrictInt = Field(ge=0)
+    parent_pid: StrictInt = Field(gt=0)
     parent_creation_time: datetime
+    stopped_at: datetime
     executable_name: str = Field(min_length=1)
     executable_hash: SHA256
     ownership_hash: SHA256
@@ -89,6 +108,34 @@ class ProcessEvidence(_StrictModel):
     stopped: StrictBool
     descendants_stopped: StrictBool
     alive_after: StrictBool
+
+    @field_validator("creation_time", "parent_creation_time", "stopped_at")
+    @classmethod
+    def _utc_timestamp(cls, value: datetime) -> datetime:
+        if not _is_utc(value):
+            raise ValueError("process timestamps must be timezone-aware UTC")
+        return value
+
+    @field_validator("executable_name")
+    @classmethod
+    def _neutral_executable_name(cls, value: str) -> str:
+        if value in {".", ".."} or "/" in value or "\\" in value or Path(value).is_absolute():
+            raise ValueError("executable_name must be a neutral basename")
+        return value
+
+    @model_validator(mode="after")
+    def _complete_lifecycle(self) -> "ProcessEvidence":
+        if self.parent_creation_time > self.creation_time or self.creation_time > self.stopped_at:
+            raise ValueError("process timestamps are not ordered")
+        if (
+            self.ownership != "validator-owned"
+            or not self.started
+            or not self.stopped
+            or not self.descendants_stopped
+            or self.alive_after
+        ):
+            raise ValueError("process lifecycle proof is incomplete")
+        return self
 
 
 class ComfyQueueEvidence(_StrictModel):
@@ -99,6 +146,23 @@ class ComfyQueueEvidence(_StrictModel):
     queue_after_prompt_ids: list[str]
     history_prompt_ids: list[str]
     terminal_history_status: Outcome
+
+    @field_validator("queue_before_prompt_ids", "queue_after_prompt_ids", "history_prompt_ids")
+    @classmethod
+    def _sorted_prompt_ids(cls, value: list[str]) -> list[str]:
+        return sorted(value)
+
+    @model_validator(mode="after")
+    def _complete_observation(self) -> "ComfyQueueEvidence":
+        if (
+            not self.queue_empty
+            or not self.history_present
+            or self.queue_before_prompt_ids.count(self.prompt_id) != 1
+            or self.prompt_id in self.queue_after_prompt_ids
+            or self.history_prompt_ids.count(self.prompt_id) != 1
+        ):
+            raise ValueError("ComfyUI queue/history proof is incomplete")
+        return self
 
 
 class GpuSnapshot(_StrictModel):
@@ -125,6 +189,19 @@ class BoundaryEvidence(_StrictModel):
     reference_hashes_before: dict[str, SHA256] = Field(default_factory=dict)
     reference_hashes_after: dict[str, SHA256] = Field(default_factory=dict)
 
+    @field_validator("repositories_before", "repositories_after")
+    @classmethod
+    def _sorted_repositories(cls, value: list[RepositorySnapshot]) -> list[RepositorySnapshot]:
+        return sorted(
+            value,
+            key=lambda snapshot: (snapshot.label, snapshot.head, snapshot.branch, snapshot.porcelain_hash),
+        )
+
+    @field_validator("reference_hashes", "reference_hashes_before", "reference_hashes_after")
+    @classmethod
+    def _sorted_hashes(cls, value: dict[str, str]) -> dict[str, str]:
+        return {key: value[key] for key in sorted(value)}
+
 
 class CaseEvidence(_StrictModel):
     case_id: str = Field(min_length=1)
@@ -146,6 +223,20 @@ class CaseEvidence(_StrictModel):
     gpu_after: GpuSnapshot
     boundary: BoundaryEvidence
 
+    @field_validator("processes")
+    @classmethod
+    def _sorted_processes(cls, value: list[ProcessEvidence]) -> list[ProcessEvidence]:
+        return sorted(
+            value,
+            key=lambda process: (
+                process.pid,
+                process.creation_time,
+                process.parent_pid,
+                process.parent_creation_time,
+                process.stopped_at,
+            ),
+        )
+
     @field_validator("case_id", "job_id", "prompt_id", "version_id")
     @classmethod
     def _opaque_identifier(cls, value: str) -> str:
@@ -158,7 +249,7 @@ class CaseEvidence(_StrictModel):
     @field_validator("started_at", "finished_at")
     @classmethod
     def _utc_timestamp(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(value):
+        if not _is_utc(value):
             raise ValueError("timestamps must be timezone-aware UTC")
         return value
 
@@ -166,6 +257,18 @@ class CaseEvidence(_StrictModel):
     def _ordered_timestamps(self) -> "CaseEvidence":
         if self.finished_at < self.started_at:
             raise ValueError("finished_at precedes started_at")
+        process_identities: set[tuple[int, datetime]] = set()
+        for process in self.processes:
+            identity = (process.pid, process.creation_time)
+            if identity in process_identities:
+                raise ValueError("process identities must be unique")
+            process_identities.add(identity)
+            if process.creation_time < self.started_at or process.stopped_at > self.finished_at:
+                raise ValueError("process timestamps fall outside the case observation")
+        if not _queue_proof_valid(self):
+            raise ValueError("ComfyUI queue/history proof is incomplete")
+        if not _gpu_proof_valid(self):
+            raise ValueError("GPU memory observation/recovery proof is incomplete")
         return self
 
 
@@ -184,20 +287,165 @@ class ReliabilityRunSummary(_StrictModel):
     duplicate_case_ids: list[str] = Field(default_factory=list)
     cleanup_failures: list[str] = Field(default_factory=list)
     validation_failures: list[str] = Field(default_factory=list)
+    boundary_failures: list[str] = Field(default_factory=list)
     steady_counts: dict[Engine, StrictInt]
+
+    @field_validator(
+        "missing_cases",
+        "duplicate_case_ids",
+        "cleanup_failures",
+        "validation_failures",
+        "boundary_failures",
+    )
+    @classmethod
+    def _sorted_unique_strings(cls, value: list[str]) -> list[str]:
+        return sorted(set(value))
+
+    @field_validator("steady_counts")
+    @classmethod
+    def _ordered_steady_counts(cls, value: dict[Engine, int]) -> dict[Engine, int]:
+        return {engine: value[engine] for engine in ENGINE_ORDER if engine in value}
 
     @model_validator(mode="after")
     def _consistent_status(self) -> "ReliabilityRunSummary":
-        failures = self.missing_cases or self.duplicate_case_ids or self.cleanup_failures or self.validation_failures
-        if self.status == "passed" and (failures or any(count != self.rounds for count in self.steady_counts.values())):
+        case_key = lambda case: (case.case_id, case.engine, case.phase, case.expected, case.actual)
+        if self.cases != sorted(self.cases, key=case_key):
+            raise ValueError("summary cases must be deterministically sorted")
+        if self.status != "passed":
+            return self
+        failures = (
+            self.missing_cases
+            or self.duplicate_case_ids
+            or self.cleanup_failures
+            or self.validation_failures
+            or self.boundary_failures
+        )
+        expected_counts = {engine: self.rounds for engine in ENGINE_ORDER}
+        case_ids = [case.case_id for case in self.cases]
+        computed_counts = {
+            engine: sum(
+                case.phase == "steady"
+                and case.engine == engine
+                and case.expected == "completed"
+                and case.actual == "completed"
+                and validate_case(case).valid
+                for case in self.cases
+            )
+            for engine in ENGINE_ORDER
+        }
+        raw_counts = {
+            engine: sum(case.phase == "steady" and case.engine == engine for case in self.cases)
+            for engine in ENGINE_ORDER
+        }
+        invalid_nonsteady = any(
+            (case.phase == "recovery" and (case.expected != "completed" or case.actual != "completed"))
+            or (case.phase == "fault" and (case.expected == "completed" or case.actual != case.expected))
+            for case in self.cases
+        )
+        if (
+            self.rounds != 10
+            or failures
+            or self.steady_counts != expected_counts
+            or computed_counts != expected_counts
+            or raw_counts != expected_counts
+            or len(case_ids) != len(set(case_ids))
+            or any(not validate_case(case).valid for case in self.cases)
+            or invalid_nonsteady
+        ):
             raise ValueError("passed summary contains failed evidence")
         return self
 
 
 class RequiredCase(_StrictModel):
     case_id: str = Field(min_length=1)
+    engine: Engine
     phase: Literal["fault", "recovery"]
     expected: Outcome
+
+    @model_validator(mode="after")
+    def _phase_outcome_contract(self) -> "RequiredCase":
+        if self.phase == "recovery" and self.expected != "completed":
+            raise ValueError("recovery cases must expect completed")
+        if self.phase == "fault" and self.expected == "completed":
+            raise ValueError("fault cases must expect a non-completed outcome")
+        return self
+
+
+def _process_proof_valid(case: CaseEvidence) -> bool:
+    identities: set[tuple[int, datetime]] = set()
+    if not case.processes:
+        return False
+    for process in case.processes:
+        try:
+            identity = (process.pid, process.creation_time)
+            if identity in identities:
+                return False
+            identities.add(identity)
+            ordered = (
+                process.parent_creation_time
+                <= process.creation_time
+                <= process.stopped_at
+                <= case.finished_at
+                and case.started_at <= process.creation_time
+            )
+        except (AttributeError, TypeError):
+            return False
+        if (
+            isinstance(process.pid, bool)
+            or not isinstance(process.pid, int)
+            or process.pid <= 0
+            or isinstance(process.parent_pid, bool)
+            or not isinstance(process.parent_pid, int)
+            or process.parent_pid <= 0
+            or process.ownership != "validator-owned"
+            or not _is_sha256(process.command_hash)
+            or not _is_sha256(process.executable_hash)
+            or not _is_sha256(process.ownership_hash)
+            or not _is_neutral_basename(process.executable_name)
+            or not _is_utc(process.parent_creation_time)
+            or not _is_utc(process.creation_time)
+            or not _is_utc(process.stopped_at)
+            or not ordered
+            or process.started is not True
+            or process.stopped is not True
+            or process.descendants_stopped is not True
+            or process.alive_after is not False
+        ):
+            return False
+    return True
+
+
+def _queue_proof_valid(case: CaseEvidence) -> bool:
+    queue = case.comfyui
+    return (
+        queue.queue_empty is True
+        and queue.history_present is True
+        and queue.prompt_id == case.prompt_id
+        and isinstance(queue.queue_before_prompt_ids, list)
+        and queue.queue_before_prompt_ids.count(case.prompt_id) == 1
+        and isinstance(queue.queue_after_prompt_ids, list)
+        and case.prompt_id not in queue.queue_after_prompt_ids
+        and isinstance(queue.history_prompt_ids, list)
+        and queue.history_prompt_ids.count(case.prompt_id) == 1
+        and queue.terminal_history_status == case.actual
+    )
+
+
+def _gpu_proof_valid(case: CaseEvidence) -> bool:
+    snapshots = (case.gpu_before, case.gpu_peak, case.gpu_after)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for snapshot in snapshots
+        for value in (snapshot.used_mib, snapshot.free_mib)
+    ):
+        return False
+    totals = [snapshot.used_mib + snapshot.free_mib for snapshot in snapshots]
+    return (
+        case.gpu_peak.used_mib >= max(case.gpu_before.used_mib, case.gpu_after.used_mib)
+        and case.gpu_after.used_mib - case.gpu_before.used_mib <= 1024
+        and case.gpu_before.free_mib - case.gpu_after.free_mib <= 1024
+        and max(totals) - min(totals) <= 1024
+    )
 
 
 def validate_case(case: CaseEvidence, *, wav_path: Path | None = None) -> CaseValidation:
@@ -207,12 +455,12 @@ def validate_case(case: CaseEvidence, *, wav_path: Path | None = None) -> CaseVa
         diagnostics.append("expected outcome does not match actual outcome")
     if not case.cleanup.ok or not case.cleanup.owned_processes_stopped or not case.cleanup.temp_paths_removed:
         diagnostics.append("cleanup proof is incomplete")
-    if (not case.comfyui.queue_empty or not case.comfyui.history_present or case.comfyui.prompt_id != case.prompt_id or case.prompt_id in case.comfyui.queue_after_prompt_ids or case.prompt_id not in case.comfyui.history_prompt_ids or case.comfyui.terminal_history_status != case.actual):
+    if not _queue_proof_valid(case):
         diagnostics.append("ComfyUI queue/history proof is incomplete")
-    if any(process.alive_after or not process.stopped or not process.descendants_stopped or process.ownership != "validator-owned" for process in case.processes):
-        diagnostics.append("process ownership/cleanup proof is incomplete")
-    if case.gpu_peak.used_mib < max(case.gpu_before.used_mib, case.gpu_after.used_mib) or case.gpu_after.used_mib - case.gpu_before.used_mib > 1024:
-        diagnostics.append("GPU memory did not recover")
+    if not _process_proof_valid(case):
+        diagnostics.append("process identity/lifecycle proof is incomplete")
+    if not _gpu_proof_valid(case):
+        diagnostics.append("GPU memory observation/recovery proof is incomplete")
     boundary = case.boundary
     repository_before = {snapshot.label: snapshot for snapshot in boundary.repositories_before}
     repository_after = {snapshot.label: snapshot for snapshot in boundary.repositories_after}
@@ -238,24 +486,26 @@ def validate_case(case: CaseEvidence, *, wav_path: Path | None = None) -> CaseVa
         if wav_path is not None:
             try:
                 proof = _wav_proof(wav_path)
-            except (OSError, RuntimeError, ValueError) as exc:
-                diagnostics.append(f"WAV proof invalid: {exc}")
+            except (OSError, RuntimeError, ValueError):
+                diagnostics.append("WAV proof is invalid")
             else:
                 evidence = case.model_copy(update={"audio": proof})
         if evidence.audio is None:
             diagnostics.append("completed case is missing WAV proof")
     elif case.audio is not None:
         diagnostics.append("non-completed case must not publish WAV proof")
-    return CaseValidation(evidence=evidence, valid=not diagnostics, diagnostics=diagnostics)
+    # Invalid evidence can originate from observation collectors using model_copy();
+    # return the controlled diagnostics without revalidating that nested instance.
+    return CaseValidation.model_construct(evidence=evidence, valid=not diagnostics, diagnostics=diagnostics)
 
 
 def finalize_run(
     fixture: ReliabilityFixture,
-    cases: list[CaseEvidence],
+    cases: Sequence[CaseEvidence],
     *,
-    required_case_ids: Mapping[str, Mapping[str, str] | RequiredCase] | Sequence[RequiredCase] | set[str],
+    required_cases: Sequence[RequiredCase],
 ) -> ReliabilityRunSummary:
-    required = _required_cases(required_case_ids)
+    required = _required_cases(required_cases)
     duplicate_case_ids = sorted(_duplicates(case.case_id for case in cases))
     present = {case.case_id for case in cases}
     missing_cases = sorted(set(required) - present)
@@ -265,13 +515,24 @@ def finalize_run(
         for validation in validations
         for diagnostic in validation.diagnostics
     )
+    boundary_failures = sorted(
+        {
+            validation.evidence.case_id
+            for validation in validations
+            if any(
+                diagnostic.startswith("boundary ")
+                or diagnostic.startswith("repository/model/private-registry ")
+                for diagnostic in validation.diagnostics
+            )
+        }
+    )
     cleanup_failures = sorted(
         case.case_id
         for case in cases
         if not case.cleanup.ok or not case.cleanup.owned_processes_stopped or not case.cleanup.temp_paths_removed
     )
-    steady_counts: dict[Engine, int] = {"gpt-sovits": 0, "indextts": 0, "cosyvoice": 0}
-    raw_steady_counts: dict[Engine, int] = {"gpt-sovits": 0, "indextts": 0, "cosyvoice": 0}
+    steady_counts: dict[Engine, int] = {engine: 0 for engine in ENGINE_ORDER}
+    raw_steady_counts: dict[Engine, int] = {engine: 0 for engine in ENGINE_ORDER}
     for validation in validations:
         case = validation.evidence
         if case.phase == "steady": raw_steady_counts[case.engine] += 1
@@ -280,22 +541,38 @@ def finalize_run(
     for engine, count in steady_counts.items():
         if raw_steady_counts[engine] != fixture.rounds or count != fixture.rounds:
             validation_failures.append(f"steady {engine} count is {raw_steady_counts[engine]}, expected {fixture.rounds}")
-    for case in cases:
+    for case, validation in zip(cases, validations, strict=True):
         spec = required.get(case.case_id)
-        if case.phase != "steady" and spec is None: validation_failures.append(f"extra required case: {case.case_id}")
-        if spec is not None and (case.phase != spec.phase or case.actual != spec.expected or not validate_case(case).valid):
-            validation_failures.append(f"required case {case.case_id} has wrong phase" if case.phase != spec.phase else f"required case failed: {case.case_id}")
+        if case.phase != "steady" and spec is None:
+            validation_failures.append(f"extra required case: {case.case_id}")
+        if spec is None:
+            continue
+        if case.engine != spec.engine:
+            validation_failures.append(f"required case {case.case_id} has wrong engine")
+        if case.phase != spec.phase:
+            validation_failures.append(f"required case {case.case_id} has wrong phase")
+        if case.expected != spec.expected:
+            validation_failures.append(f"required case {case.case_id} has wrong expected outcome")
+        if case.actual != spec.expected:
+            validation_failures.append(f"required case {case.case_id} has wrong actual outcome")
+        if not validation.valid:
+            validation_failures.append(f"required case failed: {case.case_id}")
     validation_failures = sorted(set(validation_failures))
-    failed = bool(duplicate_case_ids or missing_cases or cleanup_failures or validation_failures)
+    failed = bool(duplicate_case_ids or missing_cases or cleanup_failures or validation_failures or boundary_failures)
+    output_cases = sorted(
+        (validation.evidence for validation in validations),
+        key=lambda case: (case.case_id, case.engine, case.phase, case.expected, case.actual),
+    )
     return ReliabilityRunSummary(
         status="failed" if failed else "passed",
         fixture_version=fixture.version,
         rounds=fixture.rounds,
-        cases=[validation.evidence for validation in validations],
+        cases=output_cases,
         missing_cases=missing_cases,
         duplicate_case_ids=duplicate_case_ids,
         cleanup_failures=cleanup_failures,
         validation_failures=validation_failures,
+        boundary_failures=boundary_failures,
         steady_counts=steady_counts,
     )
 
@@ -365,32 +642,103 @@ def _duplicates(values: Any) -> set[str]:
     return duplicates
 
 
-def _required_cases(value: Mapping[str, Mapping[str, str] | RequiredCase] | Sequence[RequiredCase] | set[str]) -> dict[str, RequiredCase]:
-    if isinstance(value, set):
-        return {case_id: RequiredCase(case_id=case_id, phase="fault", expected="completed") for case_id in value}
-    if isinstance(value, Mapping):
-        return {case_id: item if isinstance(item, RequiredCase) else RequiredCase(case_id=case_id, **item) for case_id, item in value.items()}
+def _required_cases(value: Sequence[RequiredCase]) -> dict[str, RequiredCase]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise ValueError("required_cases must be an ordered RequiredCase sequence")
     output: dict[str, RequiredCase] = {}
     for item in value:
-        if item.case_id in output:
-            raise ValueError("duplicate required case IDs")
-        output[item.case_id] = item
+        if not isinstance(item, RequiredCase):
+            raise ValueError("required_cases must be an ordered RequiredCase sequence")
+        validated = RequiredCase.model_validate(item.model_dump())
+        if validated.case_id in output:
+            raise ValueError("duplicate required case specification")
+        output[validated.case_id] = validated
     return output
 
 
 def _assert_public_evidence(value: Any) -> None:
+    if isinstance(value, BaseModel):
+        _assert_public_evidence(value.model_dump(mode="json"))
+        return
     if isinstance(value, dict):
         for key, item in value.items():
-            _assert_public_evidence(str(key))
+            key_text = str(key)
+            if _is_sensitive_key(key_text) and _contains_private_value(item):
+                raise ValueError("unsafe evidence")
+            _assert_public_string(key_text)
             _assert_public_evidence(item)
         return
     if isinstance(value, (list, tuple, set)):
-        for item in value: _assert_public_evidence(item)
+        for item in value:
+            _assert_public_evidence(item)
         return
-    if not isinstance(value, str): return
+    if isinstance(value, str):
+        _assert_public_string(value)
+
+
+def _assert_public_string(value: str) -> None:
     lowered = value.lower()
-    if (re.match(r"^[a-z]:[\\/]", lowered) or lowered.startswith("\\\\") or lowered.startswith("/home/") or lowered.startswith("/users/") or re.search(r"(?:bearer\s+|token\s*[:=]|password\s*[:=]|api[_-]?key\s*[:=]|authorization)", lowered)):
+    contains_path = bool(
+        re.search(r"(?i)(?<![a-z0-9])[a-z]:[\\/]", value)
+        or re.search(r"\\\\[^\\/\s]+[\\/][^\\/\s]+", value)
+        or re.search(r"(?i)\bfile://", value)
+        or re.search(r"(?:^|[\s\"'=(:,;])/(?!/)[^\s]+", value)
+    )
+    contains_secret = bool(
+        re.search(
+            r"(?:\bbearer\s+\S+|\b(?:access[_-]?key|access[_-]?token|api[_-]?key|authorization|client[_-]?secret|password|private[_-]?key|refresh[_-]?token|secret|token)\s*[:=]\s*\S+)",
+            lowered,
+        )
+    )
+    if contains_path or contains_secret:
         raise ValueError("unsafe evidence")
+
+
+def _contains_private_value(value: Any) -> bool:
+    if value is None or value == "":
+        return False
+    if isinstance(value, (dict, list, tuple, set)) and not value:
+        return False
+    return True
+
+
+def _is_sensitive_key(value: str) -> bool:
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    normalized = re.sub(r"[^a-z0-9]+", "_", camel_split.lower()).strip("_")
+    compact = normalized.replace("_", "")
+    compact_sensitive = {key.replace("_", "") for key in _SENSITIVE_KEYS}
+    parts = set(normalized.split("_"))
+    return (
+        normalized in _SENSITIVE_KEYS
+        or compact in compact_sensitive
+        or bool(parts & {"authorization", "credential", "credentials", "password", "secret", "token"})
+        or {"api", "key"} <= parts
+        or {"access", "key"} <= parts
+        or {"private", "key"} <= parts
+    )
+
+
+def _is_utc(value: Any) -> bool:
+    return (
+        isinstance(value, datetime)
+        and value.tzinfo is not None
+        and value.utcoffset() == timezone.utc.utcoffset(value)
+    )
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and _HASH_PATTERN.fullmatch(value) is not None
+
+
+def _is_neutral_basename(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and not Path(value).is_absolute()
+    )
 
 
 def _fsync_directory(directory: Path) -> None:

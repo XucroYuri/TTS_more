@@ -5,7 +5,7 @@ import math
 import os
 import struct
 import wave
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -22,6 +22,8 @@ from app.comfyui.reliability_validation import (
     ProcessEvidence,
     RepositorySnapshot,
     ReliabilityFixture,
+    ReliabilityRunSummary,
+    RequiredCase,
     finalize_run,
     validate_case,
     write_atomic_json,
@@ -42,6 +44,8 @@ def _fixture_document() -> dict[str, object]:
 
 
 def _case(case_id: str, engine: str, *, phase: str = "steady", expected: str = "completed", actual: str = "completed", cleanup_ok: bool = True, audio: AudioProof | None = None) -> CaseEvidence:
+    started_at = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
+    finished_at = started_at + timedelta(seconds=10)
     if actual == "completed" and audio is None:
         audio = AudioProof(
             sha256="e" * 64,
@@ -59,11 +63,11 @@ def _case(case_id: str, engine: str, *, phase: str = "steady", expected: str = "
         job_id=f"job-{case_id}",
         prompt_id=f"prompt-{case_id}",
         version_id=f"v-{case_id}",
-        started_at=datetime.now(timezone.utc),
-        finished_at=datetime.now(timezone.utc),
+        started_at=started_at,
+        finished_at=finished_at,
         audio=audio,
         cleanup=CleanupEvidence(ok=cleanup_ok, owned_processes_stopped=True, temp_paths_removed=True),
-        processes=[ProcessEvidence(pid=123, ownership="validator-owned", command_hash="a" * 64, creation_time=datetime.now(timezone.utc), parent_pid=1, parent_creation_time=datetime.now(timezone.utc), executable_name="python.exe", executable_hash="a" * 64, ownership_hash="b" * 64, started=True, stopped=True, descendants_stopped=True, alive_after=False)],
+        processes=[ProcessEvidence(pid=123, ownership="validator-owned", command_hash="a" * 64, creation_time=started_at + timedelta(seconds=2), parent_pid=1, parent_creation_time=started_at + timedelta(seconds=1), stopped_at=finished_at - timedelta(seconds=1), executable_name="python.exe", executable_hash="a" * 64, ownership_hash="b" * 64, started=True, stopped=True, descendants_stopped=True, alive_after=False)],
         comfyui=ComfyQueueEvidence(queue_empty=True, history_present=True, prompt_id=f"prompt-{case_id}", queue_before_prompt_ids=[f"prompt-{case_id}"], queue_after_prompt_ids=[], history_prompt_ids=[f"prompt-{case_id}"], terminal_history_status=actual),
         gpu_before=GpuSnapshot(used_mib=1, free_mib=2),
         gpu_peak=GpuSnapshot(used_mib=2, free_mib=1),
@@ -81,6 +85,21 @@ def _case(case_id: str, engine: str, *, phase: str = "steady", expected: str = "
             reference_hashes_after={"reference": "d" * 64},
         ),
     )
+
+
+def _steady_cases() -> list[CaseEvidence]:
+    return [
+        _case(f"steady-{engine}-{index:02d}", engine)
+        for engine in ("gpt-sovits", "indextts", "cosyvoice")
+        for index in range(1, 11)
+    ]
+
+
+def _required_cases() -> list[RequiredCase]:
+    return [
+        RequiredCase(case_id="cancel-index", engine="indextts", phase="fault", expected="cancelled"),
+        RequiredCase(case_id="restart-cosy", engine="cosyvoice", phase="recovery", expected="completed"),
+    ]
 
 
 def _write_voiced_wav(path: Path) -> None:
@@ -158,24 +177,20 @@ def test_validate_case_fails_closed_without_detailed_boundary_observations() -> 
 
 def test_finalize_run_requires_exact_successful_steady_matrix_and_named_cases() -> None:
     fixture = ReliabilityFixture.model_validate(_fixture_document())
-    cases = [
-        _case(f"steady-{engine}-{index:02d}", engine)
-        for engine in ("gpt-sovits", "indextts", "cosyvoice")
-        for index in range(1, 11)
-    ]
+    cases = _steady_cases()
     cases.extend([
         _case("cancel-index", "indextts", phase="fault", expected="cancelled", actual="cancelled"),
         _case("restart-cosy", "cosyvoice", phase="recovery"),
     ])
-    required = {"cancel-index": {"phase": "fault", "expected": "cancelled"}, "restart-cosy": {"phase": "recovery", "expected": "completed"}}
-    passed = finalize_run(fixture, cases, required_case_ids=required)
+    required = _required_cases()
+    passed = finalize_run(fixture, cases, required_cases=required)
     assert passed.status == "passed"
 
-    duplicate = finalize_run(fixture, cases + [_case("steady-gpt-sovits-01", "gpt-sovits")], required_case_ids=required)
+    duplicate = finalize_run(fixture, cases + [_case("steady-gpt-sovits-01", "gpt-sovits")], required_cases=required)
     assert duplicate.status == "failed"
     assert duplicate.duplicate_case_ids == ["steady-gpt-sovits-01"]
 
-    failed = finalize_run(fixture, [_case("steady-gpt-01", "gpt-sovits"), _case("cancel-index", "indextts", phase="fault", expected="cancelled", actual="cancelled", cleanup_ok=False)], required_case_ids=required)
+    failed = finalize_run(fixture, [_case("steady-gpt-01", "gpt-sovits"), _case("cancel-index", "indextts", phase="fault", expected="cancelled", actual="cancelled", cleanup_ok=False)], required_cases=required)
     assert failed.status == "failed"
     assert failed.missing_cases == ["restart-cosy"]
     assert failed.cleanup_failures == ["cancel-index"]
@@ -211,16 +226,12 @@ def test_atomic_evidence_rolls_back_prior_file_when_directory_fsync_fails(tmp_pa
 
 def test_fix_round_1_required_case_contract_rejects_steady_recovery_and_extra_steady_case() -> None:
     fixture = ReliabilityFixture.model_validate(_fixture_document())
-    cases = [
-        _case(f"steady-{engine}-{index:02d}", engine)
-        for engine in ("gpt-sovits", "indextts", "cosyvoice")
-        for index in range(1, 11)
-    ]
+    cases = _steady_cases()
     cases.append(_case("recover-cosy", "cosyvoice", phase="steady"))
     summary = finalize_run(
         fixture,
         cases,
-        required_case_ids={"recover-cosy": {"phase": "recovery", "expected": "completed"}},
+        required_cases=[RequiredCase(case_id="recover-cosy", engine="cosyvoice", phase="recovery", expected="completed")],
     )
     assert summary.status == "failed"
     assert "required case recover-cosy has wrong phase" in summary.validation_failures
@@ -228,7 +239,7 @@ def test_fix_round_1_required_case_contract_rejects_steady_recovery_and_extra_st
     extra = finalize_run(
         fixture,
         cases + [_case("steady-gpt-extra", "gpt-sovits", expected="failed", actual="failed", audio=None)],
-        required_case_ids={},
+        required_cases=[],
     )
     assert extra.status == "failed"
     assert "steady gpt-sovits count is 11, expected 10" in extra.validation_failures
@@ -240,3 +251,202 @@ def test_fix_round_1_raw_payload_safety_rejects_nested_private_values(tmp_path: 
         write_atomic_json(target, {"nested": [r"C:\Users\private", {"authorization": "Bearer private-token"}]})
     assert "private-token" not in str(exc_info.value)
     assert target.exists() is False
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        {"cancel-index"},
+        {"cancel-index": {"phase": "fault", "expected": "cancelled"}},
+        "cancel-index",
+        [object()],
+    ],
+)
+def test_fix_round_2_required_cases_reject_legacy_or_malformed_collections(legacy: object) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    with pytest.raises(ValueError, match="ordered RequiredCase sequence") as exc_info:
+        finalize_run(fixture, _steady_cases(), required_cases=legacy)  # type: ignore[arg-type]
+    assert not isinstance(exc_info.value, AttributeError)
+
+
+def test_fix_round_2_required_case_contract_binds_engine_phase_and_outcome() -> None:
+    with pytest.raises(ValidationError):
+        RequiredCase(case_id="bad-recovery", engine="cosyvoice", phase="recovery", expected="failed")
+    with pytest.raises(ValidationError):
+        RequiredCase(case_id="bad-fault", engine="indextts", phase="fault", expected="completed")
+
+    required = _required_cases()
+    with pytest.raises(ValueError, match="duplicate required case"):
+        finalize_run(
+            ReliabilityFixture.model_validate(_fixture_document()),
+            _steady_cases(),
+            required_cases=[required[0], required[0]],
+        )
+
+    cases = _steady_cases() + [
+        _case("cancel-index", "cosyvoice", phase="fault", expected="cancelled", actual="cancelled"),
+        _case("restart-cosy", "cosyvoice", phase="recovery"),
+    ]
+    summary = finalize_run(
+        ReliabilityFixture.model_validate(_fixture_document()),
+        cases,
+        required_cases=required,
+    )
+    assert summary.status == "failed"
+    assert "required case cancel-index has wrong engine" in summary.validation_failures
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"token": "raw-token-sentinel"},
+        {"nested": {"client_secret": "raw-client-secret-sentinel"}},
+        {"nested": {"password": "raw-password-sentinel"}},
+        {"nested": {"api_key": "raw-api-key-sentinel"}},
+        {"nested": {"authorization": "raw-authorization-sentinel"}},
+        {"nested": {"private": "raw-private-sentinel"}},
+        {"nested": {"access_key": "raw-access-key-sentinel"}},
+        {"note": "request Bearer raw-bearer-sentinel"},
+        {"note": "request token=raw-token-sentinel"},
+        {"note": "request password=raw-password-sentinel"},
+        {"note": r"failure at C:\Users\private\model"},
+        {"note": r"failure at \\server\share\model"},
+        {"note": "failure at file:///C:/private/model"},
+        {"note": "failure at /opt/private/model"},
+    ],
+)
+def test_fix_round_2_public_evidence_rejects_contextual_secrets_and_embedded_paths(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> None:
+    target = tmp_path / "summary.json"
+    with pytest.raises(ValueError, match="^unsafe evidence$") as exc_info:
+        write_atomic_json(target, payload)
+    assert "sentinel" not in str(exc_info.value)
+    assert target.exists() is False
+
+
+def test_fix_round_2_public_evidence_allows_neutral_authorization_and_relative_labels(tmp_path: Path) -> None:
+    target = tmp_path / "summary.json"
+    payload = {
+        "note": "authorization overview",
+        "authorization": "",
+        "relative": "fixtures/reference.wav",
+        "sha256": "a" * 64,
+        "private_registry_hash": "b" * 64,
+    }
+    write_atomic_json(target, payload)
+    assert json.loads(target.read_text(encoding="utf-8")) == payload
+
+
+def test_fix_round_2_model_validation_redacts_nested_secret_values() -> None:
+    document = _case("steady-gpt-01", "gpt-sovits").model_dump()
+    document["boundary"]["reference_hashes"] = {"token": "model-secret-sentinel"}  # type: ignore[index]
+    with pytest.raises(ValidationError, match="unsafe evidence") as exc_info:
+        CaseEvidence.model_validate(document)
+    assert "model-secret-sentinel" not in str(exc_info.value)
+
+
+def test_fix_round_2_process_model_requires_utc_ordered_complete_observations() -> None:
+    process = _case("steady-gpt-01", "gpt-sovits").processes[0].model_dump()
+    process["creation_time"] = datetime(2026, 8, 1, 0, 0)
+    with pytest.raises(ValidationError):
+        ProcessEvidence.model_validate(process)
+
+    process = _case("steady-gpt-01", "gpt-sovits").processes[0].model_dump()
+    process["parent_pid"] = 0
+    with pytest.raises(ValidationError):
+        ProcessEvidence.model_validate(process)
+
+
+def test_fix_round_2_validate_case_rechecks_process_identity_and_lifecycle() -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    process = case.processes[0]
+    invalid_processes = [
+        [process.model_copy(update={"started": False})],
+        [process.model_copy(update={"parent_creation_time": process.creation_time + timedelta(seconds=1)})],
+        [process.model_copy(update={"stopped_at": process.creation_time - timedelta(seconds=1)})],
+        [process.model_copy(update={"parent_pid": 0})],
+        [process.model_copy(update={"executable_name": r"C:\private\python.exe"})],
+        [process.model_copy(update={"executable_hash": "not-a-hash"})],
+        [process.model_copy(update={"ownership_hash": "not-a-hash"})],
+        [process.model_copy(update={"ownership": "pre-existing"})],
+        [process, process],
+    ]
+    for processes in invalid_processes:
+        result = validate_case(case.model_copy(update={"processes": processes}))
+        assert result.valid is False
+        assert "process identity/lifecycle proof is incomplete" in result.diagnostics
+
+
+def test_fix_round_2_validate_case_requires_exact_queue_history_observation() -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    prompt_id = case.prompt_id
+    invalid_queues = [
+        case.comfyui.model_copy(update={"queue_before_prompt_ids": []}),
+        case.comfyui.model_copy(update={"queue_after_prompt_ids": [prompt_id]}),
+        case.comfyui.model_copy(update={"history_prompt_ids": [prompt_id, prompt_id]}),
+        case.comfyui.model_copy(update={"history_prompt_ids": []}),
+        case.comfyui.model_copy(update={"terminal_history_status": "failed"}),
+    ]
+    for queue in invalid_queues:
+        result = validate_case(case.model_copy(update={"comfyui": queue}))
+        assert result.valid is False
+        assert "ComfyUI queue/history proof is incomplete" in result.diagnostics
+
+
+def test_fix_round_2_validate_case_rechecks_gpu_observation_and_recovery() -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    invalid_snapshots = [
+        {"gpu_before": case.gpu_before.model_copy(update={"used_mib": -1})},
+        {"gpu_peak": case.gpu_peak.model_copy(update={"used_mib": 0})},
+        {"gpu_after": case.gpu_after.model_copy(update={"used_mib": case.gpu_before.used_mib + 1025})},
+    ]
+    for update in invalid_snapshots:
+        result = validate_case(case.model_copy(update=update))
+        assert result.valid is False
+        assert "GPU memory observation/recovery proof is incomplete" in result.diagnostics
+
+
+def test_fix_round_2_boundary_and_summary_outputs_are_deterministic() -> None:
+    case = _case("steady-gpt-01", "gpt-sovits")
+    boundary = BoundaryEvidence.model_validate(
+        {
+            **case.boundary.model_dump(),
+            "repositories_before": list(reversed(case.boundary.repositories_before)),
+            "repositories_after": list(reversed(case.boundary.repositories_after)),
+            "reference_hashes": {"z": "a" * 64, "a": "b" * 64},
+            "reference_hashes_before": {"z": "a" * 64, "a": "b" * 64},
+            "reference_hashes_after": {"z": "a" * 64, "a": "b" * 64},
+        }
+    )
+    assert [item.label for item in boundary.repositories_before] == sorted(REPOSITORY_LABELS)
+    assert list(boundary.reference_hashes) == ["a", "z"]
+
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    cases = _steady_cases() + [
+        _case("cancel-index", "indextts", phase="fault", expected="cancelled", actual="cancelled"),
+        _case("restart-cosy", "cosyvoice", phase="recovery"),
+    ]
+    summary = finalize_run(fixture, list(reversed(cases)), required_cases=list(reversed(_required_cases())))
+    assert summary.status == "passed"
+    assert [item.case_id for item in summary.cases] == sorted(item.case_id for item in cases)
+
+
+def test_fix_round_2_direct_passed_summary_cannot_bypass_validation() -> None:
+    with pytest.raises(ValidationError, match="passed summary contains failed evidence"):
+        ReliabilityRunSummary(
+            status="passed",
+            fixture_version=1,
+            rounds=10,
+            cases=[],
+            missing_cases=[],
+            duplicate_case_ids=[],
+            cleanup_failures=[],
+            validation_failures=[],
+            boundary_failures=[],
+            steady_counts={},
+        )
+
+
+REPOSITORY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")
