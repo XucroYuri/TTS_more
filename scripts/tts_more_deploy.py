@@ -1382,7 +1382,7 @@ def _validate_local_git_config_value(
     )
     boolean_values = {"true", "false", "yes", "no", "on", "off", "1", "0"}
     core_validators: dict[str, Callable[[str], bool]] = {
-        "repositoryformatversion": lambda item: item == "0",
+        "repositoryformatversion": lambda item: item in {"0", "1"},
         "filemode": lambda item: item.lower() in boolean_values,
         "bare": lambda item: item.lower() == "false",
         "logallrefupdates": lambda item: item.lower() in boolean_values,
@@ -1415,10 +1415,17 @@ def _validate_local_git_config_value(
                 value,
             )
             valid = bool(refspec and refspec.group(1) == refspec.group(2))
+        elif normalized_option == "promisor":
+            valid = value.lower() in boolean_values
+        elif normalized_option == "partialclonefilter":
+            valid = value in {"blob:none", "tree:0"}
         else:
             valid = False
+    elif normalized_section == "extensions":
+        valid = normalized_option == "partialclone" and value == "origin"
     else:
         branch_match = re.fullmatch(r'branch "([^"\\]+)"', section, flags=re.IGNORECASE)
+        submodule_match = re.fullmatch(r'submodule "([^"\\]+)"', section, flags=re.IGNORECASE)
         valid = False
         if branch_match:
             branch = branch_match.group(1)
@@ -1430,6 +1437,23 @@ def _validate_local_git_config_value(
                 valid = (normalized_option == "remote" and value == "origin") or (
                     normalized_option == "merge" and value == f"refs/heads/{branch}"
                 )
+        elif submodule_match:
+            safe_component = re.compile(r"[A-Za-z0-9_.-]+\Z")
+            name = submodule_match.group(1)
+            name_parts = name.split("/")
+            safe_name = bool(
+                name
+                and "\\" not in name
+                and all(safe_component.fullmatch(part) and part not in {".", "..", ".git"} for part in name_parts)
+            )
+            if safe_name and normalized_option == "active":
+                valid = value.lower() in boolean_values
+            elif safe_name and normalized_option == "url":
+                try:
+                    _parse_github_remote(value)
+                    valid = True
+                except ValueError:
+                    valid = False
     if not valid:
         raise RuntimeError(f"local Git config key is not allowlisted or has an unsafe value: {display_key}")
 
@@ -2211,7 +2235,7 @@ def validate_local_git_config_value(section: str, option: str, value: str) -> No
     )
     boolean_values = {"true", "false", "yes", "no", "on", "off", "1", "0"}
     core_validators = {
-        "repositoryformatversion": lambda item: item == "0",
+        "repositoryformatversion": lambda item: item in {"0", "1"},
         "filemode": lambda item: item.lower() in boolean_values,
         "bare": lambda item: item.lower() == "false",
         "logallrefupdates": lambda item: item.lower() in boolean_values,
@@ -2235,10 +2259,17 @@ def validate_local_git_config_value(section: str, option: str, value: str) -> No
                 value,
             )
             valid = bool(refspec and refspec.group(1) == refspec.group(2))
+        elif normalized_option == "promisor":
+            valid = value.lower() in boolean_values
+        elif normalized_option == "partialclonefilter":
+            valid = value in {"blob:none", "tree:0"}
         else:
             valid = False
+    elif normalized_section == "extensions":
+        valid = normalized_option == "partialclone" and value == "origin"
     else:
         branch_match = re.fullmatch(r'branch "([^"\\]+)"', section, flags=re.IGNORECASE)
+        submodule_match = re.fullmatch(r'submodule "([^"\\]+)"', section, flags=re.IGNORECASE)
         valid = False
         if branch_match:
             branch = branch_match.group(1)
@@ -2250,6 +2281,23 @@ def validate_local_git_config_value(section: str, option: str, value: str) -> No
                 valid = (normalized_option == "remote" and value == "origin") or (
                     normalized_option == "merge" and value == f"refs/heads/{branch}"
                 )
+        elif submodule_match:
+            safe_component = re.compile(r"[A-Za-z0-9_.-]+\Z")
+            name = submodule_match.group(1)
+            name_parts = name.split("/")
+            safe_name = bool(
+                name
+                and "\\" not in name
+                and all(safe_component.fullmatch(part) and part not in {".", "..", ".git"} for part in name_parts)
+            )
+            if safe_name and normalized_option == "active":
+                valid = value.lower() in boolean_values
+            elif safe_name and normalized_option == "url":
+                try:
+                    parse_github_remote(value)
+                    valid = True
+                except ValueError:
+                    valid = False
     if not valid:
         raise RuntimeError(f"local Git config key is not allowlisted or has an unsafe value: {display_key}")
 
