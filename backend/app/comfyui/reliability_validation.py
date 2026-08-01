@@ -5,7 +5,8 @@ import json
 import math
 import os
 import re
-import tempfile
+import secrets
+import shutil
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -579,36 +580,123 @@ def finalize_run(
 
 def write_atomic_json(path: Path, payload: ReliabilityRunSummary | dict[str, Any]) -> None:
     _assert_public_evidence(payload.model_dump(mode="json") if isinstance(payload, ReliabilityRunSummary) else payload)
-    path.parent.mkdir(parents=True, exist_ok=True)
     document = payload.model_dump(mode="json") if isinstance(payload, ReliabilityRunSummary) else payload
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(temporary_name)
-    backup = path.with_name(f".{path.name}.{next(tempfile._get_candidate_names())}.bak")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = _write_reserved_json(path, document)
+    except Exception:
+        raise OSError("atomic evidence preparation failed before publication") from None
+
+    backup: Path | None = None
     had_prior = path.exists()
+    if had_prior:
+        try:
+            backup = _copy_to_reserved_file(path, suffix="bak")
+            _fsync_directory(path.parent)
+        except Exception:
+            _best_effort_unlink(temporary)
+            _best_effort_unlink(backup)
+            raise OSError("atomic evidence preparation failed; live evidence is unchanged") from None
+
+    try:
+        os.replace(temporary, path)
+    except Exception:
+        _best_effort_unlink(temporary)
+        if backup is not None:
+            _best_effort_unlink(backup)
+        raise OSError("atomic evidence publication failed before commit") from None
+
+    try:
+        _fsync_directory(path.parent)
+    except Exception:
+        if backup is not None:
+            _restore_existing_after_dirsync_failure(path, backup)
+        _retain_first_write_after_dirsync_failure()
+
+    if backup is not None:
+        _best_effort_unlink(backup)
+
+
+def _write_reserved_json(path: Path, document: dict[str, Any]) -> Path:
+    descriptor, temporary = _reserve_owned_file(path, suffix="tmp")
+    handle_opened = False
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle_opened = True
             json.dump(document, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        if had_prior:
-            os.replace(path, backup)
-        try:
-            os.replace(temporary, path)
-            _fsync_directory(path.parent)
-        except BaseException:
-            if had_prior and backup.exists():
-                os.replace(backup, path)
-                try: _fsync_directory(path.parent)
-                except OSError: pass
-            elif path.exists():
-                path.unlink(missing_ok=True)
-            raise
-        backup.unlink(missing_ok=True)
     except BaseException:
-        temporary.unlink(missing_ok=True)
-        backup.unlink(missing_ok=True)
+        if not handle_opened:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _best_effort_unlink(temporary)
         raise
+    return temporary
+
+
+def _copy_to_reserved_file(source: Path, *, suffix: str) -> Path:
+    descriptor, destination = _reserve_owned_file(source, suffix=suffix)
+    handle_opened = False
+    try:
+        with os.fdopen(descriptor, "wb") as destination_handle:
+            handle_opened = True
+            with source.open("rb") as source_handle:
+                shutil.copyfileobj(source_handle, destination_handle)
+            destination_handle.flush()
+            os.fsync(destination_handle.fileno())
+    except BaseException:
+        if not handle_opened:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _best_effort_unlink(destination)
+        raise
+    return destination
+
+
+def _reserve_owned_file(path: Path, *, suffix: str) -> tuple[int, Path]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOINHERIT", 0)
+    for _attempt in range(128):
+        candidate = path.with_name(f".{path.name}.{secrets.token_hex(16)}.{suffix}")
+        try:
+            return os.open(candidate, flags, 0o600), candidate
+        except FileExistsError:
+            continue
+    raise OSError("could not reserve an evidence artifact")
+
+
+def _restore_existing_after_dirsync_failure(path: Path, backup: Path) -> None:
+    restoration: Path | None = None
+    try:
+        restoration = _copy_to_reserved_file(backup, suffix="restore.tmp")
+        os.replace(restoration, path)
+        restoration = None
+        _fsync_directory(path.parent)
+    except Exception:
+        _best_effort_unlink(restoration)
+        raise OSError("atomic evidence recovery incomplete; last-good backup retained") from None
+    _best_effort_unlink(backup)
+    raise OSError("atomic evidence publication was rolled back") from None
+
+
+def _retain_first_write_after_dirsync_failure() -> None:
+    raise OSError("atomic evidence durability unconfirmed; recoverable evidence retained") from None
+
+
+def _best_effort_unlink(path: Path | None) -> bool:
+    if path is None:
+        return True
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
 
 
 def _wav_proof(path: Path) -> AudioProof:

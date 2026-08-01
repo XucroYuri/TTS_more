@@ -111,6 +111,17 @@ def _write_voiced_wav(path: Path) -> None:
         output.writeframes(b"".join(struct.pack("<h", frame) for frame in frames))
 
 
+def _assert_scrubbed_atomic_error(error: BaseException, target: Path) -> None:
+    message = str(error)
+    assert "atomic evidence" in message
+    assert "injected-sentinel" not in message
+    assert str(target.parent) not in message
+
+
+def _atomic_artifacts(target: Path, suffix: str) -> list[Path]:
+    return sorted(target.parent.glob(f".{target.name}.*.{suffix}"))
+
+
 def test_fixture_models_reject_extra_and_bool_like_rounds() -> None:
     document = _fixture_document()
     document["rounds"] = True
@@ -196,32 +207,258 @@ def test_finalize_run_requires_exact_successful_steady_matrix_and_named_cases() 
     assert failed.cleanup_failures == ["cancel-index"]
 
 
-def test_atomic_evidence_preserves_prior_file_when_replace_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_atomic_existing_publish_replace_failure_never_moves_live_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     target = tmp_path / "summary.json"
-    write_atomic_json(target, {"status": "passed"})
-    original = target.read_bytes()
+    original = b'{"status":"passed"}\n'
+    target.write_bytes(original)
+    unrelated = tmp_path / ".summary.json.unrelated.bak"
+    unrelated.write_bytes(b"unrelated")
+    replace_calls: list[tuple[Path, Path]] = []
 
-    def fail_replace(_source: object, _target: object) -> None:
-        raise OSError("replace failed")
+    def fail_replace(source: object, destination: object) -> None:
+        replace_calls.append((Path(source), Path(destination)))
+        raise OSError(f"injected-sentinel replace failure at {target}")
 
     monkeypatch.setattr(os, "replace", fail_replace)
-    with pytest.raises(OSError, match="replace failed"):
+    with pytest.raises(OSError) as exc_info:
         write_atomic_json(target, {"status": "failed"})
+    _assert_scrubbed_atomic_error(exc_info.value, target)
+    assert len(replace_calls) == 1
+    assert replace_calls[0][0] != target
+    assert replace_calls[0][1] == target
     assert target.read_bytes() == original
-    assert list(tmp_path.glob(".summary.json.*.tmp")) == []
-    assert json.loads(target.read_text(encoding="utf-8")) == {"status": "passed"}
+    assert _atomic_artifacts(target, "tmp") == []
+    assert [path for path in _atomic_artifacts(target, "bak") if path != unrelated] == []
+    assert unrelated.read_bytes() == b"unrelated"
 
 
-def test_atomic_evidence_rolls_back_prior_file_when_directory_fsync_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_atomic_existing_dirsync_failure_restores_old_bytes_and_resyncs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     target = tmp_path / "summary.json"
-    write_atomic_json(target, {"status": "passed"})
-    original = target.read_bytes()
-    monkeypatch.setattr(reliability_validation, "_fsync_directory", lambda _directory: (_ for _ in ()).throw(OSError("fsync failed")))
-    with pytest.raises(OSError, match="fsync failed"):
+    original = b'{"status":"passed"}\n'
+    target.write_bytes(original)
+    sync_calls = 0
+
+    def fail_publish_sync(_directory: Path) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 2:
+            raise OSError(f"injected-sentinel dirsync failure at {target}")
+
+    monkeypatch.setattr(reliability_validation, "_fsync_directory", fail_publish_sync)
+    with pytest.raises(OSError) as exc_info:
         write_atomic_json(target, {"status": "failed"})
+    _assert_scrubbed_atomic_error(exc_info.value, target)
+    assert sync_calls == 3
     assert target.read_bytes() == original
-    assert list(tmp_path.glob(".summary.json.*.tmp")) == []
-    assert list(tmp_path.glob(".summary.json.*.bak")) == []
+    assert _atomic_artifacts(target, "tmp") == []
+    assert _atomic_artifacts(target, "bak") == []
+
+
+def test_atomic_existing_restore_failure_retains_byte_identical_last_good_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "summary.json"
+    original = b'{"status":"passed"}\n'
+    target.write_bytes(original)
+    real_replace = os.replace
+    target_replace_calls = 0
+    sync_calls = 0
+
+    def fail_publish_sync(_directory: Path) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 2:
+            raise OSError(f"injected-sentinel dirsync failure at {target}")
+
+    def fail_restore(source: object, destination: object) -> None:
+        nonlocal target_replace_calls
+        if Path(destination) == target:
+            target_replace_calls += 1
+            if target_replace_calls == 2:
+                raise OSError(f"injected-sentinel restore failure at {target}")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(reliability_validation, "_fsync_directory", fail_publish_sync)
+    monkeypatch.setattr(os, "replace", fail_restore)
+    with pytest.raises(OSError) as exc_info:
+        write_atomic_json(target, {"status": "failed"})
+    _assert_scrubbed_atomic_error(exc_info.value, target)
+    assert "recovery incomplete" in str(exc_info.value)
+    backups = _atomic_artifacts(target, "bak")
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+    assert json.loads(target.read_text(encoding="utf-8")) == {"status": "failed"}
+    assert _atomic_artifacts(target, "tmp") == []
+
+
+def test_atomic_committed_backup_cleanup_failure_returns_success_and_keeps_new_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "summary.json"
+    original = b'{"status":"passed"}\n'
+    target.write_bytes(original)
+    real_unlink = Path.unlink
+
+    def fail_backup_cleanup(path: Path, missing_ok: bool = False) -> None:
+        if path.suffix == ".bak":
+            raise OSError(f"injected-sentinel cleanup failure at {target}")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_backup_cleanup)
+    write_atomic_json(target, {"status": "failed"})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"status": "failed"}
+    backups = _atomic_artifacts(target, "bak")
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+    assert _atomic_artifacts(target, "tmp") == []
+
+
+def test_atomic_first_write_replace_failure_leaves_no_target_or_owned_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "summary.json"
+    unrelated = tmp_path / ".summary.json.unrelated.tmp"
+    unrelated.write_bytes(b"unrelated")
+    replace_calls: list[tuple[Path, Path]] = []
+
+    def fail_replace(source: object, destination: object) -> None:
+        replace_calls.append((Path(source), Path(destination)))
+        raise OSError(f"injected-sentinel replace failure at {target}")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError) as exc_info:
+        write_atomic_json(target, {"status": "passed"})
+    _assert_scrubbed_atomic_error(exc_info.value, target)
+    assert len(replace_calls) == 1
+    assert replace_calls[0][1] == target
+    assert target.exists() is False
+    assert [path for path in _atomic_artifacts(target, "tmp") if path != unrelated] == []
+    assert _atomic_artifacts(target, "bak") == []
+    assert unrelated.read_bytes() == b"unrelated"
+
+
+def test_atomic_first_write_dirsync_failure_retains_complete_target_when_removal_is_unproven(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "summary.json"
+    sync_calls = 0
+
+    def fail_first_sync(_directory: Path) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            raise OSError(f"injected-sentinel dirsync failure at {target}")
+
+    monkeypatch.setattr(reliability_validation, "_fsync_directory", fail_first_sync)
+    with pytest.raises(OSError) as exc_info:
+        write_atomic_json(target, {"status": "passed"})
+    _assert_scrubbed_atomic_error(exc_info.value, target)
+    assert "durability unconfirmed" in str(exc_info.value)
+    assert sync_calls == 1
+    assert json.loads(target.read_text(encoding="utf-8")) == {"status": "passed"}
+    assert _atomic_artifacts(target, "tmp") == []
+    assert _atomic_artifacts(target, "bak") == []
+
+
+def test_atomic_first_write_dirsync_failure_never_deletes_a_racing_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "summary.json"
+    racing_bytes = b'{"status":"racing-writer"}\n'
+
+    def install_racing_target_then_fail(_directory: Path) -> None:
+        target.write_bytes(racing_bytes)
+        raise OSError(f"injected-sentinel dirsync failure at {target}")
+
+    monkeypatch.setattr(reliability_validation, "_fsync_directory", install_racing_target_then_fail)
+    with pytest.raises(OSError) as exc_info:
+        write_atomic_json(target, {"status": "passed"})
+    _assert_scrubbed_atomic_error(exc_info.value, target)
+    assert "durability unconfirmed" in str(exc_info.value)
+    assert target.read_bytes() == racing_bytes
+    assert _atomic_artifacts(target, "bak") == []
+    assert _atomic_artifacts(target, "tmp") == []
+
+
+def test_atomic_existing_write_fsyncs_unique_backup_before_single_target_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "summary.json"
+    original = b'{"status":"passed"}\n'
+    target.write_bytes(original)
+    real_fsync = os.fsync
+    real_replace = os.replace
+    events: list[str] = []
+    replace_destinations: list[Path] = []
+    live_bytes_at_publish: list[bytes] = []
+
+    def record_fsync(descriptor: int) -> None:
+        events.append("fsync")
+        real_fsync(descriptor)
+
+    def record_replace(source: object, destination: object) -> None:
+        events.append("replace")
+        destination_path = Path(destination)
+        replace_destinations.append(destination_path)
+        if destination_path == target:
+            live_bytes_at_publish.append(target.read_bytes())
+        real_replace(source, destination)
+
+    def record_directory_sync(_directory: Path) -> None:
+        events.append("dirsync")
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "replace", record_replace)
+    monkeypatch.setattr(reliability_validation, "_fsync_directory", record_directory_sync)
+    write_atomic_json(target, {"status": "failed"})
+    assert events.index("replace") >= 2
+    assert events.index("dirsync") < events.index("replace")
+    assert replace_destinations == [target]
+    assert live_bytes_at_publish == [original]
+    assert json.loads(target.read_text(encoding="utf-8")) == {"status": "failed"}
+    assert _atomic_artifacts(target, "tmp") == []
+    assert _atomic_artifacts(target, "bak") == []
+
+
+def test_atomic_backup_names_are_unique_and_unrelated_files_are_never_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "summary.json"
+    initial = b'{"generation":0}\n'
+    target.write_bytes(initial)
+    unrelated = tmp_path / ".summary.json.unrelated.bak"
+    unrelated.write_bytes(b"unrelated")
+    real_unlink = Path.unlink
+
+    def retain_backups(path: Path, missing_ok: bool = False) -> None:
+        if path.suffix == ".bak" and path != unrelated:
+            raise OSError("injected-sentinel retained backup")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", retain_backups)
+    write_atomic_json(target, {"generation": 1})
+    generation_one = target.read_bytes()
+    write_atomic_json(target, {"generation": 2})
+
+    backups = [path for path in _atomic_artifacts(target, "bak") if path != unrelated]
+    assert len(backups) == 2
+    assert len({path.name for path in backups}) == 2
+    assert {path.read_bytes() for path in backups} == {initial, generation_one}
+    assert unrelated.read_bytes() == b"unrelated"
+    assert json.loads(target.read_text(encoding="utf-8")) == {"generation": 2}
 
 
 def test_fix_round_1_required_case_contract_rejects_steady_recovery_and_extra_steady_case() -> None:
