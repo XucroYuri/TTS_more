@@ -4030,6 +4030,235 @@ def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
     assert inventory.stdout.strip() == "0"
 
 
+def test_task_12_launcher_failure_arbitration_prefers_primary_and_fails_cleanup_only() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+$function = $ast.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Complete-LauncherFailureState'
+}, $true)
+if ($null -eq $function) { throw 'Complete-LauncherFailureState is missing' }
+Invoke-Expression $function.Extent.Text
+
+$primary = $null
+$cleanup = $null
+try { throw 'primary controlled startup failure' } catch { $primary = $_ }
+try { throw 'secondary injected cleanup query failure' } catch { $cleanup = $_ }
+
+$caught = $null
+try {
+    Complete-LauncherFailureState -PrimaryFailure $primary -CleanupFailure $cleanup
+} catch { $caught = $_ }
+if ($null -eq $caught -or $caught.Exception.Message -ne 'primary controlled startup failure') {
+    throw 'secondary cleanup failure replaced the primary startup failure'
+}
+
+$caught = $null
+try {
+    Complete-LauncherFailureState -PrimaryFailure $null -CleanupFailure $cleanup
+} catch { $caught = $_ }
+if (
+    $null -eq $caught -or
+    $caught.Exception.Message -ne 'Windows reliability cleanup verification failed'
+) { throw 'cleanup-only validation error incorrectly passed' }
+
+Complete-LauncherFailureState -PrimaryFailure $null -CleanupFailure $null
+Write-Output 'LAUNCHER_FAILURE_ARBITRATION_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "LAUNCHER_FAILURE_ARBITRATION_OK" in completed.stdout
+
+
+def test_task_12_wrapper_preserves_primary_error_when_cleanup_cim_query_fails(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    repository_root = Path(__file__).resolve().parents[2]
+    script_path = repository_root / "scripts" / "run-windows-comfyui-reliability.ps1"
+    output_root = tmp_path / "private failure evidence"
+    output_root.mkdir()
+    fixture_root = tmp_path / "fixture"
+    reference_root = fixture_root / "references"
+    reference_root.mkdir(parents=True)
+    resources: dict[str, dict[str, str]] = {}
+    for engine in ("gpt-sovits", "indextts", "cosyvoice"):
+        reference = reference_root / f"{engine}.wav"
+        reference.write_bytes(b"reference")
+        resources[engine] = {"reference_audio": f"references/{engine}.wav"}
+    fixture_path = fixture_root / "fixture.json"
+    fixture_path.write_text(json.dumps({"resources": resources}), encoding="utf-8")
+
+    comfy_root = tmp_path / "controlled ComfyUI cleanup query error"
+    (comfy_root / "custom_nodes" / "TTS-Audio-Suite").mkdir(parents=True)
+    (comfy_root / "main.py").write_text(
+        "import sys, time\n"
+        "sys.stdout.write('PRIMARY_ERROR_STDOUT')\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.write('PRIMARY_ERROR_STDERR')\n"
+        "sys.stderr.flush()\n"
+        "time.sleep(1.0)\n"
+        "raise SystemExit(31)\n",
+        encoding="utf-8",
+    )
+    registry_path = tmp_path / "resources.yaml"
+    registry_path.write_text("resources: {}\n", encoding="utf-8")
+    engine_roots: dict[str, Path] = {}
+    for engine in ("gpt-sovits", "indextts", "cosyvoice"):
+        engine_root = tmp_path / f"{engine}-root"
+        engine_root.mkdir()
+        engine_roots[engine] = engine_root
+
+    command = r"""
+$global:TTSMoreCleanupQueryErrors = 0
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    if ($Filter) {
+        $result = CimCmdlets\Get-CimInstance -ClassName $ClassName `
+            -Filter $Filter -ErrorAction Stop
+        if ($null -eq $result -and $Filter -match '^ProcessId = \d+$') {
+            $global:TTSMoreCleanupQueryErrors += 1
+            throw 'injected exact cleanup CIM query failure'
+        }
+        return $result
+    }
+    return @(CimCmdlets\Get-CimInstance -ClassName $ClassName -ErrorAction Stop)
+}
+
+$caught = $null
+try {
+    & $env:TTS_MORE_RELIABILITY_SCRIPT `
+        -Fixture $env:TTS_MORE_TEST_FIXTURE `
+        -OutputRoot $env:TTS_MORE_TEST_OUTPUT `
+        -ComfyUiRoot $env:TTS_MORE_TEST_COMFY_ROOT `
+        -ComfyPython $env:TTS_MORE_TEST_COMFY_PYTHON `
+        -TtsMoreRoot $env:TTS_MORE_TEST_TTS_ROOT `
+        -PreflightOnly
+} catch { $caught = $_ }
+if (
+    $null -eq $caught -or
+    $caught.Exception.Message -notlike 'Owned process exited before acquiring port 8188*'
+) { throw ('primary startup failure was not preserved: {0}' -f $caught) }
+if ($global:TTSMoreCleanupQueryErrors -ne 1) {
+    throw 'controlled cleanup CIM query error was not injected exactly once'
+}
+Write-Output 'PRIMARY_ERROR_SURVIVED_CLEANUP_QUERY_ERROR_OK'
+"""
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
+            "TTS_MORE_TEST_FIXTURE": str(fixture_path),
+            "TTS_MORE_TEST_OUTPUT": str(output_root),
+            "TTS_MORE_TEST_COMFY_ROOT": str(comfy_root),
+            "TTS_MORE_TEST_COMFY_PYTHON": str(Path(os.sys.executable).resolve()),
+            "TTS_MORE_TEST_TTS_ROOT": str(repository_root),
+            "TTS_MORE_RELIABILITY_GPT_SOVITS_ROOT": str(
+                engine_roots["gpt-sovits"]
+            ),
+            "TTS_MORE_RELIABILITY_INDEXTTS_ROOT": str(engine_roots["indextts"]),
+            "TTS_MORE_RELIABILITY_COSYVOICE_ROOT": str(engine_roots["cosyvoice"]),
+            "TTS_AUDIO_SUITE_RESOURCES": str(registry_path),
+        }
+    )
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+        timeout=20,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    combined_output = completed.stdout + completed.stderr
+    assert "PRIMARY_ERROR_SURVIVED_CLEANUP_QUERY_ERROR_OK" in completed.stdout
+    assert (
+        "WARNING: Process cleanup verification failed; preserving private "
+        "process, temp, and control evidence"
+    ) in combined_output
+    assert "injected exact cleanup CIM query failure" not in combined_output
+
+    sidecars = list(output_root.glob(".*-*.log"))
+    assert len(sidecars) == 4
+    comfy_stdout = next(output_root.glob(".comfyui-*.stdout.log"))
+    comfy_stderr = next(output_root.glob(".comfyui-*.stderr.log"))
+    backend_stdout = next(output_root.glob(".tts-more-*.stdout.log"))
+    backend_stderr = next(output_root.glob(".tts-more-*.stderr.log"))
+    assert comfy_stdout.read_bytes() == b"PRIMARY_ERROR_STDOUT"
+    assert comfy_stderr.read_bytes() == b"PRIMARY_ERROR_STDERR"
+    assert backend_stdout.read_bytes() == b""
+    assert backend_stderr.read_bytes() == b""
+    run_ids = {
+        path.name.removeprefix(".comfyui-")
+        .removeprefix(".tts-more-")
+        .split(".", 1)[0]
+        for path in sidecars
+    }
+    assert len(run_ids) == 1
+    (run_id,) = run_ids
+    assert list(output_root.glob(f"reliability-temp-{run_id}"))
+    assert list(output_root.glob(f".request-temp-{run_id}.owner.json"))
+    assert list(
+        output_root.glob(f".host-manifest-{run_id}.private.json.current.json")
+    )
+    assert not list(output_root.glob(f".host-manifest-{run_id}.private.json"))
+
+    inventory = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "@(CimCmdlets\\Get-CimInstance Win32_Process | Where-Object { "
+            "$_.CommandLine -and $_.CommandLine.Contains($env:TTS_MORE_TEST_RUN_ID) "
+            "}).Count",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**environment, "TTS_MORE_TEST_RUN_ID": run_id},
+        check=False,
+        timeout=30,
+    )
+    assert inventory.returncode == 0, inventory.stderr
+    assert inventory.stdout.strip() == "0"
+
+
 def test_task_10_powershell_identity_timestamps_compare_utc_instants_not_spelling() -> None:
     powershell = shutil.which("powershell.exe")
     if powershell is None:

@@ -756,6 +756,14 @@ function Remove-OwnedTempRoot {
     )
 }
 
+function Complete-LauncherFailureState {
+    param([object] $PrimaryFailure, [object] $CleanupFailure)
+    if ($null -ne $PrimaryFailure) { throw $PrimaryFailure }
+    if ($null -ne $CleanupFailure) {
+        throw 'Windows reliability cleanup verification failed'
+    }
+}
+
 $fixturePath = Resolve-ExistingPath -LiteralPath $Fixture -Kind File
 $comfyRootPath = Resolve-ExistingPath -LiteralPath $ComfyUiRoot -Kind Directory
 $comfyPythonPath = Resolve-ExistingPath -LiteralPath $ComfyPython -Kind File
@@ -822,6 +830,8 @@ $comfyRecord = $null
 $backendRecord = $null
 $startedProcesses = [System.Collections.Generic.List[object]]::new()
 $provisionalCleanupFailed = $false
+$primaryFailure = $null
+$cleanupFailure = $null
 try {
     $launcherRecord = Get-ProcessRecord -ProcessId $PID
     foreach ($port in @(8000, 8188)) {
@@ -931,109 +941,118 @@ try {
         Pop-Location
     }
     if ($validatorExitCode -ne 0) { throw 'Windows ComfyUI reliability gate failed' }
+} catch {
+    $primaryFailure = $_
 } finally {
-    # Python publishes public evidence before returning. Cleanup then touches
-    # only identities and temp paths created and revalidated by this run.
-    $latestBackendRecord = $backendRecord
-    $latestComfyRecord = $comfyRecord
-    $provisionalRecords = @{'tts-more' = $null; comfyui = $null}
-    $launchIntents = @{'tts-more' = $null; comfyui = $null}
-    $attemptedLabels = @{}
-    $controlStateValid = $true
-    $processCleanupProven = -not $provisionalCleanupFailed
-    if (Test-Path -LiteralPath $controlStatePath -PathType Leaf) {
-        try {
-            $controlState = Get-Content -LiteralPath $controlStatePath -Raw | ConvertFrom-Json
-            if ($controlState.version -eq 2 -and $controlState.run_id -eq $runId) {
-                $latestBackendRecord = $controlState.owned_processes.'tts-more'
-                $latestComfyRecord = $controlState.owned_processes.comfyui
-                foreach ($role in @('tts-more', 'comfyui')) {
-                    $provisionalRecords[$role] =
-                        $controlState.provisional_processes.PSObject.Properties[$role].Value
-                    $launchIntents[$role] =
-                        $controlState.launch_intents.PSObject.Properties[$role].Value
-                    $fullRecord = if ($role -eq 'tts-more') {
-                        $latestBackendRecord
-                    } else {
-                        $latestComfyRecord
+    try {
+        # Python publishes public evidence before returning. Cleanup then touches
+        # only identities and temp paths created and revalidated by this run.
+        $latestBackendRecord = $backendRecord
+        $latestComfyRecord = $comfyRecord
+        $provisionalRecords = @{'tts-more' = $null; comfyui = $null}
+        $launchIntents = @{'tts-more' = $null; comfyui = $null}
+        $attemptedLabels = @{}
+        $controlStateValid = $true
+        $processCleanupProven = -not $provisionalCleanupFailed
+        if (Test-Path -LiteralPath $controlStatePath -PathType Leaf) {
+            try {
+                $controlState = Get-Content -LiteralPath $controlStatePath -Raw | ConvertFrom-Json
+                if ($controlState.version -eq 2 -and $controlState.run_id -eq $runId) {
+                    $latestBackendRecord = $controlState.owned_processes.'tts-more'
+                    $latestComfyRecord = $controlState.owned_processes.comfyui
+                    foreach ($role in @('tts-more', 'comfyui')) {
+                        $provisionalRecords[$role] =
+                            $controlState.provisional_processes.PSObject.Properties[$role].Value
+                        $launchIntents[$role] =
+                            $controlState.launch_intents.PSObject.Properties[$role].Value
+                        $fullRecord = if ($role -eq 'tts-more') {
+                            $latestBackendRecord
+                        } else {
+                            $latestComfyRecord
+                        }
+                        if (
+                            $null -ne $fullRecord -or
+                            $null -ne $provisionalRecords[$role] -or
+                            $null -ne $launchIntents[$role]
+                        ) { $attemptedLabels[$role] = $true }
                     }
-                    if (
-                        $null -ne $fullRecord -or
-                        $null -ne $provisionalRecords[$role] -or
-                        $null -ne $launchIntents[$role]
-                    ) { $attemptedLabels[$role] = $true }
+                } else {
+                    Write-Warning 'Current process control state does not match this run; preserving replacement processes'
+                    $controlStateValid = $false
                 }
-            } else {
-                Write-Warning 'Current process control state does not match this run; preserving replacement processes'
+            } catch {
+                Write-Warning 'Current process control state is invalid; preserving replacement processes'
                 $controlStateValid = $false
             }
-        } catch {
-            Write-Warning 'Current process control state is invalid; preserving replacement processes'
+        } elseif ($startedProcesses.Count -gt 0) {
+            Write-Warning 'Current process control state is missing; preserving the validation temp root'
             $controlStateValid = $false
         }
-    } elseif ($startedProcesses.Count -gt 0) {
-        Write-Warning 'Current process control state is missing; preserving the validation temp root'
-        $controlStateValid = $false
-    }
-    if (-not $controlStateValid -and (Test-Path -LiteralPath $controlStatePath)) {
-        $attemptedLabels['unresolved-control'] = $true
-    }
-    if ($controlStateValid) {
-        foreach ($role in @('tts-more', 'comfyui')) {
-            $fullRecord = if ($role -eq 'tts-more') {
-                $latestBackendRecord
-            } else {
-                $latestComfyRecord
-            }
-            $provisionalRecord = $provisionalRecords[$role]
-            $launchIntent = $launchIntents[$role]
-            if ($null -ne $fullRecord) {
-                if ($null -ne $provisionalRecord -or $null -ne $launchIntent) {
-                    Write-Warning 'Process control state contains conflicting full and provisional identities'
-                    $processCleanupProven = $false
-                    continue
+        if (-not $controlStateValid -and (Test-Path -LiteralPath $controlStatePath)) {
+            $attemptedLabels['unresolved-control'] = $true
+        }
+        if ($controlStateValid) {
+            foreach ($role in @('tts-more', 'comfyui')) {
+                $fullRecord = if ($role -eq 'tts-more') {
+                    $latestBackendRecord
+                } else {
+                    $latestComfyRecord
                 }
-                if (-not (Stop-RecordedTree -Record $fullRecord)) {
-                    $processCleanupProven = $false
-                }
-                continue
-            }
-            if ($null -ne $provisionalRecord) {
-                if ($null -eq $launchIntent) {
-                    Write-Warning 'Provisional process identity is missing its launch intent'
-                    $processCleanupProven = $false
-                } elseif (-not (Stop-ProvisionalStartedProcess -Token $provisionalRecord)) {
-                    $processCleanupProven = $false
-                }
-                continue
-            }
-            if ($null -ne $launchIntent) {
-                try {
-                    $intentRecord = Resolve-LaunchIntentProcess -Intent $launchIntent
-                    if ($null -ne $intentRecord -and -not (Stop-RecordedTree -Record $intentRecord)) {
+                $provisionalRecord = $provisionalRecords[$role]
+                $launchIntent = $launchIntents[$role]
+                if ($null -ne $fullRecord) {
+                    if ($null -ne $provisionalRecord -or $null -ne $launchIntent) {
+                        Write-Warning 'Process control state contains conflicting full and provisional identities'
+                        $processCleanupProven = $false
+                        continue
+                    }
+                    if (-not (Stop-RecordedTree -Record $fullRecord)) {
                         $processCleanupProven = $false
                     }
-                } catch {
-                    Write-Warning 'Launch intent could not be resolved uniquely; preserving recovery records'
-                    $processCleanupProven = $false
+                    continue
+                }
+                if ($null -ne $provisionalRecord) {
+                    if ($null -eq $launchIntent) {
+                        Write-Warning 'Provisional process identity is missing its launch intent'
+                        $processCleanupProven = $false
+                    } elseif (-not (Stop-ProvisionalStartedProcess -Token $provisionalRecord)) {
+                        $processCleanupProven = $false
+                    }
+                    continue
+                }
+                if ($null -ne $launchIntent) {
+                    try {
+                        $intentRecord = Resolve-LaunchIntentProcess -Intent $launchIntent
+                        if ($null -ne $intentRecord -and -not (Stop-RecordedTree -Record $intentRecord)) {
+                            $processCleanupProven = $false
+                        }
+                    } catch {
+                        Write-Warning 'Launch intent could not be resolved uniquely; preserving recovery records'
+                        $processCleanupProven = $false
+                    }
                 }
             }
+        } else {
+            $processCleanupProven = $false
         }
-    } else {
-        $processCleanupProven = $false
+        $tempCleanupProven = $false
+        if ($processCleanupProven) {
+            $tempCleanupProven = Remove-OwnedTempRoot -Root $tempRoot -OwnerMarker $tempOwnerMarker `
+                -ExpectedRunId $runId -ResolvedOutputRoot $outputRootPath
+        } else {
+            Write-Warning 'Process cleanup was not proven; preserving the validation temp root and owner marker'
+        }
+        $ownedProcessCount = [Math]::Max($attemptedLabels.Count, $startedProcesses.Count)
+        $null = Remove-PrivateIdentityRecordsIfSafe `
+            -HostManifestPath $hostManifestPath `
+            -ControlStatePath $controlStatePath `
+            -ProcessCleanupProven $processCleanupProven `
+            -TempCleanupProven $tempCleanupProven `
+            -OwnedProcessCount $ownedProcessCount
+    } catch {
+        $cleanupFailure = $_
+        Write-Warning 'Process cleanup verification failed; preserving private process, temp, and control evidence'
     }
-    $tempCleanupProven = $false
-    if ($processCleanupProven) {
-        $tempCleanupProven = Remove-OwnedTempRoot -Root $tempRoot -OwnerMarker $tempOwnerMarker `
-            -ExpectedRunId $runId -ResolvedOutputRoot $outputRootPath
-    } else {
-        Write-Warning 'Process cleanup was not proven; preserving the validation temp root and owner marker'
-    }
-    $ownedProcessCount = [Math]::Max($attemptedLabels.Count, $startedProcesses.Count)
-    $null = Remove-PrivateIdentityRecordsIfSafe `
-        -HostManifestPath $hostManifestPath `
-        -ControlStatePath $controlStatePath `
-        -ProcessCleanupProven $processCleanupProven `
-        -TempCleanupProven $tempCleanupProven `
-        -OwnedProcessCount $ownedProcessCount
 }
+
+Complete-LauncherFailureState -PrimaryFailure $primaryFailure -CleanupFailure $cleanupFailure
