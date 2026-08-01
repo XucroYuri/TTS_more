@@ -6555,4 +6555,186 @@ Write-Output 'RECORDED_TREE_SNAPSHOT_REUSE_OK'
     assert "RECORDED_TREE_SNAPSHOT_REUSE_OK" in completed.stdout
 
 
+def test_task_12_validator_uses_backend_import_context_and_restores_launcher_cwd() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    repository_root = Path(__file__).resolve().parents[2]
+    backend_root = repository_root / "backend"
+    backend_python = backend_root / ".venv" / "Scripts" / "python.exe"
+    if not backend_python.is_file():
+        pytest.skip("The formal backend venv is unavailable")
+    script_path = repository_root / "scripts" / "run-windows-comfyui-reliability.ps1"
+
+    root_probe = subprocess.run(
+        [
+            str(backend_python),
+            "-m",
+            "app.comfyui.reliability_validation",
+            "--help",
+        ],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=30,
+    )
+    assert root_probe.returncode != 0
+    assert "No module named 'app'" in root_probe.stderr
+
+    backend_probe = subprocess.run(
+        [
+            str(backend_python),
+            "-m",
+            "app.comfyui.reliability_validation",
+            "--help",
+        ],
+        cwd=backend_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=30,
+    )
+    assert backend_probe.returncode == 0, backend_probe.stderr
+    assert "usage: reliability_validation.py" in backend_probe.stdout
+
+    command = r"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @('Invoke-ReliabilityValidator', 'Complete-LauncherFailureState')) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+
+$originalLocation = (Get-Location).Path
+$moduleArguments = @('-m', 'app.comfyui.reliability_validation', '--help')
+$null = Invoke-ReliabilityValidator `
+    -PythonPath $env:TTS_MORE_TEST_BACKEND_PYTHON `
+    -ValidatorArguments $moduleArguments `
+    -WorkingDirectory $env:TTS_MORE_TEST_BACKEND_ROOT
+if ((Get-Location).Path -ne $originalLocation) {
+    throw 'successful validator invocation did not restore the launcher location'
+}
+
+$nonzero = $null
+try {
+    Invoke-ReliabilityValidator `
+        -PythonPath $env:TTS_MORE_TEST_POWERSHELL `
+        -ValidatorArguments @('-NoProfile', '-NonInteractive', '-Command', 'exit 23') `
+        -WorkingDirectory $env:TTS_MORE_TEST_BACKEND_ROOT
+} catch { $nonzero = $_ }
+if (
+    $null -eq $nonzero -or
+    $nonzero.Exception.Message -ne 'Windows ComfyUI reliability gate failed'
+) { throw 'nonzero validator exit was not surfaced as the formal gate failure' }
+if ((Get-Location).Path -ne $originalLocation) {
+    throw 'nonzero validator invocation did not restore the launcher location'
+}
+
+$invocationError = $null
+try {
+    Invoke-ReliabilityValidator `
+        -PythonPath (Join-Path $env:TTS_MORE_TEST_BACKEND_ROOT 'missing-validator.exe') `
+        -ValidatorArguments @('--never-runs') `
+        -WorkingDirectory $env:TTS_MORE_TEST_BACKEND_ROOT
+} catch { $invocationError = $_ }
+if ($null -eq $invocationError) {
+    throw 'thrown validator invocation error was swallowed'
+}
+if ((Get-Location).Path -ne $originalLocation) {
+    throw 'thrown validator invocation did not restore the launcher location'
+}
+
+$cleanup = $null
+try { throw 'secondary injected cleanup failure' } catch { $cleanup = $_ }
+$arbitrated = $null
+try {
+    Complete-LauncherFailureState `
+        -PrimaryFailure $nonzero -CleanupFailure $cleanup
+} catch { $arbitrated = $_ }
+if (
+    $null -eq $arbitrated -or
+    $arbitrated.Exception.Message -ne 'Windows ComfyUI reliability gate failed'
+) { throw 'validator primary failure was replaced by cleanup failure' }
+if ((Get-Location).Path -ne $originalLocation) {
+    throw 'failure arbitration changed the launcher location'
+}
+
+$validatorCalls = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Invoke-ReliabilityValidator'
+}, $true))
+if ($validatorCalls.Count -ne 1) {
+    throw 'formal validator invocation is missing or ambiguous'
+}
+function Invoke-ReliabilityValidator {
+    param(
+        [string] $PythonPath,
+        [string[]] $ValidatorArguments,
+        [string] $WorkingDirectory
+    )
+    $script:capturedValidatorCall = [pscustomobject]@{
+        python_path = $PythonPath
+        arguments = @($ValidatorArguments)
+        working_directory = $WorkingDirectory
+    }
+}
+$backendPythonPath = $env:TTS_MORE_TEST_BACKEND_PYTHON
+$backendRootPath = $env:TTS_MORE_TEST_BACKEND_ROOT
+$pythonArguments = @(
+    '-m', 'app.comfyui.reliability_validation',
+    '--fixture', 'controlled fixture path',
+    '--preflight-only'
+)
+$script:capturedValidatorCall = $null
+Invoke-Expression $validatorCalls[0].Extent.Text
+if (
+    $null -eq $script:capturedValidatorCall -or
+    $script:capturedValidatorCall.python_path -ne $backendPythonPath -or
+    $script:capturedValidatorCall.working_directory -ne $backendRootPath -or
+    (@($script:capturedValidatorCall.arguments) -join "`0") -ne
+        ($pythonArguments -join "`0")
+) { throw 'formal validator wiring changed its executable, arguments, or backend context' }
+Write-Output 'VALIDATOR_BACKEND_CONTEXT_AND_RESTORATION_OK'
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={
+            **os.environ,
+            "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
+            "TTS_MORE_TEST_BACKEND_PYTHON": str(backend_python),
+            "TTS_MORE_TEST_BACKEND_ROOT": str(backend_root),
+            "TTS_MORE_TEST_POWERSHELL": powershell,
+        },
+        check=False,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "VALIDATOR_BACKEND_CONTEXT_AND_RESTORATION_OK" in completed.stdout
+
+
 REPOSITORY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")

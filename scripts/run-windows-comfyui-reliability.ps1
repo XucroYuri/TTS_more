@@ -1059,10 +1059,29 @@ function Complete-LauncherFailureState {
     }
 }
 
+function Invoke-ReliabilityValidator {
+    param(
+        [string] $PythonPath,
+        [string[]] $ValidatorArguments,
+        [string] $WorkingDirectory
+    )
+    Push-Location $WorkingDirectory
+    try {
+        & $PythonPath @ValidatorArguments
+        $validatorExitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($validatorExitCode -ne 0) {
+        throw 'Windows ComfyUI reliability gate failed'
+    }
+}
+
 $fixturePath = Resolve-ExistingPath -LiteralPath $Fixture -Kind File
 $comfyRootPath = Resolve-ExistingPath -LiteralPath $ComfyUiRoot -Kind Directory
 $comfyPythonPath = Resolve-ExistingPath -LiteralPath $ComfyPython -Kind File
 $ttsRootPath = Resolve-ExistingPath -LiteralPath $TtsMoreRoot -Kind Directory
+$backendRootPath = Resolve-ExistingPath -LiteralPath (Join-Path $ttsRootPath 'backend') -Kind Directory
 $backendPythonPath = Resolve-ExistingPath -LiteralPath (Join-Path $ttsRootPath 'backend\.venv\Scripts\python.exe') -Kind File
 $fixtureDocument = Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json
 
@@ -1264,14 +1283,8 @@ try {
     )
     if ($AllowLan) { $pythonArguments += '--allow-lan' }
     if ($PreflightOnly) { $pythonArguments += '--preflight-only' }
-    Push-Location $ttsRootPath
-    try {
-        & $backendPythonPath @pythonArguments
-        $validatorExitCode = $LASTEXITCODE
-    } finally {
-        Pop-Location
-    }
-    if ($validatorExitCode -ne 0) { throw 'Windows ComfyUI reliability gate failed' }
+    Invoke-ReliabilityValidator -PythonPath $backendPythonPath `
+        -ValidatorArguments $pythonArguments -WorkingDirectory $backendRootPath
 } catch {
     $primaryFailure = $_
 } finally {
