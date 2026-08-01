@@ -18,6 +18,7 @@ build/
 data/generated/
 data/.runtime/
 data/local/
+data/local/windows-reliability-fixture.json
 data/projects/
 data/demo/
 # Title-named project directories created by ProjectStore (sibling of data/)
@@ -25,6 +26,7 @@ Project/
 data/lan-tts-demo/
 data/real-validation/
 data/validation/
+data/validation/windows-reliability/
 data/parser_providers.json
 data/cache/
 data/cache/portable/

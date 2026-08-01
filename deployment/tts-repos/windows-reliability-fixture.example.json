@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "base_urls": {
+    "tts_more": "http://127.0.0.1:8000",
+    "comfyui": "http://127.0.0.1:8188"
+  },
+  "resources": {
+    "gpt-sovits": {"resource_id": "", "reference_audio": "", "reference_text": ""},
+    "indextts": {"resource_id": "", "reference_audio": "", "reference_text": ""},
+    "cosyvoice": {"resource_id": "", "reference_audio": "", "reference_text": ""}
+  },
+  "rounds": 10
+}

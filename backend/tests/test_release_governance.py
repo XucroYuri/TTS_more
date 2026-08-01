@@ -169,6 +169,34 @@ def test_comfyui_bridge_template_and_live_audit_are_machine_neutral() -> None:
     assert 'Path("D:/' not in audit_text
 
 
+def test_windows_reliability_fixture_example_is_redacted_and_private_outputs_are_ignored() -> None:
+    repo_root = _repo_root()
+    fixture_path = repo_root / "deployment" / "tts-repos" / "windows-reliability-fixture.example.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert fixture == {
+        "version": 1,
+        "base_urls": {"tts_more": "http://127.0.0.1:8000", "comfyui": "http://127.0.0.1:8188"},
+        "resources": {
+            "gpt-sovits": {"resource_id": "", "reference_audio": "", "reference_text": ""},
+            "indextts": {"resource_id": "", "reference_audio": "", "reference_text": ""},
+            "cosyvoice": {"resource_id": "", "reference_audio": "", "reference_text": ""},
+        },
+        "rounds": 10,
+    }
+    result = subprocess.run(
+        ["git", "check-ignore", "--stdin"],
+        cwd=repo_root,
+        input=b"data/local/windows-reliability-fixture.json\ndata/validation/windows-reliability/summary.json\n",
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert set(result.stdout.decode("utf-8").splitlines()) == {
+        "data/local/windows-reliability-fixture.json",
+        "data/validation/windows-reliability/summary.json",
+    }
+
+
 def test_committable_character_template_is_empty() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     template_path = repo_root / "data" / "templates" / "characters.example.json"
