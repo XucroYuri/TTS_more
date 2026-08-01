@@ -24,7 +24,8 @@ function Resolve-ExistingPath {
 function Get-PortOwnerPid {
     param([int] $Port)
     $owners = @(
-        Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
+        Get-NetTCPConnection -State Listen -ErrorAction Stop |
+            Where-Object { [int] $_.LocalPort -eq $Port } |
             Select-Object -ExpandProperty OwningProcess -Unique
     )
     if ($owners.Count -gt 1) { throw "Port $Port has multiple listening owners" }
@@ -218,15 +219,28 @@ function Write-LaunchIntentRunControlState {
         [ValidateSet('tts-more', 'comfyui')] [string] $ProcessLabel,
         [object] $LaunchIntent,
         [object] $BackendRecord,
-        [object] $ComfyRecord
+        [object] $ComfyRecord,
+        [object] $BackendLaunchRootRecord,
+        [object] $ComfyLaunchRootRecord
     )
+    if ($null -eq $BackendLaunchRootRecord) { $BackendLaunchRootRecord = $BackendRecord }
+    if ($null -eq $ComfyLaunchRootRecord) { $ComfyLaunchRootRecord = $ComfyRecord }
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
         $previous = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        $previousLaunchRoots = $previous.PSObject.Properties['launch_roots']
+        $previousBackendLaunchRoot = if ($null -eq $previousLaunchRoots) {
+            $previous.owned_processes.'tts-more'
+        } else { $previousLaunchRoots.Value.'tts-more' }
+        $previousComfyLaunchRoot = if ($null -eq $previousLaunchRoots) {
+            $previous.owned_processes.comfyui
+        } else { $previousLaunchRoots.Value.comfyui }
         if (
             $previous.version -ne 2 -or
             $previous.run_id -ne $RunId -or
             -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $previous.owned_processes.'tts-more') -or
             -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $previous.owned_processes.comfyui) -or
+            -not (Test-RecordDocumentMatches -Expected $BackendLaunchRootRecord -Actual $previousBackendLaunchRoot) -or
+            -not (Test-RecordDocumentMatches -Expected $ComfyLaunchRootRecord -Actual $previousComfyLaunchRoot) -or
             $null -ne $previous.provisional_processes.'tts-more' -or
             $null -ne $previous.provisional_processes.comfyui -or
             $null -ne $previous.launch_intents.'tts-more' -or
@@ -241,6 +255,10 @@ function Write-LaunchIntentRunControlState {
         owned_processes = [ordered]@{
             'tts-more' = $BackendRecord
             comfyui = $ComfyRecord
+        }
+        launch_roots = [ordered]@{
+            'tts-more' = $BackendLaunchRootRecord
+            comfyui = $ComfyLaunchRootRecord
         }
         provisional_processes = [ordered]@{
             'tts-more' = $null
@@ -259,6 +277,8 @@ function Write-LaunchIntentRunControlState {
         $persisted.run_id -ne $RunId -or
         -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $persisted.owned_processes.'tts-more') -or
         -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $persisted.owned_processes.comfyui) -or
+        -not (Test-RecordDocumentMatches -Expected $BackendLaunchRootRecord -Actual $persisted.launch_roots.'tts-more') -or
+        -not (Test-RecordDocumentMatches -Expected $ComfyLaunchRootRecord -Actual $persisted.launch_roots.comfyui) -or
         ($LaunchIntent | ConvertTo-Json -Depth 8 -Compress) -ne
             ($actualIntent | ConvertTo-Json -Depth 8 -Compress)
     ) { throw 'Pre-launch process recovery intent could not be revalidated' }
@@ -272,19 +292,32 @@ function Write-ProvisionalRunControlState {
         [object] $LaunchIntent,
         [object] $ProvisionalRecord,
         [object] $BackendRecord,
-        [object] $ComfyRecord
+        [object] $ComfyRecord,
+        [object] $BackendLaunchRootRecord,
+        [object] $ComfyLaunchRootRecord
     )
+    if ($null -eq $BackendLaunchRootRecord) { $BackendLaunchRootRecord = $BackendRecord }
+    if ($null -eq $ComfyLaunchRootRecord) { $ComfyLaunchRootRecord = $ComfyRecord }
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw 'Durable launch intent is missing before provisional identity write'
     }
     $previous = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
     $previousIntent = $previous.launch_intents.PSObject.Properties[$ProcessLabel].Value
     $otherLabel = if ($ProcessLabel -eq 'tts-more') { 'comfyui' } else { 'tts-more' }
+    $previousLaunchRoots = $previous.PSObject.Properties['launch_roots']
+    $previousBackendLaunchRoot = if ($null -eq $previousLaunchRoots) {
+        $previous.owned_processes.'tts-more'
+    } else { $previousLaunchRoots.Value.'tts-more' }
+    $previousComfyLaunchRoot = if ($null -eq $previousLaunchRoots) {
+        $previous.owned_processes.comfyui
+    } else { $previousLaunchRoots.Value.comfyui }
     if (
         $previous.version -ne 2 -or
         $previous.run_id -ne $RunId -or
         -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $previous.owned_processes.'tts-more') -or
         -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $previous.owned_processes.comfyui) -or
+        -not (Test-RecordDocumentMatches -Expected $BackendLaunchRootRecord -Actual $previousBackendLaunchRoot) -or
+        -not (Test-RecordDocumentMatches -Expected $ComfyLaunchRootRecord -Actual $previousComfyLaunchRoot) -or
         ($LaunchIntent | ConvertTo-Json -Depth 8 -Compress) -ne
             ($previousIntent | ConvertTo-Json -Depth 8 -Compress) -or
         $null -ne $previous.launch_intents.PSObject.Properties[$otherLabel].Value -or
@@ -301,6 +334,10 @@ function Write-ProvisionalRunControlState {
         owned_processes = [ordered]@{
             'tts-more' = $BackendRecord
             comfyui = $ComfyRecord
+        }
+        launch_roots = [ordered]@{
+            'tts-more' = $BackendLaunchRootRecord
+            comfyui = $ComfyLaunchRootRecord
         }
         provisional_processes = [ordered]@{
             'tts-more' = $backendProvisional
@@ -320,6 +357,8 @@ function Write-ProvisionalRunControlState {
         $persisted.run_id -ne $RunId -or
         -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $persisted.owned_processes.'tts-more') -or
         -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $persisted.owned_processes.comfyui) -or
+        -not (Test-RecordDocumentMatches -Expected $BackendLaunchRootRecord -Actual $persisted.launch_roots.'tts-more') -or
+        -not (Test-RecordDocumentMatches -Expected $ComfyLaunchRootRecord -Actual $persisted.launch_roots.comfyui) -or
         ($LaunchIntent | ConvertTo-Json -Depth 8 -Compress) -ne
             ($actualIntent | ConvertTo-Json -Depth 8 -Compress) -or
         ($ProvisionalRecord | ConvertTo-Json -Depth 8 -Compress) -ne
@@ -332,8 +371,12 @@ function Write-RunControlState {
         [string] $Path,
         [string] $RunId,
         [object] $BackendRecord,
-        [object] $ComfyRecord
+        [object] $ComfyRecord,
+        [object] $BackendLaunchRootRecord,
+        [object] $ComfyLaunchRootRecord
     )
+    if ($null -eq $BackendLaunchRootRecord) { $BackendLaunchRootRecord = $BackendRecord }
+    if ($null -eq $ComfyLaunchRootRecord) { $ComfyLaunchRootRecord = $ComfyRecord }
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
         $previous = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
         if ($previous.version -ne 2 -or $previous.run_id -ne $RunId) {
@@ -341,7 +384,14 @@ function Write-RunControlState {
         }
         foreach ($role in @('tts-more', 'comfyui')) {
             $fullRecord = if ($role -eq 'tts-more') { $BackendRecord } else { $ComfyRecord }
+            $launchRootRecord = if ($role -eq 'tts-more') {
+                $BackendLaunchRootRecord
+            } else { $ComfyLaunchRootRecord }
             $previousFull = $previous.owned_processes.PSObject.Properties[$role].Value
+            $previousLaunchRoots = $previous.PSObject.Properties['launch_roots']
+            $previousLaunchRoot = if ($null -eq $previousLaunchRoots) {
+                $previousFull
+            } else { $previousLaunchRoots.Value.PSObject.Properties[$role].Value }
             $provisional = $previous.provisional_processes.PSObject.Properties[$role].Value
             $intent = $previous.launch_intents.PSObject.Properties[$role].Value
             if ($null -ne $provisional -or $null -ne $intent) {
@@ -349,8 +399,13 @@ function Write-RunControlState {
                         -FullRecord $fullRecord -ProvisionalRecord $provisional -LaunchIntent $intent)) {
                     throw 'Full process identity does not promote the provisional recovery identity'
                 }
+                if (-not (Test-RecordDocumentMatches -Expected $fullRecord -Actual $launchRootRecord)) {
+                    throw 'Promoted process identity does not establish its launch root'
+                }
             } elseif (-not (Test-RecordDocumentMatches -Expected $previousFull -Actual $fullRecord)) {
                 throw 'Existing full process identity changed during control-state update'
+            } elseif (-not (Test-RecordDocumentMatches -Expected $previousLaunchRoot -Actual $launchRootRecord)) {
+                throw 'Existing launch-root identity changed during control-state update'
             }
         }
     }
@@ -360,6 +415,10 @@ function Write-RunControlState {
         owned_processes = [ordered]@{
             'tts-more' = $BackendRecord
             comfyui = $ComfyRecord
+        }
+        launch_roots = [ordered]@{
+            'tts-more' = $BackendLaunchRootRecord
+            comfyui = $ComfyLaunchRootRecord
         }
         provisional_processes = [ordered]@{
             'tts-more' = $null
@@ -377,6 +436,8 @@ function Write-RunControlState {
         $persisted.run_id -ne $RunId -or
         -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $persisted.owned_processes.'tts-more') -or
         -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $persisted.owned_processes.comfyui) -or
+        -not (Test-RecordDocumentMatches -Expected $BackendLaunchRootRecord -Actual $persisted.launch_roots.'tts-more') -or
+        -not (Test-RecordDocumentMatches -Expected $ComfyLaunchRootRecord -Actual $persisted.launch_roots.comfyui) -or
         $null -ne $persisted.provisional_processes.'tts-more' -or
         $null -ne $persisted.provisional_processes.comfyui -or
         $null -ne $persisted.launch_intents.'tts-more' -or
@@ -387,6 +448,84 @@ function Write-RunControlState {
             throw 'Persisted process identity no longer matches'
         }
     }
+}
+
+function Write-ListenerRunControlState {
+    param(
+        [string] $Path,
+        [string] $RunId,
+        [ValidateSet('tts-more', 'comfyui')] [string] $ProcessLabel,
+        [object] $LaunchRootRecord,
+        [object] $ListenerRecord,
+        [object] $BackendRecord,
+        [object] $ComfyRecord,
+        [object] $BackendLaunchRootRecord,
+        [object] $ComfyLaunchRootRecord
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'Launch-root recovery state is missing before listener promotion'
+    }
+    $previous = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $previousLaunchRoots = $previous.PSObject.Properties['launch_roots']
+    if ($null -eq $previousLaunchRoots) {
+        throw 'Launch-root recovery state is missing before listener promotion'
+    }
+    $previousRoot = $previousLaunchRoots.Value.PSObject.Properties[$ProcessLabel].Value
+    $previousListener = $previous.owned_processes.PSObject.Properties[$ProcessLabel].Value
+    if (
+        $previous.version -ne 2 -or
+        $previous.run_id -ne $RunId -or
+        -not (Test-RecordDocumentMatches -Expected $LaunchRootRecord -Actual $previousRoot) -or
+        -not (Test-RecordDocumentMatches -Expected $LaunchRootRecord -Actual $previousListener) -or
+        $null -ne $previous.provisional_processes.PSObject.Properties[$ProcessLabel].Value -or
+        $null -ne $previous.launch_intents.PSObject.Properties[$ProcessLabel].Value
+    ) { throw 'Existing control state does not accept listener promotion' }
+    if (
+        -not (Test-RecordDocumentMatches -Expected $BackendLaunchRootRecord -Actual $previous.launch_roots.'tts-more') -or
+        -not (Test-RecordDocumentMatches -Expected $ComfyLaunchRootRecord -Actual $previous.launch_roots.comfyui) -or
+        -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $previous.owned_processes.'tts-more') -or
+        -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $previous.owned_processes.comfyui)
+    ) { throw 'Other process control identity changed before listener promotion' }
+    if (
+        -not (Test-RecordedIdentity -Record $LaunchRootRecord) -or
+        -not (Test-RecordedIdentity -Record $ListenerRecord)
+    ) { throw 'Listener promotion identity no longer matches' }
+    $promotedBackend = if ($ProcessLabel -eq 'tts-more') { $ListenerRecord } else { $BackendRecord }
+    $promotedComfy = if ($ProcessLabel -eq 'comfyui') { $ListenerRecord } else { $ComfyRecord }
+    $document = [ordered]@{
+        version = 2
+        run_id = $RunId
+        owned_processes = [ordered]@{
+            'tts-more' = $promotedBackend
+            comfyui = $promotedComfy
+        }
+        launch_roots = [ordered]@{
+            'tts-more' = $BackendLaunchRootRecord
+            comfyui = $ComfyLaunchRootRecord
+        }
+        provisional_processes = [ordered]@{
+            'tts-more' = $null
+            comfyui = $null
+        }
+        launch_intents = [ordered]@{
+            'tts-more' = $null
+            comfyui = $null
+        }
+    }
+    Write-PrivateJsonAtomic -Path $Path -Document $document
+    $persisted = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if (
+        $persisted.version -ne 2 -or
+        $persisted.run_id -ne $RunId -or
+        -not (Test-RecordDocumentMatches -Expected $promotedBackend -Actual $persisted.owned_processes.'tts-more') -or
+        -not (Test-RecordDocumentMatches -Expected $promotedComfy -Actual $persisted.owned_processes.comfyui) -or
+        -not (Test-RecordDocumentMatches -Expected $BackendLaunchRootRecord -Actual $persisted.launch_roots.'tts-more') -or
+        -not (Test-RecordDocumentMatches -Expected $ComfyLaunchRootRecord -Actual $persisted.launch_roots.comfyui)
+    ) { throw 'Listener promotion control state could not be revalidated' }
+    if (
+        -not (Test-RecordedIdentity -Record $LaunchRootRecord) -or
+        -not (Test-RecordedIdentity -Record $ListenerRecord)
+    ) { throw 'Persisted listener promotion identity no longer matches' }
 }
 
 function Stop-ProvisionalStartedProcess {
@@ -537,6 +676,8 @@ function Start-ProvisionallyTrackedProcess {
         [string] $LaunchMarker,
         [object] $BackendRecord,
         [object] $ComfyRecord,
+        [object] $BackendLaunchRootRecord,
+        [object] $ComfyLaunchRootRecord,
         [string] $StandardOutputPath,
         [string] $StandardErrorPath,
         [ref] $ProvisionalCleanupFailed
@@ -573,7 +714,9 @@ function Start-ProvisionallyTrackedProcess {
     # post-start identity write fails.
     Write-LaunchIntentRunControlState -Path $ControlStatePath -RunId $RunId `
         -ProcessLabel $ProcessLabel -LaunchIntent $launchIntent `
-        -BackendRecord $BackendRecord -ComfyRecord $ComfyRecord
+        -BackendRecord $BackendRecord -ComfyRecord $ComfyRecord `
+        -BackendLaunchRootRecord $BackendLaunchRootRecord `
+        -ComfyLaunchRootRecord $ComfyLaunchRootRecord
     $encodedArgumentList = (@(
         foreach ($argument in $ArgumentList) {
             ConvertTo-WindowsCommandLineArgument -Argument $argument
@@ -616,7 +759,9 @@ function Start-ProvisionallyTrackedProcess {
         try {
             Write-ProvisionalRunControlState -Path $ControlStatePath -RunId $RunId `
                 -ProcessLabel $ProcessLabel -LaunchIntent $launchIntent `
-                -ProvisionalRecord $token -BackendRecord $BackendRecord -ComfyRecord $ComfyRecord
+                -ProvisionalRecord $token -BackendRecord $BackendRecord -ComfyRecord $ComfyRecord `
+                -BackendLaunchRootRecord $BackendLaunchRootRecord `
+                -ComfyLaunchRootRecord $ComfyLaunchRootRecord
         } catch {
             $persistenceFailure = $_
             $cleanupFailedRef = $ProvisionalCleanupFailed
@@ -636,20 +781,103 @@ function Start-ProvisionallyTrackedProcess {
     }
 }
 
+function Get-ExactCurrentProcessRecord {
+    param([object] $Record)
+    $current = Get-ProcessRecord -ProcessId ([int] $Record.pid)
+    if (-not (Test-RecordDocumentMatches -Expected $Record -Actual $current)) {
+        throw 'Recorded process identity changed'
+    }
+    return $current
+}
+
+function Resolve-DelegatedListenerRecord {
+    param(
+        [int] $ListenerProcessId,
+        [object] $LaunchRecord,
+        [object] $StartedAfter,
+        [object] $ObservedBefore
+    )
+    $launchCurrent = Get-ExactCurrentProcessRecord -Record $LaunchRecord
+    $listener = Get-ProcessRecord -ProcessId $ListenerProcessId
+    $startedAfterTicks = Get-UtcTicks -Value $StartedAfter
+    $observedBeforeTicks = Get-UtcTicks -Value $ObservedBefore
+    $listenerTicks = Get-UtcTicks -Value $listener.creation_time
+    $launchTicks = Get-UtcTicks -Value $launchCurrent.creation_time
+    if (
+        $listenerTicks -lt $startedAfterTicks -or
+        $listenerTicks -lt $launchTicks -or
+        $listenerTicks -gt $observedBeforeTicks
+    ) { throw 'Listening process falls outside the launch observation window' }
+
+    $candidate = $listener
+    $visited = @{}
+    for ($depth = 0; $depth -lt 64; $depth += 1) {
+        $candidatePid = [int] $candidate.pid
+        if ($visited.ContainsKey($candidatePid)) {
+            throw 'Listening process ancestry contains a cycle'
+        }
+        $visited[$candidatePid] = $true
+        if ($candidatePid -eq [int] $launchCurrent.pid) {
+            if (-not (Test-RecordDocumentMatches -Expected $launchCurrent -Actual $candidate)) {
+                throw 'Listening process ancestry reached a changed launch root'
+            }
+            return $listener
+        }
+        $parentPid = [int] $candidate.parent_pid
+        if ($parentPid -le 0 -or $parentPid -eq $candidatePid) {
+            throw 'Listening process ancestry is broken'
+        }
+        $parent = Get-ProcessRecord -ProcessId $parentPid
+        if (
+            (Get-UtcTicks -Value $parent.creation_time) -ne
+                (Get-UtcTicks -Value $candidate.parent_creation_time) -or
+            (Get-UtcTicks -Value $parent.creation_time) -gt
+                (Get-UtcTicks -Value $candidate.creation_time)
+        ) { throw 'Listening process ancestry identity changed' }
+        $candidate = $parent
+    }
+    throw 'Listening process ancestry exceeds the bounded depth'
+}
+
 function Wait-ExactPortOwner {
     param(
         [int] $Port,
         [int] $ProcessId,
         [int] $TimeoutSeconds = 180,
-        [object] $Process
+        [object] $Process,
+        [object] $LaunchRecord,
+        [object] $StartedAfter
     )
+    if ($null -ne $Process -and $Process.HasExited) {
+        $Process.WaitForExit()
+        throw "Owned process exited before acquiring port $Port; inspect the private child logs"
+    }
+    if ($null -eq $LaunchRecord) {
+        $LaunchRecord = Get-ProcessRecord -ProcessId $ProcessId
+    }
+    if ([int] $LaunchRecord.pid -ne $ProcessId) {
+        throw 'Tracked process PID does not match its launch identity'
+    }
+    if ($null -eq $StartedAfter) { $StartedAfter = $LaunchRecord.creation_time }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         if ($null -ne $Process -and $Process.HasExited) {
             $Process.WaitForExit()
             throw "Owned process exited before acquiring port $Port; inspect the private child logs"
         }
-        if ((Get-PortOwnerPid -Port $Port) -eq $ProcessId) { return }
+        $ownerPid = Get-PortOwnerPid -Port $Port
+        if ($null -ne $ownerPid) {
+            $observedBefore = [DateTime]::UtcNow.ToString('o')
+            $listener = Resolve-DelegatedListenerRecord `
+                -ListenerProcessId ([int] $ownerPid) -LaunchRecord $LaunchRecord `
+                -StartedAfter $StartedAfter -ObservedBefore $observedBefore
+            if ((Get-PortOwnerPid -Port $Port) -ne [int] $listener.pid) {
+                throw 'Listening port owner changed during identity promotion'
+            }
+            $null = Get-ExactCurrentProcessRecord -Record $listener
+            $null = Get-ExactCurrentProcessRecord -Record $LaunchRecord
+            return $listener
+        }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Owned process did not acquire port $Port"
@@ -705,6 +933,27 @@ function Stop-RecordedTree {
     } while ([DateTime]::UtcNow -lt $deadline)
     Write-Warning 'Recorded process tree did not stop; preserving the temp root'
     return $false
+}
+
+function Stop-RecordedProcessPair {
+    param([object] $LaunchRootRecord, [object] $ListenerRecord)
+    $cleanupProven = $true
+    $records = [System.Collections.Generic.List[object]]::new()
+    if ($null -ne $LaunchRootRecord) { $records.Add($LaunchRootRecord) }
+    if (
+        $null -ne $ListenerRecord -and
+        ($null -eq $LaunchRootRecord -or -not (Test-RecordDocumentMatches `
+            -Expected $LaunchRootRecord -Actual $ListenerRecord))
+    ) { $records.Add($ListenerRecord) }
+    foreach ($record in $records) {
+        try {
+            if (-not (Stop-RecordedTree -Record $record)) { $cleanupProven = $false }
+        } catch {
+            $cleanupProven = $false
+            Write-Warning 'Process cleanup verification failed; preserving private process, temp, and control evidence'
+        }
+    }
+    return $cleanupProven
 }
 
 function Test-PrivateIdentityRecordsCanBeRemoved {
@@ -859,6 +1108,8 @@ $controlStatePath = "{0}.current.json" -f $hostManifestPath
 
 $comfyRecord = $null
 $backendRecord = $null
+$comfyLaunchRootRecord = $null
+$backendLaunchRootRecord = $null
 $startedProcesses = [System.Collections.Generic.List[object]]::new()
 $provisionalCleanupFailed = $false
 $primaryFailure = $null
@@ -883,13 +1134,18 @@ try {
         -StartedProcesses $startedProcesses -ControlStatePath $controlStatePath `
         -RunId $runId -ProcessLabel 'comfyui' -LaunchMarker $comfyLaunchMarker `
         -BackendRecord $backendRecord -ComfyRecord $comfyRecord `
+        -BackendLaunchRootRecord $backendLaunchRootRecord `
+        -ComfyLaunchRootRecord $comfyLaunchRootRecord `
         -StandardOutputPath $comfyStdoutPath -StandardErrorPath $comfyStderrPath `
         -ProvisionalCleanupFailed ([ref] $provisionalCleanupFailed)
     $comfyProcess = $comfyStart.process
     try {
         $comfyRecord = Wait-ProcessRecord -ProcessId $comfyProcess.Id
+        $comfyLaunchRootRecord = $comfyRecord
         Write-RunControlState -Path $controlStatePath -RunId $runId `
-            -BackendRecord $backendRecord -ComfyRecord $comfyRecord
+            -BackendRecord $backendRecord -ComfyRecord $comfyRecord `
+            -BackendLaunchRootRecord $backendLaunchRootRecord `
+            -ComfyLaunchRootRecord $comfyLaunchRootRecord
     } catch {
         $startupFailure = $_
         Complete-ProvisionalStartupFailure `
@@ -897,7 +1153,15 @@ try {
             -CleanupFailed ([ref] $provisionalCleanupFailed) `
             -UnprovedWarning 'ComfyUI provisional process cleanup was not proven; preserving startup evidence'
     }
-    Wait-ExactPortOwner -Port 8188 -ProcessId $comfyProcess.Id -Process $comfyProcess
+    $comfyListenerRecord = Wait-ExactPortOwner -Port 8188 -ProcessId $comfyProcess.Id `
+        -Process $comfyProcess -LaunchRecord $comfyLaunchRootRecord `
+        -StartedAfter $comfyStart.token.started_after
+    Write-ListenerRunControlState -Path $controlStatePath -RunId $runId `
+        -ProcessLabel 'comfyui' -LaunchRootRecord $comfyLaunchRootRecord `
+        -ListenerRecord $comfyListenerRecord -BackendRecord $backendRecord `
+        -ComfyRecord $comfyRecord -BackendLaunchRootRecord $backendLaunchRootRecord `
+        -ComfyLaunchRootRecord $comfyLaunchRootRecord
+    $comfyRecord = $comfyListenerRecord
 
     $backendLaunchMarker = "tts_more_reliability_run=$runId-tts-more"
     $backendArguments = @(
@@ -910,13 +1174,18 @@ try {
         -StartedProcesses $startedProcesses -ControlStatePath $controlStatePath `
         -RunId $runId -ProcessLabel 'tts-more' -LaunchMarker $backendLaunchMarker `
         -BackendRecord $backendRecord -ComfyRecord $comfyRecord `
+        -BackendLaunchRootRecord $backendLaunchRootRecord `
+        -ComfyLaunchRootRecord $comfyLaunchRootRecord `
         -StandardOutputPath $backendStdoutPath -StandardErrorPath $backendStderrPath `
         -ProvisionalCleanupFailed ([ref] $provisionalCleanupFailed)
     $backendProcess = $backendStart.process
     try {
         $backendRecord = Wait-ProcessRecord -ProcessId $backendProcess.Id
+        $backendLaunchRootRecord = $backendRecord
         Write-RunControlState -Path $controlStatePath -RunId $runId `
-            -BackendRecord $backendRecord -ComfyRecord $comfyRecord
+            -BackendRecord $backendRecord -ComfyRecord $comfyRecord `
+            -BackendLaunchRootRecord $backendLaunchRootRecord `
+            -ComfyLaunchRootRecord $comfyLaunchRootRecord
     } catch {
         $startupFailure = $_
         Complete-ProvisionalStartupFailure `
@@ -924,7 +1193,15 @@ try {
             -CleanupFailed ([ref] $provisionalCleanupFailed) `
             -UnprovedWarning 'TTS More provisional process cleanup was not proven; preserving startup evidence'
     }
-    Wait-ExactPortOwner -Port 8000 -ProcessId $backendProcess.Id -Process $backendProcess
+    $backendListenerRecord = Wait-ExactPortOwner -Port 8000 -ProcessId $backendProcess.Id `
+        -Process $backendProcess -LaunchRecord $backendLaunchRootRecord `
+        -StartedAfter $backendStart.token.started_after
+    Write-ListenerRunControlState -Path $controlStatePath -RunId $runId `
+        -ProcessLabel 'tts-more' -LaunchRootRecord $backendLaunchRootRecord `
+        -ListenerRecord $backendListenerRecord -BackendRecord $backendRecord `
+        -ComfyRecord $comfyRecord -BackendLaunchRootRecord $backendLaunchRootRecord `
+        -ComfyLaunchRootRecord $comfyLaunchRootRecord
+    $backendRecord = $backendListenerRecord
 
     $hostManifest = [ordered]@{
         version = 1
@@ -932,6 +1209,10 @@ try {
         owned_processes = [ordered]@{
             'tts-more' = $backendRecord
             comfyui = $comfyRecord
+        }
+        launch_roots = [ordered]@{
+            'tts-more' = $backendLaunchRootRecord
+            comfyui = $comfyLaunchRootRecord
         }
         launch = [ordered]@{
             comfyui = [ordered]@{
@@ -963,8 +1244,8 @@ try {
         '--fixture', $fixturePath,
         '--output-root', $outputRootPath,
         '--host-manifest', $hostManifestPath,
-        '--comfyui-pid', [string] $comfyProcess.Id,
-        '--tts-more-pid', [string] $backendProcess.Id
+        '--comfyui-pid', [string] $comfyRecord.pid,
+        '--tts-more-pid', [string] $backendRecord.pid
     )
     if ($AllowLan) { $pythonArguments += '--allow-lan' }
     if ($PreflightOnly) { $pythonArguments += '--preflight-only' }
@@ -984,6 +1265,8 @@ try {
         # only identities and temp paths created and revalidated by this run.
         $latestBackendRecord = $backendRecord
         $latestComfyRecord = $comfyRecord
+        $latestBackendLaunchRootRecord = $backendLaunchRootRecord
+        $latestComfyLaunchRootRecord = $comfyLaunchRootRecord
         $provisionalRecords = @{'tts-more' = $null; comfyui = $null}
         $launchIntents = @{'tts-more' = $null; comfyui = $null}
         $attemptedLabels = @{}
@@ -995,6 +1278,14 @@ try {
                 if ($controlState.version -eq 2 -and $controlState.run_id -eq $runId) {
                     $latestBackendRecord = $controlState.owned_processes.'tts-more'
                     $latestComfyRecord = $controlState.owned_processes.comfyui
+                    $controlLaunchRoots = $controlState.PSObject.Properties['launch_roots']
+                    if ($null -eq $controlLaunchRoots) {
+                        $latestBackendLaunchRootRecord = $latestBackendRecord
+                        $latestComfyLaunchRootRecord = $latestComfyRecord
+                    } else {
+                        $latestBackendLaunchRootRecord = $controlLaunchRoots.Value.'tts-more'
+                        $latestComfyLaunchRootRecord = $controlLaunchRoots.Value.comfyui
+                    }
                     foreach ($role in @('tts-more', 'comfyui')) {
                         $provisionalRecords[$role] =
                             $controlState.provisional_processes.PSObject.Properties[$role].Value
@@ -1005,8 +1296,14 @@ try {
                         } else {
                             $latestComfyRecord
                         }
+                        $launchRootRecord = if ($role -eq 'tts-more') {
+                            $latestBackendLaunchRootRecord
+                        } else {
+                            $latestComfyLaunchRootRecord
+                        }
                         if (
                             $null -ne $fullRecord -or
+                            $null -ne $launchRootRecord -or
                             $null -ne $provisionalRecords[$role] -or
                             $null -ne $launchIntents[$role]
                         ) { $attemptedLabels[$role] = $true }
@@ -1033,6 +1330,11 @@ try {
                 } else {
                     $latestComfyRecord
                 }
+                $launchRootRecord = if ($role -eq 'tts-more') {
+                    $latestBackendLaunchRootRecord
+                } else {
+                    $latestComfyLaunchRootRecord
+                }
                 $provisionalRecord = $provisionalRecords[$role]
                 $launchIntent = $launchIntents[$role]
                 if ($null -ne $fullRecord) {
@@ -1041,10 +1343,17 @@ try {
                         $processCleanupProven = $false
                         continue
                     }
-                    if (-not (Stop-RecordedTree -Record $fullRecord)) {
+                    if (-not (Stop-RecordedProcessPair `
+                            -LaunchRootRecord $launchRootRecord -ListenerRecord $fullRecord)) {
                         $processCleanupProven = $false
                     }
                     continue
+                }
+                if ($null -ne $launchRootRecord) {
+                    if (-not (Stop-RecordedProcessPair `
+                            -LaunchRootRecord $launchRootRecord -ListenerRecord $null)) {
+                        $processCleanupProven = $false
+                    }
                 }
                 if ($null -ne $provisionalRecord) {
                     if ($null -eq $launchIntent) {

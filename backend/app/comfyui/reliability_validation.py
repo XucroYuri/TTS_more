@@ -722,6 +722,7 @@ class PrivateRestartLifecycle:
 class PrivateHostManifest:
     run_id: str
     owned_processes: dict[str, RecordedProcessIdentity]
+    launch_roots: dict[str, RecordedProcessIdentity]
     launch: dict[str, PrivateLaunchSpecification]
     boundary: PrivateBoundarySpecification
     temp_roots: tuple[Path, ...]
@@ -740,6 +741,16 @@ class PrivateHostManifest:
         owned = {
             label: RecordedProcessIdentity.from_document(value)
             for label, value in owned_raw.items()
+        }
+        launch_roots_raw = document.get("launch_roots")
+        if not isinstance(launch_roots_raw, dict) or set(launch_roots_raw) != {
+            "tts-more",
+            "comfyui",
+        }:
+            raise ValueError("host manifest launch root set is invalid")
+        launch_roots = {
+            label: RecordedProcessIdentity.from_document(value)
+            for label, value in launch_roots_raw.items()
         }
         launch_raw = document.get("launch")
         if not isinstance(launch_raw, dict) or set(launch_raw) != {"comfyui"}:
@@ -806,6 +817,7 @@ class PrivateHostManifest:
         return cls(
             run_id=run_id,
             owned_processes=owned,
+            launch_roots=launch_roots,
             launch=launch,
             boundary=boundary,
             temp_roots=temp_roots,
@@ -877,6 +889,7 @@ class WindowsReliabilityHostProbe:
         self.validation_root = self.manifest_path.parent
         self.control_state_path = Path(f"{self.manifest_path}.current.json")
         self._current: dict[str, RecordedProcessIdentity | None] = dict(manifest.owned_processes)
+        self._launch_roots: dict[str, RecordedProcessIdentity] = dict(manifest.launch_roots)
         self._active_cases: dict[str, object] = {}
         self._gpu_idle_baseline: GpuSnapshot | None = None
         self._runner_specifications: tuple[PrivateRunnerSpecification, ...] = ()
@@ -1087,6 +1100,7 @@ class WindowsReliabilityHostProbe:
         ):
             raise ValueError("restart full identity does not promote pending recovery state")
         self._current["comfyui"] = replacement
+        self._launch_roots["comfyui"] = replacement
         self._restart_intent = None
         self._restart_provisional = None
         self._persist_control_state()
@@ -1144,6 +1158,10 @@ class WindowsReliabilityHostProbe:
                 "owned_processes": {
                     label: identity.to_document() if identity is not None else None
                     for label, identity in self._current.items()
+                },
+                "launch_roots": {
+                    label: identity.to_document()
+                    for label, identity in self._launch_roots.items()
                 },
                 "provisional_processes": {
                     "tts-more": None,

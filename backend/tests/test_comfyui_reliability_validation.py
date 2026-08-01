@@ -5,6 +5,7 @@ import hashlib
 import math
 import os
 import shutil
+import socket
 import struct
 import subprocess
 import time
@@ -2932,7 +2933,7 @@ def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
         ),
         encoding="utf-8",
     )
-    return {
+    document = {
         "version": 1,
         "run_id": run_id,
         "owned_processes": {
@@ -2969,6 +2970,8 @@ def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
         },
         "temp_roots": [str(runner_temp_root), str(comfy_temp_root)],
     }
+    document["launch_roots"] = json.loads(json.dumps(document["owned_processes"]))
+    return document
 
 
 class _FakeWindowsHostSystem:
@@ -5658,6 +5661,8 @@ $comfyRecord = [ordered]@{
     parent_pid = 7000
     parent_creation_time = '2026-07-31T23:59:00Z'
 }
+$backendLaunchRootRecord = $backendRecord
+$comfyLaunchRootRecord = $comfyRecord
 $hostManifestAssignment = Find-SingleAssignment -VariableName 'hostManifest'
 Invoke-Expression $hostManifestAssignment.Extent.Text
 $hostManifest | ConvertTo-Json -Depth 10 |
@@ -5796,6 +5801,463 @@ Write-Output 'WRAPPER_MANIFEST_CAPTURE_OK'
         "restart_child": semantic_child_argv,
     }
     assert replacement == promoted[0]
+
+
+def test_task_12_delegated_windows_listener_is_promoted_from_exact_launch_root(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    listener_script = tmp_path / "delegated_listener.py"
+    listener_script.write_text(
+        "import socket, sys, time\n"
+        "with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:\n"
+        "    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+        "    listener.bind(('127.0.0.1', int(sys.argv[1])))\n"
+        "    listener.listen()\n"
+        "    time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    launcher_script = tmp_path / "venv_style_launcher.py"
+    launcher_script.write_text(
+        "import subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n"
+        "raise SystemExit(child.wait())\n",
+        encoding="utf-8",
+    )
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as available:
+        available.bind(("127.0.0.1", 0))
+        port = int(available.getsockname()[1])
+    base_python = Path(
+        getattr(os.sys, "_base_executable", os.sys.executable)
+    ).resolve()
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Get-PortOwnerPid',
+    'Get-ProcessRecord',
+    'Test-RecordDocumentMatches',
+    'Test-RecordedIdentity',
+    'Test-ProcessAbsent',
+    'Wait-ProcessRecord',
+    'ConvertTo-WindowsCommandLineArgument',
+    'Get-ExactCurrentProcessRecord',
+    'Resolve-DelegatedListenerRecord',
+    'Wait-ExactPortOwner',
+    'Stop-RecordedTree'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+
+$startedAfter = [DateTime]::UtcNow.AddMilliseconds(-100).ToString('o')
+$arguments = (@(
+    (ConvertTo-WindowsCommandLineArgument $env:TTS_MORE_DELEGATED_LAUNCHER),
+    (ConvertTo-WindowsCommandLineArgument $env:TTS_MORE_DELEGATED_LISTENER),
+    $env:TTS_MORE_DELEGATED_PORT
+)) -join ' '
+$process = Start-Process -FilePath $env:TTS_MORE_DELEGATED_PYTHON `
+    -ArgumentList $arguments -WorkingDirectory $env:TTS_MORE_DELEGATED_ROOT `
+    -WindowStyle Hidden -PassThru
+$launchRecord = $null
+try {
+    $launchRecord = Wait-ProcessRecord -ProcessId $process.Id -TimeoutSeconds 10
+    $listenerRecord = Wait-ExactPortOwner `
+        -Port ([int] $env:TTS_MORE_DELEGATED_PORT) `
+        -ProcessId $process.Id -Process $process -LaunchRecord $launchRecord `
+        -StartedAfter $startedAfter -TimeoutSeconds 10
+    if ([int] $listenerRecord.pid -eq [int] $launchRecord.pid) {
+        throw 'delegated listener was not returned as the actual owner'
+    }
+    if ((Get-PortOwnerPid ([int] $env:TTS_MORE_DELEGATED_PORT)) -ne [int] $listenerRecord.pid) {
+        throw 'returned listener no longer owns the delegated port'
+    }
+    if (-not (Test-RecordedIdentity $launchRecord) -or -not (Test-RecordedIdentity $listenerRecord)) {
+        throw 'promoted launch/listener identities are not both current'
+    }
+    Write-Output ('DELEGATED_LISTENER_PROMOTED:{0}:{1}' -f `
+        [int] $launchRecord.pid, [int] $listenerRecord.pid)
+} finally {
+    if ($null -ne $launchRecord) {
+        $null = Stop-RecordedTree -Record $launchRecord
+    } elseif (-not $process.HasExited) {
+        Stop-Process -Id $process.Id -Force -ErrorAction Stop
+        $process.WaitForExit()
+    }
+}
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={
+            **os.environ,
+            "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
+            "TTS_MORE_DELEGATED_PYTHON": str(base_python),
+            "TTS_MORE_DELEGATED_LAUNCHER": str(launcher_script),
+            "TTS_MORE_DELEGATED_LISTENER": str(listener_script),
+            "TTS_MORE_DELEGATED_ROOT": str(tmp_path),
+            "TTS_MORE_DELEGATED_PORT": str(port),
+        },
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "DELEGATED_LISTENER_PROMOTED:" in completed.stdout
+
+
+def test_task_12_delegated_listener_resolution_fails_closed_for_identity_anomalies() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Get-ProcessRecord',
+    'Test-RecordDocumentMatches',
+    'Get-ExactCurrentProcessRecord',
+    'Resolve-DelegatedListenerRecord',
+    'Wait-ExactPortOwner'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+
+function New-ProcessRow {
+    param(
+        [int] $ProcessId,
+        [int] $ParentProcessId,
+        [string] $Created,
+        [string] $ExecutablePath = 'C:\controlled\python.exe'
+    )
+    return [pscustomobject]@{
+        ProcessId = $ProcessId
+        ParentProcessId = $ParentProcessId
+        CreationDate = [DateTime]::Parse($Created).ToUniversalTime()
+        ExecutablePath = $ExecutablePath
+        CommandLine = ('python.exe controlled-{0}.py' -f $ProcessId)
+        Name = 'python.exe'
+    }
+}
+$script:root = New-ProcessRow 100 50 '2026-08-01T00:00:01Z'
+$script:listener = New-ProcessRow 200 100 '2026-08-01T00:00:02Z'
+$script:parent = New-ProcessRow 50 4 '2026-08-01T00:00:00Z'
+$script:foreign = New-ProcessRow 300 50 '2026-08-01T00:00:02Z'
+$script:mode = 'good'
+$script:queries = @{}
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    if ($script:mode -eq 'query-error') { throw 'injected ancestry query failure' }
+    $candidatePid = [int] ([regex]::Match($Filter, '\d+').Value)
+    if (-not $script:queries.ContainsKey($candidatePid)) { $script:queries[$candidatePid] = 0 }
+    $script:queries[$candidatePid] += 1
+    if ($script:mode -eq 'missing-parent' -and $candidatePid -eq 100) { return $null }
+    if ($script:mode -eq 'root-reuse' -and $candidatePid -eq 100 -and $script:queries[$candidatePid] -gt 1) {
+        return New-ProcessRow 100 50 '2026-08-01T00:00:03Z'
+    }
+    if ($script:mode -eq 'listener-reuse' -and $candidatePid -eq 200 -and $script:queries[$candidatePid] -gt 1) {
+        return New-ProcessRow 200 100 '2026-08-01T00:00:03Z'
+    }
+    if ($candidatePid -eq 100) { return $script:root }
+    if ($candidatePid -eq 200) { return $script:listener }
+    if ($candidatePid -eq 300) { return $script:foreign }
+    if ($candidatePid -eq 50) { return $script:parent }
+    return $null
+}
+function Get-PortOwnerPid {
+    param([int] $Port)
+    if ($script:mode -eq 'ambiguous') { throw 'Port 8000 has multiple listening owners' }
+    if ($script:mode -eq 'unrelated') { return 300 }
+    return 200
+}
+$tracked = [pscustomobject]@{ HasExited = $false }
+$launchRecord = [pscustomobject]@{
+    pid = 100
+    creation_time = '2026-08-01T00:00:01Z'
+    executable_path = 'C:\controlled\python.exe'
+    command_line = 'python.exe controlled-100.py'
+    parent_pid = 50
+    parent_creation_time = '2026-08-01T00:00:00Z'
+}
+$failures = [System.Collections.Generic.List[string]]::new()
+
+$listenerRecord = Wait-ExactPortOwner -Port 8000 -ProcessId 100 `
+    -Process $tracked -LaunchRecord $launchRecord `
+    -StartedAfter '2026-08-01T00:00:00Z' -TimeoutSeconds 1
+if ([int] $listenerRecord.pid -ne 200) {
+    $failures.Add('verified descendant listener was not accepted')
+}
+
+foreach ($case in @(
+    [pscustomobject]@{ mode = 'unrelated'; started = '2026-08-01T00:00:00Z' },
+    [pscustomobject]@{ mode = 'ambiguous'; started = '2026-08-01T00:00:00Z' },
+    [pscustomobject]@{ mode = 'missing-parent'; started = '2026-08-01T00:00:00Z' },
+    [pscustomobject]@{ mode = 'query-error'; started = '2026-08-01T00:00:00Z' },
+    [pscustomobject]@{ mode = 'root-reuse'; started = '2026-08-01T00:00:00Z' },
+    [pscustomobject]@{ mode = 'listener-reuse'; started = '2026-08-01T00:00:00Z' },
+    [pscustomobject]@{ mode = 'good'; started = '2026-08-01T00:00:02.500Z' }
+)) {
+    $script:mode = $case.mode
+    $script:queries = @{}
+    $caught = $null
+    try {
+        $null = Wait-ExactPortOwner -Port 8000 -ProcessId 100 `
+            -Process $tracked -LaunchRecord $launchRecord `
+            -StartedAfter $case.started -TimeoutSeconds 1
+    } catch { $caught = $_ }
+    if ($null -eq $caught) { $failures.Add("$($case.mode) was accepted") }
+}
+if ($failures.Count -ne 0) { throw ($failures -join '; ') }
+Write-Output 'DELEGATED_LISTENER_FAIL_CLOSED_OK'
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "TTS_MORE_RELIABILITY_SCRIPT": str(script_path)},
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "DELEGATED_LISTENER_FAIL_CLOSED_OK" in completed.stdout
+
+
+def test_task_12_python_control_preserves_launch_root_and_actual_listener(
+    tmp_path: Path,
+) -> None:
+    document = _host_manifest_document(tmp_path)
+    owned = document["owned_processes"]
+    launch_roots = document["launch_roots"]
+    assert isinstance(owned, dict)
+    assert isinstance(launch_roots, dict)
+    listener = owned["tts-more"]
+    assert isinstance(listener, dict)
+    root = dict(listener)
+    root.update(
+        {
+            "pid": 7999,
+            "creation_time": datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc).isoformat(),
+            "command_line": "venv-python.exe -m uvicorn app.main:app",
+        }
+    )
+    listener["parent_pid"] = 7999
+    listener["parent_creation_time"] = root["creation_time"]
+    launch_roots["tts-more"] = root
+    manifest_path = tmp_path / "host-manifest.json"
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+
+    manifest = reliability_validation.PrivateHostManifest.read(manifest_path)
+    system = _FakeWindowsHostSystem(document)
+    probe = reliability_validation.WindowsReliabilityHostProbe.from_manifest(
+        manifest_path,
+        system=system,
+    )
+    control = json.loads(
+        Path(f"{manifest_path}.current.json").read_text(encoding="utf-8")
+    )
+
+    assert manifest.launch_roots["tts-more"].pid == 7999
+    assert manifest.owned_processes["tts-more"].pid == 8000
+    assert control["launch_roots"]["tts-more"]["pid"] == 7999
+    assert control["owned_processes"]["tts-more"]["pid"] == 8000
+    assert probe.owned_processes["tts-more"].pid == 8000
+
+
+def test_task_12_listener_promotion_and_dual_identity_cleanup_fail_closed(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Test-RecordDocumentMatches',
+    'Write-PrivateJsonAtomic',
+    'Write-RunControlState',
+    'Write-ListenerRunControlState',
+    'Stop-RecordedProcessPair'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+function Test-RecordedIdentity { param([object] $Record) return $true }
+$root = [pscustomobject]@{
+    pid = 100
+    creation_time = '2026-08-01T00:00:01Z'
+    executable_path = 'C:\controlled\venv-python.exe'
+    command_line = 'venv-python.exe -m uvicorn app.main:app'
+    parent_pid = 50
+    parent_creation_time = '2026-08-01T00:00:00Z'
+}
+$listener = [pscustomobject]@{
+    pid = 200
+    creation_time = '2026-08-01T00:00:02Z'
+    executable_path = 'C:\controlled\python.exe'
+    command_line = 'python.exe -m uvicorn app.main:app'
+    parent_pid = 100
+    parent_creation_time = '2026-08-01T00:00:01Z'
+}
+$statePath = Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'control.json'
+$runId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+Write-RunControlState -Path $statePath -RunId $runId `
+    -BackendRecord $root -ComfyRecord $null `
+    -BackendLaunchRootRecord $root -ComfyLaunchRootRecord $null
+$initial = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+if (
+    [int] $initial.owned_processes.'tts-more'.pid -ne 100 -or
+    [int] $initial.launch_roots.'tts-more'.pid -ne 100
+) { throw 'initial launch root was not durably represented' }
+
+$script:realAtomicWriter = (Get-Command Write-PrivateJsonAtomic).ScriptBlock
+function Write-PrivateJsonAtomic { throw 'injected listener persistence failure' }
+$caught = $null
+try {
+    Write-ListenerRunControlState -Path $statePath -RunId $runId `
+        -ProcessLabel 'tts-more' -LaunchRootRecord $root -ListenerRecord $listener `
+        -BackendRecord $root -ComfyRecord $null `
+        -BackendLaunchRootRecord $root -ComfyLaunchRootRecord $null
+} catch { $caught = $_ }
+if ($null -eq $caught -or $caught.Exception.Message -ne 'injected listener persistence failure') {
+    throw 'listener persistence failure was not surfaced'
+}
+$retained = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+if (
+    [int] $retained.owned_processes.'tts-more'.pid -ne 100 -or
+    [int] $retained.launch_roots.'tts-more'.pid -ne 100
+) { throw 'failed listener persistence destroyed launch-root recovery state' }
+
+function Write-PrivateJsonAtomic {
+    param([string] $Path, [object] $Document)
+    & $script:realAtomicWriter -Path $Path -Document $Document
+}
+Write-ListenerRunControlState -Path $statePath -RunId $runId `
+    -ProcessLabel 'tts-more' -LaunchRootRecord $root -ListenerRecord $listener `
+    -BackendRecord $root -ComfyRecord $null `
+    -BackendLaunchRootRecord $root -ComfyLaunchRootRecord $null
+$promoted = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+if (
+    [int] $promoted.owned_processes.'tts-more'.pid -ne 200 -or
+    [int] $promoted.launch_roots.'tts-more'.pid -ne 100
+) { throw 'listener promotion did not retain both identities' }
+
+$script:stopCalls = [System.Collections.Generic.List[int]]::new()
+$script:stopMode = 'success'
+function Stop-RecordedTree {
+    param([object] $Record)
+    $script:stopCalls.Add([int] $Record.pid)
+    if ($script:stopMode -eq 'query-error' -and [int] $Record.pid -eq 100) {
+        throw 'injected cleanup identity query failure'
+    }
+    if ($script:stopMode -eq 'listener-failure' -and [int] $Record.pid -eq 200) {
+        return $false
+    }
+    return $true
+}
+if (-not (Stop-RecordedProcessPair -LaunchRootRecord $root -ListenerRecord $listener)) {
+    throw 'proved root/listener cleanup did not converge'
+}
+if ((@($script:stopCalls) -join ',') -ne '100,200') {
+    throw 'cleanup did not cover launch root then actual listener exactly once'
+}
+foreach ($mode in @('listener-failure', 'query-error')) {
+    $script:stopMode = $mode
+    $script:stopCalls.Clear()
+    if (Stop-RecordedProcessPair -LaunchRootRecord $root -ListenerRecord $listener) {
+        throw "$mode cleanup was incorrectly proven"
+    }
+    if ((@($script:stopCalls) -join ',') -ne '100,200') {
+        throw "$mode cleanup did not retain bounded coverage of both identities"
+    }
+}
+$script:stopMode = 'success'
+$script:stopCalls.Clear()
+if (-not (Stop-RecordedProcessPair -LaunchRootRecord $root -ListenerRecord $root)) {
+    throw 'identical root/listener cleanup did not converge'
+}
+if ((@($script:stopCalls) -join ',') -ne '100') {
+    throw 'identical root/listener was stopped more than once'
+}
+Write-Output 'LISTENER_PROMOTION_AND_CLEANUP_FAIL_CLOSED_OK'
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={
+            **os.environ,
+            "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
+            "TTS_MORE_PRIVATE_TEST_ROOT": str(tmp_path),
+        },
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "LISTENER_PROMOTION_AND_CLEANUP_FAIL_CLOSED_OK" in completed.stdout
 
 
 REPOSITORY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")
