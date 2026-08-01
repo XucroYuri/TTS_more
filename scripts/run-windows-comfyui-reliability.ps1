@@ -498,6 +498,31 @@ function Resolve-LaunchIntentProcess {
     return $resolved
 }
 
+function Complete-ProvisionalStartupFailure {
+    param(
+        [object] $PrimaryFailure,
+        [object] $Token,
+        [ref] $CleanupFailed,
+        [string] $UnprovedWarning
+    )
+    $cleanupError = $null
+    $cleanupProven = $false
+    try {
+        $cleanupProven = Stop-ProvisionalStartedProcess -Token $Token
+    } catch {
+        $cleanupError = $_
+    }
+    if (-not $cleanupProven) {
+        $CleanupFailed.Value = $true
+        if ($null -ne $cleanupError) {
+            Write-Warning 'Provisional process cleanup verification failed; preserving startup evidence'
+        } else {
+            Write-Warning $UnprovedWarning
+        }
+    }
+    throw $PrimaryFailure
+}
+
 function Start-ProvisionallyTrackedProcess {
     param(
         [string] $FilePath,
@@ -513,7 +538,8 @@ function Start-ProvisionallyTrackedProcess {
         [object] $BackendRecord,
         [object] $ComfyRecord,
         [string] $StandardOutputPath,
-        [string] $StandardErrorPath
+        [string] $StandardErrorPath,
+        [ref] $ProvisionalCleanupFailed
     )
     if ($LaunchMarker -notmatch '^tts_more_reliability_run=[0-9a-f]{32}-(tts-more|comfyui)$') {
         throw 'Launch marker is invalid'
@@ -593,10 +619,15 @@ function Start-ProvisionallyTrackedProcess {
                 -ProvisionalRecord $token -BackendRecord $BackendRecord -ComfyRecord $ComfyRecord
         } catch {
             $persistenceFailure = $_
-            if (-not (Stop-ProvisionalStartedProcess -Token $token)) {
-                Write-Warning 'Provisional identity write failed; preserving the durable launch intent'
+            $cleanupFailedRef = $ProvisionalCleanupFailed
+            if ($null -eq $cleanupFailedRef) {
+                $localCleanupFailed = $false
+                $cleanupFailedRef = [ref] $localCleanupFailed
             }
-            throw $persistenceFailure
+            Complete-ProvisionalStartupFailure `
+                -PrimaryFailure $persistenceFailure -Token $token `
+                -CleanupFailed $cleanupFailedRef `
+                -UnprovedWarning 'Provisional identity write failed; preserving the durable launch intent'
         }
         return [pscustomobject]@{ process = $process; token = $token }
     } finally {
@@ -852,17 +883,19 @@ try {
         -StartedProcesses $startedProcesses -ControlStatePath $controlStatePath `
         -RunId $runId -ProcessLabel 'comfyui' -LaunchMarker $comfyLaunchMarker `
         -BackendRecord $backendRecord -ComfyRecord $comfyRecord `
-        -StandardOutputPath $comfyStdoutPath -StandardErrorPath $comfyStderrPath
+        -StandardOutputPath $comfyStdoutPath -StandardErrorPath $comfyStderrPath `
+        -ProvisionalCleanupFailed ([ref] $provisionalCleanupFailed)
     $comfyProcess = $comfyStart.process
     try {
         $comfyRecord = Wait-ProcessRecord -ProcessId $comfyProcess.Id
         Write-RunControlState -Path $controlStatePath -RunId $runId `
             -BackendRecord $backendRecord -ComfyRecord $comfyRecord
     } catch {
-        if (-not (Stop-ProvisionalStartedProcess -Token $comfyStart.token)) {
-            $provisionalCleanupFailed = $true
-        }
-        throw
+        $startupFailure = $_
+        Complete-ProvisionalStartupFailure `
+            -PrimaryFailure $startupFailure -Token $comfyStart.token `
+            -CleanupFailed ([ref] $provisionalCleanupFailed) `
+            -UnprovedWarning 'ComfyUI provisional process cleanup was not proven; preserving startup evidence'
     }
     Wait-ExactPortOwner -Port 8188 -ProcessId $comfyProcess.Id -Process $comfyProcess
 
@@ -877,17 +910,19 @@ try {
         -StartedProcesses $startedProcesses -ControlStatePath $controlStatePath `
         -RunId $runId -ProcessLabel 'tts-more' -LaunchMarker $backendLaunchMarker `
         -BackendRecord $backendRecord -ComfyRecord $comfyRecord `
-        -StandardOutputPath $backendStdoutPath -StandardErrorPath $backendStderrPath
+        -StandardOutputPath $backendStdoutPath -StandardErrorPath $backendStderrPath `
+        -ProvisionalCleanupFailed ([ref] $provisionalCleanupFailed)
     $backendProcess = $backendStart.process
     try {
         $backendRecord = Wait-ProcessRecord -ProcessId $backendProcess.Id
         Write-RunControlState -Path $controlStatePath -RunId $runId `
             -BackendRecord $backendRecord -ComfyRecord $comfyRecord
     } catch {
-        if (-not (Stop-ProvisionalStartedProcess -Token $backendStart.token)) {
-            $provisionalCleanupFailed = $true
-        }
-        throw
+        $startupFailure = $_
+        Complete-ProvisionalStartupFailure `
+            -PrimaryFailure $startupFailure -Token $backendStart.token `
+            -CleanupFailed ([ref] $provisionalCleanupFailed) `
+            -UnprovedWarning 'TTS More provisional process cleanup was not proven; preserving startup evidence'
     }
     Wait-ExactPortOwner -Port 8000 -ProcessId $backendProcess.Id -Process $backendProcess
 

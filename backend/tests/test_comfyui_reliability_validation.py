@@ -4099,6 +4099,101 @@ Write-Output 'LAUNCHER_FAILURE_ARBITRATION_OK'
     assert "LAUNCHER_FAILURE_ARBITRATION_OK" in completed.stdout
 
 
+def test_task_12_startup_stage_cleanup_preserves_primary_and_marks_unproved() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+$function = $ast.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Complete-ProvisionalStartupFailure'
+}, $true)
+if ($null -eq $function) { throw 'Complete-ProvisionalStartupFailure is missing' }
+Invoke-Expression $function.Extent.Text
+
+function Stop-ProvisionalStartedProcess {
+    param([object] $Token)
+    if ($script:stopMode -eq 'error') { throw 'raw injected cleanup query error' }
+    return ($script:stopMode -eq 'success')
+}
+function Write-Warning {
+    param([object] $Message)
+    $script:warningMessages.Add([string] $Message)
+}
+
+foreach ($case in @(
+    [pscustomobject]@{ mode = 'error'; failed = $true; warning =
+        'Provisional process cleanup verification failed; preserving startup evidence' },
+    [pscustomobject]@{ mode = 'unproved'; failed = $true; warning =
+        'controlled cleanup did not converge' },
+    [pscustomobject]@{ mode = 'success'; failed = $false; warning = $null }
+)) {
+    $script:stopMode = $case.mode
+    $primary = $null
+    try { throw 'primary process-record startup failure' } catch { $primary = $_ }
+    $cleanupFailed = $false
+    $script:warningMessages = [System.Collections.Generic.List[string]]::new()
+    $caught = $null
+    try {
+        Complete-ProvisionalStartupFailure `
+            -PrimaryFailure $primary -Token ([pscustomobject]@{ pid = 4242 }) `
+            -CleanupFailed ([ref]$cleanupFailed) `
+            -UnprovedWarning 'controlled cleanup did not converge'
+    } catch { $caught = $_ }
+    if (
+        $null -eq $caught -or
+        $caught.Exception.Message -ne 'primary process-record startup failure'
+    ) { throw "startup primary was replaced for $($case.mode) cleanup" }
+    if ($cleanupFailed -ne $case.failed) {
+        throw "cleanup proof state was wrong for $($case.mode) cleanup"
+    }
+    $warningText = @($script:warningMessages) -join "`n"
+    if ($null -eq $case.warning) {
+        if ($warningText) { throw 'successful inner cleanup emitted a warning' }
+    } elseif ($warningText -notlike "*$($case.warning)*") {
+        throw "missing neutral inner cleanup warning for $($case.mode) cleanup"
+    }
+    if ($warningText -like '*raw injected cleanup query error*') {
+        throw 'raw inner cleanup error leaked into diagnostics'
+    }
+}
+Write-Output 'STARTUP_STAGE_PRIMARY_ARBITRATION_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "STARTUP_STAGE_PRIMARY_ARBITRATION_OK" in completed.stdout
+    assert "raw injected cleanup query error" not in (
+        completed.stdout + completed.stderr
+    )
+
+
 def test_task_12_wrapper_preserves_primary_error_when_cleanup_cim_query_fails(
     tmp_path: Path,
 ) -> None:
@@ -4411,6 +4506,7 @@ foreach ($name in @(
     'Write-PrivateJsonAtomic',
     'Write-LaunchIntentRunControlState',
     'Write-ProvisionalRunControlState',
+    'Complete-ProvisionalStartupFailure',
     'Start-ProvisionallyTrackedProcess',
     'Write-RunControlState'
 )) {
@@ -4548,6 +4644,7 @@ foreach ($name in @(
     'Write-PrivateJsonAtomic',
     'Write-LaunchIntentRunControlState',
     'Write-ProvisionalRunControlState',
+    'Complete-ProvisionalStartupFailure',
     'Start-ProvisionallyTrackedProcess'
 )) {
     $function = $ast.Find({
@@ -4583,7 +4680,7 @@ $script:stopCalls = 0
 function Stop-ProvisionalStartedProcess {
     param([object] $Token)
     $script:stopCalls += 1
-    return $false
+    throw 'raw injected persistence cleanup query error'
 }
 $statePath = Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'retry-control.json'
 $launcher = [pscustomobject]@{
@@ -4593,7 +4690,7 @@ $launcher = [pscustomobject]@{
 $started = New-Object 'System.Collections.Generic.List[object]'
 $runId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 $marker = "tts_more_reliability_run=$runId-comfyui"
-$threw = $false
+$caught = $null
 try {
     $null = Start-ProvisionallyTrackedProcess `
         -FilePath (Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'python.exe') `
@@ -4602,8 +4699,14 @@ try {
         -StartedProcesses $started -ControlStatePath $statePath `
         -RunId $runId -ProcessLabel 'comfyui' -LaunchMarker $marker `
         -BackendRecord $null -ComfyRecord $null
-} catch { $threw = $true }
-if (-not $threw -or $script:startCalls -ne 1 -or $script:stopCalls -ne 1 -or $script:atomicCalls -ne 2) {
+} catch { $caught = $_ }
+if (
+    $null -eq $caught -or
+    $caught.Exception.Message -ne 'injected provisional persistence failure' -or
+    $script:startCalls -ne 1 -or
+    $script:stopCalls -ne 1 -or
+    $script:atomicCalls -ne 2
+) {
     throw 'failed provisional persistence did not attempt safe convergence before exit'
 }
 if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
@@ -4671,6 +4774,12 @@ Write-Output 'PROVISIONAL_PERSISTENCE_FAILURE_OK'
 
     assert completed.returncode == 0, completed.stderr
     assert "PROVISIONAL_PERSISTENCE_FAILURE_OK" in completed.stdout
+    combined_output = completed.stdout + completed.stderr
+    assert (
+        "Provisional process cleanup verification failed; preserving startup evidence"
+        in combined_output
+    )
+    assert "raw injected persistence cleanup query error" not in combined_output
 
 
 def test_fix_round_2_powershell_launch_intent_resolver_is_unique_and_fail_closed(
@@ -5454,6 +5563,7 @@ foreach ($name in @(
     'Write-PrivateJsonAtomic',
     'Write-LaunchIntentRunControlState',
     'Write-ProvisionalRunControlState',
+    'Complete-ProvisionalStartupFailure',
     'Start-ProvisionallyTrackedProcess'
 )) {
     $function = $ast.Find({
