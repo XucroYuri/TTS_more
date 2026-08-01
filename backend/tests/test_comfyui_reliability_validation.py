@@ -59,6 +59,28 @@ def _case(case_id: str, engine: str, *, phase: str = "steady", expected: str = "
             frames=800,
             peak=0.25,
         )
+    tts_more = None
+    if phase == "fault" and expected in {"cancelled", "timeout"} and actual == expected:
+        terminal_status = "cancelled" if expected == "cancelled" else "failed"
+        control_code = "cancelled" if expected == "cancelled" else "timeout"
+        prompt_id = f"prompt-{case_id}"
+        tts_more = reliability_validation.TtsTerminalEvidence(
+            job_status=terminal_status,
+            item_status=terminal_status,
+            version_status=terminal_status,
+            manifest_version_absent=False,
+            version_audio_absent=True,
+            control=reliability_validation.FaultControlEvidence(
+                control_code=control_code,
+                failure_stage=None if expected == "cancelled" else "timeout",
+                prompt_id=prompt_id,
+                initial_state="running",
+                final_state="interrupted",
+                actions=["interrupt"],
+                duration_seconds=0.5,
+                converged=True,
+            ),
+        )
     return CaseEvidence(
         case_id=case_id,
         phase=phase,
@@ -71,6 +93,7 @@ def _case(case_id: str, engine: str, *, phase: str = "steady", expected: str = "
         started_at=started_at,
         finished_at=finished_at,
         audio=audio,
+        tts_more=tts_more,
         cleanup=CleanupEvidence(ok=cleanup_ok, owned_processes_stopped=True, temp_paths_removed=True),
         processes=[ProcessEvidence(pid=123, ownership="validator-owned", command_hash="a" * 64, creation_time=started_at + timedelta(seconds=2), parent_pid=1, parent_creation_time=started_at + timedelta(seconds=1), stopped_at=finished_at - timedelta(seconds=1), executable_name="python.exe", executable_hash="a" * 64, ownership_hash="b" * 64, started=True, stopped=True, descendants_stopped=True, alive_after=False)],
         comfyui=ComfyQueueEvidence(queue_empty=True, history_present=True, prompt_id=f"prompt-{case_id}", queue_before_prompt_ids=[f"prompt-{case_id}"], queue_after_prompt_ids=[], history_prompt_ids=[f"prompt-{case_id}"], terminal_history_status=actual),
@@ -1321,6 +1344,8 @@ def test_task_10_queued_cancel_uses_tts_terminal_proof_without_fabricated_prompt
                 "item_status": "cancelled",
                 "version_status": None,
                 "manifest_version_absent": True,
+                "version_audio_absent": True,
+                "control": None,
             },
         }
     )
@@ -1350,11 +1375,11 @@ def test_task_10_queued_cancel_rejects_missing_tts_version_or_any_prompt_claim()
             "prompt_id": None,
             "version_id": None,
             "comfyui": None,
-            "tts_more": {"job_status": "cancelled", "item_status": "cancelled", "version_status": "failed", "manifest_version_absent": False},
+            "tts_more": {"job_status": "cancelled", "item_status": "cancelled", "version_status": "failed", "manifest_version_absent": False, "version_audio_absent": True, "control": None},
         },
         {
             "prompt_submitted": True,
-            "tts_more": {"job_status": "cancelled", "item_status": "cancelled", "version_status": None, "manifest_version_absent": True},
+            "tts_more": {"job_status": "cancelled", "item_status": "cancelled", "version_status": None, "manifest_version_absent": True, "version_audio_absent": True, "control": None},
         },
     ):
         with pytest.raises(ValidationError, match="queue/history proof"):
@@ -1424,6 +1449,7 @@ class _ExecutorHttpProbe:
                     item_status="cancelled",
                     version_status=None,
                     manifest_version_absent=True,
+                    version_audio_absent=True,
                 ),
             )
         if case.action == "terminate-comfyui":
@@ -1440,6 +1466,7 @@ class _ExecutorHttpProbe:
                     item_status="failed",
                     version_status="failed",
                     manifest_version_absent=False,
+                    version_audio_absent=True,
                 ),
                 termination=reliability_validation.TerminationEvidence(
                     endpoint_unavailable=True,
@@ -1449,6 +1476,27 @@ class _ExecutorHttpProbe:
                 ),
             )
         prompt_id = f"prompt-{case.case_id}"
+        tts_more = None
+        if case.action in {"cancel-running", "timeout"}:
+            terminal_status = "cancelled" if case.action == "cancel-running" else "failed"
+            control_code = "cancelled" if case.action == "cancel-running" else "timeout"
+            tts_more = reliability_validation.TtsTerminalEvidence(
+                job_status=terminal_status,
+                item_status=terminal_status,
+                version_status=terminal_status,
+                manifest_version_absent=False,
+                version_audio_absent=True,
+                control=reliability_validation.FaultControlEvidence(
+                    control_code=control_code,
+                    failure_stage=None if case.action == "cancel-running" else "timeout",
+                    prompt_id=prompt_id,
+                    initial_state="running",
+                    final_state="interrupted",
+                    actions=["interrupt"],
+                    duration_seconds=0.5,
+                    converged=True,
+                ),
+            )
         return reliability_validation.HttpCaseObservation(
             actual=case.expected,
             job_id=f"job-{case.case_id}",
@@ -1464,6 +1512,7 @@ class _ExecutorHttpProbe:
                 history_prompt_ids=[prompt_id],
                 terminal_history_status=case.expected,
             ),
+            tts_more=tts_more,
         )
 
     def release(self) -> None:
@@ -1532,6 +1581,7 @@ class _ExecutorHostProbe:
         return reliability_validation.HostPreflightObservation(
             port_owners=port_owners,
             boundary=self.boundary,
+            gpu_idle_baseline=GpuSnapshot(used_mib=100, free_mib=8000),
         )
 
     def begin_case(self, case: reliability_validation.CasePlan) -> datetime:
@@ -1589,6 +1639,7 @@ class _ExecutorHostProbe:
             boundary=self.boundary,
             owned_processes_stopped=True,
             temp_paths_removed=True,
+            gpu_after_release=GpuSnapshot(used_mib=100, free_mib=8000),
         )
 
 
@@ -1619,6 +1670,75 @@ def test_task_10_injected_executor_runs_exact_matrix_and_writes_public_evidence(
     evidence = (tmp_path / "evidence" / "reliability-summary.json").read_text(encoding="utf-8")
     assert json.loads(evidence)["status"] == "passed"
     assert str(tmp_path) not in evidence
+
+
+def test_fix_round_1_final_gpu_compares_run_idle_baseline_after_runtime_release(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    events: list[str] = []
+
+    class TrackingHttpProbe(_ExecutorHttpProbe):
+        def release(self) -> None:
+            events.append("runtime-release")
+            super().release()
+
+    class CumulativeLeakHostProbe(_ExecutorHostProbe):
+        def preflight(
+            self,
+            fixture: ReliabilityFixture,
+        ) -> reliability_validation.HostPreflightObservation:
+            observation = super().preflight(fixture)
+            return reliability_validation.HostPreflightObservation(
+                port_owners=observation.port_owners,
+                boundary=observation.boundary,
+                gpu_idle_baseline=GpuSnapshot(used_mib=100, free_mib=8000),
+            )
+
+        def finish_case(
+            self,
+            case: reliability_validation.CasePlan,
+            started_at: datetime,
+        ) -> reliability_validation.HostCaseObservation:
+            observation = super().finish_case(case, started_at)
+            used_mib = 100 + self.case_number * 20
+            return observation.model_copy(
+                update={
+                    "gpu_before": GpuSnapshot(used_mib=used_mib, free_mib=8100 - used_mib),
+                    "gpu_peak": GpuSnapshot(used_mib=used_mib + 100, free_mib=8000 - used_mib),
+                    "gpu_after": GpuSnapshot(used_mib=used_mib + 20, free_mib=8080 - used_mib),
+                }
+            )
+
+        def final_state(self) -> reliability_validation.HostFinalObservation:
+            events.append("gpu-after-release")
+            observation = super().final_state()
+            return reliability_validation.HostFinalObservation(
+                boundary=observation.boundary,
+                owned_processes_stopped=observation.owned_processes_stopped,
+                temp_paths_removed=observation.temp_paths_removed,
+                gpu_after_release=GpuSnapshot(used_mib=1500, free_mib=6600),
+            )
+
+    http_probe = TrackingHttpProbe()
+    host_probe = CumulativeLeakHostProbe()
+    output_root = tmp_path / "evidence"
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert exc_info.value.code == "final-gpu-not-recovered"
+    assert events == ["runtime-release", "gpu-after-release"]
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+        "code": "final-gpu-not-recovered",
+        "stage": "finalize",
+    }
 
 
 def test_task_10_passed_summary_is_published_only_after_all_case_evidence(
@@ -1688,6 +1808,80 @@ def test_task_10_controller_always_finishes_active_host_case_after_http_failure(
     assert exc_info.value.code == "case-execution-failed"
     assert host_probe.finished_cases == 1
     assert http_probe.released is True
+
+
+def test_fix_round_1_case_failure_writes_current_scrubbed_case_before_failed_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    private_sentinel = f"token=case-secret {tmp_path}"
+
+    class SecondCaseFailsHttpProbe(_ExecutorHttpProbe):
+        def execute_case(
+            self,
+            case: reliability_validation.CasePlan,
+            fixture: ReliabilityFixture,
+            output_directory: Path,
+            *,
+            action_hook: object | None = None,
+        ) -> reliability_validation.HttpCaseObservation:
+            if len(self.executed) == 1:
+                raise httpx.ReadTimeout(private_sentinel)
+            return super().execute_case(
+                case,
+                fixture,
+                output_directory,
+                action_hook=action_hook,
+            )
+
+    writes: list[str] = []
+    original_write = reliability_validation.write_atomic_json
+
+    def track_write(path: Path, payload: object) -> None:
+        writes.append(path.relative_to(output_root).as_posix())
+        original_write(path, payload)
+
+    http_probe = SecondCaseFailsHttpProbe()
+    host_probe = _ExecutorHostProbe()
+    output_root = tmp_path / "evidence"
+    monkeypatch.setattr(reliability_validation, "write_atomic_json", track_write)
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert exc_info.value.code == "case-execution-failed"
+    first_case = json.loads(
+        (output_root / "cases" / "steady-01-gpt-sovits.json").read_text(encoding="utf-8")
+    )
+    failed_case = json.loads(
+        (output_root / "cases" / "steady-01-indextts.json").read_text(encoding="utf-8")
+    )
+    assert first_case["actual"] == "completed"
+    assert failed_case["status"] == "failed"
+    assert failed_case["case_id"] == "steady-01-indextts"
+    assert failed_case["engine"] == "indextts"
+    assert failed_case["expected"] == "completed"
+    assert failed_case["failure"] == {"code": "case-execution-failed", "stage": "case"}
+    assert failed_case["host"]["cleanup"] == {
+        "ok": True,
+        "owned_processes_stopped": True,
+        "temp_paths_removed": True,
+    }
+    rendered = json.dumps(failed_case)
+    assert "case-secret" not in rendered
+    assert str(tmp_path) not in rendered
+    assert writes[-3:] == [
+        "cases/steady-01-indextts.json",
+        "failure.json",
+        "reliability-summary.json",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1900,7 +2094,11 @@ def test_task_10_http_probe_executes_concrete_running_fault_and_restart_actions(
     cancelled = False
 
     def job(status: str) -> dict[str, object]:
-        error = "request timed out" if action == "timeout" and status == "failed" else None
+        error = (
+            "ComfyUI prompt prompt-timeout did not complete within 1.0s"
+            if action == "timeout" and status == "failed"
+            else None
+        )
         return {
             "job_id": f"job-{action}",
             "status": status,
@@ -1943,6 +2141,24 @@ def test_task_10_http_probe_executes_concrete_running_fault_and_restart_actions(
                 },
             )
         if request.url.path.endswith("/manifest"):
+            metadata: dict[str, object] = {}
+            if action in {"cancel-running", "timeout"}:
+                metadata = {
+                    "control_code": "cancelled" if action == "cancel-running" else "timeout",
+                    "control_details": {
+                        "prompt_id": prompt_id,
+                        "cancellation": {
+                            "prompt_id": prompt_id,
+                            "initial_state": "running",
+                            "final_state": "interrupted",
+                            "actions": ["interrupt"],
+                            "duration_seconds": 0.5,
+                            "converged": True,
+                        },
+                    },
+                }
+                if action == "timeout":
+                    metadata["failure_stage"] = "timeout"
             return httpx.Response(
                 200,
                 json={
@@ -1954,6 +2170,7 @@ def test_task_10_http_probe_executes_concrete_running_fault_and_restart_actions(
                                     "version_id": version_id,
                                     "status": terminal_status,
                                     "audio_path": str(wav_path) if expected == "completed" else None,
+                                    "metadata": metadata,
                                 }
                             ],
                         }
@@ -2215,6 +2432,7 @@ class _Task10FaultRouteScenario:
         self.cancelled = False
         self.terminated = False
         self.restarted = False
+        self.version_overrides: dict[str, object] = {}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
@@ -2241,7 +2459,10 @@ class _Task10FaultRouteScenario:
             if self.case.action == "timeout" and self.job_reads > 1:
                 return httpx.Response(
                     200,
-                    json=_task_10_job_document(status="failed", error="request timed out"),
+                    json=_task_10_job_document(
+                        status="failed",
+                        error="ComfyUI prompt prompt-main did not complete within 1.0s",
+                    ),
                 )
             if self.case.action == "terminate-comfyui" and self.terminated:
                 return httpx.Response(
@@ -2260,6 +2481,31 @@ class _Task10FaultRouteScenario:
             return httpx.Response(200, json={"queue_running": running, "queue_pending": []})
         if path == "/api/projects/windows-reliability-validation/manifest":
             persisted_status = "failed" if self.case.expected in {"failed", "timeout"} else self.case.expected
+            metadata: dict[str, object] = {}
+            if self.case.action in {"cancel-running", "timeout"}:
+                metadata = {
+                    "control_code": "cancelled" if self.case.action == "cancel-running" else "timeout",
+                    "control_details": {
+                        "prompt_id": "prompt-main",
+                        "cancellation": {
+                            "prompt_id": "prompt-main",
+                            "initial_state": "running",
+                            "final_state": "interrupted",
+                            "actions": ["interrupt"],
+                            "duration_seconds": 0.5,
+                            "converged": True,
+                        },
+                    },
+                }
+                if self.case.action == "timeout":
+                    metadata["failure_stage"] = "timeout"
+            version = {
+                "version_id": "version-main",
+                "status": persisted_status,
+                "audio_path": str(self.wav_path) if self.case.expected == "completed" else None,
+                "metadata": metadata,
+            }
+            version.update(self.version_overrides)
             return httpx.Response(
                 200,
                 json={
@@ -2267,13 +2513,7 @@ class _Task10FaultRouteScenario:
                     "lines": {
                         self.case.case_id: {
                             "line_id": self.case.case_id,
-                            "versions": [
-                                {
-                                    "version_id": "version-main",
-                                    "status": persisted_status,
-                                    "audio_path": str(self.wav_path) if self.case.expected == "completed" else None,
-                                }
-                            ],
+                            "versions": [version],
                         }
                     },
                 },
@@ -2328,6 +2568,80 @@ def test_task_10_http_probe_executes_fault_routes_and_preserves_terminal_evidenc
     assert create_call[2]["tasks"][0]["parameters"]["timeout_seconds"] == case.request_timeout_seconds
     cancel_paths = [path for method, path, _body in scenario.calls if method == "POST" and path.endswith("/cancel")]
     assert cancel_paths == (["/api/jobs/job-main/cancel"] if case.action == "cancel-running" else [])
+
+    if case.action in {"cancel-running", "timeout"}:
+        assert observation.tts_more is not None
+        assert observation.tts_more.job_status == ("cancelled" if case.action == "cancel-running" else "failed")
+        assert observation.tts_more.item_status == observation.tts_more.job_status
+        assert observation.tts_more.version_status == observation.tts_more.job_status
+        assert observation.tts_more.manifest_version_absent is False
+        assert observation.tts_more.version_audio_absent is True
+        assert observation.tts_more.control is not None
+        assert observation.tts_more.control.control_code == (
+            "cancelled" if case.action == "cancel-running" else "timeout"
+        )
+        assert observation.tts_more.control.failure_stage == (
+            None if case.action == "cancel-running" else "timeout"
+        )
+        assert observation.tts_more.control.prompt_id == "prompt-main"
+        assert observation.tts_more.control.initial_state == "running"
+        assert observation.tts_more.control.final_state == "interrupted"
+        assert observation.tts_more.control.actions == ["interrupt"]
+        assert observation.tts_more.control.converged is True
+
+
+@pytest.mark.parametrize(
+    ("case_id", "version_overrides"),
+    [
+        (
+            "cancel-running-gpt-sovits",
+            {"status": "completed", "audio_path": "forbidden-success.wav"},
+        ),
+        ("cancel-running-gpt-sovits", {"metadata": {}}),
+        (
+            "timeout-indextts",
+            {"status": "completed", "audio_path": "forbidden-success.wav"},
+        ),
+        (
+            "timeout-indextts",
+            {
+                "metadata": {
+                    "failure_stage": "timeout",
+                    "control_code": "timeout",
+                    "control_details": {
+                        "prompt_id": "prompt-main",
+                        "cancellation": {
+                            "prompt_id": "prompt-main",
+                            "initial_state": "running",
+                            "final_state": "running",
+                            "actions": ["interrupt"],
+                            "duration_seconds": 30.0,
+                            "converged": False,
+                        },
+                    },
+                }
+            },
+        ),
+    ],
+)
+def test_fix_round_1_fault_cases_reject_false_terminal_manifest_evidence(
+    tmp_path: Path,
+    case_id: str,
+    version_overrides: dict[str, object],
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _task_10_plan(case_id)
+    scenario = _Task10FaultRouteScenario(case, tmp_path / "unused.wav")
+    scenario.version_overrides.update(version_overrides)
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(scenario.handler),
+        reference_root=tmp_path,
+        poll_interval_seconds=0,
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(RuntimeError, match="fault terminal evidence"):
+        probe.execute_case(case, fixture, tmp_path)
 
 
 def test_task_10_terminate_case_does_not_probe_comfyui_after_owned_termination(
@@ -2573,14 +2887,53 @@ def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
     for root in repositories.values():
         Path(root).mkdir(parents=True)
     registry = (tmp_path / "resources.yaml").resolve()
-    registry.write_text("resources: {}\n", encoding="utf-8")
+    resource_documents: dict[str, dict[str, str]] = {}
+    resource_by_engine = {
+        "gpt-sovits": ("gpt-main", "gpt_sovits", "gpt_sovits"),
+        "indextts": ("index-main", "index_tts", "index_tts"),
+        "cosyvoice": ("cosy-main", "cosyvoice", "cosyvoice"),
+    }
+    suite_root = Path(repositories["tts-audio-suite"])
+    for engine, (resource_id, registry_engine, suite_engine) in resource_by_engine.items():
+        source_root = Path(repositories[engine])
+        interpreter = source_root / ".venv" / "Scripts" / "python.exe"
+        interpreter.parent.mkdir(parents=True, exist_ok=True)
+        interpreter.write_bytes(b"python")
+        entrypoint = suite_root / "engines" / suite_engine / "external_subprocess_runner.py"
+        entrypoint.parent.mkdir(parents=True, exist_ok=True)
+        entrypoint.write_text("# runner\n", encoding="utf-8")
+        resource_documents[resource_id] = {
+            "engine": registry_engine,
+            "source_root": str(source_root),
+        }
+    registry.write_text(
+        json.dumps({"version": 1, "resources": resource_documents}),
+        encoding="utf-8",
+    )
     reference = (tmp_path / "reference.wav").resolve()
     _write_voiced_wav(reference)
     python = (tmp_path / "python.exe").resolve()
     python.write_bytes(b"python")
+    run_id = "a" * 32
+    temp_root = (tmp_path / f"reliability-temp-{run_id}").resolve()
+    runner_temp_root = temp_root / "runner"
+    comfy_temp_root = temp_root / "comfyui" / "temp"
+    runner_temp_root.mkdir(parents=True)
+    comfy_temp_root.mkdir(parents=True)
+    (tmp_path / f".request-temp-{run_id}.owner.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "temp_root": str(temp_root),
+                "runner_temp_root": str(runner_temp_root),
+                "comfy_temp_root": str(comfy_temp_root),
+            }
+        ),
+        encoding="utf-8",
+    )
     return {
         "version": 1,
-        "run_id": "a" * 32,
+        "run_id": run_id,
         "owned_processes": {
             "tts-more": {
                 "pid": 8000,
@@ -2605,7 +2958,7 @@ def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
                 "arguments": ["main.py", "--listen", "127.0.0.1", "--port", "8188"],
                 "working_directory": str(tmp_path.resolve()),
                 "port": 8188,
-                "temp_root": str((tmp_path / "request-temp").resolve()),
+                "temp_root": str(runner_temp_root),
             }
         },
         "boundary": {
@@ -2613,12 +2966,18 @@ def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
             "private_registry": str(registry),
             "references": {"reference": str(reference)},
         },
-        "temp_roots": [str((tmp_path / "request-temp").resolve())],
+        "temp_roots": [str(runner_temp_root), str(comfy_temp_root)],
     }
 
 
 class _FakeWindowsHostSystem:
-    def __init__(self, manifest: dict[str, object], *, mismatch: bool = False) -> None:
+    def __init__(
+        self,
+        manifest: dict[str, object],
+        *,
+        mismatch: bool = False,
+        runner_inventories: list[tuple[reliability_validation.RecordedProcessIdentity, ...]] | None = None,
+    ) -> None:
         owned = manifest["owned_processes"]
         assert isinstance(owned, dict)
         self.records = {
@@ -2630,6 +2989,7 @@ class _FakeWindowsHostSystem:
         self.restarted = 0
         self.boundary = _ExecutorHostProbe().boundary
         self.case_number = 0
+        self.runner_inventories = list(runner_inventories or [])
 
     def inspect_process(self, pid: int) -> reliability_validation.RecordedProcessIdentity:
         record = next(item for item in self.records.values() if item.pid == pid)
@@ -2649,6 +3009,16 @@ class _FakeWindowsHostSystem:
     ) -> reliability_validation.BoundarySnapshot:
         del specification
         return self.boundary
+
+    def gpu_snapshot(self) -> GpuSnapshot:
+        return GpuSnapshot(used_mib=100, free_mib=8000)
+
+    def matching_runners(
+        self,
+        specifications: tuple[object, ...],
+    ) -> tuple[reliability_validation.RecordedProcessIdentity, ...]:
+        assert len(specifications) == 3
+        return self.runner_inventories.pop(0) if self.runner_inventories else ()
 
     def begin_case(
         self,
@@ -2697,6 +3067,228 @@ class _FakeWindowsHostSystem:
     def final_cleanup_state(self, temp_roots: tuple[Path, ...]) -> tuple[bool, bool]:
         del temp_roots
         return True, True
+
+
+def _recorded_runner_identity(
+    *,
+    executable: Path,
+    argv: list[str],
+    pid: int = 19001,
+) -> reliability_validation.RecordedProcessIdentity:
+    created = datetime(2026, 8, 1, 2, 0, tzinfo=timezone.utc)
+    return reliability_validation.RecordedProcessIdentity(
+        pid=pid,
+        creation_time=created,
+        executable_path=executable.resolve(),
+        command_line=subprocess.list2cmdline(argv),
+        parent_pid=8188,
+        parent_creation_time=created - timedelta(seconds=1),
+    )
+
+
+def test_fix_round_1_runner_fingerprint_is_exact_and_accepts_verified_prior_run_root(
+    tmp_path: Path,
+) -> None:
+    executable = (tmp_path / "gpt" / ".venv" / "Scripts" / "python.exe").resolve()
+    entrypoint = (
+        tmp_path
+        / "suite"
+        / "engines"
+        / "gpt_sovits"
+        / "external_subprocess_runner.py"
+    ).resolve()
+    current_root = (tmp_path / "reliability-temp-current" / "runner").resolve()
+    prior_root = (tmp_path / "reliability-temp-prior" / "runner").resolve()
+    request = prior_root / "tts-audio-suite-gptsovits-123" / "request.json"
+    specification = reliability_validation.PrivateRunnerSpecification(
+        engine="gpt-sovits",
+        executable_path=executable,
+        entrypoint_path=entrypoint,
+        temp_prefix="tts-audio-suite-gptsovits-",
+        request_roots=(current_root, prior_root),
+    )
+    exact = _recorded_runner_identity(
+        executable=executable,
+        argv=[str(executable), str(entrypoint), str(request)],
+    )
+    assert reliability_validation._process_matches_runner_specification(exact, specification) is True
+
+    wrong_executable = (tmp_path / "other" / "python.exe").resolve()
+    wrong_entrypoint = (tmp_path / "elsewhere" / "external_subprocess_runner.py").resolve()
+    wrong_engine = (
+        tmp_path
+        / "suite"
+        / "engines"
+        / "index_tts"
+        / "external_subprocess_runner.py"
+    ).resolve()
+    outside_request = (
+        tmp_path / "outside" / "tts-audio-suite-gptsovits-123" / "request.json"
+    ).resolve()
+    near_misses = [
+        _recorded_runner_identity(
+            executable=wrong_executable,
+            argv=[str(wrong_executable), str(entrypoint), str(request)],
+            pid=19002,
+        ),
+        _recorded_runner_identity(
+            executable=executable,
+            argv=[str(executable), str(wrong_entrypoint), str(request)],
+            pid=19003,
+        ),
+        _recorded_runner_identity(
+            executable=executable,
+            argv=[str(executable), str(wrong_engine), str(request)],
+            pid=19004,
+        ),
+        _recorded_runner_identity(
+            executable=executable,
+            argv=[str(executable), str(entrypoint), str(outside_request)],
+            pid=19005,
+        ),
+        _recorded_runner_identity(
+            executable=executable,
+            argv=[str(executable), "-c", "print('not a runner')"],
+            pid=19006,
+        ),
+        _recorded_runner_identity(
+            executable=wrong_executable,
+            argv=["whoami.exe"],
+            pid=19007,
+        ),
+        _recorded_runner_identity(
+            executable=executable,
+            argv=[str(executable), str(entrypoint), str(request), "extra"],
+            pid=19008,
+        ),
+    ]
+    assert all(
+        not reliability_validation._process_matches_runner_specification(identity, specification)
+        for identity in near_misses
+    )
+
+
+def test_fix_round_2_native_runner_inventory_detects_prior_run_orphan_without_live_parent(
+    tmp_path: Path,
+) -> None:
+    executable = (tmp_path / "engine" / ".venv" / "Scripts" / "python.exe").resolve()
+    entrypoint = (
+        tmp_path
+        / "suite"
+        / "engines"
+        / "gpt_sovits"
+        / "external_subprocess_runner.py"
+    ).resolve()
+    request_root = (tmp_path / "reliability-temp-prior" / "runner").resolve()
+    request = request_root / "tts-audio-suite-gptsovits-orphan" / "request.json"
+    specification = reliability_validation.PrivateRunnerSpecification(
+        engine="gpt-sovits",
+        executable_path=executable,
+        entrypoint_path=entrypoint,
+        temp_prefix="tts-audio-suite-gptsovits-",
+        request_roots=(request_root,),
+    )
+    orphan = {
+        "pid": 19009,
+        "creation_time": "2026-08-01T01:00:00.0000000Z",
+        "name": executable.name,
+        "executable_path": str(executable),
+        "command_line": subprocess.list2cmdline(
+            [str(executable), str(entrypoint), str(request)]
+        ),
+        "parent_pid": 18888,
+    }
+    system = object.__new__(reliability_validation.NativeWindowsHostSystem)
+    system._started_identities = {}
+    system._powershell_document = lambda *_args, **_kwargs: [orphan]
+
+    assert system.matching_runners((specification,)) == (19009,)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"command_line": ""},
+        {"executable_path": ""},
+        {"executable_path": "", "command_line": ""},
+        {"command_line": '"unterminated'},
+    ],
+)
+def test_fix_round_2_native_runner_inventory_fails_closed_for_incomplete_candidate(
+    tmp_path: Path,
+    mutation: dict[str, str],
+) -> None:
+    executable = (tmp_path / "engine" / ".venv" / "Scripts" / "python.exe").resolve()
+    entrypoint = (
+        tmp_path
+        / "suite"
+        / "engines"
+        / "gpt_sovits"
+        / "external_subprocess_runner.py"
+    ).resolve()
+    request_root = (tmp_path / "reliability-temp-prior" / "runner").resolve()
+    request = request_root / "tts-audio-suite-gptsovits-orphan" / "request.json"
+    specification = reliability_validation.PrivateRunnerSpecification(
+        engine="gpt-sovits",
+        executable_path=executable,
+        entrypoint_path=entrypoint,
+        temp_prefix="tts-audio-suite-gptsovits-",
+        request_roots=(request_root,),
+    )
+    candidate = {
+        "pid": 19010,
+        "creation_time": "2026-08-01T01:00:00.0000000Z",
+        "name": executable.name,
+        "executable_path": str(executable),
+        "command_line": subprocess.list2cmdline(
+            [str(executable), str(entrypoint), str(request)]
+        ),
+        "parent_pid": 18888,
+        **mutation,
+    }
+    system = object.__new__(reliability_validation.NativeWindowsHostSystem)
+    system._started_identities = {}
+    system._powershell_document = lambda *_args, **_kwargs: [candidate]
+
+    with pytest.raises(RuntimeError, match="runner inventory"):
+        system.matching_runners((specification,))
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_code"),
+    [
+        ("preflight", "pre-existing-external-runner"),
+        ("final", "final-external-runner-present"),
+    ],
+)
+def test_fix_round_1_runner_inventory_fails_gate_without_stopping_process(
+    tmp_path: Path,
+    phase: str,
+    expected_code: str,
+) -> None:
+    document = _host_manifest_document(tmp_path)
+    owned = document["owned_processes"]
+    assert isinstance(owned, dict)
+    observed = reliability_validation.RecordedProcessIdentity.from_document(owned["comfyui"])
+    inventories = [(observed,)] if phase == "preflight" else [(), (observed,)]
+    system = _FakeWindowsHostSystem(document, runner_inventories=inventories)
+    manifest_path = tmp_path / ".host-manifest-private.json"
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    probe = reliability_validation.WindowsReliabilityHostProbe.from_manifest(
+        manifest_path,
+        system=system,
+    )
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        if phase == "preflight":
+            probe.preflight(fixture)
+        else:
+            probe.preflight(fixture)
+            probe.final_state()
+
+    assert exc_info.value.code == expected_code
+    assert system.stopped == []
 
 
 def test_task_10_native_final_cleanup_detects_residue_in_configured_runner_temp_root(
@@ -2756,6 +3348,492 @@ Write-Output 'UTC_TIMESTAMP_IDENTITY_OK'
 
     assert completed.returncode == 0, completed.stderr
     assert "UTC_TIMESTAMP_IDENTITY_OK" in completed.stdout
+
+
+def test_fix_round_1_powershell_preserves_private_identity_until_cleanup_is_proven(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "run-windows-comfyui-reliability.ps1"
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+foreach ($name in @('Test-PrivateIdentityRecordsCanBeRemoved', 'Remove-PrivateIdentityRecordsIfSafe')) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+$hostRecord = Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT '.host-manifest.private.json'
+$currentRecord = "$hostRecord.current.json"
+
+function Reset-Records {
+    Set-Content -LiteralPath $hostRecord -Value '{"private":true}' -Encoding UTF8
+    Set-Content -LiteralPath $currentRecord -Value '{"private":true}' -Encoding UTF8
+}
+function Assert-RecordsPresent {
+    if (-not (Test-Path -LiteralPath $hostRecord -PathType Leaf)) { throw 'host record was removed' }
+    if (-not (Test-Path -LiteralPath $currentRecord -PathType Leaf)) { throw 'current record was removed' }
+}
+function Assert-RecordsAbsent {
+    if (Test-Path -LiteralPath $hostRecord) { throw 'host record remains' }
+    if (Test-Path -LiteralPath $currentRecord) { throw 'current record remains' }
+}
+
+Reset-Records
+if (Remove-PrivateIdentityRecordsIfSafe -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
+        -ProcessCleanupProven $false -TempCleanupProven $false -OwnedProcessCount 2) {
+    throw 'identity mismatch incorrectly allowed record removal'
+}
+Assert-RecordsPresent
+
+if (Remove-PrivateIdentityRecordsIfSafe -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
+        -ProcessCleanupProven $true -TempCleanupProven $false -OwnedProcessCount 2) {
+    throw 'unproved temp cleanup incorrectly allowed record removal'
+}
+Assert-RecordsPresent
+
+if (-not (Remove-PrivateIdentityRecordsIfSafe -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
+        -ProcessCleanupProven $true -TempCleanupProven $true -OwnedProcessCount 2)) {
+    throw 'proved cleanup did not remove private records'
+}
+Assert-RecordsAbsent
+
+Reset-Records
+if (-not (Remove-PrivateIdentityRecordsIfSafe -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
+        -ProcessCleanupProven $false -TempCleanupProven $false -OwnedProcessCount 0)) {
+    throw 'known empty ownership did not remove empty private records'
+}
+Assert-RecordsAbsent
+Write-Output 'PRIVATE_IDENTITY_RETENTION_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+    environment["TTS_MORE_PRIVATE_TEST_ROOT"] = str(tmp_path)
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "PRIVATE_IDENTITY_RETENTION_OK" in completed.stdout
+
+
+def test_fix_round_2_powershell_persists_provisional_identity_before_full_upgrade(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "run-windows-comfyui-reliability.ps1"
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Test-RecordDocumentMatches',
+    'Test-CommandLineArgument',
+    'Test-FullRecordPromotesProvisional',
+    'Write-PrivateJsonAtomic',
+    'Write-LaunchIntentRunControlState',
+    'Write-ProvisionalRunControlState',
+    'Start-ProvisionallyTrackedProcess',
+    'Write-RunControlState'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+function Start-Process {
+    param(
+        [string] $FilePath,
+        [string[]] $ArgumentList,
+        [string] $WorkingDirectory,
+        [string] $WindowStyle,
+        [switch] $PassThru
+    )
+    $intentAtLaunch = Get-Content -LiteralPath $script:statePath -Raw | ConvertFrom-Json
+    $script:startSawIntent = (
+        $intentAtLaunch.version -eq 2 -and
+        $intentAtLaunch.launch_intents.comfyui.marker -eq $script:launchMarker -and
+        $null -eq $intentAtLaunch.provisional_processes.comfyui
+    )
+    return [pscustomobject]@{ Id = 4242 }
+}
+function Test-RecordedIdentity { param([object] $Record) return $true }
+
+$statePath = Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'control.json'
+$launcher = [pscustomobject]@{
+    pid = 111
+    creation_time = '2026-08-01T00:00:00Z'
+}
+$started = New-Object 'System.Collections.Generic.List[object]'
+$executable = Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'python.exe'
+$workingDirectory = Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'working directory'
+$childTemp = Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'child temp'
+$runId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+$marker = "tts_more_reliability_run=$runId-comfyui"
+$arguments = @('-X', $marker, 'main.py', '--port', '8188')
+$script:statePath = $statePath
+$script:launchMarker = $marker
+$script:startSawIntent = $false
+$result = Start-ProvisionallyTrackedProcess -FilePath $executable `
+    -ArgumentList $arguments -WorkingDirectory $workingDirectory `
+    -ChildTempRoot $childTemp -LauncherRecord $launcher `
+    -StartedProcesses $started -ControlStatePath $statePath -RunId $runId `
+    -ProcessLabel 'comfyui' -LaunchMarker $marker `
+    -BackendRecord $null -ComfyRecord $null
+if ($result.process.Id -ne 4242 -or $started.Count -ne 1 -or -not $script:startSawIntent) {
+    throw 'launch did not occur strictly after durable intent'
+}
+if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+    throw 'provisional recovery state was not persisted before return'
+}
+$provisional = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+if (
+    $provisional.version -ne 2 -or
+    $provisional.run_id -ne $runId -or
+    $provisional.launch_intents.comfyui.marker -ne $marker -or
+    $provisional.launch_intents.comfyui.executable_path -ne [IO.Path]::GetFullPath($executable) -or
+    $provisional.launch_intents.comfyui.working_directory -ne [IO.Path]::GetFullPath($workingDirectory) -or
+    $provisional.launch_intents.comfyui.child_temp_root -ne [IO.Path]::GetFullPath($childTemp) -or
+    @($provisional.launch_intents.comfyui.arguments).Count -ne 5 -or
+    @($provisional.launch_intents.comfyui.arguments)[1] -ne $marker -or
+    [int] $provisional.provisional_processes.comfyui.pid -ne 4242 -or
+    $provisional.provisional_processes.comfyui.executable_path -ne [IO.Path]::GetFullPath($executable) -or
+    [int] $provisional.provisional_processes.comfyui.parent_pid -ne 111 -or
+    $provisional.provisional_processes.comfyui.parent_creation_time -ne '2026-08-01T00:00:00Z' -or
+    (Get-UtcTicks $provisional.provisional_processes.comfyui.started_after) -gt
+        (Get-UtcTicks $provisional.provisional_processes.comfyui.started_before)
+) { throw 'provisional recovery state is incomplete' }
+if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_PRIVATE_TEST_ROOT -File | Where-Object {
+        $_.Name -match '\.(tmp|previous)$'
+    }).Count -ne 0) { throw 'provisional publication residue remains' }
+
+$full = [pscustomobject]@{
+    pid = 4242
+    creation_time = [string] $provisional.provisional_processes.comfyui.started_after
+    executable_path = [IO.Path]::GetFullPath($executable)
+    command_line = ('python.exe -X {0} main.py --port 8188' -f $marker)
+    parent_pid = 111
+    parent_creation_time = '2026-08-01T00:00:00Z'
+}
+Write-RunControlState -Path $statePath -RunId $runId -BackendRecord $null -ComfyRecord $full
+$upgraded = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+if (
+    $upgraded.version -ne 2 -or
+    $upgraded.run_id -ne $runId -or
+    [int] $upgraded.owned_processes.comfyui.pid -ne 4242 -or
+    $null -ne $upgraded.provisional_processes.comfyui -or
+    $null -ne $upgraded.launch_intents.comfyui
+) { throw 'full process identity did not atomically replace provisional state' }
+Write-Output 'PROVISIONAL_IDENTITY_UPGRADE_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+    environment["TTS_MORE_PRIVATE_TEST_ROOT"] = str(tmp_path)
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "PROVISIONAL_IDENTITY_UPGRADE_OK" in completed.stdout
+
+
+def test_fix_round_2_powershell_provisional_persistence_failure_converges_or_retries(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "run-windows-comfyui-reliability.ps1"
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Test-RecordDocumentMatches',
+    'Write-PrivateJsonAtomic',
+    'Write-LaunchIntentRunControlState',
+    'Write-ProvisionalRunControlState',
+    'Start-ProvisionallyTrackedProcess'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+function Start-Process {
+    param(
+        [string] $FilePath,
+        [string[]] $ArgumentList,
+        [string] $WorkingDirectory,
+        [string] $WindowStyle,
+        [switch] $PassThru
+    )
+    $script:startCalls += 1
+    return [pscustomobject]@{ Id = 4343 }
+}
+
+$script:realAtomicWriter = (Get-Command Write-PrivateJsonAtomic).ScriptBlock
+$script:atomicCalls = 0
+function Write-PrivateJsonAtomic {
+    param([string] $Path, [object] $Document)
+    $script:atomicCalls += 1
+    if ($script:atomicCalls -eq 2) { throw 'injected provisional persistence failure' }
+    & $script:realAtomicWriter -Path $Path -Document $Document
+}
+$script:startCalls = 0
+$script:stopCalls = 0
+function Stop-ProvisionalStartedProcess {
+    param([object] $Token)
+    $script:stopCalls += 1
+    return $false
+}
+$statePath = Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'retry-control.json'
+$launcher = [pscustomobject]@{
+    pid = 111
+    creation_time = '2026-08-01T00:00:00Z'
+}
+$started = New-Object 'System.Collections.Generic.List[object]'
+$runId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+$marker = "tts_more_reliability_run=$runId-comfyui"
+$threw = $false
+try {
+    $null = Start-ProvisionallyTrackedProcess `
+        -FilePath (Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'python.exe') `
+        -ArgumentList @('-X', $marker, 'main.py') -WorkingDirectory $env:TTS_MORE_PRIVATE_TEST_ROOT `
+        -ChildTempRoot $env:TTS_MORE_PRIVATE_TEST_ROOT -LauncherRecord $launcher `
+        -StartedProcesses $started -ControlStatePath $statePath `
+        -RunId $runId -ProcessLabel 'comfyui' -LaunchMarker $marker `
+        -BackendRecord $null -ComfyRecord $null
+} catch { $threw = $true }
+if (-not $threw -or $script:startCalls -ne 1 -or $script:stopCalls -ne 1 -or $script:atomicCalls -ne 2) {
+    throw 'failed provisional persistence did not attempt safe convergence before exit'
+}
+if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+    throw 'unconverged process lost its pre-launch recovery intent'
+}
+$recovered = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+if (
+    $recovered.version -ne 2 -or
+    $recovered.launch_intents.comfyui.marker -ne $marker -or
+    $null -ne $recovered.provisional_processes.comfyui
+) {
+    throw 'pre-launch intent did not survive provisional persistence failure'
+}
+
+Remove-Item -LiteralPath $statePath -Force
+$script:atomicCalls = 0
+function Write-PrivateJsonAtomic {
+    param([string] $Path, [object] $Document)
+    $script:atomicCalls += 1
+    throw 'injected persistent failure'
+}
+$script:stopCalls = 0
+$script:startCalls = 0
+function Stop-ProvisionalStartedProcess {
+    param([object] $Token)
+    $script:stopCalls += 1
+    return $true
+}
+$started = New-Object 'System.Collections.Generic.List[object]'
+$runId = 'cccccccccccccccccccccccccccccccc'
+$marker = "tts_more_reliability_run=$runId-comfyui"
+$threw = $false
+try {
+    $null = Start-ProvisionallyTrackedProcess `
+        -FilePath (Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'python.exe') `
+        -ArgumentList @('-X', $marker, 'main.py') -WorkingDirectory $env:TTS_MORE_PRIVATE_TEST_ROOT `
+        -ChildTempRoot $env:TTS_MORE_PRIVATE_TEST_ROOT -LauncherRecord $launcher `
+        -StartedProcesses $started -ControlStatePath $statePath `
+        -RunId $runId -ProcessLabel 'comfyui' -LaunchMarker $marker `
+        -BackendRecord $null -ComfyRecord $null
+} catch { $threw = $true }
+if (
+    -not $threw -or
+    $script:startCalls -ne 0 -or
+    $script:stopCalls -ne 0 -or
+    (Test-Path -LiteralPath $statePath)
+) {
+    throw 'failed intent persistence did not abort before process launch'
+}
+Write-Output 'PROVISIONAL_PERSISTENCE_FAILURE_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+    environment["TTS_MORE_PRIVATE_TEST_ROOT"] = str(tmp_path)
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "PROVISIONAL_PERSISTENCE_FAILURE_OK" in completed.stdout
+
+
+def test_fix_round_2_powershell_launch_intent_resolver_is_unique_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "run-windows-comfyui-reliability.ps1"
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @('Get-UtcTicks', 'Test-CommandLineArgument', 'Resolve-LaunchIntentProcess')) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+$executable = [IO.Path]::GetFullPath((Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT 'python.exe'))
+$marker = 'tts_more_reliability_run=dddddddddddddddddddddddddddddddd-comfyui'
+$intent = [pscustomobject]@{
+    marker = $marker
+    executable_path = $executable
+    arguments = @('-X', $marker, 'main.py')
+    working_directory = $env:TTS_MORE_PRIVATE_TEST_ROOT
+    child_temp_root = $env:TTS_MORE_PRIVATE_TEST_ROOT
+    parent_pid = 111
+    parent_creation_time = '2026-08-01T00:00:00Z'
+    started_after = '2026-08-01T00:00:00Z'
+}
+function New-Candidate {
+    param([int] $CandidatePid, [string] $Marker = $script:marker)
+    return [pscustomobject]@{
+        ProcessId = $CandidatePid
+        CreationDate = [DateTime]::Parse('2026-08-01T00:00:01Z').ToUniversalTime()
+        ExecutablePath = $script:executable
+        CommandLine = ('"{0}" -X "{1}" main.py' -f $script:executable, $Marker)
+        ParentProcessId = 111
+        Name = 'python.exe'
+    }
+}
+$script:marker = $marker
+$script:executable = $executable
+$script:inventory = @((New-Candidate -CandidatePid 4444))
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    if ($script:throwInventory) { throw 'injected CIM failure' }
+    if ($Filter) {
+        $pidText = [regex]::Match($Filter, '\d+').Value
+        return @($script:inventory | Where-Object { [int] $_.ProcessId -eq [int] $pidText }) | Select-Object -First 1
+    }
+    return $script:inventory
+}
+$resolved = Resolve-LaunchIntentProcess -Intent $intent
+if (
+    [int] $resolved.pid -ne 4444 -or
+    $resolved.executable_path -ne $executable -or
+    [int] $resolved.parent_pid -ne 111 -or
+    $resolved.parent_creation_time -ne '2026-08-01T00:00:00Z'
+) { throw 'unique launch intent was not recovered' }
+
+$script:inventory = @(
+    (New-Candidate -CandidatePid 4444),
+    (New-Candidate -CandidatePid 4445)
+)
+$ambiguousThrew = $false
+try { $null = Resolve-LaunchIntentProcess -Intent $intent } catch { $ambiguousThrew = $true }
+if (-not $ambiguousThrew) { throw 'ambiguous launch intent was accepted' }
+
+$script:inventory = @([pscustomobject]@{
+    ProcessId = 4446
+    CreationDate = [DateTime]::Parse('2026-08-01T00:00:01Z').ToUniversalTime()
+    ExecutablePath = $null
+    CommandLine = $null
+    ParentProcessId = 111
+    Name = 'python.exe'
+})
+$incompleteThrew = $false
+try { $null = Resolve-LaunchIntentProcess -Intent $intent } catch { $incompleteThrew = $true }
+if (-not $incompleteThrew) { throw 'incomplete potential launch candidate was treated as absent' }
+
+$script:inventory = @((New-Candidate -CandidatePid 4447 -Marker ($marker + '-suffix')))
+if ($null -ne (Resolve-LaunchIntentProcess -Intent $intent)) {
+    throw 'launch marker substring was accepted as an exact argv token'
+}
+$script:throwInventory = $true
+$enumerationThrew = $false
+try { $null = Resolve-LaunchIntentProcess -Intent $intent } catch { $enumerationThrew = $true }
+if (-not $enumerationThrew) { throw 'CIM enumeration failure was treated as zero candidates' }
+Write-Output 'LAUNCH_INTENT_RESOLVER_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+    environment["TTS_MORE_PRIVATE_TEST_ROOT"] = str(tmp_path)
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "LAUNCH_INTENT_RESOLVER_OK" in completed.stdout
 
 
 def test_task_10_native_restart_cleans_captured_process_when_readiness_fails(

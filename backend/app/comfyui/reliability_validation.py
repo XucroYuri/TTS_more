@@ -21,6 +21,7 @@ from urllib.parse import unquote, urlsplit
 
 import httpx
 import soundfile
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, ValidationError, field_validator, model_validator
 
 
@@ -202,11 +203,38 @@ class ComfyQueueEvidence(_StrictModel):
         return self
 
 
+class FaultControlEvidence(_StrictModel):
+    control_code: Literal["cancelled", "timeout"]
+    failure_stage: Literal["timeout"] | None
+    prompt_id: str = Field(min_length=1)
+    initial_state: Literal["running"]
+    final_state: Literal["interrupted"]
+    actions: list[Literal["interrupt"]] = Field(min_length=1, max_length=1)
+    duration_seconds: StrictFloat = Field(ge=0.0, le=30.0)
+    converged: StrictBool
+
+    @field_validator("prompt_id")
+    @classmethod
+    def _opaque_prompt_id(cls, value: str) -> str:
+        if "\\" in value or "/" in value or Path(value).is_absolute():
+            raise ValueError("prompt_id must not contain paths")
+        return value
+
+    @model_validator(mode="after")
+    def _truthful_control_terminal(self) -> "FaultControlEvidence":
+        expected_stage = "timeout" if self.control_code == "timeout" else None
+        if self.failure_stage != expected_stage or self.actions != ["interrupt"] or not self.converged:
+            raise ValueError("fault control evidence is incomplete")
+        return self
+
+
 class TtsTerminalEvidence(_StrictModel):
     job_status: Outcome
     item_status: Outcome
     version_status: Outcome | None
     manifest_version_absent: StrictBool
+    version_audio_absent: StrictBool
+    control: FaultControlEvidence | None = None
 
 
 class TerminationEvidence(_StrictModel):
@@ -440,6 +468,7 @@ class BoundarySnapshot(_StrictModel):
 class HostPreflightObservation(_StrictModel):
     port_owners: dict[StrictInt, OwnedProcessIdentity]
     boundary: BoundarySnapshot
+    gpu_idle_baseline: GpuSnapshot
 
 
 @dataclass(frozen=True)
@@ -478,6 +507,28 @@ class HostCaseObservation(_StrictModel):
         return self
 
 
+class FailureMarker(_StrictModel):
+    code: Annotated[str, Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")]
+    stage: Literal["preflight", "case", "finalize"]
+
+
+class FailedCaseEvidence(_StrictModel):
+    status: Literal["failed"]
+    case_id: str = Field(min_length=1)
+    phase: Phase
+    engine: Engine
+    expected: Outcome
+    failure: FailureMarker
+    host: HostCaseObservation | None
+
+    @field_validator("case_id")
+    @classmethod
+    def _neutral_case_id(cls, value: str) -> str:
+        if "\\" in value or "/" in value or Path(value).is_absolute():
+            raise ValueError("case_id must not contain paths")
+        return value
+
+
 class HttpFinalObservation(_StrictModel):
     queue: QueueSnapshot
     runtime_released: StrictBool
@@ -487,6 +538,7 @@ class HostFinalObservation(_StrictModel):
     boundary: BoundarySnapshot
     owned_processes_stopped: StrictBool
     temp_paths_removed: StrictBool
+    gpu_after_release: GpuSnapshot
 
 
 class ReliabilityHttpProbe(Protocol):
@@ -607,6 +659,15 @@ class PrivateBoundarySpecification:
 
 
 @dataclass(frozen=True)
+class PrivateRunnerSpecification:
+    engine: Engine
+    executable_path: Path
+    entrypoint_path: Path
+    temp_prefix: str
+    request_roots: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
 class PrivateHostManifest:
     run_id: str
     owned_processes: dict[str, RecordedProcessIdentity]
@@ -707,6 +768,13 @@ class WindowsHostSystem(Protocol):
 
     def capture_boundary(self, specification: PrivateBoundarySpecification) -> BoundarySnapshot: ...
 
+    def gpu_snapshot(self) -> GpuSnapshot: ...
+
+    def matching_runners(
+        self,
+        specifications: tuple[PrivateRunnerSpecification, ...],
+    ) -> tuple[int, ...]: ...
+
     def begin_case(
         self,
         case: CasePlan,
@@ -745,9 +813,13 @@ class WindowsReliabilityHostProbe:
     ) -> None:
         self.manifest = manifest
         self.system = system
-        self.control_state_path = Path(f"{manifest_path}.current.json")
+        self.manifest_path = Path(manifest_path).resolve()
+        self.validation_root = self.manifest_path.parent
+        self.control_state_path = Path(f"{self.manifest_path}.current.json")
         self._current: dict[str, RecordedProcessIdentity | None] = dict(manifest.owned_processes)
         self._active_cases: dict[str, object] = {}
+        self._gpu_idle_baseline: GpuSnapshot | None = None
+        self._runner_specifications: tuple[PrivateRunnerSpecification, ...] = ()
         self._persist_control_state()
 
     @classmethod
@@ -774,6 +846,13 @@ class WindowsReliabilityHostProbe:
 
     def preflight(self, fixture: ReliabilityFixture) -> HostPreflightObservation:
         fixture = _revalidate_model(fixture, ReliabilityFixture)
+        self._runner_specifications = _build_private_runner_specifications(
+            self.manifest,
+            fixture,
+            validation_root=self.validation_root,
+        )
+        if self.system.matching_runners(self._runner_specifications):
+            raise LiveValidationError("pre-existing-external-runner", stage="preflight")
         port_owners: dict[int, OwnedProcessIdentity] = {}
         for label, recorded in self.manifest.owned_processes.items():
             current = self._inspect_exact(recorded)
@@ -790,7 +869,12 @@ class WindowsReliabilityHostProbe:
             port_owners[port] = owner.public_identity()
         boundary = self.system.capture_boundary(self.manifest.boundary)
         _validate_boundary_snapshot(boundary)
-        return HostPreflightObservation(port_owners=port_owners, boundary=boundary)
+        self._gpu_idle_baseline = self.system.gpu_snapshot()
+        return HostPreflightObservation(
+            port_owners=port_owners,
+            boundary=boundary,
+            gpu_idle_baseline=self._gpu_idle_baseline,
+        )
 
     def begin_case(self, case: CasePlan) -> datetime:
         if case.case_id in self._active_cases:
@@ -860,12 +944,27 @@ class WindowsReliabilityHostProbe:
             raise
 
     def final_state(self) -> HostFinalObservation:
+        if not self._runner_specifications:
+            raise LiveValidationError("runner-fingerprint-missing", stage="finalize")
+        if self.system.matching_runners(self._runner_specifications):
+            raise LiveValidationError("final-external-runner-present", stage="finalize")
         boundary = self.system.capture_boundary(self.manifest.boundary)
         runners_stopped, temp_removed = self.system.final_cleanup_state(self.manifest.temp_roots)
+        if self._gpu_idle_baseline is None:
+            raise LiveValidationError("gpu-idle-baseline-missing", stage="finalize")
+        deadline = time.monotonic() + 30.0
+        while True:
+            gpu_after_release = self.system.gpu_snapshot()
+            if _gpu_recovered_to_idle_baseline(self._gpu_idle_baseline, gpu_after_release):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
         return HostFinalObservation(
             boundary=boundary,
             owned_processes_stopped=runners_stopped,
             temp_paths_removed=temp_removed,
+            gpu_after_release=gpu_after_release,
         )
 
     def _require_current(self, label: str) -> RecordedProcessIdentity:
@@ -887,12 +986,14 @@ class WindowsReliabilityHostProbe:
         _write_private_json_atomic(
             self.control_state_path,
             {
-                "version": 1,
+                "version": 2,
                 "run_id": self.manifest.run_id,
                 "owned_processes": {
                     label: identity.to_document() if identity is not None else None
                     for label, identity in self._current.items()
                 },
+                "provisional_processes": {"tts-more": None, "comfyui": None},
+                "launch_intents": {"tts-more": None, "comfyui": None},
             },
         )
 
@@ -916,6 +1017,288 @@ def _absolute_private_path(value: Any) -> Path:
     if not path.is_absolute():
         raise ValueError("private path must be absolute")
     return path.resolve()
+
+
+def _build_private_runner_specifications(
+    manifest: PrivateHostManifest,
+    fixture: ReliabilityFixture,
+    *,
+    validation_root: Path,
+) -> tuple[PrivateRunnerSpecification, ...]:
+    try:
+        registry = yaml.safe_load(manifest.boundary.private_registry.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        raise ValueError("private runner registry is unreadable") from None
+    resources = registry.get("resources") if isinstance(registry, dict) else None
+    if registry.get("version") != 1 or not isinstance(resources, dict):
+        raise ValueError("private runner registry is invalid")
+
+    request_roots = _verified_validation_runner_roots(
+        manifest,
+        validation_root=validation_root,
+    )
+    suite_root = manifest.boundary.repositories["tts-audio-suite"]
+    definitions: tuple[tuple[Engine, str, str, str], ...] = (
+        ("gpt-sovits", "gpt_sovits", "gpt_sovits", "tts-audio-suite-gptsovits-"),
+        ("indextts", "index_tts", "index_tts", "tts-audio-suite-indextts-"),
+        ("cosyvoice", "cosyvoice", "cosyvoice", "tts-audio-suite-cosyvoice-"),
+    )
+    specifications: list[PrivateRunnerSpecification] = []
+    for engine, registry_engine, suite_engine, temp_prefix in definitions:
+        resource_id = fixture.resources[engine].resource_id
+        resource = resources.get(resource_id)
+        if not isinstance(resource, dict) or resource.get("engine") != registry_engine:
+            raise ValueError("private runner resource is missing or mismatched")
+        source_root = _absolute_private_path(resource.get("source_root"))
+        if not _same_private_path(source_root, manifest.boundary.repositories[engine]):
+            raise ValueError("private runner source root mismatches the boundary")
+        configured_python = resource.get("python_executable") if engine == "gpt-sovits" else None
+        executable_path = (
+            _absolute_private_path(configured_python)
+            if configured_python is not None
+            else (source_root / ".venv" / "Scripts" / "python.exe").resolve()
+        )
+        entrypoint_path = (
+            suite_root / "engines" / suite_engine / "external_subprocess_runner.py"
+        ).resolve()
+        if not executable_path.is_file() or not entrypoint_path.is_file():
+            raise ValueError("private runner fingerprint files are missing")
+        specifications.append(
+            PrivateRunnerSpecification(
+                engine=engine,
+                executable_path=executable_path,
+                entrypoint_path=entrypoint_path,
+                temp_prefix=temp_prefix,
+                request_roots=request_roots,
+            )
+        )
+    return tuple(specifications)
+
+
+def _verified_validation_runner_roots(
+    manifest: PrivateHostManifest,
+    *,
+    validation_root: Path,
+) -> tuple[Path, ...]:
+    validation_root = validation_root.resolve()
+    current_temp_root = (validation_root / f"reliability-temp-{manifest.run_id}").resolve()
+    current_runner_root = (current_temp_root / "runner").resolve()
+    current_comfy_root = (current_temp_root / "comfyui" / "temp").resolve()
+    if {
+        path.resolve() for path in manifest.temp_roots
+    } != {current_runner_root, current_comfy_root}:
+        raise ValueError("current validation temp roots are outside the owned boundary")
+
+    roots: set[Path] = set()
+    marker_pattern = re.compile(r"^\.request-temp-([0-9a-f]{32})\.owner\.json$")
+    for marker_path in sorted(validation_root.glob(".request-temp-*.owner.json")):
+        match = marker_pattern.fullmatch(marker_path.name)
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise ValueError("validation temp owner marker is invalid") from None
+        if (
+            match is None
+            or not isinstance(marker, dict)
+            or set(marker) != {"run_id", "temp_root", "runner_temp_root", "comfy_temp_root"}
+            or marker.get("run_id") != match.group(1)
+        ):
+            raise ValueError("validation temp owner marker is invalid")
+        run_temp_root = (validation_root / f"reliability-temp-{match.group(1)}").resolve()
+        runner_root = (run_temp_root / "runner").resolve()
+        comfy_root = (run_temp_root / "comfyui" / "temp").resolve()
+        try:
+            marker_paths_match = (
+                _same_private_path(_absolute_private_path(marker.get("temp_root")), run_temp_root)
+                and _same_private_path(_absolute_private_path(marker.get("runner_temp_root")), runner_root)
+                and _same_private_path(_absolute_private_path(marker.get("comfy_temp_root")), comfy_root)
+            )
+        except ValueError:
+            marker_paths_match = False
+        if not marker_paths_match or not runner_root.is_dir():
+            raise ValueError("validation temp owner marker is invalid")
+        roots.add(runner_root)
+    if current_runner_root not in roots:
+        raise ValueError("current validation temp owner marker is missing")
+    return tuple(sorted(roots, key=lambda path: os.path.normcase(str(path))))
+
+
+def _same_private_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.realpath(str(left))) == os.path.normcase(os.path.realpath(str(right)))
+
+
+def _process_matches_runner_specification(
+    identity: RecordedProcessIdentity,
+    specification: PrivateRunnerSpecification,
+) -> bool:
+    return _runner_command_matches_specification(
+        identity.executable_path,
+        identity.command_line,
+        specification,
+    )
+
+
+def _runner_command_matches_specification(
+    executable_path: Path,
+    command_line: str,
+    specification: PrivateRunnerSpecification,
+) -> bool:
+    if not _same_private_path(executable_path, specification.executable_path):
+        return False
+    try:
+        argv = _windows_command_line_argv(command_line)
+    except ValueError:
+        return False
+    if len(argv) != 3:
+        return False
+    try:
+        executable_arg = _absolute_private_path(argv[0])
+        entrypoint_arg = _absolute_private_path(argv[1])
+        request_arg = _absolute_private_path(argv[2])
+    except ValueError:
+        return False
+    if (
+        not _same_private_path(executable_arg, specification.executable_path)
+        or not _same_private_path(entrypoint_arg, specification.entrypoint_path)
+        or request_arg.name != "request.json"
+        or not request_arg.parent.name.startswith(specification.temp_prefix)
+        or len(request_arg.parent.name) <= len(specification.temp_prefix)
+    ):
+        return False
+    return any(
+        _same_private_path(request_arg.parent.parent, request_root)
+        for request_root in specification.request_roots
+    )
+
+
+def _matching_runner_pids(
+    document: Any,
+    specifications: tuple[PrivateRunnerSpecification, ...],
+) -> tuple[int, ...]:
+    if isinstance(document, dict):
+        items: list[Any] = [document]
+    elif isinstance(document, list):
+        items = document
+    elif document is None:
+        items = []
+    else:
+        raise RuntimeError("runner inventory document is invalid")
+
+    matches: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise RuntimeError("runner inventory item is invalid")
+        executable_raw = item.get("executable_path")
+        command_raw = item.get("command_line")
+        name_raw = item.get("name")
+        name_candidates = tuple(
+            specification
+            for specification in specifications
+            if isinstance(name_raw, str)
+            and name_raw.casefold() == specification.executable_path.name.casefold()
+        )
+        executable_path: Path | None = None
+        if isinstance(executable_raw, str) and executable_raw.strip():
+            try:
+                executable_path = _absolute_private_path(executable_raw)
+            except ValueError:
+                raise RuntimeError("runner inventory executable is invalid") from None
+
+        executable_candidates = tuple(
+            specification
+            for specification in specifications
+            if executable_path is not None
+            and _same_private_path(executable_path, specification.executable_path)
+        )
+        argv: tuple[str, ...] | None = None
+        argv_executable: Path | None = None
+        if isinstance(command_raw, str) and command_raw.strip():
+            try:
+                argv = _windows_command_line_argv(command_raw)
+                argv_executable = _absolute_private_path(argv[0])
+            except ValueError:
+                if executable_candidates or (name_candidates and executable_path is None):
+                    raise RuntimeError("runner inventory command line is invalid") from None
+        command_candidates = tuple(
+            specification
+            for specification in specifications
+            if argv_executable is not None
+            and _same_private_path(argv_executable, specification.executable_path)
+        )
+        if not executable_candidates and not command_candidates:
+            if name_candidates and executable_path is None and argv_executable is None:
+                raise RuntimeError("runner inventory candidate identity is incomplete")
+            continue
+        if (
+            executable_path is None
+            or not isinstance(command_raw, str)
+            or not command_raw.strip()
+            or argv is None
+            or not executable_candidates
+            or not command_candidates
+        ):
+            raise RuntimeError("runner inventory candidate identity is incomplete")
+        pid = item.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise RuntimeError("runner inventory candidate PID is invalid")
+        try:
+            _parse_utc_datetime(item.get("creation_time"))
+        except ValueError:
+            raise RuntimeError("runner inventory candidate timestamp is invalid") from None
+        if any(
+            _runner_command_matches_specification(executable_path, command_raw, specification)
+            for specification in specifications
+        ):
+            matches.add(pid)
+    return tuple(sorted(matches))
+
+
+def _windows_command_line_argv(command_line: str) -> tuple[str, ...]:
+    if not isinstance(command_line, str) or not command_line.strip():
+        raise ValueError("process command line is missing")
+    arguments: list[str] = []
+    index = 0
+    length = len(command_line)
+    while index < length:
+        while index < length and command_line[index] in " \t":
+            index += 1
+        if index >= length:
+            break
+        output: list[str] = []
+        in_quotes = False
+        while index < length and (in_quotes or command_line[index] not in " \t"):
+            if command_line[index] == "\\":
+                slash_start = index
+                while index < length and command_line[index] == "\\":
+                    index += 1
+                slash_count = index - slash_start
+                if index < length and command_line[index] == '"':
+                    output.extend("\\" * (slash_count // 2))
+                    if slash_count % 2:
+                        output.append('"')
+                        index += 1
+                    else:
+                        in_quotes = not in_quotes
+                        index += 1
+                else:
+                    output.extend("\\" * slash_count)
+                continue
+            if command_line[index] == '"':
+                if in_quotes and index + 1 < length and command_line[index + 1] == '"':
+                    output.append('"')
+                    index += 2
+                else:
+                    in_quotes = not in_quotes
+                    index += 1
+                continue
+            output.append(command_line[index])
+            index += 1
+        if in_quotes:
+            raise ValueError("process command line quoting is invalid")
+        arguments.append("".join(output))
+    if not arguments:
+        raise ValueError("process command line is missing")
+    return tuple(arguments)
 
 
 def _hash_private_process_identity(identity: RecordedProcessIdentity) -> str:
@@ -1037,6 +1420,18 @@ class NativeWindowsHostSystem:
             private_registry_hash=private_registry_hash,
             reference_hashes=reference_hashes,
             repositories=repositories,
+        )
+
+    def gpu_snapshot(self) -> GpuSnapshot:
+        return self._gpu_snapshot()
+
+    def matching_runners(
+        self,
+        specifications: tuple[PrivateRunnerSpecification, ...],
+    ) -> tuple[int, ...]:
+        return _matching_runner_pids(
+            self._process_inventory_document(),
+            specifications,
         )
 
     def begin_case(
@@ -1239,13 +1634,7 @@ class NativeWindowsHostSystem:
         return GpuSnapshot(used_mib=int(values[0]), free_mib=int(values[1]))
 
     def _process_snapshot(self) -> dict[int, RecordedProcessIdentity]:
-        document = self._powershell_document(
-            "$items = @(Get-CimInstance Win32_Process | ForEach-Object { "
-            "[pscustomobject]@{pid=[int]$_.ProcessId;creation_time=$_.CreationDate.ToUniversalTime().ToString('o');"
-            "executable_path=[string]$_.ExecutablePath;command_line=[string]$_.CommandLine;parent_pid=[int]$_.ParentProcessId} }); "
-            "$items | ConvertTo-Json -Compress -Depth 3",
-            {},
-        )
+        document = self._process_inventory_document()
         items = document if isinstance(document, list) else [document]
         raw_by_pid = {
             item["pid"]: item
@@ -1276,6 +1665,16 @@ class NativeWindowsHostSystem:
                 parent_creation_time=parent_creation,
             )
         return output
+
+    def _process_inventory_document(self) -> Any:
+        return self._powershell_document(
+            "$items = @(Get-CimInstance Win32_Process | ForEach-Object { "
+            "[pscustomobject]@{pid=[int]$_.ProcessId;creation_time=$_.CreationDate.ToUniversalTime().ToString('o');"
+            "name=[string]$_.Name;executable_path=[string]$_.ExecutablePath;"
+            "command_line=[string]$_.CommandLine;parent_pid=[int]$_.ParentProcessId} }); "
+            "$items | ConvertTo-Json -Compress -Depth 3",
+            {},
+        )
 
     def _stop_pid(self, pid: int) -> None:
         self._powershell_document(
@@ -1572,6 +1971,7 @@ class HttpReliabilityProbe:
                     item_status="failed",
                     version_status="failed",
                     manifest_version_absent=False,
+                    version_audio_absent=True,
                 ),
                 termination=TerminationEvidence(
                     endpoint_unavailable=True,
@@ -1579,6 +1979,15 @@ class HttpReliabilityProbe:
                     queue_before_prompt_ids=queue_before,
                     manifest_audio_absent=True,
                 ),
+            )
+        tts_terminal = None
+        if case.action in {"cancel-running", "timeout"}:
+            tts_terminal = _fault_terminal_evidence(
+                case,
+                terminal=terminal,
+                item=item,
+                version=version,
+                prompt_id=prompt_id,
             )
         queue_after_document = self._comfy_queue(fixture)
         queue_after = _comfy_prompt_ids(queue_after_document)
@@ -1603,6 +2012,7 @@ class HttpReliabilityProbe:
                 history_prompt_ids=history_ids,
                 terminal_history_status=terminal_history_status,
             ),
+            tts_more=tts_terminal,
         )
 
     def release(self) -> None:
@@ -1810,6 +2220,7 @@ class HttpReliabilityProbe:
                     item_status="cancelled",
                     version_status=None,
                     manifest_version_absent=True,
+                    version_audio_absent=True,
                 ),
             )
         finally:
@@ -1924,12 +2335,9 @@ def _job_outcome(case: CasePlan, job: dict[str, Any]) -> Outcome:
     if status != "failed":
         raise RuntimeError("job did not report a supported terminal outcome")
     if case.action == "timeout":
-        values: list[str] = [str(job.get("error") or "")]
-        items = job.get("items")
-        if isinstance(items, list):
-            values.extend(str(item.get("error") or "") for item in items if isinstance(item, dict))
-        if any(re.search(r"(?i)\b(?:timeout|timed\s+out)\b", value) for value in values):
-            return "timeout"
+        # The manifest's typed failure_stage/control_code is checked immediately
+        # after this provisional outcome; free-form error wording is not evidence.
+        return "timeout"
     return "failed"
 
 
@@ -2010,6 +2418,73 @@ def _find_manifest_version(
     if len(candidates) != 1:
         raise RuntimeError("manifest version is missing or ambiguous")
     return candidates[0]
+
+
+def _fault_terminal_evidence(
+    case: CasePlan,
+    *,
+    terminal: dict[str, Any],
+    item: dict[str, Any],
+    version: dict[str, Any],
+    prompt_id: str,
+) -> TtsTerminalEvidence:
+    if case.action == "cancel-running":
+        expected_job_status: Outcome = "cancelled"
+        expected_control_code: Literal["cancelled", "timeout"] = "cancelled"
+        expected_failure_stage: Literal["timeout"] | None = None
+    elif case.action == "timeout":
+        expected_job_status = "failed"
+        expected_control_code = "timeout"
+        expected_failure_stage = "timeout"
+    else:
+        raise RuntimeError("fault terminal evidence requested for a non-control case")
+
+    metadata = version.get("metadata")
+    control_details = metadata.get("control_details") if isinstance(metadata, dict) else None
+    cancellation = control_details.get("cancellation") if isinstance(control_details, dict) else None
+    failure_stage_matches = (
+        isinstance(metadata, dict)
+        and (
+            metadata.get("failure_stage") == expected_failure_stage
+            if expected_failure_stage is not None
+            else "failure_stage" not in metadata
+        )
+    )
+    if (
+        terminal.get("status") != expected_job_status
+        or item.get("status") != expected_job_status
+        or version.get("status") != expected_job_status
+        or bool(version.get("audio_path"))
+        or not isinstance(metadata, dict)
+        or metadata.get("control_code") != expected_control_code
+        or not failure_stage_matches
+        or not isinstance(control_details, dict)
+        or control_details.get("prompt_id") != prompt_id
+        or not isinstance(cancellation, dict)
+        or cancellation.get("prompt_id") != prompt_id
+    ):
+        raise RuntimeError("fault terminal evidence is incomplete")
+    try:
+        control = FaultControlEvidence(
+            control_code=expected_control_code,
+            failure_stage=expected_failure_stage,
+            prompt_id=prompt_id,
+            initial_state=cancellation.get("initial_state"),
+            final_state=cancellation.get("final_state"),
+            actions=cancellation.get("actions"),
+            duration_seconds=cancellation.get("duration_seconds"),
+            converged=cancellation.get("converged"),
+        )
+    except (ValidationError, ValueError, TypeError, AttributeError):
+        raise RuntimeError("fault terminal evidence is incomplete") from None
+    return TtsTerminalEvidence(
+        job_status=expected_job_status,
+        item_status=expected_job_status,
+        version_status=expected_job_status,
+        manifest_version_absent=False,
+        version_audio_absent=True,
+        control=control,
+    )
 
 
 def _public_manifest_version_id(case_id: str, raw_version_id: str) -> str:
@@ -2171,17 +2646,23 @@ def execute_reliability_validation(
     preflight_passed = False
     release_attempted = False
     baseline: BoundarySnapshot | None = None
+    gpu_idle_baseline: GpuSnapshot | None = None
+    active_case: CasePlan | None = None
+    active_host_observation: HostCaseObservation | None = None
 
     try:
         _require_endpoint_scope(fixture, allow_lan=allow_lan)
         http_preflight = _revalidate_model(http_probe.preflight(fixture), HttpPreflightObservation)
         host_preflight = _revalidate_model(host_probe.preflight(fixture), HostPreflightObservation)
         baseline = host_preflight.boundary
+        gpu_idle_baseline = host_preflight.gpu_idle_baseline
         _validate_preflight(fixture, http_preflight, host_preflight, owned_processes)
         preflight_passed = True
 
         provisional_boundary = _boundary_evidence(baseline, baseline)
         for case in selected_plan:
+            active_case = case
+            active_host_observation = None
             started_at = host_probe.begin_case(case)
             action_hook: Callable[[], None] | None = None
             if case.action == "terminate-comfyui":
@@ -2196,7 +2677,7 @@ def execute_reliability_validation(
                     action_hook=action_hook,
                 )
             finally:
-                host_observation = _revalidate_model(
+                active_host_observation = _revalidate_model(
                     host_probe.finish_case(case, started_at),
                     HostCaseObservation,
                 )
@@ -2205,19 +2686,22 @@ def execute_reliability_validation(
             evidence = _case_evidence(
                 case,
                 http_observation,
-                host_observation,
+                active_host_observation,
                 provisional_boundary,
             )
             validation = validate_case(evidence, wav_path=http_observation.wav_path)
             if not validation.valid:
                 raise LiveValidationError("case-validation-failed", stage="case")
             completed_cases.append(validation.evidence)
+            active_case = None
+            active_host_observation = None
 
         release_attempted = True
         http_probe.release()
         http_final = _revalidate_model(http_probe.final_state(), HttpFinalObservation)
         host_final = _revalidate_model(host_probe.final_state(), HostFinalObservation)
-        _validate_final_state(http_final, host_final)
+        assert gpu_idle_baseline is not None
+        _validate_final_state(http_final, host_final, gpu_idle_baseline=gpu_idle_baseline)
         assert baseline is not None
         final_boundary = _boundary_evidence(baseline, host_final.boundary)
         completed_cases = [
@@ -2254,11 +2738,30 @@ def execute_reliability_validation(
             completed_cases,
             required_cases=required_case_specs(selected_plan),
         )
-        write_atomic_json(output_root / "reliability-summary.json", summary)
+        for completed_case in summary.cases:
+            write_atomic_json(
+                output_root / "cases" / f"{completed_case.case_id}.json",
+                completed_case.model_dump(mode="json"),
+            )
+        if active_case is not None:
+            failed_case = FailedCaseEvidence(
+                status="failed",
+                case_id=active_case.case_id,
+                phase=active_case.phase,
+                engine=active_case.engine,
+                expected=active_case.expected,
+                failure=FailureMarker(code=failure.code, stage=failure.stage),
+                host=active_host_observation,
+            )
+            write_atomic_json(
+                output_root / "cases" / f"{active_case.case_id}.json",
+                failed_case.model_dump(mode="json"),
+            )
         write_atomic_json(
             output_root / "failure.json",
             {"code": failure.code, "stage": failure.stage},
         )
+        write_atomic_json(output_root / "reliability-summary.json", summary)
         raise failure
 
     for case in summary.cases:
@@ -2300,6 +2803,7 @@ def execute_reliability_preflight(
                 str(port): identity.model_dump(mode="json")
                 for port, identity in sorted(host.port_owners.items())
             },
+            "gpu_idle_baseline": host.gpu_idle_baseline.model_dump(mode="json"),
             "boundary": {
                 "aggregate_hash": host.boundary.aggregate_hash,
                 "private_registry_hash": host.boundary.private_registry_hash,
@@ -2355,14 +2859,37 @@ def _validate_preflight(
     _validate_boundary_snapshot(host.boundary)
 
 
-def _validate_final_state(http: HttpFinalObservation, host: HostFinalObservation) -> None:
+def _validate_final_state(
+    http: HttpFinalObservation,
+    host: HostFinalObservation,
+    *,
+    gpu_idle_baseline: GpuSnapshot,
+) -> None:
     if not http.runtime_released:
         raise LiveValidationError("runtime-release-failed", stage="finalize")
     if not _queue_is_idle(http.queue):
         raise LiveValidationError("final-queue-not-idle", stage="finalize")
     if not host.owned_processes_stopped or not host.temp_paths_removed:
         raise LiveValidationError("final-cleanup-incomplete", stage="finalize")
+    if not _gpu_recovered_to_idle_baseline(gpu_idle_baseline, host.gpu_after_release):
+        raise LiveValidationError("final-gpu-not-recovered", stage="finalize")
     _validate_boundary_snapshot(host.boundary)
+
+
+def _gpu_recovered_to_idle_baseline(baseline: GpuSnapshot, final: GpuSnapshot) -> bool:
+    try:
+        values = (baseline.used_mib, baseline.free_mib, final.used_mib, final.free_mib)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            return False
+        baseline_total = baseline.used_mib + baseline.free_mib
+        final_total = final.used_mib + final.free_mib
+        return (
+            final.used_mib - baseline.used_mib <= 1024
+            and baseline.free_mib - final.free_mib <= 1024
+            and abs(final_total - baseline_total) <= 1024
+        )
+    except (AttributeError, TypeError):
+        return False
 
 
 def _queue_is_idle(queue: QueueSnapshot) -> bool:
@@ -2589,6 +3116,8 @@ def _queue_proof_valid(case: CaseEvidence) -> bool:
                 and terminal.item_status == "cancelled"
                 and terminal.version_status is None
                 and terminal.manifest_version_absent is True
+                and terminal.version_audio_absent is True
+                and terminal.control is None
                 and case.termination is None
             )
         if case.case_id == "terminate-comfyui-indextts":
@@ -2605,12 +3134,39 @@ def _queue_proof_valid(case: CaseEvidence) -> bool:
                 and terminal.item_status == "failed"
                 and terminal.version_status == "failed"
                 and terminal.manifest_version_absent is False
+                and terminal.version_audio_absent is True
+                and terminal.control is None
                 and termination is not None
                 and termination.endpoint_unavailable is True
                 and termination.prompt_id == case.prompt_id
                 and termination.queue_before_prompt_ids.count(case.prompt_id) == 1
                 and termination.manifest_audio_absent is True
             )
+        terminal = case.tts_more
+        if case.phase == "fault" and case.expected in {"cancelled", "timeout"}:
+            expected_terminal_status = "cancelled" if case.expected == "cancelled" else "failed"
+            expected_control_code = "cancelled" if case.expected == "cancelled" else "timeout"
+            expected_failure_stage = None if case.expected == "cancelled" else "timeout"
+            control = terminal.control if terminal is not None else None
+            if not (
+                case.actual == case.expected
+                and case.audio is None
+                and terminal is not None
+                and terminal.job_status == expected_terminal_status
+                and terminal.item_status == expected_terminal_status
+                and terminal.version_status == expected_terminal_status
+                and terminal.manifest_version_absent is False
+                and terminal.version_audio_absent is True
+                and control is not None
+                and control.control_code == expected_control_code
+                and control.failure_stage == expected_failure_stage
+                and control.prompt_id == case.prompt_id
+                and control.initial_state == "running"
+                and control.final_state == "interrupted"
+                and control.actions == ["interrupt"]
+                and control.converged is True
+            ):
+                return False
         queue = case.comfyui
         return (
             case.prompt_submitted is True

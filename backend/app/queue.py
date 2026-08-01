@@ -419,7 +419,11 @@ class ServiceGenerationQueue:
             )
         except SynthesisCancelled as exc:
             cleanup_errors = self._discard_uncommitted_output(output_path)
-            if exc.details.get("converged") is True:
+            converged = exc.details.get("converged")
+            cancellation = exc.details.get("cancellation")
+            if converged is None and isinstance(cancellation, dict):
+                converged = cancellation.get("converged")
+            if converged is True:
                 self._record_cancelled_outcome(
                     route,
                     task,

@@ -110,25 +110,12 @@ function Test-RecordDocumentMatches {
     return $true
 }
 
-function Write-RunControlState {
-    param(
-        [string] $Path,
-        [string] $RunId,
-        [object] $BackendRecord,
-        [object] $ComfyRecord
-    )
-    $document = [ordered]@{
-        version = 1
-        run_id = $RunId
-        owned_processes = [ordered]@{
-            'tts-more' = $BackendRecord
-            comfyui = $ComfyRecord
-        }
-    }
+function Write-PrivateJsonAtomic {
+    param([string] $Path, [object] $Document)
     $temporaryPath = "{0}.{1}.tmp" -f $Path, [Guid]::NewGuid().ToString('N')
     $backupPath = "{0}.{1}.previous" -f $Path, [Guid]::NewGuid().ToString('N')
     try {
-        $document | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
+        $Document | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
         if (Test-Path -LiteralPath $Path -PathType Leaf) {
             [IO.File]::Replace($temporaryPath, $Path, $backupPath)
         } else {
@@ -142,15 +129,211 @@ function Write-RunControlState {
             Remove-Item -LiteralPath $backupPath -Force
         }
     }
+}
+
+function Test-CommandLineArgument {
+    param([string] $CommandLine, [string] $Argument)
+    if (-not $CommandLine -or $Argument -notmatch '^[A-Za-z0-9_=-]+$') { return $false }
+    $pattern = '(^|[\s"])' + [regex]::Escape($Argument) + '($|[\s"])'
+    return [regex]::IsMatch($CommandLine, $pattern)
+}
+
+function Test-FullRecordPromotesProvisional {
+    param([object] $FullRecord, [object] $ProvisionalRecord, [object] $LaunchIntent)
+    if ($null -eq $FullRecord -or $null -eq $ProvisionalRecord -or $null -eq $LaunchIntent) {
+        return $false
+    }
+    try {
+        $creationTicks = Get-UtcTicks -Value $FullRecord.creation_time
+        return (
+            [int] $FullRecord.pid -eq [int] $ProvisionalRecord.pid -and
+            [string] $FullRecord.executable_path -eq [string] $ProvisionalRecord.executable_path -and
+            [string] $FullRecord.executable_path -eq [string] $LaunchIntent.executable_path -and
+            [int] $FullRecord.parent_pid -eq [int] $ProvisionalRecord.parent_pid -and
+            [int] $FullRecord.parent_pid -eq [int] $LaunchIntent.parent_pid -and
+            (Get-UtcTicks -Value $FullRecord.parent_creation_time) -eq
+                (Get-UtcTicks -Value $ProvisionalRecord.parent_creation_time) -and
+            (Get-UtcTicks -Value $FullRecord.parent_creation_time) -eq
+                (Get-UtcTicks -Value $LaunchIntent.parent_creation_time) -and
+            $creationTicks -ge (Get-UtcTicks -Value $ProvisionalRecord.started_after) -and
+            $creationTicks -le (Get-UtcTicks -Value $ProvisionalRecord.started_before) -and
+            (Test-CommandLineArgument -CommandLine ([string] $FullRecord.command_line) `
+                -Argument ([string] $LaunchIntent.marker))
+        )
+    } catch { return $false }
+}
+
+function Write-LaunchIntentRunControlState {
+    param(
+        [string] $Path,
+        [string] $RunId,
+        [ValidateSet('tts-more', 'comfyui')] [string] $ProcessLabel,
+        [object] $LaunchIntent,
+        [object] $BackendRecord,
+        [object] $ComfyRecord
+    )
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $previous = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        if (
+            $previous.version -ne 2 -or
+            $previous.run_id -ne $RunId -or
+            -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $previous.owned_processes.'tts-more') -or
+            -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $previous.owned_processes.comfyui) -or
+            $null -ne $previous.provisional_processes.'tts-more' -or
+            $null -ne $previous.provisional_processes.comfyui -or
+            $null -ne $previous.launch_intents.'tts-more' -or
+            $null -ne $previous.launch_intents.comfyui
+        ) { throw 'Existing process control state is not ready for a new launch intent' }
+    }
+    $backendIntent = if ($ProcessLabel -eq 'tts-more') { $LaunchIntent } else { $null }
+    $comfyIntent = if ($ProcessLabel -eq 'comfyui') { $LaunchIntent } else { $null }
+    $document = [ordered]@{
+        version = 2
+        run_id = $RunId
+        owned_processes = [ordered]@{
+            'tts-more' = $BackendRecord
+            comfyui = $ComfyRecord
+        }
+        provisional_processes = [ordered]@{
+            'tts-more' = $null
+            comfyui = $null
+        }
+        launch_intents = [ordered]@{
+            'tts-more' = $backendIntent
+            comfyui = $comfyIntent
+        }
+    }
+    Write-PrivateJsonAtomic -Path $Path -Document $document
     $persisted = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $actualIntent = $persisted.launch_intents.PSObject.Properties[$ProcessLabel].Value
     if (
-        $persisted.version -ne 1 -or
+        $persisted.version -ne 2 -or
         $persisted.run_id -ne $RunId -or
         -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $persisted.owned_processes.'tts-more') -or
-        -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $persisted.owned_processes.comfyui)
-    ) {
-        throw 'Run-bound process control state could not be revalidated'
+        -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $persisted.owned_processes.comfyui) -or
+        ($LaunchIntent | ConvertTo-Json -Depth 8 -Compress) -ne
+            ($actualIntent | ConvertTo-Json -Depth 8 -Compress)
+    ) { throw 'Pre-launch process recovery intent could not be revalidated' }
+}
+
+function Write-ProvisionalRunControlState {
+    param(
+        [string] $Path,
+        [string] $RunId,
+        [ValidateSet('tts-more', 'comfyui')] [string] $ProcessLabel,
+        [object] $LaunchIntent,
+        [object] $ProvisionalRecord,
+        [object] $BackendRecord,
+        [object] $ComfyRecord
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'Durable launch intent is missing before provisional identity write'
     }
+    $previous = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $previousIntent = $previous.launch_intents.PSObject.Properties[$ProcessLabel].Value
+    $otherLabel = if ($ProcessLabel -eq 'tts-more') { 'comfyui' } else { 'tts-more' }
+    if (
+        $previous.version -ne 2 -or
+        $previous.run_id -ne $RunId -or
+        -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $previous.owned_processes.'tts-more') -or
+        -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $previous.owned_processes.comfyui) -or
+        ($LaunchIntent | ConvertTo-Json -Depth 8 -Compress) -ne
+            ($previousIntent | ConvertTo-Json -Depth 8 -Compress) -or
+        $null -ne $previous.launch_intents.PSObject.Properties[$otherLabel].Value -or
+        $null -ne $previous.provisional_processes.'tts-more' -or
+        $null -ne $previous.provisional_processes.comfyui
+    ) { throw 'Existing launch intent does not accept the provisional identity' }
+    $backendIntent = if ($ProcessLabel -eq 'tts-more') { $LaunchIntent } else { $null }
+    $comfyIntent = if ($ProcessLabel -eq 'comfyui') { $LaunchIntent } else { $null }
+    $backendProvisional = if ($ProcessLabel -eq 'tts-more') { $ProvisionalRecord } else { $null }
+    $comfyProvisional = if ($ProcessLabel -eq 'comfyui') { $ProvisionalRecord } else { $null }
+    $document = [ordered]@{
+        version = 2
+        run_id = $RunId
+        owned_processes = [ordered]@{
+            'tts-more' = $BackendRecord
+            comfyui = $ComfyRecord
+        }
+        provisional_processes = [ordered]@{
+            'tts-more' = $backendProvisional
+            comfyui = $comfyProvisional
+        }
+        launch_intents = [ordered]@{
+            'tts-more' = $backendIntent
+            comfyui = $comfyIntent
+        }
+    }
+    Write-PrivateJsonAtomic -Path $Path -Document $document
+    $persisted = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $actualIntent = $persisted.launch_intents.PSObject.Properties[$ProcessLabel].Value
+    $actualProvisional = $persisted.provisional_processes.PSObject.Properties[$ProcessLabel].Value
+    if (
+        $persisted.version -ne 2 -or
+        $persisted.run_id -ne $RunId -or
+        -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $persisted.owned_processes.'tts-more') -or
+        -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $persisted.owned_processes.comfyui) -or
+        ($LaunchIntent | ConvertTo-Json -Depth 8 -Compress) -ne
+            ($actualIntent | ConvertTo-Json -Depth 8 -Compress) -or
+        ($ProvisionalRecord | ConvertTo-Json -Depth 8 -Compress) -ne
+            ($actualProvisional | ConvertTo-Json -Depth 8 -Compress)
+    ) { throw 'Provisional process recovery identity could not be revalidated' }
+}
+
+function Write-RunControlState {
+    param(
+        [string] $Path,
+        [string] $RunId,
+        [object] $BackendRecord,
+        [object] $ComfyRecord
+    )
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $previous = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        if ($previous.version -ne 2 -or $previous.run_id -ne $RunId) {
+            throw 'Existing process control state is not promotable'
+        }
+        foreach ($role in @('tts-more', 'comfyui')) {
+            $fullRecord = if ($role -eq 'tts-more') { $BackendRecord } else { $ComfyRecord }
+            $previousFull = $previous.owned_processes.PSObject.Properties[$role].Value
+            $provisional = $previous.provisional_processes.PSObject.Properties[$role].Value
+            $intent = $previous.launch_intents.PSObject.Properties[$role].Value
+            if ($null -ne $provisional -or $null -ne $intent) {
+                if (-not (Test-FullRecordPromotesProvisional `
+                        -FullRecord $fullRecord -ProvisionalRecord $provisional -LaunchIntent $intent)) {
+                    throw 'Full process identity does not promote the provisional recovery identity'
+                }
+            } elseif (-not (Test-RecordDocumentMatches -Expected $previousFull -Actual $fullRecord)) {
+                throw 'Existing full process identity changed during control-state update'
+            }
+        }
+    }
+    $document = [ordered]@{
+        version = 2
+        run_id = $RunId
+        owned_processes = [ordered]@{
+            'tts-more' = $BackendRecord
+            comfyui = $ComfyRecord
+        }
+        provisional_processes = [ordered]@{
+            'tts-more' = $null
+            comfyui = $null
+        }
+        launch_intents = [ordered]@{
+            'tts-more' = $null
+            comfyui = $null
+        }
+    }
+    Write-PrivateJsonAtomic -Path $Path -Document $document
+    $persisted = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if (
+        $persisted.version -ne 2 -or
+        $persisted.run_id -ne $RunId -or
+        -not (Test-RecordDocumentMatches -Expected $BackendRecord -Actual $persisted.owned_processes.'tts-more') -or
+        -not (Test-RecordDocumentMatches -Expected $ComfyRecord -Actual $persisted.owned_processes.comfyui) -or
+        $null -ne $persisted.provisional_processes.'tts-more' -or
+        $null -ne $persisted.provisional_processes.comfyui -or
+        $null -ne $persisted.launch_intents.'tts-more' -or
+        $null -ne $persisted.launch_intents.comfyui
+    ) { throw 'Run-bound process control state could not be revalidated' }
     foreach ($record in @($BackendRecord, $ComfyRecord)) {
         if ($null -ne $record -and -not (Test-RecordedIdentity -Record $record)) {
             throw 'Persisted process identity no longer matches'
@@ -174,8 +357,8 @@ function Stop-ProvisionalStartedProcess {
             ) -or
             [int] $current.ParentProcessId -ne [int] $Token.parent_pid -or
             $parent.CreationDate.ToUniversalTime().Ticks -ne (Get-UtcTicks -Value $Token.parent_creation_time) -or
-            $createdAt -lt $Token.started_after -or
-            $createdAt -gt $Token.started_before
+            $createdAt.Ticks -lt (Get-UtcTicks -Value $Token.started_after) -or
+            $createdAt.Ticks -gt (Get-UtcTicks -Value $Token.started_before)
         ) {
             Write-Warning 'Provisional process identity does not match; preserving the current PID'
             return $false
@@ -195,6 +378,73 @@ function Stop-ProvisionalStartedProcess {
     }
 }
 
+function Resolve-LaunchIntentProcess {
+    param([object] $Intent)
+    $expectedPath = [IO.Path]::GetFullPath([string] $Intent.executable_path)
+    $expectedName = [IO.Path]::GetFileName($expectedPath)
+    $startedAfterTicks = Get-UtcTicks -Value $Intent.started_after
+    $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    $matches = @()
+    foreach ($candidate in $allProcesses) {
+        $candidateParentPid = [int] $candidate.ParentProcessId
+        $candidateName = [string] $candidate.Name
+        $candidatePathText = [string] $candidate.ExecutablePath
+        $sameNamedChild = (
+            $candidateParentPid -eq [int] $Intent.parent_pid -and
+            $candidateName.Equals($expectedName, [StringComparison]::OrdinalIgnoreCase)
+        )
+        $samePathChild = $false
+        if ($candidatePathText) {
+            try {
+                $samePathChild = (
+                    $candidateParentPid -eq [int] $Intent.parent_pid -and
+                    [IO.Path]::GetFullPath($candidatePathText).Equals(
+                        $expectedPath,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )
+                )
+            } catch {
+                if ($sameNamedChild) { throw 'Launch intent candidate executable path is invalid' }
+            }
+        }
+        if (-not $sameNamedChild -and -not $samePathChild) { continue }
+        if ($null -eq $candidate.CreationDate) {
+            throw 'Launch intent candidate creation time is missing'
+        }
+        try { $createdAt = $candidate.CreationDate.ToUniversalTime() } catch {
+            throw 'Launch intent candidate creation time is invalid'
+        }
+        if ($createdAt.Ticks -lt $startedAfterTicks) { continue }
+        if (-not $candidatePathText -or -not $candidate.CommandLine) {
+            throw 'Launch intent candidate identity is incomplete'
+        }
+        if (-not $samePathChild) { continue }
+        if (-not (Test-CommandLineArgument -CommandLine ([string] $candidate.CommandLine) `
+                -Argument ([string] $Intent.marker))) { continue }
+        $matches += [pscustomobject]@{
+            pid = [int] $candidate.ProcessId
+            creation_time = $createdAt.ToString('o')
+            executable_path = $expectedPath
+            command_line = [string] $candidate.CommandLine
+            parent_pid = [int] $candidate.ParentProcessId
+            parent_creation_time = [string] $Intent.parent_creation_time
+        }
+    }
+    if ($matches.Count -gt 1) { throw 'Launch intent matched multiple processes' }
+    if ($matches.Count -eq 0) { return $null }
+    $resolved = $matches[0]
+    $parents = @($allProcesses | Where-Object { [int] $_.ProcessId -eq [int] $resolved.parent_pid })
+    if ($parents.Count -gt 1) { throw 'Launch intent parent identity is ambiguous' }
+    if ($parents.Count -eq 1) {
+        if (
+            $null -eq $parents[0].CreationDate -or
+            $parents[0].CreationDate.ToUniversalTime().Ticks -ne
+                (Get-UtcTicks -Value $Intent.parent_creation_time)
+        ) { throw 'Launch intent parent identity changed' }
+    }
+    return $resolved
+}
+
 function Start-ProvisionallyTrackedProcess {
     param(
         [string] $FilePath,
@@ -202,13 +452,47 @@ function Start-ProvisionallyTrackedProcess {
         [string] $WorkingDirectory,
         [string] $ChildTempRoot,
         [object] $LauncherRecord,
-        [System.Collections.Generic.List[object]] $StartedProcesses
+        [System.Collections.Generic.List[object]] $StartedProcesses,
+        [string] $ControlStatePath,
+        [string] $RunId,
+        [ValidateSet('tts-more', 'comfyui')] [string] $ProcessLabel,
+        [string] $LaunchMarker,
+        [object] $BackendRecord,
+        [object] $ComfyRecord
     )
+    if ($LaunchMarker -notmatch '^tts_more_reliability_run=[0-9a-f]{32}-(tts-more|comfyui)$') {
+        throw 'Launch marker is invalid'
+    }
+    $markerPairCount = 0
+    for ($index = 0; $index -lt ($ArgumentList.Count - 1); $index += 1) {
+        if ($ArgumentList[$index] -eq '-X' -and $ArgumentList[$index + 1] -eq $LaunchMarker) {
+            $markerPairCount += 1
+        }
+    }
+    if ($markerPairCount -ne 1 -or @($ArgumentList | Where-Object { $_ -eq $LaunchMarker }).Count -ne 1) {
+        throw 'Launch arguments do not contain the unique recovery marker'
+    }
     $hadTemp = Test-Path Env:TEMP
     $hadTmp = Test-Path Env:TMP
     $previousTemp = $env:TEMP
     $previousTmp = $env:TMP
     $startedAfter = [DateTime]::UtcNow
+    $launchIntent = [ordered]@{
+        marker = $LaunchMarker
+        executable_path = [IO.Path]::GetFullPath($FilePath)
+        arguments = @($ArgumentList)
+        working_directory = [IO.Path]::GetFullPath($WorkingDirectory)
+        child_temp_root = [IO.Path]::GetFullPath($ChildTempRoot)
+        parent_pid = [int] $LauncherRecord.pid
+        parent_creation_time = [string] $LauncherRecord.creation_time
+        started_after = $startedAfter.ToString('o')
+    }
+    # This canonical intent must exist before Start-Process. The random -X
+    # marker makes an intent-only recovery uniquely enumerable if the first
+    # post-start identity write fails.
+    Write-LaunchIntentRunControlState -Path $ControlStatePath -RunId $RunId `
+        -ProcessLabel $ProcessLabel -LaunchIntent $launchIntent `
+        -BackendRecord $BackendRecord -ComfyRecord $ComfyRecord
     try {
         $env:TEMP = $ChildTempRoot
         $env:TMP = $ChildTempRoot
@@ -219,10 +503,21 @@ function Start-ProvisionallyTrackedProcess {
             executable_path = [IO.Path]::GetFullPath($FilePath)
             parent_pid = [int] $LauncherRecord.pid
             parent_creation_time = [string] $LauncherRecord.creation_time
-            started_after = $startedAfter
-            started_before = [DateTime]::UtcNow
+            started_after = $startedAfter.ToString('o')
+            started_before = [DateTime]::UtcNow.ToString('o')
         }
         $StartedProcesses.Add($token)
+        try {
+            Write-ProvisionalRunControlState -Path $ControlStatePath -RunId $RunId `
+                -ProcessLabel $ProcessLabel -LaunchIntent $launchIntent `
+                -ProvisionalRecord $token -BackendRecord $BackendRecord -ComfyRecord $ComfyRecord
+        } catch {
+            $persistenceFailure = $_
+            if (-not (Stop-ProvisionalStartedProcess -Token $token)) {
+                Write-Warning 'Provisional identity write failed; preserving the durable launch intent'
+            }
+            throw $persistenceFailure
+        }
         return [pscustomobject]@{ process = $process; token = $token }
     } finally {
         if ($hadTemp) { $env:TEMP = $previousTemp } else { Remove-Item Env:TEMP -ErrorAction SilentlyContinue }
@@ -291,26 +586,84 @@ function Stop-RecordedTree {
     return $false
 }
 
+function Test-PrivateIdentityRecordsCanBeRemoved {
+    param(
+        [bool] $ProcessCleanupProven,
+        [bool] $TempCleanupProven,
+        [int] $OwnedProcessCount
+    )
+    if ($OwnedProcessCount -eq 0) { return $true }
+    return $ProcessCleanupProven -and $TempCleanupProven
+}
+
+function Remove-PrivateIdentityRecordsIfSafe {
+    param(
+        [string] $HostManifestPath,
+        [string] $ControlStatePath,
+        [bool] $ProcessCleanupProven,
+        [bool] $TempCleanupProven,
+        [int] $OwnedProcessCount
+    )
+    if (-not (Test-PrivateIdentityRecordsCanBeRemoved `
+            -ProcessCleanupProven $ProcessCleanupProven `
+            -TempCleanupProven $TempCleanupProven `
+            -OwnedProcessCount $OwnedProcessCount)) {
+        Write-Warning 'Cleanup was not proven; preserving private process identity records'
+        return $false
+    }
+    # Remove current state first so a partial deletion still leaves the full
+    # launch manifest as the unique recovery identity record.
+    foreach ($privateRecord in @($ControlStatePath, $HostManifestPath)) {
+        if (-not (Test-Path -LiteralPath $privateRecord -PathType Leaf)) { continue }
+        try {
+            Remove-Item -LiteralPath $privateRecord -Force -ErrorAction Stop
+        } catch {
+            Write-Warning 'Private process identity record removal failed; preserving the remaining record'
+            return $false
+        }
+    }
+    return (
+        -not (Test-Path -LiteralPath $HostManifestPath) -and
+        -not (Test-Path -LiteralPath $ControlStatePath)
+    )
+}
+
 function Remove-OwnedTempRoot {
     param([string] $Root, [string] $OwnerMarker, [string] $ExpectedRunId, [string] $ResolvedOutputRoot)
-    if (-not (Test-Path -LiteralPath $Root)) { return }
-    $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path
+    $rootExists = Test-Path -LiteralPath $Root
+    $resolvedRoot = if ($rootExists) {
+        (Resolve-Path -LiteralPath $Root).Path
+    } else {
+        [IO.Path]::GetFullPath($Root)
+    }
     $prefix = $ResolvedOutputRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
     if (-not $resolvedRoot.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
         Write-Warning 'Validation temp root escaped the output root; preserving it'
-        return
+        return $false
     }
     if (-not (Test-Path -LiteralPath $OwnerMarker -PathType Leaf)) {
+        if (-not $rootExists) { return $true }
         Write-Warning 'Validation temp owner marker is missing; preserving the temp root'
-        return
+        return $false
     }
-    $owner = Get-Content -LiteralPath $OwnerMarker -Raw | ConvertFrom-Json
-    if ($owner.run_id -ne $ExpectedRunId -or $owner.temp_root -ne $resolvedRoot) {
-        Write-Warning 'Validation temp owner marker does not match; preserving the temp root'
-        return
+    try {
+        $owner = Get-Content -LiteralPath $OwnerMarker -Raw | ConvertFrom-Json
+        if ($owner.run_id -ne $ExpectedRunId -or $owner.temp_root -ne $resolvedRoot) {
+            Write-Warning 'Validation temp owner marker does not match; preserving the temp root'
+            return $false
+        }
+        if ($rootExists) {
+            Remove-Item -LiteralPath $resolvedRoot -Recurse -Force -ErrorAction Stop
+        }
+        Remove-Item -LiteralPath $OwnerMarker -Force -ErrorAction Stop
+    } catch {
+        Write-Warning 'Validation temp cleanup failed; preserving remaining owned artifacts'
+        return $false
     }
-    Remove-Item -LiteralPath $resolvedRoot -Recurse -Force
-    Remove-Item -LiteralPath $OwnerMarker -Force
+    return (
+        -not (Test-Path -LiteralPath $resolvedRoot) -and
+        -not (Test-Path -LiteralPath $OwnerMarker)
+    )
 }
 
 $fixturePath = Resolve-ExistingPath -LiteralPath $Fixture -Kind File
@@ -380,14 +733,17 @@ try {
 
     $listenAddress = if ($AllowLan) { '0.0.0.0' } else { '127.0.0.1' }
     $quotedComfyTempBase = '"{0}"' -f $comfyTempBase
+    $comfyLaunchMarker = "tts_more_reliability_run=$runId-comfyui"
     $comfyArguments = @(
-        'main.py', '--listen', $listenAddress, '--port', '8188',
+        '-X', $comfyLaunchMarker, 'main.py', '--listen', $listenAddress, '--port', '8188',
         '--temp-directory', $quotedComfyTempBase
     )
     $comfyStart = Start-ProvisionallyTrackedProcess -FilePath $comfyPythonPath `
         -ArgumentList $comfyArguments -WorkingDirectory $comfyRootPath `
         -ChildTempRoot $runnerTempRoot -LauncherRecord $launcherRecord `
-        -StartedProcesses $startedProcesses
+        -StartedProcesses $startedProcesses -ControlStatePath $controlStatePath `
+        -RunId $runId -ProcessLabel 'comfyui' -LaunchMarker $comfyLaunchMarker `
+        -BackendRecord $backendRecord -ComfyRecord $comfyRecord
     $comfyProcess = $comfyStart.process
     try {
         $comfyRecord = Wait-ProcessRecord -Pid $comfyProcess.Id
@@ -401,11 +757,17 @@ try {
     }
     Wait-ExactPortOwner -Port 8188 -Pid $comfyProcess.Id
 
-    $backendArguments = @('-m', 'uvicorn', 'app.main:app', '--app-dir', 'backend', '--host', $listenAddress, '--port', '8000')
+    $backendLaunchMarker = "tts_more_reliability_run=$runId-tts-more"
+    $backendArguments = @(
+        '-X', $backendLaunchMarker, '-m', 'uvicorn', 'app.main:app',
+        '--app-dir', 'backend', '--host', $listenAddress, '--port', '8000'
+    )
     $backendStart = Start-ProvisionallyTrackedProcess -FilePath $backendPythonPath `
         -ArgumentList $backendArguments -WorkingDirectory $ttsRootPath `
         -ChildTempRoot $runnerTempRoot -LauncherRecord $launcherRecord `
-        -StartedProcesses $startedProcesses
+        -StartedProcesses $startedProcesses -ControlStatePath $controlStatePath `
+        -RunId $runId -ProcessLabel 'tts-more' -LaunchMarker $backendLaunchMarker `
+        -BackendRecord $backendRecord -ComfyRecord $comfyRecord
     $backendProcess = $backendStart.process
     try {
         $backendRecord = Wait-ProcessRecord -Pid $backendProcess.Id
@@ -474,19 +836,32 @@ try {
     # only identities and temp paths created and revalidated by this run.
     $latestBackendRecord = $backendRecord
     $latestComfyRecord = $comfyRecord
+    $provisionalRecords = @{'tts-more' = $null; comfyui = $null}
+    $launchIntents = @{'tts-more' = $null; comfyui = $null}
+    $attemptedLabels = @{}
     $controlStateValid = $true
     $processCleanupProven = -not $provisionalCleanupFailed
     if (Test-Path -LiteralPath $controlStatePath -PathType Leaf) {
         try {
             $controlState = Get-Content -LiteralPath $controlStatePath -Raw | ConvertFrom-Json
-            if ($controlState.version -eq 1 -and $controlState.run_id -eq $runId) {
-                if ($null -ne $controlState.owned_processes.'tts-more') {
-                    $latestBackendRecord = $controlState.owned_processes.'tts-more'
-                }
-                if ($null -ne $controlState.owned_processes.comfyui) {
-                    $latestComfyRecord = $controlState.owned_processes.comfyui
-                } else {
-                    $latestComfyRecord = $null
+            if ($controlState.version -eq 2 -and $controlState.run_id -eq $runId) {
+                $latestBackendRecord = $controlState.owned_processes.'tts-more'
+                $latestComfyRecord = $controlState.owned_processes.comfyui
+                foreach ($role in @('tts-more', 'comfyui')) {
+                    $provisionalRecords[$role] =
+                        $controlState.provisional_processes.PSObject.Properties[$role].Value
+                    $launchIntents[$role] =
+                        $controlState.launch_intents.PSObject.Properties[$role].Value
+                    $fullRecord = if ($role -eq 'tts-more') {
+                        $latestBackendRecord
+                    } else {
+                        $latestComfyRecord
+                    }
+                    if (
+                        $null -ne $fullRecord -or
+                        $null -ne $provisionalRecords[$role] -or
+                        $null -ne $launchIntents[$role]
+                    ) { $attemptedLabels[$role] = $true }
                 }
             } else {
                 Write-Warning 'Current process control state does not match this run; preserving replacement processes'
@@ -500,26 +875,65 @@ try {
         Write-Warning 'Current process control state is missing; preserving the validation temp root'
         $controlStateValid = $false
     }
+    if (-not $controlStateValid -and (Test-Path -LiteralPath $controlStatePath)) {
+        $attemptedLabels['unresolved-control'] = $true
+    }
     if ($controlStateValid) {
-        if ($null -ne $latestBackendRecord -and -not (Stop-RecordedTree -Record $latestBackendRecord)) {
-            $processCleanupProven = $false
-        }
-        if ($null -ne $latestComfyRecord -and -not (Stop-RecordedTree -Record $latestComfyRecord)) {
-            $processCleanupProven = $false
+        foreach ($role in @('tts-more', 'comfyui')) {
+            $fullRecord = if ($role -eq 'tts-more') {
+                $latestBackendRecord
+            } else {
+                $latestComfyRecord
+            }
+            $provisionalRecord = $provisionalRecords[$role]
+            $launchIntent = $launchIntents[$role]
+            if ($null -ne $fullRecord) {
+                if ($null -ne $provisionalRecord -or $null -ne $launchIntent) {
+                    Write-Warning 'Process control state contains conflicting full and provisional identities'
+                    $processCleanupProven = $false
+                    continue
+                }
+                if (-not (Stop-RecordedTree -Record $fullRecord)) {
+                    $processCleanupProven = $false
+                }
+                continue
+            }
+            if ($null -ne $provisionalRecord) {
+                if ($null -eq $launchIntent) {
+                    Write-Warning 'Provisional process identity is missing its launch intent'
+                    $processCleanupProven = $false
+                } elseif (-not (Stop-ProvisionalStartedProcess -Token $provisionalRecord)) {
+                    $processCleanupProven = $false
+                }
+                continue
+            }
+            if ($null -ne $launchIntent) {
+                try {
+                    $intentRecord = Resolve-LaunchIntentProcess -Intent $launchIntent
+                    if ($null -ne $intentRecord -and -not (Stop-RecordedTree -Record $intentRecord)) {
+                        $processCleanupProven = $false
+                    }
+                } catch {
+                    Write-Warning 'Launch intent could not be resolved uniquely; preserving recovery records'
+                    $processCleanupProven = $false
+                }
+            }
         }
     } else {
         $processCleanupProven = $false
     }
+    $tempCleanupProven = $false
     if ($processCleanupProven) {
-        Remove-OwnedTempRoot -Root $tempRoot -OwnerMarker $tempOwnerMarker `
+        $tempCleanupProven = Remove-OwnedTempRoot -Root $tempRoot -OwnerMarker $tempOwnerMarker `
             -ExpectedRunId $runId -ResolvedOutputRoot $outputRootPath
     } else {
         Write-Warning 'Process cleanup was not proven; preserving the validation temp root and owner marker'
     }
-    if (Test-Path -LiteralPath $hostManifestPath -PathType Leaf) {
-        Remove-Item -LiteralPath $hostManifestPath -Force
-    }
-    if (Test-Path -LiteralPath $controlStatePath -PathType Leaf) {
-        Remove-Item -LiteralPath $controlStatePath -Force
-    }
+    $ownedProcessCount = [Math]::Max($attemptedLabels.Count, $startedProcesses.Count)
+    $null = Remove-PrivateIdentityRecordsIfSafe `
+        -HostManifestPath $hostManifestPath `
+        -ControlStatePath $controlStatePath `
+        -ProcessCleanupProven $processCleanupProven `
+        -TempCleanupProven $tempCleanupProven `
+        -OwnedProcessCount $ownedProcessCount
 }

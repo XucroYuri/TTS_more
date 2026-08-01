@@ -694,7 +694,17 @@ def test_generation_cancel_transitions_inflight_item_through_cancelling_and_pres
             if request.cancel_check():
                 raise SynthesisCancelled(
                     "cancelled by operator",
-                    details={"prompt_id": "prompt-1", "converged": True, "diagnostic": "prompt no longer active"},
+                    details={
+                        "prompt_id": "prompt-1",
+                        "cancellation": {
+                            "prompt_id": "prompt-1",
+                            "initial_state": "running",
+                            "final_state": "interrupted",
+                            "actions": ["interrupt"],
+                            "duration_seconds": 0.5,
+                            "converged": True,
+                        },
+                    },
                 )
             return super().synthesize(request)
 
@@ -728,6 +738,7 @@ def test_generation_cancel_transitions_inflight_item_through_cancelling_and_pres
     assert version.audio_path is None
     assert version.metadata["control_code"] == "cancelled"
     assert version.metadata["control_details"]["prompt_id"] == "prompt-1"
+    assert version.metadata["control_details"]["cancellation"]["converged"] is True
     assert "failure_stage" not in version.metadata
 
 
