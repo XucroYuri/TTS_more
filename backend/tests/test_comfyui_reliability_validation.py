@@ -3050,23 +3050,129 @@ class _FakeWindowsHostSystem:
         identity: reliability_validation.RecordedProcessIdentity,
         launch: reliability_validation.PrivateLaunchSpecification,
         convergence_seconds: float,
+        *,
+        run_id: str,
+        lifecycle: reliability_validation.PrivateRestartLifecycle,
     ) -> reliability_validation.RecordedProcessIdentity:
         del convergence_seconds
         self.restarted += 1
+        marker = f"tts_more_reliability_run={run_id}-comfyui-restart-{'c' * 32}"
+        arguments = ("-X", marker, *launch.arguments)
+        started_after = identity.creation_time + timedelta(minutes=self.restarted)
+        intent = reliability_validation.PrivateRestartLaunchIntent(
+            marker=marker,
+            executable_path=launch.executable_path,
+            arguments=arguments,
+            working_directory=launch.working_directory,
+            child_temp_root=launch.temp_root,
+            parent_pid=identity.parent_pid,
+            parent_creation_time=identity.parent_creation_time,
+            started_after=started_after,
+        )
+        lifecycle.persist_launch_intent(intent)
+        provisional = reliability_validation.PrivateRestartProvisionalProcess(
+            pid=identity.pid + self.restarted * 10_000,
+            executable_path=launch.executable_path,
+            parent_pid=identity.parent_pid,
+            parent_creation_time=identity.parent_creation_time,
+            started_after=started_after,
+            started_before=started_after + timedelta(seconds=1),
+        )
+        lifecycle.persist_provisional(provisional)
         replacement = reliability_validation.RecordedProcessIdentity(
             **{
                 **identity.__dict__,
-                "pid": identity.pid + self.restarted * 10_000,
-                "creation_time": identity.creation_time + timedelta(minutes=self.restarted),
-                "command_line": " ".join([str(launch.executable_path), *launch.arguments]),
+                "pid": provisional.pid,
+                "creation_time": started_after,
+                "executable_path": launch.executable_path,
+                "command_line": subprocess.list2cmdline(
+                    [str(launch.executable_path), *arguments]
+                ),
             }
         )
         self.records["comfyui"] = replacement
+        lifecycle.promote(replacement)
         return replacement
 
     def final_cleanup_state(self, temp_roots: tuple[Path, ...]) -> tuple[bool, bool]:
         del temp_roots
         return True, True
+
+
+class _RestartLifecycleWindowsHostSystem(_FakeWindowsHostSystem):
+    def __init__(self, manifest: dict[str, object], control_state_path: Path, *, interrupt_at: str | None = None) -> None:
+        super().__init__(manifest)
+        self.control_state_path = control_state_path
+        self.interrupt_at = interrupt_at
+        self.control_snapshots: list[dict[str, object]] = []
+
+    def _capture_control(self) -> None:
+        self.control_snapshots.append(
+            json.loads(self.control_state_path.read_text(encoding="utf-8"))
+        )
+
+    def restart_owned(
+        self,
+        identity: reliability_validation.RecordedProcessIdentity,
+        launch: reliability_validation.PrivateLaunchSpecification,
+        convergence_seconds: float,
+        *,
+        run_id: str,
+        lifecycle: reliability_validation.PrivateRestartLifecycle,
+    ) -> reliability_validation.RecordedProcessIdentity:
+        del convergence_seconds
+        marker = f"tts_more_reliability_run={run_id}-comfyui-restart-{'b' * 32}"
+        arguments = ("-X", marker, *launch.arguments)
+        started_after = identity.creation_time + timedelta(minutes=1)
+        intent = reliability_validation.PrivateRestartLaunchIntent(
+            marker=marker,
+            executable_path=launch.executable_path,
+            arguments=arguments,
+            working_directory=launch.working_directory,
+            child_temp_root=launch.temp_root,
+            parent_pid=identity.parent_pid,
+            parent_creation_time=identity.parent_creation_time,
+            started_after=started_after,
+        )
+        lifecycle.persist_launch_intent(intent)
+        self._capture_control()
+        if self.interrupt_at == "intent":
+            raise reliability_validation.RestartLifecycleError(
+                "injected interruption after launch intent",
+                cleanup_proven=False,
+            )
+
+        provisional = reliability_validation.PrivateRestartProvisionalProcess(
+            pid=18_188,
+            executable_path=launch.executable_path,
+            parent_pid=identity.parent_pid,
+            parent_creation_time=identity.parent_creation_time,
+            started_after=started_after,
+            started_before=started_after + timedelta(seconds=1),
+        )
+        lifecycle.persist_provisional(provisional)
+        self._capture_control()
+        if self.interrupt_at == "provisional":
+            raise reliability_validation.RestartLifecycleError(
+                "injected interruption after provisional identity",
+                cleanup_proven=False,
+            )
+
+        replacement = reliability_validation.RecordedProcessIdentity(
+            pid=provisional.pid,
+            creation_time=started_after + timedelta(milliseconds=500),
+            executable_path=launch.executable_path,
+            command_line=subprocess.list2cmdline(
+                [str(launch.executable_path), *arguments]
+            ),
+            parent_pid=provisional.parent_pid,
+            parent_creation_time=provisional.parent_creation_time,
+        )
+        self.records["comfyui"] = replacement
+        lifecycle.promote(replacement)
+        self._capture_control()
+        self.restarted += 1
+        return replacement
 
 
 def _recorded_runner_identity(
@@ -3838,50 +3944,296 @@ Write-Output 'LAUNCH_INTENT_RESOLVER_OK'
 
 def test_task_10_native_restart_cleans_captured_process_when_readiness_fails(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executable = tmp_path / "python.exe"
+    executable = (tmp_path / "python.exe").resolve()
     executable.write_bytes(b"python")
-    created = datetime(2026, 8, 1, 2, 0, tzinfo=timezone.utc)
-    document = {
-        "pid": 18188,
-        "creation_time": created.isoformat(),
-        "executable_path": str(executable.resolve()),
-        "command_line": "python main.py --port 8188",
-        "parent_pid": 7000,
-        "parent_creation_time": (created - timedelta(seconds=1)).isoformat(),
-    }
+    created = datetime.now(timezone.utc) - timedelta(minutes=1)
+    parent = reliability_validation.RecordedProcessIdentity(
+        pid=os.getpid(),
+        creation_time=created,
+        executable_path=Path(__file__).resolve(),
+        command_line="validator-python",
+        parent_pid=7000,
+        parent_creation_time=created - timedelta(seconds=1),
+    )
+    provenance = reliability_validation.RecordedProcessIdentity(
+        pid=8188,
+        creation_time=created,
+        executable_path=executable,
+        command_line="old-comfyui",
+        parent_pid=7000,
+        parent_creation_time=created - timedelta(seconds=1),
+    )
     system = object.__new__(reliability_validation.NativeWindowsHostSystem)
     system._started_identities = {}
     system._active_tokens = []
-    captured_updates: dict[str, str] = {}
+    intent: reliability_validation.PrivateRestartLaunchIntent | None = None
+    provisional: reliability_validation.PrivateRestartProvisionalProcess | None = None
 
-    def capture_start(_script: str, updates: dict[str, str]) -> dict[str, object]:
-        captured_updates.update(updates)
-        return document
+    class _FakePopen:
+        pid = 18_188
 
-    system._powershell_document = capture_start
+        def __init__(self, _command: list[str], **_kwargs: object) -> None:
+            pass
+
+        def terminate(self) -> None:
+            pytest.fail("captured replacement should use exact owned cleanup")
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    monkeypatch.setattr(reliability_validation.subprocess, "Popen", _FakePopen)
+
+    def inspect_process(pid: int) -> reliability_validation.RecordedProcessIdentity:
+        if pid == os.getpid():
+            return parent
+        assert intent is not None and provisional is not None and pid == provisional.pid
+        return reliability_validation.RecordedProcessIdentity(
+            pid=pid,
+            creation_time=provisional.started_after,
+            executable_path=executable,
+            command_line=subprocess.list2cmdline([str(executable), *intent.arguments]),
+            parent_pid=parent.pid,
+            parent_creation_time=parent.creation_time,
+        )
+
+    system.inspect_process = inspect_process
     system.port_owner = lambda _port: (_ for _ in ()).throw(RuntimeError("readiness failed"))
     stopped: list[int] = []
     system.stop_owned = lambda identity: stopped.append(identity.pid)
-    provenance = reliability_validation.RecordedProcessIdentity.from_document(
-        {**document, "pid": 8188}
-    )
     launch = reliability_validation.PrivateLaunchSpecification(
-        executable_path=executable.resolve(),
+        executable_path=executable,
         arguments=("main.py", "--port", "8188"),
         working_directory=tmp_path.resolve(),
         port=8188,
         temp_root=(tmp_path / "runner-temp").resolve(),
     )
 
-    with pytest.raises(RuntimeError, match="readiness failed"):
-        system.restart_owned(provenance, launch, 1.0)
+    def persist_intent(value: reliability_validation.PrivateRestartLaunchIntent) -> None:
+        nonlocal intent
+        intent = value
 
+    def persist_provisional(
+        value: reliability_validation.PrivateRestartProvisionalProcess,
+    ) -> None:
+        nonlocal provisional
+        provisional = value
+
+    with pytest.raises(reliability_validation.RestartLifecycleError) as exc_info:
+        system.restart_owned(
+            provenance,
+            launch,
+            1.0,
+            run_id="a" * 32,
+            lifecycle=reliability_validation.PrivateRestartLifecycle(
+                persist_launch_intent=persist_intent,
+                persist_provisional=persist_provisional,
+                promote=lambda _identity: None,
+            ),
+        )
+
+    assert exc_info.value.cleanup_proven is True
     assert stopped == [18188]
     assert system._started_identities == {}
-    assert captured_updates["TTS_MORE_VALIDATION_TEMP_ROOT"] == str(
-        (tmp_path / "runner-temp").resolve()
+
+
+def test_fix_round_2_native_restart_persists_lifecycle_around_process_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = (tmp_path / "python.exe").resolve()
+    executable.write_bytes(b"python")
+    working_directory = (tmp_path / "working").resolve()
+    working_directory.mkdir()
+    temp_root = (tmp_path / "runner-temp").resolve()
+    temp_root.mkdir()
+    parent_created = datetime.now(timezone.utc) - timedelta(minutes=1)
+    parent = reliability_validation.RecordedProcessIdentity(
+        pid=os.getpid(),
+        creation_time=parent_created,
+        executable_path=Path(__file__).resolve(),
+        command_line="validator-python",
+        parent_pid=7000,
+        parent_creation_time=parent_created - timedelta(seconds=1),
     )
+    provenance = reliability_validation.RecordedProcessIdentity(
+        pid=8188,
+        creation_time=parent_created,
+        executable_path=executable,
+        command_line="old-comfyui",
+        parent_pid=7000,
+        parent_creation_time=parent_created - timedelta(seconds=1),
+    )
+    launch = reliability_validation.PrivateLaunchSpecification(
+        executable_path=executable,
+        arguments=("main.py", "--port", "8188"),
+        working_directory=working_directory,
+        port=8188,
+        temp_root=temp_root,
+    )
+    events: list[str] = []
+    intents: list[reliability_validation.PrivateRestartLaunchIntent] = []
+    provisional_records: list[reliability_validation.PrivateRestartProvisionalProcess] = []
+    promoted: list[reliability_validation.RecordedProcessIdentity] = []
+    popen_calls: list[dict[str, object]] = []
+
+    class _FakePopen:
+        pid = 18_188
+
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            assert events == ["intent"]
+            events.append("start")
+            popen_calls.append({"command": command, **kwargs})
+
+        def poll(self) -> int | None:
+            return None
+
+        def terminate(self) -> None:
+            pytest.fail("successful restart must not terminate the replacement")
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    monkeypatch.setattr(reliability_validation.subprocess, "Popen", _FakePopen)
+    system = object.__new__(reliability_validation.NativeWindowsHostSystem)
+    system._started_identities = {}
+    system._active_tokens = []
+
+    def inspect_process(pid: int) -> reliability_validation.RecordedProcessIdentity:
+        if pid == os.getpid():
+            return parent
+        assert pid == 18_188
+        intent = intents[0]
+        provisional = provisional_records[0]
+        return reliability_validation.RecordedProcessIdentity(
+            pid=pid,
+            creation_time=provisional.started_after,
+            executable_path=executable,
+            command_line=subprocess.list2cmdline([str(executable), *intent.arguments]),
+            parent_pid=parent.pid,
+            parent_creation_time=parent.creation_time,
+        )
+
+    system.inspect_process = inspect_process
+    system.port_owner = lambda _port: inspect_process(18_188)
+
+    def persist_intent(intent: reliability_validation.PrivateRestartLaunchIntent) -> None:
+        events.append("intent")
+        intents.append(intent)
+
+    def persist_provisional(
+        provisional: reliability_validation.PrivateRestartProvisionalProcess,
+    ) -> None:
+        assert events == ["intent", "start"]
+        events.append("provisional")
+        provisional_records.append(provisional)
+
+    def promote(identity: reliability_validation.RecordedProcessIdentity) -> None:
+        assert events == ["intent", "start", "provisional"]
+        events.append("promote")
+        promoted.append(identity)
+
+    replacement = system.restart_owned(
+        provenance,
+        launch,
+        1.0,
+        run_id="a" * 32,
+        lifecycle=reliability_validation.PrivateRestartLifecycle(
+            persist_launch_intent=persist_intent,
+            persist_provisional=persist_provisional,
+            promote=promote,
+        ),
+    )
+
+    assert events == ["intent", "start", "provisional", "promote"]
+    assert replacement == promoted[0]
+    assert intents[0].marker in intents[0].arguments
+    assert popen_calls[0]["command"] == [str(executable), *intents[0].arguments]
+    environment = popen_calls[0]["env"]
+    assert isinstance(environment, dict)
+    assert environment["TEMP"] == str(temp_root)
+    assert environment["TMP"] == str(temp_root)
+    expected_flags = (
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    )
+    assert popen_calls[0]["creationflags"] == expected_flags
+    assert popen_calls[0]["close_fds"] is True
+    assert popen_calls[0]["stdin"] is subprocess.DEVNULL
+    assert popen_calls[0]["stdout"] is subprocess.DEVNULL
+    assert popen_calls[0]["stderr"] is subprocess.DEVNULL
+
+
+def test_fix_round_2_native_popen_post_create_failure_preserves_probe_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = _host_manifest_document(tmp_path)
+    manifest = tmp_path / "host-manifest.json"
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+    control_state_path = Path(f"{manifest}.current.json")
+    owned = document["owned_processes"]
+    assert isinstance(owned, dict)
+    old_comfyui = reliability_validation.RecordedProcessIdentity.from_document(
+        owned["comfyui"]
+    )
+    parent_created = datetime.now(timezone.utc) - timedelta(minutes=1)
+    parent = reliability_validation.RecordedProcessIdentity(
+        pid=os.getpid(),
+        creation_time=parent_created,
+        executable_path=Path(__file__).resolve(),
+        command_line="validator-python",
+        parent_pid=7000,
+        parent_creation_time=parent_created - timedelta(seconds=1),
+    )
+    system = object.__new__(reliability_validation.NativeWindowsHostSystem)
+    system._started_identities = {}
+    system._active_tokens = []
+    stopped: list[int] = []
+    simulated_created_commands: list[list[str]] = []
+
+    def inspect_process(pid: int) -> reliability_validation.RecordedProcessIdentity:
+        if pid == os.getpid():
+            return parent
+        assert pid == old_comfyui.pid
+        return old_comfyui
+
+    system.inspect_process = inspect_process
+    system.stop_owned = lambda identity: stopped.append(identity.pid)
+
+    class _PostCreateFailurePopen:
+        def __init__(self, command: list[str], **_kwargs: object) -> None:
+            persisted = json.loads(control_state_path.read_text(encoding="utf-8"))
+            intent = persisted["launch_intents"]["comfyui"]
+            assert intent is not None
+            assert command == [intent["executable_path"], *intent["arguments"]]
+            simulated_created_commands.append(command)
+            raise OSError("injected failure after CreateProcess")
+
+    monkeypatch.setattr(
+        reliability_validation.subprocess,
+        "Popen",
+        _PostCreateFailurePopen,
+    )
+    probe = reliability_validation.WindowsReliabilityHostProbe.from_manifest(
+        manifest,
+        system=system,
+    )
+    probe.terminate_comfyui()
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        probe.restart_comfyui()
+
+    assert exc_info.value.code == "restart-cleanup-failed"
+    assert len(simulated_created_commands) == 1
+    persisted = json.loads(control_state_path.read_text(encoding="utf-8"))
+    assert persisted["owned_processes"]["comfyui"] is None
+    assert persisted["launch_intents"]["comfyui"] is not None
+    assert persisted["provisional_processes"]["comfyui"] is None
+    assert stopped == [old_comfyui.pid]
 
 
 def test_task_10_windows_host_probe_revalidates_owned_identity_and_controls_only_comfyui(
@@ -3967,6 +4319,243 @@ def test_task_10_restart_handoff_stops_replacement_when_companion_persistence_fa
     assert "comfyui" not in probe.owned_processes
     control_state = json.loads(Path(f"{manifest}.current.json").read_text(encoding="utf-8"))
     assert control_state["owned_processes"]["comfyui"] is None
+
+
+def test_fix_round_2_restart_promotes_durable_intent_and_provisional_in_order(
+    tmp_path: Path,
+) -> None:
+    document = _host_manifest_document(tmp_path)
+    manifest = tmp_path / "host-manifest.json"
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+    control_state_path = Path(f"{manifest}.current.json")
+    system = _RestartLifecycleWindowsHostSystem(document, control_state_path)
+    probe = reliability_validation.WindowsReliabilityHostProbe.from_manifest(
+        manifest,
+        system=system,
+    )
+    probe.terminate_comfyui()
+
+    probe.restart_comfyui()
+
+    intent_state, provisional_state, promoted_state = system.control_snapshots
+    assert intent_state["owned_processes"]["comfyui"] is None
+    assert intent_state["launch_intents"]["comfyui"]["marker"].startswith(
+        "tts_more_reliability_run=" + "a" * 32 + "-comfyui-restart-"
+    )
+    assert intent_state["provisional_processes"]["comfyui"] is None
+    assert provisional_state["owned_processes"]["comfyui"] is None
+    assert provisional_state["provisional_processes"]["comfyui"]["pid"] == 18_188
+    assert promoted_state["owned_processes"]["comfyui"]["pid"] == 18_188
+    assert promoted_state["launch_intents"]["comfyui"] is None
+    assert promoted_state["provisional_processes"]["comfyui"] is None
+
+
+@pytest.mark.parametrize(
+    ("interrupt_at", "expects_provisional"),
+    [("intent", False), ("provisional", True)],
+)
+def test_fix_round_2_restart_interruption_preserves_wrapper_recovery_state(
+    tmp_path: Path,
+    interrupt_at: str,
+    expects_provisional: bool,
+) -> None:
+    document = _host_manifest_document(tmp_path)
+    manifest = tmp_path / "host-manifest.json"
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+    control_state_path = Path(f"{manifest}.current.json")
+    system = _RestartLifecycleWindowsHostSystem(
+        document,
+        control_state_path,
+        interrupt_at=interrupt_at,
+    )
+    probe = reliability_validation.WindowsReliabilityHostProbe.from_manifest(
+        manifest,
+        system=system,
+    )
+    probe.terminate_comfyui()
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        probe.restart_comfyui()
+
+    assert exc_info.value.code == "restart-cleanup-failed"
+    persisted = json.loads(control_state_path.read_text(encoding="utf-8"))
+    assert persisted["owned_processes"]["comfyui"] is None
+    assert persisted["launch_intents"]["comfyui"] is not None
+    if expects_provisional:
+        assert persisted["provisional_processes"]["comfyui"]["pid"] == 18_188
+    else:
+        assert persisted["provisional_processes"]["comfyui"] is None
+    assert system.stopped == [8188]
+
+
+def test_fix_round_2_wrapper_consumes_python_restart_recovery_state(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+
+    recovery_paths: dict[str, tuple[Path, Path]] = {}
+    for interrupt_at in ("intent", "provisional"):
+        root = tmp_path / interrupt_at
+        root.mkdir()
+        document = _host_manifest_document(root)
+        manifest = root / "host-manifest.json"
+        manifest.write_text(json.dumps(document), encoding="utf-8")
+        control_state_path = Path(f"{manifest}.current.json")
+        system = _RestartLifecycleWindowsHostSystem(
+            document,
+            control_state_path,
+            interrupt_at=interrupt_at,
+        )
+        probe = reliability_validation.WindowsReliabilityHostProbe.from_manifest(
+            manifest,
+            system=system,
+        )
+        probe.terminate_comfyui()
+        with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+            probe.restart_comfyui()
+        assert exc_info.value.code == "restart-cleanup-failed"
+        recovery_paths[interrupt_at] = (manifest, control_state_path)
+
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Test-ProcessAbsent',
+    'Get-UtcTicks',
+    'Test-CommandLineArgument',
+    'Stop-ProvisionalStartedProcess',
+    'Resolve-LaunchIntentProcess',
+    'Test-PrivateIdentityRecordsCanBeRemoved',
+    'Remove-PrivateIdentityRecordsIfSafe'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+
+$intentControl = Get-Content -LiteralPath $env:TTS_MORE_INTENT_CONTROL -Raw |
+    ConvertFrom-Json
+$intent = $intentControl.launch_intents.comfyui
+if (
+    $intentControl.version -ne 2 -or
+    $null -eq $intent -or
+    $null -ne $intentControl.owned_processes.comfyui -or
+    $null -ne $intentControl.provisional_processes.comfyui
+) { throw 'Python intent-only control state is invalid' }
+$intentCandidate = [pscustomobject]@{
+    ProcessId = 18188
+    CreationDate = ([DateTimeOffset]::Parse(
+        [string] $intent.started_after
+    )).UtcDateTime.AddMilliseconds(1)
+    ExecutablePath = [string] $intent.executable_path
+    CommandLine = ('"{0}" -X "{1}" main.py --listen 127.0.0.1 --port 8188' -f `
+        [string] $intent.executable_path, [string] $intent.marker)
+    ParentProcessId = [int] $intent.parent_pid
+    Name = [IO.Path]::GetFileName([string] $intent.executable_path)
+}
+$script:intentInventory = @($intentCandidate)
+$script:provisionalCandidate = $null
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    if (-not $Filter) { return $script:intentInventory }
+    $candidatePid = [int] ([regex]::Match($Filter, '\d+').Value)
+    if (
+        $null -ne $script:provisionalCandidate -and
+        $candidatePid -eq [int] $script:provisionalCandidate.ProcessId
+    ) { return $script:provisionalCandidate }
+    return $null
+}
+$resolved = Resolve-LaunchIntentProcess -Intent $intent
+if (
+    [int] $resolved.pid -ne 18188 -or
+    $resolved.executable_path -ne [string] $intent.executable_path -or
+    [int] $resolved.parent_pid -ne [int] $intent.parent_pid -or
+    $resolved.parent_creation_time -ne [string] $intent.parent_creation_time
+) { throw 'Wrapper did not recover the Python restart launch intent' }
+
+$provisionalControl = Get-Content -LiteralPath $env:TTS_MORE_PROVISIONAL_CONTROL -Raw |
+    ConvertFrom-Json
+$provisional = $provisionalControl.provisional_processes.comfyui
+if (
+    $provisionalControl.version -ne 2 -or
+    $null -eq $provisionalControl.launch_intents.comfyui -or
+    $null -eq $provisional -or
+    $null -ne $provisionalControl.owned_processes.comfyui
+) { throw 'Python provisional control state is invalid' }
+$script:provisionalCandidate = [pscustomobject]@{
+    ProcessId = [int] $provisional.pid
+    CreationDate = ([DateTimeOffset]::Parse(
+        [string] $provisional.started_after
+    )).UtcDateTime.AddMilliseconds(1)
+    ExecutablePath = [string] $provisional.executable_path
+    CommandLine = [string] $intentCandidate.CommandLine
+    ParentProcessId = [int] $provisional.parent_pid
+    Name = [IO.Path]::GetFileName([string] $provisional.executable_path)
+}
+$script:stopCalls = 0
+function Stop-Process {
+    param([int] $Id, [switch] $Force, [object] $ErrorAction)
+    $script:stopCalls += 1
+    throw "unexpected stop of PID $Id"
+}
+if (Stop-ProvisionalStartedProcess -Token $provisional) {
+    throw 'Parentless provisional identity was incorrectly accepted as owned'
+}
+if ($script:stopCalls -ne 0) {
+    throw 'Wrapper tried to stop an unproved provisional process'
+}
+if (Remove-PrivateIdentityRecordsIfSafe `
+        -HostManifestPath $env:TTS_MORE_PROVISIONAL_MANIFEST `
+        -ControlStatePath $env:TTS_MORE_PROVISIONAL_CONTROL `
+        -ProcessCleanupProven $false -TempCleanupProven $false `
+        -OwnedProcessCount 1) {
+    throw 'Wrapper removed unresolved Python restart recovery records'
+}
+if (
+    -not (Test-Path -LiteralPath $env:TTS_MORE_PROVISIONAL_MANIFEST -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $env:TTS_MORE_PROVISIONAL_CONTROL -PathType Leaf)
+) { throw 'Wrapper did not preserve unresolved Python restart recovery records' }
+Write-Output 'PYTHON_RESTART_WRAPPER_RECOVERY_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+    environment["TTS_MORE_INTENT_CONTROL"] = str(recovery_paths["intent"][1])
+    environment["TTS_MORE_PROVISIONAL_MANIFEST"] = str(
+        recovery_paths["provisional"][0]
+    )
+    environment["TTS_MORE_PROVISIONAL_CONTROL"] = str(
+        recovery_paths["provisional"][1]
+    )
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "PYTHON_RESTART_WRAPPER_RECOVERY_OK" in completed.stdout
 
 
 REPOSITORY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")

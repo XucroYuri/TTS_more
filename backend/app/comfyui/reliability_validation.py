@@ -668,6 +668,57 @@ class PrivateRunnerSpecification:
 
 
 @dataclass(frozen=True)
+class PrivateRestartLaunchIntent:
+    marker: str
+    executable_path: Path
+    arguments: tuple[str, ...]
+    working_directory: Path
+    child_temp_root: Path
+    parent_pid: int
+    parent_creation_time: datetime
+    started_after: datetime
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "marker": self.marker,
+            "executable_path": str(self.executable_path),
+            "arguments": list(self.arguments),
+            "working_directory": str(self.working_directory),
+            "child_temp_root": str(self.child_temp_root),
+            "parent_pid": self.parent_pid,
+            "parent_creation_time": self.parent_creation_time.isoformat(),
+            "started_after": self.started_after.isoformat(),
+        }
+
+
+@dataclass(frozen=True)
+class PrivateRestartProvisionalProcess:
+    pid: int
+    executable_path: Path
+    parent_pid: int
+    parent_creation_time: datetime
+    started_after: datetime
+    started_before: datetime
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "executable_path": str(self.executable_path),
+            "parent_pid": self.parent_pid,
+            "parent_creation_time": self.parent_creation_time.isoformat(),
+            "started_after": self.started_after.isoformat(),
+            "started_before": self.started_before.isoformat(),
+        }
+
+
+@dataclass(frozen=True)
+class PrivateRestartLifecycle:
+    persist_launch_intent: Callable[[PrivateRestartLaunchIntent], None]
+    persist_provisional: Callable[[PrivateRestartProvisionalProcess], None]
+    promote: Callable[[RecordedProcessIdentity], None]
+
+
+@dataclass(frozen=True)
 class PrivateHostManifest:
     run_id: str
     owned_processes: dict[str, RecordedProcessIdentity]
@@ -791,6 +842,9 @@ class WindowsHostSystem(Protocol):
         identity: RecordedProcessIdentity,
         launch: PrivateLaunchSpecification,
         convergence_seconds: float,
+        *,
+        run_id: str,
+        lifecycle: PrivateRestartLifecycle,
     ) -> RecordedProcessIdentity: ...
 
     def final_cleanup_state(self, temp_roots: tuple[Path, ...]) -> tuple[bool, bool]: ...
@@ -801,6 +855,12 @@ class LiveValidationError(RuntimeError):
         super().__init__(code)
         self.code = code
         self.stage = stage
+
+
+class RestartLifecycleError(RuntimeError):
+    def __init__(self, message: str, *, cleanup_proven: bool):
+        super().__init__(message)
+        self.cleanup_proven = cleanup_proven
 
 
 class WindowsReliabilityHostProbe:
@@ -820,6 +880,8 @@ class WindowsReliabilityHostProbe:
         self._active_cases: dict[str, object] = {}
         self._gpu_idle_baseline: GpuSnapshot | None = None
         self._runner_specifications: tuple[PrivateRunnerSpecification, ...] = ()
+        self._restart_intent: PrivateRestartLaunchIntent | None = None
+        self._restart_provisional: PrivateRestartProvisionalProcess | None = None
         self._persist_control_state()
 
     @classmethod
@@ -918,23 +980,50 @@ class WindowsReliabilityHostProbe:
             self._current["comfyui"] = None
             self._persist_control_state()
         provenance = current or self.manifest.owned_processes["comfyui"]
-        replacement: RecordedProcessIdentity | None = None
+        lifecycle = PrivateRestartLifecycle(
+            persist_launch_intent=self._persist_restart_launch_intent,
+            persist_provisional=self._persist_restart_provisional,
+            promote=self._promote_restart_identity,
+        )
         try:
-            replacement = self.system.restart_owned(provenance, launch, 180.0)
+            replacement = self.system.restart_owned(
+                provenance,
+                launch,
+                180.0,
+                run_id=self.manifest.run_id,
+                lifecycle=lifecycle,
+            )
+            if self._current.get("comfyui") != replacement:
+                raise LiveValidationError("restart-promotion-missing", stage="case")
             self._inspect_exact(replacement)
             port_owner = self.system.port_owner(launch.port)
             if port_owner != replacement:
                 raise LiveValidationError("restart-port-owner-mismatch", stage="case")
-            self._current["comfyui"] = replacement
-            self._persist_control_state()
+        except RestartLifecycleError as exc:
+            if exc.cleanup_proven:
+                self._clear_restart_state()
+                try:
+                    self._persist_control_state()
+                except Exception:
+                    pass
+                raise
+            try:
+                self._persist_control_state()
+            except Exception:
+                pass
+            raise LiveValidationError("restart-cleanup-failed", stage="case") from None
         except Exception:
             cleanup_failed = False
+            replacement = self._current.get("comfyui")
             if replacement is not None:
                 try:
                     self.system.stop_owned(replacement)
                 except Exception:
                     cleanup_failed = True
-            self._current["comfyui"] = replacement if cleanup_failed else None
+            elif self._restart_intent is not None:
+                cleanup_failed = True
+            if not cleanup_failed:
+                self._clear_restart_state()
             try:
                 self._persist_control_state()
             except Exception:
@@ -942,6 +1031,70 @@ class WindowsReliabilityHostProbe:
             if cleanup_failed:
                 raise LiveValidationError("restart-cleanup-failed", stage="case") from None
             raise
+
+    def _persist_restart_launch_intent(self, intent: PrivateRestartLaunchIntent) -> None:
+        launch = self.manifest.launch["comfyui"]
+        if (
+            self._current.get("comfyui") is not None
+            or self._restart_intent is not None
+            or self._restart_provisional is not None
+            or re.fullmatch(
+                rf"tts_more_reliability_run={self.manifest.run_id}-comfyui-restart-[0-9a-f]{{32}}",
+                intent.marker,
+            )
+            is None
+            or sum(
+                intent.arguments[index : index + 2] == ("-X", intent.marker)
+                for index in range(max(0, len(intent.arguments) - 1))
+            )
+            != 1
+            or intent.parent_pid <= 0
+            or not _same_private_path(intent.executable_path, launch.executable_path)
+            or not _same_private_path(intent.working_directory, launch.working_directory)
+            or not _same_private_path(intent.child_temp_root, launch.temp_root)
+            or not _is_utc(intent.parent_creation_time)
+            or not _is_utc(intent.started_after)
+        ):
+            raise ValueError("restart launch intent is invalid")
+        self._restart_intent = intent
+        self._persist_control_state()
+
+    def _persist_restart_provisional(self, provisional: PrivateRestartProvisionalProcess) -> None:
+        intent = self._restart_intent
+        if (
+            intent is None
+            or self._restart_provisional is not None
+            or provisional.pid <= 0
+            or provisional.parent_pid != intent.parent_pid
+            or provisional.parent_creation_time != intent.parent_creation_time
+            or not _same_private_path(provisional.executable_path, intent.executable_path)
+            or not _is_utc(provisional.started_after)
+            or not _is_utc(provisional.started_before)
+            or provisional.started_after != intent.started_after
+            or provisional.started_before < provisional.started_after
+        ):
+            raise ValueError("restart provisional identity is invalid")
+        self._restart_provisional = provisional
+        self._persist_control_state()
+
+    def _promote_restart_identity(self, replacement: RecordedProcessIdentity) -> None:
+        intent = self._restart_intent
+        provisional = self._restart_provisional
+        if (
+            intent is None
+            or provisional is None
+            or not _restart_identity_promotes_pending(replacement, intent, provisional)
+        ):
+            raise ValueError("restart full identity does not promote pending recovery state")
+        self._current["comfyui"] = replacement
+        self._restart_intent = None
+        self._restart_provisional = None
+        self._persist_control_state()
+
+    def _clear_restart_state(self) -> None:
+        self._current["comfyui"] = None
+        self._restart_intent = None
+        self._restart_provisional = None
 
     def final_state(self) -> HostFinalObservation:
         if not self._runner_specifications:
@@ -992,8 +1145,22 @@ class WindowsReliabilityHostProbe:
                     label: identity.to_document() if identity is not None else None
                     for label, identity in self._current.items()
                 },
-                "provisional_processes": {"tts-more": None, "comfyui": None},
-                "launch_intents": {"tts-more": None, "comfyui": None},
+                "provisional_processes": {
+                    "tts-more": None,
+                    "comfyui": (
+                        self._restart_provisional.to_document()
+                        if self._restart_provisional is not None
+                        else None
+                    ),
+                },
+                "launch_intents": {
+                    "tts-more": None,
+                    "comfyui": (
+                        self._restart_intent.to_document()
+                        if self._restart_intent is not None
+                        else None
+                    ),
+                },
             },
         )
 
@@ -1136,6 +1303,32 @@ def _process_matches_runner_specification(
         identity.command_line,
         specification,
     )
+
+
+def _restart_identity_promotes_pending(
+    replacement: RecordedProcessIdentity,
+    intent: PrivateRestartLaunchIntent,
+    provisional: PrivateRestartProvisionalProcess,
+) -> bool:
+    try:
+        argv = _windows_command_line_argv(replacement.command_line)
+        return (
+            replacement.pid == provisional.pid
+            and replacement.parent_pid == provisional.parent_pid == intent.parent_pid
+            and replacement.parent_creation_time
+            == provisional.parent_creation_time
+            == intent.parent_creation_time
+            and _same_private_path(replacement.executable_path, provisional.executable_path)
+            and _same_private_path(replacement.executable_path, intent.executable_path)
+            and provisional.started_after
+            <= replacement.creation_time
+            <= provisional.started_before
+            and len(argv) == len(intent.arguments) + 1
+            and _same_private_path(_absolute_private_path(argv[0]), intent.executable_path)
+            and tuple(argv[1:]) == intent.arguments
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def _runner_command_matches_specification(
@@ -1526,50 +1719,81 @@ class NativeWindowsHostSystem:
         identity: RecordedProcessIdentity,
         launch: PrivateLaunchSpecification,
         convergence_seconds: float,
+        *,
+        run_id: str,
+        lifecycle: PrivateRestartLifecycle,
     ) -> RecordedProcessIdentity:
         del identity
-        document = self._powershell_document(
-            "$arguments = @((ConvertFrom-Json $env:TTS_MORE_VALIDATION_ARGUMENTS)); "
-            "$env:TEMP = $env:TTS_MORE_VALIDATION_TEMP_ROOT; "
-            "$env:TMP = $env:TTS_MORE_VALIDATION_TEMP_ROOT; "
-            "$startedAfter = [DateTime]::UtcNow; "
-            "$launcher = Get-CimInstance Win32_Process -Filter (\"ProcessId = {0}\" -f $PID) -ErrorAction Stop; "
-            "$process = Start-Process -FilePath $env:TTS_MORE_VALIDATION_EXECUTABLE "
-            "-ArgumentList $arguments -WorkingDirectory $env:TTS_MORE_VALIDATION_WORKDIR "
-            "-WindowStyle Hidden -PassThru; "
-            "$startedBefore = [DateTime]::UtcNow; "
-            "try { "
-            "$deadline = [DateTime]::UtcNow.AddSeconds(10); $child = $null; "
-            "do { $child = Get-CimInstance Win32_Process -Filter (\"ProcessId = {0}\" -f $process.Id) "
-            "-ErrorAction SilentlyContinue; if ($null -ne $child -and $child.ExecutablePath -and $child.CommandLine) { break }; "
-            "Start-Sleep -Milliseconds 100 } while ([DateTime]::UtcNow -lt $deadline); "
-            "if ($null -eq $child -or -not $child.ExecutablePath -or -not $child.CommandLine -or "
-            "[int]$child.ParentProcessId -ne [int]$launcher.ProcessId) { throw 'started process identity is incomplete' }; "
-            "[pscustomobject]@{pid=[int]$child.ProcessId;creation_time=$child.CreationDate.ToUniversalTime().ToString('o');"
-            "executable_path=[string]$child.ExecutablePath;command_line=[string]$child.CommandLine;"
-            "parent_pid=[int]$child.ParentProcessId;"
-            "parent_creation_time=$launcher.CreationDate.ToUniversalTime().ToString('o')} | ConvertTo-Json -Compress "
-            "} catch { $current = Get-CimInstance Win32_Process -Filter (\"ProcessId = {0}\" -f $process.Id) "
-            "-ErrorAction SilentlyContinue; if ($null -ne $current -and $current.ExecutablePath -and "
-            "[IO.Path]::GetFullPath([string]$current.ExecutablePath).Equals("
-            "$env:TTS_MORE_VALIDATION_EXECUTABLE, [StringComparison]::OrdinalIgnoreCase) -and "
-            "[int]$current.ParentProcessId -eq [int]$launcher.ProcessId -and "
-            "$current.CreationDate.ToUniversalTime() -ge $startedAfter -and "
-            "$current.CreationDate.ToUniversalTime() -le $startedBefore) { "
-            "Stop-Process -Id ([int]$current.ProcessId) -Force -ErrorAction SilentlyContinue }; throw }",
-            {
-                "TTS_MORE_VALIDATION_ARGUMENTS": json.dumps(list(launch.arguments)),
-                "TTS_MORE_VALIDATION_EXECUTABLE": str(launch.executable_path),
-                "TTS_MORE_VALIDATION_WORKDIR": str(launch.working_directory),
-                "TTS_MORE_VALIDATION_TEMP_ROOT": str(launch.temp_root),
-            },
-        )
-        replacement = RecordedProcessIdentity.from_document(document)
-        self._started_identities[replacement.pid] = replacement
-        for token in self._active_tokens:
-            with token.lock:
-                token.roots.append(replacement)
+        process: subprocess.Popen[bytes] | None = None
+        replacement: RecordedProcessIdentity | None = None
+        launch_intent_persisted = False
+        registered = False
         try:
+            parent = self.inspect_process(os.getpid())
+            marker = (
+                f"tts_more_reliability_run={run_id}-comfyui-restart-"
+                f"{secrets.token_hex(16)}"
+            )
+            arguments = ("-X", marker, *launch.arguments)
+            started_after = datetime.now(timezone.utc)
+            intent = PrivateRestartLaunchIntent(
+                marker=marker,
+                executable_path=launch.executable_path,
+                arguments=arguments,
+                working_directory=launch.working_directory,
+                child_temp_root=launch.temp_root,
+                parent_pid=parent.pid,
+                parent_creation_time=parent.creation_time,
+                started_after=started_after,
+            )
+            lifecycle.persist_launch_intent(intent)
+            launch_intent_persisted = True
+            environment = os.environ.copy()
+            environment.update({"TEMP": str(launch.temp_root), "TMP": str(launch.temp_root)})
+            process = subprocess.Popen(
+                [str(launch.executable_path), *arguments],
+                cwd=str(launch.working_directory),
+                env=environment,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                ),
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            provisional = PrivateRestartProvisionalProcess(
+                pid=process.pid,
+                executable_path=launch.executable_path,
+                parent_pid=parent.pid,
+                parent_creation_time=parent.creation_time,
+                started_after=started_after,
+                started_before=datetime.now(timezone.utc),
+            )
+            lifecycle.persist_provisional(provisional)
+            identity_deadline = time.monotonic() + min(10.0, convergence_seconds)
+            while True:
+                try:
+                    candidate = self.inspect_process(process.pid)
+                except (OSError, RuntimeError, ValueError):
+                    candidate = None
+                if candidate is not None and _restart_identity_promotes_pending(
+                    candidate,
+                    intent,
+                    provisional,
+                ):
+                    replacement = candidate
+                    break
+                if time.monotonic() >= identity_deadline:
+                    raise RuntimeError("restarted process identity did not converge")
+                time.sleep(0.1)
+            self._started_identities[replacement.pid] = replacement
+            for token in self._active_tokens:
+                with token.lock:
+                    token.roots.append(replacement)
+            registered = True
+            lifecycle.promote(replacement)
             deadline = time.monotonic() + convergence_seconds
             while time.monotonic() <= deadline:
                 owner = self.port_owner(launch.port)
@@ -1577,21 +1801,34 @@ class NativeWindowsHostSystem:
                     return replacement
                 time.sleep(0.25)
             raise RuntimeError("restarted process did not own its port")
-        except Exception:
+        except Exception as exc:
             cleanup_failed = False
             try:
-                self.stop_owned(replacement)
+                if replacement is not None:
+                    self.stop_owned(replacement)
+                elif process is not None:
+                    process.terminate()
+                    process.wait(timeout=30.0)
             except Exception:
                 cleanup_failed = True
             finally:
-                self._started_identities.pop(replacement.pid, None)
-                for token in self._active_tokens:
-                    with token.lock:
-                        if replacement in token.roots:
-                            token.roots.remove(replacement)
-            if cleanup_failed:
-                raise RuntimeError("restarted process cleanup failed") from None
-            raise
+                if registered and replacement is not None:
+                    self._started_identities.pop(replacement.pid, None)
+                    for token in self._active_tokens:
+                        with token.lock:
+                            if replacement in token.roots:
+                                token.roots.remove(replacement)
+            raise RestartLifecycleError(
+                "restarted process lifecycle failed",
+                cleanup_proven=(
+                    not cleanup_failed
+                    and not (
+                        launch_intent_persisted
+                        and process is None
+                        and replacement is None
+                    )
+                ),
+            ) from exc
 
     def final_cleanup_state(self, temp_roots: tuple[Path, ...]) -> tuple[bool, bool]:
         return not self._active_tokens, not _temp_entries(temp_roots)
