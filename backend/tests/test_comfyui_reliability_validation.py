@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
+import shutil
 import struct
+import subprocess
 import warnings
 import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 from pydantic import ValidationError
 import app.comfyui.reliability_validation as reliability_validation
@@ -117,6 +121,22 @@ def _write_voiced_wav(path: Path) -> None:
         output.setsampwidth(2)
         output.setframerate(16_000)
         output.writeframes(b"".join(struct.pack("<h", frame) for frame in frames))
+
+
+def _comfy_terminal_entry(outcome: str) -> dict[str, object]:
+    if outcome == "completed":
+        return {
+            "outputs": {"9": {"audio": [{"filename": "result.wav"}]}},
+            "status": {"status_str": "success", "completed": True, "messages": []},
+        }
+    return {
+        "outputs": {},
+        "status": {
+            "status_str": "error",
+            "completed": False,
+            "messages": [["execution_interrupted", {"prompt_id": "prompt"}]],
+        },
+    }
 
 
 def _assert_scrubbed_atomic_error(error: BaseException, target: Path) -> None:
@@ -1205,6 +1225,1670 @@ def test_fix_round_2_direct_passed_summary_cannot_bypass_validation() -> None:
             boundary_failures=[],
             steady_counts={},
         )
+
+
+def test_task_10_scenario_plan_has_exact_order_ids_phases_and_deadlines() -> None:
+    plan = reliability_validation.build_case_plan(rounds=10)
+    steady = [case for case in plan if case.phase == "steady"]
+    nonsteady = [case for case in plan if case.phase != "steady"]
+
+    assert all(isinstance(case, reliability_validation.CasePlan) for case in plan)
+    assert len(plan) == 47
+    assert len({case.case_id for case in plan}) == 47
+    assert [case.engine for case in steady] == ["gpt-sovits", "indextts", "cosyvoice"] * 10
+    assert [case.case_id for case in nonsteady] == [
+        "cancel-queued",
+        "cancel-running-gpt-sovits",
+        "recover-cancel-gpt-sovits",
+        "cancel-running-indextts",
+        "recover-cancel-indextts",
+        "cancel-running-cosyvoice",
+        "recover-cancel-cosyvoice",
+        "timeout-gpt-sovits",
+        "recover-timeout-gpt-sovits",
+        "timeout-indextts",
+        "recover-timeout-indextts",
+        "timeout-cosyvoice",
+        "recover-timeout-cosyvoice",
+        "terminate-comfyui-indextts",
+        "restart-gpt-sovits",
+        "restart-indextts",
+        "restart-cosyvoice",
+    ]
+    assert [
+        (case.case_id, case.phase, case.expected)
+        for case in nonsteady
+        if case.case_id.startswith(("recover-", "restart-"))
+    ] == [
+        ("recover-cancel-gpt-sovits", "recovery", "completed"),
+        ("recover-cancel-indextts", "recovery", "completed"),
+        ("recover-cancel-cosyvoice", "recovery", "completed"),
+        ("recover-timeout-gpt-sovits", "recovery", "completed"),
+        ("recover-timeout-indextts", "recovery", "completed"),
+        ("recover-timeout-cosyvoice", "recovery", "completed"),
+        ("restart-gpt-sovits", "recovery", "completed"),
+        ("restart-indextts", "recovery", "completed"),
+        ("restart-cosyvoice", "recovery", "completed"),
+    ]
+    assert {case.convergence_seconds for case in steady} == {30.0}
+    assert {
+        case.request_timeout_seconds
+        for case in plan
+        if case.case_id.startswith("timeout-")
+    } == {1.0}
+    assert {
+        case.convergence_seconds
+        for case in nonsteady
+        if case.phase == "recovery"
+    } == {180.0}
+
+
+def test_task_10_scenario_plan_builds_unique_required_case_specs() -> None:
+    plan = reliability_validation.build_case_plan(rounds=10)
+
+    required = reliability_validation.required_case_specs(plan)
+
+    assert len(required) == 17
+    assert len({case.case_id for case in required}) == 17
+    assert all(isinstance(case, RequiredCase) for case in required)
+    assert {
+        (case.case_id, case.engine, case.phase, case.expected)
+        for case in required
+    } == {
+        (case.case_id, case.engine, case.phase, case.expected)
+        for case in plan
+        if case.phase != "steady"
+    }
+
+
+def test_task_10_queued_cancel_uses_tts_terminal_proof_without_fabricated_prompt() -> None:
+    document = _case(
+        "queued-cancel-fixture",
+        "gpt-sovits",
+        phase="fault",
+        expected="cancelled",
+        actual="cancelled",
+    ).model_dump()
+    document.update(
+        {
+            "case_id": "cancel-queued",
+            "prompt_submitted": False,
+            "prompt_id": None,
+            "version_id": None,
+            "comfyui": None,
+            "tts_more": {
+                "job_status": "cancelled",
+                "item_status": "cancelled",
+                "version_status": None,
+                "manifest_version_absent": True,
+            },
+        }
+    )
+
+    evidence = CaseEvidence.model_validate(document)
+    validation = validate_case(evidence)
+
+    assert validation.valid is True
+    serialized = validation.evidence.model_dump(mode="json")
+    assert serialized["prompt_submitted"] is False
+    assert serialized["prompt_id"] is None
+    assert serialized["comfyui"] is None
+
+
+def test_task_10_queued_cancel_rejects_missing_tts_version_or_any_prompt_claim() -> None:
+    base = _case(
+        "queued-cancel-fixture",
+        "gpt-sovits",
+        phase="fault",
+        expected="cancelled",
+        actual="cancelled",
+    ).model_dump()
+    base["case_id"] = "cancel-queued"
+    for update in (
+        {
+            "prompt_submitted": False,
+            "prompt_id": None,
+            "version_id": None,
+            "comfyui": None,
+            "tts_more": {"job_status": "cancelled", "item_status": "cancelled", "version_status": "failed", "manifest_version_absent": False},
+        },
+        {
+            "prompt_submitted": True,
+            "tts_more": {"job_status": "cancelled", "item_status": "cancelled", "version_status": None, "manifest_version_absent": True},
+        },
+    ):
+        with pytest.raises(ValidationError, match="queue/history proof"):
+            CaseEvidence.model_validate({**base, **update})
+
+
+class _ExecutorHttpProbe:
+    def __init__(self, *, preflight_mode: str = "ready") -> None:
+        self.preflight_mode = preflight_mode
+        self.executed: list[tuple[str, float, float]] = []
+        self.released = False
+
+    def preflight(
+        self,
+        fixture: ReliabilityFixture,
+    ) -> reliability_validation.HttpPreflightObservation:
+        resources = [
+            reliability_validation.ReadyResource(
+                engine=engine,
+                resource_id=fixture.resources[engine].resource_id,
+                ready=True,
+            )
+            for engine in ("gpt-sovits", "indextts", "cosyvoice")
+        ]
+        queue = reliability_validation.QueueSnapshot(
+            tts_queued=0,
+            tts_running=0,
+            comfy_pending_prompt_ids=[],
+            comfy_running_prompt_ids=[],
+        )
+        if self.preflight_mode == "missing-resource":
+            resources.pop()
+        elif self.preflight_mode == "busy-queue":
+            queue = queue.model_copy(update={"tts_running": 1})
+        return reliability_validation.HttpPreflightObservation(resources=resources, queue=queue)
+
+    def execute_case(
+        self,
+        case: reliability_validation.CasePlan,
+        fixture: ReliabilityFixture,
+        output_directory: Path,
+        *,
+        action_hook: object | None = None,
+    ) -> reliability_validation.HttpCaseObservation:
+        del fixture
+        self.executed.append(
+            (case.case_id, case.request_timeout_seconds, case.convergence_seconds),
+        )
+        if callable(action_hook):
+            action_hook()
+        wav_path: Path | None = None
+        if case.expected == "completed":
+            wav_path = output_directory / f"{case.case_id}.wav"
+            wav_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_voiced_wav(wav_path)
+        if case.action == "cancel-queued":
+            return reliability_validation.HttpCaseObservation(
+                actual="cancelled",
+                job_id=f"job-{case.case_id}",
+                prompt_id=None,
+                version_id=None,
+                wav_path=None,
+                comfyui=None,
+                prompt_submitted=False,
+                tts_more=reliability_validation.TtsTerminalEvidence(
+                    job_status="cancelled",
+                    item_status="cancelled",
+                    version_status=None,
+                    manifest_version_absent=True,
+                ),
+            )
+        if case.action == "terminate-comfyui":
+            prompt_id = f"prompt-{case.case_id}"
+            return reliability_validation.HttpCaseObservation(
+                actual="failed",
+                job_id=f"job-{case.case_id}",
+                prompt_id=prompt_id,
+                version_id=f"version-{case.case_id}",
+                wav_path=None,
+                comfyui=None,
+                tts_more=reliability_validation.TtsTerminalEvidence(
+                    job_status="failed",
+                    item_status="failed",
+                    version_status="failed",
+                    manifest_version_absent=False,
+                ),
+                termination=reliability_validation.TerminationEvidence(
+                    endpoint_unavailable=True,
+                    prompt_id=prompt_id,
+                    queue_before_prompt_ids=[prompt_id],
+                    manifest_audio_absent=True,
+                ),
+            )
+        prompt_id = f"prompt-{case.case_id}"
+        return reliability_validation.HttpCaseObservation(
+            actual=case.expected,
+            job_id=f"job-{case.case_id}",
+            prompt_id=prompt_id,
+            version_id=f"version-{case.case_id}",
+            wav_path=wav_path,
+            comfyui=ComfyQueueEvidence(
+                queue_empty=True,
+                history_present=True,
+                prompt_id=prompt_id,
+                queue_before_prompt_ids=[prompt_id],
+                queue_after_prompt_ids=[],
+                history_prompt_ids=[prompt_id],
+                terminal_history_status=case.expected,
+            ),
+        )
+
+    def release(self) -> None:
+        self.released = True
+
+    def final_state(self) -> reliability_validation.HttpFinalObservation:
+        return reliability_validation.HttpFinalObservation(
+            queue=reliability_validation.QueueSnapshot(
+                tts_queued=0,
+                tts_running=0,
+                comfy_pending_prompt_ids=[],
+                comfy_running_prompt_ids=[],
+            ),
+            runtime_released=self.released,
+        )
+
+
+class _ExecutorHostProbe:
+    def __init__(self, *, preflight_mode: str = "ready") -> None:
+        self.preflight_mode = preflight_mode
+        self.terminated = 0
+        self.restarted = 0
+        self.case_number = 0
+        self.finalized = False
+        self.boundary = reliability_validation.BoundarySnapshot(
+            aggregate_hash="b" * 64,
+            private_registry_hash="c" * 64,
+            reference_hashes={"reference": "d" * 64},
+            repositories=[
+                RepositorySnapshot(
+                    label=label,
+                    head="a" * 40,
+                    branch="feature",
+                    porcelain_hash="f" * 64,
+                )
+                for label in REPOSITORY_LABELS
+            ],
+        )
+        created = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
+        self.owned_processes = {
+            "tts-more": reliability_validation.OwnedProcessIdentity(
+                pid=8000,
+                creation_time=created,
+                executable_name="python.exe",
+                ownership_hash="1" * 64,
+            ),
+            "comfyui": reliability_validation.OwnedProcessIdentity(
+                pid=8188,
+                creation_time=created,
+                executable_name="python.exe",
+                ownership_hash="2" * 64,
+            ),
+        }
+
+    def preflight(
+        self,
+        fixture: ReliabilityFixture,
+    ) -> reliability_validation.HostPreflightObservation:
+        del fixture
+        port_owners = {
+            8000: self.owned_processes["tts-more"],
+            8188: self.owned_processes["comfyui"],
+        }
+        if self.preflight_mode == "foreign-owner":
+            port_owners[8188] = port_owners[8188].model_copy(update={"pid": 9999})
+        return reliability_validation.HostPreflightObservation(
+            port_owners=port_owners,
+            boundary=self.boundary,
+        )
+
+    def begin_case(self, case: reliability_validation.CasePlan) -> datetime:
+        del case
+        self.case_number += 1
+        return datetime(2026, 8, 1, 0, self.case_number, tzinfo=timezone.utc)
+
+    def finish_case(
+        self,
+        case: reliability_validation.CasePlan,
+        started_at: datetime,
+    ) -> reliability_validation.HostCaseObservation:
+        finished_at = started_at + timedelta(seconds=10)
+        process_started = started_at + timedelta(seconds=2)
+        return reliability_validation.HostCaseObservation(
+            started_at=started_at,
+            finished_at=finished_at,
+            cleanup=CleanupEvidence(
+                ok=True,
+                owned_processes_stopped=True,
+                temp_paths_removed=True,
+            ),
+            processes=[
+                ProcessEvidence(
+                    pid=10_000 + self.case_number,
+                    ownership="validator-owned",
+                    command_hash="a" * 64,
+                    creation_time=process_started,
+                    parent_pid=8188,
+                    parent_creation_time=started_at + timedelta(seconds=1),
+                    stopped_at=finished_at - timedelta(seconds=1),
+                    executable_name="python.exe",
+                    executable_hash="a" * 64,
+                    ownership_hash="b" * 64,
+                    started=True,
+                    stopped=True,
+                    descendants_stopped=True,
+                    alive_after=False,
+                ),
+            ],
+            gpu_before=GpuSnapshot(used_mib=100, free_mib=8000),
+            gpu_peak=GpuSnapshot(used_mib=300, free_mib=7800),
+            gpu_after=GpuSnapshot(used_mib=100, free_mib=8000),
+        )
+
+    def terminate_comfyui(self) -> None:
+        self.terminated += 1
+
+    def restart_comfyui(self) -> None:
+        self.restarted += 1
+
+    def final_state(self) -> reliability_validation.HostFinalObservation:
+        self.finalized = True
+        return reliability_validation.HostFinalObservation(
+            boundary=self.boundary,
+            owned_processes_stopped=True,
+            temp_paths_removed=True,
+        )
+
+
+def test_task_10_injected_executor_runs_exact_matrix_and_writes_public_evidence(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+
+    summary = reliability_validation.execute_reliability_validation(
+        fixture,
+        output_root=tmp_path / "evidence",
+        http_probe=http_probe,
+        host_probe=host_probe,
+        owned_processes=host_probe.owned_processes,
+    )
+
+    assert summary.status == "passed"
+    assert len(summary.cases) == 47
+    assert len(http_probe.executed) == 47
+    assert http_probe.executed[0][0] == "steady-01-gpt-sovits"
+    assert http_probe.executed[-1] == ("restart-cosyvoice", 180.0, 180.0)
+    assert host_probe.terminated == 1
+    assert host_probe.restarted == 3
+    assert http_probe.released is True
+    assert host_probe.finalized is True
+    evidence = (tmp_path / "evidence" / "reliability-summary.json").read_text(encoding="utf-8")
+    assert json.loads(evidence)["status"] == "passed"
+    assert str(tmp_path) not in evidence
+
+
+def test_task_10_passed_summary_is_published_only_after_all_case_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+    output_root = tmp_path / "evidence"
+    original_write = reliability_validation.write_atomic_json
+
+    def fail_case_write(path: Path, payload: object) -> None:
+        if path.parent.name == "cases":
+            raise OSError("injected case evidence failure")
+        original_write(path, payload)
+
+    monkeypatch.setattr(reliability_validation, "write_atomic_json", fail_case_write)
+
+    with pytest.raises(OSError, match="injected case evidence failure"):
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert (output_root / "reliability-summary.json").exists() is False
+
+
+def test_task_10_controller_always_finishes_active_host_case_after_http_failure(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+
+    class FailingHttpProbe(_ExecutorHttpProbe):
+        def execute_case(self, *args: object, **kwargs: object) -> reliability_validation.HttpCaseObservation:
+            del args, kwargs
+            raise httpx.ReadTimeout("injected case failure")
+
+    class TrackingHostProbe(_ExecutorHostProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finished_cases = 0
+
+        def finish_case(
+            self,
+            case: reliability_validation.CasePlan,
+            started_at: datetime,
+        ) -> reliability_validation.HostCaseObservation:
+            self.finished_cases += 1
+            return super().finish_case(case, started_at)
+
+    http_probe = FailingHttpProbe()
+    host_probe = TrackingHostProbe()
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            output_root=tmp_path / "evidence",
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert exc_info.value.code == "case-execution-failed"
+    assert host_probe.finished_cases == 1
+    assert http_probe.released is True
+
+
+@pytest.mark.parametrize(
+    ("fixture_update", "http_mode", "host_mode", "error_code"),
+    [
+        (
+            {"base_urls": {"tts_more": "http://192.168.2.10:8000", "comfyui": "http://127.0.0.1:8188"}},
+            "ready",
+            "ready",
+            "non-loopback-endpoint",
+        ),
+        ({}, "missing-resource", "ready", "resource-readiness"),
+        ({}, "busy-queue", "ready", "initial-queue-not-idle"),
+        ({}, "ready", "foreign-owner", "port-owner-mismatch"),
+    ],
+)
+def test_task_10_preflight_fails_closed_and_persists_failed_summary(
+    tmp_path: Path,
+    fixture_update: dict[str, object],
+    http_mode: str,
+    host_mode: str,
+    error_code: str,
+) -> None:
+    fixture_document = {**_fixture_document(), **fixture_update}
+    fixture = ReliabilityFixture.model_validate(fixture_document)
+    http_probe = _ExecutorHttpProbe(preflight_mode=http_mode)
+    host_probe = _ExecutorHostProbe(preflight_mode=host_mode)
+    output_root = tmp_path / "evidence"
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert exc_info.value.code == error_code
+    summary = json.loads((output_root / "reliability-summary.json").read_text(encoding="utf-8"))
+    failure = json.loads((output_root / "failure.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert failure == {"code": error_code, "stage": "preflight"}
+    assert str(tmp_path) not in json.dumps({"summary": summary, "failure": failure})
+
+
+def test_task_10_allow_lan_is_explicit_and_does_not_relax_other_preflight_gates(
+    tmp_path: Path,
+) -> None:
+    document = _fixture_document()
+    document["base_urls"] = {
+        "tts_more": "http://192.168.2.10:8000",
+        "comfyui": "http://192.168.2.11:8188",
+    }
+    fixture = ReliabilityFixture.model_validate(document)
+    http_probe = _ExecutorHttpProbe(preflight_mode="busy-queue")
+    host_probe = _ExecutorHostProbe()
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            output_root=tmp_path / "evidence",
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+            allow_lan=True,
+        )
+
+    assert exc_info.value.code == "initial-queue-not-idle"
+
+
+def test_task_10_http_probe_uses_exact_preflight_queue_and_release_routes() -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    calls: list[tuple[str, str, object | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        if request.url.path == "/system_stats":
+            return httpx.Response(200, json={"system": {"cuda": True}})
+        if request.url.path == "/object_info":
+            return httpx.Response(200, json={"TTSExternalEngine": {}})
+        if request.url.path == "/api/tts-audio-suite/v1/capabilities":
+            bridge_engines = {
+                "gpt-sovits": "gpt_sovits",
+                "indextts": "index_tts",
+                "cosyvoice": "cosyvoice",
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "protocol_version": 1,
+                    "resources": [
+                        {
+                            "engine": bridge_engines[engine],
+                            "resource_id": resource.resource_id,
+                            "ready": True,
+                        }
+                        for engine, resource in fixture.resources.items()
+                    ],
+                },
+            )
+        if request.url.path == "/api/generation/preflight":
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if request.url.path == "/api/queue/status":
+            return httpx.Response(200, json={"jobs": [], "queued": 0, "running": 0})
+        if request.url.path == "/queue":
+            return httpx.Response(200, json={"queue_running": [], "queue_pending": []})
+        if request.url.path == "/api/tts-audio-suite/v1/runtime/release":
+            return httpx.Response(200, json={"status": "released"})
+        if request.url.path == "/free":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=Path("fixtures"),
+    )
+
+    observation = probe.preflight(fixture)
+    probe.release()
+    final = probe.final_state()
+
+    assert {(item.engine, item.resource_id, item.ready) for item in observation.resources} == {
+        (engine, resource.resource_id, True)
+        for engine, resource in fixture.resources.items()
+    }
+    assert final.runtime_released is True
+    assert [path for method, path, _body in calls if method == "POST"].count(
+        "/api/generation/preflight"
+    ) == 3
+    assert ("GET", "/system_stats") in [(method, path) for method, path, _body in calls]
+    assert ("GET", "/object_info") in [(method, path) for method, path, _body in calls]
+    assert ("GET", "/api/tts-audio-suite/v1/capabilities") in [
+        (method, path) for method, path, _body in calls
+    ]
+    assert ("POST", "/api/tts-audio-suite/v1/runtime/release", {"all": True}) in calls
+    assert ("POST", "/free", {"unload_models": True, "free_memory": True}) in calls
+
+
+def _fault_case(
+    action: reliability_validation.CaseAction,
+    *,
+    expected: reliability_validation.Outcome,
+) -> reliability_validation.CasePlan:
+    return reliability_validation.CasePlan(
+        case_id=f"route-{action}",
+        phase="recovery" if action == "restart-readiness" else "fault",
+        engine="indextts" if action == "terminate-comfyui" else "gpt-sovits",
+        expected=expected,
+        action=action,
+        request_timeout_seconds=1.0 if action == "timeout" else 30.0,
+        convergence_seconds=30.0,
+    )
+
+
+def test_task_10_manifest_version_identity_is_line_scoped_and_publicly_unique() -> None:
+    manifest = {
+        "lines": {
+            "other-line": {
+                "line_id": "other-line",
+                "versions": [{"version_id": "v001", "audio_path": "other.wav"}],
+            },
+            "target-line": {
+                "line_id": "target-line",
+                "versions": [{"version_id": "v001", "audio_path": "target.wav"}],
+            },
+        }
+    }
+
+    selected = reliability_validation._find_manifest_version(manifest, "target-line", "v001")
+    target_public_id = reliability_validation._public_manifest_version_id("target-line", "v001")
+    other_public_id = reliability_validation._public_manifest_version_id("other-line", "v001")
+
+    assert selected["audio_path"] == "target.wav"
+    assert target_public_id != other_public_id
+    assert len(target_public_id) == 64
+    assert set(target_public_id) <= set("0123456789abcdef")
+
+
+@pytest.mark.parametrize("outcome", ["completed", "cancelled", "timeout", "failed"])
+def test_task_10_key_only_history_is_not_terminal_evidence(outcome: str) -> None:
+    with pytest.raises(RuntimeError, match="history"):
+        reliability_validation._terminal_comfy_history_status({}, expected=outcome)
+
+
+@pytest.mark.parametrize(
+    ("action", "expected", "terminal_status"),
+    [
+        ("cancel-running", "cancelled", "cancelled"),
+        ("timeout", "timeout", "failed"),
+        ("restart-readiness", "completed", "completed"),
+    ],
+)
+def test_task_10_http_probe_executes_concrete_running_fault_and_restart_actions(
+    tmp_path: Path,
+    action: reliability_validation.CaseAction,
+    expected: reliability_validation.Outcome,
+    terminal_status: str,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _fault_case(action, expected=expected)
+    prompt_id = f"prompt-{action}"
+    version_id = f"version-{action}"
+    wav_path = tmp_path / f"{action}.wav"
+    if expected == "completed":
+        _write_voiced_wav(wav_path)
+    calls: list[tuple[str, str, object | None]] = []
+    job_reads = 0
+    cancelled = False
+
+    def job(status: str) -> dict[str, object]:
+        error = "request timed out" if action == "timeout" and status == "failed" else None
+        return {
+            "job_id": f"job-{action}",
+            "status": status,
+            "error": error,
+            "items": [
+                {
+                    "status": status,
+                    "external_job_id": prompt_id,
+                    "version_id": version_id if status != "running" else None,
+                    "error": error,
+                }
+            ],
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal job_reads, cancelled
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        if request.url.path == "/api/generation/preflight":
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if request.url.path == "/api/jobs/generation":
+            return httpx.Response(200, json=job("queued"))
+        if request.url.path == f"/api/jobs/job-{action}/cancel":
+            cancelled = True
+            return httpx.Response(200, json=job("cancelled"))
+        if request.url.path == f"/api/jobs/job-{action}":
+            job_reads += 1
+            terminal = (
+                (action == "cancel-running" and cancelled)
+                or (action in {"timeout", "restart-readiness"} and job_reads >= 2)
+            )
+            return httpx.Response(200, json=job(terminal_status if terminal else "running"))
+        if request.url.path == "/queue":
+            running = job_reads == 1
+            return httpx.Response(
+                200,
+                json={
+                    "queue_running": [[0, prompt_id, {}, {}, []]] if running else [],
+                    "queue_pending": [],
+                },
+            )
+        if request.url.path.endswith("/manifest"):
+            return httpx.Response(
+                200,
+                json={
+                    "lines": {
+                        case.case_id: {
+                            "line_id": case.case_id,
+                            "versions": [
+                                {
+                                    "version_id": version_id,
+                                    "status": terminal_status,
+                                    "audio_path": str(wav_path) if expected == "completed" else None,
+                                }
+                            ],
+                        }
+                    }
+                },
+            )
+        if request.url.path == f"/history/{prompt_id}":
+            return httpx.Response(200, json={prompt_id: _comfy_terminal_entry(expected)})
+        return httpx.Response(404)
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=Path("fixtures"),
+        poll_interval_seconds=0.001,
+        sleep=lambda _seconds: None,
+    )
+    hook_calls = 0
+
+    def hook() -> None:
+        nonlocal hook_calls
+        hook_calls += 1
+
+    observation = probe.execute_case(case, fixture, tmp_path, action_hook=hook)
+
+    assert observation.actual == expected
+    assert hook_calls == (1 if action == "restart-readiness" else 0)
+    assert any(path == "/api/jobs/generation" for _method, path, _body in calls)
+    assert any(path == f"/history/{prompt_id}" for _method, path, _body in calls)
+    if action == "cancel-running":
+        assert ("POST", f"/api/jobs/job-{action}/cancel", None) in calls
+    if action == "timeout":
+        submitted = next(body for method, path, body in calls if method == "POST" and path == "/api/jobs/generation")
+        assert isinstance(submitted, dict)
+        assert submitted["tasks"][0]["parameters"]["timeout_seconds"] == 1.0
+
+
+def test_task_10_http_probe_queued_cancel_never_fabricates_comfy_prompt_or_version() -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = next(case for case in reliability_validation.build_case_plan() if case.action == "cancel-queued")
+    calls: list[tuple[str, str]] = []
+    created_jobs = 0
+    target_cancelled = False
+    blocker_cancelled = False
+
+    def target_document(*, settled: bool) -> dict[str, object]:
+        return {
+            "job_id": "job-target",
+            "status": "cancelled" if target_cancelled else "running",
+            "progress": 1.0 if target_cancelled else 0.0,
+            "error": None,
+            "updated_at": "2026-08-01T00:00:03Z" if settled else "2026-08-01T00:00:02Z",
+            "items": [
+                {
+                    "status": "cancelled" if target_cancelled else "queued",
+                    "progress": 1.0 if target_cancelled else 0.0,
+                    "external_job_id": None,
+                    "external_status": None,
+                    "error": None,
+                    "version_id": None,
+                }
+            ],
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal created_jobs, target_cancelled, blocker_cancelled
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/api/generation/preflight":
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if request.url.path.endswith("/manifest"):
+            return httpx.Response(200, json={"lines": {}})
+        if request.url.path == "/api/jobs/generation":
+            created_jobs += 1
+            return httpx.Response(200, json={"job_id": "job-blocker" if created_jobs == 1 else "job-target"})
+        if request.url.path == "/api/jobs/job-blocker" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "job_id": "job-blocker",
+                    "status": "cancelled" if blocker_cancelled else "running",
+                    "items": [{"external_job_id": "prompt-blocker"}],
+                },
+            )
+        if request.url.path == "/api/jobs/job-target" and request.method == "GET":
+            return httpx.Response(200, json=target_document(settled=blocker_cancelled))
+        if request.url.path == "/api/jobs/job-target/cancel":
+            target_cancelled = True
+            return httpx.Response(200, json=target_document(settled=False))
+        if request.url.path == "/api/jobs/job-blocker/cancel":
+            blocker_cancelled = True
+            return httpx.Response(200, json={"job_id": "job-blocker", "status": "cancelled", "items": []})
+        if request.url.path == "/queue":
+            return httpx.Response(
+                200,
+                json={
+                    "queue_running": [] if blocker_cancelled else [[0, "prompt-blocker", {}, {}, []]],
+                    "queue_pending": [],
+                },
+            )
+        return httpx.Response(404)
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=Path("fixtures"),
+        poll_interval_seconds=0.001,
+        sleep=lambda _seconds: None,
+    )
+
+    observation = probe.execute_case(case, fixture, Path("unused"))
+
+    assert observation.actual == "cancelled"
+    assert observation.prompt_submitted is False
+    assert observation.prompt_id is None
+    assert observation.version_id is None
+    assert observation.comfyui is None
+    assert not any(path.startswith("/history/") for _method, path in calls)
+
+
+def test_task_10_http_probe_termination_proves_endpoint_absence_without_fake_history() -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _fault_case("terminate-comfyui", expected="failed")
+    prompt_id = "prompt-terminate"
+    comfy_dead = False
+    job_reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal job_reads
+        if request.url.port == 8188 and comfy_dead:
+            raise httpx.ConnectError("owned ComfyUI is stopped", request=request)
+        if request.url.path == "/api/generation/preflight":
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if request.url.path == "/api/jobs/generation":
+            return httpx.Response(200, json={"job_id": "job-terminate"})
+        if request.url.path == "/api/jobs/job-terminate":
+            job_reads += 1
+            terminal = job_reads >= 2
+            return httpx.Response(
+                200,
+                json={
+                    "job_id": "job-terminate",
+                    "status": "failed" if terminal else "running",
+                    "error": "ComfyUI connection stopped" if terminal else None,
+                    "items": [
+                        {
+                            "status": "failed" if terminal else "running",
+                            "external_job_id": prompt_id,
+                            "external_status": "running" if not terminal else None,
+                            "error": "ComfyUI connection stopped" if terminal else None,
+                            "version_id": "version-terminate" if terminal else None,
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/queue":
+            return httpx.Response(200, json={"queue_running": [[0, prompt_id, {}, {}, []]], "queue_pending": []})
+        if request.url.path.endswith("/manifest"):
+            return httpx.Response(
+                200,
+                json={
+                    "lines": {
+                        case.case_id: {
+                            "line_id": case.case_id,
+                            "versions": [
+                                {
+                                    "version_id": "version-terminate",
+                                    "status": "failed",
+                                    "audio_path": None,
+                                }
+                            ],
+                        }
+                    }
+                },
+            )
+        return httpx.Response(404)
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=Path("fixtures"),
+        poll_interval_seconds=0.001,
+        sleep=lambda _seconds: None,
+    )
+
+    def terminate() -> None:
+        nonlocal comfy_dead
+        comfy_dead = True
+
+    observation = probe.execute_case(case, fixture, Path("unused"), action_hook=terminate)
+
+    assert observation.actual == "failed"
+    assert observation.comfyui is None
+    assert observation.termination is not None
+    assert observation.termination.endpoint_unavailable is True
+    assert observation.termination.queue_before_prompt_ids == [prompt_id]
+    assert observation.tts_more is not None
+    assert observation.tts_more.version_status == "failed"
+
+
+@pytest.mark.parametrize("mode", ["status", "timeout"])
+def test_task_10_http_probe_fails_closed_on_http_error_or_timeout(mode: str) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _fault_case("cancel-running", expected="cancelled")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if mode == "timeout":
+            raise httpx.ReadTimeout("injected timeout", request=request)
+        return httpx.Response(503, json={"detail": "unavailable"})
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=Path("fixtures"),
+    )
+
+    expected_error = httpx.ReadTimeout if mode == "timeout" else httpx.HTTPStatusError
+    with pytest.raises(expected_error):
+        probe.execute_case(case, fixture, Path("unused"))
+
+
+def _task_10_plan(case_id: str) -> reliability_validation.CasePlan:
+    return next(case for case in reliability_validation.build_case_plan() if case.case_id == case_id)
+
+
+def _task_10_job_document(
+    *,
+    status: str,
+    prompt_id: str | None = "prompt-main",
+    version_id: str | None = "version-main",
+    error: str | None = None,
+    updated_at: str = "2026-08-01T00:00:02Z",
+) -> dict[str, object]:
+    progress = 1.0 if status in {"completed", "cancelled", "failed"} else 0.5
+    return {
+        "job_id": "job-main",
+        "project_id": "windows-reliability-validation",
+        "status": status,
+        "progress": progress,
+        "error": error,
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": updated_at,
+        "items": [
+            {
+                "line_id": "line-main",
+                "status": status,
+                "progress": progress,
+                "external_job_id": prompt_id,
+                "external_status": status,
+                "error": error,
+                "version_id": version_id,
+            }
+        ],
+    }
+
+
+class _Task10FaultRouteScenario:
+    def __init__(self, case: reliability_validation.CasePlan, wav_path: Path) -> None:
+        self.case = case
+        self.wav_path = wav_path
+        self.calls: list[tuple[str, str, object | None]] = []
+        self.job_reads = 0
+        self.queue_reads = 0
+        self.cancelled = False
+        self.terminated = False
+        self.restarted = False
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        path = request.url.path
+        self.calls.append((request.method, path, body))
+        if self.terminated and (path == "/queue" or path.startswith("/history/")):
+            raise httpx.ConnectError("ComfyUI is intentionally offline", request=request)
+        if path == "/api/generation/preflight":
+            if self.case.action == "restart-readiness" and not self.restarted:
+                return httpx.Response(503, json={"status": "offline"})
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if path == "/api/jobs/generation":
+            return httpx.Response(200, json={"job_id": "job-main"})
+        if path == "/api/jobs/job-main/cancel":
+            self.cancelled = True
+            return httpx.Response(
+                200,
+                json=_task_10_job_document(status="cancelling", version_id=None),
+            )
+        if path == "/api/jobs/job-main":
+            self.job_reads += 1
+            if self.case.action == "cancel-running" and self.cancelled:
+                return httpx.Response(200, json=_task_10_job_document(status="cancelled"))
+            if self.case.action == "timeout" and self.job_reads > 1:
+                return httpx.Response(
+                    200,
+                    json=_task_10_job_document(status="failed", error="request timed out"),
+                )
+            if self.case.action == "terminate-comfyui" and self.terminated:
+                return httpx.Response(
+                    200,
+                    json=_task_10_job_document(status="failed", error="ComfyUI connection lost"),
+                )
+            if self.case.action == "restart-readiness":
+                return httpx.Response(200, json=_task_10_job_document(status="completed"))
+            return httpx.Response(
+                200,
+                json=_task_10_job_document(status="running", version_id=None),
+            )
+        if path == "/queue":
+            self.queue_reads += 1
+            running = [[1, "prompt-main", {}, {}, []]] if self.queue_reads == 1 else []
+            return httpx.Response(200, json={"queue_running": running, "queue_pending": []})
+        if path == "/api/projects/windows-reliability-validation/manifest":
+            persisted_status = "failed" if self.case.expected in {"failed", "timeout"} else self.case.expected
+            return httpx.Response(
+                200,
+                json={
+                    "project_id": "windows-reliability-validation",
+                    "lines": {
+                        self.case.case_id: {
+                            "line_id": self.case.case_id,
+                            "versions": [
+                                {
+                                    "version_id": "version-main",
+                                    "status": persisted_status,
+                                    "audio_path": str(self.wav_path) if self.case.expected == "completed" else None,
+                                }
+                            ],
+                        }
+                    },
+                },
+            )
+        if path == "/history/prompt-main":
+            return httpx.Response(
+                200,
+                json={"prompt-main": _comfy_terminal_entry(self.case.expected)},
+            )
+        return httpx.Response(404, json={"detail": "unexpected route"})
+
+
+@pytest.mark.parametrize(
+    ("case_id", "actual"),
+    [
+        ("cancel-running-gpt-sovits", "cancelled"),
+        ("timeout-indextts", "timeout"),
+        ("restart-cosyvoice", "completed"),
+    ],
+)
+def test_task_10_http_probe_executes_fault_routes_and_preserves_terminal_evidence(
+    tmp_path: Path,
+    case_id: str,
+    actual: str,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _task_10_plan(case_id)
+    wav_path = tmp_path / "terminal.wav"
+    if actual == "completed":
+        _write_voiced_wav(wav_path)
+    scenario = _Task10FaultRouteScenario(case, wav_path)
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(scenario.handler),
+        reference_root=tmp_path,
+        poll_interval_seconds=0,
+        sleep=lambda _seconds: None,
+    )
+
+    hook = None
+    if case.action == "restart-readiness":
+        hook = lambda: setattr(scenario, "restarted", True)
+    observation = probe.execute_case(case, fixture, tmp_path, action_hook=hook)
+
+    assert observation.actual == actual
+    assert observation.prompt_id == "prompt-main"
+    assert observation.version_id == reliability_validation._public_manifest_version_id(
+        case.case_id,
+        "version-main",
+    )
+    assert observation.comfyui is not None and observation.comfyui.queue_empty is True
+    create_call = next(call for call in scenario.calls if call[:2] == ("POST", "/api/jobs/generation"))
+    assert create_call[2]["tasks"][0]["parameters"]["timeout_seconds"] == case.request_timeout_seconds
+    cancel_paths = [path for method, path, _body in scenario.calls if method == "POST" and path.endswith("/cancel")]
+    assert cancel_paths == (["/api/jobs/job-main/cancel"] if case.action == "cancel-running" else [])
+
+
+def test_task_10_terminate_case_does_not_probe_comfyui_after_owned_termination(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _task_10_plan("terminate-comfyui-indextts")
+    scenario = _Task10FaultRouteScenario(case, tmp_path / "unused.wav")
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(scenario.handler),
+        reference_root=tmp_path,
+        poll_interval_seconds=0,
+        sleep=lambda _seconds: None,
+    )
+
+    observation = probe.execute_case(
+        case,
+        fixture,
+        tmp_path,
+        action_hook=lambda: setattr(scenario, "terminated", True),
+    )
+
+    assert observation.actual == "failed"
+    assert observation.prompt_id == "prompt-main"
+    assert observation.version_id == reliability_validation._public_manifest_version_id(
+        case.case_id,
+        "version-main",
+    )
+
+
+def test_task_10_http_probe_cancels_queued_target_before_comfyui_dispatch(tmp_path: Path) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _task_10_plan("cancel-queued")
+    calls: list[tuple[str, str, object | None]] = []
+    blocker_cancelled = False
+    target_cancelled = False
+    target_settled = False
+
+    def queued_job(*, job_id: str, status: str, prompt_id: str | None, updated_at: str) -> dict[str, object]:
+        progress = 1.0 if status == "cancelled" else (0.5 if prompt_id else 0.0)
+        return {
+            "job_id": job_id,
+            "project_id": "windows-reliability-validation",
+            "status": status,
+            "progress": progress,
+            "error": None,
+            "created_at": "2026-08-01T00:00:00Z",
+            "updated_at": updated_at,
+            "items": [
+                {
+                    "line_id": "blocker" if prompt_id else "cancel-queued",
+                    "status": status if prompt_id else ("cancelled" if status == "cancelled" else "queued"),
+                    "progress": progress,
+                    "external_job_id": prompt_id,
+                    "external_status": status if prompt_id else None,
+                    "error": None,
+                    "version_id": "version-blocker" if prompt_id and status == "cancelled" else None,
+                }
+            ],
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal blocker_cancelled, target_cancelled, target_settled
+        body = json.loads(request.content) if request.content else None
+        path = request.url.path
+        calls.append((request.method, path, body))
+        if path == "/api/generation/preflight":
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if path == "/api/projects/windows-reliability-validation/manifest":
+            return httpx.Response(200, json={"project_id": "windows-reliability-validation", "lines": {}})
+        if path == "/api/jobs/generation":
+            line_id = body["tasks"][0]["line"]["id"]
+            return httpx.Response(200, json={"job_id": "job-target" if line_id == "cancel-queued" else "job-blocker"})
+        if path == "/api/jobs/job-blocker":
+            status = "cancelled" if blocker_cancelled else "running"
+            return httpx.Response(200, json=queued_job(job_id="job-blocker", status=status, prompt_id="prompt-blocker", updated_at="2026-08-01T00:00:04Z"))
+        if path == "/api/jobs/job-target":
+            if target_cancelled:
+                target_settled = blocker_cancelled
+                updated = "2026-08-01T00:00:05Z" if target_settled else "2026-08-01T00:00:03Z"
+                return httpx.Response(200, json=queued_job(job_id="job-target", status="cancelled", prompt_id=None, updated_at=updated))
+            return httpx.Response(200, json=queued_job(job_id="job-target", status="running", prompt_id=None, updated_at="2026-08-01T00:00:02Z"))
+        if path == "/api/jobs/job-target/cancel":
+            target_cancelled = True
+            return httpx.Response(200, json=queued_job(job_id="job-target", status="cancelled", prompt_id=None, updated_at="2026-08-01T00:00:03Z"))
+        if path == "/api/jobs/job-blocker/cancel":
+            blocker_cancelled = True
+            return httpx.Response(200, json=queued_job(job_id="job-blocker", status="cancelled", prompt_id="prompt-blocker", updated_at="2026-08-01T00:00:04Z"))
+        if path == "/queue":
+            running = [] if blocker_cancelled else [[1, "prompt-blocker", {}, {}, []]]
+            return httpx.Response(200, json={"queue_running": running, "queue_pending": []})
+        return httpx.Response(404, json={"detail": "unexpected route"})
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=tmp_path,
+        poll_interval_seconds=0,
+        sleep=lambda _seconds: None,
+    )
+
+    observation = probe.execute_case(case, fixture, tmp_path)
+
+    assert observation.actual == "cancelled"
+    assert observation.prompt_submitted is False
+    assert observation.prompt_id is None
+    assert observation.version_id is None
+    assert observation.comfyui is None
+    assert observation.tts_more is not None and observation.tts_more.manifest_version_absent is True
+    assert target_settled is True
+    assert [path for method, path, _body in calls if method == "POST" and path.endswith("/cancel")] == [
+        "/api/jobs/job-target/cancel",
+        "/api/jobs/job-blocker/cancel",
+    ]
+    assert not any(path.startswith("/history/") for _method, path, _body in calls)
+
+
+@pytest.mark.parametrize("failure", ["http-status", "read-timeout"])
+def test_task_10_http_probe_fails_closed_on_transport_errors(tmp_path: Path, failure: str) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _task_10_plan("timeout-gpt-sovits")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if failure == "read-timeout":
+            raise httpx.ReadTimeout("injected read timeout", request=request)
+        return httpx.Response(503, json={"detail": "injected failure"})
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=tmp_path,
+    )
+
+    expected = httpx.HTTPStatusError if failure == "http-status" else httpx.ReadTimeout
+    with pytest.raises(expected):
+        probe.execute_case(case, fixture, tmp_path)
+
+
+def test_task_10_cli_uses_injected_probes_and_returns_nonzero_for_failed_gate(
+    tmp_path: Path,
+) -> None:
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    success_http = _ExecutorHttpProbe()
+    success_host = _ExecutorHostProbe()
+
+    success = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(tmp_path / "success"),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            success_http,
+            success_host,
+            success_host.owned_processes,
+        ),
+    )
+
+    failed_http = _ExecutorHttpProbe(preflight_mode="busy-queue")
+    failed_host = _ExecutorHostProbe()
+    failed = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(tmp_path / "failed"),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            failed_http,
+            failed_host,
+            failed_host.owned_processes,
+        ),
+    )
+
+    assert success == 0
+    assert failed == 1
+    assert json.loads((tmp_path / "success" / "reliability-summary.json").read_text())["status"] == "passed"
+    assert json.loads((tmp_path / "failed" / "reliability-summary.json").read_text())["status"] == "failed"
+
+
+def test_task_10_cli_preflight_only_writes_evidence_without_running_cases(
+    tmp_path: Path,
+) -> None:
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(tmp_path / "preflight"),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            http_probe,
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert result == 0
+    assert http_probe.executed == []
+    evidence = json.loads((tmp_path / "preflight" / "preflight.json").read_text())
+    assert evidence["status"] == "passed"
+    assert [item["engine"] for item in evidence["resources"]] == [
+        "cosyvoice",
+        "gpt-sovits",
+        "indextts",
+    ]
+    assert all("resource_id" not in item for item in evidence["resources"])
+    assert {
+        (item["engine"], item["resource_id_hash"])
+        for item in evidence["resources"]
+    } == {
+        (engine, hashlib.sha256(resource.resource_id.encode("utf-8")).hexdigest())
+        for engine, resource in ReliabilityFixture.model_validate(_fixture_document()).resources.items()
+    }
+    assert not any(
+        resource.resource_id in json.dumps(evidence)
+        for resource in ReliabilityFixture.model_validate(_fixture_document()).resources.values()
+    )
+
+
+def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
+    created = datetime(2026, 8, 1, tzinfo=timezone.utc).isoformat()
+    parent_created = datetime(2026, 7, 31, 23, 59, tzinfo=timezone.utc).isoformat()
+    repositories = {label: str((tmp_path / label).resolve()) for label in REPOSITORY_LABELS}
+    for root in repositories.values():
+        Path(root).mkdir(parents=True)
+    registry = (tmp_path / "resources.yaml").resolve()
+    registry.write_text("resources: {}\n", encoding="utf-8")
+    reference = (tmp_path / "reference.wav").resolve()
+    _write_voiced_wav(reference)
+    python = (tmp_path / "python.exe").resolve()
+    python.write_bytes(b"python")
+    return {
+        "version": 1,
+        "run_id": "a" * 32,
+        "owned_processes": {
+            "tts-more": {
+                "pid": 8000,
+                "creation_time": created,
+                "executable_path": str(python),
+                "command_line": "python -m uvicorn app.main:app",
+                "parent_pid": 7000,
+                "parent_creation_time": parent_created,
+            },
+            "comfyui": {
+                "pid": 8188,
+                "creation_time": created,
+                "executable_path": str(python),
+                "command_line": "python main.py --listen 127.0.0.1 --port 8188",
+                "parent_pid": 7000,
+                "parent_creation_time": parent_created,
+            },
+        },
+        "launch": {
+            "comfyui": {
+                "executable_path": str(python),
+                "arguments": ["main.py", "--listen", "127.0.0.1", "--port", "8188"],
+                "working_directory": str(tmp_path.resolve()),
+                "port": 8188,
+                "temp_root": str((tmp_path / "request-temp").resolve()),
+            }
+        },
+        "boundary": {
+            "repositories": repositories,
+            "private_registry": str(registry),
+            "references": {"reference": str(reference)},
+        },
+        "temp_roots": [str((tmp_path / "request-temp").resolve())],
+    }
+
+
+class _FakeWindowsHostSystem:
+    def __init__(self, manifest: dict[str, object], *, mismatch: bool = False) -> None:
+        owned = manifest["owned_processes"]
+        assert isinstance(owned, dict)
+        self.records = {
+            label: reliability_validation.RecordedProcessIdentity.from_document(document)
+            for label, document in owned.items()
+        }
+        self.mismatch = mismatch
+        self.stopped: list[int] = []
+        self.restarted = 0
+        self.boundary = _ExecutorHostProbe().boundary
+        self.case_number = 0
+
+    def inspect_process(self, pid: int) -> reliability_validation.RecordedProcessIdentity:
+        record = next(item for item in self.records.values() if item.pid == pid)
+        if self.mismatch and pid == 8188:
+            return reliability_validation.RecordedProcessIdentity(
+                **{**record.__dict__, "creation_time": record.creation_time + timedelta(seconds=1)}
+            )
+        return record
+
+    def port_owner(self, port: int) -> reliability_validation.RecordedProcessIdentity | None:
+        label = "tts-more" if port == 8000 else "comfyui"
+        return self.inspect_process(self.records[label].pid)
+
+    def capture_boundary(
+        self,
+        specification: reliability_validation.PrivateBoundarySpecification,
+    ) -> reliability_validation.BoundarySnapshot:
+        del specification
+        return self.boundary
+
+    def begin_case(
+        self,
+        case: reliability_validation.CasePlan,
+        roots: tuple[reliability_validation.RecordedProcessIdentity, ...],
+        temp_roots: tuple[Path, ...],
+    ) -> object:
+        del case, roots, temp_roots
+        self.case_number += 1
+        return datetime(2026, 8, 1, 1, self.case_number, tzinfo=timezone.utc)
+
+    def finish_case(
+        self,
+        token: object,
+        convergence_seconds: float,
+    ) -> reliability_validation.HostCaseObservation:
+        del convergence_seconds
+        assert isinstance(token, datetime)
+        return _ExecutorHostProbe().finish_case(
+            reliability_validation.build_case_plan()[0],
+            token,
+        )
+
+    def stop_owned(self, identity: reliability_validation.RecordedProcessIdentity) -> None:
+        self.stopped.append(identity.pid)
+
+    def restart_owned(
+        self,
+        identity: reliability_validation.RecordedProcessIdentity,
+        launch: reliability_validation.PrivateLaunchSpecification,
+        convergence_seconds: float,
+    ) -> reliability_validation.RecordedProcessIdentity:
+        del convergence_seconds
+        self.restarted += 1
+        replacement = reliability_validation.RecordedProcessIdentity(
+            **{
+                **identity.__dict__,
+                "pid": identity.pid + self.restarted * 10_000,
+                "creation_time": identity.creation_time + timedelta(minutes=self.restarted),
+                "command_line": " ".join([str(launch.executable_path), *launch.arguments]),
+            }
+        )
+        self.records["comfyui"] = replacement
+        return replacement
+
+    def final_cleanup_state(self, temp_roots: tuple[Path, ...]) -> tuple[bool, bool]:
+        del temp_roots
+        return True, True
+
+
+def test_task_10_native_final_cleanup_detects_residue_in_configured_runner_temp_root(
+    tmp_path: Path,
+) -> None:
+    temp_root = tmp_path / "owned-temp" / "system"
+    request_root = temp_root / "tts-audio-suite-gptsovits-residue"
+    request_root.mkdir(parents=True)
+    (request_root / "request.json").write_text("{}", encoding="utf-8")
+    system = object.__new__(reliability_validation.NativeWindowsHostSystem)
+    system._active_tokens = []
+
+    assert system.final_cleanup_state((temp_root,)) == (True, False)
+
+    (request_root / "request.json").unlink()
+    request_root.rmdir()
+    assert system.final_cleanup_state((temp_root,)) == (True, True)
+
+
+def test_task_10_powershell_identity_timestamps_compare_utc_instants_not_spelling() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "run-windows-comfyui-reliability.ps1"
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+$function = $ast.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-UtcTicks'
+}, $true)
+if ($null -eq $function) { throw 'Get-UtcTicks is missing' }
+Invoke-Expression $function.Extent.Text
+if ((Get-UtcTicks '2026-08-01T00:00:00Z') -ne (Get-UtcTicks '2026-08-01T00:00:00+00:00')) {
+    throw 'equivalent UTC timestamps did not compare equal'
+}
+Write-Output 'UTC_TIMESTAMP_IDENTITY_OK'
+"""
+    environment = os.environ.copy()
+    environment["TTS_MORE_RELIABILITY_SCRIPT"] = str(script_path)
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "UTC_TIMESTAMP_IDENTITY_OK" in completed.stdout
+
+
+def test_task_10_native_restart_cleans_captured_process_when_readiness_fails(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "python.exe"
+    executable.write_bytes(b"python")
+    created = datetime(2026, 8, 1, 2, 0, tzinfo=timezone.utc)
+    document = {
+        "pid": 18188,
+        "creation_time": created.isoformat(),
+        "executable_path": str(executable.resolve()),
+        "command_line": "python main.py --port 8188",
+        "parent_pid": 7000,
+        "parent_creation_time": (created - timedelta(seconds=1)).isoformat(),
+    }
+    system = object.__new__(reliability_validation.NativeWindowsHostSystem)
+    system._started_identities = {}
+    system._active_tokens = []
+    captured_updates: dict[str, str] = {}
+
+    def capture_start(_script: str, updates: dict[str, str]) -> dict[str, object]:
+        captured_updates.update(updates)
+        return document
+
+    system._powershell_document = capture_start
+    system.port_owner = lambda _port: (_ for _ in ()).throw(RuntimeError("readiness failed"))
+    stopped: list[int] = []
+    system.stop_owned = lambda identity: stopped.append(identity.pid)
+    provenance = reliability_validation.RecordedProcessIdentity.from_document(
+        {**document, "pid": 8188}
+    )
+    launch = reliability_validation.PrivateLaunchSpecification(
+        executable_path=executable.resolve(),
+        arguments=("main.py", "--port", "8188"),
+        working_directory=tmp_path.resolve(),
+        port=8188,
+        temp_root=(tmp_path / "runner-temp").resolve(),
+    )
+
+    with pytest.raises(RuntimeError, match="readiness failed"):
+        system.restart_owned(provenance, launch, 1.0)
+
+    assert stopped == [18188]
+    assert system._started_identities == {}
+    assert captured_updates["TTS_MORE_VALIDATION_TEMP_ROOT"] == str(
+        (tmp_path / "runner-temp").resolve()
+    )
+
+
+def test_task_10_windows_host_probe_revalidates_owned_identity_and_controls_only_comfyui(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    document = _host_manifest_document(tmp_path)
+    manifest = tmp_path / "host-manifest.json"
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+    system = _FakeWindowsHostSystem(document)
+
+    probe = reliability_validation.WindowsReliabilityHostProbe.from_manifest(
+        manifest,
+        system=system,
+    )
+    preflight = probe.preflight(fixture)
+    case = reliability_validation.build_case_plan()[0]
+    token = probe.begin_case(case)
+    observation = probe.finish_case(case, token)
+    probe.terminate_comfyui()
+    probe.restart_comfyui()
+    final = probe.final_state()
+
+    assert preflight.port_owners[8000] == probe.owned_processes["tts-more"]
+    assert preflight.port_owners[8188].pid == 8188
+    assert observation.processes
+    assert system.stopped == [8188]
+    assert system.restarted == 1
+    assert probe.owned_processes["comfyui"].pid == 18_188
+    control_state = json.loads(Path(f"{manifest}.current.json").read_text(encoding="utf-8"))
+    assert control_state["run_id"] == "a" * 32
+    assert control_state["owned_processes"]["comfyui"]["pid"] == 18_188
+    assert final.owned_processes_stopped is True
+    assert final.temp_paths_removed is True
+
+
+def test_task_10_windows_host_probe_rejects_pid_reuse_before_any_control(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    document = _host_manifest_document(tmp_path)
+    manifest = tmp_path / "host-manifest.json"
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+    system = _FakeWindowsHostSystem(document, mismatch=True)
+    probe = reliability_validation.WindowsReliabilityHostProbe.from_manifest(
+        manifest,
+        system=system,
+    )
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        probe.preflight(fixture)
+
+    assert exc_info.value.code == "process-identity-mismatch"
+    assert system.stopped == []
+
+
+def test_task_10_restart_handoff_stops_replacement_when_companion_persistence_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = _host_manifest_document(tmp_path)
+    manifest = tmp_path / "host-manifest.json"
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+    system = _FakeWindowsHostSystem(document)
+    probe = reliability_validation.WindowsReliabilityHostProbe.from_manifest(
+        manifest,
+        system=system,
+    )
+    probe.terminate_comfyui()
+    original_persist = probe._persist_control_state
+
+    def fail_replacement_handoff() -> None:
+        if probe._current.get("comfyui") is not None:
+            raise OSError("injected companion persistence failure")
+        original_persist()
+
+    monkeypatch.setattr(probe, "_persist_control_state", fail_replacement_handoff)
+
+    with pytest.raises(OSError, match="injected companion persistence failure"):
+        probe.restart_comfyui()
+
+    assert system.stopped == [8188, 18188]
+    assert "comfyui" not in probe.owned_processes
+    control_state = json.loads(Path(f"{manifest}.current.json").read_text(encoding="utf-8"))
+    assert control_state["owned_processes"]["comfyui"] is None
 
 
 REPOSITORY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")

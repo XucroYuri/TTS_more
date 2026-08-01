@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -7,23 +8,41 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
+import threading
+import time
 import warnings
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal, TypeVar
+from typing import Annotated, Any, Callable, Literal, Protocol, TypeVar
 from urllib.parse import unquote, urlsplit
 
+import httpx
 import soundfile
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, ValidationError, field_validator, model_validator
 
 
 Engine = Literal["gpt-sovits", "indextts", "cosyvoice"]
 Outcome = Literal["completed", "cancelled", "failed", "timeout"]
 Phase = Literal["steady", "fault", "recovery"]
+CaseAction = Literal[
+    "synthesize",
+    "cancel-queued",
+    "cancel-running",
+    "timeout",
+    "terminate-comfyui",
+    "restart-readiness",
+]
 SHA256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 REQUIRED_BOUNDARY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")
 ENGINE_ORDER: tuple[Engine, ...] = ("gpt-sovits", "indextts", "cosyvoice")
+_BRIDGE_ENGINE_IDS: dict[str, Engine] = {
+    "gpt_sovits": "gpt-sovits",
+    "index_tts": "indextts",
+    "cosyvoice": "cosyvoice",
+}
 _SENSITIVE_KEYS = {
     "access_key",
     "access_token",
@@ -183,6 +202,33 @@ class ComfyQueueEvidence(_StrictModel):
         return self
 
 
+class TtsTerminalEvidence(_StrictModel):
+    job_status: Outcome
+    item_status: Outcome
+    version_status: Outcome | None
+    manifest_version_absent: StrictBool
+
+
+class TerminationEvidence(_StrictModel):
+    endpoint_unavailable: StrictBool
+    prompt_id: str = Field(min_length=1)
+    queue_before_prompt_ids: list[str]
+    manifest_audio_absent: StrictBool
+
+    @field_validator("queue_before_prompt_ids")
+    @classmethod
+    def _sorted_unique_prompt_ids(cls, value: list[str]) -> list[str]:
+        if not _prompt_ids_are_unique(value):
+            raise ValueError("termination queue prompt ids must be unique")
+        return sorted(value)
+
+    @model_validator(mode="after")
+    def _target_was_running_before_termination(self) -> "TerminationEvidence":
+        if self.queue_before_prompt_ids.count(self.prompt_id) != 1:
+            raise ValueError("termination target prompt was not observed")
+        return self
+
+
 class GpuSnapshot(_StrictModel):
     used_mib: StrictInt = Field(ge=0)
     free_mib: StrictInt = Field(ge=0)
@@ -228,14 +274,17 @@ class CaseEvidence(_StrictModel):
     expected: Outcome
     actual: Outcome
     job_id: str = Field(min_length=1)
-    prompt_id: str = Field(min_length=1)
-    version_id: str = Field(min_length=1)
+    prompt_id: str | None = None
+    version_id: str | None = None
+    prompt_submitted: StrictBool = True
+    tts_more: TtsTerminalEvidence | None = None
+    termination: TerminationEvidence | None = None
     started_at: datetime
     finished_at: datetime
     audio: AudioProof | None = None
     cleanup: CleanupEvidence
     processes: list[ProcessEvidence] = Field(min_length=1)
-    comfyui: ComfyQueueEvidence
+    comfyui: ComfyQueueEvidence | None
     gpu_before: GpuSnapshot
     gpu_peak: GpuSnapshot
     gpu_after: GpuSnapshot
@@ -257,7 +306,9 @@ class CaseEvidence(_StrictModel):
 
     @field_validator("case_id", "job_id", "prompt_id", "version_id")
     @classmethod
-    def _opaque_identifier(cls, value: str) -> str:
+    def _opaque_identifier(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if "\\" in value or "/" in value or Path(value).is_absolute():
             raise ValueError("identifiers must not contain paths")
         if re.search(r"(?i)(?:token|secret|api[_-]?key)\s*[:=]", value):
@@ -311,6 +362,2070 @@ class RequiredCase(_StrictModel):
         if self.phase == "fault" and self.expected == "completed":
             raise ValueError("fault cases must expect a non-completed outcome")
         return self
+
+
+class CasePlan(_StrictModel):
+    case_id: str = Field(min_length=1)
+    phase: Phase
+    engine: Engine
+    expected: Outcome
+    action: CaseAction
+    request_timeout_seconds: StrictFloat = Field(gt=0.0, le=180.0)
+    convergence_seconds: StrictFloat = Field(gt=0.0, le=180.0)
+
+
+class ReadyResource(_StrictModel):
+    engine: Engine
+    resource_id: str = Field(min_length=1)
+    ready: StrictBool
+
+
+class QueueSnapshot(_StrictModel):
+    tts_queued: StrictInt = Field(ge=0)
+    tts_running: StrictInt = Field(ge=0)
+    comfy_pending_prompt_ids: list[str]
+    comfy_running_prompt_ids: list[str]
+
+    @field_validator("comfy_pending_prompt_ids", "comfy_running_prompt_ids")
+    @classmethod
+    def _unique_sorted_prompt_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("queue prompt ids must be unique")
+        return sorted(value)
+
+
+class HttpPreflightObservation(_StrictModel):
+    resources: list[ReadyResource]
+    queue: QueueSnapshot
+
+
+class OwnedProcessIdentity(_StrictModel):
+    pid: StrictInt = Field(gt=0)
+    creation_time: datetime
+    executable_name: str = Field(min_length=1)
+    ownership_hash: SHA256
+
+    @field_validator("creation_time")
+    @classmethod
+    def _utc_creation_time(cls, value: datetime) -> datetime:
+        if not _is_utc(value):
+            raise ValueError("process identity time must be timezone-aware UTC")
+        return value
+
+    @field_validator("executable_name")
+    @classmethod
+    def _neutral_executable_name(cls, value: str) -> str:
+        if not _is_neutral_basename(value):
+            raise ValueError("executable_name must be a neutral basename")
+        return value
+
+
+class BoundarySnapshot(_StrictModel):
+    aggregate_hash: SHA256
+    private_registry_hash: SHA256
+    reference_hashes: dict[str, SHA256]
+    repositories: list[RepositorySnapshot]
+
+    @field_validator("reference_hashes")
+    @classmethod
+    def _sorted_reference_hashes(cls, value: dict[str, str]) -> dict[str, str]:
+        return {key: value[key] for key in sorted(value)}
+
+    @field_validator("repositories")
+    @classmethod
+    def _sorted_repositories(cls, value: list[RepositorySnapshot]) -> list[RepositorySnapshot]:
+        return sorted(value, key=lambda item: (item.label, item.head, item.branch, item.porcelain_hash))
+
+
+class HostPreflightObservation(_StrictModel):
+    port_owners: dict[StrictInt, OwnedProcessIdentity]
+    boundary: BoundarySnapshot
+
+
+@dataclass(frozen=True)
+class HttpCaseObservation:
+    actual: Outcome
+    job_id: str
+    prompt_id: str | None
+    version_id: str | None
+    wav_path: Path | None
+    comfyui: ComfyQueueEvidence | None
+    prompt_submitted: bool = True
+    tts_more: TtsTerminalEvidence | None = None
+    termination: TerminationEvidence | None = None
+
+
+class HostCaseObservation(_StrictModel):
+    started_at: datetime
+    finished_at: datetime
+    cleanup: CleanupEvidence
+    processes: list[ProcessEvidence]
+    gpu_before: GpuSnapshot
+    gpu_peak: GpuSnapshot
+    gpu_after: GpuSnapshot
+
+    @field_validator("started_at", "finished_at")
+    @classmethod
+    def _utc_timestamp(cls, value: datetime) -> datetime:
+        if not _is_utc(value):
+            raise ValueError("host observation times must be timezone-aware UTC")
+        return value
+
+    @model_validator(mode="after")
+    def _ordered_times(self) -> "HostCaseObservation":
+        if self.finished_at < self.started_at:
+            raise ValueError("host observation times are not ordered")
+        return self
+
+
+class HttpFinalObservation(_StrictModel):
+    queue: QueueSnapshot
+    runtime_released: StrictBool
+
+
+class HostFinalObservation(_StrictModel):
+    boundary: BoundarySnapshot
+    owned_processes_stopped: StrictBool
+    temp_paths_removed: StrictBool
+
+
+class ReliabilityHttpProbe(Protocol):
+    def preflight(self, fixture: ReliabilityFixture) -> HttpPreflightObservation: ...
+
+    def execute_case(
+        self,
+        case: CasePlan,
+        fixture: ReliabilityFixture,
+        output_directory: Path,
+        *,
+        action_hook: Callable[[], None] | None = None,
+    ) -> HttpCaseObservation: ...
+
+    def release(self) -> None: ...
+
+    def final_state(self) -> HttpFinalObservation: ...
+
+
+class ReliabilityHostProbe(Protocol):
+    def preflight(self, fixture: ReliabilityFixture) -> HostPreflightObservation: ...
+
+    def begin_case(self, case: CasePlan) -> datetime: ...
+
+    def finish_case(self, case: CasePlan, started_at: datetime) -> HostCaseObservation: ...
+
+    def terminate_comfyui(self) -> None: ...
+
+    def restart_comfyui(self) -> None: ...
+
+    def final_state(self) -> HostFinalObservation: ...
+
+
+@dataclass(frozen=True)
+class RecordedProcessIdentity:
+    pid: int
+    creation_time: datetime
+    executable_path: Path
+    command_line: str
+    parent_pid: int
+    parent_creation_time: datetime
+
+    @classmethod
+    def from_document(cls, document: Any) -> "RecordedProcessIdentity":
+        if not isinstance(document, dict):
+            raise ValueError("recorded process identity must be an object")
+        if set(document) != {
+            "pid",
+            "creation_time",
+            "executable_path",
+            "command_line",
+            "parent_pid",
+            "parent_creation_time",
+        }:
+            raise ValueError("recorded process identity fields are invalid")
+        pid = document["pid"]
+        parent_pid = document["parent_pid"]
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or isinstance(parent_pid, bool)
+            or not isinstance(parent_pid, int)
+            or parent_pid <= 0
+            or parent_pid == pid
+        ):
+            raise ValueError("recorded process PIDs are invalid")
+        creation_time = _parse_utc_datetime(document["creation_time"])
+        parent_creation_time = _parse_utc_datetime(document["parent_creation_time"])
+        executable_path = _absolute_private_path(document["executable_path"])
+        command_line = document["command_line"]
+        if not isinstance(command_line, str) or not command_line.strip():
+            raise ValueError("recorded process command line is missing")
+        if parent_creation_time > creation_time:
+            raise ValueError("recorded process timestamps are not ordered")
+        return cls(
+            pid=pid,
+            creation_time=creation_time,
+            executable_path=executable_path,
+            command_line=command_line,
+            parent_pid=parent_pid,
+            parent_creation_time=parent_creation_time,
+        )
+
+    def public_identity(self) -> OwnedProcessIdentity:
+        return OwnedProcessIdentity(
+            pid=self.pid,
+            creation_time=self.creation_time,
+            executable_name=self.executable_path.name,
+            ownership_hash=_hash_private_process_identity(self),
+        )
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "creation_time": self.creation_time.isoformat(),
+            "executable_path": str(self.executable_path),
+            "command_line": self.command_line,
+            "parent_pid": self.parent_pid,
+            "parent_creation_time": self.parent_creation_time.isoformat(),
+        }
+
+
+@dataclass(frozen=True)
+class PrivateLaunchSpecification:
+    executable_path: Path
+    arguments: tuple[str, ...]
+    working_directory: Path
+    port: int
+    temp_root: Path
+
+
+@dataclass(frozen=True)
+class PrivateBoundarySpecification:
+    repositories: dict[str, Path]
+    private_registry: Path
+    references: dict[str, Path]
+
+
+@dataclass(frozen=True)
+class PrivateHostManifest:
+    run_id: str
+    owned_processes: dict[str, RecordedProcessIdentity]
+    launch: dict[str, PrivateLaunchSpecification]
+    boundary: PrivateBoundarySpecification
+    temp_roots: tuple[Path, ...]
+
+    @classmethod
+    def read(cls, path: Path) -> "PrivateHostManifest":
+        document = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        if not isinstance(document, dict) or document.get("version") != 1:
+            raise ValueError("host manifest version is invalid")
+        run_id = document.get("run_id")
+        if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
+            raise ValueError("host manifest run id is invalid")
+        owned_raw = document.get("owned_processes")
+        if not isinstance(owned_raw, dict) or set(owned_raw) != {"tts-more", "comfyui"}:
+            raise ValueError("host manifest owned process set is invalid")
+        owned = {
+            label: RecordedProcessIdentity.from_document(value)
+            for label, value in owned_raw.items()
+        }
+        launch_raw = document.get("launch")
+        if not isinstance(launch_raw, dict) or set(launch_raw) != {"comfyui"}:
+            raise ValueError("host manifest launch set is invalid")
+        launch: dict[str, PrivateLaunchSpecification] = {}
+        for label, value in launch_raw.items():
+            if not isinstance(value, dict) or set(value) != {
+                "executable_path",
+                "arguments",
+                "working_directory",
+                "port",
+                "temp_root",
+            }:
+                raise ValueError("host manifest launch fields are invalid")
+            arguments = value["arguments"]
+            port = value["port"]
+            if (
+                not isinstance(arguments, list)
+                or not arguments
+                or any(not isinstance(item, str) or not item for item in arguments)
+                or isinstance(port, bool)
+                or not isinstance(port, int)
+                or not 1 <= port <= 65535
+            ):
+                raise ValueError("host manifest launch values are invalid")
+            launch[label] = PrivateLaunchSpecification(
+                executable_path=_absolute_private_path(value["executable_path"]),
+                arguments=tuple(arguments),
+                working_directory=_absolute_private_path(value["working_directory"]),
+                port=port,
+                temp_root=_absolute_private_path(value["temp_root"]),
+            )
+        boundary_raw = document.get("boundary")
+        if not isinstance(boundary_raw, dict) or set(boundary_raw) != {
+            "repositories",
+            "private_registry",
+            "references",
+        }:
+            raise ValueError("host manifest boundary fields are invalid")
+        repositories_raw = boundary_raw["repositories"]
+        references_raw = boundary_raw["references"]
+        if (
+            not isinstance(repositories_raw, dict)
+            or set(repositories_raw) != set(REQUIRED_BOUNDARY_LABELS)
+            or not isinstance(references_raw, dict)
+            or not references_raw
+        ):
+            raise ValueError("host manifest boundary set is invalid")
+        boundary = PrivateBoundarySpecification(
+            repositories={
+                label: _absolute_private_path(value)
+                for label, value in repositories_raw.items()
+            },
+            private_registry=_absolute_private_path(boundary_raw["private_registry"]),
+            references={
+                label: _absolute_private_path(value)
+                for label, value in references_raw.items()
+            },
+        )
+        temp_roots_raw = document.get("temp_roots")
+        if not isinstance(temp_roots_raw, list) or not temp_roots_raw:
+            raise ValueError("host manifest temp roots are invalid")
+        temp_roots = tuple(_absolute_private_path(value) for value in temp_roots_raw)
+        return cls(
+            run_id=run_id,
+            owned_processes=owned,
+            launch=launch,
+            boundary=boundary,
+            temp_roots=temp_roots,
+        )
+
+
+class WindowsHostSystem(Protocol):
+    def inspect_process(self, pid: int) -> RecordedProcessIdentity: ...
+
+    def port_owner(self, port: int) -> RecordedProcessIdentity | None: ...
+
+    def capture_boundary(self, specification: PrivateBoundarySpecification) -> BoundarySnapshot: ...
+
+    def begin_case(
+        self,
+        case: CasePlan,
+        roots: tuple[RecordedProcessIdentity, ...],
+        temp_roots: tuple[Path, ...],
+    ) -> object: ...
+
+    def finish_case(self, token: object, convergence_seconds: float) -> HostCaseObservation: ...
+
+    def stop_owned(self, identity: RecordedProcessIdentity) -> None: ...
+
+    def restart_owned(
+        self,
+        identity: RecordedProcessIdentity,
+        launch: PrivateLaunchSpecification,
+        convergence_seconds: float,
+    ) -> RecordedProcessIdentity: ...
+
+    def final_cleanup_state(self, temp_roots: tuple[Path, ...]) -> tuple[bool, bool]: ...
+
+
+class LiveValidationError(RuntimeError):
+    def __init__(self, code: str, *, stage: Literal["preflight", "case", "finalize"]):
+        super().__init__(code)
+        self.code = code
+        self.stage = stage
+
+
+class WindowsReliabilityHostProbe:
+    def __init__(
+        self,
+        manifest: PrivateHostManifest,
+        *,
+        system: WindowsHostSystem,
+        manifest_path: Path,
+    ) -> None:
+        self.manifest = manifest
+        self.system = system
+        self.control_state_path = Path(f"{manifest_path}.current.json")
+        self._current: dict[str, RecordedProcessIdentity | None] = dict(manifest.owned_processes)
+        self._active_cases: dict[str, object] = {}
+        self._persist_control_state()
+
+    @classmethod
+    def from_manifest(
+        cls,
+        path: Path,
+        *,
+        system: WindowsHostSystem | None = None,
+    ) -> "WindowsReliabilityHostProbe":
+        manifest = PrivateHostManifest.read(path)
+        return cls(
+            manifest,
+            system=system or NativeWindowsHostSystem(),
+            manifest_path=path,
+        )
+
+    @property
+    def owned_processes(self) -> dict[str, OwnedProcessIdentity]:
+        return {
+            label: identity.public_identity()
+            for label, identity in self._current.items()
+            if identity is not None
+        }
+
+    def preflight(self, fixture: ReliabilityFixture) -> HostPreflightObservation:
+        fixture = _revalidate_model(fixture, ReliabilityFixture)
+        port_owners: dict[int, OwnedProcessIdentity] = {}
+        for label, recorded in self.manifest.owned_processes.items():
+            current = self._inspect_exact(recorded)
+            self._current[label] = current
+        labels_by_url = {"tts_more": "tts-more", "comfyui": "comfyui"}
+        for url_label, process_label in labels_by_url.items():
+            port = urlsplit(fixture.base_urls[url_label]).port
+            if port is None:
+                raise LiveValidationError("endpoint-port-missing", stage="preflight")
+            owner = self.system.port_owner(port)
+            expected = self._current[process_label]
+            if owner is None or expected is None or owner != expected:
+                raise LiveValidationError("port-owner-mismatch", stage="preflight")
+            port_owners[port] = owner.public_identity()
+        boundary = self.system.capture_boundary(self.manifest.boundary)
+        _validate_boundary_snapshot(boundary)
+        return HostPreflightObservation(port_owners=port_owners, boundary=boundary)
+
+    def begin_case(self, case: CasePlan) -> datetime:
+        if case.case_id in self._active_cases:
+            raise LiveValidationError("duplicate-active-case", stage="case")
+        roots = tuple(identity for identity in self._current.values() if identity is not None)
+        token = self.system.begin_case(case, roots, self.manifest.temp_roots)
+        self._active_cases[case.case_id] = token
+        if isinstance(token, datetime) and _is_utc(token):
+            return token
+        started_at = getattr(token, "started_at", None)
+        if not _is_utc(started_at):
+            raise LiveValidationError("host-monitor-start-failed", stage="case")
+        return started_at
+
+    def finish_case(self, case: CasePlan, started_at: datetime) -> HostCaseObservation:
+        del started_at
+        token = self._active_cases.pop(case.case_id, None)
+        if token is None:
+            raise LiveValidationError("host-monitor-token-missing", stage="case")
+        try:
+            return _revalidate_model(
+                self.system.finish_case(token, case.convergence_seconds),
+                HostCaseObservation,
+            )
+        except (ValueError, TypeError, AttributeError):
+            raise LiveValidationError("host-monitor-observation-invalid", stage="case") from None
+
+    def terminate_comfyui(self) -> None:
+        current = self._require_current("comfyui")
+        self._inspect_exact(current)
+        self.system.stop_owned(current)
+        self._current["comfyui"] = None
+        self._persist_control_state()
+
+    def restart_comfyui(self) -> None:
+        current = self._current.get("comfyui")
+        launch = self.manifest.launch["comfyui"]
+        if current is not None:
+            self._inspect_exact(current)
+            self.system.stop_owned(current)
+            self._current["comfyui"] = None
+            self._persist_control_state()
+        provenance = current or self.manifest.owned_processes["comfyui"]
+        replacement: RecordedProcessIdentity | None = None
+        try:
+            replacement = self.system.restart_owned(provenance, launch, 180.0)
+            self._inspect_exact(replacement)
+            port_owner = self.system.port_owner(launch.port)
+            if port_owner != replacement:
+                raise LiveValidationError("restart-port-owner-mismatch", stage="case")
+            self._current["comfyui"] = replacement
+            self._persist_control_state()
+        except Exception:
+            cleanup_failed = False
+            if replacement is not None:
+                try:
+                    self.system.stop_owned(replacement)
+                except Exception:
+                    cleanup_failed = True
+            self._current["comfyui"] = replacement if cleanup_failed else None
+            try:
+                self._persist_control_state()
+            except Exception:
+                pass
+            if cleanup_failed:
+                raise LiveValidationError("restart-cleanup-failed", stage="case") from None
+            raise
+
+    def final_state(self) -> HostFinalObservation:
+        boundary = self.system.capture_boundary(self.manifest.boundary)
+        runners_stopped, temp_removed = self.system.final_cleanup_state(self.manifest.temp_roots)
+        return HostFinalObservation(
+            boundary=boundary,
+            owned_processes_stopped=runners_stopped,
+            temp_paths_removed=temp_removed,
+        )
+
+    def _require_current(self, label: str) -> RecordedProcessIdentity:
+        current = self._current.get(label)
+        if current is None:
+            raise LiveValidationError("owned-process-not-running", stage="case")
+        return current
+
+    def _inspect_exact(self, recorded: RecordedProcessIdentity) -> RecordedProcessIdentity:
+        try:
+            current = self.system.inspect_process(recorded.pid)
+        except (OSError, RuntimeError, ValueError):
+            raise LiveValidationError("process-identity-mismatch", stage="preflight") from None
+        if current != recorded:
+            raise LiveValidationError("process-identity-mismatch", stage="preflight")
+        return current
+
+    def _persist_control_state(self) -> None:
+        _write_private_json_atomic(
+            self.control_state_path,
+            {
+                "version": 1,
+                "run_id": self.manifest.run_id,
+                "owned_processes": {
+                    label: identity.to_document() if identity is not None else None
+                    for label, identity in self._current.items()
+                },
+            },
+        )
+
+
+def _parse_utc_datetime(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be an ISO string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("timestamp is invalid") from None
+    if not _is_utc(parsed):
+        raise ValueError("timestamp must be UTC")
+    return parsed
+
+
+def _absolute_private_path(value: Any) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError("private path is missing")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("private path must be absolute")
+    return path.resolve()
+
+
+def _hash_private_process_identity(identity: RecordedProcessIdentity) -> str:
+    document = {
+        "pid": identity.pid,
+        "creation_time": identity.creation_time.isoformat(),
+        "executable_path": str(identity.executable_path),
+        "command_line": identity.command_line,
+        "parent_pid": identity.parent_pid,
+        "parent_creation_time": identity.parent_creation_time.isoformat(),
+    }
+    encoded = json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class _NativeCaseToken:
+    def __init__(
+        self,
+        *,
+        started_at: datetime,
+        roots: tuple[RecordedProcessIdentity, ...],
+        baseline_pids: set[int],
+        temp_roots: tuple[Path, ...],
+        temp_before: set[str],
+        gpu_before: GpuSnapshot,
+    ) -> None:
+        self.started_at = started_at
+        self.roots = list(roots)
+        self.baseline_pids = baseline_pids
+        self.temp_roots = temp_roots
+        self.temp_before = temp_before
+        self.gpu_before = gpu_before
+        self.gpu_peak = gpu_before
+        self.observed: dict[tuple[int, datetime], RecordedProcessIdentity] = {}
+        self.stopped_at: dict[tuple[int, datetime], datetime] = {}
+        self.error: Exception | None = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+
+
+class NativeWindowsHostSystem:
+    """Windows/CIM implementation used only by the explicit live command."""
+
+    def __init__(self, *, sample_interval_seconds: float = 0.1) -> None:
+        if os.name != "nt":
+            raise RuntimeError("native Windows host probe requires Windows")
+        self.sample_interval_seconds = sample_interval_seconds
+        self._started_identities: dict[int, RecordedProcessIdentity] = {}
+        self._active_tokens: list[_NativeCaseToken] = []
+
+    def inspect_process(self, pid: int) -> RecordedProcessIdentity:
+        snapshot = self._process_snapshot()
+        identity = snapshot.get(pid)
+        if identity is None:
+            raise RuntimeError("process is absent")
+        cached = self._started_identities.get(pid)
+        if cached is not None:
+            if (
+                identity.pid != cached.pid
+                or identity.creation_time != cached.creation_time
+                or identity.executable_path != cached.executable_path
+                or identity.command_line != cached.command_line
+                or identity.parent_pid != cached.parent_pid
+            ):
+                raise RuntimeError("started process identity changed")
+            return cached
+        return identity
+
+    def port_owner(self, port: int) -> RecordedProcessIdentity | None:
+        document = self._powershell_document(
+            "$owners = @(Get-NetTCPConnection -State Listen -LocalPort ([int]$env:TTS_MORE_VALIDATION_PORT) "
+            "-ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique); "
+            "if ($owners.Count -eq 0) { $null | ConvertTo-Json -Compress } "
+            "elseif ($owners.Count -eq 1) { $owners[0] | ConvertTo-Json -Compress } "
+            "else { throw 'multiple port owners' }",
+            {"TTS_MORE_VALIDATION_PORT": str(port)},
+        )
+        if document is None:
+            return None
+        if isinstance(document, bool) or not isinstance(document, int):
+            raise RuntimeError("port owner observation is invalid")
+        return self.inspect_process(document)
+
+    def capture_boundary(self, specification: PrivateBoundarySpecification) -> BoundarySnapshot:
+        repositories: list[RepositorySnapshot] = []
+        for label, root in specification.repositories.items():
+            head = self._run_text(["git", "-C", str(root), "rev-parse", "HEAD"]).strip()
+            branch = self._run_text(
+                ["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"],
+                allowed_returncodes={0, 1},
+            ).strip() or "DETACHED"
+            porcelain = self._run_bytes(
+                ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+            )
+            repositories.append(
+                RepositorySnapshot(
+                    label=label,
+                    head=head,
+                    branch=branch,
+                    porcelain_hash=hashlib.sha256(porcelain).hexdigest(),
+                )
+            )
+        private_registry_hash = _sha256_file(specification.private_registry)
+        reference_hashes = {
+            label: _sha256_file(path)
+            for label, path in specification.references.items()
+        }
+        aggregate_document = {
+            "repositories": [item.model_dump(mode="json") for item in sorted(repositories, key=lambda item: item.label)],
+            "private_registry_hash": private_registry_hash,
+            "reference_hashes": reference_hashes,
+        }
+        aggregate_hash = hashlib.sha256(
+            json.dumps(aggregate_document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return BoundarySnapshot(
+            aggregate_hash=aggregate_hash,
+            private_registry_hash=private_registry_hash,
+            reference_hashes=reference_hashes,
+            repositories=repositories,
+        )
+
+    def begin_case(
+        self,
+        case: CasePlan,
+        roots: tuple[RecordedProcessIdentity, ...],
+        temp_roots: tuple[Path, ...],
+    ) -> object:
+        del case
+        baseline = self._process_snapshot()
+        token = _NativeCaseToken(
+            started_at=datetime.now(timezone.utc),
+            roots=roots,
+            baseline_pids=set(baseline),
+            temp_roots=temp_roots,
+            temp_before=_temp_entries(temp_roots),
+            gpu_before=self._gpu_snapshot(),
+        )
+        token.thread = threading.Thread(target=self._sample_until_stopped, args=(token,), daemon=True)
+        self._active_tokens.append(token)
+        token.thread.start()
+        return token
+
+    def finish_case(self, token: object, convergence_seconds: float) -> HostCaseObservation:
+        if not isinstance(token, _NativeCaseToken):
+            raise RuntimeError("native case token is invalid")
+        token.stop_event.set()
+        if token.thread is not None:
+            token.thread.join(timeout=5.0)
+        deadline = time.monotonic() + min(30.0, convergence_seconds)
+        while time.monotonic() <= deadline:
+            self._sample_token(token)
+            with token.lock:
+                alive = [key for key in token.observed if key not in token.stopped_at]
+            if not alive:
+                break
+            time.sleep(self.sample_interval_seconds)
+        if token in self._active_tokens:
+            self._active_tokens.remove(token)
+        if token.error is not None:
+            raise RuntimeError("native case sampling failed") from None
+        finished_at = datetime.now(timezone.utc)
+        with token.lock:
+            if not token.observed or any(key not in token.stopped_at for key in token.observed):
+                raise RuntimeError("request runner lifecycle did not converge")
+            processes = [
+                _runner_process_evidence(identity, token.stopped_at[key])
+                for key, identity in token.observed.items()
+            ]
+            gpu_peak = token.gpu_peak
+        temp_removed = not _temp_entries_for_delta(token.temp_before, token_roots=token.temp_roots)
+        return HostCaseObservation(
+            started_at=token.started_at,
+            finished_at=finished_at,
+            cleanup=CleanupEvidence(
+                ok=temp_removed,
+                owned_processes_stopped=True,
+                temp_paths_removed=temp_removed,
+            ),
+            processes=processes,
+            gpu_before=token.gpu_before,
+            gpu_peak=gpu_peak,
+            gpu_after=self._gpu_snapshot(),
+        )
+
+    def stop_owned(self, identity: RecordedProcessIdentity) -> None:
+        if self.inspect_process(identity.pid) != identity:
+            raise RuntimeError("owned process identity changed")
+        snapshot = self._process_snapshot()
+        descendant_pids = _descendant_pids(snapshot, {identity.pid})
+        for pid in sorted(descendant_pids, reverse=True):
+            if pid == identity.pid:
+                continue
+            observed = snapshot.get(pid)
+            if observed is not None and self.inspect_process(pid) == observed:
+                self._stop_pid(pid)
+        if self.inspect_process(identity.pid) == identity:
+            self._stop_pid(identity.pid)
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() <= deadline:
+            try:
+                current = self.inspect_process(identity.pid)
+            except RuntimeError:
+                return
+            if current != identity:
+                return
+            time.sleep(0.1)
+        raise RuntimeError("owned process did not stop")
+
+    def restart_owned(
+        self,
+        identity: RecordedProcessIdentity,
+        launch: PrivateLaunchSpecification,
+        convergence_seconds: float,
+    ) -> RecordedProcessIdentity:
+        del identity
+        document = self._powershell_document(
+            "$arguments = @((ConvertFrom-Json $env:TTS_MORE_VALIDATION_ARGUMENTS)); "
+            "$env:TEMP = $env:TTS_MORE_VALIDATION_TEMP_ROOT; "
+            "$env:TMP = $env:TTS_MORE_VALIDATION_TEMP_ROOT; "
+            "$startedAfter = [DateTime]::UtcNow; "
+            "$launcher = Get-CimInstance Win32_Process -Filter (\"ProcessId = {0}\" -f $PID) -ErrorAction Stop; "
+            "$process = Start-Process -FilePath $env:TTS_MORE_VALIDATION_EXECUTABLE "
+            "-ArgumentList $arguments -WorkingDirectory $env:TTS_MORE_VALIDATION_WORKDIR "
+            "-WindowStyle Hidden -PassThru; "
+            "$startedBefore = [DateTime]::UtcNow; "
+            "try { "
+            "$deadline = [DateTime]::UtcNow.AddSeconds(10); $child = $null; "
+            "do { $child = Get-CimInstance Win32_Process -Filter (\"ProcessId = {0}\" -f $process.Id) "
+            "-ErrorAction SilentlyContinue; if ($null -ne $child -and $child.ExecutablePath -and $child.CommandLine) { break }; "
+            "Start-Sleep -Milliseconds 100 } while ([DateTime]::UtcNow -lt $deadline); "
+            "if ($null -eq $child -or -not $child.ExecutablePath -or -not $child.CommandLine -or "
+            "[int]$child.ParentProcessId -ne [int]$launcher.ProcessId) { throw 'started process identity is incomplete' }; "
+            "[pscustomobject]@{pid=[int]$child.ProcessId;creation_time=$child.CreationDate.ToUniversalTime().ToString('o');"
+            "executable_path=[string]$child.ExecutablePath;command_line=[string]$child.CommandLine;"
+            "parent_pid=[int]$child.ParentProcessId;"
+            "parent_creation_time=$launcher.CreationDate.ToUniversalTime().ToString('o')} | ConvertTo-Json -Compress "
+            "} catch { $current = Get-CimInstance Win32_Process -Filter (\"ProcessId = {0}\" -f $process.Id) "
+            "-ErrorAction SilentlyContinue; if ($null -ne $current -and $current.ExecutablePath -and "
+            "[IO.Path]::GetFullPath([string]$current.ExecutablePath).Equals("
+            "$env:TTS_MORE_VALIDATION_EXECUTABLE, [StringComparison]::OrdinalIgnoreCase) -and "
+            "[int]$current.ParentProcessId -eq [int]$launcher.ProcessId -and "
+            "$current.CreationDate.ToUniversalTime() -ge $startedAfter -and "
+            "$current.CreationDate.ToUniversalTime() -le $startedBefore) { "
+            "Stop-Process -Id ([int]$current.ProcessId) -Force -ErrorAction SilentlyContinue }; throw }",
+            {
+                "TTS_MORE_VALIDATION_ARGUMENTS": json.dumps(list(launch.arguments)),
+                "TTS_MORE_VALIDATION_EXECUTABLE": str(launch.executable_path),
+                "TTS_MORE_VALIDATION_WORKDIR": str(launch.working_directory),
+                "TTS_MORE_VALIDATION_TEMP_ROOT": str(launch.temp_root),
+            },
+        )
+        replacement = RecordedProcessIdentity.from_document(document)
+        self._started_identities[replacement.pid] = replacement
+        for token in self._active_tokens:
+            with token.lock:
+                token.roots.append(replacement)
+        try:
+            deadline = time.monotonic() + convergence_seconds
+            while time.monotonic() <= deadline:
+                owner = self.port_owner(launch.port)
+                if owner == replacement:
+                    return replacement
+                time.sleep(0.25)
+            raise RuntimeError("restarted process did not own its port")
+        except Exception:
+            cleanup_failed = False
+            try:
+                self.stop_owned(replacement)
+            except Exception:
+                cleanup_failed = True
+            finally:
+                self._started_identities.pop(replacement.pid, None)
+                for token in self._active_tokens:
+                    with token.lock:
+                        if replacement in token.roots:
+                            token.roots.remove(replacement)
+            if cleanup_failed:
+                raise RuntimeError("restarted process cleanup failed") from None
+            raise
+
+    def final_cleanup_state(self, temp_roots: tuple[Path, ...]) -> tuple[bool, bool]:
+        return not self._active_tokens, not _temp_entries(temp_roots)
+
+    def _sample_until_stopped(self, token: _NativeCaseToken) -> None:
+        try:
+            while not token.stop_event.wait(self.sample_interval_seconds):
+                self._sample_token(token)
+        except Exception as exc:
+            token.error = exc
+
+    def _sample_token(self, token: _NativeCaseToken) -> None:
+        snapshot = self._process_snapshot()
+        with token.lock:
+            descendants = _descendant_pids(snapshot, {root.pid for root in token.roots})
+            for pid in descendants - token.baseline_pids - {root.pid for root in token.roots}:
+                identity = snapshot.get(pid)
+                if identity is not None and identity.creation_time >= token.started_at:
+                    token.observed.setdefault((identity.pid, identity.creation_time), identity)
+            now = datetime.now(timezone.utc)
+            for key in token.observed:
+                pid, creation_time = key
+                current = snapshot.get(pid)
+                if current is None or current.creation_time != creation_time:
+                    token.stopped_at.setdefault(key, now)
+            gpu = self._gpu_snapshot()
+            if gpu.used_mib > token.gpu_peak.used_mib:
+                token.gpu_peak = gpu
+
+    def _gpu_snapshot(self) -> GpuSnapshot:
+        output = self._run_text(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.free", "--format=csv,noheader,nounits"]
+        )
+        rows = [line.strip() for line in output.splitlines() if line.strip()]
+        if len(rows) != 1:
+            raise RuntimeError("live validation requires exactly one visible GPU")
+        values = [part.strip() for part in rows[0].split(",")]
+        if len(values) != 2:
+            raise RuntimeError("nvidia-smi memory output is invalid")
+        return GpuSnapshot(used_mib=int(values[0]), free_mib=int(values[1]))
+
+    def _process_snapshot(self) -> dict[int, RecordedProcessIdentity]:
+        document = self._powershell_document(
+            "$items = @(Get-CimInstance Win32_Process | ForEach-Object { "
+            "[pscustomobject]@{pid=[int]$_.ProcessId;creation_time=$_.CreationDate.ToUniversalTime().ToString('o');"
+            "executable_path=[string]$_.ExecutablePath;command_line=[string]$_.CommandLine;parent_pid=[int]$_.ParentProcessId} }); "
+            "$items | ConvertTo-Json -Compress -Depth 3",
+            {},
+        )
+        items = document if isinstance(document, list) else [document]
+        raw_by_pid = {
+            item["pid"]: item
+            for item in items
+            if isinstance(item, dict)
+            and isinstance(item.get("pid"), int)
+            and item.get("executable_path")
+            and item.get("command_line")
+        }
+        output: dict[int, RecordedProcessIdentity] = {}
+        for pid, item in raw_by_pid.items():
+            parent = raw_by_pid.get(item.get("parent_pid"))
+            cached = self._started_identities.get(pid)
+            if parent is None and cached is None:
+                continue
+            parent_pid = cached.parent_pid if parent is None and cached is not None else parent["pid"]
+            parent_creation = (
+                cached.parent_creation_time
+                if parent is None and cached is not None
+                else _parse_utc_datetime(parent["creation_time"])
+            )
+            output[pid] = RecordedProcessIdentity(
+                pid=pid,
+                creation_time=_parse_utc_datetime(item["creation_time"]),
+                executable_path=Path(item["executable_path"]).resolve(),
+                command_line=item["command_line"],
+                parent_pid=parent_pid,
+                parent_creation_time=parent_creation,
+            )
+        return output
+
+    def _stop_pid(self, pid: int) -> None:
+        self._powershell_document(
+            "Stop-Process -Id ([int]$env:TTS_MORE_VALIDATION_PID) -Force -ErrorAction Stop; "
+            "@{stopped=$true} | ConvertTo-Json -Compress",
+            {"TTS_MORE_VALIDATION_PID": str(pid)},
+        )
+
+    def _powershell_document(self, script: str, updates: dict[str, str]) -> Any:
+        environment = os.environ.copy()
+        environment.update(updates)
+        executable = shutil.which("powershell.exe") or shutil.which("pwsh")
+        if executable is None:
+            raise RuntimeError("PowerShell is unavailable")
+        completed = subprocess.run(
+            [executable, "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("PowerShell host probe failed")
+        return json.loads(completed.stdout.strip())
+
+    @staticmethod
+    def _run_bytes(command: list[str], *, allowed_returncodes: set[int] = {0}) -> bytes:
+        completed = subprocess.run(command, capture_output=True, check=False)
+        if completed.returncode not in allowed_returncodes:
+            raise RuntimeError("host command failed")
+        return completed.stdout
+
+    @classmethod
+    def _run_text(cls, command: list[str], *, allowed_returncodes: set[int] = {0}) -> str:
+        return cls._run_bytes(command, allowed_returncodes=allowed_returncodes).decode("utf-8", errors="replace")
+
+
+def _descendant_pids(
+    snapshot: dict[int, RecordedProcessIdentity],
+    roots: set[int],
+) -> set[int]:
+    descendants = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for pid, identity in snapshot.items():
+            if identity.parent_pid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    return descendants
+
+
+def _runner_process_evidence(identity: RecordedProcessIdentity, stopped_at: datetime) -> ProcessEvidence:
+    return ProcessEvidence(
+        pid=identity.pid,
+        ownership="validator-owned",
+        command_hash=hashlib.sha256(identity.command_line.encode("utf-8")).hexdigest(),
+        creation_time=identity.creation_time,
+        parent_pid=identity.parent_pid,
+        parent_creation_time=identity.parent_creation_time,
+        stopped_at=stopped_at,
+        executable_name=identity.executable_path.name,
+        executable_hash=_sha256_file(identity.executable_path),
+        ownership_hash=_hash_private_process_identity(identity),
+        started=True,
+        stopped=True,
+        descendants_stopped=True,
+        alive_after=False,
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _temp_entries(roots: tuple[Path, ...]) -> set[str]:
+    entries: set[str] = set()
+    for root in roots:
+        if root.exists():
+            entries.update(f"{index}:{path.relative_to(root).as_posix()}" for index, path in enumerate(root.rglob("*")))
+    return entries
+
+
+def _temp_entries_for_delta(before: set[str], *, token_roots: tuple[Path, ...]) -> set[str]:
+    return _temp_entries(token_roots) - before
+
+
+class HttpReliabilityProbe:
+    """Concrete local HTTP probe for the TTS More and ComfyUI contracts."""
+
+    def __init__(
+        self,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        reference_root: Path,
+        poll_interval_seconds: float = 0.25,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.transport = transport
+        self.reference_root = Path(reference_root).resolve()
+        self.poll_interval_seconds = poll_interval_seconds
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self._fixture: ReliabilityFixture | None = None
+        self._released = False
+        self._seen_job_ids: set[str] = set()
+        self._seen_prompt_ids: set[str] = set()
+        self._seen_version_ids: set[str] = set()
+
+    def preflight(self, fixture: ReliabilityFixture) -> HttpPreflightObservation:
+        self._fixture = _revalidate_model(fixture, ReliabilityFixture)
+        comfyui_url = fixture.base_urls["comfyui"].rstrip("/")
+        tts_more_url = fixture.base_urls["tts_more"].rstrip("/")
+        system_stats = self._json("GET", f"{comfyui_url}/system_stats", timeout=5.0)
+        object_info = self._json("GET", f"{comfyui_url}/object_info", timeout=10.0)
+        capabilities = self._json(
+            "GET",
+            f"{comfyui_url}/api/tts-audio-suite/v1/capabilities",
+            timeout=10.0,
+        )
+        if not isinstance(system_stats, dict) or not isinstance(object_info, dict):
+            raise RuntimeError("ComfyUI readiness probes returned invalid documents")
+        resources_raw = capabilities.get("resources") if isinstance(capabilities, dict) else None
+        if not isinstance(resources_raw, list):
+            raise RuntimeError("ComfyUI capabilities omitted resources")
+        resources = [
+            ReadyResource(
+                engine=_canonical_bridge_engine(item.get("engine")),
+                resource_id=item.get("resource_id"),
+                ready=item.get("ready") is True,
+            )
+            for item in resources_raw
+            if isinstance(item, dict)
+        ]
+        for engine in ENGINE_ORDER:
+            response = self._json(
+                "POST",
+                f"{tts_more_url}/api/generation/preflight",
+                json_body=self._generation_payload(
+                    CasePlan(
+                        case_id=f"preflight-{engine}",
+                        phase="steady",
+                        engine=engine,
+                        expected="completed",
+                        action="synthesize",
+                        request_timeout_seconds=30.0,
+                        convergence_seconds=30.0,
+                    ),
+                    fixture,
+                ),
+                timeout=30.0,
+            )
+            if response.get("status") != "ready" or any(
+                not isinstance(item, dict) or item.get("status") != "ready"
+                for item in response.get("items", [])
+            ):
+                raise RuntimeError("TTS More generation preflight is not ready")
+        return HttpPreflightObservation(
+            resources=resources,
+            queue=self._queue_snapshot(fixture),
+        )
+
+    def execute_case(
+        self,
+        case: CasePlan,
+        fixture: ReliabilityFixture,
+        output_directory: Path,
+        *,
+        action_hook: Callable[[], None] | None = None,
+    ) -> HttpCaseObservation:
+        del output_directory
+        fixture = _revalidate_model(fixture, ReliabilityFixture)
+        tts_more_url = fixture.base_urls["tts_more"].rstrip("/")
+        comfyui_url = fixture.base_urls["comfyui"].rstrip("/")
+        payload = self._generation_payload(case, fixture)
+        if case.action == "restart-readiness" and action_hook is not None:
+            action_hook()
+        preflight = self._json(
+            "POST",
+            f"{tts_more_url}/api/generation/preflight",
+            json_body=payload,
+            timeout=min(30.0, case.convergence_seconds),
+        )
+        if preflight.get("status") != "ready":
+            raise RuntimeError("case generation preflight is not ready")
+        if case.action == "cancel-queued":
+            return self._execute_queued_cancel_case(case, fixture, payload)
+        created = self._json(
+            "POST",
+            f"{tts_more_url}/api/jobs/generation",
+            json_body=payload,
+            timeout=case.request_timeout_seconds,
+        )
+        job_id = _required_opaque_id(created.get("job_id"), "job")
+        if job_id in self._seen_job_ids:
+            raise RuntimeError("job id was reused")
+        self._seen_job_ids.add(job_id)
+
+        deadline = self.monotonic() + case.convergence_seconds
+        prompt_id: str | None = None
+        queue_before: list[str] | None = None
+        acted = False
+        endpoint_unavailable = False
+        terminal: dict[str, Any] | None = None
+        while self.monotonic() <= deadline:
+            job = self._json("GET", f"{tts_more_url}/api/jobs/{job_id}", timeout=10.0)
+            items = job.get("items")
+            item = items[0] if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict) else {}
+            external_id = item.get("external_job_id")
+            if external_id:
+                observed_prompt = _required_opaque_id(external_id, "prompt")
+                if prompt_id is not None and prompt_id != observed_prompt:
+                    raise RuntimeError("job changed prompt id")
+                prompt_id = observed_prompt
+                try:
+                    queue = self._comfy_queue(fixture)
+                except httpx.TransportError:
+                    if case.action != "terminate-comfyui" or not acted:
+                        raise
+                    endpoint_unavailable = True
+                    queue = None
+                prompt_ids = _comfy_prompt_ids(queue) if queue is not None else []
+                if prompt_id in prompt_ids and queue_before is None:
+                    queue_before = prompt_ids
+                state = _comfy_prompt_state(queue, prompt_id) if queue is not None else "absent"
+                if case.action == "cancel-queued" and not acted and state == "pending":
+                    self._cancel_job(tts_more_url, job_id)
+                    acted = True
+                elif case.action == "cancel-running" and not acted and state == "running":
+                    self._cancel_job(tts_more_url, job_id)
+                    acted = True
+                elif case.action == "terminate-comfyui" and not acted and state == "running":
+                    if action_hook is None:
+                        raise RuntimeError("terminate action hook is missing")
+                    action_hook()
+                    acted = True
+            if job.get("status") in {"completed", "cancelled", "failed"}:
+                terminal = job
+                break
+            self.sleep(self.poll_interval_seconds)
+        if terminal is None:
+            raise RuntimeError("job did not converge")
+        if case.action in {"cancel-queued", "cancel-running", "terminate-comfyui"} and not acted:
+            raise RuntimeError("fault action window was not observed")
+
+        items = terminal.get("items")
+        item = items[0] if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict) else {}
+        if prompt_id is None and item.get("external_job_id"):
+            prompt_id = _required_opaque_id(item.get("external_job_id"), "prompt")
+        if prompt_id is None or queue_before is None:
+            raise RuntimeError("prompt queue lifecycle was not observed")
+        if prompt_id in self._seen_prompt_ids:
+            raise RuntimeError("prompt id was reused")
+        self._seen_prompt_ids.add(prompt_id)
+
+        actual = _job_outcome(case, terminal)
+        manifest = self._json(
+            "GET",
+            f"{tts_more_url}/api/projects/windows-reliability-validation/manifest",
+            timeout=10.0,
+        )
+        version = _find_manifest_version(manifest, case.case_id, item.get("version_id"))
+        raw_version_id = _required_opaque_id(version.get("version_id"), "version")
+        version_id = _public_manifest_version_id(case.case_id, raw_version_id)
+        if version_id in self._seen_version_ids:
+            raise RuntimeError("version id was reused")
+        self._seen_version_ids.add(version_id)
+        wav_path = Path(version["audio_path"]) if actual == "completed" and version.get("audio_path") else None
+        if case.action == "terminate-comfyui":
+            if (
+                not endpoint_unavailable
+                or actual != "failed"
+                or item.get("status") != "failed"
+                or version.get("status") != "failed"
+                or version.get("audio_path")
+            ):
+                raise RuntimeError("ComfyUI termination proof is incomplete")
+            return HttpCaseObservation(
+                actual=actual,
+                job_id=job_id,
+                prompt_id=prompt_id,
+                version_id=version_id,
+                wav_path=None,
+                comfyui=None,
+                tts_more=TtsTerminalEvidence(
+                    job_status="failed",
+                    item_status="failed",
+                    version_status="failed",
+                    manifest_version_absent=False,
+                ),
+                termination=TerminationEvidence(
+                    endpoint_unavailable=True,
+                    prompt_id=prompt_id,
+                    queue_before_prompt_ids=queue_before,
+                    manifest_audio_absent=True,
+                ),
+            )
+        queue_after_document = self._comfy_queue(fixture)
+        queue_after = _comfy_prompt_ids(queue_after_document)
+        history = self._json("GET", f"{comfyui_url}/history/{prompt_id}", timeout=10.0)
+        history_ids = sorted(str(key) for key in history if isinstance(key, str))
+        terminal_history_status = _terminal_comfy_history_status(
+            history.get(prompt_id),
+            expected=actual,
+        )
+        return HttpCaseObservation(
+            actual=actual,
+            job_id=job_id,
+            prompt_id=prompt_id,
+            version_id=version_id,
+            wav_path=wav_path,
+            comfyui=ComfyQueueEvidence(
+                queue_empty=not queue_after,
+                history_present=prompt_id in history_ids,
+                prompt_id=prompt_id,
+                queue_before_prompt_ids=queue_before,
+                queue_after_prompt_ids=queue_after,
+                history_prompt_ids=history_ids,
+                terminal_history_status=terminal_history_status,
+            ),
+        )
+
+    def release(self) -> None:
+        if self._fixture is None:
+            raise RuntimeError("HTTP probe was not preflighted")
+        comfyui_url = self._fixture.base_urls["comfyui"].rstrip("/")
+        self._json(
+            "POST",
+            f"{comfyui_url}/api/tts-audio-suite/v1/runtime/release",
+            json_body={"all": True},
+            timeout=120.0,
+        )
+        self._json(
+            "POST",
+            f"{comfyui_url}/free",
+            json_body={"unload_models": True, "free_memory": True},
+            timeout=60.0,
+        )
+        self._released = True
+
+    def final_state(self) -> HttpFinalObservation:
+        if self._fixture is None:
+            raise RuntimeError("HTTP probe was not preflighted")
+        return HttpFinalObservation(
+            queue=self._queue_snapshot(self._fixture),
+            runtime_released=self._released,
+        )
+
+    def _generation_payload(self, case: CasePlan, fixture: ReliabilityFixture) -> dict[str, Any]:
+        resource = fixture.resources[case.engine]
+        reference_path = (self.reference_root / resource.reference_audio).resolve()
+        if not reference_path.is_relative_to(self.reference_root):
+            raise RuntimeError("reference audio escapes fixture root")
+        return {
+            "project_id": "windows-reliability-validation",
+            "tasks": [
+                {
+                    "line": {
+                        "id": case.case_id,
+                        "character_id": f"validator-{case.engine}",
+                        "text": f"Windows reliability validation {case.engine}",
+                    },
+                    "engine": case.engine,
+                    "profile": resource.resource_id,
+                    "provider_type": case.engine,
+                    "required_capabilities": ["tts", "reference_audio_voice"],
+                    "parameters": {
+                        "engine": case.engine,
+                        "resource_id": resource.resource_id,
+                        "ref_audio_path": str(reference_path),
+                        "prompt_text": resource.reference_text,
+                        "timeout_seconds": case.request_timeout_seconds,
+                    },
+                },
+            ],
+        }
+
+    def _queue_snapshot(self, fixture: ReliabilityFixture) -> QueueSnapshot:
+        tts_more_url = fixture.base_urls["tts_more"].rstrip("/")
+        tts_queue = self._json("GET", f"{tts_more_url}/api/queue/status", timeout=10.0)
+        comfy_queue = self._comfy_queue(fixture)
+        return QueueSnapshot(
+            tts_queued=tts_queue.get("queued"),
+            tts_running=tts_queue.get("running"),
+            comfy_pending_prompt_ids=_comfy_prompt_ids(comfy_queue, key="queue_pending"),
+            comfy_running_prompt_ids=_comfy_prompt_ids(comfy_queue, key="queue_running"),
+        )
+
+    def _comfy_queue(self, fixture: ReliabilityFixture) -> dict[str, Any]:
+        comfyui_url = fixture.base_urls["comfyui"].rstrip("/")
+        return self._json("GET", f"{comfyui_url}/queue", timeout=10.0)
+
+    def _execute_queued_cancel_case(
+        self,
+        case: CasePlan,
+        fixture: ReliabilityFixture,
+        payload: dict[str, Any],
+    ) -> HttpCaseObservation:
+        tts_more_url = fixture.base_urls["tts_more"].rstrip("/")
+        comfyui_url = fixture.base_urls["comfyui"].rstrip("/")
+        manifest_url = f"{tts_more_url}/api/projects/windows-reliability-validation/manifest"
+        manifest_before = self._json("GET", manifest_url, timeout=10.0)
+        if _manifest_version_ids_for_line(manifest_before, case.case_id):
+            raise RuntimeError("queued-cancel target already has manifest versions")
+
+        blocker_case = case.model_copy(
+            update={
+                "case_id": f"validator-blocker-{secrets.token_hex(8)}",
+                "action": "synthesize",
+                "request_timeout_seconds": 30.0,
+            }
+        )
+        blocker_created = self._json(
+            "POST",
+            f"{tts_more_url}/api/jobs/generation",
+            json_body=self._generation_payload(blocker_case, fixture),
+            timeout=30.0,
+        )
+        blocker_job_id = _required_opaque_id(blocker_created.get("job_id"), "job")
+        self._remember_unique(self._seen_job_ids, blocker_job_id, "job")
+        blocker_prompt_id: str | None = None
+        target_job_id: str | None = None
+        blocker_cancelled = False
+        target_cancelled = False
+        try:
+            deadline = self.monotonic() + case.convergence_seconds
+            while self.monotonic() <= deadline:
+                blocker = self._json(
+                    "GET",
+                    f"{tts_more_url}/api/jobs/{blocker_job_id}",
+                    timeout=10.0,
+                )
+                blocker_item = _single_job_item(blocker)
+                external_id = blocker_item.get("external_job_id")
+                if external_id:
+                    blocker_prompt_id = _required_opaque_id(external_id, "prompt")
+                    if _comfy_prompt_state(self._comfy_queue(fixture), blocker_prompt_id) in {
+                        "pending",
+                        "running",
+                    }:
+                        break
+                if blocker.get("status") in {"completed", "cancelled", "failed"}:
+                    raise RuntimeError("queued-cancel blocker completed before admission was held")
+                self.sleep(self.poll_interval_seconds)
+            else:
+                raise RuntimeError("queued-cancel blocker did not hold admission")
+            self._remember_unique(self._seen_prompt_ids, blocker_prompt_id, "prompt")
+
+            target_created = self._json(
+                "POST",
+                f"{tts_more_url}/api/jobs/generation",
+                json_body=payload,
+                timeout=case.request_timeout_seconds,
+            )
+            target_job_id = _required_opaque_id(target_created.get("job_id"), "job")
+            self._remember_unique(self._seen_job_ids, target_job_id, "job")
+            queued_target: dict[str, Any] | None = None
+            while self.monotonic() <= deadline:
+                target = self._json(
+                    "GET",
+                    f"{tts_more_url}/api/jobs/{target_job_id}",
+                    timeout=10.0,
+                )
+                target_item = _single_job_item(target)
+                if target.get("status") == "running" and _queued_item_is_pristine(target_item):
+                    queued_target = target
+                    break
+                if target_item.get("external_job_id") or target_item.get("status") != "queued":
+                    raise RuntimeError("queued-cancel target escaped pre-dispatch admission")
+                self.sleep(self.poll_interval_seconds)
+            if queued_target is None:
+                raise RuntimeError("queued-cancel target did not reach held admission")
+
+            cancelled = self._cancel_job(tts_more_url, target_job_id)
+            _require_pristine_queued_cancellation(cancelled)
+            target_cancelled = True
+            cancelled_updated_at = cancelled.get("updated_at")
+            if not isinstance(cancelled_updated_at, str) or not cancelled_updated_at:
+                raise RuntimeError("queued-cancel response omitted update time")
+
+            self._cancel_job(tts_more_url, blocker_job_id)
+            blocker_cancelled = True
+            settled_target: dict[str, Any] | None = None
+            while self.monotonic() <= deadline:
+                target = self._json(
+                    "GET",
+                    f"{tts_more_url}/api/jobs/{target_job_id}",
+                    timeout=10.0,
+                )
+                blocker = self._json(
+                    "GET",
+                    f"{tts_more_url}/api/jobs/{blocker_job_id}",
+                    timeout=10.0,
+                )
+                queue_ids = _comfy_prompt_ids(self._comfy_queue(fixture))
+                if (
+                    target.get("updated_at") != cancelled_updated_at
+                    and blocker.get("status") in {"cancelled", "failed", "completed"}
+                    and blocker_prompt_id not in queue_ids
+                ):
+                    _require_pristine_queued_cancellation(target)
+                    settled_target = target
+                    break
+                self.sleep(self.poll_interval_seconds)
+            if settled_target is None:
+                raise RuntimeError("queued-cancel worker did not settle after admission release")
+
+            manifest_after = self._json("GET", manifest_url, timeout=10.0)
+            manifest_absent = (
+                not _manifest_version_ids_for_line(manifest_before, case.case_id)
+                and not _manifest_version_ids_for_line(manifest_after, case.case_id)
+            )
+            if not manifest_absent:
+                raise RuntimeError("queued-cancel target fabricated a manifest version")
+            return HttpCaseObservation(
+                actual="cancelled",
+                job_id=target_job_id,
+                prompt_id=None,
+                version_id=None,
+                wav_path=None,
+                comfyui=None,
+                prompt_submitted=False,
+                tts_more=TtsTerminalEvidence(
+                    job_status="cancelled",
+                    item_status="cancelled",
+                    version_status=None,
+                    manifest_version_absent=True,
+                ),
+            )
+        finally:
+            if target_job_id is not None and not target_cancelled:
+                self._best_effort_cancel(tts_more_url, target_job_id)
+            if not blocker_cancelled:
+                self._best_effort_cancel(tts_more_url, blocker_job_id)
+
+    @staticmethod
+    def _remember_unique(seen: set[str], value: str, label: str) -> None:
+        if value in seen:
+            raise RuntimeError(f"{label} id was reused")
+        seen.add(value)
+
+    def _cancel_job(self, tts_more_url: str, job_id: str) -> dict[str, Any]:
+        return self._json("POST", f"{tts_more_url}/api/jobs/{job_id}/cancel", timeout=30.0)
+
+    def _best_effort_cancel(self, tts_more_url: str, job_id: str) -> None:
+        try:
+            self._cancel_job(tts_more_url, job_id)
+        except Exception:
+            pass
+
+    def _json(
+        self,
+        method: Literal["GET", "POST"],
+        url: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        timeout: float,
+    ) -> dict[str, Any]:
+        with httpx.Client(transport=self.transport, timeout=timeout, trust_env=False) as client:
+            response = client.request(method, url, json=json_body)
+            response.raise_for_status()
+            document = response.json()
+        if not isinstance(document, dict):
+            raise RuntimeError("HTTP probe returned a non-object document")
+        return document
+
+
+def _required_opaque_id(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value or "/" in value or "\\" in value:
+        raise RuntimeError(f"{label} id is missing or invalid")
+    return value
+
+
+def _comfy_prompt_ids(queue: dict[str, Any], *, key: str | None = None) -> list[str]:
+    keys = (key,) if key is not None else ("queue_running", "queue_pending")
+    prompt_ids: list[str] = []
+    for queue_key in keys:
+        items = queue.get(queue_key, [])
+        if not isinstance(items, list):
+            raise RuntimeError("ComfyUI queue shape is invalid")
+        for item in items:
+            if not isinstance(item, (list, tuple)) or len(item) < 2 or not isinstance(item[1], str):
+                raise RuntimeError("ComfyUI queue item is invalid")
+            prompt_ids.append(item[1])
+    if len(prompt_ids) != len(set(prompt_ids)):
+        raise RuntimeError("ComfyUI queue contains duplicate prompt ids")
+    return sorted(prompt_ids)
+
+
+def _comfy_prompt_state(queue: dict[str, Any], prompt_id: str) -> str:
+    if prompt_id in _comfy_prompt_ids(queue, key="queue_running"):
+        return "running"
+    if prompt_id in _comfy_prompt_ids(queue, key="queue_pending"):
+        return "pending"
+    return "absent"
+
+
+def _terminal_comfy_history_status(entry: Any, *, expected: Outcome) -> Outcome:
+    if not isinstance(entry, dict):
+        raise RuntimeError("ComfyUI terminal history entry is missing")
+    status = entry.get("status")
+    outputs = entry.get("outputs")
+    if not isinstance(status, dict):
+        raise RuntimeError("ComfyUI terminal history status is missing")
+    status_string = status.get("status_str")
+    completed = status.get("completed")
+    messages = status.get("messages")
+    if expected == "completed":
+        if status_string != "success" or completed is not True or not isinstance(outputs, dict) or not outputs:
+            raise RuntimeError("ComfyUI success history is incomplete")
+        return "completed"
+    interrupted = isinstance(messages, list) and any(
+        isinstance(message, list)
+        and len(message) >= 1
+        and message[0] == "execution_interrupted"
+        for message in messages
+    )
+    if expected in {"cancelled", "timeout"} and (
+        status_string == "error" and completed is False and interrupted
+    ):
+        return expected
+    if expected == "failed" and status_string == "error" and completed is False:
+        return "failed"
+    raise RuntimeError("ComfyUI terminal history does not match the TTS outcome")
+
+
+def _canonical_bridge_engine(value: Any) -> Engine:
+    if not isinstance(value, str) or value not in _BRIDGE_ENGINE_IDS:
+        raise RuntimeError("bridge reported an unsupported engine")
+    return _BRIDGE_ENGINE_IDS[value]
+
+
+def _job_outcome(case: CasePlan, job: dict[str, Any]) -> Outcome:
+    status = job.get("status")
+    if status == "completed":
+        return "completed"
+    if status == "cancelled":
+        return "cancelled"
+    if status != "failed":
+        raise RuntimeError("job did not report a supported terminal outcome")
+    if case.action == "timeout":
+        values: list[str] = [str(job.get("error") or "")]
+        items = job.get("items")
+        if isinstance(items, list):
+            values.extend(str(item.get("error") or "") for item in items if isinstance(item, dict))
+        if any(re.search(r"(?i)\b(?:timeout|timed\s+out)\b", value) for value in values):
+            return "timeout"
+    return "failed"
+
+
+def _single_job_item(job: dict[str, Any]) -> dict[str, Any]:
+    items = job.get("items")
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        raise RuntimeError("generation job did not contain exactly one item")
+    return items[0]
+
+
+def _queued_item_is_pristine(item: dict[str, Any]) -> bool:
+    return (
+        item.get("status") == "queued"
+        and item.get("progress") == 0.0
+        and all(
+            item.get(field) is None
+            for field in ("external_job_id", "external_status", "error", "version_id")
+        )
+    )
+
+
+def _require_pristine_queued_cancellation(job: dict[str, Any]) -> None:
+    item = _single_job_item(job)
+    if (
+        job.get("status") != "cancelled"
+        or job.get("progress") != 1.0
+        or job.get("error") is not None
+        or item.get("status") != "cancelled"
+        or item.get("progress") != 1.0
+        or any(
+            item.get(field) is not None
+            for field in ("external_job_id", "external_status", "error", "version_id")
+        )
+    ):
+        raise RuntimeError("queued-cancel terminal response was not pristine")
+
+
+def _manifest_version_ids_for_line(manifest: dict[str, Any], case_id: str) -> list[str]:
+    lines = manifest.get("lines")
+    if not isinstance(lines, dict):
+        raise RuntimeError("manifest lines are missing")
+    version_ids: list[str] = []
+    for line_key, history in lines.items():
+        if not isinstance(history, dict) or (
+            line_key != case_id and history.get("line_id") != case_id
+        ):
+            continue
+        versions = history.get("versions")
+        if not isinstance(versions, list):
+            raise RuntimeError("manifest line versions are missing")
+        for version in versions:
+            if not isinstance(version, dict) or not isinstance(version.get("version_id"), str):
+                raise RuntimeError("manifest version identity is invalid")
+            version_ids.append(version["version_id"])
+    return sorted(version_ids)
+
+
+def _find_manifest_version(
+    manifest: dict[str, Any],
+    case_id: str,
+    expected_version_id: Any,
+) -> dict[str, Any]:
+    lines = manifest.get("lines")
+    if not isinstance(lines, dict):
+        raise RuntimeError("manifest lines are missing")
+    candidates: list[dict[str, Any]] = []
+    for line_key, history in lines.items():
+        if not isinstance(history, dict) or (
+            line_key != case_id and history.get("line_id") != case_id
+        ):
+            continue
+        versions = history.get("versions")
+        if not isinstance(versions, list):
+            continue
+        for version in versions:
+            if isinstance(version, dict) and version.get("version_id") == expected_version_id:
+                candidates.append(version)
+    if len(candidates) != 1:
+        raise RuntimeError("manifest version is missing or ambiguous")
+    return candidates[0]
+
+
+def _public_manifest_version_id(case_id: str, raw_version_id: str) -> str:
+    return hashlib.sha256(f"{case_id}\0{raw_version_id}".encode("utf-8")).hexdigest()
+
+
+def build_case_plan(rounds: int = 10) -> tuple[CasePlan, ...]:
+    if isinstance(rounds, bool) or rounds != 10:
+        raise ValueError("reliability plan requires exactly 10 rounds")
+
+    plan: list[CasePlan] = []
+    for round_number in range(1, rounds + 1):
+        for engine in ENGINE_ORDER:
+            plan.append(
+                CasePlan(
+                    case_id=f"steady-{round_number:02d}-{engine}",
+                    phase="steady",
+                    engine=engine,
+                    expected="completed",
+                    action="synthesize",
+                    request_timeout_seconds=30.0,
+                    convergence_seconds=30.0,
+                )
+            )
+
+    plan.append(
+        CasePlan(
+            case_id="cancel-queued",
+            phase="fault",
+            engine="gpt-sovits",
+            expected="cancelled",
+            action="cancel-queued",
+            request_timeout_seconds=30.0,
+            convergence_seconds=30.0,
+        )
+    )
+    for engine in ENGINE_ORDER:
+        plan.extend(
+            (
+                CasePlan(
+                    case_id=f"cancel-running-{engine}",
+                    phase="fault",
+                    engine=engine,
+                    expected="cancelled",
+                    action="cancel-running",
+                    request_timeout_seconds=30.0,
+                    convergence_seconds=30.0,
+                ),
+                CasePlan(
+                    case_id=f"recover-cancel-{engine}",
+                    phase="recovery",
+                    engine=engine,
+                    expected="completed",
+                    action="synthesize",
+                    request_timeout_seconds=180.0,
+                    convergence_seconds=180.0,
+                ),
+            )
+        )
+    for engine in ENGINE_ORDER:
+        plan.extend(
+            (
+                CasePlan(
+                    case_id=f"timeout-{engine}",
+                    phase="fault",
+                    engine=engine,
+                    expected="timeout",
+                    action="timeout",
+                    request_timeout_seconds=1.0,
+                    convergence_seconds=30.0,
+                ),
+                CasePlan(
+                    case_id=f"recover-timeout-{engine}",
+                    phase="recovery",
+                    engine=engine,
+                    expected="completed",
+                    action="synthesize",
+                    request_timeout_seconds=180.0,
+                    convergence_seconds=180.0,
+                ),
+            )
+        )
+    plan.append(
+        CasePlan(
+            case_id="terminate-comfyui-indextts",
+            phase="fault",
+            engine="indextts",
+            expected="failed",
+            action="terminate-comfyui",
+            request_timeout_seconds=30.0,
+            convergence_seconds=30.0,
+        )
+    )
+    for engine in ENGINE_ORDER:
+        plan.append(
+            CasePlan(
+                case_id=f"restart-{engine}",
+                phase="recovery",
+                engine=engine,
+                expected="completed",
+                action="restart-readiness",
+                request_timeout_seconds=180.0,
+                convergence_seconds=180.0,
+            )
+        )
+    return tuple(plan)
+
+
+def required_case_specs(plan: Sequence[CasePlan]) -> tuple[RequiredCase, ...]:
+    required = tuple(
+        RequiredCase(
+            case_id=case.case_id,
+            engine=case.engine,
+            phase=case.phase,
+            expected=case.expected,
+        )
+        for case in plan
+        if case.phase != "steady"
+    )
+    if len({case.case_id for case in required}) != len(required):
+        raise ValueError("required case specifications must be unique")
+    return required
+
+
+def execute_reliability_validation(
+    fixture: ReliabilityFixture,
+    *,
+    output_root: Path,
+    http_probe: ReliabilityHttpProbe,
+    host_probe: ReliabilityHostProbe,
+    owned_processes: dict[str, OwnedProcessIdentity],
+    allow_lan: bool = False,
+    plan: Sequence[CasePlan] | None = None,
+) -> "ReliabilityRunSummary":
+    """Execute the opt-in matrix through injected HTTP and Windows host probes.
+
+    This controller deliberately owns no service startup or broad cleanup. The
+    PowerShell wrapper owns those processes; the probes must return exact,
+    evidence-safe observations. Every failure is persisted before it is raised.
+    """
+    try:
+        fixture = _revalidate_model(fixture, ReliabilityFixture)
+        owned_processes = {
+            label: _revalidate_model(identity, OwnedProcessIdentity)
+            for label, identity in owned_processes.items()
+        }
+        selected_plan = tuple(plan) if plan is not None else build_case_plan(fixture.rounds)
+        selected_plan = tuple(_revalidate_model(case, CasePlan) for case in selected_plan)
+        if selected_plan != build_case_plan(fixture.rounds):
+            raise LiveValidationError("case-plan-mismatch", stage="preflight")
+    except LiveValidationError:
+        raise
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        raise LiveValidationError("invalid-validator-input", stage="preflight") from None
+
+    output_root = Path(output_root)
+    completed_cases: list[CaseEvidence] = []
+    failure: LiveValidationError | None = None
+    preflight_passed = False
+    release_attempted = False
+    baseline: BoundarySnapshot | None = None
+
+    try:
+        _require_endpoint_scope(fixture, allow_lan=allow_lan)
+        http_preflight = _revalidate_model(http_probe.preflight(fixture), HttpPreflightObservation)
+        host_preflight = _revalidate_model(host_probe.preflight(fixture), HostPreflightObservation)
+        baseline = host_preflight.boundary
+        _validate_preflight(fixture, http_preflight, host_preflight, owned_processes)
+        preflight_passed = True
+
+        provisional_boundary = _boundary_evidence(baseline, baseline)
+        for case in selected_plan:
+            started_at = host_probe.begin_case(case)
+            action_hook: Callable[[], None] | None = None
+            if case.action == "terminate-comfyui":
+                action_hook = host_probe.terminate_comfyui
+            elif case.action == "restart-readiness":
+                action_hook = host_probe.restart_comfyui
+            try:
+                http_observation = http_probe.execute_case(
+                    case,
+                    fixture,
+                    output_root / "audio",
+                    action_hook=action_hook,
+                )
+            finally:
+                host_observation = _revalidate_model(
+                    host_probe.finish_case(case, started_at),
+                    HostCaseObservation,
+                )
+            if not isinstance(http_observation, HttpCaseObservation):
+                raise LiveValidationError("invalid-http-case-observation", stage="case")
+            evidence = _case_evidence(
+                case,
+                http_observation,
+                host_observation,
+                provisional_boundary,
+            )
+            validation = validate_case(evidence, wav_path=http_observation.wav_path)
+            if not validation.valid:
+                raise LiveValidationError("case-validation-failed", stage="case")
+            completed_cases.append(validation.evidence)
+
+        release_attempted = True
+        http_probe.release()
+        http_final = _revalidate_model(http_probe.final_state(), HttpFinalObservation)
+        host_final = _revalidate_model(host_probe.final_state(), HostFinalObservation)
+        _validate_final_state(http_final, host_final)
+        assert baseline is not None
+        final_boundary = _boundary_evidence(baseline, host_final.boundary)
+        completed_cases = [
+            _revalidate_model(case.model_copy(update={"boundary": final_boundary}), CaseEvidence)
+            for case in completed_cases
+        ]
+        if any(not validate_case(case).valid for case in completed_cases):
+            raise LiveValidationError("boundary-drift", stage="finalize")
+        summary = finalize_run(
+            fixture,
+            completed_cases,
+            required_cases=required_case_specs(selected_plan),
+        )
+        if summary.status != "passed":
+            raise LiveValidationError("matrix-incomplete", stage="finalize")
+    except LiveValidationError as exc:
+        failure = exc
+    except (ValueError, TypeError, AttributeError, OSError, RuntimeError, httpx.HTTPError):
+        failure = LiveValidationError(
+            "preflight-observation-failed" if not preflight_passed else "case-execution-failed",
+            stage="preflight" if not preflight_passed else "case",
+        )
+    finally:
+        if preflight_passed and not release_attempted:
+            try:
+                http_probe.release()
+            except Exception:
+                if failure is None:
+                    failure = LiveValidationError("runtime-release-failed", stage="finalize")
+
+    if failure is not None:
+        summary = finalize_run(
+            fixture,
+            completed_cases,
+            required_cases=required_case_specs(selected_plan),
+        )
+        write_atomic_json(output_root / "reliability-summary.json", summary)
+        write_atomic_json(
+            output_root / "failure.json",
+            {"code": failure.code, "stage": failure.stage},
+        )
+        raise failure
+
+    for case in summary.cases:
+        write_atomic_json(output_root / "cases" / f"{case.case_id}.json", case.model_dump(mode="json"))
+    write_atomic_json(output_root / "reliability-summary.json", summary)
+    return summary
+
+
+def execute_reliability_preflight(
+    fixture: ReliabilityFixture,
+    *,
+    output_root: Path,
+    http_probe: ReliabilityHttpProbe,
+    host_probe: ReliabilityHostProbe,
+    owned_processes: dict[str, OwnedProcessIdentity],
+    allow_lan: bool = False,
+) -> None:
+    fixture = _revalidate_model(fixture, ReliabilityFixture)
+    _require_endpoint_scope(fixture, allow_lan=allow_lan)
+    http = _revalidate_model(http_probe.preflight(fixture), HttpPreflightObservation)
+    host = _revalidate_model(host_probe.preflight(fixture), HostPreflightObservation)
+    _validate_preflight(fixture, http, host, owned_processes)
+    write_atomic_json(
+        Path(output_root) / "preflight.json",
+        {
+            "status": "passed",
+            "resources": [
+                {
+                    "engine": item.engine,
+                    "ready": item.ready,
+                    "resource_id_hash": hashlib.sha256(
+                        item.resource_id.encode("utf-8")
+                    ).hexdigest(),
+                }
+                for item in sorted(http.resources, key=lambda item: (item.engine, item.resource_id))
+            ],
+            "queue": http.queue.model_dump(mode="json"),
+            "port_owners": {
+                str(port): identity.model_dump(mode="json")
+                for port, identity in sorted(host.port_owners.items())
+            },
+            "boundary": {
+                "aggregate_hash": host.boundary.aggregate_hash,
+                "private_registry_hash": host.boundary.private_registry_hash,
+                "reference_hashes": host.boundary.reference_hashes,
+                "repositories": [item.model_dump(mode="json") for item in host.boundary.repositories],
+            },
+        },
+    )
+
+
+def _require_endpoint_scope(fixture: ReliabilityFixture, *, allow_lan: bool) -> None:
+    if allow_lan:
+        return
+    for base_url in fixture.base_urls.values():
+        try:
+            hostname = urlsplit(base_url).hostname
+        except ValueError:
+            hostname = None
+        if hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise LiveValidationError("non-loopback-endpoint", stage="preflight")
+
+
+def _validate_preflight(
+    fixture: ReliabilityFixture,
+    http: HttpPreflightObservation,
+    host: HostPreflightObservation,
+    owned_processes: dict[str, OwnedProcessIdentity],
+) -> None:
+    expected_resources = {
+        (engine, fixture.resources[engine].resource_id, True)
+        for engine in ENGINE_ORDER
+    }
+    observed_resources = {
+        (resource.engine, resource.resource_id, resource.ready)
+        for resource in http.resources
+    }
+    if len(http.resources) != len(expected_resources) or observed_resources != expected_resources:
+        raise LiveValidationError("resource-readiness", stage="preflight")
+    if not _queue_is_idle(http.queue):
+        raise LiveValidationError("initial-queue-not-idle", stage="preflight")
+    expected_owned = {"tts-more", "comfyui"}
+    if set(owned_processes) != expected_owned:
+        raise LiveValidationError("owned-process-set", stage="preflight")
+    labels_by_url = {"tts_more": "tts-more", "comfyui": "comfyui"}
+    for url_label, process_label in labels_by_url.items():
+        parsed = urlsplit(fixture.base_urls[url_label])
+        port = parsed.port
+        if port is None:
+            raise LiveValidationError("endpoint-port-missing", stage="preflight")
+        owner = host.port_owners.get(port)
+        if owner is not None and owner != owned_processes[process_label]:
+            raise LiveValidationError("port-owner-mismatch", stage="preflight")
+    _validate_boundary_snapshot(host.boundary)
+
+
+def _validate_final_state(http: HttpFinalObservation, host: HostFinalObservation) -> None:
+    if not http.runtime_released:
+        raise LiveValidationError("runtime-release-failed", stage="finalize")
+    if not _queue_is_idle(http.queue):
+        raise LiveValidationError("final-queue-not-idle", stage="finalize")
+    if not host.owned_processes_stopped or not host.temp_paths_removed:
+        raise LiveValidationError("final-cleanup-incomplete", stage="finalize")
+    _validate_boundary_snapshot(host.boundary)
+
+
+def _queue_is_idle(queue: QueueSnapshot) -> bool:
+    return (
+        queue.tts_queued == 0
+        and queue.tts_running == 0
+        and not queue.comfy_pending_prompt_ids
+        and not queue.comfy_running_prompt_ids
+    )
+
+
+def _validate_boundary_snapshot(boundary: BoundarySnapshot) -> None:
+    labels = [repository.label for repository in boundary.repositories]
+    if sorted(labels) != sorted(REQUIRED_BOUNDARY_LABELS) or len(labels) != len(set(labels)):
+        raise LiveValidationError("boundary-observation-incomplete", stage="preflight")
+    if not boundary.reference_hashes:
+        raise LiveValidationError("boundary-observation-incomplete", stage="preflight")
+
+
+def _boundary_evidence(before: BoundarySnapshot, after: BoundarySnapshot) -> BoundaryEvidence:
+    return BoundaryEvidence(
+        before_hash=before.aggregate_hash,
+        after_hash=after.aggregate_hash,
+        private_registry_hash=before.private_registry_hash,
+        reference_hashes=before.reference_hashes,
+        repositories_before=before.repositories,
+        repositories_after=after.repositories,
+        private_registry_before_hash=before.private_registry_hash,
+        private_registry_after_hash=after.private_registry_hash,
+        reference_hashes_before=before.reference_hashes,
+        reference_hashes_after=after.reference_hashes,
+    )
+
+
+def _case_evidence(
+    case: CasePlan,
+    http: HttpCaseObservation,
+    host: HostCaseObservation,
+    boundary: BoundaryEvidence,
+) -> CaseEvidence:
+    return CaseEvidence(
+        case_id=case.case_id,
+        phase=case.phase,
+        engine=case.engine,
+        expected=case.expected,
+        actual=http.actual,
+        job_id=http.job_id,
+        prompt_id=http.prompt_id,
+        version_id=http.version_id,
+        prompt_submitted=http.prompt_submitted,
+        tts_more=http.tts_more,
+        termination=http.termination,
+        started_at=host.started_at,
+        finished_at=host.finished_at,
+        audio=None,
+        cleanup=host.cleanup,
+        processes=host.processes,
+        comfyui=http.comfyui,
+        gpu_before=host.gpu_before,
+        gpu_peak=host.gpu_peak,
+        gpu_after=host.gpu_after,
+        boundary=boundary,
+    )
 
 
 class ReliabilityRunSummary(_StrictModel):
@@ -461,9 +2576,47 @@ def _process_proof_valid(case: CaseEvidence) -> bool:
 
 def _queue_proof_valid(case: CaseEvidence) -> bool:
     try:
+        if case.case_id == "cancel-queued":
+            terminal = case.tts_more
+            return (
+                case.actual == "cancelled"
+                and case.prompt_submitted is False
+                and case.prompt_id is None
+                and case.version_id is None
+                and case.comfyui is None
+                and terminal is not None
+                and terminal.job_status == "cancelled"
+                and terminal.item_status == "cancelled"
+                and terminal.version_status is None
+                and terminal.manifest_version_absent is True
+                and case.termination is None
+            )
+        if case.case_id == "terminate-comfyui-indextts":
+            terminal = case.tts_more
+            termination = case.termination
+            return (
+                case.actual == "failed"
+                and case.prompt_submitted is True
+                and case.prompt_id is not None
+                and case.version_id is not None
+                and case.comfyui is None
+                and terminal is not None
+                and terminal.job_status == "failed"
+                and terminal.item_status == "failed"
+                and terminal.version_status == "failed"
+                and terminal.manifest_version_absent is False
+                and termination is not None
+                and termination.endpoint_unavailable is True
+                and termination.prompt_id == case.prompt_id
+                and termination.queue_before_prompt_ids.count(case.prompt_id) == 1
+                and termination.manifest_audio_absent is True
+            )
         queue = case.comfyui
         return (
-            queue.queue_empty is True
+            case.prompt_submitted is True
+            and case.prompt_id is not None
+            and queue is not None
+            and queue.queue_empty is True
             and queue.history_present is True
             and queue.prompt_id == case.prompt_id
             and _prompt_ids_are_unique(queue.queue_before_prompt_ids)
@@ -473,6 +2626,7 @@ def _queue_proof_valid(case: CaseEvidence) -> bool:
             and _prompt_ids_are_unique(queue.history_prompt_ids)
             and queue.history_prompt_ids.count(case.prompt_id) == 1
             and queue.terminal_history_status == case.actual
+            and case.termination is None
         )
     except (AttributeError, TypeError):
         return False
@@ -797,6 +2951,21 @@ def _write_reserved_json(path: Path, document: dict[str, Any]) -> Path:
     return temporary
 
 
+def _write_private_json_atomic(path: Path, document: dict[str, Any]) -> None:
+    descriptor, temporary = _reserve_owned_file(path, suffix="private.tmp")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(document, handle, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except Exception:
+        _best_effort_unlink(temporary)
+        raise
+
+
 def _copy_to_reserved_file(source: Path, *, suffix: str) -> Path:
     descriptor, destination = _reserve_owned_file(source, suffix=suffix)
     handle_opened = False
@@ -1037,3 +3206,71 @@ def _fsync_directory(directory: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+ProbeFactory = Callable[
+    [ReliabilityFixture, argparse.Namespace],
+    tuple[ReliabilityHttpProbe, ReliabilityHostProbe, dict[str, OwnedProcessIdentity]],
+]
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    probe_factory: ProbeFactory | None = None,
+) -> int:
+    parser = argparse.ArgumentParser(description="Run the opt-in Windows ComfyUI reliability gate.")
+    parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--comfyui-pid", type=int, required=True)
+    parser.add_argument("--tts-more-pid", type=int, required=True)
+    parser.add_argument("--host-manifest", type=Path)
+    parser.add_argument("--allow-lan", action="store_true")
+    parser.add_argument("--preflight-only", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        document = json.loads(args.fixture.read_text(encoding="utf-8-sig"))
+        fixture = ReliabilityFixture.model_validate(document)
+        if probe_factory is None:
+            probe_factory = _default_probe_factory
+        http_probe, host_probe, owned_processes = probe_factory(fixture, args)
+        if args.preflight_only:
+            execute_reliability_preflight(
+                fixture,
+                output_root=args.output_root,
+                http_probe=http_probe,
+                host_probe=host_probe,
+                owned_processes=owned_processes,
+                allow_lan=args.allow_lan,
+            )
+            return 0
+        summary = execute_reliability_validation(
+            fixture,
+            output_root=args.output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=owned_processes,
+            allow_lan=args.allow_lan,
+        )
+    except (OSError, json.JSONDecodeError, ValidationError, LiveValidationError, ValueError, RuntimeError):
+        return 1
+    return 0 if summary.status == "passed" else 1
+
+
+def _default_probe_factory(
+    fixture: ReliabilityFixture,
+    args: argparse.Namespace,
+) -> tuple[ReliabilityHttpProbe, ReliabilityHostProbe, dict[str, OwnedProcessIdentity]]:
+    del fixture
+    if args.host_manifest is None:
+        raise LiveValidationError("host-probe-manifest-required", stage="preflight")
+    host_probe = WindowsReliabilityHostProbe.from_manifest(args.host_manifest)
+    recorded = host_probe.manifest.owned_processes
+    if recorded["comfyui"].pid != args.comfyui_pid or recorded["tts-more"].pid != args.tts_more_pid:
+        raise LiveValidationError("host-manifest-pid-mismatch", stage="preflight")
+    http_probe = HttpReliabilityProbe(reference_root=args.fixture.resolve().parent)
+    return http_probe, host_probe, host_probe.owned_processes
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
