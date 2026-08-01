@@ -83,6 +83,7 @@ import { ScriptManagerModal } from "./components/ScriptManagerModal";
 import { WaveformPlayer } from "./components/WaveformPlayer";
 import { TokenGate } from "./components/TokenGate";
 import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
+import { generationStatusCounts, generationStatusKey, generationStatusTone, isTerminalGenerationStatus, type GenerationStatusTone } from "./lib/generationStatus";
 import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./lib/gptSovitsReference";
 import { formatScriptNote } from "./lib/lineNote";
 import { firstReferenceSampleFromModel, gptSovitsProjectBindingFromModel } from "./lib/modelCatalog";
@@ -687,7 +688,7 @@ export default function App() {
   const runningServiceIds = useMemo(() => {
     const ids = new Set<string>();
     for (const item of activeJob?.items ?? []) {
-      if (item.service_id && ["loading", "running", "finalizing"].includes(item.status)) ids.add(item.service_id);
+      if (item.service_id && generationStatusTone(item.status) === "running") ids.add(item.service_id);
     }
     return ids;
   }, [activeJob]);
@@ -707,15 +708,17 @@ export default function App() {
   );
   const queueJobs = useMemo(() => queueStatus?.jobs ?? [], [queueStatus]);
   const queueItems = useMemo(() => queueJobs.flatMap((job) => job.items), [queueJobs]);
-  const queueRunningItems = queueStatus?.running ?? queueItems.filter((item) => ["loading", "running", "finalizing"].includes(item.status)).length;
-  const queueQueuedItems = queueStatus?.queued ?? queueItems.filter((item) => item.status === "queued").length;
-  const queueCompletedItems = queueItems.filter((item) => item.status === "completed").length;
-  const queueFailedItems = queueItems.filter((item) => item.status === "failed" || item.status === "cancelled").length;
-  const queueProcessedItems = queueCompletedItems + queueFailedItems;
-  const queueTotalItems = Math.max(queueItems.length, queueProcessedItems + queueRunningItems + queueQueuedItems);
-  const queueActiveJob = activeJob && !["completed", "failed", "cancelled"].includes(activeJob.status)
+  const queueCounts = useMemo(() => generationStatusCounts(queueItems.map((item) => item.status)), [queueItems]);
+  const queueRunningItems = queueStatus?.running ?? queueCounts.running;
+  const queueQueuedItems = queueStatus?.queued ?? queueCounts.queued;
+  const queueCompletedItems = queueCounts.completed;
+  const queueFailedItems = queueCounts.failed;
+  const queueCancelledItems = queueCounts.cancelled;
+  const queueProcessedItems = queueCounts.processed;
+  const queueTotalItems = Math.max(queueCounts.total, queueProcessedItems + queueRunningItems + queueQueuedItems);
+  const queueActiveJob = activeJob && !isTerminalGenerationStatus(activeJob.status)
     ? activeJob
-    : queueJobs.find((job) => !["completed", "failed", "cancelled"].includes(job.status)) ?? null;
+    : queueJobs.find((job) => !isTerminalGenerationStatus(job.status)) ?? null;
   const queueProgressRatio = queueActiveJob
     ? queueActiveJob.progress
     : queueTotalItems > 0
@@ -725,8 +728,8 @@ export default function App() {
   const queueHasWork = queueTotalItems > 0 || queueJobs.length > 0;
   const queueTopbarEntryVisible = queueHasWork || Boolean(queueActiveJob);
   const queueSyncLabel = isRefreshingTopology ? t("queue.polling") : t(queueStatus ? "queue.synced" : "queue.notSynced");
-  const queueVisibleStatusLabel = queueActiveJob ? statusText(queueActiveJob.status, t) : queueSyncLabel;
-  const queueVisibleTone = queueActiveJob ? queueStatusTone(queueActiveJob.status) : isRefreshingTopology ? "running" : "idle";
+  const queueVisibleStatusLabel = queueActiveJob ? t(generationStatusKey(queueActiveJob.status)) : queueSyncLabel;
+  const queueVisibleTone = queueActiveJob ? generationStatusTone(queueActiveJob.status) : isRefreshingTopology ? "running" : "idle";
   const topologyModalTitle =
     servicePanelSection === "roles"
       ? t("characters.libraryManager")
@@ -1309,14 +1312,9 @@ export default function App() {
 
   async function pollGenerationJob(jobId: string): Promise<GenerationJob> {
     for (let attempt = 0; attempt < 240; attempt += 1) {
-      if (generationAbortRef.current) {
-        const cancelled = await fetchGenerationJob(jobId);
-        setActiveJob(cancelled);
-        return cancelled;
-      }
       const job = await fetchGenerationJob(jobId);
       setActiveJob(job);
-      if (["completed", "failed", "cancelled"].includes(job.status)) return job;
+      if (isTerminalGenerationStatus(job.status)) return job;
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
     }
     throw new Error(t("notice.jobTimeout"));
@@ -1324,10 +1322,10 @@ export default function App() {
 
   async function cancelGeneration() {
     const jobId = activeJob?.job_id;
-    generationAbortRef.current = true;
-    if (!jobId) return;
+    if (!jobId || generationAbortRef.current || isTerminalGenerationStatus(activeJob.status)) return;
     try {
       const cancelled = await cancelGenerationJob(jobId);
+      generationAbortRef.current = cancelled.status === "cancelling" || cancelled.status === "cancelled";
       setActiveJob(cancelled);
       setNotice(t("notice.generationCancelling"), { level: "warning" });
     } catch (error) {
@@ -2340,6 +2338,7 @@ export default function App() {
                                     <span><strong>{queueRunningItems}</strong>{t("filters.running")}</span>
                                     <span><strong>{queueCompletedItems}</strong>{t("status.completed")}</span>
                                     <span><strong>{queueFailedItems}</strong>{t("status.failed")}</span>
+                                    <span><strong>{queueCancelledItems}</strong>{t("status.cancelled")}</span>
                                   </div>
                                 </>
                               )}
@@ -2355,13 +2354,13 @@ export default function App() {
                                       const jobPercent = Math.round(Math.max(0, Math.min(1, job.progress)) * 100);
                                       const promptItem = job.items.find((item) => item.external_status || item.external_job_id);
                                       return (
-                                        <article className={`queue-job-card state-${queueStatusTone(job.status)}`} key={job.job_id}>
+                                        <article className={`queue-job-card state-${generationStatusTone(job.status)}`} key={job.job_id}>
                                           <div>
                                             <strong>{job.job_id}</strong>
                                             <span>{t("queue.itemCount", { count: job.items.length })}</span>
                                           </div>
                                           <div className="queue-job-meta">
-                                            <StatusPill tone={queueStatusTone(job.status)} label={statusText(job.status, t)} />
+                                            <StatusPill tone={generationStatusTone(job.status)} label={t(generationStatusKey(job.status))} />
                                             {promptItem?.external_status && (
                                               <span className="line-meta-chip neutral" title={promptItem.external_job_id ?? ""}>
                                                 {t("queue.promptStatus", { status: statusText(promptItem.external_status, t) })}
@@ -2869,8 +2868,10 @@ export default function App() {
                       <option value="not-generated">{t("filters.notGenerated")}</option>
                       <option value="queued">{t("filters.queued")}</option>
                       <option value="running">{t("filters.running")}</option>
+                      <option value="cancelling">{t("status.cancelling")}</option>
                       <option value="completed">{t("filters.completed")}</option>
                       <option value="failed">{t("filters.failed")}</option>
+                      <option value="cancelled">{t("status.cancelled")}</option>
                     </select>
                   </label>
                   {lineToolbarState.clearButtonVisible && (
@@ -2895,8 +2896,14 @@ export default function App() {
                   </span>
                 )}
                 {isGenerating && activeJob ? (
-                  <button className="secondary-button cancel-button" onClick={() => void cancelGeneration()} title={t("actions.cancel")}>
-                    <X size={15} /> {t("actions.cancel")}
+                  <button
+                    aria-label={activeJob.status === "cancelling" ? t("status.cancelling") : t("actions.cancel")}
+                    className="secondary-button cancel-button"
+                    disabled={generationAbortRef.current || activeJob.status === "cancelling" || isTerminalGenerationStatus(activeJob.status)}
+                    onClick={() => void cancelGeneration()}
+                    title={activeJob.status === "cancelling" ? t("status.cancelling") : t("actions.cancel")}
+                  >
+                    <X size={15} /> {activeJob.status === "cancelling" ? t("status.cancelling") : t("actions.cancel")}
                   </button>
                 ) : (
                   <button className="primary-button" onClick={() => void runSelectedQueue()} disabled={isGenerating || filteredLines.length === 0}>
@@ -2947,8 +2954,8 @@ export default function App() {
               {displayedLines.map((line) => {
                 const summary = summarizeLineHistory(lineHistoryForLine(manifest, line));
                 const queueItem = activeJob?.items.find((item) => item.line_uid ? item.line_uid === (line.line_uid ?? line.id) : item.line_id === line.id);
-                const visibleTone = queueItem ? queueStatusTone(queueItem.status) : summary.tone;
-                const visibleLabel = queueItem ? t(`status.${queueItem.status}`) : summaryLabel(summary, t);
+                const visibleTone = queueItem ? generationStatusTone(queueItem.status) : summary.tone;
+                const visibleLabel = queueItem ? t(generationStatusKey(queueItem.status)) : summaryLabel(summary, t);
                 const selected = selectedLineIds.includes(line.id);
                 const rowBinding = lineBinding(line, resolvedCharacters);
                 const canGenerateLine = Boolean(rowBinding);
@@ -4607,6 +4614,7 @@ function statusText(status: string, t: Translate): string {
     running: "status.running",
     loading: "status.loading",
     finalizing: "status.finalizing",
+    cancelling: "status.cancelling",
     cancelled: "status.cancelled",
     queued: "status.queued",
     ready: "status.ready",
@@ -4728,14 +4736,6 @@ function kwjmActivationStateLabel(state: ParserProviderState, t: Translate): str
   return t("services.blocked");
 }
 
-function queueStatusTone(status: string): "idle" | "queued" | "running" | "completed" | "failed" {
-  if (status === "completed") return "completed";
-  if (status === "failed" || status === "cancelled") return "failed";
-  if (status === "queued") return "queued";
-  if (status === "loading" || status === "finalizing" || status === "running") return "running";
-  return "idle";
-}
-
 function LineHistoryPanel({
   versions,
   services,
@@ -4762,7 +4762,7 @@ function LineHistoryPanel({
         <section className="history-batch" key={group.groupId}>
           <div className="history-batch-head">
             <strong>{t("history.batch")} {group.label}</strong>
-            <StatusPill tone={queueStatusTone(group.latestStatus)} label={statusText(group.latestStatus, t)} />
+            <StatusPill tone={generationStatusTone(group.latestStatus)} label={t(generationStatusKey(group.latestStatus))} />
           </div>
           {group.versions.map((version) => {
             const player = historyPlayerSummary(version);
@@ -4774,7 +4774,7 @@ function LineHistoryPanel({
                     {player.playable ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
                     <strong>{player.versionId}</strong>
                     <small>{new Date(version.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small>
-                    <span>{statusText(player.status, t)}</span>
+                    <span>{t(generationStatusKey(player.status))}</span>
                   </button>
                   <div className="history-version-tags">
                     <span>{tags.service}</span>
@@ -4790,7 +4790,7 @@ function LineHistoryPanel({
                 ) : version.error ? (
                   <FailureHistoryMessage version={version} t={t} />
                 ) : (
-                  <p className="history-version-empty">{statusText(player.status, t)}</p>
+                  <p className="history-version-empty">{t(generationStatusKey(player.status))}</p>
                 )}
               </div>
             );
@@ -4908,6 +4908,6 @@ function splitEditableList(value: string): string[] {
     .filter(Boolean);
 }
 
-function StatusPill({ tone, label }: { tone: "idle" | "queued" | "running" | "completed" | "failed"; label: string }) {
+function StatusPill({ tone, label }: { tone: GenerationStatusTone; label: string }) {
   return <span className={`status-pill ${tone}`}>{label}</span>;
 }

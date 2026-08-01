@@ -1,6 +1,6 @@
 import type { GenerationManifest, LineHistory, ParserProviderConfig, RuntimeMode, ScriptLine, VoiceCandidates, WorkerHealth } from "../types";
 
-export type LineStatusFilter = "all" | "not-generated" | "queued" | "loading" | "running" | "finalizing" | "completed" | "failed" | "cancelled";
+export type LineStatusFilter = "all" | "not-generated" | "queued" | "loading" | "running" | "finalizing" | "cancelling" | "completed" | "failed" | "cancelled";
 
 export interface LineFilters {
   characterId?: string;

@@ -1,4 +1,4 @@
-import type { Character, GenerationVersion, ProviderType, ReferenceAudioGroup, ScriptLine, WorkerHealth } from "../types";
+import type { Character, GenerationStatus, GenerationVersion, ProviderType, ReferenceAudioGroup, ScriptLine, WorkerHealth } from "../types";
 
 export interface FallbackActionView {
   type: "start_service";
@@ -40,7 +40,7 @@ export interface InspectorDiagnosticsState {
 export interface HistoryPlayerSummary {
   versionId: string;
   playable: boolean;
-  status: string;
+  status: GenerationStatus;
   audioPath: string | null;
 }
 
