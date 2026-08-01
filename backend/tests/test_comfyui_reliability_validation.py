@@ -7,6 +7,7 @@ import os
 import shutil
 import struct
 import subprocess
+import time
 import warnings
 import wave
 from datetime import datetime, timedelta, timezone
@@ -3561,6 +3562,7 @@ foreach ($name in @(
     'Get-UtcTicks',
     'Test-RecordDocumentMatches',
     'Test-CommandLineArgument',
+    'ConvertTo-WindowsCommandLineArgument',
     'Test-FullRecordPromotesProvisional',
     'Write-PrivateJsonAtomic',
     'Write-LaunchIntentRunControlState',
@@ -3698,6 +3700,7 @@ if ($errors.Count -ne 0) { throw ($errors | Out-String) }
 foreach ($name in @(
     'Get-UtcTicks',
     'Test-RecordDocumentMatches',
+    'ConvertTo-WindowsCommandLineArgument',
     'Write-PrivateJsonAtomic',
     'Write-LaunchIntentRunControlState',
     'Write-ProvisionalRunControlState',
@@ -4556,6 +4559,289 @@ Write-Output 'PYTHON_RESTART_WRAPPER_RECOVERY_OK'
 
     assert completed.returncode == 0, completed.stderr
     assert "PYTHON_RESTART_WRAPPER_RECOVERY_OK" in completed.stdout
+
+
+def test_fix_round_3_wrapper_manifest_and_native_restart_use_semantic_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    root = (tmp_path / "semantic argv root with spaces").resolve()
+    working_directory = root / "ComfyUI working directory"
+    child_temp_root = root / "runner temp"
+    comfy_temp_base = root / "ComfyUI temp base with spaces"
+    comfy_temp_root = comfy_temp_base / "temp"
+    for directory in (working_directory, child_temp_root, comfy_temp_root):
+        directory.mkdir(parents=True)
+    capture_script = working_directory / "main.py"
+    capture_script.write_text(
+        "import json, os, sys, time\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['TTS_MORE_ARGV_CAPTURE']).write_text(\n"
+        "    json.dumps(sys.argv[1:]), encoding='utf-8'\n"
+        ")\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    control_state_path = root / "control.json"
+    manifest_path = root / "host-manifest.json"
+    initial_capture_path = root / "initial-argv.json"
+    restart_capture_path = root / "restart-argv.json"
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Test-RecordDocumentMatches',
+    'ConvertTo-WindowsCommandLineArgument',
+    'Write-PrivateJsonAtomic',
+    'Write-LaunchIntentRunControlState',
+    'Write-ProvisionalRunControlState',
+    'Start-ProvisionallyTrackedProcess'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+function Find-SingleAssignment {
+    param([string] $VariableName)
+    $matches = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+            $node.Left.VariablePath.UserPath -eq $VariableName
+    }, $true))
+    if ($matches.Count -ne 1) { throw "Expected one $VariableName assignment" }
+    return $matches[0]
+}
+
+$runId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+$listenAddress = '127.0.0.1'
+$comfyLaunchMarker = "tts_more_reliability_run=$runId-comfyui"
+$comfyPythonPath = [IO.Path]::GetFullPath($env:TTS_MORE_TEST_PYTHON)
+$comfyRootPath = [IO.Path]::GetFullPath($env:TTS_MORE_TEST_WORKING)
+$comfyTempBase = [IO.Path]::GetFullPath($env:TTS_MORE_TEST_COMFY_TEMP)
+$runnerTempRoot = [IO.Path]::GetFullPath($env:TTS_MORE_TEST_CHILD_TEMP)
+$comfyTempRoot = Join-Path $comfyTempBase 'temp'
+$quotedAssignments = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+        $node.Left.VariablePath.UserPath -eq 'quotedComfyTempBase'
+}, $true))
+if ($quotedAssignments.Count -gt 1) { throw 'Quoted temp assignment is ambiguous' }
+if ($quotedAssignments.Count -eq 1) {
+    Invoke-Expression $quotedAssignments[0].Extent.Text
+}
+$comfyArgumentsAssignment = Find-SingleAssignment -VariableName 'comfyArguments'
+Invoke-Expression $comfyArgumentsAssignment.Extent.Text
+
+$launcherRecord = [pscustomobject]@{
+    pid = $PID
+    creation_time = '2026-08-01T00:00:00Z'
+}
+$started = New-Object 'System.Collections.Generic.List[object]'
+$env:TTS_MORE_ARGV_CAPTURE = $env:TTS_MORE_INITIAL_CAPTURE
+$start = Start-ProvisionallyTrackedProcess -FilePath $comfyPythonPath `
+    -ArgumentList $comfyArguments -WorkingDirectory $comfyRootPath `
+    -ChildTempRoot $runnerTempRoot -LauncherRecord $launcherRecord `
+    -StartedProcesses $started -ControlStatePath $env:TTS_MORE_TEST_CONTROL `
+    -RunId $runId -ProcessLabel 'comfyui' -LaunchMarker $comfyLaunchMarker `
+    -BackendRecord $null -ComfyRecord $null
+$deadline = [DateTime]::UtcNow.AddSeconds(15)
+while (
+    -not (Test-Path -LiteralPath $env:TTS_MORE_INITIAL_CAPTURE -PathType Leaf) -and
+    -not $start.process.HasExited -and
+    [DateTime]::UtcNow -lt $deadline
+) { Start-Sleep -Milliseconds 50 }
+if (-not (Test-Path -LiteralPath $env:TTS_MORE_INITIAL_CAPTURE -PathType Leaf)) {
+    throw 'Initial child did not publish argv'
+}
+if (-not $start.process.HasExited) {
+    Stop-Process -Id $start.process.Id -Force -ErrorAction Stop
+    if (-not $start.process.WaitForExit(15000)) {
+        throw 'Initial child did not stop'
+    }
+}
+
+$ttsRootPath = $env:TTS_MORE_TEST_ROOT
+$suiteRoot = $env:TTS_MORE_TEST_ROOT
+$gptRoot = $env:TTS_MORE_TEST_ROOT
+$indexRoot = $env:TTS_MORE_TEST_ROOT
+$cosyRoot = $env:TTS_MORE_TEST_ROOT
+$registryPath = Join-Path $env:TTS_MORE_TEST_ROOT 'resources.yaml'
+$references = [ordered]@{ reference = (Join-Path $env:TTS_MORE_TEST_ROOT 'reference.wav') }
+$backendRecord = [ordered]@{
+    pid = 8000
+    creation_time = '2026-08-01T00:00:00Z'
+    executable_path = $comfyPythonPath
+    command_line = 'python -m uvicorn app.main:app'
+    parent_pid = 7000
+    parent_creation_time = '2026-07-31T23:59:00Z'
+}
+$comfyRecord = [ordered]@{
+    pid = 8188
+    creation_time = '2026-08-01T00:00:00Z'
+    executable_path = $comfyPythonPath
+    command_line = 'python main.py --port 8188'
+    parent_pid = 7000
+    parent_creation_time = '2026-07-31T23:59:00Z'
+}
+$hostManifestAssignment = Find-SingleAssignment -VariableName 'hostManifest'
+Invoke-Expression $hostManifestAssignment.Extent.Text
+$hostManifest | ConvertTo-Json -Depth 10 |
+    Set-Content -LiteralPath $env:TTS_MORE_TEST_MANIFEST -Encoding UTF8
+Write-Output 'WRAPPER_MANIFEST_CAPTURE_OK'
+"""
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
+            "TTS_MORE_TEST_ROOT": str(root),
+            "TTS_MORE_TEST_PYTHON": str(Path(os.sys.executable).resolve()),
+            "TTS_MORE_TEST_WORKING": str(working_directory),
+            "TTS_MORE_TEST_CHILD_TEMP": str(child_temp_root),
+            "TTS_MORE_TEST_COMFY_TEMP": str(comfy_temp_base),
+            "TTS_MORE_TEST_CONTROL": str(control_state_path),
+            "TTS_MORE_TEST_MANIFEST": str(manifest_path),
+            "TTS_MORE_INITIAL_CAPTURE": str(initial_capture_path),
+        }
+    )
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "WRAPPER_MANIFEST_CAPTURE_OK" in completed.stdout
+
+    initial_argv = json.loads(initial_capture_path.read_text(encoding="utf-8"))
+    raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    manifest = reliability_validation.PrivateHostManifest.read(manifest_path)
+    launch = manifest.launch["comfyui"]
+    real_popen = subprocess.Popen
+    children: list[subprocess.Popen[bytes]] = []
+    intents: list[reliability_validation.PrivateRestartLaunchIntent] = []
+    provisional_records: list[
+        reliability_validation.PrivateRestartProvisionalProcess
+    ] = []
+    promoted: list[reliability_validation.RecordedProcessIdentity] = []
+    parent_created = datetime.now(timezone.utc) - timedelta(minutes=1)
+    parent = reliability_validation.RecordedProcessIdentity(
+        pid=os.getpid(),
+        creation_time=parent_created,
+        executable_path=Path(__file__).resolve(),
+        command_line="validator-python",
+        parent_pid=7000,
+        parent_creation_time=parent_created - timedelta(seconds=1),
+    )
+
+    def capturing_popen(
+        command_line: list[str],
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes]:
+        child = real_popen(command_line, **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(reliability_validation.subprocess, "Popen", capturing_popen)
+    monkeypatch.setenv("TTS_MORE_ARGV_CAPTURE", str(restart_capture_path))
+    system = object.__new__(reliability_validation.NativeWindowsHostSystem)
+    system._started_identities = {}
+    system._active_tokens = []
+
+    def inspect_process(pid: int) -> reliability_validation.RecordedProcessIdentity:
+        if pid == os.getpid():
+            return parent
+        assert children and provisional_records and intents
+        assert pid == children[0].pid
+        return reliability_validation.RecordedProcessIdentity(
+            pid=pid,
+            creation_time=provisional_records[0].started_after,
+            executable_path=launch.executable_path,
+            command_line=subprocess.list2cmdline(
+                [str(launch.executable_path), *intents[0].arguments]
+            ),
+            parent_pid=parent.pid,
+            parent_creation_time=parent.creation_time,
+        )
+
+    system.inspect_process = inspect_process
+    system.port_owner = lambda _port: inspect_process(children[0].pid)
+    try:
+        replacement = system.restart_owned(
+            manifest.owned_processes["comfyui"],
+            launch,
+            1.0,
+            run_id=manifest.run_id,
+            lifecycle=reliability_validation.PrivateRestartLifecycle(
+                persist_launch_intent=intents.append,
+                persist_provisional=provisional_records.append,
+                promote=promoted.append,
+            ),
+        )
+        deadline = time.monotonic() + 10.0
+        while not restart_capture_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert restart_capture_path.exists()
+        restart_argv = json.loads(restart_capture_path.read_text(encoding="utf-8"))
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=15)
+        system._started_identities.clear()
+
+    semantic_child_argv = [
+        "--listen",
+        "127.0.0.1",
+        "--port",
+        "8188",
+        "--temp-directory",
+        str(comfy_temp_base),
+    ]
+    semantic_launch_argv = [
+        "-X",
+        "tts_more_reliability_run=" + "a" * 32 + "-comfyui",
+        "main.py",
+        *semantic_child_argv,
+    ]
+    assert {
+        "initial_child": initial_argv,
+        "persisted_manifest": raw_manifest["launch"]["comfyui"]["arguments"],
+        "python_manifest": list(launch.arguments),
+        "restart_intent_tail": list(intents[0].arguments[2:]),
+        "restart_child": restart_argv,
+    } == {
+        "initial_child": semantic_child_argv,
+        "persisted_manifest": semantic_launch_argv,
+        "python_manifest": semantic_launch_argv,
+        "restart_intent_tail": semantic_launch_argv,
+        "restart_child": semantic_child_argv,
+    }
+    assert replacement == promoted[0]
 
 
 REPOSITORY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")

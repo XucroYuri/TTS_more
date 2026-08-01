@@ -138,6 +138,40 @@ function Test-CommandLineArgument {
     return [regex]::IsMatch($CommandLine, $pattern)
 }
 
+function ConvertTo-WindowsCommandLineArgument {
+    param([AllowEmptyString()] [string] $Argument)
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+    $encoded = New-Object Text.StringBuilder
+    [void] $encoded.Append([char] 34)
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq [char] 92) {
+            $backslashes += 1
+            continue
+        }
+        if ($character -eq [char] 34) {
+            for ($index = 0; $index -lt (2 * $backslashes + 1); $index += 1) {
+                [void] $encoded.Append([char] 92)
+            }
+            [void] $encoded.Append($character)
+            $backslashes = 0
+            continue
+        }
+        for ($index = 0; $index -lt $backslashes; $index += 1) {
+            [void] $encoded.Append([char] 92)
+        }
+        $backslashes = 0
+        [void] $encoded.Append($character)
+    }
+    for ($index = 0; $index -lt (2 * $backslashes); $index += 1) {
+        [void] $encoded.Append([char] 92)
+    }
+    [void] $encoded.Append([char] 34)
+    return $encoded.ToString()
+}
+
 function Test-FullRecordPromotesProvisional {
     param([object] $FullRecord, [object] $ProvisionalRecord, [object] $LaunchIntent)
     if ($null -eq $FullRecord -or $null -eq $ProvisionalRecord -or $null -eq $LaunchIntent) {
@@ -493,10 +527,15 @@ function Start-ProvisionallyTrackedProcess {
     Write-LaunchIntentRunControlState -Path $ControlStatePath -RunId $RunId `
         -ProcessLabel $ProcessLabel -LaunchIntent $launchIntent `
         -BackendRecord $BackendRecord -ComfyRecord $ComfyRecord
+    $encodedArgumentList = (@(
+        foreach ($argument in $ArgumentList) {
+            ConvertTo-WindowsCommandLineArgument -Argument $argument
+        }
+    )) -join ' '
     try {
         $env:TEMP = $ChildTempRoot
         $env:TMP = $ChildTempRoot
-        $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList `
+        $process = Start-Process -FilePath $FilePath -ArgumentList $encodedArgumentList `
             -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -PassThru
         $token = [pscustomobject]@{
             pid = [int] $process.Id
@@ -732,11 +771,10 @@ try {
     }
 
     $listenAddress = if ($AllowLan) { '0.0.0.0' } else { '127.0.0.1' }
-    $quotedComfyTempBase = '"{0}"' -f $comfyTempBase
     $comfyLaunchMarker = "tts_more_reliability_run=$runId-comfyui"
     $comfyArguments = @(
         '-X', $comfyLaunchMarker, 'main.py', '--listen', $listenAddress, '--port', '8188',
-        '--temp-directory', $quotedComfyTempBase
+        '--temp-directory', $comfyTempBase
     )
     $comfyStart = Start-ProvisionallyTrackedProcess -FilePath $comfyPythonPath `
         -ArgumentList $comfyArguments -WorkingDirectory $comfyRootPath `
