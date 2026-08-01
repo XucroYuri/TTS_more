@@ -16,15 +16,22 @@ import yaml
 from pydantic import BaseModel
 
 from app.models import Character, GenerationManifest, ScriptProject
-from app.path_safety import WINDOWS_RESERVED_NAMES, validate_windows_component, windows_utf16_units
+from app.path_safety import (
+    WINDOWS_RESERVED_NAMES,
+    encode_windows_component,
+    validate_windows_component,
+    windows_utf16_units,
+)
 
 T = TypeVar("T", bound=BaseModel)
 R = TypeVar("R")
 
 WINDOWS_LEGACY_DIRECTORY_PATH_UNITS = 248
+WINDOWS_LEGACY_FILE_PATH_UNITS = 260
+TRASH_PROJECT_COMPONENT_UNITS = 160
 
 
-def _windows_filesystem_path(path: Path) -> Path:
+def windows_filesystem_path(path: Path) -> Path:
     if os.name != "nt":
         return path
     raw_path = os.path.abspath(os.fspath(path))
@@ -35,13 +42,88 @@ def _windows_filesystem_path(path: Path) -> Path:
     return Path(f"\\\\?\\{raw_path}")
 
 
+def windows_display_path(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    raw_path = os.fspath(path)
+    lowered = raw_path.lower()
+    if lowered.startswith("\\\\?\\unc\\"):
+        return Path(f"\\\\{raw_path[8:]}")
+    if lowered.startswith("\\\\?\\"):
+        return Path(raw_path[4:])
+    return path
+
+
+def windows_usable_file_path(path: Path) -> Path:
+    display_path = windows_display_path(path)
+    if os.name != "nt" or windows_utf16_units(os.fspath(display_path)) < WINDOWS_LEGACY_FILE_PATH_UNITS:
+        return display_path
+    return windows_filesystem_path(display_path)
+
+
+def windows_path_identity(path: str | Path) -> str:
+    normalized = ntpath.normpath(os.fspath(path))
+    lowered = normalized.lower()
+    if lowered.startswith("\\\\?\\unc\\"):
+        normalized = f"\\\\{normalized[8:]}"
+    elif lowered.startswith("\\\\?\\"):
+        normalized = normalized[4:]
+    return ntpath.normcase(ntpath.normpath(normalized))
+
+
+def windows_path_is_within(path: Path, root: Path) -> bool:
+    if os.name != "nt":
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return False
+        return True
+    path_key = windows_path_identity(path)
+    root_key = windows_path_identity(root)
+    try:
+        return ntpath.commonpath((path_key, root_key)) == root_key
+    except ValueError:
+        return False
+
+
+def _filesystem_exists(path: Path) -> bool:
+    return windows_filesystem_path(path).exists()
+
+
+def _filesystem_is_dir(path: Path) -> bool:
+    return windows_filesystem_path(path).is_dir()
+
+
+def _filesystem_iterdir(path: Path):
+    return windows_filesystem_path(path).iterdir()
+
+
+def _filesystem_mkdir(path: Path, *, parents: bool = False, exist_ok: bool = False) -> None:
+    windows_filesystem_path(path).mkdir(parents=parents, exist_ok=exist_ok)
+
+
+def _filesystem_stat(path: Path):
+    return windows_filesystem_path(path).stat()
+
+
+def _filesystem_rename(source: Path, target: Path) -> None:
+    filesystem_target = windows_filesystem_path(target)
+    filesystem_target.parent.mkdir(parents=True, exist_ok=True)
+    windows_filesystem_path(source).rename(filesystem_target)
+
+
+def _filesystem_move(source: Path, target: Path) -> None:
+    shutil.move(str(windows_filesystem_path(source)), str(windows_filesystem_path(target)))
+
+
 def _usable_project_directory(path: Path) -> Path:
     if os.name != "nt":
         return path
-    absolute_path = os.path.abspath(os.fspath(path))
+    display_path = windows_display_path(path)
+    absolute_path = os.path.abspath(os.fspath(display_path))
     if windows_utf16_units(absolute_path) < WINDOWS_LEGACY_DIRECTORY_PATH_UNITS:
-        return path
-    return _windows_filesystem_path(path)
+        return display_path
+    return windows_filesystem_path(display_path)
 
 
 class ProjectStore:
@@ -67,7 +149,7 @@ class ProjectStore:
         safe_id = self._safe_project_id(project_id)
         direct = self.writable_projects_root() / safe_id
         marker = self._read_project_marker(direct)
-        if not _windows_filesystem_path(direct).exists() or marker is None or self._same_project_id(marker, safe_id):
+        if not _filesystem_exists(direct) or marker is None or self._same_project_id(marker, safe_id):
             return _usable_project_directory(direct)
         return _usable_project_directory(
             self._unique_project_dir_for_title(self.writable_projects_root(), safe_id, safe_id)
@@ -114,11 +196,11 @@ class ProjectStore:
         projects: list[dict[str, object]] = []
         seen: set[str] = set()
         for projects_root in self.read_project_roots():
-            if not projects_root.exists():
+            if not _filesystem_exists(projects_root):
                 continue
-            for path in sorted(projects_root.iterdir(), key=lambda item: item.name.lower()):
+            for path in sorted(_filesystem_iterdir(projects_root), key=lambda item: item.name.lower()):
                 project_path = path / "project.json"
-                if not path.is_dir() or not project_path.exists():
+                if not _filesystem_is_dir(path) or not _filesystem_exists(project_path):
                     continue
                 project = self._read_model(project_path, ScriptProject)
                 project_id = self._project_id_for_dir(path)
@@ -134,7 +216,7 @@ class ProjectStore:
                         "character_count": len(project.project_characters),
                         "script_revision_count": len(project.script_revisions),
                         "parse_revision_count": len(project.parse_revisions),
-                        "updated_at": datetime.fromtimestamp(project_path.stat().st_mtime, timezone.utc).isoformat(),
+                        "updated_at": datetime.fromtimestamp(_filesystem_stat(project_path).st_mtime, timezone.utc).isoformat(),
                     }
                 )
                 seen.add(project_identity)
@@ -147,14 +229,18 @@ class ProjectStore:
             raise FileNotFoundError(project_id)
 
         trash_root = self.writable_projects_root() / ".trash"
-        trash_root.mkdir(parents=True, exist_ok=True)
+        _filesystem_mkdir(trash_root, parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        target = trash_root / f"{safe_id}-{timestamp}"
-        for index in range(1000):
-            candidate = target if index == 0 else trash_root / f"{safe_id}-{timestamp}-{index + 1}"
-            if not candidate.exists():
-                shutil.move(str(project_dir), str(candidate))
-                return candidate
+        readable_id = encode_windows_component(
+            safe_id,
+            max_units=TRASH_PROJECT_COMPONENT_UNITS,
+            fallback="project",
+        )
+        for _index in range(1000):
+            candidate = trash_root / f"{readable_id}-{timestamp}-{uuid.uuid4().hex}"
+            if not _filesystem_exists(candidate):
+                _filesystem_move(project_dir, candidate)
+                return _usable_project_directory(candidate)
         raise FileExistsError("unable to allocate trash directory")
 
     def read_project_roots(self) -> list[Path]:
@@ -168,7 +254,7 @@ class ProjectStore:
         output: list[Path] = []
         seen: set[str] = set()
         for path in roots:
-            key = str(path.resolve(strict=False)).lower()
+            key = windows_path_identity(windows_filesystem_path(path).resolve(strict=False))
             if key not in seen:
                 output.append(path)
                 seen.add(key)
@@ -234,23 +320,19 @@ class ProjectStore:
 
     def _manifest_lock_key(self, project_id: str) -> str:
         safe_project_id = self._safe_project_id(project_id)
-        key = ntpath.normcase(str(self.writable_projects_root().resolve(strict=False)))
-        if key.startswith("\\\\?\\unc\\"):
-            key = f"\\\\{key[8:]}"
-        elif key.startswith("\\\\?\\"):
-            key = key[4:]
-        return ntpath.normcase(ntpath.normpath(ntpath.join(key, safe_project_id)))
+        key = windows_path_identity(windows_filesystem_path(self.writable_projects_root()).resolve(strict=False))
+        return windows_path_identity(ntpath.join(key, safe_project_id))
 
     def _save_manifest_unlocked(self, manifest: GenerationManifest) -> None:
         self._write_text(self.project_dir(manifest.project_id) / ".project-id", self._safe_project_id(manifest.project_id))
         self._write_model(self.manifest_path(manifest.project_id), manifest)
 
     def _load_manifest_unlocked(self, project_id: str) -> GenerationManifest:
-        path = _windows_filesystem_path(self.manifest_path(project_id))
-        if path.exists():
+        path = windows_filesystem_path(self.manifest_path(project_id))
+        if _filesystem_exists(path):
             return self._read_model(path, GenerationManifest)
-        legacy_path = _windows_filesystem_path(self.legacy_manifest_path(project_id))
-        if legacy_path.exists():
+        legacy_path = windows_filesystem_path(self.legacy_manifest_path(project_id))
+        if _filesystem_exists(legacy_path):
             return self._read_model(legacy_path, GenerationManifest)
         return GenerationManifest(project_id=project_id)
 
@@ -259,7 +341,7 @@ class ProjectStore:
 
     def load_characters(self) -> list[Character]:
         path = self.characters_path()
-        if not path.exists():
+        if not _filesystem_exists(path):
             return []
         data = self._read_structured(path)
         return [Character.model_validate(item) for item in data]
@@ -271,7 +353,7 @@ class ProjectStore:
         self._write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def _write_text(self, path: Path, text: str) -> None:
-        path = _windows_filesystem_path(path)
+        path = windows_filesystem_path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         operation_id = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
         temp_path = path.with_name(f".{path.name}.{operation_id}.tmp")
@@ -285,7 +367,7 @@ class ProjectStore:
         return model_type.model_validate(self._read_structured(path))
 
     def _read_structured(self, path: Path) -> object:
-        path = _windows_filesystem_path(path)
+        path = windows_filesystem_path(path)
         text = path.read_text(encoding="utf-8")
         if path.suffix.lower() in {".yaml", ".yml"}:
             return yaml.safe_load(text)
@@ -294,8 +376,8 @@ class ProjectStore:
     def _write_project_materialized_files(self, project_dir: Path, project: ScriptProject) -> None:
         script_dir = project_dir / "script"
         output_dir = project_dir / "output"
-        script_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        _filesystem_mkdir(script_dir, parents=True, exist_ok=True)
+        _filesystem_mkdir(output_dir, parents=True, exist_ok=True)
 
         active_revision = next(
             (revision for revision in project.script_revisions if revision.revision_id == project.active_script_revision_id),
@@ -318,23 +400,23 @@ class ProjectStore:
         root = self.writable_projects_root()
         existing = self._find_project_dir_by_id(root, project_id)
         desired = self._unique_project_dir_for_title(root, project.title, project_id)
-        if existing is not None and existing != desired:
-            desired.parent.mkdir(parents=True, exist_ok=True)
-            if not desired.exists():
-                existing.rename(desired)
-            return desired
-        return desired
+        if existing is not None and windows_path_identity(existing) != windows_path_identity(desired):
+            _filesystem_mkdir(desired.parent, parents=True, exist_ok=True)
+            if not _filesystem_exists(desired):
+                _filesystem_rename(existing, desired)
+            return _usable_project_directory(desired)
+        return _usable_project_directory(desired)
 
     def _unique_project_dir_for_title(self, root: Path, title: str, project_id: str) -> Path:
         base_name = self._safe_project_title(title) or project_id
         for index in range(1000):
             name = base_name if index == 0 else f"{base_name}-{index + 1}"
             candidate = root / name
-            if not candidate.exists():
-                return candidate
+            if not _filesystem_exists(candidate):
+                return _usable_project_directory(candidate)
             marker = self._read_project_marker(candidate)
             if marker is not None and self._same_project_id(marker, project_id):
-                return candidate
+                return _usable_project_directory(candidate)
         raise ValueError("unable to allocate project directory")
 
     def _find_project_dir_by_id(self, root: Path, project_id: str) -> Path | None:
@@ -342,19 +424,19 @@ class ProjectStore:
         if self._is_project_dir(direct):
             marker = self._read_project_marker(direct)
             if marker is None or self._same_project_id(marker, project_id):
-                return direct
-        if not root.exists():
+                return _usable_project_directory(direct)
+        if not _filesystem_exists(root):
             return None
-        for path in sorted(root.iterdir(), key=lambda item: item.name.lower()):
-            if not path.is_dir() or path == direct:
+        for path in sorted(_filesystem_iterdir(root), key=lambda item: item.name.lower()):
+            if not _filesystem_is_dir(path) or windows_path_identity(path) == windows_path_identity(direct):
                 continue
             marker = self._read_project_marker(path)
             if marker is not None and self._same_project_id(marker, project_id):
-                return path
+                return _usable_project_directory(path)
         return None
 
     def _is_project_dir(self, path: Path) -> bool:
-        path = _windows_filesystem_path(path)
+        path = windows_filesystem_path(path)
         return (
             path.is_dir()
             and (
@@ -375,8 +457,8 @@ class ProjectStore:
         return marker is None or self._same_project_id(marker, project_id)
 
     def _read_project_marker(self, path: Path) -> str | None:
-        marker_path = _windows_filesystem_path(path / ".project-id")
-        if not marker_path.exists():
+        marker_path = windows_filesystem_path(path / ".project-id")
+        if not _filesystem_exists(marker_path):
             return None
         try:
             return self._safe_project_id(marker_path.read_text(encoding="utf-8"))
@@ -416,6 +498,6 @@ class ProjectStore:
         legacy_path = self.root / "characters.json"
         template_path = self.root / "templates" / "characters.example.json"
         for candidate in (local_path, legacy_path, template_path):
-            if candidate.exists():
+            if _filesystem_exists(candidate):
                 return candidate, local_path
         return local_path, local_path

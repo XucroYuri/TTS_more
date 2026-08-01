@@ -1,3 +1,4 @@
+import hashlib
 import threading
 from pathlib import Path
 
@@ -6,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.models import GenerationManifest, GenerationTask, GenerationVersion, ScriptProject
+import app.storage as storage_module
 from app.storage import ProjectStore
 
 
@@ -135,6 +137,67 @@ def test_fix_round_4_project_ids_over_255_utf16_units_are_rejected_before_alloca
         store.save_manifest(GenerationManifest(project_id=project_id))
 
     assert store.writable_projects_root().exists() is False
+
+
+def test_fix_round_5_long_project_id_blank_title_materializes_loads_and_lists(tmp_path: Path) -> None:
+    project_id = "p" * 255
+    store = ProjectStore(tmp_path)
+    project = ScriptProject(title=" ", default_language="en", lines=[])
+
+    store.save_project(project_id, project)
+
+    project_dir = store.project_dir(project_id)
+    assert project_dir.name == project_id
+    assert store.load_project(project_id).default_language == "en"
+    assert (project_dir / ".project-id").read_text(encoding="utf-8") == project_id
+    assert (project_dir / "script" / "active.md").is_file()
+    assert (project_dir / "output" / "lines.json").read_text(encoding="utf-8") == "[]"
+    assert [entry["project_id"] for entry in store.list_projects()] == [project_id]
+
+
+def test_fix_round_5_long_manifest_directory_renames_to_short_title_and_remains_loadable(tmp_path: Path) -> None:
+    project_id = "p" * 255
+    store = ProjectStore(tmp_path)
+    store.save_manifest(GenerationManifest(project_id=project_id))
+    original_dir = store.project_dir(project_id)
+
+    store.save_project(project_id, ScriptProject(title="short-title", default_language="de", lines=[]))
+
+    renamed_dir = store.project_dir(project_id)
+    assert renamed_dir.name == "short-title"
+    assert original_dir.exists() is False
+    assert store.load_project(project_id).default_language == "de"
+    assert store.load_manifest(project_id).project_id == project_id
+    assert (renamed_dir / ".project-id").read_text(encoding="utf-8") == project_id
+    assert [entry["project_id"] for entry in store.list_projects()] == [project_id]
+
+
+def test_fix_round_5_long_project_id_deletes_to_bounded_collision_safe_trash_children(tmp_path: Path) -> None:
+    project_id = "p" * 255
+    expected_hash = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:16]
+    store = ProjectStore(tmp_path)
+
+    trashed_paths: list[Path] = []
+    for _index in range(2):
+        store.save_manifest(GenerationManifest(project_id=project_id))
+        trashed_paths.append(store.delete_project(project_id))
+
+    assert trashed_paths[0] != trashed_paths[1]
+    for trashed_path in trashed_paths:
+        assert trashed_path.parent.name == ".trash"
+        assert trashed_path.is_dir()
+        assert trashed_path.name.startswith("pppppppp")
+        assert expected_hash in trashed_path.name
+        assert all(len(part.encode("utf-16-le")) // 2 <= 255 for part in trashed_path.parts[1:])
+        assert (trashed_path / ".project-id").read_text(encoding="utf-8") == project_id
+
+
+def test_fix_round_5_windows_path_identity_unifies_normal_extended_local_and_unc_spellings() -> None:
+    assert storage_module.windows_path_identity(r"C:\Project\Audio") == r"c:\project\audio"
+    assert storage_module.windows_path_identity(r"\\?\C:\Project\Audio") == r"c:\project\audio"
+    assert storage_module.windows_path_identity(r"\\Server\Share\Project\Audio") == (
+        storage_module.windows_path_identity(r"\\?\UNC\Server\Share\Project\Audio")
+    )
 
 
 @pytest.mark.parametrize("project_id", ["../escape", "..\\escape", "/absolute", "C:\\temp\\escape", ""])

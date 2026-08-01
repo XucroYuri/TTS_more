@@ -1984,6 +1984,33 @@ def test_fix_round_3_sync_routes_confine_malicious_service_and_profile_paths(
     assert audio_path.is_file()
 
 
+def test_fix_round_5_long_project_reference_upload_round_trips_through_audio_api(tmp_path: Path) -> None:
+    project_id = "p" * 255
+    audio_bytes = b"RIFF-round-five-reference"
+    client = TestClient(create_app(data_root=tmp_path), raise_server_exceptions=False)
+
+    upload = client.post(
+        f"/api/projects/{project_id}/reference-audio/upload",
+        files={"file": ("reference.wav", audio_bytes, "audio/wav")},
+    )
+
+    assert upload.status_code == 200
+    returned_path = upload.json()["sample"]["path"]
+    audio = client.get("/api/audio", params={"path": returned_path})
+    assert audio.status_code == 200
+    assert audio.content == audio_bytes
+
+    outside_path = tmp_path.parent / f"{tmp_path.name}-outside-round-five.wav"
+    outside_path.write_bytes(audio_bytes)
+    try:
+        outside_extended_path = f"\\\\?\\{outside_path.resolve(strict=False)}"
+        refused = client.get("/api/audio", params={"path": outside_extended_path})
+        assert refused.status_code == 400
+        assert refused.json()["detail"] == "audio path is outside data root"
+    finally:
+        outside_path.unlink(missing_ok=True)
+
+
 def test_generation_preflight_suggests_local_fallback_without_auto_start(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("app.services.ServiceRouter._client_ready", lambda *_args: False)
     services_path = tmp_path / "services.json"

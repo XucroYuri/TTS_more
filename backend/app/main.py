@@ -33,7 +33,13 @@ from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_referen
 from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
 from app.services import COMFYUI_TTS_AUDIO_SUITE_CONTRACT, ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
-from app.storage import ProjectStore
+from app.storage import (
+    ProjectStore,
+    windows_display_path,
+    windows_filesystem_path,
+    windows_path_is_within,
+    windows_usable_file_path,
+)
 from app.supervisor import ServiceSupervisor
 from app.service_store_io import ServicePostCommitError
 
@@ -1023,7 +1029,7 @@ def create_app(
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in AUDIO_UPLOAD_SUFFIXES:
             raise HTTPException(status_code=400, detail="unsupported audio file")
-        output_dir = store.project_reference_audio_dir(project_id) / "temporary"
+        output_dir = windows_filesystem_path(store.project_reference_audio_dir(project_id) / "temporary")
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / _safe_upload_name(file.filename or f"reference{suffix}")
         counter = 1
@@ -1036,7 +1042,13 @@ def create_app(
         if len(content) > app.state.max_upload_bytes:
             raise HTTPException(status_code=413, detail=f"audio file exceeds upload limit")
         output_path.write_bytes(content)
-        return {"sample": {"path": str(output_path), "text": "", "text_source": "manual"}}
+        return {
+            "sample": {
+                "path": str(windows_display_path(output_path)),
+                "text": "",
+                "text_source": "manual",
+            }
+        }
 
     @app.get("/api/projects/{project_id}/characters")
     def get_project_characters(project_id: str) -> dict[str, Any]:
@@ -2045,34 +2057,29 @@ def _resolve_data_audio_path(data_root: Path, raw_path: str, allowed_roots: list
 
 
 def _resolve_project_audio_file(project_audio_root: Path, data_root: Path, raw_path: str) -> Path | None:
-    root = project_audio_root.resolve()
+    root = windows_filesystem_path(project_audio_root).resolve()
     requested = Path(raw_path)
     candidates = [requested] if requested.is_absolute() else [Path.cwd() / requested, data_root / requested, root / requested]
     for candidate in candidates:
-        resolved = candidate.resolve()
-        try:
-            resolved.relative_to(root)
-        except ValueError:
-            continue
-        return resolved
+        resolved = windows_filesystem_path(candidate).resolve()
+        if windows_path_is_within(resolved, root):
+            return windows_usable_file_path(resolved)
     return None
 
 
 def _resolve_data_asset_path(data_root: Path, raw_path: str, outside_detail: str = "asset path is outside data root", allowed_roots: list[Path] | None = None) -> Path:
-    roots = [data_root.resolve()]
+    roots = [windows_filesystem_path(data_root).resolve()]
     for root in allowed_roots or []:
-        if root.exists():
-            roots.append(root.resolve())
+        filesystem_root = windows_filesystem_path(root)
+        if filesystem_root.exists():
+            roots.append(filesystem_root.resolve())
     requested = Path(raw_path)
     candidates = [requested] if requested.is_absolute() else [Path.cwd() / requested, *[root / requested for root in roots]]
     for candidate in candidates:
-        resolved = candidate.resolve()
+        resolved = windows_filesystem_path(candidate).resolve()
         for root in roots:
-            try:
-                resolved.relative_to(root)
-            except ValueError:
-                continue
-            return resolved
+            if windows_path_is_within(resolved, root):
+                return windows_usable_file_path(resolved)
     raise HTTPException(status_code=400, detail=outside_detail)
 
 
