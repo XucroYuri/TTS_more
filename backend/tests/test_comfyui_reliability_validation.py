@@ -6402,4 +6402,157 @@ Write-Output 'RECORDED_TREE_EDGE_ORDERING_OK'
     assert "RECORDED_TREE_EDGE_ORDERING_OK" in completed.stdout
 
 
+def test_task_12_recorded_tree_rejects_snapshot_to_live_pid_reuse_without_stopping() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Get-ProcessRecord',
+    'Test-RecordDocumentMatches',
+    'Test-RecordedIdentity',
+    'Test-ProcessAbsent',
+    'Stop-RecordedTree',
+    'Stop-RecordedProcessPair'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+function New-Row {
+    param([int] $ProcessId, [int] $ParentProcessId, [string] $Created)
+    return [pscustomobject]@{
+        ProcessId = $ProcessId
+        ParentProcessId = $ParentProcessId
+        CreationDate = [DateTime]::Parse($Created).ToUniversalTime()
+        ExecutablePath = ('C:\controlled\python-{0}.exe' -f $ProcessId)
+        CommandLine = ('python-{0}.exe controlled.py' -f $ProcessId)
+        Name = ('python-{0}.exe' -f $ProcessId)
+    }
+}
+function New-RootRecord {
+    return [pscustomobject]@{
+        pid = 100
+        creation_time = '2026-08-01T00:00:10Z'
+        executable_path = 'C:\controlled\python-100.exe'
+        command_line = 'python-100.exe controlled.py'
+        parent_pid = 50
+        parent_creation_time = '2026-08-01T00:00:00Z'
+    }
+}
+$script:snapshot = @()
+$script:live = @()
+$script:querySequences = @{}
+$script:queryCounts = @{}
+$script:stopped = [System.Collections.Generic.List[int]]::new()
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    if (-not $Filter) { return @($script:snapshot) }
+    $candidatePid = [int] ([regex]::Match($Filter, '\d+').Value)
+    if ($script:querySequences.ContainsKey($candidatePid)) {
+        $index = 0
+        if ($script:queryCounts.ContainsKey($candidatePid)) {
+            $index = [int] $script:queryCounts[$candidatePid]
+        }
+        $sequence = @($script:querySequences[$candidatePid])
+        if ($index -ge $sequence.Count) { $index = $sequence.Count - 1 }
+        $script:queryCounts[$candidatePid] = $index + 1
+        return $sequence[$index]
+    }
+    return @($script:live | Where-Object {
+        [int] $_.ProcessId -eq $candidatePid
+    }) | Select-Object -First 1
+}
+function Stop-Process {
+    param([int] $Id, [switch] $Force, [object] $ErrorAction)
+    $script:stopped.Add($Id)
+    $script:live = @($script:live | Where-Object {
+        [int] $_.ProcessId -ne $Id
+    })
+}
+function Set-State {
+    param([object[]] $Snapshot, [object[]] $Live)
+    $script:snapshot = @($Snapshot)
+    $script:live = @($Live)
+    $script:querySequences = @{}
+    $script:queryCounts = @{}
+    $script:stopped.Clear()
+}
+$parent = New-Row 50 4 '2026-08-01T00:00:00Z'
+$root = New-Row 100 50 '2026-08-01T00:00:10Z'
+$rootRecord = New-RootRecord
+$failures = [System.Collections.Generic.List[string]]::new()
+
+$snapshotChild = New-Row 200 100 '2026-08-01T00:00:11Z'
+$unrelatedParent = New-Row 300 50 '2026-08-01T00:00:10Z'
+$reusedChildPid = New-Row 200 300 '2026-08-01T00:00:12Z'
+Set-State @($parent, $root, $snapshotChild) @(
+    $parent, $root, $unrelatedParent, $reusedChildPid
+)
+if (Stop-RecordedProcessPair -LaunchRootRecord $rootRecord -ListenerRecord $rootRecord) {
+    $failures.Add('snapshot child PID reuse under another parent was cleanup-proven')
+}
+if ($script:stopped.Count -ne 0) {
+    $failures.Add('snapshot child PID reuse stopped a process before exact edge proof')
+}
+
+$snapshotGrandchild = New-Row 400 200 '2026-08-01T00:00:12Z'
+$newMiddleParentParent = New-Row 500 50 '2026-08-01T00:00:09Z'
+$reusedMiddleParent = New-Row 200 500 '2026-08-01T00:00:11.500Z'
+Set-State @($parent, $root, $snapshotChild, $snapshotGrandchild) @(
+    $parent, $root, $newMiddleParentParent, $reusedMiddleParent, $snapshotGrandchild
+)
+$script:querySequences[200] = @($snapshotChild, $reusedMiddleParent)
+if (Stop-RecordedProcessPair -LaunchRootRecord $rootRecord -ListenerRecord $rootRecord) {
+    $failures.Add('multi-generation middle-parent PID reuse was cleanup-proven')
+}
+if ($script:stopped.Count -ne 0) {
+    $failures.Add('middle-parent PID reuse stopped a process before exact edge proof')
+}
+
+Set-State @($parent, $root, $snapshotChild, $snapshotGrandchild) @(
+    $parent, $root, $snapshotChild, $snapshotGrandchild
+)
+if (-not (Stop-RecordedProcessPair -LaunchRootRecord $rootRecord -ListenerRecord $rootRecord)) {
+    $failures.Add('unchanged exact multi-generation tree did not cleanup-converge')
+}
+if ((@($script:stopped) -join ',') -ne '400,200,100') {
+    $failures.Add('unchanged exact tree did not stop only its recorded members')
+}
+if ($failures.Count -ne 0) { throw ($failures -join '; ') }
+Write-Output 'RECORDED_TREE_SNAPSHOT_REUSE_OK'
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "TTS_MORE_RELIABILITY_SCRIPT": str(script_path)},
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "RECORDED_TREE_SNAPSHOT_REUSE_OK" in completed.stdout
+
+
 REPOSITORY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")

@@ -898,15 +898,25 @@ function Stop-RecordedTree {
     }
     $all = @(Get-CimInstance Win32_Process)
     $descendants = @{}
-    $frontier = @([int] $Record.pid)
+    $frontier = @($Record)
     while ($frontier.Count -gt 0) {
         $next = @()
-        foreach ($parentPid in $frontier) {
-            foreach ($child in @($all | Where-Object { [int] $_.ParentProcessId -eq $parentPid })) {
+        foreach ($parentRecord in $frontier) {
+            foreach ($child in @($all | Where-Object {
+                [int] $_.ParentProcessId -eq [int] $parentRecord.pid
+            })) {
                 if (-not $descendants.ContainsKey([int] $child.ProcessId)) {
                     $childRecord = Get-ProcessRecord -ProcessId ([int] $child.ProcessId)
+                    $parentCreationTicks = Get-UtcTicks -Value $parentRecord.creation_time
+                    if (
+                        [int] $childRecord.parent_pid -ne [int] $parentRecord.pid -or
+                        (Get-UtcTicks -Value $childRecord.parent_creation_time) -ne $parentCreationTicks -or
+                        (Get-UtcTicks -Value $childRecord.creation_time) -lt $parentCreationTicks
+                    ) {
+                        throw 'Snapshot descendant no longer belongs to the exact frontier process'
+                    }
                     $descendants[[int] $child.ProcessId] = $childRecord
-                    $next += [int] $child.ProcessId
+                    $next += $childRecord
                 }
             }
         }
