@@ -1650,6 +1650,7 @@ class LiveValidationError(RuntimeError):
         self.code = code
         self.stage = stage
         self.failure_persistence_attempted = False
+        self.preserve_terminal_marker = False
 
 
 class RestartLifecycleError(RuntimeError):
@@ -4489,6 +4490,8 @@ def _execute_reliability_preflight_success(
 
 def _persist_failure_marker(output_root: Path, failure: LiveValidationError) -> None:
     failure.failure_persistence_attempted = True
+    if failure.preserve_terminal_marker:
+        return
     for _attempt in range(2):
         try:
             _publish_public_terminal_marker(
@@ -4512,6 +4515,11 @@ def _publish_public_terminal_marker(
     retired: _RetiredTerminalCohort | None = None
     marker_path = Path(output_root) / marker_name
     publication_attempted = False
+    retirement_cleanup_attempted = False
+    published_marker: _PreparedTerminalArtifact | None = None
+    expected_marker = (
+        json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
     try:
         with _TERMINAL_TRANSITION_THREAD_LOCK:
             retired = _transition_public_terminal_markers(
@@ -4521,24 +4529,53 @@ def _publish_public_terminal_marker(
             )
             if marker_name == "preflight.json":
                 _assert_passed_root_clear(Path(output_root))
+            if retired is not None:
+                retired_cases = retired.root / "cases"
+                if retired_cases.exists():
+                    _assert_exact_case_members(
+                        Path(output_root), retired_cases, retired.case_artifacts
+                    )
+                elif retired.case_artifacts:
+                    raise OSError("terminal cohort cases disappeared before cleanup")
+                retirement_cleanup_attempted = True
+                shutil.rmtree(retired.root)
+                if retired.root.exists() or retired.root.is_symlink():
+                    raise OSError("terminal cohort quarantine cleanup is incomplete")
+                retired = None
             publication_attempted = True
             if marker_name == "preflight.json":
                 write_atomic_json(marker_path, document, replace_existing=False)
             else:
                 write_atomic_json(marker_path, document)
+            published_marker = _capture_owned_terminal_marker(
+                Path(output_root), marker_path, expected_marker
+            )
             if marker_name == "preflight.json":
                 _assert_passed_root_clear(Path(output_root), marker_path=marker_path)
     except Exception as error:
+        preserve_marker = False
         if marker_name == "preflight.json" and publication_attempted:
-            _best_effort_unlink(marker_path)
-        _rollback_retired_terminal_cohort(Path(output_root), retired)
+            if published_marker is not None:
+                preserve_marker = not _unlink_owned_terminal_marker(
+                    Path(output_root), published_marker
+                )
+            else:
+                try:
+                    _safe_terminal_path(Path(output_root), marker_path, directory=False)
+                    preserve_marker = True
+                except FileNotFoundError:
+                    pass
+        if not retirement_cleanup_attempted:
+            _rollback_retired_terminal_cohort(Path(output_root), retired)
         if isinstance(error, LiveValidationError):
+            error.preserve_terminal_marker |= preserve_marker
             raise
-        raise LiveValidationError(
+        transition_error = LiveValidationError(
             "public-marker-transition-failed",
             stage=stage,
-        ) from None
-    if retired is not None: shutil.rmtree(retired.root, ignore_errors=True)
+        )
+        transition_error.preserve_terminal_marker = preserve_marker
+        raise transition_error from None
 
 
 def _transition_public_terminal_markers(
@@ -4590,6 +4627,32 @@ class _PreparedTerminalArtifact:
     sha256: str
 
 
+def _capture_owned_terminal_marker(
+    output_root: Path, marker_path: Path, expected: bytes
+) -> _PreparedTerminalArtifact:
+    content = _read_bounded_terminal_artifact(
+        marker_path, maximum_bytes=MAX_FAILED_CASE_JSON_BYTES
+    )
+    if content != expected:
+        raise OSError("published terminal marker was replaced concurrently")
+    return _PreparedTerminalArtifact(
+        path=marker_path,
+        identity=_safe_terminal_path(output_root, marker_path, directory=False),
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
+def _unlink_owned_terminal_marker(
+    output_root: Path, marker: _PreparedTerminalArtifact
+) -> bool:
+    try:
+        _assert_prepared_terminal_artifact(output_root, marker)
+        marker.path.unlink()
+    except OSError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class _PreparedTerminalCohort:
     archive: dict[str, Any] | None
@@ -4604,6 +4667,7 @@ class _PreparedTerminalCohort:
 @dataclass(frozen=True)
 class _RetiredTerminalCohort:
     root: Path
+    case_artifacts: tuple[_PreparedTerminalArtifact, ...]
 
 
 def _terminal_path_identity(path: Path, *, directory: bool) -> tuple[int, int, int, int, int]:
@@ -4669,6 +4733,20 @@ def _assert_prepared_terminal_artifact(
         raise OSError("terminal cohort artifact hash changed before mutation")
 
 
+def _assert_exact_case_members(
+    output_root: Path,
+    case_root: Path,
+    artifacts: tuple[_PreparedTerminalArtifact, ...],
+) -> None:
+    entries = tuple(sorted(case_root.iterdir(), key=lambda item: item.name))
+    if tuple(path.name for path in entries) != tuple(
+        artifact.path.name for artifact in artifacts
+    ):
+        raise OSError("terminal cohort cases membership changed before mutation")
+    for entry, artifact in zip(entries, artifacts, strict=True):
+        _assert_prepared_terminal_artifact(output_root, artifact, path=entry)
+
+
 def _retire_terminal_cohort(
     output_root: Path,
     cohort: _PreparedTerminalCohort,
@@ -4679,7 +4757,10 @@ def _retire_terminal_cohort(
     _safe_terminal_path(output_root, quarantine_root, directory=True, create=True)
     transaction_root = quarantine_root / secrets.token_hex(16)
     transaction_root.mkdir()
-    retired = _RetiredTerminalCohort(root=transaction_root)
+    retired = _RetiredTerminalCohort(
+        root=transaction_root,
+        case_artifacts=cohort.case_artifacts,
+    )
     try:
         if cohort.summary_artifact is not None:
             _assert_prepared_terminal_artifact(output_root, cohort.summary_artifact)
@@ -4692,16 +4773,16 @@ def _retire_terminal_cohort(
             _safe_terminal_path(output_root, cohort.case_root, directory=True)
             if _terminal_path_identity(cohort.case_root, directory=True) != cohort.case_root_identity:
                 raise OSError("terminal cohort cases root changed before mutation")
-            for artifact in cohort.case_artifacts:
-                _assert_prepared_terminal_artifact(output_root, artifact)
+            _assert_exact_case_members(
+                output_root, cohort.case_root, cohort.case_artifacts
+            )
             saved_cases = transaction_root / "cases"
             os.replace(cohort.case_root, saved_cases)
             if _terminal_path_identity(saved_cases, directory=True) != cohort.case_root_identity:
                 raise OSError("terminal cohort cases root changed during mutation")
-            for artifact in cohort.case_artifacts:
-                _assert_prepared_terminal_artifact(
-                    output_root, artifact, path=saved_cases / artifact.path.name
-                )
+            _assert_exact_case_members(
+                output_root, saved_cases, cohort.case_artifacts
+            )
     except Exception:
         _rollback_retired_terminal_cohort(output_root, retired)
         raise
