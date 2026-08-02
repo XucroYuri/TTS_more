@@ -22,7 +22,7 @@ from urllib.parse import unquote, urlsplit
 import httpx
 import soundfile
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, TypeAdapter, ValidationError, field_validator, model_validator
 
 
 Engine = Literal["gpt-sovits", "indextts", "cosyvoice"]
@@ -36,7 +36,7 @@ CaseAction = Literal[
     "terminate-comfyui",
     "restart-readiness",
 ]
-SHA256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+SHA256 = Annotated[str, Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")]
 REQUIRED_BOUNDARY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")
 ENGINE_ORDER: tuple[Engine, ...] = ("gpt-sovits", "indextts", "cosyvoice")
 DEFAULT_NORMAL_REQUEST_TIMEOUT_SECONDS: dict[Engine, float] = {
@@ -46,6 +46,15 @@ DEFAULT_NORMAL_REQUEST_TIMEOUT_SECONDS: dict[Engine, float] = {
 }
 MAX_NORMAL_REQUEST_TIMEOUT_SECONDS = 600.0
 TERMINAL_CONVERGENCE_SECONDS = 30.0
+MAX_PUBLIC_WINDOWS_PID = 2_147_483_647
+MAX_PUBLIC_EXECUTABLE_NAME_LENGTH = 255
+MAX_PUBLIC_GPU_MIB = 9_223_372_036_854_775_807
+MAX_FAILED_CASE_PROCESSES = 1_024
+MAX_FAILED_CASE_POLL_COUNT = 10_000
+MAX_FAILED_CASE_QUEUE_COUNT = 10_000
+MAX_FAILED_CASE_AUDIO_BYTES = 4_294_967_295
+MAX_FAILED_CASE_ID_LENGTH = 128
+MAX_FAILURE_CODE_LENGTH = 64
 _BRIDGE_ENGINE_IDS: dict[str, Engine] = {
     "gpt_sovits": "gpt-sovits",
     "index_tts": "indextts",
@@ -138,6 +147,16 @@ class _StrictModel(BaseModel):
         return value
 
 
+def _publish_object_property_bound(schema: dict[str, Any]) -> None:
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        schema["maxProperties"] = len(properties)
+
+
+class _BoundedPublicModel(_StrictModel):
+    model_config = ConfigDict(json_schema_extra=_publish_object_property_bound)
+
+
 class FixtureResource(_StrictModel):
     resource_id: str
     reference_audio: str
@@ -201,7 +220,7 @@ class AudioProof(_StrictModel):
     peak: StrictFloat = Field(gt=1e-5, le=1.0)
 
 
-class CleanupEvidence(_StrictModel):
+class CleanupEvidence(_BoundedPublicModel):
     ok: StrictBool
     owned_processes_stopped: StrictBool
     temp_paths_removed: StrictBool
@@ -588,8 +607,15 @@ class HostCaseObservation(_StrictModel):
         return self
 
 
-class FailureMarker(_StrictModel):
-    code: Annotated[str, Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")]
+class FailureMarker(_BoundedPublicModel):
+    code: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=MAX_FAILURE_CODE_LENGTH,
+            pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+        ),
+    ]
     stage: Literal["preflight", "case", "finalize"]
 
 
@@ -614,7 +640,7 @@ class _PublicPreflightQueue(_StrictModel):
 
 
 class _PublicPreflightProcess(_StrictModel):
-    pid: StrictInt = Field(gt=0, le=2_147_483_647)
+    pid: StrictInt = Field(gt=0, le=MAX_PUBLIC_WINDOWS_PID)
     creation_time: Annotated[
         str,
         Field(
@@ -623,7 +649,10 @@ class _PublicPreflightProcess(_StrictModel):
             pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$",
         ),
     ]
-    executable_name: Annotated[str, Field(min_length=1, max_length=255)]
+    executable_name: Annotated[
+        str,
+        Field(min_length=1, max_length=MAX_PUBLIC_EXECUTABLE_NAME_LENGTH),
+    ]
     ownership_hash: SHA256
 
     @field_validator("creation_time")
@@ -646,8 +675,8 @@ class _PublicPreflightProcess(_StrictModel):
 
 
 class _PublicPreflightGpu(_StrictModel):
-    used_mib: StrictInt = Field(ge=0, le=9_223_372_036_854_775_807)
-    free_mib: StrictInt = Field(ge=0, le=9_223_372_036_854_775_807)
+    used_mib: StrictInt = Field(ge=0, le=MAX_PUBLIC_GPU_MIB)
+    free_mib: StrictInt = Field(ge=0, le=MAX_PUBLIC_GPU_MIB)
 
 
 class _PublicPreflightRepository(_StrictModel):
@@ -722,15 +751,18 @@ class _PublicPreflightMarker(_StrictModel):
         return {port: value[port] for port in sorted(value, key=int)}
 
 
-class FailedCaseProcessObservation(_StrictModel):
-    pid: StrictInt = Field(gt=0)
+class FailedCaseProcessObservation(_BoundedPublicModel):
+    pid: StrictInt = Field(gt=0, le=MAX_PUBLIC_WINDOWS_PID)
     ownership: Literal["validator-owned", "pre-existing"]
     command_hash: SHA256
     creation_time: _PublicUtcTimestamp
-    parent_pid: StrictInt = Field(gt=0)
+    parent_pid: StrictInt = Field(gt=0, le=MAX_PUBLIC_WINDOWS_PID)
     parent_creation_time: _PublicUtcTimestamp
     stopped_at: _PublicUtcTimestamp
-    executable_name: str = Field(min_length=1)
+    executable_name: str = Field(
+        min_length=1,
+        max_length=MAX_PUBLIC_EXECUTABLE_NAME_LENGTH,
+    )
     executable_hash: SHA256
     ownership_hash: SHA256
     started: StrictBool
@@ -771,14 +803,22 @@ class FailedCaseProcessObservation(_StrictModel):
         return self
 
 
-class FailedCaseHostObservation(_StrictModel):
+class FailedCaseGpuObservation(_BoundedPublicModel):
+    used_mib: StrictInt = Field(ge=0, le=MAX_PUBLIC_GPU_MIB)
+    free_mib: StrictInt = Field(ge=0, le=MAX_PUBLIC_GPU_MIB)
+
+
+class FailedCaseHostObservation(_BoundedPublicModel):
     started_at: _PublicUtcTimestamp
     finished_at: _PublicUtcTimestamp
     cleanup: CleanupEvidence
-    processes: list[FailedCaseProcessObservation]
-    gpu_before: GpuSnapshot
-    gpu_peak: GpuSnapshot
-    gpu_after: GpuSnapshot
+    processes: Annotated[
+        list[FailedCaseProcessObservation],
+        Field(max_length=MAX_FAILED_CASE_PROCESSES),
+    ]
+    gpu_before: FailedCaseGpuObservation
+    gpu_peak: FailedCaseGpuObservation
+    gpu_after: FailedCaseGpuObservation
 
     @field_validator("started_at", "finished_at")
     @classmethod
@@ -823,11 +863,11 @@ class FailedCaseHostObservation(_StrictModel):
         return self
 
 
-class FailedCaseQueueObservation(_StrictModel):
+class FailedCaseQueueObservation(_BoundedPublicModel):
     observed_at: _PublicUtcTimestamp
     snapshot_sha256: SHA256
-    running_count: StrictInt = Field(ge=0)
-    pending_count: StrictInt = Field(ge=0)
+    running_count: StrictInt = Field(ge=0, le=MAX_FAILED_CASE_QUEUE_COUNT)
+    pending_count: StrictInt = Field(ge=0, le=MAX_FAILED_CASE_QUEUE_COUNT)
     target_state: Literal["running", "pending", "absent"] | None
 
     @field_validator("observed_at")
@@ -837,7 +877,7 @@ class FailedCaseQueueObservation(_StrictModel):
         return value
 
 
-class FailedCaseControlObservation(_StrictModel):
+class FailedCaseControlObservation(_BoundedPublicModel):
     interrupt_reason: Literal[
         "request-timeout",
         "user-cancel",
@@ -877,7 +917,7 @@ class FailedCaseControlObservation(_StrictModel):
         return self
 
 
-class FailedCaseObservation(_StrictModel):
+class FailedCaseObservation(_BoundedPublicModel):
     detail_status: Literal["incremental", "minimal"]
     action: CaseAction
     request_sha256: SHA256 | None
@@ -894,7 +934,7 @@ class FailedCaseObservation(_StrictModel):
     terminal_at: _PublicUtcTimestamp | None
     request_timeout_seconds: StrictFloat = Field(gt=0.0, le=MAX_NORMAL_REQUEST_TIMEOUT_SECONDS)
     convergence_seconds: StrictFloat = Field(gt=0.0, le=TERMINAL_CONVERGENCE_SECONDS)
-    poll_count: StrictInt = Field(ge=0)
+    poll_count: StrictInt = Field(ge=0, le=MAX_FAILED_CASE_POLL_COUNT)
     terminal_observed: StrictBool
     last_job_status: ObservedStatus | None
     last_item_status: ObservedStatus | None
@@ -907,7 +947,11 @@ class FailedCaseObservation(_StrictModel):
     control: FailedCaseControlObservation | None
     wav_observed: StrictBool
     audio_sha256: SHA256 | None
-    audio_size_bytes: StrictInt | None = Field(default=None, gt=0)
+    audio_size_bytes: StrictInt | None = Field(
+        default=None,
+        gt=0,
+        le=MAX_FAILED_CASE_AUDIO_BYTES,
+    )
     secondary_error_sha256: SHA256 | None
 
     @field_validator("job_created_at", "first_prompt_at", "last_poll_at", "terminal_at")
@@ -998,15 +1042,14 @@ class FailedCaseObservation(_StrictModel):
         return self
 
 
-class FailedCaseEvidence(_StrictModel):
+class _FailedCaseEvidenceCore(_BoundedPublicModel):
     status: Literal["failed"]
-    case_id: str = Field(min_length=1)
+    case_id: str = Field(min_length=1, max_length=MAX_FAILED_CASE_ID_LENGTH)
     phase: Phase
     engine: Engine
     expected: Outcome
     failure: FailureMarker
     host: FailedCaseHostObservation | None
-    observation: FailedCaseObservation | None = None
 
     @field_validator("case_id")
     @classmethod
@@ -1014,6 +1057,43 @@ class FailedCaseEvidence(_StrictModel):
         if "\\" in value or "/" in value or Path(value).is_absolute():
             raise ValueError("case_id must not contain paths")
         return value
+
+
+class LegacyFailedCaseEvidence(_FailedCaseEvidenceCore):
+    """Exact versionless schema retained only for historical failed artifacts."""
+
+
+class CurrentFailedCaseEvidence(_FailedCaseEvidenceCore):
+    schema_version: Literal[2]
+    observation: FailedCaseObservation
+
+
+FailedCaseDocument = LegacyFailedCaseEvidence | CurrentFailedCaseEvidence
+_FAILED_CASE_JSON_ADAPTER = TypeAdapter(Any)
+_FAILED_CASE_SCHEMA_ADAPTER = TypeAdapter(FailedCaseDocument)
+
+
+class FailedCaseEvidence:
+    """Formal version-aware reader for legacy and current failed-case JSON."""
+
+    @classmethod
+    def model_validate(cls, value: Any) -> FailedCaseDocument:
+        if isinstance(value, CurrentFailedCaseEvidence):
+            return CurrentFailedCaseEvidence.model_validate(value)
+        if isinstance(value, LegacyFailedCaseEvidence):
+            return LegacyFailedCaseEvidence.model_validate(value)
+        if isinstance(value, dict) and "schema_version" in value:
+            return CurrentFailedCaseEvidence.model_validate(value)
+        return LegacyFailedCaseEvidence.model_validate(value)
+
+    @classmethod
+    def model_validate_json(cls, value: str | bytes | bytearray) -> FailedCaseDocument:
+        document = _FAILED_CASE_JSON_ADAPTER.validate_json(value)
+        return cls.model_validate(document)
+
+    @classmethod
+    def model_json_schema(cls) -> dict[str, Any]:
+        return _FAILED_CASE_SCHEMA_ADAPTER.json_schema()
 
 
 def _failed_case_host_observation(
@@ -3915,10 +3995,12 @@ def _failed_case_observation_from_probe(
         return _minimal_failed_case_observation(case, secondary_error=exc)
 
 
-def _strict_failed_case_payload(evidence: FailedCaseEvidence) -> dict[str, Any]:
+def _strict_failed_case_payload(evidence: CurrentFailedCaseEvidence) -> dict[str, Any]:
     try:
         encoded = evidence.model_dump_json(warnings="error")
         validated = FailedCaseEvidence.model_validate_json(encoded)
+        if not isinstance(validated, CurrentFailedCaseEvidence):
+            raise ValueError("current failed case evidence lost its version")
         return validated.model_dump(mode="json")
     except (ValidationError, ValueError, TypeError, AttributeError, RecursionError):
         raise ValueError("invalid failed case evidence") from None
@@ -3926,7 +4008,7 @@ def _strict_failed_case_payload(evidence: FailedCaseEvidence) -> dict[str, Any]:
 
 def _persist_failed_case_evidence(
     path: Path,
-    evidence: FailedCaseEvidence,
+    evidence: CurrentFailedCaseEvidence,
     *,
     case: CasePlan,
 ) -> None:
@@ -3935,7 +4017,8 @@ def _persist_failed_case_evidence(
         return
     except Exception as detail_error:
         try:
-            fallback = FailedCaseEvidence(
+            fallback = CurrentFailedCaseEvidence(
+                schema_version=2,
                 status="failed",
                 case_id=evidence.case_id,
                 phase=evidence.phase,
@@ -4105,7 +4188,8 @@ def execute_reliability_validation(
                     http_probe,
                     active_case,
                 )
-                failed_case = FailedCaseEvidence(
+                failed_case = CurrentFailedCaseEvidence(
+                    schema_version=2,
                     status="failed",
                     case_id=active_case.case_id,
                     phase=active_case.phase,
@@ -4116,7 +4200,8 @@ def execute_reliability_validation(
                     observation=failed_observation,
                 )
             except Exception as detail_error:
-                failed_case = FailedCaseEvidence(
+                failed_case = CurrentFailedCaseEvidence(
+                    schema_version=2,
                     status="failed",
                     case_id=active_case.case_id,
                     phase=active_case.phase,

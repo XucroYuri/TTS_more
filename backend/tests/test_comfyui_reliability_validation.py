@@ -1972,6 +1972,7 @@ def test_fix_round_1_case_failure_writes_current_scrubbed_case_before_failed_sum
     )
     assert first_case["actual"] == "completed"
     assert failed_case["status"] == "failed"
+    assert failed_case["schema_version"] == 2
     assert failed_case["case_id"] == "steady-01-indextts"
     assert failed_case["engine"] == "indextts"
     assert failed_case["expected"] == "completed"
@@ -9221,6 +9222,13 @@ def _fix8_observation_document(*, detail_status: str = "incremental") -> dict[st
     }
 
 
+def _fix8_current_failed_case_document() -> dict[str, object]:
+    document = json.loads(_fix8_attempt1_failed_case_path().read_text(encoding="utf-8"))
+    document["schema_version"] = 2
+    document["observation"] = _fix8_observation_document()
+    return document
+
+
 def test_fix8_exact_matrix_attempt1_failed_case_round_trips_through_public_reader() -> None:
     artifact = _fix8_attempt1_failed_case_path().read_text(encoding="utf-8")
     original = json.loads(artifact)
@@ -9521,6 +9529,7 @@ def test_fix8_controller_persists_strict_detailed_failed_case_without_private_id
         failed_path.read_text(encoding="utf-8")
     )
     assert failed.failure.model_dump() == {"code": "case-execution-failed", "stage": "case"}
+    assert failed.schema_version == 2
     assert failed.observation == http_probe.observation
     rendered = failed_path.read_text(encoding="utf-8")
     assert "private-probe-secret" not in rendered
@@ -9567,6 +9576,7 @@ def test_fix8_secondary_detailed_case_writer_failure_uses_minimal_fallback_witho
         failed_path.read_text(encoding="utf-8")
     )
     assert failed.failure.model_dump() == {"code": "case-execution-failed", "stage": "case"}
+    assert failed.schema_version == 2
     assert failed.observation.detail_status == "minimal"
     assert failed.observation.secondary_error_sha256 is not None
     rendered = failed_path.read_text(encoding="utf-8")
@@ -9585,3 +9595,233 @@ def test_fix8_success_case_schema_is_not_polluted_by_failure_observation_fields(
     assert "failure" not in document
     assert "observation" not in document
     assert CaseEvidence.model_validate(evidence).actual == "completed"
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "legal_maximum"),
+    [
+        ("observation", "poll_count", 10_000),
+        ("queue", "running_count", 10_000),
+        ("queue", "pending_count", 10_000),
+        ("observation", "audio_size_bytes", 4_294_967_295),
+        ("process", "pid", 2_147_483_647),
+        ("process", "parent_pid", 2_147_483_647),
+        ("gpu", "used_mib", 9_223_372_036_854_775_807),
+        ("gpu", "free_mib", 9_223_372_036_854_775_807),
+    ],
+)
+def test_fix8_round1_numeric_public_bounds_accept_maximum_and_reject_first_oversize(
+    target: str,
+    field: str,
+    legal_maximum: int,
+) -> None:
+    document = _fix8_current_failed_case_document()
+    observation = document["observation"]
+    if target == "observation":
+        target_document = observation
+        if field == "audio_size_bytes":
+            observation["wav_observed"] = True
+            observation["audio_sha256"] = "a" * 64
+    elif target == "queue":
+        target_document = observation["queue"]
+    elif target == "process":
+        target_document = document["host"]["processes"][0]
+        if field == "parent_pid":
+            target_document["pid"] = 1
+    else:
+        target_document = document["host"]["gpu_before"]
+    target_document[field] = legal_maximum
+
+    assert reliability_validation.FailedCaseEvidence.model_validate(document)
+
+    target_document[field] = legal_maximum + 1
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate(document)
+
+
+def test_fix8_round1_failed_process_collection_has_audited_maximum() -> None:
+    document = _fix8_current_failed_case_document()
+    host = document["host"]
+    template = host["processes"][0]
+    processes = []
+    for offset in range(1_024):
+        process = json.loads(json.dumps(template))
+        process["pid"] = 1_000 + offset
+        process["parent_pid"] = 1
+        processes.append(process)
+    host["processes"] = processes
+
+    assert reliability_validation.FailedCaseEvidence.model_validate(document)
+
+    extra = json.loads(json.dumps(template))
+    extra["pid"] = 2_024
+    extra["parent_pid"] = 1
+    host["processes"].append(extra)
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "legal_length"),
+    [
+        ("process", "executable_name", 255),
+        ("case", "case_id", 128),
+        ("failure", "code", 64),
+    ],
+)
+def test_fix8_round1_public_strings_accept_maximum_and_reject_first_oversize(
+    target: str,
+    field: str,
+    legal_length: int,
+) -> None:
+    document = _fix8_current_failed_case_document()
+    if target == "process":
+        target_document = document["host"]["processes"][0]
+        legal = "p" * legal_length
+    elif target == "case":
+        target_document = document
+        legal = "c" * legal_length
+    else:
+        target_document = document["failure"]
+        legal = "f" * legal_length
+    target_document[field] = legal
+
+    assert reliability_validation.FailedCaseEvidence.model_validate(document)
+
+    target_document[field] = legal + "x"
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate(document)
+
+
+def test_fix8_round1_oversized_status_and_object_map_fail_closed() -> None:
+    document = _fix8_current_failed_case_document()
+    document["observation"]["last_job_status"] = "r" * 1_000_000
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate(document)
+
+    document = _fix8_current_failed_case_document()
+    document["observation"].update(
+        {f"unknown_{index}": index for index in range(100)}
+    )
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate(document)
+
+
+def _schema_branch(schema: dict[str, object], name: str) -> dict[str, object]:
+    return schema["$defs"][name]
+
+
+def _maximum_from_nullable_integer(property_schema: dict[str, object]) -> int:
+    return next(
+        branch["maximum"]
+        for branch in property_schema["anyOf"]
+        if branch.get("type") == "integer"
+    )
+
+
+def test_fix8_round1_generated_json_schema_publishes_all_audited_bounds() -> None:
+    schema = reliability_validation.FailedCaseEvidence.model_json_schema()
+    observation = _schema_branch(schema, "FailedCaseObservation")
+    queue = _schema_branch(schema, "FailedCaseQueueObservation")
+    host = _schema_branch(schema, "FailedCaseHostObservation")
+    process = _schema_branch(schema, "FailedCaseProcessObservation")
+    gpu = _schema_branch(schema, "FailedCaseGpuObservation")
+    current = _schema_branch(schema, "CurrentFailedCaseEvidence")
+    legacy = _schema_branch(schema, "LegacyFailedCaseEvidence")
+    cleanup = _schema_branch(schema, "CleanupEvidence")
+    failure = _schema_branch(schema, "FailureMarker")
+
+    assert observation["properties"]["poll_count"] == {
+        "minimum": 0,
+        "maximum": 10_000,
+        "title": "Poll Count",
+        "type": "integer",
+    }
+    assert _maximum_from_nullable_integer(
+        observation["properties"]["audio_size_bytes"]
+    ) == 4_294_967_295
+    assert queue["properties"]["running_count"]["maximum"] == 10_000
+    assert queue["properties"]["pending_count"]["maximum"] == 10_000
+    assert host["properties"]["processes"]["maxItems"] == 1_024
+    assert process["properties"]["pid"]["maximum"] == 2_147_483_647
+    assert process["properties"]["parent_pid"]["maximum"] == 2_147_483_647
+    assert process["properties"]["executable_name"]["maxLength"] == 255
+    assert gpu["properties"]["used_mib"]["maximum"] == 9_223_372_036_854_775_807
+    assert gpu["properties"]["free_mib"]["maximum"] == 9_223_372_036_854_775_807
+    assert current["properties"]["case_id"]["maxLength"] == 128
+    assert current["maxProperties"] == len(current["properties"])
+    assert legacy["maxProperties"] == len(legacy["properties"])
+    for model_schema in (
+        observation,
+        queue,
+        host,
+        process,
+        gpu,
+        current,
+        legacy,
+        cleanup,
+        failure,
+    ):
+        assert model_schema["maxProperties"] == len(model_schema["properties"])
+
+
+def test_fix8_round1_formal_reader_distinguishes_exact_legacy_and_required_current() -> None:
+    legacy_document = json.loads(_fix8_attempt1_failed_case_path().read_text(encoding="utf-8"))
+    current_document = _fix8_current_failed_case_document()
+
+    legacy = reliability_validation.FailedCaseEvidence.model_validate(legacy_document)
+    current = reliability_validation.FailedCaseEvidence.model_validate(current_document)
+
+    assert type(legacy).__name__ == "LegacyFailedCaseEvidence"
+    assert type(current).__name__ == "CurrentFailedCaseEvidence"
+    assert current.schema_version == 2
+    assert current.observation is not None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-observation",
+        "null-observation",
+        "unknown-version",
+        "spoofed-current",
+        "legacy-current-field",
+        "legacy-version-field",
+        "legacy-oversize-pid",
+    ],
+)
+def test_fix8_round1_formal_reader_rejects_ambiguous_or_incomplete_version_shapes(
+    mutation: str,
+) -> None:
+    if mutation.startswith("legacy"):
+        document = json.loads(_fix8_attempt1_failed_case_path().read_text(encoding="utf-8"))
+        if mutation == "legacy-current-field":
+            document["observation"] = _fix8_observation_document()
+        elif mutation == "legacy-version-field":
+            document["schema_version"] = 1
+        else:
+            document["host"]["processes"][0]["pid"] = 2_147_483_648
+    else:
+        document = _fix8_current_failed_case_document()
+        if mutation == "missing-observation":
+            del document["observation"]
+        elif mutation == "null-observation":
+            document["observation"] = None
+        elif mutation == "unknown-version":
+            document["schema_version"] = 3
+        else:
+            del document["observation"]
+            document["schema_version"] = 2
+
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate(document)
+
+
+def test_fix8_round1_current_minimal_fallback_is_explicit_and_versioned() -> None:
+    document = _fix8_current_failed_case_document()
+    document["observation"] = _fix8_observation_document(detail_status="minimal")
+
+    current = reliability_validation.FailedCaseEvidence.model_validate(document)
+
+    assert current.schema_version == 2
+    assert current.observation.detail_status == "minimal"
