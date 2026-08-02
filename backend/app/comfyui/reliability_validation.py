@@ -2433,16 +2433,28 @@ class HttpReliabilityProbe:
             raise RuntimeError("job id was reused")
         self._seen_job_ids.add(job_id)
 
+        action_case = case.action in {"cancel-running", "terminate-comfyui"}
         deadline = self.monotonic() + case.request_timeout_seconds
-        if case.action not in {"cancel-running", "terminate-comfyui"}:
+        if not action_case:
             deadline += case.convergence_seconds
         prompt_id: str | None = None
         queue_before: list[str] | None = None
         acted = False
         endpoint_unavailable = False
         terminal: dict[str, Any] | None = None
+
+        def require_case_window_open() -> None:
+            if self.monotonic() < deadline:
+                return
+            if not action_case:
+                raise RuntimeError("job terminal observation window expired")
+            if acted:
+                raise RuntimeError("fault terminal convergence window expired")
+            raise RuntimeError("fault action request window expired")
+
         while self.monotonic() <= deadline:
             job = self._json("GET", f"{tts_more_url}/api/jobs/{job_id}", timeout=10.0)
+            require_case_window_open()
             items = job.get("items")
             item = items[0] if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict) else {}
             external_id = item.get("external_job_id")
@@ -2458,6 +2470,7 @@ class HttpReliabilityProbe:
                         raise
                     endpoint_unavailable = True
                     queue = None
+                require_case_window_open()
                 prompt_ids = _comfy_prompt_ids(queue) if queue is not None else []
                 if prompt_id in prompt_ids and queue_before is None:
                     queue_before = prompt_ids
@@ -2466,17 +2479,19 @@ class HttpReliabilityProbe:
                     self._cancel_job(tts_more_url, job_id)
                     acted = True
                 elif case.action == "cancel-running" and not acted and state == "running":
-                    action_deadline = self.monotonic() + case.convergence_seconds
+                    require_case_window_open()
+                    deadline = self.monotonic() + case.convergence_seconds
                     self._cancel_job(tts_more_url, job_id)
                     acted = True
-                    deadline = action_deadline
+                    require_case_window_open()
                 elif case.action == "terminate-comfyui" and not acted and state == "running":
                     if action_hook is None:
                         raise RuntimeError("terminate action hook is missing")
-                    action_deadline = self.monotonic() + case.convergence_seconds
+                    require_case_window_open()
+                    deadline = self.monotonic() + case.convergence_seconds
                     action_hook()
                     acted = True
-                    deadline = action_deadline
+                    require_case_window_open()
             if job.get("status") in {"completed", "cancelled", "failed"}:
                 terminal = job
                 break
@@ -2690,17 +2705,29 @@ class HttpReliabilityProbe:
         target_cancelled = False
         try:
             admission_deadline = self.monotonic() + case.request_timeout_seconds
+
+            def require_admission_window_open() -> None:
+                if self.monotonic() >= admission_deadline:
+                    raise RuntimeError("queued-cancel admission window expired")
+
+            def require_settlement_window_open(settlement_deadline: float) -> None:
+                if self.monotonic() >= settlement_deadline:
+                    raise RuntimeError("queued-cancel settlement window expired")
+
             while self.monotonic() <= admission_deadline:
                 blocker = self._json(
                     "GET",
                     f"{tts_more_url}/api/jobs/{blocker_job_id}",
                     timeout=10.0,
                 )
+                require_admission_window_open()
                 blocker_item = _single_job_item(blocker)
                 external_id = blocker_item.get("external_job_id")
                 if external_id:
                     blocker_prompt_id = _required_opaque_id(external_id, "prompt")
-                    if _comfy_prompt_state(self._comfy_queue(fixture), blocker_prompt_id) in {
+                    blocker_queue = self._comfy_queue(fixture)
+                    require_admission_window_open()
+                    if _comfy_prompt_state(blocker_queue, blocker_prompt_id) in {
                         "pending",
                         "running",
                     }:
@@ -2720,6 +2747,7 @@ class HttpReliabilityProbe:
             )
             target_job_id = _required_opaque_id(target_created.get("job_id"), "job")
             self._remember_unique(self._seen_job_ids, target_job_id, "job")
+            require_admission_window_open()
             queued_target: dict[str, Any] | None = None
             while self.monotonic() <= admission_deadline:
                 target = self._json(
@@ -2727,6 +2755,7 @@ class HttpReliabilityProbe:
                     f"{tts_more_url}/api/jobs/{target_job_id}",
                     timeout=10.0,
                 )
+                require_admission_window_open()
                 target_item = _single_job_item(target)
                 if target.get("status") == "running" and _queued_item_is_pristine(target_item):
                     queued_target = target
@@ -2737,16 +2766,19 @@ class HttpReliabilityProbe:
             if queued_target is None:
                 raise RuntimeError("queued-cancel target did not reach held admission")
 
+            require_admission_window_open()
             settlement_deadline = self.monotonic() + case.convergence_seconds
             cancelled = self._cancel_job(tts_more_url, target_job_id)
             _require_pristine_queued_cancellation(cancelled)
             target_cancelled = True
+            require_settlement_window_open(settlement_deadline)
             cancelled_updated_at = cancelled.get("updated_at")
             if not isinstance(cancelled_updated_at, str) or not cancelled_updated_at:
                 raise RuntimeError("queued-cancel response omitted update time")
 
             self._cancel_job(tts_more_url, blocker_job_id)
             blocker_cancelled = True
+            require_settlement_window_open(settlement_deadline)
             settled_target: dict[str, Any] | None = None
             while self.monotonic() <= settlement_deadline:
                 target = self._json(
@@ -2754,12 +2786,16 @@ class HttpReliabilityProbe:
                     f"{tts_more_url}/api/jobs/{target_job_id}",
                     timeout=10.0,
                 )
+                require_settlement_window_open(settlement_deadline)
                 blocker = self._json(
                     "GET",
                     f"{tts_more_url}/api/jobs/{blocker_job_id}",
                     timeout=10.0,
                 )
-                queue_ids = _comfy_prompt_ids(self._comfy_queue(fixture))
+                require_settlement_window_open(settlement_deadline)
+                settled_queue = self._comfy_queue(fixture)
+                require_settlement_window_open(settlement_deadline)
+                queue_ids = _comfy_prompt_ids(settled_queue)
                 if (
                     target.get("updated_at") != cancelled_updated_at
                     and blocker.get("status") in {"cancelled", "failed", "completed"}
