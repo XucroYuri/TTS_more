@@ -22,7 +22,7 @@ from urllib.parse import unquote, urlsplit
 import httpx
 import soundfile
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, TypeAdapter, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, TypeAdapter, ValidationError, field_validator, model_validator
 
 
 Engine = Literal["gpt-sovits", "indextts", "cosyvoice"]
@@ -1063,14 +1063,27 @@ class LegacyFailedCaseEvidence(_FailedCaseEvidenceCore):
     """Exact versionless schema retained only for historical failed artifacts."""
 
 
+def _exact_current_failed_case_schema_version(value: Any) -> int:
+    if type(value) is not int or value != 2:
+        raise ValueError("current failed case schema version must be the exact integer 2")
+    return value
+
+
+CurrentFailedCaseSchemaVersion = Annotated[
+    Literal[2],
+    BeforeValidator(_exact_current_failed_case_schema_version),
+]
+
+
 class CurrentFailedCaseEvidence(_FailedCaseEvidenceCore):
-    schema_version: Literal[2]
+    schema_version: CurrentFailedCaseSchemaVersion
     observation: FailedCaseObservation
 
 
 FailedCaseDocument = LegacyFailedCaseEvidence | CurrentFailedCaseEvidence
 _FAILED_CASE_JSON_ADAPTER = TypeAdapter(Any)
 _FAILED_CASE_SCHEMA_ADAPTER = TypeAdapter(FailedCaseDocument)
+_CURRENT_FAILED_CASE_SCHEMA_VERSION_ADAPTER = TypeAdapter(CurrentFailedCaseSchemaVersion)
 
 
 class FailedCaseEvidence:
@@ -1083,6 +1096,7 @@ class FailedCaseEvidence:
         if isinstance(value, LegacyFailedCaseEvidence):
             return LegacyFailedCaseEvidence.model_validate(value)
         if isinstance(value, dict) and "schema_version" in value:
+            _CURRENT_FAILED_CASE_SCHEMA_VERSION_ADAPTER.validate_python(value["schema_version"])
             return CurrentFailedCaseEvidence.model_validate(value)
         return LegacyFailedCaseEvidence.model_validate(value)
 

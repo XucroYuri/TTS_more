@@ -12,6 +12,7 @@ import time
 import warnings
 import wave
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -9229,6 +9230,64 @@ def _fix8_current_failed_case_document() -> dict[str, object]:
     return document
 
 
+class _Fix8SchemaVersionAlias(int):
+    pass
+
+
+@pytest.mark.parametrize(
+    "invalid_version",
+    [
+        pytest.param(2.0, id="integral-float"),
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param("2", id="string"),
+        pytest.param(Decimal("2"), id="decimal"),
+        pytest.param(_Fix8SchemaVersionAlias(2), id="custom-int"),
+    ],
+)
+def test_fix8_round2_current_schema_version_dict_requires_exact_builtin_integer(
+    invalid_version: object,
+) -> None:
+    document = _fix8_current_failed_case_document()
+    document["schema_version"] = invalid_version
+
+    with pytest.raises(ValidationError):
+        reliability_validation.CurrentFailedCaseEvidence.model_validate(document)
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    "invalid_json_version",
+    [
+        pytest.param(2.0, id="integral-float"),
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param("2", id="string"),
+    ],
+)
+def test_fix8_round2_current_schema_version_json_requires_integer_token(
+    invalid_json_version: object,
+) -> None:
+    document = _fix8_current_failed_case_document()
+    document["schema_version"] = invalid_json_version
+
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate_json(json.dumps(document))
+
+
+def test_fix8_round2_current_schema_version_accepts_exact_integer_in_both_public_readers() -> None:
+    document = _fix8_current_failed_case_document()
+
+    from_dict = reliability_validation.FailedCaseEvidence.model_validate(document)
+    from_json = reliability_validation.FailedCaseEvidence.model_validate_json(json.dumps(document))
+
+    assert type(from_dict.schema_version) is int
+    assert from_dict.schema_version == 2
+    assert type(from_json.schema_version) is int
+    assert from_json.schema_version == 2
+
+
 def test_fix8_exact_matrix_attempt1_failed_case_round_trips_through_public_reader() -> None:
     artifact = _fix8_attempt1_failed_case_path().read_text(encoding="utf-8")
     original = json.loads(artifact)
@@ -9749,6 +9808,8 @@ def test_fix8_round1_generated_json_schema_publishes_all_audited_bounds() -> Non
     assert gpu["properties"]["used_mib"]["maximum"] == 9_223_372_036_854_775_807
     assert gpu["properties"]["free_mib"]["maximum"] == 9_223_372_036_854_775_807
     assert current["properties"]["case_id"]["maxLength"] == 128
+    assert current["properties"]["schema_version"]["const"] == 2
+    assert current["properties"]["schema_version"]["type"] == "integer"
     assert current["maxProperties"] == len(current["properties"])
     assert legacy["maxProperties"] == len(legacy["properties"])
     for model_schema in (
