@@ -55,6 +55,7 @@ MAX_FAILED_CASE_QUEUE_COUNT = 10_000
 MAX_FAILED_CASE_AUDIO_BYTES = 4_294_967_295
 MAX_FAILED_CASE_ID_LENGTH = 128
 MAX_FAILURE_CODE_LENGTH = 64
+MAX_FAILED_CASE_JSON_BYTES = 4_194_304
 _BRIDGE_ENGINE_IDS: dict[str, Engine] = {
     "gpt_sovits": "gpt-sovits",
     "index_tts": "indextts",
@@ -1081,9 +1082,135 @@ class CurrentFailedCaseEvidence(_FailedCaseEvidenceCore):
 
 
 FailedCaseDocument = LegacyFailedCaseEvidence | CurrentFailedCaseEvidence
-_FAILED_CASE_JSON_ADAPTER = TypeAdapter(Any)
 _FAILED_CASE_SCHEMA_ADAPTER = TypeAdapter(FailedCaseDocument)
-_CURRENT_FAILED_CASE_SCHEMA_VERSION_ADAPTER = TypeAdapter(CurrentFailedCaseSchemaVersion)
+_FAILED_CASE_ERROR_LOC_FIELDS = frozenset(
+    field_name
+    for model in (
+        CleanupEvidence,
+        FailureMarker,
+        FailedCaseGpuObservation,
+        FailedCaseProcessObservation,
+        FailedCaseHostObservation,
+        FailedCaseQueueObservation,
+        FailedCaseControlObservation,
+        FailedCaseObservation,
+        LegacyFailedCaseEvidence,
+        CurrentFailedCaseEvidence,
+    )
+    for field_name in model.model_fields
+)
+
+
+def _safe_failed_case_error_loc(loc: tuple[Any, ...]) -> tuple[str | int, ...]:
+    return tuple(
+        segment
+        if (
+            isinstance(segment, str)
+            and segment in _FAILED_CASE_ERROR_LOC_FIELDS
+        )
+        or (
+            type(segment) is int
+            and 0 <= segment <= MAX_FAILED_CASE_PROCESSES
+        )
+        else "<redacted>"
+        for segment in loc
+    )
+
+
+def _safe_failed_case_error_context(context: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key, value in context.items():
+        if key == "error":
+            safe[key] = "invalid failed case evidence"
+        elif value is None or type(value) in {bool, int, float}:
+            safe[key] = value
+        elif isinstance(value, str) and len(value) <= 256:
+            try:
+                _assert_public_string(value)
+            except ValueError:
+                safe[key] = "<redacted>"
+            else:
+                safe[key] = value
+        else:
+            safe[key] = "<redacted>"
+    return safe
+
+
+def _failed_case_reader_error(
+    error_type: str,
+    *,
+    loc: tuple[Any, ...] = (),
+    context: dict[str, Any] | None = None,
+) -> ValidationError:
+    detail: dict[str, Any] = {
+        "type": error_type,
+        "loc": _safe_failed_case_error_loc(loc),
+        "input": None,
+    }
+    if context:
+        detail["ctx"] = _safe_failed_case_error_context(context)
+    return ValidationError.from_exception_data(
+        "FailedCaseEvidence",
+        [detail],
+        hide_input=True,
+    )
+
+
+def _redact_failed_case_validation_error(error: ValidationError) -> ValidationError:
+    details: list[dict[str, Any]] = []
+    for original in error.errors(include_url=False, include_input=False):
+        detail: dict[str, Any] = {
+            "type": original["type"],
+            "loc": _safe_failed_case_error_loc(tuple(original["loc"])),
+            "input": None,
+        }
+        context = original.get("ctx")
+        if isinstance(context, dict) and context:
+            detail["ctx"] = _safe_failed_case_error_context(context)
+        details.append(detail)
+    return ValidationError.from_exception_data(
+        "FailedCaseEvidence",
+        details,
+        hide_input=True,
+    )
+
+
+def _parse_failed_case_json(value: str | bytes | bytearray) -> Any:
+    if isinstance(value, str):
+        if len(value) > MAX_FAILED_CASE_JSON_BYTES:
+            raise _failed_case_reader_error(
+                "json_invalid",
+                context={"error": "input exceeds the failed-case JSON byte limit"},
+            )
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise _failed_case_reader_error(
+                "json_invalid",
+                context={"error": "input is not valid UTF-8"},
+            ) from None
+    elif isinstance(value, (bytes, bytearray)):
+        if len(value) > MAX_FAILED_CASE_JSON_BYTES:
+            raise _failed_case_reader_error(
+                "json_invalid",
+                context={"error": "input exceeds the failed-case JSON byte limit"},
+            )
+        encoded = bytes(value)
+    else:
+        raise _failed_case_reader_error("json_type")
+    if len(encoded) > MAX_FAILED_CASE_JSON_BYTES:
+        raise _failed_case_reader_error(
+            "json_invalid",
+            context={"error": "input exceeds the failed-case JSON byte limit"},
+        )
+    try:
+        document = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        raise _failed_case_reader_error(
+            "json_invalid",
+            context={"error": "invalid failed-case JSON"},
+        ) from None
+    return document
 
 
 class FailedCaseEvidence:
@@ -1091,18 +1218,36 @@ class FailedCaseEvidence:
 
     @classmethod
     def model_validate(cls, value: Any) -> FailedCaseDocument:
-        if isinstance(value, CurrentFailedCaseEvidence):
-            return CurrentFailedCaseEvidence.model_validate(value)
-        if isinstance(value, LegacyFailedCaseEvidence):
+        try:
+            if isinstance(value, CurrentFailedCaseEvidence):
+                return CurrentFailedCaseEvidence.model_validate(value)
+            if isinstance(value, LegacyFailedCaseEvidence):
+                return LegacyFailedCaseEvidence.model_validate(value)
+            if not isinstance(value, dict):
+                raise _failed_case_reader_error(
+                    "model_type",
+                    context={"class_name": "FailedCaseEvidence"},
+                )
+            if "schema_version" in value:
+                schema_version = value["schema_version"]
+                if type(schema_version) is not int or schema_version != 2:
+                    raise _failed_case_reader_error(
+                        "literal_error",
+                        loc=("schema_version",),
+                        context={"expected": "2"},
+                    )
+                return CurrentFailedCaseEvidence.model_validate(value)
             return LegacyFailedCaseEvidence.model_validate(value)
-        if isinstance(value, dict) and "schema_version" in value:
-            _CURRENT_FAILED_CASE_SCHEMA_VERSION_ADAPTER.validate_python(value["schema_version"])
-            return CurrentFailedCaseEvidence.model_validate(value)
-        return LegacyFailedCaseEvidence.model_validate(value)
+        except ValidationError as error:
+            if error.title == "FailedCaseEvidence" and all(
+                detail.get("input") is None for detail in error.errors()
+            ):
+                raise
+            raise _redact_failed_case_validation_error(error) from None
 
     @classmethod
     def model_validate_json(cls, value: str | bytes | bytearray) -> FailedCaseDocument:
-        document = _FAILED_CASE_JSON_ADAPTER.validate_json(value)
+        document = _parse_failed_case_json(value)
         return cls.model_validate(document)
 
     @classmethod

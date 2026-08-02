@@ -9288,6 +9288,168 @@ def test_fix8_round2_current_schema_version_accepts_exact_integer_in_both_public
     assert from_json.schema_version == 2
 
 
+def _fix8_validation_error_renderings(error: ValidationError) -> tuple[str, ...]:
+    return (
+        str(error),
+        repr(error),
+        error.json(),
+        json.dumps(error.errors(), ensure_ascii=False, default=repr),
+    )
+
+
+def _fix8_assert_redacted_typed_error(
+    error: ValidationError,
+    *,
+    secret_marker: str,
+    expected_loc: tuple[object, ...] | None = None,
+) -> None:
+    for rendered in _fix8_validation_error_renderings(error):
+        assert secret_marker not in rendered
+    details = error.errors()
+    assert details
+    assert all(isinstance(detail["loc"], tuple) for detail in details)
+    assert all(isinstance(detail["type"], str) and detail["type"] for detail in details)
+    assert all(detail.get("input") is None for detail in details)
+    if expected_loc is not None:
+        assert any(detail["loc"] == expected_loc for detail in details)
+
+
+@pytest.mark.parametrize("reader_kind", ["dict", "json"])
+@pytest.mark.parametrize(
+    ("mutation_path", "private_value", "secret_marker", "expected_loc"),
+    [
+        pytest.param(
+            ("schema_version",),
+            "token=LEAKME",
+            "LEAKME",
+            ("schema_version",),
+            id="private-version-token",
+        ),
+        pytest.param(
+            ("host", "processes", 0, "executable_name"),
+            "F:\\private\\PATHLEAK\\python.exe",
+            "PATHLEAK",
+            None,
+            id="nested-private-path",
+        ),
+        pytest.param(
+            ("observation", "last_job_status"),
+            "Authorization: Bearer HEADERLEAK",
+            "HEADERLEAK",
+            None,
+            id="nested-private-header",
+        ),
+        pytest.param(
+            ("observation", "job_id_sha256"),
+            "job-private-PRIVATEIDLEAK",
+            "PRIVATEIDLEAK",
+            ("observation", "job_id_sha256"),
+            id="nested-private-id",
+        ),
+        pytest.param(
+            ("case_id",),
+            "OVERSIZELEAK" * 20_000,
+            "OVERSIZELEAK",
+            ("case_id",),
+            id="oversized-value",
+        ),
+    ],
+)
+def test_fix8_round3_formal_readers_never_echo_invalid_private_values(
+    reader_kind: str,
+    mutation_path: tuple[object, ...],
+    private_value: object,
+    secret_marker: str,
+    expected_loc: tuple[object, ...] | None,
+) -> None:
+    document = _fix8_current_failed_case_document()
+    target: object = document
+    for key in mutation_path[:-1]:
+        target = target[key]  # type: ignore[index]
+    target[mutation_path[-1]] = private_value  # type: ignore[index]
+
+    with pytest.raises(ValidationError) as exc_info:
+        if reader_kind == "dict":
+            reliability_validation.FailedCaseEvidence.model_validate(document)
+        else:
+            reliability_validation.FailedCaseEvidence.model_validate_json(
+                json.dumps(document)
+            )
+
+    _fix8_assert_redacted_typed_error(
+        exc_info.value,
+        secret_marker=secret_marker,
+        expected_loc=expected_loc,
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_document", "secret_marker", "expected_type", "expected_loc"),
+    [
+        pytest.param(
+            '{"schema_version":"token=MALFORMEDLEAK"',
+            "MALFORMEDLEAK",
+            "json_invalid",
+            (),
+            id="malformed-json",
+        ),
+        pytest.param(
+            json.dumps(["NONDICTLEAK"]),
+            "NONDICTLEAK",
+            "model_type",
+            (),
+            id="non-object-json",
+        ),
+    ],
+)
+def test_fix8_round3_formal_json_reader_redacts_parse_and_root_shape_failures(
+    raw_document: str,
+    secret_marker: str,
+    expected_type: str,
+    expected_loc: tuple[object, ...],
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        reliability_validation.FailedCaseEvidence.model_validate_json(raw_document)
+
+    _fix8_assert_redacted_typed_error(
+        exc_info.value,
+        secret_marker=secret_marker,
+        expected_loc=expected_loc,
+    )
+    assert exc_info.value.errors()[0]["type"] == expected_type
+
+
+def test_fix8_round3_formal_reader_reports_unknown_version_without_raw_input() -> None:
+    document = _fix8_current_failed_case_document()
+    document["schema_version"] = 3
+
+    for invalid_input in (document, json.dumps(document)):
+        with pytest.raises(ValidationError) as exc_info:
+            if isinstance(invalid_input, str):
+                reliability_validation.FailedCaseEvidence.model_validate_json(invalid_input)
+            else:
+                reliability_validation.FailedCaseEvidence.model_validate(invalid_input)
+        details = exc_info.value.errors()
+        assert details[0]["loc"] == ("schema_version",)
+        assert details[0]["type"] == "literal_error"
+        assert details[0].get("input") is None
+
+
+def test_fix8_round3_formal_json_reader_rejects_oversized_input_before_parsing() -> None:
+    raw_document = '{"schema_version":2,"oversized":"' + ("OVERSIZEJSONLEAK" * 270_000) + '"}'
+    assert len(raw_document.encode("utf-8")) > 4_194_304
+
+    with pytest.raises(ValidationError) as exc_info:
+        reliability_validation.FailedCaseEvidence.model_validate_json(raw_document)
+
+    _fix8_assert_redacted_typed_error(
+        exc_info.value,
+        secret_marker="OVERSIZEJSONLEAK",
+        expected_loc=(),
+    )
+    assert exc_info.value.errors()[0]["type"] == "json_invalid"
+
+
 def test_fix8_exact_matrix_attempt1_failed_case_round_trips_through_public_reader() -> None:
     artifact = _fix8_attempt1_failed_case_path().read_text(encoding="utf-8")
     original = json.loads(artifact)
