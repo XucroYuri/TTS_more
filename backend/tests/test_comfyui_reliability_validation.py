@@ -11090,6 +11090,7 @@ def test_fix11_single_delete_failure_reconciles_to_current_failure_with_safe_his
     fixture_path = tmp_path / "fixture.json"
     fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
     original_unlink = Path.unlink
+    original_replace = os.replace
     injected = False
 
     def fail_summary_unlink(path: Path, *args: object, **kwargs: object) -> None:
@@ -11099,7 +11100,15 @@ def test_fix11_single_delete_failure_reconciles_to_current_failure_with_safe_his
             raise OSError("single injected delete failure")
         original_unlink(path, *args, **kwargs)
 
+    def fail_summary_move(source: object, destination: object) -> None:
+        nonlocal injected
+        if Path(source) == output_root / "reliability-summary.json" and not injected:
+            injected = True
+            raise OSError("single injected retirement failure")
+        original_replace(source, destination)
+
     monkeypatch.setattr(Path, "unlink", fail_summary_unlink)
+    monkeypatch.setattr(os, "replace", fail_summary_move)
 
     assert _fix11_run_preflight(output_root, fixture_path) == 1
 
@@ -11124,6 +11133,186 @@ def test_fix11_single_delete_failure_reconciles_to_current_failure_with_safe_his
     assert archive["cases"][0]["artifact_sha256"] == hashlib.sha256(
         case_bytes
     ).hexdigest()
+
+
+def test_fix12_partial_retirement_failure_keeps_exact_raw_cohort_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "partial-retirement"
+    _, summary_bytes, case_bytes = _fix11_seed_failed_cohort(
+        output_root,
+        _fix9_current_failed_document(),
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    case_path = output_root / "cases" / "steady-01-gpt-sovits.json"
+    original_unlink = Path.unlink
+    original_replace = os.replace
+    injected = False
+
+    def fail_case_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal injected
+        if Path(path) == case_path and not injected:
+            injected = True
+            raise OSError("injected failure after summary retirement")
+        original_unlink(path, *args, **kwargs)
+
+    def fail_cases_move(source: object, destination: object) -> None:
+        nonlocal injected
+        if Path(source) == output_root / "cases" and not injected:
+            injected = True
+            raise OSError("injected failure after summary retirement")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(Path, "unlink", fail_case_unlink)
+    monkeypatch.setattr(os, "replace", fail_cases_move)
+
+    assert _fix11_run_preflight(output_root, fixture_path) == 1
+
+    assert injected is True
+    assert not (output_root / "preflight.json").exists()
+    quarantine_root = (
+        output_root / "reliability-temp-test" / "terminal-cohort-quarantine"
+    )
+    recoverable_summaries = [
+        path
+        for path in [
+            output_root / "reliability-summary.json",
+            *quarantine_root.glob("*/reliability-summary.json"),
+        ]
+        if path.is_file() and path.read_bytes() == summary_bytes
+    ]
+    recoverable_cases = [
+        path
+        for path in [
+            case_path,
+            *quarantine_root.glob("*/cases/steady-01-gpt-sovits.json"),
+        ]
+        if path.is_file() and path.read_bytes() == case_bytes
+    ]
+    assert recoverable_summaries
+    assert recoverable_cases
+
+
+def test_fix12_same_size_mtime_replacement_survives_prepare_to_mutate_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "prepare-to-mutate-race"
+    _, summary_bytes, _ = _fix11_seed_failed_cohort(
+        output_root,
+        _fix9_current_failed_document(),
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    summary_path = output_root / "reliability-summary.json"
+    replacement_bytes = summary_bytes.replace(
+        b'"status":"failed"',
+        b'"status":"passed"',
+        1,
+    )
+    assert len(replacement_bytes) == len(summary_bytes)
+    assert replacement_bytes != summary_bytes
+    original_write = reliability_validation.write_atomic_json
+    injected = False
+
+    def replace_after_archive(path: Path, payload: object, **kwargs: object) -> None:
+        nonlocal injected
+        original_write(path, payload, **kwargs)
+        if Path(path).parent.name != "terminal-cohorts" or injected:
+            return
+        injected = True
+        original_stat = summary_path.stat()
+        replacement_path = summary_path.with_name("replacement-summary.json")
+        replacement_path.write_bytes(replacement_bytes)
+        os.utime(
+            replacement_path,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+        os.replace(replacement_path, summary_path)
+        os.utime(
+            summary_path,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+
+    monkeypatch.setattr(reliability_validation, "write_atomic_json", replace_after_archive)
+
+    assert _fix11_run_preflight(output_root, fixture_path) == 1
+
+    assert injected is True
+    assert not (output_root / "preflight.json").exists()
+    assert summary_path.read_bytes() == replacement_bytes
+
+
+def test_fix12_terminal_cohort_archive_root_reparse_escape_is_rejected(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "reparse-escape"
+    _, summary_bytes, case_bytes = _fix11_seed_failed_cohort(
+        output_root,
+        _fix9_current_failed_document(),
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    outside_root = tmp_path / "outside-history"
+    outside_root.mkdir()
+    archive_root = output_root / "history" / "terminal-cohorts"
+    archive_root.parent.mkdir()
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(archive_root), str(outside_root)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert created.returncode == 0, created.stderr
+        assert archive_root.lstat().st_file_attributes & 0x400
+    else:
+        archive_root.symlink_to(outside_root, target_is_directory=True)
+
+    assert _fix11_run_preflight(output_root, fixture_path) == 1
+
+    assert not (output_root / "preflight.json").exists()
+    assert (output_root / "reliability-summary.json").read_bytes() == summary_bytes
+    assert (
+        output_root / "cases" / "steady-01-gpt-sovits.json"
+    ).read_bytes() == case_bytes
+    assert list(outside_root.iterdir()) == []
+
+
+def test_fix12_final_root_guard_removes_passed_if_summary_is_recreated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "final-root-race"
+    _, summary_bytes, _ = _fix11_seed_failed_cohort(
+        output_root,
+        _fix9_current_failed_document(),
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    original_write = reliability_validation.write_atomic_json
+    injected = False
+
+    def recreate_summary_after_passed(path: Path, payload: object, **kwargs: object) -> None:
+        nonlocal injected
+        original_write(path, payload, **kwargs)
+        if Path(path).name == "preflight.json" and not injected:
+            injected = True
+            (output_root / "reliability-summary.json").write_bytes(summary_bytes)
+
+    monkeypatch.setattr(
+        reliability_validation,
+        "write_atomic_json",
+        recreate_summary_after_passed,
+    )
+
+    assert _fix11_run_preflight(output_root, fixture_path) == 1
+
+    assert injected is True
+    assert not (output_root / "preflight.json").exists()
+    assert (output_root / "reliability-summary.json").read_bytes() == summary_bytes
 
 
 def test_fix11_exact_cohort_archive_is_idempotent_and_conflicts_fail_closed(
