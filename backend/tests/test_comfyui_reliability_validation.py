@@ -3885,6 +3885,113 @@ def test_fix5_preflight_history_requires_exact_public_schema(
         assert private_value not in archives[0].read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    ("mutation_path", "mutation_value", "expected_status"),
+    [
+        pytest.param(None, None, "validated", id="legal-true-and-integer-zero"),
+        pytest.param(("resources", 0, "ready"), 1, "invalid", id="ready-integer-one"),
+        pytest.param(("resources", 0, "ready"), 1.0, "invalid", id="ready-float-one"),
+        pytest.param(("resources", 0, "ready"), "true", "invalid", id="ready-string-true"),
+        pytest.param(("queue", "tts_queued"), False, "invalid", id="queued-bool-false"),
+        pytest.param(("queue", "tts_queued"), True, "invalid", id="queued-bool-true"),
+        pytest.param(("queue", "tts_running"), False, "invalid", id="running-bool-false"),
+        pytest.param(("queue", "tts_running"), 0.0, "invalid", id="running-float-zero"),
+        pytest.param(("queue", "tts_running"), "0", "invalid", id="running-string-zero"),
+    ],
+)
+def test_fix5b_preflight_history_requires_strict_boolean_and_integer_types(
+    tmp_path: Path,
+    mutation_path: tuple[str | int, ...] | None,
+    mutation_value: object,
+    expected_status: str,
+) -> None:
+    output_root = tmp_path / "r"
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    seed_http = _ExecutorHttpProbe()
+    seed_host = _ExecutorHostProbe()
+
+    seed_result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            seed_http,
+            seed_host,
+            seed_host.owned_processes,
+        ),
+    )
+    assert seed_result == 0
+    legal_preflight = json.loads(
+        (output_root / "preflight.json").read_text(encoding="utf-8")
+    )
+    assert all(item["ready"] is True for item in legal_preflight["resources"])
+    assert type(legal_preflight["queue"]["tts_queued"]) is int
+    assert type(legal_preflight["queue"]["tts_running"]) is int
+
+    stale_preflight = json.loads(json.dumps(legal_preflight))
+    if mutation_path is not None:
+        target: object = stale_preflight
+        for key in mutation_path[:-1]:
+            target = target[key]  # type: ignore[index]
+        target[mutation_path[-1]] = mutation_value  # type: ignore[index]
+    marker_bytes = json.dumps(stale_preflight).encode("utf-8")
+    (output_root / "preflight.json").write_bytes(marker_bytes)
+
+    failure_host = _ExecutorHostProbe()
+
+    class TypedFailureProbe(_ExecutorHttpProbe):
+        def preflight(
+            self,
+            fixture: ReliabilityFixture,
+        ) -> reliability_validation.HttpPreflightObservation:
+            del fixture
+            raise reliability_validation.LiveValidationError(
+                "registered-service-binding",
+                stage="preflight",
+            )
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            TypedFailureProbe(),
+            failure_host,
+            failure_host.owned_processes,
+        ),
+    )
+
+    assert result == 1
+    assert not (output_root / "preflight.json").exists()
+    archives = list((output_root / "history" / "terminal-markers").glob("preflight-*.json"))
+    assert len(archives) == 1
+    archived = json.loads(archives[0].read_text(encoding="utf-8"))
+    assert archived["kind"] == "preflight"
+    assert archived["sha256"] == hashlib.sha256(marker_bytes).hexdigest()
+    assert archived["document_status"] == expected_status
+    if expected_status == "validated":
+        assert archived["document"] == legal_preflight
+    else:
+        assert set(archived) == {"kind", "sha256", "document_status"}
+
+
 def test_fix5_failure_history_rejects_extra_private_fields(tmp_path: Path) -> None:
     output_root = tmp_path / "r"
     output_root.mkdir()

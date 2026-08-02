@@ -524,13 +524,20 @@ class FailureMarker(_StrictModel):
 
 class _PublicPreflightResource(_StrictModel):
     engine: Engine
-    ready: Literal[True]
+    ready: StrictBool
     resource_id_hash: SHA256
+
+    @field_validator("ready")
+    @classmethod
+    def _ready_true(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("public preflight resource must be ready")
+        return value
 
 
 class _PublicPreflightQueue(_StrictModel):
-    tts_queued: Literal[0]
-    tts_running: Literal[0]
+    tts_queued: StrictInt = Field(ge=0, le=0)
+    tts_running: StrictInt = Field(ge=0, le=0)
     comfy_pending_prompt_ids: Annotated[list[str], Field(max_length=0)]
     comfy_running_prompt_ids: Annotated[list[str], Field(max_length=0)]
 
