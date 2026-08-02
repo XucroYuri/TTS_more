@@ -107,6 +107,12 @@ function Get-UtcTicks {
     ).UtcDateTime.Ticks
 }
 
+function Get-MonotonicTimestamp {
+    $frequency = [double] [Diagnostics.Stopwatch]::Frequency
+    if ($frequency -le 0) { throw 'Monotonic clock frequency is invalid' }
+    return ([double] [Diagnostics.Stopwatch]::GetTimestamp()) / $frequency
+}
+
 function Wait-ProcessRecord {
     param([int] $ProcessId, [int] $TimeoutSeconds = 10)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -1041,7 +1047,7 @@ function Stop-RecordedTree {
     foreach ($candidatePid in $forest.Keys) {
         $remaining[[int] $candidatePid] = $forest[[int] $candidatePid]
     }
-    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    $deadline = (Get-MonotonicTimestamp) + ([double] $TimeoutMilliseconds / 1000.0)
     do {
         foreach ($candidatePid in @($remaining.Keys)) {
             $candidate = $remaining[[int] $candidatePid]
@@ -1163,7 +1169,7 @@ function Stop-RecordedTree {
             }
         }
         if ($remaining.Count -eq 0) { return $true }
-        if ([DateTime]::UtcNow -ge $deadline) { break }
+        if ((Get-MonotonicTimestamp) -ge $deadline) { break }
         Start-Sleep -Milliseconds $PollIntervalMilliseconds
     } while ($true)
 

@@ -5629,6 +5629,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
 )
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
 foreach ($name in @(
+    'Get-MonotonicTimestamp',
     'Get-UtcTicks',
     'Get-ProcessRecord',
     'Test-RecordedIdentity',
@@ -7799,6 +7800,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
 )
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
 foreach ($name in @(
+    'Get-MonotonicTimestamp',
     'Get-UtcTicks',
     'Get-PortOwnerPid',
     'Get-ProcessRecord',
@@ -8256,6 +8258,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
 )
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
 foreach ($name in @(
+    'Get-MonotonicTimestamp',
     'Get-UtcTicks',
     'Get-ProcessRecord',
     'Test-RecordDocumentMatches',
@@ -8398,6 +8401,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
 )
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
 foreach ($name in @(
+    'Get-MonotonicTimestamp',
     'Get-UtcTicks',
     'Get-ProcessRecord',
     'Test-RecordDocumentMatches',
@@ -8532,6 +8536,67 @@ Write-Output 'RECORDED_TREE_SNAPSHOT_REUSE_OK'
     assert "RECORDED_TREE_SNAPSHOT_REUSE_OK" in completed.stdout
 
 
+def test_fix10_monotonic_timestamp_is_finite_nondecreasing_and_ps51_safe() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+$function = $ast.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-MonotonicTimestamp'
+}, $true)
+if ($null -eq $function) { throw 'Get-MonotonicTimestamp is missing' }
+Invoke-Expression $function.Extent.Text
+
+$frequency = [double] [Diagnostics.Stopwatch]::Frequency
+if ($frequency -le 0) { throw 'Stopwatch frequency is not positive' }
+$previous = [double] (Get-MonotonicTimestamp)
+if ([double]::IsNaN($previous) -or [double]::IsInfinity($previous) -or $previous -lt 0) {
+    throw 'Initial monotonic timestamp is invalid'
+}
+for ($index = 0; $index -lt 64; $index += 1) {
+    $current = [double] (Get-MonotonicTimestamp)
+    if ([double]::IsNaN($current) -or [double]::IsInfinity($current) -or $current -lt $previous) {
+        throw 'Monotonic timestamp regressed or became invalid'
+    }
+    $previous = $current
+}
+Start-Sleep -Milliseconds 1
+$afterSleep = [double] (Get-MonotonicTimestamp)
+if ([double]::IsNaN($afterSleep) -or [double]::IsInfinity($afterSleep) -or $afterSleep -lt $previous) {
+    throw 'Monotonic timestamp regressed after sleep'
+}
+Write-Output 'MONOTONIC_TIMESTAMP_OK'
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "TTS_MORE_RELIABILITY_SCRIPT": str(script_path)},
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "MONOTONIC_TIMESTAMP_OK" in completed.stdout
+
+
 def test_fix6_recorded_forest_observes_post_stop_identity_transitions_safely() -> None:
     powershell = shutil.which("powershell.exe")
     if powershell is None:
@@ -8551,6 +8616,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
 )
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
 foreach ($name in @(
+    'Get-MonotonicTimestamp',
     'Get-UtcTicks',
     'Get-ProcessRecord',
     'Test-RecordDocumentMatches',
@@ -8607,6 +8673,12 @@ $script:postStop = $false
 $script:observations = @{}
 $script:stopped = [System.Collections.Generic.List[int]]::new()
 $script:warnings = [System.Collections.Generic.List[string]]::new()
+$script:clockMilliseconds = 0
+$script:sleepCount = 0
+
+function Get-MonotonicTimestamp {
+    return [double] $script:clockMilliseconds / 1000.0
+}
 
 function Get-ObservationCount {
     param([int] $ProcessId)
@@ -8641,6 +8713,9 @@ function Get-CimInstance {
     if ($candidatePid -eq 100) { return $null }
     if ($candidatePid -ne 200) { return $null }
     $observation = Get-ObservationCount -ProcessId 200
+    if ($script:mode -eq 'deadline-after-first-observation' -and $observation -eq 1) {
+        $script:clockMilliseconds = 25
+    }
     switch ($script:mode) {
         'incomplete-then-absent' {
             if ($observation -eq 1) {
@@ -8698,6 +8773,15 @@ function Get-CimInstance {
         }
         'persistent-query-error' { throw 'private persistent CIM detail' }
         'persistent-exact' { return $script:listener }
+        'deadline-after-first-observation' {
+            return [pscustomobject]@{
+                ProcessId = 200
+                ParentProcessId = 100
+                CreationDate = $script:listener.CreationDate
+                ExecutablePath = $null
+                CommandLine = $null
+            }
+        }
         default { throw 'unknown test mode' }
     }
 }
@@ -8706,7 +8790,11 @@ function Stop-Process {
     $script:stopped.Add($Id)
     if ($Id -eq 100) { $script:postStop = $true }
 }
-function Start-Sleep { param([int] $Milliseconds) }
+function Start-Sleep {
+    param([int] $Milliseconds)
+    $script:sleepCount += 1
+    $script:clockMilliseconds += $Milliseconds
+}
 function Write-Warning {
     param([string] $Message)
     $script:warnings.Add($Message)
@@ -8718,6 +8806,8 @@ function Reset-Case {
     $script:observations = @{}
     $script:stopped.Clear()
     $script:warnings.Clear()
+    $script:clockMilliseconds = 0
+    $script:sleepCount = 0
 }
 function Invoke-CleanupCase {
     return Stop-RecordedProcessPair `
@@ -8829,9 +8919,30 @@ foreach ($mode in @(
     if ($diagnostic -match 'controlled' -or $diagnostic -match 'private injected') {
         $failures.Add("$mode diagnostic exposed private identity fields")
     }
-    if ($mode -like 'persistent-*' -and [int] $script:observations[200] -lt 2) {
-        $failures.Add("$mode was not retried to a bounded deadline")
+    if ($mode -like 'persistent-*' -and [int] $script:observations[200] -ne 26) {
+        $failures.Add("$mode did not perform the deterministic bounded observation sequence")
     }
+    if ($mode -like 'persistent-*' -and $script:sleepCount -ne 25) {
+        $failures.Add("$mode did not stop polling at the exact fake-clock deadline")
+    }
+}
+
+Reset-Case 'deadline-after-first-observation'
+if (Invoke-CleanupCase) {
+    $failures.Add('an identity still ambiguous at an exhausted deadline was cleanup-proven')
+}
+if ([int] $script:observations[200] -ne 1) {
+    $failures.Add('an exhausted deadline forced extra observations')
+}
+if ($script:sleepCount -ne 0) {
+    $failures.Add('an exhausted deadline slept after its first complete observation')
+}
+if ((@($script:stopped) -join ',') -ne '200,100') {
+    $failures.Add('an exhausted deadline sent a post-stop termination or duplicated a stop')
+}
+$deadlineDiagnostic = @($script:warnings) -join "`n"
+if ($deadlineDiagnostic -notmatch 'decision=timeout' -or $deadlineDiagnostic -notmatch 'state=identity-incomplete') {
+    $failures.Add('an exhausted deadline did not preserve the fail-closed partial-forest timeout')
 }
 
 if ($failures.Count -ne 0) { throw ($failures -join '; ') }
@@ -8871,6 +8982,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
 )
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
 foreach ($name in @(
+    'Get-MonotonicTimestamp',
     'Get-UtcTicks',
     'Get-ProcessRecord',
     'Test-RecordDocumentMatches',
@@ -10094,7 +10206,7 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
 )
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
 foreach ($name in @(
-    'Get-UtcTicks', 'Get-ProcessRecord', 'Test-RecordDocumentMatches',
+    'Get-MonotonicTimestamp', 'Get-UtcTicks', 'Get-ProcessRecord', 'Test-RecordDocumentMatches',
     'Test-RecordedIdentity', 'Test-ProcessAbsent', 'Stop-RecordedTree',
     'Stop-RecordedProcessPair', 'Test-PrivateIdentityRecordsCanBeRemoved',
     'Remove-PrivateIdentityRecordsIfSafe', 'Test-OwnedTempRootCanBeRemoved',
