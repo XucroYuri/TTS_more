@@ -3450,6 +3450,331 @@ def test_fix5_full_validator_secondary_failure_persistence_never_overrides_prima
     assert not list(output_root.glob(".failure.json.*"))
 
 
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_code"),
+    [
+        ("invalid-fixture", "preflight-observation-failed"),
+        ("typed", "registered-service-binding"),
+        ("raw", "preflight-observation-failed"),
+    ],
+)
+def test_fix5_reused_output_root_archives_stale_failure_and_publishes_current_primary(
+    tmp_path: Path,
+    failure_mode: str,
+    expected_code: str,
+) -> None:
+    output_root = tmp_path / "reused-root"
+    output_root.mkdir()
+    stale_failure = {"code": "stale-prior-failure", "stage": "case"}
+    (output_root / "failure.json").write_text(
+        json.dumps(stale_failure),
+        encoding="utf-8",
+    )
+    fixture_document = _fixture_document()
+    if failure_mode == "invalid-fixture":
+        fixture_document["rounds"] = 9
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture_document), encoding="utf-8")
+    host_probe = _ExecutorHostProbe()
+
+    class CurrentFailureProbe(_ExecutorHttpProbe):
+        def preflight(
+            self,
+            fixture: ReliabilityFixture,
+        ) -> reliability_validation.HttpPreflightObservation:
+            del fixture
+            if failure_mode == "typed":
+                raise reliability_validation.LiveValidationError(
+                    "registered-service-binding",
+                    stage="preflight",
+                )
+            if failure_mode == "raw":
+                raise httpx.ReadTimeout(
+                    f"token=current-private {tmp_path}",
+                )
+            raise AssertionError("invalid fixture reached the probe")
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            CurrentFailureProbe(),
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert result == 1
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+        "code": expected_code,
+        "stage": "preflight",
+    }
+    assert not (output_root / "preflight.json").exists()
+    archives = list((output_root / "history" / "terminal-markers").glob("failure-*.json"))
+    assert len(archives) == 1
+    archived = json.loads(archives[0].read_text(encoding="utf-8"))
+    assert archived["kind"] == "failure"
+    assert archived["document"] == stale_failure
+    assert len(archived["sha256"]) == 64
+
+
+def test_fix5_reused_output_root_archives_stale_failure_before_current_success(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "reused-success"
+    output_root.mkdir()
+    stale_failure = {"code": "stale-prior-failure", "stage": "case"}
+    (output_root / "failure.json").write_text(
+        json.dumps(stale_failure),
+        encoding="utf-8",
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            http_probe,
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert result == 0
+    assert json.loads((output_root / "preflight.json").read_text(encoding="utf-8"))[
+        "status"
+    ] == "passed"
+    assert not (output_root / "failure.json").exists()
+    archives = list((output_root / "history" / "terminal-markers").glob("failure-*.json"))
+    assert len(archives) == 1
+    assert json.loads(archives[0].read_text(encoding="utf-8"))["document"] == stale_failure
+
+
+def test_fix5_marker_archive_redacts_unsafe_prior_document(tmp_path: Path) -> None:
+    output_root = tmp_path / "unsafe-prior"
+    output_root.mkdir()
+    secret = "token=stale-private-value"
+    (output_root / "failure.json").write_text(
+        json.dumps(
+            {
+                "code": "stale-prior-failure",
+                "stage": "case",
+                "detail": secret,
+            }
+        ),
+        encoding="utf-8",
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    host_probe = _ExecutorHostProbe()
+
+    class TypedFailureProbe(_ExecutorHttpProbe):
+        def preflight(
+            self,
+            fixture: ReliabilityFixture,
+        ) -> reliability_validation.HttpPreflightObservation:
+            del fixture
+            raise reliability_validation.LiveValidationError(
+                "registered-service-binding",
+                stage="preflight",
+            )
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            TypedFailureProbe(),
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert result == 1
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+        "code": "registered-service-binding",
+        "stage": "preflight",
+    }
+    archives = list((output_root / "history" / "terminal-markers").glob("failure-*.json"))
+    assert len(archives) == 1
+    archived = json.loads(archives[0].read_text(encoding="utf-8"))
+    assert archived["document_status"] == "redacted"
+    assert "document" not in archived
+    assert secret not in archives[0].name
+    assert secret not in archives[0].read_text(encoding="utf-8")
+
+
+def test_fix5_success_fails_closed_when_prior_marker_cannot_be_archived(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "archive-write-failure"
+    output_root.mkdir()
+    stale_failure = {"code": "stale-prior-failure", "stage": "case"}
+    (output_root / "failure.json").write_text(
+        json.dumps(stale_failure),
+        encoding="utf-8",
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+    original_write = reliability_validation.write_atomic_json
+
+    def fail_archive_write(path: Path, payload: object, **kwargs: object) -> None:
+        if Path(path).parent.name == "terminal-markers":
+            raise OSError("token=secondary-archive-secret C:\\private\\marker")
+        original_write(path, payload, **kwargs)
+
+    monkeypatch.setattr(reliability_validation, "write_atomic_json", fail_archive_write)
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            http_probe,
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert result == 1
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == stale_failure
+    assert not (output_root / "preflight.json").exists()
+    assert not list((output_root / "history" / "terminal-markers").glob("*.json"))
+
+
+def test_fix5_archive_failure_never_overrides_current_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    http_probe = _ExecutorHttpProbe(preflight_mode="busy-queue")
+    host_probe = _ExecutorHostProbe()
+    output_root = tmp_path / "archive-primary"
+    output_root.mkdir()
+    stale_failure = {"code": "stale-prior-failure", "stage": "case"}
+    (output_root / "failure.json").write_text(
+        json.dumps(stale_failure),
+        encoding="utf-8",
+    )
+    original_write = reliability_validation.write_atomic_json
+
+    def fail_archive_write(path: Path, payload: object, **kwargs: object) -> None:
+        if Path(path).parent.name == "terminal-markers":
+            raise OSError("token=secondary-archive-secret C:\\private\\marker")
+        original_write(path, payload, **kwargs)
+
+    monkeypatch.setattr(reliability_validation, "write_atomic_json", fail_archive_write)
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert (exc_info.value.code, exc_info.value.stage) == (
+        "initial-queue-not-idle",
+        "preflight",
+    )
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == stale_failure
+    assert not (output_root / "preflight.json").exists()
+
+
+def test_fix5_marker_archive_collision_never_overwrites_prior_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "archive-collision"
+    output_root.mkdir()
+    stale_failure = {"code": "stale-prior-failure", "stage": "case"}
+    stale_bytes = json.dumps(stale_failure).encode("utf-8")
+    (output_root / "failure.json").write_bytes(stale_bytes)
+    digest = hashlib.sha256(stale_bytes).hexdigest()
+    archive_root = output_root / "history" / "terminal-markers"
+    archive_root.mkdir(parents=True)
+    collision = archive_root / f"failure-{digest[:16]}-{'a' * 32}.json"
+    prior_history = {
+        "kind": "failure",
+        "sha256": "b" * 64,
+        "document_status": "redacted",
+    }
+    collision.write_text(json.dumps(prior_history), encoding="utf-8")
+    monkeypatch.setattr(reliability_validation.secrets, "token_hex", lambda _size: "a" * 32)
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            http_probe,
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert result == 0
+    assert json.loads(collision.read_text(encoding="utf-8")) == prior_history
+    archives = sorted(archive_root.glob("failure-*.json"))
+    assert len(archives) == 2
+    current_archives = [path for path in archives if path != collision]
+    assert len(current_archives) == 1
+    assert json.loads(current_archives[0].read_text(encoding="utf-8"))["document"] == stale_failure
+
+
 def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
     created = datetime(2026, 8, 1, tzinfo=timezone.utc).isoformat()
     parent_created = datetime(2026, 7, 31, 23, 59, tzinfo=timezone.utc).isoformat()

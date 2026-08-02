@@ -3178,6 +3178,7 @@ def execute_reliability_validation(
             pass
         raise failure
 
+    _transition_public_terminal_markers(output_root, stage="finalize")
     for case in summary.cases:
         write_atomic_json(output_root / "cases" / f"{case.case_id}.json", case.model_dump(mode="json"))
     write_atomic_json(output_root / "reliability-summary.json", summary)
@@ -3241,45 +3242,137 @@ def _execute_reliability_preflight_success(
     http = _revalidate_model(http_probe.preflight(fixture), HttpPreflightObservation)
     host = _revalidate_model(host_probe.preflight(fixture), HostPreflightObservation)
     _validate_preflight(fixture, http, host, owned_processes)
-    write_atomic_json(
-        Path(output_root) / "preflight.json",
-        {
-            "status": "passed",
-            "resources": [
-                {
-                    "engine": item.engine,
-                    "ready": item.ready,
-                    "resource_id_hash": hashlib.sha256(
-                        item.resource_id.encode("utf-8")
-                    ).hexdigest(),
-                }
-                for item in sorted(http.resources, key=lambda item: (item.engine, item.resource_id))
-            ],
-            "queue": http.queue.model_dump(mode="json"),
-            "port_owners": {
-                str(port): identity.model_dump(mode="json")
-                for port, identity in sorted(host.port_owners.items())
-            },
-            "gpu_idle_baseline": host.gpu_idle_baseline.model_dump(mode="json"),
-            "boundary": {
-                "aggregate_hash": host.boundary.aggregate_hash,
-                "private_registry_hash": host.boundary.private_registry_hash,
-                "reference_hashes": host.boundary.reference_hashes,
-                "repositories": [item.model_dump(mode="json") for item in host.boundary.repositories],
-            },
+    document = {
+        "status": "passed",
+        "resources": [
+            {
+                "engine": item.engine,
+                "ready": item.ready,
+                "resource_id_hash": hashlib.sha256(
+                    item.resource_id.encode("utf-8")
+                ).hexdigest(),
+            }
+            for item in sorted(http.resources, key=lambda item: (item.engine, item.resource_id))
+        ],
+        "queue": http.queue.model_dump(mode="json"),
+        "port_owners": {
+            str(port): identity.model_dump(mode="json")
+            for port, identity in sorted(host.port_owners.items())
         },
-    )
+        "gpu_idle_baseline": host.gpu_idle_baseline.model_dump(mode="json"),
+        "boundary": {
+            "aggregate_hash": host.boundary.aggregate_hash,
+            "private_registry_hash": host.boundary.private_registry_hash,
+            "reference_hashes": host.boundary.reference_hashes,
+            "repositories": [item.model_dump(mode="json") for item in host.boundary.repositories],
+        },
+    }
+    output_root = Path(output_root)
+    _transition_public_terminal_markers(output_root, stage="preflight")
+    write_atomic_json(output_root / "preflight.json", document)
 
 
 def _persist_failure_marker(output_root: Path, failure: LiveValidationError) -> None:
     failure.failure_persistence_attempted = True
     try:
+        _transition_public_terminal_markers(Path(output_root), stage=failure.stage)
         write_atomic_json(
             Path(output_root) / "failure.json",
             {"code": failure.code, "stage": failure.stage},
         )
     except Exception:
         pass
+
+
+def _transition_public_terminal_markers(
+    output_root: Path,
+    *,
+    stage: Literal["preflight", "case", "finalize"],
+) -> None:
+    try:
+        for kind in ("failure", "preflight"):
+            marker = Path(output_root) / f"{kind}.json"
+            if marker.is_symlink():
+                raise OSError("terminal marker must not be a link")
+            if not marker.exists():
+                continue
+            if not marker.is_file():
+                raise OSError("terminal marker must be a regular file")
+            _archive_public_terminal_marker(
+                Path(output_root),
+                marker=marker,
+                kind=kind,
+            )
+    except Exception:
+        raise LiveValidationError(
+            "public-marker-transition-failed",
+            stage=stage,
+        ) from None
+
+
+def _archive_public_terminal_marker(
+    output_root: Path,
+    *,
+    marker: Path,
+    kind: Literal["failure", "preflight"],
+) -> None:
+    maximum_document_bytes = 1024 * 1024
+    digest = hashlib.sha256()
+    document_bytes: bytes | None = None
+    with marker.open("rb") as handle:
+        size = marker.stat().st_size
+        if size <= maximum_document_bytes:
+            document_bytes = handle.read(maximum_document_bytes + 1)
+            if len(document_bytes) > maximum_document_bytes:
+                document_bytes = None
+            else:
+                digest.update(document_bytes)
+        if document_bytes is None:
+            handle.seek(0)
+            while chunk := handle.read(64 * 1024):
+                digest.update(chunk)
+    sha256 = digest.hexdigest()
+    archived_document = _validated_archived_terminal_document(kind, document_bytes)
+    archive: dict[str, Any] = {
+        "kind": kind,
+        "sha256": sha256,
+        "document_status": "validated" if archived_document is not None else "redacted",
+    }
+    if archived_document is not None:
+        archive["document"] = archived_document
+    archive_root = Path(output_root) / "history" / "terminal-markers"
+    archive_stem = f"{kind}-{sha256[:16]}-{secrets.token_hex(16)}"
+    for collision_index in range(32):
+        collision_suffix = "" if collision_index == 0 else f"-{collision_index:02d}"
+        archive_path = archive_root / f"{archive_stem}{collision_suffix}.json"
+        try:
+            write_atomic_json(archive_path, archive, replace_existing=False)
+            break
+        except OSError:
+            if archive_path.exists():
+                continue
+            raise
+    else:
+        raise OSError("terminal marker archive namespace exhausted")
+    marker.unlink()
+
+
+def _validated_archived_terminal_document(
+    kind: Literal["failure", "preflight"],
+    document_bytes: bytes | None,
+) -> dict[str, Any] | None:
+    if document_bytes is None:
+        return None
+    try:
+        document = json.loads(document_bytes.decode("utf-8-sig"))
+        if kind == "failure":
+            return FailureMarker.model_validate(document).model_dump(mode="json")
+        if not isinstance(document, dict) or document.get("status") != "passed":
+            return None
+        _assert_public_evidence(document)
+        return document
+    except (UnicodeError, json.JSONDecodeError, ValidationError, ValueError, TypeError):
+        return None
 
 
 def _require_endpoint_scope(fixture: ReliabilityFixture, *, allow_lan: bool) -> None:
@@ -3893,7 +3986,12 @@ def finalize_run(
     )
 
 
-def write_atomic_json(path: Path, payload: ReliabilityRunSummary | dict[str, Any]) -> None:
+def write_atomic_json(
+    path: Path,
+    payload: ReliabilityRunSummary | dict[str, Any],
+    *,
+    replace_existing: bool = True,
+) -> None:
     _assert_public_evidence(payload)
     if isinstance(payload, ReliabilityRunSummary):
         try:
@@ -3915,6 +4013,9 @@ def write_atomic_json(path: Path, payload: ReliabilityRunSummary | dict[str, Any
 
     backup: Path | None = None
     had_prior = path.exists()
+    if had_prior and not replace_existing:
+        _best_effort_unlink(temporary)
+        raise OSError("atomic evidence publication conflict; prior evidence is unchanged") from None
     if had_prior:
         try:
             backup = _copy_to_reserved_file(path, suffix="bak")
@@ -4295,12 +4396,7 @@ def main(
         )
     else:
         return 0 if summary.status == "passed" else 1
-    failure_path = Path(args.output_root) / "failure.json"
-    try:
-        failure_exists = failure_path.is_file()
-    except OSError:
-        failure_exists = False
-    if not failure.failure_persistence_attempted and not failure_exists:
+    if not failure.failure_persistence_attempted:
         _persist_failure_marker(Path(args.output_root), failure)
     return 1
 
