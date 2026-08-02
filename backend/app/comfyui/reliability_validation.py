@@ -64,6 +64,7 @@ MAX_FAILURE_CODE_LENGTH = 64
 MAX_FAILED_CASE_JSON_BYTES = 4_194_304
 MAX_RELIABILITY_SUMMARY_JSON_BYTES = 67_108_864
 MAX_TERMINAL_COHORT_CASES = 128
+_TERMINAL_TRANSITION_THREAD_LOCK = threading.Lock()
 _BRIDGE_ENGINE_IDS: dict[str, Engine] = {
     "gpt_sovits": "gpt-sovits",
     "index_tts": "indextts",
@@ -5015,20 +5016,36 @@ def _publish_public_terminal_marker(
     document: dict[str, Any],
     stage: Literal["preflight", "case", "finalize"],
 ) -> None:
+    retired: _RetiredTerminalCohort | None = None
+    marker_path = Path(output_root) / marker_name
+    publication_attempted = False
     try:
-        _transition_public_terminal_markers(
-            Path(output_root),
-            stage=stage,
-            retained_marker=marker_name,
-        )
-        write_atomic_json(Path(output_root) / marker_name, document)
-    except LiveValidationError:
-        raise
-    except Exception:
+        with _TERMINAL_TRANSITION_THREAD_LOCK:
+            retired = _transition_public_terminal_markers(
+                Path(output_root),
+                stage=stage,
+                retained_marker=marker_name,
+            )
+            if marker_name == "preflight.json":
+                _assert_passed_root_clear(Path(output_root))
+            publication_attempted = True
+            if marker_name == "preflight.json":
+                write_atomic_json(marker_path, document, replace_existing=False)
+            else:
+                write_atomic_json(marker_path, document)
+            if marker_name == "preflight.json":
+                _assert_passed_root_clear(Path(output_root), marker_path=marker_path)
+    except Exception as error:
+        if marker_name == "preflight.json" and publication_attempted:
+            _best_effort_unlink(marker_path)
+        _rollback_retired_terminal_cohort(Path(output_root), retired)
+        if isinstance(error, LiveValidationError):
+            raise
         raise LiveValidationError(
             "public-marker-transition-failed",
             stage=stage,
         ) from None
+    if retired is not None: shutil.rmtree(retired.root, ignore_errors=True)
 
 
 def _transition_public_terminal_markers(
@@ -5036,17 +5053,16 @@ def _transition_public_terminal_markers(
     *,
     stage: Literal["preflight", "case", "finalize"],
     retained_marker: Literal["failure.json", "preflight.json"] | None = None,
-) -> None:
+) -> _RetiredTerminalCohort | None:
+    retired: _RetiredTerminalCohort | None = None
     try:
         markers: list[tuple[Literal["failure", "preflight"], Path]] = []
         for kind in ("failure", "preflight"):
             marker = Path(output_root) / f"{kind}.json"
-            if marker.is_symlink():
-                raise OSError("terminal marker must not be a link")
-            if not marker.exists():
+            try:
+                _safe_terminal_path(Path(output_root), marker, directory=False)
+            except FileNotFoundError:
                 continue
-            if not marker.is_file():
-                raise OSError("terminal marker must be a regular file")
             markers.append((kind, marker))
         cohort = (
             _prepare_terminal_cohort_archive(Path(output_root))
@@ -5061,21 +5077,24 @@ def _transition_public_terminal_markers(
             )
         if cohort is not None:
             _archive_terminal_cohort(Path(output_root), cohort)
-        for _kind, marker in markers:
-            if marker.name != retained_marker:
-                marker.unlink()
         if cohort is not None:
-            if cohort.summary_path is not None:
-                cohort.summary_path.unlink()
-            for case_path in cohort.case_paths:
-                case_path.unlink()
-            if cohort.case_root is not None:
-                cohort.case_root.rmdir()
+            retired = _retire_terminal_cohort(Path(output_root), cohort)
+        for _kind, marker in markers:
+            marker.unlink()
     except Exception:
+        _rollback_retired_terminal_cohort(Path(output_root), retired)
         raise LiveValidationError(
             "public-marker-transition-failed",
             stage=stage,
         ) from None
+    return retired
+
+
+@dataclass(frozen=True)
+class _PreparedTerminalArtifact:
+    path: Path
+    identity: tuple[int, int, int, int, int]
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -5084,23 +5103,143 @@ class _PreparedTerminalCohort:
     summary_path: Path | None
     case_root: Path | None
     case_paths: tuple[Path, ...]
+    summary_artifact: _PreparedTerminalArtifact | None
+    case_root_identity: tuple[int, int, int, int, int] | None
+    case_artifacts: tuple[_PreparedTerminalArtifact, ...]
+
+
+@dataclass(frozen=True)
+class _RetiredTerminalCohort:
+    root: Path
+
+
+def _terminal_path_identity(path: Path, *, directory: bool) -> tuple[int, int, int, int, int]:
+    observed = path.lstat()
+    if stat.S_ISLNK(observed.st_mode) or getattr(observed, "st_file_attributes", 0) & 0x400:
+        raise OSError("terminal evidence path must not be a reparse point")
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected(observed.st_mode):
+        raise OSError("terminal evidence path has the wrong object type")
+    return (observed.st_dev, observed.st_ino, observed.st_mode, observed.st_size, observed.st_mtime_ns)
+
+
+def _safe_terminal_path(output_root: Path, path: Path, *, directory: bool, create: bool = False) -> tuple[int, int, int, int, int]:
+    root = Path(os.path.abspath(output_root))
+    target = Path(os.path.abspath(path))
+    relative = target.relative_to(root)
+    _terminal_path_identity(root, directory=True)
+    current = root
+    for index, component in enumerate(relative.parts):
+        current /= component
+        expected_directory = index < len(relative.parts) - 1 or directory
+        try:
+            _terminal_path_identity(current, directory=expected_directory)
+        except FileNotFoundError:
+            if not create or not expected_directory:
+                raise
+            current.mkdir()
+            _terminal_path_identity(current, directory=True)
+    target.resolve(strict=True).relative_to(root.resolve(strict=True))
+    return _terminal_path_identity(target, directory=directory)
 
 
 def _read_bounded_terminal_artifact(path: Path, *, maximum_bytes: int) -> bytes:
-    if path.is_symlink() or not path.is_file():
-        raise OSError("terminal cohort artifact must be a regular file")
-    before = path.stat()
-    if before.st_size < 0 or before.st_size > maximum_bytes:
+    before_stat = path.lstat()
+    before = _terminal_path_identity(path, directory=False)
+    if before_stat.st_size < 0 or before_stat.st_size > maximum_bytes:
         raise OSError("terminal cohort artifact exceeds its byte bound")
     content = path.read_bytes()
-    after = path.stat()
+    after = _terminal_path_identity(path, directory=False)
     if (
-        len(content) != before.st_size
-        or after.st_size != before.st_size
-        or after.st_mtime_ns != before.st_mtime_ns
+        len(content) != before_stat.st_size
+        or after != before
     ):
         raise OSError("terminal cohort artifact changed while being read")
     return content
+
+
+def _assert_prepared_terminal_artifact(
+    output_root: Path, artifact: _PreparedTerminalArtifact | None, *, path: Path | None = None
+) -> None:
+    if artifact is None:
+        raise OSError("terminal cohort artifact preparation is incomplete")
+    checked = artifact.path if path is None else path
+    if _safe_terminal_path(output_root, checked, directory=False) != artifact.identity:
+        raise OSError("terminal cohort artifact identity changed before mutation")
+    maximum_bytes = (
+        MAX_RELIABILITY_SUMMARY_JSON_BYTES
+        if checked.name == "reliability-summary.json"
+        else MAX_FAILED_CASE_JSON_BYTES
+    )
+    content = _read_bounded_terminal_artifact(checked, maximum_bytes=maximum_bytes)
+    if hashlib.sha256(content).hexdigest() != artifact.sha256:
+        raise OSError("terminal cohort artifact hash changed before mutation")
+
+
+def _retire_terminal_cohort(
+    output_root: Path,
+    cohort: _PreparedTerminalCohort,
+) -> _RetiredTerminalCohort:
+    quarantine_root = (
+        output_root / "reliability-temp-test" / "terminal-cohort-quarantine"
+    )
+    _safe_terminal_path(output_root, quarantine_root, directory=True, create=True)
+    transaction_root = quarantine_root / secrets.token_hex(16)
+    transaction_root.mkdir()
+    retired = _RetiredTerminalCohort(root=transaction_root)
+    try:
+        if cohort.summary_artifact is not None:
+            _assert_prepared_terminal_artifact(output_root, cohort.summary_artifact)
+            saved_summary = transaction_root / "reliability-summary.json"
+            os.replace(cohort.summary_artifact.path, saved_summary)
+            _assert_prepared_terminal_artifact(
+                output_root, cohort.summary_artifact, path=saved_summary
+            )
+        if cohort.case_root is not None:
+            _safe_terminal_path(output_root, cohort.case_root, directory=True)
+            if _terminal_path_identity(cohort.case_root, directory=True) != cohort.case_root_identity:
+                raise OSError("terminal cohort cases root changed before mutation")
+            for artifact in cohort.case_artifacts:
+                _assert_prepared_terminal_artifact(output_root, artifact)
+            saved_cases = transaction_root / "cases"
+            os.replace(cohort.case_root, saved_cases)
+            if _terminal_path_identity(saved_cases, directory=True) != cohort.case_root_identity:
+                raise OSError("terminal cohort cases root changed during mutation")
+            for artifact in cohort.case_artifacts:
+                _assert_prepared_terminal_artifact(
+                    output_root, artifact, path=saved_cases / artifact.path.name
+                )
+    except Exception:
+        _rollback_retired_terminal_cohort(output_root, retired)
+        raise
+    return retired
+
+
+def _rollback_retired_terminal_cohort(
+    output_root: Path,
+    retired: _RetiredTerminalCohort | None,
+) -> None:
+    if retired is None:
+        return
+    for saved, active in (
+        (retired.root / "cases", output_root / "cases"),
+        (retired.root / "reliability-summary.json", output_root / "reliability-summary.json"),
+    ):
+        saved_exists = saved.exists() or saved.is_symlink()
+        active_exists = active.exists() or active.is_symlink()
+        if saved_exists and not active_exists:
+            try:
+                os.replace(saved, active)
+            except OSError:
+                pass
+
+
+def _assert_passed_root_clear(output_root: Path, *, marker_path: Path | None = None) -> None:
+    forbidden = (output_root / "failure.json", output_root / "reliability-summary.json", output_root / "cases")
+    if any(path.exists() or path.is_symlink() for path in forbidden):
+        raise OSError("passed terminal marker conflicts with active failed evidence")
+    if marker_path is not None:
+        _safe_terminal_path(output_root, marker_path, directory=False)
 
 
 def _canonical_public_model_json(content: bytes, model: BaseModel) -> bool:
@@ -5127,12 +5266,19 @@ def _prepare_terminal_cohort_archive(output_root: Path) -> _PreparedTerminalCoho
     summary_path = output_root / "reliability-summary.json"
     summary: ReliabilityRunSummary | None = None
     summary_content: bytes | None = None
+    summary_artifact: _PreparedTerminalArtifact | None = None
     if summary_path.is_symlink():
         raise OSError("terminal cohort summary must not be a link")
     if summary_path.exists():
+        _safe_terminal_path(output_root, summary_path, directory=False)
         summary_content = _read_bounded_terminal_artifact(
             summary_path,
             maximum_bytes=MAX_RELIABILITY_SUMMARY_JSON_BYTES,
+        )
+        summary_artifact = _PreparedTerminalArtifact(
+            path=summary_path,
+            identity=_terminal_path_identity(summary_path, directory=False),
+            sha256=hashlib.sha256(summary_content).hexdigest(),
         )
         summary = read_reliability_summary(summary_content)
     else:
@@ -5140,11 +5286,13 @@ def _prepare_terminal_cohort_archive(output_root: Path) -> _PreparedTerminalCoho
 
     case_root = output_root / "cases"
     case_paths: list[Path] = []
+    case_root_identity: tuple[int, int, int, int, int] | None = None
+    case_artifacts: list[_PreparedTerminalArtifact] = []
     if case_root.is_symlink():
         raise OSError("terminal cohort cases root must not be a link")
     if case_root.exists():
-        if not case_root.is_dir():
-            raise OSError("terminal cohort cases root must be a directory")
+        _safe_terminal_path(output_root, case_root, directory=True)
+        case_root_identity = _terminal_path_identity(case_root, directory=True)
         entries = sorted(case_root.iterdir(), key=lambda item: item.name)
         if len(entries) > MAX_TERMINAL_COHORT_CASES:
             raise OSError("terminal cohort case count exceeds its bound")
@@ -5166,6 +5314,9 @@ def _prepare_terminal_cohort_archive(output_root: Path) -> _PreparedTerminalCoho
             summary_path=None,
             case_root=case_root,
             case_paths=(),
+            summary_artifact=None,
+            case_root_identity=case_root_identity,
+            case_artifacts=(),
         )
     if summary is None:
         raise OSError("terminal cohort cases require a reliability summary")
@@ -5174,9 +5325,17 @@ def _prepare_terminal_cohort_archive(output_root: Path) -> _PreparedTerminalCoho
     completed_case_ids: set[str] = set()
     commitments: list[dict[str, Any]] = []
     for case_path in case_paths:
+        _safe_terminal_path(output_root, case_path, directory=False)
         content = _read_bounded_terminal_artifact(
             case_path,
             maximum_bytes=MAX_FAILED_CASE_JSON_BYTES,
+        )
+        case_artifacts.append(
+            _PreparedTerminalArtifact(
+                path=case_path,
+                identity=_terminal_path_identity(case_path, directory=False),
+                sha256=hashlib.sha256(content).hexdigest(),
+            )
         )
         case_kind: Literal["completed", "failed"]
         case_schema: Literal["case-evidence", "legacy-failed", "current-failed-v2"]
@@ -5246,6 +5405,9 @@ def _prepare_terminal_cohort_archive(output_root: Path) -> _PreparedTerminalCoho
         summary_path=summary_path,
         case_root=case_root,
         case_paths=tuple(case_paths),
+        summary_artifact=summary_artifact,
+        case_root_identity=case_root_identity,
+        case_artifacts=tuple(case_artifacts),
     )
 
 
@@ -5256,6 +5418,7 @@ def _archive_terminal_cohort(
     if cohort.archive is None:
         return
     archive_root = output_root / "history" / "terminal-cohorts"
+    _safe_terminal_path(output_root, archive_root, directory=True, create=True)
     archive_digest = _sha256_document(cohort.archive)
     archive_path = archive_root / f"cohort-{archive_digest}.json"
     try:
@@ -5309,6 +5472,7 @@ def _archive_public_terminal_marker(
     if archived_document is not None:
         archive["document"] = archived_document
     archive_root = Path(output_root) / "history" / "terminal-markers"
+    _safe_terminal_path(output_root, archive_root, directory=True, create=True)
     archive_stem = f"{kind}-{sha256[:16]}-{secrets.token_hex(16)}"
     for collision_index in range(32):
         collision_suffix = "" if collision_index == 0 else f"-{collision_index:02d}"
