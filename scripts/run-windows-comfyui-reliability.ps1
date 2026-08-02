@@ -1299,6 +1299,45 @@ function Remove-OwnedTempRoot {
     )
 }
 
+function Test-OwnedTempRootCanBeRemoved {
+    param(
+        [string] $Root,
+        [string] $OwnerMarker,
+        [string] $ExpectedRunId,
+        [string] $ResolvedOutputRoot
+    )
+    try {
+        $rootExists = Test-Path -LiteralPath $Root
+        $resolvedRoot = if ($rootExists) {
+            (Resolve-Path -LiteralPath $Root).Path
+        } else {
+            [IO.Path]::GetFullPath($Root)
+        }
+        $prefix = $ResolvedOutputRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) +
+            [IO.Path]::DirectorySeparatorChar
+        if (-not $resolvedRoot.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        if (-not (Test-Path -LiteralPath $OwnerMarker -PathType Leaf)) {
+            return -not $rootExists
+        }
+        $owner = Get-Content -LiteralPath $OwnerMarker -Raw | ConvertFrom-Json
+        $ownerNames = @($owner.PSObject.Properties.Name)
+        if (
+            $ownerNames.Count -ne 4 -or
+            @($ownerNames | Where-Object {
+                $_ -notin @('run_id', 'temp_root', 'runner_temp_root', 'comfy_temp_root')
+            }).Count -ne 0
+        ) { return $false }
+        return (
+            [string] $owner.run_id -ceq $ExpectedRunId -and
+            [string] $owner.temp_root -ceq $resolvedRoot
+        )
+    } catch {
+        return $false
+    }
+}
+
 function Complete-LauncherFailureState {
     param([object] $PrimaryFailure, [object] $CleanupFailure)
     if ($null -ne $PrimaryFailure) { throw $PrimaryFailure }
@@ -1322,6 +1361,609 @@ function Invoke-ReliabilityValidator {
     }
     if ($validatorExitCode -ne 0) {
         throw 'Windows ComfyUI reliability gate failed'
+    }
+}
+
+function Get-Sha256Hex {
+    param([AllowEmptyString()] [string] $Value)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Value)
+        return -join @($algorithm.ComputeHash($bytes) | ForEach-Object { $_.ToString('X2') })
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function ConvertTo-PublicUtcTimestamp {
+    param([AllowNull()] [object] $Value)
+    if ($null -eq $Value) { return $null }
+    try {
+        $timestamp = [DateTimeOffset]::Parse(
+            [string] $Value,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        ).ToUniversalTime()
+    } catch {
+        throw 'Public launcher lifecycle timestamp is invalid'
+    }
+    return $timestamp.ToString(
+        'yyyy-MM-ddTHH:mm:ss.ffffffZ',
+        [Globalization.CultureInfo]::InvariantCulture
+    )
+}
+
+function Assert-ExactPublicProperties {
+    param([object] $Value, [string[]] $Expected)
+    if ($null -eq $Value) { throw 'Public launcher lifecycle object is missing' }
+    $actual = @($Value.PSObject.Properties.Name)
+    if (
+        $actual.Count -ne $Expected.Count -or
+        @($actual | Where-Object { $_ -notin $Expected }).Count -ne 0
+    ) { throw 'Public launcher lifecycle property set is invalid' }
+}
+
+function Test-PublicSha256Value {
+    param([object] $Value)
+    return (
+        $Value -is [string] -and
+        ([string] $Value).Length -eq 64 -and
+        [string] $Value -cmatch '^[0-9A-F]{64}$'
+    )
+}
+
+function Test-PublicUtcTimestampValue {
+    param([AllowNull()] [object] $Value, [bool] $AllowNull = $false)
+    if ($null -eq $Value) { return $AllowNull }
+    if ($Value -isnot [string] -or ([string] $Value).Length -ne 27) { return $false }
+    if ([string] $Value -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$') {
+        return $false
+    }
+    try {
+        $parsed = [DateTimeOffset]::ParseExact(
+            [string] $Value,
+            'yyyy-MM-ddTHH:mm:ss.ffffffZ',
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal
+        )
+        return $parsed.Offset -eq [TimeSpan]::Zero
+    } catch {
+        return $false
+    }
+}
+
+function New-PublicProcessCommitment {
+    param(
+        [ValidateSet('tts-more', 'comfyui')] [string] $Role,
+        [ValidateSet('launch-root', 'listener')] [string] $Kind,
+        [object] $Record
+    )
+    if ($null -eq $Record) { throw 'Public launcher lifecycle process identity is missing' }
+    $pid = [int64] $Record.pid
+    $parentPid = [int64] $Record.parent_pid
+    if ($pid -lt 1 -or $pid -gt [int]::MaxValue -or
+        $parentPid -lt 0 -or $parentPid -gt [int]::MaxValue) {
+        throw 'Public launcher lifecycle process identifier is invalid'
+    }
+    $created = ConvertTo-PublicUtcTimestamp -Value $Record.creation_time
+    $parentCreated = ConvertTo-PublicUtcTimestamp -Value $Record.parent_creation_time
+    $canonicalPrivateIdentity = @(
+        [string] $pid,
+        $created,
+        [string] $Record.executable_path,
+        [string] $Record.command_line,
+        [string] $parentPid,
+        $parentCreated
+    ) | ForEach-Object { '{0}:{1}' -f ([string] $_).Length, [string] $_ }
+    return [ordered]@{
+        role = $Role
+        kind = $Kind
+        pid = [int] $pid
+        creation_time_utc = $created
+        parent_pid = [int] $parentPid
+        parent_creation_time_utc = $parentCreated
+        identity_sha256 = Get-Sha256Hex -Value ($canonicalPrivateIdentity -join '|')
+    }
+}
+
+function New-LauncherFailureLifecycleDocument {
+    param(
+        [string] $RunId,
+        [string] $PrimaryCode,
+        [string] $PrimaryStage,
+        [object] $RunStartedAt,
+        [AllowNull()] [string] $CaseId,
+        [AllowNull()] [object] $CaseStartedAt,
+        [AllowNull()] [object] $CaseFinishedAt,
+        [hashtable] $LaunchRoots,
+        [hashtable] $Listeners
+    )
+    $processes = [System.Collections.Generic.List[object]]::new()
+    foreach ($role in @('tts-more', 'comfyui')) {
+        if ($null -ne $LaunchRoots[$role]) {
+            $processes.Add((New-PublicProcessCommitment `
+                -Role $role -Kind 'launch-root' -Record $LaunchRoots[$role]))
+        }
+        if ($null -ne $Listeners[$role]) {
+            $processes.Add((New-PublicProcessCommitment `
+                -Role $role -Kind 'listener' -Record $Listeners[$role]))
+        }
+    }
+    if ($processes.Count -lt 1 -or $processes.Count -gt 8) {
+        throw 'Public launcher lifecycle process count is invalid'
+    }
+    $ownershipRows = @($processes | ForEach-Object {
+        '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.role, $_.kind, $_.pid,
+            $_.creation_time_utc, $_.parent_pid, $_.identity_sha256
+    })
+    $caseHash = if ([string]::IsNullOrEmpty($CaseId)) {
+        $null
+    } else {
+        Get-Sha256Hex -Value $CaseId
+    }
+    return [ordered]@{
+        schema_version = [int] 1
+        kind = 'launcher-failure-lifecycle'
+        status = 'failed'
+        run_id_sha256 = Get-Sha256Hex -Value $RunId
+        primary = [ordered]@{
+            code = $PrimaryCode
+            stage = $PrimaryStage
+        }
+        case = [ordered]@{
+            case_id_sha256 = $caseHash
+            started_at = ConvertTo-PublicUtcTimestamp -Value $CaseStartedAt
+            finished_at = ConvertTo-PublicUtcTimestamp -Value $CaseFinishedAt
+        }
+        timestamps = [ordered]@{
+            run_started_at = ConvertTo-PublicUtcTimestamp -Value $RunStartedAt
+            snapshot_written_at = ConvertTo-PublicUtcTimestamp -Value ([DateTime]::UtcNow)
+            cleanup_finished_at = $null
+        }
+        processes = @($processes)
+        promotion_ownership_sha256 = Get-Sha256Hex -Value ($ownershipRows -join "`n")
+        cleanup = [ordered]@{
+            state = 'snapshot-written'
+            snapshot_written = $true
+            stop_attempted = $false
+            stop_proven = $false
+            temp_removal_eligible = $false
+            raw_disposition = [ordered]@{
+                temp_root = 'preserved-pending-cleanup'
+                owner_marker = 'preserved-pending-cleanup'
+                control_record = 'preserved-pending-cleanup'
+                host_manifest = 'preserved-pending-cleanup'
+            }
+            warning_sha256 = @()
+            secondary_sha256 = @()
+        }
+    }
+}
+
+function Assert-LauncherFailureLifecycleDocument {
+    param([object] $Document)
+    Assert-ExactPublicProperties -Value $Document -Expected @(
+        'schema_version', 'kind', 'status', 'run_id_sha256', 'primary', 'case',
+        'timestamps', 'processes', 'promotion_ownership_sha256', 'cleanup'
+    )
+    if ($Document.schema_version.GetType() -ne [int] -or $Document.schema_version -ne 1) {
+        throw 'Public launcher lifecycle version is invalid'
+    }
+    if ([string] $Document.kind -cne 'launcher-failure-lifecycle' -or
+        [string] $Document.status -cne 'failed') {
+        throw 'Public launcher lifecycle kind or status is invalid'
+    }
+    if (-not (Test-PublicSha256Value $Document.run_id_sha256) -or
+        -not (Test-PublicSha256Value $Document.promotion_ownership_sha256)) {
+        throw 'Public launcher lifecycle commitment is invalid'
+    }
+    Assert-ExactPublicProperties -Value $Document.primary -Expected @('code', 'stage')
+    foreach ($field in @('code', 'stage')) {
+        $value = $Document.primary.$field
+        if ($value -isnot [string] -or ([string] $value).Length -lt 1 -or
+            ([string] $value).Length -gt 64 -or
+            [string] $value -cnotmatch '^[a-z][a-z0-9-]*$') {
+            throw 'Public launcher lifecycle primary classification is invalid'
+        }
+    }
+    Assert-ExactPublicProperties -Value $Document.case -Expected @(
+        'case_id_sha256', 'started_at', 'finished_at'
+    )
+    if ($null -ne $Document.case.case_id_sha256 -and
+        -not (Test-PublicSha256Value $Document.case.case_id_sha256)) {
+        throw 'Public launcher lifecycle case commitment is invalid'
+    }
+    foreach ($field in @('started_at', 'finished_at')) {
+        if (-not (Test-PublicUtcTimestampValue -Value $Document.case.$field -AllowNull $true)) {
+            throw 'Public launcher lifecycle case timestamp is invalid'
+        }
+    }
+    if ($null -ne $Document.case.finished_at -and $null -eq $Document.case.started_at) {
+        throw 'Public launcher lifecycle case timestamp order is invalid'
+    }
+    if ($null -ne $Document.case.started_at -and $null -ne $Document.case.finished_at -and
+        (Get-UtcTicks $Document.case.finished_at) -lt (Get-UtcTicks $Document.case.started_at)) {
+        throw 'Public launcher lifecycle case timestamp order is invalid'
+    }
+    Assert-ExactPublicProperties -Value $Document.timestamps -Expected @(
+        'run_started_at', 'snapshot_written_at', 'cleanup_finished_at'
+    )
+    foreach ($field in @('run_started_at', 'snapshot_written_at')) {
+        if (-not (Test-PublicUtcTimestampValue -Value $Document.timestamps.$field)) {
+            throw 'Public launcher lifecycle run timestamp is invalid'
+        }
+    }
+    if (-not (Test-PublicUtcTimestampValue `
+            -Value $Document.timestamps.cleanup_finished_at -AllowNull $true)) {
+        throw 'Public launcher lifecycle cleanup timestamp is invalid'
+    }
+    $processes = @($Document.processes)
+    if ($processes.Count -lt 1 -or $processes.Count -gt 8) {
+        throw 'Public launcher lifecycle process list is invalid'
+    }
+    $processKeys = @{}
+    foreach ($process in $processes) {
+        Assert-ExactPublicProperties -Value $process -Expected @(
+            'role', 'kind', 'pid', 'creation_time_utc', 'parent_pid',
+            'parent_creation_time_utc', 'identity_sha256'
+        )
+        if ([string] $process.role -cnotin @('tts-more', 'comfyui') -or
+            [string] $process.kind -cnotin @('launch-root', 'listener')) {
+            throw 'Public launcher lifecycle process role is invalid'
+        }
+        if ($process.pid.GetType() -ne [int] -or $process.pid -lt 1 -or
+            $process.parent_pid.GetType() -ne [int] -or $process.parent_pid -lt 0) {
+            throw 'Public launcher lifecycle process identifier is invalid'
+        }
+        if (-not (Test-PublicUtcTimestampValue $process.creation_time_utc) -or
+            -not (Test-PublicUtcTimestampValue $process.parent_creation_time_utc) -or
+            -not (Test-PublicSha256Value $process.identity_sha256)) {
+            throw 'Public launcher lifecycle process commitment is invalid'
+        }
+        $processKey = '{0}|{1}' -f $process.role, $process.kind
+        if ($processKeys.ContainsKey($processKey)) {
+            throw 'Public launcher lifecycle process role is duplicated'
+        }
+        $processKeys[$processKey] = $true
+    }
+    Assert-ExactPublicProperties -Value $Document.cleanup -Expected @(
+        'state', 'snapshot_written', 'stop_attempted', 'stop_proven',
+        'temp_removal_eligible', 'raw_disposition', 'warning_sha256',
+        'secondary_sha256'
+    )
+    if ([string] $Document.cleanup.state -cnotin @(
+        'snapshot-written', 'cleanup-unproven', 'cleanup-proven'
+    )) { throw 'Public launcher lifecycle cleanup state is invalid' }
+    foreach ($field in @(
+        'snapshot_written', 'stop_attempted', 'stop_proven', 'temp_removal_eligible'
+    )) {
+        if ($Document.cleanup.$field.GetType() -ne [bool]) {
+            throw 'Public launcher lifecycle cleanup flag is invalid'
+        }
+    }
+    if (-not $Document.cleanup.snapshot_written) {
+        throw 'Public launcher lifecycle snapshot flag is invalid'
+    }
+    Assert-ExactPublicProperties -Value $Document.cleanup.raw_disposition -Expected @(
+        'temp_root', 'owner_marker', 'control_record', 'host_manifest'
+    )
+    foreach ($value in @($Document.cleanup.raw_disposition.PSObject.Properties.Value)) {
+        if ([string] $value -cnotin @(
+            'preserved-pending-cleanup', 'preserved', 'removal-committed'
+        )) { throw 'Public launcher lifecycle raw disposition is invalid' }
+    }
+    foreach ($field in @('warning_sha256', 'secondary_sha256')) {
+        $hashes = @($Document.cleanup.$field)
+        if ($hashes.Count -gt 32) {
+            throw 'Public launcher lifecycle diagnostic list is invalid'
+        }
+        foreach ($hash in $hashes) {
+            if (-not (Test-PublicSha256Value $hash)) {
+                throw 'Public launcher lifecycle diagnostic commitment is invalid'
+            }
+        }
+    }
+}
+
+function Write-LauncherFailureLifecycleAtomic {
+    param([string] $Path, [object] $Document)
+    $normalized = $Document | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    Assert-LauncherFailureLifecycleDocument -Document $normalized
+    $temporaryPath = '{0}.{1}.tmp' -f $Path, [Guid]::NewGuid().ToString('N')
+    $backupPath = '{0}.{1}.bak' -f $Path, [Guid]::NewGuid().ToString('N')
+    try {
+        $normalized | ConvertTo-Json -Depth 12 |
+            Set-Content -LiteralPath $temporaryPath -Encoding UTF8 -ErrorAction Stop
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [IO.File]::Replace($temporaryPath, $Path, $backupPath)
+            if (Test-Path -LiteralPath $backupPath) {
+                Remove-Item -LiteralPath $backupPath -Force -ErrorAction Stop
+            }
+        } else {
+            [IO.File]::Move($temporaryPath, $Path)
+        }
+        $roundTrip = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
+        Assert-LauncherFailureLifecycleDocument -Document $roundTrip
+    } finally {
+        foreach ($artifact in @($temporaryPath, $backupPath)) {
+            if (Test-Path -LiteralPath $artifact -PathType Leaf) {
+                Remove-Item -LiteralPath $artifact -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+function Assert-LauncherLifecycleSecondaryMarkerDocument {
+    param([object] $Document)
+    Assert-ExactPublicProperties -Value $Document -Expected @(
+        'schema_version', 'kind', 'status', 'run_id_sha256',
+        'lifecycle_write_failed', 'raw_removal_failed', 'secondary_sha256'
+    )
+    if ($Document.schema_version.GetType() -ne [int] -or $Document.schema_version -ne 1 -or
+        [string] $Document.kind -cne 'launcher-failure-lifecycle-secondary' -or
+        [string] $Document.status -cne 'failed') {
+        throw 'Public launcher lifecycle secondary classification is invalid'
+    }
+    if (-not (Test-PublicSha256Value $Document.run_id_sha256) -or
+        $Document.lifecycle_write_failed.GetType() -ne [bool] -or
+        $Document.raw_removal_failed.GetType() -ne [bool] -or
+        (-not $Document.lifecycle_write_failed -and -not $Document.raw_removal_failed)) {
+        throw 'Public launcher lifecycle secondary flag is invalid'
+    }
+    $hashes = @($Document.secondary_sha256)
+    if ($hashes.Count -lt 1 -or $hashes.Count -gt 32) {
+        throw 'Public launcher lifecycle secondary list is invalid'
+    }
+    foreach ($hash in $hashes) {
+        if (-not (Test-PublicSha256Value $hash)) {
+            throw 'Public launcher lifecycle secondary commitment is invalid'
+        }
+    }
+}
+
+function Write-LauncherLifecycleSecondaryMarkerAtomic {
+    param(
+        [string] $Path,
+        [string] $RunIdSha256,
+        [string[]] $SecondarySha256,
+        [bool] $LifecycleWriteFailed,
+        [bool] $RawRemovalFailed
+    )
+    if (-not (Test-PublicSha256Value $RunIdSha256)) {
+        throw 'Public launcher lifecycle secondary run commitment is invalid'
+    }
+    $hashes = @($SecondarySha256 | Select-Object -Unique | Select-Object -First 32)
+    foreach ($hash in $hashes) {
+        if (-not (Test-PublicSha256Value $hash)) {
+            throw 'Public launcher lifecycle secondary commitment is invalid'
+        }
+    }
+    $document = [ordered]@{
+        schema_version = [int] 1
+        kind = 'launcher-failure-lifecycle-secondary'
+        status = 'failed'
+        run_id_sha256 = $RunIdSha256
+        lifecycle_write_failed = [bool] $LifecycleWriteFailed
+        raw_removal_failed = [bool] $RawRemovalFailed
+        secondary_sha256 = $hashes
+    }
+    $normalized = $document | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+    Assert-LauncherLifecycleSecondaryMarkerDocument -Document $normalized
+    $temporaryPath = '{0}.{1}.tmp' -f $Path, [Guid]::NewGuid().ToString('N')
+    try {
+        $normalized | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath $temporaryPath -Encoding UTF8 -ErrorAction Stop
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            [IO.File]::Replace($temporaryPath, $Path, $null)
+        } else {
+            [IO.File]::Move($temporaryPath, $Path)
+        }
+        $roundTrip = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop |
+            ConvertFrom-Json
+        Assert-LauncherLifecycleSecondaryMarkerDocument -Document $roundTrip
+    } finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Invoke-LauncherCleanupTransaction {
+    param(
+        [bool] $PublishFailureLifecycle,
+        [string] $LifecyclePath,
+        [string] $SecondaryPath,
+        [object] $LifecycleDocument,
+        [scriptblock] $CleanupProofOperation,
+        [scriptblock] $RawRemovalOperation
+    )
+    $initialSnapshotWritten = $false
+    $cleanupProven = $false
+    $rawRemovalAttempted = $false
+    $cleanupFailure = $null
+    $secondaryHashes = [System.Collections.Generic.List[string]]::new()
+    if ($PublishFailureLifecycle) {
+        try {
+            Write-LauncherFailureLifecycleAtomic `
+                -Path $LifecyclePath -Document $LifecycleDocument
+            $initialSnapshotWritten = $true
+        } catch {
+            $cleanupFailure = $_
+            $secondaryHashes.Add((Get-Sha256Hex -Value ([string] $_.Exception.Message)))
+            try {
+                Write-LauncherLifecycleSecondaryMarkerAtomic `
+                    -Path $SecondaryPath `
+                    -RunIdSha256 $LifecycleDocument.run_id_sha256 `
+                    -SecondarySha256 @($secondaryHashes) `
+                    -LifecycleWriteFailed $true -RawRemovalFailed $false
+            } catch {
+                Write-Warning 'Launcher lifecycle secondary evidence could not be published'
+            }
+        }
+    }
+    $proof = $null
+    try {
+        $proof = & $CleanupProofOperation $PublishFailureLifecycle
+        if ($null -eq $proof) { throw 'Launcher cleanup proof result is missing' }
+    } catch {
+        if ($null -eq $cleanupFailure) { $cleanupFailure = $_ }
+        $secondaryHashes.Add((Get-Sha256Hex -Value ([string] $_.Exception.Message)))
+        $proof = [pscustomobject]@{
+            stop_attempted = $false
+            stop_proven = $false
+            temp_removal_eligible = $false
+            warning_sha256 = @()
+            secondary_sha256 = @()
+        }
+    }
+    $cleanupProven = (
+        $proof.stop_attempted -is [bool] -and $proof.stop_attempted -and
+        $proof.stop_proven -is [bool] -and $proof.stop_proven -and
+        $proof.temp_removal_eligible -is [bool] -and $proof.temp_removal_eligible
+    )
+    foreach ($hash in @($proof.secondary_sha256)) {
+        if (Test-PublicSha256Value $hash) { $secondaryHashes.Add([string] $hash) }
+    }
+    if ($PublishFailureLifecycle -and $initialSnapshotWritten) {
+        $LifecycleDocument.timestamps.cleanup_finished_at =
+            ConvertTo-PublicUtcTimestamp -Value ([DateTime]::UtcNow)
+        $LifecycleDocument.cleanup.stop_attempted = [bool] $proof.stop_attempted
+        $LifecycleDocument.cleanup.stop_proven = [bool] $proof.stop_proven
+        $LifecycleDocument.cleanup.temp_removal_eligible =
+            [bool] $proof.temp_removal_eligible
+        $LifecycleDocument.cleanup.warning_sha256 = @(
+            @($proof.warning_sha256) |
+                Where-Object { Test-PublicSha256Value $_ } |
+                Select-Object -Unique |
+                Select-Object -First 32
+        )
+        $LifecycleDocument.cleanup.secondary_sha256 = @(
+            @($secondaryHashes) | Select-Object -Unique | Select-Object -First 32
+        )
+        $disposition = if ($cleanupProven) { 'removal-committed' } else { 'preserved' }
+        $LifecycleDocument.cleanup.state = if ($cleanupProven) {
+            'cleanup-proven'
+        } else {
+            'cleanup-unproven'
+        }
+        foreach ($field in @('temp_root', 'owner_marker', 'control_record', 'host_manifest')) {
+            $LifecycleDocument.cleanup.raw_disposition[$field] = $disposition
+        }
+        try {
+            Write-LauncherFailureLifecycleAtomic `
+                -Path $LifecyclePath -Document $LifecycleDocument
+        } catch {
+            $cleanupProven = $false
+            if ($null -eq $cleanupFailure) { $cleanupFailure = $_ }
+            $secondaryHashes.Add((Get-Sha256Hex -Value ([string] $_.Exception.Message)))
+            try {
+                Write-LauncherLifecycleSecondaryMarkerAtomic `
+                    -Path $SecondaryPath `
+                    -RunIdSha256 $LifecycleDocument.run_id_sha256 `
+                    -SecondarySha256 @($secondaryHashes) `
+                    -LifecycleWriteFailed $true -RawRemovalFailed $false
+            } catch {
+                Write-Warning 'Launcher lifecycle secondary evidence could not be published'
+            }
+        }
+    }
+    $removalAuthorized = if ($PublishFailureLifecycle) {
+        $initialSnapshotWritten -and $cleanupProven
+    } else {
+        $cleanupProven
+    }
+    if ($removalAuthorized) {
+        $rawRemovalAttempted = $true
+        try {
+            & $RawRemovalOperation $proof
+        } catch {
+            if ($null -eq $cleanupFailure) { $cleanupFailure = $_ }
+            $secondaryHashes.Add((Get-Sha256Hex -Value ([string] $_.Exception.Message)))
+            if ($PublishFailureLifecycle) {
+                try {
+                    Write-LauncherLifecycleSecondaryMarkerAtomic `
+                        -Path $SecondaryPath `
+                        -RunIdSha256 $LifecycleDocument.run_id_sha256 `
+                        -SecondarySha256 @($secondaryHashes) `
+                        -LifecycleWriteFailed $false -RawRemovalFailed $true
+                } catch {
+                    Write-Warning 'Launcher lifecycle secondary evidence could not be published'
+                }
+            }
+        }
+    } elseif (-not $cleanupProven -and $null -eq $cleanupFailure) {
+        try { throw 'Launcher cleanup proof did not converge' } catch { $cleanupFailure = $_ }
+    }
+    return [pscustomobject]@{
+        cleanup_proven = [bool] $cleanupProven
+        raw_removal_attempted = [bool] $rawRemovalAttempted
+        cleanup_failure = $cleanupFailure
+    }
+}
+
+function Get-LauncherPublicFailureContext {
+    param([string] $OutputRoot)
+    $code = 'launcher-validation-failed'
+    $stage = 'validator'
+    $failurePath = Join-Path $OutputRoot 'failure.json'
+    if (Test-Path -LiteralPath $failurePath -PathType Leaf) {
+        try {
+            $failure = Get-Content -LiteralPath $failurePath -Raw | ConvertFrom-Json
+            foreach ($field in @('code', 'stage')) {
+                $candidate = [string] $failure.$field
+                if (
+                    $candidate.Length -lt 1 -or $candidate.Length -gt 64 -or
+                    $candidate -cnotmatch '^[a-z][a-z0-9-]*$'
+                ) { throw 'Public failure classification is invalid' }
+            }
+            $code = [string] $failure.code
+            $stage = [string] $failure.stage
+        } catch {
+            $code = 'launcher-validation-failed'
+            $stage = 'validator'
+        }
+    }
+    $caseId = $null
+    $caseStartedAt = $null
+    $caseFinishedAt = $null
+    $caseRoot = Join-Path $OutputRoot 'cases'
+    if (Test-Path -LiteralPath $caseRoot -PathType Container) {
+        try {
+            $caseFile = Get-ChildItem -LiteralPath $caseRoot -Filter '*.json' -File |
+                Sort-Object -Property LastWriteTimeUtc, Name |
+                Select-Object -Last 1
+            if ($null -ne $caseFile) {
+                $caseDocument = Get-Content -LiteralPath $caseFile.FullName -Raw |
+                    ConvertFrom-Json
+                $candidateId = [string] $caseDocument.case_id
+                if ($candidateId.Length -ge 1 -and $candidateId.Length -le 128) {
+                    $caseId = $candidateId
+                }
+                $host = $caseDocument.PSObject.Properties['host']
+                if ($null -ne $host -and $null -ne $host.Value) {
+                    try {
+                        $caseStartedAt = ConvertTo-PublicUtcTimestamp `
+                            -Value $host.Value.started_at
+                        $caseFinishedAt = ConvertTo-PublicUtcTimestamp `
+                            -Value $host.Value.finished_at
+                    } catch {
+                        $caseStartedAt = $null
+                        $caseFinishedAt = $null
+                    }
+                }
+            }
+        } catch {
+            $caseId = $null
+            $caseStartedAt = $null
+            $caseFinishedAt = $null
+        }
+    }
+    return [pscustomobject]@{
+        code = $code
+        stage = $stage
+        case_id = $caseId
+        case_started_at = $caseStartedAt
+        case_finished_at = $caseFinishedAt
     }
 }
 
@@ -1357,7 +1999,15 @@ foreach ($engine in @('gpt-sovits', 'indextts', 'cosyvoice')) {
     $references[$engine] = $referencePath
 }
 
+$runStartedAt = [DateTime]::UtcNow
 $runId = [Guid]::NewGuid().ToString('N')
+$runIdSha256 = Get-Sha256Hex -Value $runId
+$launcherLifecyclePath = Join-Path $outputRootPath (
+    'launcher-failure-lifecycle-{0}.json' -f $runIdSha256
+)
+$launcherLifecycleSecondaryPath = Join-Path $outputRootPath (
+    'launcher-failure-lifecycle-secondary-{0}.json' -f $runIdSha256
+)
 $comfyStdoutPath = Join-Path $outputRootPath (".comfyui-{0}.stdout.log" -f $runId)
 $comfyStderrPath = Join-Path $outputRootPath (".comfyui-{0}.stderr.log" -f $runId)
 $backendStdoutPath = Join-Path $outputRootPath (".tts-more-{0}.stdout.log" -f $runId)
@@ -1396,6 +2046,7 @@ $startedProcesses = [System.Collections.Generic.List[object]]::new()
 $provisionalCleanupFailed = $false
 $primaryFailure = $null
 $cleanupFailure = $null
+$formalValidatorInvoked = $false
 try {
     $launcherRecord = Get-ProcessRecord -ProcessId $PID
     foreach ($port in @(8000, 8188)) {
@@ -1531,6 +2182,7 @@ try {
     )
     if ($AllowLan) { $pythonArguments += '--allow-lan' }
     if ($PreflightOnly) { $pythonArguments += '--preflight-only' }
+    $formalValidatorInvoked = $true
     Invoke-ReliabilityValidator -PythonPath $backendPythonPath `
         -ValidatorArguments $pythonArguments -WorkingDirectory $backendRootPath
 } catch {
@@ -1599,76 +2251,157 @@ try {
         if (-not $controlStateValid -and (Test-Path -LiteralPath $controlStatePath)) {
             $attemptedLabels['unresolved-control'] = $true
         }
-        if ($controlStateValid) {
-            foreach ($role in @('tts-more', 'comfyui')) {
-                $fullRecord = if ($role -eq 'tts-more') {
-                    $latestBackendRecord
-                } else {
-                    $latestComfyRecord
-                }
-                $launchRootRecord = if ($role -eq 'tts-more') {
-                    $latestBackendLaunchRootRecord
-                } else {
-                    $latestComfyLaunchRootRecord
-                }
-                $provisionalRecord = $provisionalRecords[$role]
-                $launchIntent = $launchIntents[$role]
-                if ($null -ne $fullRecord) {
-                    if ($null -ne $provisionalRecord -or $null -ne $launchIntent) {
-                        Write-Warning 'Process control state contains conflicting full and provisional identities'
-                        $processCleanupProven = $false
-                        continue
+        $publishFailureLifecycle = [bool] (
+            $formalValidatorInvoked -and $null -ne $primaryFailure
+        )
+        $lifecycleDocument = $null
+        if ($publishFailureLifecycle) {
+            try {
+                $publicFailureContext = Get-LauncherPublicFailureContext `
+                    -OutputRoot $outputRootPath
+                $lifecycleDocument = New-LauncherFailureLifecycleDocument `
+                    -RunId $runId `
+                    -PrimaryCode $publicFailureContext.code `
+                    -PrimaryStage $publicFailureContext.stage `
+                    -RunStartedAt $runStartedAt `
+                    -CaseId $publicFailureContext.case_id `
+                    -CaseStartedAt $publicFailureContext.case_started_at `
+                    -CaseFinishedAt $publicFailureContext.case_finished_at `
+                    -LaunchRoots @{
+                        'tts-more' = $latestBackendLaunchRootRecord
+                        comfyui = $latestComfyLaunchRootRecord
+                    } `
+                    -Listeners @{
+                        'tts-more' = $latestBackendRecord
+                        comfyui = $latestComfyRecord
                     }
-                    if (-not (Stop-RecordedProcessPair `
-                            -LaunchRootRecord $launchRootRecord -ListenerRecord $fullRecord)) {
-                        $processCleanupProven = $false
-                    }
-                    continue
-                }
-                if ($null -ne $launchRootRecord) {
-                    if (-not (Stop-RecordedProcessPair `
-                            -LaunchRootRecord $launchRootRecord -ListenerRecord $null)) {
-                        $processCleanupProven = $false
-                    }
-                }
-                if ($null -ne $provisionalRecord) {
-                    if ($null -eq $launchIntent) {
-                        Write-Warning 'Provisional process identity is missing its launch intent'
-                        $processCleanupProven = $false
-                    } elseif (-not (Stop-ProvisionalStartedProcess -Token $provisionalRecord)) {
-                        $processCleanupProven = $false
-                    }
-                    continue
-                }
-                if ($null -ne $launchIntent) {
-                    try {
-                        $intentRecord = Resolve-LaunchIntentProcess -Intent $launchIntent
-                        if ($null -ne $intentRecord -and -not (Stop-RecordedTree -Record $intentRecord)) {
-                            $processCleanupProven = $false
-                        }
-                    } catch {
-                        Write-Warning 'Launch intent could not be resolved uniquely; preserving recovery records'
-                        $processCleanupProven = $false
-                    }
+            } catch {
+                # A deliberately invalid minimal value forces the first public
+                # gate to fail while retaining the run commitment needed by
+                # the separate secondary marker. Cleanup proof still runs.
+                $lifecycleDocument = [ordered]@{
+                    run_id_sha256 = $runIdSha256
                 }
             }
-        } else {
-            $processCleanupProven = $false
         }
-        $tempCleanupProven = $false
-        if ($processCleanupProven) {
-            $tempCleanupProven = Remove-OwnedTempRoot -Root $tempRoot -OwnerMarker $tempOwnerMarker `
+        $cleanupProofOperation = {
+            param([bool] $PreserveRaw)
+            $operationProcessCleanupProven = [bool] $processCleanupProven
+            if ($controlStateValid) {
+                foreach ($role in @('tts-more', 'comfyui')) {
+                    $fullRecord = if ($role -eq 'tts-more') {
+                        $latestBackendRecord
+                    } else {
+                        $latestComfyRecord
+                    }
+                    $launchRootRecord = if ($role -eq 'tts-more') {
+                        $latestBackendLaunchRootRecord
+                    } else {
+                        $latestComfyLaunchRootRecord
+                    }
+                    $provisionalRecord = $provisionalRecords[$role]
+                    $launchIntent = $launchIntents[$role]
+                    if ($null -ne $fullRecord) {
+                        if ($null -ne $provisionalRecord -or $null -ne $launchIntent) {
+                            Write-Warning 'Process control state contains conflicting full and provisional identities'
+                            $operationProcessCleanupProven = $false
+                            continue
+                        }
+                        if (-not (Stop-RecordedProcessPair `
+                                -LaunchRootRecord $launchRootRecord `
+                                -ListenerRecord $fullRecord)) {
+                            $operationProcessCleanupProven = $false
+                        }
+                        continue
+                    }
+                    if ($null -ne $launchRootRecord) {
+                        if (-not (Stop-RecordedProcessPair `
+                                -LaunchRootRecord $launchRootRecord `
+                                -ListenerRecord $null)) {
+                            $operationProcessCleanupProven = $false
+                        }
+                    }
+                    if ($null -ne $provisionalRecord) {
+                        if ($null -eq $launchIntent) {
+                            Write-Warning 'Provisional process identity is missing its launch intent'
+                            $operationProcessCleanupProven = $false
+                        } elseif (-not (Stop-ProvisionalStartedProcess -Token $provisionalRecord)) {
+                            $operationProcessCleanupProven = $false
+                        }
+                        continue
+                    }
+                    if ($null -ne $launchIntent) {
+                        try {
+                            $intentRecord = Resolve-LaunchIntentProcess -Intent $launchIntent
+                            if (
+                                $null -ne $intentRecord -and
+                                -not (Stop-RecordedTree -Record $intentRecord)
+                            ) { $operationProcessCleanupProven = $false }
+                        } catch {
+                            Write-Warning 'Launch intent could not be resolved uniquely; preserving recovery records'
+                            $operationProcessCleanupProven = $false
+                        }
+                    }
+                }
+            } else {
+                $operationProcessCleanupProven = $false
+            }
+            $tempRemovalEligible = $false
+            if ($operationProcessCleanupProven) {
+                $tempRemovalEligible = Test-OwnedTempRootCanBeRemoved `
+                    -Root $tempRoot -OwnerMarker $tempOwnerMarker `
+                    -ExpectedRunId $runId -ResolvedOutputRoot $outputRootPath
+            }
+            $warningHashes = @()
+            if (-not $operationProcessCleanupProven) {
+                $warningHashes += Get-Sha256Hex `
+                    -Value 'process-cleanup-unproven'
+            }
+            if (-not $tempRemovalEligible) {
+                $warningHashes += Get-Sha256Hex `
+                    -Value 'temp-removal-eligibility-unproven'
+            }
+            return [pscustomobject]@{
+                stop_attempted = $true
+                stop_proven = [bool] $operationProcessCleanupProven
+                temp_removal_eligible = [bool] $tempRemovalEligible
+                warning_sha256 = @($warningHashes)
+                secondary_sha256 = @()
+                owned_process_count = [Math]::Max(
+                    $attemptedLabels.Count,
+                    $startedProcesses.Count
+                )
+            }
+        }
+        $rawRemovalOperation = {
+            param([object] $Proof)
+            $tempRemoved = Remove-OwnedTempRoot `
+                -Root $tempRoot -OwnerMarker $tempOwnerMarker `
                 -ExpectedRunId $runId -ResolvedOutputRoot $outputRootPath
-        } else {
-            Write-Warning 'Process cleanup was not proven; preserving the validation temp root and owner marker'
+            if (-not $tempRemoved) {
+                throw 'Owned temp removal did not converge after lifecycle commit'
+            }
+            $recordsRemoved = Remove-PrivateIdentityRecordsIfSafe `
+                -HostManifestPath $hostManifestPath `
+                -ControlStatePath $controlStatePath `
+                -ProcessCleanupProven $true `
+                -TempCleanupProven $true `
+                -OwnedProcessCount ([int] $Proof.owned_process_count)
+            if (-not $recordsRemoved) {
+                throw 'Private identity removal did not converge after lifecycle commit'
+            }
         }
-        $ownedProcessCount = [Math]::Max($attemptedLabels.Count, $startedProcesses.Count)
-        $null = Remove-PrivateIdentityRecordsIfSafe `
-            -HostManifestPath $hostManifestPath `
-            -ControlStatePath $controlStatePath `
-            -ProcessCleanupProven $processCleanupProven `
-            -TempCleanupProven $tempCleanupProven `
-            -OwnedProcessCount $ownedProcessCount
+        $cleanupTransaction = Invoke-LauncherCleanupTransaction `
+            -PublishFailureLifecycle $publishFailureLifecycle `
+            -LifecyclePath $launcherLifecyclePath `
+            -SecondaryPath $launcherLifecycleSecondaryPath `
+            -LifecycleDocument $lifecycleDocument `
+            -CleanupProofOperation $cleanupProofOperation `
+            -RawRemovalOperation $rawRemovalOperation
+        $cleanupFailure = $cleanupTransaction.cleanup_failure
+        if ($null -ne $cleanupFailure) {
+            Write-Warning 'Process cleanup verification failed; preserving remaining private recovery evidence'
+        }
     } catch {
         $cleanupFailure = $_
         Write-Warning 'Process cleanup verification failed; preserving private process, temp, and control evidence'

@@ -10048,3 +10048,599 @@ def test_fix8_round1_current_minimal_fallback_is_explicit_and_versioned() -> Non
 
     assert current.schema_version == 2
     assert current.observation.detail_status == "minimal"
+
+
+def _run_fix9_powershell_behavior(command: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
+            "TTS_MORE_FIX9_ROOT": str(tmp_path),
+        }
+    )
+    return subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_fix9_nonzero_lifecycle_commits_before_exact_forest_stop_and_raw_removal(
+    tmp_path: Path,
+) -> None:
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT, [ref]$tokens, [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks', 'Get-ProcessRecord', 'Test-RecordDocumentMatches',
+    'Test-RecordedIdentity', 'Test-ProcessAbsent', 'Stop-RecordedTree',
+    'Stop-RecordedProcessPair', 'Test-PrivateIdentityRecordsCanBeRemoved',
+    'Remove-PrivateIdentityRecordsIfSafe', 'Test-OwnedTempRootCanBeRemoved',
+        'Remove-OwnedTempRoot', 'Get-Sha256Hex', 'ConvertTo-PublicUtcTimestamp',
+        'Assert-ExactPublicProperties', 'Test-PublicSha256Value',
+        'Test-PublicUtcTimestampValue', 'New-PublicProcessCommitment',
+    'New-LauncherFailureLifecycleDocument',
+    'Assert-LauncherFailureLifecycleDocument',
+        'Write-LauncherFailureLifecycleAtomic',
+        'Assert-LauncherLifecycleSecondaryMarkerDocument',
+        'Write-LauncherLifecycleSecondaryMarkerAtomic',
+    'Invoke-LauncherCleanupTransaction', 'Complete-LauncherFailureState'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+function New-Row {
+    param([int] $ProcessId, [int] $ParentProcessId, [string] $Created)
+    [pscustomobject]@{
+        ProcessId=$ProcessId; ParentProcessId=$ParentProcessId
+        CreationDate=[DateTime]::Parse($Created).ToUniversalTime()
+        ExecutablePath="C:\private\model\python-$ProcessId.exe"
+        CommandLine="python-$ProcessId.exe --token SECRET_TOKEN --model PRIVATE_MODEL"
+        Name="python-$ProcessId.exe"
+    }
+}
+function New-Record {
+    param([object] $Row, [object] $Parent)
+    [pscustomobject]@{
+        pid=[int]$Row.ProcessId
+        creation_time=$Row.CreationDate.ToUniversalTime().ToString('o')
+        executable_path=[string]$Row.ExecutablePath
+        command_line=[string]$Row.CommandLine
+        parent_pid=[int]$Row.ParentProcessId
+        parent_creation_time=$Parent.CreationDate.ToUniversalTime().ToString('o')
+    }
+}
+$script:parent=New-Row 50 4 '2026-08-02T00:00:00Z'
+$script:root=New-Row 100 50 '2026-08-02T00:00:10Z'
+$script:listener=New-Row 200 100 '2026-08-02T00:00:11Z'
+$rootRecord=New-Record $script:root $script:parent
+$listenerRecord=New-Record $script:listener $script:root
+$script:alive=@{50=$true;100=$true;200=$true}
+$script:stopped=[System.Collections.Generic.List[int]]::new()
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    $rows=@($script:parent,$script:root,$script:listener)
+    if (-not $Filter) { return @($rows | Where-Object {$script:alive[[int]$_.ProcessId]}) }
+    $candidatePid=[int]([regex]::Match($Filter,'\d+').Value)
+    return @($rows | Where-Object {
+        [int]$_.ProcessId -eq $candidatePid -and $script:alive[$candidatePid]
+    } | Select-Object -First 1)
+}
+function Stop-Process {
+    param([int] $Id, [switch] $Force, [object] $ErrorAction)
+    if (-not (Test-Path -LiteralPath $script:lifecyclePath -PathType Leaf)) {
+        throw 'process stop preceded the public lifecycle snapshot'
+    }
+    $before=Get-Content -LiteralPath $script:lifecyclePath -Raw | ConvertFrom-Json
+    if ($before.cleanup.state -ne 'snapshot-written') {
+        throw 'process stop did not observe the initial snapshot state'
+    }
+    $script:stopped.Add($Id); $script:alive[$Id]=$false
+}
+function Start-Sleep { param([int] $Milliseconds) }
+
+$outputRoot=Join-Path $env:TTS_MORE_FIX9_ROOT 'public evidence'
+New-Item -ItemType Directory -Path $outputRoot | Out-Null
+$tempRoot=Join-Path $outputRoot 'reliability-temp-private'
+New-Item -ItemType Directory -Path (Join-Path $tempRoot 'runner') -Force | Out-Null
+$owner=Join-Path $outputRoot '.request-temp-private.owner.json'
+$hostRecord=Join-Path $outputRoot '.host-manifest-private.private.json'
+$controlRecord="$hostRecord.current.json"
+@{run_id='raw-run-id';temp_root=[IO.Path]::GetFullPath($tempRoot)
+  runner_temp_root=[IO.Path]::GetFullPath((Join-Path $tempRoot 'runner'))
+  comfy_temp_root=[IO.Path]::GetFullPath((Join-Path $tempRoot 'comfyui'))} |
+    ConvertTo-Json -Compress | Set-Content -LiteralPath $owner -Encoding UTF8
+Set-Content -LiteralPath $hostRecord -Value '{"private":true}' -Encoding UTF8
+Set-Content -LiteralPath $controlRecord -Value '{"private":true}' -Encoding UTF8
+$script:lifecyclePath=Join-Path $outputRoot 'launcher-failure-lifecycle.json'
+$secondaryPath=Join-Path $outputRoot 'launcher-failure-lifecycle-secondary.json'
+$document=New-LauncherFailureLifecycleDocument `
+    -RunId 'raw-run-id' -PrimaryCode 'case-execution-failed' -PrimaryStage 'case' `
+    -RunStartedAt '2026-08-02T00:00:00Z' `
+    -CaseId 'steady-01-gpt-sovits-private-id' `
+    -CaseStartedAt '2026-08-02T00:00:20Z' `
+    -CaseFinishedAt '2026-08-02T00:00:50Z' `
+    -LaunchRoots @{'tts-more'=$rootRecord;comfyui=$rootRecord} `
+    -Listeners @{'tts-more'=$listenerRecord;comfyui=$listenerRecord}
+$proof={
+    param([bool] $PreserveRaw)
+    if (-not $PreserveRaw) { throw 'formal nonzero cleanup bypassed transaction gate' }
+    $stopProven=Stop-RecordedProcessPair -LaunchRootRecord $rootRecord `
+        -ListenerRecord $listenerRecord -TimeoutMilliseconds 25 `
+        -PollIntervalMilliseconds 1
+    $tempEligible=Test-OwnedTempRootCanBeRemoved -Root $tempRoot `
+        -OwnerMarker $owner -ExpectedRunId 'raw-run-id' `
+        -ResolvedOutputRoot ([IO.Path]::GetFullPath($outputRoot))
+    [pscustomobject]@{
+        stop_attempted=$true;stop_proven=[bool]$stopProven
+        temp_removal_eligible=[bool]$tempEligible
+        warning_sha256=@();secondary_sha256=@()
+    }
+}
+$remove={
+    if (-not (Remove-OwnedTempRoot -Root $tempRoot -OwnerMarker $owner `
+            -ExpectedRunId 'raw-run-id' `
+            -ResolvedOutputRoot ([IO.Path]::GetFullPath($outputRoot)))) {
+        throw 'owned temp removal did not converge'
+    }
+    if (-not (Remove-PrivateIdentityRecordsIfSafe `
+            -HostManifestPath $hostRecord -ControlStatePath $controlRecord `
+            -ProcessCleanupProven $true -TempCleanupProven $true `
+            -OwnedProcessCount 2)) { throw 'private identity removal did not converge' }
+}
+$transaction=Invoke-LauncherCleanupTransaction `
+    -PublishFailureLifecycle $true -LifecyclePath $script:lifecyclePath `
+    -SecondaryPath $secondaryPath -LifecycleDocument $document `
+    -CleanupProofOperation $proof -RawRemovalOperation $remove
+if (-not $transaction.cleanup_proven -or -not $transaction.raw_removal_attempted) {
+    throw 'proved cleanup was not committed to raw removal'
+}
+if ((@($script:stopped)-join ',') -ne '200,100') {
+    throw 'exact forest did not stop listener then root exactly once'
+}
+foreach ($path in @($tempRoot,$owner,$controlRecord,$hostRecord)) {
+    if (Test-Path -LiteralPath $path) { throw 'proved raw recovery record remains' }
+}
+if (Test-Path -LiteralPath $secondaryPath) { throw 'successful transaction wrote secondary evidence' }
+$persisted=Get-Content -LiteralPath $script:lifecyclePath -Raw | ConvertFrom-Json
+Assert-LauncherFailureLifecycleDocument -Document $persisted
+if ($persisted.status -ne 'failed' -or $persisted.cleanup.state -ne 'cleanup-proven') {
+    throw 'final lifecycle state was not failed/cleanup-proven'
+}
+if (-not $persisted.cleanup.stop_attempted -or -not $persisted.cleanup.stop_proven) {
+    throw 'final lifecycle omitted exact stop proof'
+}
+foreach ($name in @('temp_root','owner_marker','control_record','host_manifest')) {
+    if ($persisted.cleanup.raw_disposition.$name -ne 'removal-committed') {
+        throw "$name did not commit removal before deletion"
+    }
+}
+$publicText=Get-Content -LiteralPath $script:lifecyclePath -Raw
+foreach ($secret in @('C:\private','SECRET_TOKEN','PRIVATE_MODEL','raw-run-id',
+                       'steady-01-gpt-sovits-private-id')) {
+    if ($publicText.Contains($secret)) { throw 'public lifecycle leaked private value' }
+}
+$primary=$null
+try { throw 'Windows ComfyUI reliability gate failed' } catch { $primary=$_ }
+$caught=$null
+try {
+    Complete-LauncherFailureState -PrimaryFailure $primary `
+        -CleanupFailure $transaction.cleanup_failure
+} catch { $caught=$_ }
+if ($null -eq $caught -or $caught.Exception.Message -ne $primary.Exception.Message) {
+    throw 'lifecycle transaction replaced primary failure'
+}
+Write-Output 'FIX9_NONZERO_LIFECYCLE_TRANSACTION_OK'
+"""
+    completed = _run_fix9_powershell_behavior(command, tmp_path)
+    assert completed.returncode == 0, completed.stderr
+    assert "FIX9_NONZERO_LIFECYCLE_TRANSACTION_OK" in completed.stdout
+
+
+def test_fix9_snapshot_failures_cleanup_warning_and_success_are_fail_closed(
+    tmp_path: Path,
+) -> None:
+    command = r"""
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks','Get-Sha256Hex','ConvertTo-PublicUtcTimestamp',
+    'Assert-ExactPublicProperties','Test-PublicSha256Value',
+    'Test-PublicUtcTimestampValue','New-PublicProcessCommitment',
+    'New-LauncherFailureLifecycleDocument',
+    'Assert-LauncherFailureLifecycleDocument','Write-LauncherFailureLifecycleAtomic',
+    'Assert-LauncherLifecycleSecondaryMarkerDocument',
+    'Write-LauncherLifecycleSecondaryMarkerAtomic','Invoke-LauncherCleanupTransaction',
+    'Complete-LauncherFailureState'
+)) {
+    $function=$ast.Find({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $name
+    },$true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+function New-Record {
+    [pscustomobject]@{
+        pid=123;creation_time='2026-08-02T00:00:01Z'
+        executable_path='C:\private\python.exe'
+        command_line='python --header Authorization:Bearer-PRIVATE'
+        parent_pid=50;parent_creation_time='2026-08-02T00:00:00Z'
+    }
+}
+function New-Document {
+    $record=New-Record
+    New-LauncherFailureLifecycleDocument -RunId 'private-run' `
+        -PrimaryCode 'case-execution-failed' -PrimaryStage 'case' `
+        -RunStartedAt '2026-08-02T00:00:00Z' -CaseId 'private-case' `
+        -CaseStartedAt '2026-08-02T00:00:02Z' `
+        -CaseFinishedAt '2026-08-02T00:00:03Z' `
+        -LaunchRoots @{'tts-more'=$record;comfyui=$record} `
+        -Listeners @{'tts-more'=$record;comfyui=$record}
+}
+function Reset-Raw { param([string]$Root)
+    New-Item -ItemType Directory -Path $Root -Force | Out-Null
+    foreach($name in @('temp','owner','control','manifest')) {
+        Set-Content -LiteralPath (Join-Path $Root $name) -Value 'PRIVATE_RAW' -Encoding UTF8
+    }
+}
+function Assert-RawPresent { param([string]$Root)
+    foreach($name in @('temp','owner','control','manifest')) {
+        if(-not(Test-Path -LiteralPath (Join-Path $Root $name))) {
+            throw "$name raw recovery record was removed"
+        }
+    }
+}
+$base=Join-Path $env:TTS_MORE_FIX9_ROOT 'failure modes'
+New-Item -ItemType Directory -Path $base | Out-Null
+$script:writeMode='normal';$script:writeCount=0
+$realWriter=${function:Write-LauncherFailureLifecycleAtomic}
+function Write-LauncherFailureLifecycleAtomic {
+    param([string]$Path,[object]$Document)
+    $script:writeCount+=1
+    if($script:writeMode -eq 'initial-fail' -and $script:writeCount -eq 1) {
+        throw 'PRIVATE initial path C:\leak\TOKEN'
+    }
+    if($script:writeMode -eq 'commit-fail' -and $script:writeCount -eq 2) {
+        throw 'PRIVATE commit header Authorization:Bearer-LEAK'
+    }
+    & $realWriter -Path $Path -Document $Document
+}
+foreach($mode in @('initial-fail','commit-fail','cleanup-warning')) {
+    $caseRoot=Join-Path $base $mode;Reset-Raw $caseRoot
+    $lifecycle=Join-Path $caseRoot 'lifecycle.json'
+    $secondary=Join-Path $caseRoot 'secondary.json'
+    $script:writeMode=$mode;$script:writeCount=0
+    $script:proofCalled=0;$script:removeCalled=0
+    $proof={param([bool]$PreserveRaw)
+        $script:proofCalled+=1
+        [pscustomobject]@{
+            stop_attempted=$true
+            stop_proven=($script:writeMode -ne 'cleanup-warning')
+            temp_removal_eligible=($script:writeMode -ne 'cleanup-warning')
+            warning_sha256=if($script:writeMode -eq 'cleanup-warning') {
+                @((Get-Sha256Hex 'bounded-cleanup-warning'))
+            } else {@()}
+            secondary_sha256=@()
+        }
+    }
+    $remove={
+        $script:removeCalled+=1
+        foreach($name in @('temp','owner','control','manifest')) {
+            Remove-Item -LiteralPath (Join-Path $caseRoot $name) -Force
+        }
+    }
+    $transaction=Invoke-LauncherCleanupTransaction `
+        -PublishFailureLifecycle $true -LifecyclePath $lifecycle `
+        -SecondaryPath $secondary -LifecycleDocument (New-Document) `
+        -CleanupProofOperation $proof -RawRemovalOperation $remove
+    if($script:proofCalled -ne 1) { throw "$mode did not attempt cleanup proof" }
+    if($script:removeCalled -ne 0) { throw "$mode crossed raw-removal gate" }
+    Assert-RawPresent $caseRoot
+    if($mode -ne 'cleanup-warning' -and
+       -not(Test-Path -LiteralPath $secondary -PathType Leaf)) {
+        throw "$mode omitted public secondary evidence"
+    }
+    if($mode -eq 'cleanup-warning') {
+        $failed=Get-Content -LiteralPath $lifecycle -Raw | ConvertFrom-Json
+        Assert-LauncherFailureLifecycleDocument $failed
+        if($failed.cleanup.state -ne 'cleanup-unproven') {
+            throw 'cleanup warning omitted cleanup-unproven state'
+        }
+        foreach($value in $failed.cleanup.raw_disposition.PSObject.Properties.Value) {
+            if($value -ne 'preserved') { throw 'cleanup warning did not preserve raw' }
+        }
+    }
+    $combined=''
+    foreach($path in @($lifecycle,$secondary)) {
+        if(Test-Path -LiteralPath $path) {$combined+=Get-Content -LiteralPath $path -Raw}
+    }
+    foreach($secret in @('C:\leak','TOKEN','Authorization','Bearer-LEAK','PRIVATE')) {
+        if($combined.Contains($secret)) { throw "$mode leaked raw secondary detail" }
+    }
+    $primary=$null;try{throw 'ORIGINAL_FORMAL_PRIMARY'}catch{$primary=$_}
+    $caught=$null
+    try{Complete-LauncherFailureState -PrimaryFailure $primary `
+            -CleanupFailure $transaction.cleanup_failure}catch{$caught=$_}
+    if($null -eq $caught -or $caught.Exception.Message -ne 'ORIGINAL_FORMAL_PRIMARY') {
+        throw "$mode replaced primary failure"
+    }
+}
+$removalRoot=Join-Path $base 'removal-fail';Reset-Raw $removalRoot
+$script:writeMode='normal';$script:writeCount=0;$script:removeCalled=0
+$removalLifecycle=Join-Path $removalRoot 'lifecycle.json'
+$removalSecondary=Join-Path $removalRoot 'secondary.json'
+$removalTransaction=Invoke-LauncherCleanupTransaction `
+    -PublishFailureLifecycle $true -LifecyclePath $removalLifecycle `
+    -SecondaryPath $removalSecondary -LifecycleDocument (New-Document) `
+    -CleanupProofOperation {param([bool]$PreserveRaw)
+        [pscustomobject]@{stop_attempted=$true;stop_proven=$true
+            temp_removal_eligible=$true;warning_sha256=@();secondary_sha256=@()}
+    } `
+    -RawRemovalOperation {
+        $script:removeCalled+=1
+        throw 'PRIVATE deletion path C:\secret\remaining TOKEN'
+    }
+if($script:removeCalled -ne 1 -or -not $removalTransaction.raw_removal_attempted) {
+    throw 'committed removal failure was not attempted exactly once'
+}
+Assert-RawPresent $removalRoot
+$committed=Get-Content -LiteralPath $removalLifecycle -Raw | ConvertFrom-Json
+if($committed.cleanup.state -ne 'cleanup-proven') {
+    throw 'deletion failure rolled back the committed cleanup proof'
+}
+$removalMarker=Get-Content -LiteralPath $removalSecondary -Raw | ConvertFrom-Json
+Assert-LauncherLifecycleSecondaryMarkerDocument $removalMarker
+if(-not $removalMarker.raw_removal_failed -or $removalMarker.lifecycle_write_failed) {
+    throw 'deletion failure marker flags are wrong'
+}
+$removalPublic=(Get-Content -LiteralPath $removalSecondary -Raw) +
+    (Get-Content -LiteralPath $removalLifecycle -Raw)
+foreach($secret in @('C:\secret','TOKEN','PRIVATE')) {
+    if($removalPublic.Contains($secret)) { throw 'deletion failure leaked raw detail' }
+}
+$primary=$null;try{throw 'ORIGINAL_REMOVAL_PRIMARY'}catch{$primary=$_}
+$caught=$null
+try{Complete-LauncherFailureState -PrimaryFailure $primary `
+        -CleanupFailure $removalTransaction.cleanup_failure}catch{$caught=$_}
+if($null -eq $caught -or $caught.Exception.Message -ne 'ORIGINAL_REMOVAL_PRIMARY') {
+    throw 'deletion failure replaced primary failure'
+}
+$successRoot=Join-Path $base 'success';Reset-Raw $successRoot
+$script:writeMode='normal';$script:writeCount=0;$script:removeCalled=0
+$success=Invoke-LauncherCleanupTransaction -PublishFailureLifecycle $false `
+    -LifecyclePath (Join-Path $successRoot 'lifecycle.json') `
+    -SecondaryPath (Join-Path $successRoot 'secondary.json') `
+    -LifecycleDocument (New-Document) `
+    -CleanupProofOperation {param([bool]$PreserveRaw)
+        if($PreserveRaw){throw 'success requested failure retention'}
+        [pscustomobject]@{stop_attempted=$true;stop_proven=$true
+            temp_removal_eligible=$true;warning_sha256=@();secondary_sha256=@()}
+    } `
+    -RawRemovalOperation {
+        $script:removeCalled+=1
+        foreach($name in @('temp','owner','control','manifest')) {
+            Remove-Item -LiteralPath (Join-Path $successRoot $name) -Force
+        }
+    }
+if($script:removeCalled -ne 1){throw 'success did not remove proven raw records'}
+if(Test-Path -LiteralPath (Join-Path $successRoot 'lifecycle.json')) {
+    throw 'success published failure lifecycle'
+}
+if(Test-Path -LiteralPath (Join-Path $successRoot 'secondary.json')) {
+    throw 'success published failure secondary marker'
+}
+Write-Output 'FIX9_FAILURE_AND_SUCCESS_GATES_OK'
+"""
+    completed = _run_fix9_powershell_behavior(command, tmp_path)
+    assert completed.returncode == 0, completed.stderr
+    assert "FIX9_FAILURE_AND_SUCCESS_GATES_OK" in completed.stdout
+
+
+def test_fix9_lifecycle_schema_roundtrip_bounds_and_redaction_are_strict(
+    tmp_path: Path,
+) -> None:
+    command = r"""
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
+)
+if($errors.Count -ne 0){throw($errors|Out-String)}
+foreach($name in @('Get-UtcTicks','Get-Sha256Hex','ConvertTo-PublicUtcTimestamp',
+    'Assert-ExactPublicProperties','Test-PublicSha256Value',
+    'Test-PublicUtcTimestampValue','New-PublicProcessCommitment',
+    'New-LauncherFailureLifecycleDocument',
+    'Assert-LauncherFailureLifecycleDocument','Write-LauncherFailureLifecycleAtomic',
+    'Assert-LauncherLifecycleSecondaryMarkerDocument',
+    'Write-LauncherLifecycleSecondaryMarkerAtomic')){
+    $function=$ast.Find({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $name
+    },$true)
+    if($null -eq $function){throw "$name is missing"}
+    Invoke-Expression $function.Extent.Text
+}
+$privateRecord=[pscustomobject]@{
+    pid=123;creation_time='2026-08-02T00:00:01Z'
+    executable_path='C:\Users\PRIVATE\model\python.exe'
+    command_line='python --token TOP_SECRET --header Authorization:Bearer-X'
+    parent_pid=50;parent_creation_time='2026-08-02T00:00:00Z'
+}
+$document=New-LauncherFailureLifecycleDocument -RunId 'PRIVATE_RUN_ID' `
+    -PrimaryCode 'case-execution-failed' -PrimaryStage 'case' `
+    -RunStartedAt '2026-08-02T00:00:00Z' -CaseId 'PRIVATE_CASE_ID' `
+    -CaseStartedAt '2026-08-02T00:00:02Z' `
+    -CaseFinishedAt '2026-08-02T00:00:03Z' `
+    -LaunchRoots @{'tts-more'=$privateRecord;comfyui=$privateRecord} `
+    -Listeners @{'tts-more'=$privateRecord;comfyui=$privateRecord}
+$target=Join-Path $env:TTS_MORE_FIX9_ROOT 'roundtrip.json'
+Write-LauncherFailureLifecycleAtomic -Path $target -Document $document
+$persisted=Get-Content -LiteralPath $target -Raw | ConvertFrom-Json
+Assert-LauncherFailureLifecycleDocument -Document $persisted
+$publicText=Get-Content -LiteralPath $target -Raw
+foreach($secret in @('C:\Users\PRIVATE','TOP_SECRET','Authorization','Bearer-X',
+                      'PRIVATE_RUN_ID','PRIVATE_CASE_ID')){
+    if($publicText.Contains($secret)){throw 'strict roundtrip leaked private value'}
+}
+function Clone-Document {param([object]$Value)
+    $Value|ConvertTo-Json -Depth 20|ConvertFrom-Json
+}
+function Must-Reject {param([scriptblock]$Mutation,[string]$Name)
+    $candidate=Clone-Document $persisted;& $Mutation $candidate
+    $caught=$null
+    try{Assert-LauncherFailureLifecycleDocument -Document $candidate}catch{$caught=$_}
+    if($null -eq $caught){throw "$Name mutation passed strict schema"}
+    $rendered=[string]$caught
+    foreach($secret in @('C:\Users\PRIVATE','TOP_SECRET','Authorization','Bearer-X')){
+        if($rendered.Contains($secret)){throw "$Name error leaked private input"}
+    }
+}
+Must-Reject {param($d)$d.PSObject.Properties.Remove('primary')} 'missing-primary'
+Must-Reject {param($d)$d|Add-Member extra 'forbidden'} 'extra-root'
+Must-Reject {param($d)$d.schema_version=1.0} 'non-integer-version'
+Must-Reject {param($d)$d.kind='other'} 'wrong-kind'
+Must-Reject {param($d)$d.status='passed'} 'passed-status'
+Must-Reject {param($d)$d.primary.code=('x'*65)} 'oversize-code'
+Must-Reject {param($d)$d.timestamps.run_started_at='not-utc'} 'invalid-utc'
+Must-Reject {param($d)$d.processes[0].pid=2147483648} 'oversize-pid'
+Must-Reject {param($d)$d.processes[0].identity_sha256=('z'*64)} 'invalid-hash'
+Must-Reject {param($d)$d.processes[0].role='private-role'} 'invalid-role'
+Must-Reject {param($d)$d.cleanup.state='removed'} 'invalid-cleanup-state'
+Must-Reject {param($d)$d.cleanup.warning_sha256=@(1..33|ForEach-Object{'a'*64})} 'warning-bound'
+Must-Reject {param($d)$d.cleanup|Add-Member private_path 'C:\Users\PRIVATE'} 'extra-nested'
+$secondaryPath=Join-Path $env:TTS_MORE_FIX9_ROOT 'secondary-roundtrip.json'
+Write-LauncherLifecycleSecondaryMarkerAtomic -Path $secondaryPath `
+    -RunIdSha256 $persisted.run_id_sha256 `
+    -SecondarySha256 @((Get-Sha256Hex 'PRIVATE secondary diagnostic')) `
+    -LifecycleWriteFailed $true -RawRemovalFailed $false
+$secondary=Get-Content -LiteralPath $secondaryPath -Raw | ConvertFrom-Json
+Assert-LauncherLifecycleSecondaryMarkerDocument $secondary
+if((Get-Content -LiteralPath $secondaryPath -Raw).Contains('PRIVATE secondary diagnostic')) {
+    throw 'secondary strict roundtrip leaked raw diagnostic'
+}
+$secondaryExtra=Clone-Document $secondary
+$secondaryExtra|Add-Member private_path 'C:\Users\PRIVATE'
+$caught=$null
+try{Assert-LauncherLifecycleSecondaryMarkerDocument $secondaryExtra}catch{$caught=$_}
+if($null -eq $caught){throw 'secondary extra property passed strict schema'}
+$secondaryFlags=Clone-Document $secondary
+$secondaryFlags.lifecycle_write_failed=$false
+$caught=$null
+try{Assert-LauncherLifecycleSecondaryMarkerDocument $secondaryFlags}catch{$caught=$_}
+if($null -eq $caught){throw 'secondary marker accepted no active failure flag'}
+Write-Output 'FIX9_STRICT_SCHEMA_ROUNDTRIP_OK'
+"""
+    completed = _run_fix9_powershell_behavior(command, tmp_path)
+    assert completed.returncode == 0, completed.stderr
+    assert "FIX9_STRICT_SCHEMA_ROUNDTRIP_OK" in completed.stdout
+
+
+def test_fix9_top_level_cleanup_routes_formal_failure_through_transaction() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
+)
+if($errors.Count -ne 0){throw($errors|Out-String)}
+$calls=@($ast.FindAll({param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -eq 'Invoke-LauncherCleanupTransaction'
+},$true))
+if($calls.Count -ne 1){throw 'top-level cleanup transaction is missing or ambiguous'}
+$invocationStatement=$calls[0]
+while($null -ne $invocationStatement -and
+      $invocationStatement -isnot [Management.Automation.Language.AssignmentStatementAst]){
+    $invocationStatement=$invocationStatement.Parent
+}
+if($null -eq $invocationStatement){throw 'cleanup transaction result is not assigned'}
+$resultAssignments=@($ast.FindAll({param($node)
+    if($node -isnot [Management.Automation.Language.AssignmentStatementAst]){return $false}
+    if($node.Left -isnot [Management.Automation.Language.VariableExpressionAst] -or
+       $node.Left.VariablePath.UserPath -ne 'cleanupFailure'){return $false}
+    $member=$node.Right.Find({param($child)
+        $child -is [Management.Automation.Language.MemberExpressionAst] -and
+        [string]$child.Member.Value -eq 'cleanup_failure'
+    },$true)
+    return $null -ne $member
+},$true))
+if($resultAssignments.Count -ne 1){throw 'cleanup result arbitration assignment is missing'}
+function Invoke-LauncherCleanupTransaction {
+    param([bool]$PublishFailureLifecycle,[string]$LifecyclePath,
+        [string]$SecondaryPath,[object]$LifecycleDocument,
+        [scriptblock]$CleanupProofOperation,[scriptblock]$RawRemovalOperation)
+    $script:captured=[pscustomobject]@{
+        publish=$PublishFailureLifecycle;lifecycle=$LifecyclePath
+        secondary=$SecondaryPath;document=$LifecycleDocument
+        proof=$CleanupProofOperation;remove=$RawRemovalOperation
+    }
+    [pscustomobject]@{cleanup_failure=$null}
+}
+$publishFailureLifecycle=$true
+$launcherLifecyclePath='controlled lifecycle'
+$launcherLifecycleSecondaryPath='controlled secondary'
+$lifecycleDocument=[pscustomobject]@{kind='controlled document'}
+$cleanupProofOperation={ 'controlled proof' }
+$rawRemovalOperation={ 'controlled removal' }
+$cleanupFailure='not replaced'
+Invoke-Expression $invocationStatement.Extent.Text
+Invoke-Expression $resultAssignments[0].Extent.Text
+if(-not $script:captured.publish -or
+   $script:captured.lifecycle -ne $launcherLifecyclePath -or
+   $script:captured.secondary -ne $launcherLifecycleSecondaryPath -or
+   $script:captured.document -ne $lifecycleDocument -or
+   $script:captured.proof -ne $cleanupProofOperation -or
+   $script:captured.remove -ne $rawRemovalOperation){
+    throw 'formal failure transaction arguments changed at the top-level call'
+}
+if($null -ne $cleanupFailure){throw 'transaction result was not wired into arbitration'}
+$publishFailureLifecycle=$false
+Invoke-Expression $invocationStatement.Extent.Text
+Invoke-Expression $resultAssignments[0].Extent.Text
+if($script:captured.publish){throw 'successful cleanup was routed as a failure lifecycle'}
+Write-Output 'FIX9_TOP_LEVEL_TRANSACTION_WIRING_OK'
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "TTS_MORE_RELIABILITY_SCRIPT": str(script_path)},
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "FIX9_TOP_LEVEL_TRANSACTION_WIRING_OK" in completed.stdout
