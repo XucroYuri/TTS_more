@@ -62,6 +62,8 @@ MAX_FAILED_CASE_AUDIO_BYTES = 4_294_967_295
 MAX_FAILED_CASE_ID_LENGTH = 128
 MAX_FAILURE_CODE_LENGTH = 64
 MAX_FAILED_CASE_JSON_BYTES = 4_194_304
+MAX_RELIABILITY_SUMMARY_JSON_BYTES = 67_108_864
+MAX_TERMINAL_COHORT_CASES = 128
 _BRIDGE_ENGINE_IDS: dict[str, Engine] = {
     "gpt_sovits": "gpt-sovits",
     "index_tts": "indextts",
@@ -5046,20 +5048,231 @@ def _transition_public_terminal_markers(
             if not marker.is_file():
                 raise OSError("terminal marker must be a regular file")
             markers.append((kind, marker))
+        cohort = (
+            _prepare_terminal_cohort_archive(Path(output_root))
+            if retained_marker == "preflight.json"
+            else None
+        )
         for kind, marker in markers:
             _archive_public_terminal_marker(
                 Path(output_root),
                 marker=marker,
                 kind=kind,
             )
+        if cohort is not None:
+            _archive_terminal_cohort(Path(output_root), cohort)
         for _kind, marker in markers:
             if marker.name != retained_marker:
                 marker.unlink()
+        if cohort is not None:
+            if cohort.summary_path is not None:
+                cohort.summary_path.unlink()
+            for case_path in cohort.case_paths:
+                case_path.unlink()
+            if cohort.case_root is not None:
+                cohort.case_root.rmdir()
     except Exception:
         raise LiveValidationError(
             "public-marker-transition-failed",
             stage=stage,
         ) from None
+
+
+@dataclass(frozen=True)
+class _PreparedTerminalCohort:
+    archive: dict[str, Any] | None
+    summary_path: Path | None
+    case_root: Path | None
+    case_paths: tuple[Path, ...]
+
+
+def _read_bounded_terminal_artifact(path: Path, *, maximum_bytes: int) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise OSError("terminal cohort artifact must be a regular file")
+    before = path.stat()
+    if before.st_size < 0 or before.st_size > maximum_bytes:
+        raise OSError("terminal cohort artifact exceeds its byte bound")
+    content = path.read_bytes()
+    after = path.stat()
+    if (
+        len(content) != before.st_size
+        or after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+    ):
+        raise OSError("terminal cohort artifact changed while being read")
+    return content
+
+
+def _canonical_public_model_json(content: bytes, model: BaseModel) -> bool:
+    try:
+        document = json.loads(content)
+        canonical_input = json.dumps(
+            document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        canonical_model = json.dumps(
+            model.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (UnicodeError, ValueError, TypeError, AttributeError, RecursionError):
+        return False
+    return canonical_input == canonical_model
+
+
+def _prepare_terminal_cohort_archive(output_root: Path) -> _PreparedTerminalCohort | None:
+    summary_path = output_root / "reliability-summary.json"
+    summary: ReliabilityRunSummary | None = None
+    summary_content: bytes | None = None
+    if summary_path.is_symlink():
+        raise OSError("terminal cohort summary must not be a link")
+    if summary_path.exists():
+        summary_content = _read_bounded_terminal_artifact(
+            summary_path,
+            maximum_bytes=MAX_RELIABILITY_SUMMARY_JSON_BYTES,
+        )
+        summary = read_reliability_summary(summary_content)
+    else:
+        summary_path = None
+
+    case_root = output_root / "cases"
+    case_paths: list[Path] = []
+    if case_root.is_symlink():
+        raise OSError("terminal cohort cases root must not be a link")
+    if case_root.exists():
+        if not case_root.is_dir():
+            raise OSError("terminal cohort cases root must be a directory")
+        entries = sorted(case_root.iterdir(), key=lambda item: item.name)
+        if len(entries) > MAX_TERMINAL_COHORT_CASES:
+            raise OSError("terminal cohort case count exceeds its bound")
+        for case_path in entries:
+            if (
+                re.fullmatch(r"[a-z0-9][a-z0-9-]{0,127}\.json", case_path.name)
+                is None
+            ):
+                raise OSError("terminal cohort case name is invalid")
+            case_paths.append(case_path)
+    else:
+        case_root = None
+
+    if summary is None and not case_paths:
+        if case_root is None:
+            return None
+        return _PreparedTerminalCohort(
+            archive=None,
+            summary_path=None,
+            case_root=case_root,
+            case_paths=(),
+        )
+    if summary is None:
+        raise OSError("terminal cohort cases require a reliability summary")
+
+    summary_cases = {case.case_id: case for case in summary.cases}
+    completed_case_ids: set[str] = set()
+    commitments: list[dict[str, Any]] = []
+    for case_path in case_paths:
+        content = _read_bounded_terminal_artifact(
+            case_path,
+            maximum_bytes=MAX_FAILED_CASE_JSON_BYTES,
+        )
+        case_kind: Literal["completed", "failed"]
+        case_schema: Literal["case-evidence", "legacy-failed", "current-failed-v2"]
+        try:
+            failed_case = FailedCaseEvidence.model_validate_json(content)
+        except ValidationError:
+            try:
+                completed_case = CaseEvidence.model_validate_json(content)
+            except ValidationError:
+                raise OSError("terminal cohort case failed formal validation") from None
+            if not _canonical_public_model_json(content, completed_case):
+                raise OSError("terminal cohort completed case is not canonical")
+            expected_case = summary_cases.get(completed_case.case_id)
+            if expected_case is None or expected_case != completed_case:
+                raise OSError("terminal cohort completed case is not bound to its summary")
+            completed_case_ids.add(completed_case.case_id)
+            case_id = completed_case.case_id
+            case_kind = "completed"
+            case_schema = "case-evidence"
+        else:
+            if summary.status != "failed":
+                raise OSError("passed terminal cohort contains a failed case")
+            if not _canonical_public_model_json(content, failed_case):
+                raise OSError("terminal cohort failed case is not canonical")
+            case_id = failed_case.case_id
+            case_kind = "failed"
+            case_schema = (
+                "current-failed-v2"
+                if isinstance(failed_case, CurrentFailedCaseEvidence)
+                else "legacy-failed"
+            )
+        if case_path.stem != case_id:
+            raise OSError("terminal cohort case filename does not match its document")
+        commitments.append(
+            {
+                "kind": case_kind,
+                "case_schema": case_schema,
+                "case_id_sha256": _sha256_text(case_id),
+                "artifact_sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    if completed_case_ids != set(summary_cases):
+        raise OSError("terminal cohort summary cases are incomplete")
+    commitments.sort(
+        key=lambda item: (
+            item["case_id_sha256"],
+            item["kind"],
+            item["case_schema"],
+            item["artifact_sha256"],
+        )
+    )
+
+    archive = {
+        "schema_version": 1,
+        "kind": "reliability-terminal-cohort",
+        "document_status": "validated",
+        "summary": {
+            "artifact_sha256": hashlib.sha256(summary_content or b"").hexdigest(),
+            "status": summary.status,
+            "completed_case_count": len(summary.cases),
+        },
+        "cases": commitments,
+    }
+    validated_archive = _ArchivedTerminalCohort.model_validate(archive)
+    return _PreparedTerminalCohort(
+        archive=validated_archive.model_dump(mode="json"),
+        summary_path=summary_path,
+        case_root=case_root,
+        case_paths=tuple(case_paths),
+    )
+
+
+def _archive_terminal_cohort(
+    output_root: Path,
+    cohort: _PreparedTerminalCohort,
+) -> None:
+    if cohort.archive is None:
+        return
+    archive_root = output_root / "history" / "terminal-cohorts"
+    archive_digest = _sha256_document(cohort.archive)
+    archive_path = archive_root / f"cohort-{archive_digest}.json"
+    try:
+        write_atomic_json(archive_path, cohort.archive, replace_existing=False)
+    except OSError:
+        if archive_path.is_symlink() or not archive_path.is_file():
+            raise
+        existing = _read_bounded_terminal_artifact(
+            archive_path,
+            maximum_bytes=MAX_FAILED_CASE_JSON_BYTES,
+        )
+        try:
+            validated = _ArchivedTerminalCohort.model_validate_json(existing)
+        except ValidationError:
+            raise OSError("terminal cohort archive conflicts with prior history") from None
+        if validated.model_dump(mode="json") != cohort.archive:
+            raise OSError("terminal cohort archive conflicts with prior history")
 
 
 def _archive_public_terminal_marker(
@@ -5372,6 +5585,74 @@ class ReliabilityRunSummary(_StrictModel):
         ):
             raise ValueError("passed summary contains failed evidence")
         return self
+
+
+def read_reliability_summary(content: bytes) -> ReliabilityRunSummary:
+    if not isinstance(content, bytes) or len(content) > MAX_RELIABILITY_SUMMARY_JSON_BYTES:
+        raise ValueError("reliability summary is invalid")
+    try:
+        document = json.loads(content)
+        summary = ReliabilityRunSummary.model_validate_json(content, strict=False)
+        canonical_input = json.dumps(
+            document,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        canonical_model = json.dumps(
+            summary.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if canonical_input != canonical_model:
+            raise ValueError("reliability summary is not canonical")
+        return summary
+    except Exception:
+        raise ValueError("reliability summary is invalid") from None
+
+
+class _ArchivedTerminalSummaryCommitment(_StrictModel):
+    artifact_sha256: SHA256
+    status: Literal["passed", "failed"]
+    completed_case_count: StrictInt = Field(ge=0, le=MAX_TERMINAL_COHORT_CASES)
+
+
+class _ArchivedTerminalCaseCommitment(_StrictModel):
+    kind: Literal["completed", "failed"]
+    case_schema: Literal["case-evidence", "legacy-failed", "current-failed-v2"]
+    case_id_sha256: SHA256
+    artifact_sha256: SHA256
+
+
+class _ArchivedTerminalCohort(_StrictModel):
+    schema_version: StrictInt = Field(ge=1, le=1)
+    kind: Literal["reliability-terminal-cohort"]
+    document_status: Literal["validated"]
+    summary: _ArchivedTerminalSummaryCommitment
+    cases: Annotated[
+        list[_ArchivedTerminalCaseCommitment],
+        Field(max_length=MAX_TERMINAL_COHORT_CASES),
+    ]
+
+    @field_validator("cases")
+    @classmethod
+    def _ordered_unique_cases(
+        cls,
+        value: list[_ArchivedTerminalCaseCommitment],
+    ) -> list[_ArchivedTerminalCaseCommitment]:
+        ordered = sorted(
+            value,
+            key=lambda item: (
+                item.case_id_sha256,
+                item.kind,
+                item.case_schema,
+                item.artifact_sha256,
+            ),
+        )
+        if value != ordered or len({item.case_id_sha256 for item in value}) != len(value):
+            raise ValueError("terminal cohort case commitments must be ordered and unique")
+        return value
 
 
 def _process_proof_valid(case: CaseEvidence) -> bool:

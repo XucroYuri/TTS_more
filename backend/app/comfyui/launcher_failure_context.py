@@ -26,6 +26,8 @@ from .reliability_validation import (
     _parse_public_utc,
     _public_utc,
     _run_key_argument,
+    read_reliability_summary,
+    read_reliability_summary,
 )
 
 
@@ -265,29 +267,6 @@ def _read_current_bytes(path: Path, stamp: LauncherEvidenceStamp) -> bytes:
     return content
 
 
-def _read_reliability_summary(content: bytes) -> ReliabilityRunSummary:
-    try:
-        document = json.loads(content)
-        summary = ReliabilityRunSummary.model_validate_json(content, strict=False)
-        canonical_input = json.dumps(
-            document,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        canonical_model = json.dumps(
-            summary.model_dump(mode="json"),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        if canonical_input != canonical_model:
-            raise ValueError("reliability summary is not canonical")
-        return summary
-    except Exception:
-        raise ValueError("reliability summary is invalid") from None
-
-
 def _baseline_case_map(
     baseline: LauncherFailureEvidenceBaseline,
 ) -> dict[str, LauncherEvidenceStamp]:
@@ -346,7 +325,7 @@ def evaluate_launcher_failure_context(
     ):
         try:
             assert summary_stamp is not None
-            summary = _read_reliability_summary(
+            summary = read_reliability_summary(
                 _read_current_bytes(
                     output_root / "reliability-summary.json",
                     summary_stamp,

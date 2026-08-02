@@ -11322,6 +11322,296 @@ def _fix9_failed_summary(cases: list[CaseEvidence] | None = None) -> Reliability
     )
 
 
+def test_fix11_preflight_success_retires_failed_summary_and_legacy_case(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "reused-evidence"
+    _fix9_publish_current_root(output_root)
+    failed_case_path = output_root / "cases" / "steady-01-gpt-sovits.json"
+    failed_case_path.parent.mkdir(parents=True)
+    failed_case_path.write_bytes(_fix8_attempt1_failed_case_path().read_bytes())
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            http_probe,
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert result == 0
+    assert json.loads((output_root / "preflight.json").read_text(encoding="utf-8"))[
+        "status"
+    ] == "passed"
+    assert not (output_root / "failure.json").exists()
+    assert not (output_root / "reliability-summary.json").exists()
+    assert not (output_root / "cases").exists()
+    archives = list((output_root / "history" / "terminal-cohorts").glob("*.json"))
+    assert len(archives) == 1
+    archive_text = archives[0].read_text(encoding="utf-8")
+    archive = json.loads(archive_text)
+    assert set(archive) == {
+        "schema_version",
+        "kind",
+        "document_status",
+        "summary",
+        "cases",
+    }
+    assert archive["summary"] == {
+        "artifact_sha256": hashlib.sha256(
+            _fix9_failed_summary().model_dump_json().encode("utf-8")
+        ).hexdigest(),
+        "status": "failed",
+        "completed_case_count": 0,
+    }
+    assert archive["cases"][0]["case_schema"] == "legacy-failed"
+    assert archive["cases"][0]["artifact_sha256"] == hashlib.sha256(
+        _fix8_attempt1_failed_case_path().read_bytes()
+    ).hexdigest()
+    assert "steady-01-gpt-sovits" not in archive_text
+    assert "resource_id" not in archive_text
+
+
+def _fix11_run_preflight(output_root: Path, fixture_path: Path) -> int:
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+    return reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            http_probe,
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+
+def _fix11_seed_failed_cohort(
+    output_root: Path,
+    failed_case: dict[str, object],
+) -> tuple[bytes, bytes, bytes]:
+    _fix9_publish_current_root(output_root)
+    failure_path = output_root / "failure.json"
+    summary_path = output_root / "reliability-summary.json"
+    case_path = output_root / "cases" / "steady-01-gpt-sovits.json"
+    _fix9_write_context_artifact(case_path, failed_case)
+    return failure_path.read_bytes(), summary_path.read_bytes(), case_path.read_bytes()
+
+
+def test_fix11_preflight_success_uses_current_failed_case_reader_and_hash_only_history(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "current-evidence"
+    failed_case = _fix9_current_failed_document()
+    _, summary_bytes, case_bytes = _fix11_seed_failed_cohort(output_root, failed_case)
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+
+    assert _fix11_run_preflight(output_root, fixture_path) == 0
+
+    archive_path = next((output_root / "history" / "terminal-cohorts").glob("*.json"))
+    archive_text = archive_path.read_text(encoding="utf-8")
+    archive = json.loads(archive_text)
+    assert archive["summary"]["artifact_sha256"] == hashlib.sha256(
+        summary_bytes
+    ).hexdigest()
+    assert archive["cases"] == [
+        {
+            "kind": "failed",
+            "case_schema": "current-failed-v2",
+            "case_id_sha256": hashlib.sha256(
+                b"steady-01-gpt-sovits"
+            ).hexdigest(),
+            "artifact_sha256": hashlib.sha256(case_bytes).hexdigest(),
+        }
+    ]
+    for raw_value in (
+        "steady-01-gpt-sovits",
+        failed_case["observation"]["request_sha256"],  # type: ignore[index]
+        failed_case["observation"]["job_id_sha256"],  # type: ignore[index]
+    ):
+        assert raw_value not in archive_text
+
+
+def test_fix11_invalid_failed_case_fails_closed_without_mutating_active_cohort(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "invalid-case"
+    failed_case = _fix9_current_failed_document()
+    failed_case["private_raw_case"] = "token=PRIVATE-CASE-CONTENT"
+    original = _fix11_seed_failed_cohort(output_root, failed_case)
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+
+    assert _fix11_run_preflight(output_root, fixture_path) == 1
+
+    assert not (output_root / "preflight.json").exists()
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+        "code": "public-marker-transition-failed",
+        "stage": "preflight",
+    }
+    assert (output_root / "reliability-summary.json").read_bytes() == original[1]
+    assert (
+        output_root / "cases" / "steady-01-gpt-sovits.json"
+    ).read_bytes() == original[2]
+    assert not list((output_root / "history" / "terminal-cohorts").glob("*.json"))
+    archived_failures = list(
+        (output_root / "history" / "terminal-markers").glob("failure-*.json")
+    )
+    assert archived_failures
+    assert all(
+        json.loads(path.read_text(encoding="utf-8"))["document"]
+        == json.loads(original[0])
+        for path in archived_failures
+    )
+
+
+def test_fix11_cohort_archive_failure_preserves_active_evidence_and_blocks_passed_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "archive-failure"
+    original = _fix11_seed_failed_cohort(
+        output_root,
+        _fix9_current_failed_document(),
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    original_write = reliability_validation.write_atomic_json
+
+    def fail_cohort_archive(path: Path, payload: object, **kwargs: object) -> None:
+        if Path(path).parent.name == "terminal-cohorts":
+            raise OSError("private archive failure")
+        original_write(path, payload, **kwargs)
+
+    monkeypatch.setattr(reliability_validation, "write_atomic_json", fail_cohort_archive)
+
+    assert _fix11_run_preflight(output_root, fixture_path) == 1
+
+    assert not (output_root / "preflight.json").exists()
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+        "code": "public-marker-transition-failed",
+        "stage": "preflight",
+    }
+    assert (output_root / "reliability-summary.json").read_bytes() == original[1]
+    assert (
+        output_root / "cases" / "steady-01-gpt-sovits.json"
+    ).read_bytes() == original[2]
+    archived_failures = list(
+        (output_root / "history" / "terminal-markers").glob("failure-*.json")
+    )
+    assert archived_failures
+    assert all(
+        json.loads(path.read_text(encoding="utf-8"))["document"]
+        == json.loads(original[0])
+        for path in archived_failures
+    )
+
+
+def test_fix11_single_delete_failure_reconciles_to_current_failure_with_safe_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "delete-failure"
+    _, summary_bytes, case_bytes = _fix11_seed_failed_cohort(
+        output_root,
+        _fix9_current_failed_document(),
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    original_unlink = Path.unlink
+    injected = False
+
+    def fail_summary_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal injected
+        if Path(path) == output_root / "reliability-summary.json" and not injected:
+            injected = True
+            raise OSError("single injected delete failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_summary_unlink)
+
+    assert _fix11_run_preflight(output_root, fixture_path) == 1
+
+    assert injected is True
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+        "code": "public-marker-transition-failed",
+        "stage": "preflight",
+    }
+    assert not (output_root / "preflight.json").exists()
+    assert (output_root / "reliability-summary.json").read_bytes() == summary_bytes
+    assert (
+        output_root / "cases" / "steady-01-gpt-sovits.json"
+    ).read_bytes() == case_bytes
+    archive = json.loads(
+        next((output_root / "history" / "terminal-cohorts").glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert archive["summary"]["artifact_sha256"] == hashlib.sha256(
+        summary_bytes
+    ).hexdigest()
+    assert archive["cases"][0]["artifact_sha256"] == hashlib.sha256(
+        case_bytes
+    ).hexdigest()
+
+
+def test_fix11_exact_cohort_archive_is_idempotent_and_conflicts_fail_closed(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "idempotent"
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    failed_case = _fix9_current_failed_document()
+    _fix11_seed_failed_cohort(output_root, failed_case)
+    assert _fix11_run_preflight(output_root, fixture_path) == 0
+    archive_root = output_root / "history" / "terminal-cohorts"
+    archive_path = next(archive_root.glob("*.json"))
+    exact_archive = archive_path.read_bytes()
+
+    _fix11_seed_failed_cohort(output_root, failed_case)
+    assert _fix11_run_preflight(output_root, fixture_path) == 0
+    assert list(archive_root.glob("*.json")) == [archive_path]
+    assert archive_path.read_bytes() == exact_archive
+
+    conflicting = json.loads(exact_archive)
+    conflicting["summary"]["completed_case_count"] = 1
+    archive_path.write_text(json.dumps(conflicting), encoding="utf-8")
+    _fix11_seed_failed_cohort(output_root, failed_case)
+    assert _fix11_run_preflight(output_root, fixture_path) == 1
+    assert not (output_root / "preflight.json").exists()
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+        "code": "public-marker-transition-failed",
+        "stage": "preflight",
+    }
+    assert (output_root / "reliability-summary.json").exists()
+    assert (output_root / "cases" / "steady-01-gpt-sovits.json").exists()
+
+
 def _fix9_current_failed_document(
     case_id: str = "steady-01-gpt-sovits",
     *,
