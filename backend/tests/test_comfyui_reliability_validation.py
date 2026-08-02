@@ -8,6 +8,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import time
 import warnings
 import wave
@@ -10064,6 +10065,8 @@ def _run_fix9_powershell_behavior(command: str, tmp_path: Path) -> subprocess.Co
         {
             "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
             "TTS_MORE_FIX9_ROOT": str(tmp_path),
+            "TTS_MORE_FIX9_PYTHON": sys.executable,
+            "TTS_MORE_FIX9_BACKEND_ROOT": str(Path(__file__).resolve().parents[1]),
         }
     )
     return subprocess.run(
@@ -10181,9 +10184,11 @@ $secondaryPath=Join-Path $outputRoot 'launcher-failure-lifecycle-secondary.json'
 $document=New-LauncherFailureLifecycleDocument `
     -RunId 'raw-run-id' -PrimaryCode 'case-execution-failed' -PrimaryStage 'case' `
     -RunStartedAt '2026-08-02T00:00:00Z' `
-    -CaseId 'steady-01-gpt-sovits-private-id' `
+    -FailureSha256 ('A'*64) -SummarySha256 ('B'*64) -CompletedCaseCount 0 `
+    -CaseIdSha256 ('C'*64) -CaseArtifactSha256 ('D'*64) `
     -CaseStartedAt '2026-08-02T00:00:20Z' `
     -CaseFinishedAt '2026-08-02T00:00:50Z' `
+    -CaseContextSecondarySha256 @() `
     -LaunchRoots @{'tts-more'=$rootRecord;comfyui=$rootRecord} `
     -Listeners @{'tts-more'=$listenerRecord;comfyui=$listenerRecord}
 $proof={
@@ -10233,6 +10238,14 @@ if ($persisted.status -ne 'failed' -or $persisted.cleanup.state -ne 'cleanup-pro
 }
 if (-not $persisted.cleanup.stop_attempted -or -not $persisted.cleanup.stop_proven) {
     throw 'final lifecycle omitted exact stop proof'
+}
+if($persisted.validation.failure_sha256 -cne ('A'*64) -or
+   $persisted.validation.summary_sha256 -cne ('B'*64) -or
+   $persisted.validation.completed_case_count -ne 0 -or
+   $persisted.case.case_id_sha256 -cne ('C'*64) -or
+   $persisted.case.artifact_sha256 -cne ('D'*64) -or
+   @($persisted.case.context_secondary_sha256).Count -ne 0){
+    throw 'formal Python context commitments were not retained'
 }
 $expectedProcessValues = @{
     'tts-more|launch-root' = '100|2026-08-02T00:00:10.000000Z|50|2026-08-02T00:00:00.000000Z'
@@ -10318,9 +10331,13 @@ function New-Document {
     $record=New-Record
     New-LauncherFailureLifecycleDocument -RunId 'private-run' `
         -PrimaryCode 'case-execution-failed' -PrimaryStage 'case' `
-        -RunStartedAt '2026-08-02T00:00:00Z' -CaseId 'private-case' `
+        -RunStartedAt '2026-08-02T00:00:00Z' `
+        -FailureSha256 ('A'*64) -SummarySha256 ('B'*64) `
+        -CompletedCaseCount 0 -CaseIdSha256 ('C'*64) `
+        -CaseArtifactSha256 ('D'*64) `
         -CaseStartedAt '2026-08-02T00:00:02Z' `
         -CaseFinishedAt '2026-08-02T00:00:03Z' `
+        -CaseContextSecondarySha256 @() `
         -LaunchRoots @{'tts-more'=$record;comfyui=$record} `
         -Listeners @{'tts-more'=$record;comfyui=$record}
 }
@@ -10514,9 +10531,14 @@ $privateRecord=[pscustomobject]@{
 }
 $document=New-LauncherFailureLifecycleDocument -RunId 'PRIVATE_RUN_ID' `
     -PrimaryCode 'case-execution-failed' -PrimaryStage 'case' `
-    -RunStartedAt '2026-08-02T00:00:00Z' -CaseId 'PRIVATE_CASE_ID' `
+    -RunStartedAt '2026-08-02T00:00:00Z' `
+    -FailureSha256 ('A'*64) -SummarySha256 ('B'*64) `
+    -CompletedCaseCount 0 `
+    -CaseIdSha256 (Get-Sha256Hex 'PRIVATE_CASE_ID') `
+    -CaseArtifactSha256 ('D'*64) `
     -CaseStartedAt '2026-08-02T00:00:02Z' `
     -CaseFinishedAt '2026-08-02T00:00:03Z' `
+    -CaseContextSecondarySha256 @() `
     -LaunchRoots @{'tts-more'=$privateRecord;comfyui=$privateRecord} `
     -Listeners @{'tts-more'=$privateRecord;comfyui=$privateRecord}
 $target=Join-Path $env:TTS_MORE_FIX9_ROOT 'roundtrip.json'
@@ -10566,6 +10588,10 @@ Must-Reject {param($d)$d.cleanup.state='cleanup-proven'} 'contradictory-cleanup-
 Must-Reject {param($d)
     $d.cleanup.state='snapshot-written';$d.cleanup.stop_attempted=$true
 } 'contradictory-snapshot-stop'
+Must-Reject {param($d)$d.validation.completed_case_count=$true} 'boolean-summary-count'
+Must-Reject {param($d)$d.validation.summary_sha256=$null} 'orphan-summary-count'
+Must-Reject {param($d)$d.case.artifact_sha256=$null} 'incomplete-bound-case'
+Must-Reject {param($d)$d.case.context_secondary_sha256=('A'*64)} 'scalar-case-secondary'
 Must-Reject {param($d)$d.cleanup|Add-Member private_path 'C:\Users\PRIVATE'} 'extra-nested'
 $validUnproven=Clone-Document $persisted
 $validUnproven.cleanup.state='cleanup-unproven'
@@ -10586,6 +10612,20 @@ foreach($property in $validProven.cleanup.raw_disposition.PSObject.Properties){
     $property.Value='removal-committed'
 }
 Assert-LauncherFailureLifecycleDocument $validProven
+$unbound=New-LauncherFailureLifecycleDocument -RunId 'PRIVATE_UNBOUND_RUN' `
+    -PrimaryCode 'launcher-validation-failed' -PrimaryStage 'validator' `
+    -RunStartedAt '2026-08-02T00:00:00Z' `
+    -FailureSha256 $null -SummarySha256 $null -CompletedCaseCount $null `
+    -CaseIdSha256 $null -CaseArtifactSha256 $null `
+    -CaseStartedAt $null -CaseFinishedAt $null `
+    -CaseContextSecondarySha256 @((Get-Sha256Hex 'case-context-unbound')) `
+    -LaunchRoots @{'tts-more'=$privateRecord;comfyui=$privateRecord} `
+    -Listeners @{'tts-more'=$privateRecord;comfyui=$privateRecord}
+Assert-LauncherFailureLifecycleDocument $unbound
+if($null -ne $unbound.case.case_id_sha256 -or
+   @($unbound.case.context_secondary_sha256).Count -ne 1){
+    throw 'unbound case context was not represented by one hash-only secondary'
+}
 $secondaryPath=Join-Path $env:TTS_MORE_FIX9_ROOT 'secondary-roundtrip.json'
 Write-LauncherLifecycleSecondaryMarkerAtomic -Path $secondaryPath `
     -RunIdSha256 $persisted.run_id_sha256 `
@@ -10625,9 +10665,314 @@ Write-Output 'FIX9_STRICT_SCHEMA_ROUNDTRIP_OK'
     assert "FIX9_STRICT_SCHEMA_ROUNDTRIP_OK" in completed.stdout
 
 
-def test_fix9_failure_context_is_bound_to_current_summary_and_case_artifact(
+_FIX9_CONTEXT_RUN_STARTED = "2026-08-02T08:52:00.000000Z"
+_FIX9_CONTEXT_OBSERVED = "2026-08-02T08:54:00.000000Z"
+_FIX9_CONTEXT_MTIME = datetime(2026, 8, 2, 8, 53, 30, tzinfo=timezone.utc).timestamp()
+_FIX9_CONTEXT_UNBOUND_SHA256 = "5DC0F77777A90692DF95A71D5A3DF97F662EC3DDD5227730F4EB81E887B77D15"
+
+
+def _fix9_context_cli(
+    output_root: Path,
+    baseline_path: Path,
+    mode: str,
+    *,
+    observed_at: str = _FIX9_CONTEXT_OBSERVED,
+) -> subprocess.CompletedProcess[str]:
+    backend_root = Path(__file__).resolve().parents[1]
+    arguments = [
+        sys.executable,
+        "-m",
+        "app.comfyui.launcher_failure_context",
+        mode,
+        "--output-root",
+        str(output_root),
+        "--baseline-path",
+        str(baseline_path),
+    ]
+    if mode == "evaluate":
+        arguments.extend(
+            [
+                "--run-started-at",
+                _FIX9_CONTEXT_RUN_STARTED,
+                "--failure-observed-at",
+                observed_at,
+            ]
+        )
+    return subprocess.run(
+        arguments,
+        cwd=backend_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=30,
+    )
+
+
+def _fix9_snapshot_context(output_root: Path) -> Path:
+    baseline_path = output_root / "reliability-temp-test" / "context-baseline.private.json"
+    completed = _fix9_context_cli(output_root, baseline_path, "snapshot")
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    return baseline_path
+
+
+def _fix9_evaluate_context(
+    output_root: Path,
+    baseline_path: Path,
+    *,
+    observed_at: str = _FIX9_CONTEXT_OBSERVED,
+) -> dict[str, object]:
+    completed = _fix9_context_cli(
+        output_root,
+        baseline_path,
+        "evaluate",
+        observed_at=observed_at,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    return json.loads(completed.stdout)
+
+
+def _fix9_write_context_artifact(path: Path, document: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(document, str):
+        rendered = document
+    elif hasattr(document, "model_dump_json"):
+        rendered = document.model_dump_json()  # type: ignore[union-attr]
+    else:
+        rendered = json.dumps(document, ensure_ascii=False, sort_keys=True)
+    path.write_text(rendered, encoding="utf-8")
+    os.utime(path, (_FIX9_CONTEXT_MTIME, _FIX9_CONTEXT_MTIME))
+
+
+def _fix9_failed_summary(cases: list[CaseEvidence] | None = None) -> ReliabilityRunSummary:
+    return finalize_run(
+        ReliabilityFixture.model_validate(_fixture_document()),
+        [] if cases is None else cases,
+        required_cases=_required_cases(),
+    )
+
+
+def _fix9_current_failed_document(
+    case_id: str = "steady-01-gpt-sovits",
+    *,
+    failure_code: str = "case-execution-failed",
+) -> dict[str, object]:
+    document = _fix8_current_failed_case_document()
+    document["case_id"] = case_id
+    document["failure"] = {"code": failure_code, "stage": "case"}
+    reliability_validation.FailedCaseEvidence.model_validate(document)
+    return document
+
+
+def _fix9_publish_current_root(
+    output_root: Path,
+    *,
+    summary: ReliabilityRunSummary | None = None,
+) -> None:
+    _fix9_write_context_artifact(
+        output_root / "failure.json",
+        {"code": "case-execution-failed", "stage": "case"},
+    )
+    _fix9_write_context_artifact(
+        output_root / "reliability-summary.json",
+        _fix9_failed_summary() if summary is None else summary,
+    )
+
+
+def _fix9_assert_unbound_context(context: dict[str, object]) -> None:
+    assert context["case"] is None
+    assert context["case_context_secondary_sha256"] == [_FIX9_CONTEXT_UNBOUND_SHA256]
+
+
+def test_fix9_round2_baseline_manifest_is_exact_relative_and_content_bound(
     tmp_path: Path,
 ) -> None:
+    output_root = tmp_path / "evidence"
+    _fix9_write_context_artifact(
+        output_root / "failure.json",
+        {"code": "old-failure", "stage": "case"},
+    )
+    _fix9_write_context_artifact(output_root / "reliability-summary.json", {"old": True})
+    _fix9_write_context_artifact(output_root / "cases" / "old-case.json", {"old": True})
+
+    baseline_path = _fix9_snapshot_context(output_root)
+
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert set(baseline) == {"schema_version", "failure", "summary", "cases"}
+    assert baseline["schema_version"] == 1
+    assert baseline["failure"]["relative_name"] == "failure.json"
+    assert baseline["summary"]["relative_name"] == "reliability-summary.json"
+    assert [entry["relative_name"] for entry in baseline["cases"]] == [
+        "cases/old-case.json"
+    ]
+    for entry in [baseline["failure"], baseline["summary"], *baseline["cases"]]:
+        assert set(entry) == {"relative_name", "length", "sha256", "last_write_utc"}
+        assert entry["length"] > 0
+        assert len(entry["sha256"]) == 64
+        assert str(tmp_path) not in json.dumps(entry)
+
+
+def test_fix9_round2_shallow_spoof_is_rejected_by_formal_failed_case_reader(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    baseline_path = _fix9_snapshot_context(output_root)
+    _fix9_publish_current_root(output_root)
+    shallow_spoof = {
+        "status": "failed",
+        "case_id": "spoof-case",
+        "phase": "steady",
+        "engine": "gpt-sovits",
+        "expected": "completed",
+        "failure": {"code": "case-execution-failed", "stage": "case"},
+        "host": {
+            "started_at": "2026-08-02T08:52:54.000000Z",
+            "finished_at": "2026-08-02T08:53:28.000000Z",
+        },
+    }
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate(shallow_spoof)
+    _fix9_write_context_artifact(output_root / "cases" / "spoof-case.json", shallow_spoof)
+
+    context = _fix9_evaluate_context(output_root, baseline_path)
+
+    assert context["primary"] == {"code": "case-execution-failed", "stage": "case"}
+    assert context["summary"]["completed_case_count"] == 0
+    _fix9_assert_unbound_context(context)
+    assert "spoof-case" not in json.dumps(context)
+
+
+def test_fix9_round2_real_current_failed_case_binds_without_summary_membership(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    baseline_path = _fix9_snapshot_context(output_root)
+    _fix9_publish_current_root(output_root)
+    failed = _fix9_current_failed_document()
+    case_path = output_root / "cases" / "steady-01-gpt-sovits.json"
+    _fix9_write_context_artifact(case_path, failed)
+
+    context = _fix9_evaluate_context(output_root, baseline_path)
+
+    assert context["primary"] == {"code": "case-execution-failed", "stage": "case"}
+    assert context["summary"]["completed_case_count"] == 0
+    assert context["case"] == {
+        "case_id_sha256": "E2FF6E5CE91A9A30DD649EF9C791F37DAA0CDCDE02D8A98D29DF17FF01496AEB",
+        "artifact_sha256": hashlib.sha256(case_path.read_bytes()).hexdigest().upper(),
+        "started_at": "2026-08-02T08:52:54.464966Z",
+        "finished_at": "2026-08-02T08:53:28.427910Z",
+    }
+    assert context["case_context_secondary_sha256"] == []
+    assert failed["case_id"] not in json.dumps(context)
+
+
+def test_fix9_round2_previous_completed_summary_case_is_never_active_failure(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    baseline_path = _fix9_snapshot_context(output_root)
+    previous = _case("steady-previous-gpt-sovits", "gpt-sovits")
+    summary = _fix9_failed_summary([previous])
+    _fix9_publish_current_root(output_root, summary=summary)
+    _fix9_write_context_artifact(
+        output_root / "cases" / "steady-previous-gpt-sovits.json",
+        previous,
+    )
+
+    context = _fix9_evaluate_context(output_root, baseline_path)
+
+    assert context["summary"]["completed_case_count"] == 1
+    _fix9_assert_unbound_context(context)
+
+
+def test_fix9_round2_ambiguous_current_failed_candidates_are_rejected(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    baseline_path = _fix9_snapshot_context(output_root)
+    _fix9_publish_current_root(output_root)
+    for case_id in ("steady-01-gpt-sovits", "steady-02-gpt-sovits"):
+        _fix9_write_context_artifact(
+            output_root / "cases" / f"{case_id}.json",
+            _fix9_current_failed_document(case_id),
+        )
+
+    context = _fix9_evaluate_context(output_root, baseline_path)
+
+    _fix9_assert_unbound_context(context)
+
+
+@pytest.mark.parametrize("mode", ["failure-mismatch", "future-window"])
+def test_fix9_round2_mismatched_or_future_failed_candidate_is_unbound(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    output_root = tmp_path / "evidence"
+    baseline_path = _fix9_snapshot_context(output_root)
+    _fix9_publish_current_root(output_root)
+    failed = _fix9_current_failed_document(
+        failure_code="different-current-failure" if mode == "failure-mismatch" else "case-execution-failed"
+    )
+    _fix9_write_context_artifact(
+        output_root / "cases" / "steady-01-gpt-sovits.json",
+        failed,
+    )
+
+    context = _fix9_evaluate_context(
+        output_root,
+        baseline_path,
+        observed_at=(
+            "2026-08-02T08:52:30.000000Z"
+            if mode == "future-window"
+            else _FIX9_CONTEXT_OBSERVED
+        ),
+    )
+
+    _fix9_assert_unbound_context(context)
+
+
+def test_fix9_round2_unchanged_rewrite_does_not_escape_baseline(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    _fix9_publish_current_root(output_root)
+    case_path = output_root / "cases" / "steady-01-gpt-sovits.json"
+    _fix9_write_context_artifact(case_path, _fix9_current_failed_document())
+    baseline_path = _fix9_snapshot_context(output_root)
+    original_documents = {
+        path: path.read_bytes()
+        for path in (
+            output_root / "failure.json",
+            output_root / "reliability-summary.json",
+            case_path,
+        )
+    }
+    for path, content in original_documents.items():
+        path.write_bytes(content)
+        os.utime(path, (_FIX9_CONTEXT_MTIME + 10, _FIX9_CONTEXT_MTIME + 10))
+
+    context = _fix9_evaluate_context(output_root, baseline_path)
+
+    assert context["primary"] == {"code": "launcher-validation-failed", "stage": "validator"}
+    assert context["failure_sha256"] is None
+    assert context["summary"] is None
+    _fix9_assert_unbound_context(context)
+
+
+def test_fix9_round2_powershell_reader_uses_backend_cli_and_restores_context(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "powershell-context"
+    baseline_path = _fix9_snapshot_context(output_root)
+    _fix9_publish_current_root(output_root)
+    _fix9_write_context_artifact(
+        output_root / "cases" / "steady-01-gpt-sovits.json",
+        _fix9_current_failed_document(),
+    )
     command = r"""
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -10637,10 +10982,8 @@ $ast=[Management.Automation.Language.Parser]::ParseFile(
 )
 if($errors.Count -ne 0){throw($errors|Out-String)}
 foreach($name in @(
-    'Get-Sha256Hex','ConvertTo-PublicUtcTimestamp','Assert-ExactPublicProperties',
-    'Test-PublicJsonArray','Get-LauncherEvidenceFileStamp',
-    'Get-LauncherFailureEvidenceBaseline',
-    'Test-LauncherArtifactPublishedDuringRun','Get-LauncherPublicFailureContext'
+    'Get-Sha256Hex','ConvertTo-PublicUtcTimestamp',
+    'Invoke-LauncherFailureContextHelper','Get-LauncherPublicFailureContext'
 )){
     $function=$ast.Find({param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -10649,91 +10992,53 @@ foreach($name in @(
     if($null -eq $function){throw "$name is missing"}
     Invoke-Expression $function.Extent.Text
 }
-function Write-Json {param([string]$Path,[object]$Document)
-    $Document|ConvertTo-Json -Depth 30|Set-Content -LiteralPath $Path -Encoding UTF8
+$outputRoot=Join-Path $env:TTS_MORE_FIX9_ROOT 'powershell-context'
+$baseline=Join-Path $outputRoot 'reliability-temp-test\context-baseline.private.json'
+$original=(Get-Location).Path
+$raw=Invoke-LauncherFailureContextHelper -Mode 'evaluate' `
+    -PythonPath $env:TTS_MORE_FIX9_PYTHON `
+    -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
+    -OutputRoot $outputRoot -BaselinePath $baseline `
+    -RunStartedAt '2026-08-02T08:52:00.000000Z' `
+    -FailureObservedAt '2026-08-02T08:54:00.000000Z'
+if((Get-Location).Path -ne $original){throw 'helper did not restore launcher working directory'}
+foreach($secret in @('steady-01-gpt-sovits',$outputRoot)){
+    if($raw.Contains($secret)){throw 'helper public output leaked raw context'}
 }
-function New-Summary {param([object]$Case)
-    $caseList=[object[]]@()
-    if($null -ne $Case){$caseList=[object[]](,$Case)}
-    [ordered]@{
-        status='failed';fixture_version=1;rounds=10;required_cases=@()
-        cases=$caseList
-        missing_cases=@();duplicate_case_ids=@();cleanup_failures=@()
-        validation_failures=@('current validation failed');boundary_failures=@()
-        steady_counts=[ordered]@{'gpt-sovits'=0;indextts=0;cosyvoice=0}
-    }
+$context=Get-LauncherPublicFailureContext `
+    -PythonPath $env:TTS_MORE_FIX9_PYTHON `
+    -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
+    -OutputRoot $outputRoot -BaselinePath $baseline `
+    -RunStartedAt '2026-08-02T08:52:00.000000Z' `
+    -FailureObservedAt '2026-08-02T08:54:00.000000Z'
+if($context.primary.code -ne 'case-execution-failed' -or
+   $context.primary.stage -ne 'case' -or
+   $context.summary.completed_case_count -ne 0 -or
+   $context.case.case_id_sha256 -ne
+      'E2FF6E5CE91A9A30DD649EF9C791F37DAA0CDCDE02D8A98D29DF17FF01496AEB' -or
+   @($context.case_context_secondary_sha256).Count -ne 0){
+    throw 'PowerShell did not consume the formal helper context'
 }
-$root=Join-Path $env:TTS_MORE_FIX9_ROOT 'context binding'
-$cases=Join-Path $root 'cases'
-New-Item -ItemType Directory -Path $cases -Force|Out-Null
-$staleCase=[ordered]@{
-    case_id='stale-case';started_at='2025-01-01T00:00:00Z'
-    finished_at='2025-01-01T00:00:01Z';actual='failed'
+$fallback=Get-LauncherPublicFailureContext `
+    -PythonPath $env:TTS_MORE_FIX9_PYTHON `
+    -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
+    -OutputRoot $outputRoot -BaselinePath (Join-Path $outputRoot 'missing.private.json') `
+    -RunStartedAt '2026-08-02T08:52:00.000000Z' `
+    -FailureObservedAt '2026-08-02T08:54:00.000000Z'
+if($fallback.primary.code -ne 'launcher-validation-failed' -or
+   $fallback.primary.stage -ne 'validator' -or $null -ne $fallback.case -or
+   @($fallback.case_context_secondary_sha256).Count -ne 1 -or
+   $fallback.case_context_secondary_sha256[0] -ne
+       (Get-Sha256Hex 'case-context-unbound')){
+    throw 'helper failure did not produce the fixed hash-only unbound fallback'
 }
-Write-Json (Join-Path $root 'failure.json') ([ordered]@{code='stale-failure';stage='case'})
-Write-Json (Join-Path $root 'reliability-summary.json') (New-Summary $staleCase)
-Write-Json (Join-Path $cases 'stale-case.json') $staleCase
-foreach($path in @(
-    (Join-Path $root 'failure.json'),(Join-Path $root 'reliability-summary.json'),
-    (Join-Path $cases 'stale-case.json')
-)){
-    (Get-Item -LiteralPath $path).LastWriteTimeUtc=[DateTime]'2025-01-01T00:00:02Z'
-}
-$baseline=Get-LauncherFailureEvidenceBaseline -OutputRoot $root
-$runStarted=[DateTime]::UtcNow.AddSeconds(-1)
-$observed=[DateTime]::UtcNow.AddSeconds(1)
-$stale=Get-LauncherPublicFailureContext -OutputRoot $root `
-    -Baseline $baseline -RunStartedAt $runStarted -FailureObservedAt $observed
-if($stale.code -ne 'launcher-validation-failed' -or $stale.stage -ne 'validator'){
-    throw 'a new invocation reused a stale failure marker'
-}
-if($null -ne $stale.case_id -or $null -ne $stale.case_started_at -or
-   $null -ne $stale.case_finished_at){
-    throw 'a new invocation reused stale case context'
-}
-$currentStarted=[DateTime]::UtcNow.AddMilliseconds(-100)
-$currentFinished=[DateTime]::UtcNow
-$currentCase=[ordered]@{
-    case_id='current-case'
-    started_at=$currentStarted.ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ')
-    finished_at=$currentFinished.ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ')
-    actual='failed'
-}
-Write-Json (Join-Path $root 'failure.json') ([ordered]@{code='current-failure';stage='case'})
-Write-Json (Join-Path $root 'reliability-summary.json') (New-Summary $currentCase)
-Write-Json (Join-Path $cases 'current-case.json') $currentCase
-$observed=[DateTime]::UtcNow.AddSeconds(1)
-$current=Get-LauncherPublicFailureContext -OutputRoot $root `
-    -Baseline $baseline -RunStartedAt $runStarted -FailureObservedAt $observed
-if($current.code -ne 'current-failure' -or $current.stage -ne 'case'){
-    throw 'the current invocation failure marker was not accepted'
-}
-if($current.case_id -ne 'current-case' -or
-   $current.case_started_at -ne $currentStarted.ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ') -or
-   $current.case_finished_at -ne $currentFinished.ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ')){
-    throw 'the current summary/case binding was not accepted'
-}
-$mismatch=[ordered]@{
-    case_id='current-case'
-    started_at=$currentCase.started_at;finished_at=$currentCase.finished_at
-    actual='completed'
-}
-Write-Json (Join-Path $cases 'current-case.json') $mismatch
-$observed=[DateTime]::UtcNow.AddSeconds(1)
-$unbound=Get-LauncherPublicFailureContext -OutputRoot $root `
-    -Baseline $baseline -RunStartedAt $runStarted -FailureObservedAt $observed
-if($unbound.code -ne 'current-failure' -or $unbound.stage -ne 'case'){
-    throw 'a case mismatch discarded the independently bound failure marker'
-}
-if($null -ne $unbound.case_id){
-    throw 'a case artifact not exactly represented by the current summary was accepted'
-}
-Write-Output 'FIX9_CURRENT_FAILURE_CONTEXT_BINDING_OK'
+if((Get-Location).Path -ne $original){throw 'fallback changed launcher working directory'}
+Write-Output 'FIX9_FORMAL_PYTHON_CONTEXT_READER_OK'
 """
     completed = _run_fix9_powershell_behavior(command, tmp_path)
     assert completed.returncode == 0, completed.stderr
     assert completed.stderr == ""
-    assert "FIX9_CURRENT_FAILURE_CONTEXT_BINDING_OK" in completed.stdout
+    assert "FIX9_FORMAL_PYTHON_CONTEXT_READER_OK" in completed.stdout
 
 
 def test_fix9_top_level_cleanup_routes_formal_failure_through_transaction() -> None:

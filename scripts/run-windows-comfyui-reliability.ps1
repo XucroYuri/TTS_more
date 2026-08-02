@@ -1396,7 +1396,11 @@ function ConvertTo-PublicUtcTimestamp {
 function Assert-ExactPublicProperties {
     param([object] $Value, [string[]] $Expected)
     if ($null -eq $Value) { throw 'Public launcher lifecycle object is missing' }
-    $actual = @($Value.PSObject.Properties.Name)
+    $actual = if ($Value -is [Collections.IDictionary]) {
+        @($Value.Keys | ForEach-Object { [string] $_ })
+    } else {
+        @($Value.PSObject.Properties.Name)
+    }
     if ($actual.Count -ne $Expected.Count) {
         throw 'Public launcher lifecycle property set is invalid'
     }
@@ -1486,9 +1490,14 @@ function New-LauncherFailureLifecycleDocument {
         [string] $PrimaryCode,
         [string] $PrimaryStage,
         [object] $RunStartedAt,
-        [AllowNull()] [string] $CaseId,
+        [AllowNull()] [string] $FailureSha256,
+        [AllowNull()] [string] $SummarySha256,
+        [AllowNull()] [object] $CompletedCaseCount,
+        [AllowNull()] [string] $CaseIdSha256,
+        [AllowNull()] [string] $CaseArtifactSha256,
         [AllowNull()] [object] $CaseStartedAt,
         [AllowNull()] [object] $CaseFinishedAt,
+        [object[]] $CaseContextSecondarySha256 = @(),
         [hashtable] $LaunchRoots,
         [hashtable] $Listeners
     )
@@ -1510,11 +1519,18 @@ function New-LauncherFailureLifecycleDocument {
         '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.role, $_.kind, $_.pid,
             $_.creation_time_utc, $_.parent_pid, $_.identity_sha256
     })
-    $caseHash = if ([string]::IsNullOrEmpty($CaseId)) {
+    $failureCommitment = if ([string]::IsNullOrEmpty($FailureSha256)) {
         $null
-    } else {
-        Get-Sha256Hex -Value $CaseId
-    }
+    } else { $FailureSha256 }
+    $summaryCommitment = if ([string]::IsNullOrEmpty($SummarySha256)) {
+        $null
+    } else { $SummarySha256 }
+    $caseIdCommitment = if ([string]::IsNullOrEmpty($CaseIdSha256)) {
+        $null
+    } else { $CaseIdSha256 }
+    $caseArtifactCommitment = if ([string]::IsNullOrEmpty($CaseArtifactSha256)) {
+        $null
+    } else { $CaseArtifactSha256 }
     return [ordered]@{
         schema_version = [int] 1
         kind = 'launcher-failure-lifecycle'
@@ -1524,10 +1540,17 @@ function New-LauncherFailureLifecycleDocument {
             code = $PrimaryCode
             stage = $PrimaryStage
         }
+        validation = [ordered]@{
+            failure_sha256 = $failureCommitment
+            summary_sha256 = $summaryCommitment
+            completed_case_count = $CompletedCaseCount
+        }
         case = [ordered]@{
-            case_id_sha256 = $caseHash
+            case_id_sha256 = $caseIdCommitment
+            artifact_sha256 = $caseArtifactCommitment
             started_at = ConvertTo-PublicUtcTimestamp -Value $CaseStartedAt
             finished_at = ConvertTo-PublicUtcTimestamp -Value $CaseFinishedAt
+            context_secondary_sha256 = @($CaseContextSecondarySha256)
         }
         timestamps = [ordered]@{
             run_started_at = ConvertTo-PublicUtcTimestamp -Value $RunStartedAt
@@ -1557,8 +1580,8 @@ function New-LauncherFailureLifecycleDocument {
 function Assert-LauncherFailureLifecycleDocument {
     param([object] $Document)
     Assert-ExactPublicProperties -Value $Document -Expected @(
-        'schema_version', 'kind', 'status', 'run_id_sha256', 'primary', 'case',
-        'timestamps', 'processes', 'promotion_ownership_sha256', 'cleanup'
+        'schema_version', 'kind', 'status', 'run_id_sha256', 'primary', 'validation',
+        'case', 'timestamps', 'processes', 'promotion_ownership_sha256', 'cleanup'
     )
     if ($null -eq $Document.schema_version -or
         $Document.schema_version.GetType() -ne [int] -or
@@ -1582,24 +1605,68 @@ function Assert-LauncherFailureLifecycleDocument {
             throw 'Public launcher lifecycle primary classification is invalid'
         }
     }
-    Assert-ExactPublicProperties -Value $Document.case -Expected @(
-        'case_id_sha256', 'started_at', 'finished_at'
+    Assert-ExactPublicProperties -Value $Document.validation -Expected @(
+        'failure_sha256', 'summary_sha256', 'completed_case_count'
     )
-    if ($null -ne $Document.case.case_id_sha256 -and
-        -not (Test-PublicSha256Value $Document.case.case_id_sha256)) {
-        throw 'Public launcher lifecycle case commitment is invalid'
+    if ($null -ne $Document.validation.failure_sha256 -and
+        -not (Test-PublicSha256Value $Document.validation.failure_sha256)) {
+        throw 'Public launcher lifecycle failure commitment is invalid'
+    }
+    $summaryBound = $null -ne $Document.validation.summary_sha256
+    $countBound = $null -ne $Document.validation.completed_case_count
+    if ($summaryBound -ne $countBound) {
+        throw 'Public launcher lifecycle summary commitment is incomplete'
+    }
+    if ($summaryBound) {
+        if (-not (Test-PublicSha256Value $Document.validation.summary_sha256) -or
+            $Document.validation.completed_case_count.GetType() -ne [int] -or
+            [int] $Document.validation.completed_case_count -lt 0 -or
+            [int] $Document.validation.completed_case_count -gt 128) {
+            throw 'Public launcher lifecycle summary commitment is invalid'
+        }
+    }
+    Assert-ExactPublicProperties -Value $Document.case -Expected @(
+        'case_id_sha256', 'artifact_sha256', 'started_at', 'finished_at',
+        'context_secondary_sha256'
+    )
+    if (-not (Test-PublicJsonArray $Document.case.context_secondary_sha256)) {
+        throw 'Public launcher lifecycle case secondary list is invalid'
+    }
+    $caseSecondary = @($Document.case.context_secondary_sha256)
+    if ($caseSecondary.Count -gt 1) {
+        throw 'Public launcher lifecycle case secondary list is invalid'
+    }
+    foreach ($hash in $caseSecondary) {
+        if (-not (Test-PublicSha256Value $hash)) {
+            throw 'Public launcher lifecycle case secondary commitment is invalid'
+        }
     }
     foreach ($field in @('started_at', 'finished_at')) {
         if (-not (Test-PublicUtcTimestampValue -Value $Document.case.$field -AllowNull $true)) {
             throw 'Public launcher lifecycle case timestamp is invalid'
         }
     }
-    if ($null -ne $Document.case.finished_at -and $null -eq $Document.case.started_at) {
-        throw 'Public launcher lifecycle case timestamp order is invalid'
-    }
-    if ($null -ne $Document.case.started_at -and $null -ne $Document.case.finished_at -and
-        (Get-UtcTicks $Document.case.finished_at) -lt (Get-UtcTicks $Document.case.started_at)) {
-        throw 'Public launcher lifecycle case timestamp order is invalid'
+    $caseBound = $null -ne $Document.case.case_id_sha256
+    if ($caseBound) {
+        if (-not (Test-PublicSha256Value $Document.case.case_id_sha256) -or
+            -not (Test-PublicSha256Value $Document.case.artifact_sha256) -or
+            $null -eq $Document.case.started_at -or
+            $null -eq $Document.case.finished_at -or
+            $caseSecondary.Count -ne 0) {
+            throw 'Public launcher lifecycle bound case commitment is invalid'
+        }
+        if ((Get-UtcTicks $Document.case.finished_at) -lt
+            (Get-UtcTicks $Document.case.started_at)) {
+            throw 'Public launcher lifecycle case timestamp order is invalid'
+        }
+    } else {
+        if ($null -ne $Document.case.artifact_sha256 -or
+            $null -ne $Document.case.started_at -or
+            $null -ne $Document.case.finished_at -or
+            $caseSecondary.Count -ne 1 -or
+            [string] $caseSecondary[0] -cne (Get-Sha256Hex -Value 'case-context-unbound')) {
+            throw 'Public launcher lifecycle unbound case commitment is invalid'
+        }
     }
     Assert-ExactPublicProperties -Value $Document.timestamps -Expected @(
         'run_started_at', 'snapshot_written_at', 'cleanup_finished_at'
@@ -1668,7 +1735,11 @@ function Assert-LauncherFailureLifecycleDocument {
     Assert-ExactPublicProperties -Value $Document.cleanup.raw_disposition -Expected @(
         'temp_root', 'owner_marker', 'control_record', 'host_manifest'
     )
-    foreach ($value in @($Document.cleanup.raw_disposition.PSObject.Properties.Value)) {
+    $rawDispositionFields = @(
+        'temp_root', 'owner_marker', 'control_record', 'host_manifest'
+    )
+    foreach ($field in $rawDispositionFields) {
+        $value = $Document.cleanup.raw_disposition.$field
         if ([string] $value -cnotin @(
             'preserved-pending-cleanup', 'preserved', 'removal-committed'
         )) { throw 'Public launcher lifecycle raw disposition is invalid' }
@@ -1693,7 +1764,9 @@ function Assert-LauncherFailureLifecycleDocument {
     if ($Document.cleanup.temp_removal_eligible -and -not $Document.cleanup.stop_proven) {
         throw 'Public launcher lifecycle cleanup transition is invalid'
     }
-    $rawDispositions = @($Document.cleanup.raw_disposition.PSObject.Properties.Value)
+    $rawDispositions = @($rawDispositionFields | ForEach-Object {
+        $Document.cleanup.raw_disposition.$_
+    })
     $warningCount = @($Document.cleanup.warning_sha256).Count
     $secondaryCount = @($Document.cleanup.secondary_sha256).Count
     switch ([string] $Document.cleanup.state) {
@@ -1977,228 +2050,86 @@ function Invoke-LauncherCleanupTransaction {
     }
 }
 
-function Get-LauncherEvidenceFileStamp {
-    param([string] $Path)
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-    try {
-        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
-        $content = [IO.File]::ReadAllText($item.FullName)
-        return [pscustomobject]@{
-            last_write_utc_ticks = [Int64] $item.LastWriteTimeUtc.Ticks
-            length = [Int64] $item.Length
-            sha256 = Get-Sha256Hex -Value $content
-        }
-    } catch {
-        return $null
-    }
-}
-
-function Get-LauncherFailureEvidenceBaseline {
-    param([string] $OutputRoot)
-    $caseStamps = @{}
-    $caseRoot = Join-Path $OutputRoot 'cases'
-    if (Test-Path -LiteralPath $caseRoot -PathType Container) {
-        foreach ($caseFile in @(Get-ChildItem -LiteralPath $caseRoot -Filter '*.json' -File)) {
-            $stamp = Get-LauncherEvidenceFileStamp -Path $caseFile.FullName
-            if ($null -ne $stamp) { $caseStamps[[string] $caseFile.Name] = $stamp }
-        }
-    }
-    return [pscustomobject]@{
-        failure = Get-LauncherEvidenceFileStamp -Path (Join-Path $OutputRoot 'failure.json')
-        summary = Get-LauncherEvidenceFileStamp -Path (
-            Join-Path $OutputRoot 'reliability-summary.json'
-        )
-        cases = $caseStamps
-    }
-}
-
-function Test-LauncherArtifactPublishedDuringRun {
+function Invoke-LauncherFailureContextHelper {
     param(
-        [string] $Path,
-        [AllowNull()] [object] $BaselineStamp,
-        [object] $RunStartedAt,
-        [object] $FailureObservedAt
+        [ValidateSet('snapshot', 'evaluate')] [string] $Mode,
+        [string] $PythonPath,
+        [string] $WorkingDirectory,
+        [string] $OutputRoot,
+        [string] $BaselinePath,
+        [AllowNull()] [object] $RunStartedAt,
+        [AllowNull()] [object] $FailureObservedAt
     )
-    $currentStamp = Get-LauncherEvidenceFileStamp -Path $Path
-    if ($null -eq $currentStamp) { return $false }
-    try {
-        $started = [DateTimeOffset]::Parse(
-            [string] $RunStartedAt,
-            [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::AssumeUniversal
-        ).ToUniversalTime()
-        $observed = [DateTimeOffset]::Parse(
-            [string] $FailureObservedAt,
-            [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::AssumeUniversal
-        ).ToUniversalTime()
-        if ($observed -lt $started) { return $false }
-        $published = [DateTimeOffset]::new(
-            [DateTime]::new([Int64] $currentStamp.last_write_utc_ticks, [DateTimeKind]::Utc)
-        )
-        if ($published -lt $started -or $published -gt $observed.AddSeconds(2)) {
-            return $false
+    $arguments = @(
+        '-m', 'app.comfyui.launcher_failure_context', $Mode,
+        '--output-root', $OutputRoot,
+        '--baseline-path', $BaselinePath
+    )
+    if ($Mode -eq 'evaluate') {
+        if ($null -eq $RunStartedAt -or $null -eq $FailureObservedAt) {
+            throw 'Launcher failure context evaluation bounds are missing'
         }
-        if ($null -eq $BaselineStamp) { return $true }
-        return (
-            [string] $currentStamp.sha256 -cne [string] $BaselineStamp.sha256 -or
-            [Int64] $currentStamp.length -ne [Int64] $BaselineStamp.length -or
-            [Int64] $currentStamp.last_write_utc_ticks -gt
-                [Int64] $BaselineStamp.last_write_utc_ticks
+        $arguments += @(
+            '--run-started-at', (ConvertTo-PublicUtcTimestamp -Value $RunStartedAt),
+            '--failure-observed-at', (ConvertTo-PublicUtcTimestamp -Value $FailureObservedAt)
         )
-    } catch {
-        return $false
     }
+    $helperOutput = @()
+    $helperExitCode = 1
+    Push-Location -LiteralPath $WorkingDirectory
+    try {
+        $helperOutput = @(& $PythonPath @arguments 2>$null)
+        $helperExitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($helperExitCode -ne 0) {
+        throw 'Launcher failure context helper failed'
+    }
+    $rendered = [string] ($helperOutput -join [Environment]::NewLine)
+    if ($Mode -eq 'snapshot') {
+        if ($rendered.Length -ne 0) {
+            throw 'Launcher failure context snapshot output is invalid'
+        }
+        return ''
+    }
+    if ($rendered.Length -lt 1 -or $rendered.Length -gt 65536) {
+        throw 'Launcher failure context helper output is invalid'
+    }
+    return $rendered
 }
 
 function Get-LauncherPublicFailureContext {
     param(
+        [string] $PythonPath,
+        [string] $WorkingDirectory,
         [string] $OutputRoot,
-        [object] $Baseline,
+        [string] $BaselinePath,
         [object] $RunStartedAt,
         [object] $FailureObservedAt
     )
-    $code = 'launcher-validation-failed'
-    $stage = 'validator'
-    $failurePath = Join-Path $OutputRoot 'failure.json'
-    $failureBaseline = $null
-    try { $failureBaseline = $Baseline.failure } catch { $failureBaseline = $null }
-    if (Test-LauncherArtifactPublishedDuringRun -Path $failurePath `
-            -BaselineStamp $failureBaseline -RunStartedAt $RunStartedAt `
-            -FailureObservedAt $FailureObservedAt) {
-        try {
-            $failure = Get-Content -LiteralPath $failurePath -Raw | ConvertFrom-Json
-            Assert-ExactPublicProperties -Value $failure -Expected @('code', 'stage')
-            if ($failure.code -isnot [string] -or
-                ([string] $failure.code).Length -lt 1 -or
-                ([string] $failure.code).Length -gt 64 -or
-                [string] $failure.code -cnotmatch '^[a-z][a-z0-9-]*$' -or
-                $failure.stage -isnot [string] -or
-                @('preflight', 'case', 'finalize') -cnotcontains [string] $failure.stage) {
-                throw 'Public failure classification is invalid'
+    try {
+        $rendered = Invoke-LauncherFailureContextHelper -Mode 'evaluate' `
+            -PythonPath $PythonPath -WorkingDirectory $WorkingDirectory `
+            -OutputRoot $OutputRoot -BaselinePath $BaselinePath `
+            -RunStartedAt $RunStartedAt -FailureObservedAt $FailureObservedAt
+        return $rendered | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return [pscustomobject]@{
+            schema_version = [int] 1
+            kind = 'launcher-failure-context'
+            status = 'failed'
+            primary = [pscustomobject]@{
+                code = 'launcher-validation-failed'
+                stage = 'validator'
             }
-            $code = [string] $failure.code
-            $stage = [string] $failure.stage
-        } catch {
-            $code = 'launcher-validation-failed'
-            $stage = 'validator'
-        }
-    }
-    $caseId = $null
-    $caseStartedAt = $null
-    $caseFinishedAt = $null
-    $summaryPath = Join-Path $OutputRoot 'reliability-summary.json'
-    $caseRoot = Join-Path $OutputRoot 'cases'
-    $summaryBaseline = $null
-    try { $summaryBaseline = $Baseline.summary } catch { $summaryBaseline = $null }
-    if (
-        (Test-Path -LiteralPath $caseRoot -PathType Container) -and
-        (Test-LauncherArtifactPublishedDuringRun -Path $summaryPath `
-            -BaselineStamp $summaryBaseline -RunStartedAt $RunStartedAt `
-            -FailureObservedAt $FailureObservedAt)
-    ) {
-        try {
-            $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
-            Assert-ExactPublicProperties -Value $summary -Expected @(
-                'status', 'fixture_version', 'rounds', 'required_cases', 'cases',
-                'missing_cases', 'duplicate_case_ids', 'cleanup_failures',
-                'validation_failures', 'boundary_failures', 'steady_counts'
+            failure_sha256 = $null
+            summary = $null
+            case = $null
+            case_context_secondary_sha256 = @(
+                Get-Sha256Hex -Value 'case-context-unbound'
             )
-            if ($summary.status -isnot [string] -or $summary.status -cne 'failed' -or
-                $null -eq $summary.fixture_version -or
-                $summary.fixture_version.GetType() -ne [int] -or
-                [int] $summary.fixture_version -ne 1 -or
-                $null -eq $summary.rounds -or $summary.rounds.GetType() -ne [int] -or
-                [int] $summary.rounds -lt 1 -or [int] $summary.rounds -gt 100) {
-                throw 'Public reliability summary scalar contract is invalid'
-            }
-            foreach ($arrayField in @(
-                'required_cases', 'cases', 'missing_cases', 'duplicate_case_ids',
-                'cleanup_failures', 'validation_failures', 'boundary_failures'
-            )) {
-                if (-not (Test-PublicJsonArray $summary.$arrayField)) {
-                    throw ('Public reliability summary array contract is invalid: {0}' -f $arrayField)
-                }
-            }
-            if (@($summary.cases).Count -gt 64) {
-                throw 'Public reliability summary case bound is invalid'
-            }
-            Assert-ExactPublicProperties -Value $summary.steady_counts -Expected @(
-                'gpt-sovits', 'indextts', 'cosyvoice'
-            )
-            foreach ($engine in @('gpt-sovits', 'indextts', 'cosyvoice')) {
-                $count = $summary.steady_counts.$engine
-                if ($null -eq $count -or $count.GetType() -ne [int] -or
-                    [int] $count -lt 0 -or [int] $count -gt 100) {
-                    throw 'Public reliability summary count is invalid'
-                }
-            }
-            $baselineCases = @{}
-            try {
-                if ($Baseline.cases -is [hashtable]) { $baselineCases = $Baseline.cases }
-            } catch { $baselineCases = @{} }
-            $bestStamp = [Int64]::MinValue
-            foreach ($summaryCase in @($summary.cases)) {
-                if ($null -eq $summaryCase) { continue }
-                $idProperty = $summaryCase.PSObject.Properties['case_id']
-                $startedProperty = $summaryCase.PSObject.Properties['started_at']
-                $finishedProperty = $summaryCase.PSObject.Properties['finished_at']
-                if ($null -eq $idProperty -or $null -eq $startedProperty -or
-                    $null -eq $finishedProperty -or $idProperty.Value -isnot [string]) {
-                    continue
-                }
-                $candidateId = [string] $idProperty.Value
-                if ($candidateId -cnotmatch '^[a-z0-9][a-z0-9-]{0,127}$') { continue }
-                $caseName = '{0}.json' -f $candidateId
-                $casePath = Join-Path $caseRoot $caseName
-                $caseBaseline = $null
-                if ($baselineCases.ContainsKey($caseName)) {
-                    $caseBaseline = $baselineCases[$caseName]
-                }
-                if (-not (Test-LauncherArtifactPublishedDuringRun -Path $casePath `
-                        -BaselineStamp $caseBaseline -RunStartedAt $RunStartedAt `
-                        -FailureObservedAt $FailureObservedAt)) { continue }
-                $caseDocument = Get-Content -LiteralPath $casePath -Raw | ConvertFrom-Json
-                $summaryCaseJson = $summaryCase | ConvertTo-Json -Depth 100 -Compress
-                $caseJson = $caseDocument | ConvertTo-Json -Depth 100 -Compress
-                if ($summaryCaseJson -cne $caseJson) { continue }
-                $candidateStarted = ConvertTo-PublicUtcTimestamp -Value $startedProperty.Value
-                $candidateFinished = ConvertTo-PublicUtcTimestamp -Value $finishedProperty.Value
-                $startedMoment = [DateTimeOffset]::Parse($candidateStarted).ToUniversalTime()
-                $finishedMoment = [DateTimeOffset]::Parse($candidateFinished).ToUniversalTime()
-                $runMoment = [DateTimeOffset]::Parse(
-                    [string] $RunStartedAt,
-                    [Globalization.CultureInfo]::InvariantCulture,
-                    [Globalization.DateTimeStyles]::AssumeUniversal
-                ).ToUniversalTime()
-                $observedMoment = [DateTimeOffset]::Parse(
-                    [string] $FailureObservedAt,
-                    [Globalization.CultureInfo]::InvariantCulture,
-                    [Globalization.DateTimeStyles]::AssumeUniversal
-                ).ToUniversalTime()
-                if ($startedMoment -lt $runMoment -or $finishedMoment -lt $startedMoment -or
-                    $finishedMoment -gt $observedMoment.AddSeconds(2)) { continue }
-                $caseStamp = Get-LauncherEvidenceFileStamp -Path $casePath
-                if ($null -ne $caseStamp -and
-                    [Int64] $caseStamp.last_write_utc_ticks -gt $bestStamp) {
-                    $bestStamp = [Int64] $caseStamp.last_write_utc_ticks
-                    $caseId = $candidateId
-                    $caseStartedAt = $candidateStarted
-                    $caseFinishedAt = $candidateFinished
-                }
-            }
-        } catch {
-            $caseId = $null
-            $caseStartedAt = $null
-            $caseFinishedAt = $null
         }
-    }
-    return [pscustomobject]@{
-        code = $code
-        stage = $stage
-        case_id = $caseId
-        case_started_at = $caseStartedAt
-        case_finished_at = $caseFinishedAt
     }
 }
 
@@ -2263,6 +2194,8 @@ $tempRoot = (Resolve-Path -LiteralPath $tempRoot).Path
 $runnerTempRoot = (Resolve-Path -LiteralPath $runnerTempRoot).Path
 $comfyTempBase = (Resolve-Path -LiteralPath $comfyTempBase).Path
 $comfyTempRoot = (Resolve-Path -LiteralPath $comfyTempRoot).Path
+$failureEvidenceBaselinePath = Join-Path `
+    $tempRoot 'launcher-failure-context-baseline.private.json'
 $tempOwnerMarker = Join-Path $outputRootPath (".request-temp-{0}.owner.json" -f $runId)
 @{
     run_id = $runId
@@ -2282,7 +2215,7 @@ $provisionalCleanupFailed = $false
 $primaryFailure = $null
 $cleanupFailure = $null
 $formalValidatorInvoked = $false
-$failureEvidenceBaseline = $null
+$validatorStartedAt = $null
 $validatorFinishedAt = $null
 try {
     $launcherRecord = Get-ProcessRecord -ProcessId $PID
@@ -2419,8 +2352,10 @@ try {
     )
     if ($AllowLan) { $pythonArguments += '--allow-lan' }
     if ($PreflightOnly) { $pythonArguments += '--preflight-only' }
-    $failureEvidenceBaseline = Get-LauncherFailureEvidenceBaseline `
-        -OutputRoot $outputRootPath
+    Invoke-LauncherFailureContextHelper -Mode 'snapshot' `
+        -PythonPath $backendPythonPath -WorkingDirectory $backendRootPath `
+        -OutputRoot $outputRootPath -BaselinePath $failureEvidenceBaselinePath | Out-Null
+    $validatorStartedAt = [DateTime]::UtcNow
     $formalValidatorInvoked = $true
     try {
         Invoke-ReliabilityValidator -PythonPath $backendPythonPath `
@@ -2501,18 +2436,44 @@ try {
         if ($publishFailureLifecycle) {
             try {
                 $publicFailureContext = Get-LauncherPublicFailureContext `
+                    -PythonPath $backendPythonPath `
+                    -WorkingDirectory $backendRootPath `
                     -OutputRoot $outputRootPath `
-                    -Baseline $failureEvidenceBaseline `
-                    -RunStartedAt $runStartedAt `
+                    -BaselinePath $failureEvidenceBaselinePath `
+                    -RunStartedAt $validatorStartedAt `
                     -FailureObservedAt $validatorFinishedAt
+                $summarySha256 = if ($null -eq $publicFailureContext.summary) {
+                    $null
+                } else { $publicFailureContext.summary.artifact_sha256 }
+                $completedCaseCount = if ($null -eq $publicFailureContext.summary) {
+                    $null
+                } else { $publicFailureContext.summary.completed_case_count }
+                $caseIdSha256 = if ($null -eq $publicFailureContext.case) {
+                    $null
+                } else { $publicFailureContext.case.case_id_sha256 }
+                $caseArtifactSha256 = if ($null -eq $publicFailureContext.case) {
+                    $null
+                } else { $publicFailureContext.case.artifact_sha256 }
+                $caseStartedAt = if ($null -eq $publicFailureContext.case) {
+                    $null
+                } else { $publicFailureContext.case.started_at }
+                $caseFinishedAt = if ($null -eq $publicFailureContext.case) {
+                    $null
+                } else { $publicFailureContext.case.finished_at }
                 $lifecycleDocument = New-LauncherFailureLifecycleDocument `
                     -RunId $runId `
-                    -PrimaryCode $publicFailureContext.code `
-                    -PrimaryStage $publicFailureContext.stage `
+                    -PrimaryCode $publicFailureContext.primary.code `
+                    -PrimaryStage $publicFailureContext.primary.stage `
                     -RunStartedAt $runStartedAt `
-                    -CaseId $publicFailureContext.case_id `
-                    -CaseStartedAt $publicFailureContext.case_started_at `
-                    -CaseFinishedAt $publicFailureContext.case_finished_at `
+                    -FailureSha256 $publicFailureContext.failure_sha256 `
+                    -SummarySha256 $summarySha256 `
+                    -CompletedCaseCount $completedCaseCount `
+                    -CaseIdSha256 $caseIdSha256 `
+                    -CaseArtifactSha256 $caseArtifactSha256 `
+                    -CaseStartedAt $caseStartedAt `
+                    -CaseFinishedAt $caseFinishedAt `
+                    -CaseContextSecondarySha256 `
+                        @($publicFailureContext.case_context_secondary_sha256) `
                     -LaunchRoots @{
                         'tts-more' = $latestBackendLaunchRootRecord
                         comfyui = $latestComfyLaunchRootRecord
