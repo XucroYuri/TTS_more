@@ -8205,6 +8205,138 @@ Write-Output 'RECORDED_FOREST_POST_STOP_TRANSITIONS_OK'
     assert "RECORDED_FOREST_POST_STOP_TRANSITIONS_OK" in completed.stdout
 
 
+def test_fix6_recorded_forest_stops_overlapping_seed_subtrees_children_first() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Get-ProcessRecord',
+    'Test-RecordDocumentMatches',
+    'Test-RecordedIdentity',
+    'Test-ProcessAbsent',
+    'Stop-RecordedTree',
+    'Stop-RecordedProcessPair'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+
+function New-Row {
+    param(
+        [int] $ProcessId,
+        [int] $ParentProcessId,
+        [string] $Created
+    )
+    return [pscustomobject]@{
+        ProcessId = $ProcessId
+        ParentProcessId = $ParentProcessId
+        CreationDate = [DateTime]::Parse($Created).ToUniversalTime()
+        ExecutablePath = ('C:\controlled\python-{0}.exe' -f $ProcessId)
+        CommandLine = ('python-{0}.exe controlled.py' -f $ProcessId)
+        Name = ('python-{0}.exe' -f $ProcessId)
+    }
+}
+function New-Record {
+    param([object] $Row, [object] $Parent)
+    return [pscustomobject]@{
+        pid = [int] $Row.ProcessId
+        creation_time = $Row.CreationDate.ToUniversalTime().ToString('o')
+        executable_path = [string] $Row.ExecutablePath
+        command_line = [string] $Row.CommandLine
+        parent_pid = [int] $Row.ParentProcessId
+        parent_creation_time = $Parent.CreationDate.ToUniversalTime().ToString('o')
+    }
+}
+
+$script:inventory = @()
+$script:stopped = [System.Collections.Generic.List[int]]::new()
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    if (-not $Filter) { return @($script:inventory) }
+    $candidatePid = [int] ([regex]::Match($Filter, '\d+').Value)
+    return @($script:inventory | Where-Object {
+        [int] $_.ProcessId -eq $candidatePid
+    }) | Select-Object -First 1
+}
+function Stop-Process {
+    param([int] $Id, [switch] $Force, [object] $ErrorAction)
+    $script:stopped.Add($Id)
+    $script:inventory = @($script:inventory | Where-Object {
+        [int] $_.ProcessId -ne $Id
+    })
+}
+function Start-Sleep { param([int] $Milliseconds) }
+
+$parent = New-Row 50 4 '2026-08-01T00:00:00Z'
+$root = New-Row 100 50 '2026-08-01T00:00:10Z'
+$middle = New-Row 250 100 '2026-08-01T00:00:11Z'
+$listener = New-Row 200 250 '2026-08-01T00:00:12Z'
+$child = New-Row 150 200 '2026-08-01T00:00:13Z'
+$rootRecord = New-Record $root $parent
+$listenerRecord = New-Record $listener $middle
+$script:inventory = @($parent, $root, $middle, $listener, $child)
+$script:stopped.Clear()
+if (-not (Stop-RecordedProcessPair `
+        -LaunchRootRecord $rootRecord -ListenerRecord $listenerRecord `
+        -TimeoutMilliseconds 25 -PollIntervalMilliseconds 1)) {
+    throw 'overlapping listener-seed forest did not cleanup-converge'
+}
+if ((@($script:stopped) -join ',') -ne '150,200,250,100') {
+    throw ('overlapping listener-seed stop order was {0}' -f (@($script:stopped) -join ','))
+}
+
+$child = New-Row 150 200 '2026-08-01T00:00:13Z'
+$sameDepthSibling = New-Row 175 200 '2026-08-01T00:00:13.500Z'
+$leaf = New-Row 125 150 '2026-08-01T00:00:14Z'
+$script:inventory = @(
+    $parent, $root, $middle, $listener, $child, $sameDepthSibling, $leaf
+)
+$script:stopped.Clear()
+if (-not (Stop-RecordedProcessPair `
+        -LaunchRootRecord $rootRecord -ListenerRecord $listenerRecord `
+        -TimeoutMilliseconds 25 -PollIntervalMilliseconds 1)) {
+    throw 'deep overlapping forest did not cleanup-converge'
+}
+if ((@($script:stopped) -join ',') -ne '125,175,150,200,250,100') {
+    throw ('deep/tie-break stop order was {0}' -f (@($script:stopped) -join ','))
+}
+Write-Output 'RECORDED_FOREST_TOPOLOGICAL_STOP_ORDER_OK'
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "TTS_MORE_RELIABILITY_SCRIPT": str(script_path)},
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "RECORDED_FOREST_TOPOLOGICAL_STOP_ORDER_OK" in completed.stdout
+
+
 def test_task_12_validator_uses_backend_import_context_and_restores_launcher_cwd() -> None:
     powershell = shutil.which("powershell.exe")
     if powershell is None:

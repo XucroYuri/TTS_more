@@ -1006,6 +1006,21 @@ function Stop-RecordedTree {
         }
     }
 
+    # Seed traversal depth is provisional because a listener can be both a
+    # depth-zero seed and a later descendant of the launch root. Recompute the
+    # final topology from the now-complete, cycle-free recorded parent edges.
+    $finalDepths = @{}
+    foreach ($candidatePid in @($forest.Keys)) {
+        $candidateDepth = 0
+        $cursorPid = [int] $candidatePid
+        while ($forest.ContainsKey([int] $forest[$cursorPid].parent_pid)) {
+            $candidateDepth += 1
+            $cursorPid = [int] $forest[$cursorPid].parent_pid
+        }
+        $finalDepths[[int] $candidatePid] = $candidateDepth
+    }
+    $depths = $finalDepths
+
     $stopOrder = @(
         foreach ($candidatePid in $forest.Keys) {
             [pscustomobject]@{
