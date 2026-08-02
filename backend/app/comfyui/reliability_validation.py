@@ -522,6 +522,128 @@ class FailureMarker(_StrictModel):
     stage: Literal["preflight", "case", "finalize"]
 
 
+class _PublicPreflightResource(_StrictModel):
+    engine: Engine
+    ready: Literal[True]
+    resource_id_hash: SHA256
+
+
+class _PublicPreflightQueue(_StrictModel):
+    tts_queued: Literal[0]
+    tts_running: Literal[0]
+    comfy_pending_prompt_ids: Annotated[list[str], Field(max_length=0)]
+    comfy_running_prompt_ids: Annotated[list[str], Field(max_length=0)]
+
+
+class _PublicPreflightProcess(_StrictModel):
+    pid: StrictInt = Field(gt=0, le=2_147_483_647)
+    creation_time: Annotated[
+        str,
+        Field(
+            min_length=20,
+            max_length=27,
+            pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$",
+        ),
+    ]
+    executable_name: Annotated[str, Field(min_length=1, max_length=255)]
+    ownership_hash: SHA256
+
+    @field_validator("creation_time")
+    @classmethod
+    def _utc_creation_time(cls, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+        except ValueError:
+            raise ValueError("process identity time must be valid UTC") from None
+        if not _is_utc(parsed):
+            raise ValueError("process identity time must be timezone-aware UTC")
+        return value
+
+    @field_validator("executable_name")
+    @classmethod
+    def _neutral_executable_name(cls, value: str) -> str:
+        if not _is_neutral_basename(value):
+            raise ValueError("executable_name must be a neutral basename")
+        return value
+
+
+class _PublicPreflightGpu(_StrictModel):
+    used_mib: StrictInt = Field(ge=0, le=9_223_372_036_854_775_807)
+    free_mib: StrictInt = Field(ge=0, le=9_223_372_036_854_775_807)
+
+
+class _PublicPreflightRepository(_StrictModel):
+    label: Annotated[str, Field(min_length=1, max_length=64)]
+    head: Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
+    branch: Annotated[str, Field(min_length=1, max_length=255)]
+    porcelain_hash: SHA256
+
+
+class _PublicPreflightBoundary(_StrictModel):
+    aggregate_hash: SHA256
+    private_registry_hash: SHA256
+    reference_hashes: Annotated[
+        dict[Annotated[str, Field(min_length=1, max_length=128)], SHA256],
+        Field(min_length=1, max_length=64),
+    ]
+    repositories: Annotated[
+        list[_PublicPreflightRepository],
+        Field(min_length=len(REQUIRED_BOUNDARY_LABELS), max_length=len(REQUIRED_BOUNDARY_LABELS)),
+    ]
+
+    @field_validator("reference_hashes")
+    @classmethod
+    def _ordered_reference_hashes(cls, value: dict[str, str]) -> dict[str, str]:
+        return {key: value[key] for key in sorted(value)}
+
+    @field_validator("repositories")
+    @classmethod
+    def _exact_ordered_repositories(
+        cls,
+        value: list[_PublicPreflightRepository],
+    ) -> list[_PublicPreflightRepository]:
+        labels = [item.label for item in value]
+        if labels != sorted(REQUIRED_BOUNDARY_LABELS):
+            raise ValueError("public preflight repository set is incomplete")
+        return value
+
+
+class _PublicPreflightMarker(_StrictModel):
+    status: Literal["passed"]
+    resources: Annotated[
+        list[_PublicPreflightResource],
+        Field(min_length=len(ENGINE_ORDER), max_length=len(ENGINE_ORDER)),
+    ]
+    queue: _PublicPreflightQueue
+    port_owners: Annotated[dict[str, _PublicPreflightProcess], Field(max_length=16)]
+    gpu_idle_baseline: _PublicPreflightGpu
+    boundary: _PublicPreflightBoundary
+
+    @field_validator("resources")
+    @classmethod
+    def _exact_ordered_resources(
+        cls,
+        value: list[_PublicPreflightResource],
+    ) -> list[_PublicPreflightResource]:
+        if [item.engine for item in value] != sorted(ENGINE_ORDER):
+            raise ValueError("public preflight resource set is incomplete")
+        return value
+
+    @field_validator("port_owners")
+    @classmethod
+    def _bounded_port_owner_keys(
+        cls,
+        value: dict[str, _PublicPreflightProcess],
+    ) -> dict[str, _PublicPreflightProcess]:
+        if any(
+            re.fullmatch(r"[1-9][0-9]{0,4}", port) is None
+            or not 1 <= int(port) <= 65_535
+            for port in value
+        ):
+            raise ValueError("public preflight port owner key is invalid")
+        return {port: value[port] for port in sorted(value, key=int)}
+
+
 class FailedCaseEvidence(_StrictModel):
     status: Literal["failed"]
     case_id: str = Field(min_length=1)
@@ -3369,11 +3491,14 @@ def _archive_public_terminal_marker(
             while chunk := handle.read(64 * 1024):
                 digest.update(chunk)
     sha256 = digest.hexdigest()
-    archived_document = _validated_archived_terminal_document(kind, document_bytes)
+    archived_document, document_status = _validated_archived_terminal_document(
+        kind,
+        document_bytes,
+    )
     archive: dict[str, Any] = {
         "kind": kind,
         "sha256": sha256,
-        "document_status": "validated" if archived_document is not None else "redacted",
+        "document_status": document_status,
     }
     if archived_document is not None:
         archive["document"] = archived_document
@@ -3396,19 +3521,22 @@ def _archive_public_terminal_marker(
 def _validated_archived_terminal_document(
     kind: Literal["failure", "preflight"],
     document_bytes: bytes | None,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, Literal["validated", "invalid", "redacted"]]:
     if document_bytes is None:
-        return None
+        return None, "redacted"
     try:
         document = json.loads(document_bytes.decode("utf-8-sig"))
-        if kind == "failure":
-            return FailureMarker.model_validate(document).model_dump(mode="json")
-        if not isinstance(document, dict) or document.get("status") != "passed":
-            return None
         _assert_public_evidence(document)
-        return document
-    except (UnicodeError, json.JSONDecodeError, ValidationError, ValueError, TypeError):
-        return None
+    except (UnicodeError, ValueError, TypeError, AttributeError, RecursionError):
+        return None, "redacted"
+    try:
+        if kind == "failure":
+            validated = FailureMarker.model_validate(document)
+        else:
+            validated = _PublicPreflightMarker.model_validate_json(document_bytes)
+        return validated.model_dump(mode="json"), "validated"
+    except (ValidationError, ValueError, TypeError, AttributeError, RecursionError):
+        return None, "invalid"
 
 
 def _require_endpoint_scope(fixture: ReliabilityFixture, *, allow_lan: bool) -> None:

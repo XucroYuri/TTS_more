@@ -3775,6 +3775,164 @@ def test_fix5_marker_archive_collision_never_overwrites_prior_history(
     assert json.loads(current_archives[0].read_text(encoding="utf-8"))["document"] == stale_failure
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_status"),
+    [
+        ("legal", "validated"),
+        ("top-level-service-id", "invalid"),
+        ("nested-resource-id", "invalid"),
+        ("disguised-binding", "invalid"),
+        ("oversized-reference-map", "invalid"),
+        ("unsafe-header", "redacted"),
+    ],
+)
+def test_fix5_preflight_history_requires_exact_public_schema(
+    tmp_path: Path,
+    mutation: str,
+    expected_status: str,
+) -> None:
+    output_root = tmp_path / "r"
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    seed_http = _ExecutorHttpProbe()
+    seed_host = _ExecutorHostProbe()
+    seed_result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            seed_http,
+            seed_host,
+            seed_host.owned_processes,
+        ),
+    )
+    assert seed_result == 0
+    legal_preflight = json.loads(
+        (output_root / "preflight.json").read_text(encoding="utf-8")
+    )
+    stale_preflight = json.loads(json.dumps(legal_preflight))
+    private_value = "runtime-private-service-134"
+    if mutation == "top-level-service-id":
+        stale_preflight["service_id"] = private_value
+    elif mutation == "nested-resource-id":
+        stale_preflight["resources"][0]["resource_id"] = private_value
+    elif mutation == "disguised-binding":
+        stale_preflight["boundary"]["runtime_binding"] = private_value
+    elif mutation == "oversized-reference-map":
+        stale_preflight["boundary"]["reference_hashes"] = {
+            f"reference-{index}": "d" * 64
+            for index in range(65)
+        }
+    elif mutation == "unsafe-header":
+        stale_preflight["headers"] = {
+            "Authorization": "Bearer runtime-private-token",
+        }
+        private_value = "runtime-private-token"
+    (output_root / "preflight.json").write_text(
+        json.dumps(stale_preflight),
+        encoding="utf-8",
+    )
+    failure_host = _ExecutorHostProbe()
+
+    class TypedFailureProbe(_ExecutorHttpProbe):
+        def preflight(
+            self,
+            fixture: ReliabilityFixture,
+        ) -> reliability_validation.HttpPreflightObservation:
+            del fixture
+            raise reliability_validation.LiveValidationError(
+                "registered-service-binding",
+                stage="preflight",
+            )
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            TypedFailureProbe(),
+            failure_host,
+            failure_host.owned_processes,
+        ),
+    )
+
+    assert result == 1
+    assert not (output_root / "preflight.json").exists()
+    archives = list((output_root / "history" / "terminal-markers").glob("preflight-*.json"))
+    assert len(archives) == 1
+    archived = json.loads(archives[0].read_text(encoding="utf-8"))
+    assert archived["document_status"] == expected_status
+    if expected_status == "validated":
+        assert archived["document"] == legal_preflight
+    else:
+        assert "document" not in archived
+        assert private_value not in archives[0].read_text(encoding="utf-8")
+
+
+def test_fix5_failure_history_rejects_extra_private_fields(tmp_path: Path) -> None:
+    output_root = tmp_path / "r"
+    output_root.mkdir()
+    private_service_id = "runtime-private-service-134"
+    (output_root / "failure.json").write_text(
+        json.dumps(
+            {
+                "code": "stale-prior-failure",
+                "stage": "case",
+                "service_id": private_service_id,
+            }
+        ),
+        encoding="utf-8",
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            http_probe,
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert result == 0
+    archives = list((output_root / "history" / "terminal-markers").glob("failure-*.json"))
+    assert len(archives) == 1
+    archived_text = archives[0].read_text(encoding="utf-8")
+    archived = json.loads(archived_text)
+    assert archived["document_status"] == "invalid"
+    assert "document" not in archived
+    assert private_service_id not in archived_text
+
+
 @pytest.mark.parametrize("business_path", ["primary-failure", "otherwise-success"])
 @pytest.mark.parametrize(
     "fault_point",
@@ -3909,7 +4067,15 @@ def test_fix5_two_marker_transition_reconciles_every_single_io_fault(
         for path in archives
     ]
     assert stale_failure in archived_documents
-    assert stale_preflight in archived_documents
+    preflight_archives = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in archives
+        if path.name.startswith("preflight-")
+    ]
+    assert preflight_archives
+    assert all(item["document_status"] == "invalid" for item in preflight_archives)
+    assert all("document" not in item for item in preflight_archives)
+    assert all(len(item["sha256"]) == 64 for item in preflight_archives)
     assert len(archives) == len({path.name for path in archives})
     assert all("token=" not in path.read_text(encoding="utf-8") for path in archives)
 
