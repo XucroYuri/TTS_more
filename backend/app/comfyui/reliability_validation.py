@@ -3268,28 +3268,60 @@ def _execute_reliability_preflight_success(
         },
     }
     output_root = Path(output_root)
-    _transition_public_terminal_markers(output_root, stage="preflight")
-    write_atomic_json(output_root / "preflight.json", document)
+    _publish_public_terminal_marker(
+        output_root,
+        marker_name="preflight.json",
+        document=document,
+        stage="preflight",
+    )
 
 
 def _persist_failure_marker(output_root: Path, failure: LiveValidationError) -> None:
     failure.failure_persistence_attempted = True
+    for _attempt in range(2):
+        try:
+            _publish_public_terminal_marker(
+                Path(output_root),
+                marker_name="failure.json",
+                document={"code": failure.code, "stage": failure.stage},
+                stage=failure.stage,
+            )
+            return
+        except Exception:
+            continue
+
+
+def _publish_public_terminal_marker(
+    output_root: Path,
+    *,
+    marker_name: Literal["failure.json", "preflight.json"],
+    document: dict[str, Any],
+    stage: Literal["preflight", "case", "finalize"],
+) -> None:
     try:
-        _transition_public_terminal_markers(Path(output_root), stage=failure.stage)
-        write_atomic_json(
-            Path(output_root) / "failure.json",
-            {"code": failure.code, "stage": failure.stage},
+        _transition_public_terminal_markers(
+            Path(output_root),
+            stage=stage,
+            retained_marker=marker_name,
         )
+        write_atomic_json(Path(output_root) / marker_name, document)
+    except LiveValidationError:
+        raise
     except Exception:
-        pass
+        raise LiveValidationError(
+            "public-marker-transition-failed",
+            stage=stage,
+        ) from None
 
 
 def _transition_public_terminal_markers(
     output_root: Path,
     *,
     stage: Literal["preflight", "case", "finalize"],
+    retained_marker: Literal["failure.json", "preflight.json"] | None = None,
 ) -> None:
     try:
+        markers: list[tuple[Literal["failure", "preflight"], Path]] = []
         for kind in ("failure", "preflight"):
             marker = Path(output_root) / f"{kind}.json"
             if marker.is_symlink():
@@ -3298,11 +3330,16 @@ def _transition_public_terminal_markers(
                 continue
             if not marker.is_file():
                 raise OSError("terminal marker must be a regular file")
+            markers.append((kind, marker))
+        for kind, marker in markers:
             _archive_public_terminal_marker(
                 Path(output_root),
                 marker=marker,
                 kind=kind,
             )
+        for _kind, marker in markers:
+            if marker.name != retained_marker:
+                marker.unlink()
     except Exception:
         raise LiveValidationError(
             "public-marker-transition-failed",
@@ -3354,7 +3391,6 @@ def _archive_public_terminal_marker(
             raise
     else:
         raise OSError("terminal marker archive namespace exhausted")
-    marker.unlink()
 
 
 def _validated_archived_terminal_document(

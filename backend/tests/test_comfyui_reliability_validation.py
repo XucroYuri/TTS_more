@@ -3406,7 +3406,7 @@ def test_fix5_preflight_failure_evidence_write_failure_preserves_nonzero_without
     )
 
     assert result == 1
-    assert writes == [output_root / "failure.json"]
+    assert writes == [output_root / "failure.json", output_root / "failure.json"]
     assert not (output_root / "failure.json").exists()
     assert not list(output_root.glob(".failure.json.*"))
     assert not (output_root / "preflight.json").exists()
@@ -3773,6 +3773,145 @@ def test_fix5_marker_archive_collision_never_overwrites_prior_history(
     current_archives = [path for path in archives if path != collision]
     assert len(current_archives) == 1
     assert json.loads(current_archives[0].read_text(encoding="utf-8"))["document"] == stale_failure
+
+
+@pytest.mark.parametrize("business_path", ["primary-failure", "otherwise-success"])
+@pytest.mark.parametrize(
+    "fault_point",
+    ["archive-first", "archive-second", "unlink", "publish-current"],
+)
+def test_fix5_two_marker_transition_reconciles_every_single_io_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    business_path: str,
+    fault_point: str,
+) -> None:
+    output_root = tmp_path / "r"
+    output_root.mkdir()
+    stale_failure = {"code": "stale-prior-failure", "stage": "case"}
+    stale_preflight = {"status": "passed"}
+    (output_root / "failure.json").write_text(
+        json.dumps(stale_failure),
+        encoding="utf-8",
+    )
+    (output_root / "preflight.json").write_text(
+        json.dumps(stale_preflight),
+        encoding="utf-8",
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    host_probe = _ExecutorHostProbe()
+
+    class TypedFailureProbe(_ExecutorHttpProbe):
+        def preflight(
+            self,
+            fixture: ReliabilityFixture,
+        ) -> reliability_validation.HttpPreflightObservation:
+            del fixture
+            raise reliability_validation.LiveValidationError(
+                "registered-service-binding",
+                stage="preflight",
+            )
+
+    http_probe: _ExecutorHttpProbe
+    if business_path == "primary-failure":
+        http_probe = TypedFailureProbe()
+        expected_failure = {
+            "code": "registered-service-binding",
+            "stage": "preflight",
+        }
+        current_marker_name = "failure.json"
+    else:
+        http_probe = _ExecutorHttpProbe()
+        expected_failure = {
+            "code": "public-marker-transition-failed",
+            "stage": "preflight",
+        }
+        current_marker_name = "preflight.json"
+
+    original_write = reliability_validation.write_atomic_json
+    archive_write_count = 0
+    fault_raised = False
+
+    def injected_write(
+        path: Path,
+        payload: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal archive_write_count, fault_raised
+        path = Path(path)
+        if path.parent.name == "terminal-markers":
+            archive_write_count += 1
+            archive_target = {
+                "archive-first": 1,
+                "archive-second": 2,
+            }.get(fault_point)
+            if archive_target == archive_write_count and not fault_raised:
+                fault_raised = True
+                raise OSError("token=archive-private C:\\private\\history")
+        if (
+            fault_point == "publish-current"
+            and path.parent == output_root
+            and path.name == current_marker_name
+            and not fault_raised
+        ):
+            fault_raised = True
+            raise OSError("token=publish-private C:\\private\\current")
+        original_write(path, payload, **kwargs)
+
+    monkeypatch.setattr(reliability_validation, "write_atomic_json", injected_write)
+    original_unlink = Path.unlink
+
+    def injected_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal fault_raised
+        marker = Path(path)
+        if (
+            fault_point == "unlink"
+            and marker.parent == output_root
+            and marker.name in {"failure.json", "preflight.json"}
+            and not fault_raised
+        ):
+            fault_raised = True
+            raise OSError("token=unlink-private C:\\private\\current")
+        original_unlink(marker, *args, **kwargs)
+
+    if fault_point == "unlink":
+        monkeypatch.setattr(Path, "unlink", injected_unlink)
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            http_probe,
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert fault_raised is True, archive_write_count
+    assert result == 1
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == (
+        expected_failure
+    )
+    assert not (output_root / "preflight.json").exists()
+    archives = list((output_root / "history" / "terminal-markers").glob("*.json"))
+    archived_documents = [
+        json.loads(path.read_text(encoding="utf-8")).get("document")
+        for path in archives
+    ]
+    assert stale_failure in archived_documents
+    assert stale_preflight in archived_documents
+    assert len(archives) == len({path.name for path in archives})
+    assert all("token=" not in path.read_text(encoding="utf-8") for path in archives)
 
 
 def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
