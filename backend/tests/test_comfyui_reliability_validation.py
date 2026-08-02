@@ -11769,6 +11769,142 @@ def test_fix12_final_root_guard_removes_passed_if_summary_is_recreated(
     assert (output_root / "reliability-summary.json").read_bytes() == summary_bytes
 
 
+def test_fix12_cleanup_failure_keeps_raw_recoverable_and_blocks_passed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "cleanup-failure"
+    _, summary_bytes, case_bytes = _fix11_seed_failed_cohort(
+        output_root,
+        _fix9_current_failed_document(),
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    original_rmtree = shutil.rmtree
+    injected = False
+
+    def fail_or_emulate_ignored_cleanup(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal injected
+        if Path(path).parent.name == "terminal-cohort-quarantine":
+            injected = True
+            if kwargs.get("ignore_errors") is True:
+                return
+            raise PermissionError("injected quarantine cleanup failure")
+        original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", fail_or_emulate_ignored_cleanup)
+
+    result = _fix11_run_preflight(output_root, fixture_path)
+
+    assert injected is True
+    assert result == 1
+    assert not (output_root / "preflight.json").exists()
+    quarantine_root = (
+        output_root / "reliability-temp-test" / "terminal-cohort-quarantine"
+    )
+    assert any(
+        path.read_bytes() == summary_bytes
+        for path in quarantine_root.glob("*/reliability-summary.json")
+    )
+    assert any(
+        path.read_bytes() == case_bytes
+        for path in quarantine_root.glob("*/cases/steady-01-gpt-sovits.json")
+    )
+
+
+def test_fix12_uncommitted_case_member_survives_exact_membership_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "case-membership-race"
+    _fix11_seed_failed_cohort(output_root, _fix9_current_failed_document())
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    case_root = output_root / "cases"
+    racing_path = case_root / "racing-private.json"
+    racing_bytes = b'{"private":"DO-NOT-DELETE"}'
+    original_write = reliability_validation.write_atomic_json
+    injected = False
+
+    def add_member_after_archive(path: Path, payload: object, **kwargs: object) -> None:
+        nonlocal injected
+        original_write(path, payload, **kwargs)
+        if Path(path).parent.name != "terminal-cohorts" or injected:
+            return
+        injected = True
+        original_stat = case_root.stat()
+        racing_path.write_bytes(racing_bytes)
+        os.utime(
+            case_root,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+
+    monkeypatch.setattr(reliability_validation, "write_atomic_json", add_member_after_archive)
+
+    result = _fix11_run_preflight(output_root, fixture_path)
+
+    quarantine_root = (
+        output_root / "reliability-temp-test" / "terminal-cohort-quarantine"
+    )
+    preserved = any(
+        path.is_file() and path.read_bytes() == racing_bytes
+        for path in [racing_path, *quarantine_root.glob("*/cases/racing-private.json")]
+    )
+    assert injected is True
+    assert (result, preserved, (output_root / "preflight.json").exists()) == (
+        1,
+        True,
+        False,
+    )
+
+
+def test_fix12_passed_rollback_preserves_replacement_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "marker-replacement-race"
+    _, summary_bytes, _ = _fix11_seed_failed_cohort(
+        output_root,
+        _fix9_current_failed_document(),
+    )
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    marker_path = output_root / "preflight.json"
+    competitor_bytes = b'{"status":"competitor-writer"}\n'
+    original_write = reliability_validation.write_atomic_json
+    injected = False
+
+    def replace_marker_then_conflict(path: Path, payload: object, **kwargs: object) -> None:
+        nonlocal injected
+        original_write(path, payload, **kwargs)
+        if Path(path) != marker_path or injected:
+            return
+        injected = True
+        competitor_path = output_root / "competitor-preflight.json"
+        competitor_path.write_bytes(competitor_bytes)
+        os.replace(competitor_path, marker_path)
+        (output_root / "reliability-summary.json").write_bytes(summary_bytes)
+
+    monkeypatch.setattr(
+        reliability_validation,
+        "write_atomic_json",
+        replace_marker_then_conflict,
+    )
+
+    result = _fix11_run_preflight(output_root, fixture_path)
+
+    preserved = marker_path.is_file() and marker_path.read_bytes() == competitor_bytes
+    passed = marker_path.is_file() and json.loads(
+        marker_path.read_text(encoding="utf-8")
+    ).get("status") == "passed"
+    assert injected is True
+    assert (result, preserved, passed) == (1, True, False)
+
+
 def test_fix11_exact_cohort_archive_is_idempotent_and_conflicts_fail_closed(
     tmp_path: Path,
 ) -> None:
