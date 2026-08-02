@@ -1976,6 +1976,13 @@ def test_fix_round_1_case_failure_writes_current_scrubbed_case_before_failed_sum
     assert failed_case["engine"] == "indextts"
     assert failed_case["expected"] == "completed"
     assert failed_case["failure"] == {"code": "case-execution-failed", "stage": "case"}
+    parsed_failed_case = reliability_validation.FailedCaseEvidence.model_validate_json(
+        (output_root / "cases" / "steady-01-indextts.json").read_text(encoding="utf-8")
+    )
+    assert parsed_failed_case.observation.detail_status == "minimal"
+    assert parsed_failed_case.observation.job_created is False
+    assert parsed_failed_case.observation.terminal_observed is False
+    assert parsed_failed_case.observation.poll_count == 0
     assert failed_case["host"]["cleanup"] == {
         "ok": True,
         "owned_processes_stopped": True,
@@ -2602,6 +2609,19 @@ def test_task_10_http_probe_queued_cancel_never_fabricates_comfy_prompt_or_versi
     assert observation.version_id is None
     assert observation.comfyui is None
     assert not any(path.startswith("/history/") for _method, path in calls)
+    partial = probe.failed_case_observation(case)
+    assert partial.job_created is True
+    assert partial.prompt_observed is False
+    assert partial.job_id_sha256 == hashlib.sha256(b"job-target").hexdigest()
+    assert partial.terminal_observed is True
+    assert partial.last_job_status == "cancelled"
+    assert partial.last_item_status == "cancelled"
+    assert partial.control is not None
+    assert partial.control.interrupt_reason == "user-cancel"
+    assert partial.control.interrupt_class == "job-cancel-request"
+    assert partial.control.initial_state == "absent"
+    assert partial.control.final_state == "dequeued"
+    assert partial.control.converged is True
 
 
 def test_task_10_http_probe_termination_proves_endpoint_absence_without_fake_history() -> None:
@@ -9144,3 +9164,424 @@ Write-Output 'VALIDATOR_BACKEND_CONTEXT_AND_RESTORATION_OK'
 
 
 REPOSITORY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")
+
+
+def _fix8_attempt1_failed_case_path() -> Path:
+    return (
+        Path(__file__).parent
+        / "fixtures"
+        / "comfyui-windows-reliability"
+        / "matrix-attempt1-failed-case.json"
+    )
+
+
+def _fix8_observation_document(*, detail_status: str = "incremental") -> dict[str, object]:
+    return {
+        "detail_status": detail_status,
+        "action": "synthesize",
+        "request_sha256": "1" * 64 if detail_status == "incremental" else None,
+        "service_id_sha256": "2" * 64 if detail_status == "incremental" else None,
+        "resource_id_sha256": "3" * 64 if detail_status == "incremental" else None,
+        "job_created": detail_status == "incremental",
+        "prompt_observed": detail_status == "incremental",
+        "job_id_sha256": "4" * 64 if detail_status == "incremental" else None,
+        "prompt_id_sha256": "5" * 64 if detail_status == "incremental" else None,
+        "version_id_sha256": None,
+        "job_created_at": "2026-08-02T08:52:55Z" if detail_status == "incremental" else None,
+        "first_prompt_at": "2026-08-02T08:52:56Z" if detail_status == "incremental" else None,
+        "last_poll_at": "2026-08-02T08:52:57Z" if detail_status == "incremental" else None,
+        "terminal_at": None,
+        "request_timeout_seconds": 120.0,
+        "convergence_seconds": 30.0,
+        "poll_count": 2 if detail_status == "incremental" else 0,
+        "terminal_observed": False,
+        "last_job_status": "running" if detail_status == "incremental" else None,
+        "last_item_status": "running" if detail_status == "incremental" else None,
+        "last_external_status": "running" if detail_status == "incremental" else None,
+        "last_response_sha256": "6" * 64 if detail_status == "incremental" else None,
+        "last_control_code": None,
+        "last_failure_stage": None,
+        "diagnostic_sha256": "7" * 64 if detail_status == "incremental" else None,
+        "queue": (
+            {
+                "observed_at": "2026-08-02T08:52:56Z",
+                "snapshot_sha256": "8" * 64,
+                "running_count": 1,
+                "pending_count": 0,
+                "target_state": "running",
+            }
+            if detail_status == "incremental"
+            else None
+        ),
+        "control": None,
+        "wav_observed": False,
+        "audio_sha256": None,
+        "audio_size_bytes": None,
+        "secondary_error_sha256": None,
+    }
+
+
+def test_fix8_exact_matrix_attempt1_failed_case_round_trips_through_public_reader() -> None:
+    artifact = _fix8_attempt1_failed_case_path().read_text(encoding="utf-8")
+    original = json.loads(artifact)
+
+    parsed = reliability_validation.FailedCaseEvidence.model_validate_json(artifact)
+
+    assert parsed.model_dump(mode="json", exclude_unset=True) == original
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        (("host", "started_at"), "2026-08-02T08:52:54+00:00"),
+        (("host", "finished_at"), "2026-13-02T08:53:28Z"),
+        (("host", "processes", 0, "creation_time"), "not-a-time"),
+        (("host", "processes", 0, "parent_creation_time"), "2026-08-02 08:52:33Z"),
+        (("host", "processes", 0, "stopped_at"), "2026-08-02T08:53:28.385378"),
+    ],
+)
+def test_fix8_failed_case_reader_rejects_noncanonical_or_invalid_utc_strings(
+    mutation: tuple[object, ...],
+    value: object,
+) -> None:
+    document = json.loads(_fix8_attempt1_failed_case_path().read_text(encoding="utf-8"))
+    target: object = document
+    for key in mutation[:-1]:
+        target = target[key]  # type: ignore[index]
+    target[mutation[-1]] = value  # type: ignore[index]
+
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "host-extra",
+        "process-extra",
+        "host-reversed",
+        "process-reversed",
+        "strict-pid",
+    ],
+)
+def test_fix8_failed_case_reader_keeps_extra_strictness_and_timestamp_ordering(
+    mutation: str,
+) -> None:
+    document = json.loads(_fix8_attempt1_failed_case_path().read_text(encoding="utf-8"))
+    if mutation == "host-extra":
+        document["host"]["private_path"] = "neutral-looking-value"
+    elif mutation == "process-extra":
+        document["host"]["processes"][0]["raw_command"] = "python"
+    elif mutation == "host-reversed":
+        document["host"]["finished_at"] = "2026-08-02T08:52:53Z"
+    elif mutation == "process-reversed":
+        document["host"]["processes"][0]["stopped_at"] = "2026-08-02T08:52:56Z"
+    else:
+        document["host"]["processes"][0]["pid"] = True
+
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseEvidence.model_validate(document)
+
+
+def test_fix8_real_http_probe_retains_hash_only_timeout_partial_observation(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _fault_case("timeout", expected="timeout")
+    raw_job_id = "job-local-private-4711"
+    raw_prompt_id = "prompt-local-private-9912"
+    raw_version_id = "version-local-private-2288"
+    private_diagnostic = f"token=private-timeout-secret {tmp_path}"
+    job_reads = 0
+    queue_reads = 0
+
+    def job(status: str) -> dict[str, object]:
+        return {
+            "job_id": raw_job_id,
+            "status": status,
+            "error": private_diagnostic if status == "failed" else None,
+            "items": [
+                {
+                    "status": status,
+                    "external_status": status,
+                    "external_job_id": raw_prompt_id,
+                    "version_id": raw_version_id if status == "failed" else None,
+                    "error": private_diagnostic if status == "failed" else None,
+                }
+            ],
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal job_reads, queue_reads
+        if request.url.path == "/api/generation/preflight":
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if request.url.path == "/api/jobs/generation":
+            return httpx.Response(200, json={"job_id": raw_job_id})
+        if request.url.path == f"/api/jobs/{raw_job_id}":
+            job_reads += 1
+            return httpx.Response(200, json=job("running" if job_reads == 1 else "failed"))
+        if request.url.path == "/queue":
+            queue_reads += 1
+            if queue_reads == 3:
+                raise httpx.ReadTimeout(private_diagnostic, request=request)
+            return httpx.Response(
+                200,
+                json={
+                    "queue_running": [[0, raw_prompt_id, {}, {}, []]] if queue_reads == 1 else [],
+                    "queue_pending": [],
+                },
+            )
+        if request.url.path.endswith("/manifest"):
+            return httpx.Response(
+                200,
+                json={
+                    "lines": {
+                        case.case_id: {
+                            "line_id": case.case_id,
+                            "versions": [
+                                {
+                                    "version_id": raw_version_id,
+                                    "status": "failed",
+                                    "audio_path": None,
+                                    "metadata": {
+                                        "control_code": "timeout",
+                                        "failure_stage": "timeout",
+                                        "control_details": {
+                                            "prompt_id": raw_prompt_id,
+                                            "cancellation": {
+                                                "prompt_id": raw_prompt_id,
+                                                "initial_state": "running",
+                                                "final_state": "interrupted",
+                                                "actions": ["interrupt"],
+                                                "duration_seconds": 0.5,
+                                                "converged": True,
+                                            },
+                                        },
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                },
+            )
+        return httpx.Response(404)
+
+    wall_time = datetime(2026, 8, 2, 8, 52, 54, tzinfo=timezone.utc)
+
+    def utcnow() -> datetime:
+        nonlocal wall_time
+        wall_time += timedelta(milliseconds=100)
+        return wall_time
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=Path("fixtures"),
+        poll_interval_seconds=0.001,
+        sleep=lambda _seconds: None,
+        utcnow=utcnow,
+    )
+    _preflight_http_probe_for_case(probe, fixture)
+
+    with pytest.raises(httpx.ReadTimeout):
+        probe.execute_case(case, fixture, tmp_path)
+
+    observation = probe.failed_case_observation(case)
+    assert observation.detail_status == "incremental"
+    assert observation.job_created is True
+    assert observation.prompt_observed is True
+    assert observation.terminal_observed is True
+    assert observation.poll_count == 2
+    assert observation.job_id_sha256 == hashlib.sha256(raw_job_id.encode()).hexdigest()
+    assert observation.prompt_id_sha256 == hashlib.sha256(raw_prompt_id.encode()).hexdigest()
+    assert observation.version_id_sha256 == hashlib.sha256(raw_version_id.encode()).hexdigest()
+    assert observation.last_job_status == "failed"
+    assert observation.last_item_status == "failed"
+    assert observation.last_external_status == "failed"
+    assert observation.control is not None
+    assert observation.control.interrupt_reason == "request-timeout"
+    assert observation.control.interrupt_class == "prompt-scoped-interrupt"
+    assert observation.control.converged is True
+    assert observation.queue is not None
+    assert observation.queue.target_state == "absent"
+    assert observation.wav_observed is False
+    assert observation.audio_sha256 is None
+    assert observation.audio_size_bytes is None
+    rendered = observation.model_dump_json()
+    for private_value in (
+        raw_job_id,
+        raw_prompt_id,
+        raw_version_id,
+        private_diagnostic,
+        str(tmp_path),
+        fixture.resources[case.engine].resource_id,
+    ):
+        assert private_value not in rendered
+    assert reliability_validation.FailedCaseObservation.model_validate_json(rendered) == observation
+
+
+def test_fix8_malformed_free_form_status_and_error_are_hash_only_secondary_evidence() -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _fault_case("timeout", expected="timeout")
+    probe = reliability_validation.HttpReliabilityProbe(reference_root=Path("fixtures"))
+    probe._registered_service_ids = {case.engine: "service-private"}
+    probe._begin_failed_case_observation(case, fixture)
+    probe._record_job_created(case, "job-private")
+
+    probe._record_job_poll(
+        case,
+        {
+            "status": "running",
+            "error": {"token": "private-value"},
+            "items": [
+                {
+                    "status": "running",
+                    "external_status": ["private-stage"],
+                    "error": {"path": "F:\\private\\model"},
+                }
+            ],
+        },
+    )
+
+    observation = probe.failed_case_observation(case)
+    assert observation.poll_count == 1
+    assert observation.last_external_status is None
+    assert observation.diagnostic_sha256 is not None
+    rendered = observation.model_dump_json()
+    assert "private-value" not in rendered
+    assert "private-stage" not in rendered
+    assert "F:\\private" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("job_created_at", "2026-08-02T08:52:55Z"),
+        ("last_control_code", "timeout"),
+        ("last_failure_stage", "timeout"),
+    ],
+)
+def test_fix8_minimal_observation_rejects_orphaned_detailed_fields(
+    field: str,
+    value: object,
+) -> None:
+    document = _fix8_observation_document(detail_status="minimal")
+    document[field] = value
+
+    with pytest.raises(ValidationError):
+        reliability_validation.FailedCaseObservation.model_validate(document)
+
+
+class _Fix8DetailedFailureProbe(_ExecutorHttpProbe):
+    def __init__(self) -> None:
+        super().__init__()
+        self.observation = reliability_validation.FailedCaseObservation.model_validate(
+            _fix8_observation_document()
+        )
+
+    def execute_case(
+        self,
+        case: reliability_validation.CasePlan,
+        fixture: ReliabilityFixture,
+        output_directory: Path,
+        *,
+        action_hook: object | None = None,
+    ) -> reliability_validation.HttpCaseObservation:
+        del fixture, output_directory, action_hook
+        self.executed.append((case.case_id, case.request_timeout_seconds, case.convergence_seconds))
+        raise RuntimeError("token=private-probe-secret F:\\private\\model")
+
+    def failed_case_observation(
+        self,
+        case: reliability_validation.CasePlan,
+    ) -> reliability_validation.FailedCaseObservation:
+        assert case.case_id == "steady-01-gpt-sovits"
+        return self.observation
+
+
+def test_fix8_controller_persists_strict_detailed_failed_case_without_private_ids(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    http_probe = _Fix8DetailedFailureProbe()
+    host_probe = _ExecutorHostProbe()
+    output_root = tmp_path / "private evidence"
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert exc_info.value.code == "case-execution-failed"
+    failed_path = output_root / "cases" / "steady-01-gpt-sovits.json"
+    failed = reliability_validation.FailedCaseEvidence.model_validate_json(
+        failed_path.read_text(encoding="utf-8")
+    )
+    assert failed.failure.model_dump() == {"code": "case-execution-failed", "stage": "case"}
+    assert failed.observation == http_probe.observation
+    rendered = failed_path.read_text(encoding="utf-8")
+    assert "private-probe-secret" not in rendered
+    assert "F:\\private" not in rendered
+    assert (output_root / "failure.json").read_text(encoding="utf-8").find(
+        "case-execution-failed"
+    ) >= 0
+
+
+def test_fix8_secondary_detailed_case_writer_failure_uses_minimal_fallback_without_replacing_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    http_probe = _Fix8DetailedFailureProbe()
+    host_probe = _ExecutorHostProbe()
+    output_root = tmp_path / "evidence"
+    original_write = reliability_validation.write_atomic_json
+    failed_case_writes = 0
+
+    def fail_detailed_once(path: Path, payload: object, **kwargs: object) -> None:
+        nonlocal failed_case_writes
+        if path.parent.name == "cases" and isinstance(payload, dict) and payload.get("status") == "failed":
+            failed_case_writes += 1
+            if failed_case_writes == 1:
+                raise OSError(f"token=secondary-writer-secret {tmp_path}")
+        original_write(path, payload, **kwargs)
+
+    monkeypatch.setattr(reliability_validation, "write_atomic_json", fail_detailed_once)
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert exc_info.value.code == "case-execution-failed"
+    assert failed_case_writes == 2
+    failed_path = output_root / "cases" / "steady-01-gpt-sovits.json"
+    failed = reliability_validation.FailedCaseEvidence.model_validate_json(
+        failed_path.read_text(encoding="utf-8")
+    )
+    assert failed.failure.model_dump() == {"code": "case-execution-failed", "stage": "case"}
+    assert failed.observation.detail_status == "minimal"
+    assert failed.observation.secondary_error_sha256 is not None
+    rendered = failed_path.read_text(encoding="utf-8")
+    assert "secondary-writer-secret" not in rendered
+    assert str(tmp_path) not in rendered
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+        "code": "case-execution-failed",
+        "stage": "case",
+    }
+
+
+def test_fix8_success_case_schema_is_not_polluted_by_failure_observation_fields() -> None:
+    evidence = _case("success-gpt", "gpt-sovits")
+    document = evidence.model_dump(mode="json")
+
+    assert "failure" not in document
+    assert "observation" not in document
+    assert CaseEvidence.model_validate(evidence).actual == "completed"

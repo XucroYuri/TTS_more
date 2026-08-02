@@ -1,0 +1,50 @@
+{
+  "case_id": "steady-01-gpt-sovits",
+  "engine": "gpt-sovits",
+  "expected": "completed",
+  "failure": {
+    "code": "case-execution-failed",
+    "stage": "case"
+  },
+  "host": {
+    "cleanup": {
+      "ok": true,
+      "owned_processes_stopped": true,
+      "temp_paths_removed": true
+    },
+    "finished_at": "2026-08-02T08:53:28.427910Z",
+    "gpu_after": {
+      "free_mib": 15032,
+      "used_mib": 1076
+    },
+    "gpu_before": {
+      "free_mib": 15032,
+      "used_mib": 1076
+    },
+    "gpu_peak": {
+      "free_mib": 15032,
+      "used_mib": 1076
+    },
+    "processes": [
+      {
+        "alive_after": false,
+        "command_hash": "d6135a959a38ed7c4cacfc2798cef2c3ee67e6320011d47c9db5f6027762f893",
+        "creation_time": "2026-08-02T08:52:57.292540Z",
+        "descendants_stopped": true,
+        "executable_hash": "62c225fb9cdc41b139c7024581c233644f975ffc35314558c60ebefa6b88be01",
+        "executable_name": "python.exe",
+        "ownership": "validator-owned",
+        "ownership_hash": "d4f885529aa1a4848b6d02f2e46bf1ab122f843f4329c4075b76f4384b8ae2c8",
+        "parent_creation_time": "2026-08-02T08:52:33.155318Z",
+        "parent_pid": 32748,
+        "pid": 14344,
+        "started": true,
+        "stopped": true,
+        "stopped_at": "2026-08-02T08:53:28.385378Z"
+      }
+    ],
+    "started_at": "2026-08-02T08:52:54.464966Z"
+  },
+  "phase": "steady",
+  "status": "failed"
+}

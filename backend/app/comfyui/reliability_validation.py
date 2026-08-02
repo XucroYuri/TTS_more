@@ -80,6 +80,45 @@ _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SCHEME_URI_PATTERN = re.compile(r"(?i)(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s<>\"']+")
 _NETWORK_URI_PATTERN = re.compile(r"(?<![:/])//[^\s<>\"']+")
 ModelT = TypeVar("ModelT", bound="_StrictModel")
+_PUBLIC_UTC_PATTERN = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
+_PublicUtcTimestamp = Annotated[
+    str,
+    Field(min_length=20, max_length=27, pattern=_PUBLIC_UTC_PATTERN),
+]
+ObservedStatus = Literal["queued", "running", "cancelling", "cancelled", "failed", "completed"]
+
+
+def _parse_public_utc(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+    except ValueError:
+        raise ValueError("timestamp must be valid UTC") from None
+    if not _is_utc(parsed):
+        raise ValueError("timestamp must be timezone-aware UTC")
+    return parsed
+
+
+def _public_utc(value: datetime) -> str:
+    if not _is_utc(value):
+        raise ValueError("timestamp must be timezone-aware UTC")
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_document(value: Any) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        encoded = type(value).__name__.encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class _StrictModel(BaseModel):
@@ -683,6 +722,282 @@ class _PublicPreflightMarker(_StrictModel):
         return {port: value[port] for port in sorted(value, key=int)}
 
 
+class FailedCaseProcessObservation(_StrictModel):
+    pid: StrictInt = Field(gt=0)
+    ownership: Literal["validator-owned", "pre-existing"]
+    command_hash: SHA256
+    creation_time: _PublicUtcTimestamp
+    parent_pid: StrictInt = Field(gt=0)
+    parent_creation_time: _PublicUtcTimestamp
+    stopped_at: _PublicUtcTimestamp
+    executable_name: str = Field(min_length=1)
+    executable_hash: SHA256
+    ownership_hash: SHA256
+    started: StrictBool
+    stopped: StrictBool
+    descendants_stopped: StrictBool
+    alive_after: StrictBool
+
+    @field_validator("creation_time", "parent_creation_time", "stopped_at")
+    @classmethod
+    def _valid_utc_timestamp(cls, value: str) -> str:
+        _parse_public_utc(value)
+        return value
+
+    @field_validator("executable_name")
+    @classmethod
+    def _neutral_executable_name(cls, value: str) -> str:
+        if not _is_neutral_basename(value):
+            raise ValueError("executable_name must be a neutral basename")
+        return value
+
+    @model_validator(mode="after")
+    def _complete_lifecycle(self) -> "FailedCaseProcessObservation":
+        parent_created = _parse_public_utc(self.parent_creation_time)
+        created = _parse_public_utc(self.creation_time)
+        stopped = _parse_public_utc(self.stopped_at)
+        if parent_created > created or created > stopped:
+            raise ValueError("process timestamps are not ordered")
+        if self.parent_pid == self.pid:
+            raise ValueError("process parent_pid must differ from pid")
+        if (
+            self.ownership != "validator-owned"
+            or not self.started
+            or not self.stopped
+            or not self.descendants_stopped
+            or self.alive_after
+        ):
+            raise ValueError("process lifecycle proof is incomplete")
+        return self
+
+
+class FailedCaseHostObservation(_StrictModel):
+    started_at: _PublicUtcTimestamp
+    finished_at: _PublicUtcTimestamp
+    cleanup: CleanupEvidence
+    processes: list[FailedCaseProcessObservation]
+    gpu_before: GpuSnapshot
+    gpu_peak: GpuSnapshot
+    gpu_after: GpuSnapshot
+
+    @field_validator("started_at", "finished_at")
+    @classmethod
+    def _valid_utc_timestamp(cls, value: str) -> str:
+        _parse_public_utc(value)
+        return value
+
+    @field_validator("processes")
+    @classmethod
+    def _sorted_processes(
+        cls,
+        value: list[FailedCaseProcessObservation],
+    ) -> list[FailedCaseProcessObservation]:
+        return sorted(
+            value,
+            key=lambda process: (
+                process.pid,
+                process.creation_time,
+                process.parent_pid,
+                process.parent_creation_time,
+                process.stopped_at,
+            ),
+        )
+
+    @model_validator(mode="after")
+    def _ordered_times(self) -> "FailedCaseHostObservation":
+        started = _parse_public_utc(self.started_at)
+        finished = _parse_public_utc(self.finished_at)
+        if finished < started:
+            raise ValueError("host observation times are not ordered")
+        process_identities: set[tuple[int, str]] = set()
+        for process in self.processes:
+            identity = (process.pid, process.creation_time)
+            if identity in process_identities:
+                raise ValueError("process identities must be unique")
+            process_identities.add(identity)
+            if (
+                _parse_public_utc(process.creation_time) < started
+                or _parse_public_utc(process.stopped_at) > finished
+            ):
+                raise ValueError("process timestamps fall outside the host observation")
+        return self
+
+
+class FailedCaseQueueObservation(_StrictModel):
+    observed_at: _PublicUtcTimestamp
+    snapshot_sha256: SHA256
+    running_count: StrictInt = Field(ge=0)
+    pending_count: StrictInt = Field(ge=0)
+    target_state: Literal["running", "pending", "absent"] | None
+
+    @field_validator("observed_at")
+    @classmethod
+    def _valid_utc_timestamp(cls, value: str) -> str:
+        _parse_public_utc(value)
+        return value
+
+
+class FailedCaseControlObservation(_StrictModel):
+    interrupt_reason: Literal[
+        "request-timeout",
+        "user-cancel",
+        "owned-comfyui-termination",
+        "validator-release",
+    ]
+    interrupt_class: Literal[
+        "job-cancel-request",
+        "prompt-scoped-interrupt",
+        "owned-service-termination",
+    ]
+    requested_at: _PublicUtcTimestamp | None
+    converged_at: _PublicUtcTimestamp | None
+    initial_state: Literal["running", "pending", "absent"] | None
+    final_state: Literal["interrupted", "dequeued", "absent"] | None
+    converged: StrictBool | None
+    duration_seconds: StrictFloat | None = Field(default=None, ge=0.0, le=30.0)
+    diagnostic_sha256: SHA256 | None
+
+    @field_validator("requested_at", "converged_at")
+    @classmethod
+    def _valid_optional_utc_timestamp(cls, value: str | None) -> str | None:
+        if value is not None:
+            _parse_public_utc(value)
+        return value
+
+    @model_validator(mode="after")
+    def _ordered_control_times(self) -> "FailedCaseControlObservation":
+        if (
+            self.requested_at is not None
+            and self.converged_at is not None
+            and _parse_public_utc(self.converged_at) < _parse_public_utc(self.requested_at)
+        ):
+            raise ValueError("control timestamps are not ordered")
+        if self.converged is True and (self.converged_at is None or self.final_state is None):
+            raise ValueError("converged control evidence is incomplete")
+        return self
+
+
+class FailedCaseObservation(_StrictModel):
+    detail_status: Literal["incremental", "minimal"]
+    action: CaseAction
+    request_sha256: SHA256 | None
+    service_id_sha256: SHA256 | None
+    resource_id_sha256: SHA256 | None
+    job_created: StrictBool
+    prompt_observed: StrictBool
+    job_id_sha256: SHA256 | None
+    prompt_id_sha256: SHA256 | None
+    version_id_sha256: SHA256 | None
+    job_created_at: _PublicUtcTimestamp | None
+    first_prompt_at: _PublicUtcTimestamp | None
+    last_poll_at: _PublicUtcTimestamp | None
+    terminal_at: _PublicUtcTimestamp | None
+    request_timeout_seconds: StrictFloat = Field(gt=0.0, le=MAX_NORMAL_REQUEST_TIMEOUT_SECONDS)
+    convergence_seconds: StrictFloat = Field(gt=0.0, le=TERMINAL_CONVERGENCE_SECONDS)
+    poll_count: StrictInt = Field(ge=0)
+    terminal_observed: StrictBool
+    last_job_status: ObservedStatus | None
+    last_item_status: ObservedStatus | None
+    last_external_status: ObservedStatus | None
+    last_response_sha256: SHA256 | None
+    last_control_code: Literal["cancelled", "timeout"] | None
+    last_failure_stage: Literal["timeout", "cancellation_cleanup"] | None
+    diagnostic_sha256: SHA256 | None
+    queue: FailedCaseQueueObservation | None
+    control: FailedCaseControlObservation | None
+    wav_observed: StrictBool
+    audio_sha256: SHA256 | None
+    audio_size_bytes: StrictInt | None = Field(default=None, gt=0)
+    secondary_error_sha256: SHA256 | None
+
+    @field_validator("job_created_at", "first_prompt_at", "last_poll_at", "terminal_at")
+    @classmethod
+    def _valid_optional_utc_timestamp(cls, value: str | None) -> str | None:
+        if value is not None:
+            _parse_public_utc(value)
+        return value
+
+    @model_validator(mode="after")
+    def _partial_observation_contract(self) -> "FailedCaseObservation":
+        if self.job_created != (self.job_id_sha256 is not None and self.job_created_at is not None):
+            raise ValueError("job creation observation is inconsistent")
+        if self.prompt_observed != (
+            self.prompt_id_sha256 is not None and self.first_prompt_at is not None
+        ):
+            raise ValueError("prompt observation is inconsistent")
+        if self.prompt_observed and not self.job_created:
+            raise ValueError("prompt observation precedes job creation")
+        if self.poll_count == 0:
+            if any(
+                value is not None
+                for value in (
+                    self.last_poll_at,
+                    self.last_job_status,
+                    self.last_item_status,
+                    self.last_external_status,
+                    self.last_response_sha256,
+                )
+            ):
+                raise ValueError("zero-poll observation contains poll detail")
+        elif self.last_poll_at is None or self.last_response_sha256 is None:
+            raise ValueError("poll observation is incomplete")
+        if self.terminal_observed != (
+            self.terminal_at is not None
+            and self.last_job_status in {"completed", "cancelled", "failed"}
+        ):
+            raise ValueError("terminal observation is inconsistent")
+        if self.wav_observed != (
+            self.audio_sha256 is not None and self.audio_size_bytes is not None
+        ):
+            raise ValueError("audio observation is inconsistent")
+        if (
+            self.queue is not None
+            and self.queue.target_state in {"running", "pending"}
+            and not self.prompt_observed
+        ):
+            raise ValueError("queue target state lacks a prompt commitment")
+        if self.job_created_at is not None:
+            created = _parse_public_utc(self.job_created_at)
+            if self.first_prompt_at is not None and _parse_public_utc(self.first_prompt_at) < created:
+                raise ValueError("prompt observation precedes job creation")
+            if self.last_poll_at is not None and _parse_public_utc(self.last_poll_at) < created:
+                raise ValueError("poll observation precedes job creation")
+            if self.terminal_at is not None and _parse_public_utc(self.terminal_at) < created:
+                raise ValueError("terminal observation precedes job creation")
+        if self.detail_status == "minimal" and any(
+            (
+                self.request_sha256,
+                self.service_id_sha256,
+                self.resource_id_sha256,
+                self.job_created,
+                self.prompt_observed,
+                self.job_id_sha256,
+                self.prompt_id_sha256,
+                self.version_id_sha256,
+                self.job_created_at,
+                self.first_prompt_at,
+                self.last_poll_at,
+                self.terminal_at,
+                self.poll_count,
+                self.terminal_observed,
+                self.last_job_status,
+                self.last_item_status,
+                self.last_external_status,
+                self.last_response_sha256,
+                self.last_control_code,
+                self.last_failure_stage,
+                self.diagnostic_sha256,
+                self.queue,
+                self.control,
+                self.wav_observed,
+                self.audio_sha256,
+                self.audio_size_bytes,
+            )
+        ):
+            raise ValueError("minimal observation contains detailed evidence")
+        return self
+
+
 class FailedCaseEvidence(_StrictModel):
     status: Literal["failed"]
     case_id: str = Field(min_length=1)
@@ -690,7 +1005,8 @@ class FailedCaseEvidence(_StrictModel):
     engine: Engine
     expected: Outcome
     failure: FailureMarker
-    host: HostCaseObservation | None
+    host: FailedCaseHostObservation | None
+    observation: FailedCaseObservation | None = None
 
     @field_validator("case_id")
     @classmethod
@@ -698,6 +1014,58 @@ class FailedCaseEvidence(_StrictModel):
         if "\\" in value or "/" in value or Path(value).is_absolute():
             raise ValueError("case_id must not contain paths")
         return value
+
+
+def _failed_case_host_observation(
+    host: HostCaseObservation | None,
+) -> FailedCaseHostObservation | None:
+    if host is None:
+        return None
+    return FailedCaseHostObservation.model_validate(host.model_dump(mode="json"))
+
+
+def _minimal_failed_case_observation(
+    case: CasePlan,
+    *,
+    secondary_error: BaseException | None = None,
+) -> FailedCaseObservation:
+    return FailedCaseObservation(
+        detail_status="minimal",
+        action=case.action,
+        request_sha256=None,
+        service_id_sha256=None,
+        resource_id_sha256=None,
+        job_created=False,
+        prompt_observed=False,
+        job_id_sha256=None,
+        prompt_id_sha256=None,
+        version_id_sha256=None,
+        job_created_at=None,
+        first_prompt_at=None,
+        last_poll_at=None,
+        terminal_at=None,
+        request_timeout_seconds=case.request_timeout_seconds,
+        convergence_seconds=case.convergence_seconds,
+        poll_count=0,
+        terminal_observed=False,
+        last_job_status=None,
+        last_item_status=None,
+        last_external_status=None,
+        last_response_sha256=None,
+        last_control_code=None,
+        last_failure_stage=None,
+        diagnostic_sha256=None,
+        queue=None,
+        control=None,
+        wav_observed=False,
+        audio_sha256=None,
+        audio_size_bytes=None,
+        secondary_error_sha256=(
+            _sha256_text(f"{type(secondary_error).__name__}\0{secondary_error}")
+            if secondary_error is not None
+            else None
+        ),
+    )
 
 
 class HttpFinalObservation(_StrictModel):
@@ -2314,18 +2682,21 @@ class HttpReliabilityProbe:
         poll_interval_seconds: float = 0.25,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.transport = transport
         self.reference_root = Path(reference_root).resolve()
         self.poll_interval_seconds = poll_interval_seconds
         self.monotonic = monotonic
         self.sleep = sleep
+        self.utcnow = utcnow
         self._fixture: ReliabilityFixture | None = None
         self._registered_service_ids: dict[Engine, str] = {}
         self._released = False
         self._seen_job_ids: set[str] = set()
         self._seen_prompt_ids: set[str] = set()
         self._seen_version_ids: set[str] = set()
+        self._failed_case_observations: dict[str, FailedCaseObservation] = {}
 
     def preflight(self, fixture: ReliabilityFixture) -> HttpPreflightObservation:
         self._fixture = _revalidate_model(fixture, ReliabilityFixture)
@@ -2397,6 +2768,269 @@ class HttpReliabilityProbe:
             queue=self._queue_snapshot(fixture),
         )
 
+    def _observation_now(self) -> str:
+        return _public_utc(self.utcnow())
+
+    def _begin_failed_case_observation(
+        self,
+        case: CasePlan,
+        fixture: ReliabilityFixture,
+    ) -> None:
+        service_id = self._registered_service_ids.get(case.engine)
+        try:
+            self._failed_case_observations[case.case_id] = FailedCaseObservation(
+                detail_status="incremental",
+                action=case.action,
+                request_sha256=None,
+                service_id_sha256=_sha256_text(service_id) if service_id is not None else None,
+                resource_id_sha256=_sha256_text(fixture.resources[case.engine].resource_id),
+                job_created=False,
+                prompt_observed=False,
+                job_id_sha256=None,
+                prompt_id_sha256=None,
+                version_id_sha256=None,
+                job_created_at=None,
+                first_prompt_at=None,
+                last_poll_at=None,
+                terminal_at=None,
+                request_timeout_seconds=case.request_timeout_seconds,
+                convergence_seconds=case.convergence_seconds,
+                poll_count=0,
+                terminal_observed=False,
+                last_job_status=None,
+                last_item_status=None,
+                last_external_status=None,
+                last_response_sha256=None,
+                last_control_code=None,
+                last_failure_stage=None,
+                diagnostic_sha256=None,
+                queue=None,
+                control=None,
+                wav_observed=False,
+                audio_sha256=None,
+                audio_size_bytes=None,
+                secondary_error_sha256=None,
+            )
+        except Exception as exc:
+            self._failed_case_observations[case.case_id] = _minimal_failed_case_observation(
+                case,
+                secondary_error=exc,
+            )
+
+    def _update_failed_case_observation(self, case: CasePlan, **updates: Any) -> None:
+        current = self._failed_case_observations.get(case.case_id)
+        if current is None or current.detail_status == "minimal":
+            return
+        try:
+            document = current.model_dump(mode="python")
+            document.update(updates)
+            self._failed_case_observations[case.case_id] = FailedCaseObservation.model_validate(
+                document
+            )
+        except Exception as exc:
+            self._failed_case_observations[case.case_id] = _minimal_failed_case_observation(
+                case,
+                secondary_error=exc,
+            )
+
+    def failed_case_observation(self, case: CasePlan) -> FailedCaseObservation:
+        observation = self._failed_case_observations.get(case.case_id)
+        if observation is None:
+            return _minimal_failed_case_observation(case)
+        return _revalidate_model(observation, FailedCaseObservation)
+
+    @staticmethod
+    def _observed_status(value: Any) -> ObservedStatus | None:
+        if isinstance(value, str) and value in {
+            "queued",
+            "running",
+            "cancelling",
+            "cancelled",
+            "failed",
+            "completed",
+        }:
+            return value
+        return None
+
+    def _record_request_payload(self, case: CasePlan, payload: dict[str, Any]) -> None:
+        self._update_failed_case_observation(
+            case,
+            request_sha256=_sha256_document(payload),
+        )
+
+    def _record_job_created(self, case: CasePlan, job_id: str) -> None:
+        self._update_failed_case_observation(
+            case,
+            job_created=True,
+            job_id_sha256=_sha256_text(job_id),
+            job_created_at=self._observation_now(),
+        )
+
+    def _record_job_poll(self, case: CasePlan, job: dict[str, Any]) -> None:
+        current = self._failed_case_observations.get(case.case_id)
+        if current is None or current.detail_status == "minimal":
+            return
+        observed_at = self._observation_now()
+        items = job.get("items")
+        item = items[0] if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict) else {}
+        job_status = self._observed_status(job.get("status"))
+        item_status = self._observed_status(item.get("status"))
+        external_status = self._observed_status(item.get("external_status"))
+        terminal_observed = job_status in {"completed", "cancelled", "failed"}
+        diagnostics = [job.get("error"), item.get("error")]
+        unknown_external_status = item.get("external_status") if external_status is None else None
+        if unknown_external_status is not None:
+            diagnostics.append(unknown_external_status)
+        diagnostic_values = [value for value in diagnostics if value is not None and value != ""]
+        self._update_failed_case_observation(
+            case,
+            poll_count=current.poll_count + 1,
+            last_poll_at=observed_at,
+            terminal_at=observed_at if terminal_observed else current.terminal_at,
+            terminal_observed=terminal_observed,
+            last_job_status=job_status,
+            last_item_status=item_status,
+            last_external_status=external_status,
+            last_response_sha256=_sha256_document(job),
+            diagnostic_sha256=(
+                _sha256_document(diagnostic_values)
+                if diagnostic_values
+                else current.diagnostic_sha256
+            ),
+        )
+
+    def _record_prompt(self, case: CasePlan, prompt_id: str) -> None:
+        current = self._failed_case_observations.get(case.case_id)
+        if current is None or current.detail_status == "minimal" or current.prompt_observed:
+            return
+        self._update_failed_case_observation(
+            case,
+            prompt_observed=True,
+            prompt_id_sha256=_sha256_text(prompt_id),
+            first_prompt_at=self._observation_now(),
+        )
+
+    def _record_queue(
+        self,
+        case: CasePlan,
+        queue: dict[str, Any],
+        prompt_id: str | None,
+    ) -> None:
+        try:
+            running_ids = _comfy_prompt_ids(queue, key="queue_running")
+            pending_ids = _comfy_prompt_ids(queue, key="queue_pending")
+            if prompt_id is None:
+                target_state = None
+            elif prompt_id in running_ids:
+                target_state = "running"
+            elif prompt_id in pending_ids:
+                target_state = "pending"
+            else:
+                target_state = "absent"
+            observation = FailedCaseQueueObservation(
+                observed_at=self._observation_now(),
+                snapshot_sha256=_sha256_document(queue),
+                running_count=len(running_ids),
+                pending_count=len(pending_ids),
+                target_state=target_state,
+            )
+            self._update_failed_case_observation(case, queue=observation)
+        except Exception as exc:
+            self._failed_case_observations[case.case_id] = _minimal_failed_case_observation(
+                case,
+                secondary_error=exc,
+            )
+
+    def _record_control_request(
+        self,
+        case: CasePlan,
+        *,
+        reason: Literal["user-cancel", "owned-comfyui-termination"],
+        interrupt_class: Literal["job-cancel-request", "owned-service-termination"],
+        initial_state: Literal["running", "pending", "absent"],
+    ) -> None:
+        self._update_failed_case_observation(
+            case,
+            control=FailedCaseControlObservation(
+                interrupt_reason=reason,
+                interrupt_class=interrupt_class,
+                requested_at=self._observation_now(),
+                converged_at=None,
+                initial_state=initial_state,
+                final_state=None,
+                converged=None,
+                duration_seconds=None,
+                diagnostic_sha256=None,
+            ),
+        )
+
+    def _record_terminal_control(
+        self,
+        case: CasePlan,
+        control: FaultControlEvidence,
+    ) -> None:
+        current = self._failed_case_observations.get(case.case_id)
+        prior_control = current.control if current is not None else None
+        reason: Literal["request-timeout", "user-cancel"] = (
+            "request-timeout" if control.control_code == "timeout" else "user-cancel"
+        )
+        self._update_failed_case_observation(
+            case,
+            last_control_code=control.control_code,
+            last_failure_stage=control.failure_stage,
+            control=FailedCaseControlObservation(
+                interrupt_reason=reason,
+                interrupt_class="prompt-scoped-interrupt",
+                requested_at=prior_control.requested_at if prior_control is not None else None,
+                converged_at=self._observation_now(),
+                initial_state=control.initial_state,
+                final_state=control.final_state,
+                converged=control.converged,
+                duration_seconds=control.duration_seconds,
+                diagnostic_sha256=None,
+            ),
+        )
+
+    def _record_queued_control_terminal(self, case: CasePlan) -> None:
+        current = self._failed_case_observations.get(case.case_id)
+        prior_control = current.control if current is not None else None
+        self._update_failed_case_observation(
+            case,
+            control=FailedCaseControlObservation(
+                interrupt_reason="user-cancel",
+                interrupt_class="job-cancel-request",
+                requested_at=prior_control.requested_at if prior_control is not None else None,
+                converged_at=self._observation_now(),
+                initial_state="absent",
+                final_state="dequeued",
+                converged=True,
+                duration_seconds=None,
+                diagnostic_sha256=None,
+            ),
+        )
+
+    def _record_version_and_audio(
+        self,
+        case: CasePlan,
+        raw_version_id: str,
+        wav_path: Path | None,
+    ) -> None:
+        updates: dict[str, Any] = {"version_id_sha256": _sha256_text(raw_version_id)}
+        if wav_path is not None and wav_path.is_file():
+            try:
+                size = wav_path.stat().st_size
+                if size > 0:
+                    updates.update(
+                        wav_observed=True,
+                        audio_sha256=_sha256_file(wav_path),
+                        audio_size_bytes=size,
+                    )
+            except OSError as exc:
+                updates["diagnostic_sha256"] = _sha256_text(
+                    f"{type(exc).__name__}\0{exc}"
+                )
+        self._update_failed_case_observation(case, **updates)
+
     def execute_case(
         self,
         case: CasePlan,
@@ -2407,9 +3041,11 @@ class HttpReliabilityProbe:
     ) -> HttpCaseObservation:
         del output_directory
         fixture = _revalidate_model(fixture, ReliabilityFixture)
+        self._begin_failed_case_observation(case, fixture)
         tts_more_url = fixture.base_urls["tts_more"].rstrip("/")
         comfyui_url = fixture.base_urls["comfyui"].rstrip("/")
         payload = self._generation_payload(case, fixture)
+        self._record_request_payload(case, payload)
         if case.action == "restart-readiness" and action_hook is not None:
             action_hook()
         preflight = self._json(
@@ -2429,6 +3065,7 @@ class HttpReliabilityProbe:
             timeout=case.request_timeout_seconds,
         )
         job_id = _required_opaque_id(created.get("job_id"), "job")
+        self._record_job_created(case, job_id)
         if job_id in self._seen_job_ids:
             raise RuntimeError("job id was reused")
         self._seen_job_ids.add(job_id)
@@ -2454,6 +3091,7 @@ class HttpReliabilityProbe:
 
         while self.monotonic() <= deadline:
             job = self._json("GET", f"{tts_more_url}/api/jobs/{job_id}", timeout=10.0)
+            self._record_job_poll(case, job)
             require_case_window_open()
             items = job.get("items")
             item = items[0] if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict) else {}
@@ -2463,6 +3101,7 @@ class HttpReliabilityProbe:
                 if prompt_id is not None and prompt_id != observed_prompt:
                     raise RuntimeError("job changed prompt id")
                 prompt_id = observed_prompt
+                self._record_prompt(case, prompt_id)
                 try:
                     queue = self._comfy_queue(fixture)
                 except httpx.TransportError:
@@ -2471,6 +3110,8 @@ class HttpReliabilityProbe:
                     endpoint_unavailable = True
                     queue = None
                 require_case_window_open()
+                if queue is not None:
+                    self._record_queue(case, queue, prompt_id)
                 prompt_ids = _comfy_prompt_ids(queue) if queue is not None else []
                 if prompt_id in prompt_ids and queue_before is None:
                     queue_before = prompt_ids
@@ -2481,6 +3122,12 @@ class HttpReliabilityProbe:
                 elif case.action == "cancel-running" and not acted and state == "running":
                     require_case_window_open()
                     deadline = self.monotonic() + case.convergence_seconds
+                    self._record_control_request(
+                        case,
+                        reason="user-cancel",
+                        interrupt_class="job-cancel-request",
+                        initial_state="running",
+                    )
                     self._cancel_job(tts_more_url, job_id)
                     acted = True
                     require_case_window_open()
@@ -2489,6 +3136,12 @@ class HttpReliabilityProbe:
                         raise RuntimeError("terminate action hook is missing")
                     require_case_window_open()
                     deadline = self.monotonic() + case.convergence_seconds
+                    self._record_control_request(
+                        case,
+                        reason="owned-comfyui-termination",
+                        interrupt_class="owned-service-termination",
+                        initial_state="running",
+                    )
                     action_hook()
                     acted = True
                     require_case_window_open()
@@ -2524,6 +3177,7 @@ class HttpReliabilityProbe:
             raise RuntimeError("version id was reused")
         self._seen_version_ids.add(version_id)
         wav_path = Path(version["audio_path"]) if actual == "completed" and version.get("audio_path") else None
+        self._record_version_and_audio(case, raw_version_id, wav_path)
         if case.action == "terminate-comfyui":
             if (
                 not endpoint_unavailable
@@ -2563,7 +3217,10 @@ class HttpReliabilityProbe:
                 version=version,
                 prompt_id=prompt_id,
             )
+            assert tts_terminal.control is not None
+            self._record_terminal_control(case, tts_terminal.control)
         queue_after_document = self._comfy_queue(fixture)
+        self._record_queue(case, queue_after_document, prompt_id)
         queue_after = _comfy_prompt_ids(queue_after_document)
         history = self._json("GET", f"{comfyui_url}/history/{prompt_id}", timeout=10.0)
         history_ids = sorted(str(key) for key in history if isinstance(key, str))
@@ -2746,6 +3403,7 @@ class HttpReliabilityProbe:
                 timeout=case.request_timeout_seconds,
             )
             target_job_id = _required_opaque_id(target_created.get("job_id"), "job")
+            self._record_job_created(case, target_job_id)
             self._remember_unique(self._seen_job_ids, target_job_id, "job")
             require_admission_window_open()
             queued_target: dict[str, Any] | None = None
@@ -2755,6 +3413,7 @@ class HttpReliabilityProbe:
                     f"{tts_more_url}/api/jobs/{target_job_id}",
                     timeout=10.0,
                 )
+                self._record_job_poll(case, target)
                 require_admission_window_open()
                 target_item = _single_job_item(target)
                 if target.get("status") == "running" and _queued_item_is_pristine(target_item):
@@ -2768,7 +3427,14 @@ class HttpReliabilityProbe:
 
             require_admission_window_open()
             settlement_deadline = self.monotonic() + case.convergence_seconds
+            self._record_control_request(
+                case,
+                reason="user-cancel",
+                interrupt_class="job-cancel-request",
+                initial_state="absent",
+            )
             cancelled = self._cancel_job(tts_more_url, target_job_id)
+            self._record_job_poll(case, cancelled)
             _require_pristine_queued_cancellation(cancelled)
             target_cancelled = True
             require_settlement_window_open(settlement_deadline)
@@ -2786,6 +3452,7 @@ class HttpReliabilityProbe:
                     f"{tts_more_url}/api/jobs/{target_job_id}",
                     timeout=10.0,
                 )
+                self._record_job_poll(case, target)
                 require_settlement_window_open(settlement_deadline)
                 blocker = self._json(
                     "GET",
@@ -2794,6 +3461,7 @@ class HttpReliabilityProbe:
                 )
                 require_settlement_window_open(settlement_deadline)
                 settled_queue = self._comfy_queue(fixture)
+                self._record_queue(case, settled_queue, None)
                 require_settlement_window_open(settlement_deadline)
                 queue_ids = _comfy_prompt_ids(settled_queue)
                 if (
@@ -2807,6 +3475,7 @@ class HttpReliabilityProbe:
                 self.sleep(self.poll_interval_seconds)
             if settled_target is None:
                 raise RuntimeError("queued-cancel worker did not settle after admission release")
+            self._record_queued_control_terminal(case)
 
             manifest_after = self._json("GET", manifest_url, timeout=10.0)
             manifest_absent = (
@@ -3226,6 +3895,64 @@ def required_case_specs(plan: Sequence[CasePlan]) -> tuple[RequiredCase, ...]:
     return required
 
 
+def _failed_case_observation_from_probe(
+    http_probe: ReliabilityHttpProbe,
+    case: CasePlan,
+) -> FailedCaseObservation:
+    reader = getattr(http_probe, "failed_case_observation", None)
+    if not callable(reader):
+        return _minimal_failed_case_observation(case)
+    try:
+        observation = _revalidate_model(reader(case), FailedCaseObservation)
+        if (
+            observation.action != case.action
+            or observation.request_timeout_seconds != case.request_timeout_seconds
+            or observation.convergence_seconds != case.convergence_seconds
+        ):
+            raise ValueError("failed case observation does not match its case plan")
+        return observation
+    except Exception as exc:
+        return _minimal_failed_case_observation(case, secondary_error=exc)
+
+
+def _strict_failed_case_payload(evidence: FailedCaseEvidence) -> dict[str, Any]:
+    try:
+        encoded = evidence.model_dump_json(warnings="error")
+        validated = FailedCaseEvidence.model_validate_json(encoded)
+        return validated.model_dump(mode="json")
+    except (ValidationError, ValueError, TypeError, AttributeError, RecursionError):
+        raise ValueError("invalid failed case evidence") from None
+
+
+def _persist_failed_case_evidence(
+    path: Path,
+    evidence: FailedCaseEvidence,
+    *,
+    case: CasePlan,
+) -> None:
+    try:
+        write_atomic_json(path, _strict_failed_case_payload(evidence))
+        return
+    except Exception as detail_error:
+        try:
+            fallback = FailedCaseEvidence(
+                status="failed",
+                case_id=evidence.case_id,
+                phase=evidence.phase,
+                engine=evidence.engine,
+                expected=evidence.expected,
+                failure=evidence.failure,
+                host=evidence.host,
+                observation=_minimal_failed_case_observation(
+                    case,
+                    secondary_error=detail_error,
+                ),
+            )
+            write_atomic_json(path, _strict_failed_case_payload(fallback))
+        except Exception:
+            return
+
+
 def execute_reliability_validation(
     fixture: ReliabilityFixture,
     *,
@@ -3372,22 +4099,41 @@ def execute_reliability_validation(
             except Exception:
                 pass
         if active_case is not None:
-            failed_case = FailedCaseEvidence(
-                status="failed",
-                case_id=active_case.case_id,
-                phase=active_case.phase,
-                engine=active_case.engine,
-                expected=active_case.expected,
-                failure=FailureMarker(code=failure.code, stage=failure.stage),
-                host=active_host_observation,
-            )
             try:
-                write_atomic_json(
-                    output_root / "cases" / f"{active_case.case_id}.json",
-                    failed_case.model_dump(mode="json"),
+                failed_host = _failed_case_host_observation(active_host_observation)
+                failed_observation = _failed_case_observation_from_probe(
+                    http_probe,
+                    active_case,
                 )
-            except Exception:
-                pass
+                failed_case = FailedCaseEvidence(
+                    status="failed",
+                    case_id=active_case.case_id,
+                    phase=active_case.phase,
+                    engine=active_case.engine,
+                    expected=active_case.expected,
+                    failure=FailureMarker(code=failure.code, stage=failure.stage),
+                    host=failed_host,
+                    observation=failed_observation,
+                )
+            except Exception as detail_error:
+                failed_case = FailedCaseEvidence(
+                    status="failed",
+                    case_id=active_case.case_id,
+                    phase=active_case.phase,
+                    engine=active_case.engine,
+                    expected=active_case.expected,
+                    failure=FailureMarker(code=failure.code, stage=failure.stage),
+                    host=None,
+                    observation=_minimal_failed_case_observation(
+                        active_case,
+                        secondary_error=detail_error,
+                    ),
+                )
+            _persist_failed_case_evidence(
+                output_root / "cases" / f"{active_case.case_id}.json",
+                failed_case,
+                case=active_case,
+            )
         _persist_failure_marker(output_root, failure)
         try:
             write_atomic_json(output_root / "reliability-summary.json", summary)
