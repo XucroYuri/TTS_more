@@ -1410,7 +1410,7 @@ def test_task_10_scenario_plan_has_exact_order_ids_phases_and_deadlines() -> Non
         case.convergence_seconds
         for case in nonsteady
         if case.phase == "recovery"
-    } == {180.0}
+    } == {30.0}
 
 
 def test_task_10_scenario_plan_builds_unique_required_case_specs() -> None:
@@ -1769,7 +1769,7 @@ def test_task_10_injected_executor_runs_exact_matrix_and_writes_public_evidence(
     assert len(summary.cases) == 47
     assert len(http_probe.executed) == 47
     assert http_probe.executed[0][0] == "steady-01-gpt-sovits"
-    assert http_probe.executed[-1] == ("restart-cosyvoice", 180.0, 180.0)
+    assert http_probe.executed[-1] == ("restart-cosyvoice", 180.0, 30.0)
     assert host_probe.terminated == 1
     assert host_probe.restarted == 3
     assert http_probe.released is True
@@ -2707,6 +2707,321 @@ def test_task_10_http_probe_fails_closed_on_http_error_or_timeout(mode: str) -> 
 
 def _task_10_plan(case_id: str) -> reliability_validation.CasePlan:
     return next(case for case in reliability_validation.build_case_plan() if case.case_id == case_id)
+
+
+def test_fix7_normal_request_budget_has_separate_terminal_convergence_window(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = reliability_validation.CasePlan(
+        case_id="steady-cold-gpt-sovits",
+        phase="steady",
+        engine="gpt-sovits",
+        expected="completed",
+        action="synthesize",
+        request_timeout_seconds=30.0,
+        convergence_seconds=30.0,
+    )
+    wav_path = tmp_path / "cold-success.wav"
+    _write_voiced_wav(wav_path)
+    clock = {"now": 0.0}
+    calls: list[tuple[str, str, object | None]] = []
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    def job_document() -> dict[str, object]:
+        terminal = clock["now"] >= 31.0
+        prompt_id = "prompt-cold" if clock["now"] >= 2.0 else None
+        return {
+            "job_id": "job-cold",
+            "status": "completed" if terminal else "running",
+            "error": None,
+            "items": [
+                {
+                    "status": "completed" if terminal else "running",
+                    "external_job_id": prompt_id,
+                    "version_id": "version-cold" if terminal else None,
+                    "error": None,
+                }
+            ],
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        if request.url.path == "/api/generation/preflight":
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if request.url.path == "/api/jobs/generation":
+            return httpx.Response(200, json={"job_id": "job-cold"})
+        if request.url.path == "/api/jobs/job-cold":
+            return httpx.Response(200, json=job_document())
+        if request.url.path == "/queue":
+            running = clock["now"] >= 2.0 and clock["now"] < 31.0
+            return httpx.Response(
+                200,
+                json={
+                    "queue_running": [[1, "prompt-cold", {}, {}, []]] if running else [],
+                    "queue_pending": [],
+                },
+            )
+        if request.url.path.endswith("/manifest"):
+            return httpx.Response(
+                200,
+                json={
+                    "lines": {
+                        case.case_id: {
+                            "line_id": case.case_id,
+                            "versions": [
+                                {
+                                    "version_id": "version-cold",
+                                    "status": "completed",
+                                    "audio_path": str(wav_path),
+                                    "metadata": {},
+                                }
+                            ],
+                        }
+                    }
+                },
+            )
+        if request.url.path == "/history/prompt-cold":
+            return httpx.Response(
+                200,
+                json={"prompt-cold": _comfy_terminal_entry("completed")},
+            )
+        return httpx.Response(404, json={"detail": "unexpected route"})
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=tmp_path,
+        poll_interval_seconds=0.25,
+        monotonic=lambda: clock["now"],
+        sleep=sleep,
+    )
+    _preflight_http_probe_for_case(probe, fixture)
+
+    observation = probe.execute_case(case, fixture, tmp_path)
+
+    assert observation.actual == "completed"
+    assert clock["now"] == 31.0
+    create_call = next(call for call in calls if call[:2] == ("POST", "/api/jobs/generation"))
+    assert create_call[2]["tasks"][0]["parameters"]["timeout_seconds"] == 30.0
+
+
+def test_fix7_cancel_terminal_window_is_bounded_from_the_action(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = reliability_validation.CasePlan(
+        case_id="cancel-running-gpt-sovits",
+        phase="fault",
+        engine="gpt-sovits",
+        expected="cancelled",
+        action="cancel-running",
+        request_timeout_seconds=30.0,
+        convergence_seconds=30.0,
+    )
+    clock = {"now": 0.0}
+    cancelled_at: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    def job_document() -> dict[str, object]:
+        terminal = bool(cancelled_at) and clock["now"] >= 59.0
+        return {
+            "job_id": "job-cancel-window",
+            "status": "cancelled" if terminal else ("cancelling" if cancelled_at else "running"),
+            "error": None,
+            "items": [
+                {
+                    "status": "cancelled" if terminal else ("cancelling" if cancelled_at else "running"),
+                    "external_job_id": "prompt-cancel-window" if clock["now"] >= 25.0 else None,
+                    "version_id": "version-cancel-window" if terminal else None,
+                    "error": None,
+                }
+            ],
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/generation/preflight":
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if request.url.path == "/api/jobs/generation":
+            return httpx.Response(200, json={"job_id": "job-cancel-window"})
+        if request.url.path == "/api/jobs/job-cancel-window/cancel":
+            cancelled_at.append(clock["now"])
+            return httpx.Response(200, json=job_document())
+        if request.url.path == "/api/jobs/job-cancel-window":
+            return httpx.Response(200, json=job_document())
+        if request.url.path == "/queue":
+            running = clock["now"] >= 25.0 and clock["now"] < 59.0
+            return httpx.Response(
+                200,
+                json={
+                    "queue_running": [[1, "prompt-cancel-window", {}, {}, []]] if running else [],
+                    "queue_pending": [],
+                },
+            )
+        if request.url.path.endswith("/manifest"):
+            return httpx.Response(
+                200,
+                json={
+                    "lines": {
+                        case.case_id: {
+                            "line_id": case.case_id,
+                            "versions": [
+                                {
+                                    "version_id": "version-cancel-window",
+                                    "status": "cancelled",
+                                    "audio_path": None,
+                                    "metadata": {
+                                        "control_code": "cancelled",
+                                        "control_details": {
+                                            "prompt_id": "prompt-cancel-window",
+                                            "cancellation": {
+                                                "prompt_id": "prompt-cancel-window",
+                                                "initial_state": "running",
+                                                "final_state": "interrupted",
+                                                "actions": ["interrupt"],
+                                                "duration_seconds": 0.5,
+                                                "converged": True,
+                                            },
+                                        },
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                },
+            )
+        if request.url.path == "/history/prompt-cancel-window":
+            return httpx.Response(
+                200,
+                json={"prompt-cancel-window": _comfy_terminal_entry("cancelled")},
+            )
+        return httpx.Response(404, json={"detail": "unexpected route"})
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=tmp_path,
+        poll_interval_seconds=0.25,
+        monotonic=lambda: clock["now"],
+        sleep=sleep,
+    )
+    _preflight_http_probe_for_case(probe, fixture)
+
+    with pytest.raises(RuntimeError, match="job did not converge"):
+        probe.execute_case(case, fixture, tmp_path)
+
+    assert cancelled_at == [25.0]
+    assert clock["now"] == 55.25
+
+
+def test_fix7_fixture_normal_budgets_drive_every_completed_case_and_remain_bounded(
+    tmp_path: Path,
+) -> None:
+    document = _fixture_document()
+    document["normal_request_timeout_seconds"] = {
+        "gpt-sovits": 150.0,
+        "indextts": 300.0,
+        "cosyvoice": 210.0,
+    }
+    fixture = ReliabilityFixture.model_validate(document)
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+
+    summary = reliability_validation.execute_reliability_validation(
+        fixture,
+        output_root=tmp_path / "evidence",
+        http_probe=http_probe,
+        host_probe=host_probe,
+        owned_processes=host_probe.owned_processes,
+    )
+
+    expected_normal = {
+        "gpt-sovits": 150.0,
+        "indextts": 300.0,
+        "cosyvoice": 210.0,
+    }
+    plan_by_id = {
+        case.case_id: case
+        for case in reliability_validation.build_case_plan(
+            rounds=fixture.rounds,
+            normal_request_timeout_seconds=fixture.normal_request_timeout_seconds,
+        )
+    }
+    assert summary.status == "passed"
+    assert len(http_probe.executed) == 47
+    assert [plan_by_id[case_id].engine for case_id, _request, _terminal in http_probe.executed[:3]] == [
+        "gpt-sovits",
+        "indextts",
+        "cosyvoice",
+    ]
+    for case_id, request_seconds, terminal_seconds in http_probe.executed:
+        case = plan_by_id[case_id]
+        assert 0.0 < terminal_seconds <= 30.0
+        if case.expected == "completed":
+            assert request_seconds == expected_normal[case.engine]
+        elif case.action == "timeout":
+            assert request_seconds == 1.0
+    default_fixture = ReliabilityFixture.model_validate(_fixture_document())
+    default_plan = reliability_validation.build_case_plan(
+        rounds=default_fixture.rounds,
+        normal_request_timeout_seconds=default_fixture.normal_request_timeout_seconds,
+    )
+    assert default_fixture.normal_request_timeout_seconds == {
+        "gpt-sovits": 120.0,
+        "indextts": 240.0,
+        "cosyvoice": 180.0,
+    }
+    assert sum(
+        case.request_timeout_seconds + case.convergence_seconds
+        for case in default_plan
+    ) == 8_583.0
+
+
+@pytest.mark.parametrize(
+    "budgets",
+    [
+        {"gpt-sovits": 120.0, "indextts": 240.0},
+        {
+            "gpt-sovits": 120.0,
+            "indextts": 240.0,
+            "cosyvoice": 180.0,
+            "other": 180.0,
+        },
+        {"gpt-sovits": True, "indextts": 240.0, "cosyvoice": 180.0},
+        {"gpt-sovits": 120, "indextts": 240.0, "cosyvoice": 180.0},
+        {"gpt-sovits": 119.99, "indextts": 240.0, "cosyvoice": 180.0},
+        {"gpt-sovits": 120.0, "indextts": 239.99, "cosyvoice": 180.0},
+        {"gpt-sovits": 120.0, "indextts": 240.0, "cosyvoice": 179.99},
+        {"gpt-sovits": 601.0, "indextts": 240.0, "cosyvoice": 180.0},
+        {"gpt-sovits": float("nan"), "indextts": 240.0, "cosyvoice": 180.0},
+        {"gpt-sovits": 120.0, "indextts": float("inf"), "cosyvoice": 180.0},
+    ],
+)
+def test_fix7_fixture_rejects_unsafe_normal_request_budgets(
+    budgets: dict[str, object],
+) -> None:
+    document = _fixture_document()
+    document["normal_request_timeout_seconds"] = budgets
+
+    with pytest.raises(ValidationError):
+        ReliabilityFixture.model_validate(document)
+
+
+def test_fix7_normal_case_cancellation_remains_a_failed_expectation() -> None:
+    evidence = _case(
+        "steady-cancelled-gpt-sovits",
+        "gpt-sovits",
+        expected="completed",
+        actual="cancelled",
+    )
+
+    validation = validate_case(evidence)
+
+    assert validation.valid is False
+    assert "expected outcome does not match actual outcome" in validation.diagnostics
 
 
 def _task_10_job_document(

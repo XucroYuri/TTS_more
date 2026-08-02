@@ -181,6 +181,11 @@ def test_windows_reliability_fixture_example_is_redacted_and_private_outputs_are
             "indextts": {"resource_id": "", "reference_audio": "", "reference_text": ""},
             "cosyvoice": {"resource_id": "", "reference_audio": "", "reference_text": ""},
         },
+        "normal_request_timeout_seconds": {
+            "gpt-sovits": 120.0,
+            "indextts": 240.0,
+            "cosyvoice": 180.0,
+        },
         "rounds": 10,
     }
     result = subprocess.run(

@@ -39,6 +39,13 @@ CaseAction = Literal[
 SHA256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 REQUIRED_BOUNDARY_LABELS = ("tts-more", "tts-audio-suite", "comfyui", "gpt-sovits", "indextts", "cosyvoice")
 ENGINE_ORDER: tuple[Engine, ...] = ("gpt-sovits", "indextts", "cosyvoice")
+DEFAULT_NORMAL_REQUEST_TIMEOUT_SECONDS: dict[Engine, float] = {
+    "gpt-sovits": 120.0,
+    "indextts": 240.0,
+    "cosyvoice": 180.0,
+}
+MAX_NORMAL_REQUEST_TIMEOUT_SECONDS = 600.0
+TERMINAL_CONVERGENCE_SECONDS = 30.0
 _BRIDGE_ENGINE_IDS: dict[str, Engine] = {
     "gpt_sovits": "gpt-sovits",
     "index_tts": "indextts",
@@ -105,11 +112,36 @@ class FixtureResource(_StrictModel):
         return value
 
 
+def _validate_normal_request_timeouts(value: Any) -> dict[Engine, float]:
+    if not isinstance(value, dict) or set(value) != set(ENGINE_ORDER):
+        raise ValueError("normal request timeouts must contain exactly the three engines")
+    validated: dict[Engine, float] = {}
+    for engine in ENGINE_ORDER:
+        seconds = value.get(engine)
+        if type(seconds) is not float or not math.isfinite(seconds):
+            raise ValueError("normal request timeouts must be finite strict floats")
+        if (
+            seconds < DEFAULT_NORMAL_REQUEST_TIMEOUT_SECONDS[engine]
+            or seconds > MAX_NORMAL_REQUEST_TIMEOUT_SECONDS
+        ):
+            raise ValueError("normal request timeout is outside the reviewed safe range")
+        validated[engine] = seconds
+    return validated
+
+
 class ReliabilityFixture(_StrictModel):
     version: Literal[1]
     base_urls: dict[Literal["tts_more", "comfyui"], str]
     resources: dict[Engine, FixtureResource]
     rounds: StrictInt
+    normal_request_timeout_seconds: dict[Engine, StrictFloat] = Field(
+        default_factory=lambda: dict(DEFAULT_NORMAL_REQUEST_TIMEOUT_SECONDS),
+    )
+
+    @field_validator("normal_request_timeout_seconds", mode="before")
+    @classmethod
+    def _normal_request_timeout_contract(cls, value: Any) -> dict[Engine, float]:
+        return _validate_normal_request_timeouts(value)
 
     @model_validator(mode="after")
     def _fixture_contract(self) -> "ReliabilityFixture":
@@ -408,8 +440,8 @@ class CasePlan(_StrictModel):
     engine: Engine
     expected: Outcome
     action: CaseAction
-    request_timeout_seconds: StrictFloat = Field(gt=0.0, le=180.0)
-    convergence_seconds: StrictFloat = Field(gt=0.0, le=180.0)
+    request_timeout_seconds: StrictFloat = Field(gt=0.0, le=MAX_NORMAL_REQUEST_TIMEOUT_SECONDS)
+    convergence_seconds: StrictFloat = Field(gt=0.0, le=TERMINAL_CONVERGENCE_SECONDS)
 
 
 class ReadyResource(_StrictModel):
@@ -2401,7 +2433,11 @@ class HttpReliabilityProbe:
             raise RuntimeError("job id was reused")
         self._seen_job_ids.add(job_id)
 
-        deadline = self.monotonic() + case.convergence_seconds
+        deadline = (
+            self.monotonic()
+            + case.request_timeout_seconds
+            + case.convergence_seconds
+        )
         prompt_id: str | None = None
         queue_before: list[str] | None = None
         acted = False
@@ -2434,11 +2470,13 @@ class HttpReliabilityProbe:
                 elif case.action == "cancel-running" and not acted and state == "running":
                     self._cancel_job(tts_more_url, job_id)
                     acted = True
+                    deadline = self.monotonic() + case.convergence_seconds
                 elif case.action == "terminate-comfyui" and not acted and state == "running":
                     if action_hook is None:
                         raise RuntimeError("terminate action hook is missing")
                     action_hook()
                     acted = True
+                    deadline = self.monotonic() + case.convergence_seconds
             if job.get("status") in {"completed", "cancelled", "failed"}:
                 terminal = job
                 break
@@ -3024,9 +3062,18 @@ def _public_manifest_version_id(case_id: str, raw_version_id: str) -> str:
     return hashlib.sha256(f"{case_id}\0{raw_version_id}".encode("utf-8")).hexdigest()
 
 
-def build_case_plan(rounds: int = 10) -> tuple[CasePlan, ...]:
+def build_case_plan(
+    rounds: int = 10,
+    *,
+    normal_request_timeout_seconds: dict[Engine, float] | None = None,
+) -> tuple[CasePlan, ...]:
     if isinstance(rounds, bool) or rounds != 10:
         raise ValueError("reliability plan requires exactly 10 rounds")
+    normal_timeouts = _validate_normal_request_timeouts(
+        dict(DEFAULT_NORMAL_REQUEST_TIMEOUT_SECONDS)
+        if normal_request_timeout_seconds is None
+        else normal_request_timeout_seconds
+    )
 
     plan: list[CasePlan] = []
     for round_number in range(1, rounds + 1):
@@ -3038,8 +3085,8 @@ def build_case_plan(rounds: int = 10) -> tuple[CasePlan, ...]:
                     engine=engine,
                     expected="completed",
                     action="synthesize",
-                    request_timeout_seconds=30.0,
-                    convergence_seconds=30.0,
+                    request_timeout_seconds=normal_timeouts[engine],
+                    convergence_seconds=TERMINAL_CONVERGENCE_SECONDS,
                 )
             )
 
@@ -3051,7 +3098,7 @@ def build_case_plan(rounds: int = 10) -> tuple[CasePlan, ...]:
             expected="cancelled",
             action="cancel-queued",
             request_timeout_seconds=30.0,
-            convergence_seconds=30.0,
+            convergence_seconds=TERMINAL_CONVERGENCE_SECONDS,
         )
     )
     for engine in ENGINE_ORDER:
@@ -3064,7 +3111,7 @@ def build_case_plan(rounds: int = 10) -> tuple[CasePlan, ...]:
                     expected="cancelled",
                     action="cancel-running",
                     request_timeout_seconds=30.0,
-                    convergence_seconds=30.0,
+                    convergence_seconds=TERMINAL_CONVERGENCE_SECONDS,
                 ),
                 CasePlan(
                     case_id=f"recover-cancel-{engine}",
@@ -3072,8 +3119,8 @@ def build_case_plan(rounds: int = 10) -> tuple[CasePlan, ...]:
                     engine=engine,
                     expected="completed",
                     action="synthesize",
-                    request_timeout_seconds=180.0,
-                    convergence_seconds=180.0,
+                    request_timeout_seconds=normal_timeouts[engine],
+                    convergence_seconds=TERMINAL_CONVERGENCE_SECONDS,
                 ),
             )
         )
@@ -3087,7 +3134,7 @@ def build_case_plan(rounds: int = 10) -> tuple[CasePlan, ...]:
                     expected="timeout",
                     action="timeout",
                     request_timeout_seconds=1.0,
-                    convergence_seconds=30.0,
+                    convergence_seconds=TERMINAL_CONVERGENCE_SECONDS,
                 ),
                 CasePlan(
                     case_id=f"recover-timeout-{engine}",
@@ -3095,8 +3142,8 @@ def build_case_plan(rounds: int = 10) -> tuple[CasePlan, ...]:
                     engine=engine,
                     expected="completed",
                     action="synthesize",
-                    request_timeout_seconds=180.0,
-                    convergence_seconds=180.0,
+                    request_timeout_seconds=normal_timeouts[engine],
+                    convergence_seconds=TERMINAL_CONVERGENCE_SECONDS,
                 ),
             )
         )
@@ -3108,7 +3155,7 @@ def build_case_plan(rounds: int = 10) -> tuple[CasePlan, ...]:
             expected="failed",
             action="terminate-comfyui",
             request_timeout_seconds=30.0,
-            convergence_seconds=30.0,
+            convergence_seconds=TERMINAL_CONVERGENCE_SECONDS,
         )
     )
     for engine in ENGINE_ORDER:
@@ -3119,8 +3166,8 @@ def build_case_plan(rounds: int = 10) -> tuple[CasePlan, ...]:
                 engine=engine,
                 expected="completed",
                 action="restart-readiness",
-                request_timeout_seconds=180.0,
-                convergence_seconds=180.0,
+                request_timeout_seconds=normal_timeouts[engine],
+                convergence_seconds=TERMINAL_CONVERGENCE_SECONDS,
             )
         )
     return tuple(plan)
@@ -3164,9 +3211,13 @@ def execute_reliability_validation(
             label: _revalidate_model(identity, OwnedProcessIdentity)
             for label, identity in owned_processes.items()
         }
-        selected_plan = tuple(plan) if plan is not None else build_case_plan(fixture.rounds)
+        expected_plan = build_case_plan(
+            fixture.rounds,
+            normal_request_timeout_seconds=fixture.normal_request_timeout_seconds,
+        )
+        selected_plan = tuple(plan) if plan is not None else expected_plan
         selected_plan = tuple(_revalidate_model(case, CasePlan) for case in selected_plan)
-        if selected_plan != build_case_plan(fixture.rounds):
+        if selected_plan != expected_plan:
             raise LiveValidationError("case-plan-mismatch", stage="preflight")
     except LiveValidationError:
         raise

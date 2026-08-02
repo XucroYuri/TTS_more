@@ -8,6 +8,8 @@ It does not run in CI and does not modify the official GPT-SoVITS, IndexTTS, Cos
 
 Copy `deployment/tts-repos/windows-reliability-fixture.example.json` to the ignored `data/local` area. Keep both endpoints on `127.0.0.1` unless LAN access is intentional, fill exactly one ready `resource_id` per engine, and set each `reference_audio` to a path relative to the private fixture. Keep `rounds` at `10`.
 
+`normal_request_timeout_seconds` is the public, engine-specific allowance for a normal synthesis, including Windows cold model startup. Its deterministic defaults are 120 seconds for GPT-SoVITS, 240 seconds for IndexTTS, and 180 seconds for CosyVoice. An older private fixture that omits this field receives those defaults without modification. An explicit map must contain all and only the three engines, use finite JSON floating-point values no lower than the defaults, and remain at or below the 600-second TTS More public request ceiling. These are acceptance ceilings, not latency targets.
+
 The three configured TTS More services must point to the same ComfyUI instance, use the TTS-Audio-Suite v1 bridge contract, share one GPU resource group, and keep `capacity: 1`.
 
 Set the private checkout and registry locations in the current PowerShell session:
@@ -39,7 +41,7 @@ Success writes `preflight.json`. It performs no synthesis request. `-AllowLan` i
 
 ## Full gate
 
-Run the same command without `-PreflightOnly`. Allow roughly 30–90 minutes depending on model load times. The command exits zero only after all 47 unique cases pass:
+Run the same command without `-PreflightOnly`. A typical run may take roughly 30–90 minutes depending on model load times. The default 47-case plan has an auditable 8,583-second case-level request-plus-terminal ceiling (143.05 minutes), before the separately bounded restart-readiness and fixed HTTP/host operations. The command exits zero only after all 47 unique cases pass:
 
 - 30/30 steady cases: `gpt-sovits`, `indextts`, `cosyvoice`, repeated ten times in that order;
 - queued cancellation, one running cancellation per engine, and a completed recovery after each running cancellation;
@@ -50,7 +52,7 @@ Run the same command without `-PreflightOnly`. Allow roughly 30–90 minutes dep
 - empty TTS More and ComfyUI queues, present terminal ComfyUI history for ordinary dispatched cases, truthful endpoint-unavailable/TTS-failure evidence for owned ComfyUI termination, runtime release plus `/free`, no runner/temp residue, and GPU memory within 1,024 MiB of the pre-case baseline;
 - identical before/after Git HEAD, branch, porcelain hash, private registry hash, and reference hashes.
 
-Cancellation and ordinary case cleanup must converge within 30 seconds. Restart/readiness and recovery cases have 180 seconds. The timeout request itself uses one second. Exceeding a deadline fails the run; it is never converted into a pass.
+Normal steady, recovery, and post-restart synthesis requests use the fixture's engine-specific request allowance. After that request window, terminal and queue observation receives one separate window of at most 30 seconds. The intentional timeout request itself remains exactly one second followed by at most 30 seconds of cancellation convergence. User cancellation and owned-ComfyUI termination receive at most 30 seconds after the action to reach terminal state. ComfyUI restart readiness remains an independent operation bounded at 180 seconds. Exceeding any deadline fails the run; cancellation is never converted into a successful synthesis, and no window is retried or extended indefinitely.
 
 ## Evidence and cleanup
 
