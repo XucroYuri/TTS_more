@@ -10963,6 +10963,171 @@ def test_fix9_round2_unchanged_rewrite_does_not_escape_baseline(
     _fix9_assert_unbound_context(context)
 
 
+def _fix9_write_stream_protocol_helper(root: Path) -> Path:
+    module_root = root / "fake helper & module"
+    package_root = module_root / "app" / "comfyui"
+    package_root.mkdir(parents=True)
+    (module_root / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "launcher_failure_context.py").write_text(
+        """from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+mode = os.environ["TTS_MORE_FIX9_EMITTER_MODE"]
+record_path = os.environ.get("TTS_MORE_FIX9_EMITTER_RECORD")
+if record_path:
+    Path(record_path).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+
+outputs = {
+    "valid-lf": b'{"safe":true}\\n',
+    "valid-crlf": b'{"safe":true}\\r\\n',
+    "zero": b"",
+    "empty-line": b"\\n",
+    "leading-line": b'\\n{"safe":true}\\n',
+    "trailing-line": b'{"safe":true}\\n\\n',
+    "formatted-two-line": b'{\\n"safe":true}\\n',
+    "double-crlf": b'{"safe":true}\\r\\n\\r\\n',
+    "bare-cr": b'{"safe":true}\\r',
+    "nul": b'{"safe":true}\\x00\\n',
+    "invalid-utf8": b'{"safe":"\\xff"}\\n',
+    "non-json": b'not-json\\n',
+    "stderr": b'{"safe":true}\\n',
+    "nonzero": b'{"safe":true}\\n',
+    "snapshot-success": b"",
+    "snapshot-stdout": b'{"safe":true}\\n',
+    "snapshot-stderr": b"",
+}
+sys.stdout.buffer.write(outputs[mode])
+if mode in {"stderr", "snapshot-stderr"}:
+    sys.stderr.buffer.write(b'PRIVATE helper diagnostic\\x00\\xff\\r\\n')
+sys.stdout.buffer.flush()
+sys.stderr.buffer.flush()
+raise SystemExit(7 if mode == "nonzero" else 0)
+""",
+        encoding="utf-8",
+    )
+    return module_root
+
+
+def test_fix9_round3_powershell_helper_enforces_exact_stream_protocol(
+    tmp_path: Path,
+) -> None:
+    fake_root = _fix9_write_stream_protocol_helper(tmp_path)
+    command = r"""
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
+)
+if($errors.Count -ne 0){throw($errors|Out-String)}
+foreach($name in @(
+    'ConvertTo-WindowsCommandLineArgument','ConvertTo-PublicUtcTimestamp',
+    'Invoke-LauncherFailureContextHelper'
+)){
+    $function=$ast.Find({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $name
+    },$true)
+    if($null -eq $function){throw "$name is missing"}
+    Invoke-Expression $function.Extent.Text
+}
+$fakeRoot=Join-Path $env:TTS_MORE_FIX9_ROOT 'fake helper & module'
+$outputRoot=Join-Path $env:TTS_MORE_FIX9_ROOT `
+    'argument space & semicolon; dollars$ parentheses()'
+$captureRoot=Join-Path $outputRoot 'run-owned temp & capture'
+New-Item -ItemType Directory -Path $captureRoot -Force|Out-Null
+$baseline=Join-Path $captureRoot 'context baseline.private.json'
+$record=Join-Path $env:TTS_MORE_FIX9_ROOT 'helper-arguments.json'
+$env:TTS_MORE_FIX9_EMITTER_RECORD=$record
+$original=(Get-Location).Path
+
+function Assert-No-Capture {
+    if(@(Get-ChildItem -LiteralPath $captureRoot -File -Force).Count -ne 0){
+        throw 'helper capture files were not removed'
+    }
+}
+function Invoke-Protocol {
+    param([string]$EmitterMode,[string]$HelperMode='evaluate')
+    $env:TTS_MORE_FIX9_EMITTER_MODE=$EmitterMode
+    Invoke-LauncherFailureContextHelper -Mode $HelperMode `
+        -PythonPath $env:TTS_MORE_FIX9_PYTHON -WorkingDirectory $fakeRoot `
+        -OutputRoot $outputRoot -BaselinePath $baseline `
+        -RunOwnedTempRoot $captureRoot `
+        -RunStartedAt '2026-08-02T08:52:00.000000Z' `
+        -FailureObservedAt '2026-08-02T08:54:00.000000Z'
+}
+function Must-Reject {
+    param([string]$EmitterMode,[string]$HelperMode='evaluate')
+    $caught=$null
+    try{Invoke-Protocol -EmitterMode $EmitterMode -HelperMode $HelperMode|Out-Null}catch{
+        $caught=$_
+    }
+    if($null -eq $caught){throw "$EmitterMode unexpectedly passed"}
+    if((Get-Location).Path -ne $original){throw "$EmitterMode changed launcher cwd"}
+    Assert-No-Capture
+    $rendered=[string]$caught
+    foreach($private in @('PRIVATE helper diagnostic',$outputRoot,$baseline)){
+        if($rendered.Contains($private)){throw "$EmitterMode leaked helper context"}
+    }
+}
+
+foreach($valid in @('valid-lf','valid-crlf')){
+    $actual=Invoke-Protocol -EmitterMode $valid
+    if($actual -cne '{"safe":true}'){throw "$valid did not return one exact JSON line"}
+    if((Get-Location).Path -ne $original){throw "$valid changed launcher cwd"}
+    Assert-No-Capture
+}
+foreach($invalid in @(
+    'zero','empty-line','leading-line','trailing-line','formatted-two-line',
+    'double-crlf','bare-cr','nul','invalid-utf8','non-json','stderr','nonzero'
+)){
+    Must-Reject -EmitterMode $invalid
+}
+$snapshot=Invoke-Protocol -EmitterMode 'snapshot-success' -HelperMode 'snapshot'
+if($snapshot -cne ''){throw 'empty snapshot output was not accepted exactly'}
+if((Get-Location).Path -ne $original){throw 'snapshot success changed launcher cwd'}
+Assert-No-Capture
+Must-Reject -EmitterMode 'snapshot-stdout' -HelperMode 'snapshot'
+Must-Reject -EmitterMode 'snapshot-stderr' -HelperMode 'snapshot'
+
+$missing=Join-Path $fakeRoot 'missing-python.exe'
+$caught=$null
+try{
+    Invoke-LauncherFailureContextHelper -Mode 'evaluate' `
+        -PythonPath $missing -WorkingDirectory $fakeRoot `
+        -OutputRoot $outputRoot -BaselinePath $baseline `
+        -RunOwnedTempRoot $captureRoot `
+        -RunStartedAt '2026-08-02T08:52:00.000000Z' `
+        -FailureObservedAt '2026-08-02T08:54:00.000000Z'|Out-Null
+}catch{$caught=$_}
+if($null -eq $caught){throw 'process-start throw unexpectedly passed'}
+if((Get-Location).Path -ne $original){throw 'process-start throw changed launcher cwd'}
+Assert-No-Capture
+
+$arguments=Get-Content -LiteralPath $record -Raw|ConvertFrom-Json
+$expected=@(
+    'snapshot','--output-root',$outputRoot,'--baseline-path',$baseline
+)
+if(@($arguments).Count -ne $expected.Count){throw 'helper argv count changed'}
+for($index=0;$index -lt $expected.Count;$index+=1){
+    if([string]$arguments[$index] -cne [string]$expected[$index]){
+        throw 'helper argv was not passed as exact literal values'
+    }
+}
+Write-Output 'FIX9_EXACT_HELPER_STREAM_PROTOCOL_OK'
+"""
+    completed = _run_fix9_powershell_behavior(command, tmp_path)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert "FIX9_EXACT_HELPER_STREAM_PROTOCOL_OK" in completed.stdout
+
+
 def test_fix9_round2_powershell_reader_uses_backend_cli_and_restores_context(
     tmp_path: Path,
 ) -> None:
@@ -10982,7 +11147,8 @@ $ast=[Management.Automation.Language.Parser]::ParseFile(
 )
 if($errors.Count -ne 0){throw($errors|Out-String)}
 foreach($name in @(
-    'Get-Sha256Hex','ConvertTo-PublicUtcTimestamp',
+    'Get-Sha256Hex','ConvertTo-WindowsCommandLineArgument',
+    'ConvertTo-PublicUtcTimestamp',
     'Invoke-LauncherFailureContextHelper','Get-LauncherPublicFailureContext'
 )){
     $function=$ast.Find({param($node)
@@ -10999,6 +11165,7 @@ $raw=Invoke-LauncherFailureContextHelper -Mode 'evaluate' `
     -PythonPath $env:TTS_MORE_FIX9_PYTHON `
     -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
     -OutputRoot $outputRoot -BaselinePath $baseline `
+    -RunOwnedTempRoot (Split-Path -Parent $baseline) `
     -RunStartedAt '2026-08-02T08:52:00.000000Z' `
     -FailureObservedAt '2026-08-02T08:54:00.000000Z'
 if((Get-Location).Path -ne $original){throw 'helper did not restore launcher working directory'}
@@ -11009,6 +11176,7 @@ $context=Get-LauncherPublicFailureContext `
     -PythonPath $env:TTS_MORE_FIX9_PYTHON `
     -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
     -OutputRoot $outputRoot -BaselinePath $baseline `
+    -RunOwnedTempRoot (Split-Path -Parent $baseline) `
     -RunStartedAt '2026-08-02T08:52:00.000000Z' `
     -FailureObservedAt '2026-08-02T08:54:00.000000Z'
 if($context.primary.code -ne 'case-execution-failed' -or
@@ -11023,6 +11191,7 @@ $fallback=Get-LauncherPublicFailureContext `
     -PythonPath $env:TTS_MORE_FIX9_PYTHON `
     -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
     -OutputRoot $outputRoot -BaselinePath (Join-Path $outputRoot 'missing.private.json') `
+    -RunOwnedTempRoot (Split-Path -Parent $baseline) `
     -RunStartedAt '2026-08-02T08:52:00.000000Z' `
     -FailureObservedAt '2026-08-02T08:54:00.000000Z'
 if($fallback.primary.code -ne 'launcher-validation-failed' -or

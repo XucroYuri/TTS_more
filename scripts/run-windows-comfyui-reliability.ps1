@@ -2057,6 +2057,7 @@ function Invoke-LauncherFailureContextHelper {
         [string] $WorkingDirectory,
         [string] $OutputRoot,
         [string] $BaselinePath,
+        [string] $RunOwnedTempRoot,
         [AllowNull()] [object] $RunStartedAt,
         [AllowNull()] [object] $FailureObservedAt
     )
@@ -2074,26 +2075,131 @@ function Invoke-LauncherFailureContextHelper {
             '--failure-observed-at', (ConvertTo-PublicUtcTimestamp -Value $FailureObservedAt)
         )
     }
-    $helperOutput = @()
-    $helperExitCode = 1
-    Push-Location -LiteralPath $WorkingDirectory
+    $resolvedOutputRoot = (Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop).Path
+    $resolvedCaptureRoot = (
+        Resolve-Path -LiteralPath $RunOwnedTempRoot -ErrorAction Stop
+    ).Path
+    $captureItem = Get-Item -LiteralPath $resolvedCaptureRoot -ErrorAction Stop
+    $outputPrefix = $resolvedOutputRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) +
+        [IO.Path]::DirectorySeparatorChar
+    $baselineParent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($BaselinePath))
+    if (
+        -not $captureItem.PSIsContainer -or
+        ([int] $captureItem.Attributes -band [int] [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        -not $resolvedCaptureRoot.StartsWith(
+            $outputPrefix,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or
+        -not $baselineParent.Equals(
+            $resolvedCaptureRoot,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    ) { throw 'Launcher failure context capture root is invalid' }
+    $captureId = [Guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path $resolvedCaptureRoot (
+        '.launcher-failure-context-{0}.stdout.capture' -f $captureId
+    )
+    $stderrPath = Join-Path $resolvedCaptureRoot (
+        '.launcher-failure-context-{0}.stderr.capture' -f $captureId
+    )
+    $encodedArguments = (@(
+        foreach ($argument in $arguments) {
+            ConvertTo-WindowsCommandLineArgument -Argument $argument
+        }
+    )) -join ' '
+    $helperExitCode = $null
+    $stdoutBytes = $null
+    $stderrLength = $null
+    $operationFailure = $null
+    $cleanupFailure = $false
+    $locationPushed = $false
     try {
-        $helperOutput = @(& $PythonPath @arguments 2>$null)
-        $helperExitCode = $LASTEXITCODE
+        foreach ($capturePath in @($stdoutPath, $stderrPath)) {
+            if (Test-Path -LiteralPath $capturePath) {
+                throw 'Launcher failure context capture target already exists'
+            }
+            $captureStream = [IO.File]::Open(
+                $capturePath,
+                [IO.FileMode]::CreateNew,
+                [IO.FileAccess]::Write,
+                [IO.FileShare]::None
+            )
+            $captureStream.Dispose()
+        }
+        Push-Location -LiteralPath $WorkingDirectory
+        $locationPushed = $true
+        $process = Start-Process -FilePath $PythonPath `
+            -ArgumentList $encodedArguments -WorkingDirectory $WorkingDirectory `
+            -WindowStyle Hidden -PassThru -Wait `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        $helperExitCode = [int] $process.ExitCode
+        $stderrLength = [Int64] (
+            Get-Item -LiteralPath $stderrPath -ErrorAction Stop
+        ).Length
+        $stdoutLength = [Int64] (
+            Get-Item -LiteralPath $stdoutPath -ErrorAction Stop
+        ).Length
+        if ($stdoutLength -le 65538) {
+            $stdoutBytes = [IO.File]::ReadAllBytes($stdoutPath)
+        }
+    } catch {
+        $operationFailure = $_
     } finally {
-        Pop-Location
+        if ($locationPushed) {
+            try { Pop-Location -ErrorAction Stop } catch { $cleanupFailure = $true }
+        }
+        foreach ($capturePath in @($stdoutPath, $stderrPath)) {
+            if (Test-Path -LiteralPath $capturePath) {
+                try {
+                    Remove-Item -LiteralPath $capturePath -Force -ErrorAction Stop
+                } catch { $cleanupFailure = $true }
+            }
+        }
     }
-    if ($helperExitCode -ne 0) {
+    if ($null -ne $operationFailure -or $cleanupFailure -or
+        $null -eq $helperExitCode -or $helperExitCode -ne 0 -or
+        $null -eq $stderrLength -or $stderrLength -ne 0) {
         throw 'Launcher failure context helper failed'
     }
-    $rendered = [string] ($helperOutput -join [Environment]::NewLine)
     if ($Mode -eq 'snapshot') {
-        if ($rendered.Length -ne 0) {
+        if ($null -eq $stdoutBytes -or $stdoutBytes.Length -ne 0) {
             throw 'Launcher failure context snapshot output is invalid'
         }
         return ''
     }
-    if ($rendered.Length -lt 1 -or $rendered.Length -gt 65536) {
+    if ($null -eq $stdoutBytes -or $stdoutBytes.Length -lt 1) {
+        throw 'Launcher failure context helper output is invalid'
+    }
+    $bodyLength = $stdoutBytes.Length
+    if ($stdoutBytes[$bodyLength - 1] -eq [byte] 10) {
+        $bodyLength -= 1
+        if ($bodyLength -gt 0 -and $stdoutBytes[$bodyLength - 1] -eq [byte] 13) {
+            $bodyLength -= 1
+        }
+    }
+    if ($bodyLength -lt 1 -or $bodyLength -gt 65536) {
+        throw 'Launcher failure context helper output is invalid'
+    }
+    for ($index = 0; $index -lt $bodyLength; $index += 1) {
+        if ($stdoutBytes[$index] -eq [byte] 0 -or
+            $stdoutBytes[$index] -eq [byte] 10 -or
+            $stdoutBytes[$index] -eq [byte] 13) {
+            throw 'Launcher failure context helper output is invalid'
+        }
+    }
+    try {
+        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+        $rendered = $strictUtf8.GetString($stdoutBytes, 0, $bodyLength)
+        if ([string]::IsNullOrWhiteSpace($rendered) -or
+            $rendered[0] -eq [char] 0xFEFF) {
+            throw 'Launcher failure context helper output is invalid'
+        }
+        $parsed = $rendered | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $parsed -or $parsed -is [Array] -or
+            $parsed -is [string] -or $parsed -is [ValueType]) {
+            throw 'Launcher failure context helper output is invalid'
+        }
+    } catch {
         throw 'Launcher failure context helper output is invalid'
     }
     return $rendered
@@ -2105,6 +2211,7 @@ function Get-LauncherPublicFailureContext {
         [string] $WorkingDirectory,
         [string] $OutputRoot,
         [string] $BaselinePath,
+        [string] $RunOwnedTempRoot,
         [object] $RunStartedAt,
         [object] $FailureObservedAt
     )
@@ -2112,6 +2219,7 @@ function Get-LauncherPublicFailureContext {
         $rendered = Invoke-LauncherFailureContextHelper -Mode 'evaluate' `
             -PythonPath $PythonPath -WorkingDirectory $WorkingDirectory `
             -OutputRoot $OutputRoot -BaselinePath $BaselinePath `
+            -RunOwnedTempRoot $RunOwnedTempRoot `
             -RunStartedAt $RunStartedAt -FailureObservedAt $FailureObservedAt
         return $rendered | ConvertFrom-Json -ErrorAction Stop
     } catch {
@@ -2354,7 +2462,8 @@ try {
     if ($PreflightOnly) { $pythonArguments += '--preflight-only' }
     Invoke-LauncherFailureContextHelper -Mode 'snapshot' `
         -PythonPath $backendPythonPath -WorkingDirectory $backendRootPath `
-        -OutputRoot $outputRootPath -BaselinePath $failureEvidenceBaselinePath | Out-Null
+        -OutputRoot $outputRootPath -BaselinePath $failureEvidenceBaselinePath `
+        -RunOwnedTempRoot $tempRoot | Out-Null
     $validatorStartedAt = [DateTime]::UtcNow
     $formalValidatorInvoked = $true
     try {
@@ -2440,6 +2549,7 @@ try {
                     -WorkingDirectory $backendRootPath `
                     -OutputRoot $outputRootPath `
                     -BaselinePath $failureEvidenceBaselinePath `
+                    -RunOwnedTempRoot $tempRoot `
                     -RunStartedAt $validatorStartedAt `
                     -FailureObservedAt $validatorFinishedAt
                 $summarySha256 = if ($null -eq $publicFailureContext.summary) {
