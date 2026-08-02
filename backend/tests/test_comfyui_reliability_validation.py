@@ -175,6 +175,111 @@ def _atomic_artifacts(target: Path, suffix: str) -> list[Path]:
     return sorted(target.parent.glob(f".{target.name}.*.{suffix}"))
 
 
+_REGISTERED_SERVICE_CAPABILITIES = [
+    "tts",
+    "reference_audio_voice",
+    "wav_output",
+    "comfyui",
+    "tts-audio-suite",
+]
+
+
+def _registered_service_document(
+    fixture: ReliabilityFixture,
+    engine: str,
+    *,
+    service_id: str | None = None,
+) -> dict[str, object]:
+    return {
+        "service_id": service_id or f"derived-{engine}",
+        "service_kind": "tts",
+        "engine": engine,
+        "provider_type": engine,
+        "api_contract": "comfyui-tts-audio-suite-v1",
+        "base_url": fixture.base_urls["comfyui"] + "/",
+        "enabled": True,
+        "ready": True,
+        "resource_group": "comfyui-local-0",
+        "capacity": 1,
+        "capabilities": list(_REGISTERED_SERVICE_CAPABILITIES),
+        "default_params": {
+            "engine": engine,
+            "resource_id": fixture.resources[engine].resource_id,
+        },
+    }
+
+
+def _registered_service_transport(
+    fixture: ReliabilityFixture,
+    services: list[dict[str, object]],
+    calls: list[tuple[str, str, object | None]],
+    *,
+    generation_preflight_document: dict[str, object] | None = None,
+) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        if request.url.path == "/system_stats":
+            return httpx.Response(200, json={"system": {"cuda": True}})
+        if request.url.path == "/object_info":
+            return httpx.Response(200, json={"TTSExternalEngine": {}})
+        if request.url.path == "/api/tts-audio-suite/v1/capabilities":
+            bridge_engines = {
+                "gpt-sovits": "gpt_sovits",
+                "indextts": "index_tts",
+                "cosyvoice": "cosyvoice",
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "protocol_version": 1,
+                    "resources": [
+                        {
+                            "engine": bridge_engines[engine],
+                            "resource_id": resource.resource_id,
+                            "ready": True,
+                        }
+                        for engine, resource in fixture.resources.items()
+                    ],
+                },
+            )
+        if request.url.path == "/api/services":
+            return httpx.Response(200, json={"services": services})
+        if request.url.path == "/api/generation/preflight":
+            return httpx.Response(
+                200,
+                json=generation_preflight_document
+                or {"status": "ready", "items": [{"status": "ready"}]},
+            )
+        if request.url.path == "/api/queue/status":
+            return httpx.Response(200, json={"jobs": [], "queued": 0, "running": 0})
+        if request.url.path == "/queue":
+            return httpx.Response(200, json={"queue_running": [], "queue_pending": []})
+        return httpx.Response(404)
+
+    return httpx.MockTransport(handler)
+
+
+def _preflight_http_probe_for_case(
+    probe: reliability_validation.HttpReliabilityProbe,
+    fixture: ReliabilityFixture,
+) -> None:
+    case_transport = probe.transport
+    calls: list[tuple[str, str, object | None]] = []
+    try:
+        probe.transport = _registered_service_transport(
+            fixture,
+            [
+                _registered_service_document(fixture, engine)
+                for engine in reliability_validation.ENGINE_ORDER
+            ],
+            calls,
+        )
+        probe.preflight(fixture)
+    finally:
+        probe.transport = case_transport
+
+
 def test_fixture_models_reject_extra_and_bool_like_rounds() -> None:
     document = _fixture_document()
     document["rounds"] = True
@@ -1955,6 +2060,200 @@ def test_task_10_allow_lan_is_explicit_and_does_not_relax_other_preflight_gates(
     assert exc_info.value.code == "initial-queue-not-idle"
 
 
+def test_fix5_registered_services_bind_unique_runtime_ids_into_all_generation_payloads() -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    service_ids = {
+        "gpt-sovits": "runtime-selected-gpt-v2",
+        "indextts": "runtime-selected-index-v2",
+        "cosyvoice": "runtime-selected-cosy-v2",
+    }
+    services = [
+        _registered_service_document(fixture, engine, service_id=service_ids[engine])
+        for engine in reliability_validation.ENGINE_ORDER
+    ]
+    calls: list[tuple[str, str, object | None]] = []
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=_registered_service_transport(fixture, services, calls),
+        reference_root=Path("fixtures"),
+    )
+
+    probe.preflight(fixture)
+
+    preflight_payloads = [
+        body
+        for method, path, body in calls
+        if method == "POST" and path == "/api/generation/preflight"
+    ]
+    assert [payload["tasks"][0]["service_id"] for payload in preflight_payloads] == [
+        service_ids[engine] for engine in reliability_validation.ENGINE_ORDER
+    ]
+    later_case = reliability_validation.CasePlan(
+        case_id="later-cosy",
+        phase="steady",
+        engine="cosyvoice",
+        expected="completed",
+        action="synthesize",
+        request_timeout_seconds=30.0,
+        convergence_seconds=30.0,
+    )
+    assert probe._generation_payload(later_case, fixture)["tasks"][0]["service_id"] == service_ids["cosyvoice"]
+    assert ("GET", "/api/services") in [(method, path) for method, path, _body in calls]
+
+
+def test_fix5_generation_payload_fails_closed_before_registered_services_are_bound() -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    probe = reliability_validation.HttpReliabilityProbe(reference_root=Path("fixtures"))
+    case = reliability_validation.CasePlan(
+        case_id="unbound-gpt",
+        phase="steady",
+        engine="gpt-sovits",
+        expected="completed",
+        action="synthesize",
+        request_timeout_seconds=30.0,
+        convergence_seconds=30.0,
+    )
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        probe._generation_payload(case, fixture)
+
+    assert (exc_info.value.code, exc_info.value.stage) == (
+        "registered-service-binding",
+        "preflight",
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "zero-match",
+        "multiple-matches",
+        "disabled",
+        "not-ready",
+        "wrong-contract",
+        "wrong-engine",
+        "wrong-provider",
+        "wrong-resource",
+        "wrong-base-url",
+        "missing-capability",
+        "wrong-capacity",
+        "inconsistent-resource-group",
+    ],
+)
+def test_fix5_registered_service_binding_fails_closed_for_nonunique_or_invalid_runtime_contract(
+    defect: str,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    services = [
+        _registered_service_document(fixture, engine)
+        for engine in reliability_validation.ENGINE_ORDER
+    ]
+    target = services[0]
+    if defect == "zero-match":
+        services.pop(0)
+    elif defect == "multiple-matches":
+        duplicate = json.loads(json.dumps(target))
+        duplicate["service_id"] = "second-valid-gpt-service"
+        services.append(duplicate)
+    elif defect == "disabled":
+        target["enabled"] = False
+    elif defect == "not-ready":
+        target["ready"] = False
+    elif defect == "wrong-contract":
+        target["api_contract"] = "tts-more-v1"
+    elif defect == "wrong-engine":
+        target["engine"] = "indextts"
+    elif defect == "wrong-provider":
+        target["provider_type"] = "indextts"
+    elif defect == "wrong-resource":
+        target["default_params"] = {"resource_id": "wrong-gpt-resource"}
+    elif defect == "wrong-base-url":
+        target["base_url"] = "http://127.0.0.1:8199"
+    elif defect == "missing-capability":
+        target["capabilities"] = [
+            capability
+            for capability in _REGISTERED_SERVICE_CAPABILITIES
+            if capability != "tts-audio-suite"
+        ]
+    elif defect == "wrong-capacity":
+        target["capacity"] = 2
+    elif defect == "inconsistent-resource-group":
+        target["resource_group"] = "different-gpu"
+    else:
+        raise AssertionError(defect)
+    calls: list[tuple[str, str, object | None]] = []
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=_registered_service_transport(fixture, services, calls),
+        reference_root=Path("fixtures"),
+    )
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        probe.preflight(fixture)
+
+    assert (exc_info.value.code, exc_info.value.stage) == (
+        "registered-service-binding",
+        "preflight",
+    )
+    assert not any(path == "/api/generation/preflight" for _method, path, _body in calls)
+
+
+def test_fix5_derived_gpt_service_binding_passes_real_tts_more_preflight_without_raw_weights(
+    tmp_path: Path,
+) -> None:
+    from app.main import GenerateRequest, _preflight_task
+    from app.models import TTSServiceEndpoint
+    from app.queue import ServiceGenerationQueue
+    from app.services import MockServiceClient, ServiceRegistry, ServiceRouter
+    from app.supervisor import ServiceSupervisor
+
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    service_id = "runtime-derived-gpt-not-hard-coded"
+    service_document = _registered_service_document(
+        fixture,
+        "gpt-sovits",
+        service_id=service_id,
+    )
+    calls: list[tuple[str, str, object | None]] = []
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=_registered_service_transport(
+            fixture,
+            [
+                service_document,
+                _registered_service_document(fixture, "indextts"),
+                _registered_service_document(fixture, "cosyvoice"),
+            ],
+            calls,
+        ),
+        reference_root=Path("fixtures"),
+    )
+    probe.preflight(fixture)
+    case = reliability_validation.CasePlan(
+        case_id="real-gpt-preflight",
+        phase="steady",
+        engine="gpt-sovits",
+        expected="completed",
+        action="synthesize",
+        request_timeout_seconds=30.0,
+        convergence_seconds=30.0,
+    )
+    payload = probe._generation_payload(case, fixture)
+    request = GenerateRequest.model_validate(payload)
+    endpoint = TTSServiceEndpoint.model_validate(service_document)
+    registry = ServiceRegistry([endpoint])
+    router = ServiceRouter(
+        registry,
+        clients={service_id: MockServiceClient(endpoint)},
+    )
+    queue = ServiceGenerationQueue(router)
+    supervisor = ServiceSupervisor(project_root=tmp_path, runtime_root=tmp_path / "runtime")
+
+    result = _preflight_task(router, supervisor, queue, request.tasks[0])
+
+    assert result["status"] == "ready"
+    assert result["selected_service_id"] == service_id
+    assert payload["tasks"][0]["parameters"].get("gpt_weights_path") is None
+    assert payload["tasks"][0]["parameters"].get("sovits_weights_path") is None
+
+
 def test_task_10_http_probe_uses_exact_preflight_queue_and_release_routes() -> None:
     fixture = ReliabilityFixture.model_validate(_fixture_document())
     calls: list[tuple[str, str, object | None]] = []
@@ -1984,6 +2283,16 @@ def test_task_10_http_probe_uses_exact_preflight_queue_and_release_routes() -> N
                         }
                         for engine, resource in fixture.resources.items()
                     ],
+                },
+            )
+        if request.url.path == "/api/services":
+            return httpx.Response(
+                200,
+                json={
+                    "services": [
+                        _registered_service_document(fixture, engine)
+                        for engine in reliability_validation.ENGINE_ORDER
+                    ]
                 },
             )
         if request.url.path == "/api/generation/preflight":
@@ -2018,6 +2327,9 @@ def test_task_10_http_probe_uses_exact_preflight_queue_and_release_routes() -> N
     assert ("GET", "/system_stats") in [(method, path) for method, path, _body in calls]
     assert ("GET", "/object_info") in [(method, path) for method, path, _body in calls]
     assert ("GET", "/api/tts-audio-suite/v1/capabilities") in [
+        (method, path) for method, path, _body in calls
+    ]
+    assert ("GET", "/api/services") in [
         (method, path) for method, path, _body in calls
     ]
     assert ("POST", "/api/tts-audio-suite/v1/runtime/release", {"all": True}) in calls
@@ -2189,6 +2501,7 @@ def test_task_10_http_probe_executes_concrete_running_fault_and_restart_actions(
         poll_interval_seconds=0.001,
         sleep=lambda _seconds: None,
     )
+    _preflight_http_probe_for_case(probe, fixture)
     hook_calls = 0
 
     def hook() -> None:
@@ -2279,6 +2592,7 @@ def test_task_10_http_probe_queued_cancel_never_fabricates_comfy_prompt_or_versi
         poll_interval_seconds=0.001,
         sleep=lambda _seconds: None,
     )
+    _preflight_http_probe_for_case(probe, fixture)
 
     observation = probe.execute_case(case, fixture, Path("unused"))
 
@@ -2353,6 +2667,7 @@ def test_task_10_http_probe_termination_proves_endpoint_absence_without_fake_his
         poll_interval_seconds=0.001,
         sleep=lambda _seconds: None,
     )
+    _preflight_http_probe_for_case(probe, fixture)
 
     def terminate() -> None:
         nonlocal comfy_dead
@@ -2383,6 +2698,7 @@ def test_task_10_http_probe_fails_closed_on_http_error_or_timeout(mode: str) -> 
         transport=httpx.MockTransport(handler),
         reference_root=Path("fixtures"),
     )
+    _preflight_http_probe_for_case(probe, fixture)
 
     expected_error = httpx.ReadTimeout if mode == "timeout" else httpx.HTTPStatusError
     with pytest.raises(expected_error):
@@ -2553,6 +2869,7 @@ def test_task_10_http_probe_executes_fault_routes_and_preserves_terminal_evidenc
         poll_interval_seconds=0,
         sleep=lambda _seconds: None,
     )
+    _preflight_http_probe_for_case(probe, fixture)
 
     hook = None
     if case.action == "restart-readiness":
@@ -2641,6 +2958,7 @@ def test_fix_round_1_fault_cases_reject_false_terminal_manifest_evidence(
         poll_interval_seconds=0,
         sleep=lambda _seconds: None,
     )
+    _preflight_http_probe_for_case(probe, fixture)
 
     with pytest.raises(RuntimeError, match="fault terminal evidence"):
         probe.execute_case(case, fixture, tmp_path)
@@ -2658,6 +2976,7 @@ def test_task_10_terminate_case_does_not_probe_comfyui_after_owned_termination(
         poll_interval_seconds=0,
         sleep=lambda _seconds: None,
     )
+    _preflight_http_probe_for_case(probe, fixture)
 
     observation = probe.execute_case(
         case,
@@ -2743,6 +3062,7 @@ def test_task_10_http_probe_cancels_queued_target_before_comfyui_dispatch(tmp_pa
         poll_interval_seconds=0,
         sleep=lambda _seconds: None,
     )
+    _preflight_http_probe_for_case(probe, fixture)
 
     observation = probe.execute_case(case, fixture, tmp_path)
 
@@ -2774,6 +3094,7 @@ def test_task_10_http_probe_fails_closed_on_transport_errors(tmp_path: Path, fai
         transport=httpx.MockTransport(handler),
         reference_root=tmp_path,
     )
+    _preflight_http_probe_for_case(probe, fixture)
 
     expected = httpx.HTTPStatusError if failure == "http-status" else httpx.ReadTimeout
     with pytest.raises(expected):
@@ -2863,6 +3184,7 @@ def test_task_10_cli_preflight_only_writes_evidence_without_running_cases(
     assert http_probe.executed == []
     evidence = json.loads((tmp_path / "preflight" / "preflight.json").read_text())
     assert evidence["status"] == "passed"
+    assert not (tmp_path / "preflight" / "failure.json").exists()
     assert [item["engine"] for item in evidence["resources"]] == [
         "cosyvoice",
         "gpt-sovits",
@@ -2880,6 +3202,252 @@ def test_task_10_cli_preflight_only_writes_evidence_without_running_cases(
         resource.resource_id in json.dumps(evidence)
         for resource in ReliabilityFixture.model_validate(_fixture_document()).resources.values()
     )
+
+
+def test_fix5_preflight_only_persists_typed_primary_failure_and_real_cli_returns_one(
+    tmp_path: Path,
+) -> None:
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    host_probe = _ExecutorHostProbe()
+
+    class TypedFailureProbe(_ExecutorHttpProbe):
+        def preflight(
+            self,
+            fixture: ReliabilityFixture,
+        ) -> reliability_validation.HttpPreflightObservation:
+            del fixture
+            raise reliability_validation.LiveValidationError(
+                "registered-service-binding",
+                stage="preflight",
+            )
+
+    output_root = tmp_path / "typed-failure"
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            TypedFailureProbe(),
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert result == 1
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+        "code": "registered-service-binding",
+        "stage": "preflight",
+    }
+    assert not (output_root / "preflight.json").exists()
+
+
+def test_fix5_real_blocked_generation_preflight_persists_stable_sanitized_failure(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    private_reason = f"token=private-value model=C:\\private\\voice {tmp_path}"
+    calls: list[tuple[str, str, object | None]] = []
+    http_probe = reliability_validation.HttpReliabilityProbe(
+        transport=_registered_service_transport(
+            fixture,
+            [
+                _registered_service_document(fixture, engine)
+                for engine in reliability_validation.ENGINE_ORDER
+            ],
+            calls,
+            generation_preflight_document={
+                "status": "blocked",
+                "items": [{"status": "blocked", "reason": private_reason}],
+            },
+        ),
+        reference_root=tmp_path,
+    )
+    host_probe = _ExecutorHostProbe()
+    output_root = tmp_path / "blocked-preflight"
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            http_probe,
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    persisted = (output_root / "failure.json").read_text(encoding="utf-8")
+    assert result == 1
+    assert json.loads(persisted) == {
+        "code": "tts-more-preflight-not-ready",
+        "stage": "preflight",
+    }
+    assert private_reason not in persisted
+    assert str(tmp_path) not in persisted
+    assert not (output_root / "preflight.json").exists()
+
+
+def test_fix5_preflight_only_maps_and_scrubs_raw_observation_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_sentinel = f"token=private-value Authorization=Bearer-private {tmp_path}"
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    host_probe = _ExecutorHostProbe()
+
+    class RawFailureProbe(_ExecutorHttpProbe):
+        def preflight(
+            self,
+            fixture: ReliabilityFixture,
+        ) -> reliability_validation.HttpPreflightObservation:
+            del fixture
+            raise httpx.ReadTimeout(private_sentinel)
+
+    output_root = tmp_path / "raw-failure"
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            RawFailureProbe(),
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    captured = capsys.readouterr()
+    persisted = (output_root / "failure.json").read_text(encoding="utf-8")
+    assert result == 1
+    assert json.loads(persisted) == {
+        "code": "preflight-observation-failed",
+        "stage": "preflight",
+    }
+    assert private_sentinel not in persisted
+    assert "private-value" not in captured.out + captured.err
+    assert str(tmp_path) not in captured.out + captured.err
+    assert not (output_root / "preflight.json").exists()
+
+
+def test_fix5_preflight_failure_evidence_write_failure_preserves_nonzero_without_partial_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    host_probe = _ExecutorHostProbe()
+    writes: list[Path] = []
+
+    class TypedFailureProbe(_ExecutorHttpProbe):
+        def preflight(
+            self,
+            fixture: ReliabilityFixture,
+        ) -> reliability_validation.HttpPreflightObservation:
+            del fixture
+            raise reliability_validation.LiveValidationError(
+                "registered-service-binding",
+                stage="preflight",
+            )
+
+    def fail_atomic_write(path: Path, payload: object) -> None:
+        del payload
+        writes.append(Path(path))
+        partial = Path(path).with_name(f".{Path(path).name}.injected.partial")
+        partial.write_text("incomplete", encoding="utf-8")
+        partial.unlink()
+        raise RuntimeError("token=writer-secret C:\\private\\model")
+
+    monkeypatch.setattr(reliability_validation, "write_atomic_json", fail_atomic_write)
+    output_root = tmp_path / "write-failure"
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ],
+        probe_factory=lambda _fixture, _args: (
+            TypedFailureProbe(),
+            host_probe,
+            host_probe.owned_processes,
+        ),
+    )
+
+    assert result == 1
+    assert writes == [output_root / "failure.json"]
+    assert not (output_root / "failure.json").exists()
+    assert not list(output_root.glob(".failure.json.*"))
+    assert not (output_root / "preflight.json").exists()
+
+
+def test_fix5_full_validator_secondary_failure_persistence_never_overrides_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    http_probe = _ExecutorHttpProbe(preflight_mode="busy-queue")
+    host_probe = _ExecutorHostProbe()
+    output_root = tmp_path / "matrix-primary"
+    original_write = reliability_validation.write_atomic_json
+
+    def fail_only_failure_marker(path: Path, payload: object) -> None:
+        if Path(path).name == "failure.json":
+            raise RuntimeError("token=secondary-writer-secret C:\\private\\model")
+        original_write(path, payload)
+
+    monkeypatch.setattr(
+        reliability_validation,
+        "write_atomic_json",
+        fail_only_failure_marker,
+    )
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert (exc_info.value.code, exc_info.value.stage) == (
+        "initial-queue-not-idle",
+        "preflight",
+    )
+    assert not (output_root / "failure.json").exists()
+    assert not list(output_root.glob(".failure.json.*"))
 
 
 def _host_manifest_document(tmp_path: Path) -> dict[str, object]:

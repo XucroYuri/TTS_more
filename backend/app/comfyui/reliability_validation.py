@@ -44,6 +44,16 @@ _BRIDGE_ENGINE_IDS: dict[str, Engine] = {
     "index_tts": "indextts",
     "cosyvoice": "cosyvoice",
 }
+_REGISTERED_SERVICE_CONTRACT = "comfyui-tts-audio-suite-v1"
+_REGISTERED_SERVICE_CAPABILITIES = frozenset(
+    {
+        "tts",
+        "reference-audio-voice",
+        "wav-output",
+        "comfyui",
+        "tts-audio-suite",
+    }
+)
 _SENSITIVE_KEYS = {
     "access_key",
     "access_token",
@@ -867,6 +877,7 @@ class LiveValidationError(RuntimeError):
         super().__init__(code)
         self.code = code
         self.stage = stage
+        self.failure_persistence_attempted = False
 
 
 class RestartLifecycleError(RuntimeError):
@@ -2023,6 +2034,114 @@ def _temp_entries_for_delta(before: set[str], *, token_roots: tuple[Path, ...]) 
     return _temp_entries(token_roots) - before
 
 
+def _resolve_registered_service_bindings(
+    document: dict[str, Any],
+    fixture: ReliabilityFixture,
+) -> dict[Engine, str]:
+    services = document.get("services")
+    if not isinstance(services, list):
+        raise LiveValidationError("registered-service-binding", stage="preflight")
+    expected_base_url = _normalized_registered_service_url(
+        fixture.base_urls["comfyui"],
+    )
+    if expected_base_url is None:
+        raise LiveValidationError("registered-service-binding", stage="preflight")
+
+    bindings: dict[Engine, str] = {}
+    resource_groups: set[str] = set()
+    for engine in ENGINE_ORDER:
+        expected_resource_id = fixture.resources[engine].resource_id
+        matches = [
+            service
+            for service in services
+            if _registered_service_matches(
+                service,
+                engine=engine,
+                resource_id=expected_resource_id,
+                base_url=expected_base_url,
+            )
+        ]
+        if len(matches) != 1:
+            raise LiveValidationError("registered-service-binding", stage="preflight")
+        match = matches[0]
+        service_id = match.get("service_id")
+        resource_group = match.get("resource_group")
+        if (
+            not isinstance(service_id, str)
+            or not service_id.strip()
+            or not isinstance(resource_group, str)
+            or not resource_group.strip()
+        ):
+            raise LiveValidationError("registered-service-binding", stage="preflight")
+        bindings[engine] = service_id
+        resource_groups.add(resource_group)
+
+    if len(bindings) != len(ENGINE_ORDER) or len(set(bindings.values())) != len(ENGINE_ORDER):
+        raise LiveValidationError("registered-service-binding", stage="preflight")
+    if len(resource_groups) != 1:
+        raise LiveValidationError("registered-service-binding", stage="preflight")
+    return bindings
+
+
+def _registered_service_matches(
+    service: Any,
+    *,
+    engine: Engine,
+    resource_id: str,
+    base_url: tuple[str, str, int, str],
+) -> bool:
+    if not isinstance(service, dict):
+        return False
+    capabilities = service.get("capabilities")
+    default_params = service.get("default_params")
+    if not isinstance(capabilities, list) or not all(
+        isinstance(capability, str) for capability in capabilities
+    ):
+        return False
+    normalized_capabilities = {
+        capability.replace("_", "-").casefold()
+        for capability in capabilities
+    }
+    capacity = service.get("capacity")
+    return bool(
+        service.get("service_kind") == "tts"
+        and service.get("enabled") is True
+        and service.get("ready") is True
+        and service.get("api_contract") == _REGISTERED_SERVICE_CONTRACT
+        and service.get("engine") == engine
+        and service.get("provider_type") == engine
+        and isinstance(default_params, dict)
+        and default_params.get("resource_id") == resource_id
+        and _normalized_registered_service_url(service.get("base_url")) == base_url
+        and _REGISTERED_SERVICE_CAPABILITIES <= normalized_capabilities
+        and type(capacity) is int
+        and capacity == 1
+    )
+
+
+def _normalized_registered_service_url(value: Any) -> tuple[str, str, int, str] | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = urlsplit(value.strip())
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.casefold()
+    if (
+        scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    path = parsed.path.rstrip("/") or "/"
+    return (scheme, parsed.hostname.casefold(), effective_port, path)
+
+
 class HttpReliabilityProbe:
     """Concrete local HTTP probe for the TTS More and ComfyUI contracts."""
 
@@ -2041,6 +2160,7 @@ class HttpReliabilityProbe:
         self.monotonic = monotonic
         self.sleep = sleep
         self._fixture: ReliabilityFixture | None = None
+        self._registered_service_ids: dict[Engine, str] = {}
         self._released = False
         self._seen_job_ids: set[str] = set()
         self._seen_prompt_ids: set[str] = set()
@@ -2048,6 +2168,7 @@ class HttpReliabilityProbe:
 
     def preflight(self, fixture: ReliabilityFixture) -> HttpPreflightObservation:
         self._fixture = _revalidate_model(fixture, ReliabilityFixture)
+        self._registered_service_ids = {}
         comfyui_url = fixture.base_urls["comfyui"].rstrip("/")
         tts_more_url = fixture.base_urls["tts_more"].rstrip("/")
         system_stats = self._json("GET", f"{comfyui_url}/system_stats", timeout=5.0)
@@ -2071,6 +2192,15 @@ class HttpReliabilityProbe:
             for item in resources_raw
             if isinstance(item, dict)
         ]
+        service_status = self._json(
+            "GET",
+            f"{tts_more_url}/api/services",
+            timeout=30.0,
+        )
+        self._registered_service_ids = _resolve_registered_service_bindings(
+            service_status,
+            fixture,
+        )
         for engine in ENGINE_ORDER:
             response = self._json(
                 "POST",
@@ -2089,11 +2219,18 @@ class HttpReliabilityProbe:
                 ),
                 timeout=30.0,
             )
-            if response.get("status") != "ready" or any(
-                not isinstance(item, dict) or item.get("status") != "ready"
-                for item in response.get("items", [])
+            response_items = response.get("items")
+            if (
+                response.get("status") != "ready"
+                or not isinstance(response_items, list)
+                or len(response_items) != 1
+                or not isinstance(response_items[0], dict)
+                or response_items[0].get("status") != "ready"
             ):
-                raise RuntimeError("TTS More generation preflight is not ready")
+                raise LiveValidationError(
+                    "tts-more-preflight-not-ready",
+                    stage="preflight",
+                )
         return HttpPreflightObservation(
             resources=resources,
             queue=self._queue_snapshot(fixture),
@@ -2297,6 +2434,17 @@ class HttpReliabilityProbe:
         )
 
     def _generation_payload(self, case: CasePlan, fixture: ReliabilityFixture) -> dict[str, Any]:
+        service_id = self._registered_service_ids.get(case.engine)
+        if (
+            service_id is None
+            or self._fixture is None
+            or self._fixture != fixture
+            or set(self._registered_service_ids) != set(ENGINE_ORDER)
+        ):
+            raise LiveValidationError(
+                "registered-service-binding",
+                stage="preflight",
+            )
         resource = fixture.resources[case.engine]
         reference_path = (self.reference_root / resource.reference_audio).resolve()
         if not reference_path.is_relative_to(self.reference_root):
@@ -2312,6 +2460,7 @@ class HttpReliabilityProbe:
                     },
                     "engine": case.engine,
                     "profile": resource.resource_id,
+                    "service_id": service_id,
                     "provider_type": case.engine,
                     "required_capabilities": ["tts", "reference_audio_voice"],
                     "parameters": {
@@ -2988,16 +3137,23 @@ def execute_reliability_validation(
                     failure = LiveValidationError("runtime-release-failed", stage="finalize")
 
     if failure is not None:
-        summary = finalize_run(
-            fixture,
-            completed_cases,
-            required_cases=required_case_specs(selected_plan),
-        )
-        for completed_case in summary.cases:
-            write_atomic_json(
-                output_root / "cases" / f"{completed_case.case_id}.json",
-                completed_case.model_dump(mode="json"),
+        try:
+            summary = finalize_run(
+                fixture,
+                completed_cases,
+                required_cases=required_case_specs(selected_plan),
             )
+        except Exception:
+            _persist_failure_marker(output_root, failure)
+            raise failure
+        for completed_case in summary.cases:
+            try:
+                write_atomic_json(
+                    output_root / "cases" / f"{completed_case.case_id}.json",
+                    completed_case.model_dump(mode="json"),
+                )
+            except Exception:
+                pass
         if active_case is not None:
             failed_case = FailedCaseEvidence(
                 status="failed",
@@ -3008,15 +3164,18 @@ def execute_reliability_validation(
                 failure=FailureMarker(code=failure.code, stage=failure.stage),
                 host=active_host_observation,
             )
-            write_atomic_json(
-                output_root / "cases" / f"{active_case.case_id}.json",
-                failed_case.model_dump(mode="json"),
-            )
-        write_atomic_json(
-            output_root / "failure.json",
-            {"code": failure.code, "stage": failure.stage},
-        )
-        write_atomic_json(output_root / "reliability-summary.json", summary)
+            try:
+                write_atomic_json(
+                    output_root / "cases" / f"{active_case.case_id}.json",
+                    failed_case.model_dump(mode="json"),
+                )
+            except Exception:
+                pass
+        _persist_failure_marker(output_root, failure)
+        try:
+            write_atomic_json(output_root / "reliability-summary.json", summary)
+        except Exception:
+            pass
         raise failure
 
     for case in summary.cases:
@@ -3026,6 +3185,49 @@ def execute_reliability_validation(
 
 
 def execute_reliability_preflight(
+    fixture: ReliabilityFixture,
+    *,
+    output_root: Path,
+    http_probe: ReliabilityHttpProbe,
+    host_probe: ReliabilityHostProbe,
+    owned_processes: dict[str, OwnedProcessIdentity],
+    allow_lan: bool = False,
+) -> None:
+    failure: LiveValidationError | None = None
+    try:
+        _execute_reliability_preflight_success(
+            fixture,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=owned_processes,
+            allow_lan=allow_lan,
+        )
+    except LiveValidationError as exc:
+        failure = exc
+    except (
+        OSError,
+        json.JSONDecodeError,
+        ValidationError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        RecursionError,
+        RuntimeError,
+        httpx.HTTPError,
+    ):
+        failure = LiveValidationError(
+            "preflight-observation-failed",
+            stage="preflight",
+        )
+    else:
+        return
+    assert failure is not None
+    _persist_failure_marker(Path(output_root), failure)
+    raise failure
+
+
+def _execute_reliability_preflight_success(
     fixture: ReliabilityFixture,
     *,
     output_root: Path,
@@ -3067,6 +3269,17 @@ def execute_reliability_preflight(
             },
         },
     )
+
+
+def _persist_failure_marker(output_root: Path, failure: LiveValidationError) -> None:
+    failure.failure_persistence_attempted = True
+    try:
+        write_atomic_json(
+            Path(output_root) / "failure.json",
+            {"code": failure.code, "stage": failure.stage},
+        )
+    except Exception:
+        pass
 
 
 def _require_endpoint_scope(fixture: ReliabilityFixture, *, allow_lan: bool) -> None:
@@ -4063,9 +4276,33 @@ def main(
             owned_processes=owned_processes,
             allow_lan=args.allow_lan,
         )
-    except (OSError, json.JSONDecodeError, ValidationError, LiveValidationError, ValueError, RuntimeError):
-        return 1
-    return 0 if summary.status == "passed" else 1
+    except LiveValidationError as exc:
+        failure = exc
+    except (
+        OSError,
+        json.JSONDecodeError,
+        ValidationError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        RecursionError,
+        RuntimeError,
+        httpx.HTTPError,
+    ):
+        failure = LiveValidationError(
+            "preflight-observation-failed",
+            stage="preflight",
+        )
+    else:
+        return 0 if summary.status == "passed" else 1
+    failure_path = Path(args.output_root) / "failure.json"
+    try:
+        failure_exists = failure_path.is_file()
+    except OSError:
+        failure_exists = False
+    if not failure.failure_persistence_attempted and not failure_exists:
+        _persist_failure_marker(Path(args.output_root), failure)
+    return 1
 
 
 def _default_probe_factory(
