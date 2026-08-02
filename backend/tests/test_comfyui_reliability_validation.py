@@ -2808,8 +2808,19 @@ def test_fix7_normal_request_budget_has_separate_terminal_convergence_window(
     assert create_call[2]["tasks"][0]["parameters"]["timeout_seconds"] == 30.0
 
 
-def test_fix7_cancel_terminal_window_is_bounded_from_the_action(
+@pytest.mark.parametrize(
+    ("running_at", "terminal_at", "expected_cancelled_at", "expected_end"),
+    [
+        (25.0, 59.0, [25.0], 55.25),
+        (40.0, 65.0, [], 30.25),
+    ],
+)
+def test_fix7_cancel_request_and_terminal_windows_are_separate_and_bounded(
     tmp_path: Path,
+    running_at: float,
+    terminal_at: float,
+    expected_cancelled_at: list[float],
+    expected_end: float,
 ) -> None:
     fixture = ReliabilityFixture.model_validate(_fixture_document())
     case = reliability_validation.CasePlan(
@@ -2828,7 +2839,7 @@ def test_fix7_cancel_terminal_window_is_bounded_from_the_action(
         clock["now"] += seconds
 
     def job_document() -> dict[str, object]:
-        terminal = bool(cancelled_at) and clock["now"] >= 59.0
+        terminal = bool(cancelled_at) and clock["now"] >= terminal_at
         return {
             "job_id": "job-cancel-window",
             "status": "cancelled" if terminal else ("cancelling" if cancelled_at else "running"),
@@ -2836,7 +2847,7 @@ def test_fix7_cancel_terminal_window_is_bounded_from_the_action(
             "items": [
                 {
                     "status": "cancelled" if terminal else ("cancelling" if cancelled_at else "running"),
-                    "external_job_id": "prompt-cancel-window" if clock["now"] >= 25.0 else None,
+                    "external_job_id": "prompt-cancel-window" if clock["now"] >= running_at else None,
                     "version_id": "version-cancel-window" if terminal else None,
                     "error": None,
                 }
@@ -2854,7 +2865,7 @@ def test_fix7_cancel_terminal_window_is_bounded_from_the_action(
         if request.url.path == "/api/jobs/job-cancel-window":
             return httpx.Response(200, json=job_document())
         if request.url.path == "/queue":
-            running = clock["now"] >= 25.0 and clock["now"] < 59.0
+            running = clock["now"] >= running_at and clock["now"] < terminal_at
             return httpx.Response(
                 200,
                 json={
@@ -2913,8 +2924,188 @@ def test_fix7_cancel_terminal_window_is_bounded_from_the_action(
     with pytest.raises(RuntimeError, match="job did not converge"):
         probe.execute_case(case, fixture, tmp_path)
 
-    assert cancelled_at == [25.0]
-    assert clock["now"] == 55.25
+    assert cancelled_at == expected_cancelled_at
+    assert clock["now"] == expected_end
+
+
+def test_fix7_terminate_action_must_be_observed_inside_request_window(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = reliability_validation.CasePlan(
+        case_id="terminate-comfyui-indextts",
+        phase="fault",
+        engine="indextts",
+        expected="failed",
+        action="terminate-comfyui",
+        request_timeout_seconds=30.0,
+        convergence_seconds=30.0,
+    )
+    clock = {"now": 0.0}
+    action_times: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/generation/preflight":
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if request.url.path == "/api/jobs/generation":
+            return httpx.Response(200, json={"job_id": "job-late-terminate"})
+        if request.url.path == "/api/jobs/job-late-terminate":
+            return httpx.Response(
+                200,
+                json={
+                    "job_id": "job-late-terminate",
+                    "status": "running",
+                    "error": None,
+                    "items": [
+                        {
+                            "status": "running",
+                            "external_job_id": (
+                                "prompt-late-terminate" if clock["now"] >= 40.0 else None
+                            ),
+                            "version_id": None,
+                            "error": None,
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/queue":
+            return httpx.Response(
+                200,
+                json={
+                    "queue_running": (
+                        [[1, "prompt-late-terminate", {}, {}, []]]
+                        if clock["now"] >= 40.0
+                        else []
+                    ),
+                    "queue_pending": [],
+                },
+            )
+        return httpx.Response(404, json={"detail": "unexpected route"})
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=tmp_path,
+        poll_interval_seconds=0.25,
+        monotonic=lambda: clock["now"],
+        sleep=lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    _preflight_http_probe_for_case(probe, fixture)
+
+    with pytest.raises(RuntimeError, match="job did not converge"):
+        probe.execute_case(
+            case,
+            fixture,
+            tmp_path,
+            action_hook=lambda: action_times.append(clock["now"]),
+        )
+
+    assert action_times == []
+    assert clock["now"] == 30.25
+
+
+def test_fix7_queued_cancel_gets_fresh_terminal_window_after_shared_admission_budget(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = next(case for case in reliability_validation.build_case_plan() if case.action == "cancel-queued")
+    clock = {"now": 0.0}
+    created_jobs = 0
+    target_cancelled_at: list[float] = []
+    blocker_cancelled_at: list[float] = []
+
+    def target_document() -> dict[str, object]:
+        cancelled = bool(target_cancelled_at)
+        admitted = clock["now"] >= 25.0
+        settled = cancelled and clock["now"] >= 35.0
+        return {
+            "job_id": "job-queued-target",
+            "status": "cancelled" if cancelled else ("running" if admitted else "queued"),
+            "progress": 1.0 if cancelled else 0.0,
+            "error": None,
+            "updated_at": "settled" if settled else ("cancelled" if cancelled else "queued"),
+            "items": [
+                {
+                    "status": "cancelled" if cancelled else "queued",
+                    "progress": 1.0 if cancelled else 0.0,
+                    "external_job_id": None,
+                    "external_status": None,
+                    "error": None,
+                    "version_id": None,
+                }
+            ],
+        }
+
+    def blocker_document() -> dict[str, object]:
+        settled = bool(blocker_cancelled_at) and clock["now"] >= 35.0
+        return {
+            "job_id": "job-queued-blocker",
+            "status": "cancelled" if settled else ("cancelling" if blocker_cancelled_at else "running"),
+            "progress": 1.0 if settled else 0.5,
+            "error": None,
+            "updated_at": "settled" if settled else "running",
+            "items": [
+                {
+                    "status": "cancelled" if settled else "running",
+                    "progress": 1.0 if settled else 0.5,
+                    "external_job_id": "prompt-queued-blocker" if clock["now"] >= 10.0 else None,
+                    "external_status": "cancelled" if settled else "running",
+                    "error": None,
+                    "version_id": None,
+                }
+            ],
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal created_jobs
+        if request.url.path == "/api/generation/preflight":
+            return httpx.Response(200, json={"status": "ready", "items": [{"status": "ready"}]})
+        if request.url.path.endswith("/manifest"):
+            return httpx.Response(200, json={"project_id": "windows-reliability-validation", "lines": {}})
+        if request.url.path == "/api/jobs/generation":
+            created_jobs += 1
+            return httpx.Response(
+                200,
+                json={"job_id": "job-queued-blocker" if created_jobs == 1 else "job-queued-target"},
+            )
+        if request.url.path == "/api/jobs/job-queued-blocker" and request.method == "GET":
+            return httpx.Response(200, json=blocker_document())
+        if request.url.path == "/api/jobs/job-queued-target" and request.method == "GET":
+            return httpx.Response(200, json=target_document())
+        if request.url.path == "/api/jobs/job-queued-target/cancel":
+            target_cancelled_at.append(clock["now"])
+            return httpx.Response(200, json=target_document())
+        if request.url.path == "/api/jobs/job-queued-blocker/cancel":
+            blocker_cancelled_at.append(clock["now"])
+            return httpx.Response(200, json=blocker_document())
+        if request.url.path == "/queue":
+            held = clock["now"] >= 10.0 and clock["now"] < 35.0
+            return httpx.Response(
+                200,
+                json={
+                    "queue_running": (
+                        [[1, "prompt-queued-blocker", {}, {}, []]] if held else []
+                    ),
+                    "queue_pending": [],
+                },
+            )
+        return httpx.Response(404, json={"detail": "unexpected route"})
+
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(handler),
+        reference_root=tmp_path,
+        poll_interval_seconds=1.0,
+        monotonic=lambda: clock["now"],
+        sleep=lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    _preflight_http_probe_for_case(probe, fixture)
+
+    observation = probe.execute_case(case, fixture, tmp_path)
+
+    assert observation.actual == "cancelled"
+    assert observation.prompt_submitted is False
+    assert target_cancelled_at == [25.0]
+    assert blocker_cancelled_at == [25.0]
+    assert clock["now"] == 35.0
 
 
 def test_fix7_fixture_normal_budgets_drive_every_completed_case_and_remain_bounded(
@@ -2974,6 +3165,33 @@ def test_fix7_fixture_normal_budgets_drive_every_completed_case_and_remain_bound
         "indextts": 240.0,
         "cosyvoice": 180.0,
     }
+    grouped_cases = {
+        "steady": [case for case in default_plan if case.phase == "steady"],
+        "queued-cancel": [case for case in default_plan if case.action == "cancel-queued"],
+        "running-cancel": [case for case in default_plan if case.action == "cancel-running"],
+        "cancel-recovery": [case for case in default_plan if case.case_id.startswith("recover-cancel-")],
+        "intentional-timeout": [case for case in default_plan if case.action == "timeout"],
+        "timeout-recovery": [case for case in default_plan if case.case_id.startswith("recover-timeout-")],
+        "terminate": [case for case in default_plan if case.action == "terminate-comfyui"],
+        "post-restart": [case for case in default_plan if case.action == "restart-readiness"],
+    }
+    assert {
+        label: (
+            len(cases),
+            sum(case.request_timeout_seconds + case.convergence_seconds for case in cases),
+        )
+        for label, cases in grouped_cases.items()
+    } == {
+        "steady": (30, 6_300.0),
+        "queued-cancel": (1, 60.0),
+        "running-cancel": (3, 180.0),
+        "cancel-recovery": (3, 630.0),
+        "intentional-timeout": (3, 93.0),
+        "timeout-recovery": (3, 630.0),
+        "terminate": (1, 60.0),
+        "post-restart": (3, 630.0),
+    }
+    assert sum(len(cases) for cases in grouped_cases.values()) == 47
     assert sum(
         case.request_timeout_seconds + case.convergence_seconds
         for case in default_plan

@@ -2433,11 +2433,9 @@ class HttpReliabilityProbe:
             raise RuntimeError("job id was reused")
         self._seen_job_ids.add(job_id)
 
-        deadline = (
-            self.monotonic()
-            + case.request_timeout_seconds
-            + case.convergence_seconds
-        )
+        deadline = self.monotonic() + case.request_timeout_seconds
+        if case.action not in {"cancel-running", "terminate-comfyui"}:
+            deadline += case.convergence_seconds
         prompt_id: str | None = None
         queue_before: list[str] | None = None
         acted = False
@@ -2468,15 +2466,17 @@ class HttpReliabilityProbe:
                     self._cancel_job(tts_more_url, job_id)
                     acted = True
                 elif case.action == "cancel-running" and not acted and state == "running":
+                    action_deadline = self.monotonic() + case.convergence_seconds
                     self._cancel_job(tts_more_url, job_id)
                     acted = True
-                    deadline = self.monotonic() + case.convergence_seconds
+                    deadline = action_deadline
                 elif case.action == "terminate-comfyui" and not acted and state == "running":
                     if action_hook is None:
                         raise RuntimeError("terminate action hook is missing")
+                    action_deadline = self.monotonic() + case.convergence_seconds
                     action_hook()
                     acted = True
-                    deadline = self.monotonic() + case.convergence_seconds
+                    deadline = action_deadline
             if job.get("status") in {"completed", "cancelled", "failed"}:
                 terminal = job
                 break
@@ -2689,8 +2689,8 @@ class HttpReliabilityProbe:
         blocker_cancelled = False
         target_cancelled = False
         try:
-            deadline = self.monotonic() + case.convergence_seconds
-            while self.monotonic() <= deadline:
+            admission_deadline = self.monotonic() + case.request_timeout_seconds
+            while self.monotonic() <= admission_deadline:
                 blocker = self._json(
                     "GET",
                     f"{tts_more_url}/api/jobs/{blocker_job_id}",
@@ -2721,7 +2721,7 @@ class HttpReliabilityProbe:
             target_job_id = _required_opaque_id(target_created.get("job_id"), "job")
             self._remember_unique(self._seen_job_ids, target_job_id, "job")
             queued_target: dict[str, Any] | None = None
-            while self.monotonic() <= deadline:
+            while self.monotonic() <= admission_deadline:
                 target = self._json(
                     "GET",
                     f"{tts_more_url}/api/jobs/{target_job_id}",
@@ -2737,6 +2737,7 @@ class HttpReliabilityProbe:
             if queued_target is None:
                 raise RuntimeError("queued-cancel target did not reach held admission")
 
+            settlement_deadline = self.monotonic() + case.convergence_seconds
             cancelled = self._cancel_job(tts_more_url, target_job_id)
             _require_pristine_queued_cancellation(cancelled)
             target_cancelled = True
@@ -2747,7 +2748,7 @@ class HttpReliabilityProbe:
             self._cancel_job(tts_more_url, blocker_job_id)
             blocker_cancelled = True
             settled_target: dict[str, Any] | None = None
-            while self.monotonic() <= deadline:
+            while self.monotonic() <= settlement_deadline:
                 target = self._json(
                     "GET",
                     f"{tts_more_url}/api/jobs/{target_job_id}",
