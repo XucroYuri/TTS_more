@@ -10082,6 +10082,8 @@ def test_fix9_nonzero_lifecycle_commits_before_exact_forest_stop_and_raw_removal
     tmp_path: Path,
 ) -> None:
     command = r"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
@@ -10094,7 +10096,7 @@ foreach ($name in @(
     'Stop-RecordedProcessPair', 'Test-PrivateIdentityRecordsCanBeRemoved',
     'Remove-PrivateIdentityRecordsIfSafe', 'Test-OwnedTempRootCanBeRemoved',
         'Remove-OwnedTempRoot', 'Get-Sha256Hex', 'ConvertTo-PublicUtcTimestamp',
-        'Assert-ExactPublicProperties', 'Test-PublicSha256Value',
+        'Assert-ExactPublicProperties', 'Test-PublicJsonArray', 'Test-PublicSha256Value',
         'Test-PublicUtcTimestampValue', 'New-PublicProcessCommitment',
     'New-LauncherFailureLifecycleDocument',
     'Assert-LauncherFailureLifecycleDocument',
@@ -10232,6 +10234,24 @@ if ($persisted.status -ne 'failed' -or $persisted.cleanup.state -ne 'cleanup-pro
 if (-not $persisted.cleanup.stop_attempted -or -not $persisted.cleanup.stop_proven) {
     throw 'final lifecycle omitted exact stop proof'
 }
+$expectedProcessValues = @{
+    'tts-more|launch-root' = '100|2026-08-02T00:00:10.000000Z|50|2026-08-02T00:00:00.000000Z'
+    'tts-more|listener' = '200|2026-08-02T00:00:11.000000Z|100|2026-08-02T00:00:10.000000Z'
+    'comfyui|launch-root' = '100|2026-08-02T00:00:10.000000Z|50|2026-08-02T00:00:00.000000Z'
+    'comfyui|listener' = '200|2026-08-02T00:00:11.000000Z|100|2026-08-02T00:00:10.000000Z'
+}
+foreach ($process in @($persisted.processes)) {
+    $key = '{0}|{1}' -f $process.role, $process.kind
+    $actual = '{0}|{1}|{2}|{3}' -f $process.pid, $process.creation_time_utc,
+        $process.parent_pid, $process.parent_creation_time_utc
+    if (-not $expectedProcessValues.ContainsKey($key) -or
+        $actual -cne $expectedProcessValues[$key]) {
+        throw 'public process commitment did not preserve the supplied exact identity'
+    }
+    if ([int] $process.pid -eq [int] $PID) {
+        throw 'public process commitment captured the PowerShell host PID'
+    }
+}
 foreach ($name in @('temp_root','owner_marker','control_record','host_manifest')) {
     if ($persisted.cleanup.raw_disposition.$name -ne 'removal-committed') {
         throw "$name did not commit removal before deletion"
@@ -10256,6 +10276,7 @@ Write-Output 'FIX9_NONZERO_LIFECYCLE_TRANSACTION_OK'
 """
     completed = _run_fix9_powershell_behavior(command, tmp_path)
     assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
     assert "FIX9_NONZERO_LIFECYCLE_TRANSACTION_OK" in completed.stdout
 
 
@@ -10270,7 +10291,7 @@ $ast=[Management.Automation.Language.Parser]::ParseFile(
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
 foreach ($name in @(
     'Get-UtcTicks','Get-Sha256Hex','ConvertTo-PublicUtcTimestamp',
-    'Assert-ExactPublicProperties','Test-PublicSha256Value',
+    'Assert-ExactPublicProperties','Test-PublicJsonArray','Test-PublicSha256Value',
     'Test-PublicUtcTimestampValue','New-PublicProcessCommitment',
     'New-LauncherFailureLifecycleDocument',
     'Assert-LauncherFailureLifecycleDocument','Write-LauncherFailureLifecycleAtomic',
@@ -10472,7 +10493,7 @@ $ast=[Management.Automation.Language.Parser]::ParseFile(
 )
 if($errors.Count -ne 0){throw($errors|Out-String)}
 foreach($name in @('Get-UtcTicks','Get-Sha256Hex','ConvertTo-PublicUtcTimestamp',
-    'Assert-ExactPublicProperties','Test-PublicSha256Value',
+    'Assert-ExactPublicProperties','Test-PublicJsonArray','Test-PublicSha256Value',
     'Test-PublicUtcTimestampValue','New-PublicProcessCommitment',
     'New-LauncherFailureLifecycleDocument',
     'Assert-LauncherFailureLifecycleDocument','Write-LauncherFailureLifecycleAtomic',
@@ -10522,6 +10543,9 @@ function Must-Reject {param([scriptblock]$Mutation,[string]$Name)
 }
 Must-Reject {param($d)$d.PSObject.Properties.Remove('primary')} 'missing-primary'
 Must-Reject {param($d)$d|Add-Member extra 'forbidden'} 'extra-root'
+Must-Reject {param($d)
+    $value=$d.kind;$d.PSObject.Properties.Remove('kind');$d|Add-Member Kind $value
+} 'case-variant-root-key'
 Must-Reject {param($d)$d.schema_version=1.0} 'non-integer-version'
 Must-Reject {param($d)$d.kind='other'} 'wrong-kind'
 Must-Reject {param($d)$d.status='passed'} 'passed-status'
@@ -10530,9 +10554,38 @@ Must-Reject {param($d)$d.timestamps.run_started_at='not-utc'} 'invalid-utc'
 Must-Reject {param($d)$d.processes[0].pid=2147483648} 'oversize-pid'
 Must-Reject {param($d)$d.processes[0].identity_sha256=('z'*64)} 'invalid-hash'
 Must-Reject {param($d)$d.processes[0].role='private-role'} 'invalid-role'
+Must-Reject {param($d)$d.processes=$d.processes[0]} 'scalar-processes'
+Must-Reject {param($d)$d.processes=$null} 'null-processes'
+Must-Reject {param($d)$d.processes[0].pid=$true} 'boolean-pid'
 Must-Reject {param($d)$d.cleanup.state='removed'} 'invalid-cleanup-state'
 Must-Reject {param($d)$d.cleanup.warning_sha256=@(1..33|ForEach-Object{'a'*64})} 'warning-bound'
+Must-Reject {param($d)$d.cleanup.warning_sha256=('a'*64)} 'scalar-warning'
+Must-Reject {param($d)$d.cleanup.secondary_sha256=('a'*64)} 'scalar-secondary'
+Must-Reject {param($d)$d.cleanup.snapshot_written=1} 'integer-boolean-flag'
+Must-Reject {param($d)$d.cleanup.state='cleanup-proven'} 'contradictory-cleanup-proven'
+Must-Reject {param($d)
+    $d.cleanup.state='snapshot-written';$d.cleanup.stop_attempted=$true
+} 'contradictory-snapshot-stop'
 Must-Reject {param($d)$d.cleanup|Add-Member private_path 'C:\Users\PRIVATE'} 'extra-nested'
+$validUnproven=Clone-Document $persisted
+$validUnproven.cleanup.state='cleanup-unproven'
+$validUnproven.cleanup.stop_attempted=$true
+$validUnproven.timestamps.cleanup_finished_at='2026-08-02T00:00:04.000000Z'
+foreach($property in $validUnproven.cleanup.raw_disposition.PSObject.Properties){
+    $property.Value='preserved'
+}
+$validUnproven.cleanup.warning_sha256=@('A'*64)
+Assert-LauncherFailureLifecycleDocument $validUnproven
+$validProven=Clone-Document $persisted
+$validProven.cleanup.state='cleanup-proven'
+$validProven.cleanup.stop_attempted=$true
+$validProven.cleanup.stop_proven=$true
+$validProven.cleanup.temp_removal_eligible=$true
+$validProven.timestamps.cleanup_finished_at='2026-08-02T00:00:04.000000Z'
+foreach($property in $validProven.cleanup.raw_disposition.PSObject.Properties){
+    $property.Value='removal-committed'
+}
+Assert-LauncherFailureLifecycleDocument $validProven
 $secondaryPath=Join-Path $env:TTS_MORE_FIX9_ROOT 'secondary-roundtrip.json'
 Write-LauncherLifecycleSecondaryMarkerAtomic -Path $secondaryPath `
     -RunIdSha256 $persisted.run_id_sha256 `
@@ -10553,11 +10606,134 @@ $secondaryFlags.lifecycle_write_failed=$false
 $caught=$null
 try{Assert-LauncherLifecycleSecondaryMarkerDocument $secondaryFlags}catch{$caught=$_}
 if($null -eq $caught){throw 'secondary marker accepted no active failure flag'}
+$secondaryScalar=Clone-Document $secondary
+$secondaryScalar.secondary_sha256=$secondaryScalar.secondary_sha256[0]
+$caught=$null
+try{Assert-LauncherLifecycleSecondaryMarkerDocument $secondaryScalar}catch{$caught=$_}
+if($null -eq $caught){throw 'secondary marker accepted scalar hash collection'}
+$secondaryCase=Clone-Document $secondary
+$secondaryKind=$secondaryCase.kind
+$secondaryCase.PSObject.Properties.Remove('kind')
+$secondaryCase|Add-Member Kind $secondaryKind
+$caught=$null
+try{Assert-LauncherLifecycleSecondaryMarkerDocument $secondaryCase}catch{$caught=$_}
+if($null -eq $caught){throw 'secondary marker accepted case-variant key'}
 Write-Output 'FIX9_STRICT_SCHEMA_ROUNDTRIP_OK'
 """
     completed = _run_fix9_powershell_behavior(command, tmp_path)
     assert completed.returncode == 0, completed.stderr
     assert "FIX9_STRICT_SCHEMA_ROUNDTRIP_OK" in completed.stdout
+
+
+def test_fix9_failure_context_is_bound_to_current_summary_and_case_artifact(
+    tmp_path: Path,
+) -> None:
+    command = r"""
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
+)
+if($errors.Count -ne 0){throw($errors|Out-String)}
+foreach($name in @(
+    'Get-Sha256Hex','ConvertTo-PublicUtcTimestamp','Assert-ExactPublicProperties',
+    'Test-PublicJsonArray','Get-LauncherEvidenceFileStamp',
+    'Get-LauncherFailureEvidenceBaseline',
+    'Test-LauncherArtifactPublishedDuringRun','Get-LauncherPublicFailureContext'
+)){
+    $function=$ast.Find({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $name
+    },$true)
+    if($null -eq $function){throw "$name is missing"}
+    Invoke-Expression $function.Extent.Text
+}
+function Write-Json {param([string]$Path,[object]$Document)
+    $Document|ConvertTo-Json -Depth 30|Set-Content -LiteralPath $Path -Encoding UTF8
+}
+function New-Summary {param([object]$Case)
+    $caseList=[object[]]@()
+    if($null -ne $Case){$caseList=[object[]](,$Case)}
+    [ordered]@{
+        status='failed';fixture_version=1;rounds=10;required_cases=@()
+        cases=$caseList
+        missing_cases=@();duplicate_case_ids=@();cleanup_failures=@()
+        validation_failures=@('current validation failed');boundary_failures=@()
+        steady_counts=[ordered]@{'gpt-sovits'=0;indextts=0;cosyvoice=0}
+    }
+}
+$root=Join-Path $env:TTS_MORE_FIX9_ROOT 'context binding'
+$cases=Join-Path $root 'cases'
+New-Item -ItemType Directory -Path $cases -Force|Out-Null
+$staleCase=[ordered]@{
+    case_id='stale-case';started_at='2025-01-01T00:00:00Z'
+    finished_at='2025-01-01T00:00:01Z';actual='failed'
+}
+Write-Json (Join-Path $root 'failure.json') ([ordered]@{code='stale-failure';stage='case'})
+Write-Json (Join-Path $root 'reliability-summary.json') (New-Summary $staleCase)
+Write-Json (Join-Path $cases 'stale-case.json') $staleCase
+foreach($path in @(
+    (Join-Path $root 'failure.json'),(Join-Path $root 'reliability-summary.json'),
+    (Join-Path $cases 'stale-case.json')
+)){
+    (Get-Item -LiteralPath $path).LastWriteTimeUtc=[DateTime]'2025-01-01T00:00:02Z'
+}
+$baseline=Get-LauncherFailureEvidenceBaseline -OutputRoot $root
+$runStarted=[DateTime]::UtcNow.AddSeconds(-1)
+$observed=[DateTime]::UtcNow.AddSeconds(1)
+$stale=Get-LauncherPublicFailureContext -OutputRoot $root `
+    -Baseline $baseline -RunStartedAt $runStarted -FailureObservedAt $observed
+if($stale.code -ne 'launcher-validation-failed' -or $stale.stage -ne 'validator'){
+    throw 'a new invocation reused a stale failure marker'
+}
+if($null -ne $stale.case_id -or $null -ne $stale.case_started_at -or
+   $null -ne $stale.case_finished_at){
+    throw 'a new invocation reused stale case context'
+}
+$currentStarted=[DateTime]::UtcNow.AddMilliseconds(-100)
+$currentFinished=[DateTime]::UtcNow
+$currentCase=[ordered]@{
+    case_id='current-case'
+    started_at=$currentStarted.ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ')
+    finished_at=$currentFinished.ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ')
+    actual='failed'
+}
+Write-Json (Join-Path $root 'failure.json') ([ordered]@{code='current-failure';stage='case'})
+Write-Json (Join-Path $root 'reliability-summary.json') (New-Summary $currentCase)
+Write-Json (Join-Path $cases 'current-case.json') $currentCase
+$observed=[DateTime]::UtcNow.AddSeconds(1)
+$current=Get-LauncherPublicFailureContext -OutputRoot $root `
+    -Baseline $baseline -RunStartedAt $runStarted -FailureObservedAt $observed
+if($current.code -ne 'current-failure' -or $current.stage -ne 'case'){
+    throw 'the current invocation failure marker was not accepted'
+}
+if($current.case_id -ne 'current-case' -or
+   $current.case_started_at -ne $currentStarted.ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ') -or
+   $current.case_finished_at -ne $currentFinished.ToString('yyyy-MM-ddTHH:mm:ss.ffffffZ')){
+    throw 'the current summary/case binding was not accepted'
+}
+$mismatch=[ordered]@{
+    case_id='current-case'
+    started_at=$currentCase.started_at;finished_at=$currentCase.finished_at
+    actual='completed'
+}
+Write-Json (Join-Path $cases 'current-case.json') $mismatch
+$observed=[DateTime]::UtcNow.AddSeconds(1)
+$unbound=Get-LauncherPublicFailureContext -OutputRoot $root `
+    -Baseline $baseline -RunStartedAt $runStarted -FailureObservedAt $observed
+if($unbound.code -ne 'current-failure' -or $unbound.stage -ne 'case'){
+    throw 'a case mismatch discarded the independently bound failure marker'
+}
+if($null -ne $unbound.case_id){
+    throw 'a case artifact not exactly represented by the current summary was accepted'
+}
+Write-Output 'FIX9_CURRENT_FAILURE_CONTEXT_BINDING_OK'
+"""
+    completed = _run_fix9_powershell_behavior(command, tmp_path)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert "FIX9_CURRENT_FAILURE_CONTEXT_BINDING_OK" in completed.stdout
 
 
 def test_fix9_top_level_cleanup_routes_formal_failure_through_transaction() -> None:
