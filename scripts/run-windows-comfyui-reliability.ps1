@@ -85,7 +85,7 @@ function Test-RecordedIdentity {
             [int] $current.ParentProcessId -ne [int] $Record.parent_pid
         ) { return $false }
         $parent = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ([int] $Record.parent_pid)) -ErrorAction Stop
-        if ($null -eq $parent) { return $true }
+        if ($null -eq $parent) { return $false }
         $parentCreation = $parent.PSObject.Properties['CreationDate']
         if ($null -eq $parentCreation -or $null -eq $parentCreation.Value) { return $false }
         return $parent.CreationDate.ToUniversalTime().Ticks -eq (Get-UtcTicks -Value $Record.parent_creation_time)
@@ -889,86 +889,319 @@ function Wait-ExactPortOwner {
 }
 
 function Stop-RecordedTree {
-    param([object] $Record)
-    if (Test-ProcessAbsent -ProcessId ([int] $Record.pid)) { return $true }
-    if (-not (Test-RecordedIdentity -Record $Record)) {
-        if (Test-ProcessAbsent -ProcessId ([int] $Record.pid)) { return $true }
-        Write-Warning 'Recorded process identity no longer matches; preserving the current PID'
-        return $false
+    param(
+        [object] $Record,
+        [object[]] $AdditionalRecords = @(),
+        [string] $RecordRole = 'recorded-process',
+        [string[]] $AdditionalRoles = @(),
+        [int] $TimeoutMilliseconds = 30000,
+        [int] $PollIntervalMilliseconds = 100
+    )
+    if ($TimeoutMilliseconds -lt 0 -or $PollIntervalMilliseconds -lt 0) {
+        throw 'Process cleanup observation bounds are invalid'
     }
+
+    $seedRecords = @($Record) + @($AdditionalRecords | Where-Object { $null -ne $_ })
+    $seedRoles = @($RecordRole) + @($AdditionalRoles)
+    $forest = @{}
+    $depths = @{}
+    $roles = @{}
+    $frontier = @()
+
+    for ($seedIndex = 0; $seedIndex -lt $seedRecords.Count; $seedIndex += 1) {
+        $seed = $seedRecords[$seedIndex]
+        if ($null -eq $seed) { continue }
+        $seedPid = [int] $seed.pid
+        $seedRole = 'recorded-process'
+        if ($seedIndex -lt $seedRoles.Count -and $seedRoles[$seedIndex]) {
+            $seedRole = [string] $seedRoles[$seedIndex]
+        }
+        if ($forest.ContainsKey($seedPid)) {
+            if (-not (Test-RecordDocumentMatches -Expected $forest[$seedPid] -Actual $seed)) {
+                throw 'Recorded cleanup seeds reuse one PID with different identities'
+            }
+            if ([string] $roles[$seedPid] -ne $seedRole) {
+                $roles[$seedPid] = ('{0}+{1}' -f [string] $roles[$seedPid], $seedRole)
+            }
+            continue
+        }
+        if (Test-ProcessAbsent -ProcessId $seedPid) { continue }
+        if (-not (Test-RecordedIdentity -Record $seed)) {
+            if (Test-ProcessAbsent -ProcessId $seedPid) { continue }
+            Write-Warning (
+                'Process cleanup decision role={0}; pid={1}; expected_creation={2}; current_creation=unavailable; decision=pre-stop-unproved' -f
+                    $seedRole, $seedPid, [string] $seed.creation_time
+            )
+            return $false
+        }
+        $forest[$seedPid] = $seed
+        $depths[$seedPid] = 0
+        $roles[$seedPid] = $seedRole
+        $frontier += $seed
+    }
+    if ($forest.Count -eq 0) { return $true }
+
     $all = @(Get-CimInstance Win32_Process)
-    $descendants = @{}
-    $frontier = @($Record)
     while ($frontier.Count -gt 0) {
         $next = @()
         foreach ($parentRecord in $frontier) {
+            $parentPid = [int] $parentRecord.pid
             foreach ($child in @($all | Where-Object {
-                [int] $_.ParentProcessId -eq [int] $parentRecord.pid
+                [int] $_.ParentProcessId -eq $parentPid
             })) {
-                if (-not $descendants.ContainsKey([int] $child.ProcessId)) {
-                    $childRecord = Get-ProcessRecord -ProcessId ([int] $child.ProcessId)
-                    $parentCreationTicks = Get-UtcTicks -Value $parentRecord.creation_time
-                    if (
-                        [int] $childRecord.parent_pid -ne [int] $parentRecord.pid -or
-                        (Get-UtcTicks -Value $childRecord.parent_creation_time) -ne $parentCreationTicks -or
-                        (Get-UtcTicks -Value $childRecord.creation_time) -lt $parentCreationTicks
-                    ) {
-                        throw 'Snapshot descendant no longer belongs to the exact frontier process'
-                    }
-                    $descendants[[int] $child.ProcessId] = $childRecord
-                    $next += $childRecord
+                $childPid = [int] $child.ProcessId
+                if ($childPid -eq $parentPid) {
+                    throw 'Recorded process forest contains a self-parent edge'
                 }
+                $childRecord = Get-ProcessRecord -ProcessId $childPid
+                $parentCreationTicks = Get-UtcTicks -Value $parentRecord.creation_time
+                if (
+                    [int] $childRecord.parent_pid -ne $parentPid -or
+                    (Get-UtcTicks -Value $childRecord.parent_creation_time) -ne $parentCreationTicks -or
+                    (Get-UtcTicks -Value $childRecord.creation_time) -lt $parentCreationTicks
+                ) {
+                    throw 'Snapshot descendant no longer belongs to the exact frontier process'
+                }
+                $childDepth = [int] $depths[$parentPid] + 1
+                if ($forest.ContainsKey($childPid)) {
+                    if (-not (Test-RecordDocumentMatches -Expected $forest[$childPid] -Actual $childRecord)) {
+                        throw 'Recorded process forest PID identity changed during collection'
+                    }
+                    if ($childDepth -gt [int] $depths[$childPid]) {
+                        $depths[$childPid] = $childDepth
+                    }
+                    continue
+                }
+                $forest[$childPid] = $childRecord
+                $depths[$childPid] = $childDepth
+                $roles[$childPid] = 'descendant'
+                $next += $childRecord
             }
         }
         $frontier = $next
     }
-    foreach ($childPid in @($descendants.Keys | Sort-Object -Descending)) {
-        $childRecord = $descendants[$childPid]
-        if (Test-RecordedIdentity -Record $childRecord) {
-            Stop-Process -Id ([int] $childPid) -Force -ErrorAction SilentlyContinue
+
+    foreach ($candidatePid in @($forest.Keys)) {
+        $seen = @{}
+        $cursorPid = [int] $candidatePid
+        while ($forest.ContainsKey($cursorPid)) {
+            if ($seen.ContainsKey($cursorPid)) {
+                throw 'Recorded process forest contains a cyclic parent edge'
+            }
+            $seen[$cursorPid] = $true
+            $cursorPid = [int] $forest[$cursorPid].parent_pid
         }
     }
-    if (Test-RecordedIdentity -Record $Record) {
-        Stop-Process -Id ([int] $Record.pid) -Force -ErrorAction SilentlyContinue
+
+    # Complete the exact-identity and edge gate for the entire forest before
+    # the first Stop-Process call. Post-stop processing is observation-only.
+    foreach ($candidate in @($forest.Values)) {
+        if (-not (Test-RecordedIdentity -Record $candidate)) {
+            Write-Warning (
+                'Process cleanup decision role={0}; pid={1}; expected_creation={2}; current_creation=unavailable; decision=pre-stop-unproved' -f
+                    [string] $roles[[int] $candidate.pid], [int] $candidate.pid,
+                    [string] $candidate.creation_time
+            )
+            return $false
+        }
     }
-    $records = @($descendants.Values) + @($Record)
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    do {
-        $allAbsent = $true
-        foreach ($candidate in $records) {
-            if (Test-ProcessAbsent -ProcessId ([int] $candidate.pid)) { continue }
-            $allAbsent = $false
-            if (-not (Test-RecordedIdentity -Record $candidate)) {
-                Write-Warning 'A stopped PID was reused or changed; preserving the temp root'
-                return $false
+
+    $stopOrder = @(
+        foreach ($candidatePid in $forest.Keys) {
+            [pscustomobject]@{
+                pid = [int] $candidatePid
+                depth = [int] $depths[[int] $candidatePid]
             }
         }
-        if ($allAbsent) { return $true }
-        Start-Sleep -Milliseconds 100
-    } while ([DateTime]::UtcNow -lt $deadline)
-    Write-Warning 'Recorded process tree did not stop; preserving the temp root'
+    ) | Sort-Object -Property @(
+        @{ Expression = 'depth'; Descending = $true },
+        @{ Expression = 'pid'; Descending = $true }
+    )
+    foreach ($item in $stopOrder) {
+        Stop-Process -Id ([int] $item.pid) -Force -ErrorAction SilentlyContinue
+    }
+
+    $remaining = @{}
+    $lastObservations = @{}
+    foreach ($candidatePid in $forest.Keys) {
+        $remaining[[int] $candidatePid] = $forest[[int] $candidatePid]
+    }
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    do {
+        foreach ($candidatePid in @($remaining.Keys)) {
+            $candidate = $remaining[[int] $candidatePid]
+            $role = [string] $roles[[int] $candidatePid]
+            $current = $null
+            try {
+                $current = Get-CimInstance Win32_Process `
+                    -Filter ("ProcessId = {0}" -f ([int] $candidatePid)) `
+                    -ErrorAction Stop
+            } catch {
+                $lastObservations[[int] $candidatePid] = [pscustomobject]@{
+                    current_creation = 'unavailable'
+                    state = 'query-error'
+                }
+                continue
+            }
+            if ($null -eq $current) {
+                $remaining.Remove([int] $candidatePid)
+                continue
+            }
+
+            $creationProperty = $current.PSObject.Properties['CreationDate']
+            $currentCreation = 'unavailable'
+            $currentTicks = $null
+            if ($null -ne $creationProperty -and $null -ne $creationProperty.Value) {
+                try {
+                    $currentTicks = $current.CreationDate.ToUniversalTime().Ticks
+                    $currentCreation = $current.CreationDate.ToUniversalTime().ToString('o')
+                } catch { $currentTicks = $null }
+            }
+            if ($null -eq $currentTicks) {
+                $lastObservations[[int] $candidatePid] = [pscustomobject]@{
+                    current_creation = $currentCreation
+                    state = 'identity-incomplete'
+                }
+                continue
+            }
+            $expectedTicks = Get-UtcTicks -Value $candidate.creation_time
+            if ($currentTicks -ne $expectedTicks) {
+                Write-Warning (
+                    'Process cleanup decision role={0}; pid={1}; expected_creation={2}; current_creation={3}; decision=replacement-not-owned' -f
+                        $role, [int] $candidatePid, [string] $candidate.creation_time,
+                        $currentCreation
+                )
+                $remaining.Remove([int] $candidatePid)
+                continue
+            }
+
+            $identityIncomplete = $false
+            foreach ($field in @('ProcessId', 'ExecutablePath', 'CommandLine', 'ParentProcessId')) {
+                $property = $current.PSObject.Properties[$field]
+                if ($null -eq $property -or $null -eq $property.Value) {
+                    $identityIncomplete = $true
+                    break
+                }
+            }
+            if ($identityIncomplete) {
+                $lastObservations[[int] $candidatePid] = [pscustomobject]@{
+                    current_creation = $currentCreation
+                    state = 'identity-incomplete'
+                }
+                continue
+            }
+            if (
+                [int] $current.ProcessId -ne [int] $candidate.pid -or
+                [IO.Path]::GetFullPath([string] $current.ExecutablePath) -ne [string] $candidate.executable_path -or
+                [string] $current.CommandLine -ne [string] $candidate.command_line -or
+                [int] $current.ParentProcessId -ne [int] $candidate.parent_pid
+            ) {
+                Write-Warning (
+                    'Process cleanup decision role={0}; pid={1}; expected_creation={2}; current_creation={3}; decision=changed' -f
+                        $role, [int] $candidatePid, [string] $candidate.creation_time,
+                        $currentCreation
+                )
+                return $false
+            }
+
+            try {
+                $parent = Get-CimInstance Win32_Process `
+                    -Filter ("ProcessId = {0}" -f ([int] $candidate.parent_pid)) `
+                    -ErrorAction Stop
+            } catch {
+                $lastObservations[[int] $candidatePid] = [pscustomobject]@{
+                    current_creation = $currentCreation
+                    state = 'query-error'
+                }
+                continue
+            }
+            if ($null -eq $parent) {
+                $lastObservations[[int] $candidatePid] = [pscustomobject]@{
+                    current_creation = $currentCreation
+                    state = 'parent-exited'
+                }
+                continue
+            }
+            $parentCreation = $parent.PSObject.Properties['CreationDate']
+            $parentTicks = $null
+            if ($null -ne $parentCreation -and $null -ne $parentCreation.Value) {
+                try { $parentTicks = $parent.CreationDate.ToUniversalTime().Ticks } catch { $parentTicks = $null }
+            }
+            if ($null -eq $parentTicks) {
+                $lastObservations[[int] $candidatePid] = [pscustomobject]@{
+                    current_creation = $currentCreation
+                    state = 'identity-incomplete'
+                }
+                continue
+            }
+            if ($parentTicks -ne (Get-UtcTicks -Value $candidate.parent_creation_time)) {
+                Write-Warning (
+                    'Process cleanup decision role={0}; pid={1}; expected_creation={2}; current_creation={3}; decision=changed' -f
+                        $role, [int] $candidatePid, [string] $candidate.creation_time,
+                        $currentCreation
+                )
+                return $false
+            }
+            $lastObservations[[int] $candidatePid] = [pscustomobject]@{
+                current_creation = $currentCreation
+                state = 'same-identity'
+            }
+        }
+        if ($remaining.Count -eq 0) { return $true }
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        Start-Sleep -Milliseconds $PollIntervalMilliseconds
+    } while ($true)
+
+    foreach ($candidatePid in @($remaining.Keys | Sort-Object)) {
+        $candidate = $remaining[[int] $candidatePid]
+        $observation = $lastObservations[[int] $candidatePid]
+        $currentCreation = 'unavailable'
+        $state = 'unobserved'
+        if ($null -ne $observation) {
+            $currentCreation = [string] $observation.current_creation
+            $state = [string] $observation.state
+        }
+        Write-Warning (
+            'Process cleanup decision role={0}; pid={1}; expected_creation={2}; current_creation={3}; decision=timeout; state={4}' -f
+                [string] $roles[[int] $candidatePid], [int] $candidatePid,
+                [string] $candidate.creation_time, $currentCreation, $state
+        )
+    }
     return $false
 }
 
 function Stop-RecordedProcessPair {
-    param([object] $LaunchRootRecord, [object] $ListenerRecord)
-    $cleanupProven = $true
-    $records = [System.Collections.Generic.List[object]]::new()
-    if ($null -ne $LaunchRootRecord) { $records.Add($LaunchRootRecord) }
-    if (
-        $null -ne $ListenerRecord -and
-        ($null -eq $LaunchRootRecord -or -not (Test-RecordDocumentMatches `
-            -Expected $LaunchRootRecord -Actual $ListenerRecord))
-    ) { $records.Add($ListenerRecord) }
-    foreach ($record in $records) {
-        try {
-            if (-not (Stop-RecordedTree -Record $record)) { $cleanupProven = $false }
-        } catch {
-            $cleanupProven = $false
-            Write-Warning 'Process cleanup verification failed; preserving private process, temp, and control evidence'
+    param(
+        [object] $LaunchRootRecord,
+        [object] $ListenerRecord,
+        [int] $TimeoutMilliseconds = 30000,
+        [int] $PollIntervalMilliseconds = 100
+    )
+    try {
+        if ($null -ne $LaunchRootRecord) {
+            $additional = @()
+            $additionalRoles = @()
+            if ($null -ne $ListenerRecord) {
+                $additional = @($ListenerRecord)
+                $additionalRoles = @('listener')
+            }
+            return Stop-RecordedTree -Record $LaunchRootRecord `
+                -AdditionalRecords $additional `
+                -RecordRole 'launch-root' -AdditionalRoles $additionalRoles `
+                -TimeoutMilliseconds $TimeoutMilliseconds `
+                -PollIntervalMilliseconds $PollIntervalMilliseconds
         }
+        if ($null -ne $ListenerRecord) {
+            return Stop-RecordedTree -Record $ListenerRecord `
+                -RecordRole 'listener' `
+                -TimeoutMilliseconds $TimeoutMilliseconds `
+                -PollIntervalMilliseconds $PollIntervalMilliseconds
+        }
+        return $true
+    } catch {
+        Write-Warning 'Process cleanup verification failed; preserving private process, temp, and control evidence'
+        return $false
     }
-    return $cleanupProven
 }
 
 function Test-PrivateIdentityRecordsCanBeRemoved {

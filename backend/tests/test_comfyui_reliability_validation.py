@@ -7508,14 +7508,28 @@ if (
 ) { throw 'listener promotion did not retain both identities' }
 
 $script:stopCalls = [System.Collections.Generic.List[int]]::new()
+$script:forestCalls = 0
 $script:stopMode = 'success'
 function Stop-RecordedTree {
-    param([object] $Record)
+    param(
+        [object] $Record,
+        [object[]] $AdditionalRecords,
+        [string] $RecordRole,
+        [string[]] $AdditionalRoles,
+        [int] $TimeoutMilliseconds,
+        [int] $PollIntervalMilliseconds
+    )
+    $script:forestCalls += 1
     $script:stopCalls.Add([int] $Record.pid)
-    if ($script:stopMode -eq 'query-error' -and [int] $Record.pid -eq 100) {
+    foreach ($additional in @($AdditionalRecords)) {
+        if (-not (Test-RecordDocumentMatches -Expected $Record -Actual $additional)) {
+            $script:stopCalls.Add([int] $additional.pid)
+        }
+    }
+    if ($script:stopMode -eq 'query-error') {
         throw 'injected cleanup identity query failure'
     }
-    if ($script:stopMode -eq 'listener-failure' -and [int] $Record.pid -eq 200) {
+    if ($script:stopMode -eq 'listener-failure') {
         return $false
     }
     return $true
@@ -7524,25 +7538,36 @@ if (-not (Stop-RecordedProcessPair -LaunchRootRecord $root -ListenerRecord $list
     throw 'proved root/listener cleanup did not converge'
 }
 if ((@($script:stopCalls) -join ',') -ne '100,200') {
-    throw 'cleanup did not cover launch root then actual listener exactly once'
+    throw 'cleanup did not submit launch root and listener to one exact forest'
+}
+if ($script:forestCalls -ne 1) {
+    throw 'cleanup adjudicated launch root and listener as separate forests'
 }
 foreach ($mode in @('listener-failure', 'query-error')) {
     $script:stopMode = $mode
     $script:stopCalls.Clear()
+    $script:forestCalls = 0
     if (Stop-RecordedProcessPair -LaunchRootRecord $root -ListenerRecord $listener) {
         throw "$mode cleanup was incorrectly proven"
     }
     if ((@($script:stopCalls) -join ',') -ne '100,200') {
         throw "$mode cleanup did not retain bounded coverage of both identities"
     }
+    if ($script:forestCalls -ne 1) {
+        throw "$mode cleanup split the recorded forest"
+    }
 }
 $script:stopMode = 'success'
 $script:stopCalls.Clear()
+$script:forestCalls = 0
 if (-not (Stop-RecordedProcessPair -LaunchRootRecord $root -ListenerRecord $root)) {
     throw 'identical root/listener cleanup did not converge'
 }
 if ((@($script:stopCalls) -join ',') -ne '100') {
     throw 'identical root/listener was stopped more than once'
+}
+if ($script:forestCalls -ne 1) {
+    throw 'identical root/listener did not use one forest cleanup'
 }
 Write-Output 'LISTENER_PROMOTION_AND_CLEANUP_FAIL_CLOSED_OK'
 """
@@ -7858,6 +7883,326 @@ Write-Output 'RECORDED_TREE_SNAPSHOT_REUSE_OK'
 
     assert completed.returncode == 0, completed.stderr
     assert "RECORDED_TREE_SNAPSHOT_REUSE_OK" in completed.stdout
+
+
+def test_fix6_recorded_forest_observes_post_stop_identity_transitions_safely() -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "run-windows-comfyui-reliability.ps1"
+    )
+    command = r"""
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+foreach ($name in @(
+    'Get-UtcTicks',
+    'Get-ProcessRecord',
+    'Test-RecordDocumentMatches',
+    'Test-RecordedIdentity',
+    'Test-ProcessAbsent',
+    'Stop-RecordedTree',
+    'Stop-RecordedProcessPair'
+)) {
+    $function = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq $name
+    }, $true)
+    if ($null -eq $function) { throw "$name is missing" }
+    Invoke-Expression $function.Extent.Text
+}
+
+function New-Row {
+    param(
+        [int] $ProcessId,
+        [int] $ParentProcessId,
+        [string] $Created,
+        [string] $ExecutableSuffix = ''
+    )
+    return [pscustomobject]@{
+        ProcessId = $ProcessId
+        ParentProcessId = $ParentProcessId
+        CreationDate = [DateTime]::Parse($Created).ToUniversalTime()
+        ExecutablePath = ('C:\controlled\python-{0}{1}.exe' -f $ProcessId, $ExecutableSuffix)
+        CommandLine = ('python-{0}{1}.exe controlled.py' -f $ProcessId, $ExecutableSuffix)
+        Name = ('python-{0}.exe' -f $ProcessId)
+    }
+}
+function New-Record {
+    param([object] $Row, [object] $Parent)
+    return [pscustomobject]@{
+        pid = [int] $Row.ProcessId
+        creation_time = $Row.CreationDate.ToUniversalTime().ToString('o')
+        executable_path = [string] $Row.ExecutablePath
+        command_line = [string] $Row.CommandLine
+        parent_pid = [int] $Row.ParentProcessId
+        parent_creation_time = $Parent.CreationDate.ToUniversalTime().ToString('o')
+    }
+}
+
+$script:parent = New-Row 50 4 '2026-08-01T00:00:00Z'
+$script:root = New-Row 100 50 '2026-08-01T00:00:10Z'
+$script:listener = New-Row 200 100 '2026-08-01T00:00:11Z'
+$script:rootRecord = New-Record $script:root $script:parent
+$script:listenerRecord = New-Record $script:listener $script:root
+$script:snapshot = @($script:parent, $script:root, $script:listener)
+$script:mode = ''
+$script:postStop = $false
+$script:observations = @{}
+$script:stopped = [System.Collections.Generic.List[int]]::new()
+$script:warnings = [System.Collections.Generic.List[string]]::new()
+
+function Get-ObservationCount {
+    param([int] $ProcessId)
+    if (-not $script:observations.ContainsKey($ProcessId)) {
+        $script:observations[$ProcessId] = 0
+    }
+    $script:observations[$ProcessId] = [int] $script:observations[$ProcessId] + 1
+    return [int] $script:observations[$ProcessId]
+}
+function Get-CimInstance {
+    param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
+    if (-not $Filter) { return @($script:snapshot) }
+    $candidatePid = [int] ([regex]::Match($Filter, '\d+').Value)
+    if (-not $script:postStop) {
+        if ($candidatePid -eq 50) { return $script:parent }
+        if ($candidatePid -eq 100) {
+            if ($script:mode -eq 'pre-stop-missing-creation') {
+                return [pscustomobject]@{
+                    ProcessId = 100
+                    ParentProcessId = 50
+                    CreationDate = $null
+                    ExecutablePath = $script:root.ExecutablePath
+                    CommandLine = $script:root.CommandLine
+                }
+            }
+            return $script:root
+        }
+        if ($candidatePid -eq 200) { return $script:listener }
+        return $null
+    }
+    if ($candidatePid -eq 50) { return $script:parent }
+    if ($candidatePid -eq 100) { return $null }
+    if ($candidatePid -ne 200) { return $null }
+    $observation = Get-ObservationCount -ProcessId 200
+    switch ($script:mode) {
+        'incomplete-then-absent' {
+            if ($observation -eq 1) {
+                return [pscustomobject]@{
+                    ProcessId = 200
+                    ParentProcessId = 100
+                    CreationDate = $script:listener.CreationDate
+                    ExecutablePath = $null
+                    CommandLine = $null
+                }
+            }
+            return $null
+        }
+        'missing-creation-then-absent' {
+            if ($observation -eq 1) {
+                return [pscustomobject]@{
+                    ProcessId = 200
+                    ParentProcessId = 100
+                    CreationDate = $null
+                    ExecutablePath = $script:listener.ExecutablePath
+                    CommandLine = $script:listener.CommandLine
+                }
+            }
+            return $null
+        }
+        'parent-exited-then-absent' {
+            if ($observation -eq 1) { return $script:listener }
+            return $null
+        }
+        'query-error-then-absent' {
+            if ($observation -eq 1) { throw 'private injected CIM detail' }
+            return $null
+        }
+        'exact-twice-then-absent' {
+            if ($observation -le 2) { return $script:listener }
+            return $null
+        }
+        'pid-reused' {
+            return New-Row 200 50 '2026-08-01T00:00:30Z' '-replacement'
+        }
+        'same-creation-changed' {
+            return New-Row 200 100 '2026-08-01T00:00:11Z' '-changed'
+        }
+        'same-creation-edge-changed' {
+            return New-Row 200 50 '2026-08-01T00:00:11Z'
+        }
+        'persistent-incomplete' {
+            return [pscustomobject]@{
+                ProcessId = 200
+                ParentProcessId = 100
+                CreationDate = $script:listener.CreationDate
+                ExecutablePath = $null
+                CommandLine = $null
+            }
+        }
+        'persistent-query-error' { throw 'private persistent CIM detail' }
+        'persistent-exact' { return $script:listener }
+        default { throw 'unknown test mode' }
+    }
+}
+function Stop-Process {
+    param([int] $Id, [switch] $Force, [object] $ErrorAction)
+    $script:stopped.Add($Id)
+    if ($Id -eq 100) { $script:postStop = $true }
+}
+function Start-Sleep { param([int] $Milliseconds) }
+function Write-Warning {
+    param([string] $Message)
+    $script:warnings.Add($Message)
+}
+function Reset-Case {
+    param([string] $Mode)
+    $script:mode = $Mode
+    $script:postStop = $false
+    $script:observations = @{}
+    $script:stopped.Clear()
+    $script:warnings.Clear()
+}
+function Invoke-CleanupCase {
+    return Stop-RecordedProcessPair `
+        -LaunchRootRecord $script:rootRecord `
+        -ListenerRecord $script:listenerRecord `
+        -TimeoutMilliseconds 25 `
+        -PollIntervalMilliseconds 1
+}
+
+$failures = [System.Collections.Generic.List[string]]::new()
+foreach ($mode in @(
+    'incomplete-then-absent',
+    'missing-creation-then-absent',
+    'parent-exited-then-absent',
+    'query-error-then-absent',
+    'exact-twice-then-absent'
+)) {
+    Reset-Case $mode
+    if (-not (Invoke-CleanupCase)) {
+        $failures.Add("$mode did not converge after the original identity disappeared")
+    }
+    if ((@($script:stopped) -join ',') -ne '200,100') {
+        $failures.Add("$mode did not stop each exact forest identity once")
+    }
+    if ([int] $script:observations[200] -lt 2) {
+        $failures.Add("$mode was not observed across the termination transition")
+    }
+}
+
+Reset-Case 'pre-stop-missing-creation'
+if (Invoke-CleanupCase) {
+    $failures.Add('missing creation time before stop was cleanup-proven')
+}
+if ($script:stopped.Count -ne 0) {
+    $failures.Add('missing creation time before stop terminated a numeric PID')
+}
+
+$originalRoot = $script:root
+$originalListener = $script:listener
+$originalRootRecord = $script:rootRecord
+$originalListenerRecord = $script:listenerRecord
+$originalSnapshot = $script:snapshot
+$script:root = New-Row 100 200 '2026-08-01T00:00:10Z'
+$script:listener = New-Row 200 100 '2026-08-01T00:00:10Z'
+$script:rootRecord = New-Record $script:root $script:listener
+$script:listenerRecord = New-Record $script:listener $script:root
+$script:snapshot = @($script:root, $script:listener)
+Reset-Case 'pre-stop-cycle'
+if (Invoke-CleanupCase) {
+    $failures.Add('cyclic exact-parent forest was cleanup-proven')
+}
+if ($script:stopped.Count -ne 0) {
+    $failures.Add('cyclic exact-parent forest stopped a process before rejecting the cycle')
+}
+$script:root = $originalRoot
+$script:listener = $originalListener
+$script:rootRecord = $originalRootRecord
+$script:listenerRecord = $originalListenerRecord
+$script:snapshot = $originalSnapshot
+
+Reset-Case 'pid-reused'
+if (-not (Invoke-CleanupCase)) {
+    $failures.Add('post-stop PID reuse did not prove the recorded identity exited')
+}
+if ((@($script:stopped) -join ',') -ne '200,100') {
+    $failures.Add('the replacement PID was stopped or an exact identity was stopped twice')
+}
+$reuseDiagnostic = @($script:warnings) -join "`n"
+if (
+    $reuseDiagnostic -notmatch 'role=listener' -or
+    $reuseDiagnostic -notmatch 'pid=200' -or
+    $reuseDiagnostic -notmatch 'expected_creation=' -or
+    $reuseDiagnostic -notmatch 'current_creation=' -or
+    $reuseDiagnostic -notmatch 'decision=replacement-not-owned'
+) { $failures.Add('PID reuse did not produce a distinct sanitized ownership decision') }
+if (
+    $reuseDiagnostic -match 'controlled' -or
+    $reuseDiagnostic -match 'private injected' -or
+    $reuseDiagnostic -match 'CommandLine'
+) { $failures.Add('PID reuse diagnostic exposed private identity fields') }
+
+foreach ($mode in @(
+    'same-creation-changed',
+    'same-creation-edge-changed',
+    'persistent-incomplete',
+    'persistent-query-error',
+    'persistent-exact'
+)) {
+    Reset-Case $mode
+    if (Invoke-CleanupCase) {
+        $failures.Add("$mode was incorrectly cleanup-proven")
+    }
+    if ((@($script:stopped) -join ',') -ne '200,100') {
+        $failures.Add("$mode sent a post-stop termination or duplicated a stop")
+    }
+    $diagnostic = @($script:warnings) -join "`n"
+    if (
+        $diagnostic -notmatch 'role=listener' -or
+        $diagnostic -notmatch 'pid=200' -or
+        $diagnostic -notmatch 'expected_creation=' -or
+        $diagnostic -notmatch 'current_creation='
+    ) { $failures.Add("$mode did not retain a role-specific bounded diagnostic") }
+    if ($mode -like 'same-creation-*' -and $diagnostic -notmatch 'decision=changed') {
+        $failures.Add("$mode was not distinguished from a transient timeout")
+    }
+    if ($mode -like 'persistent-*' -and $diagnostic -notmatch 'decision=timeout') {
+        $failures.Add("$mode did not retain a bounded timeout decision")
+    }
+    if ($diagnostic -match 'controlled' -or $diagnostic -match 'private injected') {
+        $failures.Add("$mode diagnostic exposed private identity fields")
+    }
+    if ($mode -like 'persistent-*' -and [int] $script:observations[200] -lt 2) {
+        $failures.Add("$mode was not retried to a bounded deadline")
+    }
+}
+
+if ($failures.Count -ne 0) { throw ($failures -join '; ') }
+Write-Output 'RECORDED_FOREST_POST_STOP_TRANSITIONS_OK'
+"""
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "TTS_MORE_RELIABILITY_SCRIPT": str(script_path)},
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "RECORDED_FOREST_POST_STOP_TRANSITIONS_OK" in completed.stdout
 
 
 def test_task_12_validator_uses_backend_import_context_and_restores_launcher_cwd() -> None:
