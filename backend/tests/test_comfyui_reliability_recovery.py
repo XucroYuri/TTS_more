@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +26,20 @@ def _canonical(payload: object) -> bytes:
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode("utf-8")
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            pytest.skip(f"Windows junction creation is unavailable: {completed.stderr}")
+    else:
+        link.symlink_to(target, target_is_directory=True)
 
 
 def _process_record(pid: int, parent_pid: int) -> dict[str, object]:
@@ -584,6 +600,248 @@ def test_recovery_cli_token_is_one_shot_and_execute_requires_fresh_observations(
     assert first.returncode != 0
     assert replay.returncode != 0
     assert (private_leaf / ".h").exists()
+
+
+def test_capability_store_rejects_inherited_or_world_accessible_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / recovery.CAPABILITY_DIRECTORY
+    store.mkdir()
+    if os.name != "nt":
+        store.chmod(0o777)
+    monkeypatch.setattr(recovery.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    with pytest.raises(ValueError, match="capability store"):
+        recovery._capability_directory()
+
+
+def test_capability_store_rejects_owner_identity_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(recovery.tempfile, "gettempdir", lambda: str(tmp_path))
+    store = recovery._capability_directory()
+    if os.name == "nt":
+        expected = recovery._windows_private_sddl(directory=True)
+        foreign_owner = "O:S-1-5-18" + expected[expected.index("D:") :]
+        monkeypatch.setattr(
+            recovery, "_windows_security_descriptor_sddl", lambda _path: foreign_owner
+        )
+    else:
+        monkeypatch.setattr(recovery.os, "geteuid", lambda: store.stat().st_uid + 1)
+
+    with pytest.raises(ValueError, match="capability store"):
+        recovery._validate_capability_directory_security(store)
+
+
+def test_capability_store_rejects_acl_drift_after_secure_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(recovery.tempfile, "gettempdir", lambda: str(tmp_path))
+    store = recovery._capability_directory()
+    if os.name == "nt":
+        changed = subprocess.run(
+            ["icacls.exe", str(store), "/grant", "*S-1-1-0:(RX)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert changed.returncode == 0, changed.stderr + changed.stdout
+    else:
+        store.chmod(0o750)
+
+    with pytest.raises(ValueError, match="capability store"):
+        recovery._capability_directory()
+
+
+def test_capability_store_rejects_reparse_without_touching_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    sentinel.write_bytes(b"outside-must-survive")
+    base = tmp_path / "base"
+    base.mkdir()
+    link = base / recovery.CAPABILITY_DIRECTORY
+    _make_directory_link(link, outside)
+    monkeypatch.setattr(recovery.tempfile, "gettempdir", lambda: str(base))
+    try:
+        with pytest.raises(ValueError, match="capability store"):
+            recovery._capability_directory()
+        assert sentinel.read_bytes() == b"outside-must-survive"
+    finally:
+        if link.exists():
+            link.rmdir()
+
+
+def test_capability_file_never_contains_output_or_private_paths(tmp_path: Path) -> None:
+    output_root, run_key, _private_leaf, processes, ports = _failed_recovery_fixture(tmp_path)
+    plan = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+    assert isinstance(plan, recovery.RecoveryPlan)
+    token = recovery.encode_plan_token(plan)
+    target = recovery._capability_directory() / (
+        hashlib.sha256(token.encode("ascii")).hexdigest() + ".cap"
+    )
+    try:
+        payload = target.read_bytes()
+        for sensitive_path in (str(output_root), str(plan.private_root)):
+            assert sensitive_path.encode("utf-8") not in payload
+            escaped = json.dumps(sensitive_path, ensure_ascii=False)[1:-1].encode("utf-8")
+            assert escaped not in payload
+        assert b'"plan"' not in payload
+        assert not payload.startswith(b"{")
+    finally:
+        for suffix in (".cap", ".claim"):
+            path = target.with_suffix(suffix)
+            if path.exists():
+                path.unlink()
+
+
+def test_attacker_cannot_forge_plaintext_capability_for_chosen_token(tmp_path: Path) -> None:
+    output_root, run_key, _private_leaf, processes, ports = _failed_recovery_fixture(tmp_path)
+    plan = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+    assert isinstance(plan, recovery.RecoveryPlan)
+    token = secrets.token_hex(32)
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    now = int(recovery.time.time())
+    forged = {
+        "schema_version": 1,
+        "kind": "reliability-recovery-capability",
+        "token_sha256": token_hash,
+        "issued_at": now,
+        "expires_at": now + recovery.CAPABILITY_LIFETIME_SECONDS,
+        "plan": plan.model_dump(mode="json"),
+    }
+    target = recovery._capability_directory() / f"{token_hash}.cap"
+    forged_payload = _canonical(forged)
+    descriptor = recovery._create_private_capability_file(
+        target,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        assert os.write(descriptor, forged_payload) == len(forged_payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    recovery._validate_capability_file(target)
+    try:
+        with pytest.raises(ValueError, match="plan token"):
+            recovery.decode_plan_token(token)
+        assert (output_root / ".private-recovery" / run_key / ".h").exists()
+    finally:
+        for path in (target, target.with_suffix(".claim")):
+            if path.exists():
+                path.unlink()
+
+
+def test_copying_capability_ciphertext_to_another_token_cannot_authorize_it(
+    tmp_path: Path,
+) -> None:
+    output_root, run_key, _private_leaf, processes, ports = _failed_recovery_fixture(tmp_path)
+    plan = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+    assert isinstance(plan, recovery.RecoveryPlan)
+    first_token = recovery.encode_plan_token(plan)
+    second_token = recovery.encode_plan_token(plan)
+    directory = recovery._capability_directory()
+    first = directory / f"{hashlib.sha256(first_token.encode('ascii')).hexdigest()}.cap"
+    second = directory / f"{hashlib.sha256(second_token.encode('ascii')).hexdigest()}.cap"
+    try:
+        first_payload = first.read_bytes()
+        assert str(output_root).encode("utf-8") not in first_payload
+        escaped_root = json.dumps(str(output_root), ensure_ascii=False)[1:-1].encode("utf-8")
+        assert escaped_root not in first_payload
+        assert b'"plan"' not in first_payload
+        shutil.copyfile(first, second)
+        with pytest.raises(ValueError, match="plan token"):
+            recovery.decode_plan_token(second_token)
+        assert recovery.decode_plan_token(first_token).run_key == run_key
+    finally:
+        for target in (first, second):
+            for path in (target, target.with_suffix(".claim")):
+                if path.exists():
+                    path.unlink()
+
+
+def test_capability_file_acl_drift_is_rejected_before_decryption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability_base = tmp_path / "cap-base"
+    capability_base.mkdir()
+    monkeypatch.setattr(
+        recovery.tempfile, "gettempdir", lambda: str(capability_base)
+    )
+    output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(
+        tmp_path / "fixture"
+    )
+    plan = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+    assert isinstance(plan, recovery.RecoveryPlan)
+    token = recovery.encode_plan_token(plan)
+    target = recovery._capability_directory() / (
+        hashlib.sha256(token.encode("ascii")).hexdigest() + ".cap"
+    )
+    if os.name == "nt":
+        changed = subprocess.run(
+            ["icacls.exe", str(target), "/grant", "*S-1-1-0:(R)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert changed.returncode == 0, changed.stderr + changed.stdout
+    else:
+        target.chmod(0o640)
+    try:
+        with pytest.raises(ValueError, match="plan token"):
+            recovery.decode_plan_token(token)
+        assert (private_leaf / ".h").exists()
+    finally:
+        if target.exists():
+            target.unlink()
+
+
+def test_expired_capability_is_rejected_without_deleting_private_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability_base = tmp_path / "cap-base"
+    capability_base.mkdir()
+    monkeypatch.setattr(
+        recovery.tempfile, "gettempdir", lambda: str(capability_base)
+    )
+    output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(
+        tmp_path / "fixture"
+    )
+    plan = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+    assert isinstance(plan, recovery.RecoveryPlan)
+    issued_at = int(recovery.time.time())
+    token = recovery.encode_plan_token(plan)
+    target = recovery._capability_directory() / (
+        hashlib.sha256(token.encode("ascii")).hexdigest() + ".cap"
+    )
+    monkeypatch.setattr(
+        recovery.time,
+        "time",
+        lambda: issued_at + recovery.CAPABILITY_LIFETIME_SECONDS + 1,
+    )
+    try:
+        with pytest.raises(ValueError, match="plan token"):
+            recovery.decode_plan_token(token)
+        assert (private_leaf / ".h").exists()
+    finally:
+        if target.exists():
+            target.unlink()
 
 
 def test_recovery_execute_rejects_namespace_or_leaf_identity_drift_without_delete(tmp_path: Path) -> None:

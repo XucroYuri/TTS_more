@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -21,6 +22,7 @@ MAX_OBSERVED_PROCESSES = 4096
 MAX_OBSERVED_PORTS = 64
 CAPABILITY_LIFETIME_SECONDS = 120
 CAPABILITY_DIRECTORY = "tts-more-reliability-recovery-capabilities"
+CAPABILITY_MAGIC = b"TTSRCAP2\0"
 DELETE_ORDER: tuple[Literal[".p", ".c", ".h", ".o"], ...] = (
     ".p",
     ".c",
@@ -653,10 +655,11 @@ def encode_plan_token(plan: RecoveryPlan) -> str:
         "expires_at": issued_at + CAPABILITY_LIFETIME_SECONDS,
         "plan": validated.model_dump(mode="json"),
     }
-    payload = (
+    plaintext = (
         json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode("utf-8")
+    payload = CAPABILITY_MAGIC + _protect_capability(plaintext, token)
     directory = _capability_directory()
     target = directory / f"{hashlib.sha256(token.encode('ascii')).hexdigest()}.cap"
     flags = (
@@ -666,7 +669,7 @@ def encode_plan_token(plan: RecoveryPlan) -> str:
         | getattr(os, "O_BINARY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    descriptor = os.open(target, flags, 0o600)
+    descriptor = _create_private_capability_file(target, flags)
     try:
         view = memoryview(payload)
         written = 0
@@ -699,6 +702,7 @@ def decode_plan_token(token: str) -> RecoveryPlan:
     directory = _capability_directory()
     target = directory / f"{token_hash}.cap"
     claim = directory / f"{token_hash}.claim"
+    _validate_capability_file(target)
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(target, flags)
     try:
@@ -726,7 +730,10 @@ def decode_plan_token(token: str) -> RecoveryPlan:
             or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
         ):
             raise ValueError("recovery plan token is invalid")
-        document = _load_json_no_duplicates(payload)
+        if not payload.startswith(CAPABILITY_MAGIC):
+            raise ValueError("recovery plan token is invalid")
+        plaintext = _unprotect_capability(payload[len(CAPABILITY_MAGIC) :], token)
+        document = _load_json_no_duplicates(plaintext)
         if type(document) is not dict or set(document) != {
             "schema_version",
             "kind",
@@ -752,12 +759,11 @@ def decode_plan_token(token: str) -> RecoveryPlan:
             json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             + "\n"
         ).encode("utf-8")
-        if payload != canonical:
+        if plaintext != canonical:
             raise ValueError("recovery plan token is invalid")
-        claim_descriptor = os.open(
+        claim_descriptor = _create_private_capability_file(
             claim,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
         )
         os.close(claim_descriptor)
         try:
@@ -785,7 +791,10 @@ def decode_plan_token(token: str) -> RecoveryPlan:
 def _capability_directory() -> Path:
     directory = Path(tempfile.gettempdir()) / CAPABILITY_DIRECTORY
     try:
-        directory.mkdir(mode=0o700, exist_ok=True)
+        if os.name == "nt":
+            _create_windows_private_directory(directory)
+        else:
+            directory.mkdir(mode=0o700, exist_ok=True)
         result = directory.lstat()
     except OSError as exc:
         raise ValueError("recovery capability store is unavailable") from exc
@@ -795,4 +804,362 @@ def _capability_directory() -> Path:
         or not stat.S_ISDIR(result.st_mode)
     ):
         raise ValueError("recovery capability store is unsafe")
+    _validate_capability_directory_security(directory)
     return directory
+
+
+def _protect_capability(plaintext: bytes, token: str) -> bytes:
+    token_bytes = bytes.fromhex(token)
+    if os.name == "nt":
+        return _windows_dpapi(plaintext, token_bytes, protect=True)
+    nonce = secrets.token_bytes(32)
+    ciphertext = _xor_hmac_stream(plaintext, token_bytes, nonce)
+    tag = hmac.new(token_bytes, b"auth\0" + nonce + ciphertext, hashlib.sha256).digest()
+    return nonce + ciphertext + tag
+
+
+def _unprotect_capability(payload: bytes, token: str) -> bytes:
+    token_bytes = bytes.fromhex(token)
+    if os.name == "nt":
+        return _windows_dpapi(payload, token_bytes, protect=False)
+    if len(payload) < 64:
+        raise ValueError("recovery plan token is invalid")
+    nonce, ciphertext, tag = payload[:32], payload[32:-32], payload[-32:]
+    expected = hmac.new(
+        token_bytes, b"auth\0" + nonce + ciphertext, hashlib.sha256
+    ).digest()
+    if not hmac.compare_digest(tag, expected):
+        raise ValueError("recovery plan token is invalid")
+    return _xor_hmac_stream(ciphertext, token_bytes, nonce)
+
+
+def _xor_hmac_stream(payload: bytes, key: bytes, nonce: bytes) -> bytes:
+    result = bytearray(len(payload))
+    offset = 0
+    counter = 0
+    while offset < len(payload):
+        block = hmac.new(
+            key,
+            b"enc\0" + nonce + counter.to_bytes(8, "big"),
+            hashlib.sha256,
+        ).digest()
+        count = min(len(block), len(payload) - offset)
+        for index in range(count):
+            result[offset + index] = payload[offset + index] ^ block[index]
+        offset += count
+        counter += 1
+    return bytes(result)
+
+
+def _windows_dpapi(payload: bytes, entropy: bytes, *, protect: bool) -> bytes:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DataBlob(ctypes.Structure):
+            _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
+
+        def blob(value: bytes) -> tuple[DataBlob, object]:
+            buffer = (ctypes.c_ubyte * len(value)).from_buffer_copy(value)
+            return DataBlob(len(value), buffer), buffer
+
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        input_blob, input_buffer = blob(payload)
+        entropy_blob, entropy_buffer = blob(entropy)
+        output_blob = DataBlob()
+        if protect:
+            operation = crypt32.CryptProtectData
+            operation.argtypes = [
+                ctypes.POINTER(DataBlob),
+                wintypes.LPCWSTR,
+                ctypes.POINTER(DataBlob),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                ctypes.POINTER(DataBlob),
+            ]
+            arguments = (
+                ctypes.byref(input_blob),
+                "TTS More reliability recovery",
+                ctypes.byref(entropy_blob),
+                None,
+                None,
+                1,
+                ctypes.byref(output_blob),
+            )
+        else:
+            operation = crypt32.CryptUnprotectData
+            description = wintypes.LPWSTR()
+            operation.argtypes = [
+                ctypes.POINTER(DataBlob),
+                ctypes.POINTER(wintypes.LPWSTR),
+                ctypes.POINTER(DataBlob),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                ctypes.POINTER(DataBlob),
+            ]
+            arguments = (
+                ctypes.byref(input_blob),
+                ctypes.byref(description),
+                ctypes.byref(entropy_blob),
+                None,
+                None,
+                1,
+                ctypes.byref(output_blob),
+            )
+        operation.restype = wintypes.BOOL
+        if not operation(*arguments):
+            raise ValueError("recovery plan token is invalid")
+        try:
+            return ctypes.string_at(output_blob.data, output_blob.size)
+        finally:
+            kernel32.LocalFree(output_blob.data)
+            if not protect and description:
+                kernel32.LocalFree(description)
+    except (OSError, ValueError):
+        raise
+    except Exception as exc:
+        raise ValueError("recovery plan token is invalid") from exc
+
+
+def _windows_current_user_sid() -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    class SidAndAttributes(ctypes.Structure):
+        _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
+
+    class TokenUser(ctypes.Structure):
+        _fields_ = [("user", SidAndAttributes)]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    token = wintypes.HANDLE()
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)
+    ):
+        raise ValueError("recovery capability store is unavailable")
+    try:
+        needed = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
+        buffer = ctypes.create_string_buffer(needed.value)
+        if not advapi32.GetTokenInformation(
+            token, 1, buffer, needed, ctypes.byref(needed)
+        ):
+            raise ValueError("recovery capability store is unavailable")
+        sid = ctypes.cast(buffer, ctypes.POINTER(TokenUser)).contents.user.sid
+        rendered = wintypes.LPWSTR()
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.LPWSTR),
+        ]
+        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+        if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(rendered)):
+            raise ValueError("recovery capability store is unavailable")
+        try:
+            return rendered.value
+        finally:
+            kernel32.LocalFree(rendered)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _windows_security_descriptor_sddl(path: Path) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    owner = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    result = advapi32.GetNamedSecurityInfoW(
+        str(path),
+        1,
+        0x00000001 | 0x00000004,
+        ctypes.byref(owner),
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if result != 0:
+        raise ValueError("recovery capability store is unavailable")
+    rendered = wintypes.LPWSTR()
+    length = wintypes.ULONG()
+    try:
+        advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPWSTR),
+            ctypes.POINTER(wintypes.ULONG),
+        ]
+        advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
+        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            1,
+            0x00000001 | 0x00000004,
+            ctypes.byref(rendered),
+            ctypes.byref(length),
+        ):
+            raise ValueError("recovery capability store is unavailable")
+        return rendered.value
+    finally:
+        if rendered:
+            kernel32.LocalFree(rendered)
+        kernel32.LocalFree(descriptor)
+
+
+def _windows_private_sddl(*, directory: bool) -> str:
+    flags = "OICI" if directory else ""
+    sid = _windows_current_user_sid()
+    return f"O:{sid}D:P(A;{flags};FA;;;{sid})"
+
+
+def _windows_security_descriptor(sddl: str) -> object:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    descriptor = ctypes.c_void_p()
+    size = wintypes.DWORD()
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, ctypes.byref(descriptor), ctypes.byref(size)
+    ):
+        raise ValueError("recovery capability store is unavailable")
+    return descriptor
+
+
+def _create_windows_private_directory(directory: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.DWORD),
+            ("descriptor", ctypes.c_void_p),
+            ("inherit", wintypes.BOOL),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    descriptor = _windows_security_descriptor(_windows_private_sddl(directory=True))
+    attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+    kernel32.CreateDirectoryW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(SecurityAttributes),
+    ]
+    kernel32.CreateDirectoryW.restype = wintypes.BOOL
+    try:
+        if not kernel32.CreateDirectoryW(str(directory), ctypes.byref(attributes)):
+            error = ctypes.get_last_error()
+            if error != 183:
+                raise ValueError("recovery capability store is unavailable")
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _validate_capability_directory_security(directory: Path) -> None:
+    metadata = directory.lstat()
+    if os.name == "nt":
+        if _windows_security_descriptor_sddl(directory) != _windows_private_sddl(
+            directory=True
+        ):
+            raise ValueError("recovery capability store ACL is unsafe")
+    elif metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise ValueError("recovery capability store permissions are unsafe")
+
+
+def _create_private_capability_file(path: Path, flags: int) -> int:
+    if os.name != "nt":
+        descriptor = os.open(path, flags, 0o600)
+        _validate_capability_file(path)
+        return descriptor
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.DWORD),
+            ("descriptor", ctypes.c_void_p),
+            ("inherit", wintypes.BOOL),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    descriptor = _windows_security_descriptor(_windows_private_sddl(directory=False))
+    attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(SecurityAttributes),
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    invalid_handle = wintypes.HANDLE(-1).value
+    try:
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x40000000,
+            0,
+            ctypes.byref(attributes),
+            1,
+            0x00000080,
+            None,
+        )
+        if handle == invalid_handle:
+            raise FileExistsError(str(path))
+    finally:
+        kernel32.LocalFree(descriptor)
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _validate_capability_file(path: Path) -> None:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0)
+        & evidence._FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise ValueError("recovery plan token is invalid")
+    if os.name == "nt":
+        if _windows_security_descriptor_sddl(path) != _windows_private_sddl(
+            directory=False
+        ):
+            raise ValueError("recovery plan token is invalid")
+    elif metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ValueError("recovery plan token is invalid")
