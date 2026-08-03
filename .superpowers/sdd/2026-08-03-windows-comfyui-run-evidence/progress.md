@@ -1,0 +1,27 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-03-windows-comfyui-run-evidence.md
+
+Setup: TTS More branch dev-xu/windows-comfyui-run-evidence created from 72fdd803 and merged execution-time github/master at a47cce1.
+Setup: plugin branch dev-xu/windows-runner-integration created from ce443482; fork/upstream fetched before Task 1.
+Setup: Fix11/Fix12 retirement/quarantine experiments explicitly excluded.
+Coordination: collaboration thread cap counted completed agents and blocked a fresh reviewer spawn; independent reviewer role was assigned to plan_terminal_interfaces, which did not implement Task 1.
+Task 1: fix round 1/5 (1 addressed, 0 open — corrected invalid module-probe evidence SHA in both repositories; commits 8d6b725 and 29891d2).
+Task 1: complete (TTS More commits a47cce1..8d6b725; plugin commits ce44348..29891d2; scoped re-review clean).
+Coordination: collaboration thread cap prevented a fresh Task 2 implementer thread; task12_preflight8 was reassigned with a fresh task brief and did not reuse old evidence as Task 2 proof. plan_terminal_interfaces remained the independent reviewer.
+Task 2: minor (deferred): consider splitting the 842-line security-sensitive store into schema/canonical and platform I/O internals without changing the public module.
+Task 2: minor (deferred): add a direct failed-terminal CAS publication test; Task 4 must still behavior-test failed current terminals.
+Task 2: fix round 1/5 (3 addressed, 1 open — Windows artifact-parent creation still precedes the run mutex and can mutate frozen membership; commit 5977dfc).
+Task 2: fix round 2/5 (1 addressed, 0 open — missing artifact parents are now created inside the run lock after terminal-absence validation; commit 5ebaed8).
+Task 2: complete (commits 8d6b725..5ebaed8, review clean after two rounds; historical original-64 per-cycle RED stdout remains explicitly unverifiable).
+Coordination: collaboration thread cap prevented a fresh Task 3 implementer thread; task1_remote_audit was reassigned with a fresh Task 3 brief and plan_terminal_interfaces remained independent reviewer.
+Task 3: minor (deferred): validate direct preflight run_key before invoking any probes; final review must confirm Task 4 entrypoints still fail before side effects.
+Task 3: fix round 1/5 (2 addressed, 3 open — late-failure summary and CLI privacy closed; WAV parent-handle TOCTOU, current verification downgrade, and exact TDD commands remain open; commit 0ac1094).
+Task 3: fix round 2/5 (3 addressed, 0 open — stable relative temp-audio read, current verification continuity, and auditable command reporting; commit 7f152d1).
+Task 3: complete (commits 5ebaed8..7f152d1, review clean after two rounds; deferred preflight probe-order minor remains for final review).
+Coordination: collaboration thread cap prevented a fresh Task 4 implementer; task12_preflight8 began the supervisor, then repeated silent stalls required bounded C1/C2 and I1-I3 handoffs to task1_remote_audit. plan_terminal_interfaces remained independent and made no product changes.
+Task 4: initial implementation commit 52644d6 added the formal supervisor, strict supervision schemas/CLI, supervised inner contract, immutable terminal/CAS behavior tests, and supervised-only documentation.
+Task 4: fix round 1/5 (3 addressed, 1 open — authoritative artifact/WAV validation, truthful controlled launcher cleanup results, and no-follow output/run creation fixed in commits 976a475; private-residual cleanup publication remained open).
+Task 4: fix round 2/5 (3 addressed, 1 open — failed primary/terminal source binding, strict WAV container enforcement, and full-lifecycle non-delete-shared boundary lease fixed in commit 8086c8b; independent re-review found no new Critical/Important).
+Task 4: blocked design decision (F2): preserving mutable `.p/.o/.h/.c` recovery evidence inside exact immutable run membership is incompatible with publishing that cleanup failure as current. Current fail-safe behavior retains an orphan and leaves the previous pointer unchanged. User authorization is required either for a separate private recovery namespace or for an explicit orphan-policy amendment before Task 4 can be completed.
+Amendment Tasks 1-5: implemented through `f7278f69d9e8df42d3c26094b2866a45168c61e7`; each task received a final independent READY review. Exact commits and review files are bound in `task-private-recovery-review.md`.
+Amendment Task 6: private suites passed twice with identical `146 passed, 1 skipped`; plugin suites failed twice with identical `1 failed, 333 passed, 2 skipped` at `MossClipStagingNode`; TTS More reliability/supervisor gate returned `3 failed, 443 passed`; governance `17 passed`, queue/process `48 passed`, frontend `156 passed` plus build, pip check, PowerShell 5.1 parse, compile, and diff check passed.
+Amendment Task 6: NOT READY — plugin all-node registration and three inner-launcher private-boundary fixture regressions are new deterministic blockers; full backend exceeded the bounded approximately 12-minute window without an authoritative result. Historical seven host-capability limitations were not reclassified or claimed unchanged. No live preflight, CUDA, three-engine smoke, or 47-case matrix was run.

@@ -1,5 +1,10 @@
 # Windows ComfyUI + TTS-Audio-Suite Immutable Run Evidence Plan
 
+> Private cleanup-failure residue and explicit recovery are governed by the
+> [private recovery namespace amendment](2026-08-03-windows-private-recovery-namespace.md).
+> The amendment preserves this plan's public pointer/terminal contracts while
+> moving mutable recovery state outside immutable public run membership.
+
 > Execute with `superpowers:subagent-driven-development`. Every implementation task uses behavior-first RED/GREEN tests and an independent task review.
 
 ## Goal
