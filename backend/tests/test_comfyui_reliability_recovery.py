@@ -844,6 +844,57 @@ def test_expired_capability_is_rejected_without_deleting_private_evidence(
             target.unlink()
 
 
+@pytest.mark.parametrize("drift_call", [2, 3, 4, 5])
+def test_acl_race_before_claim_or_consume_rejects_without_consuming_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift_call: int
+) -> None:
+    capability_base = tmp_path / "cap-base"
+    capability_base.mkdir()
+    monkeypatch.setattr(
+        recovery.tempfile, "gettempdir", lambda: str(capability_base)
+    )
+    output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(
+        tmp_path / "fixture"
+    )
+    plan = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+    assert isinstance(plan, recovery.RecoveryPlan)
+    token = recovery.encode_plan_token(plan)
+    directory = recovery._capability_directory()
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    target = directory / f"{token_hash}.cap"
+    claim = directory / f"{token_hash}.claim"
+    original_validator = recovery._validate_capability_store
+    validation_count = 0
+
+    def inject_acl_drift_at_preclaim(path: Path) -> None:
+        nonlocal validation_count
+        validation_count += 1
+        original_validator(path)
+        if validation_count == drift_call:
+            raise ValueError("recovery capability store ACL is unsafe")
+
+    monkeypatch.setattr(
+        recovery, "_validate_capability_store", inject_acl_drift_at_preclaim
+    )
+    try:
+        with pytest.raises(ValueError, match="capability store"):
+            recovery.decode_plan_token(token)
+        assert target.exists()
+        assert not claim.exists()
+        assert (private_leaf / ".h").exists()
+        monkeypatch.setattr(
+            recovery, "_validate_capability_store", original_validator
+        )
+        assert recovery.decode_plan_token(token).run_key == run_key
+    finally:
+        if target.exists():
+            target.unlink()
+        if claim.exists():
+            claim.unlink()
+
+
 def test_recovery_execute_rejects_namespace_or_leaf_identity_drift_without_delete(tmp_path: Path) -> None:
     output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(tmp_path)
     plan = recovery.validate_recovery_owner(output_root, run_key, observed_processes=processes, observed_ports=ports)

@@ -705,6 +705,9 @@ def decode_plan_token(token: str) -> RecoveryPlan:
     _validate_capability_file(target)
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(target, flags)
+    claim_descriptor = -1
+    claim_created = False
+    capability_consumed = False
     try:
         opened = os.fstat(descriptor)
         named = target.lstat()
@@ -761,31 +764,63 @@ def decode_plan_token(token: str) -> RecoveryPlan:
         ).encode("utf-8")
         if plaintext != canonical:
             raise ValueError("recovery plan token is invalid")
+        _validate_capability_store(directory)
         claim_descriptor = _create_private_capability_file(
             claim,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            delete_on_close=os.name == "nt",
         )
-        os.close(claim_descriptor)
-        try:
-            # Windows CRT opens do not share deletion.  The exclusive claim
-            # is already durable, so close the validated read handle before
-            # consuming the exact same-name capability.
-            os.close(descriptor)
-            descriptor = -1
-            final = target.lstat()
-            if (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino):
-                raise ValueError("recovery plan token is invalid")
-            os.unlink(target)
-        except BaseException:
-            # Retain the claim on an ambiguous consume.  This intentionally
-            # makes the capability unusable rather than risking replay.
-            raise
+        claim_created = True
+        _validate_capability_file(claim)
+        _validate_capability_store(directory)
+        # Windows CRT read handles do not share deletion.  The exclusive
+        # claim remains held while the exact cap identity and store security
+        # are revalidated at the consume boundary.
+        os.close(descriptor)
+        descriptor = -1
+        _validate_capability_store(directory)
+        final = target.lstat()
+        if (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("recovery plan token is invalid")
+        _validate_capability_file(target)
+        _validate_capability_store(directory)
+        os.unlink(target)
+        capability_consumed = True
+        # Post-consume verification, then a separate immediate precondition
+        # for the claim-removal mutation below.
+        _validate_capability_store(directory)
+        _validate_capability_store(directory)
+        if os.name == "nt":
+            # FILE_FLAG_DELETE_ON_CLOSE removes only the exact protected
+            # claim handle created above; unsafe pre-consume exits close this
+            # handle and leave the capability itself untouched.
+            os.close(claim_descriptor)
+            claim_descriptor = -1
         else:
+            os.close(claim_descriptor)
+            claim_descriptor = -1
             os.unlink(claim)
+        claim_created = False
+        _validate_capability_store(directory)
         return plan
     finally:
         if descriptor != -1:
             os.close(descriptor)
+        if claim_descriptor != -1:
+            claim_opened = os.fstat(claim_descriptor)
+            os.close(claim_descriptor)
+            claim_descriptor = -1
+            if os.name != "nt" and claim_created and not capability_consumed:
+                try:
+                    claim_named = claim.lstat()
+                    if (claim_opened.st_dev, claim_opened.st_ino) == (
+                        claim_named.st_dev,
+                        claim_named.st_ino,
+                    ):
+                        _validate_capability_file(claim)
+                        os.unlink(claim)
+                except OSError:
+                    pass
 
 
 def _capability_directory() -> Path:
@@ -795,6 +830,14 @@ def _capability_directory() -> Path:
             _create_windows_private_directory(directory)
         else:
             directory.mkdir(mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise ValueError("recovery capability store is unavailable") from exc
+    _validate_capability_store(directory)
+    return directory
+
+
+def _validate_capability_store(directory: Path) -> None:
+    try:
         result = directory.lstat()
     except OSError as exc:
         raise ValueError("recovery capability store is unavailable") from exc
@@ -805,7 +848,6 @@ def _capability_directory() -> Path:
     ):
         raise ValueError("recovery capability store is unsafe")
     _validate_capability_directory_security(directory)
-    return directory
 
 
 def _protect_capability(plaintext: bytes, token: str) -> bytes:
@@ -1096,7 +1138,9 @@ def _validate_capability_directory_security(directory: Path) -> None:
         raise ValueError("recovery capability store permissions are unsafe")
 
 
-def _create_private_capability_file(path: Path, flags: int) -> int:
+def _create_private_capability_file(
+    path: Path, flags: int, *, delete_on_close: bool = False
+) -> int:
     if os.name != "nt":
         descriptor = os.open(path, flags, 0o600)
         _validate_capability_file(path)
@@ -1129,11 +1173,11 @@ def _create_private_capability_file(path: Path, flags: int) -> int:
     try:
         handle = kernel32.CreateFileW(
             str(path),
-            0x40000000,
+            0x40000000 | (0x00010000 if delete_on_close else 0),
             0,
             ctypes.byref(attributes),
             1,
-            0x00000080,
+            0x00000080 | (0x04000000 if delete_on_close else 0),
             None,
         )
         if handle == invalid_handle:
