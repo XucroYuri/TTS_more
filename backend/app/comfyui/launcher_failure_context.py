@@ -12,9 +12,12 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BeforeValidator, Field, StrictInt, field_validator, model_validator
 
+from . import reliability_evidence
 from .reliability_validation import (
+    CaseEvidence,
     FailedCaseEvidence,
     FailureMarker,
+    ReliabilityRunFailure,
     ReliabilityRunSummary,
     _StrictModel,
     _parse_public_utc,
@@ -414,6 +417,188 @@ def evaluate_launcher_failure_context(
     )
 
 
+def _canonical_run_model(model: Any) -> bytes:
+    return (
+        json.dumps(
+            model.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _strict_run_model(
+    output_root: Path,
+    run_key: str,
+    kind: str,
+    model_type: Any,
+    *,
+    name: str | None = None,
+) -> tuple[Any, bytes]:
+    raw = reliability_evidence.read_artifact(
+        output_root,
+        run_key,
+        kind,
+        name=name,
+    )
+    if model_type in {ReliabilityRunSummary, CaseEvidence}:
+        model = model_type.model_validate_json(raw, strict=False)
+    else:
+        model = model_type.model_validate_json(raw)
+    if raw != _canonical_run_model(model):
+        raise ValueError("run artifact is not canonical")
+    return model, raw
+
+
+def _verify_terminal_if_present(output_root: Path, run_key: str) -> None:
+    terminal_path = Path(output_root).absolute() / "runs" / run_key / "terminal.json"
+    if os.path.lexists(terminal_path):
+        reliability_evidence.verify_run(output_root, run_key)
+
+
+def _evaluate_launcher_failure_context_for_run(
+    output_root: Path,
+    run_key: str,
+) -> LauncherFailureContext:
+    failure_document, failure_raw = _strict_run_model(
+        output_root,
+        run_key,
+        "failure",
+        ReliabilityRunFailure,
+    )
+    if failure_document.run_key != run_key:
+        raise ValueError("run failure binding mismatch")
+    _verify_terminal_if_present(output_root, run_key)
+    summary, summary_raw = _strict_run_model(
+        output_root,
+        run_key,
+        "summary",
+        ReliabilityRunSummary,
+    )
+    if summary.status != "failed":
+        raise ValueError("run failure summary is not failed")
+
+    completed_ids: set[str] = set()
+    for expected_case in summary.cases:
+        if expected_case.case_id in completed_ids:
+            raise ValueError("run case binding is duplicated")
+        completed_ids.add(expected_case.case_id)
+        stored_case, _ = _strict_run_model(
+            output_root,
+            run_key,
+            "case",
+            CaseEvidence,
+            name=expected_case.case_id,
+        )
+        if stored_case != expected_case:
+            raise ValueError("run case binding mismatch")
+        if stored_case.audio is not None:
+            audio = reliability_evidence.read_artifact(
+                output_root,
+                run_key,
+                "audio",
+                name=stored_case.case_id,
+            )
+            if (
+                len(audio) != stored_case.audio.size_bytes
+                or hashlib.sha256(audio).hexdigest() != stored_case.audio.sha256
+            ):
+                raise ValueError("run audio commitment mismatch")
+
+    case_commitment: LauncherFailureCaseCommitment | None = None
+    active_case_id = failure_document.active_case_id
+    if active_case_id is not None:
+        if active_case_id in completed_ids:
+            raise ValueError("active run case is already completed")
+        failed_case, failed_case_raw = _strict_run_model(
+            output_root,
+            run_key,
+            "case",
+            FailedCaseEvidence,
+            name=active_case_id,
+        )
+        if (
+            failed_case.status != "failed"
+            or failed_case.case_id != active_case_id
+            or failed_case.failure != failure_document.failure
+            or failed_case.host is None
+        ):
+            raise ValueError("active run case binding mismatch")
+        started_at = _parse_public_utc(failed_case.host.started_at)
+        finished_at = _parse_public_utc(failed_case.host.finished_at)
+        case_commitment = LauncherFailureCaseCommitment(
+            case_id_sha256=hashlib.sha256(active_case_id.encode("utf-8")).hexdigest().upper(),
+            artifact_sha256=hashlib.sha256(failed_case_raw).hexdigest().upper(),
+            started_at=_public_utc(started_at),
+            finished_at=_public_utc(finished_at),
+        )
+
+    return LauncherFailureContext(
+        schema_version=1,
+        kind="launcher-failure-context",
+        status="failed",
+        primary=LauncherFailurePrimary(
+            code=failure_document.failure.code,
+            stage=failure_document.failure.stage,
+        ),
+        failure_sha256=hashlib.sha256(failure_raw).hexdigest().upper(),
+        summary=LauncherFailureSummaryCommitment(
+            artifact_sha256=hashlib.sha256(summary_raw).hexdigest().upper(),
+            completed_case_count=len(summary.cases),
+        ),
+        case=case_commitment,
+        case_context_secondary_sha256=(
+            [] if case_commitment is not None else [_CASE_CONTEXT_UNBOUND_SHA256]
+        ),
+    )
+
+
+def evaluate_launcher_failure_context_for_run(
+    output_root: Path,
+    run_key: str,
+) -> LauncherFailureContext:
+    """Evaluate exactly one run without consulting mtimes, root markers, or current."""
+    try:
+        return _evaluate_launcher_failure_context_for_run(
+            Path(output_root),
+            run_key,
+        )
+    except Exception:
+        raise ValueError("launcher run context is invalid") from None
+
+
+def evaluate_current_launcher_failure_context(
+    output_root: Path,
+    *,
+    baseline_path: Path | None = None,
+    run_started_at: str | None = None,
+    failure_observed_at: str | None = None,
+) -> LauncherFailureContext:
+    """Prefer a verified current run; legacy audit is pointer-absent only."""
+    try:
+        current = reliability_evidence.verify_current(Path(output_root))
+    except Exception:
+        raise ValueError("launcher current context is invalid") from None
+    if isinstance(current, dict) and current["status"] == "absent":
+        if baseline_path is None or run_started_at is None or failure_observed_at is None:
+            raise ValueError("launcher legacy context is unavailable")
+        return evaluate_launcher_failure_context(
+            Path(output_root),
+            baseline_path,
+            run_started_at=run_started_at,
+            failure_observed_at=failure_observed_at,
+        )
+    try:
+        return evaluate_launcher_failure_context_for_run(
+            Path(output_root),
+            current.pointer.run_key,
+        )
+    except Exception:
+        raise ValueError("launcher current context is invalid") from None
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Read launcher failure context safely.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -424,6 +609,14 @@ def _parser() -> argparse.ArgumentParser:
         if mode == "evaluate":
             child.add_argument("--run-started-at", required=True)
             child.add_argument("--failure-observed-at", required=True)
+    run = subparsers.add_parser("evaluate-run")
+    run.add_argument("--output-root", type=Path, required=True)
+    run.add_argument("--run-key", required=True)
+    current = subparsers.add_parser("evaluate-current")
+    current.add_argument("--output-root", type=Path, required=True)
+    current.add_argument("--baseline-path", type=Path)
+    current.add_argument("--run-started-at")
+    current.add_argument("--failure-observed-at")
     return parser
 
 
@@ -436,12 +629,25 @@ def main(argv: list[str] | None = None) -> int:
                 args.baseline_path,
             )
             return 0
-        context = evaluate_launcher_failure_context(
-            args.output_root,
-            args.baseline_path,
-            run_started_at=args.run_started_at,
-            failure_observed_at=args.failure_observed_at,
-        )
+        if args.mode == "evaluate-run":
+            context = evaluate_launcher_failure_context_for_run(
+                args.output_root,
+                args.run_key,
+            )
+        elif args.mode == "evaluate-current":
+            context = evaluate_current_launcher_failure_context(
+                args.output_root,
+                baseline_path=args.baseline_path,
+                run_started_at=args.run_started_at,
+                failure_observed_at=args.failure_observed_at,
+            )
+        else:
+            context = evaluate_launcher_failure_context(
+                args.output_root,
+                args.baseline_path,
+                run_started_at=args.run_started_at,
+                failure_observed_at=args.failure_observed_at,
+            )
         print(context.model_dump_json())
         return 0
     except Exception:

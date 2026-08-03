@@ -8,7 +8,9 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
+import tempfile
 import threading
 import time
 import warnings
@@ -23,6 +25,8 @@ import httpx
 import soundfile
 import yaml
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, StrictFloat, StrictInt, TypeAdapter, ValidationError, field_validator, model_validator
+
+from app.comfyui import reliability_evidence
 
 
 Engine = Literal["gpt-sovits", "indextts", "cosyvoice"]
@@ -618,6 +622,17 @@ class FailureMarker(_BoundedPublicModel):
         ),
     ]
     stage: Literal["preflight", "case", "finalize"]
+
+
+class ReliabilityRunFailure(_StrictModel):
+    schema_version: Literal[1] = 1
+    status: Literal["failed"] = "failed"
+    run_key: SHA256
+    failure: FailureMarker
+    active_case_id: Annotated[
+        str,
+        Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]{0,63}$"),
+    ] | None = None
 
 
 class _PublicPreflightResource(_StrictModel):
@@ -4195,9 +4210,58 @@ def _persist_failed_case_evidence(
             return
 
 
+def _persist_run_failed_case_evidence(
+    output_root: Path,
+    run_key: str,
+    evidence: CurrentFailedCaseEvidence,
+    *,
+    case: CasePlan,
+) -> None:
+    try:
+        validated = CurrentFailedCaseEvidence.model_validate(
+            _strict_failed_case_payload(evidence)
+        )
+        _write_run_json(
+            output_root,
+            run_key,
+            "case",
+            validated,
+            stage="case",
+            name=case.case_id,
+        )
+        return
+    except Exception as detail_error:
+        try:
+            fallback = CurrentFailedCaseEvidence(
+                schema_version=2,
+                status="failed",
+                case_id=evidence.case_id,
+                phase=evidence.phase,
+                engine=evidence.engine,
+                expected=evidence.expected,
+                failure=evidence.failure,
+                host=evidence.host,
+                observation=_minimal_failed_case_observation(
+                    case,
+                    secondary_error=detail_error,
+                ),
+            )
+            _write_run_json(
+                output_root,
+                run_key,
+                "case",
+                fallback,
+                stage="case",
+                name=case.case_id,
+            )
+        except Exception:
+            return
+
+
 def execute_reliability_validation(
     fixture: ReliabilityFixture,
     *,
+    run_key: str,
     output_root: Path,
     http_probe: ReliabilityHttpProbe,
     host_probe: ReliabilityHostProbe,
@@ -4212,6 +4276,7 @@ def execute_reliability_validation(
     evidence-safe observations. Every failure is persisted before it is raised.
     """
     try:
+        run_key = _validated_run_key(run_key)
         fixture = _revalidate_model(fixture, ReliabilityFixture)
         owned_processes = {
             label: _revalidate_model(identity, OwnedProcessIdentity)
@@ -4231,6 +4296,7 @@ def execute_reliability_validation(
         raise LiveValidationError("invalid-validator-input", stage="preflight") from None
 
     output_root = Path(output_root)
+    _prepare_evidence_output_root(output_root)
     completed_cases: list[CaseEvidence] = []
     failure: LiveValidationError | None = None
     preflight_passed = False
@@ -4239,6 +4305,8 @@ def execute_reliability_validation(
     gpu_idle_baseline: GpuSnapshot | None = None
     active_case: CasePlan | None = None
     active_host_observation: HostCaseObservation | None = None
+    temporary_directory = tempfile.TemporaryDirectory(prefix="tts-more-reliability-")
+    temporary_root = Path(temporary_directory.name)
 
     try:
         _require_endpoint_scope(fixture, allow_lan=allow_lan)
@@ -4247,6 +4315,13 @@ def execute_reliability_validation(
         baseline = host_preflight.boundary
         gpu_idle_baseline = host_preflight.gpu_idle_baseline
         _validate_preflight(fixture, http_preflight, host_preflight, owned_processes)
+        _write_run_json(
+            output_root,
+            run_key,
+            "preflight",
+            _public_preflight_marker(http_preflight, host_preflight),
+            stage="preflight",
+        )
         preflight_passed = True
 
         provisional_boundary = _boundary_evidence(baseline, baseline)
@@ -4263,7 +4338,7 @@ def execute_reliability_validation(
                 http_observation = http_probe.execute_case(
                     case,
                     fixture,
-                    output_root / "audio",
+                    temporary_root / "audio",
                     action_hook=action_hook,
                 )
             finally:
@@ -4282,6 +4357,25 @@ def execute_reliability_validation(
             validation = validate_case(evidence, wav_path=http_observation.wav_path)
             if not validation.valid:
                 raise LiveValidationError("case-validation-failed", stage="case")
+            if validation.evidence.audio is not None:
+                if http_observation.wav_path is None:
+                    raise LiveValidationError("missing-audio-output", stage="case")
+                _write_run_audio(
+                    output_root,
+                    run_key,
+                    validation.evidence.case_id,
+                    http_observation.wav_path,
+                    temporary_root,
+                    validation.evidence.audio,
+                )
+            _write_run_json(
+                output_root,
+                run_key,
+                "case",
+                validation.evidence,
+                stage="case",
+                name=validation.evidence.case_id,
+            )
             completed_cases.append(validation.evidence)
             active_case = None
             active_host_observation = None
@@ -4321,6 +4415,11 @@ def execute_reliability_validation(
             except Exception:
                 if failure is None:
                     failure = LiveValidationError("runtime-release-failed", stage="finalize")
+        try:
+            temporary_directory.cleanup()
+        except OSError:
+            if failure is None:
+                failure = LiveValidationError("temporary-audio-cleanup-failed", stage="finalize")
 
     if failure is not None:
         try:
@@ -4330,13 +4429,17 @@ def execute_reliability_validation(
                 required_cases=required_case_specs(selected_plan),
             )
         except Exception:
-            _persist_failure_marker(output_root, failure)
+            _persist_run_failure_marker(output_root, run_key, failure)
             raise failure
         for completed_case in summary.cases:
             try:
-                write_atomic_json(
-                    output_root / "cases" / f"{completed_case.case_id}.json",
-                    completed_case.model_dump(mode="json"),
+                _write_run_json(
+                    output_root,
+                    run_key,
+                    "case",
+                    completed_case,
+                    stage="case",
+                    name=completed_case.case_id,
                 )
             except Exception:
                 pass
@@ -4373,38 +4476,65 @@ def execute_reliability_validation(
                         secondary_error=detail_error,
                     ),
                 )
-            _persist_failed_case_evidence(
-                output_root / "cases" / f"{active_case.case_id}.json",
+            _persist_run_failed_case_evidence(
+                output_root,
+                run_key,
                 failed_case,
                 case=active_case,
             )
-        _persist_failure_marker(output_root, failure)
+        _persist_run_failure_marker(
+            output_root,
+            run_key,
+            failure,
+            active_case_id=active_case.case_id if active_case is not None else None,
+        )
         try:
-            write_atomic_json(output_root / "reliability-summary.json", summary)
+            _write_run_json(
+                output_root,
+                run_key,
+                "summary",
+                summary,
+                stage="finalize",
+            )
         except Exception:
             pass
         raise failure
 
-    _transition_public_terminal_markers(output_root, stage="finalize")
     for case in summary.cases:
-        write_atomic_json(output_root / "cases" / f"{case.case_id}.json", case.model_dump(mode="json"))
-    write_atomic_json(output_root / "reliability-summary.json", summary)
+        _write_run_json(
+            output_root,
+            run_key,
+            "case",
+            case,
+            stage="finalize",
+            name=case.case_id,
+        )
+    _write_run_json(
+        output_root,
+        run_key,
+        "summary",
+        summary,
+        stage="finalize",
+    )
     return summary
 
 
 def execute_reliability_preflight(
     fixture: ReliabilityFixture,
     *,
+    run_key: str,
     output_root: Path,
     http_probe: ReliabilityHttpProbe,
     host_probe: ReliabilityHostProbe,
     owned_processes: dict[str, OwnedProcessIdentity],
     allow_lan: bool = False,
 ) -> None:
+    _prepare_evidence_output_root(Path(output_root))
     failure: LiveValidationError | None = None
     try:
         _execute_reliability_preflight_success(
             fixture,
+            run_key=run_key,
             output_root=output_root,
             http_probe=http_probe,
             host_probe=host_probe,
@@ -4431,13 +4561,14 @@ def execute_reliability_preflight(
     else:
         return
     assert failure is not None
-    _persist_failure_marker(Path(output_root), failure)
+    _persist_run_failure_marker(Path(output_root), run_key, failure)
     raise failure
 
 
 def _execute_reliability_preflight_success(
     fixture: ReliabilityFixture,
     *,
+    run_key: str,
     output_root: Path,
     http_probe: ReliabilityHttpProbe,
     host_probe: ReliabilityHostProbe,
@@ -4449,6 +4580,20 @@ def _execute_reliability_preflight_success(
     http = _revalidate_model(http_probe.preflight(fixture), HttpPreflightObservation)
     host = _revalidate_model(host_probe.preflight(fixture), HostPreflightObservation)
     _validate_preflight(fixture, http, host, owned_processes)
+    marker = _public_preflight_marker(http, host)
+    _write_run_json(
+        Path(output_root),
+        run_key,
+        "preflight",
+        marker,
+        stage="preflight",
+    )
+
+
+def _public_preflight_marker(
+    http: HttpPreflightObservation,
+    host: HostPreflightObservation,
+) -> _PublicPreflightMarker:
     document = {
         "status": "passed",
         "resources": [
@@ -4474,13 +4619,177 @@ def _execute_reliability_preflight_success(
             "repositories": [item.model_dump(mode="json") for item in host.boundary.repositories],
         },
     }
-    output_root = Path(output_root)
-    _publish_public_terminal_marker(
-        output_root,
-        marker_name="preflight.json",
-        document=document,
-        stage="preflight",
-    )
+    return _PublicPreflightMarker.model_validate(document)
+
+
+def _canonical_model_json(model: BaseModel) -> bytes:
+    return (
+        json.dumps(
+            model.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _prepare_evidence_output_root(output_root: Path) -> None:
+    try:
+        output_root.mkdir(parents=True, exist_ok=True)
+        metadata = output_root.lstat()
+    except OSError:
+        raise LiveValidationError("evidence-output-root-unavailable", stage="preflight") from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & 0x400
+    ):
+        raise LiveValidationError("evidence-output-root-unsafe", stage="preflight")
+
+
+def _validated_run_key(value: str) -> str:
+    try:
+        return TypeAdapter(reliability_evidence.RunKey).validate_python(value)
+    except ValidationError:
+        raise LiveValidationError("invalid-run-key", stage="preflight") from None
+
+
+def _write_run_json(
+    output_root: Path,
+    run_key: str,
+    kind: str,
+    model: BaseModel,
+    *,
+    stage: Literal["preflight", "case", "finalize"],
+    name: str | None = None,
+) -> reliability_evidence.ArtifactCommitment:
+    safe_key = _validated_run_key(run_key)
+    try:
+        return reliability_evidence.write_artifact(
+            output_root,
+            safe_key,
+            kind,
+            _canonical_model_json(model),
+            name=name,
+        )
+    except reliability_evidence.EvidenceStoreError:
+        raise LiveValidationError("evidence-artifact-write-failed", stage=stage) from None
+
+
+def _read_validated_temporary_audio(
+    path: Path,
+    temporary_root: Path,
+    proof: AudioProof,
+) -> bytes:
+    candidate = Path(path).absolute()
+    root = Path(temporary_root).absolute()
+    if not candidate.is_relative_to(root):
+        raise LiveValidationError("unsafe-audio-output", stage="case")
+    try:
+        relative = candidate.relative_to(root)
+        current = root
+        for component in relative.parts[:-1]:
+            directory_metadata = os.lstat(current)
+            if (
+                not stat.S_ISDIR(directory_metadata.st_mode)
+                or stat.S_ISLNK(directory_metadata.st_mode)
+                or getattr(directory_metadata, "st_file_attributes", 0) & 0x400
+            ):
+                raise OSError
+            current /= component
+        parent_metadata = os.lstat(current)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_ISLNK(parent_metadata.st_mode)
+            or getattr(parent_metadata, "st_file_attributes", 0) & 0x400
+        ):
+            raise OSError
+        metadata = os.lstat(candidate)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or getattr(metadata, "st_file_attributes", 0) & 0x400
+            or metadata.st_size > reliability_evidence.MAX_ARTIFACT_BYTES
+        ):
+            raise OSError
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(candidate, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_size != metadata.st_size:
+                raise OSError
+            payload = bytearray()
+            while len(payload) <= reliability_evidence.MAX_ARTIFACT_BYTES:
+                chunk = os.read(descriptor, min(1024 * 1024, reliability_evidence.MAX_ARTIFACT_BYTES + 1 - len(payload)))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > reliability_evidence.MAX_ARTIFACT_BYTES:
+                raise OSError
+            closed = os.fstat(descriptor)
+            if (
+                closed.st_size != opened.st_size
+                or closed.st_mtime_ns != opened.st_mtime_ns
+                or getattr(closed, "st_ino", None) != getattr(opened, "st_ino", None)
+            ):
+                raise OSError
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise LiveValidationError("unsafe-audio-output", stage="case") from None
+    audio = bytes(payload)
+    if len(audio) != proof.size_bytes or hashlib.sha256(audio).hexdigest() != proof.sha256:
+        raise LiveValidationError("audio-proof-mismatch", stage="case")
+    return audio
+
+
+def _write_run_audio(
+    output_root: Path,
+    run_key: str,
+    case_id: str,
+    source: Path,
+    temporary_root: Path,
+    proof: AudioProof,
+) -> reliability_evidence.ArtifactCommitment:
+    payload = _read_validated_temporary_audio(source, temporary_root, proof)
+    try:
+        commitment = reliability_evidence.write_artifact(
+            output_root,
+            run_key,
+            "audio",
+            payload,
+            name=case_id,
+        )
+    except reliability_evidence.EvidenceStoreError:
+        raise LiveValidationError("evidence-artifact-write-failed", stage="case") from None
+    if commitment.size_bytes != proof.size_bytes or commitment.sha256 != proof.sha256:
+        raise LiveValidationError("audio-commitment-mismatch", stage="case")
+    return commitment
+
+
+def _persist_run_failure_marker(
+    output_root: Path,
+    run_key: str,
+    failure: LiveValidationError,
+    *,
+    active_case_id: str | None = None,
+) -> None:
+    failure.failure_persistence_attempted = True
+    try:
+        _write_run_json(
+            output_root,
+            run_key,
+            "failure",
+            ReliabilityRunFailure(
+                run_key=run_key,
+                failure=FailureMarker(code=failure.code, stage=failure.stage),
+                active_case_id=active_case_id,
+            ),
+            stage=failure.stage,
+        )
+    except Exception:
+        return
 
 
 def _persist_failure_marker(output_root: Path, failure: LiveValidationError) -> None:
@@ -5588,6 +5897,12 @@ ProbeFactory = Callable[
 ]
 
 
+def _run_key_argument(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError("run key must be 64 lowercase hexadecimal characters")
+    return value
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -5596,6 +5911,7 @@ def main(
     parser = argparse.ArgumentParser(description="Run the opt-in Windows ComfyUI reliability gate.")
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--run-key", type=_run_key_argument, required=True)
     parser.add_argument("--comfyui-pid", type=int, required=True)
     parser.add_argument("--tts-more-pid", type=int, required=True)
     parser.add_argument("--host-manifest", type=Path)
@@ -5603,6 +5919,7 @@ def main(
     parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args(argv)
     try:
+        _prepare_evidence_output_root(args.output_root)
         document = json.loads(args.fixture.read_text(encoding="utf-8-sig"))
         fixture = ReliabilityFixture.model_validate(document)
         if probe_factory is None:
@@ -5611,6 +5928,7 @@ def main(
         if args.preflight_only:
             execute_reliability_preflight(
                 fixture,
+                run_key=args.run_key,
                 output_root=args.output_root,
                 http_probe=http_probe,
                 host_probe=host_probe,
@@ -5620,6 +5938,7 @@ def main(
             return 0
         summary = execute_reliability_validation(
             fixture,
+            run_key=args.run_key,
             output_root=args.output_root,
             http_probe=http_probe,
             host_probe=host_probe,
@@ -5646,7 +5965,7 @@ def main(
     else:
         return 0 if summary.status == "passed" else 1
     if not failure.failure_persistence_attempted:
-        _persist_failure_marker(Path(args.output_root), failure)
+        _persist_run_failure_marker(Path(args.output_root), args.run_key, failure)
     return 1
 
 

@@ -1411,3 +1411,18 @@ def test_verify_rejects_real_member_junction_without_reading_outside_sentinel(
         assert sentinel.read_text(encoding="utf-8") == "outside-must-survive"
     finally:
         junction.rmdir()
+
+
+def test_read_artifact_returns_only_the_exact_bounded_run_member(tmp_path: Path) -> None:
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    run_key = "d" * 64
+    payload = b'{"status":"failed"}\n'
+    evidence.write_artifact(output_root, run_key, "failure", payload)
+    evidence.write_artifact(output_root, "e" * 64, "failure", b"other-run\n")
+
+    assert evidence.read_artifact(output_root, run_key, "failure") == payload
+    with pytest.raises(evidence.EvidenceStoreError):
+        evidence.read_artifact(output_root, "f" * 64, "failure")
+    with pytest.raises(evidence.EvidenceStoreError):
+        evidence.read_artifact(output_root, run_key, "case", name="../escape")

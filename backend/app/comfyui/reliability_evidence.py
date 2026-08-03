@@ -826,6 +826,26 @@ def write_artifact(
     )
 
 
+def read_artifact(
+    output_root: Path,
+    run_key: str,
+    kind: str,
+    *,
+    name: str | None = None,
+) -> bytes:
+    """Read one exact immutable run member with the store's safety checks."""
+    relative_name = _artifact_relative_name(kind, name)
+    safe_key = _validated_run_key(run_key)
+    run, resolved_root = _run_root(output_root, safe_key, create=False)
+    target = _artifact_path(
+        run,
+        relative_name,
+        resolved_root,
+        create_parent=False,
+    )
+    return _read_bounded_regular(target, max_bytes=MAX_ARTIFACT_BYTES)
+
+
 def _canonical_json(model: BaseModel) -> bytes:
     return (
         json.dumps(

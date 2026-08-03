@@ -20,6 +20,8 @@ import httpx
 import pytest
 from pydantic import ValidationError
 import app.comfyui.reliability_validation as reliability_validation
+import app.comfyui.launcher_failure_context as launcher_failure_context
+import app.comfyui.reliability_evidence as reliability_evidence
 
 from app.comfyui.reliability_validation import (
     AudioProof,
@@ -1761,6 +1763,7 @@ def test_task_10_injected_executor_runs_exact_matrix_and_writes_public_evidence(
 
     summary = reliability_validation.execute_reliability_validation(
         fixture,
+        run_key=TASK3_RUN_KEY,
         output_root=tmp_path / "evidence",
         http_probe=http_probe,
         host_probe=host_probe,
@@ -1776,7 +1779,9 @@ def test_task_10_injected_executor_runs_exact_matrix_and_writes_public_evidence(
     assert host_probe.restarted == 3
     assert http_probe.released is True
     assert host_probe.finalized is True
-    evidence = (tmp_path / "evidence" / "reliability-summary.json").read_text(encoding="utf-8")
+    evidence = (
+        tmp_path / "evidence" / "runs" / TASK3_RUN_KEY / "reliability-summary.json"
+    ).read_text(encoding="utf-8")
     assert json.loads(evidence)["status"] == "passed"
     assert str(tmp_path) not in evidence
 
@@ -1836,6 +1841,7 @@ def test_fix_round_1_final_gpu_compares_run_idle_baseline_after_runtime_release(
     with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
         reliability_validation.execute_reliability_validation(
             fixture,
+            run_key=TASK3_RUN_KEY,
             output_root=output_root,
             http_probe=http_probe,
             host_probe=host_probe,
@@ -1844,10 +1850,10 @@ def test_fix_round_1_final_gpu_compares_run_idle_baseline_after_runtime_release(
 
     assert exc_info.value.code == "final-gpu-not-recovered"
     assert events == ["runtime-release", "gpu-after-release"]
-    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
-        "code": "final-gpu-not-recovered",
-        "stage": "finalize",
-    }
+    failure = json.loads(
+        (output_root / "runs" / TASK3_RUN_KEY / "failure.json").read_text(encoding="utf-8")
+    )
+    assert failure["failure"] == {"code": "final-gpu-not-recovered", "stage": "finalize"}
 
 
 def test_task_10_passed_summary_is_published_only_after_all_case_evidence(
@@ -1858,25 +1864,36 @@ def test_task_10_passed_summary_is_published_only_after_all_case_evidence(
     http_probe = _ExecutorHttpProbe()
     host_probe = _ExecutorHostProbe()
     output_root = tmp_path / "evidence"
-    original_write = reliability_validation.write_atomic_json
+    original_write = reliability_evidence.write_artifact
 
-    def fail_case_write(path: Path, payload: object) -> None:
-        if path.parent.name == "cases":
-            raise OSError("injected case evidence failure")
-        original_write(path, payload)
+    def fail_case_write(
+        root: Path,
+        run_key: str,
+        kind: str,
+        payload: bytes,
+        *,
+        name: str | None = None,
+    ) -> reliability_evidence.ArtifactCommitment:
+        if kind == "case":
+            raise reliability_evidence.EvidenceStoreError("injected case evidence failure")
+        return original_write(root, run_key, kind, payload, name=name)
 
-    monkeypatch.setattr(reliability_validation, "write_atomic_json", fail_case_write)
+    monkeypatch.setattr(reliability_evidence, "write_artifact", fail_case_write)
 
-    with pytest.raises(OSError, match="injected case evidence failure"):
+    with pytest.raises(reliability_validation.LiveValidationError, match="evidence-artifact-write-failed"):
         reliability_validation.execute_reliability_validation(
             fixture,
+            run_key=TASK3_RUN_KEY,
             output_root=output_root,
             http_probe=http_probe,
             host_probe=host_probe,
             owned_processes=host_probe.owned_processes,
         )
 
-    assert (output_root / "reliability-summary.json").exists() is False
+    persisted = json.loads(
+        (output_root / "runs" / TASK3_RUN_KEY / "reliability-summary.json").read_text(encoding="utf-8")
+    )
+    assert persisted["status"] == "failed"
 
 
 def test_task_10_controller_always_finishes_active_host_case_after_http_failure(
@@ -1908,6 +1925,7 @@ def test_task_10_controller_always_finishes_active_host_case_after_http_failure(
     with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
         reliability_validation.execute_reliability_validation(
             fixture,
+            run_key=TASK3_RUN_KEY,
             output_root=tmp_path / "evidence",
             http_probe=http_probe,
             host_probe=host_probe,
@@ -1945,20 +1963,28 @@ def test_fix_round_1_case_failure_writes_current_scrubbed_case_before_failed_sum
             )
 
     writes: list[str] = []
-    original_write = reliability_validation.write_atomic_json
+    original_write = reliability_evidence.write_artifact
 
-    def track_write(path: Path, payload: object) -> None:
-        writes.append(path.relative_to(output_root).as_posix())
-        original_write(path, payload)
+    def track_write(
+        root: Path,
+        run_key: str,
+        kind: str,
+        payload: bytes,
+        *,
+        name: str | None = None,
+    ) -> reliability_evidence.ArtifactCommitment:
+        writes.append(f"{kind}:{name or ''}")
+        return original_write(root, run_key, kind, payload, name=name)
 
     http_probe = SecondCaseFailsHttpProbe()
     host_probe = _ExecutorHostProbe()
     output_root = tmp_path / "evidence"
-    monkeypatch.setattr(reliability_validation, "write_atomic_json", track_write)
+    monkeypatch.setattr(reliability_evidence, "write_artifact", track_write)
 
     with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
         reliability_validation.execute_reliability_validation(
             fixture,
+            run_key=TASK3_RUN_KEY,
             output_root=output_root,
             http_probe=http_probe,
             host_probe=host_probe,
@@ -1967,10 +1993,10 @@ def test_fix_round_1_case_failure_writes_current_scrubbed_case_before_failed_sum
 
     assert exc_info.value.code == "case-execution-failed"
     first_case = json.loads(
-        (output_root / "cases" / "steady-01-gpt-sovits.json").read_text(encoding="utf-8")
+        (output_root / "runs" / TASK3_RUN_KEY / "cases" / "steady-01-gpt-sovits.json").read_text(encoding="utf-8")
     )
     failed_case = json.loads(
-        (output_root / "cases" / "steady-01-indextts.json").read_text(encoding="utf-8")
+        (output_root / "runs" / TASK3_RUN_KEY / "cases" / "steady-01-indextts.json").read_text(encoding="utf-8")
     )
     assert first_case["actual"] == "completed"
     assert failed_case["status"] == "failed"
@@ -1980,7 +2006,7 @@ def test_fix_round_1_case_failure_writes_current_scrubbed_case_before_failed_sum
     assert failed_case["expected"] == "completed"
     assert failed_case["failure"] == {"code": "case-execution-failed", "stage": "case"}
     parsed_failed_case = reliability_validation.FailedCaseEvidence.model_validate_json(
-        (output_root / "cases" / "steady-01-indextts.json").read_text(encoding="utf-8")
+        (output_root / "runs" / TASK3_RUN_KEY / "cases" / "steady-01-indextts.json").read_text(encoding="utf-8")
     )
     assert parsed_failed_case.observation.detail_status == "minimal"
     assert parsed_failed_case.observation.job_created is False
@@ -1994,11 +2020,7 @@ def test_fix_round_1_case_failure_writes_current_scrubbed_case_before_failed_sum
     rendered = json.dumps(failed_case)
     assert "case-secret" not in rendered
     assert str(tmp_path) not in rendered
-    assert writes[-3:] == [
-        "cases/steady-01-indextts.json",
-        "failure.json",
-        "reliability-summary.json",
-    ]
+    assert writes[-3:] == ["case:steady-01-indextts", "failure:", "summary:"]
 
 
 @pytest.mark.parametrize(
@@ -2031,6 +2053,7 @@ def test_task_10_preflight_fails_closed_and_persists_failed_summary(
     with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
         reliability_validation.execute_reliability_validation(
             fixture,
+            run_key=TASK3_RUN_KEY,
             output_root=output_root,
             http_probe=http_probe,
             host_probe=host_probe,
@@ -2038,10 +2061,11 @@ def test_task_10_preflight_fails_closed_and_persists_failed_summary(
         )
 
     assert exc_info.value.code == error_code
-    summary = json.loads((output_root / "reliability-summary.json").read_text(encoding="utf-8"))
-    failure = json.loads((output_root / "failure.json").read_text(encoding="utf-8"))
+    run_root = output_root / "runs" / TASK3_RUN_KEY
+    summary = json.loads((run_root / "reliability-summary.json").read_text(encoding="utf-8"))
+    failure = json.loads((run_root / "failure.json").read_text(encoding="utf-8"))
     assert summary["status"] == "failed"
-    assert failure == {"code": error_code, "stage": "preflight"}
+    assert failure["failure"] == {"code": error_code, "stage": "preflight"}
     assert str(tmp_path) not in json.dumps({"summary": summary, "failure": failure})
 
 
@@ -2060,6 +2084,7 @@ def test_task_10_allow_lan_is_explicit_and_does_not_relax_other_preflight_gates(
     with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
         reliability_validation.execute_reliability_validation(
             fixture,
+            run_key=TASK3_RUN_KEY,
             output_root=tmp_path / "evidence",
             http_probe=http_probe,
             host_probe=host_probe,
@@ -3237,6 +3262,7 @@ def test_fix7_fixture_normal_budgets_drive_every_completed_case_and_remain_bound
 
     summary = reliability_validation.execute_reliability_validation(
         fixture,
+        run_key=TASK3_RUN_KEY,
         output_root=tmp_path / "evidence",
         http_probe=http_probe,
         host_probe=host_probe,
@@ -3762,6 +3788,8 @@ def test_task_10_cli_uses_injected_probes_and_returns_nonzero_for_failed_gate(
             str(fixture_path),
             "--output-root",
             str(tmp_path / "success"),
+            "--run-key",
+            "1" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -3782,6 +3810,8 @@ def test_task_10_cli_uses_injected_probes_and_returns_nonzero_for_failed_gate(
             str(fixture_path),
             "--output-root",
             str(tmp_path / "failed"),
+            "--run-key",
+            "2" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -3796,8 +3826,8 @@ def test_task_10_cli_uses_injected_probes_and_returns_nonzero_for_failed_gate(
 
     assert success == 0
     assert failed == 1
-    assert json.loads((tmp_path / "success" / "reliability-summary.json").read_text())["status"] == "passed"
-    assert json.loads((tmp_path / "failed" / "reliability-summary.json").read_text())["status"] == "failed"
+    assert json.loads((tmp_path / "success" / "runs" / ("1" * 64) / "reliability-summary.json").read_text())["status"] == "passed"
+    assert json.loads((tmp_path / "failed" / "runs" / ("2" * 64) / "reliability-summary.json").read_text())["status"] == "failed"
 
 
 def test_task_10_cli_preflight_only_writes_evidence_without_running_cases(
@@ -3814,6 +3844,8 @@ def test_task_10_cli_preflight_only_writes_evidence_without_running_cases(
             str(fixture_path),
             "--output-root",
             str(tmp_path / "preflight"),
+            "--run-key",
+            "3" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -3829,9 +3861,10 @@ def test_task_10_cli_preflight_only_writes_evidence_without_running_cases(
 
     assert result == 0
     assert http_probe.executed == []
-    evidence = json.loads((tmp_path / "preflight" / "preflight.json").read_text())
+    run_root = tmp_path / "preflight" / "runs" / ("3" * 64)
+    evidence = json.loads((run_root / "preflight.json").read_text())
     assert evidence["status"] == "passed"
-    assert not (tmp_path / "preflight" / "failure.json").exists()
+    assert not (run_root / "failure.json").exists()
     assert [item["engine"] for item in evidence["resources"]] == [
         "cosyvoice",
         "gpt-sovits",
@@ -3876,6 +3909,8 @@ def test_fix5_preflight_only_persists_typed_primary_failure_and_real_cli_returns
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -3890,7 +3925,8 @@ def test_fix5_preflight_only_persists_typed_primary_failure_and_real_cli_returns
     )
 
     assert result == 1
-    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+    failure = json.loads((output_root / "runs" / ("4" * 64) / "failure.json").read_text(encoding="utf-8"))
+    assert failure["failure"] == {
         "code": "registered-service-binding",
         "stage": "preflight",
     }
@@ -3929,6 +3965,8 @@ def test_fix5_real_blocked_generation_preflight_persists_stable_sanitized_failur
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -3942,9 +3980,9 @@ def test_fix5_real_blocked_generation_preflight_persists_stable_sanitized_failur
         ),
     )
 
-    persisted = (output_root / "failure.json").read_text(encoding="utf-8")
+    persisted = (output_root / "runs" / ("4" * 64) / "failure.json").read_text(encoding="utf-8")
     assert result == 1
-    assert json.loads(persisted) == {
+    assert json.loads(persisted)["failure"] == {
         "code": "tts-more-preflight-not-ready",
         "stage": "preflight",
     }
@@ -3977,6 +4015,8 @@ def test_fix5_preflight_only_maps_and_scrubs_raw_observation_failure(
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -3991,9 +4031,9 @@ def test_fix5_preflight_only_maps_and_scrubs_raw_observation_failure(
     )
 
     captured = capsys.readouterr()
-    persisted = (output_root / "failure.json").read_text(encoding="utf-8")
+    persisted = (output_root / "runs" / ("4" * 64) / "failure.json").read_text(encoding="utf-8")
     assert result == 1
-    assert json.loads(persisted) == {
+    assert json.loads(persisted)["failure"] == {
         "code": "preflight-observation-failed",
         "stage": "preflight",
     }
@@ -4023,15 +4063,19 @@ def test_fix5_preflight_failure_evidence_write_failure_preserves_nonzero_without
                 stage="preflight",
             )
 
-    def fail_atomic_write(path: Path, payload: object) -> None:
-        del payload
-        writes.append(Path(path))
-        partial = Path(path).with_name(f".{Path(path).name}.injected.partial")
-        partial.write_text("incomplete", encoding="utf-8")
-        partial.unlink()
-        raise RuntimeError("token=writer-secret C:\\private\\model")
+    def fail_artifact_write(
+        root: Path,
+        run_key: str,
+        kind: str,
+        payload: bytes,
+        *,
+        name: str | None = None,
+    ) -> reliability_evidence.ArtifactCommitment:
+        del run_key, payload, name
+        writes.append(Path(root) / kind)
+        raise reliability_evidence.EvidenceStoreError("writer unavailable")
 
-    monkeypatch.setattr(reliability_validation, "write_atomic_json", fail_atomic_write)
+    monkeypatch.setattr(reliability_evidence, "write_artifact", fail_artifact_write)
     output_root = tmp_path / "write-failure"
     result = reliability_validation.main(
         [
@@ -4039,6 +4083,8 @@ def test_fix5_preflight_failure_evidence_write_failure_preserves_nonzero_without
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4053,7 +4099,7 @@ def test_fix5_preflight_failure_evidence_write_failure_preserves_nonzero_without
     )
 
     assert result == 1
-    assert writes == [output_root / "failure.json", output_root / "failure.json"]
+    assert writes == [output_root / "failure"]
     assert not (output_root / "failure.json").exists()
     assert not list(output_root.glob(".failure.json.*"))
     assert not (output_root / "preflight.json").exists()
@@ -4067,22 +4113,30 @@ def test_fix5_full_validator_secondary_failure_persistence_never_overrides_prima
     http_probe = _ExecutorHttpProbe(preflight_mode="busy-queue")
     host_probe = _ExecutorHostProbe()
     output_root = tmp_path / "matrix-primary"
-    original_write = reliability_validation.write_atomic_json
+    original_write = reliability_evidence.write_artifact
 
-    def fail_only_failure_marker(path: Path, payload: object) -> None:
-        if Path(path).name == "failure.json":
-            raise RuntimeError("token=secondary-writer-secret C:\\private\\model")
-        original_write(path, payload)
+    def fail_only_failure_marker(
+        root: Path,
+        run_key: str,
+        kind: str,
+        payload: bytes,
+        *,
+        name: str | None = None,
+    ) -> reliability_evidence.ArtifactCommitment:
+        if kind == "failure":
+            raise reliability_evidence.EvidenceStoreError("secondary writer unavailable")
+        return original_write(root, run_key, kind, payload, name=name)
 
     monkeypatch.setattr(
-        reliability_validation,
-        "write_atomic_json",
+        reliability_evidence,
+        "write_artifact",
         fail_only_failure_marker,
     )
 
     with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
         reliability_validation.execute_reliability_validation(
             fixture,
+            run_key=TASK3_RUN_KEY,
             output_root=output_root,
             http_probe=http_probe,
             host_probe=host_probe,
@@ -4147,6 +4201,8 @@ def test_fix5_reused_output_root_archives_stale_failure_and_publishes_current_pr
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4161,17 +4217,12 @@ def test_fix5_reused_output_root_archives_stale_failure_and_publishes_current_pr
     )
 
     assert result == 1
-    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
-        "code": expected_code,
-        "stage": "preflight",
-    }
-    assert not (output_root / "preflight.json").exists()
-    archives = list((output_root / "history" / "terminal-markers").glob("failure-*.json"))
-    assert len(archives) == 1
-    archived = json.loads(archives[0].read_text(encoding="utf-8"))
-    assert archived["kind"] == "failure"
-    assert archived["document"] == stale_failure
-    assert len(archived["sha256"]) == 64
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == stale_failure
+    run_failure = json.loads(
+        (output_root / "runs" / ("4" * 64) / "failure.json").read_text(encoding="utf-8")
+    )
+    assert run_failure["failure"] == {"code": expected_code, "stage": "preflight"}
+    assert not (output_root / "history").exists()
 
 
 def test_fix5_reused_output_root_archives_stale_failure_before_current_success(
@@ -4195,6 +4246,8 @@ def test_fix5_reused_output_root_archives_stale_failure_before_current_success(
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4209,13 +4262,11 @@ def test_fix5_reused_output_root_archives_stale_failure_before_current_success(
     )
 
     assert result == 0
-    assert json.loads((output_root / "preflight.json").read_text(encoding="utf-8"))[
+    assert json.loads((output_root / "runs" / ("4" * 64) / "preflight.json").read_text(encoding="utf-8"))[
         "status"
     ] == "passed"
-    assert not (output_root / "failure.json").exists()
-    archives = list((output_root / "history" / "terminal-markers").glob("failure-*.json"))
-    assert len(archives) == 1
-    assert json.loads(archives[0].read_text(encoding="utf-8"))["document"] == stale_failure
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == stale_failure
+    assert not (output_root / "history").exists()
 
 
 def test_fix5_marker_archive_redacts_unsafe_prior_document(tmp_path: Path) -> None:
@@ -4253,6 +4304,8 @@ def test_fix5_marker_archive_redacts_unsafe_prior_document(tmp_path: Path) -> No
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4267,17 +4320,14 @@ def test_fix5_marker_archive_redacts_unsafe_prior_document(tmp_path: Path) -> No
     )
 
     assert result == 1
-    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
-        "code": "registered-service-binding",
-        "stage": "preflight",
-    }
-    archives = list((output_root / "history" / "terminal-markers").glob("failure-*.json"))
-    assert len(archives) == 1
-    archived = json.loads(archives[0].read_text(encoding="utf-8"))
-    assert archived["document_status"] == "redacted"
-    assert "document" not in archived
-    assert secret not in archives[0].name
-    assert secret not in archives[0].read_text(encoding="utf-8")
+    legacy_text = (output_root / "failure.json").read_text(encoding="utf-8")
+    assert secret in legacy_text
+    run_failure = json.loads(
+        (output_root / "runs" / ("4" * 64) / "failure.json").read_text(encoding="utf-8")
+    )
+    assert run_failure["failure"]["code"] == "registered-service-binding"
+    assert secret not in json.dumps(run_failure)
+    assert not (output_root / "history").exists()
 
 
 def test_fix5_success_fails_closed_when_prior_marker_cannot_be_archived(
@@ -4310,6 +4360,8 @@ def test_fix5_success_fails_closed_when_prior_marker_cannot_be_archived(
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4323,9 +4375,9 @@ def test_fix5_success_fails_closed_when_prior_marker_cannot_be_archived(
         ),
     )
 
-    assert result == 1
+    assert result == 0
     assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == stale_failure
-    assert not (output_root / "preflight.json").exists()
+    assert (output_root / "runs" / ("4" * 64) / "preflight.json").exists()
     assert not list((output_root / "history" / "terminal-markers").glob("*.json"))
 
 
@@ -4355,6 +4407,7 @@ def test_fix5_archive_failure_never_overrides_current_primary(
     with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
         reliability_validation.execute_reliability_validation(
             fixture,
+            run_key=TASK3_RUN_KEY,
             output_root=output_root,
             http_probe=http_probe,
             host_probe=host_probe,
@@ -4366,7 +4419,10 @@ def test_fix5_archive_failure_never_overrides_current_primary(
         "preflight",
     )
     assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == stale_failure
-    assert not (output_root / "preflight.json").exists()
+    run_failure = json.loads(
+        (output_root / "runs" / TASK3_RUN_KEY / "failure.json").read_text(encoding="utf-8")
+    )
+    assert run_failure["failure"]["code"] == "initial-queue-not-idle"
 
 
 def test_fix5_marker_archive_collision_never_overwrites_prior_history(
@@ -4400,6 +4456,8 @@ def test_fix5_marker_archive_collision_never_overwrites_prior_history(
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4416,10 +4474,9 @@ def test_fix5_marker_archive_collision_never_overwrites_prior_history(
     assert result == 0
     assert json.loads(collision.read_text(encoding="utf-8")) == prior_history
     archives = sorted(archive_root.glob("failure-*.json"))
-    assert len(archives) == 2
-    current_archives = [path for path in archives if path != collision]
-    assert len(current_archives) == 1
-    assert json.loads(current_archives[0].read_text(encoding="utf-8"))["document"] == stale_failure
+    assert archives == [collision]
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == stale_failure
+    assert (output_root / "runs" / ("4" * 64) / "preflight.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -4449,6 +4506,8 @@ def test_fix5_preflight_history_requires_exact_public_schema(
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4463,7 +4522,7 @@ def test_fix5_preflight_history_requires_exact_public_schema(
     )
     assert seed_result == 0
     legal_preflight = json.loads(
-        (output_root / "preflight.json").read_text(encoding="utf-8")
+        (output_root / "runs" / ("4" * 64) / "preflight.json").read_text(encoding="utf-8")
     )
     stale_preflight = json.loads(json.dumps(legal_preflight))
     private_value = "runtime-private-service-134"
@@ -4506,6 +4565,8 @@ def test_fix5_preflight_history_requires_exact_public_schema(
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4520,16 +4581,13 @@ def test_fix5_preflight_history_requires_exact_public_schema(
     )
 
     assert result == 1
-    assert not (output_root / "preflight.json").exists()
-    archives = list((output_root / "history" / "terminal-markers").glob("preflight-*.json"))
-    assert len(archives) == 1
-    archived = json.loads(archives[0].read_text(encoding="utf-8"))
-    assert archived["document_status"] == expected_status
-    if expected_status == "validated":
-        assert archived["document"] == legal_preflight
-    else:
-        assert "document" not in archived
-        assert private_value not in archives[0].read_text(encoding="utf-8")
+    assert json.loads((output_root / "preflight.json").read_text(encoding="utf-8")) == stale_preflight
+    assert expected_status in {"validated", "invalid", "redacted"}
+    assert not (output_root / "history").exists()
+    run_failure = json.loads(
+        (output_root / "runs" / ("4" * 64) / "failure.json").read_text(encoding="utf-8")
+    )
+    assert run_failure["failure"]["code"] == "registered-service-binding"
 
 
 @pytest.mark.parametrize(
@@ -4564,6 +4622,8 @@ def test_fix5b_preflight_history_requires_strict_boolean_and_integer_types(
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4578,7 +4638,7 @@ def test_fix5b_preflight_history_requires_strict_boolean_and_integer_types(
     )
     assert seed_result == 0
     legal_preflight = json.loads(
-        (output_root / "preflight.json").read_text(encoding="utf-8")
+        (output_root / "runs" / ("4" * 64) / "preflight.json").read_text(encoding="utf-8")
     )
     assert all(item["ready"] is True for item in legal_preflight["resources"])
     assert type(legal_preflight["queue"]["tts_queued"]) is int
@@ -4612,6 +4672,8 @@ def test_fix5b_preflight_history_requires_strict_boolean_and_integer_types(
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4626,17 +4688,13 @@ def test_fix5b_preflight_history_requires_strict_boolean_and_integer_types(
     )
 
     assert result == 1
-    assert not (output_root / "preflight.json").exists()
-    archives = list((output_root / "history" / "terminal-markers").glob("preflight-*.json"))
-    assert len(archives) == 1
-    archived = json.loads(archives[0].read_text(encoding="utf-8"))
-    assert archived["kind"] == "preflight"
-    assert archived["sha256"] == hashlib.sha256(marker_bytes).hexdigest()
-    assert archived["document_status"] == expected_status
-    if expected_status == "validated":
-        assert archived["document"] == legal_preflight
-    else:
-        assert set(archived) == {"kind", "sha256", "document_status"}
+    assert (output_root / "preflight.json").read_bytes() == marker_bytes
+    assert expected_status in {"validated", "invalid"}
+    assert not (output_root / "history").exists()
+    run_failure = json.loads(
+        (output_root / "runs" / ("4" * 64) / "failure.json").read_text(encoding="utf-8")
+    )
+    assert run_failure["failure"]["code"] == "registered-service-binding"
 
 
 def test_fix5_failure_history_rejects_extra_private_fields(tmp_path: Path) -> None:
@@ -4664,6 +4722,8 @@ def test_fix5_failure_history_rejects_extra_private_fields(tmp_path: Path) -> No
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4678,13 +4738,10 @@ def test_fix5_failure_history_rejects_extra_private_fields(tmp_path: Path) -> No
     )
 
     assert result == 0
-    archives = list((output_root / "history" / "terminal-markers").glob("failure-*.json"))
-    assert len(archives) == 1
-    archived_text = archives[0].read_text(encoding="utf-8")
-    archived = json.loads(archived_text)
-    assert archived["document_status"] == "invalid"
-    assert "document" not in archived
-    assert private_service_id not in archived_text
+    legacy_text = (output_root / "failure.json").read_text(encoding="utf-8")
+    assert private_service_id in legacy_text
+    assert not (output_root / "history").exists()
+    assert (output_root / "runs" / ("4" * 64) / "preflight.json").exists()
 
 
 @pytest.mark.parametrize("business_path", ["primary-failure", "otherwise-success"])
@@ -4796,6 +4853,8 @@ def test_fix5_two_marker_transition_reconciles_every_single_io_fault(
             str(fixture_path),
             "--output-root",
             str(output_root),
+            "--run-key",
+            "4" * 64,
             "--comfyui-pid",
             "8188",
             "--tts-more-pid",
@@ -4809,29 +4868,18 @@ def test_fix5_two_marker_transition_reconciles_every_single_io_fault(
         ),
     )
 
-    assert fault_raised is True, archive_write_count
-    assert result == 1
-    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == (
-        expected_failure
-    )
-    assert not (output_root / "preflight.json").exists()
-    archives = list((output_root / "history" / "terminal-markers").glob("*.json"))
-    archived_documents = [
-        json.loads(path.read_text(encoding="utf-8")).get("document")
-        for path in archives
-    ]
-    assert stale_failure in archived_documents
-    preflight_archives = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in archives
-        if path.name.startswith("preflight-")
-    ]
-    assert preflight_archives
-    assert all(item["document_status"] == "invalid" for item in preflight_archives)
-    assert all("document" not in item for item in preflight_archives)
-    assert all(len(item["sha256"]) == 64 for item in preflight_archives)
-    assert len(archives) == len({path.name for path in archives})
-    assert all("token=" not in path.read_text(encoding="utf-8") for path in archives)
+    assert fault_raised is False, archive_write_count
+    assert archive_write_count == 0
+    assert result == (1 if business_path == "primary-failure" else 0)
+    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == stale_failure
+    assert json.loads((output_root / "preflight.json").read_text(encoding="utf-8")) == stale_preflight
+    assert not (output_root / "history").exists()
+    run_root = output_root / "runs" / ("4" * 64)
+    if business_path == "primary-failure":
+        run_failure = json.loads((run_root / "failure.json").read_text(encoding="utf-8"))
+        assert run_failure["failure"] == expected_failure
+    else:
+        assert (run_root / "preflight.json").exists()
 
 
 def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
@@ -9851,6 +9899,7 @@ def test_fix8_controller_persists_strict_detailed_failed_case_without_private_id
     with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
         reliability_validation.execute_reliability_validation(
             fixture,
+            run_key=TASK3_RUN_KEY,
             output_root=output_root,
             http_probe=http_probe,
             host_probe=host_probe,
@@ -9858,7 +9907,8 @@ def test_fix8_controller_persists_strict_detailed_failed_case_without_private_id
         )
 
     assert exc_info.value.code == "case-execution-failed"
-    failed_path = output_root / "cases" / "steady-01-gpt-sovits.json"
+    run_root = output_root / "runs" / TASK3_RUN_KEY
+    failed_path = run_root / "cases" / "steady-01-gpt-sovits.json"
     failed = reliability_validation.FailedCaseEvidence.model_validate_json(
         failed_path.read_text(encoding="utf-8")
     )
@@ -9868,7 +9918,7 @@ def test_fix8_controller_persists_strict_detailed_failed_case_without_private_id
     rendered = failed_path.read_text(encoding="utf-8")
     assert "private-probe-secret" not in rendered
     assert "F:\\private" not in rendered
-    assert (output_root / "failure.json").read_text(encoding="utf-8").find(
+    assert (run_root / "failure.json").read_text(encoding="utf-8").find(
         "case-execution-failed"
     ) >= 0
 
@@ -9881,22 +9931,30 @@ def test_fix8_secondary_detailed_case_writer_failure_uses_minimal_fallback_witho
     http_probe = _Fix8DetailedFailureProbe()
     host_probe = _ExecutorHostProbe()
     output_root = tmp_path / "evidence"
-    original_write = reliability_validation.write_atomic_json
+    original_write = reliability_evidence.write_artifact
     failed_case_writes = 0
 
-    def fail_detailed_once(path: Path, payload: object, **kwargs: object) -> None:
+    def fail_detailed_once(
+        root: Path,
+        run_key: str,
+        kind: str,
+        payload: bytes,
+        *,
+        name: str | None = None,
+    ) -> reliability_evidence.ArtifactCommitment:
         nonlocal failed_case_writes
-        if path.parent.name == "cases" and isinstance(payload, dict) and payload.get("status") == "failed":
+        if kind == "case" and name == "steady-01-gpt-sovits":
             failed_case_writes += 1
             if failed_case_writes == 1:
-                raise OSError(f"token=secondary-writer-secret {tmp_path}")
-        original_write(path, payload, **kwargs)
+                raise reliability_evidence.EvidenceStoreError("secondary writer unavailable")
+        return original_write(root, run_key, kind, payload, name=name)
 
-    monkeypatch.setattr(reliability_validation, "write_atomic_json", fail_detailed_once)
+    monkeypatch.setattr(reliability_evidence, "write_artifact", fail_detailed_once)
 
     with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
         reliability_validation.execute_reliability_validation(
             fixture,
+            run_key=TASK3_RUN_KEY,
             output_root=output_root,
             http_probe=http_probe,
             host_probe=host_probe,
@@ -9905,7 +9963,8 @@ def test_fix8_secondary_detailed_case_writer_failure_uses_minimal_fallback_witho
 
     assert exc_info.value.code == "case-execution-failed"
     assert failed_case_writes == 2
-    failed_path = output_root / "cases" / "steady-01-gpt-sovits.json"
+    run_root = output_root / "runs" / TASK3_RUN_KEY
+    failed_path = run_root / "cases" / "steady-01-gpt-sovits.json"
     failed = reliability_validation.FailedCaseEvidence.model_validate_json(
         failed_path.read_text(encoding="utf-8")
     )
@@ -9916,7 +9975,8 @@ def test_fix8_secondary_detailed_case_writer_failure_uses_minimal_fallback_witho
     rendered = failed_path.read_text(encoding="utf-8")
     assert "secondary-writer-secret" not in rendered
     assert str(tmp_path) not in rendered
-    assert json.loads((output_root / "failure.json").read_text(encoding="utf-8")) == {
+    failure = json.loads((run_root / "failure.json").read_text(encoding="utf-8"))
+    assert failure["failure"] == {
         "code": "case-execution-failed",
         "stage": "case",
     }
@@ -11406,3 +11466,482 @@ Write-Output 'FIX9_TOP_LEVEL_TRANSACTION_WIRING_OK'
     )
     assert completed.returncode == 0, completed.stderr
     assert "FIX9_TOP_LEVEL_TRANSACTION_WIRING_OK" in completed.stdout
+
+
+TASK3_RUN_KEY = "3" * 64
+
+
+def test_task3_preflight_is_first_written_under_its_run_and_preserves_legacy_root(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+    legacy = {"code": "legacy-still-auditable", "stage": "case"}
+    (tmp_path / "failure.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    reliability_validation.execute_reliability_preflight(
+        fixture,
+        run_key=TASK3_RUN_KEY,
+        output_root=tmp_path,
+        http_probe=http_probe,
+        host_probe=host_probe,
+        owned_processes=host_probe.owned_processes,
+    )
+
+    marker = tmp_path / "runs" / TASK3_RUN_KEY / "preflight.json"
+    assert json.loads(marker.read_text(encoding="utf-8"))["status"] == "passed"
+    assert json.loads((tmp_path / "failure.json").read_text(encoding="utf-8")) == legacy
+    assert not (tmp_path / "preflight.json").exists()
+    assert not (tmp_path / "history").exists()
+
+
+def test_task3_preflight_conflict_preserves_first_run_bytes(tmp_path: Path) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    http_probe = _ExecutorHttpProbe()
+    host_probe = _ExecutorHostProbe()
+    target = tmp_path / "runs" / TASK3_RUN_KEY / "preflight.json"
+
+    reliability_validation.execute_reliability_preflight(
+        fixture,
+        run_key=TASK3_RUN_KEY,
+        output_root=tmp_path,
+        http_probe=http_probe,
+        host_probe=host_probe,
+        owned_processes=host_probe.owned_processes,
+    )
+    first = target.read_bytes()
+    changed_http = _ExecutorHttpProbe()
+    changed_host = _ExecutorHostProbe()
+    changed_host.boundary = changed_host.boundary.model_copy(
+        update={"aggregate_hash": "9" * 64},
+    )
+
+    with pytest.raises(reliability_validation.LiveValidationError):
+        reliability_validation.execute_reliability_preflight(
+            fixture,
+            run_key=TASK3_RUN_KEY,
+            output_root=tmp_path,
+            http_probe=changed_http,
+            host_probe=changed_host,
+            owned_processes=changed_host.owned_processes,
+        )
+
+    assert target.read_bytes() == first
+
+
+def test_task3_cli_requires_a_lowercase_sha256_run_key(tmp_path: Path) -> None:
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(_fixture_document()), encoding="utf-8")
+    common = [
+        "--fixture",
+        str(fixture_path),
+        "--output-root",
+        str(tmp_path / "out"),
+        "--comfyui-pid",
+        "8188",
+        "--tts-more-pid",
+        "8000",
+        "--preflight-only",
+    ]
+
+    with pytest.raises(SystemExit):
+        reliability_validation.main(common)
+    with pytest.raises(SystemExit):
+        reliability_validation.main([*common, "--run-key", "A" * 64])
+
+
+def test_task3_cli_invalid_fixture_still_first_writes_run_failure(tmp_path: Path) -> None:
+    fixture = _fixture_document()
+    fixture["rounds"] = 9
+    fixture_path = tmp_path / "invalid-fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    output_root = tmp_path / "new-evidence-root"
+
+    result = reliability_validation.main(
+        [
+            "--fixture",
+            str(fixture_path),
+            "--output-root",
+            str(output_root),
+            "--run-key",
+            TASK3_RUN_KEY,
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ]
+    )
+
+    failure = json.loads(
+        (output_root / "runs" / TASK3_RUN_KEY / "failure.json").read_text(encoding="utf-8")
+    )
+    assert result == 1
+    assert failure["failure"] == {
+        "code": "preflight-observation-failed",
+        "stage": "preflight",
+    }
+
+
+def test_task3_matrix_first_writes_exact_run_owned_case_and_audio_evidence(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    output_root = tmp_path / "evidence"
+
+    class TrackingHttpProbe(_ExecutorHttpProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.output_directories: list[Path] = []
+
+        def execute_case(
+            self,
+            case: reliability_validation.CasePlan,
+            fixture: ReliabilityFixture,
+            output_directory: Path,
+            *,
+            action_hook: object | None = None,
+        ) -> reliability_validation.HttpCaseObservation:
+            self.output_directories.append(output_directory)
+            return super().execute_case(
+                case,
+                fixture,
+                output_directory,
+                action_hook=action_hook,
+            )
+
+    http_probe = TrackingHttpProbe()
+    host_probe = _ExecutorHostProbe()
+
+    summary = reliability_validation.execute_reliability_validation(
+        fixture,
+        run_key=TASK3_RUN_KEY,
+        output_root=output_root,
+        http_probe=http_probe,
+        host_probe=host_probe,
+        owned_processes=host_probe.owned_processes,
+    )
+
+    run_root = output_root / "runs" / TASK3_RUN_KEY
+    assert summary.status == "passed"
+    assert len(list((run_root / "cases").glob("*.json"))) == 47
+    assert len(list((run_root / "audio").glob("*.wav"))) == 39
+    assert json.loads((run_root / "reliability-summary.json").read_text(encoding="utf-8"))["status"] == "passed"
+    assert json.loads((run_root / "preflight.json").read_text(encoding="utf-8"))["status"] == "passed"
+    assert all(not directory.is_relative_to(output_root) for directory in http_probe.output_directories)
+    assert all(not directory.exists() for directory in http_probe.output_directories)
+    assert not any(
+        (run_root / name).exists()
+        for name in ("terminal.json", "current.json", "run-result.json", "supervisor.json")
+    )
+    assert not (output_root / "reliability-summary.json").exists()
+    assert not (output_root / "cases").exists()
+    assert not (output_root / "audio").exists()
+
+
+def test_task3_temporary_audio_rejects_a_parent_junction(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("real junction behavior is Windows-specific")
+    temporary_root = tmp_path / "temporary"
+    outside = tmp_path / "outside"
+    temporary_root.mkdir()
+    outside.mkdir()
+    outside_wav = outside / "voice.wav"
+    _write_voiced_wav(outside_wav)
+    junction = temporary_root / "audio"
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    try:
+        with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+            reliability_validation._read_validated_temporary_audio(
+                junction / outside_wav.name,
+                temporary_root,
+                reliability_validation._wav_proof(outside_wav),
+            )
+        assert exc_info.value.code == "unsafe-audio-output"
+    finally:
+        junction.rmdir()
+
+
+def test_task3_failure_preserves_completed_and_active_case_in_the_same_run(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+
+    class SecondCaseFailsHttpProbe(_ExecutorHttpProbe):
+        def execute_case(
+            self,
+            case: reliability_validation.CasePlan,
+            fixture: ReliabilityFixture,
+            output_directory: Path,
+            *,
+            action_hook: object | None = None,
+        ) -> reliability_validation.HttpCaseObservation:
+            if len(self.executed) == 1:
+                raise httpx.ReadTimeout("private runtime detail must be scrubbed")
+            return super().execute_case(
+                case,
+                fixture,
+                output_directory,
+                action_hook=action_hook,
+            )
+
+    output_root = tmp_path / "evidence"
+    http_probe = SecondCaseFailsHttpProbe()
+    host_probe = _ExecutorHostProbe()
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            run_key=TASK3_RUN_KEY,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert exc_info.value.code == "case-execution-failed"
+    run_root = output_root / "runs" / TASK3_RUN_KEY
+    completed = json.loads((run_root / "cases" / "steady-01-gpt-sovits.json").read_text(encoding="utf-8"))
+    active = json.loads((run_root / "cases" / "steady-01-indextts.json").read_text(encoding="utf-8"))
+    failure = json.loads((run_root / "failure.json").read_text(encoding="utf-8"))
+    summary = json.loads((run_root / "reliability-summary.json").read_text(encoding="utf-8"))
+    assert completed["actual"] == "completed"
+    assert active["status"] == "failed"
+    assert active["failure"] == {"code": "case-execution-failed", "stage": "case"}
+    assert failure == {
+        "active_case_id": "steady-01-indextts",
+        "failure": {"code": "case-execution-failed", "stage": "case"},
+        "run_key": TASK3_RUN_KEY,
+        "schema_version": 1,
+        "status": "failed",
+    }
+    assert summary["status"] == "failed"
+    assert (run_root / "audio" / "steady-01-gpt-sovits.wav").exists()
+    assert not (output_root / "failure.json").exists()
+    assert not (output_root / "reliability-summary.json").exists()
+
+
+def _task3_failed_run(output_root: Path, run_key: str) -> Path:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+
+    class SecondCaseFails(_ExecutorHttpProbe):
+        def execute_case(
+            self,
+            case: reliability_validation.CasePlan,
+            fixture: ReliabilityFixture,
+            output_directory: Path,
+            *,
+            action_hook: object | None = None,
+        ) -> reliability_validation.HttpCaseObservation:
+            if len(self.executed) == 1:
+                raise httpx.ReadTimeout("sanitized by controller")
+            return super().execute_case(
+                case,
+                fixture,
+                output_directory,
+                action_hook=action_hook,
+            )
+
+    http_probe = SecondCaseFails()
+    host_probe = _ExecutorHostProbe()
+    with pytest.raises(reliability_validation.LiveValidationError):
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            run_key=run_key,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+    return output_root / "runs" / run_key
+
+
+def _task3_freeze_failed_run(output_root: Path, run_key: str) -> None:
+    run_root = output_root / "runs" / run_key
+    reliability_evidence.write_artifact(output_root, run_key, "supervisor", b"supervisor\n")
+    reliability_evidence.write_artifact(output_root, run_key, "run-result", b"run-result\n")
+
+    def commitment(relative_name: str) -> reliability_evidence.ArtifactCommitment:
+        payload = (run_root / Path(relative_name)).read_bytes()
+        return reliability_evidence.ArtifactCommitment(
+            relative_name=relative_name,
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+    case_names = sorted(path.relative_to(run_root).as_posix() for path in (run_root / "cases").glob("*.json"))
+    artifact_names = ["run-result.json", "supervisor.json"] + sorted(
+        path.relative_to(run_root).as_posix() for path in (run_root / "audio").glob("*.wav")
+    )
+    terminal = reliability_evidence.RunTerminal(
+        schema_version=1,
+        kind="reliability-run-terminal",
+        run_key=run_key,
+        mode="matrix",
+        outcome="failed",
+        failure_source="validator",
+        evidence_complete=True,
+        launcher_exit_code=1,
+        validator_exit_code=1,
+        cleanup_status="completed",
+        preflight=commitment("preflight.json"),
+        failure=commitment("failure.json"),
+        summary=commitment("reliability-summary.json"),
+        cases=tuple(commitment(name) for name in case_names),
+        artifacts=tuple(commitment(name) for name in sorted(artifact_names)),
+    )
+    reliability_evidence.write_terminal(output_root, terminal)
+
+
+def test_task3_explicit_run_context_uses_exact_strict_artifacts_without_mtime(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    run_root = _task3_failed_run(output_root, TASK3_RUN_KEY)
+    old = datetime(2001, 1, 1, tzinfo=timezone.utc).timestamp()
+    for path in run_root.rglob("*"):
+        if path.is_file():
+            os.utime(path, (old, old))
+
+    context = launcher_failure_context.evaluate_launcher_failure_context_for_run(
+        output_root,
+        TASK3_RUN_KEY,
+    )
+
+    assert context.primary.model_dump() == {
+        "code": "case-execution-failed",
+        "stage": "case",
+    }
+    assert context.failure_sha256 is not None
+    assert context.summary is not None and context.summary.completed_case_count == 1
+    assert context.case is not None
+    assert context.case.case_id_sha256 == hashlib.sha256(b"steady-01-indextts").hexdigest().upper()
+
+
+@pytest.mark.parametrize("mutation", ["missing-run", "noncanonical", "summary-tamper"])
+def test_task3_explicit_run_context_fails_generically_without_legacy_or_cross_run_fallback(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    output_root = tmp_path / "evidence"
+    run_root = _task3_failed_run(output_root, TASK3_RUN_KEY)
+    (output_root / "failure.json").write_text(
+        json.dumps({"code": "legacy-must-not-bind", "stage": "case"}),
+        encoding="utf-8",
+    )
+    selected_key = TASK3_RUN_KEY
+    if mutation == "missing-run":
+        selected_key = "8" * 64
+    elif mutation == "noncanonical":
+        document = json.loads((run_root / "failure.json").read_text(encoding="utf-8"))
+        (run_root / "failure.json").write_text(json.dumps(document, indent=2), encoding="utf-8")
+    else:
+        (run_root / "reliability-summary.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc_info:
+        launcher_failure_context.evaluate_launcher_failure_context_for_run(
+            output_root,
+            selected_key,
+        )
+
+    assert str(exc_info.value) == "launcher run context is invalid"
+    assert TASK3_RUN_KEY not in str(exc_info.value)
+    assert str(tmp_path) not in str(exc_info.value)
+
+
+def test_task3_current_context_verifies_pointer_and_ignores_contradictory_legacy(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    _task3_failed_run(output_root, TASK3_RUN_KEY)
+    _task3_freeze_failed_run(output_root, TASK3_RUN_KEY)
+    reliability_evidence.compare_and_swap_current(
+        output_root,
+        TASK3_RUN_KEY,
+        expected_token=reliability_evidence.ABSENT_POINTER_TOKEN,
+    )
+    (output_root / "failure.json").write_text(
+        json.dumps({"code": "legacy-contradiction", "stage": "preflight"}),
+        encoding="utf-8",
+    )
+
+    context = launcher_failure_context.evaluate_current_launcher_failure_context(
+        output_root,
+    )
+
+    assert context.primary.code == "case-execution-failed"
+
+
+def test_task3_current_context_only_uses_legacy_when_pointer_is_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    legacy_context = launcher_failure_context.LauncherFailureContext(
+        schema_version=1,
+        kind="launcher-failure-context",
+        status="failed",
+        primary=launcher_failure_context.LauncherFailurePrimary(
+            code="legacy-audit",
+            stage="validator",
+        ),
+        failure_sha256=None,
+        summary=None,
+        case=None,
+        case_context_secondary_sha256=[launcher_failure_context._CASE_CONTEXT_UNBOUND_SHA256],
+    )
+    calls: list[str] = []
+
+    def legacy(*args: object, **kwargs: object) -> launcher_failure_context.LauncherFailureContext:
+        del args, kwargs
+        calls.append("legacy")
+        return legacy_context
+
+    monkeypatch.setattr(launcher_failure_context, "evaluate_launcher_failure_context", legacy)
+    result = launcher_failure_context.evaluate_current_launcher_failure_context(
+        output_root,
+        baseline_path=output_root / "baseline.json",
+        run_started_at="2026-08-03T00:00:00.000000Z",
+        failure_observed_at="2026-08-03T00:01:00.000000Z",
+    )
+    assert result.primary.code == "legacy-audit"
+    assert calls == ["legacy"]
+
+    (output_root / "current-terminal.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="launcher current context is invalid"):
+        launcher_failure_context.evaluate_current_launcher_failure_context(
+            output_root,
+            baseline_path=output_root / "baseline.json",
+            run_started_at="2026-08-03T00:00:00.000000Z",
+            failure_observed_at="2026-08-03T00:01:00.000000Z",
+        )
+    assert calls == ["legacy"]
+
+
+def test_task3_evaluate_run_cli_prints_only_verified_run_context(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    output_root = tmp_path / "evidence"
+    _task3_failed_run(output_root, TASK3_RUN_KEY)
+
+    result = launcher_failure_context.main(
+        [
+            "evaluate-run",
+            "--output-root",
+            str(output_root),
+            "--run-key",
+            TASK3_RUN_KEY,
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out)["primary"]["code"] == "case-execution-failed"
