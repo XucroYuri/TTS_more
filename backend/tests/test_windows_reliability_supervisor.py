@@ -839,6 +839,106 @@ def test_private_recovery_leaf_swap_is_blocked_for_the_full_supervised_lifecycle
     assert not (output_root / ".private-recovery" / current.pointer.run_key).exists()
 
 
+def test_cleanup_success_holds_deleted_private_leaf_name_through_publication(
+    tmp_path: Path,
+) -> None:
+    harness_scripts = tmp_path / "harness" / "scripts"
+    harness_scripts.mkdir(parents=True)
+    supervisor = harness_scripts / SUPERVISOR_SOURCE.name
+    pause_marker = tmp_path / "private-delete-pending.marker"
+    supervisor_source = SUPERVISOR_SOURCE.read_text(encoding="utf-8")
+    deletion = "        $directoryLease.RemovePrivateRunDirectory()"
+    assert supervisor_source.count(deletion) == 1
+    supervisor.write_text(
+        supervisor_source.replace(
+            deletion,
+            deletion
+            + "\n"
+            + f"        [IO.File]::WriteAllText('{_powershell_literal(pause_marker)}', 'pending')\n"
+            + "        Start-Sleep -Milliseconds 1200",
+        ),
+        encoding="utf-8",
+    )
+    start_count = tmp_path / "start-count.txt"
+    raw_run_id = tmp_path / "raw-run-id.txt"
+    evidence_fixture = tmp_path / "authoritative-public-fixture"
+    _write_authoritative_public_fixture(evidence_fixture, matrix=False)
+    _write_fake_inner(
+        harness_scripts / INNER_SOURCE.name,
+        start_count_path=start_count,
+        raw_run_id_path=raw_run_id,
+        scenario="preflight",
+        evidence_fixture=evidence_fixture,
+    )
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text("{}\n", encoding="utf-8")
+    comfy_root = tmp_path / "comfyui"
+    comfy_root.mkdir()
+    comfy_python = tmp_path / "comfy-python.exe"
+    comfy_python.write_bytes(b"test-only")
+    output_root = tmp_path / "evidence"
+    process = subprocess.Popen(
+        [
+            str(POWERSHELL),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(supervisor),
+            "-Fixture",
+            str(fixture),
+            "-OutputRoot",
+            str(output_root),
+            "-ComfyUiRoot",
+            str(comfy_root),
+            "-ComfyPython",
+            str(comfy_python),
+            "-TtsMoreRoot",
+            str(REPOSITORY_ROOT),
+            "-PreflightOnly",
+        ],
+        cwd=REPOSITORY_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not pause_marker.exists():
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                raise AssertionError(stdout + stderr)
+            if time.monotonic() >= deadline:
+                raise AssertionError("private deletion gate was not reached")
+            time.sleep(0.01)
+        run_key = hashlib.sha256(
+            raw_run_id.read_text(encoding="utf-8").encode("utf-8")
+        ).hexdigest()
+        private_leaf = output_root / ".private-recovery" / run_key
+        try:
+            private_leaf_observation = f"stat:{private_leaf.lstat()}"
+        except OSError as exc:
+            private_leaf_observation = f"error:{exc!r}"
+        recreation_blocked = False
+        try:
+            private_leaf.mkdir()
+        except OSError:
+            recreation_blocked = True
+        stdout, stderr = process.communicate(timeout=20)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+    assert recreation_blocked, "delete-pending private leaf name was reusable"
+    assert process.returncode == 0, private_leaf_observation + "\n" + stdout + stderr
+    current = reliability_evidence.verify_current(output_root)
+    assert not (output_root / ".private-recovery" / current.pointer.run_key).exists()
+
+
 def test_r3_validation_failure_releases_the_directory_lease(tmp_path: Path) -> None:
     completed, output_root, _start_count, _raw_run_id = _run_supervisor(
         tmp_path,
@@ -1548,6 +1648,50 @@ def test_private_recovery_snapshot_crash_preserves_old_current_and_orphan(
     run_root = output_root / "runs" / run_key
     assert not (run_root / "logs" / "private-recovery.log").exists()
     assert not (run_root / "terminal.json").exists()
+
+
+def test_post_delete_private_leaf_recreation_fails_closed_without_deleting_replacement(
+    tmp_path: Path,
+) -> None:
+    _completed, output_root, _start_count, _raw_run_id = _run_supervisor(tmp_path)
+    old_pointer_bytes = (output_root / "current-terminal.json").read_bytes()
+    old_current = reliability_evidence.verify_current(output_root)
+    run_key = "d" * 64
+    expected_token, prepared_run = _prepare_orphan_preflight_run(output_root, run_key)
+    _prepare_direct_finalization(
+        output_root,
+        prepared_run,
+        mode="preflight",
+        launcher_exit_code=0,
+    )
+    replacement = Path(prepared_run.private_root)
+    replacement.mkdir()
+    sentinel = replacement / "replacement-sentinel.bin"
+    sentinel.write_bytes(b"replacement-must-survive")
+
+    with pytest.raises(
+        reliability_supervision.SupervisionError,
+        match="private recovery cleanup is incomplete",
+    ):
+        reliability_supervision.finalize_supervision(
+            output_root,
+            run_key,
+            mode="preflight",
+            expected_token=expected_token,
+            expected_root_identity=prepared_run.root_identity,
+            expected_run_root_identity=prepared_run.run_root_identity,
+            expected_private_root_identity=prepared_run.private_root_identity,
+            expected_private_namespace_identity=(
+                prepared_run.private_namespace_identity
+            ),
+            launcher_exit_code=0,
+            child_start_count=1,
+        )
+
+    assert (output_root / "current-terminal.json").read_bytes() == old_pointer_bytes
+    assert reliability_evidence.verify_current(output_root) == old_current
+    assert sentinel.read_bytes() == b"replacement-must-survive"
+    assert not (output_root / "runs" / run_key / "terminal.json").exists()
 
 
 def _assert_no_current(output_root: Path) -> None:

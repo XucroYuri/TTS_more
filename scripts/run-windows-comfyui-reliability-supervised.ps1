@@ -414,13 +414,6 @@ namespace TtsMore {
                     (uint)Marshal.SizeOf(typeof(FileDispositionInformation)))) {
                 throw new IOException("private run directory could not be removed");
             }
-            IntPtr removed = privateRunHandle;
-            privateRunHandle = IntPtr.Zero;
-            handles.Remove(removed);
-            CloseHandle(removed);
-            if (Directory.Exists(privateRunPath)) {
-                throw new IOException("private run directory removal is incomplete");
-            }
         }
 
         public void Dispose() {

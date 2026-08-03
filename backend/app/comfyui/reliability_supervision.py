@@ -710,6 +710,21 @@ def prepare_private_finalization(
         raise SupervisionError("private finalization could not be prepared") from exc
 
 
+def _private_leaf_is_absent_or_delete_pending(private_leaf: Path) -> bool:
+    try:
+        observed = private_leaf.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        raise SupervisionError("private recovery cleanup is unverifiable") from exc
+    return (
+        os.name == "nt"
+        and observed.st_dev == 0
+        and observed.st_ino == 0
+        and observed.st_nlink == 0
+    )
+
+
 def finalize_supervision(
     output_root: Path,
     run_key: str,
@@ -745,7 +760,7 @@ def finalize_supervision(
             child_start_count=child_start_count,
         )
         if result.cleanup_status == "completed":
-            if os.path.lexists(private_leaf):
+            if not _private_leaf_is_absent_or_delete_pending(private_leaf):
                 raise SupervisionError("private recovery cleanup is incomplete")
         elif result.cleanup_status == "failed":
             evidence.validate_directory_identity(
