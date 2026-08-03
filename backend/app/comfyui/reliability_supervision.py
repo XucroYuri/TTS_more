@@ -6,7 +6,14 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationError,
+    model_validator,
+)
 
 from app.comfyui import reliability_evidence as evidence
 from app.comfyui import reliability_private_recovery as private_recovery
@@ -164,6 +171,15 @@ class StreamCommitment(_StrictModel):
     kind: Literal["reliability-stream-commitment"]
     size_bytes: StrictInt = Field(ge=0, le=evidence.MAX_ARTIFACT_BYTES)
     sha256: evidence.SHA256
+
+
+class LauncherLifecycleCommitment(_StrictModel):
+    schema_version: Literal[1]
+    kind: Literal["reliability-launcher-lifecycle-commitment"]
+    run_key: evidence.RunKey
+    source_size_bytes: StrictInt = Field(ge=0, le=evidence.MAX_ARTIFACT_BYTES)
+    source_sha256: evidence.SHA256
+    promotion_ownership_sha256: evidence.SHA256
 
 
 class PreparedRun(_StrictModel):
@@ -408,12 +424,29 @@ def commit_log(
         )
         if len(payload) != metadata.st_size:
             raise SupervisionError("supervisor log source changed")
-        public_commitment = StreamCommitment(
-            schema_version=1,
-            kind="reliability-stream-commitment",
-            size_bytes=len(payload),
-            sha256=hashlib.sha256(payload).hexdigest(),
-        )
+        if name in {"launcher-lifecycle", "launcher-lifecycle-secondary"}:
+            try:
+                public_commitment = _launcher_lifecycle_commitment(
+                    payload,
+                    run_key=run_key,
+                )
+            except (UnicodeError, json.JSONDecodeError, ValidationError, ValueError, TypeError):
+                # Historical/test launchers may only expose an opaque stream.
+                # Publication remains backward compatible, while explicit
+                # destructive recovery later rejects this weaker commitment.
+                public_commitment = StreamCommitment(
+                    schema_version=1,
+                    kind="reliability-stream-commitment",
+                    size_bytes=len(payload),
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                )
+        else:
+            public_commitment = StreamCommitment(
+                schema_version=1,
+                kind="reliability-stream-commitment",
+                size_bytes=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+            )
         return evidence.write_artifact(
             Path(output_root),
             run_key,
@@ -421,8 +454,117 @@ def commit_log(
             _canonical_json(public_commitment),
             name=name,
         )
-    except (OSError, evidence.EvidenceStoreError, ValueError, TypeError) as exc:
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValidationError,
+        evidence.EvidenceStoreError,
+        ValueError,
+        TypeError,
+    ) as exc:
         raise SupervisionError("supervisor log could not be committed") from exc
+
+
+def _launcher_lifecycle_commitment(
+    payload: bytes,
+    *,
+    run_key: str,
+) -> LauncherLifecycleCommitment:
+    def unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("launcher lifecycle contains duplicate members")
+            result[key] = value
+        return result
+
+    document = json.loads(payload.decode("utf-8-sig"), object_pairs_hook=unique_pairs)
+    if type(document) is not dict or set(document) != {
+        "schema_version",
+        "kind",
+        "status",
+        "run_id_sha256",
+        "primary",
+        "validation",
+        "case",
+        "timestamps",
+        "processes",
+        "promotion_ownership_sha256",
+        "cleanup",
+    }:
+        raise ValueError("launcher lifecycle schema is invalid")
+    if (
+        document["schema_version"] != 1
+        or document["kind"] != "launcher-failure-lifecycle"
+        or document["status"] != "failed"
+        or type(document["run_id_sha256"]) is not str
+        or document["run_id_sha256"].lower() != run_key
+        or type(document["processes"]) is not list
+        or not 1 <= len(document["processes"]) <= 8
+    ):
+        raise ValueError("launcher lifecycle identity is invalid")
+    rows: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for process in document["processes"]:
+        if type(process) is not dict or set(process) != {
+            "role",
+            "kind",
+            "pid",
+            "creation_time_utc",
+            "parent_pid",
+            "parent_creation_time_utc",
+            "identity_sha256",
+        }:
+            raise ValueError("launcher lifecycle process schema is invalid")
+        role = process["role"]
+        process_kind = process["kind"]
+        key = (role, process_kind)
+        if (
+            role not in {"tts-more", "comfyui"}
+            or process_kind not in {"launch-root", "listener"}
+            or key in seen
+            or type(process["pid"]) is not int
+            or not 0 < process["pid"] <= 2**31 - 1
+            or type(process["parent_pid"]) is not int
+            or not 0 <= process["parent_pid"] <= 2**31 - 1
+            or type(process["creation_time_utc"]) is not str
+            or type(process["parent_creation_time_utc"]) is not str
+        ):
+            raise ValueError("launcher lifecycle process identity is invalid")
+        if (
+            type(process["identity_sha256"]) is not str
+            or len(process["identity_sha256"]) != 64
+            or any(character not in "0123456789ABCDEF" for character in process["identity_sha256"])
+        ):
+            raise ValueError("launcher lifecycle process identity is invalid")
+        seen.add(key)
+        rows.append(
+            "|".join(
+                (
+                    role,
+                    process_kind,
+                    str(process["pid"]),
+                    process["creation_time_utc"],
+                    str(process["parent_pid"]),
+                    process["identity_sha256"],
+                )
+            )
+        )
+    ownership = hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
+    if (
+        type(document["promotion_ownership_sha256"]) is not str
+        or ownership.upper() != document["promotion_ownership_sha256"]
+    ):
+        raise ValueError("launcher lifecycle ownership commitment is invalid")
+    return LauncherLifecycleCommitment(
+        schema_version=1,
+        kind="reliability-launcher-lifecycle-commitment",
+        run_key=run_key,
+        source_size_bytes=len(payload),
+        source_sha256=hashlib.sha256(payload).hexdigest(),
+        promotion_ownership_sha256=ownership,
+    )
 
 
 def _read_inner_result(output_root: Path, run_key: str) -> InnerRunResult:

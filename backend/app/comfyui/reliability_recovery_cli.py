@@ -90,7 +90,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan = decode_plan_token(args.plan_token)
             if str(Path(args.output_root).absolute()) != plan.output_root or args.run_key != plan.run_key:
                 raise RecoveryCliError("recovery plan binding is invalid")
-            result = execute_recovery_delete(plan)
+            processes, ports = _observations()
+            result = execute_recovery_delete(
+                plan,
+                observed_processes=processes,
+                observed_ports=ports,
+            )
             _emit({"ok": result.status == "removed", "result": result.model_dump(mode="json")})
             return 0 if result.status == "removed" else 1
     except (

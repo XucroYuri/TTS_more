@@ -37,12 +37,7 @@ function Invoke-RecoveryBridge {
     return [pscustomobject]@{ exit_code = [int] $exitCode; document = $document }
 }
 
-try {
-    $script:BackendRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\backend'))
-    $script:PythonPath = Join-Path $script:BackendRoot '.venv\Scripts\python.exe'
-    if (-not (Test-Path -LiteralPath $script:PythonPath -PathType Leaf)) {
-        throw 'Formal backend Python is unavailable'
-    }
+function Get-RecoveryObservation {
     $processRows = [System.Collections.Generic.List[object]]::new()
     $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
     if ($processes.Count -gt $MaximumObservedProcesses) {
@@ -83,9 +78,14 @@ try {
         })
     }
     $ports = [ordered]@{}
+    # Query the provider once with fail-closed error handling.  Filtering an
+    # authoritative all-listeners snapshot makes "no listener on this port" a
+    # normal empty result without suppressing provider failures.
+    $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop)
     foreach ($port in @(8000, 8188)) {
         $owners = @(
-            Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue |
+            $listeners |
+                Where-Object { [int] $_.LocalPort -eq $port } |
                 Select-Object -ExpandProperty OwningProcess -Unique
         )
         if ($owners.Count -gt 1) { throw 'Port observation is ambiguous' }
@@ -96,6 +96,16 @@ try {
     if ([Text.Encoding]::UTF8.GetByteCount($observation) -gt $MaximumObservationBytes) {
         throw 'Recovery observation exceeds its bound'
     }
+    return $observation
+}
+
+try {
+    $script:BackendRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\backend'))
+    $script:PythonPath = Join-Path $script:BackendRoot '.venv\Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $script:PythonPath -PathType Leaf)) {
+        throw 'Formal backend Python is unavailable'
+    }
+    $observation = Get-RecoveryObservation
     $plan = Invoke-RecoveryBridge -InputJson $observation -Arguments @(
         '-m', 'app.comfyui.reliability_recovery_cli', 'plan',
         '--output-root', ([IO.Path]::GetFullPath($OutputRoot)),
@@ -105,7 +115,10 @@ try {
         [string]::IsNullOrEmpty([string] $plan.document.plan_token)) {
         throw 'Recovery ownership proof was rejected'
     }
-    $execute = Invoke-RecoveryBridge -InputJson $null -Arguments @(
+    # The capability is not a substitute for liveness. Re-query immediately
+    # before execute; any provider error or ambiguity aborts the proof.
+    $freshObservation = Get-RecoveryObservation
+    $execute = Invoke-RecoveryBridge -InputJson $freshObservation -Arguments @(
         '-m', 'app.comfyui.reliability_recovery_cli', 'execute',
         '--output-root', ([IO.Path]::GetFullPath($OutputRoot)),
         '--run-key', $RunKey,

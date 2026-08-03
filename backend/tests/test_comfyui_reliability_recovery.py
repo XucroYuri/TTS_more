@@ -12,6 +12,7 @@ import pytest
 from app.comfyui import reliability_evidence as evidence
 from app.comfyui import reliability_private_recovery as private_recovery
 from app.comfyui import reliability_recovery as recovery
+from app.comfyui import reliability_supervision as supervision
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +41,14 @@ def _commitment(output_root: Path, run_key: str, kind: str, payload: bytes, *, n
     return evidence.write_artifact(output_root, run_key, kind, payload, name=name)
 
 
-def _failed_recovery_fixture(tmp_path: Path) -> tuple[Path, str, Path, tuple[dict[str, object], ...], dict[str, int | None]]:
+def _failed_recovery_fixture(
+    tmp_path: Path,
+    *,
+    malformed_supervisor: bool = False,
+    malformed_run_result: bool = False,
+    wrong_lifecycle_binding: bool = False,
+    with_secondary_lifecycle: bool = False,
+) -> tuple[Path, str, Path, tuple[dict[str, object], ...], dict[str, int | None]]:
     raw_run_id = "recovery-fixture-run"
     run_key = hashlib.sha256(raw_run_id.encode("utf-8")).hexdigest()
     output_root = tmp_path / "evidence"
@@ -66,20 +74,88 @@ def _failed_recovery_fixture(tmp_path: Path) -> tuple[Path, str, Path, tuple[dic
         "owned_processes": {"tts-more": tts, "comfyui": comfy},
         "launch_roots": {"tts-more": tts, "comfyui": comfy},
         "launch": {
-            "tts-more": {"port": 8000},
-            "comfyui": {"port": 8188},
+            "comfyui": {
+                "executable_path": "C:/fixture/python-4102.exe",
+                "arguments": ["main.py", "--port", "8188"],
+                "working_directory": "C:/fixture/comfyui",
+                "port": 8188,
+                "temp_root": "C:/fixture/temp",
+            },
         },
         "boundary": {"repositories": {}, "private_registry": "C:/private.json", "references": {}},
         "temp_roots": ["C:/fixture/temp"],
     }
-    (private_leaf / ".h").write_bytes(_canonical(host))
+    host_payload = _canonical(host)
+    (private_leaf / ".h").write_bytes(host_payload)
 
     snapshot = private_recovery.observe_private_recovery(boundary)
     snapshot_commitment = private_recovery.write_private_recovery_snapshot(
         output_root, run_key, snapshot
     )
-    supervisor = _commitment(output_root, run_key, "supervisor", b"supervisor\n")
-    run_result = _commitment(output_root, run_key, "run-result", b"run-result\n")
+    supervisor_model = supervision.SupervisorRecord(
+        schema_version=1,
+        kind="reliability-supervisor-result",
+        run_key=run_key,
+        mode="preflight",
+        child_start_count=1,
+        launcher_exit_code=7,
+        validator_exit_code=0,
+        cleanup_status="failed",
+        outcome="failed",
+        failure_source="cleanup",
+    )
+    inner_model = supervision.InnerRunResult(
+        schema_version=1,
+        kind="reliability-inner-run-result",
+        run_key=run_key,
+        mode="preflight",
+        outcome="failed",
+        failure_source="cleanup",
+        validator_exit_code=0,
+        cleanup_status="failed",
+        reported_by="inner",
+    )
+    supervisor_payload = b"supervisor\n" if malformed_supervisor else _canonical(supervisor_model.model_dump(mode="json"))
+    run_result_payload = b"run-result\n" if malformed_run_result else _canonical(inner_model.model_dump(mode="json"))
+    supervisor = _commitment(output_root, run_key, "supervisor", supervisor_payload)
+    run_result = _commitment(output_root, run_key, "run-result", run_result_payload)
+    _owner_processes, _owner_ports, owner_public_identity = recovery._owner_proof(
+        host_payload, run_key
+    )
+    lifecycle_model = supervision.LauncherLifecycleCommitment(
+        schema_version=1,
+        kind="reliability-launcher-lifecycle-commitment",
+        run_key=run_key,
+        source_size_bytes=128,
+        source_sha256="9" * 64,
+        promotion_ownership_sha256=(
+            "8" * 64 if wrong_lifecycle_binding else owner_public_identity
+        ),
+    )
+    lifecycle = _commitment(
+        output_root,
+        run_key,
+        "log",
+        _canonical(lifecycle_model.model_dump(mode="json")),
+        name="launcher-lifecycle",
+    )
+    lifecycle_artifacts = [lifecycle]
+    if with_secondary_lifecycle:
+        secondary = supervision.StreamCommitment(
+            schema_version=1,
+            kind="reliability-stream-commitment",
+            size_bytes=42,
+            sha256="7" * 64,
+        )
+        lifecycle_artifacts.append(
+            _commitment(
+                output_root,
+                run_key,
+                "log",
+                _canonical(secondary.model_dump(mode="json")),
+                name="launcher-lifecycle-secondary",
+            )
+        )
     failure = _commitment(output_root, run_key, "failure", b"failure\n")
     terminal = evidence.RunTerminal(
         schema_version=1,
@@ -96,7 +172,12 @@ def _failed_recovery_fixture(tmp_path: Path) -> tuple[Path, str, Path, tuple[dic
         failure=failure,
         summary=None,
         cases=(),
-        artifacts=tuple(sorted((supervisor, run_result, snapshot_commitment), key=lambda item: item.relative_name)),
+        artifacts=tuple(
+            sorted(
+                (supervisor, run_result, snapshot_commitment, *lifecycle_artifacts),
+                key=lambda item: item.relative_name,
+            )
+        ),
     )
     evidence.write_terminal(
         output_root,
@@ -123,7 +204,9 @@ def test_recovery_removes_only_private_roles_and_leaf(tmp_path: Path) -> None:
         output_root, run_key, observed_processes=processes, observed_ports=ports
     )
     assert isinstance(plan, recovery.RecoveryPlan)
-    result = recovery.execute_recovery_delete(plan)
+    result = recovery.execute_recovery_delete(
+        plan, observed_processes=processes, observed_ports=ports
+    )
 
     assert result.status == "removed"
     assert result.deleted_roles == (".p", ".c", ".h", ".o")
@@ -205,12 +288,126 @@ def test_recovery_rejects_live_descendant_of_recorded_owner(tmp_path: Path) -> N
     assert private_leaf.exists()
 
 
+def test_execute_revalidates_fresh_owner_and_both_owned_ports(tmp_path: Path) -> None:
+    output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(tmp_path)
+    plan = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+    assert isinstance(plan, recovery.RecoveryPlan)
+    host = json.loads((private_leaf / ".h").read_text(encoding="utf-8"))
+    owner = host["owned_processes"]["tts-more"]
+    live_owner = {
+        "pid": owner["pid"],
+        "creation_time": owner["creation_time"],
+        "executable_sha256": hashlib.sha256(owner["executable_path"].encode()).hexdigest(),
+        "command_line_sha256": hashlib.sha256(owner["command_line"].encode()).hexdigest(),
+        "parent_pid": owner["parent_pid"],
+        "parent_creation_time": owner["parent_creation_time"],
+    }
+
+    owner_result = recovery.execute_recovery_delete(
+        plan,
+        observed_processes=(live_owner,),
+        observed_ports=ports,
+    )
+    port_result = recovery.execute_recovery_delete(
+        plan,
+        observed_processes=processes,
+        observed_ports={"8000": 9999, "8188": None},
+    )
+
+    assert owner_result.status == "rejected"
+    assert port_result.status == "rejected"
+    assert (private_leaf / ".h").exists()
+
+
+@pytest.mark.parametrize("malformed", ["supervisor", "run-result", "lifecycle-binding"])
+def test_recovery_rejects_malformed_public_ownership_artifacts_before_delete(
+    tmp_path: Path, malformed: str
+) -> None:
+    output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(
+        tmp_path,
+        malformed_supervisor=malformed == "supervisor",
+        malformed_run_result=malformed == "run-result",
+        wrong_lifecycle_binding=malformed == "lifecycle-binding",
+    )
+
+    decision = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+
+    assert isinstance(decision, recovery.RecoveryResult)
+    assert decision.deleted_roles == ()
+    assert (private_leaf / ".h").exists()
+
+
+def test_recovery_binds_optional_secondary_lifecycle_stream_without_treating_it_as_owner(
+    tmp_path: Path,
+) -> None:
+    output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(
+        tmp_path, with_secondary_lifecycle=True
+    )
+
+    decision = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+
+    assert isinstance(decision, recovery.RecoveryPlan)
+    assert (private_leaf / ".h").exists()
+
+
+def test_supervision_lifecycle_commitment_exports_owner_digest_for_recovery() -> None:
+    run_key = "a" * 64
+    processes: list[dict[str, object]] = []
+    rows: list[str] = []
+    for role, pid in (("tts-more", 4101), ("comfyui", 4102)):
+        record = recovery._record(_process_record(pid, 4000))
+        for kind in ("launch-root", "listener"):
+            identity = str(record["public_identity_sha256"]).upper()
+            process = {
+                "role": role,
+                "kind": kind,
+                "pid": pid,
+                "creation_time_utc": record["public_creation_time"],
+                "parent_pid": 4000,
+                "parent_creation_time_utc": record["public_parent_creation_time"],
+                "identity_sha256": identity,
+            }
+            processes.append(process)
+            rows.append(
+                f"{role}|{kind}|{pid}|{record['public_creation_time']}|4000|{identity}"
+            )
+    ownership = hashlib.sha256("\n".join(rows).encode()).hexdigest()
+    raw = _canonical(
+        {
+            "schema_version": 1,
+            "kind": "launcher-failure-lifecycle",
+            "status": "failed",
+            "run_id_sha256": run_key.upper(),
+            "primary": {},
+            "validation": {},
+            "case": {},
+            "timestamps": {},
+            "processes": processes,
+            "promotion_ownership_sha256": ownership.upper(),
+            "cleanup": {},
+        }
+    )
+
+    commitment = supervision._launcher_lifecycle_commitment(raw, run_key=run_key)
+
+    assert commitment.promotion_ownership_sha256 == ownership
+    assert commitment.run_key == run_key
+
+
 def test_recovery_execute_revalidates_concurrent_replacement_and_is_not_replayable(tmp_path: Path) -> None:
     output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(tmp_path)
     plan = recovery.validate_recovery_owner(output_root, run_key, observed_processes=processes, observed_ports=ports)
     assert isinstance(plan, recovery.RecoveryPlan)
     (private_leaf / ".h").write_bytes(b"replacement")
-    rejected = recovery.execute_recovery_delete(plan)
+    rejected = recovery.execute_recovery_delete(
+        plan, observed_processes=processes, observed_ports=ports
+    )
     assert rejected.status == "rejected"
     assert rejected.deleted_roles == ()
     assert private_leaf.exists()
@@ -219,8 +416,12 @@ def test_recovery_execute_revalidates_concurrent_replacement_and_is_not_replayab
     output_root2, run_key2, _leaf2, processes2, ports2 = _failed_recovery_fixture(tmp_path / "second")
     plan2 = recovery.validate_recovery_owner(output_root2, run_key2, observed_processes=processes2, observed_ports=ports2)
     assert isinstance(plan2, recovery.RecoveryPlan)
-    assert recovery.execute_recovery_delete(plan2).status == "removed"
-    assert recovery.execute_recovery_delete(plan2) == recovery.RecoveryResult(
+    assert recovery.execute_recovery_delete(
+        plan2, observed_processes=processes2, observed_ports=ports2
+    ).status == "removed"
+    assert recovery.execute_recovery_delete(
+        plan2, observed_processes=processes2, observed_ports=ports2
+    ) == recovery.RecoveryResult(
         status="rejected", run_key=run_key2, deleted_roles=(), reason_code="recovery-proof-failed"
     )
 
@@ -241,7 +442,9 @@ def test_recovery_partial_os_failure_is_truthful_and_never_touches_public_eviden
         original(*args, **kwargs)
 
     monkeypatch.setattr(recovery, "_delete_validated_role", fail_after_mutable)
-    result = recovery.execute_recovery_delete(plan)
+    result = recovery.execute_recovery_delete(
+        plan, observed_processes=processes, observed_ports=ports
+    )
 
     assert result.status == "rejected"
     assert result.deleted_roles == (".p",)
@@ -294,6 +497,8 @@ def test_recovery_cli_plan_and_execute_expose_only_an_opaque_token(tmp_path: Pat
     plan_document = json.loads(planned.stdout)
     assert set(plan_document) == {"ok", "plan_token"}
     assert str(private_leaf) not in planned.stdout
+    assert len(plan_document["plan_token"]) == 64
+    int(plan_document["plan_token"], 16)
 
     executed = subprocess.run(
         [
@@ -309,6 +514,7 @@ def test_recovery_cli_plan_and_execute_expose_only_an_opaque_token(tmp_path: Pat
             plan_document["plan_token"],
         ],
         cwd=BACKEND_ROOT,
+        input=observations,
         capture_output=True,
         text=True,
         check=False,
@@ -335,6 +541,7 @@ def test_recovery_cli_rejects_tampered_token_without_deleting_private_bytes(tmp_
     executed = subprocess.run(
         [sys.executable, "-m", "app.comfyui.reliability_recovery_cli", "execute", "--output-root", str(output_root), "--run-key", run_key, "--plan-token", tampered],
         cwd=BACKEND_ROOT,
+        input=json.dumps({"processes": list(processes), "ports": ports}),
         capture_output=True,
         text=True,
         check=False,
@@ -342,6 +549,41 @@ def test_recovery_cli_rejects_tampered_token_without_deleting_private_bytes(tmp_
 
     assert executed.returncode != 0
     assert (private_leaf / ".h").read_bytes() == before
+    assert recovery.decode_plan_token(token).run_key == run_key
+
+
+def test_recovery_cli_token_is_one_shot_and_execute_requires_fresh_observations(tmp_path: Path) -> None:
+    output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(tmp_path)
+    safe = json.dumps({"processes": list(processes), "ports": ports})
+    planned = subprocess.run(
+        [sys.executable, "-m", "app.comfyui.reliability_recovery_cli", "plan", "--output-root", str(output_root), "--run-key", run_key],
+        cwd=BACKEND_ROOT,
+        input=safe,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    token = json.loads(planned.stdout)["plan_token"]
+    occupied = json.dumps({"processes": [], "ports": {"8000": 9999, "8188": None}})
+    arguments = [
+        sys.executable,
+        "-m",
+        "app.comfyui.reliability_recovery_cli",
+        "execute",
+        "--output-root",
+        str(output_root),
+        "--run-key",
+        run_key,
+        "--plan-token",
+        token,
+    ]
+
+    first = subprocess.run(arguments, cwd=BACKEND_ROOT, input=occupied, capture_output=True, text=True, check=False)
+    replay = subprocess.run(arguments, cwd=BACKEND_ROOT, input=safe, capture_output=True, text=True, check=False)
+
+    assert first.returncode != 0
+    assert replay.returncode != 0
+    assert (private_leaf / ".h").exists()
 
 
 def test_recovery_execute_rejects_namespace_or_leaf_identity_drift_without_delete(tmp_path: Path) -> None:
@@ -349,12 +591,16 @@ def test_recovery_execute_rejects_namespace_or_leaf_identity_drift_without_delet
     plan = recovery.validate_recovery_owner(output_root, run_key, observed_processes=processes, observed_ports=ports)
     assert isinstance(plan, recovery.RecoveryPlan)
     wrong_namespace = plan.model_copy(update={"namespace_identity_sha256": "e" * 64})
-    assert recovery.execute_recovery_delete(wrong_namespace).deleted_roles == ()
+    assert recovery.execute_recovery_delete(
+        wrong_namespace, observed_processes=processes, observed_ports=ports
+    ).deleted_roles == ()
     parked = private_leaf.with_name(private_leaf.name + ".parked")
     private_leaf.rename(parked)
     private_leaf.mkdir()
 
-    result = recovery.execute_recovery_delete(plan)
+    result = recovery.execute_recovery_delete(
+        plan, observed_processes=processes, observed_ports=ports
+    )
 
     assert result.status == "rejected"
     assert result.deleted_roles == ()
@@ -369,6 +615,10 @@ def test_recovery_powershell_entry_accepts_no_private_path_parameter() -> None:
     assert "$RunKey" in parameter_block
     assert "Private" not in parameter_block
     assert ".private-recovery" not in source
+    assert "Get-NetTCPConnection" in source
+    assert "-ErrorAction Stop" in source
+    assert "SilentlyContinue" not in source
+    assert source.count("Get-RecoveryObservation") >= 3
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
