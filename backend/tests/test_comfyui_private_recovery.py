@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from app.comfyui import reliability_evidence as evidence
+from app.comfyui import reliability_private_recovery as recovery
 from app.comfyui.reliability_private_recovery import (
     PRIVATE_RECOVERY_DIRECTORY,
     PrivateRecoveryError,
@@ -112,4 +113,83 @@ def test_junction_boundary_rejects_private_run_link_without_touching_outside_sen
 
     after = sentinel.stat()
     assert sentinel.read_bytes() == b"outside bytes must remain unchanged"
+    assert after.st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
+@pytest.mark.parametrize("target_name", ["inside", "outside"])
+def test_boundary_validation_rejects_private_leaf_junction(
+    tmp_path: Path, target_name: str
+) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    boundary = prepare_private_recovery(
+        output_root,
+        RUN_KEY,
+        expected_root_identity=_identity(output_root),
+    )
+    private_run = private_recovery_root(output_root, RUN_KEY)
+    private_run.rmdir()
+    target = (output_root if target_name == "inside" else tmp_path) / target_name
+    target.mkdir()
+    sentinel = target / "sentinel.bin"
+    sentinel.write_bytes(b"private leaf target must not be touched")
+    before = sentinel.stat()
+    _make_windows_junction(private_run, target)
+
+    with pytest.raises(PrivateRecoveryError, match="reparse|unsafe|identity changed"):
+        validate_private_recovery(
+            output_root,
+            RUN_KEY,
+            expected_root_identity=boundary.root_identity,
+            expected_private_root_identity=boundary.private_root_identity,
+        )
+
+    after = sentinel.stat()
+    assert sentinel.read_bytes() == b"private leaf target must not be touched"
+    assert after.st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.skipif(os.name == "nt", reason="exercises POSIX openat no-follow semantics")
+def test_boundary_portable_prepare_rejects_private_ancestor_replacement_before_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    sentinel.write_bytes(b"outside must not change")
+    before = sentinel.stat()
+    private_root = output_root / PRIVATE_RECOVERY_DIRECTORY
+    parked = output_root / ".private-recovery.parked"
+    original_mkdir = os.mkdir
+    swapped = False
+
+    def replace_private_root_before_leaf_create(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        if path == RUN_KEY and dir_fd is not None and not swapped:
+            swapped = True
+            private_root.rename(parked)
+            private_root.symlink_to(outside, target_is_directory=True)
+        original_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(recovery.os, "mkdir", replace_private_root_before_leaf_create)
+
+    with pytest.raises(PrivateRecoveryError):
+        recovery._portable_prepare(
+            output_root,
+            RUN_KEY,
+            expected_root_identity=_identity(output_root),
+        )
+
+    after = sentinel.stat()
+    assert swapped
+    assert not (outside / RUN_KEY).exists()
+    assert sentinel.read_bytes() == b"outside must not change"
     assert after.st_mtime_ns == before.st_mtime_ns
