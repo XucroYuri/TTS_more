@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,27 @@ def _make_windows_junction(junction: Path, target: Path) -> None:
         check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def _wait_for_path(path: Path, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 10
+    while not path.exists():
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            pytest.fail(
+                f"process exited before readiness: {process.returncode}; "
+                f"stdout={stdout!r}; stderr={stderr!r}"
+            )
+        if time.monotonic() >= deadline:
+            process.kill()
+            process.communicate()
+            pytest.fail("process did not reach readiness gate")
+        time.sleep(0.01)
+
+
+def _assert_process_blocked(process: subprocess.Popen[str]) -> None:
+    with pytest.raises(subprocess.TimeoutExpired):
+        process.wait(timeout=0.75)
 
 
 def test_snapshot_current_reports_pointer_absence_as_legacy_eligible(
@@ -837,6 +859,172 @@ def test_independent_crashes_before_terminal_and_before_pointer_preserve_old_cur
     assert (output_root / "current-terminal.json").read_bytes() == old_pointer
 
 
+def test_cross_process_freeze_holds_run_lock_until_terminal_publication(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    terminal = _write_preflight_passed_run(output_root, "7" * 64)
+    source = tmp_path / "terminal-source.json"
+    _write_terminal_source(source, terminal)
+    freeze_ready = tmp_path / "freeze-ready"
+    freeze_release = tmp_path / "freeze-release"
+    writer_started = tmp_path / "writer-started"
+    freezer = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys,time; from pathlib import Path; "
+                "from app.comfyui import reliability_evidence as e; "
+                "root,source,ready,release=map(Path,sys.argv[1:5]); "
+                "original=e._first_write_terminal; "
+                "exec('def gated(path,payload):\\n ready.write_bytes(b\"ready\")\\n "
+                "while not release.exists(): time.sleep(0.01)\\n "
+                "return original(path,payload)',globals()); "
+                "e._first_write_terminal=gated; "
+                "e.write_terminal(root,e.load_terminal(source))"
+            ),
+            str(output_root),
+            str(source),
+            str(freeze_ready),
+            str(freeze_release),
+        ],
+        cwd=BACKEND_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    writer: subprocess.Popen[str] | None = None
+    try:
+        _wait_for_path(freeze_ready, freezer)
+        writer = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; from pathlib import Path; "
+                    "from app.comfyui.reliability_evidence import "
+                    "EvidenceStoreError,write_artifact; "
+                    "Path(sys.argv[3]).write_bytes(b'started'); "
+                    "\ntry: write_artifact(Path(sys.argv[1]),sys.argv[2],"
+                    "'log',b'late\\n',name='late')"
+                    "\nexcept EvidenceStoreError: raise SystemExit(1)"
+                ),
+                str(output_root),
+                terminal.run_key,
+                str(writer_started),
+            ],
+            cwd=BACKEND_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        _wait_for_path(writer_started, writer)
+        _assert_process_blocked(writer)
+        freeze_release.write_bytes(b"release")
+        freeze_stdout, freeze_stderr = freezer.communicate(timeout=10)
+        writer_stdout, writer_stderr = writer.communicate(timeout=10)
+
+        assert freezer.returncode == 0, freeze_stdout + freeze_stderr
+        assert writer.returncode == 1, writer_stdout + writer_stderr
+        assert evidence.verify_run(output_root, terminal.run_key).status == "verified"
+        assert not (
+            output_root / "runs" / terminal.run_key / "logs" / "late.log"
+        ).exists()
+    finally:
+        freeze_release.touch(exist_ok=True)
+        for process in (freezer, writer):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate()
+
+
+def test_cross_process_artifact_write_holds_run_lock_across_first_write(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    terminal = _write_preflight_passed_run(output_root, "8" * 64)
+    source = tmp_path / "terminal-source.json"
+    _write_terminal_source(source, terminal)
+    writer_ready = tmp_path / "writer-ready"
+    writer_release = tmp_path / "writer-release"
+    freeze_started = tmp_path / "freeze-started"
+    writer = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys,time; from pathlib import Path; "
+                "from app.comfyui import reliability_evidence as e; "
+                "root,ready,release=map(Path,(sys.argv[1],sys.argv[3],sys.argv[4])); "
+                "key=sys.argv[2]; original=e._first_write_bytes; "
+                "exec('def gated(path,payload):\\n ready.write_bytes(b\"ready\")\\n "
+                "while not release.exists(): time.sleep(0.01)\\n "
+                "return original(path,payload)',globals()); "
+                "e._first_write_bytes=gated; "
+                "e.write_artifact(root,key,'log',b'late\\n',name='late')"
+            ),
+            str(output_root),
+            terminal.run_key,
+            str(writer_ready),
+            str(writer_release),
+        ],
+        cwd=BACKEND_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    freezer: subprocess.Popen[str] | None = None
+    try:
+        _wait_for_path(writer_ready, writer)
+        freezer = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; from pathlib import Path; "
+                    "from app.comfyui.reliability_evidence import "
+                    "EvidenceStoreError,load_terminal,write_terminal; "
+                    "Path(sys.argv[3]).write_bytes(b'started'); "
+                    "\ntry: write_terminal(Path(sys.argv[1]),load_terminal(Path(sys.argv[2])))"
+                    "\nexcept EvidenceStoreError: raise SystemExit(1)"
+                ),
+                str(output_root),
+                str(source),
+                str(freeze_started),
+            ],
+            cwd=BACKEND_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        _wait_for_path(freeze_started, freezer)
+        _assert_process_blocked(freezer)
+        writer_release.write_bytes(b"release")
+        writer_stdout, writer_stderr = writer.communicate(timeout=10)
+        freeze_stdout, freeze_stderr = freezer.communicate(timeout=10)
+
+        assert writer.returncode == 0, writer_stdout + writer_stderr
+        assert freezer.returncode == 1, freeze_stdout + freeze_stderr
+        assert not (
+            output_root / "runs" / terminal.run_key / "terminal.json"
+        ).exists()
+        assert (
+            output_root / "runs" / terminal.run_key / "logs" / "late.log"
+        ).read_bytes() == b"late\n"
+    finally:
+        writer_release.touch(exist_ok=True)
+        for process in (writer, freezer):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate()
+
 def test_cli_commit_and_verify_commands_emit_only_structured_json(tmp_path: Path) -> None:
     output_root = tmp_path / "evidence"
     output_root.mkdir()
@@ -883,36 +1071,77 @@ def test_two_real_cli_writers_from_one_token_have_one_winner_and_keep_both_runs(
         _write_preflight_passed_run(output_root, "f" * 64),
         _write_preflight_passed_run(output_root, "0" * 64),
     ]
-    sources: list[Path] = []
+    lock_held = tmp_path / "pointer-lock-held"
+    lock_release = tmp_path / "pointer-lock-release"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys,time; from pathlib import Path; "
+                "from app.comfyui import reliability_evidence as e; "
+                "root,held,release=map(Path,sys.argv[1:4]); "
+                "exec('with e._current_pointer_lock(root):\\n "
+                "held.write_bytes(b\"held\")\\n "
+                "while not release.exists(): time.sleep(0.01)',globals())"
+            ),
+            str(output_root),
+            str(lock_held),
+            str(lock_release),
+        ],
+        cwd=BACKEND_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
     processes: list[subprocess.Popen[str]] = []
-    for index, terminal in enumerate(terminals):
-        source = tmp_path / f"terminal-{index}.json"
-        _write_terminal_source(source, terminal)
-        sources.append(source)
-        processes.append(
-            subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "app.comfyui.reliability_evidence_cli",
-                    "commit-run",
-                    "--output-root",
-                    str(output_root),
-                    "--run-key",
-                    terminal.run_key,
-                    "--terminal-json",
-                    str(source),
-                    "--expected-token",
-                    "absent",
-                ],
-                cwd=BACKEND_ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
+    try:
+        _wait_for_path(lock_held, holder)
+        for index, terminal in enumerate(terminals):
+            source = tmp_path / f"terminal-{index}.json"
+            _write_terminal_source(source, terminal)
+            processes.append(
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "app.comfyui.reliability_evidence_cli",
+                        "commit-run",
+                        "--output-root",
+                        str(output_root),
+                        "--run-key",
+                        terminal.run_key,
+                        "--terminal-json",
+                        str(source),
+                        "--expected-token",
+                        "absent",
+                    ],
+                    cwd=BACKEND_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                )
             )
-        )
-    results = [process.communicate(timeout=30) for process in processes]
+        for process, terminal in zip(processes, terminals, strict=True):
+            _wait_for_path(
+                output_root / "runs" / terminal.run_key / "terminal.json",
+                process,
+            )
+        for process in processes:
+            _assert_process_blocked(process)
+        lock_release.write_bytes(b"release")
+        holder_stdout, holder_stderr = holder.communicate(timeout=10)
+        assert holder.returncode == 0, holder_stdout + holder_stderr
+        results = [process.communicate(timeout=30) for process in processes]
+    finally:
+        lock_release.touch(exist_ok=True)
+        for process in (holder, *processes):
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
     codes = [process.returncode for process in processes]
 
     assert sorted(codes) == [0, 1]
@@ -986,6 +1215,33 @@ def test_cli_invalid_terminal_does_not_echo_private_values_or_paths(tmp_path: Pa
     assert str(output_root) not in combined
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("PRIVATE-SUBCOMMAND-SECRET",),
+        (
+            "snapshot-current",
+            "--output-root",
+            ".",
+            "--PRIVATE-OPTION-SECRET",
+        ),
+    ],
+)
+def test_cli_argument_errors_are_structured_and_never_echo_argv_secrets(
+    arguments: tuple[str, ...],
+) -> None:
+    completed = _run_cli(*arguments)
+
+    assert completed.returncode == 1
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == {
+        "error": {"code": "evidence-store-error"},
+        "ok": False,
+    }
+    combined = completed.stdout + completed.stderr
+    assert "PRIVATE-" not in combined
+
+
 def test_write_rejects_real_run_junction_without_touching_outside_sentinel(
     tmp_path: Path,
 ) -> None:
@@ -1013,6 +1269,72 @@ def test_write_rejects_real_run_junction_without_touching_outside_sentinel(
         assert not (outside / "logs" / "escape.log").exists()
     finally:
         junction.rmdir()
+
+
+def test_write_rejects_controlled_parent_swap_to_real_junction_before_open(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    terminal = _write_preflight_passed_run(output_root, "9" * 64)
+    run_root = output_root / "runs" / terminal.run_key
+    logs = run_root / "logs"
+    original_logs = run_root / "logs-original"
+    outside = tmp_path / "outside-swap"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("outside-must-survive", encoding="utf-8")
+    ready = tmp_path / "open-ready"
+    release = tmp_path / "open-release"
+    writer = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys,time; from pathlib import Path; "
+                "from app.comfyui import reliability_evidence as e; "
+                "root,ready,release=map(Path,(sys.argv[1],sys.argv[3],sys.argv[4])); "
+                "key=sys.argv[2]; original=e._first_write_bytes; "
+                "exec('def gated(path,payload):\\n ready.write_bytes(b\"ready\")\\n "
+                "while not release.exists(): time.sleep(0.01)\\n "
+                "return original(path,payload)',globals()); "
+                "e._first_write_bytes=gated; "
+                "\ntry: e.write_artifact(root,key,'log',b'escape\\n',name='escape')"
+                "\nexcept e.EvidenceStoreError: raise SystemExit(1)"
+            ),
+            str(output_root),
+            terminal.run_key,
+            str(ready),
+            str(release),
+        ],
+        cwd=BACKEND_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        _wait_for_path(ready, writer)
+        logs.rename(original_logs)
+        _make_windows_junction(logs, outside)
+        release.write_bytes(b"release")
+        stdout, stderr = writer.communicate(timeout=10)
+
+        assert writer.returncode == 1, stdout + stderr
+        assert sentinel.read_text(encoding="utf-8") == "outside-must-survive"
+        assert sorted(path.name for path in outside.iterdir()) == ["sentinel.txt"]
+    finally:
+        release.touch(exist_ok=True)
+        if writer.poll() is None:
+            writer.kill()
+            writer.communicate()
+        escaped = outside / "escape.log"
+        if escaped.exists():
+            escaped.unlink()
+        if logs.exists():
+            logs.rmdir()
+        if original_logs.exists():
+            original_logs.rename(logs)
 
 
 def test_verify_rejects_real_member_junction_without_reading_outside_sentinel(

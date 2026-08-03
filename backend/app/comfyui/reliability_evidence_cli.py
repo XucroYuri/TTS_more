@@ -17,8 +17,14 @@ from app.comfyui.reliability_evidence import (
 )
 
 
+class _SanitizedArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        del message
+        raise EvidenceStoreError("CLI arguments are invalid")
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="reliability-evidence")
+    parser = _SanitizedArgumentParser(prog="reliability-evidence")
     commands = parser.add_subparsers(dest="command", required=True)
     snapshot = commands.add_parser("snapshot-current")
     snapshot.add_argument("--output-root", required=True)
@@ -40,8 +46,8 @@ def _emit(payload: dict[str, object]) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
     try:
+        args = _parser().parse_args(argv)
         if args.command == "snapshot-current":
             _emit({"ok": True, "snapshot": snapshot_current(Path(args.output_root))})
             return 0

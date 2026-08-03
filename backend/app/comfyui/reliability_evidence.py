@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -266,6 +267,298 @@ def _require_real_regular_file(path: Path) -> os.stat_result:
     return result
 
 
+class _WindowsUnicodeString(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.c_ushort),
+        ("MaximumLength", ctypes.c_ushort),
+        ("Buffer", ctypes.c_wchar_p),
+    ]
+
+
+class _WindowsObjectAttributes(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.c_ulong),
+        ("RootDirectory", ctypes.c_void_p),
+        ("ObjectName", ctypes.POINTER(_WindowsUnicodeString)),
+        ("Attributes", ctypes.c_ulong),
+        ("SecurityDescriptor", ctypes.c_void_p),
+        ("SecurityQualityOfService", ctypes.c_void_p),
+    ]
+
+
+class _WindowsIoStatusBlock(ctypes.Structure):
+    _fields_ = [
+        ("Status", ctypes.c_void_p),
+        ("Information", ctypes.c_size_t),
+    ]
+
+
+class _WindowsFileTime(ctypes.Structure):
+    _fields_ = [
+        ("LowDateTime", ctypes.c_ulong),
+        ("HighDateTime", ctypes.c_ulong),
+    ]
+
+
+class _WindowsFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("FileAttributes", ctypes.c_ulong),
+        ("CreationTime", _WindowsFileTime),
+        ("LastAccessTime", _WindowsFileTime),
+        ("LastWriteTime", _WindowsFileTime),
+        ("VolumeSerialNumber", ctypes.c_ulong),
+        ("FileSizeHigh", ctypes.c_ulong),
+        ("FileSizeLow", ctypes.c_ulong),
+        ("NumberOfLinks", ctypes.c_ulong),
+        ("FileIndexHigh", ctypes.c_ulong),
+        ("FileIndexLow", ctypes.c_ulong),
+    ]
+
+
+def _windows_handle_information(handle: int) -> _WindowsFileInformation:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_WindowsFileInformation),
+    ]
+    get_information.restype = ctypes.c_int
+    information = _WindowsFileInformation()
+    if not get_information(handle, ctypes.byref(information)):
+        raise EvidenceStoreError("evidence handle identity is unavailable")
+    return information
+
+
+def _windows_close_handle(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    close_handle(handle)
+
+
+def _windows_open_root_directory(path: Path) -> int:
+    before = _require_real_directory(path)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    handle = create_file(
+        str(path),
+        0x80 | 0x00100000,
+        0x1 | 0x2 | 0x4,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle in {None, invalid_handle}:
+        raise EvidenceStoreError("evidence root handle is unavailable")
+    try:
+        information = _windows_handle_information(handle)
+        after = _require_real_directory(path)
+        file_index = (information.FileIndexHigh << 32) | information.FileIndexLow
+        if (
+            information.FileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT
+            or not information.FileAttributes & 0x10
+            or before.st_ino != file_index
+            or after.st_ino != file_index
+        ):
+            raise EvidenceStoreError("evidence root handle is unsafe")
+        return int(handle)
+    except BaseException:
+        _windows_close_handle(int(handle))
+        raise
+
+
+def _windows_relative_name(
+    name: str,
+) -> tuple[ctypes.Array[ctypes.c_wchar], _WindowsUnicodeString]:
+    if not name or name in {".", ".."} or "\\" in name or "/" in name:
+        raise EvidenceStoreError("evidence relative name is invalid")
+    buffer = ctypes.create_unicode_buffer(name)
+    byte_length = len(name.encode("utf-16-le"))
+    unicode_name = _WindowsUnicodeString(
+        Length=byte_length,
+        MaximumLength=byte_length + 2,
+        Buffer=ctypes.cast(buffer, ctypes.c_wchar_p),
+    )
+    return buffer, unicode_name
+
+
+def _windows_nt_create(
+    parent_handle: int,
+    name: str,
+    *,
+    directory: bool,
+    create_new: bool,
+    create_if_missing: bool = False,
+) -> int:
+    _buffer, unicode_name = _windows_relative_name(name)
+    object_attributes = _WindowsObjectAttributes(
+        Length=ctypes.sizeof(_WindowsObjectAttributes),
+        RootDirectory=parent_handle,
+        ObjectName=ctypes.pointer(unicode_name),
+        Attributes=0x40 | 0x1000,
+        SecurityDescriptor=None,
+        SecurityQualityOfService=None,
+    )
+    io_status = _WindowsIoStatusBlock()
+    output_handle = ctypes.c_void_p()
+    ntdll = ctypes.WinDLL("ntdll")
+    nt_create_file = ntdll.NtCreateFile
+    nt_create_file.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_uint32,
+        ctypes.POINTER(_WindowsObjectAttributes),
+        ctypes.POINTER(_WindowsIoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    nt_create_file.restype = ctypes.c_long
+    desired_access = 0x80 | 0x00100000
+    if directory:
+        desired_access |= 0x1
+    elif create_new:
+        desired_access |= 0x2
+    else:
+        desired_access |= 0x1
+    create_options = 0x20 | 0x00200000
+    create_options |= 0x1 if directory else 0x40
+    status = nt_create_file(
+        ctypes.byref(output_handle),
+        desired_access,
+        ctypes.byref(object_attributes),
+        ctypes.byref(io_status),
+        None,
+        0x80,
+        0x1 | 0x2 | 0x4,
+        3 if create_if_missing else (2 if create_new else 1),
+        create_options,
+        None,
+        0,
+    )
+    unsigned_status = status & 0xFFFFFFFF
+    if status < 0:
+        if unsigned_status == 0xC0000035:
+            raise FileExistsError(name)
+        raise EvidenceStoreError("evidence relative open was rejected")
+    handle = int(output_handle.value)
+    try:
+        information = _windows_handle_information(handle)
+        if information.FileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise EvidenceStoreError(
+                "evidence directory is unsafe" if directory else "evidence file is unsafe"
+            )
+        if directory != bool(information.FileAttributes & 0x10):
+            raise EvidenceStoreError("evidence relative handle has the wrong type")
+        return handle
+    except BaseException:
+        _windows_close_handle(handle)
+        raise
+
+
+def _windows_evidence_layout(path: Path) -> tuple[Path, tuple[str, ...]] | None:
+    absolute = Path(path).absolute()
+    parts = absolute.parts
+    for index in range(len(parts) - 2):
+        if parts[index] != "runs" or _ARTIFACT_NAME.fullmatch(parts[index + 1]) is None:
+            continue
+        if re.fullmatch(r"[0-9a-f]{64}", parts[index + 1]) is None:
+            continue
+        relative = tuple(parts[index:])
+        if len(relative) not in {3, 4}:
+            continue
+        return Path(*parts[:index]), relative
+    return None
+
+
+def _windows_open_evidence_descriptor(path: Path, *, create_new: bool) -> int | None:
+    if os.name != "nt":
+        return None
+    layout = _windows_evidence_layout(path)
+    if layout is None:
+        return None
+    root, relative = layout
+    root_handle = _windows_open_root_directory(root)
+    directory_handles = [root_handle]
+    file_handle: int | None = None
+    try:
+        parent = root_handle
+        for component in relative[:-1]:
+            parent = _windows_nt_create(
+                parent,
+                component,
+                directory=True,
+                create_new=False,
+            )
+            directory_handles.append(parent)
+        file_handle = _windows_nt_create(
+            parent,
+            relative[-1],
+            directory=False,
+            create_new=create_new,
+        )
+        import msvcrt
+
+        flags = (os.O_WRONLY if create_new else os.O_RDONLY) | getattr(
+            os,
+            "O_BINARY",
+            0,
+        )
+        descriptor = msvcrt.open_osfhandle(file_handle, flags)
+        file_handle = None
+        return descriptor
+    finally:
+        if file_handle is not None:
+            _windows_close_handle(file_handle)
+        for handle in reversed(directory_handles):
+            _windows_close_handle(handle)
+
+
+def _windows_prepare_run_directories(
+    output_root: Path,
+    run_key: str,
+    relative_name: str,
+) -> bool:
+    if os.name != "nt":
+        return False
+    root, _ = _validated_root(output_root)
+    safe_key = _validated_run_key(run_key)
+    components = ["runs", safe_key, *relative_name.split("/")[:-1]]
+    root_handle = _windows_open_root_directory(root)
+    handles = [root_handle]
+    try:
+        parent = root_handle
+        for component in components:
+            parent = _windows_nt_create(
+                parent,
+                component,
+                directory=True,
+                create_new=False,
+                create_if_missing=True,
+            )
+            handles.append(parent)
+        return True
+    finally:
+        for handle in reversed(handles):
+            _windows_close_handle(handle)
+
+
 def _ensure_real_directory(path: Path) -> None:
     try:
         path.mkdir()
@@ -337,7 +630,10 @@ def _artifact_path(
     parts = relative_name.split("/")
     target = run_root.joinpath(*parts)
     if len(parts) == 2 and create_parent:
-        _ensure_real_directory(target.parent)
+        if os.name == "nt":
+            _require_real_directory(target.parent)
+        else:
+            _ensure_real_directory(target.parent)
     else:
         _require_real_directory(target.parent)
     try:
@@ -348,17 +644,24 @@ def _artifact_path(
 
 
 def _read_bounded_regular(path: Path, *, max_bytes: int) -> bytes:
-    before = _require_real_regular_file(path)
-    if before.st_size > max_bytes:
-        raise EvidenceStoreError("evidence file exceeds its size limit")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise EvidenceStoreError("evidence file could not be opened") from exc
+    descriptor = _windows_open_evidence_descriptor(path, create_new=False)
+    before: os.stat_result | None = None
+    if descriptor is None:
+        before = _require_real_regular_file(path)
+        if before.st_size > max_bytes:
+            raise EvidenceStoreError("evidence file exceeds its size limit")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise EvidenceStoreError("evidence file could not be opened") from exc
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_size != before.st_size:
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > max_bytes:
             raise EvidenceStoreError("evidence file identity changed")
         chunks: list[bytes] = []
         remaining = max_bytes + 1
@@ -372,12 +675,20 @@ def _read_bounded_regular(path: Path, *, max_bytes: int) -> bytes:
     finally:
         os.close(descriptor)
     after = _require_real_regular_file(path)
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
     identity_opened = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
     identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if identity_before != identity_opened or identity_before != identity_after:
+    if before is not None:
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        if identity_before != identity_opened:
+            raise EvidenceStoreError("evidence file identity changed")
+    if identity_opened != identity_after:
         raise EvidenceStoreError("evidence file identity changed")
-    if len(payload) != before.st_size or len(payload) > max_bytes:
+    if len(payload) != opened.st_size or len(payload) > max_bytes:
         raise EvidenceStoreError("evidence file exceeds its size limit")
     return payload
 
@@ -391,7 +702,9 @@ def _first_write_bytes(path: Path, payload: bytes) -> None:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = _windows_open_evidence_descriptor(path, create_new=True)
+        if descriptor is None:
+            descriptor = os.open(path, flags, 0o600)
     except FileExistsError:
         existing = _read_bounded_regular(path, max_bytes=MAX_ARTIFACT_BYTES)
         if existing != payload:
@@ -414,6 +727,68 @@ def _first_write_bytes(path: Path, payload: bytes) -> None:
         os.close(descriptor)
 
 
+@contextmanager
+def _run_operation_lock(output_root: Path, run_key: str) -> Iterator[None]:
+    root, resolved_root = _validated_root(output_root)
+    safe_key = _validated_run_key(run_key)
+    lock_identity = hashlib.sha256(
+        (os.path.normcase(str(resolved_root)) + "\0" + safe_key).encode("utf-8")
+    ).hexdigest()
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_mutex = kernel32.CreateMutexW
+        create_mutex.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        create_mutex.restype = ctypes.c_void_p
+        wait_for_single_object = kernel32.WaitForSingleObject
+        wait_for_single_object.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        wait_for_single_object.restype = ctypes.c_uint32
+        release_mutex = kernel32.ReleaseMutex
+        release_mutex.argtypes = [ctypes.c_void_p]
+        release_mutex.restype = ctypes.c_int
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+
+        handle = create_mutex(
+            None,
+            False,
+            f"Local\\TTSMoreReliabilityRun-{lock_identity}",
+        )
+        if not handle:
+            raise EvidenceStoreError("run operation lock is unavailable")
+        acquired = False
+        try:
+            wait_result = wait_for_single_object(handle, 30_000)
+            if wait_result not in {0x0, 0x80}:
+                raise EvidenceStoreError("run operation lock timed out")
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                release_mutex(handle)
+            close_handle(handle)
+        return
+
+    lock_path = root / f".run-{lock_identity}.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise EvidenceStoreError("run operation lock is unavailable") from exc
+    try:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def write_artifact(
     output_root: Path,
     run_key: str,
@@ -425,16 +800,20 @@ def write_artifact(
     if type(payload) is not bytes or len(payload) > MAX_ARTIFACT_BYTES:
         raise EvidenceStoreError("artifact payload is invalid")
     relative_name = _artifact_relative_name(kind, name)
-    run, resolved_root = _run_root(output_root, run_key, create=True)
-    if os.path.lexists(run / "terminal.json"):
-        raise EvidenceStoreError("run is already frozen")
-    target = _artifact_path(
-        run,
-        relative_name,
-        resolved_root,
-        create_parent=True,
-    )
-    _first_write_bytes(target, payload)
+    safe_key = _validated_run_key(run_key)
+    if not _windows_prepare_run_directories(output_root, safe_key, relative_name):
+        _run_root(output_root, safe_key, create=True)
+    with _run_operation_lock(output_root, safe_key):
+        run, resolved_root = _run_root(output_root, safe_key, create=False)
+        if os.path.lexists(run / "terminal.json"):
+            raise EvidenceStoreError("run is already frozen")
+        target = _artifact_path(
+            run,
+            relative_name,
+            resolved_root,
+            create_parent=True,
+        )
+        _first_write_bytes(target, payload)
     return ArtifactCommitment(
         relative_name=relative_name,
         size_bytes=len(payload),
@@ -567,14 +946,19 @@ def write_terminal(
         )
     except ValidationError as exc:
         raise EvidenceStoreError("terminal is invalid") from exc
-    run, resolved_root = _run_root(output_root, validated.run_key, create=False)
-    terminal_path = run / "terminal.json"
     payload = _canonical_json(validated)
-    if not os.path.lexists(terminal_path):
-        _assert_exact_membership(run, validated, include_terminal=False)
-        _verify_commitments(run, resolved_root, validated)
-    _first_write_terminal(terminal_path, payload)
-    verify_run(output_root, validated.run_key)
+    with _run_operation_lock(output_root, validated.run_key):
+        run, resolved_root = _run_root(
+            output_root,
+            validated.run_key,
+            create=False,
+        )
+        terminal_path = run / "terminal.json"
+        if not os.path.lexists(terminal_path):
+            _assert_exact_membership(run, validated, include_terminal=False)
+            _verify_commitments(run, resolved_root, validated)
+        _first_write_terminal(terminal_path, payload)
+        verify_run(output_root, validated.run_key)
     return TerminalCommitment(
         size_bytes=len(payload),
         sha256=hashlib.sha256(payload).hexdigest(),
