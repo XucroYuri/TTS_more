@@ -415,27 +415,18 @@ def test_harness_requires_windows_and_rejects_incomplete_package_set(tmp_path: P
     assert ET.fromstring(junit).tag == "testsuites"
 
 
-def test_portable_release_workflow_runs_harness_unit_tests_and_single_package_smoke() -> None:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    assert "backend/tests/test_portable_first_run_harness.py" in workflow
-    assert "test-portable-first-run.ps1" in workflow
-    assert "TTS_MORE_FIRST_RUN_PYTHON" in workflow
-    single_smoke = workflow[workflow.index("Run TTS More clean-Windows single-package smoke") :]
-    single_smoke = single_smoke[: single_smoke.index("Upload sanitized clean-Windows smoke evidence")]
-    assert "shell: powershell" in single_smoke
-    assert "-Packages $zip.FullName" in workflow
-    assert "single-package-smoke" in workflow
-    assert "portable-first-run-smoke-evidence" in workflow
-    assert "single-package-smoke/acceptance.json" in workflow
-    assert "single-package-smoke/acceptance.junit.xml" in workflow
-    assert workflow.index("test-portable-first-run.ps1") < workflow.index(
-        "portable-first-run-smoke-evidence"
-    )
+def test_retired_portable_release_workflow_does_not_run_first_run_harness() -> None:
+    ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    assert not WORKFLOW.exists()
+    assert "backend/tests/test_portable_first_run_harness.py" not in ci_workflow
+    assert "test-portable-first-run.ps1" not in ci_workflow
+    assert "TTS_MORE_FIRST_RUN_PYTHON" not in ci_workflow
+    assert "portable-first-run-smoke-evidence" not in ci_workflow
 
 
 def test_windows_ci_uses_short_pytest_base_temp_without_weakening_package_path_guard() -> None:
     ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
-    portable_workflow = WORKFLOW.read_text(encoding="utf-8")
     start_controller = (REPO_ROOT / "scripts" / "Invoke-PortableStart.ps1").read_text(
         encoding="utf-8"
     )
@@ -443,21 +434,12 @@ def test_windows_ci_uses_short_pytest_base_temp_without_weakening_package_path_g
     assert "runner.os == 'Windows'" in ci_workflow
     assert '--basetemp="{0}/pytest-{1}"' in ci_workflow
     assert "runner.temp" in ci_workflow
-    bootstrap_job_header = portable_workflow.split("    steps:", 1)[0]
-    immutable_locks_step = portable_workflow.split("- name: Check immutable locks", 1)[1]
-    immutable_locks_step = immutable_locks_step.split("- name:", 1)[0]
-    assert "PYTEST_ADDOPTS" not in bootstrap_job_header
-    assert '--basetemp="{0}/portable-{1}"' in immutable_locks_step
-    assert "runner.temp" in immutable_locks_step
-    for addopts in (
-        r'--basetemp="D:\a\_temp/pytest-123"',
-        r'--basetemp="D:\a\_temp/portable-123"',
-    ):
-        parsed = shlex.split(addopts, posix=True)
-        assert len(parsed) == 1
-        base_temp = parsed[0].split("=", 1)[1]
-        assert base_temp.startswith(r"D:\a\_temp")
-        assert PureWindowsPath(base_temp).is_absolute()
+    addopts = r'--basetemp="D:\a\_temp/pytest-123"'
+    parsed = shlex.split(addopts, posix=True)
+    assert len(parsed) == 1
+    base_temp = parsed[0].split("=", 1)[1]
+    assert base_temp.startswith(r"D:\a\_temp")
+    assert PureWindowsPath(base_temp).is_absolute()
     assert "PACKAGE_PATH_TOO_DEEP" in start_controller
 
 
