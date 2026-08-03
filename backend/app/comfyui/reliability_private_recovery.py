@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -860,3 +861,437 @@ def write_private_recovery_snapshot(
         canonical,
         name="private-recovery",
     )
+
+
+@dataclass
+class _DeleteNode:
+    role: str
+    relative: str
+    name: str
+    parent: int
+    handle: int
+    is_directory: bool
+    size_bytes: int
+    sha256: str | None
+    depth: int
+
+
+class PrivateRecoveryDeleteTransaction:
+    """A fully prevalidated, no-follow deletion transaction.
+
+    No deletion occurs while the transaction is built.  The caller may only
+    delete the four fixed roles, in the fixed recovery order, and then the
+    run-key leaf.  On Windows every object is held without delete sharing from
+    validation through disposition; on POSIX every unlink/rmdir is relative to
+    its already-open parent and rechecks the held inode immediately first.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_key: str,
+        namespace_handle: int,
+        leaf_handle: int,
+        nodes: tuple[_DeleteNode, ...],
+    ) -> None:
+        self.run_key = run_key
+        self.namespace_handle = namespace_handle
+        self.leaf_handle = leaf_handle
+        self.nodes = list(nodes)
+        self.mutation_count = 0
+        self._closed = False
+
+    def role_payload(self, role: str) -> bytes:
+        matches = [node for node in self.nodes if node.role == role and node.relative == role]
+        if len(matches) != 1 or matches[0].is_directory:
+            raise _fail("private recovery static member is unavailable")
+        return _read_delete_node(matches[0])
+
+    def delete_role(self, role: str) -> None:
+        if role not in {".p", ".c", ".h", ".o"}:
+            raise _fail("private recovery deletion role is invalid")
+        selected = [node for node in self.nodes if node.role == role]
+        for node in sorted(selected, key=lambda item: (item.depth, item.relative), reverse=True):
+            _delete_held_node(node)
+            self.nodes.remove(node)
+            self.mutation_count += 1
+
+    def delete_leaf(self) -> None:
+        if self.nodes:
+            raise _fail("private recovery run directory is not empty")
+        if os.name == "nt":
+            _windows_mark_delete(self.leaf_handle)
+            evidence._windows_close_handle(self.leaf_handle)
+        else:
+            _portable_revalidate_name(self.namespace_handle, self.run_key, self.leaf_handle)
+            os.rmdir(self.run_key, dir_fd=self.namespace_handle)
+            os.close(self.leaf_handle)
+        self.leaf_handle = -1
+        self.mutation_count += 1
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for node in reversed(self.nodes):
+            try:
+                _close_delete_handle(node.handle)
+            except OSError:
+                pass
+        self.nodes.clear()
+        for handle in (self.leaf_handle, self.namespace_handle):
+            if handle != -1:
+                try:
+                    _close_delete_handle(handle)
+                except OSError:
+                    pass
+        self.leaf_handle = -1
+        self.namespace_handle = -1
+
+    def __enter__(self) -> "PrivateRecoveryDeleteTransaction":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+def _windows_open_delete_relative(parent: int, name: str, *, directory: bool) -> int:
+    import ctypes
+
+    _buffer, unicode_name = evidence._windows_relative_name(name)
+    attributes = evidence._WindowsObjectAttributes(
+        Length=ctypes.sizeof(evidence._WindowsObjectAttributes),
+        RootDirectory=parent,
+        ObjectName=ctypes.pointer(unicode_name),
+        Attributes=0x40 | 0x1000,
+        SecurityDescriptor=None,
+        SecurityQualityOfService=None,
+    )
+    status_block = evidence._WindowsIoStatusBlock()
+    output = ctypes.c_void_p()
+    nt_create_file = ctypes.WinDLL("ntdll").NtCreateFile
+    nt_create_file.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_uint32,
+        ctypes.POINTER(evidence._WindowsObjectAttributes),
+        ctypes.POINTER(evidence._WindowsIoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    nt_create_file.restype = ctypes.c_long
+    status = nt_create_file(
+        ctypes.byref(output),
+        0x00010000 | 0x00100000 | 0x80 | 0x1,
+        ctypes.byref(attributes),
+        ctypes.byref(status_block),
+        None,
+        0x80,
+        0x1,  # share read only: deny replacement, deletion, and new writers
+        1,
+        0x20 | 0x00200000 | (0x1 if directory else 0x40),
+        None,
+        0,
+    )
+    if status < 0 or output.value is None:
+        raise _fail("private recovery delete lease is unavailable")
+    handle = int(output.value)
+    try:
+        information = evidence._windows_handle_information(handle)
+        if information.FileAttributes & evidence._FILE_ATTRIBUTE_REPARSE_POINT:
+            raise _fail("private recovery delete lease rejected a reparse member")
+        if directory != bool(information.FileAttributes & 0x10):
+            raise _fail("private recovery delete lease has the wrong kind")
+        return handle
+    except BaseException:
+        evidence._windows_close_handle(handle)
+        raise
+
+
+def _windows_mark_delete(handle: int) -> None:
+    import ctypes
+
+    class _Disposition(ctypes.Structure):
+        _fields_ = [("DeleteFile", ctypes.c_int)]
+
+    disposition = _Disposition(1)
+    setter = ctypes.WinDLL("kernel32", use_last_error=True).SetFileInformationByHandle
+    setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    setter.restype = ctypes.c_int
+    if not setter(handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+        raise OSError(ctypes.get_last_error(), "private recovery deletion failed")
+
+
+def _windows_read_handle(handle: int, size: int) -> bytes:
+    import ctypes
+
+    if size < 0 or size > MAX_PRIVATE_RECOVERY_STABLE_MEMBER_BYTES:
+        raise _fail("private recovery delete member exceeds size limit")
+    reader = ctypes.WinDLL("kernel32", use_last_error=True).ReadFile
+    reader.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_void_p,
+    ]
+    reader.restype = ctypes.c_int
+    seeker = ctypes.WinDLL("kernel32", use_last_error=True).SetFilePointerEx
+    seeker.argtypes = [ctypes.c_void_p, ctypes.c_longlong, ctypes.c_void_p, ctypes.c_uint32]
+    seeker.restype = ctypes.c_int
+    if not seeker(handle, 0, None, 0):
+        raise _fail("private recovery delete member could not be read")
+    payload = bytearray()
+    while len(payload) < size:
+        request = min(1024 * 1024, size - len(payload))
+        buffer = ctypes.create_string_buffer(request)
+        read = ctypes.c_uint32()
+        if not reader(handle, buffer, request, ctypes.byref(read), None):
+            raise _fail("private recovery delete member could not be read")
+        if read.value == 0:
+            break
+        payload.extend(buffer.raw[: read.value])
+    if len(payload) != size:
+        raise _fail("private recovery delete member changed")
+    return bytes(payload)
+
+
+def _portable_open_delete_relative(parent: int, name: str, *, directory: bool) -> int:
+    flags = _PORTABLE_DIRECTORY_FLAGS if directory else _FILE_OPEN_FLAGS
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent)
+        opened = os.fstat(descriptor)
+        if directory != stat.S_ISDIR(opened.st_mode) or (not directory and not stat.S_ISREG(opened.st_mode)):
+            raise _fail("private recovery delete lease has the wrong kind")
+        return descriptor
+    except BaseException:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise
+
+
+def _open_delete_relative(parent: int, name: str, *, directory: bool) -> int:
+    if os.name == "nt":
+        return _windows_open_delete_relative(parent, name, directory=directory)
+    return _portable_open_delete_relative(parent, name, directory=directory)
+
+
+def _close_delete_handle(handle: int) -> None:
+    if os.name == "nt":
+        evidence._windows_close_handle(handle)
+    else:
+        os.close(handle)
+
+
+def _delete_handle_size(handle: int) -> int:
+    if os.name == "nt":
+        information = evidence._windows_handle_information(handle)
+        return (information.FileSizeHigh << 32) | information.FileSizeLow
+    return os.fstat(handle).st_size
+
+
+def _read_delete_handle(handle: int, size: int) -> bytes:
+    if os.name == "nt":
+        return _windows_read_handle(handle, size)
+    os.lseek(handle, 0, os.SEEK_SET)
+    payload = bytearray()
+    while len(payload) <= MAX_PRIVATE_RECOVERY_STABLE_MEMBER_BYTES:
+        chunk = os.read(handle, min(1024 * 1024, MAX_PRIVATE_RECOVERY_STABLE_MEMBER_BYTES + 1 - len(payload)))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    if len(payload) != size or len(payload) > MAX_PRIVATE_RECOVERY_STABLE_MEMBER_BYTES:
+        raise _fail("private recovery delete member changed")
+    return bytes(payload)
+
+
+def _read_delete_node(node: _DeleteNode) -> bytes:
+    if node.is_directory:
+        raise _fail("private recovery delete member has the wrong kind")
+    payload = _read_delete_handle(node.handle, node.size_bytes)
+    if hashlib.sha256(payload).hexdigest() != node.sha256:
+        raise _fail("private recovery delete member changed")
+    return payload
+
+
+def _portable_revalidate_name(parent: int, name: str, handle: int) -> None:
+    try:
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except OSError as exc:
+        raise _fail("private recovery delete member changed") from exc
+    held = os.fstat(handle)
+    if stat.S_ISLNK(named.st_mode) or (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
+        raise _fail("private recovery delete member changed")
+
+
+def _delete_held_node(node: _DeleteNode) -> None:
+    if os.name == "nt":
+        _windows_mark_delete(node.handle)
+        evidence._windows_close_handle(node.handle)
+    else:
+        _portable_revalidate_name(node.parent, node.name, node.handle)
+        if node.is_directory:
+            os.rmdir(node.name, dir_fd=node.parent)
+        else:
+            os.unlink(node.name, dir_fd=node.parent)
+        os.close(node.handle)
+    node.handle = -1
+
+
+def _open_delete_tree(
+    leaf_handle: int,
+    snapshot: PrivateRecoverySnapshot,
+) -> tuple[_DeleteNode, ...]:
+    expected_static = {member.role: member for member in snapshot.static_members}
+    expected_mutable = {
+        (entry.relative_name_sha256, entry.kind): entry
+        for entry in snapshot.mutable_tree.entries
+    }
+    nodes: list[_DeleteNode] = []
+    opened_directories: list[int] = []
+    try:
+        top = dict(_directory_names(leaf_handle))
+        expected_top = {
+            **{role: False for role, member in expected_static.items() if member.present},
+            **({".p": True} if snapshot.mutable_tree.present else {}),
+        }
+        if top != expected_top:
+            raise _fail("private recovery delete membership changed")
+        for role in (".o", ".h", ".c"):
+            member = expected_static[role]
+            if not member.present:
+                continue
+            handle = _open_delete_relative(leaf_handle, role, directory=False)
+            size = _delete_handle_size(handle)
+            payload = _read_delete_handle(handle, size)
+            digest = hashlib.sha256(payload).hexdigest()
+            if size != member.size_bytes or digest != member.sha256:
+                _close_delete_handle(handle)
+                raise _fail("private recovery static commitment changed")
+            nodes.append(_DeleteNode(role, role, role, leaf_handle, handle, False, size, digest, 0))
+        if snapshot.mutable_tree.present:
+            mutable = _open_delete_relative(leaf_handle, ".p", directory=True)
+            opened_directories.append(mutable)
+            nodes.append(_DeleteNode(".p", ".p", ".p", leaf_handle, mutable, True, 0, None, 0))
+            pending: list[tuple[int, str, int]] = [(mutable, "", 1)]
+            observed: dict[tuple[str, str], tuple[int, str | None]] = {}
+            while pending:
+                parent, prefix, depth = pending.pop(0)
+                for name, is_directory in _directory_names(parent):
+                    relative = _normalized_relative(prefix, name)
+                    digest_name = hashlib.sha256(relative.encode("utf-8")).hexdigest()
+                    handle = _open_delete_relative(parent, name, directory=is_directory)
+                    if is_directory:
+                        size = 0
+                        digest = None
+                        pending.append((handle, relative, depth + 1))
+                        opened_directories.append(handle)
+                    else:
+                        size = _delete_handle_size(handle)
+                        payload = _read_delete_handle(handle, size)
+                        digest = hashlib.sha256(payload).hexdigest()
+                    key = (digest_name, "directory" if is_directory else "file")
+                    if key in observed:
+                        _close_delete_handle(handle)
+                        raise _fail("private recovery mutable commitment collides")
+                    observed[key] = (size, digest)
+                    nodes.append(_DeleteNode(".p", relative, name, parent, handle, is_directory, size, digest, depth))
+            if set(observed) != set(expected_mutable):
+                raise _fail("private recovery mutable membership changed")
+            for key, (size, digest) in observed.items():
+                expected = expected_mutable[key]
+                if not expected.stable or expected.observed_size_bytes != size or expected.sha256 != digest:
+                    raise _fail("private recovery mutable commitment changed")
+        return tuple(nodes)
+    except BaseException:
+        for node in reversed(nodes):
+            if node.handle != -1:
+                try:
+                    _close_delete_handle(node.handle)
+                except OSError:
+                    pass
+        raise
+
+
+def open_private_recovery_delete_transaction(
+    output_root: Path,
+    run_key: str,
+    *,
+    expected_root_identity: str,
+    expected_namespace_identity: str,
+    expected_leaf_identity: str,
+    snapshot: PrivateRecoverySnapshot,
+) -> PrivateRecoveryDeleteTransaction:
+    """Lease and prevalidate every private member without deleting any byte."""
+    safe_key = _validated_run_key(run_key)
+    expected_root = _validated_identity(expected_root_identity)
+    expected_namespace = _validated_identity(expected_namespace_identity)
+    expected_leaf = _validated_identity(expected_leaf_identity)
+    if (
+        snapshot.run_key != safe_key
+        or snapshot.namespace_identity_sha256 != expected_namespace
+        or not snapshot.observation_complete
+        or snapshot.overflow
+        or any(not entry.stable for entry in snapshot.mutable_tree.entries)
+    ):
+        raise _fail("private recovery snapshot cannot authorize deletion")
+    root = evidence.validate_directory_identity(Path(output_root), expected_root)[0]
+    if os.name == "nt":
+        root_handle = evidence._windows_open_root_directory(root)
+        namespace_handle = -1
+        leaf_handle = -1
+        try:
+            namespace_handle = _windows_open_delete_relative(
+                root_handle, PRIVATE_RECOVERY_DIRECTORY, directory=True
+            )
+            namespace_information = evidence._windows_handle_information(namespace_handle)
+            if evidence._windows_directory_identity(namespace_information) != expected_namespace:
+                raise _fail("private recovery namespace identity changed")
+            leaf_handle = _windows_open_delete_relative(namespace_handle, safe_key, directory=True)
+            leaf_information = evidence._windows_handle_information(leaf_handle)
+            if evidence._windows_directory_identity(leaf_information) != expected_leaf:
+                raise _fail("private recovery leaf identity changed")
+            nodes = _open_delete_tree(leaf_handle, snapshot)
+            return PrivateRecoveryDeleteTransaction(
+                run_key=safe_key,
+                namespace_handle=namespace_handle,
+                leaf_handle=leaf_handle,
+                nodes=nodes,
+            )
+        except BaseException:
+            for handle in (leaf_handle, namespace_handle):
+                if handle != -1:
+                    evidence._windows_close_handle(handle)
+            raise
+        finally:
+            evidence._windows_close_handle(root_handle)
+    root_handle = _portable_open_directory(root)
+    namespace_handle = -1
+    leaf_handle = -1
+    try:
+        namespace_handle = _open_delete_relative(
+            root_handle, PRIVATE_RECOVERY_DIRECTORY, directory=True
+        )
+        if _portable_identity(os.fstat(namespace_handle)) != expected_namespace:
+            raise _fail("private recovery namespace identity changed")
+        leaf_handle = _open_delete_relative(namespace_handle, safe_key, directory=True)
+        if _portable_identity(os.fstat(leaf_handle)) != expected_leaf:
+            raise _fail("private recovery leaf identity changed")
+        nodes = _open_delete_tree(leaf_handle, snapshot)
+        return PrivateRecoveryDeleteTransaction(
+            run_key=safe_key,
+            namespace_handle=namespace_handle,
+            leaf_handle=leaf_handle,
+            nodes=nodes,
+        )
+    except BaseException:
+        for handle in (leaf_handle, namespace_handle):
+            if handle != -1:
+                os.close(handle)
+        raise
+    finally:
+        os.close(root_handle)
