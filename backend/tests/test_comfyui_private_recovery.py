@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.comfyui import reliability_evidence as evidence
 from app.comfyui import reliability_private_recovery as recovery
@@ -510,3 +511,30 @@ def test_snapshot_writer_rejects_payload_over_its_configured_limit(tmp_path: Pat
 
     with pytest.raises(PrivateRecoveryError, match="snapshot exceeds size limit"):
         write_private_recovery_snapshot(output_root, RUN_KEY, snapshot)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_stable_member_bytes", 67_108_865),
+        ("max_snapshot_bytes", 4_194_305),
+    ],
+)
+def test_snapshot_limits_reject_values_above_fixed_privacy_ceilings(
+    field: str, value: int
+) -> None:
+    with pytest.raises(ValidationError):
+        PrivateRecoveryLimits(**{field: value})
+
+
+def test_snapshot_runtime_rejects_bypassed_over_64mib_static_read_limit(
+    tmp_path: Path,
+) -> None:
+    _, boundary, private_run = _prepared_boundary(tmp_path)
+    static = private_run / ".h"
+    with static.open("wb") as handle:
+        handle.truncate(67_108_865)
+    bypassed = PrivateRecoveryLimits.model_construct(max_stable_member_bytes=67_108_865)
+
+    with pytest.raises(PrivateRecoveryError, match="limits are invalid"):
+        observe_private_recovery(boundary, limits=bypassed)

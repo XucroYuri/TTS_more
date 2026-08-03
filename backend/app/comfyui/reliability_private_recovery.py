@@ -15,6 +15,10 @@ from . import reliability_evidence as evidence
 
 PRIVATE_RECOVERY_DIRECTORY = ".private-recovery"
 PRIVATE_ROLES: tuple[str, ...] = (".o", ".h", ".c")
+MAX_PRIVATE_RECOVERY_ENTRIES = 4096
+MAX_PRIVATE_RECOVERY_OBSERVED_BYTES = 68_719_476_736
+MAX_PRIVATE_RECOVERY_STABLE_MEMBER_BYTES = 67_108_864
+MAX_PRIVATE_RECOVERY_SNAPSHOT_BYTES = 4_194_304
 
 
 class PrivateRecoveryError(evidence.EvidenceStoreError):
@@ -31,10 +35,22 @@ class PrivateRecoveryBoundary(evidence._StrictModel):
 
 
 class PrivateRecoveryLimits(evidence._StrictModel):
-    max_entries: StrictInt = 4096
-    max_total_observed_bytes: StrictInt = 68_719_476_736
-    max_stable_member_bytes: StrictInt = 67_108_864
-    max_snapshot_bytes: StrictInt = 4_194_304
+    max_entries: StrictInt = Field(default=4096, ge=0, le=MAX_PRIVATE_RECOVERY_ENTRIES)
+    max_total_observed_bytes: StrictInt = Field(
+        default=68_719_476_736,
+        ge=0,
+        le=MAX_PRIVATE_RECOVERY_OBSERVED_BYTES,
+    )
+    max_stable_member_bytes: StrictInt = Field(
+        default=67_108_864,
+        ge=0,
+        le=MAX_PRIVATE_RECOVERY_STABLE_MEMBER_BYTES,
+    )
+    max_snapshot_bytes: StrictInt = Field(
+        default=4_194_304,
+        ge=0,
+        le=MAX_PRIVATE_RECOVERY_SNAPSHOT_BYTES,
+    )
 
 
 class PrivateStaticMember(evidence._StrictModel):
@@ -75,6 +91,17 @@ class PrivateRecoverySnapshot(evidence._StrictModel):
 
 def _fail(message: str) -> PrivateRecoveryError:
     return PrivateRecoveryError(message)
+
+
+def _require_valid_limits(limits: PrivateRecoveryLimits) -> None:
+    values = (
+        (limits.max_entries, MAX_PRIVATE_RECOVERY_ENTRIES),
+        (limits.max_total_observed_bytes, MAX_PRIVATE_RECOVERY_OBSERVED_BYTES),
+        (limits.max_stable_member_bytes, MAX_PRIVATE_RECOVERY_STABLE_MEMBER_BYTES),
+        (limits.max_snapshot_bytes, MAX_PRIVATE_RECOVERY_SNAPSHOT_BYTES),
+    )
+    if any(type(value) is not int or value < 0 or value > maximum for value, maximum in values):
+        raise _fail("private recovery limits are invalid")
 
 
 def _validated_run_key(run_key: str) -> str:
@@ -764,15 +791,7 @@ def observe_private_recovery(
     *,
     limits: PrivateRecoveryLimits = PrivateRecoveryLimits(),
 ) -> PrivateRecoverySnapshot:
-    if (
-        limits.max_entries < 0
-        or limits.max_entries > 4096
-        or limits.max_total_observed_bytes < 0
-        or limits.max_total_observed_bytes > 68_719_476_736
-        or limits.max_stable_member_bytes < 0
-        or limits.max_snapshot_bytes < 0
-    ):
-        raise _fail("private recovery limits are invalid")
+    _require_valid_limits(limits)
     run_handle, safe_key = _open_observation_run(boundary)
     try:
         top_level_names = {name for name, _ in _directory_names(run_handle)}
@@ -822,6 +841,7 @@ def write_private_recovery_snapshot(
     safe_key = _validated_run_key(run_key)
     if snapshot.run_key != safe_key:
         raise _fail("private recovery snapshot run key does not match output run")
+    _require_valid_limits(snapshot.limits)
     canonical = (
         json.dumps(
             snapshot.model_dump(mode="json"),
