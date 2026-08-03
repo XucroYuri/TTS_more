@@ -42,6 +42,36 @@ def _make_directory_link(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+def _set_windows_sddl(path: Path, sddl: str) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    descriptor = ctypes.c_void_p()
+    size = wintypes.DWORD()
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    assert advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, ctypes.byref(descriptor), ctypes.byref(size)
+    )
+    advapi32.SetFileSecurityW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    advapi32.SetFileSecurityW.restype = wintypes.BOOL
+    try:
+        assert advapi32.SetFileSecurityW(str(path), 0x00000001 | 0x00000004, descriptor)
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
 def _process_record(pid: int, parent_pid: int) -> dict[str, object]:
     return {
         "pid": pid,
@@ -889,6 +919,129 @@ def test_acl_race_before_claim_or_consume_rejects_without_consuming_capability(
         )
         assert recovery.decode_plan_token(token).run_key == run_key
     finally:
+        if target.exists():
+            target.unlink()
+        if claim.exists():
+            claim.unlink()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows ACL notifications")
+def test_transient_acl_grant_around_cap_delete_cannot_consume_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability_base = tmp_path / "cap-base"
+    capability_base.mkdir()
+    monkeypatch.setattr(
+        recovery.tempfile, "gettempdir", lambda: str(capability_base)
+    )
+    output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(
+        tmp_path / "fixture"
+    )
+    plan = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+    assert isinstance(plan, recovery.RecoveryPlan)
+    token = recovery.encode_plan_token(plan)
+    directory = recovery._capability_directory()
+    target = directory / (
+        hashlib.sha256(token.encode("ascii")).hexdigest() + ".cap"
+    )
+    claim = target.with_suffix(".claim")
+    safe_sddl = recovery._windows_security_descriptor_sddl(directory)
+    original_validator = recovery._validate_capability_store
+    validation_count = 0
+
+    def grant_then_hide_acl_drift(path: Path) -> None:
+        nonlocal validation_count
+        validation_count += 1
+        if validation_count == 7:
+            _set_windows_sddl(directory, safe_sddl)
+        original_validator(path)
+        if validation_count == 6:
+            changed = subprocess.run(
+                ["icacls.exe", str(directory), "/grant", "*S-1-1-0:(RX)"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert changed.returncode == 0, changed.stderr + changed.stdout
+
+    monkeypatch.setattr(
+        recovery, "_validate_capability_store", grant_then_hide_acl_drift
+    )
+    try:
+        with pytest.raises(ValueError, match="capability store"):
+            recovery.decode_plan_token(token)
+        _set_windows_sddl(directory, safe_sddl)
+        assert target.exists()
+        assert not claim.exists()
+        assert (private_leaf / ".h").exists()
+        monkeypatch.setattr(
+            recovery, "_validate_capability_store", original_validator
+        )
+        assert recovery.decode_plan_token(token).run_key == run_key
+    finally:
+        _set_windows_sddl(directory, safe_sddl)
+        if target.exists():
+            target.unlink()
+        if claim.exists():
+            claim.unlink()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows ACL notifications")
+def test_transient_acl_grant_inside_handle_disposition_is_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability_base = tmp_path / "cap-base"
+    capability_base.mkdir()
+    monkeypatch.setattr(
+        recovery.tempfile, "gettempdir", lambda: str(capability_base)
+    )
+    output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(
+        tmp_path / "fixture"
+    )
+    plan = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+    assert isinstance(plan, recovery.RecoveryPlan)
+    token = recovery.encode_plan_token(plan)
+    directory = recovery._capability_directory()
+    target = directory / (
+        hashlib.sha256(token.encode("ascii")).hexdigest() + ".cap"
+    )
+    claim = target.with_suffix(".claim")
+    safe_sddl = recovery._windows_security_descriptor_sddl(directory)
+    original_disposition = recovery._set_capability_delete_disposition
+
+    def mutate_during_disposition(descriptor: int, *, delete: bool) -> None:
+        if not delete:
+            original_disposition(descriptor, delete=False)
+            return
+        changed = subprocess.run(
+            ["icacls.exe", str(directory), "/grant", "*S-1-1-0:(RX)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert changed.returncode == 0, changed.stderr + changed.stdout
+        original_disposition(descriptor, delete=True)
+        _set_windows_sddl(directory, safe_sddl)
+
+    monkeypatch.setattr(
+        recovery, "_set_capability_delete_disposition", mutate_during_disposition
+    )
+    try:
+        with pytest.raises(ValueError, match="capability store"):
+            recovery.decode_plan_token(token)
+        assert target.exists()
+        assert not claim.exists()
+        assert (private_leaf / ".h").exists()
+        monkeypatch.setattr(
+            recovery, "_set_capability_delete_disposition", original_disposition
+        )
+        assert recovery.decode_plan_token(token).run_key == run_key
+    finally:
+        _set_windows_sddl(directory, safe_sddl)
         if target.exists():
             target.unlink()
         if claim.exists():

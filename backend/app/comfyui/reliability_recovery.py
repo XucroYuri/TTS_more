@@ -702,13 +702,16 @@ def decode_plan_token(token: str) -> RecoveryPlan:
     directory = _capability_directory()
     target = directory / f"{token_hash}.cap"
     claim = directory / f"{token_hash}.claim"
-    _validate_capability_file(target)
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(target, flags)
+    lease = _CapabilityStoreLease(directory)
+    descriptor = -1
     claim_descriptor = -1
     claim_created = False
     capability_consumed = False
+    delete_pending = False
     try:
+        lease.validate()
+        _validate_capability_file(target)
+        descriptor = _open_capability_for_decode(target)
         opened = os.fstat(descriptor)
         named = target.lstat()
         if (
@@ -764,7 +767,7 @@ def decode_plan_token(token: str) -> RecoveryPlan:
         ).encode("utf-8")
         if plaintext != canonical:
             raise ValueError("recovery plan token is invalid")
-        _validate_capability_store(directory)
+        lease.validate()
         claim_descriptor = _create_private_capability_file(
             claim,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -772,24 +775,30 @@ def decode_plan_token(token: str) -> RecoveryPlan:
         )
         claim_created = True
         _validate_capability_file(claim)
-        _validate_capability_store(directory)
-        # Windows CRT read handles do not share deletion.  The exclusive
-        # claim remains held while the exact cap identity and store security
-        # are revalidated at the consume boundary.
-        os.close(descriptor)
-        descriptor = -1
-        _validate_capability_store(directory)
+        lease.validate()
+        # The exclusive claim and validated DELETE-capable cap handle remain
+        # held while store identity and security are revalidated at consume.
+        lease.validate()
         final = target.lstat()
         if (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino):
             raise ValueError("recovery plan token is invalid")
         _validate_capability_file(target)
-        _validate_capability_store(directory)
-        os.unlink(target)
-        capability_consumed = True
-        # Post-consume verification, then a separate immediate precondition
-        # for the claim-removal mutation below.
-        _validate_capability_store(directory)
-        _validate_capability_store(directory)
+        lease.validate()
+        if os.name == "nt":
+            _set_capability_delete_disposition(descriptor, delete=True)
+            delete_pending = True
+            try:
+                lease.validate()
+            except BaseException:
+                _set_capability_delete_disposition(descriptor, delete=False)
+                delete_pending = False
+                raise
+        else:
+            os.unlink(target)
+            capability_consumed = True
+            lease.validate()
+        # Separate immediate precondition for claim removal below.
+        lease.validate()
         if os.name == "nt":
             # FILE_FLAG_DELETE_ON_CLOSE removes only the exact protected
             # claim handle created above; unsafe pre-consume exits close this
@@ -801,9 +810,25 @@ def decode_plan_token(token: str) -> RecoveryPlan:
             claim_descriptor = -1
             os.unlink(claim)
         claim_created = False
-        _validate_capability_store(directory)
+        lease.validate()
+        if os.name == "nt":
+            lease.validate()
+            # The post-disposition validation above is the final authorization
+            # point.  From here the deny-delete store handle plus share-zero
+            # cap handle make close an exact handle-relative commit; no path or
+            # ACL interposition can redirect it to another object.
+            os.close(descriptor)
+            descriptor = -1
+            delete_pending = False
+            capability_consumed = True
         return plan
     finally:
+        if delete_pending and descriptor != -1:
+            try:
+                _set_capability_delete_disposition(descriptor, delete=False)
+                delete_pending = False
+            except OSError:
+                pass
         if descriptor != -1:
             os.close(descriptor)
         if claim_descriptor != -1:
@@ -821,6 +846,7 @@ def decode_plan_token(token: str) -> RecoveryPlan:
                         os.unlink(claim)
                 except OSError:
                     pass
+        lease.close()
 
 
 def _capability_directory() -> Path:
@@ -848,6 +874,213 @@ def _validate_capability_store(directory: Path) -> None:
     ):
         raise ValueError("recovery capability store is unsafe")
     _validate_capability_directory_security(directory)
+
+
+class _CapabilityStoreLease:
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.directory_handle: int | None = None
+        self.notification_handle: int | None = None
+        self.identity: tuple[int, int, int] | None = None
+        if os.name == "nt":
+            self._open_windows()
+
+    def _open_windows(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        invalid = wintypes.HANDLE(-1).value
+        handle = kernel32.CreateFileW(
+            str(self.directory),
+            0x00020000 | 0x00000080,
+            0x00000001 | 0x00000002,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        if handle == invalid:
+            raise ValueError("recovery capability store lease is unavailable")
+        self.directory_handle = handle
+        try:
+            self.identity = _windows_handle_identity(handle, require_directory=True)
+            kernel32.FindFirstChangeNotificationW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            ]
+            kernel32.FindFirstChangeNotificationW.restype = wintypes.HANDLE
+            notification = kernel32.FindFirstChangeNotificationW(
+                str(self.directory.parent), False, 0x00000100
+            )
+            if notification == invalid:
+                raise ValueError("recovery capability store lease is unavailable")
+            self.notification_handle = notification
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            self.directory_handle = None
+            raise
+
+    def validate(self) -> None:
+        _validate_capability_store(self.directory)
+        if os.name != "nt":
+            return
+        import ctypes
+
+        if self.directory_handle is None or self.notification_handle is None:
+            raise ValueError("recovery capability store lease is invalid")
+        if _windows_handle_identity(
+            self.directory_handle, require_directory=True
+        ) != self.identity:
+            raise ValueError("recovery capability store lease identity changed")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        wait = kernel32.WaitForSingleObject(self.notification_handle, 0)
+        if wait == 0:
+            raise ValueError("recovery capability store security changed")
+        if wait != 0x00000102:
+            raise ValueError("recovery capability store lease is unavailable")
+
+    def close(self) -> None:
+        if os.name != "nt":
+            return
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if self.notification_handle is not None:
+            kernel32.FindCloseChangeNotification(self.notification_handle)
+            self.notification_handle = None
+        if self.directory_handle is not None:
+            kernel32.CloseHandle(self.directory_handle)
+            self.directory_handle = None
+
+
+def _windows_handle_identity(
+    handle: int, *, require_directory: bool
+) -> tuple[int, int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", wintypes.DWORD), ("high", wintypes.DWORD)]
+
+    class FileInformation(ctypes.Structure):
+        _fields_ = [
+            ("attributes", wintypes.DWORD),
+            ("creation_time", FileTime),
+            ("access_time", FileTime),
+            ("write_time", FileTime),
+            ("volume_serial", wintypes.DWORD),
+            ("size_high", wintypes.DWORD),
+            ("size_low", wintypes.DWORD),
+            ("links", wintypes.DWORD),
+            ("index_high", wintypes.DWORD),
+            ("index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(FileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    information = FileInformation()
+    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+        raise ValueError("recovery capability store lease is unavailable")
+    is_directory = bool(information.attributes & 0x00000010)
+    if (
+        is_directory != require_directory
+        or information.attributes & evidence._FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise ValueError("recovery capability store lease is unsafe")
+    return (
+        int(information.volume_serial),
+        int(information.index_high),
+        int(information.index_low),
+    )
+
+
+def _open_capability_for_decode(path: Path) -> int:
+    if os.name != "nt":
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        return os.open(path, flags)
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    invalid = wintypes.HANDLE(-1).value
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x80000000 | 0x00010000,
+        0,
+        None,
+        3,
+        0x00000080 | 0x00200000,
+        None,
+    )
+    if handle == invalid:
+        raise ValueError("recovery plan token is invalid")
+    try:
+        return msvcrt.open_osfhandle(
+            handle, os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        )
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+
+
+def _set_capability_delete_disposition(descriptor: int, *, delete: bool) -> None:
+    if os.name != "nt":
+        raise OSError("handle-relative disposition is Windows-only")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileDispositionInformation(ctypes.Structure):
+        _fields_ = [("delete_file", wintypes.BOOL)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    information = FileDispositionInformation(bool(delete))
+    handle = msvcrt.get_osfhandle(descriptor)
+    if not kernel32.SetFileInformationByHandle(
+        handle,
+        4,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        raise OSError(ctypes.get_last_error(), "capability disposition failed")
 
 
 def _protect_capability(plaintext: bytes, token: str) -> bytes:
