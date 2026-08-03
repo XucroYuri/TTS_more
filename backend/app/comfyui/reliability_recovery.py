@@ -880,8 +880,10 @@ class _CapabilityStoreLease:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
         self.directory_handle: int | None = None
+        self.parent_handle: int | None = None
         self.notification_handle: int | None = None
         self.identity: tuple[int, int, int] | None = None
+        self.parent_identity: tuple[int, int, int] | None = None
         if os.name == "nt":
             self._open_windows()
 
@@ -890,30 +892,15 @@ class _CapabilityStoreLease:
         from ctypes import wintypes
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateFileW.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.HANDLE,
-        ]
-        kernel32.CreateFileW.restype = wintypes.HANDLE
         invalid = wintypes.HANDLE(-1).value
-        handle = kernel32.CreateFileW(
-            str(self.directory),
-            0x00020000 | 0x00000080,
-            0x00000001 | 0x00000002,
-            None,
-            3,
-            0x02000000 | 0x00200000,
-            None,
-        )
-        if handle == invalid:
-            raise ValueError("recovery capability store lease is unavailable")
-        self.directory_handle = handle
+        parent_handle = _windows_open_directory_anchor(self.directory.parent)
+        self.parent_handle = parent_handle
         try:
+            self.parent_identity = _windows_handle_identity(
+                parent_handle, require_directory=True
+            )
+            handle = _windows_open_directory_anchor(self.directory)
+            self.directory_handle = handle
             self.identity = _windows_handle_identity(handle, require_directory=True)
             kernel32.FindFirstChangeNotificationW.argtypes = [
                 wintypes.LPCWSTR,
@@ -928,8 +915,11 @@ class _CapabilityStoreLease:
                 raise ValueError("recovery capability store lease is unavailable")
             self.notification_handle = notification
         except BaseException:
-            kernel32.CloseHandle(handle)
-            self.directory_handle = None
+            if self.directory_handle is not None:
+                kernel32.CloseHandle(self.directory_handle)
+                self.directory_handle = None
+            kernel32.CloseHandle(parent_handle)
+            self.parent_handle = None
             raise
 
     def validate(self) -> None:
@@ -938,12 +928,25 @@ class _CapabilityStoreLease:
             return
         import ctypes
 
-        if self.directory_handle is None or self.notification_handle is None:
+        if (
+            self.directory_handle is None
+            or self.parent_handle is None
+            or self.notification_handle is None
+        ):
             raise ValueError("recovery capability store lease is invalid")
+        if (
+            _windows_handle_identity(self.parent_handle, require_directory=True)
+            != self.parent_identity
+            or _windows_named_directory_identity(self.directory.parent)
+            != self.parent_identity
+        ):
+            raise ValueError("recovery capability store parent identity changed")
         if _windows_handle_identity(
             self.directory_handle, require_directory=True
         ) != self.identity:
             raise ValueError("recovery capability store lease identity changed")
+        if _windows_named_directory_identity(self.directory) != self.identity:
+            raise ValueError("recovery capability store named identity changed")
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         wait = kernel32.WaitForSingleObject(self.notification_handle, 0)
         if wait == 0:
@@ -963,6 +966,72 @@ class _CapabilityStoreLease:
         if self.directory_handle is not None:
             kernel32.CloseHandle(self.directory_handle)
             self.directory_handle = None
+        if self.parent_handle is not None:
+            kernel32.CloseHandle(self.parent_handle)
+            self.parent_handle = None
+
+
+def _windows_open_directory_anchor(path: Path) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    invalid = wintypes.HANDLE(-1).value
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x00020000 | 0x00010000 | 0x00000080,
+        0x00000001 | 0x00000002,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if handle == invalid:
+        raise ValueError("recovery capability store anchor is unavailable")
+    return handle
+
+
+def _windows_named_directory_identity(path: Path) -> tuple[int, int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    invalid = wintypes.HANDLE(-1).value
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x00000080,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if handle == invalid:
+        raise ValueError("recovery capability store named path is unavailable")
+    try:
+        return _windows_handle_identity(handle, require_directory=True)
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _windows_handle_identity(

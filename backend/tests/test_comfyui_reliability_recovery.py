@@ -1048,6 +1048,82 @@ def test_transient_acl_grant_inside_handle_disposition_is_cancelled(
             claim.unlink()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows rename sharing")
+def test_store_rename_and_exact_acl_replacement_cannot_consume_copied_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capability_base = tmp_path / "cap-base"
+    capability_base.mkdir()
+    monkeypatch.setattr(
+        recovery.tempfile, "gettempdir", lambda: str(capability_base)
+    )
+    output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(
+        tmp_path / "fixture"
+    )
+    plan = recovery.validate_recovery_owner(
+        output_root, run_key, observed_processes=processes, observed_ports=ports
+    )
+    assert isinstance(plan, recovery.RecoveryPlan)
+    token = recovery.encode_plan_token(plan)
+    directory = recovery._capability_directory()
+    moved = directory.with_name(directory.name + "-moved")
+    token_name = hashlib.sha256(token.encode("ascii")).hexdigest() + ".cap"
+    original_cap = directory / token_name
+    payload = original_cap.read_bytes()
+    original_validate = recovery._CapabilityStoreLease.validate
+    attempted = False
+
+    def validate_then_swap(lease: object) -> None:
+        nonlocal attempted
+        original_validate(lease)
+        if attempted:
+            return
+        attempted = True
+        try:
+            directory.rename(moved)
+        except OSError as exc:
+            raise ValueError("recovery capability store identity swap was blocked") from exc
+        recovery._create_windows_private_directory(directory)
+        replacement = directory / token_name
+        descriptor = recovery._create_private_capability_file(
+            replacement,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+        )
+        try:
+            assert os.write(descriptor, payload) == len(payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    monkeypatch.setattr(
+        recovery._CapabilityStoreLease, "validate", validate_then_swap
+    )
+    try:
+        with pytest.raises(ValueError, match="capability store"):
+            recovery.decode_plan_token(token)
+        assert (directory / token_name).exists()
+        assert not (directory / token_name).with_suffix(".claim").exists()
+        assert (private_leaf / ".h").exists()
+        monkeypatch.setattr(
+            recovery._CapabilityStoreLease, "validate", original_validate
+        )
+        assert recovery.decode_plan_token(token).run_key == run_key
+    finally:
+        monkeypatch.setattr(
+            recovery._CapabilityStoreLease, "validate", original_validate
+        )
+        if moved.exists():
+            replacement = directory / token_name
+            if replacement.exists():
+                replacement.unlink()
+            replacement_claim = replacement.with_suffix(".claim")
+            if replacement_claim.exists():
+                replacement_claim.unlink()
+            if directory.exists():
+                directory.rmdir()
+            moved.rename(directory)
+
+
 def test_recovery_execute_rejects_namespace_or_leaf_identity_drift_without_delete(tmp_path: Path) -> None:
     output_root, run_key, private_leaf, processes, ports = _failed_recovery_fixture(tmp_path)
     plan = recovery.validate_recovery_owner(output_root, run_key, observed_processes=processes, observed_ports=ports)
