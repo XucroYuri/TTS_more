@@ -43,20 +43,27 @@ from app.comfyui.reliability_validation import (
 )
 
 
-def _prepare_supervised_run(
+def _prepare_inner_supervised_run(
     output_root: Path,
     run_id: str,
-) -> tuple[Path, str, str]:
+) -> reliability_supervision.PreparedRun:
     run_key = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
     prepared_root = reliability_supervision.prepare_output_root(output_root)
-    prepared_run = reliability_supervision.prepare_run(
+    return reliability_supervision.prepare_run(
         output_root,
         run_key,
         expected_root_identity=prepared_root.root_identity,
     )
+
+
+def _prepare_supervised_run(
+    output_root: Path,
+    run_id: str,
+) -> tuple[Path, str, str]:
+    prepared_run = _prepare_inner_supervised_run(output_root, run_id)
     return (
         Path(prepared_run.run_root),
-        prepared_root.root_identity,
+        prepared_run.root_identity,
         prepared_run.run_root_identity,
     )
 
@@ -5527,10 +5534,11 @@ def test_task_12_wrapper_cleans_owned_empty_temp_after_launcher_identity_failure
     output_root = tmp_path / "validation output"
     output_root.mkdir()
     run_id = "1" * 32
-    run_root, root_identity, run_root_identity = _prepare_supervised_run(
+    prepared_run = _prepare_inner_supervised_run(
         output_root,
         run_id,
     )
+    private_root = Path(prepared_run.private_root)
     sentinel_directory = output_root / "unrelated sentinel directory"
     sentinel_directory.mkdir()
     sentinel_file = output_root / "unrelated-sentinel.txt"
@@ -5593,11 +5601,11 @@ $matchingBefore = @(Get-MatchingProcessIdentities)
 function Get-CimInstance {
     param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
     $ownedRoots = @(
-        Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_RUN_ROOT -Directory `
+        Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_PRIVATE_ROOT -Directory `
             -Filter '.p'
     )
     $ownerMarkers = @(
-        Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_RUN_ROOT -File `
+        Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_PRIVATE_ROOT -File `
             -Filter '.o'
     )
     if ($ownedRoots.Count -ne 1 -or $ownerMarkers.Count -ne 1) {
@@ -5623,6 +5631,9 @@ try {
         -RunId '11111111111111111111111111111111' `
         -OutputRootIdentity $env:TTS_MORE_TEST_ROOT_IDENTITY `
         -RunRootIdentity $env:TTS_MORE_TEST_RUN_ROOT_IDENTITY `
+        -PrivateRecoveryRoot $env:TTS_MORE_TEST_PRIVATE_ROOT `
+        -PrivateRecoveryRootIdentity $env:TTS_MORE_TEST_PRIVATE_ROOT_IDENTITY `
+        -PrivateRecoveryNamespaceIdentity $env:TTS_MORE_TEST_PRIVATE_NAMESPACE_IDENTITY `
         -PreflightOnly
 } catch {
     $caught = $_
@@ -5631,10 +5642,10 @@ try {
 if ($null -eq $caught -or $caught.Exception.Message -ne 'injected launcher identity failure') {
     throw ('Expected injected launcher identity failure, got: {0}' -f $caught)
 }
-if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_RUN_ROOT -Directory -Filter '.p').Count -ne 0) {
+if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_PRIVATE_ROOT -Directory -Filter '.p').Count -ne 0) {
     throw 'run-owned temp root survived early launcher identity failure'
 }
-if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_RUN_ROOT -File -Filter '.o').Count -ne 0) {
+if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_PRIVATE_ROOT -File -Filter '.o').Count -ne 0) {
     throw 'run-owned temp marker survived early launcher identity failure'
 }
 if (
@@ -5656,9 +5667,13 @@ Write-Output 'EARLY_LAUNCHER_FAILURE_CLEANUP_OK'
             "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
             "TTS_MORE_TEST_FIXTURE": str(fixture_path),
             "TTS_MORE_TEST_OUTPUT": str(output_root),
-            "TTS_MORE_TEST_RUN_ROOT": str(run_root),
-            "TTS_MORE_TEST_ROOT_IDENTITY": root_identity,
-            "TTS_MORE_TEST_RUN_ROOT_IDENTITY": run_root_identity,
+            "TTS_MORE_TEST_ROOT_IDENTITY": prepared_run.root_identity,
+            "TTS_MORE_TEST_RUN_ROOT_IDENTITY": prepared_run.run_root_identity,
+            "TTS_MORE_TEST_PRIVATE_ROOT": str(private_root),
+            "TTS_MORE_TEST_PRIVATE_ROOT_IDENTITY": prepared_run.private_root_identity,
+            "TTS_MORE_TEST_PRIVATE_NAMESPACE_IDENTITY": (
+                prepared_run.private_namespace_identity
+            ),
             "TTS_MORE_TEST_COMFY_ROOT": str(comfy_root),
             "TTS_MORE_TEST_COMFY_PYTHON": str(fake_comfy_python),
             "TTS_MORE_TEST_TTS_ROOT": str(repository_root),
@@ -5928,10 +5943,12 @@ def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
     output_root = tmp_path / "private evidence"
     output_root.mkdir()
     run_id = "2" * 32
-    run_root, root_identity, run_root_identity = _prepare_supervised_run(
+    prepared_run = _prepare_inner_supervised_run(
         output_root,
         run_id,
     )
+    run_root = Path(prepared_run.run_root)
+    private_root = Path(prepared_run.private_root)
     fixture_root = tmp_path / "fixture"
     reference_root = fixture_root / "references"
     reference_root.mkdir(parents=True)
@@ -6000,9 +6017,15 @@ def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
             "-RunId",
             "22222222222222222222222222222222",
             "-OutputRootIdentity",
-            root_identity,
+            prepared_run.root_identity,
             "-RunRootIdentity",
-            run_root_identity,
+            prepared_run.run_root_identity,
+            "-PrivateRecoveryRoot",
+            str(private_root),
+            "-PrivateRecoveryRootIdentity",
+            prepared_run.private_root_identity,
+            "-PrivateRecoveryNamespaceIdentity",
+            prepared_run.private_namespace_identity,
             "-PreflightOnly",
         ],
         capture_output=True,
@@ -6038,13 +6061,13 @@ def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
         "--port",
         "8188",
         "--temp-directory",
-        str(run_root / ".p" / "comfyui"),
+        str(private_root / ".p" / "comfyui"),
     ]
     assert all(str(path) not in semantic_argv for path in sidecars)
-    assert not (run_root / ".p").exists()
-    assert not (run_root / ".o").exists()
-    assert not (run_root / ".h").exists()
-    assert not (run_root / ".c").exists()
+    assert not (private_root / ".p").exists()
+    assert not (private_root / ".o").exists()
+    assert not (private_root / ".h").exists()
+    assert not (private_root / ".c").exists()
 
     inventory = subprocess.run(
         [
@@ -6243,10 +6266,12 @@ def test_task_12_wrapper_preserves_primary_error_when_cleanup_cim_query_fails(
     output_root = tmp_path / "private failure evidence"
     output_root.mkdir()
     run_id = "3" * 32
-    run_root, root_identity, run_root_identity = _prepare_supervised_run(
+    prepared_run = _prepare_inner_supervised_run(
         output_root,
         run_id,
     )
+    run_root = Path(prepared_run.run_root)
+    private_root = Path(prepared_run.private_root)
     fixture_root = tmp_path / "fixture"
     reference_root = fixture_root / "references"
     reference_root.mkdir(parents=True)
@@ -6307,6 +6332,9 @@ function Get-CimInstance {
     -RunId '33333333333333333333333333333333' `
     -OutputRootIdentity $env:TTS_MORE_TEST_ROOT_IDENTITY `
     -RunRootIdentity $env:TTS_MORE_TEST_RUN_ROOT_IDENTITY `
+    -PrivateRecoveryRoot $env:TTS_MORE_TEST_PRIVATE_ROOT `
+    -PrivateRecoveryRootIdentity $env:TTS_MORE_TEST_PRIVATE_ROOT_IDENTITY `
+    -PrivateRecoveryNamespaceIdentity $env:TTS_MORE_TEST_PRIVATE_NAMESPACE_IDENTITY `
     -PreflightOnly
 """
     cleanup_query_marker = tmp_path / "cleanup-query.marker"
@@ -6316,8 +6344,13 @@ function Get-CimInstance {
             "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
             "TTS_MORE_TEST_FIXTURE": str(fixture_path),
             "TTS_MORE_TEST_OUTPUT": str(output_root),
-            "TTS_MORE_TEST_ROOT_IDENTITY": root_identity,
-            "TTS_MORE_TEST_RUN_ROOT_IDENTITY": run_root_identity,
+            "TTS_MORE_TEST_ROOT_IDENTITY": prepared_run.root_identity,
+            "TTS_MORE_TEST_RUN_ROOT_IDENTITY": prepared_run.run_root_identity,
+            "TTS_MORE_TEST_PRIVATE_ROOT": str(private_root),
+            "TTS_MORE_TEST_PRIVATE_ROOT_IDENTITY": prepared_run.private_root_identity,
+            "TTS_MORE_TEST_PRIVATE_NAMESPACE_IDENTITY": (
+                prepared_run.private_namespace_identity
+            ),
             "TTS_MORE_CLEANUP_QUERY_MARKER": str(cleanup_query_marker),
             "TTS_MORE_TEST_COMFY_ROOT": str(comfy_root),
             "TTS_MORE_TEST_COMFY_PYTHON": str(Path(os.sys.executable).resolve()),
@@ -6373,10 +6406,10 @@ function Get-CimInstance {
     assert comfy_stderr.read_bytes() == b"PRIMARY_ERROR_STDERR"
     assert backend_stdout.read_bytes() == b""
     assert backend_stderr.read_bytes() == b""
-    assert (run_root / ".p").is_dir()
-    assert (run_root / ".o").is_file()
-    assert (run_root / ".c").is_file()
-    assert not (run_root / ".h").exists()
+    assert (private_root / ".p").is_dir()
+    assert (private_root / ".o").is_file()
+    assert (private_root / ".c").is_file()
+    assert not (private_root / ".h").exists()
 
     inventory = subprocess.run(
         [
