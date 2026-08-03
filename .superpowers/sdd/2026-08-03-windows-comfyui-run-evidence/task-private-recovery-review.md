@@ -328,3 +328,28 @@ incomplete, and the targeted portable release checks still expose the missing
 Task 6 verdict remains **NOT READY**. No supervised preflight, CUDA smoke,
 three-engine synthesis, 47-case matrix, PR, merge, or remote synchronization
 was run or authorized by this report.
+
+## Final deterministic code-gate update — 2026-08-04
+
+The portable-release workflow blocker was retired by commit
+`96e357668797b8094060c2e600d86062cfb317b5`. Its independent READY review is
+recorded at
+`.superpowers/sdd/2026-08-03-windows-comfyui-run-evidence/review-retired-portable-workflow-fix.md`.
+
+The authoritative short-basetemp full-backend review then completed the exact
+backend gate with:
+
+```text
+7 failed, 1666 passed, 40 skipped, 2 warnings in 535.60s
+```
+
+All seven failures are the already permitted Windows host-capability class,
+with exact causes: `pwsh` unavailable (2), symlink privilege
+`WinError 1314` (4), and `net share` access denied (1). The prior long-path
+portable run's 23 extra failures are gone; no new product failure was found.
+
+Together with the remediation suites and static gates above, this establishes
+the latest deterministic code-gate verdict as **READY**. This is not a live
+runtime certification: supervised preflight, CUDA, three-engine synthesis,
+real WAV output, and the 47-case matrix remain explicit opt-in work and were
+not run in Task 6. No PR, merge, or remote synchronization is claimed here.
