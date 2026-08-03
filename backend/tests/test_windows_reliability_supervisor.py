@@ -351,6 +351,9 @@ param(
     [Parameter(Mandatory = $true)] [string] $RunId,
     [Parameter(Mandatory = $true)] [string] $OutputRootIdentity,
     [Parameter(Mandatory = $true)] [string] $RunRootIdentity,
+    [string] $PrivateRecoveryRoot,
+    [string] $PrivateRecoveryRootIdentity,
+    [string] $PrivateRecoveryNamespaceIdentity,
     [switch] $AllowLan,
     [switch] $PreflightOnly
 )
@@ -379,6 +382,11 @@ try {{
 $backendRoot = Join-Path $TtsMoreRoot 'backend'
 $backendPython = Join-Path $backendRoot '.venv\Scripts\python.exe'
 $runDirectory = Join-Path (Join-Path $OutputRoot 'runs') $runKey
+$privateDirectory = if ([string]::IsNullOrEmpty($PrivateRecoveryRoot)) {{
+    $runDirectory
+}} else {{
+    $PrivateRecoveryRoot
+}}
 [IO.Directory]::CreateDirectory($runDirectory) | Out-Null
 if ($scenario -eq 'lease-race') {{
     $parked = $runDirectory + '.parked'
@@ -400,6 +408,34 @@ if ($scenario -eq 'lease-race') {{
         if ($junctionCreated) {{ [IO.Directory]::Delete($runDirectory) }}
         if (Test-Path -LiteralPath $parked -PathType Container) {{
             [IO.Directory]::Move($parked, $runDirectory)
+        }}
+    }}
+    [IO.File]::WriteAllText(
+        $swapMarker,
+        $(if ($swapSucceeded) {{ 'swapped' }} else {{ 'blocked' }})
+    )
+}}
+if ($scenario -eq 'private-lease-race') {{
+    $parked = $privateDirectory + '.parked'
+    $swapSucceeded = $false
+    try {{
+        [IO.Directory]::Move($privateDirectory, $parked)
+        [IO.Directory]::CreateDirectory($privateDirectory) | Out-Null
+        [IO.File]::WriteAllBytes(
+            (Join-Path $privateDirectory 'replacement.bin'),
+            [byte[]](80,82,73,86,65,84,69)
+        )
+        $swapSucceeded = $true
+    }} catch {{
+        $swapSucceeded = $false
+    }} finally {{
+        if ($swapSucceeded -and (
+                Test-Path -LiteralPath $privateDirectory -PathType Container
+            )) {{
+            [IO.Directory]::Delete($privateDirectory, $true)
+        }}
+        if (Test-Path -LiteralPath $parked -PathType Container) {{
+            [IO.Directory]::Move($parked, $privateDirectory)
         }}
     }}
     [IO.File]::WriteAllText(
@@ -429,6 +465,7 @@ if ($scenario -in @('junk-preflight', 'junk-matrix')) {{
 $mode = if ($scenario -in @(
     'preflight', 'privacy', 'extra-member', 'cas', 'junk-preflight',
     'launcher-completed', 'launcher-residual', 'lease-race'
+    , 'private-lease-race'
 )) {{ 'preflight' }} else {{ 'matrix' }}
 if ($scenario -eq 'junk-matrix') {{
     [IO.Directory]::CreateDirectory((Join-Path $runDirectory 'cases')) | Out-Null
@@ -464,14 +501,14 @@ if ($scenario -in @('cleanup', 'cleanup-residual')) {{
     }}
 }}
 if ($scenario -in @('cleanup-residual', 'launcher-residual')) {{
-    [IO.Directory]::CreateDirectory((Join-Path $runDirectory '.p')) | Out-Null
+    [IO.Directory]::CreateDirectory((Join-Path $privateDirectory '.p')) | Out-Null
     [IO.File]::WriteAllBytes(
-        (Join-Path (Join-Path $runDirectory '.p') 'sentinel.bin'),
+        (Join-Path (Join-Path $privateDirectory '.p') 'sentinel.bin'),
         [byte[]](0,1,127,128,254,255)
     )
     foreach ($privateName in @('.o', '.h', '.c')) {{
         [IO.File]::WriteAllText(
-            (Join-Path $runDirectory $privateName),
+            (Join-Path $privateDirectory $privateName),
             ('PRIVATE-IDENTITY ' + $privateName),
             $utf8
         )
@@ -675,6 +712,7 @@ def _run_supervisor(
                     "launcher-completed",
                     "launcher-residual",
                     "lease-race",
+                    "private-lease-race",
                 }
                 else []
             ),
@@ -784,6 +822,23 @@ def test_r3_run_root_swap_is_blocked_for_the_full_supervised_lifecycle(
     assert current.pointer.mode == "preflight"
 
 
+def test_private_recovery_leaf_swap_is_blocked_for_the_full_supervised_lifecycle(
+    tmp_path: Path,
+) -> None:
+    completed, output_root, start_count, _raw_run_id = _run_supervisor(
+        tmp_path,
+        scenario="private-lease-race",
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert start_count.read_text(encoding="utf-8") == "1"
+    assert (tmp_path / "lease-race.marker").read_text(encoding="utf-8") == "blocked"
+    current = reliability_evidence.verify_current(output_root)
+    assert current.pointer.outcome == "passed"
+    assert current.pointer.mode == "preflight"
+    assert not (output_root / ".private-recovery" / current.pointer.run_key).exists()
+
+
 def test_r3_validation_failure_releases_the_directory_lease(tmp_path: Path) -> None:
     completed, output_root, _start_count, _raw_run_id = _run_supervisor(
         tmp_path,
@@ -816,6 +871,7 @@ def test_supervisor_starts_inner_once_and_commits_preflight_passed_current(
     assert current.run.terminal.launcher_exit_code == 0
     assert current.run.terminal.validator_exit_code == 0
     run_root = output_root / "runs" / current.pointer.run_key
+    assert not (output_root / ".private-recovery" / current.pointer.run_key).exists()
     assert sorted(
         path.relative_to(run_root).as_posix()
         for path in run_root.rglob("*")
@@ -949,6 +1005,31 @@ def _assert_public_cli_verification(output_root: Path, run_key: str) -> None:
         assert payload["verification"]["status"] in {"verified", "current"}
 
 
+def _prepare_direct_finalization(
+    output_root: Path,
+    prepared_run: reliability_supervision.PreparedRun,
+    *,
+    mode: str,
+    launcher_exit_code: int,
+    child_start_count: int = 1,
+) -> None:
+    prepared = reliability_supervision.prepare_private_finalization(
+        output_root,
+        prepared_run.run_key,
+        mode=mode,  # type: ignore[arg-type]
+        expected_root_identity=prepared_run.root_identity,
+        expected_run_root_identity=prepared_run.run_root_identity,
+        expected_private_root_identity=prepared_run.private_root_identity,
+        expected_private_namespace_identity=(
+            prepared_run.private_namespace_identity
+        ),
+        launcher_exit_code=launcher_exit_code,
+        child_start_count=child_start_count,
+    )
+    if prepared.cleanup_status == "completed":
+        Path(prepared_run.private_root).rmdir()
+
+
 def test_supervisor_commits_exact_matrix_success(tmp_path: Path) -> None:
     completed, output_root, start_count, _raw_run_id = _run_supervisor(
         tmp_path,
@@ -1026,7 +1107,7 @@ def test_r1_failed_artifacts_are_cross_bound_to_terminal_and_primary_facts(
     )
     run_key = hashlib.sha256(str(output_root).encode("utf-8")).hexdigest()
     prepared_root = reliability_supervision.prepare_output_root(output_root)
-    reliability_supervision.prepare_run(
+    prepared_run = reliability_supervision.prepare_run(
         output_root,
         run_key,
         expected_root_identity=prepared_root.root_identity,
@@ -1064,6 +1145,12 @@ def test_r1_failed_artifacts_are_cross_bound_to_terminal_and_primary_facts(
         "failure",
         _canonical_model_bytes(marker),
     )
+    _prepare_direct_finalization(
+        output_root,
+        prepared_run,
+        mode="preflight",
+        launcher_exit_code=launcher_exit_code,
+    )
 
     if expected_current:
         finalized = reliability_supervision.finalize_supervision(
@@ -1071,6 +1158,12 @@ def test_r1_failed_artifacts_are_cross_bound_to_terminal_and_primary_facts(
             run_key,
             mode="preflight",
             expected_token=expected_token,
+            expected_root_identity=prepared_run.root_identity,
+            expected_run_root_identity=prepared_run.run_root_identity,
+            expected_private_root_identity=prepared_run.private_root_identity,
+            expected_private_namespace_identity=(
+                prepared_run.private_namespace_identity
+            ),
             launcher_exit_code=launcher_exit_code,
             child_start_count=1,
         )
@@ -1089,6 +1182,12 @@ def test_r1_failed_artifacts_are_cross_bound_to_terminal_and_primary_facts(
                 run_key,
                 mode="preflight",
                 expected_token=expected_token,
+                expected_root_identity=prepared_run.root_identity,
+                expected_run_root_identity=prepared_run.run_root_identity,
+                expected_private_root_identity=prepared_run.private_root_identity,
+                expected_private_namespace_identity=(
+                    prepared_run.private_namespace_identity
+                ),
                 launcher_exit_code=launcher_exit_code,
                 child_start_count=1,
             )
@@ -1114,7 +1213,7 @@ def _run_actual_inner_prevalidator_failure(
     tmp_path: Path,
     *,
     cleanup_unproven: bool,
-) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
     run_id = "4" * 32
     run_key = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
     output_root = tmp_path / "evidence"
@@ -1125,6 +1224,7 @@ def _run_actual_inner_prevalidator_failure(
         expected_root_identity=prepared_root.root_identity,
     )
     run_root = Path(prepared_run.run_root)
+    private_root = Path(prepared_run.private_root)
     fixture_root = tmp_path / "fixture"
     fixture_root.mkdir()
     resources: dict[str, dict[str, str]] = {}
@@ -1137,7 +1237,7 @@ def _run_actual_inner_prevalidator_failure(
     comfy_root = tmp_path / "ComfyUI"
     (comfy_root / "custom_nodes" / "TTS-Audio-Suite").mkdir(parents=True)
     started_marker = tmp_path / "fake-comfy-started.marker"
-    control_path = run_root / ".c"
+    control_path = private_root / ".c"
     (comfy_root / "main.py").write_text(
         "from pathlib import Path\n"
         "import os, time\n"
@@ -1194,6 +1294,12 @@ def _run_actual_inner_prevalidator_failure(
             prepared_root.root_identity,
             "-RunRootIdentity",
             prepared_run.run_root_identity,
+            "-PrivateRecoveryRoot",
+            prepared_run.private_root,
+            "-PrivateRecoveryRootIdentity",
+            prepared_run.private_root_identity,
+            "-PrivateRecoveryNamespaceIdentity",
+            prepared_run.private_namespace_identity,
             "-PreflightOnly",
         ],
         cwd=REPOSITORY_ROOT,
@@ -1205,7 +1311,7 @@ def _run_actual_inner_prevalidator_failure(
         timeout=30,
         check=False,
     )
-    return completed, run_root, started_marker
+    return completed, run_root, private_root, started_marker
 
 
 @pytest.mark.parametrize(
@@ -1217,7 +1323,7 @@ def test_f3_inner_prevalidator_failure_records_truthful_started_service_cleanup(
     cleanup_unproven: bool,
     expected_cleanup: str,
 ) -> None:
-    completed, run_root, started_marker = _run_actual_inner_prevalidator_failure(
+    completed, run_root, private_root, started_marker = _run_actual_inner_prevalidator_failure(
         tmp_path,
         cleanup_unproven=cleanup_unproven,
     )
@@ -1233,9 +1339,10 @@ def test_f3_inner_prevalidator_failure_records_truthful_started_service_cleanup(
     assert result.validator_exit_code is None
     assert result.cleanup_status == expected_cleanup
     if cleanup_unproven:
-        assert any((run_root / name).exists() for name in (".p", ".o", ".h", ".c"))
+        assert any((private_root / name).exists() for name in (".p", ".o", ".h", ".c"))
     else:
-        assert not any((run_root / name).exists() for name in (".p", ".o", ".h", ".c"))
+        assert not any((private_root / name).exists() for name in (".p", ".o", ".h", ".c"))
+    assert not any((run_root / name).exists() for name in (".p", ".o", ".h", ".c"))
 
 
 def test_f3_supervisor_commits_inner_launcher_cleanup_completed(tmp_path: Path) -> None:
@@ -1246,7 +1353,7 @@ def test_f3_supervisor_commits_inner_launcher_cleanup_completed(tmp_path: Path) 
 
     assert completed.returncode == 9, completed.stdout + completed.stderr
     assert start_count.read_text(encoding="utf-8") == "1"
-    _assert_terminal(
+    current = _assert_terminal(
         output_root,
         mode="preflight",
         outcome="failed",
@@ -1255,9 +1362,10 @@ def test_f3_supervisor_commits_inner_launcher_cleanup_completed(tmp_path: Path) 
         validator_exit_code=None,
         cleanup_status="completed",
     )
+    assert not (output_root / ".private-recovery" / current.pointer.run_key).exists()
 
 
-def test_f3_supervisor_preserves_inner_launcher_cleanup_residual_as_orphan(
+def test_f3_supervisor_publishes_inner_launcher_private_recovery_residual(
     tmp_path: Path,
 ) -> None:
     completed, output_root, start_count, _raw_run_id = _run_supervisor(
@@ -1265,10 +1373,18 @@ def test_f3_supervisor_preserves_inner_launcher_cleanup_residual_as_orphan(
         scenario="launcher-residual",
     )
 
-    assert completed.returncode != 0
+    assert completed.returncode == 7, completed.stdout + completed.stderr
     assert start_count.read_text(encoding="utf-8") == "1"
-    _assert_no_current(output_root)
-    run_root = next((output_root / "runs").iterdir())
+    current = _assert_terminal(
+        output_root,
+        mode="preflight",
+        outcome="failed",
+        failure_source="launcher",
+        launcher_exit_code=7,
+        validator_exit_code=None,
+        cleanup_status="failed",
+    )
+    run_root = output_root / "runs" / current.pointer.run_key
     result = reliability_supervision.InnerRunResult.model_validate_json(
         (run_root / "run-result.json").read_bytes(),
         strict=True,
@@ -1277,8 +1393,13 @@ def test_f3_supervisor_preserves_inner_launcher_cleanup_residual_as_orphan(
     assert result.failure_source == "launcher"
     assert result.validator_exit_code is None
     assert result.cleanup_status == "failed"
-    assert any((run_root / name).exists() for name in (".p", ".o", ".h", ".c"))
-    assert not (run_root / "terminal.json").exists()
+    assert not any((run_root / name).exists() for name in (".p", ".o", ".h", ".c"))
+    private_root = output_root / ".private-recovery" / current.pointer.run_key
+    assert (private_root / ".p" / "sentinel.bin").read_bytes() == bytes(
+        (0, 1, 127, 128, 254, 255)
+    )
+    assert all((private_root / name).is_file() for name in (".o", ".h", ".c"))
+    assert (run_root / "logs" / "private-recovery.log").is_file()
 
 
 def test_supervisor_commits_cleanup_failure(tmp_path: Path) -> None:
@@ -1312,6 +1433,7 @@ def test_supervisor_commits_cleanup_failure(tmp_path: Path) -> None:
         "logs/inner-stdout.log",
         "logs/launcher-lifecycle-secondary.log",
         "logs/launcher-lifecycle.log",
+        "logs/private-recovery.log",
         "logs/tts-more-stderr.log",
         "logs/tts-more-stdout.log",
     }
@@ -1319,18 +1441,30 @@ def test_supervisor_commits_cleanup_failure(tmp_path: Path) -> None:
         assert b"PRIVATE-RECOVERY" not in path.read_bytes()
 
 
-def test_cleanup_failure_with_private_recovery_residual_remains_orphan(
+def test_cleanup_failure_publishes_private_recovery_residual_as_current(
     tmp_path: Path,
 ) -> None:
     seeded_output_root = tmp_path / "evidence"
     seeded_output_root.mkdir()
     old_run_key = "a" * 64
-    old_expected_token = _prepare_orphan_preflight_run(seeded_output_root, old_run_key)
+    old_expected_token, old_prepared = _prepare_orphan_preflight_run(
+        seeded_output_root, old_run_key
+    )
+    _prepare_direct_finalization(
+        seeded_output_root,
+        old_prepared,
+        mode="preflight",
+        launcher_exit_code=0,
+    )
     reliability_supervision.finalize_supervision(
         seeded_output_root,
         old_run_key,
         mode="preflight",
         expected_token=old_expected_token,
+        expected_root_identity=old_prepared.root_identity,
+        expected_run_root_identity=old_prepared.run_root_identity,
+        expected_private_root_identity=old_prepared.private_root_identity,
+        expected_private_namespace_identity=old_prepared.private_namespace_identity,
         launcher_exit_code=0,
         child_start_count=1,
     )
@@ -1341,20 +1475,78 @@ def test_cleanup_failure_with_private_recovery_residual_remains_orphan(
         scenario="cleanup-residual",
     )
 
-    assert completed.returncode != 0
+    assert completed.returncode == 7, completed.stdout + completed.stderr
     assert start_count.read_text(encoding="utf-8") == "1"
-    assert (output_root / "current-terminal.json").read_bytes() == old_pointer_bytes
-    assert reliability_evidence.verify_current(output_root) == old_current
-    run_roots = [
-        path for path in (output_root / "runs").glob("*") if path.name != old_run_key
-    ]
-    assert len(run_roots) == 1
-    run_root = run_roots[0]
-    assert (run_root / ".p" / "sentinel.bin").read_bytes() == bytes(
+    assert (output_root / "current-terminal.json").read_bytes() != old_pointer_bytes
+    current = reliability_evidence.verify_current(output_root)
+    assert current != old_current
+    assert current.run.terminal.failure_source == "cleanup"
+    assert current.run.terminal.cleanup_status == "failed"
+    run_root = output_root / "runs" / current.pointer.run_key
+    assert not any((run_root / name).exists() for name in (".p", ".o", ".h", ".c"))
+    assert (run_root / "logs" / "private-recovery.log").is_file()
+    private_root = output_root / ".private-recovery" / current.pointer.run_key
+    assert (private_root / ".p" / "sentinel.bin").read_bytes() == bytes(
         (0, 1, 127, 128, 254, 255)
     )
     for private_name in (".o", ".h", ".c"):
-        assert (run_root / private_name).is_file()
+        assert (private_root / private_name).is_file()
+    assert (run_root / "terminal.json").is_file()
+
+
+def test_private_recovery_snapshot_crash_preserves_old_current_and_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _completed, output_root, _start_count, _raw_run_id = _run_supervisor(tmp_path)
+    old_pointer_bytes = (output_root / "current-terminal.json").read_bytes()
+    old_current = reliability_evidence.verify_current(output_root)
+    run_key = "c" * 64
+    prepared_root = reliability_supervision.prepare_output_root(output_root)
+    prepared_run = reliability_supervision.prepare_run(
+        output_root,
+        run_key,
+        expected_root_identity=prepared_root.root_identity,
+    )
+    reliability_supervision.record_inner_result(
+        output_root,
+        run_key,
+        mode="preflight",
+        validator_exit_code=0,
+        cleanup_status="failed",
+    )
+    private_root = Path(prepared_run.private_root)
+    (private_root / ".o").write_bytes(b"private-owner")
+
+    def crash_before_snapshot(*_args: object, **_kwargs: object) -> None:
+        raise SystemExit("intentional-before-private-snapshot")
+
+    monkeypatch.setattr(
+        reliability_supervision,
+        "write_private_recovery_snapshot",
+        crash_before_snapshot,
+        raising=False,
+    )
+    with pytest.raises(SystemExit, match="intentional-before-private-snapshot"):
+        reliability_supervision.prepare_private_finalization(
+            output_root,
+            run_key,
+            mode="preflight",
+            expected_root_identity=prepared_run.root_identity,
+            expected_run_root_identity=prepared_run.run_root_identity,
+            expected_private_root_identity=prepared_run.private_root_identity,
+            expected_private_namespace_identity=(
+                prepared_run.private_namespace_identity
+            ),
+            launcher_exit_code=7,
+            child_start_count=1,
+        )
+
+    assert (output_root / "current-terminal.json").read_bytes() == old_pointer_bytes
+    assert reliability_evidence.verify_current(output_root) == old_current
+    assert (private_root / ".o").read_bytes() == b"private-owner"
+    run_root = output_root / "runs" / run_key
+    assert not (run_root / "logs" / "private-recovery.log").exists()
     assert not (run_root / "terminal.json").exists()
 
 
@@ -1464,8 +1656,16 @@ def test_malformed_inner_result_types_never_advance_current(tmp_path: Path) -> N
         assert not list((output_root / "runs").glob("*/terminal.json"))
 
 
-def _prepare_orphan_preflight_run(output_root: Path, run_key: str) -> str:
+def _prepare_orphan_preflight_run(
+    output_root: Path, run_key: str
+) -> tuple[str, reliability_supervision.PreparedRun]:
     expected_token = reliability_evidence.snapshot_current(output_root)["token"]
+    prepared_root = reliability_supervision.prepare_output_root(output_root)
+    prepared_run = reliability_supervision.prepare_run(
+        output_root,
+        run_key,
+        expected_root_identity=prepared_root.root_identity,
+    )
     fixture_directory = output_root.parent / f"authoritative-{run_key[:12]}"
     _write_authoritative_public_fixture(fixture_directory, matrix=False)
     reliability_evidence.write_artifact(
@@ -1481,7 +1681,7 @@ def _prepare_orphan_preflight_run(output_root: Path, run_key: str) -> str:
         validator_exit_code=0,
         cleanup_status="completed",
     )
-    return expected_token
+    return expected_token, prepared_run
 
 
 def test_crash_before_terminal_preserves_old_current_and_orphan(
@@ -1492,7 +1692,13 @@ def test_crash_before_terminal_preserves_old_current_and_orphan(
     old_pointer = (output_root / "current-terminal.json").read_bytes()
     old_current = reliability_evidence.verify_current(output_root)
     run_key = "a" * 64
-    expected_token = _prepare_orphan_preflight_run(output_root, run_key)
+    expected_token, prepared_run = _prepare_orphan_preflight_run(output_root, run_key)
+    _prepare_direct_finalization(
+        output_root,
+        prepared_run,
+        mode="preflight",
+        launcher_exit_code=0,
+    )
 
     def crash_before_terminal(*_args: object, **_kwargs: object) -> None:
         raise SystemExit("intentional-before-terminal")
@@ -1504,6 +1710,12 @@ def test_crash_before_terminal_preserves_old_current_and_orphan(
             run_key,
             mode="preflight",
             expected_token=expected_token,
+            expected_root_identity=prepared_run.root_identity,
+            expected_run_root_identity=prepared_run.run_root_identity,
+            expected_private_root_identity=prepared_run.private_root_identity,
+            expected_private_namespace_identity=(
+                prepared_run.private_namespace_identity
+            ),
             launcher_exit_code=0,
             child_start_count=1,
         )
@@ -1524,7 +1736,13 @@ def test_crash_after_terminal_before_cas_preserves_verified_orphan(
     old_pointer = (output_root / "current-terminal.json").read_bytes()
     old_current = reliability_evidence.verify_current(output_root)
     run_key = "b" * 64
-    expected_token = _prepare_orphan_preflight_run(output_root, run_key)
+    expected_token, prepared_run = _prepare_orphan_preflight_run(output_root, run_key)
+    _prepare_direct_finalization(
+        output_root,
+        prepared_run,
+        mode="preflight",
+        launcher_exit_code=0,
+    )
 
     def crash_before_cas(*_args: object, **_kwargs: object) -> None:
         raise SystemExit("intentional-before-cas")
@@ -1540,6 +1758,12 @@ def test_crash_after_terminal_before_cas_preserves_verified_orphan(
             run_key,
             mode="preflight",
             expected_token=expected_token,
+            expected_root_identity=prepared_run.root_identity,
+            expected_run_root_identity=prepared_run.run_root_identity,
+            expected_private_root_identity=prepared_run.private_root_identity,
+            expected_private_namespace_identity=(
+                prepared_run.private_namespace_identity
+            ),
             launcher_exit_code=0,
             child_start_count=1,
         )

@@ -8,6 +8,9 @@ param(
     [string] $RunId,
     [string] $OutputRootIdentity,
     [string] $RunRootIdentity,
+    [string] $PrivateRecoveryRoot,
+    [string] $PrivateRecoveryRootIdentity,
+    [string] $PrivateRecoveryNamespaceIdentity,
     [switch] $AllowLan,
     [switch] $PreflightOnly
 )
@@ -18,7 +21,10 @@ if (
     [string]::IsNullOrEmpty($RunId) -or
     $RunId -cnotmatch '^[0-9a-f]{32}$' -or
     $OutputRootIdentity -cnotmatch '^[0-9a-f]{64}$' -or
-    $RunRootIdentity -cnotmatch '^[0-9a-f]{64}$'
+    $RunRootIdentity -cnotmatch '^[0-9a-f]{64}$' -or
+    [string]::IsNullOrEmpty($PrivateRecoveryRoot) -or
+    $PrivateRecoveryRootIdentity -cnotmatch '^[0-9a-f]{64}$' -or
+    $PrivateRecoveryNamespaceIdentity -cnotmatch '^[0-9a-f]{64}$'
 ) {
     [Console]::Error.WriteLine('Supervised reliability contract is invalid')
     exit 7
@@ -40,7 +46,9 @@ function Invoke-RunBoundaryValidation {
         [string] $OutputRoot,
         [string] $RunKey,
         [string] $ExpectedRootIdentity,
-        [string] $ExpectedRunRootIdentity
+        [string] $ExpectedRunRootIdentity,
+        [string] $ExpectedPrivateRootIdentity,
+        [string] $ExpectedPrivateNamespaceIdentity
     )
     Push-Location -LiteralPath $BackendRoot
     try {
@@ -48,7 +56,10 @@ function Invoke-RunBoundaryValidation {
             & $PythonPath -m app.comfyui.reliability_supervision_cli `
                 validate-run-root --output-root $OutputRoot --run-key $RunKey `
                 --expected-root-identity $ExpectedRootIdentity `
-                --expected-run-root-identity $ExpectedRunRootIdentity 2>$null
+                --expected-run-root-identity $ExpectedRunRootIdentity `
+                --expected-private-root-identity $ExpectedPrivateRootIdentity `
+                --expected-private-namespace-identity `
+                    $ExpectedPrivateNamespaceIdentity 2>$null
         )
         $helperExit = $LASTEXITCODE
     } finally {
@@ -2387,15 +2398,30 @@ try {
         -PythonPath $backendPythonPath -BackendRoot $backendRootPath `
         -OutputRoot $OutputRoot -RunKey $runIdSha256 `
         -ExpectedRootIdentity $OutputRootIdentity `
-        -ExpectedRunRootIdentity $RunRootIdentity
+        -ExpectedRunRootIdentity $RunRootIdentity `
+        -ExpectedPrivateRootIdentity $PrivateRecoveryRootIdentity `
+        -ExpectedPrivateNamespaceIdentity $PrivateRecoveryNamespaceIdentity
+    $expectedPrivateRecoveryRoot = [IO.Path]::GetFullPath(
+        (Join-Path (Join-Path $OutputRoot '.private-recovery') $runIdSha256)
+    )
+    $suppliedPrivateRecoveryRoot = [IO.Path]::GetFullPath($PrivateRecoveryRoot)
     if (
         $runBoundary.ok -ne $true -or
         $runBoundary.result.run_key -cne $runIdSha256 -or
         $runBoundary.result.root_identity -cne $OutputRootIdentity -or
-        $runBoundary.result.run_root_identity -cne $RunRootIdentity
+        $runBoundary.result.run_root_identity -cne $RunRootIdentity -or
+        $runBoundary.result.private_root_identity -cne $PrivateRecoveryRootIdentity -or
+        $runBoundary.result.private_namespace_identity -cne `
+            $PrivateRecoveryNamespaceIdentity -or
+        [string] $runBoundary.result.private_root -cne $suppliedPrivateRecoveryRoot -or
+        -not $suppliedPrivateRecoveryRoot.Equals(
+            $expectedPrivateRecoveryRoot,
+            [StringComparison]::OrdinalIgnoreCase
+        )
     ) { throw 'Formal run boundary validation failed' }
     $outputRootPath = [string] $runBoundary.result.output_root
     $runEvidenceRoot = [string] $runBoundary.result.run_root
+    $privateRecoveryRootPath = $suppliedPrivateRecoveryRoot
 } catch {
     [Console]::Error.WriteLine('Supervised reliability contract is invalid')
     exit 7
@@ -2424,10 +2450,10 @@ $comfyStdoutPath = Join-Path $runEvidenceRoot '.co'
 $comfyStderrPath = Join-Path $runEvidenceRoot '.ce'
 $backendStdoutPath = Join-Path $runEvidenceRoot '.bo'
 $backendStderrPath = Join-Path $runEvidenceRoot '.be'
-$tempRoot = Join-Path $runEvidenceRoot '.p'
-$tempOwnerMarker = Join-Path $runEvidenceRoot '.o'
-$hostManifestPath = Join-Path $runEvidenceRoot '.h'
-$controlStatePath = Join-Path $runEvidenceRoot '.c'
+$tempRoot = Join-Path $privateRecoveryRootPath '.p'
+$tempOwnerMarker = Join-Path $privateRecoveryRootPath '.o'
+$hostManifestPath = Join-Path $privateRecoveryRootPath '.h'
+$controlStatePath = Join-Path $privateRecoveryRootPath '.c'
 $reservedRunPaths = @(
     $tempRoot, $tempOwnerMarker, $hostManifestPath, $controlStatePath,
     $comfyStdoutPath, $comfyStderrPath, $backendStdoutPath, $backendStderrPath,
@@ -2812,7 +2838,7 @@ try {
             if ($operationProcessCleanupProven) {
                 $tempRemovalEligible = Test-OwnedTempRootCanBeRemoved `
                     -Root $tempRoot -OwnerMarker $tempOwnerMarker `
-                    -ExpectedRunId $runId -ResolvedRunRoot $runEvidenceRoot
+                    -ExpectedRunId $runId -ResolvedRunRoot $privateRecoveryRootPath
             }
             $warningHashes = @()
             if (-not $operationProcessCleanupProven) {
@@ -2839,12 +2865,12 @@ try {
             param([object] $Proof)
             $tempRemoved = Remove-OwnedTempRoot `
                 -Root $tempRoot -OwnerMarker $tempOwnerMarker `
-                -ExpectedRunId $runId -ResolvedRunRoot $runEvidenceRoot
+                -ExpectedRunId $runId -ResolvedRunRoot $privateRecoveryRootPath
             if (-not $tempRemoved) {
                 throw 'Owned temp removal did not converge after lifecycle commit'
             }
             $recordsRemoved = Remove-PrivateIdentityRecordsIfSafe `
-                -ResolvedRunRoot $runEvidenceRoot `
+                -ResolvedRunRoot $privateRecoveryRootPath `
                 -HostManifestPath $hostManifestPath `
                 -ControlStatePath $controlStatePath `
                 -ProcessCleanupProven $true `

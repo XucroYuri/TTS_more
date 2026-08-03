@@ -9,7 +9,13 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
 
 from app.comfyui import reliability_evidence as evidence
+from app.comfyui import reliability_private_recovery as private_recovery
 from app.comfyui import reliability_validation as validation
+from app.comfyui.reliability_private_recovery import (
+    PrivateRecoveryBoundary,
+    observe_private_recovery,
+    write_private_recovery_snapshot,
+)
 from app.comfyui.reliability_validation import FailureMarker, ReliabilityRunFailure
 
 
@@ -167,6 +173,9 @@ class PreparedRun(_StrictModel):
     root_identity: evidence.SHA256
     run_root: str
     run_root_identity: evidence.SHA256
+    private_root: str
+    private_root_identity: evidence.SHA256
+    private_namespace_identity: evidence.SHA256
 
 
 class PreparedOutputRoot(_StrictModel):
@@ -182,6 +191,15 @@ class ValidatedRunBoundary(_StrictModel):
     root_identity: evidence.SHA256
     run_root: str
     run_root_identity: evidence.SHA256
+    private_root: str
+    private_root_identity: evidence.SHA256
+    private_namespace_identity: evidence.SHA256
+
+
+class PreparedPrivateFinalization(_StrictModel):
+    status: Literal["ready"]
+    run_key: evidence.RunKey
+    cleanup_status: Literal["completed", "failed", "not-started"]
 
 
 def prepare_output_root(output_root: Path) -> PreparedOutputRoot:
@@ -224,6 +242,18 @@ def prepare_run(
             files, directories = evidence._scan_run_membership(run_root)
             if files or directories:
                 raise SupervisionError("formal run is not empty")
+            private_boundary = private_recovery.prepare_private_recovery(
+                validated_root,
+                validated_key,
+                expected_root_identity=root_identity,
+            )
+            private_root = private_recovery.private_recovery_root(
+                validated_root,
+                validated_key,
+            )
+            private_root, private_root_identity = evidence.read_directory_identity(
+                private_root
+            )
         return PreparedRun(
             status="prepared",
             run_key=validated_key,
@@ -231,8 +261,17 @@ def prepare_run(
             root_identity=root_identity,
             run_root=str(run_root),
             run_root_identity=run_root_identity,
+            private_root=str(private_root),
+            private_root_identity=private_root_identity,
+            private_namespace_identity=private_boundary.private_root_identity,
         )
-    except (evidence.EvidenceStoreError, OSError, ValueError, TypeError) as exc:
+    except (
+        evidence.EvidenceStoreError,
+        private_recovery.PrivateRecoveryError,
+        OSError,
+        ValueError,
+        TypeError,
+    ) as exc:
         if isinstance(exc, SupervisionError):
             raise
         raise SupervisionError("formal run could not be prepared") from exc
@@ -244,6 +283,8 @@ def validate_run_boundary(
     *,
     expected_root_identity: str,
     expected_run_root_identity: str,
+    expected_private_root_identity: str,
+    expected_private_namespace_identity: str,
 ) -> ValidatedRunBoundary:
     try:
         validated_key = evidence._validated_run_key(run_key)
@@ -255,6 +296,20 @@ def validate_run_boundary(
             validated_root / "runs" / validated_key,
             expected_run_root_identity,
         )
+        private_boundary = private_recovery.validate_private_recovery(
+            validated_root,
+            validated_key,
+            expected_root_identity=root_identity,
+            expected_private_root_identity=expected_private_namespace_identity,
+        )
+        private_root = private_recovery.private_recovery_root(
+            validated_root,
+            validated_key,
+        )
+        private_root, private_root_identity = evidence.validate_directory_identity(
+            private_root,
+            expected_private_root_identity,
+        )
         return ValidatedRunBoundary(
             status="validated",
             run_key=validated_key,
@@ -262,8 +317,18 @@ def validate_run_boundary(
             root_identity=root_identity,
             run_root=str(run_root),
             run_root_identity=run_root_identity,
+            private_root=str(private_root),
+            private_root_identity=private_root_identity,
+            private_namespace_identity=private_boundary.private_root_identity,
         )
-    except (ValidationError, evidence.EvidenceStoreError, OSError, ValueError, TypeError) as exc:
+    except (
+        ValidationError,
+        evidence.EvidenceStoreError,
+        private_recovery.PrivateRecoveryError,
+        OSError,
+        ValueError,
+        TypeError,
+    ) as exc:
         raise SupervisionError("formal run boundary is invalid") from exc
 
 
@@ -483,6 +548,8 @@ def _build_terminal(
     run_key: str,
     inner_result: InnerRunResult,
     supervisor: SupervisorRecord,
+    *,
+    expected_private_root_identity: str,
 ) -> evidence.RunTerminal:
     run_root, _ = evidence._run_root(output_root, run_key, create=False)
     files, _directories = evidence._scan_run_membership(run_root)
@@ -505,6 +572,9 @@ def _build_terminal(
                 supervisor_validator_exit_code=supervisor.validator_exit_code,
                 inner_cleanup_status=inner_result.cleanup_status,
                 supervisor_cleanup_status=supervisor.cleanup_status,
+            ),
+            expected_private_recovery_namespace_identity=(
+                expected_private_root_identity
             ),
         )
     except ValueError as exc:
@@ -554,33 +624,136 @@ def _build_terminal(
         raise SupervisionError("terminal classification is invalid") from exc
 
 
+def _resolve_supervision_result(
+    root: Path,
+    run_key: str,
+    *,
+    mode: Literal["preflight", "matrix"],
+    launcher_exit_code: int,
+    child_start_count: int,
+) -> InnerRunResult:
+    if child_start_count not in {0, 1}:
+        raise SupervisionError("supervision binding is invalid")
+    if _has_run_member(root, run_key, "run-result.json"):
+        if child_start_count != 1:
+            raise SupervisionError("supervision binding is invalid")
+        result = _read_inner_result(root, run_key)
+    elif child_start_count == 0 and launcher_exit_code != 0:
+        result = _launcher_fallback_result(root, run_key, mode=mode)
+    else:
+        raise SupervisionError("inner result is missing")
+    if result.mode != mode:
+        raise SupervisionError("supervision binding is invalid")
+    if result.outcome == "passed" and launcher_exit_code != 0:
+        raise SupervisionError("launcher exit contradicts inner result")
+    if result.outcome == "failed" and launcher_exit_code == 0:
+        raise SupervisionError("launcher exit contradicts inner result")
+    return result
+
+
+def prepare_private_finalization(
+    output_root: Path,
+    run_key: str,
+    *,
+    mode: Literal["preflight", "matrix"],
+    expected_root_identity: str,
+    expected_run_root_identity: str,
+    expected_private_root_identity: str,
+    expected_private_namespace_identity: str,
+    launcher_exit_code: int,
+    child_start_count: int,
+) -> PreparedPrivateFinalization:
+    try:
+        boundary = validate_run_boundary(
+            Path(output_root),
+            run_key,
+            expected_root_identity=expected_root_identity,
+            expected_run_root_identity=expected_run_root_identity,
+            expected_private_root_identity=expected_private_root_identity,
+            expected_private_namespace_identity=expected_private_namespace_identity,
+        )
+        root = Path(boundary.output_root)
+        result = _resolve_supervision_result(
+            root,
+            run_key,
+            mode=mode,
+            launcher_exit_code=launcher_exit_code,
+            child_start_count=child_start_count,
+        )
+        if result.cleanup_status == "failed":
+            held_private_boundary = PrivateRecoveryBoundary(
+                status="validated",
+                run_key=boundary.run_key,
+                output_root=boundary.output_root,
+                root_identity=boundary.root_identity,
+                private_root=str(Path(boundary.private_root).parent),
+                private_root_identity=boundary.private_namespace_identity,
+            )
+            snapshot = observe_private_recovery(held_private_boundary)
+            write_private_recovery_snapshot(root, run_key, snapshot)
+        return PreparedPrivateFinalization(
+            status="ready",
+            run_key=boundary.run_key,
+            cleanup_status=result.cleanup_status,
+        )
+    except (
+        ValidationError,
+        evidence.EvidenceStoreError,
+        private_recovery.PrivateRecoveryError,
+        SupervisionError,
+        OSError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        if isinstance(exc, SupervisionError):
+            raise
+        raise SupervisionError("private finalization could not be prepared") from exc
+
+
 def finalize_supervision(
     output_root: Path,
     run_key: str,
     *,
     mode: Literal["preflight", "matrix"],
     expected_token: str,
+    expected_root_identity: str,
+    expected_run_root_identity: str,
+    expected_private_root_identity: str,
+    expected_private_namespace_identity: str,
     launcher_exit_code: int,
     child_start_count: int,
 ) -> FinalizedSupervision:
     try:
-        root = Path(output_root)
-        if child_start_count not in {0, 1}:
-            raise SupervisionError("supervision binding is invalid")
-        if _has_run_member(root, run_key, "run-result.json"):
-            if child_start_count != 1:
-                raise SupervisionError("supervision binding is invalid")
-            result = _read_inner_result(root, run_key)
-        elif child_start_count == 0 and launcher_exit_code != 0:
-            result = _launcher_fallback_result(root, run_key, mode=mode)
-        else:
-            raise SupervisionError("inner result is missing")
-        if result.mode != mode:
-            raise SupervisionError("supervision binding is invalid")
-        if result.outcome == "passed" and launcher_exit_code != 0:
-            raise SupervisionError("launcher exit contradicts inner result")
-        if result.outcome == "failed" and launcher_exit_code == 0:
-            raise SupervisionError("launcher exit contradicts inner result")
+        validated_key = evidence._validated_run_key(run_key)
+        root, root_identity = evidence.validate_directory_identity(
+            Path(output_root), expected_root_identity
+        )
+        evidence.validate_directory_identity(
+            root / "runs" / validated_key,
+            expected_run_root_identity,
+        )
+        private_namespace, private_namespace_identity = evidence.validate_directory_identity(
+            root / private_recovery.PRIVATE_RECOVERY_DIRECTORY,
+            expected_private_namespace_identity,
+        )
+        private_leaf = private_namespace / validated_key
+        result = _resolve_supervision_result(
+            root,
+            validated_key,
+            mode=mode,
+            launcher_exit_code=launcher_exit_code,
+            child_start_count=child_start_count,
+        )
+        if result.cleanup_status == "completed":
+            if os.path.lexists(private_leaf):
+                raise SupervisionError("private recovery cleanup is incomplete")
+        elif result.cleanup_status == "failed":
+            evidence.validate_directory_identity(
+                private_leaf,
+                expected_private_root_identity,
+            )
+            if not _has_run_member(root, validated_key, "logs/private-recovery.log"):
+                raise SupervisionError("private recovery snapshot is missing")
         if result.outcome == "failed":
             _write_failure_marker(
                 root,
@@ -606,8 +779,20 @@ def finalize_supervision(
             "supervisor",
             _canonical_json(supervisor),
         )
-        terminal = _build_terminal(root, run_key, result, supervisor)
-        evidence.write_terminal(root, terminal)
+        terminal = _build_terminal(
+            root,
+            run_key,
+            result,
+            supervisor,
+            expected_private_root_identity=private_namespace_identity,
+        )
+        evidence.write_terminal(
+            root,
+            terminal,
+            expected_private_recovery_namespace_identity=(
+                private_namespace_identity
+            ),
+        )
         pointer = evidence.compare_and_swap_current(
             root,
             run_key,
@@ -627,7 +812,9 @@ def finalize_supervision(
     except (
         ValidationError,
         evidence.EvidenceStoreError,
+        private_recovery.PrivateRecoveryError,
         SupervisionError,
+        OSError,
         ValueError,
         TypeError,
     ) as exc:

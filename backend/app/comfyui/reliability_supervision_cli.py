@@ -9,6 +9,7 @@ from app.comfyui.reliability_supervision import (
     SupervisionError,
     commit_log,
     finalize_supervision,
+    prepare_private_finalization,
     prepare_output_root,
     prepare_run,
     record_inner_result,
@@ -36,6 +37,8 @@ def _parser() -> argparse.ArgumentParser:
     validate_run.add_argument("--run-key", required=True)
     validate_run.add_argument("--expected-root-identity", required=True)
     validate_run.add_argument("--expected-run-root-identity", required=True)
+    validate_run.add_argument("--expected-private-root-identity", required=True)
+    validate_run.add_argument("--expected-private-namespace-identity", required=True)
     inner = commands.add_parser("record-inner")
     inner.add_argument("--output-root", required=True)
     inner.add_argument("--run-key", required=True)
@@ -48,11 +51,25 @@ def _parser() -> argparse.ArgumentParser:
     log.add_argument("--run-key", required=True)
     log.add_argument("--name", required=True)
     log.add_argument("--source-file", required=True)
+    prepare_finalize = commands.add_parser("prepare-finalize")
+    prepare_finalize.add_argument("--output-root", required=True)
+    prepare_finalize.add_argument("--run-key", required=True)
+    prepare_finalize.add_argument("--mode", choices=("preflight", "matrix"), required=True)
+    prepare_finalize.add_argument("--expected-root-identity", required=True)
+    prepare_finalize.add_argument("--expected-run-root-identity", required=True)
+    prepare_finalize.add_argument("--expected-private-root-identity", required=True)
+    prepare_finalize.add_argument("--expected-private-namespace-identity", required=True)
+    prepare_finalize.add_argument("--launcher-exit-code", type=int, required=True)
+    prepare_finalize.add_argument("--child-start-count", type=int, required=True)
     finalize = commands.add_parser("finalize")
     finalize.add_argument("--output-root", required=True)
     finalize.add_argument("--run-key", required=True)
     finalize.add_argument("--mode", choices=("preflight", "matrix"), required=True)
     finalize.add_argument("--expected-token", required=True)
+    finalize.add_argument("--expected-root-identity", required=True)
+    finalize.add_argument("--expected-run-root-identity", required=True)
+    finalize.add_argument("--expected-private-root-identity", required=True)
+    finalize.add_argument("--expected-private-namespace-identity", required=True)
     finalize.add_argument("--launcher-exit-code", type=int, required=True)
     finalize.add_argument("--child-start-count", type=int, required=True)
     return parser
@@ -83,6 +100,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.run_key,
                 expected_root_identity=args.expected_root_identity,
                 expected_run_root_identity=args.expected_run_root_identity,
+                expected_private_root_identity=args.expected_private_root_identity,
+                expected_private_namespace_identity=args.expected_private_namespace_identity,
             )
             _emit({"ok": True, "result": validated.model_dump(mode="json")})
             return 0
@@ -106,12 +125,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _emit({"ok": True, "commitment": commitment.model_dump(mode="json")})
             return 0
+        if args.command == "prepare-finalize":
+            result = prepare_private_finalization(
+                Path(args.output_root),
+                args.run_key,
+                mode=args.mode,
+                expected_root_identity=args.expected_root_identity,
+                expected_run_root_identity=args.expected_run_root_identity,
+                expected_private_root_identity=args.expected_private_root_identity,
+                expected_private_namespace_identity=(
+                    args.expected_private_namespace_identity
+                ),
+                launcher_exit_code=args.launcher_exit_code,
+                child_start_count=args.child_start_count,
+            )
+            _emit({"ok": True, "result": result.model_dump(mode="json")})
+            return 0
         if args.command == "finalize":
             result = finalize_supervision(
                 Path(args.output_root),
                 args.run_key,
                 mode=args.mode,
                 expected_token=args.expected_token,
+                expected_root_identity=args.expected_root_identity,
+                expected_run_root_identity=args.expected_run_root_identity,
+                expected_private_root_identity=args.expected_private_root_identity,
+                expected_private_namespace_identity=(
+                    args.expected_private_namespace_identity
+                ),
                 launcher_exit_code=args.launcher_exit_code,
                 child_start_count=args.child_start_count,
             )

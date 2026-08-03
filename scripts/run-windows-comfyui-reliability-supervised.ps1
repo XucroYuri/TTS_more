@@ -190,8 +190,11 @@ function New-ReliabilityDirectoryLease {
     param(
         [string] $OutputRoot,
         [string] $RunRoot,
+        [string] $PrivateRecoveryRoot,
         [string] $ExpectedRootIdentity,
-        [string] $ExpectedRunIdentity
+        [string] $ExpectedRunIdentity,
+        [string] $ExpectedPrivateRootIdentity,
+        [string] $ExpectedPrivateNamespaceIdentity
     )
     if ($null -eq ('TtsMore.ReliabilityDirectoryLease' -as [type])) {
         Add-Type -TypeDefinition @'
@@ -245,7 +248,23 @@ namespace TtsMore {
         [DllImport("kernel32.dll")]
         private static extern bool CloseHandle(IntPtr handle);
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileDispositionInformation {
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool DeleteFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetFileInformationByHandle(
+            IntPtr handle,
+            int informationClass,
+            ref FileDispositionInformation information,
+            uint bufferSize
+        );
+
         private readonly List<IntPtr> handles = new List<IntPtr>();
+        private IntPtr privateRunHandle = IntPtr.Zero;
+        private string privateRunPath;
         private bool disposed;
 
         private ReliabilityDirectoryLease() { }
@@ -297,20 +316,37 @@ namespace TtsMore {
         public static ReliabilityDirectoryLease Acquire(
             string outputRoot,
             string runRoot,
+            string privateRecoveryRoot,
             string expectedRootIdentity,
-            string expectedRunIdentity
+            string expectedRunIdentity,
+            string expectedPrivateRootIdentity,
+            string expectedPrivateNamespaceIdentity
         ) {
             if (
                 String.IsNullOrEmpty(expectedRootIdentity) ||
                 String.IsNullOrEmpty(expectedRunIdentity) ||
+                String.IsNullOrEmpty(expectedPrivateRootIdentity) ||
+                String.IsNullOrEmpty(expectedPrivateNamespaceIdentity) ||
                 expectedRootIdentity.Length != 64 ||
-                expectedRunIdentity.Length != 64
+                expectedRunIdentity.Length != 64 ||
+                expectedPrivateRootIdentity.Length != 64 ||
+                expectedPrivateNamespaceIdentity.Length != 64
             ) throw new IOException("directory identity is invalid");
             string output = NormalizeDirectory(outputRoot);
             string run = NormalizeDirectory(runRoot);
+            string privateRun = NormalizeDirectory(privateRecoveryRoot);
+            string privateDirectory = Path.GetDirectoryName(privateRun);
             string prefix = output.EndsWith("\\", StringComparison.Ordinal) ?
                 output : output + "\\";
-            if (!run.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) {
+            string expectedPrivateRun = Path.Combine(
+                output, ".private-recovery", Path.GetFileName(run)
+            );
+            if (
+                !run.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(
+                    privateRun, expectedPrivateRun, StringComparison.OrdinalIgnoreCase
+                )
+            ) {
                 throw new IOException("run root is outside output root");
             }
             ReliabilityDirectoryLease lease = new ReliabilityDirectoryLease();
@@ -338,10 +374,52 @@ namespace TtsMore {
                 if (!outputBound || Identity(information) != expectedRunIdentity) {
                     throw new IOException("directory identity changed");
                 }
+                root = Path.GetPathRoot(privateDirectory);
+                current = root;
+                information = lease.OpenComponent(current, false);
+                relative = privateDirectory.Substring(root.Length);
+                foreach (string component in relative.Split(
+                    new char[] { '\\' }, StringSplitOptions.RemoveEmptyEntries
+                )) {
+                    current = Path.Combine(current, component);
+                    information = lease.OpenComponent(
+                        current,
+                        false
+                    );
+                }
+                if (Identity(information) != expectedPrivateNamespaceIdentity) {
+                    throw new IOException("private directory identity changed");
+                }
+                information = lease.OpenComponent(privateRun, true);
+                lease.privateRunHandle = lease.handles[lease.handles.Count - 1];
+                lease.privateRunPath = privateRun;
+                if (Identity(information) != expectedPrivateRootIdentity) {
+                    throw new IOException("private run identity changed");
+                }
                 return lease;
             } catch {
                 lease.Dispose();
                 throw;
+            }
+        }
+
+        public void RemovePrivateRunDirectory() {
+            if (disposed || privateRunHandle == IntPtr.Zero) {
+                throw new IOException("private run lease is unavailable");
+            }
+            FileDispositionInformation information =
+                new FileDispositionInformation { DeleteFile = true };
+            if (!SetFileInformationByHandle(
+                    privateRunHandle, 4, ref information,
+                    (uint)Marshal.SizeOf(typeof(FileDispositionInformation)))) {
+                throw new IOException("private run directory could not be removed");
+            }
+            IntPtr removed = privateRunHandle;
+            privateRunHandle = IntPtr.Zero;
+            handles.Remove(removed);
+            CloseHandle(removed);
+            if (Directory.Exists(privateRunPath)) {
+                throw new IOException("private run directory removal is incomplete");
             }
         }
 
@@ -360,8 +438,11 @@ namespace TtsMore {
     return [TtsMore.ReliabilityDirectoryLease]::Acquire(
         $OutputRoot,
         $RunRoot,
+        $PrivateRecoveryRoot,
         $ExpectedRootIdentity,
-        $ExpectedRunIdentity
+        $ExpectedRunIdentity,
+        $ExpectedPrivateRootIdentity,
+        $ExpectedPrivateNamespaceIdentity
     )
 }
 
@@ -421,19 +502,30 @@ try {
         $prepared.ok -ne $true -or
         $prepared.result.run_key -cne $runKey -or
         $prepared.result.root_identity -cne $rootIdentity -or
-        $prepared.result.run_root_identity -cnotmatch '^[0-9a-f]{64}$'
+        $prepared.result.run_root_identity -cnotmatch '^[0-9a-f]{64}$' -or
+        $prepared.result.private_root_identity -cnotmatch '^[0-9a-f]{64}$' -or
+        $prepared.result.private_namespace_identity -cnotmatch '^[0-9a-f]{64}$'
     ) {
         throw 'Formal run preparation failed'
     }
     $runRootIdentity = [string] $prepared.result.run_root_identity
     $runRootPath = [string] $prepared.result.run_root
-    if ([string]::IsNullOrEmpty($runRootPath)) {
-        throw 'Formal run root is unavailable'
+    $privateRecoveryRootPath = [string] $prepared.result.private_root
+    $privateRootIdentity = [string] $prepared.result.private_root_identity
+    $privateNamespaceIdentity = [string] $prepared.result.private_namespace_identity
+    if (
+        [string]::IsNullOrEmpty($runRootPath) -or
+        [string]::IsNullOrEmpty($privateRecoveryRootPath)
+    ) {
+        throw 'Formal run roots are unavailable'
     }
     $directoryLease = New-ReliabilityDirectoryLease `
         -OutputRoot $outputRootPath -RunRoot $runRootPath `
+        -PrivateRecoveryRoot $privateRecoveryRootPath `
         -ExpectedRootIdentity $rootIdentity `
-        -ExpectedRunIdentity $runRootIdentity
+        -ExpectedRunIdentity $runRootIdentity `
+        -ExpectedPrivateRootIdentity $privateRootIdentity `
+        -ExpectedPrivateNamespaceIdentity $privateNamespaceIdentity
     $validatedBoundary = Invoke-PythonJson `
         -PythonPath $backendPython -BackendRoot $backendRoot `
         -Arguments @(
@@ -441,13 +533,18 @@ try {
             '--output-root', $outputRootPath,
             '--run-key', $runKey,
             '--expected-root-identity', $rootIdentity,
-            '--expected-run-root-identity', $runRootIdentity
+            '--expected-run-root-identity', $runRootIdentity,
+            '--expected-private-root-identity', $privateRootIdentity,
+            '--expected-private-namespace-identity', $privateNamespaceIdentity
         )
     if (
         $validatedBoundary.ok -ne $true -or
         $validatedBoundary.result.run_key -cne $runKey -or
         $validatedBoundary.result.root_identity -cne $rootIdentity -or
-        $validatedBoundary.result.run_root_identity -cne $runRootIdentity
+        $validatedBoundary.result.run_root_identity -cne $runRootIdentity -or
+        $validatedBoundary.result.private_root_identity -cne $privateRootIdentity -or
+        $validatedBoundary.result.private_namespace_identity -cne $privateNamespaceIdentity -or
+        $validatedBoundary.result.private_root -cne $privateRecoveryRootPath
     ) { throw 'Formal run boundary validation failed' }
 
     $innerArguments = @(
@@ -459,7 +556,10 @@ try {
         '-TtsMoreRoot', $ttsMoreRootPath,
         '-RunId', $runId,
         '-OutputRootIdentity', $rootIdentity,
-        '-RunRootIdentity', $runRootIdentity
+        '-RunRootIdentity', $runRootIdentity,
+        '-PrivateRecoveryRoot', $privateRecoveryRootPath,
+        '-PrivateRecoveryRootIdentity', $privateRootIdentity,
+        '-PrivateRecoveryNamespaceIdentity', $privateNamespaceIdentity
     )
     if ($AllowLan) { $innerArguments += '-AllowLan' }
     if ($PreflightOnly) { $innerArguments += '-PreflightOnly' }
@@ -542,6 +642,31 @@ try {
         }
     }
 
+    $preparedFinalization = Invoke-PythonJson `
+        -PythonPath $backendPython -BackendRoot $backendRoot `
+        -Arguments @(
+            '-m', 'app.comfyui.reliability_supervision_cli', 'prepare-finalize',
+            '--output-root', $outputRootPath,
+            '--run-key', $runKey,
+            '--mode', $mode,
+            '--expected-root-identity', $rootIdentity,
+            '--expected-run-root-identity', $runRootIdentity,
+            '--expected-private-root-identity', $privateRootIdentity,
+            '--expected-private-namespace-identity', $privateNamespaceIdentity,
+            '--launcher-exit-code', [string] $childExit,
+            '--child-start-count', [string] $childStartCount
+        )
+    if (
+        $preparedFinalization.ok -ne $true -or
+        $preparedFinalization.result.run_key -cne $runKey -or
+        $preparedFinalization.result.cleanup_status -cnotin @(
+            'completed', 'failed', 'not-started'
+        )
+    ) { throw 'Private finalization preparation failed' }
+    if ($preparedFinalization.result.cleanup_status -ceq 'completed') {
+        $directoryLease.RemovePrivateRunDirectory()
+    }
+
     $finalized = Invoke-PythonJson -PythonPath $backendPython -BackendRoot $backendRoot `
         -Arguments @(
             '-m', 'app.comfyui.reliability_supervision_cli', 'finalize',
@@ -549,6 +674,10 @@ try {
             '--run-key', $runKey,
             '--mode', $mode,
             '--expected-token', $expectedToken,
+            '--expected-root-identity', $rootIdentity,
+            '--expected-run-root-identity', $runRootIdentity,
+            '--expected-private-root-identity', $privateRootIdentity,
+            '--expected-private-namespace-identity', $privateNamespaceIdentity,
             '--launcher-exit-code', [string] $childExit,
             '--child-start-count', [string] $childStartCount
         )
