@@ -5862,6 +5862,17 @@ def verify_run_artifacts(
             create=False,
         )
         files, _directories = reliability_evidence._scan_run_membership(run_root)
+        if "logs/private-recovery.log" in files:
+            private_recovery_log = reliability_evidence.read_artifact(
+                output_root,
+                safe_key,
+                "log",
+                name="private-recovery",
+            )
+            reliability_evidence.verify_private_recovery_log(
+                private_recovery_log,
+                expected_run_key=safe_key,
+            )
         if (
             supervision.inner_mode != mode
             or supervision.supervisor_mode != mode

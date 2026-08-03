@@ -1068,6 +1068,47 @@ def _canonical_json(model: BaseModel) -> bytes:
     ).encode("utf-8")
 
 
+def verify_private_recovery_log(
+    payload: bytes,
+    *,
+    expected_run_key: str,
+    expected_namespace_identity: str | None = None,
+) -> "PrivateRecoverySnapshot":
+    """Validate a public private-recovery snapshot without opening its namespace."""
+    try:
+        # This import must stay local: reliability_private_recovery depends on this
+        # evidence module for its safe public artifact writer.
+        from .reliability_private_recovery import (
+            MAX_PRIVATE_RECOVERY_SNAPSHOT_BYTES,
+            PrivateRecoverySnapshot,
+        )
+
+        if type(payload) is not bytes or len(payload) > MAX_PRIVATE_RECOVERY_SNAPSHOT_BYTES:
+            raise ValueError("snapshot payload is invalid")
+        safe_key = _validated_run_key(expected_run_key)
+        expected_identity = (
+            None
+            if expected_namespace_identity is None
+            else TypeAdapter(SHA256).validate_python(
+                expected_namespace_identity,
+                strict=True,
+            )
+        )
+        snapshot = PrivateRecoverySnapshot.model_validate_json(payload, strict=True)
+        if payload != _canonical_json(snapshot):
+            raise ValueError("snapshot is not canonical")
+        if snapshot.run_key != safe_key:
+            raise ValueError("snapshot run key does not match")
+        if (
+            expected_identity is not None
+            and snapshot.namespace_identity_sha256 != expected_identity
+        ):
+            raise ValueError("snapshot namespace identity does not match")
+        return snapshot
+    except (ImportError, ValidationError, ValueError, TypeError) as exc:
+        raise EvidenceStoreError("private recovery snapshot is invalid") from exc
+
+
 def _all_commitments(terminal: RunTerminal) -> tuple[ArtifactCommitment, ...]:
     special = tuple(
         item
@@ -1217,6 +1258,17 @@ def verify_run(output_root: Path, run_key: str) -> RunVerification:
         raise EvidenceStoreError("terminal run key mismatch")
     _assert_exact_membership(run, terminal, include_terminal=True)
     _verify_commitments(run, resolved_root, terminal)
+    if any(
+        item.relative_name == "logs/private-recovery.log"
+        for item in terminal.artifacts
+    ):
+        try:
+            verify_private_recovery_log(
+                read_artifact(output_root, run_key, "log", name="private-recovery"),
+                expected_run_key=run_key,
+            )
+        except EvidenceStoreError as exc:
+            raise EvidenceStoreError("private recovery snapshot is invalid") from exc
     return RunVerification(
         status="verified",
         run_key=run_key,

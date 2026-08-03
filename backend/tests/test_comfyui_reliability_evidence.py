@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.comfyui import reliability_evidence as evidence
+from app.comfyui import reliability_private_recovery as recovery
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -489,6 +490,35 @@ def _write_preflight_passed_run(
     )
 
 
+def _write_preflight_run_with_private_recovery_log(
+    output_root: Path,
+    run_key: str = "d" * 64,
+) -> evidence.RunTerminal:
+    boundary = recovery.prepare_private_recovery(
+        output_root,
+        run_key,
+        expected_root_identity=evidence.read_directory_identity(output_root)[1],
+    )
+    private_run = recovery.private_recovery_root(output_root, run_key)
+    (private_run / ".o").write_bytes(b"private-owner")
+    snapshot = recovery.observe_private_recovery(boundary)
+    private_log = recovery.write_private_recovery_snapshot(output_root, run_key, snapshot)
+    base = _write_preflight_passed_run(output_root, run_key)
+    terminal = evidence.RunTerminal.model_validate(
+        base.model_dump(mode="json")
+        | {
+            "artifacts": [
+                item.model_dump(mode="json")
+                for item in sorted(
+                    (*base.artifacts, private_log), key=lambda item: item.relative_name
+                )
+            ]
+        },
+        strict=True,
+    )
+    return terminal
+
+
 def _write_preflight_failed_run(
     output_root: Path,
     run_key: str = "6" * 64,
@@ -732,6 +762,61 @@ def test_verify_run_rejects_exact_recursive_membership_drift(
 
     with pytest.raises(evidence.EvidenceStoreError, match="membership mismatch"):
         evidence.verify_run(output_root, terminal.run_key)
+
+
+def test_verify_run_keeps_public_terminal_verifiable_when_private_sibling_drifts(
+    tmp_path: Path,
+) -> None:
+    """Catches traversal of the private sibling during public terminal verification."""
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    terminal = _write_preflight_run_with_private_recovery_log(output_root)
+    evidence.write_terminal(output_root, terminal)
+    private_run = recovery.private_recovery_root(output_root, terminal.run_key)
+    (private_run / ".o").write_bytes(b"contradictory-private-owner")
+    (private_run / "uncommitted-private-file").write_bytes(b"private-only")
+
+    verified = evidence.verify_run(output_root, terminal.run_key)
+
+    assert verified.status == "verified"
+
+
+def test_verify_run_rejects_private_log_with_changed_static_commitment(
+    tmp_path: Path,
+) -> None:
+    """Catches a verifier that skips the terminal commitment for the public snapshot log."""
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    terminal = _write_preflight_run_with_private_recovery_log(output_root)
+    evidence.write_terminal(output_root, terminal)
+    private_log = output_root / "runs" / terminal.run_key / "logs" / "private-recovery.log"
+    document = json.loads(private_log.read_bytes())
+    document["static_members"][0]["sha256"] = "f" * 64
+    private_log.write_bytes(_canonical_json(document))
+
+    with pytest.raises(evidence.EvidenceStoreError, match="commitment mismatch"):
+        evidence.verify_run(output_root, terminal.run_key)
+
+
+def test_pointer_absent_legacy_snapshot_ignores_private_sibling_namespace(
+    tmp_path: Path,
+) -> None:
+    """Catches legacy pointer reads that probe or follow the private sibling namespace."""
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    private = output_root / recovery.PRIVATE_RECOVERY_DIRECTORY
+    private.mkdir()
+    (private / "contradictory").write_bytes(b"not public evidence")
+
+    snapshot = evidence.snapshot_current(output_root)
+    current = evidence.verify_current(output_root)
+
+    assert snapshot == {
+        "status": "absent",
+        "token": "absent",
+        "legacy_eligible": True,
+    }
+    assert current == snapshot
 
 
 def test_verify_run_rejects_terminal_tampering_and_invalid_schema(tmp_path: Path) -> None:

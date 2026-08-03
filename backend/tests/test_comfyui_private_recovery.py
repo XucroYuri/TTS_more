@@ -249,6 +249,60 @@ def test_snapshot_hashes_stable_static_members_and_writes_canonical_public_log(
     ).encode("utf-8")
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "extra-field",
+        "noncanonical",
+        "wrong-run-key",
+        "wrong-namespace-identity",
+        "raw-name",
+        "path",
+    ],
+)
+def test_public_snapshot_reader_rejects_noncanonical_or_unbound_private_log(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Catches a reader that accepts malformed, cross-run, or path-bearing snapshots."""
+    output_root, boundary, _ = _prepared_boundary(tmp_path)
+    snapshot = observe_private_recovery(boundary)
+    write_private_recovery_snapshot(output_root, RUN_KEY, snapshot)
+    payload = evidence.read_artifact(output_root, RUN_KEY, "log", name="private-recovery")
+    document = json.loads(payload)
+    if mutation == "extra-field":
+        document["extra"] = "unexpected"
+    elif mutation == "wrong-run-key":
+        document["run_key"] = "b" * 64
+    elif mutation == "wrong-namespace-identity":
+        document["namespace_identity_sha256"] = "b" * 64
+    elif mutation == "raw-name":
+        document["raw_name"] = "private-model.bin"
+    elif mutation == "path":
+        document["path"] = "C:/private/model.bin"
+
+    candidate = (
+        json.dumps(document, indent=2).encode("utf-8")
+        if mutation == "noncanonical"
+        else (
+            json.dumps(
+                document,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    )
+
+    with pytest.raises(evidence.EvidenceStoreError, match="snapshot"):
+        evidence.verify_private_recovery_log(
+            candidate,
+            expected_run_key=RUN_KEY,
+            expected_namespace_identity=boundary.private_root_identity,
+        )
+
+
 def test_snapshot_reports_missing_static_roles_without_hashes(tmp_path: Path) -> None:
     _, boundary, private_run = _prepared_boundary(tmp_path)
     (private_run / ".h").write_bytes(b"present history")
