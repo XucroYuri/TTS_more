@@ -116,7 +116,7 @@ to these commits:
 | Capability | Existing commit evidence |
 |---|---|
 | Plugin Bridge/API | `701a5351e0b2b345e8b3a12561764c5443537ef7` and later fork commits |
-| Side-effect-free installer probe | `e349dc005181873f1b6755ff73f4b0b50c0e0feb` |
+| Side-effect-free installer probe | `e349dc00fc83c1c70a06366b8e3c9dfb6a6de359`; implementation: `install.py` `PathFinder.find_spec` walk; test: `tests/unit/test_installer_runtime_repairs.py::test_module_available_finds_nested_module_without_importing_parent` |
 | FFmpeg/FFprobe fail-closed discovery | `63b2b56440532700b1b9217171918349e11c8baa` |
 | Dynamic ComfyUI TTS model paths | `5dd7d0d29bc16cf0857b7f43f740a8e62872f5e3` |
 | Toolchain/path behavior tests | `4537b42aa6eddeb20ac01b0cb89d177a8a97a96b` |
