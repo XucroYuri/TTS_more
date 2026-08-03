@@ -14,8 +14,8 @@ or WAV production. No live run was started.
 - TTS More worktree: branch `dev-xu/windows-comfyui-run-evidence`, gate HEAD
   `f7278f69d9e8df42d3c26094b2866a45168c61e7` before this documentation commit.
 - TTS-Audio-Suite worktree: branch `dev-xu/windows-runner-integration`, commit
-  `29891d2` (`docs: correct module probe evidence SHA`), clean before and after
-  the read-only plugin gates.
+  `29891d2d35879c14dbd2cff5329f1671cfa25b77` (`docs: correct module probe
+  evidence SHA`), clean before and after the read-only plugin gates.
 - Official ComfyUI and GPT-SoVITS/IndexTTS/CosyVoice sources were not modified
   or invoked by Task 6. Their live checkout/model/runtime boundary remains an
   opt-in validation prerequisite.
@@ -80,7 +80,7 @@ MOSS Clip Staging failed: 'bool' object has no attribute 'view'
 ```
 
 This is a deterministic plugin registration blocker at plugin commit
-`29891d2`. It is not one of the historical seven TTS More Windows
+`29891d2d35879c14dbd2cff5329f1671cfa25b77`. It is not one of the historical seven TTS More Windows
 host-capability limitations and is not caused by Task 6's documentation diff.
 No plugin source was changed to hide or repair it.
 
@@ -150,7 +150,10 @@ exit 0; 26 files, 156 tests passed
 pnpm --dir frontend build
 exit 0; TypeScript and Vite production build completed
 
-Windows PowerShell 5.1 AST parse:
+Windows PowerShell 5.1 AST parse command:
+
+$parseFailed = $false; foreach ($script in @('scripts/run-windows-comfyui-reliability.ps1','scripts/run-windows-comfyui-reliability-supervised.ps1','scripts/recover-windows-comfyui-reliability-run.ps1')) { $tokens = $null; $errors = $null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $script), [ref]$tokens, [ref]$errors) | Out-Null; if ($errors.Count -ne 0) { $parseFailed = $true } }; if ($parseFailed) { exit 1 }
+
 scripts/run-windows-comfyui-reliability.ps1: exit 0
 scripts/run-windows-comfyui-reliability-supervised.ps1: exit 0
 scripts/recover-windows-comfyui-reliability-run.ps1: exit 0
@@ -168,11 +171,21 @@ The full-backend command was started exactly as required:
 backend\.venv\Scripts\python.exe -m pytest -q backend
 ```
 
-It did not complete within the agreed approximately 12-minute bounded window
-and was terminated. Pytest's quiet buffered output yielded no authoritative
-collection/pass/fail count before termination. Therefore Task 6 cannot verify
-that the historical seven Windows host-capability limitations have unchanged
-counts and causes. They are not reclassified, waived, or claimed as current.
+The controller's bounded wait exceeded the agreed approximately 12-minute
+window and returned without a pytest result. That controller return did not
+terminate the owned pytest process tree: process IDs 6060 and 42684 remained
+running with the exact `backend\.venv\Scripts\python.exe -m pytest -q backend`
+command/path/start-time identity. Consequently there is no authoritative
+pytest exit code or collection/pass/fail count for this run.
+
+At `2026-08-03 23:34:15 +08:00`, the controller cleanup explicitly ran
+`Stop-Process -Id 42684,6060 -Force`. After approximately 500 ms,
+`Get-CimInstance Win32_Process -Filter "ProcessId = 6060 OR ProcessId = 42684"`
+returned no process, proving both owned orphan PIDs were gone. This cleanup is
+not a pytest result and must not be described as normal test termination.
+Therefore Task 6 cannot verify that the historical seven Windows
+host-capability limitations have unchanged counts and causes. They are not
+reclassified, waived, or claimed as current.
 
 ## Boundary/readiness conclusion
 
