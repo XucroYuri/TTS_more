@@ -218,6 +218,17 @@ reviewed as READY. The TTS More fixture repair is bound to commit
 `978a7786d76d32b5065751376aa6437d54be8042`. These are remediation bindings;
 the earlier review reports remain unchanged.
 
+Independent review artifacts for these remediation bindings are:
+
+- TTS More fixture READY review:
+  `.superpowers/sdd/2026-08-03-windows-comfyui-run-evidence/task-fixture-remediation-review.md`,
+  covering `6c5ba28..cacf8b28e6d776962bf5fd922caf09138c32ffc3`.
+- TTS-Audio-Suite plugin READY review:
+  `F:\\Code\\Github\\TTS_more\\.worktrees\\tts-audio-suite-run-evidence\\docs\\reviews\\2026-08-04-mossclip-loader-review.md`,
+  committed in review-docs SHA
+  `e6da700fa64d744083a741f9a287696d13539b78`, covering
+  `29891d2..978a7786d76d32b5065751376aa6437d54be8042`.
+
 ### Remediation deterministic gates
 
 Required private/evidence/recovery suites, run twice from the TTS More
