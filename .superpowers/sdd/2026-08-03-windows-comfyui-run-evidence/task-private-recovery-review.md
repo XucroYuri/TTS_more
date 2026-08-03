@@ -12,10 +12,14 @@ or WAV production. No live run was started.
 ## Source binding
 
 - TTS More worktree: branch `dev-xu/windows-comfyui-run-evidence`, gate HEAD
-  `f7278f69d9e8df42d3c26094b2866a45168c61e7` before this documentation commit.
-- TTS-Audio-Suite worktree: branch `dev-xu/windows-runner-integration`, commit
-  `29891d2d35879c14dbd2cff5329f1671cfa25b77` (`docs: correct module probe
-  evidence SHA`), clean before and after the read-only plugin gates.
+  `f7278f69d9e8df42d3c26094b2866a45168c61e7` before the original Task 6
+  documentation commit. Remediation fixture commit:
+  `cacf8b28e6d776962bf5fd922caf09138c32ffc3`.
+- TTS-Audio-Suite worktree: branch `dev-xu/windows-runner-integration`, current
+  remediation HEAD `978a7786d76d32b5065751376aa6437d54be8042`, on top of
+  `151e5661e1bbf21fae3e3d3b678808087369acbe`; prior baseline was
+  `29891d2d35879c14dbd2cff5329f1671cfa25b77`. The worktree was clean before
+  and after the read-only plugin gates.
 - Official ComfyUI and GPT-SoVITS/IndexTTS/CosyVoice sources were not modified
   or invoked by Task 6. Their live checkout/model/runtime boundary remains an
   opt-in validation prerequisite.
@@ -204,3 +208,112 @@ matrix, PR, merge, or remote synchronization is authorized by this report.
 The next implementation round must first behavior-fix the plugin registration
 failure and the three TTS More private-boundary fixtures, then rerun every
 failed/incomplete deterministic gate.
+
+## Remediation round — 2026-08-04
+
+The two deterministic blockers above were behavior-fixed and independently
+reviewed as READY. The TTS More fixture repair is bound to commit
+`cacf8b28e6d776962bf5fd922caf09138c32ffc3`. The plugin repair is bound to
+`151e5661e1bbf21fae3e3d3b678808087369acbe` plus
+`978a7786d76d32b5065751376aa6437d54be8042`. These are remediation bindings;
+the earlier review reports remain unchanged.
+
+### Remediation deterministic gates
+
+Required private/evidence/recovery suites, run twice from the TTS More
+worktree:
+
+```text
+backend\\.venv\\Scripts\\python.exe -m pytest -q backend/tests/test_comfyui_private_recovery.py backend/tests/test_comfyui_reliability_recovery.py backend/tests/test_comfyui_reliability_evidence.py
+run 1: exit 0; 146 passed, 1 skipped in 19.57s
+run 2: exit 0; 146 passed, 1 skipped in 19.50s
+```
+
+The sole skip remains the existing POSIX-only openat/no-follow behavior on
+Windows.
+
+Plugin full unit suite, twice, in the established F Python 3.12.3
+environment (`F:\\venvs\\comfyui-tts`), with `COMFYUI_TESTING=1`:
+
+```text
+pytest tests/unit -q
+run 1: exit 0; 335 passed, 2 skipped, 1 warning in 16.07s
+run 2: exit 0; 335 passed, 2 skipped, 1 warning in 15.92s
+pip check: exit 0; No broken requirements found.
+```
+
+TTS More reliability and supervisor suites after the fixture repair:
+
+```text
+backend\\.venv\\Scripts\\python.exe -m pytest -q backend/tests/test_comfyui_reliability_validation.py backend/tests/test_windows_reliability_supervisor.py
+exit 0; 446 passed in 418.15s (0:06:58)
+```
+
+### Full-backend bounded run and cleanup
+
+The exact required command was launched under a process-tree-aware bounded
+harness:
+
+```text
+backend\\.venv\\Scripts\\python.exe -m pytest -q backend
+```
+
+Owned root PID `7512` and child PID `42608` started at
+`2026-08-04 00:10:20.561 +08:00`. Stdout was redirected to
+`%TEMP%\\tts-more-remediation-full-backend-2.stdout.log` and stderr to the
+matching `.stderr.log` (stderr stayed empty). The approximately 15-minute
+deadline elapsed around `00:25:20-00:25:30 +08:00`; stdout reached 59% and
+contained ten progress `F` markers, but no pytest summary, result, or
+authoritative exit code. This run is therefore incomplete, not a claimed
+ten-test failure result.
+
+The first recursive cleanup attempt at `00:25:44 +08:00` used the read-only
+PowerShell variable name `$pid` and consequently did not stop the tree. The
+controller was corrected to use `$procId`, walk the owned descendants, and
+force-stop the explicit owned IDs. At `00:26:18 +08:00`, an exact query for
+root `7512`, child `42608`, and their recorded descendants returned no rows:
+`OWNED_IDS_REMAINING=<none>`. The transient wrapper PID seen while querying
+was the current command wrapper because its command text contained the pytest
+arguments; it was not part of the owned test tree.
+
+Targeted diagnostics explain the observed progress markers but do not turn the
+incomplete full run into an authoritative result. The deploy/GPU/portable
+control selection returned `7 failed, 374 passed, 4 skipped` in 37.27s; the
+seven failures are the unchanged Windows host-capability class (missing
+required shell, symlink privilege WinError 1314, missing `pwsh.exe`, and
+`net share` access denied). No new product cause was found. Portable control
+alone returned `108 passed`.
+
+The portable first-run subset returned `22 passed, 2 failed, 2 deselected` in
+5.21s. Both failures are deterministic missing-repository-workflow checks:
+`test_portable_release_workflow_runs_harness_unit_tests_and_single_package_smoke`
+and
+`test_windows_ci_uses_short_pytest_base_temp_without_weakening_package_path_guard`
+cannot find `.github/workflows/portable-release.yml`. The isolated real-package
+test `test_harness_runs_real_packages_below_spaced_unicode_temp_root` passed
+(`1 passed`), so the missing workflow remains the separate blocker. Because
+the full run stopped before a summary, one progress-only marker cannot be
+assigned to an authoritative test name.
+
+### Remediation static gates
+
+```text
+test_release_governance.py: 17 passed in 1.65s
+test_service_queue.py + test_subprocess_safety.py: 48 passed in 2.14s
+frontend Vitest: 26 files, 156 tests passed
+frontend production build: exit 0
+PowerShell 5.1 parser: all three reliability scripts PARSE_OK, exit 0
+compileall: exit 0
+git diff --check: exit 0
+```
+
+### Latest readiness
+
+The private/evidence/recovery, plugin, reliability/supervisor, governance,
+queue/process, frontend, parser, compile, dependency, and diff gates are now
+green for their recorded scopes. The required full-backend gate remains
+incomplete, and the targeted portable release checks still expose the missing
+`.github/workflows/portable-release.yml` blocker. Accordingly the latest
+Task 6 verdict remains **NOT READY**. No supervised preflight, CUDA smoke,
+three-engine synthesis, 47-case matrix, PR, merge, or remote synchronization
+was run or authorized by this report.
