@@ -625,6 +625,56 @@ def test_terminal_freeze_rejects_later_artifact_and_never_overwrites_terminal(
     assert original_terminal != b"tampered-terminal"
 
 
+def test_frozen_run_rejects_late_artifact_before_creating_missing_parent(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    terminal = _write_preflight_passed_run(output_root, "a" * 64)
+    evidence.write_terminal(output_root, terminal)
+    evidence.compare_and_swap_current(
+        output_root,
+        terminal.run_key,
+        expected_token="absent",
+    )
+    run_root = output_root / "runs" / terminal.run_key
+    audio_parent = run_root / "audio"
+    assert not audio_parent.exists()
+    tracked_paths = sorted(
+        [path for path in run_root.rglob("*") if path.is_file()]
+        + [output_root / "current-terminal.json"],
+        key=lambda path: str(path),
+    )
+    before = {
+        path.relative_to(output_root).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in tracked_paths
+    }
+
+    with pytest.raises(evidence.EvidenceStoreError, match="run is already frozen"):
+        evidence.write_artifact(
+            output_root,
+            terminal.run_key,
+            "audio",
+            b"RIFF-late-audio",
+            name="late",
+        )
+
+    assert not audio_parent.exists()
+    after = {
+        path.relative_to(output_root).as_posix(): (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in tracked_paths
+    }
+    assert after == before
+    assert evidence.verify_run(output_root, terminal.run_key).status == "verified"
+    assert evidence.verify_current(output_root).pointer.run_key == terminal.run_key
+
+
 @pytest.mark.parametrize(
     "relative_name",
     [

@@ -801,12 +801,17 @@ def write_artifact(
         raise EvidenceStoreError("artifact payload is invalid")
     relative_name = _artifact_relative_name(kind, name)
     safe_key = _validated_run_key(run_key)
-    if not _windows_prepare_run_directories(output_root, safe_key, relative_name):
-        _run_root(output_root, safe_key, create=True)
     with _run_operation_lock(output_root, safe_key):
+        if not _windows_prepare_run_directories(
+            output_root,
+            safe_key,
+            "supervisor.json",
+        ):
+            _run_root(output_root, safe_key, create=True)
         run, resolved_root = _run_root(output_root, safe_key, create=False)
         if os.path.lexists(run / "terminal.json"):
             raise EvidenceStoreError("run is already frozen")
+        _windows_prepare_run_directories(output_root, safe_key, relative_name)
         target = _artifact_path(
             run,
             relative_name,
