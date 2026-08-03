@@ -1,6 +1,6 @@
-# Windows ComfyUI reliability validator
+# Windows ComfyUI formal reliability supervisor
 
-This validator is an opt-in, single-GPU acceptance gate for TTS More with ComfyUI and TTS-Audio-Suite. It runs 30 steady syntheses in round-major order, the cancellation/timeout/termination matrix, recovery syntheses, runtime release, queue convergence, GPU recovery, runner cleanup, and final repository/model boundary comparison.
+This supervised validator is an opt-in, single-GPU acceptance gate for TTS More with ComfyUI and TTS-Audio-Suite. It runs 30 steady syntheses in round-major order, the cancellation/timeout/termination matrix, recovery syntheses, runtime release, queue convergence, GPU recovery, runner cleanup, and final repository/model boundary comparison.
 
 It does not run in CI and does not modify the official GPT-SoVITS, IndexTTS, CosyVoice, or ComfyUI checkouts. A pass is not an eight-hour soak, throughput benchmark, subjective audio-quality certification, or multi-GPU certification.
 
@@ -25,10 +25,13 @@ The script derives TTS-Audio-Suite from `custom_nodes/TTS-Audio-Suite` under the
 
 ## Preflight
 
-Use `-PreflightOnly` first. The wrapper refuses missing or non-exact paths, occupied ports 8000/8188, PID identity changes, non-loopback fixture endpoints without explicit `-AllowLan`, anything other than the exact three ready resource IDs, non-idle TTS More or ComfyUI queues, incomplete repository/model boundaries, and unexpected validation temp residue.
+Use `-PreflightOnly` first. `scripts/run-windows-comfyui-reliability-supervised.ps1` is the only formal entry point. The similarly named inner script is a non-authoritative implementation detail: invoking it directly cannot create `terminal.json`, advance `current-terminal.json`, or certify a run.
+
+The supervisor refuses missing or non-exact paths, occupied ports 8000/8188, PID identity changes, non-loopback fixture endpoints without explicit `-AllowLan`, anything other than the exact three ready resource IDs, non-idle TTS More or ComfyUI queues, incomplete repository/model boundaries, and unexpected validation temp residue.
 
 ```powershell
-powershell.exe -NoProfile -File scripts/run-windows-comfyui-reliability.ps1 `
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+  -File scripts/run-windows-comfyui-reliability-supervised.ps1 `
   -Fixture '<private-fixture-json>' `
   -OutputRoot '<private-evidence-root>' `
   -ComfyUiRoot '<comfyui-checkout>' `
@@ -37,7 +40,7 @@ powershell.exe -NoProfile -File scripts/run-windows-comfyui-reliability.ps1 `
   -PreflightOnly
 ```
 
-Success writes `preflight.json`. It performs no synthesis request. `-AllowLan` is the only way to permit LAN fixture URLs; it also binds the validator-owned services to all interfaces, so use it only on a trusted network with host firewall rules in place.
+Success performs no synthesis request. It returns zero only after a `preflight/passed` run is frozen, verified, atomically published as current, and verified again through the current pointer. `-AllowLan` is the only way to permit LAN fixture URLs; it also binds the validator-owned services to all interfaces, so use it only on a trusted network with host firewall rules in place.
 
 ## Full gate
 
@@ -54,17 +57,52 @@ Run the same command without `-PreflightOnly`. A typical run may take roughly 30
 
 Normal steady, recovery, and post-restart synthesis requests use the fixture's engine-specific request allowance. After that request window, terminal and queue observation receives one separate window of at most 30 seconds. The intentional timeout request itself remains exactly one second followed by at most 30 seconds of cancellation convergence. Running-cancel and owned-ComfyUI-termination cases must observe and issue their action within the fault case's 30-second request phase, then receive one fresh terminal window of at most 30 seconds measured from action issuance. Queued cancellation shares one 30-second admission phase across blocker admission and target queue admission, then receives one fresh at-most-30-second settlement window measured from target cancellation issuance. ComfyUI restart readiness remains an independent operation bounded at 180 seconds. Exceeding any deadline fails the run; cancellation is never converted into a successful synthesis, and no window is retried or extended indefinitely.
 
-## Evidence and cleanup
+## Immutable evidence and publication
 
-The evidence root contains `reliability-summary.json`, one public JSON document under `cases/` for each case, generated audio retained by the normal TTS More project output, and `failure.json` when the gate fails. Public evidence contains neutral IDs, hashes, timestamps, metrics, and executable basenames—not source paths, model paths, registry values, command lines, credentials, or tokens. A current failed case is explicitly `schema_version: 2` and must carry a non-null strict partial observation: request/service/resource/job/prompt/version values are SHA-256 commitments only; event times, poll count, bounded terminal/control status, queue commitment, and any already-observed WAV hash/size are retained. If detailed observation validation or publication fails, the validator retries one versioned, schema-valid minimal observation with only a hash of the secondary evidence error; the original case failure code and stage remain primary. The formal reader rejects JSON larger than 4 MiB before parsing and reports typed validation locations/codes without retaining raw invalid input in exception renderings. It retains a separate versionless legacy branch only for the exact historical field shape; legacy documents cannot carry current-only fields or bypass current bounds. Both branches accept only canonical UTC `Z` timestamps, ordered lifecycles, strict bounded scalar/collection values, and no unknown fields.
+Each supervised attempt receives a fresh unpredictable run identity. The public run key is its 64-character lowercase SHA-256 commitment. The supervisor derives every path; no argument can select an individual artifact, terminal, pointer, log, or temporary path.
 
-The wrapper creates a private host manifest and one run-owned temp base beneath the output root. TTS More inherits an owned system temp directory through child-only `TEMP`/`TMP` values, while ComfyUI receives an owned `--temp-directory` base; the manifest monitors the actual runner root and ComfyUI's resulting `<base>\temp` root. The wrapper restores its own environment immediately after each child launch.
+```text
+<evidence-root>/
+  current-terminal.json
+  runs/
+    <64-lowercase-run-key>/
+      terminal.json
+      supervisor.json
+      run-result.json
+      preflight.json
+      failure.json                 # failed runs only
+      reliability-summary.json    # applicable matrix runs only
+      cases/                       # applicable matrix runs only
+      audio/                       # completed synthesis proofs only
+      logs/                        # hash-only stream commitments
+```
 
-Every `Start-Process` result is tracked provisionally before CIM identity capture. The wrapper atomically persists and revalidates the run-ID-bound companion state before waiting for either port or proceeding to later operations. If capture or persistence fails, it stops the just-started PID only when its executable, creation window, parent PID, and parent creation time still match. Python writes evidence before wrapper cleanup. In `finally`, cleanup re-reads the companion state, compares PID, creation time, executable, command line, parent PID, and parent creation time, and stops only matching validator-owned processes and descendants. A mismatched or reused PID is preserved with a warning. Recursive deletion is limited to the resolved temp base under the exact output root and requires its matching owner marker. Public evidence is preserved; model environments, checkouts, user configuration, and pre-existing processes are never deleted.
+Only artifacts applicable to that run may exist. `terminal.json` commits the exact file membership, sizes, and SHA-256 values; extra, missing, renamed, replaced, non-regular, symlink, junction, mount-point, or other reparse members fail closed. `supervisor.json` and `run-result.json` are mandatory. Passing matrix runs retain exactly 47 cases and 39 WAV commitments. `terminal.json` is first-write and is never one of its own commitments.
 
-When the formal Python validator returns nonzero, the launcher first atomically writes `launcher-failure-lifecycle-<run-sha256>.json` before the first process stop. Immediately before that validator invocation, a backend helper records a private exact manifest of `failure.json`, `reliability-summary.json`, and every `cases/*.json` using relative name, byte length, SHA-256, and last-write UTC. On failure, the same helper uses the formal Python `FailureMarker`, `ReliabilityRunSummary`, and current/legacy `FailedCaseEvidence` models. It accepts only artifacts whose content is new or changed from that manifest and whose last-write and case host times are inside the exact validator interval; there is no clock-tolerance extension. The summary contributes only its artifact hash and completed-case count. A case is bound only when exactly one changed failed-case document has a safe filename matching its case ID and a failure marker matching the current root marker. Zero, multiple, unchanged, malformed, mismatched, or out-of-window candidates publish no case identity and instead carry the fixed hash-only `case-context-unbound` secondary commitment.
+The supervisor performs publication in this order:
 
-The strict version-1 lifecycle schema contains only the failed primary code/stage, validation artifact commitments, hashed run/case and ownership commitments, bounded role/PID/UTC parent-edge observations, and cleanup transaction state; executable paths, command lines, private IDs, model/resource values, headers, tokens, and raw diagnostics are never published. Keys are case-sensitive, JSON collections must remain arrays after round-trip, and cleanup flags, timestamps, diagnostics, and raw dispositions must describe one consistent `snapshot-written`, `cleanup-unproven`, or `cleanup-proven` state. Exact forest stop and a non-destructive owner/temp eligibility check then run. Raw temp/owner/control/manifest deletion is authorized only after a second atomic lifecycle write records `cleanup-proven` and `removal-committed`; this is a transaction commitment, not a premature claim that deletion finished. Either lifecycle write failure or unproved cleanup preserves all still-existing raw recovery records while process convergence remains attempted. A later precise-deletion failure is hash-only secondary evidence and preserves the original validator failure. Actual post-commit absence remains a separate host/evidence audit. Successful runs publish no failure lifecycle and retain the normal exact cleanup path.
+1. Snapshot the exact `current-terminal.json` token before starting the child.
+2. Prepare a new empty `runs/<run-key>` and start the inner launcher exactly once through `System.Diagnostics.Process`.
+3. Fully drain both child streams into byte-bounded captures, reject overflow or invalid UTF-8 before publication, close the process/stream handles, and commit only size/SHA-256 stream documents—not raw child output.
+4. Read the strict inner result, finalize `supervisor.json`, enumerate exact membership, first-write `terminal.json`, and verify the frozen run.
+5. Compare-and-swap only `current-terminal.json` using the original snapshot token. A CAS mismatch is never retried with a new token.
+6. Verify the new current pointer and its run before returning the child's exact signed Int32 exit code.
+
+Two supervisors starting from the same token keep distinct immutable run directories; only the first CAS succeeds. A crash before terminal or before CAS leaves an unreferenced orphan and preserves the previous current pointer byte-for-byte.
+
+All public schemas forbid unknown fields and implicit coercion, impose collection/string/integer bounds, and use canonical compact sorted UTF-8 JSON without a BOM. Public evidence contains neutral IDs, hashes, timestamps, metrics, and bounded process observations—not checkout/model/reference paths, registry values, resource IDs, commands, credentials, tokens, URI userinfo, environment dumps, or raw exceptions. A current failed case uses the strict versioned partial-observation schema; identifiers are commitments only. If detailed case observation cannot be validated, the original primary failure is retained with a single hash-only secondary commitment.
+
+### Current pointer and legacy reads
+
+New supervised writers never create or update root-level legacy evidence. If `current-terminal.json` is present, it must validate canonically and bind a verified immutable run; an invalid present pointer fails closed and never falls back to legacy evidence. Only when the pointer is absent may the existing strict legacy reader inspect historical root-level evidence in read-only mode. Legacy bytes and mtimes are never changed, moved, deleted, archived, or quarantined.
+
+## Cleanup boundary
+
+The inner launcher owns one exact private temp/recovery set inside its selected run and never writes the terminal or current pointer. Service starts are tracked provisionally before full CIM capture. Cleanup revalidates PID, creation time, executable, command line, parent PID, parent creation time, descendant edges, and exact port ownership; a mismatched or reused PID is preserved. Temp deletion requires the exact run-owned `.p` root, `.o` owner marker, raw run ID, and exact derived runner/ComfyUI temp paths. Private identity removal accepts only that run's exact `.h` and `.c` pair. Model environments, checkouts, configuration, and pre-existing processes are outside the deletion boundary.
+
+On validator failure, the launcher reads failure context only through `launcher_failure_context evaluate-run --output-root <root> --run-key <run-key>`. It does not create a legacy snapshot or infer evidence from mtimes. Run-owned raw service/lifecycle streams use fixed private short names and are converted by the supervisor to bounded hash-only log commitments before exact-membership freeze.
+
+A cleanup failure is current-eligible only when the child has completed and no mutable private recovery members remain in the run. If cleanup is unproven and `.p`, `.o`, `.h`, or `.c` must be preserved for safe recovery, the supervisor fails closed: it does not delete or relocate them, does not first-write `terminal.json`, and does not advance the previous current pointer. That preserved attempt remains an orphan for diagnosis rather than a falsely immutable current run.
 
 ## Failure triage
 

@@ -5507,6 +5507,9 @@ def test_task_12_wrapper_cleans_owned_empty_temp_after_launcher_identity_failure
     script_path = repository_root / "scripts" / "run-windows-comfyui-reliability.ps1"
     output_root = tmp_path / "validation output"
     output_root.mkdir()
+    run_id = "1" * 32
+    run_root = output_root / "runs" / hashlib.sha256(run_id.encode()).hexdigest()
+    run_root.mkdir(parents=True)
     sentinel_directory = output_root / "unrelated sentinel directory"
     sentinel_directory.mkdir()
     sentinel_file = output_root / "unrelated-sentinel.txt"
@@ -5569,12 +5572,12 @@ $matchingBefore = @(Get-MatchingProcessIdentities)
 function Get-CimInstance {
     param([string] $ClassName, [string] $Filter, [object] $ErrorAction)
     $ownedRoots = @(
-        Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_OUTPUT -Directory `
-            -Filter 'reliability-temp-*'
+        Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_RUN_ROOT -Directory `
+            -Filter '.p'
     )
     $ownerMarkers = @(
-        Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_OUTPUT -File `
-            -Filter '.request-temp-*.owner.json'
+        Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_RUN_ROOT -File `
+            -Filter '.o'
     )
     if ($ownedRoots.Count -ne 1 -or $ownerMarkers.Count -ne 1) {
         throw 'launcher identity failure was not injected after owned artifacts existed'
@@ -5596,6 +5599,7 @@ try {
         -ComfyUiRoot $env:TTS_MORE_TEST_COMFY_ROOT `
         -ComfyPython $env:TTS_MORE_TEST_COMFY_PYTHON `
         -TtsMoreRoot $env:TTS_MORE_TEST_TTS_ROOT `
+        -RunId '11111111111111111111111111111111' `
         -PreflightOnly
 } catch {
     $caught = $_
@@ -5604,10 +5608,10 @@ try {
 if ($null -eq $caught -or $caught.Exception.Message -ne 'injected launcher identity failure') {
     throw ('Expected injected launcher identity failure, got: {0}' -f $caught)
 }
-if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_OUTPUT -Directory -Filter 'reliability-temp-*').Count -ne 0) {
+if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_RUN_ROOT -Directory -Filter '.p').Count -ne 0) {
     throw 'run-owned temp root survived early launcher identity failure'
 }
-if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_OUTPUT -File -Filter '.request-temp-*.owner.json').Count -ne 0) {
+if (@(Get-ChildItem -LiteralPath $env:TTS_MORE_TEST_RUN_ROOT -File -Filter '.o').Count -ne 0) {
     throw 'run-owned temp marker survived early launcher identity failure'
 }
 if (
@@ -5629,6 +5633,7 @@ Write-Output 'EARLY_LAUNCHER_FAILURE_CLEANUP_OK'
             "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
             "TTS_MORE_TEST_FIXTURE": str(fixture_path),
             "TTS_MORE_TEST_OUTPUT": str(output_root),
+            "TTS_MORE_TEST_RUN_ROOT": str(run_root),
             "TTS_MORE_TEST_COMFY_ROOT": str(comfy_root),
             "TTS_MORE_TEST_COMFY_PYTHON": str(fake_comfy_python),
             "TTS_MORE_TEST_TTS_ROOT": str(repository_root),
@@ -5897,6 +5902,9 @@ def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
     script_path = repository_root / "scripts" / "run-windows-comfyui-reliability.ps1"
     output_root = tmp_path / "private evidence"
     output_root.mkdir()
+    run_id = "2" * 32
+    run_root = output_root / "runs" / hashlib.sha256(run_id.encode()).hexdigest()
+    run_root.mkdir(parents=True)
     fixture_root = tmp_path / "fixture"
     reference_root = fixture_root / "references"
     reference_root.mkdir(parents=True)
@@ -5962,6 +5970,8 @@ def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
             str(Path(os.sys.executable).resolve()),
             "-TtsMoreRoot",
             str(repository_root),
+            "-RunId",
+            "22222222222222222222222222222222",
             "-PreflightOnly",
         ],
         capture_output=True,
@@ -5979,21 +5989,12 @@ def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
     assert "property 'ProcessId'" not in combined_output
     assert "Provisional process could not be proven owned" not in combined_output
 
-    sidecars = list(output_root.glob(".*-*.log"))
+    sidecars = [run_root / name for name in (".co", ".ce", ".bo", ".be")]
     assert len(sidecars) == 4
-    comfy_stdout = next(output_root.glob(".comfyui-*.stdout.log"))
-    comfy_stderr = next(output_root.glob(".comfyui-*.stderr.log"))
-    backend_stdout = next(output_root.glob(".tts-more-*.stdout.log"))
-    backend_stderr = next(output_root.glob(".tts-more-*.stderr.log"))
-    run_ids = {
-        path.name.removeprefix(".comfyui-")
-        .removeprefix(".tts-more-")
-        .split(".", 1)[0]
-        for path in sidecars
-    }
-    assert len(run_ids) == 1
-    (run_id,) = run_ids
-    assert len(run_id) == 32 and all(character in "0123456789abcdef" for character in run_id)
+    comfy_stdout = run_root / ".co"
+    comfy_stderr = run_root / ".ce"
+    backend_stdout = run_root / ".bo"
+    backend_stderr = run_root / ".be"
     assert comfy_stdout.read_bytes() == b"CONTROLLED_COMFY_STDOUT"
     assert comfy_stderr.read_bytes() == b"CONTROLLED_COMFY_STDERR"
     assert backend_stdout.read_bytes() == b""
@@ -6006,12 +6007,13 @@ def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
         "--port",
         "8188",
         "--temp-directory",
-        str(output_root / f"reliability-temp-{run_id}" / "comfyui"),
+        str(run_root / ".p" / "comfyui"),
     ]
     assert all(str(path) not in semantic_argv for path in sidecars)
-    assert not list(output_root.glob("reliability-temp-*"))
-    assert not list(output_root.glob(".request-temp-*.owner.json"))
-    assert not list(output_root.glob(".host-manifest-*.private.json*"))
+    assert not (run_root / ".p").exists()
+    assert not (run_root / ".o").exists()
+    assert not (run_root / ".h").exists()
+    assert not (run_root / ".c").exists()
 
     inventory = subprocess.run(
         [
@@ -6209,6 +6211,9 @@ def test_task_12_wrapper_preserves_primary_error_when_cleanup_cim_query_fails(
     script_path = repository_root / "scripts" / "run-windows-comfyui-reliability.ps1"
     output_root = tmp_path / "private failure evidence"
     output_root.mkdir()
+    run_id = "3" * 32
+    run_root = output_root / "runs" / hashlib.sha256(run_id.encode()).hexdigest()
+    run_root.mkdir(parents=True)
     fixture_root = tmp_path / "fixture"
     reference_root = fixture_root / "references"
     reference_root.mkdir(parents=True)
@@ -6264,6 +6269,7 @@ try {
         -ComfyUiRoot $env:TTS_MORE_TEST_COMFY_ROOT `
         -ComfyPython $env:TTS_MORE_TEST_COMFY_PYTHON `
         -TtsMoreRoot $env:TTS_MORE_TEST_TTS_ROOT `
+        -RunId '33333333333333333333333333333333' `
         -PreflightOnly
 } catch { $caught = $_ }
 if (
@@ -6312,30 +6318,20 @@ Write-Output 'PRIMARY_ERROR_SURVIVED_CLEANUP_QUERY_ERROR_OK'
     ) in combined_output
     assert "injected exact cleanup CIM query failure" not in combined_output
 
-    sidecars = list(output_root.glob(".*-*.log"))
+    sidecars = [run_root / name for name in (".co", ".ce", ".bo", ".be")]
     assert len(sidecars) == 4
-    comfy_stdout = next(output_root.glob(".comfyui-*.stdout.log"))
-    comfy_stderr = next(output_root.glob(".comfyui-*.stderr.log"))
-    backend_stdout = next(output_root.glob(".tts-more-*.stdout.log"))
-    backend_stderr = next(output_root.glob(".tts-more-*.stderr.log"))
+    comfy_stdout = run_root / ".co"
+    comfy_stderr = run_root / ".ce"
+    backend_stdout = run_root / ".bo"
+    backend_stderr = run_root / ".be"
     assert comfy_stdout.read_bytes() == b"PRIMARY_ERROR_STDOUT"
     assert comfy_stderr.read_bytes() == b"PRIMARY_ERROR_STDERR"
     assert backend_stdout.read_bytes() == b""
     assert backend_stderr.read_bytes() == b""
-    run_ids = {
-        path.name.removeprefix(".comfyui-")
-        .removeprefix(".tts-more-")
-        .split(".", 1)[0]
-        for path in sidecars
-    }
-    assert len(run_ids) == 1
-    (run_id,) = run_ids
-    assert list(output_root.glob(f"reliability-temp-{run_id}"))
-    assert list(output_root.glob(f".request-temp-{run_id}.owner.json"))
-    assert list(
-        output_root.glob(f".host-manifest-{run_id}.private.json.current.json")
-    )
-    assert not list(output_root.glob(f".host-manifest-{run_id}.private.json"))
+    assert (run_root / ".p").is_dir()
+    assert (run_root / ".o").is_file()
+    assert (run_root / ".c").is_file()
+    assert not (run_root / ".h").exists()
 
     inventory = subprocess.run(
         [
@@ -6425,8 +6421,9 @@ foreach ($name in @('Test-PrivateIdentityRecordsCanBeRemoved', 'Remove-PrivateId
     if ($null -eq $function) { throw "$name is missing" }
     Invoke-Expression $function.Extent.Text
 }
-$hostRecord = Join-Path $env:TTS_MORE_PRIVATE_TEST_ROOT '.host-manifest.private.json'
-$currentRecord = "$hostRecord.current.json"
+$runRoot = $env:TTS_MORE_PRIVATE_TEST_ROOT
+$hostRecord = Join-Path $runRoot '.h'
+$currentRecord = Join-Path $runRoot '.c'
 
 function Reset-Records {
     Set-Content -LiteralPath $hostRecord -Value '{"private":true}' -Encoding UTF8
@@ -6442,26 +6439,30 @@ function Assert-RecordsAbsent {
 }
 
 Reset-Records
-if (Remove-PrivateIdentityRecordsIfSafe -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
+if (Remove-PrivateIdentityRecordsIfSafe -ResolvedRunRoot $runRoot `
+        -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
         -ProcessCleanupProven $false -TempCleanupProven $false -OwnedProcessCount 2) {
     throw 'identity mismatch incorrectly allowed record removal'
 }
 Assert-RecordsPresent
 
-if (Remove-PrivateIdentityRecordsIfSafe -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
+if (Remove-PrivateIdentityRecordsIfSafe -ResolvedRunRoot $runRoot `
+        -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
         -ProcessCleanupProven $true -TempCleanupProven $false -OwnedProcessCount 2) {
     throw 'unproved temp cleanup incorrectly allowed record removal'
 }
 Assert-RecordsPresent
 
-if (-not (Remove-PrivateIdentityRecordsIfSafe -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
+if (-not (Remove-PrivateIdentityRecordsIfSafe -ResolvedRunRoot $runRoot `
+        -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
         -ProcessCleanupProven $true -TempCleanupProven $true -OwnedProcessCount 2)) {
     throw 'proved cleanup did not remove private records'
 }
 Assert-RecordsAbsent
 
 Reset-Records
-if (-not (Remove-PrivateIdentityRecordsIfSafe -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
+if (-not (Remove-PrivateIdentityRecordsIfSafe -ResolvedRunRoot $runRoot `
+        -HostManifestPath $hostRecord -ControlStatePath $currentRecord `
         -ProcessCleanupProven $false -TempCleanupProven $false -OwnedProcessCount 0)) {
     throw 'known empty ownership did not remove empty private records'
 }
@@ -10341,19 +10342,22 @@ function Start-Sleep { param([int] $Milliseconds) }
 
 $outputRoot=Join-Path $env:TTS_MORE_FIX9_ROOT 'public evidence'
 New-Item -ItemType Directory -Path $outputRoot | Out-Null
-$tempRoot=Join-Path $outputRoot 'reliability-temp-private'
+$runRoot=Join-Path (Join-Path $outputRoot 'runs') ('A'*64)
+New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+$tempRoot=Join-Path $runRoot '.p'
 New-Item -ItemType Directory -Path (Join-Path $tempRoot 'runner') -Force | Out-Null
-$owner=Join-Path $outputRoot '.request-temp-private.owner.json'
-$hostRecord=Join-Path $outputRoot '.host-manifest-private.private.json'
-$controlRecord="$hostRecord.current.json"
+New-Item -ItemType Directory -Path (Join-Path (Join-Path $tempRoot 'comfyui') 'temp') -Force | Out-Null
+$owner=Join-Path $runRoot '.o'
+$hostRecord=Join-Path $runRoot '.h'
+$controlRecord=Join-Path $runRoot '.c'
 @{run_id='raw-run-id';temp_root=[IO.Path]::GetFullPath($tempRoot)
   runner_temp_root=[IO.Path]::GetFullPath((Join-Path $tempRoot 'runner'))
-  comfy_temp_root=[IO.Path]::GetFullPath((Join-Path $tempRoot 'comfyui'))} |
+  comfy_temp_root=[IO.Path]::GetFullPath((Join-Path (Join-Path $tempRoot 'comfyui') 'temp'))} |
     ConvertTo-Json -Compress | Set-Content -LiteralPath $owner -Encoding UTF8
 Set-Content -LiteralPath $hostRecord -Value '{"private":true}' -Encoding UTF8
 Set-Content -LiteralPath $controlRecord -Value '{"private":true}' -Encoding UTF8
-$script:lifecyclePath=Join-Path $outputRoot 'launcher-failure-lifecycle.json'
-$secondaryPath=Join-Path $outputRoot 'launcher-failure-lifecycle-secondary.json'
+$script:lifecyclePath=Join-Path $runRoot '.l'
+$secondaryPath=Join-Path $runRoot '.s'
 $document=New-LauncherFailureLifecycleDocument `
     -RunId 'raw-run-id' -PrimaryCode 'case-execution-failed' -PrimaryStage 'case' `
     -RunStartedAt '2026-08-02T00:00:00Z' `
@@ -10372,7 +10376,7 @@ $proof={
         -PollIntervalMilliseconds 1
     $tempEligible=Test-OwnedTempRootCanBeRemoved -Root $tempRoot `
         -OwnerMarker $owner -ExpectedRunId 'raw-run-id' `
-        -ResolvedOutputRoot ([IO.Path]::GetFullPath($outputRoot))
+        -ResolvedRunRoot ([IO.Path]::GetFullPath($runRoot))
     [pscustomobject]@{
         stop_attempted=$true;stop_proven=[bool]$stopProven
         temp_removal_eligible=[bool]$tempEligible
@@ -10382,10 +10386,11 @@ $proof={
 $remove={
     if (-not (Remove-OwnedTempRoot -Root $tempRoot -OwnerMarker $owner `
             -ExpectedRunId 'raw-run-id' `
-            -ResolvedOutputRoot ([IO.Path]::GetFullPath($outputRoot)))) {
+            -ResolvedRunRoot ([IO.Path]::GetFullPath($runRoot)))) {
         throw 'owned temp removal did not converge'
     }
     if (-not (Remove-PrivateIdentityRecordsIfSafe `
+            -ResolvedRunRoot ([IO.Path]::GetFullPath($runRoot)) `
             -HostManifestPath $hostRecord -ControlStatePath $controlRecord `
             -ProcessCleanupProven $true -TempCleanupProven $true `
             -OwnedProcessCount 2)) { throw 'private identity removal did not converge' }
@@ -11198,10 +11203,9 @@ $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile(
     $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
 )
-if($errors.Count -ne 0){throw($errors|Out-String)}
-foreach($name in @(
-    'ConvertTo-WindowsCommandLineArgument','ConvertTo-PublicUtcTimestamp',
-    'Invoke-LauncherFailureContextHelper'
+    if($errors.Count -ne 0){throw($errors|Out-String)}
+    foreach($name in @(
+        'ConvertTo-WindowsCommandLineArgument','Invoke-LauncherFailureContextHelper'
 )){
     $function=$ast.Find({param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -11213,9 +11217,9 @@ foreach($name in @(
 $fakeRoot=Join-Path $env:TTS_MORE_FIX9_ROOT 'fake helper & module'
 $outputRoot=Join-Path $env:TTS_MORE_FIX9_ROOT `
     'argument space & semicolon; dollars$ parentheses()'
-$captureRoot=Join-Path $outputRoot 'run-owned temp & capture'
-New-Item -ItemType Directory -Path $captureRoot -Force|Out-Null
-$baseline=Join-Path $captureRoot 'context baseline.private.json'
+    $captureRoot=Join-Path $outputRoot 'run-owned temp & capture'
+    New-Item -ItemType Directory -Path $captureRoot -Force|Out-Null
+    $runKey='4444444444444444444444444444444444444444444444444444444444444444'
 $record=Join-Path $env:TTS_MORE_FIX9_ROOT 'helper-arguments.json'
 $env:TTS_MORE_FIX9_EMITTER_RECORD=$record
 $original=(Get-Location).Path
@@ -11224,28 +11228,26 @@ function Assert-No-Capture {
     if(@(Get-ChildItem -LiteralPath $captureRoot -File -Force).Count -ne 0){
         throw 'helper capture files were not removed'
     }
-}
-function Invoke-Protocol {
-    param([string]$EmitterMode,[string]$HelperMode='evaluate')
-    $env:TTS_MORE_FIX9_EMITTER_MODE=$EmitterMode
-    Invoke-LauncherFailureContextHelper -Mode $HelperMode `
-        -PythonPath $env:TTS_MORE_FIX9_PYTHON -WorkingDirectory $fakeRoot `
-        -OutputRoot $outputRoot -BaselinePath $baseline `
-        -RunOwnedTempRoot $captureRoot `
-        -RunStartedAt '2026-08-02T08:52:00.000000Z' `
-        -FailureObservedAt '2026-08-02T08:54:00.000000Z'
-}
-function Must-Reject {
-    param([string]$EmitterMode,[string]$HelperMode='evaluate')
-    $caught=$null
-    try{Invoke-Protocol -EmitterMode $EmitterMode -HelperMode $HelperMode|Out-Null}catch{
+    }
+    function Invoke-Protocol {
+        param([string]$EmitterMode)
+        $env:TTS_MORE_FIX9_EMITTER_MODE=$EmitterMode
+        Invoke-LauncherFailureContextHelper -Mode 'evaluate-run' `
+            -PythonPath $env:TTS_MORE_FIX9_PYTHON -WorkingDirectory $fakeRoot `
+            -OutputRoot $outputRoot -RunKey $runKey `
+            -RunOwnedTempRoot $captureRoot
+    }
+    function Must-Reject {
+        param([string]$EmitterMode)
+        $caught=$null
+        try{Invoke-Protocol -EmitterMode $EmitterMode|Out-Null}catch{
         $caught=$_
     }
     if($null -eq $caught){throw "$EmitterMode unexpectedly passed"}
     if((Get-Location).Path -ne $original){throw "$EmitterMode changed launcher cwd"}
     Assert-No-Capture
     $rendered=[string]$caught
-    foreach($private in @('PRIVATE helper diagnostic',$outputRoot,$baseline)){
+        foreach($private in @('PRIVATE helper diagnostic',$outputRoot,$runKey)){
         if($rendered.Contains($private)){throw "$EmitterMode leaked helper context"}
     }
 }
@@ -11262,30 +11264,21 @@ foreach($invalid in @(
 )){
     Must-Reject -EmitterMode $invalid
 }
-$snapshot=Invoke-Protocol -EmitterMode 'snapshot-success' -HelperMode 'snapshot'
-if($snapshot -cne ''){throw 'empty snapshot output was not accepted exactly'}
-if((Get-Location).Path -ne $original){throw 'snapshot success changed launcher cwd'}
-Assert-No-Capture
-Must-Reject -EmitterMode 'snapshot-stdout' -HelperMode 'snapshot'
-Must-Reject -EmitterMode 'snapshot-stderr' -HelperMode 'snapshot'
-
-$missing=Join-Path $fakeRoot 'missing-python.exe'
-$caught=$null
-try{
-    Invoke-LauncherFailureContextHelper -Mode 'evaluate' `
-        -PythonPath $missing -WorkingDirectory $fakeRoot `
-        -OutputRoot $outputRoot -BaselinePath $baseline `
-        -RunOwnedTempRoot $captureRoot `
-        -RunStartedAt '2026-08-02T08:52:00.000000Z' `
-        -FailureObservedAt '2026-08-02T08:54:00.000000Z'|Out-Null
+    $missing=Join-Path $fakeRoot 'missing-python.exe'
+    $caught=$null
+    try{
+        Invoke-LauncherFailureContextHelper -Mode 'evaluate-run' `
+            -PythonPath $missing -WorkingDirectory $fakeRoot `
+            -OutputRoot $outputRoot -RunKey $runKey `
+            -RunOwnedTempRoot $captureRoot|Out-Null
 }catch{$caught=$_}
 if($null -eq $caught){throw 'process-start throw unexpectedly passed'}
 if((Get-Location).Path -ne $original){throw 'process-start throw changed launcher cwd'}
 Assert-No-Capture
 
-$arguments=Get-Content -LiteralPath $record -Raw|ConvertFrom-Json
-$expected=@(
-    'snapshot','--output-root',$outputRoot,'--baseline-path',$baseline
+    $arguments=Get-Content -LiteralPath $record -Raw|ConvertFrom-Json
+    $expected=@(
+        'evaluate-run','--output-root',$outputRoot,'--run-key',$runKey
 )
 if(@($arguments).Count -ne $expected.Count){throw 'helper argv count changed'}
 for($index=0;$index -lt $expected.Count;$index+=1){
@@ -11305,12 +11298,10 @@ def test_fix9_round2_powershell_reader_uses_backend_cli_and_restores_context(
     tmp_path: Path,
 ) -> None:
     output_root = tmp_path / "powershell-context"
-    baseline_path = _fix9_snapshot_context(output_root)
-    _fix9_publish_current_root(output_root)
-    _fix9_write_context_artifact(
-        output_root / "cases" / "steady-01-gpt-sovits.json",
-        _fix9_current_failed_document(),
-    )
+    run_root = _task3_failed_run(output_root, TASK3_RUN_KEY)
+    capture_root = run_root / ".private-context"
+    capture_root.mkdir()
+    expected_case_sha256 = hashlib.sha256(b"steady-01-indextts").hexdigest().upper()
     command = r"""
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -11318,11 +11309,10 @@ $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile(
     $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
 )
-if($errors.Count -ne 0){throw($errors|Out-String)}
-foreach($name in @(
-    'Get-Sha256Hex','ConvertTo-WindowsCommandLineArgument',
-    'ConvertTo-PublicUtcTimestamp',
-    'Invoke-LauncherFailureContextHelper','Get-LauncherPublicFailureContext'
+    if($errors.Count -ne 0){throw($errors|Out-String)}
+    foreach($name in @(
+        'Get-Sha256Hex','ConvertTo-WindowsCommandLineArgument',
+        'Invoke-LauncherFailureContextHelper','Get-LauncherPublicFailureContext'
 )){
     $function=$ast.Find({param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -11330,53 +11320,51 @@ foreach($name in @(
     },$true)
     if($null -eq $function){throw "$name is missing"}
     Invoke-Expression $function.Extent.Text
-}
-$outputRoot=Join-Path $env:TTS_MORE_FIX9_ROOT 'powershell-context'
-$baseline=Join-Path $outputRoot 'reliability-temp-test\context-baseline.private.json'
-$original=(Get-Location).Path
-$raw=Invoke-LauncherFailureContextHelper -Mode 'evaluate' `
-    -PythonPath $env:TTS_MORE_FIX9_PYTHON `
-    -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
-    -OutputRoot $outputRoot -BaselinePath $baseline `
-    -RunOwnedTempRoot (Split-Path -Parent $baseline) `
-    -RunStartedAt '2026-08-02T08:52:00.000000Z' `
-    -FailureObservedAt '2026-08-02T08:54:00.000000Z'
+    }
+    $outputRoot=Join-Path $env:TTS_MORE_FIX9_ROOT 'powershell-context'
+    $runKey='{run_key}'
+    $captureRoot=Join-Path (Join-Path (Join-Path $outputRoot 'runs') $runKey) `
+        '.private-context'
+    $original=(Get-Location).Path
+    $raw=Invoke-LauncherFailureContextHelper -Mode 'evaluate-run' `
+        -PythonPath $env:TTS_MORE_FIX9_PYTHON `
+        -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
+        -OutputRoot $outputRoot -RunKey $runKey `
+        -RunOwnedTempRoot $captureRoot
 if((Get-Location).Path -ne $original){throw 'helper did not restore launcher working directory'}
-foreach($secret in @('steady-01-gpt-sovits',$outputRoot)){
+    foreach($secret in @('steady-01-indextts',$outputRoot)){
     if($raw.Contains($secret)){throw 'helper public output leaked raw context'}
 }
 $context=Get-LauncherPublicFailureContext `
-    -PythonPath $env:TTS_MORE_FIX9_PYTHON `
-    -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
-    -OutputRoot $outputRoot -BaselinePath $baseline `
-    -RunOwnedTempRoot (Split-Path -Parent $baseline) `
-    -RunStartedAt '2026-08-02T08:52:00.000000Z' `
-    -FailureObservedAt '2026-08-02T08:54:00.000000Z'
+        -PythonPath $env:TTS_MORE_FIX9_PYTHON `
+        -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
+        -OutputRoot $outputRoot -RunKey $runKey `
+        -RunOwnedTempRoot $captureRoot
 if($context.primary.code -ne 'case-execution-failed' -or
    $context.primary.stage -ne 'case' -or
-   $context.summary.completed_case_count -ne 0 -or
-   $context.case.case_id_sha256 -ne
-      'E2FF6E5CE91A9A30DD649EF9C791F37DAA0CDCDE02D8A98D29DF17FF01496AEB' -or
+       $context.summary.completed_case_count -ne 1 -or
+       $context.case.case_id_sha256 -ne
+          '{expected_case_sha256}' -or
    @($context.case_context_secondary_sha256).Count -ne 0){
     throw 'PowerShell did not consume the formal helper context'
 }
 $fallback=Get-LauncherPublicFailureContext `
-    -PythonPath $env:TTS_MORE_FIX9_PYTHON `
-    -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
-    -OutputRoot $outputRoot -BaselinePath (Join-Path $outputRoot 'missing.private.json') `
-    -RunOwnedTempRoot (Split-Path -Parent $baseline) `
-    -RunStartedAt '2026-08-02T08:52:00.000000Z' `
-    -FailureObservedAt '2026-08-02T08:54:00.000000Z'
+        -PythonPath $env:TTS_MORE_FIX9_PYTHON `
+        -WorkingDirectory $env:TTS_MORE_FIX9_BACKEND_ROOT `
+        -OutputRoot $outputRoot -RunKey ('8' * 64) `
+        -RunOwnedTempRoot $captureRoot
 if($fallback.primary.code -ne 'launcher-validation-failed' -or
    $fallback.primary.stage -ne 'validator' -or $null -ne $fallback.case -or
    @($fallback.case_context_secondary_sha256).Count -ne 1 -or
    $fallback.case_context_secondary_sha256[0] -ne
        (Get-Sha256Hex 'case-context-unbound')){
     throw 'helper failure did not produce the fixed hash-only unbound fallback'
-}
-if((Get-Location).Path -ne $original){throw 'fallback changed launcher working directory'}
-Write-Output 'FIX9_FORMAL_PYTHON_CONTEXT_READER_OK'
-"""
+    }
+    if((Get-Location).Path -ne $original){throw 'fallback changed launcher working directory'}
+    Write-Output 'FIX9_FORMAL_PYTHON_CONTEXT_READER_OK'
+    """.replace("{run_key}", TASK3_RUN_KEY).replace(
+        "{expected_case_sha256}", expected_case_sha256
+    )
     completed = _run_fix9_powershell_behavior(command, tmp_path)
     assert completed.returncode == 0, completed.stderr
     assert completed.stderr == ""
@@ -12735,3 +12723,551 @@ def test_task3_evaluate_run_cli_prints_only_verified_run_context(tmp_path: Path,
 
     assert result == 0
     assert json.loads(capsys.readouterr().out)["primary"]["code"] == "case-execution-failed"
+
+
+def test_task4_inner_absent_output_root_fails_closed_without_mutation(
+    tmp_path: Path,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    repository_root = Path(__file__).resolve().parents[2]
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text("{}", encoding="utf-8")
+    comfy_root = tmp_path / "comfy"
+    comfy_root.mkdir()
+    comfy_python = tmp_path / "comfy-python.exe"
+    comfy_python.write_bytes(b"")
+    output_root = tmp_path / "must-remain-absent"
+    before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(repository_root / "scripts" / "run-windows-comfyui-reliability.ps1"),
+            "-Fixture",
+            str(fixture_path),
+            "-OutputRoot",
+            str(output_root),
+            "-ComfyUiRoot",
+            str(comfy_root),
+            "-ComfyPython",
+            str(comfy_python),
+            "-TtsMoreRoot",
+            str(repository_root),
+            "-RunId",
+            "4" * 32,
+            "-PreflightOnly",
+        ],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+    )
+
+    assert completed.returncode == 7
+    assert completed.stdout == ""
+    assert completed.stderr.strip() == "Supervised reliability contract is invalid"
+    assert not output_root.exists()
+    assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")) == before
+
+
+def test_task4_inner_failure_context_uses_only_run_scoped_cli_contract(
+    tmp_path: Path,
+) -> None:
+    run_key = hashlib.sha256(("4" * 32).encode()).hexdigest()
+    output_root = tmp_path / "evidence"
+    capture_root = output_root / "runs" / run_key / ".private-capture"
+    capture_root.mkdir(parents=True)
+    run_failure = {
+        "code": "run-scoped-failure",
+        "stage": "case",
+        "failure_sha256": "A" * 64,
+        "summary_sha256": "B" * 64,
+    }
+    (capture_root.parent / "failure.json").write_text(
+        json.dumps(run_failure),
+        encoding="utf-8",
+    )
+    (output_root / "failure.json").write_text(
+        json.dumps(
+            {
+                "code": "legacy-contradiction",
+                "stage": "preflight",
+                "failure_sha256": "C" * 64,
+                "summary_sha256": "D" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_root = tmp_path / "task4-helper"
+    package_root = fake_root / "app" / "comfyui"
+    package_root.mkdir(parents=True)
+    (fake_root / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "launcher_failure_context.py").write_text(
+        """from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+
+Path("argv.json").write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+mode = sys.argv[1]
+arguments = dict(zip(sys.argv[2::2], sys.argv[3::2]))
+output_root = Path(arguments["--output-root"])
+if mode == "evaluate-run":
+    source = output_root / "runs" / arguments["--run-key"] / "failure.json"
+else:
+    source = output_root / "failure.json"
+document = json.loads(source.read_text(encoding="utf-8"))
+context = {
+    "schema_version": 1,
+    "kind": "launcher-failure-context",
+    "status": "failed",
+    "primary": {"code": document["code"], "stage": document["stage"]},
+    "failure_sha256": document["failure_sha256"],
+    "summary": {
+        "artifact_sha256": document["summary_sha256"],
+        "completed_case_count": 1,
+    },
+    "case": None,
+    "case_context_secondary_sha256": [],
+}
+print(json.dumps(context, separators=(",", ":")))
+""",
+        encoding="utf-8",
+    )
+    command = r"""
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
+)
+if($errors.Count -ne 0){throw($errors|Out-String)}
+foreach($name in @(
+    'Get-Sha256Hex','ConvertTo-WindowsCommandLineArgument',
+    'Invoke-LauncherFailureContextHelper','Get-LauncherPublicFailureContext'
+)){
+    $function=$ast.Find({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $name
+    },$true)
+    if($null -eq $function){throw "$name is missing"}
+    Invoke-Expression $function.Extent.Text
+}
+$outputRoot=Join-Path $env:TTS_MORE_FIX9_ROOT 'evidence'
+$runKey='{run_key}'
+$captureRoot=Join-Path (Join-Path (Join-Path $outputRoot 'runs') $runKey) `
+    '.private-capture'
+$context=Get-LauncherPublicFailureContext `
+    -PythonPath $env:TTS_MORE_FIX9_PYTHON `
+    -WorkingDirectory (Join-Path $env:TTS_MORE_FIX9_ROOT 'task4-helper') `
+    -OutputRoot $outputRoot -RunKey $runKey -RunOwnedTempRoot $captureRoot
+if($context.primary.code -cne 'run-scoped-failure' -or
+   $context.failure_sha256 -cne ('A' * 64) -or
+   $context.summary.artifact_sha256 -cne ('B' * 64)){
+    throw 'run-scoped failure commitments did not win'
+}
+Write-Output 'TASK4_RUN_SCOPED_FAILURE_CONTEXT_OK'
+""".replace("{run_key}", run_key)
+
+    completed = _run_fix9_powershell_behavior(command, tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert "TASK4_RUN_SCOPED_FAILURE_CONTEXT_OK" in completed.stdout
+    arguments = json.loads((fake_root / "argv.json").read_text(encoding="utf-8"))
+    assert arguments == [
+        "evaluate-run",
+        "--output-root",
+        str(output_root),
+        "--run-key",
+        run_key,
+    ]
+    assert not {
+        "snapshot",
+        "evaluate",
+        "--baseline-path",
+        "--run-started-at",
+        "--failure-observed-at",
+    }.intersection(arguments)
+
+
+def test_task4_i1_cleanup_authorization_requires_exact_run_owned_paths(
+    tmp_path: Path,
+) -> None:
+    command = r"""
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
+)
+if($errors.Count -ne 0){throw($errors|Out-String)}
+foreach($name in @('Test-OwnedTempRootCanBeRemoved','Remove-OwnedTempRoot')){
+    $function=$ast.Find({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $name
+    },$true)
+    if($null -eq $function){throw "$name is missing"}
+    Invoke-Expression $function.Extent.Text
+}
+$outputRoot=Join-Path $env:TTS_MORE_FIX9_ROOT 'evidence'
+$runKey=('4' * 64)
+$runRoot=Join-Path (Join-Path $outputRoot 'runs') $runKey
+$otherRunRoot=Join-Path (Join-Path $outputRoot 'runs') ('5' * 64)
+$expectedRunId=('4' * 32)
+New-Item -ItemType Directory -Path $runRoot -Force|Out-Null
+New-Item -ItemType Directory -Path $otherRunRoot -Force|Out-Null
+$exactRoot=Join-Path $runRoot '.p'
+$exactOwner=Join-Path $runRoot '.o'
+$sentinelBytes=[byte[]](0,1,2,127,128,254,255)
+
+function Write-Owner {
+    param(
+        [string]$Path,[string]$Root,[string]$RunId=$expectedRunId,
+        [string]$Runner=(Join-Path $Root 'runner'),
+        [string]$Comfy=(Join-Path (Join-Path $Root 'comfyui') 'temp')
+    )
+    @{run_id=$RunId;temp_root=[IO.Path]::GetFullPath($Root)
+      runner_temp_root=[IO.Path]::GetFullPath($Runner)
+      comfy_temp_root=[IO.Path]::GetFullPath($Comfy)} |
+        ConvertTo-Json -Compress | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+function Assert-RejectedWithoutMutation {
+    param(
+        [string]$Label,[string]$Root,[string]$Owner,
+        [string]$MarkerRoot=$Root,[string]$MarkerRunId=$expectedRunId,
+        [string]$MarkerRunner=(Join-Path $MarkerRoot 'runner'),
+        [string]$MarkerComfy=(Join-Path (Join-Path $MarkerRoot 'comfyui') 'temp')
+    )
+    New-Item -ItemType Directory -Path $Root -Force|Out-Null
+    $sentinel=Join-Path $Root 'sentinel.bin'
+    [IO.File]::WriteAllBytes($sentinel,$sentinelBytes)
+    Write-Owner -Path $Owner -Root $MarkerRoot -RunId $MarkerRunId `
+        -Runner $MarkerRunner -Comfy $MarkerComfy
+    $beforeSentinel=[Convert]::ToBase64String([IO.File]::ReadAllBytes($sentinel))
+    $beforeOwner=[Convert]::ToBase64String([IO.File]::ReadAllBytes($Owner))
+    if(Test-OwnedTempRootCanBeRemoved -Root $Root -OwnerMarker $Owner `
+            -ExpectedRunId $expectedRunId -ResolvedRunRoot $runRoot){
+        throw "$Label eligibility unexpectedly passed"
+    }
+    if(Remove-OwnedTempRoot -Root $Root -OwnerMarker $Owner `
+            -ExpectedRunId $expectedRunId -ResolvedRunRoot $runRoot){
+        throw "$Label removal unexpectedly passed"
+    }
+    if(-not (Test-Path -LiteralPath $sentinel -PathType Leaf) -or
+       -not (Test-Path -LiteralPath $Owner -PathType Leaf) -or
+       [Convert]::ToBase64String([IO.File]::ReadAllBytes($sentinel)) -cne $beforeSentinel -or
+       [Convert]::ToBase64String([IO.File]::ReadAllBytes($Owner)) -cne $beforeOwner){
+        throw "$Label mutated protected bytes"
+    }
+    Remove-Item -LiteralPath $Root -Recurse -Force
+    Remove-Item -LiteralPath $Owner -Force
+}
+
+Assert-RejectedWithoutMutation -Label 'legacy-root' `
+    -Root (Join-Path $outputRoot 'reliability-temp-legacy') -Owner $exactOwner
+Assert-RejectedWithoutMutation -Label 'child-root' `
+    -Root (Join-Path $exactRoot 'child') -Owner $exactOwner
+Assert-RejectedWithoutMutation -Label 'sibling-run' `
+    -Root (Join-Path $otherRunRoot '.p') -Owner $exactOwner
+Assert-RejectedWithoutMutation -Label 'marker-run-id' `
+    -Root $exactRoot -Owner $exactOwner -MarkerRunId ('6' * 32)
+Assert-RejectedWithoutMutation -Label 'marker-temp-root' `
+    -Root $exactRoot -Owner $exactOwner -MarkerRoot (Join-Path $exactRoot 'child')
+Assert-RejectedWithoutMutation -Label 'marker-runner-root' `
+    -Root $exactRoot -Owner $exactOwner `
+    -MarkerRunner (Join-Path $exactRoot 'wrong-runner')
+Assert-RejectedWithoutMutation -Label 'marker-comfy-root' `
+    -Root $exactRoot -Owner $exactOwner `
+    -MarkerComfy (Join-Path $exactRoot 'wrong-comfy')
+
+New-Item -ItemType Directory -Path (Join-Path $exactRoot 'runner') -Force|Out-Null
+New-Item -ItemType Directory -Path (Join-Path (Join-Path $exactRoot 'comfyui') 'temp') -Force|Out-Null
+[IO.File]::WriteAllBytes((Join-Path $exactRoot 'owned.bin'),$sentinelBytes)
+Write-Owner -Path $exactOwner -Root $exactRoot
+if(-not (Test-OwnedTempRootCanBeRemoved -Root $exactRoot -OwnerMarker $exactOwner `
+        -ExpectedRunId $expectedRunId -ResolvedRunRoot $runRoot)){
+    throw 'exact run-owned paths were rejected'
+}
+if(-not (Remove-OwnedTempRoot -Root $exactRoot -OwnerMarker $exactOwner `
+        -ExpectedRunId $expectedRunId -ResolvedRunRoot $runRoot)){
+    throw 'exact run-owned paths were not removed'
+}
+if((Test-Path -LiteralPath $exactRoot) -or (Test-Path -LiteralPath $exactOwner)){
+    throw 'exact run-owned cleanup did not converge'
+}
+Write-Output 'TASK4_I1_EXACT_CLEANUP_AUTHORIZATION_OK'
+"""
+
+    completed = _run_fix9_powershell_behavior(command, tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert "TASK4_I1_EXACT_CLEANUP_AUTHORIZATION_OK" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    [".p", ".o", ".h", ".c", ".co", ".ce", ".bo", ".be", ".l", ".s"],
+)
+def test_task4_i2_preexisting_reserved_ingress_fails_before_process_start(
+    tmp_path: Path,
+    reserved_name: str,
+) -> None:
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is unavailable")
+    repository_root = Path(__file__).resolve().parents[2]
+    run_id = "4" * 32
+    run_key = hashlib.sha256(run_id.encode()).hexdigest()
+    output_root = tmp_path / "evidence"
+    run_root = output_root / "runs" / run_key
+    run_root.mkdir(parents=True)
+    reserved_path = run_root / reserved_name
+    sentinel = b"TASK4-RESERVED-SENTINEL\x00\x7f\x80\xfe\xff"
+    if reserved_name == ".p":
+        reserved_path.mkdir()
+        (reserved_path / "sentinel.bin").write_bytes(sentinel)
+    else:
+        reserved_path.write_bytes(sentinel)
+
+    fixture_root = tmp_path / "fixture"
+    fixture_root.mkdir()
+    resources: dict[str, dict[str, str]] = {}
+    for engine in ("gpt-sovits", "indextts", "cosyvoice"):
+        reference_name = f"{engine}.wav"
+        (fixture_root / reference_name).write_bytes(b"RIFF-test")
+        resources[engine] = {"reference_audio": reference_name}
+    fixture_path = fixture_root / "fixture.json"
+    fixture_path.write_text(json.dumps({"resources": resources}), encoding="utf-8")
+
+    comfy_root = tmp_path / "ComfyUI"
+    (comfy_root / "custom_nodes" / "TTS-Audio-Suite").mkdir(parents=True)
+    model_roots = {}
+    for name in ("gpt", "index", "cosy"):
+        model_root = tmp_path / name
+        model_root.mkdir()
+        model_roots[name] = model_root
+    registry_path = tmp_path / "resources.json"
+    registry_path.write_text("{}", encoding="utf-8")
+    trap_path = tmp_path / "process-started.bin"
+
+    def snapshot() -> list[tuple[str, bool, bytes | None]]:
+        return [
+            (
+                path.relative_to(run_root).as_posix(),
+                path.is_dir(),
+                None if path.is_dir() else path.read_bytes(),
+            )
+            for path in sorted(run_root.rglob("*"))
+        ]
+
+    before = snapshot()
+    command = r"""
+function Start-Process {
+    [IO.File]::WriteAllBytes($env:TTS_MORE_TASK4_PROCESS_TRAP,[byte[]](1))
+    throw 'process start trap reached'
+}
+& $env:TTS_MORE_RELIABILITY_SCRIPT `
+    -Fixture $env:TTS_MORE_TASK4_FIXTURE `
+    -OutputRoot $env:TTS_MORE_TASK4_OUTPUT `
+    -ComfyUiRoot $env:TTS_MORE_TASK4_COMFY `
+    -ComfyPython $env:TTS_MORE_TASK4_PYTHON `
+    -TtsMoreRoot $env:TTS_MORE_TASK4_REPOSITORY `
+    -RunId ('4' * 32) -PreflightOnly
+"""
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TTS_MORE_RELIABILITY_SCRIPT": str(
+                repository_root / "scripts" / "run-windows-comfyui-reliability.ps1"
+            ),
+            "TTS_MORE_TASK4_FIXTURE": str(fixture_path),
+            "TTS_MORE_TASK4_OUTPUT": str(output_root),
+            "TTS_MORE_TASK4_COMFY": str(comfy_root),
+            "TTS_MORE_TASK4_PYTHON": powershell,
+            "TTS_MORE_TASK4_REPOSITORY": str(repository_root),
+            "TTS_MORE_TASK4_PROCESS_TRAP": str(trap_path),
+            "TTS_MORE_RELIABILITY_GPT_SOVITS_ROOT": str(model_roots["gpt"]),
+            "TTS_MORE_RELIABILITY_INDEXTTS_ROOT": str(model_roots["index"]),
+            "TTS_MORE_RELIABILITY_COSYVOICE_ROOT": str(model_roots["cosy"]),
+            "TTS_AUDIO_SUITE_RESOURCES": str(registry_path),
+        }
+    )
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert completed.stderr.strip() == "Supervised reliability contract is invalid"
+    assert not trap_path.exists()
+    assert snapshot() == before
+
+
+def test_task4_i2_lifecycle_replacement_requires_exact_identity(
+    tmp_path: Path,
+) -> None:
+    command = r"""
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
+)
+if($errors.Count -ne 0){throw($errors|Out-String)}
+$function=$ast.Find({param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Write-LauncherFailureLifecycleAtomic'
+},$true)
+if($null -eq $function){throw 'Write-LauncherFailureLifecycleAtomic is missing'}
+Invoke-Expression $function.Extent.Text
+function Assert-LauncherFailureLifecycleDocument { param([object]$Document) }
+function New-Lifecycle {
+    param([string]$RunHash,[string]$PrimaryCode,[string]$CleanupState)
+    [ordered]@{
+        schema_version=1;kind='launcher-failure-lifecycle';status='failed'
+        run_id_sha256=$RunHash
+        primary=[ordered]@{code=$PrimaryCode;stage='case'}
+        validation=[ordered]@{failure_sha256=('B'*64);summary_sha256=('C'*64);completed_case_count=1}
+        case=[ordered]@{case_id_sha256=('D'*64);artifact_sha256=('E'*64);started_at='2026-08-03T00:00:00Z';finished_at='2026-08-03T00:00:01Z';context_secondary_sha256=@()}
+        timestamps=[ordered]@{run_started_at='2026-08-03T00:00:00Z';snapshot_written_at='2026-08-03T00:00:02Z';cleanup_finished_at=$null}
+        processes=@([ordered]@{role='comfyui';pid=1})
+        promotion_ownership_sha256=('F'*64)
+        cleanup=[ordered]@{state=$CleanupState}
+    }
+}
+$path=Join-Path $env:TTS_MORE_FIX9_ROOT '.l'
+$initial=New-Lifecycle -RunHash ('A'*64) -PrimaryCode 'case-execution-failed' `
+    -CleanupState 'snapshot-written'
+Write-LauncherFailureLifecycleAtomic -Path $path -Document $initial
+$updated=New-Lifecycle -RunHash ('A'*64) -PrimaryCode 'case-execution-failed' `
+    -CleanupState 'cleanup-proven'
+Write-LauncherFailureLifecycleAtomic -Path $path -Document $updated
+$before=[Convert]::ToBase64String([IO.File]::ReadAllBytes($path))
+$caught=$null
+try {
+    $contradictory=New-Lifecycle -RunHash ('A'*64) -PrimaryCode 'different-run-identity' `
+        -CleanupState 'cleanup-proven'
+    Write-LauncherFailureLifecycleAtomic -Path $path -Document $contradictory
+} catch { $caught=$_ }
+if($null -eq $caught){throw 'contradictory lifecycle identity replaced the owned file'}
+if([Convert]::ToBase64String([IO.File]::ReadAllBytes($path)) -cne $before){
+    throw 'rejected lifecycle replacement mutated the owned file'
+}
+Write-Output 'TASK4_I2_EXACT_LIFECYCLE_REPLACEMENT_OK'
+"""
+
+    completed = _run_fix9_powershell_behavior(command, tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert "TASK4_I2_EXACT_LIFECYCLE_REPLACEMENT_OK" in completed.stdout
+
+
+def test_task4_i3_private_identity_removal_is_exactly_run_scoped(
+    tmp_path: Path,
+) -> None:
+    command = r"""
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+$tokens=$null;$errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile(
+    $env:TTS_MORE_RELIABILITY_SCRIPT,[ref]$tokens,[ref]$errors
+)
+if($errors.Count -ne 0){throw($errors|Out-String)}
+foreach($name in @(
+    'Test-PrivateIdentityRecordsCanBeRemoved','Remove-PrivateIdentityRecordsIfSafe'
+)){
+    $function=$ast.Find({param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $name
+    },$true)
+    if($null -eq $function){throw "$name is missing"}
+    Invoke-Expression $function.Extent.Text
+}
+$outputRoot=Join-Path $env:TTS_MORE_FIX9_ROOT 'evidence'
+$runRoot=Join-Path (Join-Path $outputRoot 'runs') ('4'*64)
+$siblingRoot=Join-Path (Join-Path $outputRoot 'runs') ('5'*64)
+New-Item -ItemType Directory -Path $runRoot -Force|Out-Null
+New-Item -ItemType Directory -Path $siblingRoot -Force|Out-Null
+$sentinelBytes=[byte[]](0,3,7,127,128,251,255)
+
+function Assert-RejectedPair {
+    param([string]$Label,[string]$HostPath,[string]$ControlPath)
+    New-Item -ItemType Directory -Path (Split-Path -Parent $HostPath) -Force|Out-Null
+    New-Item -ItemType Directory -Path (Split-Path -Parent $ControlPath) -Force|Out-Null
+    [IO.File]::WriteAllBytes($HostPath,$sentinelBytes)
+    [IO.File]::WriteAllBytes($ControlPath,$sentinelBytes)
+    $beforeHost=[Convert]::ToBase64String([IO.File]::ReadAllBytes($HostPath))
+    $beforeControl=[Convert]::ToBase64String([IO.File]::ReadAllBytes($ControlPath))
+    if(Remove-PrivateIdentityRecordsIfSafe `
+            -ResolvedRunRoot $runRoot `
+            -HostManifestPath $HostPath -ControlStatePath $ControlPath `
+            -ProcessCleanupProven $true -TempCleanupProven $true `
+            -OwnedProcessCount 2){
+        throw "$Label removal unexpectedly passed"
+    }
+    if(-not (Test-Path -LiteralPath $HostPath -PathType Leaf) -or
+       -not (Test-Path -LiteralPath $ControlPath -PathType Leaf) -or
+       [Convert]::ToBase64String([IO.File]::ReadAllBytes($HostPath)) -cne $beforeHost -or
+       [Convert]::ToBase64String([IO.File]::ReadAllBytes($ControlPath)) -cne $beforeControl){
+        throw "$Label mutated protected identity bytes"
+    }
+    Remove-Item -LiteralPath $HostPath -Force
+    Remove-Item -LiteralPath $ControlPath -Force
+}
+
+Assert-RejectedPair -Label 'shared-root' `
+    -HostPath (Join-Path $outputRoot '.h') -ControlPath (Join-Path $outputRoot '.c')
+Assert-RejectedPair -Label 'sibling-run' `
+    -HostPath (Join-Path $siblingRoot '.h') -ControlPath (Join-Path $siblingRoot '.c')
+Assert-RejectedPair -Label 'run-child' `
+    -HostPath (Join-Path (Join-Path $runRoot 'child') '.h') `
+    -ControlPath (Join-Path (Join-Path $runRoot 'child') '.c')
+Assert-RejectedPair -Label 'mixed-exact-and-shared' `
+    -HostPath (Join-Path $runRoot '.h') -ControlPath (Join-Path $outputRoot '.c')
+
+$exactHost=Join-Path $runRoot '.h'
+$exactControl=Join-Path $runRoot '.c'
+[IO.File]::WriteAllBytes($exactHost,$sentinelBytes)
+[IO.File]::WriteAllBytes($exactControl,$sentinelBytes)
+if(-not (Remove-PrivateIdentityRecordsIfSafe `
+        -ResolvedRunRoot $runRoot `
+        -HostManifestPath $exactHost -ControlStatePath $exactControl `
+        -ProcessCleanupProven $true -TempCleanupProven $true `
+        -OwnedProcessCount 2)){
+    throw 'exact run identity records were not removed'
+}
+if((Test-Path -LiteralPath $exactHost) -or (Test-Path -LiteralPath $exactControl)){
+    throw 'exact run identity cleanup did not converge'
+}
+Write-Output 'TASK4_I3_EXACT_PRIVATE_IDENTITY_REMOVAL_OK'
+"""
+
+    completed = _run_fix9_powershell_behavior(command, tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert "TASK4_I3_EXACT_PRIVATE_IDENTITY_REMOVAL_OK" in completed.stdout

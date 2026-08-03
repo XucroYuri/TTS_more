@@ -5,12 +5,20 @@ param(
     [Parameter(Mandatory = $true)] [string] $ComfyUiRoot,
     [Parameter(Mandatory = $true)] [string] $ComfyPython,
     [Parameter(Mandatory = $true)] [string] $TtsMoreRoot,
+    [string] $RunId,
     [switch] $AllowLan,
     [switch] $PreflightOnly
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if (
+    [string]::IsNullOrEmpty($RunId) -or
+    $RunId -cnotmatch '^[0-9a-f]{32}$'
+) {
+    [Console]::Error.WriteLine('Supervised reliability contract is invalid')
+    exit 7
+}
 
 function Resolve-ExistingPath {
     param([string] $LiteralPath, [ValidateSet('File', 'Directory')] [string] $Kind)
@@ -19,6 +27,23 @@ function Resolve-ExistingPath {
     if ($Kind -eq 'File' -and -not $item.PSIsContainer) { return $item.FullName }
     if ($Kind -eq 'Directory' -and $item.PSIsContainer) { return $item.FullName }
     throw "Expected an existing $Kind"
+}
+
+function Write-NewUtf8TextFile {
+    param([string] $Path, [string] $Value)
+    $bytes = (New-Object Text.UTF8Encoding($false, $true)).GetBytes($Value)
+    $stream = [IO.File]::Open(
+        $Path,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
 }
 
 function Get-PortOwnerPid {
@@ -1237,12 +1262,45 @@ function Test-PrivateIdentityRecordsCanBeRemoved {
 
 function Remove-PrivateIdentityRecordsIfSafe {
     param(
+        [string] $ResolvedRunRoot,
         [string] $HostManifestPath,
         [string] $ControlStatePath,
         [bool] $ProcessCleanupProven,
         [bool] $TempCleanupProven,
         [int] $OwnedProcessCount
     )
+    try {
+        $runRootPath = (Resolve-Path -LiteralPath $ResolvedRunRoot -ErrorAction Stop).Path
+        $expectedHostManifestPath = [IO.Path]::GetFullPath((Join-Path $runRootPath '.h'))
+        $expectedControlStatePath = [IO.Path]::GetFullPath((Join-Path $runRootPath '.c'))
+        $resolvedHostManifestPath = [IO.Path]::GetFullPath($HostManifestPath)
+        $resolvedControlStatePath = [IO.Path]::GetFullPath($ControlStatePath)
+        if (
+            -not $resolvedHostManifestPath.Equals(
+                $expectedHostManifestPath,
+                [StringComparison]::OrdinalIgnoreCase
+            ) -or
+            -not $resolvedControlStatePath.Equals(
+                $expectedControlStatePath,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        ) {
+            Write-Warning 'Private process identity paths are not run-owned; preserving them'
+            return $false
+        }
+        foreach ($privateRecord in @($resolvedControlStatePath, $resolvedHostManifestPath)) {
+            if (-not (Test-Path -LiteralPath $privateRecord)) { continue }
+            $recordItem = Get-Item -LiteralPath $privateRecord -Force -ErrorAction Stop
+            if ($recordItem.PSIsContainer -or
+                ([int] $recordItem.Attributes -band [int] [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Write-Warning 'Private process identity record is invalid; preserving records'
+                return $false
+            }
+        }
+    } catch {
+        Write-Warning 'Private process identity paths could not be validated; preserving records'
+        return $false
+    }
     if (-not (Test-PrivateIdentityRecordsCanBeRemoved `
             -ProcessCleanupProven $ProcessCleanupProven `
             -TempCleanupProven $TempCleanupProven `
@@ -1252,7 +1310,7 @@ function Remove-PrivateIdentityRecordsIfSafe {
     }
     # Remove current state first so a partial deletion still leaves the full
     # launch manifest as the unique recovery identity record.
-    foreach ($privateRecord in @($ControlStatePath, $HostManifestPath)) {
+    foreach ($privateRecord in @($resolvedControlStatePath, $resolvedHostManifestPath)) {
         if (-not (Test-Path -LiteralPath $privateRecord -PathType Leaf)) { continue }
         try {
             Remove-Item -LiteralPath $privateRecord -Force -ErrorAction Stop
@@ -1262,46 +1320,41 @@ function Remove-PrivateIdentityRecordsIfSafe {
         }
     }
     return (
-        -not (Test-Path -LiteralPath $HostManifestPath) -and
-        -not (Test-Path -LiteralPath $ControlStatePath)
+        -not (Test-Path -LiteralPath $resolvedHostManifestPath) -and
+        -not (Test-Path -LiteralPath $resolvedControlStatePath)
     )
 }
 
 function Remove-OwnedTempRoot {
-    param([string] $Root, [string] $OwnerMarker, [string] $ExpectedRunId, [string] $ResolvedOutputRoot)
-    $rootExists = Test-Path -LiteralPath $Root
-    $resolvedRoot = if ($rootExists) {
-        (Resolve-Path -LiteralPath $Root).Path
-    } else {
-        [IO.Path]::GetFullPath($Root)
-    }
-    $prefix = $ResolvedOutputRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
-    if (-not $resolvedRoot.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
-        Write-Warning 'Validation temp root escaped the output root; preserving it'
+    param(
+        [string] $Root,
+        [string] $OwnerMarker,
+        [string] $ExpectedRunId,
+        [string] $ResolvedRunRoot
+    )
+    if (-not (Test-OwnedTempRootCanBeRemoved `
+            -Root $Root -OwnerMarker $OwnerMarker `
+            -ExpectedRunId $ExpectedRunId `
+            -ResolvedRunRoot $ResolvedRunRoot)) {
+        Write-Warning 'Validation temp ownership is invalid; preserving run artifacts'
         return $false
     }
-    if (-not (Test-Path -LiteralPath $OwnerMarker -PathType Leaf)) {
-        if (-not $rootExists) { return $true }
-        Write-Warning 'Validation temp owner marker is missing; preserving the temp root'
-        return $false
-    }
+    $resolvedRoot = [IO.Path]::GetFullPath($Root)
+    $resolvedOwnerMarker = [IO.Path]::GetFullPath($OwnerMarker)
     try {
-        $owner = Get-Content -LiteralPath $OwnerMarker -Raw | ConvertFrom-Json
-        if ($owner.run_id -ne $ExpectedRunId -or $owner.temp_root -ne $resolvedRoot) {
-            Write-Warning 'Validation temp owner marker does not match; preserving the temp root'
-            return $false
-        }
-        if ($rootExists) {
+        if (Test-Path -LiteralPath $resolvedRoot) {
             Remove-Item -LiteralPath $resolvedRoot -Recurse -Force -ErrorAction Stop
         }
-        Remove-Item -LiteralPath $OwnerMarker -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $resolvedOwnerMarker -PathType Leaf) {
+            Remove-Item -LiteralPath $resolvedOwnerMarker -Force -ErrorAction Stop
+        }
     } catch {
         Write-Warning 'Validation temp cleanup failed; preserving remaining owned artifacts'
         return $false
     }
     return (
         -not (Test-Path -LiteralPath $resolvedRoot) -and
-        -not (Test-Path -LiteralPath $OwnerMarker)
+        -not (Test-Path -LiteralPath $resolvedOwnerMarker)
     )
 }
 
@@ -1310,24 +1363,43 @@ function Test-OwnedTempRootCanBeRemoved {
         [string] $Root,
         [string] $OwnerMarker,
         [string] $ExpectedRunId,
-        [string] $ResolvedOutputRoot
+        [string] $ResolvedRunRoot
     )
     try {
+        $resolvedRunRootPath = (Resolve-Path -LiteralPath $ResolvedRunRoot -ErrorAction Stop).Path
+        $expectedRoot = [IO.Path]::GetFullPath((Join-Path $resolvedRunRootPath '.p'))
+        $expectedOwnerMarker = [IO.Path]::GetFullPath((Join-Path $resolvedRunRootPath '.o'))
         $rootExists = Test-Path -LiteralPath $Root
         $resolvedRoot = if ($rootExists) {
             (Resolve-Path -LiteralPath $Root).Path
         } else {
             [IO.Path]::GetFullPath($Root)
         }
-        $prefix = $ResolvedOutputRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) +
-            [IO.Path]::DirectorySeparatorChar
-        if (-not $resolvedRoot.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        $resolvedOwnerMarker = [IO.Path]::GetFullPath($OwnerMarker)
+        if (
+            -not $resolvedRoot.Equals($expectedRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $resolvedOwnerMarker.Equals(
+                $expectedOwnerMarker,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        ) {
             return $false
         }
-        if (-not (Test-Path -LiteralPath $OwnerMarker -PathType Leaf)) {
+        if ($rootExists) {
+            $rootItem = Get-Item -LiteralPath $resolvedRoot -Force -ErrorAction Stop
+            if (-not $rootItem.PSIsContainer -or
+                ([int] $rootItem.Attributes -band [int] [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return $false
+            }
+        }
+        if (-not (Test-Path -LiteralPath $resolvedOwnerMarker -PathType Leaf)) {
             return -not $rootExists
         }
-        $owner = Get-Content -LiteralPath $OwnerMarker -Raw | ConvertFrom-Json
+        $ownerItem = Get-Item -LiteralPath $resolvedOwnerMarker -Force -ErrorAction Stop
+        if (([int] $ownerItem.Attributes -band [int] [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+        $owner = Get-Content -LiteralPath $resolvedOwnerMarker -Raw | ConvertFrom-Json
         $ownerNames = @($owner.PSObject.Properties.Name)
         if (
             $ownerNames.Count -ne 4 -or
@@ -1337,7 +1409,11 @@ function Test-OwnedTempRootCanBeRemoved {
         ) { return $false }
         return (
             [string] $owner.run_id -ceq $ExpectedRunId -and
-            [string] $owner.temp_root -ceq $resolvedRoot
+            [string] $owner.temp_root -ceq $expectedRoot -and
+            [string] $owner.runner_temp_root -ceq (Join-Path $expectedRoot 'runner') -and
+            [string] $owner.comfy_temp_root -ceq (
+                Join-Path (Join-Path $expectedRoot 'comfyui') 'temp'
+            )
         )
     } catch {
         return $false
@@ -1362,6 +1438,10 @@ function Invoke-ReliabilityValidator {
     try {
         & $PythonPath @ValidatorArguments
         $validatorExitCode = $LASTEXITCODE
+        if ($null -eq $validatorExitCode -or $validatorExitCode -isnot [int]) {
+            throw 'Windows ComfyUI reliability validator exit is invalid'
+        }
+        $script:formalValidatorExitCode = [int] $validatorExitCode
     } finally {
         Pop-Location
     }
@@ -1818,6 +1898,43 @@ function Write-LauncherFailureLifecycleAtomic {
     param([string] $Path, [object] $Document)
     $normalized = $Document | ConvertTo-Json -Depth 12 | ConvertFrom-Json
     Assert-LauncherFailureLifecycleDocument -Document $normalized
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $existing = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        Assert-LauncherFailureLifecycleDocument -Document $existing
+        $existingIdentity = [ordered]@{
+            schema_version = $existing.schema_version
+            kind = $existing.kind
+            status = $existing.status
+            run_id_sha256 = $existing.run_id_sha256
+            primary = $existing.primary
+            validation = $existing.validation
+            case = $existing.case
+            run_started_at = $existing.timestamps.run_started_at
+            snapshot_written_at = $existing.timestamps.snapshot_written_at
+            processes = $existing.processes
+            promotion_ownership_sha256 = $existing.promotion_ownership_sha256
+        }
+        $replacementIdentity = [ordered]@{
+            schema_version = $normalized.schema_version
+            kind = $normalized.kind
+            status = $normalized.status
+            run_id_sha256 = $normalized.run_id_sha256
+            primary = $normalized.primary
+            validation = $normalized.validation
+            case = $normalized.case
+            run_started_at = $normalized.timestamps.run_started_at
+            snapshot_written_at = $normalized.timestamps.snapshot_written_at
+            processes = $normalized.processes
+            promotion_ownership_sha256 = $normalized.promotion_ownership_sha256
+        }
+        if (
+            ($existingIdentity | ConvertTo-Json -Depth 12 -Compress) -cne
+            ($replacementIdentity | ConvertTo-Json -Depth 12 -Compress)
+        ) {
+            throw 'Existing launcher lifecycle identity does not match this run'
+        }
+    }
     $temporaryPath = '{0}.{1}.tmp' -f $Path, [Guid]::NewGuid().ToString('N')
     $backupPath = '{0}.{1}.bak' -f $Path, [Guid]::NewGuid().ToString('N')
     try {
@@ -2058,29 +2175,21 @@ function Invoke-LauncherCleanupTransaction {
 
 function Invoke-LauncherFailureContextHelper {
     param(
-        [ValidateSet('snapshot', 'evaluate')] [string] $Mode,
+        [ValidateSet('evaluate-run')] [string] $Mode,
         [string] $PythonPath,
         [string] $WorkingDirectory,
         [string] $OutputRoot,
-        [string] $BaselinePath,
-        [string] $RunOwnedTempRoot,
-        [AllowNull()] [object] $RunStartedAt,
-        [AllowNull()] [object] $FailureObservedAt
+        [string] $RunKey,
+        [string] $RunOwnedTempRoot
     )
+    if ($RunKey -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'Launcher failure context run key is invalid'
+    }
     $arguments = @(
         '-m', 'app.comfyui.launcher_failure_context', $Mode,
         '--output-root', $OutputRoot,
-        '--baseline-path', $BaselinePath
+        '--run-key', $RunKey
     )
-    if ($Mode -eq 'evaluate') {
-        if ($null -eq $RunStartedAt -or $null -eq $FailureObservedAt) {
-            throw 'Launcher failure context evaluation bounds are missing'
-        }
-        $arguments += @(
-            '--run-started-at', (ConvertTo-PublicUtcTimestamp -Value $RunStartedAt),
-            '--failure-observed-at', (ConvertTo-PublicUtcTimestamp -Value $FailureObservedAt)
-        )
-    }
     $resolvedOutputRoot = (Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop).Path
     $resolvedCaptureRoot = (
         Resolve-Path -LiteralPath $RunOwnedTempRoot -ErrorAction Stop
@@ -2088,26 +2197,17 @@ function Invoke-LauncherFailureContextHelper {
     $captureItem = Get-Item -LiteralPath $resolvedCaptureRoot -ErrorAction Stop
     $outputPrefix = $resolvedOutputRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) +
         [IO.Path]::DirectorySeparatorChar
-    $baselineParent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($BaselinePath))
     if (
         -not $captureItem.PSIsContainer -or
         ([int] $captureItem.Attributes -band [int] [IO.FileAttributes]::ReparsePoint) -ne 0 -or
         -not $resolvedCaptureRoot.StartsWith(
             $outputPrefix,
             [StringComparison]::OrdinalIgnoreCase
-        ) -or
-        -not $baselineParent.Equals(
-            $resolvedCaptureRoot,
-            [StringComparison]::OrdinalIgnoreCase
         )
     ) { throw 'Launcher failure context capture root is invalid' }
     $captureId = [Guid]::NewGuid().ToString('N')
-    $stdoutPath = Join-Path $resolvedCaptureRoot (
-        '.launcher-failure-context-{0}.stdout.capture' -f $captureId
-    )
-    $stderrPath = Join-Path $resolvedCaptureRoot (
-        '.launcher-failure-context-{0}.stderr.capture' -f $captureId
-    )
+    $stdoutPath = Join-Path $resolvedCaptureRoot ('.{0}.o' -f $captureId)
+    $stderrPath = Join-Path $resolvedCaptureRoot ('.{0}.e' -f $captureId)
     $encodedArguments = (@(
         foreach ($argument in $arguments) {
             ConvertTo-WindowsCommandLineArgument -Argument $argument
@@ -2167,12 +2267,6 @@ function Invoke-LauncherFailureContextHelper {
         $null -eq $stderrLength -or $stderrLength -ne 0) {
         throw 'Launcher failure context helper failed'
     }
-    if ($Mode -eq 'snapshot') {
-        if ($null -eq $stdoutBytes -or $stdoutBytes.Length -ne 0) {
-            throw 'Launcher failure context snapshot output is invalid'
-        }
-        return ''
-    }
     if ($null -eq $stdoutBytes -or $stdoutBytes.Length -lt 1) {
         throw 'Launcher failure context helper output is invalid'
     }
@@ -2216,17 +2310,14 @@ function Get-LauncherPublicFailureContext {
         [string] $PythonPath,
         [string] $WorkingDirectory,
         [string] $OutputRoot,
-        [string] $BaselinePath,
-        [string] $RunOwnedTempRoot,
-        [object] $RunStartedAt,
-        [object] $FailureObservedAt
+        [string] $RunKey,
+        [string] $RunOwnedTempRoot
     )
     try {
-        $rendered = Invoke-LauncherFailureContextHelper -Mode 'evaluate' `
+        $rendered = Invoke-LauncherFailureContextHelper -Mode 'evaluate-run' `
             -PythonPath $PythonPath -WorkingDirectory $WorkingDirectory `
-            -OutputRoot $OutputRoot -BaselinePath $BaselinePath `
-            -RunOwnedTempRoot $RunOwnedTempRoot `
-            -RunStartedAt $RunStartedAt -FailureObservedAt $FailureObservedAt
+            -OutputRoot $OutputRoot -RunKey $RunKey `
+            -RunOwnedTempRoot $RunOwnedTempRoot
         return $rendered | ConvertFrom-Json -ErrorAction Stop
     } catch {
         return [pscustomobject]@{
@@ -2247,6 +2338,7 @@ function Get-LauncherPublicFailureContext {
     }
 }
 
+$runIdSha256 = (Get-Sha256Hex -Value $runId).ToLowerInvariant()
 $fixturePath = Resolve-ExistingPath -LiteralPath $Fixture -Kind File
 $comfyRootPath = Resolve-ExistingPath -LiteralPath $ComfyUiRoot -Kind Directory
 $comfyPythonPath = Resolve-ExistingPath -LiteralPath $ComfyPython -Kind File
@@ -2255,12 +2347,17 @@ $backendRootPath = Resolve-ExistingPath -LiteralPath (Join-Path $ttsRootPath 'ba
 $backendPythonPath = Resolve-ExistingPath -LiteralPath (Join-Path $ttsRootPath 'backend\.venv\Scripts\python.exe') -Kind File
 $fixtureDocument = Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json
 
-if (-not (Test-Path -LiteralPath $OutputRoot)) {
-    New-Item -ItemType Directory -Path $OutputRoot | Out-Null
-}
-$outputRootPath = (Resolve-Path -LiteralPath $OutputRoot).Path
-if ($outputRootPath -eq [IO.Path]::GetPathRoot($outputRootPath)) {
-    throw 'OutputRoot must not be a drive root'
+try {
+    $outputRootPath = Resolve-ExistingPath -LiteralPath $OutputRoot -Kind Directory
+    if ($outputRootPath -eq [IO.Path]::GetPathRoot($outputRootPath)) {
+        throw 'OutputRoot must not be a drive root'
+    }
+    $runEvidenceRoot = Resolve-ExistingPath -LiteralPath (
+        Join-Path (Join-Path $outputRootPath 'runs') $runIdSha256
+    ) -Kind Directory
+} catch {
+    [Console]::Error.WriteLine('Supervised reliability contract is invalid')
+    exit 7
 }
 
 $suiteCandidate = Join-Path $comfyRootPath 'custom_nodes\TTS-Audio-Suite'
@@ -2280,45 +2377,49 @@ foreach ($engine in @('gpt-sovits', 'indextts', 'cosyvoice')) {
 }
 
 $runStartedAt = [DateTime]::UtcNow
-$runId = [Guid]::NewGuid().ToString('N')
-$runIdSha256 = Get-Sha256Hex -Value $runId
-$launcherLifecyclePath = Join-Path $outputRootPath (
-    'launcher-failure-lifecycle-{0}.json' -f $runIdSha256
+$launcherLifecyclePath = Join-Path $runEvidenceRoot '.l'
+$launcherLifecycleSecondaryPath = Join-Path $runEvidenceRoot '.s'
+$comfyStdoutPath = Join-Path $runEvidenceRoot '.co'
+$comfyStderrPath = Join-Path $runEvidenceRoot '.ce'
+$backendStdoutPath = Join-Path $runEvidenceRoot '.bo'
+$backendStderrPath = Join-Path $runEvidenceRoot '.be'
+$tempRoot = Join-Path $runEvidenceRoot '.p'
+$tempOwnerMarker = Join-Path $runEvidenceRoot '.o'
+$hostManifestPath = Join-Path $runEvidenceRoot '.h'
+$controlStatePath = Join-Path $runEvidenceRoot '.c'
+$reservedRunPaths = @(
+    $tempRoot, $tempOwnerMarker, $hostManifestPath, $controlStatePath,
+    $comfyStdoutPath, $comfyStderrPath, $backendStdoutPath, $backendStderrPath,
+    $launcherLifecyclePath, $launcherLifecycleSecondaryPath
 )
-$launcherLifecycleSecondaryPath = Join-Path $outputRootPath (
-    'launcher-failure-lifecycle-secondary-{0}.json' -f $runIdSha256
-)
-$comfyStdoutPath = Join-Path $outputRootPath (".comfyui-{0}.stdout.log" -f $runId)
-$comfyStderrPath = Join-Path $outputRootPath (".comfyui-{0}.stderr.log" -f $runId)
-$backendStdoutPath = Join-Path $outputRootPath (".tts-more-{0}.stdout.log" -f $runId)
-$backendStderrPath = Join-Path $outputRootPath (".tts-more-{0}.stderr.log" -f $runId)
+foreach ($reservedRunPath in $reservedRunPaths) {
+    if (Test-Path -LiteralPath $reservedRunPath) {
+        [Console]::Error.WriteLine('Supervised reliability contract is invalid')
+        exit 7
+    }
+}
 foreach ($sidecarPath in @(
     $comfyStdoutPath, $comfyStderrPath, $backendStdoutPath, $backendStderrPath
 )) {
     New-Item -ItemType File -Path $sidecarPath -ErrorAction Stop | Out-Null
 }
-$tempRoot = Join-Path $outputRootPath ("reliability-temp-{0}" -f $runId)
 $runnerTempRoot = Join-Path $tempRoot 'runner'
 $comfyTempBase = Join-Path $tempRoot 'comfyui'
 $comfyTempRoot = Join-Path $comfyTempBase 'temp'
-foreach ($directory in @($runnerTempRoot, $comfyTempRoot)) {
-    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+foreach ($directory in @($tempRoot, $runnerTempRoot, $comfyTempBase, $comfyTempRoot)) {
+    New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
 }
 $tempRoot = (Resolve-Path -LiteralPath $tempRoot).Path
 $runnerTempRoot = (Resolve-Path -LiteralPath $runnerTempRoot).Path
 $comfyTempBase = (Resolve-Path -LiteralPath $comfyTempBase).Path
 $comfyTempRoot = (Resolve-Path -LiteralPath $comfyTempRoot).Path
-$failureEvidenceBaselinePath = Join-Path `
-    $tempRoot 'launcher-failure-context-baseline.private.json'
-$tempOwnerMarker = Join-Path $outputRootPath (".request-temp-{0}.owner.json" -f $runId)
-@{
+$tempOwnerDocument = @{
     run_id = $runId
     temp_root = $tempRoot
     runner_temp_root = $runnerTempRoot
     comfy_temp_root = $comfyTempRoot
-} | ConvertTo-Json -Compress | Set-Content -LiteralPath $tempOwnerMarker -Encoding UTF8
-$hostManifestPath = Join-Path $outputRootPath (".host-manifest-{0}.private.json" -f $runId)
-$controlStatePath = "{0}.current.json" -f $hostManifestPath
+} | ConvertTo-Json -Compress
+Write-NewUtf8TextFile -Path $tempOwnerMarker -Value $tempOwnerDocument
 
 $comfyRecord = $null
 $backendRecord = $null
@@ -2329,6 +2430,7 @@ $provisionalCleanupFailed = $false
 $primaryFailure = $null
 $cleanupFailure = $null
 $formalValidatorInvoked = $false
+$formalValidatorExitCode = $null
 $validatorStartedAt = $null
 $validatorFinishedAt = $null
 try {
@@ -2454,22 +2556,20 @@ try {
         }
         temp_roots = @($runnerTempRoot, $comfyTempRoot)
     }
-    $hostManifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $hostManifestPath -Encoding UTF8
+    Write-NewUtf8TextFile -Path $hostManifestPath `
+        -Value ($hostManifest | ConvertTo-Json -Depth 10)
 
     $pythonArguments = @(
         '-m', 'app.comfyui.reliability_validation',
         '--fixture', $fixturePath,
         '--output-root', $outputRootPath,
+        '--run-key', $runIdSha256,
         '--host-manifest', $hostManifestPath,
         '--comfyui-pid', [string] $comfyRecord.pid,
         '--tts-more-pid', [string] $backendRecord.pid
     )
     if ($AllowLan) { $pythonArguments += '--allow-lan' }
     if ($PreflightOnly) { $pythonArguments += '--preflight-only' }
-    Invoke-LauncherFailureContextHelper -Mode 'snapshot' `
-        -PythonPath $backendPythonPath -WorkingDirectory $backendRootPath `
-        -OutputRoot $outputRootPath -BaselinePath $failureEvidenceBaselinePath `
-        -RunOwnedTempRoot $tempRoot | Out-Null
     $validatorStartedAt = [DateTime]::UtcNow
     $formalValidatorInvoked = $true
     try {
@@ -2554,10 +2654,8 @@ try {
                     -PythonPath $backendPythonPath `
                     -WorkingDirectory $backendRootPath `
                     -OutputRoot $outputRootPath `
-                    -BaselinePath $failureEvidenceBaselinePath `
-                    -RunOwnedTempRoot $tempRoot `
-                    -RunStartedAt $validatorStartedAt `
-                    -FailureObservedAt $validatorFinishedAt
+                    -RunKey $runIdSha256 `
+                    -RunOwnedTempRoot $tempRoot
                 $summarySha256 = if ($null -eq $publicFailureContext.summary) {
                     $null
                 } else { $publicFailureContext.summary.artifact_sha256 }
@@ -2673,7 +2771,7 @@ try {
             if ($operationProcessCleanupProven) {
                 $tempRemovalEligible = Test-OwnedTempRootCanBeRemoved `
                     -Root $tempRoot -OwnerMarker $tempOwnerMarker `
-                    -ExpectedRunId $runId -ResolvedOutputRoot $outputRootPath
+                    -ExpectedRunId $runId -ResolvedRunRoot $runEvidenceRoot
             }
             $warningHashes = @()
             if (-not $operationProcessCleanupProven) {
@@ -2700,11 +2798,12 @@ try {
             param([object] $Proof)
             $tempRemoved = Remove-OwnedTempRoot `
                 -Root $tempRoot -OwnerMarker $tempOwnerMarker `
-                -ExpectedRunId $runId -ResolvedOutputRoot $outputRootPath
+                -ExpectedRunId $runId -ResolvedRunRoot $runEvidenceRoot
             if (-not $tempRemoved) {
                 throw 'Owned temp removal did not converge after lifecycle commit'
             }
             $recordsRemoved = Remove-PrivateIdentityRecordsIfSafe `
+                -ResolvedRunRoot $runEvidenceRoot `
                 -HostManifestPath $hostManifestPath `
                 -ControlStatePath $controlStatePath `
                 -ProcessCleanupProven $true `
@@ -2729,6 +2828,27 @@ try {
         $cleanupFailure = $_
         Write-Warning 'Process cleanup verification failed; preserving private process, temp, and control evidence'
     }
+}
+
+if ($formalValidatorInvoked -and $null -ne $formalValidatorExitCode) {
+    $cleanupStatus = if ($null -eq $cleanupFailure) { 'completed' } else { 'failed' }
+    Push-Location -LiteralPath $backendRootPath
+    try {
+        & $backendPythonPath -m app.comfyui.reliability_supervision_cli record-inner `
+            --output-root $outputRootPath --run-key $runIdSha256 `
+            --mode $(if ($PreflightOnly) { 'preflight' } else { 'matrix' }) `
+            --validator-exit-code ([string] $formalValidatorExitCode) `
+            --cleanup-status $cleanupStatus
+        $runResultExitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($runResultExitCode -ne 0) {
+        [Console]::Error.WriteLine('Supervised reliability result could not be recorded')
+        exit 1
+    }
+    if ($cleanupStatus -eq 'failed') { exit 7 }
+    exit ([int] $formalValidatorExitCode)
 }
 
 Complete-LauncherFailureState -PrimaryFailure $primaryFailure -CleanupFailure $cleanupFailure

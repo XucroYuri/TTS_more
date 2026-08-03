@@ -1,0 +1,496 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, model_validator
+
+from app.comfyui import reliability_evidence as evidence
+from app.comfyui.reliability_validation import FailureMarker, ReliabilityRunFailure
+
+
+class SupervisionError(RuntimeError):
+    """A sanitized formal-supervision failure."""
+
+
+class _StrictModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        hide_input_in_errors=True,
+        frozen=True,
+        revalidate_instances="always",
+        allow_inf_nan=False,
+    )
+
+
+class InnerRunResult(_StrictModel):
+    schema_version: Literal[1]
+    kind: Literal["reliability-inner-run-result"]
+    run_key: evidence.RunKey
+    mode: Literal["preflight", "matrix"]
+    outcome: Literal["passed", "failed"]
+    failure_source: Literal["none", "validator", "cleanup", "launcher"]
+    validator_exit_code: StrictInt | None = Field(
+        ge=-(2**31),
+        le=2**31 - 1,
+    )
+    cleanup_status: Literal["completed", "failed", "not-started"]
+    reported_by: Literal["inner", "supervisor-fallback"]
+
+    @model_validator(mode="after")
+    def _coherent_result(self) -> "InnerRunResult":
+        if self.outcome == "passed":
+            if (
+                self.failure_source != "none"
+                or self.validator_exit_code != 0
+                or self.cleanup_status != "completed"
+                or self.reported_by != "inner"
+            ):
+                raise ValueError("passing inner result is incoherent")
+        elif self.failure_source == "validator":
+            if (
+                self.validator_exit_code is None
+                or self.validator_exit_code == 0
+                or self.cleanup_status != "completed"
+                or self.reported_by != "inner"
+            ):
+                raise ValueError("validator failure result is incoherent")
+        elif self.failure_source == "cleanup":
+            if (
+                self.validator_exit_code is None
+                or self.cleanup_status != "failed"
+                or self.reported_by != "inner"
+            ):
+                raise ValueError("cleanup failure result is incoherent")
+        elif self.failure_source == "launcher":
+            if (
+                self.validator_exit_code is not None
+                or self.cleanup_status != "not-started"
+                or self.reported_by != "supervisor-fallback"
+            ):
+                raise ValueError("launcher fallback result is incoherent")
+        else:
+            raise ValueError("failed inner result has no failure source")
+        return self
+
+
+class SupervisorRecord(_StrictModel):
+    schema_version: Literal[1]
+    kind: Literal["reliability-supervisor-result"]
+    run_key: evidence.RunKey
+    mode: Literal["preflight", "matrix"]
+    child_start_count: Literal[1]
+    launcher_exit_code: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+    validator_exit_code: StrictInt | None = Field(
+        ge=-(2**31),
+        le=2**31 - 1,
+    )
+    cleanup_status: Literal["completed", "failed", "not-started"]
+    outcome: Literal["passed", "failed"]
+    failure_source: Literal["none", "launcher", "validator", "cleanup"]
+
+    @model_validator(mode="after")
+    def _coherent_record(self) -> "SupervisorRecord":
+        if self.outcome == "passed":
+            if (
+                self.failure_source != "none"
+                or self.launcher_exit_code != 0
+                or self.validator_exit_code != 0
+                or self.cleanup_status != "completed"
+            ):
+                raise ValueError("passing supervisor result is incoherent")
+        elif self.failure_source == "launcher":
+            if (
+                self.launcher_exit_code == 0
+                or self.validator_exit_code is not None
+                or self.cleanup_status != "not-started"
+            ):
+                raise ValueError("launcher supervisor result is incoherent")
+        elif self.failure_source == "validator":
+            if (
+                self.launcher_exit_code == 0
+                or self.validator_exit_code is None
+                or self.validator_exit_code == 0
+                or self.cleanup_status != "completed"
+            ):
+                raise ValueError("validator supervisor result is incoherent")
+        elif self.failure_source == "cleanup":
+            if self.launcher_exit_code == 0 or self.cleanup_status != "failed":
+                raise ValueError("cleanup supervisor result is incoherent")
+        else:
+            raise ValueError("failed supervisor result has no failure source")
+        return self
+
+
+class FinalizedSupervision(_StrictModel):
+    status: Literal["current"]
+    run_key: evidence.RunKey
+    pointer_token: evidence.SHA256
+    formal_exit_code: StrictInt = Field(ge=-(2**31), le=2**31 - 1)
+
+
+class StreamCommitment(_StrictModel):
+    schema_version: Literal[1]
+    kind: Literal["reliability-stream-commitment"]
+    size_bytes: StrictInt = Field(ge=0, le=evidence.MAX_ARTIFACT_BYTES)
+    sha256: evidence.SHA256
+
+
+class PreparedRun(_StrictModel):
+    status: Literal["prepared"]
+    run_key: evidence.RunKey
+
+
+def prepare_run(output_root: Path, run_key: str) -> PreparedRun:
+    try:
+        root = Path(output_root)
+        validated_key = evidence._validated_run_key(run_key)
+        validated_root, _resolved_root = evidence._validated_root(root)
+        with evidence._run_operation_lock(validated_root, validated_key):
+            candidate = validated_root / "runs" / validated_key
+            if os.path.lexists(candidate):
+                raise SupervisionError("formal run already exists")
+            run_root, _ = evidence._run_root(
+                validated_root,
+                validated_key,
+                create=True,
+            )
+            files, directories = evidence._scan_run_membership(run_root)
+            if files or directories:
+                raise SupervisionError("formal run is not empty")
+        return PreparedRun(status="prepared", run_key=validated_key)
+    except (evidence.EvidenceStoreError, OSError, ValueError, TypeError) as exc:
+        if isinstance(exc, SupervisionError):
+            raise
+        raise SupervisionError("formal run could not be prepared") from exc
+
+
+def _canonical_json(model: BaseModel) -> bytes:
+    return (
+        json.dumps(
+            model.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def record_inner_result(
+    output_root: Path,
+    run_key: str,
+    *,
+    mode: Literal["preflight", "matrix"],
+    validator_exit_code: int,
+    cleanup_status: Literal["completed", "failed"],
+) -> evidence.ArtifactCommitment:
+    if cleanup_status == "failed":
+        outcome = "failed"
+        failure_source = "cleanup"
+    elif validator_exit_code == 0:
+        outcome = "passed"
+        failure_source = "none"
+    else:
+        outcome = "failed"
+        failure_source = "validator"
+    try:
+        result = InnerRunResult(
+            schema_version=1,
+            kind="reliability-inner-run-result",
+            run_key=run_key,
+            mode=mode,
+            outcome=outcome,
+            failure_source=failure_source,
+            validator_exit_code=validator_exit_code,
+            cleanup_status=cleanup_status,
+            reported_by="inner",
+        )
+        return evidence.write_artifact(
+            Path(output_root),
+            run_key,
+            "run-result",
+            _canonical_json(result),
+        )
+    except (ValidationError, evidence.EvidenceStoreError, ValueError, TypeError) as exc:
+        raise SupervisionError("inner result could not be recorded") from exc
+
+
+def commit_log(
+    output_root: Path,
+    run_key: str,
+    name: str,
+    source_file: Path,
+) -> evidence.ArtifactCommitment:
+    try:
+        source = Path(source_file)
+        metadata = source.lstat()
+        if not source.is_file() or source.is_symlink() or metadata.st_size > evidence.MAX_ARTIFACT_BYTES:
+            raise SupervisionError("supervisor log source is invalid")
+        payload = evidence._read_bounded_regular(
+            source,
+            max_bytes=evidence.MAX_ARTIFACT_BYTES,
+        )
+        if len(payload) != metadata.st_size:
+            raise SupervisionError("supervisor log source changed")
+        public_commitment = StreamCommitment(
+            schema_version=1,
+            kind="reliability-stream-commitment",
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        return evidence.write_artifact(
+            Path(output_root),
+            run_key,
+            "log",
+            _canonical_json(public_commitment),
+            name=name,
+        )
+    except (OSError, evidence.EvidenceStoreError, ValueError, TypeError) as exc:
+        raise SupervisionError("supervisor log could not be committed") from exc
+
+
+def _read_inner_result(output_root: Path, run_key: str) -> InnerRunResult:
+    try:
+        raw = evidence.read_artifact(output_root, run_key, "run-result")
+        result = InnerRunResult.model_validate_json(raw, strict=True)
+        if raw != _canonical_json(result) or result.run_key != run_key:
+            raise ValueError("inner result binding is invalid")
+        return result
+    except (ValidationError, evidence.EvidenceStoreError, ValueError, TypeError) as exc:
+        raise SupervisionError("inner result is invalid") from exc
+
+
+def _has_run_member(output_root: Path, run_key: str, relative_name: str) -> bool:
+    try:
+        run_root, _ = evidence._run_root(output_root, run_key, create=False)
+        files, _directories = evidence._scan_run_membership(run_root)
+        return relative_name in files
+    except evidence.EvidenceStoreError as exc:
+        raise SupervisionError("run membership is invalid") from exc
+
+
+def _write_failure_marker(
+    output_root: Path,
+    run_key: str,
+    *,
+    failure_source: Literal["launcher", "validator", "cleanup"],
+) -> None:
+    if _has_run_member(output_root, run_key, "failure.json"):
+        return
+    marker = ReliabilityRunFailure(
+        run_key=run_key,
+        failure=FailureMarker(
+            code={
+                "launcher": "launcher-failed",
+                "validator": "validator-failed",
+                "cleanup": "cleanup-failed",
+            }[failure_source],
+            stage="preflight" if failure_source == "launcher" else "finalize",
+        ),
+    )
+    evidence.write_artifact(
+        output_root,
+        run_key,
+        "failure",
+        _canonical_json(marker),
+    )
+
+
+def _read_failure_marker(output_root: Path, run_key: str) -> ReliabilityRunFailure:
+    try:
+        raw = evidence.read_artifact(output_root, run_key, "failure")
+        marker = ReliabilityRunFailure.model_validate_json(raw, strict=True)
+        if raw != _canonical_json(marker) or marker.run_key != run_key:
+            raise ValueError("failure marker binding is invalid")
+        return marker
+    except (ValidationError, evidence.EvidenceStoreError, ValueError, TypeError) as exc:
+        raise SupervisionError("failure marker is invalid") from exc
+
+
+def _launcher_fallback_result(
+    output_root: Path,
+    run_key: str,
+    *,
+    mode: Literal["preflight", "matrix"],
+) -> InnerRunResult:
+    result = InnerRunResult(
+        schema_version=1,
+        kind="reliability-inner-run-result",
+        run_key=run_key,
+        mode=mode,
+        outcome="failed",
+        failure_source="launcher",
+        validator_exit_code=None,
+        cleanup_status="not-started",
+        reported_by="supervisor-fallback",
+    )
+    evidence.write_artifact(
+        output_root,
+        run_key,
+        "run-result",
+        _canonical_json(result),
+    )
+    _write_failure_marker(
+        output_root,
+        run_key,
+        failure_source="launcher",
+    )
+    return result
+
+
+def _artifact_commitment(output_root: Path, run_key: str, relative_name: str) -> evidence.ArtifactCommitment:
+    if relative_name in evidence._FIXED_ARTIFACT_NAMES.values():
+        kind = next(
+            key
+            for key, value in evidence._FIXED_ARTIFACT_NAMES.items()
+            if value == relative_name
+        )
+        payload = evidence.read_artifact(output_root, run_key, kind)
+    else:
+        directory, filename = relative_name.split("/", 1)
+        stem = filename.rsplit(".", 1)[0]
+        kind = {"cases": "case", "audio": "audio", "logs": "log"}[directory]
+        payload = evidence.read_artifact(output_root, run_key, kind, name=stem)
+    return evidence.ArtifactCommitment(
+        relative_name=relative_name,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def _build_terminal(
+    output_root: Path,
+    run_key: str,
+    supervisor: SupervisorRecord,
+) -> evidence.RunTerminal:
+    run_root, _ = evidence._run_root(output_root, run_key, create=False)
+    files, _directories = evidence._scan_run_membership(run_root)
+    if "terminal.json" in files:
+        raise SupervisionError("run is already terminal")
+    commitments = {
+        relative_name: _artifact_commitment(output_root, run_key, relative_name)
+        for relative_name in sorted(files)
+    }
+    audio_count = sum(name.startswith("audio/") for name in commitments)
+    if supervisor.outcome == "passed" and supervisor.mode == "matrix":
+        if len([name for name in commitments if name.startswith("cases/")]) != 47:
+            raise SupervisionError("matrix case membership is invalid")
+        if audio_count != 39:
+            raise SupervisionError("matrix audio membership is invalid")
+    if supervisor.mode == "preflight" and audio_count:
+        raise SupervisionError("preflight audio membership is invalid")
+    if supervisor.outcome == "failed":
+        _read_failure_marker(output_root, run_key)
+    try:
+        return evidence.RunTerminal(
+            schema_version=1,
+            kind="reliability-run-terminal",
+            run_key=run_key,
+            mode=supervisor.mode,
+            outcome=supervisor.outcome,
+            failure_source=supervisor.failure_source,
+            evidence_complete=True,
+            launcher_exit_code=supervisor.launcher_exit_code,
+            validator_exit_code=supervisor.validator_exit_code,
+            cleanup_status=supervisor.cleanup_status,
+            preflight=commitments.get("preflight.json"),
+            failure=commitments.get("failure.json"),
+            summary=commitments.get("reliability-summary.json"),
+            cases=tuple(
+                commitment
+                for name, commitment in commitments.items()
+                if name.startswith("cases/")
+            ),
+            artifacts=tuple(
+                commitment
+                for name, commitment in commitments.items()
+                if name in {"supervisor.json", "run-result.json"}
+                or name.startswith(("logs/", "audio/"))
+            ),
+        )
+    except (ValidationError, ValueError, TypeError) as exc:
+        raise SupervisionError("terminal classification is invalid") from exc
+
+
+def finalize_supervision(
+    output_root: Path,
+    run_key: str,
+    *,
+    mode: Literal["preflight", "matrix"],
+    expected_token: str,
+    launcher_exit_code: int,
+    child_start_count: int,
+) -> FinalizedSupervision:
+    try:
+        root = Path(output_root)
+        if child_start_count != 1:
+            raise SupervisionError("supervision binding is invalid")
+        if _has_run_member(root, run_key, "run-result.json"):
+            result = _read_inner_result(root, run_key)
+        elif launcher_exit_code != 0:
+            result = _launcher_fallback_result(root, run_key, mode=mode)
+        else:
+            raise SupervisionError("inner result is missing")
+        if result.mode != mode:
+            raise SupervisionError("supervision binding is invalid")
+        if result.outcome == "passed" and launcher_exit_code != 0:
+            raise SupervisionError("launcher exit contradicts inner result")
+        if result.outcome == "failed" and launcher_exit_code == 0:
+            raise SupervisionError("launcher exit contradicts inner result")
+        if result.outcome == "failed":
+            _write_failure_marker(
+                root,
+                run_key,
+                failure_source=result.failure_source,
+            )
+        supervisor = SupervisorRecord(
+            schema_version=1,
+            kind="reliability-supervisor-result",
+            run_key=run_key,
+            mode=mode,
+            child_start_count=1,
+            launcher_exit_code=launcher_exit_code,
+            validator_exit_code=result.validator_exit_code,
+            cleanup_status=result.cleanup_status,
+            outcome=result.outcome,
+            failure_source=result.failure_source,
+        )
+        evidence.write_artifact(
+            root,
+            run_key,
+            "supervisor",
+            _canonical_json(supervisor),
+        )
+        terminal = _build_terminal(root, run_key, supervisor)
+        evidence.write_terminal(root, terminal)
+        pointer = evidence.compare_and_swap_current(
+            root,
+            run_key,
+            expected_token=expected_token,
+        )
+        current = evidence.verify_current(root)
+        if not isinstance(current, evidence.CurrentVerification):
+            raise SupervisionError("current verification is invalid")
+        if current.pointer != pointer or current.run.terminal != terminal:
+            raise SupervisionError("current verification is invalid")
+        return FinalizedSupervision(
+            status="current",
+            run_key=run_key,
+            pointer_token=evidence.pointer_token(pointer),
+            formal_exit_code=launcher_exit_code,
+        )
+    except (
+        ValidationError,
+        evidence.EvidenceStoreError,
+        SupervisionError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        if isinstance(exc, SupervisionError):
+            raise
+        raise SupervisionError("supervision could not be finalized") from exc
