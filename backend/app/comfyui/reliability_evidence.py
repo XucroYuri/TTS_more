@@ -494,6 +494,23 @@ def _windows_open_evidence_descriptor(path: Path, *, create_new: bool) -> int | 
     if layout is None:
         return None
     root, relative = layout
+    return _windows_open_relative_descriptor(
+        root,
+        relative,
+        create_new=create_new,
+    )
+
+
+def _windows_open_relative_descriptor(
+    root: Path,
+    relative: tuple[str, ...],
+    *,
+    create_new: bool,
+) -> int | None:
+    if os.name != "nt":
+        return None
+    if not relative:
+        raise EvidenceStoreError("evidence relative name is invalid")
     root_handle = _windows_open_root_directory(root)
     directory_handles = [root_handle]
     file_handle: int | None = None

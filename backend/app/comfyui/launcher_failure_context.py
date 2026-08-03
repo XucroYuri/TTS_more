@@ -514,17 +514,18 @@ def _verify_terminal_if_present(
 def _evaluate_launcher_failure_context_for_run(
     output_root: Path,
     run_key: str,
+    *,
+    verification: reliability_evidence.RunVerification | None,
 ) -> LauncherFailureContext:
     failure_document, failure_raw = _strict_run_model(
         output_root,
         run_key,
         "failure",
         ReliabilityRunFailure,
+        verification=verification,
     )
     if failure_document.run_key != run_key:
         raise ValueError("run failure binding mismatch")
-    verification = _verify_terminal_if_present(output_root, run_key)
-    _assert_verified_commitment(verification, "failure.json", failure_raw)
     summary, summary_raw = _strict_run_model(
         output_root,
         run_key,
@@ -597,7 +598,7 @@ def _evaluate_launcher_failure_context_for_run(
             finished_at=_public_utc(finished_at),
         )
 
-    return LauncherFailureContext(
+    context = LauncherFailureContext(
         schema_version=1,
         kind="launcher-failure-context",
         status="failed",
@@ -615,6 +616,11 @@ def _evaluate_launcher_failure_context_for_run(
             [] if case_commitment is not None else [_CASE_CONTEXT_UNBOUND_SHA256]
         ),
     )
+    if verification is not None:
+        observed = reliability_evidence.verify_run(output_root, run_key)
+        if observed != verification:
+            raise ValueError("run terminal commitment changed")
+    return context
 
 
 def evaluate_launcher_failure_context_for_run(
@@ -623,9 +629,11 @@ def evaluate_launcher_failure_context_for_run(
 ) -> LauncherFailureContext:
     """Evaluate exactly one run without consulting mtimes, root markers, or current."""
     try:
+        verification = _verify_terminal_if_present(Path(output_root), run_key)
         return _evaluate_launcher_failure_context_for_run(
             Path(output_root),
             run_key,
+            verification=verification,
         )
     except Exception:
         raise ValueError("launcher run context is invalid") from None
@@ -653,10 +661,17 @@ def evaluate_current_launcher_failure_context(
             failure_observed_at=failure_observed_at,
         )
     try:
-        return evaluate_launcher_failure_context_for_run(
+        context = _evaluate_launcher_failure_context_for_run(
             Path(output_root),
             current.pointer.run_key,
+            verification=current.run,
         )
+        observed = reliability_evidence.verify_current(Path(output_root))
+        if not isinstance(observed, reliability_evidence.CurrentVerification):
+            raise ValueError("current pointer disappeared")
+        if observed != current:
+            raise ValueError("current pointer commitment changed")
+        return context
     except Exception:
         raise ValueError("launcher current context is invalid") from None
 

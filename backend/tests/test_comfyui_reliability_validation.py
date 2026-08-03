@@ -11786,7 +11786,7 @@ def test_fix_round1_controller_commits_the_single_safe_read_when_source_changes_
     original_bytes: bytes | None = None
     source_path: Path | None = None
     replaced = False
-    original_read = reliability_validation.soundfile.read
+    original_proof = reliability_validation._wav_proof_from_bytes
 
     class ReplacedAfterDecodeProbe(_ExecutorHttpProbe):
         def execute_case(
@@ -11811,16 +11811,19 @@ def test_fix_round1_controller_commits_the_single_safe_read_when_source_changes_
                 assert hashlib.sha256(original_bytes).digest() != hashlib.sha256(replacement_bytes).digest()
             return observation
 
-    def replace_after_decode(source: object, *args: object, **kwargs: object) -> object:
+    def replace_after_safe_read(payload: bytes) -> reliability_validation.AudioProof:
         nonlocal replaced
-        decoded = original_read(source, *args, **kwargs)
-        if not replaced and isinstance(source, (str, Path)) and Path(source) == source_path:
+        if not replaced:
             assert source_path is not None
             source_path.write_bytes(replacement_bytes)
             replaced = True
-        return decoded
+        return original_proof(payload)
 
-    monkeypatch.setattr(reliability_validation.soundfile, "read", replace_after_decode)
+    monkeypatch.setattr(
+        reliability_validation,
+        "_wav_proof_from_bytes",
+        replace_after_safe_read,
+    )
     output_root = tmp_path / "evidence"
     http_probe = ReplacedAfterDecodeProbe()
     host_probe = _ExecutorHostProbe()
@@ -11835,9 +11838,173 @@ def test_fix_round1_controller_commits_the_single_safe_read_when_source_changes_
     )
 
     assert original_bytes is not None
+    assert replaced
     committed = (output_root / "runs" / TASK3_RUN_KEY / "audio" / "steady-01-gpt-sovits.wav").read_bytes()
     assert hashlib.sha256(committed).hexdigest() == hashlib.sha256(original_bytes).hexdigest()
     assert committed != replacement_bytes
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the controlled junction swap is Windows-specific")
+def test_fix_round2_controller_opens_audio_beneath_stable_parent_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_wav = outside / "steady-01-gpt-sovits.wav"
+    frames = [int(7_000 * math.cos(index / 5)) for index in range(800)]
+    with wave.open(str(outside_wav), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"".join(struct.pack("<h", frame) for frame in frames))
+    outside_bytes = outside_wav.read_bytes()
+    outside_identity = outside_wav.stat().st_ino
+
+    source_path: Path | None = None
+    source_parent: Path | None = None
+    retained_parent: Path | None = None
+    original_bytes: bytes | None = None
+    swap_triggered = False
+    swap_restored = False
+    outside_read = False
+
+    class NestedAudioProbe(_ExecutorHttpProbe):
+        def execute_case(
+            self,
+            case: reliability_validation.CasePlan,
+            fixture: ReliabilityFixture,
+            output_directory: Path,
+            *,
+            action_hook: object | None = None,
+        ) -> reliability_validation.HttpCaseObservation:
+            nonlocal source_path, source_parent, retained_parent, original_bytes
+            observation = super().execute_case(
+                case,
+                fixture,
+                output_directory,
+                action_hook=action_hook,
+            )
+            if source_path is not None or observation.wav_path is None:
+                return observation
+            nested = output_directory / "nested"
+            nested.mkdir()
+            source_path = nested / observation.wav_path.name
+            observation.wav_path.replace(source_path)
+            source_parent = nested
+            retained_parent = output_directory / "retained-nested"
+            original_bytes = source_path.read_bytes()
+            assert len(original_bytes) == len(outside_bytes)
+            assert original_bytes != outside_bytes
+            return _task3_observation_with_wav(observation, source_path)
+
+    def swap_parent_to_outside() -> None:
+        nonlocal swap_triggered
+        assert source_parent is not None and retained_parent is not None
+        source_parent.rename(retained_parent)
+        completed = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(source_parent), str(outside)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        swap_triggered = True
+
+    def restore_parent() -> None:
+        assert source_parent is not None and retained_parent is not None
+        source_parent.rmdir()
+        retained_parent.rename(source_parent)
+
+    real_open = os.open
+
+    def raced_absolute_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if not swap_triggered and source_path is not None and Path(path) == source_path:
+            swap_parent_to_outside()
+            return real_open(path, flags, *args, **kwargs)
+        return real_open(path, flags, *args, **kwargs)
+
+    real_nt_create = reliability_evidence._windows_nt_create
+
+    def raced_relative_open(
+        parent_handle: int,
+        name: str,
+        *,
+        directory: bool,
+        create_new: bool,
+        create_if_missing: bool = False,
+    ) -> int:
+        if (
+            not swap_triggered
+            and source_path is not None
+            and not directory
+            and name == source_path.name
+        ):
+            swap_parent_to_outside()
+            return real_nt_create(
+                parent_handle,
+                name,
+                directory=directory,
+                create_new=create_new,
+                create_if_missing=create_if_missing,
+            )
+        return real_nt_create(
+            parent_handle,
+            name,
+            directory=directory,
+            create_new=create_new,
+            create_if_missing=create_if_missing,
+        )
+
+    real_read = os.read
+
+    def observe_outside_read(descriptor: int, length: int) -> bytes:
+        nonlocal outside_read
+        if os.fstat(descriptor).st_ino == outside_identity:
+            outside_read = True
+        return real_read(descriptor, length)
+
+    real_proof = reliability_validation._wav_proof_from_bytes
+
+    def restore_after_safe_read(payload: bytes) -> reliability_validation.AudioProof:
+        nonlocal swap_restored
+        if swap_triggered and not swap_restored:
+            restore_parent()
+            swap_restored = True
+        return real_proof(payload)
+
+    monkeypatch.setattr(reliability_validation.os, "open", raced_absolute_open)
+    monkeypatch.setattr(reliability_validation.os, "read", observe_outside_read)
+    monkeypatch.setattr(
+        reliability_validation,
+        "_wav_proof_from_bytes",
+        restore_after_safe_read,
+    )
+    monkeypatch.setattr(reliability_evidence, "_windows_nt_create", raced_relative_open)
+    output_root = tmp_path / "evidence"
+    http_probe = NestedAudioProbe()
+    host_probe = _ExecutorHostProbe()
+
+    reliability_validation.execute_reliability_validation(
+        fixture,
+        run_key=TASK3_RUN_KEY,
+        output_root=output_root,
+        http_probe=http_probe,
+        host_probe=host_probe,
+        owned_processes=host_probe.owned_processes,
+    )
+
+    assert swap_triggered
+    assert swap_restored
+    assert not outside_read
+    assert original_bytes is not None
+    committed = (output_root / "runs" / TASK3_RUN_KEY / "audio" / "steady-01-gpt-sovits.wav").read_bytes()
+    assert committed == original_bytes
+    assert committed != outside_bytes
 
 
 @pytest.mark.parametrize("late_failure", ["release", "gpu", "boundary", "temp-cleanup"])
@@ -12050,6 +12217,175 @@ def test_fix_round1_frozen_context_rechecks_bytes_against_the_verified_terminal(
         else "launcher current context is invalid"
     )
     assert str(exc_info.value) == expected
+
+
+@pytest.mark.parametrize("artifact", ["terminal", "failure", "summary", "case", "audio"])
+def test_fix_round2_current_context_never_downgrades_after_verified_terminal_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact: str,
+) -> None:
+    output_root = tmp_path / "evidence"
+    run_root = _task3_failed_run(output_root, TASK3_RUN_KEY)
+    _task3_freeze_failed_run(output_root, TASK3_RUN_KEY)
+    reliability_evidence.compare_and_swap_current(
+        output_root,
+        TASK3_RUN_KEY,
+        expected_token=reliability_evidence.ABSENT_POINTER_TOKEN,
+    )
+
+    def canonical(model: object) -> bytes:
+        return (
+            json.dumps(
+                model.model_dump(mode="json"),  # type: ignore[attr-defined]
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    def mutate_artifact() -> None:
+        summary_path = run_root / "reliability-summary.json"
+        summary = ReliabilityRunSummary.model_validate_json(
+            summary_path.read_bytes(),
+            strict=False,
+        )
+        if artifact == "failure":
+            failure_path = run_root / "failure.json"
+            failure = reliability_validation.ReliabilityRunFailure.model_validate_json(
+                failure_path.read_bytes()
+            )
+            failure_path.write_bytes(canonical(failure.model_copy(update={"active_case_id": None})))
+        elif artifact == "summary":
+            mutated_summary = ReliabilityRunSummary.model_validate(
+                {
+                    **summary.model_dump(mode="json"),
+                    "validation_failures": sorted(
+                        {*summary.validation_failures, "post-current-verify mutation"}
+                    ),
+                },
+                strict=False,
+            )
+            summary_path.write_bytes(canonical(mutated_summary))
+        elif artifact in {"case", "audio"}:
+            completed = summary.cases[0]
+            if artifact == "case":
+                mutated_case = CaseEvidence.model_validate(
+                    {**completed.model_dump(mode="json"), "job_id": "post-current-job"},
+                    strict=False,
+                )
+            else:
+                replacement = tmp_path / "post-current.wav"
+                frames = [int(6_000 * math.cos(index / 4)) for index in range(800)]
+                with wave.open(str(replacement), "wb") as output:
+                    output.setnchannels(1)
+                    output.setsampwidth(2)
+                    output.setframerate(16_000)
+                    output.writeframes(b"".join(struct.pack("<h", frame) for frame in frames))
+                replacement_bytes = replacement.read_bytes()
+                mutated_case = completed.model_copy(
+                    update={
+                        "audio": reliability_validation._wav_proof_from_bytes(
+                            replacement_bytes
+                        )
+                    }
+                )
+                (run_root / "audio" / f"{completed.case_id}.wav").write_bytes(
+                    replacement_bytes
+                )
+            (run_root / "cases" / f"{completed.case_id}.json").write_bytes(
+                canonical(mutated_case)
+            )
+            mutated_summary = ReliabilityRunSummary.model_validate(
+                {
+                    **summary.model_dump(mode="json"),
+                    "cases": [
+                        (mutated_case if case.case_id == completed.case_id else case).model_dump(
+                            mode="json"
+                        )
+                        for case in summary.cases
+                    ],
+                },
+                strict=False,
+            )
+            summary_path.write_bytes(canonical(mutated_summary))
+
+    original_verify_current = reliability_evidence.verify_current
+    race_triggered = False
+
+    def race_after_current_verify(
+        root: Path,
+    ) -> reliability_evidence.CurrentVerification | reliability_evidence.PointerSnapshot:
+        nonlocal race_triggered
+        current = original_verify_current(root)
+        if not race_triggered:
+            mutate_artifact()
+            (run_root / "terminal.json").unlink()
+            race_triggered = True
+        return current
+
+    monkeypatch.setattr(reliability_evidence, "verify_current", race_after_current_verify)
+
+    with pytest.raises(ValueError) as exc_info:
+        launcher_failure_context.evaluate_current_launcher_failure_context(output_root)
+
+    assert race_triggered
+    assert str(exc_info.value) == "launcher current context is invalid"
+
+
+@pytest.mark.parametrize("anchor", ["terminal", "current"])
+def test_fix_round2_current_context_rechecks_anchors_after_consuming_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    anchor: str,
+) -> None:
+    output_root = tmp_path / "evidence"
+    run_root = _task3_failed_run(output_root, TASK3_RUN_KEY)
+    _task3_freeze_failed_run(output_root, TASK3_RUN_KEY)
+    reliability_evidence.compare_and_swap_current(
+        output_root,
+        TASK3_RUN_KEY,
+        expected_token=reliability_evidence.ABSENT_POINTER_TOKEN,
+    )
+    failure = reliability_validation.ReliabilityRunFailure.model_validate_json(
+        (run_root / "failure.json").read_bytes()
+    )
+    assert failure.active_case_id is not None
+
+    original_read = reliability_evidence.read_artifact
+    anchor_removed = False
+
+    def remove_anchor_after_last_consumed_artifact(
+        root: Path,
+        run_key: str,
+        kind: str,
+        *,
+        name: str | None = None,
+    ) -> bytes:
+        nonlocal anchor_removed
+        payload = original_read(root, run_key, kind, name=name)
+        if kind == "case" and name == failure.active_case_id and not anchor_removed:
+            target = (
+                run_root / "terminal.json"
+                if anchor == "terminal"
+                else output_root / "current-terminal.json"
+            )
+            target.unlink()
+            anchor_removed = True
+        return payload
+
+    monkeypatch.setattr(
+        reliability_evidence,
+        "read_artifact",
+        remove_anchor_after_last_consumed_artifact,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        launcher_failure_context.evaluate_current_launcher_failure_context(output_root)
+
+    assert anchor_removed
+    assert str(exc_info.value) == "launcher current context is invalid"
 
 
 @pytest.mark.parametrize(

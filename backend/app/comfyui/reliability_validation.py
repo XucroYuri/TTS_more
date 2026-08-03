@@ -4688,58 +4688,72 @@ def _read_validated_temporary_audio(
     root = Path(temporary_root).absolute()
     if not candidate.is_relative_to(root):
         raise LiveValidationError("unsafe-audio-output", stage="case")
+    descriptor: int | None = None
     try:
         relative = candidate.relative_to(root)
-        current = root
-        for component in relative.parts[:-1]:
-            directory_metadata = os.lstat(current)
+        descriptor = reliability_evidence._windows_open_relative_descriptor(
+            root,
+            relative.parts,
+            create_new=False,
+        )
+        metadata: os.stat_result | None = None
+        if descriptor is None:
+            current = root
+            for component in relative.parts[:-1]:
+                directory_metadata = os.lstat(current)
+                if (
+                    not stat.S_ISDIR(directory_metadata.st_mode)
+                    or stat.S_ISLNK(directory_metadata.st_mode)
+                    or getattr(directory_metadata, "st_file_attributes", 0) & 0x400
+                ):
+                    raise OSError
+                current /= component
+            parent_metadata = os.lstat(current)
             if (
-                not stat.S_ISDIR(directory_metadata.st_mode)
-                or stat.S_ISLNK(directory_metadata.st_mode)
-                or getattr(directory_metadata, "st_file_attributes", 0) & 0x400
+                not stat.S_ISDIR(parent_metadata.st_mode)
+                or stat.S_ISLNK(parent_metadata.st_mode)
+                or getattr(parent_metadata, "st_file_attributes", 0) & 0x400
             ):
                 raise OSError
-            current /= component
-        parent_metadata = os.lstat(current)
-        if (
-            not stat.S_ISDIR(parent_metadata.st_mode)
-            or stat.S_ISLNK(parent_metadata.st_mode)
-            or getattr(parent_metadata, "st_file_attributes", 0) & 0x400
-        ):
-            raise OSError
-        metadata = os.lstat(candidate)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or getattr(metadata, "st_file_attributes", 0) & 0x400
-            or metadata.st_size > reliability_evidence.MAX_ARTIFACT_BYTES
-        ):
-            raise OSError
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(candidate, flags)
-        try:
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode) or opened.st_size != metadata.st_size:
-                raise OSError
-            payload = bytearray()
-            while len(payload) <= reliability_evidence.MAX_ARTIFACT_BYTES:
-                chunk = os.read(descriptor, min(1024 * 1024, reliability_evidence.MAX_ARTIFACT_BYTES + 1 - len(payload)))
-                if not chunk:
-                    break
-                payload.extend(chunk)
-            if len(payload) > reliability_evidence.MAX_ARTIFACT_BYTES:
-                raise OSError
-            closed = os.fstat(descriptor)
+            metadata = os.lstat(candidate)
             if (
-                closed.st_size != opened.st_size
-                or closed.st_mtime_ns != opened.st_mtime_ns
-                or getattr(closed, "st_ino", None) != getattr(opened, "st_ino", None)
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0) & 0x400
             ):
                 raise OSError
-        finally:
-            os.close(descriptor)
-    except OSError:
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(candidate, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size > reliability_evidence.MAX_ARTIFACT_BYTES
+            or (metadata is not None and opened.st_size != metadata.st_size)
+        ):
+            raise OSError
+        payload = bytearray()
+        while len(payload) <= reliability_evidence.MAX_ARTIFACT_BYTES:
+            chunk = os.read(descriptor, min(1024 * 1024, reliability_evidence.MAX_ARTIFACT_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > reliability_evidence.MAX_ARTIFACT_BYTES:
+            raise OSError
+        closed = os.fstat(descriptor)
+        if (
+            closed.st_size != opened.st_size
+            or closed.st_mtime_ns != opened.st_mtime_ns
+            or getattr(closed, "st_ino", None) != getattr(opened, "st_ino", None)
+        ):
+            raise OSError
+    except (OSError, reliability_evidence.EvidenceStoreError):
         raise LiveValidationError("unsafe-audio-output", stage="case") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     return bytes(payload)
 
 
