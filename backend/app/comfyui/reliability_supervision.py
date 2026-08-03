@@ -677,6 +677,28 @@ def _observe_exact_private_recovery(
     return snapshot
 
 
+def _validate_private_recovery_membership(
+    boundary: PrivateRecoveryBoundary,
+    snapshot: private_recovery.PrivateRecoverySnapshot,
+) -> None:
+    static_roles = tuple(member.role for member in snapshot.static_members)
+    if (
+        len(set(static_roles)) != len(private_recovery.PRIVATE_ROLES)
+        or frozenset(static_roles) != frozenset(private_recovery.PRIVATE_ROLES)
+    ):
+        raise SupervisionError("private recovery snapshot membership is invalid")
+    expected = {
+        member.role for member in snapshot.static_members if member.present
+    }
+    if snapshot.mutable_tree.present:
+        expected.add(".p")
+    expected_members = frozenset(expected)
+    before = _private_recovery_top_level_names(boundary)
+    after = _private_recovery_top_level_names(boundary)
+    if before != expected_members or after != before:
+        raise SupervisionError("private recovery membership is invalid")
+
+
 def prepare_private_finalization(
     output_root: Path,
     run_key: str,
@@ -778,6 +800,8 @@ def finalize_supervision(
             expected_private_namespace_identity,
         )
         private_leaf = private_namespace / validated_key
+        held_private_boundary: PrivateRecoveryBoundary | None = None
+        private_snapshot: private_recovery.PrivateRecoverySnapshot | None = None
         result = _resolve_supervision_result(
             root,
             validated_key,
@@ -795,6 +819,28 @@ def finalize_supervision(
             )
             if not _has_run_member(root, validated_key, "logs/private-recovery.log"):
                 raise SupervisionError("private recovery snapshot is missing")
+            private_snapshot = evidence.verify_private_recovery_log(
+                evidence.read_artifact(
+                    root,
+                    validated_key,
+                    "log",
+                    name="private-recovery",
+                ),
+                expected_run_key=validated_key,
+                expected_namespace_identity=private_namespace_identity,
+            )
+            held_private_boundary = PrivateRecoveryBoundary(
+                status="validated",
+                run_key=validated_key,
+                output_root=str(root),
+                root_identity=root_identity,
+                private_root=str(private_namespace),
+                private_root_identity=private_namespace_identity,
+            )
+            _validate_private_recovery_membership(
+                held_private_boundary,
+                private_snapshot,
+            )
         if result.outcome == "failed":
             _write_failure_marker(
                 root,
@@ -827,6 +873,11 @@ def finalize_supervision(
             supervisor,
             expected_private_root_identity=private_namespace_identity,
         )
+        if held_private_boundary is not None and private_snapshot is not None:
+            _validate_private_recovery_membership(
+                held_private_boundary,
+                private_snapshot,
+            )
         evidence.write_terminal(
             root,
             terminal,
@@ -834,6 +885,11 @@ def finalize_supervision(
                 private_namespace_identity
             ),
         )
+        if held_private_boundary is not None and private_snapshot is not None:
+            _validate_private_recovery_membership(
+                held_private_boundary,
+                private_snapshot,
+            )
         pointer = evidence.compare_and_swap_current(
             root,
             run_key,

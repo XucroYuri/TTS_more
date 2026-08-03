@@ -947,6 +947,130 @@ def test_cleanup_success_holds_deleted_private_leaf_name_through_publication(
     assert not (output_root / ".private-recovery" / current.pointer.run_key).exists()
 
 
+def test_cleanup_failure_rechecks_private_members_after_snapshot_before_publication(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    old_run_key = "f" * 64
+    old_expected_token, old_prepared = _prepare_orphan_preflight_run(
+        output_root,
+        old_run_key,
+    )
+    _prepare_direct_finalization(
+        output_root,
+        old_prepared,
+        mode="preflight",
+        launcher_exit_code=0,
+    )
+    reliability_supervision.finalize_supervision(
+        output_root,
+        old_run_key,
+        mode="preflight",
+        expected_token=old_expected_token,
+        expected_root_identity=old_prepared.root_identity,
+        expected_run_root_identity=old_prepared.run_root_identity,
+        expected_private_root_identity=old_prepared.private_root_identity,
+        expected_private_namespace_identity=old_prepared.private_namespace_identity,
+        launcher_exit_code=0,
+        child_start_count=1,
+    )
+    old_pointer_bytes = (output_root / "current-terminal.json").read_bytes()
+    old_current = reliability_evidence.verify_current(output_root)
+
+    harness_scripts = tmp_path / "harness" / "scripts"
+    harness_scripts.mkdir(parents=True)
+    supervisor = harness_scripts / SUPERVISOR_SOURCE.name
+    pause_marker = tmp_path / "private-snapshot-complete.marker"
+    supervisor_source = SUPERVISOR_SOURCE.read_text(encoding="utf-8")
+    publish_gate = (
+        "    if ($preparedFinalization.result.cleanup_status -ceq 'completed') {"
+    )
+    assert supervisor_source.count(publish_gate) == 1
+    supervisor.write_text(
+        supervisor_source.replace(
+            publish_gate,
+            f"    [IO.File]::WriteAllText('{_powershell_literal(pause_marker)}', 'ready')\n"
+            + "    Start-Sleep -Milliseconds 1200\n"
+            + publish_gate,
+        ),
+        encoding="utf-8",
+    )
+    start_count = tmp_path / "start-count.txt"
+    raw_run_id = tmp_path / "raw-run-id.txt"
+    evidence_fixture = tmp_path / "authoritative-public-fixture"
+    _write_authoritative_public_fixture(evidence_fixture, matrix=False)
+    _write_fake_inner(
+        harness_scripts / INNER_SOURCE.name,
+        start_count_path=start_count,
+        raw_run_id_path=raw_run_id,
+        scenario="cleanup-residual",
+        evidence_fixture=evidence_fixture,
+    )
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text("{}\n", encoding="utf-8")
+    comfy_root = tmp_path / "comfyui"
+    comfy_root.mkdir()
+    comfy_python = tmp_path / "comfy-python.exe"
+    comfy_python.write_bytes(b"test-only")
+    process = subprocess.Popen(
+        [
+            str(POWERSHELL),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(supervisor),
+            "-Fixture",
+            str(fixture),
+            "-OutputRoot",
+            str(output_root),
+            "-ComfyUiRoot",
+            str(comfy_root),
+            "-ComfyPython",
+            str(comfy_python),
+            "-TtsMoreRoot",
+            str(REPOSITORY_ROOT),
+        ],
+        cwd=REPOSITORY_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not pause_marker.exists():
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                raise AssertionError(stdout + stderr)
+            if time.monotonic() >= deadline:
+                raise AssertionError("private snapshot gate was not reached")
+            time.sleep(0.01)
+        run_key = hashlib.sha256(
+            raw_run_id.read_text(encoding="utf-8").encode("utf-8")
+        ).hexdigest()
+        private_leaf = output_root / ".private-recovery" / run_key
+        rogue = private_leaf / "rogue-after-snapshot.bin"
+        rogue.write_bytes(b"rogue-after-snapshot-must-survive")
+        stdout, stderr = process.communicate(timeout=20)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+    assert process.returncode != 0, stdout + stderr
+    assert (output_root / "current-terminal.json").read_bytes() == old_pointer_bytes
+    assert reliability_evidence.verify_current(output_root) == old_current
+    assert rogue.read_bytes() == b"rogue-after-snapshot-must-survive"
+    assert (private_leaf / ".p" / "sentinel.bin").read_bytes() == bytes(
+        (0, 1, 127, 128, 254, 255)
+    )
+    assert not (output_root / "runs" / run_key / "terminal.json").exists()
+
+
 def test_r3_validation_failure_releases_the_directory_lease(tmp_path: Path) -> None:
     completed, output_root, _start_count, _raw_run_id = _run_supervisor(
         tmp_path,
