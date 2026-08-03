@@ -947,8 +947,17 @@ def test_cleanup_success_holds_deleted_private_leaf_name_through_publication(
     assert not (output_root / ".private-recovery" / current.pointer.run_key).exists()
 
 
+@pytest.mark.parametrize(
+    "post_snapshot_mutation",
+    (
+        "rogue-member",
+        "static-file-to-directory",
+        "mutable-directory-to-file",
+    ),
+)
 def test_cleanup_failure_rechecks_private_members_after_snapshot_before_publication(
     tmp_path: Path,
+    post_snapshot_mutation: str,
 ) -> None:
     output_root = tmp_path / "evidence"
     output_root.mkdir()
@@ -1053,8 +1062,21 @@ def test_cleanup_failure_rechecks_private_members_after_snapshot_before_publicat
             raw_run_id.read_text(encoding="utf-8").encode("utf-8")
         ).hexdigest()
         private_leaf = output_root / ".private-recovery" / run_key
-        rogue = private_leaf / "rogue-after-snapshot.bin"
-        rogue.write_bytes(b"rogue-after-snapshot-must-survive")
+        if post_snapshot_mutation == "rogue-member":
+            replacement_sentinel = private_leaf / "rogue-after-snapshot.bin"
+            replacement_bytes = b"rogue-after-snapshot-must-survive"
+        elif post_snapshot_mutation == "static-file-to-directory":
+            static_member = private_leaf / ".o"
+            static_member.unlink()
+            static_member.mkdir()
+            replacement_sentinel = static_member / "replacement-sentinel.bin"
+            replacement_bytes = b"static-directory-must-survive"
+        else:
+            mutable_member = private_leaf / ".p"
+            shutil.rmtree(mutable_member)
+            replacement_sentinel = mutable_member
+            replacement_bytes = b"mutable-file-must-survive"
+        replacement_sentinel.write_bytes(replacement_bytes)
         stdout, stderr = process.communicate(timeout=20)
     finally:
         if process.poll() is None:
@@ -1064,10 +1086,11 @@ def test_cleanup_failure_rechecks_private_members_after_snapshot_before_publicat
     assert process.returncode != 0, stdout + stderr
     assert (output_root / "current-terminal.json").read_bytes() == old_pointer_bytes
     assert reliability_evidence.verify_current(output_root) == old_current
-    assert rogue.read_bytes() == b"rogue-after-snapshot-must-survive"
-    assert (private_leaf / ".p" / "sentinel.bin").read_bytes() == bytes(
-        (0, 1, 127, 128, 254, 255)
-    )
+    assert replacement_sentinel.read_bytes() == replacement_bytes
+    if post_snapshot_mutation != "mutable-directory-to-file":
+        assert (private_leaf / ".p" / "sentinel.bin").read_bytes() == bytes(
+            (0, 1, 127, 128, 254, 255)
+        )
     assert not (output_root / "runs" / run_key / "terminal.json").exists()
 
 

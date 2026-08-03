@@ -651,14 +651,12 @@ def _resolve_supervision_result(
     return result
 
 
-def _private_recovery_top_level_names(
+def _private_recovery_top_level_members(
     boundary: PrivateRecoveryBoundary,
-) -> frozenset[str]:
+) -> frozenset[tuple[str, bool]]:
     run_handle, _safe_key = private_recovery._open_observation_run(boundary)
     try:
-        return frozenset(
-            name for name, _kind in private_recovery._directory_names(run_handle)
-        )
+        return frozenset(private_recovery._directory_names(run_handle))
     finally:
         private_recovery._close_directory(run_handle)
 
@@ -666,12 +664,14 @@ def _private_recovery_top_level_names(
 def _observe_exact_private_recovery(
     boundary: PrivateRecoveryBoundary,
 ) -> private_recovery.PrivateRecoverySnapshot:
-    allowed = frozenset({".p", *private_recovery.PRIVATE_ROLES})
-    before = _private_recovery_top_level_names(boundary)
+    allowed = frozenset(
+        {(".p", True), *((role, False) for role in private_recovery.PRIVATE_ROLES)}
+    )
+    before = _private_recovery_top_level_members(boundary)
     if not before.issubset(allowed):
         raise SupervisionError("private recovery membership is invalid")
     snapshot = observe_private_recovery(boundary)
-    after = _private_recovery_top_level_names(boundary)
+    after = _private_recovery_top_level_members(boundary)
     if after != before or not after.issubset(allowed):
         raise SupervisionError("private recovery membership is invalid")
     return snapshot
@@ -688,13 +688,15 @@ def _validate_private_recovery_membership(
     ):
         raise SupervisionError("private recovery snapshot membership is invalid")
     expected = {
-        member.role for member in snapshot.static_members if member.present
+        (member.role, False)
+        for member in snapshot.static_members
+        if member.present
     }
     if snapshot.mutable_tree.present:
-        expected.add(".p")
+        expected.add((".p", True))
     expected_members = frozenset(expected)
-    before = _private_recovery_top_level_names(boundary)
-    after = _private_recovery_top_level_names(boundary)
+    before = _private_recovery_top_level_members(boundary)
+    after = _private_recovery_top_level_members(boundary)
     if before != expected_members or after != before:
         raise SupervisionError("private recovery membership is invalid")
 
