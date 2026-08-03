@@ -5769,6 +5769,194 @@ def _wav_proof_from_bytes(data: bytes) -> AudioProof:
     )
 
 
+def verify_run_artifacts(
+    output_root: Path,
+    run_key: str,
+    *,
+    mode: Literal["preflight", "matrix"],
+    outcome: Literal["passed", "failed"],
+) -> None:
+    """Validate one unfrozen run through the authoritative public models."""
+
+    try:
+        safe_key = _validated_run_key(run_key)
+        run_root, _resolved_root = reliability_evidence._run_root(
+            Path(output_root),
+            safe_key,
+            create=False,
+        )
+        files, _directories = reliability_evidence._scan_run_membership(run_root)
+
+        def read_fixed(kind: str) -> bytes:
+            return reliability_evidence.read_artifact(output_root, safe_key, kind)
+
+        preflight: _PublicPreflightMarker | None = None
+        if "preflight.json" in files:
+            raw_preflight = read_fixed("preflight")
+            preflight = _PublicPreflightMarker.model_validate_json(
+                raw_preflight,
+                strict=True,
+            )
+            if raw_preflight != _canonical_model_json(preflight):
+                raise ValueError("preflight evidence is not canonical")
+        elif outcome == "passed":
+            raise ValueError("passing run is missing preflight evidence")
+
+        failure: ReliabilityRunFailure | None = None
+        if "failure.json" in files:
+            raw_failure = read_fixed("failure")
+            failure = ReliabilityRunFailure.model_validate_json(
+                raw_failure,
+                strict=True,
+            )
+            if (
+                raw_failure != _canonical_model_json(failure)
+                or failure.run_key != safe_key
+            ):
+                raise ValueError("failure evidence is not canonical or bound")
+        if outcome == "failed" and failure is None:
+            raise ValueError("failed run is missing failure evidence")
+        if outcome == "passed" and failure is not None:
+            raise ValueError("passing run contains failure evidence")
+
+        summary: ReliabilityRunSummary | None = None
+        if "reliability-summary.json" in files:
+            raw_summary = read_fixed("summary")
+            summary = ReliabilityRunSummary.model_validate_json(
+                raw_summary,
+                strict=False,
+            )
+            if raw_summary != _canonical_model_json(summary):
+                raise ValueError("summary evidence is not canonical")
+
+        case_names = sorted(
+            name[len("cases/") : -len(".json")]
+            for name in files
+            if name.startswith("cases/") and name.endswith(".json")
+        )
+        audio_names = sorted(
+            name[len("audio/") : -len(".wav")]
+            for name in files
+            if name.startswith("audio/") and name.endswith(".wav")
+        )
+        if mode == "preflight":
+            if summary is not None or case_names or audio_names:
+                raise ValueError("preflight run contains matrix evidence")
+            return
+
+        plan = build_case_plan(rounds=10)
+        expected_by_id = {case.case_id: case for case in plan}
+        expected_required = sorted(
+            required_case_specs(plan),
+            key=lambda required: (
+                required.case_id,
+                required.engine,
+                required.phase,
+                required.expected,
+            ),
+        )
+        completed_cases: dict[str, CaseEvidence] = {}
+        failed_cases: dict[str, CurrentFailedCaseEvidence] = {}
+        for case_name in case_names:
+            raw_case = reliability_evidence.read_artifact(
+                output_root,
+                safe_key,
+                "case",
+                name=case_name,
+            )
+            try:
+                case = CaseEvidence.model_validate_json(raw_case, strict=False)
+            except ValidationError:
+                failed_case = FailedCaseEvidence.model_validate_json(raw_case)
+                if not isinstance(failed_case, CurrentFailedCaseEvidence):
+                    raise ValueError("new run contains legacy failed-case evidence")
+                if (
+                    raw_case != _canonical_model_json(failed_case)
+                    or failed_case.case_id != case_name
+                ):
+                    raise ValueError("failed-case evidence is not canonical or bound")
+                planned = expected_by_id.get(case_name)
+                if (
+                    planned is None
+                    or failed_case.phase != planned.phase
+                    or failed_case.engine != planned.engine
+                    or failed_case.expected != planned.expected
+                ):
+                    raise ValueError("failed-case evidence does not match the exact plan")
+                failed_cases[case_name] = failed_case
+                continue
+            if raw_case != _canonical_model_json(case) or case.case_id != case_name:
+                raise ValueError("case evidence is not canonical or filename-bound")
+            planned = expected_by_id.get(case_name)
+            if (
+                planned is None
+                or case.phase != planned.phase
+                or case.engine != planned.engine
+                or case.expected != planned.expected
+                or not validate_case(case).valid
+            ):
+                raise ValueError("case evidence does not match the exact plan")
+            completed_cases[case_name] = case
+
+        if set(completed_cases) & set(failed_cases):
+            raise ValueError("case evidence is ambiguous")
+        if len(failed_cases) > 1:
+            raise ValueError("run contains multiple failed-case documents")
+
+        completed_audio_ids = {
+            case_id for case_id, case in completed_cases.items() if case.actual == "completed"
+        }
+        if set(audio_names) != completed_audio_ids:
+            raise ValueError("audio membership does not match completed cases")
+        for audio_name in audio_names:
+            audio_payload = reliability_evidence.read_artifact(
+                output_root,
+                safe_key,
+                "audio",
+                name=audio_name,
+            )
+            if _wav_proof_from_bytes(audio_payload) != completed_cases[audio_name].audio:
+                raise ValueError("WAV bytes do not match their case proof")
+
+        ordered_completed = sorted(
+            completed_cases.values(),
+            key=lambda case: (
+                case.case_id,
+                case.engine,
+                case.phase,
+                case.expected,
+                case.actual,
+            ),
+        )
+        if summary is not None:
+            if (
+                summary.status != outcome
+                or summary.required_cases != expected_required
+                or summary.cases != ordered_completed
+            ):
+                raise ValueError("summary is not bound to exact case evidence")
+
+        if outcome == "passed":
+            if (
+                summary is None
+                or failed_cases
+                or set(completed_cases) != set(expected_by_id)
+                or len(completed_audio_ids) != 39
+            ):
+                raise ValueError("passing matrix evidence is incomplete")
+        else:
+            assert failure is not None
+            failed_case_id = next(iter(failed_cases), None)
+            if failure.active_case_id != failed_case_id:
+                raise ValueError("failure marker is not bound to failed-case evidence")
+            if failed_case_id is not None:
+                failed_case = failed_cases[failed_case_id]
+                if failed_case.failure != failure.failure:
+                    raise ValueError("failure markers disagree")
+    except Exception:
+        raise ValueError("run artifacts are invalid") from None
+
+
 def _wav_proof(path: Path) -> AudioProof:
     return _wav_proof_from_bytes(path.read_bytes())
 

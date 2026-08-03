@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import io
 import json
+import math
 import shutil
+import struct
 import subprocess
 import ctypes
+import hashlib
 import time
 import os
 import sys
+import wave
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from app.comfyui import reliability_evidence
 from app.comfyui import reliability_supervision
+from app.comfyui import reliability_validation
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -24,8 +31,292 @@ INNER_SOURCE = REPOSITORY_ROOT / "scripts" / "run-windows-comfyui-reliability.ps
 POWERSHELL = Path("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
 
 
+def _make_windows_junction(junction: Path, target: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("real junction behavior is Windows-specific")
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"Windows junction creation is unavailable: {completed.stderr}")
+
+
 def _powershell_literal(value: Path) -> str:
     return str(value).replace("'", "''")
+
+
+def _canonical_model_bytes(model: object) -> bytes:
+    return (
+        json.dumps(
+            model.model_dump(mode="json"),  # type: ignore[attr-defined]
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _voiced_wav_bytes() -> bytes:
+    buffer = io.BytesIO()
+    frames = [int(8_000 * math.sin(index / 8)) for index in range(800)]
+    with wave.open(buffer, "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"".join(struct.pack("<h", frame) for frame in frames))
+    return buffer.getvalue()
+
+
+def _write_authoritative_public_fixture(directory: Path, *, matrix: bool) -> None:
+    directory.mkdir(parents=True)
+    timestamp = "2026-08-03T00:00:00Z"
+    preflight = reliability_validation._PublicPreflightMarker.model_validate(
+        {
+            "status": "passed",
+            "resources": [
+                {
+                    "engine": engine,
+                    "ready": True,
+                    "resource_id_hash": hashlib.sha256(engine.encode("utf-8")).hexdigest(),
+                }
+                for engine in sorted(reliability_validation.ENGINE_ORDER)
+            ],
+            "queue": {
+                "tts_queued": 0,
+                "tts_running": 0,
+                "comfy_pending_prompt_ids": [],
+                "comfy_running_prompt_ids": [],
+            },
+            "port_owners": {
+                "8000": {
+                    "pid": 8000,
+                    "creation_time": timestamp,
+                    "executable_name": "python.exe",
+                    "ownership_hash": "1" * 64,
+                },
+                "8188": {
+                    "pid": 8188,
+                    "creation_time": timestamp,
+                    "executable_name": "python.exe",
+                    "ownership_hash": "2" * 64,
+                },
+            },
+            "gpu_idle_baseline": {"used_mib": 100, "free_mib": 8000},
+            "boundary": {
+                "aggregate_hash": "b" * 64,
+                "private_registry_hash": "c" * 64,
+                "reference_hashes": {"reference": "d" * 64},
+                "repositories": [
+                    {
+                        "label": label,
+                        "head": "a" * 40,
+                        "branch": "feature",
+                        "porcelain_hash": "f" * 64,
+                    }
+                    for label in sorted(reliability_validation.REQUIRED_BOUNDARY_LABELS)
+                ],
+            },
+        }
+    )
+    (directory / "preflight.json").write_bytes(_canonical_model_bytes(preflight))
+    if not matrix:
+        return
+
+    cases_directory = directory / "cases"
+    audio_directory = directory / "audio"
+    cases_directory.mkdir()
+    audio_directory.mkdir()
+    wav_payload = _voiced_wav_bytes()
+    audio_proof = reliability_validation._wav_proof_from_bytes(wav_payload)
+    boundary = reliability_validation.BoundaryEvidence(
+        before_hash="b" * 64,
+        after_hash="b" * 64,
+        private_registry_hash="c" * 64,
+        reference_hashes={"reference": "d" * 64},
+        repositories_before=[
+            reliability_validation.RepositorySnapshot(
+                label=label,
+                head="a" * 40,
+                branch="feature",
+                porcelain_hash="f" * 64,
+            )
+            for label in reliability_validation.REQUIRED_BOUNDARY_LABELS
+        ],
+        repositories_after=[
+            reliability_validation.RepositorySnapshot(
+                label=label,
+                head="a" * 40,
+                branch="feature",
+                porcelain_hash="f" * 64,
+            )
+            for label in reliability_validation.REQUIRED_BOUNDARY_LABELS
+        ],
+        private_registry_before_hash="c" * 64,
+        private_registry_after_hash="c" * 64,
+        reference_hashes_before={"reference": "d" * 64},
+        reference_hashes_after={"reference": "d" * 64},
+    )
+    plan = reliability_validation.build_case_plan(rounds=10)
+    cases: list[reliability_validation.CaseEvidence] = []
+    for index, case_plan in enumerate(plan, start=1):
+        started_at = datetime(2026, 8, 3, tzinfo=timezone.utc) + timedelta(
+            minutes=index
+        )
+        finished_at = started_at + timedelta(seconds=10)
+        prompt_id = f"prompt-{case_plan.case_id}"
+        actual = case_plan.expected
+        prompt_submitted = case_plan.action != "cancel-queued"
+        version_id = None if not prompt_submitted else f"version-{case_plan.case_id}"
+        comfyui = None
+        tts_more = None
+        termination = None
+        if case_plan.action == "cancel-queued":
+            tts_more = reliability_validation.TtsTerminalEvidence(
+                job_status="cancelled",
+                item_status="cancelled",
+                version_status=None,
+                manifest_version_absent=True,
+                version_audio_absent=True,
+            )
+            prompt_id_value = None
+        elif case_plan.action == "terminate-comfyui":
+            tts_more = reliability_validation.TtsTerminalEvidence(
+                job_status="failed",
+                item_status="failed",
+                version_status="failed",
+                manifest_version_absent=False,
+                version_audio_absent=True,
+            )
+            termination = reliability_validation.TerminationEvidence(
+                endpoint_unavailable=True,
+                prompt_id=prompt_id,
+                queue_before_prompt_ids=[prompt_id],
+                manifest_audio_absent=True,
+            )
+            prompt_id_value = prompt_id
+        else:
+            if case_plan.action in {"cancel-running", "timeout"}:
+                terminal_status = (
+                    "cancelled" if case_plan.action == "cancel-running" else "failed"
+                )
+                tts_more = reliability_validation.TtsTerminalEvidence(
+                    job_status=terminal_status,
+                    item_status=terminal_status,
+                    version_status=terminal_status,
+                    manifest_version_absent=False,
+                    version_audio_absent=True,
+                    control=reliability_validation.FaultControlEvidence(
+                        control_code=(
+                            "cancelled"
+                            if case_plan.action == "cancel-running"
+                            else "timeout"
+                        ),
+                        failure_stage=(
+                            None if case_plan.action == "cancel-running" else "timeout"
+                        ),
+                        prompt_id=prompt_id,
+                        initial_state="running",
+                        final_state="interrupted",
+                        actions=["interrupt"],
+                        duration_seconds=0.5,
+                        converged=True,
+                    ),
+                )
+            comfyui = reliability_validation.ComfyQueueEvidence(
+                queue_empty=True,
+                history_present=True,
+                prompt_id=prompt_id,
+                queue_before_prompt_ids=[prompt_id],
+                queue_after_prompt_ids=[],
+                history_prompt_ids=[prompt_id],
+                terminal_history_status=actual,
+            )
+            prompt_id_value = prompt_id
+        case = reliability_validation.CaseEvidence(
+            case_id=case_plan.case_id,
+            phase=case_plan.phase,
+            engine=case_plan.engine,
+            expected=case_plan.expected,
+            actual=actual,
+            job_id=f"job-{case_plan.case_id}",
+            prompt_id=prompt_id_value,
+            version_id=version_id,
+            prompt_submitted=prompt_submitted,
+            tts_more=tts_more,
+            termination=termination,
+            started_at=started_at,
+            finished_at=finished_at,
+            audio=audio_proof if actual == "completed" else None,
+            cleanup=reliability_validation.CleanupEvidence(
+                ok=True,
+                owned_processes_stopped=True,
+                temp_paths_removed=True,
+            ),
+            processes=[
+                reliability_validation.ProcessEvidence(
+                    pid=10_000 + index,
+                    ownership="validator-owned",
+                    command_hash="a" * 64,
+                    creation_time=started_at + timedelta(seconds=2),
+                    parent_pid=8188,
+                    parent_creation_time=started_at + timedelta(seconds=1),
+                    stopped_at=finished_at - timedelta(seconds=1),
+                    executable_name="python.exe",
+                    executable_hash="a" * 64,
+                    ownership_hash="b" * 64,
+                    started=True,
+                    stopped=True,
+                    descendants_stopped=True,
+                    alive_after=False,
+                )
+            ],
+            comfyui=comfyui,
+            gpu_before=reliability_validation.GpuSnapshot(used_mib=100, free_mib=8000),
+            gpu_peak=reliability_validation.GpuSnapshot(used_mib=300, free_mib=7800),
+            gpu_after=reliability_validation.GpuSnapshot(used_mib=100, free_mib=8000),
+            boundary=boundary,
+        )
+        assert reliability_validation.validate_case(case).valid is True
+        cases.append(case)
+        (cases_directory / f"{case.case_id}.json").write_bytes(
+            _canonical_model_bytes(case)
+        )
+        if case.audio is not None:
+            (audio_directory / f"{case.case_id}.wav").write_bytes(wav_payload)
+
+    fixture = reliability_validation.ReliabilityFixture.model_validate(
+        {
+            "version": 1,
+            "base_urls": {
+                "tts_more": "http://127.0.0.1:8000",
+                "comfyui": "http://127.0.0.1:8188",
+            },
+            "resources": {
+                engine: {
+                    "resource_id": f"{engine}-resource",
+                    "reference_audio": f"fixtures/{engine}.wav",
+                    "reference_text": engine,
+                }
+                for engine in reliability_validation.ENGINE_ORDER
+            },
+            "rounds": 10,
+        }
+    )
+    summary = reliability_validation.finalize_run(
+        fixture,
+        cases,
+        required_cases=reliability_validation.required_case_specs(plan),
+    )
+    assert summary.status == "passed"
+    (directory / "reliability-summary.json").write_bytes(
+        _canonical_model_bytes(summary)
+    )
 
 
 def _write_fake_inner(
@@ -34,6 +325,7 @@ def _write_fake_inner(
     start_count_path: Path,
     raw_run_id_path: Path,
     scenario: str,
+    evidence_fixture: Path | None = None,
     ready_directory: Path | None = None,
     release_path: Path | None = None,
 ) -> None:
@@ -47,6 +339,8 @@ param(
     [Parameter(Mandatory = $true)] [string] $ComfyPython,
     [Parameter(Mandatory = $true)] [string] $TtsMoreRoot,
     [Parameter(Mandatory = $true)] [string] $RunId,
+    [Parameter(Mandatory = $true)] [string] $OutputRootIdentity,
+    [Parameter(Mandatory = $true)] [string] $RunRootIdentity,
     [switch] $AllowLan,
     [switch] $PreflightOnly
 )
@@ -56,6 +350,7 @@ $countPath = '{_powershell_literal(start_count_path)}'
 $rawRunIdPath = '{_powershell_literal(raw_run_id_path)}'
 $readyDirectory = '{_powershell_literal(ready_directory or script_path.parent)}'
 $releasePath = '{_powershell_literal(release_path or script_path)}'
+$evidenceFixture = '{_powershell_literal(evidence_fixture or script_path)}'
 if ($scenario -ne 'cas') {{
     $count = if (Test-Path -LiteralPath $countPath) {{
         [int] (Get-Content -LiteralPath $countPath -Raw)
@@ -87,9 +382,16 @@ if ($scenario -eq 'launcher') {{
     exit 9
 }}
 if ($scenario -eq 'missing-result-zero') {{ exit 0 }}
-[IO.File]::WriteAllText((Join-Path $runDirectory 'preflight.json'), '{{"status":"passed"}}' + [Environment]::NewLine, $utf8)
-$mode = if ($scenario -in @('preflight', 'privacy', 'extra-member', 'cas')) {{ 'preflight' }} else {{ 'matrix' }}
-if ($scenario -in @('matrix', 'sparse-matrix')) {{
+if ($scenario -in @('junk-preflight', 'junk-matrix')) {{
+    [IO.File]::WriteAllText((Join-Path $runDirectory 'preflight.json'), '{{"status":"passed"}}' + [Environment]::NewLine, $utf8)
+}} else {{
+    Get-ChildItem -LiteralPath $evidenceFixture -Force | Copy-Item -Destination $runDirectory -Recurse
+}}
+$mode = if ($scenario -in @(
+    'preflight', 'privacy', 'extra-member', 'cas', 'junk-preflight',
+    'launcher-completed', 'launcher-residual'
+)) {{ 'preflight' }} else {{ 'matrix' }}
+if ($scenario -eq 'junk-matrix') {{
     [IO.Directory]::CreateDirectory((Join-Path $runDirectory 'cases')) | Out-Null
     [IO.Directory]::CreateDirectory((Join-Path $runDirectory 'audio')) | Out-Null
     $lastCase = if ($scenario -eq 'sparse-matrix') {{ 45 }} else {{ 46 }}
@@ -103,8 +405,11 @@ if ($scenario -in @('matrix', 'sparse-matrix')) {{
     }}
     [IO.File]::WriteAllText((Join-Path $runDirectory 'reliability-summary.json'), '{{"status":"passed"}}' + [Environment]::NewLine, $utf8)
 }}
+if ($scenario -eq 'sparse-matrix') {{
+    Remove-Item -LiteralPath ((Get-ChildItem -LiteralPath (Join-Path $runDirectory 'cases') -File | Select-Object -Last 1).FullName) -Force
+}}
 $validatorExit = if ($scenario -eq 'validator') {{ 7 }} elseif ($scenario -eq 'negative') {{ -7 }} else {{ 0 }}
-$cleanupStatus = if ($scenario -in @('cleanup', 'cleanup-residual')) {{ 'failed' }} else {{ 'completed' }}
+$cleanupStatus = if ($scenario -in @('cleanup', 'cleanup-residual', 'launcher-residual')) {{ 'failed' }} else {{ 'completed' }}
 if ($scenario -in @('validator', 'cleanup', 'cleanup-residual', 'negative')) {{
     $failureCode = if ($scenario -in @('cleanup', 'cleanup-residual')) {{ 'cleanup-failed' }} else {{ 'validator-failed' }}
     $failure = '{{"active_case_id":null,"failure":{{"code":"' + $failureCode + '","stage":"finalize"}},"run_key":"' + $runKey + '","schema_version":1,"status":"failed"}}' + [char] 10
@@ -119,7 +424,7 @@ if ($scenario -in @('cleanup', 'cleanup-residual')) {{
         )
     }}
 }}
-if ($scenario -eq 'cleanup-residual') {{
+if ($scenario -in @('cleanup-residual', 'launcher-residual')) {{
     [IO.Directory]::CreateDirectory((Join-Path $runDirectory '.p')) | Out-Null
     [IO.File]::WriteAllBytes(
         (Join-Path (Join-Path $runDirectory '.p') 'sentinel.bin'),
@@ -153,9 +458,15 @@ if ($scenario -eq 'extra-member') {{
 }}
 Push-Location -LiteralPath $backendRoot
 try {{
-    & $backendPython -m app.comfyui.reliability_supervision_cli record-inner `
-        --output-root $OutputRoot --run-key $runKey --mode $mode `
-        --validator-exit-code $validatorExit --cleanup-status $cleanupStatus
+    if ($scenario -in @('launcher-completed', 'launcher-residual')) {{
+        & $backendPython -m app.comfyui.reliability_supervision_cli record-inner `
+            --output-root $OutputRoot --run-key $runKey --mode $mode `
+            --failure-source launcher --cleanup-status $cleanupStatus
+    }} else {{
+        & $backendPython -m app.comfyui.reliability_supervision_cli record-inner `
+            --output-root $OutputRoot --run-key $runKey --mode $mode `
+            --validator-exit-code $validatorExit --cleanup-status $cleanupStatus
+    }}
     $pythonExit = $LASTEXITCODE
 }} finally {{
     Pop-Location
@@ -168,6 +479,8 @@ if ($scenario -eq 'privacy') {{
     [Console]::Error.WriteLine('https://user:password@example.invalid/private')
 }}
 if ($scenario -in @('validator', 'cleanup', 'cleanup-residual')) {{ exit 7 }}
+if ($scenario -eq 'launcher-completed') {{ exit 9 }}
+if ($scenario -eq 'launcher-residual') {{ exit 7 }}
 if ($scenario -eq 'negative') {{ exit -7 }}
 exit 0
 """.strip()
@@ -187,11 +500,48 @@ def _run_supervisor(
     shutil.copy2(SUPERVISOR_SOURCE, supervisor)
     start_count = tmp_path / "start-count.txt"
     raw_run_id = tmp_path / "raw-run-id.txt"
+    evidence_fixture = tmp_path / "authoritative-public-fixture"
+    matrix_scenarios = {
+        "matrix",
+        "sparse-matrix",
+        "wrong-case-ids",
+        "mismatched-bindings",
+        "non-wav",
+    }
+    _write_authoritative_public_fixture(
+        evidence_fixture,
+        matrix=scenario in matrix_scenarios,
+    )
+    if scenario in {"launcher-completed", "launcher-residual"}:
+        (evidence_fixture / "preflight.json").unlink()
+    if scenario == "wrong-case-ids":
+        first_case = sorted((evidence_fixture / "cases").glob("*.json"))[0]
+        first_case.rename(first_case.with_name("wrong-case-id.json"))
+    elif scenario == "mismatched-bindings":
+        for case_path in sorted((evidence_fixture / "cases").glob("*.json")):
+            document = json.loads(case_path.read_text(encoding="utf-8"))
+            if document["audio"] is not None:
+                document["audio"]["sha256"] = "0" * 64
+                case_path.write_text(
+                    json.dumps(
+                        document,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                break
+    elif scenario == "non-wav":
+        first_audio = sorted((evidence_fixture / "audio").glob("*.wav"))[0]
+        first_audio.write_bytes(b"RIFFx")
     _write_fake_inner(
         harness_scripts / "run-windows-comfyui-reliability.ps1",
         start_count_path=start_count,
         raw_run_id_path=raw_run_id,
         scenario=scenario,
+        evidence_fixture=evidence_fixture,
     )
     fixture = tmp_path / "fixture.json"
     fixture.write_text("{}\n", encoding="utf-8")
@@ -221,7 +571,14 @@ def _run_supervisor(
             str(REPOSITORY_ROOT),
             *(
                 ["-PreflightOnly"]
-                if scenario in {"preflight", "privacy", "extra-member"}
+                if scenario in {
+                    "preflight",
+                    "privacy",
+                    "extra-member",
+                    "junk-preflight",
+                    "launcher-completed",
+                    "launcher-residual",
+                }
                 else []
             ),
         ],
@@ -234,6 +591,81 @@ def _run_supervisor(
         check=False,
     )
     return completed, output_root, start_count, raw_run_id
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a real Windows junction")
+def test_f4_junction_ancestor_is_rejected_before_output_creation_or_child_start(
+    tmp_path: Path,
+) -> None:
+    harness_scripts = tmp_path / "harness" / "scripts"
+    harness_scripts.mkdir(parents=True)
+    supervisor = harness_scripts / SUPERVISOR_SOURCE.name
+    shutil.copy2(SUPERVISOR_SOURCE, supervisor)
+    child_started = tmp_path / "child-started.txt"
+    (harness_scripts / INNER_SOURCE.name).write_text(
+        (
+            "[CmdletBinding()]\n"
+            "param([Parameter(ValueFromRemainingArguments = $true)] $Rest)\n"
+            f"[IO.File]::WriteAllText('{_powershell_literal(child_started)}', 'started')\n"
+            "exit 0\n"
+        ),
+        encoding="utf-8",
+    )
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text("{}\n", encoding="utf-8")
+    comfy_root = tmp_path / "comfyui"
+    comfy_root.mkdir()
+    comfy_python = tmp_path / "comfy-python.exe"
+    comfy_python.write_bytes(b"test-only")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    sentinel.write_bytes(b"outside-must-survive")
+    junction = tmp_path / "junction"
+    _make_windows_junction(junction, outside)
+    escaped_output = outside / "must-remain-absent"
+    output_root = junction / escaped_output.name
+    assert not escaped_output.exists()
+
+    try:
+        completed = subprocess.run(
+            [
+                str(POWERSHELL),
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(supervisor),
+                "-Fixture",
+                str(fixture),
+                "-OutputRoot",
+                str(output_root),
+                "-ComfyUiRoot",
+                str(comfy_root),
+                "-ComfyPython",
+                str(comfy_python),
+                "-TtsMoreRoot",
+                str(REPOSITORY_ROOT),
+                "-PreflightOnly",
+            ],
+            cwd=REPOSITORY_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+
+        assert completed.returncode != 0
+        assert not escaped_output.exists()
+        assert sentinel.read_bytes() == b"outside-must-survive"
+        assert not child_started.exists()
+        assert not (outside / "current-terminal.json").exists()
+        assert not list(outside.glob("runs/*/terminal.json"))
+    finally:
+        junction.rmdir()
 
 
 def test_supervisor_starts_inner_once_and_commits_preflight_passed_current(
@@ -274,9 +706,46 @@ def test_supervisor_starts_inner_once_and_commits_preflight_passed_current(
         )
     ]
     assert raw_run_id not in json.dumps(public_documents, sort_keys=True)
-    committed_logs = b"".join(path.read_bytes() for path in (run_root / "logs").glob("*.log"))
+    committed_logs = b"".join(
+        path.read_bytes() for path in (run_root / "logs").glob("*.log")
+    )
     assert b"fake-inner-stdout" not in committed_logs
     assert b"fake-inner-stderr" not in committed_logs
+
+
+def test_f1_status_only_preflight_cannot_become_current(tmp_path: Path) -> None:
+    completed, output_root, _start_count, raw_run_id_path = _run_supervisor(
+        tmp_path,
+        scenario="junk-preflight",
+    )
+
+    raw_run_id = raw_run_id_path.read_text(encoding="utf-8")
+    run_key = hashlib.sha256(raw_run_id.encode("utf-8")).hexdigest()
+    run_root = output_root / "runs" / run_key
+    assert completed.returncode != 0
+    assert not (run_root / "terminal.json").exists()
+    assert not (output_root / "current-terminal.json").exists()
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["junk-matrix", "wrong-case-ids", "mismatched-bindings", "non-wav"],
+)
+def test_f1_invalid_matrix_artifacts_cannot_become_current(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    completed, output_root, _start_count, raw_run_id_path = _run_supervisor(
+        tmp_path,
+        scenario=scenario,
+    )
+
+    raw_run_id = raw_run_id_path.read_text(encoding="utf-8")
+    run_key = hashlib.sha256(raw_run_id.encode("utf-8")).hexdigest()
+    run_root = output_root / "runs" / run_key
+    assert completed.returncode != 0
+    assert not (run_root / "terminal.json").exists()
+    assert not (output_root / "current-terminal.json").exists()
 
 
 def _assert_terminal(
@@ -373,7 +842,7 @@ def test_supervisor_commits_validator_failure_with_exact_exit_7(tmp_path: Path) 
     )
 
 
-def test_supervisor_commits_launcher_crash_without_fabricated_validator_exit(
+def test_f3_started_child_missing_result_fails_closed(
     tmp_path: Path,
 ) -> None:
     completed, output_root, start_count, _raw_run_id = _run_supervisor(
@@ -381,17 +850,181 @@ def test_supervisor_commits_launcher_crash_without_fabricated_validator_exit(
         scenario="launcher",
     )
 
+    assert completed.returncode != 0
+    assert start_count.read_text(encoding="utf-8") == "1"
+    _assert_no_current(output_root)
+    assert not list((output_root / "runs").glob("*/terminal.json"))
+
+
+def _run_actual_inner_prevalidator_failure(
+    tmp_path: Path,
+    *,
+    cleanup_unproven: bool,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    run_id = "4" * 32
+    run_key = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    output_root = tmp_path / "evidence"
+    prepared_root = reliability_supervision.prepare_output_root(output_root)
+    prepared_run = reliability_supervision.prepare_run(
+        output_root,
+        run_key,
+        expected_root_identity=prepared_root.root_identity,
+    )
+    run_root = Path(prepared_run.run_root)
+    fixture_root = tmp_path / "fixture"
+    fixture_root.mkdir()
+    resources: dict[str, dict[str, str]] = {}
+    for engine in reliability_validation.ENGINE_ORDER:
+        reference_name = f"{engine}.wav"
+        (fixture_root / reference_name).write_bytes(b"test-reference")
+        resources[engine] = {"reference_audio": reference_name}
+    fixture_path = fixture_root / "fixture.json"
+    fixture_path.write_text(json.dumps({"resources": resources}), encoding="utf-8")
+    comfy_root = tmp_path / "ComfyUI"
+    (comfy_root / "custom_nodes" / "TTS-Audio-Suite").mkdir(parents=True)
+    started_marker = tmp_path / "fake-comfy-started.marker"
+    control_path = run_root / ".c"
+    (comfy_root / "main.py").write_text(
+        "from pathlib import Path\n"
+        "import os, time\n"
+        "Path(os.environ['TTS_MORE_F3_STARTED']).write_text('started')\n"
+        "time.sleep(0.35)\n"
+        + (
+            "Path(os.environ['TTS_MORE_F3_CONTROL']).unlink(missing_ok=True)\n"
+            if cleanup_unproven
+            else ""
+        )
+        + "raise SystemExit(23)\n",
+        encoding="utf-8",
+    )
+    model_roots: dict[str, Path] = {}
+    for name in ("gpt", "index", "cosy"):
+        model_root = tmp_path / name
+        model_root.mkdir()
+        model_roots[name] = model_root
+    registry_path = tmp_path / "resources.json"
+    registry_path.write_text("{}\n", encoding="utf-8")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TTS_MORE_RELIABILITY_GPT_SOVITS_ROOT": str(model_roots["gpt"]),
+            "TTS_MORE_RELIABILITY_INDEXTTS_ROOT": str(model_roots["index"]),
+            "TTS_MORE_RELIABILITY_COSYVOICE_ROOT": str(model_roots["cosy"]),
+            "TTS_AUDIO_SUITE_RESOURCES": str(registry_path),
+            "TTS_MORE_F3_STARTED": str(started_marker),
+            "TTS_MORE_F3_CONTROL": str(control_path),
+        }
+    )
+    completed = subprocess.run(
+        [
+            str(POWERSHELL),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(INNER_SOURCE),
+            "-Fixture",
+            str(fixture_path),
+            "-OutputRoot",
+            str(output_root),
+            "-ComfyUiRoot",
+            str(comfy_root),
+            "-ComfyPython",
+            sys.executable,
+            "-TtsMoreRoot",
+            str(REPOSITORY_ROOT),
+            "-RunId",
+            run_id,
+            "-OutputRootIdentity",
+            prepared_root.root_identity,
+            "-RunRootIdentity",
+            prepared_run.run_root_identity,
+            "-PreflightOnly",
+        ],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        timeout=30,
+        check=False,
+    )
+    return completed, run_root, started_marker
+
+
+@pytest.mark.parametrize(
+    ("cleanup_unproven", "expected_cleanup"),
+    [(False, "completed"), (True, "failed")],
+)
+def test_f3_inner_prevalidator_failure_records_truthful_started_service_cleanup(
+    tmp_path: Path,
+    cleanup_unproven: bool,
+    expected_cleanup: str,
+) -> None:
+    completed, run_root, started_marker = _run_actual_inner_prevalidator_failure(
+        tmp_path,
+        cleanup_unproven=cleanup_unproven,
+    )
+
+    assert completed.returncode != 0
+    assert started_marker.read_text(encoding="utf-8") == "started"
+    result = reliability_supervision.InnerRunResult.model_validate_json(
+        (run_root / "run-result.json").read_bytes(),
+        strict=True,
+    )
+    assert result.reported_by == "inner"
+    assert result.failure_source == "launcher"
+    assert result.validator_exit_code is None
+    assert result.cleanup_status == expected_cleanup
+    if cleanup_unproven:
+        assert any((run_root / name).exists() for name in (".p", ".o", ".h", ".c"))
+    else:
+        assert not any((run_root / name).exists() for name in (".p", ".o", ".h", ".c"))
+
+
+def test_f3_supervisor_commits_inner_launcher_cleanup_completed(tmp_path: Path) -> None:
+    completed, output_root, start_count, _raw_run_id = _run_supervisor(
+        tmp_path,
+        scenario="launcher-completed",
+    )
+
     assert completed.returncode == 9, completed.stdout + completed.stderr
     assert start_count.read_text(encoding="utf-8") == "1"
     _assert_terminal(
         output_root,
-        mode="matrix",
+        mode="preflight",
         outcome="failed",
         failure_source="launcher",
         launcher_exit_code=9,
         validator_exit_code=None,
-        cleanup_status="not-started",
+        cleanup_status="completed",
     )
+
+
+def test_f3_supervisor_preserves_inner_launcher_cleanup_residual_as_orphan(
+    tmp_path: Path,
+) -> None:
+    completed, output_root, start_count, _raw_run_id = _run_supervisor(
+        tmp_path,
+        scenario="launcher-residual",
+    )
+
+    assert completed.returncode != 0
+    assert start_count.read_text(encoding="utf-8") == "1"
+    _assert_no_current(output_root)
+    run_root = next((output_root / "runs").iterdir())
+    result = reliability_supervision.InnerRunResult.model_validate_json(
+        (run_root / "run-result.json").read_bytes(),
+        strict=True,
+    )
+    assert result.reported_by == "inner"
+    assert result.failure_source == "launcher"
+    assert result.validator_exit_code is None
+    assert result.cleanup_status == "failed"
+    assert any((run_root / name).exists() for name in (".p", ".o", ".h", ".c"))
+    assert not (run_root / "terminal.json").exists()
 
 
 def test_supervisor_commits_cleanup_failure(tmp_path: Path) -> None:
@@ -579,11 +1212,13 @@ def test_malformed_inner_result_types_never_advance_current(tmp_path: Path) -> N
 
 def _prepare_orphan_preflight_run(output_root: Path, run_key: str) -> str:
     expected_token = reliability_evidence.snapshot_current(output_root)["token"]
+    fixture_directory = output_root.parent / f"authoritative-{run_key[:12]}"
+    _write_authoritative_public_fixture(fixture_directory, matrix=False)
     reliability_evidence.write_artifact(
         output_root,
         run_key,
         "preflight",
-        b'{"status":"passed"}\n',
+        (fixture_directory / "preflight.json").read_bytes(),
     )
     reliability_supervision.record_inner_result(
         output_root,
@@ -672,11 +1307,14 @@ def test_two_real_supervisors_from_one_token_have_one_cas_winner(
     ready_directory = tmp_path / "ready"
     ready_directory.mkdir()
     release_path = tmp_path / "release"
+    evidence_fixture = tmp_path / "authoritative-public-fixture"
+    _write_authoritative_public_fixture(evidence_fixture, matrix=False)
     _write_fake_inner(
         harness_scripts / "run-windows-comfyui-reliability.ps1",
         start_count_path=tmp_path / "unused-count.txt",
         raw_run_id_path=tmp_path / "unused-run-id.txt",
         scenario="cas",
+        evidence_fixture=evidence_fixture,
         ready_directory=ready_directory,
         release_path=release_path,
     )

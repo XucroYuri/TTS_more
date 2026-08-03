@@ -329,6 +329,14 @@ def _windows_handle_information(handle: int) -> _WindowsFileInformation:
     return information
 
 
+def _windows_directory_identity(information: _WindowsFileInformation) -> str:
+    file_index = (information.FileIndexHigh << 32) | information.FileIndexLow
+    material = f"{information.VolumeSerialNumber:08x}:{file_index:016x}".encode(
+        "ascii"
+    )
+    return hashlib.sha256(material).hexdigest()
+
+
 def _windows_close_handle(handle: int) -> None:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     close_handle = kernel32.CloseHandle
@@ -470,6 +478,191 @@ def _windows_nt_create(
     except BaseException:
         _windows_close_handle(handle)
         raise
+
+
+def _absolute_directory_path(path: Path) -> Path:
+    try:
+        absolute = Path(os.path.abspath(os.fspath(path)))
+    except (OSError, TypeError, ValueError) as exc:
+        raise EvidenceStoreError("evidence directory path is invalid") from exc
+    if absolute == Path(absolute.anchor) or len(absolute.parts) < 2:
+        raise EvidenceStoreError("evidence directory path is invalid")
+    return absolute
+
+
+def _windows_open_directory_chain(path: Path, *, create_final: bool) -> tuple[Path, str]:
+    absolute = _absolute_directory_path(path)
+    if os.name != "nt":
+        raise EvidenceStoreError("Windows directory boundary is unavailable")
+    anchor = Path(absolute.anchor)
+    components = absolute.parts[1:]
+    root_handle = _windows_open_root_directory(anchor)
+    handles = [root_handle]
+    try:
+        parent = root_handle
+        for index, component in enumerate(components):
+            is_final = index == len(components) - 1
+            parent = _windows_nt_create(
+                parent,
+                component,
+                directory=True,
+                create_new=False,
+                create_if_missing=create_final and is_final,
+            )
+            handles.append(parent)
+        information = _windows_handle_information(parent)
+        after = _require_real_directory(absolute)
+        file_index = (information.FileIndexHigh << 32) | information.FileIndexLow
+        if after.st_ino != file_index:
+            raise EvidenceStoreError("evidence directory identity changed")
+        return absolute, _windows_directory_identity(information)
+    finally:
+        for handle in reversed(handles):
+            _windows_close_handle(handle)
+
+
+def _portable_open_directory_chain(path: Path, *, create_final: bool) -> tuple[Path, str]:
+    absolute = _absolute_directory_path(path)
+    components = absolute.parts[1:]
+    current = Path(absolute.anchor)
+    _require_real_directory(current)
+    for index, component in enumerate(components):
+        current = current / component
+        is_final = index == len(components) - 1
+        if create_final and is_final and not os.path.lexists(current):
+            try:
+                os.mkdir(current)
+            except OSError as exc:
+                raise EvidenceStoreError(
+                    "evidence directory could not be created"
+                ) from exc
+        _require_real_directory(current)
+    result = _require_real_directory(absolute)
+    material = f"{result.st_dev:x}:{result.st_ino:x}".encode("ascii")
+    return absolute, hashlib.sha256(material).hexdigest()
+
+
+def prepare_output_root_directory(path: Path) -> tuple[Path, str]:
+    """Create only the final output leaf after a no-follow ancestor walk."""
+    if os.name == "nt":
+        return _windows_open_directory_chain(path, create_final=True)
+    return _portable_open_directory_chain(path, create_final=True)
+
+
+def read_directory_identity(path: Path) -> tuple[Path, str]:
+    if os.name == "nt":
+        return _windows_open_directory_chain(path, create_final=False)
+    return _portable_open_directory_chain(path, create_final=False)
+
+
+def validate_directory_identity(path: Path, expected_identity: str) -> tuple[Path, str]:
+    try:
+        validated_identity = TypeAdapter(SHA256).validate_python(
+            expected_identity,
+            strict=True,
+        )
+    except ValidationError as exc:
+        raise EvidenceStoreError("evidence directory identity is invalid") from exc
+    absolute, actual_identity = read_directory_identity(path)
+    if actual_identity != validated_identity:
+        raise EvidenceStoreError("evidence directory identity changed")
+    return absolute, actual_identity
+
+
+def _windows_prepare_new_run_directory(
+    output_root: Path,
+    run_key: str,
+    expected_root_identity: str,
+) -> tuple[Path, str, Path, str]:
+    absolute = _absolute_directory_path(output_root)
+    safe_key = _validated_run_key(run_key)
+    root_handle = _windows_open_root_directory(Path(absolute.anchor))
+    handles = [root_handle]
+    try:
+        parent = root_handle
+        for component in absolute.parts[1:]:
+            parent = _windows_nt_create(
+                parent,
+                component,
+                directory=True,
+                create_new=False,
+            )
+            handles.append(parent)
+        root_information = _windows_handle_information(parent)
+        root_identity = _windows_directory_identity(root_information)
+        if root_identity != expected_root_identity:
+            raise EvidenceStoreError("evidence directory identity changed")
+        runs_handle = _windows_nt_create(
+            parent,
+            "runs",
+            directory=True,
+            create_new=False,
+            create_if_missing=True,
+        )
+        handles.append(runs_handle)
+        run_handle = _windows_nt_create(
+            runs_handle,
+            safe_key,
+            directory=True,
+            create_new=True,
+        )
+        handles.append(run_handle)
+        run_information = _windows_handle_information(run_handle)
+        run_identity = _windows_directory_identity(run_information)
+        run_root = absolute / "runs" / safe_key
+        root_after = _require_real_directory(absolute)
+        run_after = _require_real_directory(run_root)
+        root_index = (
+            root_information.FileIndexHigh << 32
+        ) | root_information.FileIndexLow
+        run_index = (run_information.FileIndexHigh << 32) | run_information.FileIndexLow
+        if root_after.st_ino != root_index or run_after.st_ino != run_index:
+            raise EvidenceStoreError("evidence directory identity changed")
+        return absolute, root_identity, run_root, run_identity
+    finally:
+        for handle in reversed(handles):
+            _windows_close_handle(handle)
+
+
+def prepare_new_run_directory(
+    output_root: Path,
+    run_key: str,
+    expected_root_identity: str,
+) -> tuple[Path, str, Path, str]:
+    try:
+        validated_identity = TypeAdapter(SHA256).validate_python(
+            expected_root_identity,
+            strict=True,
+        )
+    except ValidationError as exc:
+        raise EvidenceStoreError("evidence directory identity is invalid") from exc
+    if os.name == "nt":
+        return _windows_prepare_new_run_directory(
+            output_root,
+            run_key,
+            validated_identity,
+        )
+    root, root_identity = validate_directory_identity(
+        output_root,
+        validated_identity,
+    )
+    safe_key = _validated_run_key(run_key)
+    runs = root / "runs"
+    if not os.path.lexists(runs):
+        try:
+            os.mkdir(runs)
+        except OSError as exc:
+            raise EvidenceStoreError("run directory could not be created") from exc
+    _require_real_directory(runs)
+    run_root = runs / safe_key
+    try:
+        os.mkdir(run_root)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise EvidenceStoreError("run directory could not be created") from exc
+    canonical_run, run_identity = read_directory_identity(run_root)
+    return root, root_identity, canonical_run, run_identity
 
 
 def _windows_evidence_layout(path: Path) -> tuple[Path, tuple[str, ...]] | None:

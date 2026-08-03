@@ -6,6 +6,8 @@ param(
     [Parameter(Mandatory = $true)] [string] $ComfyPython,
     [Parameter(Mandatory = $true)] [string] $TtsMoreRoot,
     [string] $RunId,
+    [string] $OutputRootIdentity,
+    [string] $RunRootIdentity,
     [switch] $AllowLan,
     [switch] $PreflightOnly
 )
@@ -14,7 +16,9 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (
     [string]::IsNullOrEmpty($RunId) -or
-    $RunId -cnotmatch '^[0-9a-f]{32}$'
+    $RunId -cnotmatch '^[0-9a-f]{32}$' -or
+    $OutputRootIdentity -cnotmatch '^[0-9a-f]{64}$' -or
+    $RunRootIdentity -cnotmatch '^[0-9a-f]{64}$'
 ) {
     [Console]::Error.WriteLine('Supervised reliability contract is invalid')
     exit 7
@@ -27,6 +31,37 @@ function Resolve-ExistingPath {
     if ($Kind -eq 'File' -and -not $item.PSIsContainer) { return $item.FullName }
     if ($Kind -eq 'Directory' -and $item.PSIsContainer) { return $item.FullName }
     throw "Expected an existing $Kind"
+}
+
+function Invoke-RunBoundaryValidation {
+    param(
+        [string] $PythonPath,
+        [string] $BackendRoot,
+        [string] $OutputRoot,
+        [string] $RunKey,
+        [string] $ExpectedRootIdentity,
+        [string] $ExpectedRunRootIdentity
+    )
+    Push-Location -LiteralPath $BackendRoot
+    try {
+        $rendered = @(
+            & $PythonPath -m app.comfyui.reliability_supervision_cli `
+                validate-run-root --output-root $OutputRoot --run-key $RunKey `
+                --expected-root-identity $ExpectedRootIdentity `
+                --expected-run-root-identity $ExpectedRunRootIdentity 2>$null
+        )
+        $helperExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($helperExit -ne 0 -or $rendered.Count -ne 1) {
+        throw 'Formal run boundary validation failed'
+    }
+    try {
+        return ([string] $rendered[0]) | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw 'Formal run boundary validation returned invalid output'
+    }
 }
 
 function Write-NewUtf8TextFile {
@@ -2348,13 +2383,19 @@ $backendPythonPath = Resolve-ExistingPath -LiteralPath (Join-Path $ttsRootPath '
 $fixtureDocument = Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json
 
 try {
-    $outputRootPath = Resolve-ExistingPath -LiteralPath $OutputRoot -Kind Directory
-    if ($outputRootPath -eq [IO.Path]::GetPathRoot($outputRootPath)) {
-        throw 'OutputRoot must not be a drive root'
-    }
-    $runEvidenceRoot = Resolve-ExistingPath -LiteralPath (
-        Join-Path (Join-Path $outputRootPath 'runs') $runIdSha256
-    ) -Kind Directory
+    $runBoundary = Invoke-RunBoundaryValidation `
+        -PythonPath $backendPythonPath -BackendRoot $backendRootPath `
+        -OutputRoot $OutputRoot -RunKey $runIdSha256 `
+        -ExpectedRootIdentity $OutputRootIdentity `
+        -ExpectedRunRootIdentity $RunRootIdentity
+    if (
+        $runBoundary.ok -ne $true -or
+        $runBoundary.result.run_key -cne $runIdSha256 -or
+        $runBoundary.result.root_identity -cne $OutputRootIdentity -or
+        $runBoundary.result.run_root_identity -cne $RunRootIdentity
+    ) { throw 'Formal run boundary validation failed' }
+    $outputRootPath = [string] $runBoundary.result.output_root
+    $runEvidenceRoot = [string] $runBoundary.result.run_root
 } catch {
     [Console]::Error.WriteLine('Supervised reliability contract is invalid')
     exit 7
@@ -2830,25 +2871,36 @@ try {
     }
 }
 
+$cleanupStatus = if ($null -eq $cleanupFailure) { 'completed' } else { 'failed' }
+$runResultArguments = @(
+    '-m', 'app.comfyui.reliability_supervision_cli', 'record-inner',
+    '--output-root', $outputRootPath,
+    '--run-key', $runIdSha256,
+    '--mode', $(if ($PreflightOnly) { 'preflight' } else { 'matrix' }),
+    '--cleanup-status', $cleanupStatus
+)
 if ($formalValidatorInvoked -and $null -ne $formalValidatorExitCode) {
-    $cleanupStatus = if ($null -eq $cleanupFailure) { 'completed' } else { 'failed' }
-    Push-Location -LiteralPath $backendRootPath
-    try {
-        & $backendPythonPath -m app.comfyui.reliability_supervision_cli record-inner `
-            --output-root $outputRootPath --run-key $runIdSha256 `
-            --mode $(if ($PreflightOnly) { 'preflight' } else { 'matrix' }) `
-            --validator-exit-code ([string] $formalValidatorExitCode) `
-            --cleanup-status $cleanupStatus
-        $runResultExitCode = $LASTEXITCODE
-    } finally {
-        Pop-Location
-    }
-    if ($runResultExitCode -ne 0) {
-        [Console]::Error.WriteLine('Supervised reliability result could not be recorded')
-        exit 1
-    }
-    if ($cleanupStatus -eq 'failed') { exit 7 }
+    $runResultArguments += @(
+        '--validator-exit-code', [string] $formalValidatorExitCode
+    )
+} else {
+    $runResultArguments += @('--failure-source', 'launcher')
+}
+Push-Location -LiteralPath $backendRootPath
+try {
+    & $backendPythonPath @runResultArguments
+    $runResultExitCode = $LASTEXITCODE
+} finally {
+    Pop-Location
+}
+if ($runResultExitCode -ne 0) {
+    [Console]::Error.WriteLine('Supervised reliability result could not be recorded')
+    exit 1
+}
+if ($cleanupStatus -eq 'failed') { exit 7 }
+if ($formalValidatorInvoked -and $null -ne $formalValidatorExitCode) {
     exit ([int] $formalValidatorExitCode)
 }
 
 Complete-LauncherFailureState -PrimaryFailure $primaryFailure -CleanupFailure $cleanupFailure
+exit 1

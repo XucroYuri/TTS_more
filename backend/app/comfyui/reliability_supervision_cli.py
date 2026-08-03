@@ -9,8 +9,10 @@ from app.comfyui.reliability_supervision import (
     SupervisionError,
     commit_log,
     finalize_supervision,
+    prepare_output_root,
     prepare_run,
     record_inner_result,
+    validate_run_boundary,
 )
 
 
@@ -23,15 +25,24 @@ class _Parser(argparse.ArgumentParser):
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="reliability-supervision")
     commands = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
+    prepare_root = commands.add_parser("prepare-output-root")
+    prepare_root.add_argument("--output-root", required=True)
     prepare = commands.add_parser("prepare-run")
     prepare.add_argument("--output-root", required=True)
     prepare.add_argument("--run-key", required=True)
+    prepare.add_argument("--expected-root-identity", required=True)
+    validate_run = commands.add_parser("validate-run-root")
+    validate_run.add_argument("--output-root", required=True)
+    validate_run.add_argument("--run-key", required=True)
+    validate_run.add_argument("--expected-root-identity", required=True)
+    validate_run.add_argument("--expected-run-root-identity", required=True)
     inner = commands.add_parser("record-inner")
     inner.add_argument("--output-root", required=True)
     inner.add_argument("--run-key", required=True)
     inner.add_argument("--mode", choices=("preflight", "matrix"), required=True)
-    inner.add_argument("--validator-exit-code", type=int, required=True)
+    inner.add_argument("--validator-exit-code", type=int)
     inner.add_argument("--cleanup-status", choices=("completed", "failed"), required=True)
+    inner.add_argument("--failure-source", choices=("launcher",))
     log = commands.add_parser("commit-log")
     log.add_argument("--output-root", required=True)
     log.add_argument("--run-key", required=True)
@@ -54,9 +65,26 @@ def _emit(payload: dict[str, object]) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
-        if args.command == "prepare-run":
-            prepared = prepare_run(Path(args.output_root), args.run_key)
+        if args.command == "prepare-output-root":
+            prepared = prepare_output_root(Path(args.output_root))
             _emit({"ok": True, "result": prepared.model_dump(mode="json")})
+            return 0
+        if args.command == "prepare-run":
+            prepared = prepare_run(
+                Path(args.output_root),
+                args.run_key,
+                expected_root_identity=args.expected_root_identity,
+            )
+            _emit({"ok": True, "result": prepared.model_dump(mode="json")})
+            return 0
+        if args.command == "validate-run-root":
+            validated = validate_run_boundary(
+                Path(args.output_root),
+                args.run_key,
+                expected_root_identity=args.expected_root_identity,
+                expected_run_root_identity=args.expected_run_root_identity,
+            )
+            _emit({"ok": True, "result": validated.model_dump(mode="json")})
             return 0
         if args.command == "record-inner":
             commitment = record_inner_result(
@@ -65,6 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 mode=args.mode,
                 validator_exit_code=args.validator_exit_code,
                 cleanup_status=args.cleanup_status,
+                failure_source=args.failure_source,
             )
             _emit({"ok": True, "commitment": commitment.model_dump(mode="json")})
             return 0

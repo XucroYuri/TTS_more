@@ -23,6 +23,7 @@ from pydantic import ValidationError
 import app.comfyui.reliability_validation as reliability_validation
 import app.comfyui.launcher_failure_context as launcher_failure_context
 import app.comfyui.reliability_evidence as reliability_evidence
+import app.comfyui.reliability_supervision as reliability_supervision
 
 from app.comfyui.reliability_validation import (
     AudioProof,
@@ -40,6 +41,24 @@ from app.comfyui.reliability_validation import (
     validate_case,
     write_atomic_json,
 )
+
+
+def _prepare_supervised_run(
+    output_root: Path,
+    run_id: str,
+) -> tuple[Path, str, str]:
+    run_key = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    prepared_root = reliability_supervision.prepare_output_root(output_root)
+    prepared_run = reliability_supervision.prepare_run(
+        output_root,
+        run_key,
+        expected_root_identity=prepared_root.root_identity,
+    )
+    return (
+        Path(prepared_run.run_root),
+        prepared_root.root_identity,
+        prepared_run.run_root_identity,
+    )
 
 
 def _fixture_document() -> dict[str, object]:
@@ -5508,8 +5527,10 @@ def test_task_12_wrapper_cleans_owned_empty_temp_after_launcher_identity_failure
     output_root = tmp_path / "validation output"
     output_root.mkdir()
     run_id = "1" * 32
-    run_root = output_root / "runs" / hashlib.sha256(run_id.encode()).hexdigest()
-    run_root.mkdir(parents=True)
+    run_root, root_identity, run_root_identity = _prepare_supervised_run(
+        output_root,
+        run_id,
+    )
     sentinel_directory = output_root / "unrelated sentinel directory"
     sentinel_directory.mkdir()
     sentinel_file = output_root / "unrelated-sentinel.txt"
@@ -5600,6 +5621,8 @@ try {
         -ComfyPython $env:TTS_MORE_TEST_COMFY_PYTHON `
         -TtsMoreRoot $env:TTS_MORE_TEST_TTS_ROOT `
         -RunId '11111111111111111111111111111111' `
+        -OutputRootIdentity $env:TTS_MORE_TEST_ROOT_IDENTITY `
+        -RunRootIdentity $env:TTS_MORE_TEST_RUN_ROOT_IDENTITY `
         -PreflightOnly
 } catch {
     $caught = $_
@@ -5634,6 +5657,8 @@ Write-Output 'EARLY_LAUNCHER_FAILURE_CLEANUP_OK'
             "TTS_MORE_TEST_FIXTURE": str(fixture_path),
             "TTS_MORE_TEST_OUTPUT": str(output_root),
             "TTS_MORE_TEST_RUN_ROOT": str(run_root),
+            "TTS_MORE_TEST_ROOT_IDENTITY": root_identity,
+            "TTS_MORE_TEST_RUN_ROOT_IDENTITY": run_root_identity,
             "TTS_MORE_TEST_COMFY_ROOT": str(comfy_root),
             "TTS_MORE_TEST_COMFY_PYTHON": str(fake_comfy_python),
             "TTS_MORE_TEST_TTS_ROOT": str(repository_root),
@@ -5903,8 +5928,10 @@ def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
     output_root = tmp_path / "private evidence"
     output_root.mkdir()
     run_id = "2" * 32
-    run_root = output_root / "runs" / hashlib.sha256(run_id.encode()).hexdigest()
-    run_root.mkdir(parents=True)
+    run_root, root_identity, run_root_identity = _prepare_supervised_run(
+        output_root,
+        run_id,
+    )
     fixture_root = tmp_path / "fixture"
     reference_root = fixture_root / "references"
     reference_root.mkdir(parents=True)
@@ -5972,6 +5999,10 @@ def test_task_12_wrapper_preserves_exited_child_startup_logs_and_primary_error(
             str(repository_root),
             "-RunId",
             "22222222222222222222222222222222",
+            "-OutputRootIdentity",
+            root_identity,
+            "-RunRootIdentity",
+            run_root_identity,
             "-PreflightOnly",
         ],
         capture_output=True,
@@ -6212,8 +6243,10 @@ def test_task_12_wrapper_preserves_primary_error_when_cleanup_cim_query_fails(
     output_root = tmp_path / "private failure evidence"
     output_root.mkdir()
     run_id = "3" * 32
-    run_root = output_root / "runs" / hashlib.sha256(run_id.encode()).hexdigest()
-    run_root.mkdir(parents=True)
+    run_root, root_identity, run_root_identity = _prepare_supervised_run(
+        output_root,
+        run_id,
+    )
     fixture_root = tmp_path / "fixture"
     reference_root = fixture_root / "references"
     reference_root.mkdir(parents=True)
@@ -6254,6 +6287,10 @@ function Get-CimInstance {
             -Filter $Filter -ErrorAction Stop
         if ($null -eq $result -and $Filter -match '^ProcessId = \d+$') {
             $global:TTSMoreCleanupQueryErrors += 1
+            [IO.File]::WriteAllText(
+                $env:TTS_MORE_CLEANUP_QUERY_MARKER,
+                [string] $global:TTSMoreCleanupQueryErrors
+            )
             throw 'injected exact cleanup CIM query failure'
         }
         return $result
@@ -6261,32 +6298,27 @@ function Get-CimInstance {
     return @(CimCmdlets\Get-CimInstance -ClassName $ClassName -ErrorAction Stop)
 }
 
-$caught = $null
-try {
-    & $env:TTS_MORE_RELIABILITY_SCRIPT `
-        -Fixture $env:TTS_MORE_TEST_FIXTURE `
-        -OutputRoot $env:TTS_MORE_TEST_OUTPUT `
-        -ComfyUiRoot $env:TTS_MORE_TEST_COMFY_ROOT `
-        -ComfyPython $env:TTS_MORE_TEST_COMFY_PYTHON `
-        -TtsMoreRoot $env:TTS_MORE_TEST_TTS_ROOT `
-        -RunId '33333333333333333333333333333333' `
-        -PreflightOnly
-} catch { $caught = $_ }
-if (
-    $null -eq $caught -or
-    $caught.Exception.Message -notlike 'Owned process exited before acquiring port 8188*'
-) { throw ('primary startup failure was not preserved: {0}' -f $caught) }
-if ($global:TTSMoreCleanupQueryErrors -ne 1) {
-    throw 'controlled cleanup CIM query error was not injected exactly once'
-}
-Write-Output 'PRIMARY_ERROR_SURVIVED_CLEANUP_QUERY_ERROR_OK'
+& $env:TTS_MORE_RELIABILITY_SCRIPT `
+    -Fixture $env:TTS_MORE_TEST_FIXTURE `
+    -OutputRoot $env:TTS_MORE_TEST_OUTPUT `
+    -ComfyUiRoot $env:TTS_MORE_TEST_COMFY_ROOT `
+    -ComfyPython $env:TTS_MORE_TEST_COMFY_PYTHON `
+    -TtsMoreRoot $env:TTS_MORE_TEST_TTS_ROOT `
+    -RunId '33333333333333333333333333333333' `
+    -OutputRootIdentity $env:TTS_MORE_TEST_ROOT_IDENTITY `
+    -RunRootIdentity $env:TTS_MORE_TEST_RUN_ROOT_IDENTITY `
+    -PreflightOnly
 """
+    cleanup_query_marker = tmp_path / "cleanup-query.marker"
     environment = os.environ.copy()
     environment.update(
         {
             "TTS_MORE_RELIABILITY_SCRIPT": str(script_path),
             "TTS_MORE_TEST_FIXTURE": str(fixture_path),
             "TTS_MORE_TEST_OUTPUT": str(output_root),
+            "TTS_MORE_TEST_ROOT_IDENTITY": root_identity,
+            "TTS_MORE_TEST_RUN_ROOT_IDENTITY": run_root_identity,
+            "TTS_MORE_CLEANUP_QUERY_MARKER": str(cleanup_query_marker),
             "TTS_MORE_TEST_COMFY_ROOT": str(comfy_root),
             "TTS_MORE_TEST_COMFY_PYTHON": str(Path(os.sys.executable).resolve()),
             "TTS_MORE_TEST_TTS_ROOT": str(repository_root),
@@ -6309,14 +6341,27 @@ Write-Output 'PRIMARY_ERROR_SURVIVED_CLEANUP_QUERY_ERROR_OK'
         timeout=20,
     )
 
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode != 0, completed.stderr
     combined_output = completed.stdout + completed.stderr
-    assert "PRIMARY_ERROR_SURVIVED_CLEANUP_QUERY_ERROR_OK" in completed.stdout
+    assert cleanup_query_marker.read_text(encoding="utf-8") == "1"
     assert (
         "WARNING: Process cleanup verification failed; preserving private "
         "process, temp, and control evidence"
     ) in combined_output
     assert "injected exact cleanup CIM query failure" not in combined_output
+
+    result = json.loads((run_root / "run-result.json").read_bytes())
+    assert result == {
+        "cleanup_status": "failed",
+        "failure_source": "launcher",
+        "kind": "reliability-inner-run-result",
+        "mode": "preflight",
+        "outcome": "failed",
+        "reported_by": "inner",
+        "run_key": hashlib.sha256(run_id.encode("utf-8")).hexdigest(),
+        "schema_version": 1,
+        "validator_exit_code": None,
+    }
 
     sidecars = [run_root / name for name in (".co", ".ce", ".bo", ".be")]
     assert len(sidecars) == 4
@@ -13034,8 +13079,10 @@ def test_task4_i2_preexisting_reserved_ingress_fails_before_process_start(
     run_id = "4" * 32
     run_key = hashlib.sha256(run_id.encode()).hexdigest()
     output_root = tmp_path / "evidence"
-    run_root = output_root / "runs" / run_key
-    run_root.mkdir(parents=True)
+    run_root, root_identity, run_root_identity = _prepare_supervised_run(
+        output_root,
+        run_id,
+    )
     reserved_path = run_root / reserved_name
     sentinel = b"TASK4-RESERVED-SENTINEL\x00\x7f\x80\xfe\xff"
     if reserved_name == ".p":
@@ -13087,7 +13134,10 @@ function Start-Process {
     -ComfyUiRoot $env:TTS_MORE_TASK4_COMFY `
     -ComfyPython $env:TTS_MORE_TASK4_PYTHON `
     -TtsMoreRoot $env:TTS_MORE_TASK4_REPOSITORY `
-    -RunId ('4' * 32) -PreflightOnly
+    -RunId ('4' * 32) `
+    -OutputRootIdentity $env:TTS_MORE_TASK4_ROOT_IDENTITY `
+    -RunRootIdentity $env:TTS_MORE_TASK4_RUN_ROOT_IDENTITY `
+    -PreflightOnly
 """
     environment = os.environ.copy()
     environment.update(
@@ -13097,6 +13147,8 @@ function Start-Process {
             ),
             "TTS_MORE_TASK4_FIXTURE": str(fixture_path),
             "TTS_MORE_TASK4_OUTPUT": str(output_root),
+            "TTS_MORE_TASK4_ROOT_IDENTITY": root_identity,
+            "TTS_MORE_TASK4_RUN_ROOT_IDENTITY": run_root_identity,
             "TTS_MORE_TASK4_COMFY": str(comfy_root),
             "TTS_MORE_TASK4_PYTHON": powershell,
             "TTS_MORE_TASK4_REPOSITORY": str(repository_root),

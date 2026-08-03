@@ -187,8 +187,7 @@ function Invoke-PythonJson {
 }
 
 try {
-    [IO.Directory]::CreateDirectory($OutputRoot) | Out-Null
-    $outputRootPath = (Resolve-Path -LiteralPath $OutputRoot -ErrorAction Stop).Path
+    $outputRootRequest = [IO.Path]::GetFullPath($OutputRoot)
     $ttsMoreRootPath = (Resolve-Path -LiteralPath $TtsMoreRoot -ErrorAction Stop).Path
     $backendRoot = Join-Path $ttsMoreRootPath 'backend'
     $backendPython = Join-Path $backendRoot '.venv\Scripts\python.exe'
@@ -199,6 +198,18 @@ try {
     if (-not (Test-Path -LiteralPath $innerScript -PathType Leaf)) {
         throw 'Formal inner launcher is unavailable'
     }
+    $preparedRoot = Invoke-PythonJson -PythonPath $backendPython -BackendRoot $backendRoot `
+        -Arguments @(
+            '-m', 'app.comfyui.reliability_supervision_cli', 'prepare-output-root',
+            '--output-root', $outputRootRequest
+        )
+    if (
+        $preparedRoot.ok -ne $true -or
+        $preparedRoot.result.root_identity -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]::IsNullOrEmpty([string] $preparedRoot.result.output_root)
+    ) { throw 'Formal output root preparation failed' }
+    $outputRootPath = [string] $preparedRoot.result.output_root
+    $rootIdentity = [string] $preparedRoot.result.root_identity
 
     $snapshot = Invoke-PythonJson -PythonPath $backendPython -BackendRoot $backendRoot `
         -Arguments @(
@@ -222,11 +233,18 @@ try {
         -Arguments @(
             '-m', 'app.comfyui.reliability_supervision_cli', 'prepare-run',
             '--output-root', $outputRootPath,
-            '--run-key', $runKey
+            '--run-key', $runKey,
+            '--expected-root-identity', $rootIdentity
         )
-    if ($prepared.ok -ne $true -or $prepared.result.run_key -cne $runKey) {
+    if (
+        $prepared.ok -ne $true -or
+        $prepared.result.run_key -cne $runKey -or
+        $prepared.result.root_identity -cne $rootIdentity -or
+        $prepared.result.run_root_identity -cnotmatch '^[0-9a-f]{64}$'
+    ) {
         throw 'Formal run preparation failed'
     }
+    $runRootIdentity = [string] $prepared.result.run_root_identity
 
     $innerArguments = @(
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $innerScript,
@@ -235,7 +253,9 @@ try {
         '-ComfyUiRoot', $ComfyUiRoot,
         '-ComfyPython', $ComfyPython,
         '-TtsMoreRoot', $ttsMoreRootPath,
-        '-RunId', $runId
+        '-RunId', $runId,
+        '-OutputRootIdentity', $rootIdentity,
+        '-RunRootIdentity', $runRootIdentity
     )
     if ($AllowLan) { $innerArguments += '-AllowLan' }
     if ($PreflightOnly) { $innerArguments += '-PreflightOnly' }
