@@ -651,6 +651,32 @@ def _resolve_supervision_result(
     return result
 
 
+def _private_recovery_top_level_names(
+    boundary: PrivateRecoveryBoundary,
+) -> frozenset[str]:
+    run_handle, _safe_key = private_recovery._open_observation_run(boundary)
+    try:
+        return frozenset(
+            name for name, _kind in private_recovery._directory_names(run_handle)
+        )
+    finally:
+        private_recovery._close_directory(run_handle)
+
+
+def _observe_exact_private_recovery(
+    boundary: PrivateRecoveryBoundary,
+) -> private_recovery.PrivateRecoverySnapshot:
+    allowed = frozenset({".p", *private_recovery.PRIVATE_ROLES})
+    before = _private_recovery_top_level_names(boundary)
+    if not before.issubset(allowed):
+        raise SupervisionError("private recovery membership is invalid")
+    snapshot = observe_private_recovery(boundary)
+    after = _private_recovery_top_level_names(boundary)
+    if after != before or not after.issubset(allowed):
+        raise SupervisionError("private recovery membership is invalid")
+    return snapshot
+
+
 def prepare_private_finalization(
     output_root: Path,
     run_key: str,
@@ -689,7 +715,7 @@ def prepare_private_finalization(
                 private_root=str(Path(boundary.private_root).parent),
                 private_root_identity=boundary.private_namespace_identity,
             )
-            snapshot = observe_private_recovery(held_private_boundary)
+            snapshot = _observe_exact_private_recovery(held_private_boundary)
             write_private_recovery_snapshot(root, run_key, snapshot)
         return PreparedPrivateFinalization(
             status="ready",

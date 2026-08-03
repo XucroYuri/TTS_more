@@ -485,9 +485,11 @@ if ($scenario -eq 'sparse-matrix') {{
     Remove-Item -LiteralPath ((Get-ChildItem -LiteralPath (Join-Path $runDirectory 'cases') -File | Select-Object -Last 1).FullName) -Force
 }}
 $validatorExit = if ($scenario -eq 'validator') {{ 7 }} elseif ($scenario -eq 'negative') {{ -7 }} else {{ 0 }}
-$cleanupStatus = if ($scenario -in @('cleanup', 'cleanup-residual', 'launcher-residual')) {{ 'failed' }} else {{ 'completed' }}
-if ($scenario -in @('validator', 'cleanup', 'cleanup-residual', 'negative')) {{
-    $failureCode = if ($scenario -in @('cleanup', 'cleanup-residual')) {{ 'cleanup-failed' }} else {{ 'validator-failed' }}
+$cleanupStatus = if ($scenario -in @(
+    'cleanup', 'cleanup-residual', 'cleanup-rogue', 'launcher-residual'
+)) {{ 'failed' }} else {{ 'completed' }}
+if ($scenario -in @('validator', 'cleanup', 'cleanup-residual', 'cleanup-rogue', 'negative')) {{
+    $failureCode = if ($scenario -in @('cleanup', 'cleanup-residual', 'cleanup-rogue')) {{ 'cleanup-failed' }} else {{ 'validator-failed' }}
     $failure = '{{"active_case_id":null,"failure":{{"code":"' + $failureCode + '","stage":"finalize"}},"run_key":"' + $runKey + '","schema_version":1,"status":"failed"}}' + [char] 10
     [IO.File]::WriteAllText((Join-Path $runDirectory 'failure.json'), $failure, $utf8)
 }}
@@ -500,7 +502,7 @@ if ($scenario -in @('cleanup', 'cleanup-residual')) {{
         )
     }}
 }}
-if ($scenario -in @('cleanup-residual', 'launcher-residual')) {{
+if ($scenario -in @('cleanup-residual', 'cleanup-rogue', 'launcher-residual')) {{
     [IO.Directory]::CreateDirectory((Join-Path $privateDirectory '.p')) | Out-Null
     [IO.File]::WriteAllBytes(
         (Join-Path (Join-Path $privateDirectory '.p') 'sentinel.bin'),
@@ -513,6 +515,12 @@ if ($scenario -in @('cleanup-residual', 'launcher-residual')) {{
             $utf8
         )
     }}
+}}
+if ($scenario -eq 'cleanup-rogue') {{
+    [IO.File]::WriteAllBytes(
+        (Join-Path $privateDirectory 'rogue.bin'),
+        [byte[]](82,79,71,85,69,0,127,128,254,255)
+    )
 }}
 if ($scenario.StartsWith('invalid-')) {{
     $validatorFragment = switch ($scenario) {{
@@ -554,7 +562,7 @@ if ($scenario -eq 'privacy') {{
     [Console]::Out.WriteLine('token=TOP-SECRET C:\private\model.ckpt resource_id=voice-private')
     [Console]::Error.WriteLine('https://user:password@example.invalid/private')
 }}
-if ($scenario -in @('validator', 'cleanup', 'cleanup-residual')) {{ exit 7 }}
+if ($scenario -in @('validator', 'cleanup', 'cleanup-residual', 'cleanup-rogue')) {{ exit 7 }}
 if ($scenario -eq 'launcher-completed') {{ exit 9 }}
 if ($scenario -eq 'launcher-residual') {{ exit 7 }}
 if ($scenario -eq 'negative') {{ exit -7 }}
@@ -1592,6 +1600,59 @@ def test_cleanup_failure_publishes_private_recovery_residual_as_current(
     for private_name in (".o", ".h", ".c"):
         assert (private_root / private_name).is_file()
     assert (run_root / "terminal.json").is_file()
+
+
+def test_cleanup_failure_with_rogue_private_member_preserves_old_current_and_raw_leaf(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    old_run_key = "e" * 64
+    old_expected_token, old_prepared = _prepare_orphan_preflight_run(
+        output_root,
+        old_run_key,
+    )
+    _prepare_direct_finalization(
+        output_root,
+        old_prepared,
+        mode="preflight",
+        launcher_exit_code=0,
+    )
+    reliability_supervision.finalize_supervision(
+        output_root,
+        old_run_key,
+        mode="preflight",
+        expected_token=old_expected_token,
+        expected_root_identity=old_prepared.root_identity,
+        expected_run_root_identity=old_prepared.run_root_identity,
+        expected_private_root_identity=old_prepared.private_root_identity,
+        expected_private_namespace_identity=old_prepared.private_namespace_identity,
+        launcher_exit_code=0,
+        child_start_count=1,
+    )
+    old_pointer_bytes = (output_root / "current-terminal.json").read_bytes()
+    old_current = reliability_evidence.verify_current(output_root)
+
+    completed, output_root, start_count, raw_run_id = _run_supervisor(
+        tmp_path,
+        scenario="cleanup-rogue",
+    )
+
+    assert completed.returncode != 0
+    assert start_count.read_text(encoding="utf-8") == "1"
+    assert (output_root / "current-terminal.json").read_bytes() == old_pointer_bytes
+    assert reliability_evidence.verify_current(output_root) == old_current
+    run_key = hashlib.sha256(
+        raw_run_id.read_text(encoding="utf-8").encode("utf-8")
+    ).hexdigest()
+    private_leaf = output_root / ".private-recovery" / run_key
+    assert (private_leaf / "rogue.bin").read_bytes() == bytes(
+        (82, 79, 71, 85, 69, 0, 127, 128, 254, 255)
+    )
+    assert (private_leaf / ".p" / "sentinel.bin").read_bytes() == bytes(
+        (0, 1, 127, 128, 254, 255)
+    )
+    assert not (output_root / "runs" / run_key / "terminal.json").exists()
 
 
 def test_private_recovery_snapshot_crash_preserves_old_current_and_orphan(
