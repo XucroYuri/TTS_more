@@ -5750,6 +5750,8 @@ def _best_effort_unlink(path: Path | None) -> bool:
 
 
 def _wav_proof_from_bytes(data: bytes) -> AudioProof:
+    if soundfile.info(io.BytesIO(data)).format != "WAV":
+        raise ValueError("audio container is not WAV")
     samples, sample_rate = soundfile.read(io.BytesIO(data), dtype="float32", always_2d=True)
     if sample_rate <= 0 or len(samples) <= 0:
         raise ValueError("empty audio")
@@ -5769,12 +5771,86 @@ def _wav_proof_from_bytes(data: bytes) -> AudioProof:
     )
 
 
+class RunArtifactSupervisionFacts(_StrictModel):
+    inner_mode: Literal["preflight", "matrix"]
+    supervisor_mode: Literal["preflight", "matrix"]
+    inner_outcome: Literal["passed", "failed"]
+    supervisor_outcome: Literal["passed", "failed"]
+    inner_failure_source: Literal["none", "launcher", "validator", "cleanup"]
+    supervisor_failure_source: Literal["none", "launcher", "validator", "cleanup"]
+    inner_validator_exit_code: StrictInt | None
+    supervisor_validator_exit_code: StrictInt | None
+    inner_cleanup_status: Literal["completed", "failed", "not-started"]
+    supervisor_cleanup_status: Literal["completed", "failed", "not-started"]
+
+    @model_validator(mode="after")
+    def _same_formal_facts(self) -> "RunArtifactSupervisionFacts":
+        if (
+            self.inner_mode != self.supervisor_mode
+            or self.inner_outcome != self.supervisor_outcome
+            or self.inner_failure_source != self.supervisor_failure_source
+            or self.inner_validator_exit_code != self.supervisor_validator_exit_code
+            or self.inner_cleanup_status != self.supervisor_cleanup_status
+        ):
+            raise ValueError("inner and supervisor facts disagree")
+        return self
+
+
+def _validate_failed_artifact_contract(
+    failure: ReliabilityRunFailure,
+    facts: RunArtifactSupervisionFacts,
+    *,
+    failed_case: CurrentFailedCaseEvidence | None,
+) -> None:
+    source = facts.supervisor_failure_source
+    validator_exit_code = facts.supervisor_validator_exit_code
+    cleanup_status = facts.supervisor_cleanup_status
+    if source == "launcher":
+        if (
+            validator_exit_code is not None
+            or failure.active_case_id is not None
+            or failure.failure
+            != FailureMarker(code="launcher-failed", stage="preflight")
+        ):
+            raise ValueError("launcher failure artifacts contradict supervision")
+        return
+    if source == "validator":
+        if validator_exit_code in {None, 0} or cleanup_status != "completed":
+            raise ValueError("validator failure facts are incoherent")
+        if failed_case is None and (
+            failure.active_case_id is not None
+            or failure.failure
+            != FailureMarker(code="validator-failed", stage="finalize")
+        ):
+            raise ValueError("validator failure artifacts contradict supervision")
+        return
+    if source == "cleanup":
+        if validator_exit_code is None or cleanup_status != "failed":
+            raise ValueError("cleanup failure facts are incoherent")
+        if validator_exit_code == 0:
+            if (
+                failure.active_case_id is not None
+                or failure.failure
+                != FailureMarker(code="cleanup-failed", stage="finalize")
+            ):
+                raise ValueError("cleanup failure artifacts contradict supervision")
+        elif failed_case is None and (
+            failure.active_case_id is not None
+            or failure.failure
+            != FailureMarker(code="validator-failed", stage="finalize")
+        ):
+            raise ValueError("cleanup lost the earlier validator failure")
+        return
+    raise ValueError("failed run has no terminal failure source")
+
+
 def verify_run_artifacts(
     output_root: Path,
     run_key: str,
     *,
     mode: Literal["preflight", "matrix"],
     outcome: Literal["passed", "failed"],
+    supervision: RunArtifactSupervisionFacts,
 ) -> None:
     """Validate one unfrozen run through the authoritative public models."""
 
@@ -5786,6 +5862,13 @@ def verify_run_artifacts(
             create=False,
         )
         files, _directories = reliability_evidence._scan_run_membership(run_root)
+        if (
+            supervision.inner_mode != mode
+            or supervision.supervisor_mode != mode
+            or supervision.inner_outcome != outcome
+            or supervision.supervisor_outcome != outcome
+        ):
+            raise ValueError("artifact and supervision classifications disagree")
 
         def read_fixed(kind: str) -> bytes:
             return reliability_evidence.read_artifact(output_root, safe_key, kind)
@@ -5842,6 +5925,13 @@ def verify_run_artifacts(
         if mode == "preflight":
             if summary is not None or case_names or audio_names:
                 raise ValueError("preflight run contains matrix evidence")
+            if outcome == "failed":
+                assert failure is not None
+                _validate_failed_artifact_contract(
+                    failure,
+                    supervision,
+                    failed_case=None,
+                )
             return
 
         plan = build_case_plan(rounds=10)
@@ -5953,6 +6043,13 @@ def verify_run_artifacts(
                 failed_case = failed_cases[failed_case_id]
                 if failed_case.failure != failure.failure:
                     raise ValueError("failure markers disagree")
+            _validate_failed_artifact_contract(
+                failure,
+                supervision,
+                failed_case=(
+                    None if failed_case_id is None else failed_cases[failed_case_id]
+                ),
+            )
     except Exception:
         raise ValueError("run artifacts are invalid") from None
 

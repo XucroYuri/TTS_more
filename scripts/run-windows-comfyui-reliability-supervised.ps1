@@ -186,6 +186,187 @@ function Invoke-PythonJson {
     }
 }
 
+function New-ReliabilityDirectoryLease {
+    param(
+        [string] $OutputRoot,
+        [string] $RunRoot,
+        [string] $ExpectedRootIdentity,
+        [string] $ExpectedRunIdentity
+    )
+    if ($null -eq ('TtsMore.ReliabilityDirectoryLease' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace TtsMore {
+    public sealed class ReliabilityDirectoryLease : IDisposable {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileTime {
+            public uint LowDateTime;
+            public uint HighDateTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileInformation {
+            public uint FileAttributes;
+            public FileTime CreationTime;
+            public FileTime LastAccessTime;
+            public FileTime LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile
+        );
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(
+            IntPtr handle,
+            out FileInformation information
+        );
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private readonly List<IntPtr> handles = new List<IntPtr>();
+        private bool disposed;
+
+        private ReliabilityDirectoryLease() { }
+
+        private static string NormalizeDirectory(string path) {
+            string full = Path.GetFullPath(path);
+            string root = Path.GetPathRoot(full);
+            if (String.IsNullOrEmpty(root)) throw new IOException("missing path root");
+            return full.Length == root.Length ? root : full.TrimEnd('\\');
+        }
+
+        private static string Identity(FileInformation information) {
+            ulong index = ((ulong)information.FileIndexHigh << 32) |
+                information.FileIndexLow;
+            string material = information.VolumeSerialNumber.ToString(
+                "x8", CultureInfo.InvariantCulture
+            ) + ":" + index.ToString("x16", CultureInfo.InvariantCulture);
+            using (SHA256 sha256 = SHA256.Create()) {
+                byte[] digest = sha256.ComputeHash(Encoding.ASCII.GetBytes(material));
+                return BitConverter.ToString(digest).Replace("-", "").ToLowerInvariant();
+            }
+        }
+
+        private FileInformation OpenComponent(string path, bool holdDeleteAccess) {
+            IntPtr handle = CreateFile(
+                path,
+                0x00100080 | (holdDeleteAccess ? 0x00010000u : 0u),
+                0x00000001 | 0x00000002,
+                IntPtr.Zero,
+                3,
+                0x02000000 | 0x00200000,
+                IntPtr.Zero
+            );
+            if (handle == new IntPtr(-1)) throw new IOException("directory open failed");
+            handles.Add(handle);
+            FileInformation information;
+            if (!GetFileInformationByHandle(handle, out information)) {
+                throw new IOException("directory identity unavailable");
+            }
+            if (
+                (information.FileAttributes & 0x00000400) != 0 ||
+                (information.FileAttributes & 0x00000010) == 0
+            ) {
+                throw new IOException("directory lease rejected reparse or non-directory");
+            }
+            return information;
+        }
+
+        public static ReliabilityDirectoryLease Acquire(
+            string outputRoot,
+            string runRoot,
+            string expectedRootIdentity,
+            string expectedRunIdentity
+        ) {
+            if (
+                String.IsNullOrEmpty(expectedRootIdentity) ||
+                String.IsNullOrEmpty(expectedRunIdentity) ||
+                expectedRootIdentity.Length != 64 ||
+                expectedRunIdentity.Length != 64
+            ) throw new IOException("directory identity is invalid");
+            string output = NormalizeDirectory(outputRoot);
+            string run = NormalizeDirectory(runRoot);
+            string prefix = output.EndsWith("\\", StringComparison.Ordinal) ?
+                output : output + "\\";
+            if (!run.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) {
+                throw new IOException("run root is outside output root");
+            }
+            ReliabilityDirectoryLease lease = new ReliabilityDirectoryLease();
+            try {
+                string root = Path.GetPathRoot(run);
+                string current = root;
+                bool outputBound = false;
+                FileInformation information = lease.OpenComponent(current, false);
+                if (String.Equals(current, output, StringComparison.OrdinalIgnoreCase)) {
+                    outputBound = Identity(information) == expectedRootIdentity;
+                }
+                string relative = run.Substring(root.Length);
+                foreach (string component in relative.Split(
+                    new char[] { '\\' }, StringSplitOptions.RemoveEmptyEntries
+                )) {
+                    current = Path.Combine(current, component);
+                    information = lease.OpenComponent(
+                        current,
+                        String.Equals(current, run, StringComparison.OrdinalIgnoreCase)
+                    );
+                    if (String.Equals(current, output, StringComparison.OrdinalIgnoreCase)) {
+                        outputBound = Identity(information) == expectedRootIdentity;
+                    }
+                }
+                if (!outputBound || Identity(information) != expectedRunIdentity) {
+                    throw new IOException("directory identity changed");
+                }
+                return lease;
+            } catch {
+                lease.Dispose();
+                throw;
+            }
+        }
+
+        public void Dispose() {
+            if (disposed) return;
+            disposed = true;
+            for (int index = handles.Count - 1; index >= 0; index--) {
+                CloseHandle(handles[index]);
+            }
+            handles.Clear();
+        }
+    }
+}
+'@ -ErrorAction Stop
+    }
+    return [TtsMore.ReliabilityDirectoryLease]::Acquire(
+        $OutputRoot,
+        $RunRoot,
+        $ExpectedRootIdentity,
+        $ExpectedRunIdentity
+    )
+}
+
+$directoryLease = $null
+$formalExitCode = 1
 try {
     $outputRootRequest = [IO.Path]::GetFullPath($OutputRoot)
     $ttsMoreRootPath = (Resolve-Path -LiteralPath $TtsMoreRoot -ErrorAction Stop).Path
@@ -245,6 +426,29 @@ try {
         throw 'Formal run preparation failed'
     }
     $runRootIdentity = [string] $prepared.result.run_root_identity
+    $runRootPath = [string] $prepared.result.run_root
+    if ([string]::IsNullOrEmpty($runRootPath)) {
+        throw 'Formal run root is unavailable'
+    }
+    $directoryLease = New-ReliabilityDirectoryLease `
+        -OutputRoot $outputRootPath -RunRoot $runRootPath `
+        -ExpectedRootIdentity $rootIdentity `
+        -ExpectedRunIdentity $runRootIdentity
+    $validatedBoundary = Invoke-PythonJson `
+        -PythonPath $backendPython -BackendRoot $backendRoot `
+        -Arguments @(
+            '-m', 'app.comfyui.reliability_supervision_cli', 'validate-run-root',
+            '--output-root', $outputRootPath,
+            '--run-key', $runKey,
+            '--expected-root-identity', $rootIdentity,
+            '--expected-run-root-identity', $runRootIdentity
+        )
+    if (
+        $validatedBoundary.ok -ne $true -or
+        $validatedBoundary.result.run_key -cne $runKey -or
+        $validatedBoundary.result.root_identity -cne $rootIdentity -or
+        $validatedBoundary.result.run_root_identity -cne $runRootIdentity
+    ) { throw 'Formal run boundary validation failed' }
 
     $innerArguments = @(
         '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $innerScript,
@@ -349,8 +553,13 @@ try {
             '--child-start-count', [string] $childStartCount
         )
     if ($finalized.ok -ne $true) { throw 'Formal supervision commit failed' }
-    exit $childExit
+    $formalExitCode = $childExit
 } catch {
     [Console]::Error.WriteLine('Formal reliability supervision failed')
-    exit 1
+    $formalExitCode = 1
+} finally {
+    if ($null -ne $directoryLease) {
+        $directoryLease.Dispose()
+    }
 }
+exit $formalExitCode

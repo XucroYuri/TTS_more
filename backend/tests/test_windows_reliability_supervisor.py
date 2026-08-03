@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import soundfile
 
 from app.comfyui import reliability_evidence
 from app.comfyui import reliability_supervision
@@ -70,6 +71,13 @@ def _voiced_wav_bytes() -> bytes:
         output.setsampwidth(2)
         output.setframerate(16_000)
         output.writeframes(b"".join(struct.pack("<h", frame) for frame in frames))
+    return buffer.getvalue()
+
+
+def _voiced_container_bytes(container_format: str) -> bytes:
+    buffer = io.BytesIO()
+    samples = [0.25 * math.sin(index / 8) for index in range(800)]
+    soundfile.write(buffer, samples, 16_000, format=container_format)
     return buffer.getvalue()
 
 
@@ -328,6 +336,8 @@ def _write_fake_inner(
     evidence_fixture: Path | None = None,
     ready_directory: Path | None = None,
     release_path: Path | None = None,
+    swap_outside: Path | None = None,
+    swap_marker: Path | None = None,
 ) -> None:
     script_path.write_text(
         rf"""
@@ -351,6 +361,8 @@ $rawRunIdPath = '{_powershell_literal(raw_run_id_path)}'
 $readyDirectory = '{_powershell_literal(ready_directory or script_path.parent)}'
 $releasePath = '{_powershell_literal(release_path or script_path)}'
 $evidenceFixture = '{_powershell_literal(evidence_fixture or script_path)}'
+$swapOutside = '{_powershell_literal(swap_outside or script_path.parent)}'
+$swapMarker = '{_powershell_literal(swap_marker or script_path)}'
 if ($scenario -ne 'cas') {{
     $count = if (Test-Path -LiteralPath $countPath) {{
         [int] (Get-Content -LiteralPath $countPath -Raw)
@@ -368,6 +380,33 @@ $backendRoot = Join-Path $TtsMoreRoot 'backend'
 $backendPython = Join-Path $backendRoot '.venv\Scripts\python.exe'
 $runDirectory = Join-Path (Join-Path $OutputRoot 'runs') $runKey
 [IO.Directory]::CreateDirectory($runDirectory) | Out-Null
+if ($scenario -eq 'lease-race') {{
+    $parked = $runDirectory + '.parked'
+    $junctionCreated = $false
+    $swapSucceeded = $false
+    try {{
+        [IO.Directory]::Move($runDirectory, $parked)
+        & cmd.exe /d /c mklink /J $runDirectory $swapOutside | Out-Null
+        if ($LASTEXITCODE -ne 0) {{ throw 'junction swap failed' }}
+        $junctionCreated = $true
+        [IO.File]::WriteAllBytes(
+            (Join-Path $runDirectory 'escaped.bin'),
+            [byte[]](76,69,65,83,69)
+        )
+        $swapSucceeded = $true
+    }} catch {{
+        $swapSucceeded = $false
+    }} finally {{
+        if ($junctionCreated) {{ [IO.Directory]::Delete($runDirectory) }}
+        if (Test-Path -LiteralPath $parked -PathType Container) {{
+            [IO.Directory]::Move($parked, $runDirectory)
+        }}
+    }}
+    [IO.File]::WriteAllText(
+        $swapMarker,
+        $(if ($swapSucceeded) {{ 'swapped' }} else {{ 'blocked' }})
+    )
+}}
 if ($scenario -eq 'cas') {{
     [IO.File]::WriteAllText((Join-Path $readyDirectory ($RunId + '.ready')), $runKey)
     $deadline = [DateTime]::UtcNow.AddSeconds(20)
@@ -389,7 +428,7 @@ if ($scenario -in @('junk-preflight', 'junk-matrix')) {{
 }}
 $mode = if ($scenario -in @(
     'preflight', 'privacy', 'extra-member', 'cas', 'junk-preflight',
-    'launcher-completed', 'launcher-residual'
+    'launcher-completed', 'launcher-residual', 'lease-race'
 )) {{ 'preflight' }} else {{ 'matrix' }}
 if ($scenario -eq 'junk-matrix') {{
     [IO.Directory]::CreateDirectory((Join-Path $runDirectory 'cases')) | Out-Null
@@ -507,6 +546,8 @@ def _run_supervisor(
         "wrong-case-ids",
         "mismatched-bindings",
         "non-wav",
+        "flac-as-wav",
+        "ogg-as-wav",
     }
     _write_authoritative_public_fixture(
         evidence_fixture,
@@ -536,12 +577,67 @@ def _run_supervisor(
     elif scenario == "non-wav":
         first_audio = sorted((evidence_fixture / "audio").glob("*.wav"))[0]
         first_audio.write_bytes(b"RIFFx")
+    elif scenario in {"flac-as-wav", "ogg-as-wav"}:
+        first_audio = sorted((evidence_fixture / "audio").glob("*.wav"))[0]
+        container_format = "FLAC" if scenario == "flac-as-wav" else "OGG"
+        payload = _voiced_container_bytes(container_format)
+        first_audio.write_bytes(payload)
+        decoded, sample_rate = soundfile.read(
+            io.BytesIO(payload),
+            dtype="float32",
+            always_2d=True,
+        )
+        proof = {
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+            "sample_rate": sample_rate,
+            "frames": int(decoded.shape[0]),
+            "peak": float(max(abs(float(decoded.min())), abs(float(decoded.max())))),
+        }
+        case_path = evidence_fixture / "cases" / f"{first_audio.stem}.json"
+        case_document = json.loads(case_path.read_text(encoding="utf-8"))
+        case_document["audio"] = proof
+        case_path.write_bytes(
+            (
+                json.dumps(
+                    case_document,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        summary_path = evidence_fixture / "reliability-summary.json"
+        summary_document = json.loads(summary_path.read_text(encoding="utf-8"))
+        for case in summary_document["cases"]:
+            if case["case_id"] == first_audio.stem:
+                case["audio"] = proof
+                break
+        summary_path.write_bytes(
+            (
+                json.dumps(
+                    summary_document,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+    swap_outside = tmp_path / "lease-race-outside"
+    swap_marker = tmp_path / "lease-race.marker"
+    if scenario == "lease-race":
+        swap_outside.mkdir()
+        (swap_outside / "sentinel.bin").write_bytes(b"outside-must-survive")
     _write_fake_inner(
         harness_scripts / "run-windows-comfyui-reliability.ps1",
         start_count_path=start_count,
         raw_run_id_path=raw_run_id,
         scenario=scenario,
         evidence_fixture=evidence_fixture,
+        swap_outside=swap_outside,
+        swap_marker=swap_marker,
     )
     fixture = tmp_path / "fixture.json"
     fixture.write_text("{}\n", encoding="utf-8")
@@ -578,6 +674,7 @@ def _run_supervisor(
                     "junk-preflight",
                     "launcher-completed",
                     "launcher-residual",
+                    "lease-race",
                 }
                 else []
             ),
@@ -668,6 +765,41 @@ def test_f4_junction_ancestor_is_rejected_before_output_creation_or_child_start(
         junction.rmdir()
 
 
+def test_r3_run_root_swap_is_blocked_for_the_full_supervised_lifecycle(
+    tmp_path: Path,
+) -> None:
+    completed, output_root, start_count, _raw_run_id = _run_supervisor(
+        tmp_path,
+        scenario="lease-race",
+    )
+
+    outside = tmp_path / "lease-race-outside"
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert start_count.read_text(encoding="utf-8") == "1"
+    assert (tmp_path / "lease-race.marker").read_text(encoding="utf-8") == "blocked"
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel.bin"]
+    assert (outside / "sentinel.bin").read_bytes() == b"outside-must-survive"
+    current = reliability_evidence.verify_current(output_root)
+    assert current.pointer.outcome == "passed"
+    assert current.pointer.mode == "preflight"
+
+
+def test_r3_validation_failure_releases_the_directory_lease(tmp_path: Path) -> None:
+    completed, output_root, _start_count, _raw_run_id = _run_supervisor(
+        tmp_path,
+        scenario="junk-preflight",
+    )
+
+    assert completed.returncode != 0
+    _assert_no_current(output_root)
+    run_root = next((output_root / "runs").iterdir())
+    assert not (run_root / "terminal.json").exists()
+    moved = run_root.with_name(f"{run_root.name}.released")
+    run_root.rename(moved)
+    moved.rename(run_root)
+    assert run_root.is_dir()
+
+
 def test_supervisor_starts_inner_once_and_commits_preflight_passed_current(
     tmp_path: Path,
 ) -> None:
@@ -732,6 +864,24 @@ def test_f1_status_only_preflight_cannot_become_current(tmp_path: Path) -> None:
     ["junk-matrix", "wrong-case-ids", "mismatched-bindings", "non-wav"],
 )
 def test_f1_invalid_matrix_artifacts_cannot_become_current(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    completed, output_root, _start_count, raw_run_id_path = _run_supervisor(
+        tmp_path,
+        scenario=scenario,
+    )
+
+    raw_run_id = raw_run_id_path.read_text(encoding="utf-8")
+    run_key = hashlib.sha256(raw_run_id.encode("utf-8")).hexdigest()
+    run_root = output_root / "runs" / run_key
+    assert completed.returncode != 0
+    assert not (run_root / "terminal.json").exists()
+    assert not (output_root / "current-terminal.json").exists()
+
+
+@pytest.mark.parametrize("scenario", ["flac-as-wav", "ogg-as-wav"])
+def test_r2_decodable_non_wav_container_cannot_become_current(
     tmp_path: Path,
     scenario: str,
 ) -> None:
@@ -840,6 +990,110 @@ def test_supervisor_commits_validator_failure_with_exact_exit_7(tmp_path: Path) 
         validator_exit_code=7,
         cleanup_status="completed",
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "terminal_source",
+        "validator_exit_code",
+        "cleanup_status",
+        "marker_code",
+        "marker_stage",
+        "expected_current",
+    ),
+    [
+        ("launcher", None, "completed", "launcher-failed", "preflight", True),
+        ("launcher", None, "completed", "validator-failed", "finalize", False),
+        ("validator", 7, "completed", "validator-failed", "finalize", True),
+        ("validator", 7, "completed", "cleanup-failed", "finalize", False),
+        ("cleanup", 0, "failed", "cleanup-failed", "finalize", True),
+        ("cleanup", 0, "failed", "validator-failed", "finalize", False),
+        ("cleanup", 7, "failed", "validator-failed", "finalize", True),
+        ("cleanup", 7, "failed", "cleanup-failed", "finalize", False),
+    ],
+)
+def test_r1_failed_artifacts_are_cross_bound_to_terminal_and_primary_facts(
+    tmp_path: Path,
+    terminal_source: str,
+    validator_exit_code: int | None,
+    cleanup_status: str,
+    marker_code: str,
+    marker_stage: str,
+    expected_current: bool,
+) -> None:
+    output_root = tmp_path / (
+        f"{terminal_source}-{validator_exit_code}-{cleanup_status}-{marker_code}"
+    )
+    run_key = hashlib.sha256(str(output_root).encode("utf-8")).hexdigest()
+    prepared_root = reliability_supervision.prepare_output_root(output_root)
+    reliability_supervision.prepare_run(
+        output_root,
+        run_key,
+        expected_root_identity=prepared_root.root_identity,
+    )
+    expected_token = reliability_evidence.snapshot_current(output_root)["token"]
+    if terminal_source == "launcher":
+        reliability_supervision.record_inner_result(
+            output_root,
+            run_key,
+            mode="preflight",
+            validator_exit_code=None,
+            cleanup_status=cleanup_status,  # type: ignore[arg-type]
+            failure_source="launcher",
+        )
+        launcher_exit_code = 9
+    else:
+        reliability_supervision.record_inner_result(
+            output_root,
+            run_key,
+            mode="preflight",
+            validator_exit_code=validator_exit_code,
+            cleanup_status=cleanup_status,  # type: ignore[arg-type]
+        )
+        launcher_exit_code = 7
+    marker = reliability_validation.ReliabilityRunFailure(
+        run_key=run_key,
+        failure=reliability_validation.FailureMarker(
+            code=marker_code,
+            stage=marker_stage,  # type: ignore[arg-type]
+        ),
+    )
+    reliability_evidence.write_artifact(
+        output_root,
+        run_key,
+        "failure",
+        _canonical_model_bytes(marker),
+    )
+
+    if expected_current:
+        finalized = reliability_supervision.finalize_supervision(
+            output_root,
+            run_key,
+            mode="preflight",
+            expected_token=expected_token,
+            launcher_exit_code=launcher_exit_code,
+            child_start_count=1,
+        )
+        assert finalized.status == "current"
+        current = reliability_evidence.verify_current(output_root)
+        assert current.run.terminal.failure_source == terminal_source
+        assert current.run.terminal.validator_exit_code == validator_exit_code
+        assert current.run.terminal.cleanup_status == cleanup_status
+    else:
+        with pytest.raises(
+            reliability_supervision.SupervisionError,
+            match="run artifacts are invalid",
+        ):
+            reliability_supervision.finalize_supervision(
+                output_root,
+                run_key,
+                mode="preflight",
+                expected_token=expected_token,
+                launcher_exit_code=launcher_exit_code,
+                child_start_count=1,
+            )
+        _assert_no_current(output_root)
+        assert not (output_root / "runs" / run_key / "terminal.json").exists()
 
 
 def test_f3_started_child_missing_result_fails_closed(

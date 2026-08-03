@@ -385,9 +385,17 @@ def _write_failure_marker(
     run_key: str,
     *,
     failure_source: Literal["launcher", "validator", "cleanup"],
+    validator_exit_code: int | None,
 ) -> None:
     if _has_run_member(output_root, run_key, "failure.json"):
         return
+    marker_source = (
+        "validator"
+        if failure_source == "cleanup"
+        and validator_exit_code is not None
+        and validator_exit_code != 0
+        else failure_source
+    )
     marker = ReliabilityRunFailure(
         run_key=run_key,
         failure=FailureMarker(
@@ -395,8 +403,8 @@ def _write_failure_marker(
                 "launcher": "launcher-failed",
                 "validator": "validator-failed",
                 "cleanup": "cleanup-failed",
-            }[failure_source],
-            stage="preflight" if failure_source == "launcher" else "finalize",
+            }[marker_source],
+            stage="preflight" if marker_source == "launcher" else "finalize",
         ),
     )
     evidence.write_artifact(
@@ -445,6 +453,7 @@ def _launcher_fallback_result(
         output_root,
         run_key,
         failure_source="launcher",
+        validator_exit_code=None,
     )
     return result
 
@@ -472,6 +481,7 @@ def _artifact_commitment(output_root: Path, run_key: str, relative_name: str) ->
 def _build_terminal(
     output_root: Path,
     run_key: str,
+    inner_result: InnerRunResult,
     supervisor: SupervisorRecord,
 ) -> evidence.RunTerminal:
     run_root, _ = evidence._run_root(output_root, run_key, create=False)
@@ -484,6 +494,18 @@ def _build_terminal(
             run_key,
             mode=supervisor.mode,
             outcome=supervisor.outcome,
+            supervision=validation.RunArtifactSupervisionFacts(
+                inner_mode=inner_result.mode,
+                supervisor_mode=supervisor.mode,
+                inner_outcome=inner_result.outcome,
+                supervisor_outcome=supervisor.outcome,
+                inner_failure_source=inner_result.failure_source,
+                supervisor_failure_source=supervisor.failure_source,
+                inner_validator_exit_code=inner_result.validator_exit_code,
+                supervisor_validator_exit_code=supervisor.validator_exit_code,
+                inner_cleanup_status=inner_result.cleanup_status,
+                supervisor_cleanup_status=supervisor.cleanup_status,
+            ),
         )
     except ValueError as exc:
         raise SupervisionError("run artifacts are invalid") from exc
@@ -564,6 +586,7 @@ def finalize_supervision(
                 root,
                 run_key,
                 failure_source=result.failure_source,
+                validator_exit_code=result.validator_exit_code,
             )
         supervisor = SupervisorRecord(
             schema_version=1,
@@ -583,7 +606,7 @@ def finalize_supervision(
             "supervisor",
             _canonical_json(supervisor),
         )
-        terminal = _build_terminal(root, run_key, supervisor)
+        terminal = _build_terminal(root, run_key, result, supervisor)
         evidence.write_terminal(root, terminal)
         pointer = evidence.compare_and_swap_current(
             root,
