@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
@@ -10,6 +11,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -4298,6 +4300,7 @@ def execute_reliability_validation(
     output_root = Path(output_root)
     _prepare_evidence_output_root(output_root)
     completed_cases: list[CaseEvidence] = []
+    stored_cases: list[CaseEvidence] = []
     failure: LiveValidationError | None = None
     preflight_passed = False
     release_attempted = False
@@ -4354,18 +4357,28 @@ def execute_reliability_validation(
                 active_host_observation,
                 provisional_boundary,
             )
-            validation = validate_case(evidence, wav_path=http_observation.wav_path)
+            audio_payload: bytes | None = None
+            if evidence.actual == "completed":
+                if http_observation.wav_path is None:
+                    raise LiveValidationError("missing-audio-output", stage="case")
+                audio_payload = _read_validated_temporary_audio(
+                    http_observation.wav_path,
+                    temporary_root,
+                )
+                evidence = evidence.model_copy(
+                    update={"audio": _wav_proof_from_bytes(audio_payload)}
+                )
+            validation = validate_case(evidence)
             if not validation.valid:
                 raise LiveValidationError("case-validation-failed", stage="case")
             if validation.evidence.audio is not None:
-                if http_observation.wav_path is None:
+                if audio_payload is None:
                     raise LiveValidationError("missing-audio-output", stage="case")
                 _write_run_audio(
                     output_root,
                     run_key,
                     validation.evidence.case_id,
-                    http_observation.wav_path,
-                    temporary_root,
+                    audio_payload,
                     validation.evidence.audio,
                 )
             _write_run_json(
@@ -4377,6 +4390,7 @@ def execute_reliability_validation(
                 name=validation.evidence.case_id,
             )
             completed_cases.append(validation.evidence)
+            stored_cases.append(validation.evidence)
             active_case = None
             active_host_observation = None
 
@@ -4423,26 +4437,15 @@ def execute_reliability_validation(
 
     if failure is not None:
         try:
-            summary = finalize_run(
+            summary = _failed_run_summary(
                 fixture,
-                completed_cases,
+                stored_cases,
                 required_cases=required_case_specs(selected_plan),
+                failure=failure,
             )
         except Exception:
             _persist_run_failure_marker(output_root, run_key, failure)
             raise failure
-        for completed_case in summary.cases:
-            try:
-                _write_run_json(
-                    output_root,
-                    run_key,
-                    "case",
-                    completed_case,
-                    stage="case",
-                    name=completed_case.case_id,
-                )
-            except Exception:
-                pass
         if active_case is not None:
             try:
                 failed_host = _failed_case_host_observation(active_host_observation)
@@ -4680,7 +4683,6 @@ def _write_run_json(
 def _read_validated_temporary_audio(
     path: Path,
     temporary_root: Path,
-    proof: AudioProof,
 ) -> bytes:
     candidate = Path(path).absolute()
     root = Path(temporary_root).absolute()
@@ -4738,21 +4740,18 @@ def _read_validated_temporary_audio(
             os.close(descriptor)
     except OSError:
         raise LiveValidationError("unsafe-audio-output", stage="case") from None
-    audio = bytes(payload)
-    if len(audio) != proof.size_bytes or hashlib.sha256(audio).hexdigest() != proof.sha256:
-        raise LiveValidationError("audio-proof-mismatch", stage="case")
-    return audio
+    return bytes(payload)
 
 
 def _write_run_audio(
     output_root: Path,
     run_key: str,
     case_id: str,
-    source: Path,
-    temporary_root: Path,
+    payload: bytes,
     proof: AudioProof,
 ) -> reliability_evidence.ArtifactCommitment:
-    payload = _read_validated_temporary_audio(source, temporary_root, proof)
+    if len(payload) != proof.size_bytes or hashlib.sha256(payload).hexdigest() != proof.sha256:
+        raise LiveValidationError("audio-proof-mismatch", stage="case")
     try:
         commitment = reliability_evidence.write_artifact(
             output_root,
@@ -5544,6 +5543,32 @@ def finalize_run(
     )
 
 
+def _failed_run_summary(
+    fixture: ReliabilityFixture,
+    cases: Sequence[CaseEvidence],
+    *,
+    required_cases: Sequence[RequiredCase],
+    failure: LiveValidationError,
+) -> ReliabilityRunSummary:
+    summary = finalize_run(
+        fixture,
+        cases,
+        required_cases=required_cases,
+    )
+    diagnostics = sorted(
+        set(summary.validation_failures)
+        | {f"run finalization failed: {failure.code}"}
+    )
+    return ReliabilityRunSummary.model_validate(
+        {
+            **summary.model_dump(mode="json"),
+            "status": "failed",
+            "validation_failures": diagnostics,
+        },
+        strict=False,
+    )
+
+
 def write_atomic_json(
     path: Path,
     payload: ReliabilityRunSummary | dict[str, Any],
@@ -5710,8 +5735,8 @@ def _best_effort_unlink(path: Path | None) -> bool:
     return True
 
 
-def _wav_proof(path: Path) -> AudioProof:
-    samples, sample_rate = soundfile.read(path, dtype="float32", always_2d=True)
+def _wav_proof_from_bytes(data: bytes) -> AudioProof:
+    samples, sample_rate = soundfile.read(io.BytesIO(data), dtype="float32", always_2d=True)
     if sample_rate <= 0 or len(samples) <= 0:
         raise ValueError("empty audio")
     minimum = float(samples.min())
@@ -5721,7 +5746,6 @@ def _wav_proof(path: Path) -> AudioProof:
     peak = max(abs(minimum), abs(maximum))
     if peak <= 1e-5:
         raise ValueError("silent audio")
-    data = path.read_bytes()
     return AudioProof(
         sha256=hashlib.sha256(data).hexdigest(),
         size_bytes=len(data),
@@ -5729,6 +5753,10 @@ def _wav_proof(path: Path) -> AudioProof:
         frames=int(samples.shape[0]),
         peak=float(peak),
     )
+
+
+def _wav_proof(path: Path) -> AudioProof:
+    return _wav_proof_from_bytes(path.read_bytes())
 
 
 def _duplicates(values: Any) -> set[str]:
@@ -5897,6 +5925,16 @@ ProbeFactory = Callable[
 ]
 
 
+class PublicArgumentError(Exception):
+    """Signal an invalid public CLI without retaining argparse diagnostics."""
+
+
+class PublicArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        del message
+        raise PublicArgumentError
+
+
 def _run_key_argument(value: str) -> str:
     if re.fullmatch(r"[0-9a-f]{64}", value) is None:
         raise argparse.ArgumentTypeError("run key must be 64 lowercase hexadecimal characters")
@@ -5908,7 +5946,7 @@ def main(
     *,
     probe_factory: ProbeFactory | None = None,
 ) -> int:
-    parser = argparse.ArgumentParser(description="Run the opt-in Windows ComfyUI reliability gate.")
+    parser = PublicArgumentParser(description="Run the opt-in Windows ComfyUI reliability gate.")
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--run-key", type=_run_key_argument, required=True)
@@ -5917,7 +5955,13 @@ def main(
     parser.add_argument("--host-manifest", type=Path)
     parser.add_argument("--allow-lan", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except PublicArgumentError:
+        if argv is not None:
+            raise SystemExit(2) from None
+        print('{"error":"invalid-arguments"}', file=sys.stderr)
+        return 2
     try:
         _prepare_evidence_output_root(args.output_root)
         document = json.loads(args.fixture.read_text(encoding="utf-8-sig"))

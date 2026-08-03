@@ -9,6 +9,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import warnings
 import wave
@@ -11665,11 +11666,464 @@ def test_task3_temporary_audio_rejects_a_parent_junction(tmp_path: Path) -> None
             reliability_validation._read_validated_temporary_audio(
                 junction / outside_wav.name,
                 temporary_root,
-                reliability_validation._wav_proof(outside_wav),
             )
         assert exc_info.value.code == "unsafe-audio-output"
     finally:
         junction.rmdir()
+
+
+def _task3_observation_with_wav(
+    observation: reliability_validation.HttpCaseObservation,
+    wav_path: Path,
+) -> reliability_validation.HttpCaseObservation:
+    return reliability_validation.HttpCaseObservation(
+        actual=observation.actual,
+        job_id=observation.job_id,
+        prompt_id=observation.prompt_id,
+        version_id=observation.version_id,
+        wav_path=wav_path,
+        comfyui=observation.comfyui,
+        prompt_submitted=observation.prompt_submitted,
+        tts_more=observation.tts_more,
+        termination=observation.termination,
+    )
+
+
+@pytest.mark.parametrize("mode", ["outside", "junction", "oversize"])
+def test_fix_round1_controller_never_decodes_untrusted_probe_path_before_safe_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    class UntrustedAudioProbe(_ExecutorHttpProbe):
+        def execute_case(
+            self,
+            case: reliability_validation.CasePlan,
+            fixture: ReliabilityFixture,
+            output_directory: Path,
+            *,
+            action_hook: object | None = None,
+        ) -> reliability_validation.HttpCaseObservation:
+            observation = super().execute_case(
+                case,
+                fixture,
+                output_directory,
+                action_hook=action_hook,
+            )
+            assert observation.wav_path is not None
+            if mode == "outside":
+                target = outside / "outside.wav"
+                _write_voiced_wav(target)
+            elif mode == "junction":
+                if os.name != "nt":
+                    pytest.skip("real junction behavior is Windows-specific")
+                target_root = outside / "junction-target"
+                target_root.mkdir()
+                target = target_root / "junction.wav"
+                _write_voiced_wav(target)
+                junction = output_directory / "escape"
+                completed = subprocess.run(
+                    ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target_root)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    check=False,
+                )
+                assert completed.returncode == 0, completed.stdout + completed.stderr
+                target = junction / target.name
+            else:
+                target = observation.wav_path
+                with target.open("ab") as stream:
+                    stream.truncate(reliability_evidence.MAX_ARTIFACT_BYTES + 1)
+            return _task3_observation_with_wav(observation, target)
+
+    decoded_sources: list[object] = []
+    original_read = reliability_validation.soundfile.read
+
+    def record_decode(source: object, *args: object, **kwargs: object) -> object:
+        decoded_sources.append(source)
+        return original_read(source, *args, **kwargs)
+
+    monkeypatch.setattr(reliability_validation.soundfile, "read", record_decode)
+    output_root = tmp_path / "evidence"
+    http_probe = UntrustedAudioProbe()
+    host_probe = _ExecutorHostProbe()
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation.execute_reliability_validation(
+            fixture,
+            run_key=TASK3_RUN_KEY,
+            output_root=output_root,
+            http_probe=http_probe,
+            host_probe=host_probe,
+            owned_processes=host_probe.owned_processes,
+        )
+
+    assert exc_info.value.code == "unsafe-audio-output"
+    assert not any(isinstance(source, (str, Path)) for source in decoded_sources)
+    assert not (output_root / "runs" / TASK3_RUN_KEY / "audio" / "steady-01-gpt-sovits.wav").exists()
+
+
+def test_fix_round1_controller_commits_the_single_safe_read_when_source_changes_after_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    replacement = tmp_path / "replacement.wav"
+    frames = [int(7_000 * math.cos(index / 5)) for index in range(800)]
+    with wave.open(str(replacement), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"".join(struct.pack("<h", frame) for frame in frames))
+    replacement_bytes = replacement.read_bytes()
+    original_bytes: bytes | None = None
+    source_path: Path | None = None
+    replaced = False
+    original_read = reliability_validation.soundfile.read
+
+    class ReplacedAfterDecodeProbe(_ExecutorHttpProbe):
+        def execute_case(
+            self,
+            case: reliability_validation.CasePlan,
+            fixture: ReliabilityFixture,
+            output_directory: Path,
+            *,
+            action_hook: object | None = None,
+        ) -> reliability_validation.HttpCaseObservation:
+            nonlocal original_bytes, source_path
+            observation = super().execute_case(
+                case,
+                fixture,
+                output_directory,
+                action_hook=action_hook,
+            )
+            if original_bytes is None:
+                assert observation.wav_path is not None
+                source_path = observation.wav_path
+                original_bytes = source_path.read_bytes()
+                assert hashlib.sha256(original_bytes).digest() != hashlib.sha256(replacement_bytes).digest()
+            return observation
+
+    def replace_after_decode(source: object, *args: object, **kwargs: object) -> object:
+        nonlocal replaced
+        decoded = original_read(source, *args, **kwargs)
+        if not replaced and isinstance(source, (str, Path)) and Path(source) == source_path:
+            assert source_path is not None
+            source_path.write_bytes(replacement_bytes)
+            replaced = True
+        return decoded
+
+    monkeypatch.setattr(reliability_validation.soundfile, "read", replace_after_decode)
+    output_root = tmp_path / "evidence"
+    http_probe = ReplacedAfterDecodeProbe()
+    host_probe = _ExecutorHostProbe()
+
+    reliability_validation.execute_reliability_validation(
+        fixture,
+        run_key=TASK3_RUN_KEY,
+        output_root=output_root,
+        http_probe=http_probe,
+        host_probe=host_probe,
+        owned_processes=host_probe.owned_processes,
+    )
+
+    assert original_bytes is not None
+    committed = (output_root / "runs" / TASK3_RUN_KEY / "audio" / "steady-01-gpt-sovits.wav").read_bytes()
+    assert hashlib.sha256(committed).hexdigest() == hashlib.sha256(original_bytes).hexdigest()
+    assert committed != replacement_bytes
+
+
+@pytest.mark.parametrize("late_failure", ["release", "gpu", "boundary", "temp-cleanup"])
+def test_fix_round1_late_failure_uses_exact_stored_cases_and_remains_readable_when_frozen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    late_failure: str,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    cleanup_targets: list[tempfile.TemporaryDirectory[str]] = []
+
+    class LateHttpProbe(_ExecutorHttpProbe):
+        def release(self) -> None:
+            if late_failure == "release":
+                raise RuntimeError("private release detail")
+            super().release()
+
+    class LateHostProbe(_ExecutorHostProbe):
+        def final_state(self) -> reliability_validation.HostFinalObservation:
+            observation = super().final_state()
+            if late_failure == "gpu":
+                return observation.model_copy(
+                    update={"gpu_after_release": GpuSnapshot(used_mib=2000, free_mib=6100)}
+                )
+            if late_failure == "boundary":
+                return observation.model_copy(
+                    update={
+                        "boundary": observation.boundary.model_copy(
+                            update={"aggregate_hash": "9" * 64}
+                        )
+                    }
+                )
+            return observation
+
+    if late_failure == "temp-cleanup":
+        real_factory = tempfile.TemporaryDirectory
+
+        class CleanupFailureDirectory:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self._real = real_factory(*args, **kwargs)
+                self.name = self._real.name
+                cleanup_targets.append(self._real)
+
+            def cleanup(self) -> None:
+                raise OSError("private cleanup detail")
+
+        monkeypatch.setattr(
+            reliability_validation.tempfile,
+            "TemporaryDirectory",
+            CleanupFailureDirectory,
+        )
+
+    output_root = tmp_path / "evidence"
+    http_probe = LateHttpProbe()
+    host_probe = LateHostProbe()
+    try:
+        with pytest.raises(reliability_validation.LiveValidationError):
+            reliability_validation.execute_reliability_validation(
+                fixture,
+                run_key=TASK3_RUN_KEY,
+                output_root=output_root,
+                http_probe=http_probe,
+                host_probe=host_probe,
+                owned_processes=host_probe.owned_processes,
+            )
+
+        run_root = output_root / "runs" / TASK3_RUN_KEY
+        summary = ReliabilityRunSummary.model_validate_json(
+            (run_root / "reliability-summary.json").read_bytes(),
+            strict=False,
+        )
+        assert summary.status == "failed"
+        assert len(summary.cases) == 47
+        for summary_case in summary.cases:
+            stored_case = CaseEvidence.model_validate_json(
+                (run_root / "cases" / f"{summary_case.case_id}.json").read_bytes(),
+                strict=False,
+            )
+            assert stored_case == summary_case
+
+        explicit = launcher_failure_context.evaluate_launcher_failure_context_for_run(
+            output_root,
+            TASK3_RUN_KEY,
+        )
+        assert explicit.summary is not None and explicit.summary.completed_case_count == 47
+        assert explicit.case is None
+
+        _task3_freeze_failed_run(output_root, TASK3_RUN_KEY)
+        reliability_evidence.compare_and_swap_current(
+            output_root,
+            TASK3_RUN_KEY,
+            expected_token=reliability_evidence.ABSENT_POINTER_TOKEN,
+        )
+        current = launcher_failure_context.evaluate_current_launcher_failure_context(output_root)
+        assert current.primary == explicit.primary
+        assert current.summary == explicit.summary
+    finally:
+        for target in cleanup_targets:
+            target.cleanup()
+
+
+@pytest.mark.parametrize("reader_mode", ["explicit", "current"])
+@pytest.mark.parametrize("artifact", ["summary", "case", "audio"])
+def test_fix_round1_frozen_context_rechecks_bytes_against_the_verified_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader_mode: str,
+    artifact: str,
+) -> None:
+    output_root = tmp_path / "evidence"
+    run_root = _task3_failed_run(output_root, TASK3_RUN_KEY)
+    _task3_freeze_failed_run(output_root, TASK3_RUN_KEY)
+    if reader_mode == "current":
+        reliability_evidence.compare_and_swap_current(
+            output_root,
+            TASK3_RUN_KEY,
+            expected_token=reliability_evidence.ABSENT_POINTER_TOKEN,
+        )
+
+    def canonical(model: object) -> bytes:
+        return (
+            json.dumps(
+                model.model_dump(mode="json"),  # type: ignore[attr-defined]
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    def mutate_committed_evidence() -> None:
+        summary_path = run_root / "reliability-summary.json"
+        summary = ReliabilityRunSummary.model_validate_json(
+            summary_path.read_bytes(),
+            strict=False,
+        )
+        if artifact == "summary":
+            mutated = ReliabilityRunSummary.model_validate(
+                {
+                    **summary.model_dump(mode="json"),
+                    "validation_failures": [*summary.validation_failures, "post-verify mutation"],
+                },
+                strict=False,
+            )
+            summary_path.write_bytes(canonical(mutated))
+            return
+
+        completed = summary.cases[0]
+        if artifact == "case":
+            mutated_case = CaseEvidence.model_validate(
+                {**completed.model_dump(mode="json"), "job_id": "post-verify-job"},
+                strict=False,
+            )
+        else:
+            replacement = tmp_path / "post-verify.wav"
+            frames = [int(6_000 * math.cos(index / 4)) for index in range(800)]
+            with wave.open(str(replacement), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16_000)
+                output.writeframes(b"".join(struct.pack("<h", frame) for frame in frames))
+            replacement_bytes = replacement.read_bytes()
+            mutated_case = completed.model_copy(
+                update={"audio": reliability_validation._wav_proof_from_bytes(replacement_bytes)}
+            )
+            (run_root / "audio" / f"{completed.case_id}.wav").write_bytes(replacement_bytes)
+
+        (run_root / "cases" / f"{completed.case_id}.json").write_bytes(
+            canonical(mutated_case)
+        )
+        mutated_cases = [
+            mutated_case if case.case_id == completed.case_id else case
+            for case in summary.cases
+        ]
+        mutated_summary = ReliabilityRunSummary.model_validate(
+            {**summary.model_dump(mode="json"), "cases": [case.model_dump(mode="json") for case in mutated_cases]},
+            strict=False,
+        )
+        summary_path.write_bytes(canonical(mutated_summary))
+
+    original_verify = reliability_evidence.verify_run
+    verify_calls = 0
+
+    def mutate_after_relevant_verify(
+        root: Path,
+        run_key: str,
+    ) -> reliability_evidence.RunVerification:
+        nonlocal verify_calls
+        verified = original_verify(root, run_key)
+        verify_calls += 1
+        target_call = 1 if reader_mode == "explicit" else 2
+        if verify_calls == target_call:
+            mutate_committed_evidence()
+        return verified
+
+    monkeypatch.setattr(reliability_evidence, "verify_run", mutate_after_relevant_verify)
+
+    with pytest.raises(ValueError) as exc_info:
+        if reader_mode == "explicit":
+            launcher_failure_context.evaluate_launcher_failure_context_for_run(
+                output_root,
+                TASK3_RUN_KEY,
+            )
+        else:
+            launcher_failure_context.evaluate_current_launcher_failure_context(output_root)
+
+    expected = (
+        "launcher run context is invalid"
+        if reader_mode == "explicit"
+        else "launcher current context is invalid"
+    )
+    assert str(exc_info.value) == expected
+
+
+@pytest.mark.parametrize(
+    ("module", "scenario"),
+    [
+        ("app.comfyui.reliability_validation", "invalid-int"),
+        ("app.comfyui.reliability_validation", "invalid-run-key"),
+        ("app.comfyui.reliability_validation", "missing"),
+        ("app.comfyui.reliability_validation", "unknown"),
+        ("app.comfyui.launcher_failure_context", "invalid-run-key"),
+        ("app.comfyui.launcher_failure_context", "missing"),
+        ("app.comfyui.launcher_failure_context", "unknown"),
+    ],
+)
+def test_fix_round1_real_cli_argument_errors_never_echo_secret_values(
+    tmp_path: Path,
+    module: str,
+    scenario: str,
+) -> None:
+    secret = "raw-cli-secret-should-never-echo"
+    if module.endswith("reliability_validation"):
+        arguments = [
+            "--fixture",
+            str(tmp_path / "fixture.json"),
+            "--output-root",
+            str(tmp_path / "evidence"),
+            "--run-key",
+            "1" * 64,
+            "--comfyui-pid",
+            "8188",
+            "--tts-more-pid",
+            "8000",
+            "--preflight-only",
+        ]
+        if scenario == "invalid-int":
+            arguments[arguments.index("8188")] = secret
+        elif scenario == "invalid-run-key":
+            arguments[arguments.index("1" * 64)] = secret
+        elif scenario == "missing":
+            index = arguments.index("--tts-more-pid")
+            del arguments[index : index + 2]
+            arguments[arguments.index(str(tmp_path / "fixture.json"))] = secret
+        else:
+            arguments.extend(["--secret", secret])
+    else:
+        arguments = [
+            "evaluate-run",
+            "--output-root",
+            str(tmp_path / "evidence"),
+            "--run-key",
+            "1" * 64,
+        ]
+        if scenario == "invalid-run-key":
+            arguments[-1] = secret
+        elif scenario == "missing":
+            arguments = ["evaluate-run", "--output-root", secret]
+        else:
+            arguments.extend(["--secret", secret])
+
+    completed = subprocess.run(
+        [sys.executable, "-m", module, *arguments],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == '{"error":"invalid-arguments"}\n'
+    assert secret not in completed.stdout + completed.stderr
 
 
 def test_task3_failure_preserves_completed_and_active_case_in_the_same_run(

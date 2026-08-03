@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -19,9 +20,12 @@ from .reliability_validation import (
     FailureMarker,
     ReliabilityRunFailure,
     ReliabilityRunSummary,
+    PublicArgumentError,
+    PublicArgumentParser,
     _StrictModel,
     _parse_public_utc,
     _public_utc,
+    _run_key_argument,
 )
 
 
@@ -436,6 +440,7 @@ def _strict_run_model(
     model_type: Any,
     *,
     name: str | None = None,
+    verification: reliability_evidence.RunVerification | None = None,
 ) -> tuple[Any, bytes]:
     raw = reliability_evidence.read_artifact(
         output_root,
@@ -449,13 +454,61 @@ def _strict_run_model(
         model = model_type.model_validate_json(raw)
     if raw != _canonical_run_model(model):
         raise ValueError("run artifact is not canonical")
+    _assert_verified_commitment(
+        verification,
+        _run_relative_name(kind, name),
+        raw,
+    )
     return model, raw
 
 
-def _verify_terminal_if_present(output_root: Path, run_key: str) -> None:
+def _run_relative_name(kind: str, name: str | None) -> str:
+    fixed = {
+        "failure": "failure.json",
+        "summary": "reliability-summary.json",
+        "preflight": "preflight.json",
+    }
+    if kind in fixed and name is None:
+        return fixed[kind]
+    suffixes = {"case": ("cases", ".json"), "audio": ("audio", ".wav")}
+    if kind not in suffixes or name is None:
+        raise ValueError("run artifact role is invalid")
+    directory, suffix = suffixes[kind]
+    return f"{directory}/{name}{suffix}"
+
+
+def _assert_verified_commitment(
+    verification: reliability_evidence.RunVerification | None,
+    relative_name: str,
+    payload: bytes,
+) -> None:
+    if verification is None:
+        return
+    terminal = verification.terminal
+    commitments = [
+        item
+        for item in (terminal.preflight, terminal.failure, terminal.summary)
+        if item is not None
+    ] + list(terminal.cases) + list(terminal.artifacts)
+    matches = [item for item in commitments if item.relative_name == relative_name]
+    if len(matches) != 1:
+        raise ValueError("verified run commitment is missing")
+    commitment = matches[0]
+    if (
+        len(payload) != commitment.size_bytes
+        or hashlib.sha256(payload).hexdigest() != commitment.sha256
+    ):
+        raise ValueError("verified run commitment changed")
+
+
+def _verify_terminal_if_present(
+    output_root: Path,
+    run_key: str,
+) -> reliability_evidence.RunVerification | None:
     terminal_path = Path(output_root).absolute() / "runs" / run_key / "terminal.json"
     if os.path.lexists(terminal_path):
-        reliability_evidence.verify_run(output_root, run_key)
+        return reliability_evidence.verify_run(output_root, run_key)
+    return None
 
 
 def _evaluate_launcher_failure_context_for_run(
@@ -470,12 +523,14 @@ def _evaluate_launcher_failure_context_for_run(
     )
     if failure_document.run_key != run_key:
         raise ValueError("run failure binding mismatch")
-    _verify_terminal_if_present(output_root, run_key)
+    verification = _verify_terminal_if_present(output_root, run_key)
+    _assert_verified_commitment(verification, "failure.json", failure_raw)
     summary, summary_raw = _strict_run_model(
         output_root,
         run_key,
         "summary",
         ReliabilityRunSummary,
+        verification=verification,
     )
     if summary.status != "failed":
         raise ValueError("run failure summary is not failed")
@@ -491,6 +546,7 @@ def _evaluate_launcher_failure_context_for_run(
             "case",
             CaseEvidence,
             name=expected_case.case_id,
+            verification=verification,
         )
         if stored_case != expected_case:
             raise ValueError("run case binding mismatch")
@@ -500,6 +556,11 @@ def _evaluate_launcher_failure_context_for_run(
                 run_key,
                 "audio",
                 name=stored_case.case_id,
+            )
+            _assert_verified_commitment(
+                verification,
+                f"audio/{stored_case.case_id}.wav",
+                audio,
             )
             if (
                 len(audio) != stored_case.audio.size_bytes
@@ -518,6 +579,7 @@ def _evaluate_launcher_failure_context_for_run(
             "case",
             FailedCaseEvidence,
             name=active_case_id,
+            verification=verification,
         )
         if (
             failed_case.status != "failed"
@@ -600,8 +662,12 @@ def evaluate_current_launcher_failure_context(
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Read launcher failure context safely.")
-    subparsers = parser.add_subparsers(dest="mode", required=True)
+    parser = PublicArgumentParser(description="Read launcher failure context safely.")
+    subparsers = parser.add_subparsers(
+        dest="mode",
+        required=True,
+        parser_class=PublicArgumentParser,
+    )
     for mode in ("snapshot", "evaluate"):
         child = subparsers.add_parser(mode)
         child.add_argument("--output-root", type=Path, required=True)
@@ -611,7 +677,7 @@ def _parser() -> argparse.ArgumentParser:
             child.add_argument("--failure-observed-at", required=True)
     run = subparsers.add_parser("evaluate-run")
     run.add_argument("--output-root", type=Path, required=True)
-    run.add_argument("--run-key", required=True)
+    run.add_argument("--run-key", type=_run_key_argument, required=True)
     current = subparsers.add_parser("evaluate-current")
     current.add_argument("--output-root", type=Path, required=True)
     current.add_argument("--baseline-path", type=Path)
@@ -623,6 +689,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
+    except PublicArgumentError:
+        if argv is not None:
+            raise SystemExit(2) from None
+        print('{"error":"invalid-arguments"}', file=sys.stderr)
+        return 2
+    try:
         if args.mode == "snapshot":
             write_launcher_failure_evidence_baseline(
                 args.output_root,
