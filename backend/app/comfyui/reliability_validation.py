@@ -5851,6 +5851,7 @@ def verify_run_artifacts(
     mode: Literal["preflight", "matrix"],
     outcome: Literal["passed", "failed"],
     supervision: RunArtifactSupervisionFacts,
+    expected_private_recovery_namespace_identity: str | None = None,
 ) -> None:
     """Validate one unfrozen run through the authoritative public models."""
 
@@ -5863,6 +5864,8 @@ def verify_run_artifacts(
         )
         files, _directories = reliability_evidence._scan_run_membership(run_root)
         if "logs/private-recovery.log" in files:
+            if expected_private_recovery_namespace_identity is None:
+                raise ValueError("private recovery namespace identity is required")
             private_recovery_log = reliability_evidence.read_artifact(
                 output_root,
                 safe_key,
@@ -5872,6 +5875,9 @@ def verify_run_artifacts(
             reliability_evidence.verify_private_recovery_log(
                 private_recovery_log,
                 expected_run_key=safe_key,
+                expected_namespace_identity=(
+                    expected_private_recovery_namespace_identity
+                ),
             )
         if (
             supervision.inner_mode != mode

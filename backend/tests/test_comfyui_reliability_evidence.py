@@ -493,7 +493,7 @@ def _write_preflight_passed_run(
 def _write_preflight_run_with_private_recovery_log(
     output_root: Path,
     run_key: str = "d" * 64,
-) -> evidence.RunTerminal:
+) -> tuple[evidence.RunTerminal, str]:
     boundary = recovery.prepare_private_recovery(
         output_root,
         run_key,
@@ -516,7 +516,7 @@ def _write_preflight_run_with_private_recovery_log(
         },
         strict=True,
     )
-    return terminal
+    return terminal, boundary.private_root_identity
 
 
 def _write_preflight_failed_run(
@@ -770,13 +770,23 @@ def test_verify_run_keeps_public_terminal_verifiable_when_private_sibling_drifts
     """Catches traversal of the private sibling during public terminal verification."""
     output_root = tmp_path / "evidence"
     output_root.mkdir()
-    terminal = _write_preflight_run_with_private_recovery_log(output_root)
-    evidence.write_terminal(output_root, terminal)
+    terminal, namespace_identity = _write_preflight_run_with_private_recovery_log(
+        output_root
+    )
+    evidence.write_terminal(
+        output_root,
+        terminal,
+        expected_private_recovery_namespace_identity=namespace_identity,
+    )
     private_run = recovery.private_recovery_root(output_root, terminal.run_key)
     (private_run / ".o").write_bytes(b"contradictory-private-owner")
     (private_run / "uncommitted-private-file").write_bytes(b"private-only")
 
-    verified = evidence.verify_run(output_root, terminal.run_key)
+    verified = evidence.verify_run(
+        output_root,
+        terminal.run_key,
+        expected_private_recovery_namespace_identity=namespace_identity,
+    )
 
     assert verified.status == "verified"
 
@@ -787,15 +797,114 @@ def test_verify_run_rejects_private_log_with_changed_static_commitment(
     """Catches a verifier that skips the terminal commitment for the public snapshot log."""
     output_root = tmp_path / "evidence"
     output_root.mkdir()
-    terminal = _write_preflight_run_with_private_recovery_log(output_root)
-    evidence.write_terminal(output_root, terminal)
+    terminal, namespace_identity = _write_preflight_run_with_private_recovery_log(
+        output_root
+    )
+    evidence.write_terminal(
+        output_root,
+        terminal,
+        expected_private_recovery_namespace_identity=namespace_identity,
+    )
     private_log = output_root / "runs" / terminal.run_key / "logs" / "private-recovery.log"
     document = json.loads(private_log.read_bytes())
     document["static_members"][0]["sha256"] = "f" * 64
     private_log.write_bytes(_canonical_json(document))
 
     with pytest.raises(evidence.EvidenceStoreError, match="commitment mismatch"):
-        evidence.verify_run(output_root, terminal.run_key)
+        evidence.verify_run(
+            output_root,
+            terminal.run_key,
+            expected_private_recovery_namespace_identity=namespace_identity,
+        )
+
+
+def test_boundary_aware_terminal_publication_rejects_recommitted_namespace_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Catches a publisher that omits the held private-namespace identity."""
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    terminal, namespace_identity = _write_preflight_run_with_private_recovery_log(
+        output_root
+    )
+    private_log = output_root / "runs" / terminal.run_key / "logs" / "private-recovery.log"
+    document = json.loads(private_log.read_bytes())
+    replacement_identity = (
+        "0" * 64 if namespace_identity != "0" * 64 else "1" * 64
+    )
+    document["namespace_identity_sha256"] = replacement_identity
+    replacement = _canonical_json(document)
+    private_log.write_bytes(replacement)
+    recommitted_log = evidence.ArtifactCommitment(
+        relative_name="logs/private-recovery.log",
+        size_bytes=len(replacement),
+        sha256=hashlib.sha256(replacement).hexdigest(),
+    )
+    recommitted_terminal = evidence.RunTerminal.model_validate(
+        terminal.model_dump(mode="json")
+        | {
+            "artifacts": [
+                item.model_dump(mode="json")
+                for item in sorted(
+                    (
+                        recommitted_log
+                        if item.relative_name == "logs/private-recovery.log"
+                        else item
+                        for item in terminal.artifacts
+                    ),
+                    key=lambda item: item.relative_name,
+                )
+            ]
+        },
+        strict=True,
+    )
+
+    with pytest.raises(evidence.EvidenceStoreError, match="snapshot"):
+        evidence.write_terminal(
+            output_root,
+            recommitted_terminal,
+            expected_private_recovery_namespace_identity=namespace_identity,
+        )
+
+    assert not (output_root / "runs" / terminal.run_key / "terminal.json").exists()
+
+
+def test_cli_verify_run_forwards_private_namespace_identity(
+    tmp_path: Path,
+) -> None:
+    """Catches a public CLI reader that drops the caller-held namespace identity."""
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+    terminal, namespace_identity = _write_preflight_run_with_private_recovery_log(
+        output_root
+    )
+    evidence.write_terminal(
+        output_root,
+        terminal,
+        expected_private_recovery_namespace_identity=namespace_identity,
+    )
+
+    verified = _run_cli(
+        "verify-run",
+        "--output-root",
+        str(output_root),
+        "--run-key",
+        terminal.run_key,
+        "--private-recovery-namespace-identity",
+        namespace_identity,
+    )
+    mismatched = _run_cli(
+        "verify-run",
+        "--output-root",
+        str(output_root),
+        "--run-key",
+        terminal.run_key,
+        "--private-recovery-namespace-identity",
+        "0" * 64 if namespace_identity != "0" * 64 else "1" * 64,
+    )
+
+    assert verified.returncode == 0, verified.stderr
+    assert mismatched.returncode == 1
 
 
 def test_pointer_absent_legacy_snapshot_ignores_private_sibling_namespace(

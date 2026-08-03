@@ -1200,6 +1200,28 @@ def _verify_commitments(
             raise EvidenceStoreError("artifact commitment mismatch")
 
 
+def _verify_private_recovery_commitment(
+    output_root: Path,
+    run_key: str,
+    terminal: RunTerminal,
+    *,
+    expected_namespace_identity: str | None,
+    require_namespace_identity: bool,
+) -> None:
+    if not any(
+        item.relative_name == "logs/private-recovery.log"
+        for item in terminal.artifacts
+    ):
+        return
+    if require_namespace_identity and expected_namespace_identity is None:
+        raise EvidenceStoreError("private recovery namespace identity is required")
+    verify_private_recovery_log(
+        read_artifact(output_root, run_key, "log", name="private-recovery"),
+        expected_run_key=run_key,
+        expected_namespace_identity=expected_namespace_identity,
+    )
+
+
 def _first_write_terminal(path: Path, payload: bytes) -> None:
     if len(payload) > MAX_TERMINAL_BYTES:
         raise EvidenceStoreError("terminal exceeds its size limit")
@@ -1214,6 +1236,8 @@ def _first_write_terminal(path: Path, payload: bytes) -> None:
 def write_terminal(
     output_root: Path,
     terminal: RunTerminal,
+    *,
+    expected_private_recovery_namespace_identity: str | None = None,
 ) -> TerminalCommitment:
     try:
         validated = RunTerminal.model_validate(
@@ -1233,15 +1257,33 @@ def write_terminal(
         if not os.path.lexists(terminal_path):
             _assert_exact_membership(run, validated, include_terminal=False)
             _verify_commitments(run, resolved_root, validated)
+        _verify_private_recovery_commitment(
+            output_root,
+            validated.run_key,
+            validated,
+            expected_namespace_identity=expected_private_recovery_namespace_identity,
+            require_namespace_identity=True,
+        )
         _first_write_terminal(terminal_path, payload)
-        verify_run(output_root, validated.run_key)
+        verify_run(
+            output_root,
+            validated.run_key,
+            expected_private_recovery_namespace_identity=(
+                expected_private_recovery_namespace_identity
+            ),
+        )
     return TerminalCommitment(
         size_bytes=len(payload),
         sha256=hashlib.sha256(payload).hexdigest(),
     )
 
 
-def verify_run(output_root: Path, run_key: str) -> RunVerification:
+def verify_run(
+    output_root: Path,
+    run_key: str,
+    *,
+    expected_private_recovery_namespace_identity: str | None = None,
+) -> RunVerification:
     run, resolved_root = _run_root(output_root, run_key, create=False)
     terminal_path = run / "terminal.json"
     try:
@@ -1258,17 +1300,16 @@ def verify_run(output_root: Path, run_key: str) -> RunVerification:
         raise EvidenceStoreError("terminal run key mismatch")
     _assert_exact_membership(run, terminal, include_terminal=True)
     _verify_commitments(run, resolved_root, terminal)
-    if any(
-        item.relative_name == "logs/private-recovery.log"
-        for item in terminal.artifacts
-    ):
-        try:
-            verify_private_recovery_log(
-                read_artifact(output_root, run_key, "log", name="private-recovery"),
-                expected_run_key=run_key,
-            )
-        except EvidenceStoreError as exc:
-            raise EvidenceStoreError("private recovery snapshot is invalid") from exc
+    try:
+        _verify_private_recovery_commitment(
+            output_root,
+            run_key,
+            terminal,
+            expected_namespace_identity=expected_private_recovery_namespace_identity,
+            require_namespace_identity=False,
+        )
+    except EvidenceStoreError as exc:
+        raise EvidenceStoreError("private recovery snapshot is invalid") from exc
     return RunVerification(
         status="verified",
         run_key=run_key,

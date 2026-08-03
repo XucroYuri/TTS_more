@@ -33,11 +33,13 @@ def _parser() -> argparse.ArgumentParser:
     commit.add_argument("--run-key", required=True)
     commit.add_argument("--terminal-json", required=True)
     commit.add_argument("--expected-token", required=True)
+    commit.add_argument("--private-recovery-namespace-identity")
     verify_current_parser = commands.add_parser("verify-current")
     verify_current_parser.add_argument("--output-root", required=True)
     verify_run_parser = commands.add_parser("verify-run")
     verify_run_parser.add_argument("--output-root", required=True)
     verify_run_parser.add_argument("--run-key", required=True)
+    verify_run_parser.add_argument("--private-recovery-namespace-identity")
     return parser
 
 
@@ -55,7 +57,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             terminal = load_terminal(Path(args.terminal_json))
             if terminal.run_key != args.run_key:
                 raise EvidenceStoreError("terminal run key mismatch")
-            write_terminal(Path(args.output_root), terminal)
+            write_terminal(
+                Path(args.output_root),
+                terminal,
+                expected_private_recovery_namespace_identity=(
+                    args.private_recovery_namespace_identity
+                ),
+            )
             pointer = compare_and_swap_current(
                 Path(args.output_root),
                 args.run_key,
@@ -79,7 +87,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             _emit({"ok": True, "verification": payload})
             return 0
         if args.command == "verify-run":
-            verification = verify_run(Path(args.output_root), args.run_key)
+            verification = verify_run(
+                Path(args.output_root),
+                args.run_key,
+                expected_private_recovery_namespace_identity=(
+                    args.private_recovery_namespace_identity
+                ),
+            )
             _emit(
                 {
                     "ok": True,
