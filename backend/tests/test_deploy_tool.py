@@ -2725,11 +2725,8 @@ def _set_local_git_config(path: Path, key: str, value: str) -> None:
         ("maintenance.strategy", "incremental"),
         ("merge.tool", "marker-command"),
         ("filter.attack.clean", "marker-command"),
-        ("submodule.attack.url", "https://github.com/attacker/repo.git"),
+        ("submodule.attack.url", "https://attacker.invalid/repo.git"),
         ("remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/attacker"),
-        ("remote.origin.promisor", "true"),
-        ("remote.origin.partialCloneFilter", "blob:none"),
-        ("extensions.partialClone", "origin"),
         ("unknown.setting", "value"),
     ],
 )
@@ -2752,6 +2749,42 @@ def test_local_git_config_audit_rejects_every_non_allowlisted_key_without_git(
 
     with pytest.raises(RuntimeError, match=r"local Git config key is not allowlisted.*" + re.escape(key)):
         deploy._audit_local_git_config(target, environment={})
+
+
+def test_local_git_config_audit_allows_standard_partial_clone_metadata(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "index-tts"
+    _init_git_checkout(target, "https://github.com/XucroYuri/index-tts.git")
+    _set_local_git_config(target, "core.repositoryformatversion", "1")
+    _set_local_git_config(target, "remote.origin.promisor", "true")
+    _set_local_git_config(target, "remote.origin.partialCloneFilter", "blob:none")
+    _set_local_git_config(target, "extensions.partialClone", "origin")
+
+    values = deploy._audit_local_git_config(target, environment={})
+
+    assert values["core.repositoryformatversion"] == "1"
+    assert values['remote "origin".promisor'] == "true"
+    assert values['remote "origin".partialclonefilter'] == "blob:none"
+    assert values["extensions.partialclone"] == "origin"
+
+
+def test_local_git_config_audit_allows_validated_submodule_metadata(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    deploy = _load_deploy_module(repo_root)
+    target = tmp_path / "repo" / "cosyvoice"
+    _init_git_checkout(target, "https://github.com/XucroYuri/CosyVoice.git")
+    _set_local_git_config(target, "submodule.third_party/Matcha-TTS.active", "true")
+    _set_local_git_config(
+        target,
+        "submodule.third_party/Matcha-TTS.url",
+        "https://github.com/shivammehta25/Matcha-TTS.git",
+    )
+
+    values = deploy._audit_local_git_config(target, environment={})
+
+    assert values['submodule "third_party/matcha-tts".active'] == "true"
+    assert values['submodule "third_party/matcha-tts".url'] == "https://github.com/shivammehta25/Matcha-TTS.git"
 
 
 def test_app_rejects_alternate_refs_command_without_executing_marker(tmp_path: Path) -> None:
