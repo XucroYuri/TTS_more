@@ -208,13 +208,16 @@ scripts/recover-windows-comfyui-reliability-run.ps1 `
 
 The command accepts no private path. It fixed-derives the namespace, obtains
 the same no-follow ancestor and directory leases, and validates the public
-snapshot when one exists. Owner identity facts come only from the run's strict,
-first-written public supervisor, run-result, and lifecycle artifacts; the
-private files and the redacted snapshot are never trusted as ownership claims.
-An orphan without sufficient public ownership facts cannot be recovered by
-this command and remains a zero-delete manual investigation case. Before
-deleting any byte the command completes one read-only prevalidation transaction
-that proves:
+snapshot when one exists. The snapshot's static `.h` commitment is checked
+first; only an exact, stable, identity-matched `.h` byte sequence may then be
+decoded as the private process-identity record. The snapshot itself never
+asserts ownership, and `.h` is not read at all when its public commitment or
+namespace identity fails. The decoded record must agree with the run's strict,
+first-written public supervisor, run-result, and lifecycle bindings. An orphan
+without sufficient public or committed-private ownership facts cannot be
+recovered by this command and remains a zero-delete manual investigation case.
+Before deleting any byte the command completes one read-only prevalidation
+transaction that proves:
 
 - output-root, namespace, run-key, and snapshot identities agree;
 - the namespace has no extra top-level members or reparse descendants;
