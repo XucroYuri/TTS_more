@@ -5605,6 +5605,35 @@ def test_task_10_native_final_cleanup_detects_residue_in_configured_runner_temp_
     assert system.final_cleanup_state((temp_root,)) == (True, True)
 
 
+def test_task_10_temp_delta_ignores_rglob_order_changes_but_detects_new_residue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_root = tmp_path / "owned-temp"
+    temp_root.mkdir()
+    first = temp_root / "first.tmp"
+    stable = temp_root / "stable.tmp"
+    new = temp_root / "new.tmp"
+    first.write_text("first", encoding="utf-8")
+    stable.write_text("stable", encoding="utf-8")
+    order = [first, stable]
+
+    def rglob(_self: Path, _pattern: str) -> object:
+        return iter(order)
+
+    monkeypatch.setattr(Path, "rglob", rglob)
+    before = reliability_validation._temp_entries((temp_root,))
+    order[:] = [stable, new]
+    new.write_text("new", encoding="utf-8")
+
+    delta = reliability_validation._temp_entries_for_delta(
+        before,
+        token_roots=(temp_root,),
+    )
+
+    assert delta == {"0:new.tmp"}
+
+
 def test_task_12_powershell_process_helpers_accept_current_process_identity() -> None:
     powershell = shutil.which("powershell.exe")
     if powershell is None:
