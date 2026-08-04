@@ -169,15 +169,29 @@ function Get-StrictProcessExitCode {
 
 function Invoke-PythonJson {
     param([string] $PythonPath, [string] $BackendRoot, [string[]] $Arguments)
+    $stderrPath = $null
+    $helperStderr = ''
     Push-Location -LiteralPath $BackendRoot
     try {
-        $rendered = @(& $PythonPath @Arguments 2>$null)
+        $stderrPath = [IO.Path]::GetTempFileName()
+        $rendered = @(& $PythonPath @Arguments 2>$stderrPath)
         $helperExit = $LASTEXITCODE
+        if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+            $helperStderr = [IO.File]::ReadAllText($stderrPath)
+        }
     } finally {
         Pop-Location
+        if ($null -ne $stderrPath -and (Test-Path -LiteralPath $stderrPath -PathType Leaf)) {
+            Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+        }
     }
     if ($helperExit -ne 0 -or $rendered.Count -ne 1) {
-        throw 'Formal supervision helper failed'
+        $detail = ([string] $helperStderr).Trim()
+        if ($detail.Length -gt 1024) { $detail = $detail.Substring(0, 1024) }
+        if ([string]::IsNullOrEmpty($detail)) {
+            throw ('Formal supervision helper failed (exit {0})' -f $helperExit)
+        }
+        throw ('Formal supervision helper failed (exit {0}): {1}' -f $helperExit, $detail)
     }
     try {
         return ([string] $rendered[0]) | ConvertFrom-Json -ErrorAction Stop
@@ -700,7 +714,9 @@ try {
     if ($finalized.ok -ne $true) { throw 'Formal supervision commit failed' }
     $formalExitCode = $childExit
 } catch {
-    [Console]::Error.WriteLine('Formal reliability supervision failed')
+    [Console]::Error.WriteLine(
+        ('Formal reliability supervision failed: {0}' -f $_.Exception.Message)
+    )
     $formalExitCode = 1
 } finally {
     if ($null -ne $directoryLease) {
