@@ -1401,6 +1401,34 @@ def _windows_security_descriptor(sddl: str) -> object:
     return descriptor
 
 
+def _windows_security_descriptor_binary(sddl: str) -> bytes:
+    """Return the canonical self-relative descriptor bytes for an SDDL value.
+
+    Windows may render a descriptor using well-known aliases (for example
+    ``LA`` for the local Administrator SID) even when it was created from the
+    equivalent numeric SID.  Comparing rendered SDDL strings would reject
+    that semantically identical descriptor.  Binary conversion keeps the
+    security check exact while ignoring only presentation aliases/order.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    descriptor = _windows_security_descriptor(sddl)
+    advapi32.GetSecurityDescriptorLength.argtypes = [ctypes.c_void_p]
+    advapi32.GetSecurityDescriptorLength.restype = wintypes.DWORD
+    length = advapi32.GetSecurityDescriptorLength(descriptor)
+    if not length:
+        kernel32.LocalFree(descriptor)
+        raise ValueError("recovery capability store is unavailable")
+    try:
+        return ctypes.string_at(descriptor, length)
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
 def _create_windows_private_directory(directory: Path) -> None:
     import ctypes
     from ctypes import wintypes
@@ -1432,8 +1460,10 @@ def _create_windows_private_directory(directory: Path) -> None:
 def _validate_capability_directory_security(directory: Path) -> None:
     metadata = directory.lstat()
     if os.name == "nt":
-        if _windows_security_descriptor_sddl(directory) != _windows_private_sddl(
-            directory=True
+        actual = _windows_security_descriptor_sddl(directory)
+        expected = _windows_private_sddl(directory=True)
+        if _windows_security_descriptor_binary(actual) != _windows_security_descriptor_binary(
+            expected
         ):
             raise ValueError("recovery capability store ACL is unsafe")
     elif metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
@@ -1503,8 +1533,10 @@ def _validate_capability_file(path: Path) -> None:
     ):
         raise ValueError("recovery plan token is invalid")
     if os.name == "nt":
-        if _windows_security_descriptor_sddl(path) != _windows_private_sddl(
-            directory=False
+        actual = _windows_security_descriptor_sddl(path)
+        expected = _windows_private_sddl(directory=False)
+        if _windows_security_descriptor_binary(actual) != _windows_security_descriptor_binary(
+            expected
         ):
             raise ValueError("recovery plan token is invalid")
     elif metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
