@@ -428,7 +428,12 @@ class ProjectStore:
         if not _filesystem_exists(root):
             return None
         for path in sorted(_filesystem_iterdir(root), key=lambda item: item.name.lower()):
-            if not _filesystem_is_dir(path) or windows_path_identity(path) == windows_path_identity(direct):
+            same_direct = (
+                windows_path_identity(path) == windows_path_identity(direct)
+                if os.name == "nt"
+                else path == direct
+            )
+            if not _filesystem_is_dir(path) or same_direct:
                 continue
             marker = self._read_project_marker(path)
             if marker is not None and self._same_project_id(marker, project_id):
