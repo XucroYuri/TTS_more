@@ -186,6 +186,32 @@ function Invoke-PythonJson {
     }
 }
 
+function Resolve-BackendPython {
+    param([string] $TtsMoreRootPath)
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace([string] $env:TTS_MORE_BACKEND_PYTHON)) {
+        $candidates.Add([string] $env:TTS_MORE_BACKEND_PYTHON)
+    }
+    # The repository root .venv is the documented layout.  Keep the older
+    # backend/.venv location as a compatibility fallback for existing local
+    # worktrees, then use the interpreter installed by CI/setup-python.
+    $candidates.Add((Join-Path $TtsMoreRootPath '.venv\Scripts\python.exe'))
+    $candidates.Add((Join-Path $TtsMoreRootPath 'backend\.venv\Scripts\python.exe'))
+    if ([string]::Equals([string] $env:GITHUB_ACTIONS, 'true', [StringComparison]::OrdinalIgnoreCase)) {
+        $pythonCommand = Get-Command 'python.exe' -ErrorAction SilentlyContinue
+        if ($null -ne $pythonCommand) { $candidates.Add([string] $pythonCommand.Source) }
+    }
+    foreach ($candidate in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            $resolved = Resolve-Path -LiteralPath $candidate -ErrorAction SilentlyContinue
+            if ($null -ne $resolved -and (Test-Path -LiteralPath $resolved.Path -PathType Leaf)) {
+                return $resolved.Path
+            }
+        }
+    }
+    throw 'Formal backend Python is unavailable'
+}
+
 function New-ReliabilityDirectoryLease {
     param(
         [string] $OutputRoot,
@@ -445,10 +471,7 @@ try {
     $outputRootRequest = [IO.Path]::GetFullPath($OutputRoot)
     $ttsMoreRootPath = (Resolve-Path -LiteralPath $TtsMoreRoot -ErrorAction Stop).Path
     $backendRoot = Join-Path $ttsMoreRootPath 'backend'
-    $backendPython = Join-Path $backendRoot '.venv\Scripts\python.exe'
-    if (-not (Test-Path -LiteralPath $backendPython -PathType Leaf)) {
-        throw 'Formal backend Python is unavailable'
-    }
+    $backendPython = Resolve-BackendPython -TtsMoreRootPath $ttsMoreRootPath
     $innerScript = Join-Path $PSScriptRoot 'run-windows-comfyui-reliability.ps1'
     if (-not (Test-Path -LiteralPath $innerScript -PathType Leaf)) {
         throw 'Formal inner launcher is unavailable'

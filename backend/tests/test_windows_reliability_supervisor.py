@@ -23,6 +23,12 @@ from app.comfyui import reliability_supervision
 from app.comfyui import reliability_validation
 
 
+pytestmark = pytest.mark.skipif(
+    os.name != "nt",
+    reason="the supervised PowerShell lifecycle is Windows-only",
+)
+
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 BACKEND_ROOT = REPOSITORY_ROOT / "backend"
 SUPERVISOR_SOURCE = (

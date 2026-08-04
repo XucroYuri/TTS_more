@@ -1,4 +1,5 @@
 import hashlib
+import os
 import threading
 from pathlib import Path
 
@@ -101,7 +102,13 @@ def test_fix_round_4_unicode_project_ids_keep_distinct_directories_markers_and_l
     [
         pytest.param("p" * 121, id="121-ascii-units"),
         pytest.param("p" * 255, id="255-ascii-units"),
-        pytest.param(("p" * 253) + "\U0001f600", id="255-units-with-surrogate-pair"),
+        pytest.param(
+            ("p" * 253) + "\U0001f600",
+            id="255-units-with-surrogate-pair",
+            marks=pytest.mark.skipif(
+                os.name != "nt", reason="UTF-16 filename budget is Windows-specific"
+            ),
+        ),
     ],
 )
 def test_fix_round_4_project_ids_through_255_utf16_units_persist_without_rewriting(

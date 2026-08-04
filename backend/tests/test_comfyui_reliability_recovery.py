@@ -683,6 +683,7 @@ def test_capability_store_rejects_acl_drift_after_secure_creation(
         recovery._capability_directory()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point behavior is Windows-only")
 def test_capability_store_rejects_reparse_without_touching_outside(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

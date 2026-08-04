@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,6 +60,7 @@ def test_supervised_launcher_cleanup_tracks_validator_control_state_path() -> No
     assert "-ControlStatePath $controlStatePath" in launcher
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior is Windows-only")
 def test_live_private_recovery_rejects_outside_runner_junction_and_preserves_sentinel(
     tmp_path: Path,
 ) -> None:

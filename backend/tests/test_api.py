@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -2018,10 +2019,11 @@ def test_fix_round_5_long_project_reference_upload_round_trips_through_audio_api
     outside_path = tmp_path.parent / f"{tmp_path.name}-outside-round-five.wav"
     outside_path.write_bytes(audio_bytes)
     try:
-        outside_extended_path = f"\\\\?\\{outside_path.resolve(strict=False)}"
-        refused = client.get("/api/audio", params={"path": outside_extended_path})
-        assert refused.status_code == 400
-        assert refused.json()["detail"] == "audio path is outside data root"
+        if os.name == "nt":
+            outside_extended_path = f"\\\\?\\{outside_path.resolve(strict=False)}"
+            refused = client.get("/api/audio", params={"path": outside_extended_path})
+            assert refused.status_code == 400
+            assert refused.json()["detail"] == "audio path is outside data root"
     finally:
         outside_path.unlink(missing_ok=True)
 

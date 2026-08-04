@@ -39,6 +39,29 @@ function Resolve-ExistingPath {
     throw "Expected an existing $Kind"
 }
 
+function Resolve-BackendPython {
+    param([string] $TtsMoreRootPath)
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace([string] $env:TTS_MORE_BACKEND_PYTHON)) {
+        $candidates.Add([string] $env:TTS_MORE_BACKEND_PYTHON)
+    }
+    $candidates.Add((Join-Path $TtsMoreRootPath '.venv\Scripts\python.exe'))
+    $candidates.Add((Join-Path $TtsMoreRootPath 'backend\.venv\Scripts\python.exe'))
+    if ([string]::Equals([string] $env:GITHUB_ACTIONS, 'true', [StringComparison]::OrdinalIgnoreCase)) {
+        $pythonCommand = Get-Command 'python.exe' -ErrorAction SilentlyContinue
+        if ($null -ne $pythonCommand) { $candidates.Add([string] $pythonCommand.Source) }
+    }
+    foreach ($candidate in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            $resolved = Resolve-Path -LiteralPath $candidate -ErrorAction SilentlyContinue
+            if ($null -ne $resolved -and (Test-Path -LiteralPath $resolved.Path -PathType Leaf)) {
+                return $resolved.Path
+            }
+        }
+    }
+    throw 'Formal backend Python is unavailable'
+}
+
 function Invoke-RunBoundaryValidation {
     param(
         [string] $PythonPath,
@@ -2390,7 +2413,7 @@ $comfyRootPath = Resolve-ExistingPath -LiteralPath $ComfyUiRoot -Kind Directory
 $comfyPythonPath = Resolve-ExistingPath -LiteralPath $ComfyPython -Kind File
 $ttsRootPath = Resolve-ExistingPath -LiteralPath $TtsMoreRoot -Kind Directory
 $backendRootPath = Resolve-ExistingPath -LiteralPath (Join-Path $ttsRootPath 'backend') -Kind Directory
-$backendPythonPath = Resolve-ExistingPath -LiteralPath (Join-Path $ttsRootPath 'backend\.venv\Scripts\python.exe') -Kind File
+$backendPythonPath = Resolve-BackendPython -TtsMoreRootPath $ttsRootPath
 $fixtureDocument = Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json
 
 try {
