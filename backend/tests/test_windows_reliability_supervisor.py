@@ -381,12 +381,23 @@ if ($scenario -ne 'cas') {{
 }}
 $sha = [Security.Cryptography.SHA256]::Create()
 try {{
-    $runKey = ([BitConverter]::ToString(
+$runKey = ([BitConverter]::ToString(
         $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($RunId))
     )).Replace('-', '').ToLowerInvariant()
 }} finally {{ $sha.Dispose() }}
 $backendRoot = Join-Path $TtsMoreRoot 'backend'
-$backendPython = Join-Path $backendRoot '.venv\Scripts\python.exe'
+$backendPython = [string] $env:TTS_MORE_BACKEND_PYTHON
+if ([string]::IsNullOrWhiteSpace($backendPython)) {{
+    $backendPython = Join-Path $TtsMoreRoot '.venv\Scripts\python.exe'
+}}
+if (-not (Test-Path -LiteralPath $backendPython -PathType Leaf)) {{
+    $backendPython = Join-Path $backendRoot '.venv\Scripts\python.exe'
+}}
+if (-not (Test-Path -LiteralPath $backendPython -PathType Leaf)) {{
+    $pythonCommand = Get-Command 'python.exe' -ErrorAction SilentlyContinue
+    if ($null -ne $pythonCommand) {{ $backendPython = [string] $pythonCommand.Source }}
+}}
+if (-not (Test-Path -LiteralPath $backendPython -PathType Leaf)) {{ exit 95 }}
 $runDirectory = Join-Path (Join-Path $OutputRoot 'runs') $runKey
 $privateDirectory = if ([string]::IsNullOrEmpty($PrivateRecoveryRoot)) {{
     $runDirectory
