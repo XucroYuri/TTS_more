@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)] [string] $ComfyUiRoot,
     [Parameter(Mandatory = $true)] [string] $ComfyPython,
     [Parameter(Mandatory = $true)] [string] $TtsMoreRoot,
+    [string] $TtsMoreSourceRoot,
     [string] $TtsAudioSuiteSourceRoot,
     [string] $RunId,
     [string] $OutputRootIdentity,
@@ -2443,7 +2444,7 @@ try {
             [StringComparison]::OrdinalIgnoreCase
         )
     ) { throw 'Formal run boundary validation failed' }
-    $outputRootPath = [string] $runBoundary.result.output_root
+$outputRootPath = [string] $runBoundary.result.output_root
     $runEvidenceRoot = [string] $runBoundary.result.run_root
     $privateRecoveryRootPath = $suppliedPrivateRecoveryRoot
 } catch {
@@ -2453,6 +2454,11 @@ try {
 
 $suiteCandidate = Join-Path $comfyRootPath 'custom_nodes\TTS-Audio-Suite'
 $suiteRoot = Resolve-ExistingPath -LiteralPath $suiteCandidate -Kind Directory
+$ttsMoreSourceRoot = if ([string]::IsNullOrWhiteSpace($TtsMoreSourceRoot)) {
+    $ttsRootPath
+} else {
+    Resolve-ExistingPath -LiteralPath $TtsMoreSourceRoot -Kind Directory
+}
 $suiteSourceRoot = if ([string]::IsNullOrWhiteSpace($TtsAudioSuiteSourceRoot)) {
     $suiteRoot
 } else {
@@ -2648,7 +2654,11 @@ try {
                 cosyvoice = $cosyRoot
             }
             repository_sources = [ordered]@{
-                'tts-more' = $ttsRootPath
+                'tts-more' = if (Get-Variable -Name ttsMoreSourceRoot -ErrorAction SilentlyContinue) {
+                    Get-Variable -Name ttsMoreSourceRoot -ValueOnly
+                } else {
+                    $ttsRootPath
+                }
                 'tts-audio-suite' = if (Get-Variable -Name suiteSourceRoot -ErrorAction SilentlyContinue) {
                     Get-Variable -Name suiteSourceRoot -ValueOnly
                 } else {
