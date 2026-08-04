@@ -989,8 +989,13 @@ def _windows_open_directory_anchor(path: Path) -> int:
     invalid = wintypes.HANDLE(-1).value
     handle = kernel32.CreateFileW(
         str(path),
-        0x00020000 | 0x00010000 | 0x00000080,
-        0x00000001 | 0x00000002,
+        # The anchor is an identity/readability handle, not a deletion lock.
+        # Requesting DELETE on the shared TEMP parent conflicts with handles
+        # held by pytest/runner processes that intentionally omit
+        # FILE_SHARE_DELETE.  Handle identity, the named-path recheck and the
+        # parent change notification still detect replacement/deletion.
+        0x00020000 | 0x00000080,
+        0x00000001 | 0x00000002 | 0x00000004,
         None,
         3,
         0x02000000 | 0x00200000,
