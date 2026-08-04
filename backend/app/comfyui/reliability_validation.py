@@ -2903,9 +2903,12 @@ def _sha256_file(path: Path) -> str:
 
 def _temp_entries(roots: tuple[Path, ...]) -> set[str]:
     entries: set[str] = set()
-    for root in roots:
+    for root_index, root in enumerate(roots):
         if root.exists():
-            entries.update(f"{index}:{path.relative_to(root).as_posix()}" for index, path in enumerate(root.rglob("*")))
+            entries.update(
+                f"{root_index}:{path.relative_to(root).as_posix()}"
+                for path in root.rglob("*")
+            )
     return entries
 
 
