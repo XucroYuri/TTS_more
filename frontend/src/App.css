@@ -5378,7 +5378,8 @@ h3 {
 .status-pill.running,
 .status-pill.queued,
 .status-pill.loading,
-.status-pill.finalizing {
+.status-pill.finalizing,
+.status-pill.cancelling {
   color: #0059ec;
   background: #f0f7ff;
 }

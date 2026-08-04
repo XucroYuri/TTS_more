@@ -24,6 +24,52 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e 'backend[dev]'
+      - name: Isolate Windows test temporary directory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $testTemp = Join-Path $env:RUNNER_TEMP ("tts-more-pytest-{0}" -f $env:GITHUB_RUN_ID)
+          New-Item -ItemType Directory -Force -Path $testTemp | Out-Null
+          "TEMP=$testTemp" >> $env:GITHUB_ENV
+          "TMP=$testTemp" >> $env:GITHUB_ENV
+          "TTS_MORE_BACKEND_PYTHON=$((Get-Command python.exe).Source)" >> $env:GITHUB_ENV
+      - name: Diagnose Windows recovery ACL
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          whoami /user
+          Write-Host "TEMP=$env:TEMP"
+          icacls.exe $env:TEMP
+          $env:PYTHONPATH = Join-Path $env:GITHUB_WORKSPACE 'backend'
+          $diagnostic = @'
+          import os
+          import tempfile
+          from pathlib import Path
+          from app.comfyui import reliability_recovery as recovery
+
+          print("python", os.sys.executable)
+          print("tempdir", tempfile.gettempdir())
+          print("sid", recovery._windows_current_user_sid())
+          print("expected", recovery._windows_private_sddl(directory=True))
+          store = Path(tempfile.gettempdir()) / recovery.CAPABILITY_DIRECTORY
+          try:
+              actual = recovery._windows_security_descriptor_sddl(store)
+          except Exception as exc:
+              actual = f"<unavailable: {type(exc).__name__}: {exc}>"
+          print("store", store)
+          print("actual", actual)
+          try:
+              print("validated", recovery._capability_directory())
+          except Exception as exc:
+              print("validation_error", type(exc).__name__, str(exc))
+              try:
+                  print("actual_after", recovery._windows_security_descriptor_sddl(store))
+              except Exception as after_exc:
+                  print("actual_after_error", type(after_exc).__name__, str(after_exc))
+          '@
+          $diagnostic | python -
+          icacls.exe (Join-Path $env:TEMP 'tts-more-reliability-recovery-capabilities')
       - name: Run pytest
         env:
           # The suite must pass without network egress; proxy vars break httpx.
@@ -31,6 +77,7 @@ jobs:
           HTTP_PROXY: ""
           HTTPS_PROXY: ""
           TTS_MORE_SKIP_LEGACY_PORTABLE: "1"
+          TTS_MORE_SUPERVISION_DEBUG: "1"
           # Keep Windows tmp_path below the production portable-package path budget.
           PYTEST_ADDOPTS: ${{ runner.os == 'Windows' && format('--basetemp="{0}/pytest-{1}"', runner.temp, github.run_id) || '' }}
         run: pytest backend -q

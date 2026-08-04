@@ -1,6 +1,8 @@
 import json
+import os
 from pathlib import Path
 import subprocess
+import threading
 import time
 from types import SimpleNamespace
 
@@ -9,7 +11,8 @@ import httpx
 import pytest
 
 import app.main as main_module
-from app.models import Character, ScriptLine
+from app.adapters.base import SynthesisCancelled
+from app.models import Character, GenerationTask, ScriptLine
 from app.main import _layer_service_status, _portable_controller_root, _resolve_repo_lock_path, create_app
 from app.open_source_tts import OpenSourceTTSConfigureRequest
 from app.parser import ParsedScriptDraft, ParserProviderUnavailable, ParserQualityError
@@ -32,6 +35,21 @@ def test_health_reports_repos_and_workers(tmp_path: Path) -> None:
     payload = response.json()
     assert payload["status"] == "ok"
     assert {worker["engine"] for worker in payload["workers"]} == {"gpt-sovits", "indextts", "cosyvoice"}
+
+
+def test_comfyui_workflow_template_catalog_is_public_and_stable(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.get("/api/comfyui/workflow-templates")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] == 1
+    assert [item["name"] for item in payload["templates"]] == [
+        "text-only",
+        "reference-clone",
+        "controlled",
+    ]
 
 
 def test_parse_script_requires_enabled_llm_parser(tmp_path: Path) -> None:
@@ -1001,8 +1019,13 @@ def test_generate_writes_audio_manifest_under_project_output(tmp_path: Path) -> 
     assert response.status_code == 200
     version = response.json()["lines"]["parse-r001:l001"]["versions"][0]
     audio_path = Path(version["audio_path"])
-    assert "output" in audio_path.parts
-    assert audio_path.parts[-4:-1] == ("gpt-sovits", "mock-gpt", "line-temp-gpt")
+    project_audio_root = tmp_path / "Project" / "剧本 Demo" / "output" / "audio"
+    audio_path.resolve(strict=True).relative_to(project_audio_root.resolve(strict=True))
+    assert version["engine"] == "gpt-sovits"
+    assert version["service_id"] == "mock-gpt"
+    assert version["profile"] == "line-temp-gpt"
+    assert version["binding_id"] == "line-temp-gpt"
+    assert audio_path.is_file()
     assert (tmp_path / "Project" / "剧本 Demo" / "output" / "manifest.json").is_file()
 
 
@@ -1765,6 +1788,246 @@ def test_generate_routes_task_to_service_endpoint(tmp_path: Path) -> None:
     assert version["metadata"]["load_verification_level"] == "assumed_after_success"
 
 
+def test_fix_round_2_sync_generate_preserves_manager_commit_from_stale_snapshot(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "mock-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "base_url": "mock://gpt",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    app = create_app(data_root=tmp_path, services_path=services_path)
+    client = TestClient(app)
+    original_queue = app.state.queue
+    sync_snapshot_loaded = threading.Event()
+    release_sync = threading.Event()
+
+    class BlockingSyncQueue:
+        def run(self, *args, **kwargs):
+            sync_snapshot_loaded.set()
+            assert release_sync.wait(3)
+            return original_queue.run(*args, **kwargs)
+
+    app.state.queue = BlockingSyncQueue()
+    common_parameters = {
+        "gpt_weights_path": "voice.ckpt",
+        "sovits_weights_path": "voice.pth",
+        "ref_audio_path": "voice.wav",
+        "prompt_text": "参考文本",
+    }
+    sync_payload = {
+        "project_id": "demo",
+        "tasks": [
+            {
+                "line": {"id": "sync-line", "character_id": "role", "text": "同步生成"},
+                "engine": "gpt-sovits",
+                "profile": "sync-profile",
+                "service_id": "mock-gpt",
+                "parameters": common_parameters,
+            }
+        ],
+    }
+    response_holder: list = []
+
+    def run_sync_generate() -> None:
+        response_holder.append(client.post("/api/generate", json=sync_payload))
+
+    sync_thread = threading.Thread(target=run_sync_generate, name="sync-generate-route")
+    sync_thread.start()
+    assert sync_snapshot_loaded.wait(3)
+
+    async_task = GenerationTask.model_validate(
+        {
+            "line": {"id": "async-line", "character_id": "role", "text": "异步生成"},
+            "engine": "gpt-sovits",
+            "profile": "async-profile",
+            "service_id": "mock-gpt",
+            "parameters": common_parameters,
+        }
+    )
+    async_job = app.state.job_manager.submit("demo", [async_task])
+    assert _wait_for_job(client, async_job.job_id)["status"] == "completed"
+    release_sync.set()
+    sync_thread.join(5)
+
+    assert not sync_thread.is_alive()
+    assert len(response_holder) == 1
+    assert response_holder[0].status_code == 200
+    assert set(response_holder[0].json()["lines"]) == {"async-line", "sync-line"}
+    assert set(app.state.store.load_manifest("demo").lines) == {"async-line", "sync-line"}
+
+
+def test_fix_round_2_concurrent_sync_generate_keeps_distinct_audio_evidence(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "mock-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "base_url": "mock://gpt",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    app = create_app(data_root=tmp_path, services_path=services_path)
+    client = TestClient(app)
+    original_queue = app.state.queue
+    both_snapshots_loaded = threading.Event()
+    release_generates = threading.Event()
+    guard = threading.Lock()
+    arrivals = 0
+
+    class ConcurrentSyncQueue:
+        def run(self, *args, **kwargs):
+            nonlocal arrivals
+            with guard:
+                arrivals += 1
+                if arrivals == 2:
+                    both_snapshots_loaded.set()
+            assert both_snapshots_loaded.wait(3)
+            assert release_generates.wait(3)
+            return original_queue.run(*args, **kwargs)
+
+    app.state.queue = ConcurrentSyncQueue()
+    payload = {
+        "project_id": "demo",
+        "tasks": [
+            {
+                "line": {"id": "shared-line", "character_id": "role", "text": "并发同步生成"},
+                "engine": "gpt-sovits",
+                "profile": "shared-profile",
+                "service_id": "mock-gpt",
+                "parameters": {
+                    "gpt_weights_path": "voice.ckpt",
+                    "sovits_weights_path": "voice.pth",
+                    "ref_audio_path": "voice.wav",
+                    "prompt_text": "参考文本",
+                },
+            }
+        ],
+    }
+    responses: list = []
+
+    def generate() -> None:
+        responses.append(client.post("/api/generate", json=payload))
+
+    first = threading.Thread(target=generate, name="sync-generate-1")
+    second = threading.Thread(target=generate, name="sync-generate-2")
+    first.start()
+    second.start()
+    assert both_snapshots_loaded.wait(3)
+    release_generates.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert [response.status_code for response in responses] == [200, 200]
+    versions = app.state.store.load_manifest("demo").lines["shared-line"].versions
+    audio_paths = [Path(version.audio_path or "") for version in versions]
+    assert [version.version_id for version in versions] == ["v001", "v002"]
+    assert len(set(audio_paths)) == 2
+    assert all(path.is_file() for path in audio_paths)
+
+
+@pytest.mark.parametrize("route", ["/api/generate", "/api/validation/real-tts/run"])
+def test_fix_round_3_sync_routes_confine_malicious_service_and_profile_paths(
+    tmp_path: Path, route: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TTS_MORE_SERVICE_MODE", "mock")
+    logical_service_id = str(tmp_path / "outside-service")
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps(
+            [
+                {
+                    "service_id": logical_service_id,
+                    "engine": "gpt-sovits",
+                    "provider_type": "gpt-sovits",
+                    "base_url": "mock://gpt",
+                    "resource_group": "local-gpu-0",
+                    "capabilities": ["tts"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    app = create_app(data_root=tmp_path, services_path=services_path)
+    client = TestClient(app)
+    response = client.post(
+        route,
+        json={
+            "project_id": "demo",
+            "tasks": [
+                {
+                    "line": {"id": "sync-line", "character_id": "role", "text": "路径约束"},
+                    "engine": "gpt-sovits",
+                    "profile": "..\\unsafe-profile",
+                    "service_id": logical_service_id,
+                    "parameters": {
+                        "gpt_weights_path": "voice.ckpt",
+                        "sovits_weights_path": "voice.pth",
+                        "ref_audio_path": "voice.wav",
+                        "prompt_text": "参考文本",
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    manifest = payload["manifest"] if route.endswith("/real-tts/run") else payload
+    version = manifest["lines"]["sync-line"]["versions"][0]
+    audio_path = Path(version["audio_path"]).resolve(strict=False)
+    audio_path.relative_to(app.state.store.project_audio_dir("demo").resolve(strict=False))
+    assert version["service_id"] == logical_service_id
+    assert version["profile"] == "..\\unsafe-profile"
+    assert audio_path.is_file()
+
+
+def test_fix_round_5_long_project_reference_upload_round_trips_through_audio_api(tmp_path: Path) -> None:
+    project_id = "p" * 255
+    audio_bytes = b"RIFF-round-five-reference"
+    client = TestClient(create_app(data_root=tmp_path), raise_server_exceptions=False)
+
+    upload = client.post(
+        f"/api/projects/{project_id}/reference-audio/upload",
+        files={"file": ("reference.wav", audio_bytes, "audio/wav")},
+    )
+
+    assert upload.status_code == 200
+    returned_path = upload.json()["sample"]["path"]
+    audio = client.get("/api/audio", params={"path": returned_path})
+    assert audio.status_code == 200
+    assert audio.content == audio_bytes
+
+    outside_path = tmp_path.parent / f"{tmp_path.name}-outside-round-five.wav"
+    outside_path.write_bytes(audio_bytes)
+    try:
+        if os.name == "nt":
+            outside_extended_path = f"\\\\?\\{outside_path.resolve(strict=False)}"
+            refused = client.get("/api/audio", params={"path": outside_extended_path})
+            assert refused.status_code == 400
+            assert refused.json()["detail"] == "audio path is outside data root"
+    finally:
+        outside_path.unlink(missing_ok=True)
+
+
 def test_generation_preflight_suggests_local_fallback_without_auto_start(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("app.services.ServiceRouter._client_ready", lambda *_args: False)
     services_path = tmp_path / "services.json"
@@ -1967,7 +2230,7 @@ def test_demo_validation_plan_splits_runnable_and_blocked_lines(tmp_path: Path) 
         encoding="utf-8",
     )
     client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
-    client.put(
+    characters_response = client.put(
         "/api/characters",
         json=[
             {
@@ -2001,7 +2264,8 @@ def test_demo_validation_plan_splits_runnable_and_blocked_lines(tmp_path: Path) 
             }
         ],
     )
-    client.put(
+    assert characters_response.status_code == 200, characters_response.text
+    project_response = client.put(
         "/api/projects/demo",
         json={
             "title": "Demo",
@@ -2011,6 +2275,7 @@ def test_demo_validation_plan_splits_runnable_and_blocked_lines(tmp_path: Path) 
             ],
         },
     )
+    assert project_response.status_code == 200, project_response.text
 
     response = client.get("/api/validation/demo-plan?project_id=demo&limit=10&repeats=2")
 
@@ -2088,6 +2353,96 @@ def test_generation_job_api_runs_in_background_and_reports_status(tmp_path: Path
 
     assert queue_status.status_code == 200
     assert queue_status.json()["queued"] == 0
+
+
+def test_generation_job_cancel_api_serializes_cancelling_then_persists_cancelled_prompt_version(tmp_path: Path) -> None:
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        """
+[
+  {
+    "service_id": "mock-gpt",
+    "engine": "gpt-sovits",
+    "provider_type": "gpt-sovits",
+    "base_url": "mock://gpt",
+    "resource_group": "local-gpu-0",
+    "capabilities": ["tts", "trained_weights_voice"]
+  }
+]
+""",
+        encoding="utf-8",
+    )
+    started = threading.Event()
+    release = threading.Event()
+    app = create_app(data_root=tmp_path, services_path=services_path)
+    original = app.state.service_router.clients["mock-gpt"]
+
+    class ApiCancelClient:
+        endpoint = original.endpoint
+
+        def health(self):
+            return original.health()
+
+        def load(self, profile, parameters=None):
+            return original.load(profile, parameters)
+
+        def unload(self):
+            return original.unload()
+
+        def synthesize(self, request):
+            started.set()
+            assert request.cancel_check is not None
+            assert release.wait(3)
+            if request.cancel_check():
+                raise SynthesisCancelled(
+                    "cancelled through API",
+                    details={"prompt_id": "prompt-api-cancel", "converged": True},
+                )
+            return original.synthesize(request)
+
+    app.state.service_router.clients["mock-gpt"] = ApiCancelClient()
+    client = TestClient(app)
+    created = client.post(
+        "/api/jobs/generation",
+        json={
+            "project_id": "demo",
+            "tasks": [
+                {
+                    "line": {"id": "cancel-line", "character_id": "alice", "text": "你好"},
+                    "engine": "gpt-sovits",
+                    "profile": "alice-gpt",
+                    "service_id": "mock-gpt",
+                    "provider_type": "gpt-sovits",
+                    "required_capabilities": ["trained_weights_voice"],
+                    "parameters": {
+                        "gpt_weights_path": "a.ckpt",
+                        "sovits_weights_path": "a.pth",
+                        "ref_audio_path": "a.wav",
+                        "prompt_text": "参考文本",
+                    },
+                }
+            ],
+        },
+    )
+    assert created.status_code == 200
+    job_id = created.json()["job_id"]
+    assert started.wait(3)
+
+    cancelling = client.post(f"/api/jobs/{job_id}/cancel")
+
+    assert cancelling.status_code == 200
+    assert cancelling.json()["status"] == "cancelling"
+    assert cancelling.json()["items"][0]["status"] == "cancelling"
+    release.set()
+    final = _wait_for_job(client, job_id)
+    assert final["status"] == "cancelled"
+    assert final["items"][0]["status"] == "cancelled"
+    manifest = client.get("/api/projects/demo/manifest")
+    assert manifest.status_code == 200
+    version = manifest.json()["lines"]["cancel-line"]["versions"][0]
+    assert version["status"] == "cancelled"
+    assert version["audio_path"] is None
+    assert version["metadata"]["control_details"]["prompt_id"] == "prompt-api-cancel"
 
 
 def test_registered_comfyui_gpt_endpoint_allows_registry_owned_weights_in_preflight_and_job(tmp_path: Path) -> None:

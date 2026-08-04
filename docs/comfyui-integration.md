@@ -74,6 +74,31 @@ curl http://127.0.0.1:8188/api/tts-audio-suite/v1/capabilities
 }
 ```
 
+## 三种稳定工作流模板
+
+TTS More 的 ComfyUI builder 提供三个稳定名称，均复用同一套 `resource_id`、队列和 WAV 输出契约：
+
+| `workflow_template` | 用途 | 必要输入 |
+| :--- | :--- | :--- |
+| `text-only` | 纯文本合成；会清除遗留的参考音频绑定 | `resource_id`、`text` |
+| `reference-clone` | 使用上传后的参考音频进行音色克隆 | `resource_id`、`text`、`asset_id` |
+| `controlled` | 在同一图结构中保留引擎控制项（如 GPT-SoVITS 切句、采样参数） | `resource_id`、`text` |
+
+模板通过服务端点的 `default_params` 或单次任务 `parameters` 选择。例如：
+
+```json
+{
+  "engine": "gpt-sovits",
+  "workflow_template": "controlled",
+  "resource_id": "gpt-sovits-local",
+  "text": "你好，这是一次 ComfyUI 联动验证。",
+  "how_to_cut": "按标点符号切",
+  "temperature": 0.8
+}
+```
+
+`reference-clone` 的 `asset_id` 必须来自 TTS-Audio-Suite 的音频上传接口；不能把本机路径直接写入工作流。对应插件仓库也提供可拖入 ComfyUI 的三份 API prompt 示例：GPT-SoVITS、IndexTTS 和 CosyVoice。示例中的资源 ID 是占位值，实际运行时必须替换为本机 `resources.yaml` 中已登记且 `capabilities` 报告为 `ready` 的资源。
+
 ## 服务端点配置详解
 
 | 字段 | 说明 |

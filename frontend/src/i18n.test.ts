@@ -22,6 +22,10 @@ describe("i18n configuration", () => {
     expect(tText(resources["zh-CN"], "app.title")).toBe("TTS More");
     expect(tText(resources["zh-CN"], "validation.run")).toBe("运行核心模型检查");
     expect(tText(resources["en-US"], "validation.run")).toBe("Run core-model check");
+    expect(tText(resources["zh-CN"], "status.cancelling")).toBe("取消中");
+    expect(tText(resources["zh-CN"], "status.cancelled")).toBe("已取消");
+    expect(tText(resources["en-US"], "status.cancelling")).toBe("Cancelling");
+    expect(tText(resources["en-US"], "status.cancelled")).toBe("Cancelled");
   });
 
   it("cycles between supported languages for the compact topbar toggle", () => {

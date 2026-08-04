@@ -4,15 +4,17 @@ import logging
 import os
 import threading
 import uuid
-import re
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from app.adapters.base import SynthesisRequest
+from app.adapters.base import SynthesisCancelled, SynthesisRequest, SynthesisTimeout
 from app.models import EngineName, GenerationJob, GenerationManifest, GenerationQueueItem, GenerationStatus, GenerationTask, GenerationVersion, ProviderType
+from app.net_guard import scrub_error
+from app.path_safety import encode_windows_component, windows_utf16_units
 from app.services import COMFYUI_TTS_CONTRACTS, ServiceRoute, build_load_signature
 
 ExternalStatusUpdate = dict[str, Any]
@@ -25,8 +27,124 @@ def _task_line_uid(task: GenerationTask) -> str:
     return task.line.line_uid or task.line.id
 
 
-def _safe_line_output_stem(task: GenerationTask) -> str:
-    return re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", _task_line_uid(task)).strip("._-") or task.line.id
+WINDOWS_MAX_OUTPUT_PATH_UNITS = 259
+OUTPUT_DIRECTORY_COMPONENT_UNITS = 22
+OUTPUT_NAMESPACE_UNITS = 18
+OUTPUT_FILENAME_MAX_UNITS = 120
+
+
+def _generation_output_path(
+    output_dir: Path,
+    task: GenerationTask,
+    route: ServiceRoute,
+    version_id: str,
+    output_namespace: str | None,
+) -> Path:
+    engine_component = encode_windows_component(
+        task.engine.value,
+        max_units=OUTPUT_DIRECTORY_COMPONENT_UNITS,
+        fallback="engine",
+    )
+    service_component = encode_windows_component(
+        route.endpoint.service_id,
+        max_units=OUTPUT_DIRECTORY_COMPONENT_UNITS,
+        fallback="service",
+    )
+    profile_component = encode_windows_component(
+        task.profile,
+        max_units=OUTPUT_DIRECTORY_COMPONENT_UNITS,
+        fallback="profile",
+    )
+    parent = output_dir / engine_component / service_component / profile_component
+    root_resolved = output_dir.resolve(strict=False)
+    parent_resolved = parent.resolve(strict=False)
+    try:
+        parent_resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError("generation output path escapes the configured output root") from exc
+
+    suffix = f"_{version_id}.wav"
+    if output_namespace is not None:
+        namespace_component = encode_windows_component(
+            output_namespace,
+            max_units=OUTPUT_NAMESPACE_UNITS,
+            fallback="job",
+        )
+        suffix = f"_{namespace_component}{suffix}"
+
+    remaining_path_units = (
+        WINDOWS_MAX_OUTPUT_PATH_UNITS
+        - windows_utf16_units(str(parent_resolved))
+        - windows_utf16_units(os.sep)
+    )
+    filename_units = min(OUTPUT_FILENAME_MAX_UNITS, remaining_path_units)
+    line_units = filename_units - windows_utf16_units(suffix)
+    if line_units < 18:
+        raise ValueError("output root exhausts the Windows path budget")
+    line_component = encode_windows_component(
+        _task_line_uid(task),
+        max_units=line_units,
+        fallback="line",
+    )
+    output_path = parent / f"{line_component}{suffix}"
+    output_resolved = output_path.resolve(strict=False)
+    try:
+        output_resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError("generation output path escapes the configured output root") from exc
+    if windows_utf16_units(str(output_resolved)) > WINDOWS_MAX_OUTPUT_PATH_UNITS:
+        raise ValueError("generation output exceeds the Windows path budget")
+    return output_path
+
+
+@dataclass(frozen=True)
+class ManifestVersionIdAssignment:
+    line_key: str
+    provisional_id: str
+    actual_id: str
+
+
+@dataclass(frozen=True)
+class ManifestPersistenceResult:
+    manifest: GenerationManifest
+    assignments: tuple[ManifestVersionIdAssignment, ...]
+
+
+def persist_manifest_delta(
+    store: Any,
+    baseline: GenerationManifest,
+    updated: GenerationManifest,
+) -> ManifestPersistenceResult:
+    if baseline.project_id != updated.project_id:
+        raise RuntimeError("manifest delta project ids do not match")
+
+    def merge(current: GenerationManifest) -> ManifestPersistenceResult:
+        assignments: list[ManifestVersionIdAssignment] = []
+        for line_key, updated_history in updated.lines.items():
+            baseline_history = baseline.lines.get(line_key)
+            baseline_versions = baseline_history.versions if baseline_history else []
+            if len(updated_history.versions) < len(baseline_versions):
+                raise RuntimeError(f"manifest line {line_key} removed baseline generation versions")
+            if updated_history.versions[: len(baseline_versions)] != baseline_versions:
+                raise RuntimeError(f"manifest line {line_key} changed baseline generation versions")
+            for version in updated_history.versions[len(baseline_versions) :]:
+                provisional_id = version.version_id
+                current.append_version(updated_history.line_id, version)
+                current_history = current.history_for_line(updated_history.line_id, version.line_uid)
+                actual_id = current_history.versions[-1].version_id if current_history else provisional_id
+                assignments.append(
+                    ManifestVersionIdAssignment(
+                        line_key=line_key,
+                        provisional_id=provisional_id,
+                        actual_id=actual_id,
+                    )
+                )
+        return ManifestPersistenceResult(
+            manifest=current.model_copy(deep=True),
+            assignments=tuple(assignments),
+        )
+
+    return store.update_manifest(updated.project_id, merge)
 
 
 class ServiceGenerationQueue:
@@ -60,6 +178,7 @@ class ServiceGenerationQueue:
         output_dir: Path,
         status_callback: StatusCallback | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        output_namespace: str | None = None,
     ) -> GenerationManifest:
         grouped: "OrderedDict[str, OrderedDict[str, list[tuple[int, GenerationTask, ServiceRoute, str]]]]" = OrderedDict()
         for index, task in enumerate(tasks):
@@ -79,7 +198,16 @@ class ServiceGenerationQueue:
 
         with ThreadPoolExecutor(max_workers=len(work_items)) as executor:
             futures = [
-                executor.submit(self._run_resource_clusters, resource_group, clusters, manifest, output_dir, status_callback, cancel_check)
+                executor.submit(
+                    self._run_resource_clusters,
+                    resource_group,
+                    clusters,
+                    manifest,
+                    output_dir,
+                    status_callback,
+                    cancel_check,
+                    output_namespace,
+                )
                 for resource_group, clusters in work_items
             ]
             for future in futures:
@@ -94,11 +222,21 @@ class ServiceGenerationQueue:
         output_dir: Path,
         status_callback: StatusCallback | None,
         cancel_check: Callable[[], bool] | None = None,
+        output_namespace: str | None = None,
     ) -> None:
         for cluster_key, group in clusters:
             if cancel_check and cancel_check():
                 return
-            self._run_service_cluster(resource_group, cluster_key, group, manifest, output_dir, status_callback, cancel_check)
+            self._run_service_cluster(
+                resource_group,
+                cluster_key,
+                group,
+                manifest,
+                output_dir,
+                status_callback,
+                cancel_check,
+                output_namespace,
+            )
 
     def _run_service_cluster(
         self,
@@ -109,9 +247,12 @@ class ServiceGenerationQueue:
         output_dir: Path,
         status_callback: StatusCallback | None,
         cancel_check: Callable[[], bool] | None = None,
+        output_namespace: str | None = None,
     ) -> None:
         semaphore = self._resource_semaphore(resource_group, capacity=group[0][2].endpoint.capacity)
         with semaphore:
+            if cancel_check and cancel_check():
+                return
             (_index, first_task, route, _first_cluster) = group[0]
             self._emit(first_task, "loading", 0.05, cluster_key, None, status_callback)
             first_signature = build_load_signature(route.endpoint, first_task.parameters)
@@ -175,7 +316,16 @@ class ServiceGenerationQueue:
                         raise
                     self._mark_loaded(task_route.endpoint.service_id, task_signature, "loaded_unverified")
                 self._active_resource_services[resource_group] = (task_route.endpoint.service_id, task_route.client)
-                self._run_task(task_route, task, manifest, output_dir, task_cluster_key, status_callback)
+                self._run_task(
+                    task_route,
+                    task,
+                    manifest,
+                    output_dir,
+                    task_cluster_key,
+                    status_callback,
+                    cancel_check,
+                    output_namespace,
+                )
 
     def _run_task(
         self,
@@ -185,19 +335,15 @@ class ServiceGenerationQueue:
         output_dir: Path,
         cluster_key: str | None = None,
         status_callback: StatusCallback | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        output_namespace: str | None = None,
     ) -> None:
         self._emit(task, "running", 0.35, cluster_key, None, status_callback)
         with self._manifest_lock:
             history = manifest.history_for_line(task.line.id, _task_line_uid(task))
             version_number = len(history.versions) + 1 if history else 1
             version_id = f"v{version_number:03d}"
-        output_path = (
-            output_dir
-            / task.engine.value
-            / route.endpoint.service_id
-            / task.profile
-            / f"{_safe_line_output_stem(task)}_{version_id}.wav"
-        )
+        output_path = _generation_output_path(output_dir, task, route, version_id, output_namespace)
         requested_load_signature = build_load_signature(route.endpoint, task.parameters)
         revision_context = _revision_context(task)
         binding_snapshot = route.binding.model_dump(mode="json") if route.binding else None
@@ -217,9 +363,32 @@ class ServiceGenerationQueue:
                     output_path=output_path,
                     parameters=task.parameters,
                     progress_callback=progress_callback,
+                    cancel_check=cancel_check,
                 )
             )
+            if cancel_check and cancel_check():
+                self._record_cancelled_outcome(
+                    route,
+                    task,
+                    manifest,
+                    cluster_key,
+                    output_paths=(output_path, result.audio_path),
+                    details=result.metadata,
+                    status_callback=status_callback,
+                )
+                return
             self._emit(task, "finalizing", 0.9, cluster_key, version_id, status_callback)
+            if cancel_check and cancel_check():
+                self._record_cancelled_outcome(
+                    route,
+                    task,
+                    manifest,
+                    cluster_key,
+                    output_paths=(output_path, result.audio_path),
+                    details=result.metadata,
+                    status_callback=status_callback,
+                )
+                return
             load_verification_level = str(result.metadata.get("load_verification_level", "assumed_after_success"))
             verified_load_signature = str(result.metadata.get("verified_load_signature") or requested_load_signature)
             self._mark_loaded(route.endpoint.service_id, verified_load_signature, load_verification_level)
@@ -248,7 +417,53 @@ class ServiceGenerationQueue:
                     "load_verification_level": load_verification_level,
                 },
             )
+        except SynthesisCancelled as exc:
+            cleanup_errors = self._discard_uncommitted_output(output_path)
+            converged = exc.details.get("converged")
+            cancellation = exc.details.get("cancellation")
+            if converged is None and isinstance(cancellation, dict):
+                converged = cancellation.get("converged")
+            if converged is True:
+                self._record_cancelled_outcome(
+                    route,
+                    task,
+                    manifest,
+                    cluster_key,
+                    output_paths=(),
+                    details=self._with_output_cleanup_errors(exc.details, cleanup_errors),
+                    status_callback=status_callback,
+                    error=exc,
+                    force_failed=bool(cleanup_errors),
+                )
+            else:
+                failed_version_id = self._append_failed_version(
+                    route,
+                    task,
+                    manifest,
+                    cluster_key,
+                    "cancellation_cleanup",
+                    exc,
+                    control_code=exc.code,
+                    control_details=self._with_output_cleanup_errors(exc.details, cleanup_errors),
+                )
+                self._emit(task, "failed", 1.0, cluster_key, failed_version_id, status_callback)
+            return
+        except SynthesisTimeout as exc:
+            cleanup_errors = self._discard_uncommitted_output(output_path)
+            failed_version_id = self._append_failed_version(
+                route,
+                task,
+                manifest,
+                cluster_key,
+                "timeout",
+                exc,
+                control_code=exc.code,
+                control_details=self._with_output_cleanup_errors(exc.details, cleanup_errors),
+            )
+            self._emit(task, "failed", 1.0, cluster_key, failed_version_id, status_callback)
+            return
         except Exception as exc:
+            cleanup_errors = self._discard_uncommitted_output(output_path)
             failed_version_id = self._append_failed_version(
                 route,
                 task,
@@ -256,13 +471,27 @@ class ServiceGenerationQueue:
                 cluster_key,
                 "synthesis",
                 exc,
+                extra_metadata=self._with_output_cleanup_errors({}, cleanup_errors),
             )
             self._emit(task, "failed", 1.0, cluster_key, failed_version_id, status_callback)
             return
         with self._manifest_lock:
             manifest.append_version(task.line.id, version)
+            history = manifest.history_for_line(task.line.id, _task_line_uid(task))
+            committed_version_id = history.versions[-1].version_id if history else version_id
         if version.status == "completed":
-            self._emit(task, "completed", 1.0, cluster_key, version_id, status_callback)
+            self._emit(task, "completed", 1.0, cluster_key, committed_version_id, status_callback)
+            if cancel_check and cancel_check():
+                self._remove_manifest_version(manifest, task, committed_version_id)
+                self._record_cancelled_outcome(
+                    route,
+                    task,
+                    manifest,
+                    cluster_key,
+                    output_paths=(output_path, result.audio_path),
+                    details=result.metadata,
+                    status_callback=status_callback,
+                )
 
     def _append_failed_version(
         self,
@@ -272,6 +501,61 @@ class ServiceGenerationQueue:
         cluster_key: str | None,
         failure_stage: str,
         exc: Exception,
+        *,
+        control_code: str | None = None,
+        control_details: dict[str, Any] | None = None,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> str:
+        requested_load_signature = build_load_signature(route.endpoint, task.parameters)
+        revision_context = _revision_context(task)
+        binding_snapshot = route.binding.model_dump(mode="json") if route.binding else None
+        with self._manifest_lock:
+            history = manifest.history_for_line(task.line.id, _task_line_uid(task))
+            version_id = f"v{(len(history.versions) if history else 0) + 1:03d}"
+            metadata: dict[str, Any] = {
+                "cluster_key": cluster_key or build_cluster_key(task, route),
+                "failure_stage": failure_stage,
+                "requested_load_signature": requested_load_signature,
+            }
+            if control_code is not None:
+                metadata["control_code"] = control_code
+            if control_details is not None:
+                metadata["control_details"] = self._sanitize_control_details(control_details)
+            if extra_metadata:
+                metadata.update(self._sanitize_control_details(extra_metadata))
+            manifest.append_version(
+                task.line.id,
+                GenerationVersion(
+                    version_id=version_id,
+                    line_uid=_task_line_uid(task),
+                    script_revision_id=revision_context.get("script_revision_id"),
+                    parse_revision_id=revision_context.get("parse_revision_id"),
+                    engine=task.engine,
+                    profile=task.profile,
+                    service_id=route.endpoint.service_id,
+                    resource_group=route.endpoint.resource_group,
+                    provider_type=route.endpoint.provider_type,
+                    binding_id=task.binding_id or (route.binding.binding_id if route.binding else None),
+                    binding_snapshot=binding_snapshot,
+                    requested_load_signature=requested_load_signature,
+                    status="failed",
+                    parameters=task.parameters,
+                    metadata=metadata,
+                    error=scrub_error(exc, route.endpoint.base_url),
+                ),
+            )
+            history = manifest.history_for_line(task.line.id, _task_line_uid(task))
+            return history.versions[-1].version_id if history else version_id
+
+    def _append_cancelled_version(
+        self,
+        route: ServiceRoute,
+        task: GenerationTask,
+        manifest: GenerationManifest,
+        cluster_key: str | None,
+        *,
+        details: dict[str, Any],
+        error: Exception | None = None,
     ) -> str:
         requested_load_signature = build_load_signature(route.endpoint, task.parameters)
         revision_context = _revision_context(task)
@@ -294,17 +578,101 @@ class ServiceGenerationQueue:
                     binding_id=task.binding_id or (route.binding.binding_id if route.binding else None),
                     binding_snapshot=binding_snapshot,
                     requested_load_signature=requested_load_signature,
-                    status="failed",
+                    status="cancelled",
                     parameters=task.parameters,
                     metadata={
                         "cluster_key": cluster_key or build_cluster_key(task, route),
-                        "failure_stage": failure_stage,
                         "requested_load_signature": requested_load_signature,
+                        "control_code": "cancelled",
+                        "control_details": self._sanitize_control_details(details),
                     },
-                    error=str(exc),
+                    error=scrub_error(error, route.endpoint.base_url) if error is not None else None,
                 ),
             )
-        return version_id
+            history = manifest.history_for_line(task.line.id, _task_line_uid(task))
+            return history.versions[-1].version_id if history else version_id
+
+    def _record_cancelled_outcome(
+        self,
+        route: ServiceRoute,
+        task: GenerationTask,
+        manifest: GenerationManifest,
+        cluster_key: str | None,
+        *,
+        output_paths: tuple[Path, ...],
+        details: dict[str, Any],
+        status_callback: StatusCallback | None,
+        error: Exception | None = None,
+        force_failed: bool = False,
+    ) -> None:
+        cleanup_errors = self._discard_uncommitted_output(*output_paths)
+        control_details = self._with_output_cleanup_errors(details, cleanup_errors)
+        if force_failed or cleanup_errors:
+            prior_cleanup_error = control_details.get("output_cleanup_error")
+            if cleanup_errors:
+                cleanup_error = RuntimeError(f"uncommitted output cleanup failed: {'; '.join(cleanup_errors)}")
+            elif prior_cleanup_error:
+                cleanup_error = RuntimeError(f"uncommitted output cleanup failed: {prior_cleanup_error}")
+            else:
+                cleanup_error = error or RuntimeError("uncommitted output cleanup failed")
+            version_id = self._append_failed_version(
+                route,
+                task,
+                manifest,
+                cluster_key,
+                "cancellation_cleanup",
+                cleanup_error,
+                control_code="cancelled",
+                control_details=control_details,
+            )
+            self._emit(task, "failed", 1.0, cluster_key, version_id, status_callback)
+            return
+        version_id = self._append_cancelled_version(
+            route,
+            task,
+            manifest,
+            cluster_key,
+            details=control_details,
+            error=error,
+        )
+        self._emit(task, "cancelled", 1.0, cluster_key, version_id, status_callback)
+
+    @staticmethod
+    def _discard_uncommitted_output(*paths: Path) -> list[str]:
+        errors: list[str] = []
+        for path in set(paths):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                diagnostic = scrub_error(exc)
+                errors.append(f"{path.name}: {diagnostic}")
+                logger.warning("Failed to discard uncommitted generation output %s: %s", path, diagnostic)
+        return errors
+
+    @staticmethod
+    def _with_output_cleanup_errors(details: dict[str, Any], cleanup_errors: list[str]) -> dict[str, Any]:
+        output = dict(details)
+        if cleanup_errors:
+            output["output_cleanup_error"] = "; ".join(cleanup_errors)
+        return output
+
+    def _remove_manifest_version(self, manifest: GenerationManifest, task: GenerationTask, version_id: str) -> None:
+        with self._manifest_lock:
+            history = manifest.history_for_line(task.line.id, _task_line_uid(task))
+            if history is not None:
+                history.versions = [version for version in history.versions if version.version_id != version_id]
+
+    @classmethod
+    def _sanitize_control_details(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {scrub_error(str(key)): cls._sanitize_control_details(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [cls._sanitize_control_details(item) for item in value]
+        if isinstance(value, str):
+            return scrub_error(value)
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return scrub_error(str(value))
 
     def _mark_loaded(self, service_id: str, signature: str, verification_level: str) -> None:
         self._loaded_signatures[service_id] = signature
@@ -480,6 +848,7 @@ class GenerationJobManager:
         self._executor = ThreadPoolExecutor(max_workers=self.MAX_ACTIVE_JOBS, thread_name_prefix="tts-job")
 
     def submit(self, project_id: str, tasks: list[GenerationTask]) -> GenerationJob:
+        tasks = [task.model_copy(deep=True) for task in tasks]
         job_id = f"job-{uuid.uuid4().hex[:12]}"
         diagnostics = self._task_diagnostics(tasks)
         items = [
@@ -569,84 +938,158 @@ class GenerationJobManager:
             self._evict_locked()
             jobs = list(self._jobs.values())
         queued = sum(1 for job in jobs for item in job.items if item.status == "queued")
-        running = sum(1 for job in jobs for item in job.items if item.status in {"loading", "running", "finalizing"})
+        running = sum(1 for job in jobs for item in job.items if item.status in {"loading", "running", "finalizing", "cancelling"})
         return {"jobs": [job.model_dump(mode="json") for job in jobs], "queued": queued, "running": running}
 
     def cancel(self, job_id: str) -> GenerationJob:
         with self._lock:
             job = self._jobs[job_id]
-            if job.status in {"completed", "failed"}:
+            if job.status in {"completed", "failed", "cancelled", "cancelling"}:
                 return job
-            job.status = "cancelled"
-            job.updated_at = datetime.now(timezone.utc)
+            has_active = False
             for item in job.items:
-                # Only items not yet started are flipped to cancelled; an
-                # in-flight synthesis (loading/running) cannot be interrupted
-                # mid-HTTP-call, but the job loop will stop dispatching
-                # further lines for this job.
                 if item.status == "queued":
                     item.status = "cancelled"
+                    item.progress = 1.0
+                elif item.status in {"loading", "running", "finalizing"}:
+                    item.status = "cancelling"
+                    has_active = True
+            if has_active:
+                job.status = "cancelling"
+            elif any(item.status == "failed" for item in job.items):
+                job.status = "failed"
+            elif job.items and all(item.status == "completed" for item in job.items):
+                job.status = "completed"
+                job.progress = 1.0
+            else:
+                job.status = "cancelled"
+                job.progress = 1.0
+            job.updated_at = datetime.now(timezone.utc)
             return job
 
     def _is_cancelled(self, job_id: str) -> bool:
         """Check whether a job has been cancelled (called between line dispatches)."""
         with self._lock:
             job = self._jobs.get(job_id)
-            return bool(job and job.status == "cancelled")
+            return bool(job and job.status in {"cancelling", "cancelled"})
 
     def _run_job(self, job_id: str, tasks: list[GenerationTask]) -> None:
         manifest: GenerationManifest | None = None
+        baseline: GenerationManifest | None = None
+        persistence_attempted = False
         try:
             with self._lock:
                 job = self._jobs[job_id]
-                if job.status == "cancelled":
+                if job.status in {"cancelling", "cancelled"}:
                     return
                 job.status = "running"
                 job.updated_at = datetime.now(timezone.utc)
-            manifest = self.store.load_manifest(self.get(job_id).project_id)
-            output_dir = self.store.project_audio_dir(self.get(job_id).project_id)
+            project_id = self.get(job_id).project_id
+            loaded_manifest = self.store.load_manifest(project_id)
+            baseline = loaded_manifest.model_copy(deep=True)
+            manifest = loaded_manifest.model_copy(deep=True)
+            output_dir = self.store.project_audio_dir(project_id)
             self._record_prefailed_items(job_id, tasks, manifest)
             runnable_tasks = self._runnable_tasks(job_id, tasks)
+            with self._lock:
+                task_ids = {
+                    id(task): item.task_id
+                    for task, item in zip(tasks, self._jobs[job_id].items, strict=True)
+                }
             self.queue.run(
                 runnable_tasks,
                 manifest,
                 output_dir=output_dir,
                 status_callback=lambda task, status, progress, cluster_key, version_id, external_update: self._update_item(
-                    job_id, task, status, progress, cluster_key, version_id, external_update
+                    job_id,
+                    task,
+                    status,
+                    progress,
+                    cluster_key,
+                    version_id,
+                    external_update,
+                    target_task_id=task_ids[id(task)],
                 ),
                 cancel_check=lambda: self._is_cancelled(job_id),
+                output_namespace=job_id,
             )
             self._sync_item_errors_from_manifest(job_id, manifest)
-            self.store.save_manifest(manifest)
+            persistence_attempted = True
+            self._persist_manifest_delta(job_id, baseline, manifest)
             self._finish_job(job_id)
         except Exception as exc:
-            if manifest is not None:
-                self.store.save_manifest(manifest)
-            failed_at = datetime.now(timezone.utc)
-            with self._lock:
-                job = self._jobs[job_id]
-                if job.status == "cancelled":
-                    return
-                job.status = "failed"
-                job.error = str(exc)
-                job.updated_at = failed_at
-                for item in job.items:
-                    if item.status not in {"completed", "failed", "cancelled"}:
-                        item.status = "failed"
-                        item.progress = 1.0
-                        item.error = item.error or str(exc)
-                job.progress = sum(item.progress for item in job.items) / max(1, len(job.items))
+            failure_message = scrub_error(exc)
+            persistence_failed = persistence_attempted
+            if manifest is not None and baseline is not None and not persistence_attempted:
+                try:
+                    persistence_attempted = True
+                    self._persist_manifest_delta(job_id, baseline, manifest)
+                except Exception as persistence_exc:
+                    persistence_failed = True
+                    failure_message = (
+                        f"{failure_message}; manifest persistence failed: {scrub_error(persistence_exc)}"
+                    )
+            elif persistence_failed:
+                failure_message = f"manifest persistence failed: {failure_message}"
+            self._fail_job(job_id, failure_message, persistence_failed=persistence_failed)
 
-    def _record_prefailed_items(self, job_id: str, tasks: list[GenerationTask], manifest: GenerationManifest) -> None:
-        tasks_by_key = {(task.line.id, _task_line_uid(task)): task for task in tasks}
+    def _persist_manifest_delta(
+        self,
+        job_id: str,
+        baseline: GenerationManifest,
+        updated: GenerationManifest,
+    ) -> None:
+        result = persist_manifest_delta(self.store, baseline, updated)
+        for assignment in result.assignments:
+            if assignment.actual_id != assignment.provisional_id:
+                self._replace_item_version_id(
+                    job_id,
+                    line_key=assignment.line_key,
+                    provisional_id=assignment.provisional_id,
+                    actual_id=assignment.actual_id,
+                )
+
+    def _replace_item_version_id(
+        self,
+        job_id: str,
+        *,
+        line_key: str,
+        provisional_id: str,
+        actual_id: str,
+    ) -> None:
+        with self._lock:
+            for item in self._jobs[job_id].items:
+                if (
+                    (item.line_uid or item.line_id) == line_key
+                    and item.version_id == provisional_id
+                ):
+                    item.version_id = actual_id
+
+    def _fail_job(self, job_id: str, message: str, *, persistence_failed: bool) -> None:
+        failed_at = datetime.now(timezone.utc)
         with self._lock:
             job = self._jobs[job_id]
-            failed_items = [item for item in job.items if item.status == "failed" and item.error and item.version_id is None]
+            job.status = "failed"
+            job.error = message
+            job.updated_at = failed_at
+            for item in job.items:
+                if item.status not in {"completed", "failed", "cancelled"}:
+                    item.status = "failed"
+                item.progress = 1.0
+                if persistence_failed or item.status == "failed":
+                    item.error = item.error or message
+            job.progress = 1.0
 
-        for item in failed_items:
-            task = tasks_by_key.get((item.line_id, item.line_uid or item.line_id))
-            if task is None:
-                continue
+    def _record_prefailed_items(self, job_id: str, tasks: list[GenerationTask], manifest: GenerationManifest) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            failed_items = [
+                (item, task)
+                for item, task in zip(job.items, tasks, strict=True)
+                if item.status == "failed" and item.error and item.version_id is None
+            ]
+
+        for item, task in failed_items:
             history = manifest.history_for_line(item.line_id, item.line_uid)
             version_id = f"v{(len(history.versions) if history else 0) + 1:03d}"
             revision_context = _revision_context(task)
@@ -678,10 +1121,13 @@ class GenerationJobManager:
     def _runnable_tasks(self, job_id: str, tasks: list[GenerationTask]) -> list[GenerationTask]:
         with self._lock:
             job = self._jobs[job_id]
-            if job.status == "cancelled":
+            if job.status in {"cancelling", "cancelled"}:
                 return []
-            skipped = {(item.line_id, item.line_uid or item.line_id) for item in job.items if item.status in {"cancelled", "failed"}}
-        return [task for task in tasks if (task.line.id, _task_line_uid(task)) not in skipped]
+            return [
+                task
+                for task, item in zip(tasks, job.items, strict=True)
+                if item.status not in {"cancelled", "failed"}
+            ]
 
     def _update_item(
         self,
@@ -692,13 +1138,19 @@ class GenerationJobManager:
         cluster_key: str | None,
         version_id: str | None,
         external_update: ExternalStatusUpdate | None = None,
+        target_task_id: str | None = None,
     ) -> None:
         with self._lock:
             job = self._jobs[job_id]
             for item in job.items:
+                if target_task_id is not None and item.task_id != target_task_id:
+                    continue
                 if item.line_id == task.line.id and (item.line_uid or item.line_id) == _task_line_uid(task):
-                    item.status = status
-                    item.progress = progress
+                    if item.status == "cancelling" and status not in {"cancelled", "failed"}:
+                        item.progress = max(item.progress, progress)
+                    elif item.status not in {"completed", "failed", "cancelled"}:
+                        item.status = status
+                        item.progress = progress
                     item.cluster_key = cluster_key or item.cluster_key
                     item.service_id = task.service_id or item.service_id
                     item.version_id = version_id or item.version_id
@@ -740,10 +1192,14 @@ class GenerationJobManager:
     def _finish_job(self, job_id: str) -> None:
         with self._lock:
             job = self._jobs[job_id]
-            if job.status == "cancelled":
-                return
+            for item in job.items:
+                if item.status == "cancelling":
+                    item.status = "cancelled"
+                    item.progress = 1.0
             if any(item.status == "failed" for item in job.items):
                 job.status = "failed"
+            elif job.status == "cancelling" or any(item.status == "cancelled" for item in job.items):
+                job.status = "cancelled"
             else:
                 job.status = "completed"
             job.progress = 1.0

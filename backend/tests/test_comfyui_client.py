@@ -8,8 +8,14 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app.adapters.base import SynthesisRequest, SynthesisResult
-from app.comfyui.client import ComfyUIAPIClient
+from app.adapters.base import (
+    SynthesisCancelled,
+    SynthesisControlError,
+    SynthesisRequest,
+    SynthesisResult,
+    SynthesisTimeout,
+)
+from app.comfyui.client import ComfyUIAPIClient, PromptCancellationResult
 from app.comfyui.workflow_builder import (
     build_workflow,
     build_cosyvoice_workflow,
@@ -49,11 +55,339 @@ def _audio_bytes() -> bytes:
         output.setnchannels(1)
         output.setsampwidth(2)
         output.setframerate(16000)
-        output.writeframes(b"\x00\x00" * 160)
+        output.writeframes(b"\x00\x10" * 160)
     return buffer.getvalue()
 
 
+def test_synthesis_request_carries_cancel_check_and_control_details(tmp_path):
+    from app.adapters.base import SynthesisCancelled, SynthesisRequest
+
+    request = SynthesisRequest(
+        line=ScriptLine(id="l1", character_id="c1", text="hello"),
+        profile="voice",
+        output_path=tmp_path / "out.wav",
+        cancel_check=lambda: True,
+    )
+    error = SynthesisCancelled("cancelled", details={"prompt_id": "p1"})
+    assert request.cancel_check is not None and request.cancel_check()
+    assert error.code == "cancelled"
+    assert error.details == {"prompt_id": "p1"}
+
+
 class TestComfyUIAPIClient:
+    def test_cancel_prompt_interrupts_only_the_targeted_running_prompt(self):
+        state = {"running": True}
+        requests: list[tuple[str, str, bytes]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path, request.content))
+            if request.url.path == "/queue":
+                running = [[1, "prompt-1", {}, {}, []]] if state["running"] else []
+                return httpx.Response(
+                    200,
+                    json={"queue_running": running, "queue_pending": []},
+                )
+            if request.url.path == "/interrupt":
+                assert json.loads(request.content) == {"prompt_id": "prompt-1"}
+                state["running"] = False
+                return httpx.Response(200, json={})
+            if request.url.path == "/history/prompt-1":
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt("prompt-1", max_wait=1.0)
+
+        assert result.initial_state == "running"
+        assert result.final_state == "interrupted"
+        assert result.converged is True
+        assert result.actions == ("interrupt",)
+        assert all(
+            body != b"{}"
+            for _method, path, body in requests
+            if path == "/interrupt"
+        )
+
+    def test_cancel_prompt_deletes_only_the_targeted_pending_prompt(self):
+        state = {"pending": True}
+        requests: list[tuple[str, str, bytes]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path, request.content))
+            if request.url.path == "/queue" and request.method == "GET":
+                pending = [[2, "prompt-2", {}, {}, []]] if state["pending"] else []
+                return httpx.Response(
+                    200,
+                    json={"queue_running": [], "queue_pending": pending},
+                )
+            if request.url.path == "/queue" and request.method == "POST":
+                assert json.loads(request.content) == {"delete": ["prompt-2"]}
+                state["pending"] = False
+                return httpx.Response(200, json={})
+            if request.url.path == "/history/prompt-2":
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt("prompt-2", max_wait=1.0)
+
+        assert result.initial_state == "pending"
+        assert result.final_state == "dequeued"
+        assert result.converged is True
+        assert result.actions == ("delete",)
+        assert all(path != "/interrupt" for _method, path, _body in requests)
+
+    def test_cancel_prompt_is_idempotent_when_prompt_is_already_absent(self):
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            if request.url.path == "/queue":
+                return httpx.Response(
+                    200,
+                    json={"queue_running": [], "queue_pending": []},
+                )
+            if request.url.path == "/history/prompt-3":
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt("prompt-3")
+
+        assert result.initial_state == "absent"
+        assert result.final_state == "absent"
+        assert result.actions == ()
+        assert result.converged is True
+        assert requests == [("GET", "/queue"), ("GET", "/history/prompt-3")]
+
+    def test_cancel_prompt_is_idempotent_when_prompt_is_already_terminal(self):
+        prompt_id = "prompt-4"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/queue":
+                return httpx.Response(
+                    200,
+                    json={"queue_running": [], "queue_pending": []},
+                )
+            if request.url.path == f"/history/{prompt_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        prompt_id: {
+                            "outputs": {"4": {"audio": [{"filename": "done.wav"}]}},
+                            "status": {
+                                "status_str": "success",
+                                "completed": True,
+                                "messages": [["execution_success", {"prompt_id": prompt_id}]],
+                            },
+                        }
+                    },
+                )
+            raise AssertionError(request.url)
+
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt(prompt_id)
+
+        assert result.initial_state == "completed"
+        assert result.final_state == "completed"
+        assert result.actions == ()
+        assert result.converged is True
+
+    def test_cancel_prompt_reports_failure_when_target_does_not_leave_queue(
+        self,
+        monkeypatch,
+    ):
+        clock = {"now": 0.0}
+        requests: list[tuple[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            if request.url.path == "/queue":
+                return httpx.Response(
+                    200,
+                    json={
+                        "queue_running": [[1, "prompt-5", {}, {}, []]],
+                        "queue_pending": [],
+                    },
+                )
+            if request.url.path == "/interrupt":
+                return httpx.Response(200, json={})
+            if request.url.path == "/history/prompt-5":
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        def fake_sleep(seconds: float) -> None:
+            assert seconds <= 0.25
+            clock["now"] += 30.0
+
+        monkeypatch.setattr("app.comfyui.client.time.monotonic", lambda: clock["now"])
+        monkeypatch.setattr("app.comfyui.client.time.sleep", fake_sleep)
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt("prompt-5", max_wait=30.0)
+
+        assert result.initial_state == "running"
+        assert result.final_state == "running"
+        assert result.actions == ("interrupt",)
+        assert result.duration_seconds == 30.0
+        assert result.converged is False
+        assert requests.count(("POST", "/interrupt")) == 1
+
+    def test_cancel_prompt_caps_max_wait_at_thirty_seconds(
+        self,
+        monkeypatch,
+    ):
+        clock = {"now": 0.0}
+        requests: list[tuple[str, str]] = []
+        request_timeouts: list[float] = []
+        state = {"running": True}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append((request.method, request.url.path))
+            request_timeouts.append(request.extensions["timeout"]["connect"])
+            if request.url.path == "/queue":
+                running = [[1, "prompt-capped", {}, {}, []]] if state["running"] else []
+                clock["now"] = 30.0
+                return httpx.Response(
+                    200,
+                    json={"queue_running": running, "queue_pending": []},
+                )
+            if request.url.path == "/interrupt":
+                state["running"] = False
+                return httpx.Response(200, json={})
+            if request.url.path == "/history/prompt-capped":
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        monkeypatch.setattr("app.comfyui.client.time.monotonic", lambda: clock["now"])
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+
+        result = client.cancel_prompt("prompt-capped", max_wait=90.0)
+
+        assert requests == [("GET", "/queue")]
+        assert request_timeouts == [30.0]
+        assert result.converged is False
+        assert result.diagnostic == "ComfyUI cancellation deadline exhausted"
+
+    def test_cancel_prompt_passes_remaining_budget_to_each_http_request(
+        self,
+        monkeypatch,
+    ):
+        clock = {"now": 0.0}
+        state = {"running": True}
+        observed: list[tuple[str, str, float]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            observed.append(
+                (
+                    request.method,
+                    request.url.path,
+                    request.extensions["timeout"]["connect"],
+                )
+            )
+            if request.url.path == "/queue":
+                running = [[1, "prompt-budget", {}, {}, []]] if state["running"] else []
+                clock["now"] += 1.0
+                return httpx.Response(
+                    200,
+                    json={"queue_running": running, "queue_pending": []},
+                )
+            if request.url.path == "/interrupt":
+                state["running"] = False
+                clock["now"] += 1.0
+                return httpx.Response(200, json={})
+            if request.url.path == "/history/prompt-budget":
+                clock["now"] += 2.0
+                return httpx.Response(200, json={})
+            raise AssertionError(request.url)
+
+        monkeypatch.setattr("app.comfyui.client.time.monotonic", lambda: clock["now"])
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+
+        result = client.cancel_prompt("prompt-budget", max_wait=5.0)
+
+        assert observed == [
+            ("GET", "/queue", 5.0),
+            ("POST", "/interrupt", 4.0),
+            ("GET", "/queue", 3.0),
+            ("GET", "/history/prompt-budget", 2.0),
+        ]
+        assert result.converged is False
+        assert result.final_state == "absent"
+        assert result.diagnostic == "ComfyUI cancellation deadline exhausted"
+
+    def test_cancel_prompt_preserves_sanitized_post_interrupt_execution_error(self):
+        prompt_id = "prompt-6"
+        state = {"running": True}
+        exception_message = (
+            "IndexTTS interruption cleanup failed: process exit could not be verified"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/queue":
+                running = [[1, prompt_id, {}, {}, []]] if state["running"] else []
+                return httpx.Response(
+                    200,
+                    json={"queue_running": running, "queue_pending": []},
+                )
+            if request.url.path == "/interrupt":
+                assert json.loads(request.content) == {"prompt_id": prompt_id}
+                state["running"] = False
+                return httpx.Response(200, json={})
+            if request.url.path == f"/history/{prompt_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        prompt_id: {
+                            "outputs": {},
+                            "status": {
+                                "status_str": "error",
+                                "completed": False,
+                                "messages": [
+                                    [
+                                        "execution_error",
+                                        {
+                                            "prompt_id": prompt_id,
+                                            "exception_message": exception_message,
+                                        },
+                                    ]
+                                ],
+                            },
+                        }
+                    },
+                )
+            raise AssertionError(request.url)
+
+        client = ComfyUIAPIClient(
+            "http://127.0.0.1:8188",
+            transport=httpx.MockTransport(handler),
+        )
+        result = client.cancel_prompt(prompt_id, max_wait=1.0)
+
+        assert result.final_state == "error"
+        assert result.converged is False
+        assert result.diagnostic == exception_message
+
     def test_system_stats_ready(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"system": {"cuda": True}})
@@ -120,6 +454,214 @@ class TestComfyUIAPIClient:
             result = api.poll_until_done(prompt_id, poll_interval=0.01, max_wait=5.0)
             assert "outputs" in result
             assert result["outputs"]["4"]["audio"][0]["filename"] == "tts_more_cosyvoice_00001.flac"
+
+    def test_poll_until_done_cancels_prompt_when_requested(self, monkeypatch):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        history_calls: list[str] = []
+        monkeypatch.setattr(
+            client,
+            "get_history",
+            lambda prompt_id: history_calls.append(prompt_id) or {},
+        )
+        monkeypatch.setattr(
+            client,
+            "cancel_prompt",
+            lambda prompt_id, max_wait=30.0: PromptCancellationResult(
+                prompt_id,
+                "running",
+                "absent",
+                ("interrupt",),
+                0.1,
+                True,
+            ),
+        )
+
+        with pytest.raises(SynthesisCancelled) as caught:
+            client.poll_until_done(
+                "p1",
+                poll_interval=0.01,
+                max_wait=1.0,
+                cancel_check=lambda: True,
+            )
+
+        assert caught.value.details["prompt_id"] == "p1"
+        assert caught.value.details["cancellation"]["converged"] is True
+        assert history_calls == []
+
+    def test_poll_until_done_checks_cancellation_during_long_poll_sleep(
+        self,
+        monkeypatch,
+    ):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        checks = iter([False, True])
+        sleeps: list[float] = []
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+        monkeypatch.setattr(
+            client,
+            "cancel_prompt",
+            lambda prompt_id, max_wait=30.0: PromptCancellationResult(
+                prompt_id,
+                "running",
+                "interrupted",
+                ("interrupt",),
+                0.1,
+                True,
+            ),
+        )
+        monkeypatch.setattr(
+            "app.comfyui.client.time.sleep",
+            lambda seconds: sleeps.append(seconds),
+        )
+
+        with pytest.raises(SynthesisCancelled):
+            client.poll_until_done(
+                "p-sleep",
+                poll_interval=2.0,
+                max_wait=1.0,
+                cancel_check=lambda: next(checks),
+            )
+
+        assert sleeps
+        assert max(sleeps) <= 0.25
+
+    def test_poll_until_done_preserves_failed_cancellation_result(self, monkeypatch):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+        monkeypatch.setattr(
+            client,
+            "cancel_prompt",
+            lambda prompt_id, max_wait=30.0: PromptCancellationResult(
+                prompt_id,
+                "running",
+                "error",
+                ("interrupt",),
+                0.1,
+                False,
+                "cleanup failed",
+            ),
+        )
+
+        with pytest.raises(SynthesisCancelled) as caught:
+            client.poll_until_done(
+                "p-failed-cancel",
+                max_wait=1.0,
+                cancel_check=lambda: True,
+            )
+
+        assert caught.value.details["cancellation"] == {
+            "prompt_id": "p-failed-cancel",
+            "initial_state": "running",
+            "final_state": "error",
+            "actions": ("interrupt",),
+            "duration_seconds": 0.1,
+            "converged": False,
+            "diagnostic": "cleanup failed",
+        }
+
+    def test_poll_until_done_preserves_cancelled_type_when_cancel_prompt_raises(
+        self,
+        monkeypatch,
+    ):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+
+        def fail_cancel(prompt_id: str, max_wait: float = 30.0):
+            raise httpx.ConnectError(
+                "cleanup request failed?api_key=super-secret",
+            )
+
+        monkeypatch.setattr(client, "cancel_prompt", fail_cancel)
+
+        with pytest.raises(SynthesisCancelled) as caught:
+            client.poll_until_done(
+                "p-cancel-error",
+                max_wait=1.0,
+                cancel_check=lambda: True,
+            )
+
+        cancellation = caught.value.details["cancellation"]
+        assert cancellation["converged"] is False
+        assert cancellation["final_state"] == "error"
+        assert "super-secret" not in cancellation["diagnostic"]
+
+    def test_poll_timeout_cancels_before_raising_timeout(self, monkeypatch):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+        cancelled: list[str] = []
+        monkeypatch.setattr(
+            client,
+            "cancel_prompt",
+            lambda prompt_id, max_wait=30.0: cancelled.append(prompt_id)
+            or PromptCancellationResult(
+                prompt_id,
+                "running",
+                "absent",
+                ("interrupt",),
+                0.1,
+                True,
+            ),
+        )
+
+        with pytest.raises(SynthesisTimeout) as caught:
+            client.poll_until_done("p2", poll_interval=0.001, max_wait=0.001)
+
+        assert cancelled == ["p2"]
+        assert caught.value.details["prompt_id"] == "p2"
+        assert caught.value.details["cancellation"]["converged"] is True
+
+    def test_poll_timeout_remains_primary_when_cancellation_cleanup_fails(
+        self,
+        monkeypatch,
+    ):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+        monkeypatch.setattr(
+            client,
+            "cancel_prompt",
+            lambda prompt_id, max_wait=30.0: PromptCancellationResult(
+                prompt_id,
+                "running",
+                "error",
+                ("interrupt",),
+                0.1,
+                False,
+                "cleanup failed",
+            ),
+        )
+
+        with pytest.raises(SynthesisTimeout) as caught:
+            client.poll_until_done("p3", poll_interval=0.001, max_wait=0.001)
+
+        assert caught.value.code == "timeout"
+        assert caught.value.details["cancellation"]["converged"] is False
+        assert caught.value.details["cancellation"]["diagnostic"] == "cleanup failed"
+
+    def test_poll_timeout_preserves_timeout_type_when_cancel_prompt_raises(
+        self,
+        monkeypatch,
+    ):
+        client = ComfyUIAPIClient("http://127.0.0.1:8188")
+        monkeypatch.setattr(client, "get_history", lambda prompt_id: {})
+
+        def fail_cancel(prompt_id: str, max_wait: float = 30.0):
+            raise httpx.ConnectError(
+                "cleanup request failed password=super-secret",
+            )
+
+        monkeypatch.setattr(client, "cancel_prompt", fail_cancel)
+
+        with pytest.raises(SynthesisTimeout) as caught:
+            client.poll_until_done(
+                "p-timeout-error",
+                poll_interval=0.001,
+                max_wait=0.001,
+            )
+
+        cancellation = caught.value.details["cancellation"]
+        assert caught.value.code == "timeout"
+        assert cancellation["converged"] is False
+        assert cancellation["final_state"] == "error"
+        assert "super-secret" not in cancellation["diagnostic"]
 
     def test_poll_until_done_raises_comfyui_execution_error_when_completed_is_false(self):
         prompt_id = "e0e0579f-fc34-4397-a182-66bc0786e943"
@@ -445,8 +987,493 @@ class TestComfyUITTSClient:
         assert result.metadata["prompt_id"] == prompt_id
         assert result.metadata["engine"] == "cosyvoice"
         assert result.metadata["resource_id"] == "cosy-main"
+        assert result.metadata["sample_rate"] == 16000
+        assert result.metadata["frames"] == 160
+        assert result.metadata["peak"] > 0.1
         assert "POST /api/tts-audio-suite/v1/assets/audio" in call_log
         assert "DELETE /api/tts-audio-suite/v1/assets/audio/asset-1" in call_log
+
+    def test_fix_round1_cancelling_progress_precedes_convergence_and_asset_delete(
+        self,
+        tmp_path: Path,
+    ):
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(_audio_bytes())
+        updates: list[dict[str, object]] = []
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-1", character_id="role", text="cancel me"),
+            profile="cosy-main",
+            output_path=tmp_path / "cancelled.wav",
+            parameters={
+                "engine": "cosyvoice",
+                "resource_id": "cosy-main",
+                "reference_audio": str(reference),
+            },
+            progress_callback=updates.append,
+            cancel_check=lambda: True,
+        )
+        client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint())
+        client._build_workflow = lambda _engine, _params: {
+            "1": {"class_type": "TestNode", "inputs": {}}
+        }
+        events: list[str] = []
+        client.api.upload_audio = lambda _path: {"asset_id": "asset-1"}
+        client.api.submit_workflow = lambda _workflow: "prompt-1"
+
+        def progress(update: dict[str, object]) -> None:
+            events.append(f"progress:{update['external_status']}")
+            updates.append(update)
+
+        request = SynthesisRequest(
+            line=request.line,
+            profile=request.profile,
+            output_path=request.output_path,
+            parameters=request.parameters,
+            progress_callback=progress,
+            cancel_check=request.cancel_check,
+        )
+
+        def cancel_prompt(prompt_id: str, max_wait: float):
+            assert max_wait == 30.0
+            events.append(f"cancel-start:{prompt_id}")
+            result = PromptCancellationResult(
+                prompt_id=prompt_id,
+                initial_state="running",
+                final_state="interrupted",
+                actions=("interrupt",),
+                duration_seconds=0.5,
+                converged=True,
+            )
+            events.append(f"cancel-converged:{prompt_id}")
+            return result
+
+        client.api.cancel_prompt = cancel_prompt
+        client.api.delete_audio = lambda asset_id: events.append(f"delete:{asset_id}")
+
+        with pytest.raises(SynthesisCancelled) as caught:
+            client.synthesize(request)
+
+        assert caught.value.code == "cancelled"
+        assert caught.value.details["prompt_id"] == "prompt-1"
+        assert caught.value.details["cancellation"]["converged"] is True
+        assert events == [
+            "progress:queued",
+            "progress:cancelling",
+            "cancel-start:prompt-1",
+            "cancel-converged:prompt-1",
+            "delete:asset-1",
+            "progress:cancelled",
+        ]
+        assert [update["external_status"] for update in updates] == [
+            "queued",
+            "cancelling",
+            "cancelled",
+        ]
+
+    def test_fix_round1_cleanup_failure_does_not_mutate_reused_timeout_details(
+        self,
+        tmp_path: Path,
+    ):
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(_audio_bytes())
+        updates: list[dict[str, object]] = []
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-2", character_id="role", text="time out"),
+            profile="cosy-main",
+            output_path=tmp_path / "timeout.wav",
+            parameters={
+                "engine": "cosyvoice",
+                "resource_id": "cosy-main",
+                "reference_audio": str(reference),
+                "timeout_seconds": 1.0,
+            },
+            progress_callback=updates.append,
+            cancel_check=lambda: False,
+        )
+        client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint())
+        client._build_workflow = lambda _engine, _params: {
+            "1": {"class_type": "TestNode", "inputs": {}}
+        }
+        events: list[str] = []
+        client.api.upload_audio = lambda _path: {"asset_id": "asset-timeout"}
+        client.api.submit_workflow = lambda _workflow: "prompt-timeout"
+        timeout = SynthesisTimeout(
+            "timed out",
+            details={
+                "prompt_id": "prompt-timeout",
+                "cancellation": {"converged": True},
+            },
+        )
+
+        def poll_until_timeout(
+            prompt_id: str,
+            poll_interval: float,
+            max_wait: float,
+            *,
+            cancel_check,
+        ):
+            assert poll_interval == 2.0
+            assert max_wait == 1.0
+            assert cancel_check is not None
+            assert cancel_check() is False
+            events.append(f"poll:{prompt_id}")
+            events.append(f"cancel:{prompt_id}")
+            events.append(f"converged:{prompt_id}")
+            raise timeout
+
+        def fail_delete(asset_id: str) -> None:
+            events.append(f"delete:{asset_id}")
+            raise RuntimeError("cleanup Authorization: Bearer cleanup-secret")
+
+        client.api.poll_until_done = poll_until_timeout
+        client.api.delete_audio = fail_delete
+
+        with pytest.raises(SynthesisTimeout) as caught:
+            client.synthesize(request)
+
+        assert caught.value is not timeout
+        assert caught.value.code == "timeout"
+        assert caught.value.details["prompt_id"] == "prompt-timeout"
+        assert caught.value.details["cancellation"] == {"converged": True}
+        assert caught.value.details["cleanup_error"] == (
+            "cleanup Authorization: Bearer ***"
+        )
+        assert timeout.details == {
+            "prompt_id": "prompt-timeout",
+            "cancellation": {"converged": True},
+        }
+        assert events == [
+            "poll:prompt-timeout",
+            "cancel:prompt-timeout",
+            "converged:prompt-timeout",
+            "delete:asset-timeout",
+        ]
+        assert [update["external_status"] for update in updates] == [
+            "queued",
+            "timeout",
+        ]
+
+        client.api.delete_audio = lambda asset_id: events.append(f"delete-again:{asset_id}")
+        with pytest.raises(SynthesisTimeout) as reused:
+            client.synthesize(request)
+
+        assert reused.value is timeout
+        assert "cleanup_error" not in reused.value.details
+        assert events[-4:] == [
+            "poll:prompt-timeout",
+            "cancel:prompt-timeout",
+            "converged:prompt-timeout",
+            "delete-again:asset-timeout",
+        ]
+
+    def test_comfy_service_cleanup_order_retains_scrubbed_primary_and_cleanup_diagnostics(
+        self,
+        tmp_path: Path,
+    ):
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(_audio_bytes())
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-3", character_id="role", text="fail"),
+            profile="cosy-main",
+            output_path=tmp_path / "failed.wav",
+            parameters={
+                "engine": "cosyvoice",
+                "resource_id": "cosy-main",
+                "reference_audio": str(reference),
+            },
+        )
+        client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint())
+        client._build_workflow = lambda _engine, _params: {
+            "1": {"class_type": "TestNode", "inputs": {}}
+        }
+        events: list[str] = []
+        client.api.upload_audio = lambda _path: {"asset_id": "asset-failed"}
+        client.api.submit_workflow = lambda _workflow: "prompt-failed"
+
+        def poll_until_done(*_args, **_kwargs):
+            events.append("poll-completed:prompt-failed")
+            return {
+                "outputs": {
+                    "4": {
+                        "audio": [
+                            {
+                                "filename": "failed.wav",
+                                "subfolder": "",
+                                "type": "output",
+                            }
+                        ]
+                    }
+                }
+            }
+
+        def fail_download(**_kwargs):
+            events.append("download:failed.wav")
+            raise RuntimeError("primary Authorization: Bearer primary-secret")
+
+        def fail_delete(asset_id: str) -> None:
+            events.append(f"delete:{asset_id}")
+            raise RuntimeError("cleanup Authorization: Bearer cleanup-secret")
+
+        client.api.poll_until_done = poll_until_done
+        client.api.download_output = fail_download
+        client.api.delete_audio = fail_delete
+
+        with pytest.raises(RuntimeError) as caught:
+            client.synthesize(request)
+
+        diagnostic = str(caught.value)
+        assert "primary Authorization: Bearer ***" in diagnostic
+        assert "cleanup Authorization: Bearer ***" in diagnostic
+        assert "primary-secret" not in diagnostic
+        assert "cleanup-secret" not in diagnostic
+        assert events == [
+            "poll-completed:prompt-failed",
+            "download:failed.wav",
+            "delete:asset-failed",
+        ]
+
+    def test_fix_round1_submit_failure_after_upload_retains_asset(self, tmp_path: Path):
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(_audio_bytes())
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-submit", character_id="role", text="submit"),
+            profile="cosy-main",
+            output_path=tmp_path / "submit.wav",
+            parameters={
+                "engine": "cosyvoice",
+                "resource_id": "cosy-main",
+                "reference_audio": str(reference),
+            },
+        )
+        client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint())
+        client._build_workflow = lambda _engine, _params: {
+            "1": {"class_type": "TestNode", "inputs": {}}
+        }
+        events: list[str] = []
+        client.api.upload_audio = lambda _path: events.append("upload") or {
+            "asset_id": "asset-submit"
+        }
+
+        def fail_submit(_workflow):
+            events.append("submit")
+            raise RuntimeError("submit failed")
+
+        client.api.submit_workflow = fail_submit
+        client.api.delete_audio = lambda asset_id: events.append(f"delete:{asset_id}")
+
+        with pytest.raises(RuntimeError, match="submit failed"):
+            client.synthesize(request)
+
+        assert events == ["upload", "submit"]
+
+    def test_fix_round1_poll_transport_failure_retains_asset(self, tmp_path: Path):
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(_audio_bytes())
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-poll", character_id="role", text="poll"),
+            profile="cosy-main",
+            output_path=tmp_path / "poll.wav",
+            parameters={
+                "engine": "cosyvoice",
+                "resource_id": "cosy-main",
+                "reference_audio": str(reference),
+            },
+        )
+        client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint())
+        client._build_workflow = lambda _engine, _params: {
+            "1": {"class_type": "TestNode", "inputs": {}}
+        }
+        events: list[str] = []
+        client.api.upload_audio = lambda _path: {"asset_id": "asset-poll"}
+        client.api.submit_workflow = lambda _workflow: "prompt-poll"
+
+        def fail_poll(*_args, **_kwargs):
+            events.append("poll")
+            raise httpx.ConnectError("ComfyUI server unavailable")
+
+        client.api.poll_until_done = fail_poll
+        client.api.delete_audio = lambda asset_id: events.append(f"delete:{asset_id}")
+
+        with pytest.raises(RuntimeError, match="ComfyUI server unavailable"):
+            client.synthesize(request)
+
+        assert events == ["poll"]
+
+    @pytest.mark.parametrize(
+        ("error_type", "details"),
+        [
+            (
+                SynthesisCancelled,
+                {
+                    "prompt_id": "prompt-control",
+                    "cancellation": {"converged": False},
+                },
+            ),
+            (
+                SynthesisTimeout,
+                {
+                    "prompt_id": "prompt-control",
+                    "max_wait": 1.0,
+                    "cancellation": {"converged": False},
+                },
+            ),
+            (
+                SynthesisControlError,
+                {"prompt_id": "prompt-control", "converged": False},
+            ),
+        ],
+        ids=("cancelled", "timeout", "generic-control"),
+    )
+    def test_fix_round1_nonconverged_control_outcome_retains_asset(
+        self,
+        tmp_path: Path,
+        error_type,
+        details: dict[str, object],
+    ):
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(_audio_bytes())
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-control", character_id="role", text="control"),
+            profile="cosy-main",
+            output_path=tmp_path / "control.wav",
+            parameters={
+                "engine": "cosyvoice",
+                "resource_id": "cosy-main",
+                "reference_audio": str(reference),
+            },
+        )
+        client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint())
+        client._build_workflow = lambda _engine, _params: {
+            "1": {"class_type": "TestNode", "inputs": {}}
+        }
+        events: list[str] = []
+        client.api.upload_audio = lambda _path: {"asset_id": "asset-control"}
+        client.api.submit_workflow = lambda _workflow: "prompt-control"
+        control_error = error_type("control did not converge", details=details)
+
+        def fail_control(*_args, **_kwargs):
+            events.append("poll-control")
+            raise control_error
+
+        client.api.poll_until_done = fail_control
+        client.api.delete_audio = lambda asset_id: events.append(f"delete:{asset_id}")
+
+        with pytest.raises(error_type) as caught:
+            client.synthesize(request)
+
+        assert caught.value.code == control_error.code
+        assert events == ["poll-control"]
+
+    def test_fix_round1_progress_observer_failure_preserves_cancel_and_cleanup(
+        self,
+        tmp_path: Path,
+    ):
+        reference = tmp_path / "reference.wav"
+        reference.write_bytes(_audio_bytes())
+        events: list[str] = []
+
+        def throwing_progress(update: dict[str, object]) -> None:
+            events.append(f"observer:{update['external_status']}")
+            raise RuntimeError("observer failed")
+
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-observer", character_id="role", text="cancel"),
+            profile="cosy-main",
+            output_path=tmp_path / "observer.wav",
+            parameters={
+                "engine": "cosyvoice",
+                "resource_id": "cosy-main",
+                "reference_audio": str(reference),
+            },
+            progress_callback=throwing_progress,
+            cancel_check=lambda: True,
+        )
+        client = ComfyUITTSClient(_cosyvoice_audio_suite_endpoint())
+        client._build_workflow = lambda _engine, _params: {
+            "1": {"class_type": "TestNode", "inputs": {}}
+        }
+        client.api.upload_audio = lambda _path: {"asset_id": "asset-observer"}
+        client.api.submit_workflow = lambda _workflow: "prompt-observer"
+
+        def cancel_prompt(prompt_id: str, max_wait: float):
+            assert max_wait == 30.0
+            events.append(f"cancel-converged:{prompt_id}")
+            return PromptCancellationResult(
+                prompt_id=prompt_id,
+                initial_state="running",
+                final_state="interrupted",
+                actions=("interrupt",),
+                duration_seconds=0.1,
+                converged=True,
+            )
+
+        client.api.cancel_prompt = cancel_prompt
+        client.api.delete_audio = lambda asset_id: events.append(f"delete:{asset_id}")
+
+        with pytest.raises(SynthesisCancelled) as caught:
+            client.synthesize(request)
+
+        assert caught.value.code == "cancelled"
+        assert caught.value.details["cancellation"]["converged"] is True
+        assert events == [
+            "observer:queued",
+            "observer:cancelling",
+            "cancel-converged:prompt-observer",
+            "delete:asset-observer",
+            "observer:cancelled",
+        ]
+
+    def test_synthesize_preserves_existing_output_when_downloaded_riff_is_corrupt(
+        self,
+        tmp_path: Path,
+    ):
+        prompt_id = "corrupt-output-001"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/prompt":
+                return httpx.Response(200, json={"prompt_id": prompt_id})
+            if request.url.path == f"/history/{prompt_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        prompt_id: {
+                            "outputs": {
+                                "4": {
+                                    "audio": [
+                                        {
+                                            "filename": "corrupt.wav",
+                                            "subfolder": "",
+                                            "type": "output",
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                )
+            if request.url.path == "/view":
+                return httpx.Response(
+                    200,
+                    content=b"RIFF\x08\x00\x00\x00WAVEcorrupt",
+                )
+            return httpx.Response(404)
+
+        output_path = tmp_path / "result.wav"
+        output_path.write_bytes(b"existing output")
+        request = SynthesisRequest(
+            line=ScriptLine(id="line-1", character_id="char-1", text="Hello world"),
+            profile="default",
+            output_path=output_path,
+            parameters={"engine": "cosyvoice"},
+        )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as mock_client:
+            client = ComfyUITTSClient(_cosyvoice_endpoint(), transport=mock_client._transport)
+            with pytest.raises(RuntimeError, match="decode"):
+                client.synthesize(request)
+
+        assert output_path.read_bytes() == b"existing output"
+        assert list(tmp_path.glob(".result.wav.*.tmp")) == []
 
     def test_synthesize_reports_prompt_status_updates(self, tmp_path: Path):
         prompt_id = "prompt-status-001"

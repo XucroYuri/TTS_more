@@ -1,6 +1,7 @@
 import type { LineHistory, WorkerHealth } from "../types";
+import { generationStatusTone, type GenerationStatusTone } from "./generationStatus";
 
-export type StatusTone = "idle" | "queued" | "running" | "completed" | "failed";
+export type StatusTone = GenerationStatusTone;
 
 export interface LineSummary {
   label: string;
@@ -18,16 +19,8 @@ export function summarizeLineHistory(history?: LineHistory): LineSummary {
     label: latest.status,
     latestVersionId: latest.version_id,
     canPlay: latest.status === "completed" && Boolean(latest.audio_path),
-    tone: statusTone(latest.status)
+    tone: generationStatusTone(latest.status)
   };
-}
-
-export function statusTone(status: string): StatusTone {
-  if (status === "completed") return "completed";
-  if (status === "failed" || status === "cancelled") return "failed";
-  if (status === "queued") return "queued";
-  if (status === "loading" || status === "running" || status === "finalizing") return "running";
-  return "idle";
 }
 
 export function workerReadinessLabel(worker: Pick<WorkerHealth, "ready" | "engine">): string {

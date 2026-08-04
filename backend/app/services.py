@@ -4,7 +4,6 @@ import json
 import os
 import base64
 import hashlib
-import io
 import re
 import time
 import uuid
@@ -16,7 +15,14 @@ from typing import Any, Callable, Protocol, Sequence
 
 import httpx
 
-from app.adapters.base import SynthesisRequest, SynthesisResult
+from app.adapters.base import (
+    SynthesisCancelled,
+    SynthesisControlError,
+    SynthesisRequest,
+    SynthesisResult,
+    SynthesisTimeout,
+)
+from app.comfyui.output import publish_wav_atomic
 from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
 from app.net_guard import scrub_error
 from app.portable_endpoint_trust import (
@@ -1888,6 +1894,8 @@ class ComfyUITTSClient:
     def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
         try:
             return self._synthesize_impl(request)
+        except SynthesisControlError:
+            raise
         except Exception as exc:
             raise RuntimeError(scrub_error(exc, self.endpoint.base_url)) from exc
 
@@ -1900,13 +1908,16 @@ class ComfyUITTSClient:
     ) -> None:
         if request.progress_callback is None:
             return
-        request.progress_callback(
-            {
-                "external_job_id": prompt_id,
-                "external_status": status,
-                "progress": progress,
-            }
-        )
+        try:
+            request.progress_callback(
+                {
+                    "external_job_id": prompt_id,
+                    "external_status": status,
+                    "progress": progress,
+                }
+            )
+        except Exception:
+            return
 
     def _synthesize_impl(self, request: SynthesisRequest) -> SynthesisResult:
         engine_value = request.parameters.get("engine") or (
@@ -1923,6 +1934,8 @@ class ComfyUITTSClient:
             "",
         )
         asset_id: str | None = None
+        prompt_id: str | None = None
+        prompt_converged = False
         synthesis_error: Exception | None = None
         result: SynthesisResult | None = None
         try:
@@ -1936,9 +1949,28 @@ class ComfyUITTSClient:
             self._emit_prompt_progress(request, prompt_id, "queued", 0.1)
             timeout = float(params.get("timeout_seconds", 600.0))
             poll_interval = float(params.get("poll_interval", 2.0))
+            cancelling_emitted = False
+
+            def cancel_check_with_progress() -> bool:
+                nonlocal cancelling_emitted
+                if request.cancel_check is None or not request.cancel_check():
+                    return False
+                if not cancelling_emitted:
+                    self._emit_prompt_progress(request, prompt_id, "cancelling", 0.1)
+                    cancelling_emitted = True
+                return True
+
             history_entry = self.api.poll_until_done(
-                prompt_id, poll_interval=poll_interval, max_wait=timeout
+                prompt_id,
+                poll_interval=poll_interval,
+                max_wait=timeout,
+                cancel_check=(
+                    cancel_check_with_progress
+                    if request.cancel_check is not None
+                    else None
+                ),
             )
+            prompt_converged = True
             output_files = self.api._extract_output_filenames(history_entry)
             if not output_files:
                 raise RuntimeError(
@@ -1950,7 +1982,7 @@ class ComfyUITTSClient:
                 subfolder=first_output["subfolder"],
                 folder_type=first_output["type"],
             )
-            _write_wav(request.output_path, audio_bytes)
+            audio_metadata = publish_wav_atomic(request.output_path, audio_bytes)
             result = SynthesisResult(
                 audio_path=request.output_path,
                 metadata={
@@ -1961,17 +1993,69 @@ class ComfyUITTSClient:
                     "engine": engine_value,
                     "resource_id": params["resource_id"],
                     "comfyui_output_files": output_files,
+                    **audio_metadata,
                 },
             )
         except Exception as exc:
             synthesis_error = exc
+            if isinstance(exc, SynthesisControlError):
+                cancellation = exc.details.get("cancellation")
+                if isinstance(cancellation, dict):
+                    prompt_converged = cancellation.get("converged") is True
+                else:
+                    prompt_converged = exc.details.get("converged") is True
         cleanup_error: Exception | None = None
-        if asset_id:
+        if asset_id and prompt_converged:
             try:
                 self.api.delete_audio(asset_id)
             except Exception as exc:
                 cleanup_error = exc
         if synthesis_error is not None:
+            if isinstance(synthesis_error, SynthesisControlError):
+                control_error = synthesis_error
+                if cleanup_error is not None:
+                    control_error = type(synthesis_error)(
+                        str(synthesis_error),
+                        details={
+                            **synthesis_error.details,
+                            "cleanup_error": scrub_error(
+                                cleanup_error,
+                                self.endpoint.base_url,
+                            ),
+                        },
+                    )
+                control_prompt_id = str(
+                    control_error.details.get("prompt_id") or prompt_id or ""
+                )
+                if isinstance(control_error, SynthesisCancelled) and prompt_converged:
+                    self._emit_prompt_progress(
+                        request,
+                        control_prompt_id,
+                        "cancelled",
+                        0.1,
+                    )
+                elif isinstance(control_error, SynthesisTimeout):
+                    self._emit_prompt_progress(
+                        request,
+                        control_prompt_id,
+                        "timeout",
+                        0.1,
+                    )
+                if control_error is synthesis_error:
+                    raise control_error
+                raise control_error from synthesis_error
+            if cleanup_error is not None:
+                primary_diagnostic = scrub_error(
+                    synthesis_error,
+                    self.endpoint.base_url,
+                )
+                cleanup_diagnostic = scrub_error(
+                    cleanup_error,
+                    self.endpoint.base_url,
+                )
+                raise RuntimeError(
+                    f"{primary_diagnostic}; asset cleanup failed: {cleanup_diagnostic}"
+                ) from synthesis_error
             raise synthesis_error
         if cleanup_error is not None:
             raise cleanup_error
@@ -1983,21 +2067,6 @@ class ComfyUITTSClient:
         resource_id = str(self.endpoint.default_params.get("resource_id", "")).strip()
         self.api.release_runtime(resource_id=resource_id or None)
         self.api.free_memory()
-
-
-def _write_wav(output_path: Path, audio_bytes: bytes) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if audio_bytes.startswith(b"RIFF") and audio_bytes[8:12] == b"WAVE":
-        output_path.write_bytes(audio_bytes)
-        return
-
-    import soundfile
-
-    samples, sample_rate = soundfile.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
-    if sample_rate <= 0 or samples.size == 0:
-        raise ValueError("ComfyUI returned empty audio")
-    soundfile.write(str(output_path), samples, sample_rate, format="WAV", subtype="PCM_16")
-
 
 def _tiny_wav_bytes() -> bytes:
     return (

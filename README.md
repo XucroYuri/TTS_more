@@ -144,6 +144,8 @@ export TTS_MORE_RUN_REAL_TTS=1
 
 真实 TTS pytest 不能替代正式 CUDA 认证。Windows 单机只从 [单机 CUDA Runbook](docs/cuda-e2e-single-node.md) 复制命令；四机可信 LAN 见 [分布式 Runbook](docs/cuda-e2e-distributed.md)；门禁和证据语义见 [CUDA 验证契约](docs/cuda-e2e-validation.md)。macOS 和普通 hosted CI 不能签发 Windows CUDA 认证。
 
+Windows ComfyUI 正式可靠性门禁只使用 [Windows ComfyUI reliability runbook](docs/comfyui-windows-reliability.md) 中的 `scripts/run-windows-comfyui-reliability-supervised.ps1`；内层实现不是权威入口，不能签发或发布正式证据。
+
 ### ComfyUI 开发与验证变量
 
 | 变量 | 用途 | 示例 |

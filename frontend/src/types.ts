@@ -3,7 +3,7 @@ export type ProviderType = "gpt-sovits" | "indextts" | "cosyvoice" | "vibevoice"
 export type SourceProfile = "local_repo" | "local_endpoint" | "lan_endpoint" | "cloud_endpoint" | "api_placeholder";
 export type CatalogProvider = "gpt-sovits" | "indextts" | "cosyvoice";
 export type SetupState = "not_configured" | "repo_missing" | "repo_found" | "env_missing" | "endpoint_unreachable" | "partial" | "ready";
-export type GenerationStatus = "queued" | "loading" | "running" | "finalizing" | "completed" | "failed" | "cancelled";
+export type GenerationStatus = "queued" | "loading" | "running" | "finalizing" | "cancelling" | "completed" | "failed" | "cancelled";
 
 export type PortableOperationPhase =
   | "not_initialized"
@@ -576,7 +576,7 @@ export interface ServiceSettingsPayload {
   services: Array<WorkerHealth & { secrets?: Record<string, string> }>;
 }
 
-export type QueueItemStatus = "queued" | "loading" | "running" | "finalizing" | "completed" | "failed" | "cancelled";
+export type QueueItemStatus = "queued" | "loading" | "running" | "finalizing" | "cancelling" | "completed" | "failed" | "cancelled";
 
 export interface GenerationQueueItem {
   task_id: string;

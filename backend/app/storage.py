@@ -1,31 +1,136 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import re
 import shutil
+import threading
+import uuid
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypeVar
+from typing import Callable, TypeVar
 
 import yaml
 from pydantic import BaseModel
 
 from app.models import Character, GenerationManifest, ScriptProject
+from app.path_safety import (
+    WINDOWS_RESERVED_NAMES,
+    encode_windows_component,
+    validate_windows_component,
+    windows_utf16_units,
+)
 
 T = TypeVar("T", bound=BaseModel)
+R = TypeVar("R")
 
-WINDOWS_RESERVED_NAMES = {
-    "CON",
-    "PRN",
-    "AUX",
-    "NUL",
-    *(f"COM{index}" for index in range(1, 10)),
-    *(f"LPT{index}" for index in range(1, 10)),
-}
+WINDOWS_LEGACY_DIRECTORY_PATH_UNITS = 248
+WINDOWS_LEGACY_FILE_PATH_UNITS = 260
+TRASH_PROJECT_COMPONENT_UNITS = 160
+
+
+def windows_filesystem_path(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    raw_path = os.path.abspath(os.fspath(path))
+    if raw_path.startswith("\\\\?\\"):
+        return Path(raw_path)
+    if raw_path.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{raw_path[2:]}")
+    return Path(f"\\\\?\\{raw_path}")
+
+
+def windows_display_path(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    raw_path = os.fspath(path)
+    lowered = raw_path.lower()
+    if lowered.startswith("\\\\?\\unc\\"):
+        return Path(f"\\\\{raw_path[8:]}")
+    if lowered.startswith("\\\\?\\"):
+        return Path(raw_path[4:])
+    return path
+
+
+def windows_usable_file_path(path: Path) -> Path:
+    display_path = windows_display_path(path)
+    if os.name != "nt" or windows_utf16_units(os.fspath(display_path)) < WINDOWS_LEGACY_FILE_PATH_UNITS:
+        return display_path
+    return windows_filesystem_path(display_path)
+
+
+def windows_path_identity(path: str | Path) -> str:
+    normalized = ntpath.normpath(os.fspath(path))
+    lowered = normalized.lower()
+    if lowered.startswith("\\\\?\\unc\\"):
+        normalized = f"\\\\{normalized[8:]}"
+    elif lowered.startswith("\\\\?\\"):
+        normalized = normalized[4:]
+    return ntpath.normcase(ntpath.normpath(normalized))
+
+
+def windows_path_is_within(path: Path, root: Path) -> bool:
+    if os.name != "nt":
+        try:
+            path.relative_to(root)
+        except ValueError:
+            return False
+        return True
+    path_key = windows_path_identity(path)
+    root_key = windows_path_identity(root)
+    try:
+        return ntpath.commonpath((path_key, root_key)) == root_key
+    except ValueError:
+        return False
+
+
+def _filesystem_exists(path: Path) -> bool:
+    return windows_filesystem_path(path).exists()
+
+
+def _filesystem_is_dir(path: Path) -> bool:
+    return windows_filesystem_path(path).is_dir()
+
+
+def _filesystem_iterdir(path: Path):
+    return windows_filesystem_path(path).iterdir()
+
+
+def _filesystem_mkdir(path: Path, *, parents: bool = False, exist_ok: bool = False) -> None:
+    windows_filesystem_path(path).mkdir(parents=parents, exist_ok=exist_ok)
+
+
+def _filesystem_stat(path: Path):
+    return windows_filesystem_path(path).stat()
+
+
+def _filesystem_rename(source: Path, target: Path) -> None:
+    filesystem_target = windows_filesystem_path(target)
+    filesystem_target.parent.mkdir(parents=True, exist_ok=True)
+    windows_filesystem_path(source).rename(filesystem_target)
+
+
+def _filesystem_move(source: Path, target: Path) -> None:
+    shutil.move(str(windows_filesystem_path(source)), str(windows_filesystem_path(target)))
+
+
+def _usable_project_directory(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    display_path = windows_display_path(path)
+    absolute_path = os.path.abspath(os.fspath(display_path))
+    if windows_utf16_units(absolute_path) < WINDOWS_LEGACY_DIRECTORY_PATH_UNITS:
+        return display_path
+    return windows_filesystem_path(display_path)
 
 
 class ProjectStore:
+    _manifest_locks_guard = threading.Lock()
+    _manifest_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
+    _manifest_update_state = threading.local()
+
     def __init__(self, root: Path) -> None:
         self.root = root
 
@@ -34,19 +139,21 @@ class ProjectStore:
         for root in self.read_project_roots():
             candidate = root / safe_id
             if self._is_project_dir(candidate) and self._project_dir_matches_id(candidate, safe_id):
-                return candidate
+                return _usable_project_directory(candidate)
             marked = self._find_project_dir_by_id(root, safe_id)
             if marked is not None:
-                return marked
+                return _usable_project_directory(marked)
         return self.writable_project_dir(safe_id)
 
     def writable_project_dir(self, project_id: str) -> Path:
         safe_id = self._safe_project_id(project_id)
         direct = self.writable_projects_root() / safe_id
         marker = self._read_project_marker(direct)
-        if not direct.exists() or marker is None or marker == safe_id:
-            return direct
-        return self._unique_project_dir_for_title(self.writable_projects_root(), safe_id, safe_id)
+        if not _filesystem_exists(direct) or marker is None or self._same_project_id(marker, safe_id):
+            return _usable_project_directory(direct)
+        return _usable_project_directory(
+            self._unique_project_dir_for_title(self.writable_projects_root(), safe_id, safe_id)
+        )
 
     def project_path(self, project_id: str) -> Path:
         return self.project_dir(project_id) / "project.json"
@@ -89,15 +196,16 @@ class ProjectStore:
         projects: list[dict[str, object]] = []
         seen: set[str] = set()
         for projects_root in self.read_project_roots():
-            if not projects_root.exists():
+            if not _filesystem_exists(projects_root):
                 continue
-            for path in sorted(projects_root.iterdir(), key=lambda item: item.name.lower()):
+            for path in sorted(_filesystem_iterdir(projects_root), key=lambda item: item.name.lower()):
                 project_path = path / "project.json"
-                if not path.is_dir() or not project_path.exists():
+                if not _filesystem_is_dir(path) or not _filesystem_exists(project_path):
                     continue
                 project = self._read_model(project_path, ScriptProject)
                 project_id = self._project_id_for_dir(path)
-                if project_id in seen:
+                project_identity = self._project_id_identity(project_id)
+                if project_identity in seen:
                     continue
                 projects.append(
                     {
@@ -108,10 +216,10 @@ class ProjectStore:
                         "character_count": len(project.project_characters),
                         "script_revision_count": len(project.script_revisions),
                         "parse_revision_count": len(project.parse_revisions),
-                        "updated_at": datetime.fromtimestamp(project_path.stat().st_mtime, timezone.utc).isoformat(),
+                        "updated_at": datetime.fromtimestamp(_filesystem_stat(project_path).st_mtime, timezone.utc).isoformat(),
                     }
                 )
-                seen.add(project_id)
+                seen.add(project_identity)
         return projects
 
     def delete_project(self, project_id: str) -> Path:
@@ -121,14 +229,18 @@ class ProjectStore:
             raise FileNotFoundError(project_id)
 
         trash_root = self.writable_projects_root() / ".trash"
-        trash_root.mkdir(parents=True, exist_ok=True)
+        _filesystem_mkdir(trash_root, parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        target = trash_root / f"{safe_id}-{timestamp}"
-        for index in range(1000):
-            candidate = target if index == 0 else trash_root / f"{safe_id}-{timestamp}-{index + 1}"
-            if not candidate.exists():
-                shutil.move(str(project_dir), str(candidate))
-                return candidate
+        readable_id = encode_windows_component(
+            safe_id,
+            max_units=TRASH_PROJECT_COMPONENT_UNITS,
+            fallback="project",
+        )
+        for _index in range(1000):
+            candidate = trash_root / f"{readable_id}-{timestamp}-{uuid.uuid4().hex}"
+            if not _filesystem_exists(candidate):
+                _filesystem_move(project_dir, candidate)
+                return _usable_project_directory(candidate)
         raise FileExistsError("unable to allocate trash directory")
 
     def read_project_roots(self) -> list[Path]:
@@ -142,7 +254,7 @@ class ProjectStore:
         output: list[Path] = []
         seen: set[str] = set()
         for path in roots:
-            key = str(path.resolve(strict=False)).lower()
+            key = windows_path_identity(windows_filesystem_path(path).resolve(strict=False))
             if key not in seen:
                 output.append(path)
                 seen.add(key)
@@ -160,15 +272,67 @@ class ProjectStore:
         return self.default_projects_root()
 
     def save_manifest(self, manifest: GenerationManifest) -> None:
+        project_id = self._safe_project_id(manifest.project_id)
+        with self._manifest_lock(project_id):
+            self._save_manifest_unlocked(manifest)
+
+    def load_manifest(self, project_id: str) -> GenerationManifest:
+        return self._load_manifest_unlocked(self._safe_project_id(project_id))
+
+    def update_manifest(
+        self,
+        project_id: str,
+        mutation: Callable[[GenerationManifest], R],
+    ) -> R:
+        safe_project_id = self._safe_project_id(project_id)
+        project_key = self._manifest_lock_key(safe_project_id)
+        active_project_keys = getattr(self._manifest_update_state, "project_keys", [])
+        if project_key in active_project_keys:
+            raise RuntimeError("nested manifest transaction for the same project is not allowed")
+        if active_project_keys and project_key < active_project_keys[-1]:
+            raise RuntimeError("nested manifest transaction violates project lock ordering")
+        with self._manifest_lock(safe_project_id):
+            active_project_keys.append(project_key)
+            self._manifest_update_state.project_keys = active_project_keys
+            try:
+                manifest = self._load_manifest_unlocked(safe_project_id).model_copy(deep=True)
+                if not self._same_project_id(manifest.project_id, safe_project_id):
+                    raise ValueError("manifest project id does not match transaction project")
+                original_project_id = manifest.project_id
+                result = mutation(manifest)
+                if manifest.project_id != original_project_id:
+                    raise ValueError("manifest transaction changed project id")
+                self._save_manifest_unlocked(manifest)
+                return result
+            finally:
+                active_project_keys.pop()
+                if not active_project_keys:
+                    del self._manifest_update_state.project_keys
+
+    def _manifest_lock(self, project_id: str) -> threading.RLock:
+        key = self._manifest_lock_key(project_id)
+        with self._manifest_locks_guard:
+            lock = self._manifest_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._manifest_locks[key] = lock
+            return lock
+
+    def _manifest_lock_key(self, project_id: str) -> str:
+        safe_project_id = self._safe_project_id(project_id)
+        key = windows_path_identity(windows_filesystem_path(self.writable_projects_root()).resolve(strict=False))
+        return windows_path_identity(ntpath.join(key, safe_project_id))
+
+    def _save_manifest_unlocked(self, manifest: GenerationManifest) -> None:
         self._write_text(self.project_dir(manifest.project_id) / ".project-id", self._safe_project_id(manifest.project_id))
         self._write_model(self.manifest_path(manifest.project_id), manifest)
 
-    def load_manifest(self, project_id: str) -> GenerationManifest:
-        path = self.manifest_path(project_id)
-        if path.exists():
+    def _load_manifest_unlocked(self, project_id: str) -> GenerationManifest:
+        path = windows_filesystem_path(self.manifest_path(project_id))
+        if _filesystem_exists(path):
             return self._read_model(path, GenerationManifest)
-        legacy_path = self.legacy_manifest_path(project_id)
-        if legacy_path.exists():
+        legacy_path = windows_filesystem_path(self.legacy_manifest_path(project_id))
+        if _filesystem_exists(legacy_path):
             return self._read_model(legacy_path, GenerationManifest)
         return GenerationManifest(project_id=project_id)
 
@@ -177,7 +341,7 @@ class ProjectStore:
 
     def load_characters(self) -> list[Character]:
         path = self.characters_path()
-        if not path.exists():
+        if not _filesystem_exists(path):
             return []
         data = self._read_structured(path)
         return [Character.model_validate(item) for item in data]
@@ -186,21 +350,24 @@ class ProjectStore:
         self._write_json(path, model.model_dump(mode="json"))
 
     def _write_json(self, path: Path, payload: object) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp_path.replace(path)
+        self._write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def _write_text(self, path: Path, text: str) -> None:
+        path = windows_filesystem_path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temp_path.write_text(text, encoding="utf-8")
-        temp_path.replace(path)
+        operation_id = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+        temp_path = path.with_name(f".{path.name}.{operation_id}.tmp")
+        try:
+            temp_path.write_text(text, encoding="utf-8")
+            temp_path.replace(path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def _read_model(self, path: Path, model_type: type[T]) -> T:
         return model_type.model_validate(self._read_structured(path))
 
     def _read_structured(self, path: Path) -> object:
+        path = windows_filesystem_path(path)
         text = path.read_text(encoding="utf-8")
         if path.suffix.lower() in {".yaml", ".yml"}:
             return yaml.safe_load(text)
@@ -209,8 +376,8 @@ class ProjectStore:
     def _write_project_materialized_files(self, project_dir: Path, project: ScriptProject) -> None:
         script_dir = project_dir / "script"
         output_dir = project_dir / "output"
-        script_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        _filesystem_mkdir(script_dir, parents=True, exist_ok=True)
+        _filesystem_mkdir(output_dir, parents=True, exist_ok=True)
 
         active_revision = next(
             (revision for revision in project.script_revisions if revision.revision_id == project.active_script_revision_id),
@@ -233,41 +400,48 @@ class ProjectStore:
         root = self.writable_projects_root()
         existing = self._find_project_dir_by_id(root, project_id)
         desired = self._unique_project_dir_for_title(root, project.title, project_id)
-        if existing is not None and existing != desired:
-            desired.parent.mkdir(parents=True, exist_ok=True)
-            if not desired.exists():
-                existing.rename(desired)
-            return desired
-        return desired
+        if existing is not None and windows_path_identity(existing) != windows_path_identity(desired):
+            _filesystem_mkdir(desired.parent, parents=True, exist_ok=True)
+            if not _filesystem_exists(desired):
+                _filesystem_rename(existing, desired)
+            return _usable_project_directory(desired)
+        return _usable_project_directory(desired)
 
     def _unique_project_dir_for_title(self, root: Path, title: str, project_id: str) -> Path:
         base_name = self._safe_project_title(title) or project_id
         for index in range(1000):
             name = base_name if index == 0 else f"{base_name}-{index + 1}"
             candidate = root / name
-            if not candidate.exists():
-                return candidate
+            if not _filesystem_exists(candidate):
+                return _usable_project_directory(candidate)
             marker = self._read_project_marker(candidate)
-            if marker == project_id:
-                return candidate
+            if marker is not None and self._same_project_id(marker, project_id):
+                return _usable_project_directory(candidate)
         raise ValueError("unable to allocate project directory")
 
     def _find_project_dir_by_id(self, root: Path, project_id: str) -> Path | None:
         direct = root / project_id
         if self._is_project_dir(direct):
             marker = self._read_project_marker(direct)
-            if marker is None or marker == project_id:
-                return direct
-        if not root.exists():
+            if marker is None or self._same_project_id(marker, project_id):
+                return _usable_project_directory(direct)
+        if not _filesystem_exists(root):
             return None
-        for path in sorted(root.iterdir(), key=lambda item: item.name.lower()):
-            if not path.is_dir() or path == direct:
+        for path in sorted(_filesystem_iterdir(root), key=lambda item: item.name.lower()):
+            same_direct = (
+                windows_path_identity(path) == windows_path_identity(direct)
+                if os.name == "nt"
+                else path == direct
+            )
+            if not _filesystem_is_dir(path) or same_direct:
                 continue
-            if self._read_project_marker(path) == project_id:
-                return path
+            marker = self._read_project_marker(path)
+            if marker is not None and self._same_project_id(marker, project_id):
+                return _usable_project_directory(path)
         return None
 
     def _is_project_dir(self, path: Path) -> bool:
+        path = windows_filesystem_path(path)
         return (
             path.is_dir()
             and (
@@ -285,26 +459,25 @@ class ProjectStore:
 
     def _project_dir_matches_id(self, path: Path, project_id: str) -> bool:
         marker = self._read_project_marker(path)
-        return marker is None or marker == project_id
+        return marker is None or self._same_project_id(marker, project_id)
 
     def _read_project_marker(self, path: Path) -> str | None:
-        marker_path = path / ".project-id"
-        if not marker_path.exists():
+        marker_path = windows_filesystem_path(path / ".project-id")
+        if not _filesystem_exists(marker_path):
             return None
         try:
-            return self._safe_project_id(marker_path.read_text(encoding="utf-8").strip())
+            return self._safe_project_id(marker_path.read_text(encoding="utf-8"))
         except ValueError:
             return None
 
     def _safe_project_id(self, project_id: str) -> str:
-        value = project_id.strip()
-        if not value:
-            raise ValueError("project id is required")
-        if value in {".", ".."} or any(separator in value for separator in ("/", "\\")):
-            raise ValueError("project id must be a single path segment")
-        if ":" in value or Path(value).is_absolute():
-            raise ValueError("project id must be relative")
-        return value
+        return validate_windows_component(project_id, label="project id", max_units=255)
+
+    def _project_id_identity(self, project_id: str) -> str:
+        return ntpath.normcase(self._safe_project_id(project_id))
+
+    def _same_project_id(self, left: str, right: str) -> bool:
+        return self._project_id_identity(left) == self._project_id_identity(right)
 
     def _safe_project_title(self, title: str) -> str:
         value = title.strip()
@@ -330,6 +503,6 @@ class ProjectStore:
         legacy_path = self.root / "characters.json"
         template_path = self.root / "templates" / "characters.example.json"
         for candidate in (local_path, legacy_path, template_path):
-            if candidate.exists():
+            if _filesystem_exists(candidate):
                 return candidate, local_path
         return local_path, local_path
