@@ -33,6 +33,7 @@ from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_referen
 from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
 from app.services import COMFYUI_TTS_AUDIO_SUITE_CONTRACT, ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
+from app.comfyui.workflow_builder import workflow_template_catalog
 from app.storage import (
     ProjectStore,
     windows_display_path,
@@ -243,6 +244,10 @@ def create_app(
     @app.get("/api/open-source-tts/catalog")
     def open_source_tts_catalog() -> dict[str, Any]:
         return {"providers": open_source_catalog(project_root)}
+
+    @app.get("/api/comfyui/workflow-templates")
+    def comfyui_workflow_templates() -> dict[str, Any]:
+        return {"schema_version": 1, "templates": workflow_template_catalog()}
 
     @app.post("/api/open-source-tts/detect")
     def open_source_tts_detect(request: OpenSourceTTSDetectRequest) -> dict[str, Any]:

@@ -1678,12 +1678,17 @@ class WindowsReliabilityHostProbe:
         *,
         system: WindowsHostSystem,
         manifest_path: Path,
+        control_state_path: Path | None = None,
     ) -> None:
         self.manifest = manifest
         self.system = system
         self.manifest_path = Path(manifest_path).resolve()
         self.validation_root = self.manifest_path.parent
-        self.control_state_path = Path(f"{self.manifest_path}.current.json")
+        self.control_state_path = (
+            Path(control_state_path).resolve()
+            if control_state_path is not None
+            else Path(f"{self.manifest_path}.current.json")
+        )
         self._current: dict[str, RecordedProcessIdentity | None] = dict(manifest.owned_processes)
         self._launch_roots: dict[str, RecordedProcessIdentity] = dict(manifest.launch_roots)
         self._active_cases: dict[str, object] = {}
@@ -1699,12 +1704,14 @@ class WindowsReliabilityHostProbe:
         path: Path,
         *,
         system: WindowsHostSystem | None = None,
+        control_state_path: Path | None = None,
     ) -> "WindowsReliabilityHostProbe":
         manifest = PrivateHostManifest.read(path)
         return cls(
             manifest,
             system=system or NativeWindowsHostSystem(),
             manifest_path=path,
+            control_state_path=control_state_path,
         )
 
     @property
@@ -2000,6 +2007,35 @@ def _absolute_private_path(value: Any) -> Path:
     return path.resolve()
 
 
+def _verified_private_directory(path: Path) -> Path:
+    """Resolve a private directory only after rejecting Windows reparse points."""
+    try:
+        metadata = path.lstat()
+    except OSError:
+        raise ValueError("validation temp directory is unavailable") from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & 0x400
+    ):
+        raise ValueError("validation temp directory is unsafe")
+    return path.resolve()
+
+
+def _verified_private_file(path: Path) -> Path:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        raise ValueError("validation temp owner marker is unavailable") from None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & 0x400
+    ):
+        raise ValueError("validation temp owner marker is unsafe")
+    return path
+
+
 def _build_private_runner_specifications(
     manifest: PrivateHostManifest,
     fixture: ReliabilityFixture,
@@ -2061,14 +2097,62 @@ def _verified_validation_runner_roots(
     *,
     validation_root: Path,
 ) -> tuple[Path, ...]:
-    validation_root = validation_root.resolve()
-    current_temp_root = (validation_root / f"reliability-temp-{manifest.run_id}").resolve()
-    current_runner_root = (current_temp_root / "runner").resolve()
-    current_comfy_root = (current_temp_root / "comfyui" / "temp").resolve()
-    if {
-        path.resolve() for path in manifest.temp_roots
-    } != {current_runner_root, current_comfy_root}:
-        raise ValueError("current validation temp roots are outside the owned boundary")
+    validation_root = _verified_private_directory(validation_root)
+    legacy_temp_root_path = validation_root / f"reliability-temp-{manifest.run_id}"
+    legacy_runner_root_path = legacy_temp_root_path / "runner"
+    legacy_comfy_root_path = legacy_temp_root_path / "comfyui" / "temp"
+    legacy_temp_root = legacy_temp_root_path.resolve()
+    legacy_runner_root = legacy_runner_root_path.resolve()
+    legacy_comfy_root = legacy_comfy_root_path.resolve()
+    manifest_temp_roots = {path.resolve() for path in manifest.temp_roots}
+    if manifest_temp_roots == {legacy_runner_root, legacy_comfy_root}:
+        legacy_temp_root = _verified_private_directory(legacy_temp_root_path)
+        legacy_runner_root = _verified_private_directory(legacy_runner_root_path)
+        _verified_private_directory(legacy_temp_root_path / "comfyui")
+        legacy_comfy_root = _verified_private_directory(legacy_comfy_root_path)
+        current_temp_root = legacy_temp_root
+        current_runner_root = legacy_runner_root
+        current_comfy_root = legacy_comfy_root
+    else:
+        # The supervised Windows launcher keeps its private recovery state in
+        # <output-root>/.private-recovery/<run-key>/.p.  The launcher owner
+        # marker is the authoritative binding for this layout; do not infer
+        # roots from mtime or accept any path outside the exact .p subtree.
+        current_temp_root_path = validation_root / ".p"
+        current_runner_root_path = current_temp_root_path / "runner"
+        current_comfy_base_path = current_temp_root_path / "comfyui"
+        current_comfy_root_path = current_comfy_base_path / "temp"
+        current_temp_root = _verified_private_directory(current_temp_root_path)
+        current_runner_root = _verified_private_directory(current_runner_root_path)
+        current_comfy_base = _verified_private_directory(current_comfy_base_path)
+        current_comfy_root = _verified_private_directory(current_comfy_root_path)
+        if manifest_temp_roots != {current_runner_root, current_comfy_root}:
+            raise ValueError("current validation temp roots are outside the owned boundary")
+        owner_marker_path = validation_root / ".o"
+        _verified_private_file(owner_marker_path)
+        try:
+            owner_marker = json.loads(owner_marker_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raise ValueError("validation temp owner marker is invalid") from None
+        if (
+            not isinstance(owner_marker, dict)
+            or set(owner_marker) != {"run_id", "temp_root", "runner_temp_root", "comfy_temp_root"}
+            or owner_marker.get("run_id") != manifest.run_id
+        ):
+            raise ValueError("validation temp owner marker is invalid")
+        try:
+            marker_paths_match = (
+                _same_private_path(_absolute_private_path(owner_marker.get("temp_root")), current_temp_root)
+                and _same_private_path(_absolute_private_path(owner_marker.get("runner_temp_root")), current_runner_root)
+                and _same_private_path(_absolute_private_path(owner_marker.get("comfy_temp_root")), current_comfy_root)
+            )
+        except ValueError:
+            marker_paths_match = False
+        if not marker_paths_match or not current_runner_root.is_dir() or not current_comfy_root.is_dir():
+            raise ValueError("validation temp owner marker is invalid")
+        if any(validation_root.glob(".request-temp-*.owner.json")):
+            raise ValueError("unexpected validation temp owner marker")
+        return (current_runner_root,)
 
     roots: set[Path] = set()
     marker_pattern = re.compile(r"^\.request-temp-([0-9a-f]{32})\.owner\.json$")
@@ -6269,6 +6353,7 @@ def main(
     parser.add_argument("--comfyui-pid", type=int, required=True)
     parser.add_argument("--tts-more-pid", type=int, required=True)
     parser.add_argument("--host-manifest", type=Path)
+    parser.add_argument("--control-state", type=Path)
     parser.add_argument("--allow-lan", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
     try:
@@ -6336,7 +6421,10 @@ def _default_probe_factory(
     del fixture
     if args.host_manifest is None:
         raise LiveValidationError("host-probe-manifest-required", stage="preflight")
-    host_probe = WindowsReliabilityHostProbe.from_manifest(args.host_manifest)
+    host_probe = WindowsReliabilityHostProbe.from_manifest(
+        args.host_manifest,
+        control_state_path=args.control_state,
+    )
     recorded = host_probe.manifest.owned_processes
     if recorded["comfyui"].pid != args.comfyui_pid or recorded["tts-more"].pid != args.tts_more_pid:
         raise LiveValidationError("host-manifest-pid-mismatch", stage="preflight")

@@ -36,6 +36,21 @@ def test_health_reports_repos_and_workers(tmp_path: Path) -> None:
     assert {worker["engine"] for worker in payload["workers"]} == {"gpt-sovits", "indextts", "cosyvoice"}
 
 
+def test_comfyui_workflow_template_catalog_is_public_and_stable(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+
+    response = client.get("/api/comfyui/workflow-templates")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] == 1
+    assert [item["name"] for item in payload["templates"]] == [
+        "text-only",
+        "reference-clone",
+        "controlled",
+    ]
+
+
 def test_parse_script_requires_enabled_llm_parser(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path))
 

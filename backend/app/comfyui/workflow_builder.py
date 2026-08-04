@@ -19,6 +19,40 @@ _GPT_SOVITS_CUT_METHODS = {
     "cut5": "按标点符号切",
 }
 
+_WORKFLOW_TEMPLATES = (
+    {
+        "schema_version": 1,
+        "name": "text-only",
+        "title": "Text-only TTS",
+        "description": "Generate from text without a reference-audio asset.",
+        "required": ["resource_id", "text"],
+    },
+    {
+        "schema_version": 1,
+        "name": "reference-clone",
+        "title": "Reference voice clone",
+        "description": "Upload a reference asset and bind it to the unified text node.",
+        "required": ["resource_id", "text"],
+    },
+    {
+        "schema_version": 1,
+        "name": "controlled",
+        "title": "Controlled TTS",
+        "description": "Use engine-specific controls while keeping the same queue and audio output contract.",
+        "required": ["resource_id", "text"],
+    },
+)
+
+_WORKFLOW_TEMPLATE_ALIASES = {
+    "text": "text-only",
+    "text-only": "text-only",
+    "reference": "reference-clone",
+    "reference-clone": "reference-clone",
+    "voice-clone": "reference-clone",
+    "controlled": "controlled",
+    "instruction": "controlled",
+}
+
 
 def _resource_id(params: dict[str, Any]) -> str:
     value = str(params.get("resource_id", "")).strip()
@@ -111,7 +145,12 @@ def build_gpt_sovits_workflow(params: dict[str, Any]) -> dict[str, Any]:
     return _base_workflow("gpt-sovits", params, inputs)
 
 
-def build_workflow(engine: str, params: dict[str, Any]) -> dict[str, Any]:
+def workflow_template_catalog() -> list[dict[str, Any]]:
+    """Return the stable public catalog for the three generic TTS workflows."""
+    return [dict(item) for item in _WORKFLOW_TEMPLATES]
+
+
+def _build_engine_workflow(engine: str, params: dict[str, Any]) -> dict[str, Any]:
     normalized = engine.casefold().replace("_", "-")
     if normalized in {"cosyvoice", "cosyvoice3"}:
         return build_cosyvoice_workflow(params)
@@ -120,6 +159,36 @@ def build_workflow(engine: str, params: dict[str, Any]) -> dict[str, Any]:
     if normalized == "gpt-sovits":
         return build_gpt_sovits_workflow(params)
     raise ValueError(f"Unsupported ComfyUI TTS engine: {engine}")
+
+
+def build_workflow_template(
+    template: str,
+    engine: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_template = _WORKFLOW_TEMPLATE_ALIASES.get(template.casefold().strip())
+    if normalized_template is None:
+        raise ValueError(f"Unsupported ComfyUI TTS workflow template: {template}")
+    if "text" not in params:
+        raise ValueError("ComfyUI TTS template text is required")
+    _resource_id(params)
+    effective_params = dict(params)
+    effective_params.pop("workflow_template", None)
+    if normalized_template == "text-only":
+        # A text-only graph must never accidentally retain a stale asset link.
+        effective_params.pop("asset_id", None)
+        effective_params.pop("prompt_text", None)
+    elif normalized_template == "reference-clone":
+        if not str(effective_params.get("asset_id", "")).strip():
+            raise ValueError("reference-clone workflow requires asset_id")
+    return _build_engine_workflow(engine, effective_params)
+
+
+def build_workflow(engine: str, params: dict[str, Any]) -> dict[str, Any]:
+    template = str(params.get("workflow_template", "")).strip()
+    if template:
+        return build_workflow_template(template, engine, params)
+    return _build_engine_workflow(engine, params)
 
 
 def load_workflow_from_file(path: str) -> dict[str, Any]:

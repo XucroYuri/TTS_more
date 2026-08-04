@@ -2632,6 +2632,7 @@ try {
         '--output-root', $outputRootPath,
         '--run-key', $runIdSha256,
         '--host-manifest', $hostManifestPath,
+        '--control-state', $controlStatePath,
         '--comfyui-pid', [string] $comfyRecord.pid,
         '--tts-more-pid', [string] $backendRecord.pid
     )
