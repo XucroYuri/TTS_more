@@ -9,8 +9,10 @@ from typing import ClassVar
 import pytest
 
 from app.adapters.base import SynthesisCancelled, SynthesisRequest, SynthesisResult, SynthesisTimeout
+from app.comfyui.output import TEMPORARY_WAV_NAME_UNITS
 from app.models import EngineName, GenerationManifest, GenerationTask, GenerationVersion, ProviderType, ScriptLine, TTSServiceEndpoint
-from app.queue import GenerationJobManager, ServiceGenerationQueue
+from app.path_safety import windows_utf16_units
+from app.queue import GenerationJobManager, ServiceGenerationQueue, WINDOWS_MAX_OUTPUT_PATH_UNITS
 from app.services import ServiceRoute
 from app.storage import ProjectStore
 
@@ -1619,3 +1621,25 @@ def test_fix_round_3_output_path_fails_before_synthesis_when_root_exhausts_windo
         )
 
     assert not any(call.startswith("synthesize:") for call in client.calls)
+
+
+def test_fix_round_5_output_path_reserves_atomic_wav_temp_name_budget(tmp_path: Path) -> None:
+    output_root = tmp_path
+    while windows_utf16_units(str(output_root.resolve(strict=False))) < 130:
+        output_root = output_root / "budget-segment"
+
+    client = RecordingServiceClient(endpoint("safe-service", EngineName.GPT_SOVITS, "gpu-a"))
+    queue = ServiceGenerationQueue(StaticRouter({"safe-service": client}))
+    manifest = GenerationManifest(project_id="demo")
+
+    queue.run(
+        [task("safe-line", EngineName.GPT_SOVITS, "safe-profile", "safe-service")],
+        manifest,
+        output_root,
+    )
+
+    output_path = Path(manifest.lines["safe-line"].versions[0].audio_path or "").resolve(strict=False)
+    parent_units = windows_utf16_units(str(output_path.parent))
+    assert manifest.lines["safe-line"].versions[0].status == "completed"
+    assert parent_units + windows_utf16_units("\\") + TEMPORARY_WAV_NAME_UNITS <= WINDOWS_MAX_OUTPUT_PATH_UNITS
+    assert windows_utf16_units(str(output_path)) <= WINDOWS_MAX_OUTPUT_PATH_UNITS
