@@ -63,8 +63,13 @@ jobs:
               print("validated", recovery._capability_directory())
           except Exception as exc:
               print("validation_error", type(exc).__name__, str(exc))
+              try:
+                  print("actual_after", recovery._windows_security_descriptor_sddl(store))
+              except Exception as after_exc:
+                  print("actual_after_error", type(after_exc).__name__, str(after_exc))
           '@
           $diagnostic | python -
+          icacls.exe (Join-Path $env:TEMP 'tts-more-reliability-recovery-capabilities')
       - name: Run pytest
         env:
           # The suite must pass without network egress; proxy vars break httpx.
