@@ -3609,6 +3609,122 @@ def test_task_10_http_probe_executes_fault_routes_and_preserves_terminal_evidenc
         assert observation.tts_more.control.converged is True
 
 
+def test_http_probe_resolves_relative_manifest_audio_against_explicit_tts_more_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    case = _task_10_plan("restart-cosyvoice")
+    tts_more_root = tmp_path / "tts-more"
+    audio_path = tts_more_root / "outputs" / "terminal.wav"
+    audio_path.parent.mkdir(parents=True)
+    _write_voiced_wav(audio_path)
+    unrelated_cwd = tmp_path / "backend-cwd"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+
+    class RelativeAudioScenario(_Task10FaultRouteScenario):
+        def handler(self, request: httpx.Request) -> httpx.Response:
+            response = super().handler(request)
+            if request.url.path.endswith("/manifest"):
+                document = response.json()
+                document["lines"][case.case_id]["versions"][0]["audio_path"] = (
+                    "outputs/terminal.wav"
+                )
+                return httpx.Response(200, json=document)
+            return response
+
+    scenario = RelativeAudioScenario(case, audio_path)
+    probe = reliability_validation.HttpReliabilityProbe(
+        transport=httpx.MockTransport(scenario.handler),
+        reference_root=tmp_path,
+        tts_more_root=tts_more_root,
+        poll_interval_seconds=0,
+        sleep=lambda _seconds: None,
+    )
+    _preflight_http_probe_for_case(probe, fixture)
+
+    observation = probe.execute_case(
+        case,
+        fixture,
+        tmp_path / "unused",
+        action_hook=lambda: setattr(scenario, "restarted", True),
+    )
+
+    assert observation.wav_path == audio_path
+    assert observation.audio_root == tts_more_root.absolute()
+
+
+@pytest.mark.parametrize("audio_reference", ["../outside.wav", "absolute"])
+def test_http_probe_rejects_manifest_audio_escape_from_explicit_tts_more_root(
+    tmp_path: Path,
+    audio_reference: str,
+) -> None:
+    tts_more_root = tmp_path / "tts-more"
+    outside = tmp_path / "outside.wav"
+    tts_more_root.mkdir()
+    _write_voiced_wav(outside)
+    value = str(outside) if audio_reference == "absolute" else audio_reference
+
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation._resolve_manifest_audio_path(
+            value,
+            root=tts_more_root,
+        )
+
+    assert exc_info.value.code == "unsafe-audio-output"
+
+
+@pytest.mark.parametrize("audio_reference", [None, "", 42, object()])
+def test_http_probe_rejects_invalid_manifest_audio_path_as_case_failure(
+    tmp_path: Path,
+    audio_reference: object,
+) -> None:
+    with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+        reliability_validation._resolve_manifest_audio_path(
+            audio_reference,
+            root=tmp_path,
+        )
+
+    assert exc_info.value.code == "unsafe-audio-output"
+
+
+def test_http_probe_rejects_audio_root_reparse_without_following_outside_target(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write_voiced_wav(outside / "voice.wav")
+    linked_root = tmp_path / "tts-more-link"
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(linked_root), str(outside)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+        if completed.returncode != 0:
+            pytest.skip("junction creation is unavailable")
+    else:
+        linked_root.symlink_to(outside, target_is_directory=True)
+
+    try:
+        with pytest.raises(reliability_validation.LiveValidationError) as exc_info:
+            reliability_validation._resolve_manifest_audio_path(
+                "voice.wav",
+                root=linked_root,
+            )
+        assert exc_info.value.code == "unsafe-audio-output"
+    finally:
+        if os.name == "nt":
+            linked_root.rmdir()
+        else:
+            linked_root.unlink()
+
+
 @pytest.mark.parametrize(
     ("case_id", "version_overrides"),
     [
