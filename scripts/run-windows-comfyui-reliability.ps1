@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)] [string] $ComfyUiRoot,
     [Parameter(Mandatory = $true)] [string] $ComfyPython,
     [Parameter(Mandatory = $true)] [string] $TtsMoreRoot,
+    [string] $TtsAudioSuiteSourceRoot,
     [string] $RunId,
     [string] $OutputRootIdentity,
     [string] $RunRootIdentity,
@@ -2452,6 +2453,11 @@ try {
 
 $suiteCandidate = Join-Path $comfyRootPath 'custom_nodes\TTS-Audio-Suite'
 $suiteRoot = Resolve-ExistingPath -LiteralPath $suiteCandidate -Kind Directory
+$suiteSourceRoot = if ([string]::IsNullOrWhiteSpace($TtsAudioSuiteSourceRoot)) {
+    $suiteRoot
+} else {
+    Resolve-ExistingPath -LiteralPath $TtsAudioSuiteSourceRoot -Kind Directory
+}
 $gptRoot = Resolve-ExistingPath -LiteralPath $env:TTS_MORE_RELIABILITY_GPT_SOVITS_ROOT -Kind Directory
 $indexRoot = Resolve-ExistingPath -LiteralPath $env:TTS_MORE_RELIABILITY_INDEXTTS_ROOT -Kind Directory
 $cosyRoot = Resolve-ExistingPath -LiteralPath $env:TTS_MORE_RELIABILITY_COSYVOICE_ROOT -Kind Directory
@@ -2636,6 +2642,18 @@ try {
             repositories = [ordered]@{
                 'tts-more' = $ttsRootPath
                 'tts-audio-suite' = $suiteRoot
+                comfyui = $comfyRootPath
+                'gpt-sovits' = $gptRoot
+                indextts = $indexRoot
+                cosyvoice = $cosyRoot
+            }
+            repository_sources = [ordered]@{
+                'tts-more' = $ttsRootPath
+                'tts-audio-suite' = if (Get-Variable -Name suiteSourceRoot -ErrorAction SilentlyContinue) {
+                    Get-Variable -Name suiteSourceRoot -ValueOnly
+                } else {
+                    $suiteRoot
+                }
                 comfyui = $comfyRootPath
                 'gpt-sovits' = $gptRoot
                 indextts = $indexRoot

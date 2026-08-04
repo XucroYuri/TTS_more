@@ -1449,6 +1449,7 @@ class PrivateLaunchSpecification:
 @dataclass(frozen=True)
 class PrivateBoundarySpecification:
     repositories: dict[str, Path]
+    repository_sources: dict[str, Path]
     private_registry: Path
     references: dict[str, Path]
 
@@ -1579,17 +1580,20 @@ class PrivateHostManifest:
                 temp_root=_absolute_private_path(value["temp_root"]),
             )
         boundary_raw = document.get("boundary")
-        if not isinstance(boundary_raw, dict) or set(boundary_raw) != {
+        if not isinstance(boundary_raw, dict) or not {
             "repositories",
             "private_registry",
             "references",
-        }:
+        }.issubset(boundary_raw):
             raise ValueError("host manifest boundary fields are invalid")
         repositories_raw = boundary_raw["repositories"]
+        repository_sources_raw = boundary_raw.get("repository_sources", repositories_raw)
         references_raw = boundary_raw["references"]
         if (
             not isinstance(repositories_raw, dict)
             or set(repositories_raw) != set(REQUIRED_BOUNDARY_LABELS)
+            or not isinstance(repository_sources_raw, dict)
+            or set(repository_sources_raw) != set(REQUIRED_BOUNDARY_LABELS)
             or not isinstance(references_raw, dict)
             or not references_raw
         ):
@@ -1598,6 +1602,10 @@ class PrivateHostManifest:
             repositories={
                 label: _absolute_private_path(value)
                 for label, value in repositories_raw.items()
+            },
+            repository_sources={
+                label: _absolute_private_path(value)
+                for label, value in repository_sources_raw.items()
             },
             private_registry=_absolute_private_path(boundary_raw["private_registry"]),
             references={
@@ -2477,13 +2485,14 @@ class NativeWindowsHostSystem:
     def capture_boundary(self, specification: PrivateBoundarySpecification) -> BoundarySnapshot:
         repositories: list[RepositorySnapshot] = []
         for label, root in specification.repositories.items():
-            head = self._run_text(["git", "-C", str(root), "rev-parse", "HEAD"]).strip()
+            source_root = specification.repository_sources[label]
+            head = self._run_text(["git", "-C", str(source_root), "rev-parse", "HEAD"]).strip()
             branch = self._run_text(
-                ["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"],
+                ["git", "-C", str(source_root), "symbolic-ref", "--quiet", "--short", "HEAD"],
                 allowed_returncodes={0, 1},
             ).strip() or "DETACHED"
             porcelain = self._run_bytes(
-                ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all"]
+                ["git", "-C", str(source_root), "status", "--porcelain=v1", "-z", "--untracked-files=all"]
             )
             repositories.append(
                 RepositorySnapshot(

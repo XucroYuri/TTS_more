@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)] [string] $ComfyUiRoot,
     [Parameter(Mandatory = $true)] [string] $ComfyPython,
     [Parameter(Mandatory = $true)] [string] $TtsMoreRoot,
+    [string] $TtsAudioSuiteSourceRoot,
     [switch] $AllowLan,
     [switch] $PreflightOnly
 )
@@ -599,6 +600,9 @@ try {
         '-PrivateRecoveryRootIdentity', $privateRootIdentity,
         '-PrivateRecoveryNamespaceIdentity', $privateNamespaceIdentity
     )
+    if (-not [string]::IsNullOrWhiteSpace($TtsAudioSuiteSourceRoot)) {
+        $innerArguments += @('-TtsAudioSuiteSourceRoot', $TtsAudioSuiteSourceRoot)
+    }
     if ($AllowLan) { $innerArguments += '-AllowLan' }
     if ($PreflightOnly) { $innerArguments += '-PreflightOnly' }
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
