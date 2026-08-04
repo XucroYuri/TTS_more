@@ -5001,6 +5001,50 @@ def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
     return document
 
 
+def test_capture_boundary_uses_independent_repository_sources_for_provenance(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime_roots = {label: (tmp_path / "runtime" / label).resolve() for label in REPOSITORY_LABELS}
+    source_roots = {label: (tmp_path / "source" / label).resolve() for label in REPOSITORY_LABELS}
+    for root in [*runtime_roots.values(), *source_roots.values()]:
+        root.mkdir(parents=True)
+    registry = tmp_path / "resources.yaml"
+    registry.write_text("registry\n", encoding="utf-8")
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    specification = reliability_validation.PrivateBoundarySpecification(
+        repositories=runtime_roots,
+        repository_sources=source_roots,
+        private_registry=registry,
+        references={"reference": reference},
+    )
+    system = object.__new__(reliability_validation.NativeWindowsHostSystem)
+    git_calls: list[list[str]] = []
+
+    def run_text(arguments, allowed_returncodes={0}):
+        del allowed_returncodes
+        git_calls.append(list(arguments))
+        if arguments[-2:] == ["rev-parse", "HEAD"]:
+            return "a" * 40
+        return "main"
+
+    def run_bytes(arguments):
+        git_calls.append(list(arguments))
+        return b""
+
+    monkeypatch.setattr(system, "_run_text", run_text)
+    monkeypatch.setattr(system, "_run_bytes", run_bytes)
+    boundary = system.capture_boundary(specification)
+
+    assert len(git_calls) == len(REPOSITORY_LABELS) * 3
+    for label in REPOSITORY_LABELS:
+        label_calls = [call for call in git_calls if str(source_roots[label]) in call]
+        assert len(label_calls) == 3
+        assert not any(str(runtime_roots[label]) in call for call in label_calls)
+    assert {item.label for item in boundary.repositories} == set(REPOSITORY_LABELS)
+
+
 class _FakeWindowsHostSystem:
     def __init__(
         self,
