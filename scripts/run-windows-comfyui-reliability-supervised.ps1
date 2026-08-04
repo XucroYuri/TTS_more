@@ -187,6 +187,14 @@ function Invoke-PythonJson {
     }
     if ($helperExit -ne 0 -or $rendered.Count -ne 1) {
         $detail = ([string] $helperStderr).Trim()
+        $stdoutDetail = ([string]::Join("`n", @($rendered))).Trim()
+        if ($stdoutDetail.Length -gt 1024) { $stdoutDetail = $stdoutDetail.Substring(0, 1024) }
+        if ([string]::IsNullOrEmpty($detail)) { $detail = $stdoutDetail }
+        if ([string]::IsNullOrEmpty($detail)) {
+            $detail = ('stdout-lines={0}' -f $rendered.Count)
+        } elseif ($rendered.Count -ne 1) {
+            $detail = ('stdout-lines={0}: {1}' -f $rendered.Count, $detail)
+        }
         if ($detail.Length -gt 1024) { $detail = $detail.Substring(0, 1024) }
         if ([string]::IsNullOrEmpty($detail)) {
             throw ('Formal supervision helper failed (exit {0})' -f $helperExit)
