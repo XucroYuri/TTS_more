@@ -53,6 +53,7 @@ def test_fix_round_3_project_store_rejects_windows_alias_ids_before_filesystem_c
     assert store.writable_projects_root().exists() is False
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows path aliases are Windows-specific")
 def test_fix_round_3_project_store_case_aliases_share_identity_across_store_instances(tmp_path: Path) -> None:
     first = ProjectStore(tmp_path)
     second = ProjectStore(Path(f"\\\\?\\{tmp_path}"))

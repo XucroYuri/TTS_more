@@ -2230,7 +2230,7 @@ def test_demo_validation_plan_splits_runnable_and_blocked_lines(tmp_path: Path) 
         encoding="utf-8",
     )
     client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
-    client.put(
+    characters_response = client.put(
         "/api/characters",
         json=[
             {
@@ -2264,7 +2264,8 @@ def test_demo_validation_plan_splits_runnable_and_blocked_lines(tmp_path: Path) 
             }
         ],
     )
-    client.put(
+    assert characters_response.status_code == 200, characters_response.text
+    project_response = client.put(
         "/api/projects/demo",
         json={
             "title": "Demo",
@@ -2274,6 +2275,7 @@ def test_demo_validation_plan_splits_runnable_and_blocked_lines(tmp_path: Path) 
             ],
         },
     )
+    assert project_response.status_code == 200, project_response.text
 
     response = client.get("/api/validation/demo-plan?project_id=demo&limit=10&repeats=2")
 
