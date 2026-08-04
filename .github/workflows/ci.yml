@@ -32,6 +32,39 @@ jobs:
           New-Item -ItemType Directory -Force -Path $testTemp | Out-Null
           "TEMP=$testTemp" >> $env:GITHUB_ENV
           "TMP=$testTemp" >> $env:GITHUB_ENV
+          "TTS_MORE_BACKEND_PYTHON=$((Get-Command python.exe).Source)" >> $env:GITHUB_ENV
+      - name: Diagnose Windows recovery ACL
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          whoami /user
+          Write-Host "TEMP=$env:TEMP"
+          icacls.exe $env:TEMP
+          $env:PYTHONPATH = Join-Path $env:GITHUB_WORKSPACE 'backend'
+          $diagnostic = @'
+          import os
+          import tempfile
+          from pathlib import Path
+          from app.comfyui import reliability_recovery as recovery
+
+          print("python", os.sys.executable)
+          print("tempdir", tempfile.gettempdir())
+          print("sid", recovery._windows_current_user_sid())
+          print("expected", recovery._windows_private_sddl(directory=True))
+          store = Path(tempfile.gettempdir()) / recovery.CAPABILITY_DIRECTORY
+          try:
+              actual = recovery._windows_security_descriptor_sddl(store)
+          except Exception as exc:
+              actual = f"<unavailable: {type(exc).__name__}: {exc}>"
+          print("store", store)
+          print("actual", actual)
+          try:
+              print("validated", recovery._capability_directory())
+          except Exception as exc:
+              print("validation_error", type(exc).__name__, str(exc))
+          '@
+          $diagnostic | python -
       - name: Run pytest
         env:
           # The suite must pass without network egress; proxy vars break httpx.
