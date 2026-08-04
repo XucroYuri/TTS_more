@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.adapters.base import SynthesisCancelled, SynthesisRequest, SynthesisTimeout
+from app.comfyui.output import TEMPORARY_WAV_NAME_UNITS
 from app.models import EngineName, GenerationJob, GenerationManifest, GenerationQueueItem, GenerationStatus, GenerationTask, GenerationVersion, ProviderType
 from app.net_guard import scrub_error
 from app.path_safety import encode_windows_component, windows_utf16_units
@@ -76,6 +77,7 @@ def _generation_output_path(
         WINDOWS_MAX_OUTPUT_PATH_UNITS
         - windows_utf16_units(str(parent_resolved))
         - windows_utf16_units(os.sep)
+        - TEMPORARY_WAV_NAME_UNITS
     )
     filename_units = min(OUTPUT_FILENAME_MAX_UNITS, remaining_path_units)
     line_units = filename_units - windows_utf16_units(suffix)

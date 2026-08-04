@@ -2,16 +2,50 @@ from __future__ import annotations
 
 import io
 import math
+import os
 from pathlib import Path
 from uuid import uuid4
 
 import soundfile
 
+from app.path_safety import windows_utf16_units
+
+
+_TEMPORARY_WAV_TOKEN_LENGTH = 16
+TEMPORARY_WAV_NAME_UNITS = len(".t-" + ("0" * _TEMPORARY_WAV_TOKEN_LENGTH) + ".tmp")
+_TEMPORARY_WAV_RESERVATION_ATTEMPTS = 8
+_WINDOWS_MAX_PATH_UNITS = 259
+
+
+def _ensure_windows_path_budget(path: Path) -> None:
+    if (
+        os.name == "nt"
+        and windows_utf16_units(os.path.abspath(os.fspath(path))) > _WINDOWS_MAX_PATH_UNITS
+    ):
+        raise ValueError("ComfyUI WAV temporary path exceeds the Windows path budget")
+
+
+def _reserve_temporary_wav_path(output_path: Path) -> Path:
+    for _ in range(_TEMPORARY_WAV_RESERVATION_ATTEMPTS):
+        temporary = output_path.with_name(
+            f".t-{uuid4().hex[:_TEMPORARY_WAV_TOKEN_LENGTH]}.tmp"
+        )
+        _ensure_windows_path_budget(temporary)
+        try:
+            with temporary.open("xb"):
+                pass
+        except FileExistsError:
+            continue
+        return temporary
+    raise FileExistsError("Could not reserve a unique ComfyUI WAV temporary path")
+
 
 def publish_wav_atomic(output_path: Path, audio_bytes: bytes) -> dict[str, int | float]:
+    _ensure_windows_path_budget(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output_path.with_name(f".{output_path.name}.{uuid4().hex}.tmp")
+    temporary: Path | None = None
     try:
+        temporary = _reserve_temporary_wav_path(output_path)
         if audio_bytes.startswith(b"RIFF") and audio_bytes[8:12] == b"WAVE":
             temporary.write_bytes(audio_bytes)
         else:
@@ -31,7 +65,8 @@ def publish_wav_atomic(output_path: Path, audio_bytes: bytes) -> dict[str, int |
         temporary.replace(output_path)
         return metadata
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _decode(source: Path | io.BytesIO | bytes):
