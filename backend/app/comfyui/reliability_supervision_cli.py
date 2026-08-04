@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Sequence
 
@@ -158,8 +159,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _emit({"ok": True, "result": result.model_dump(mode="json")})
             return 0
-    except SupervisionError:
-        _emit({"error": {"code": "supervision-error"}, "ok": False})
+    except SupervisionError as exc:
+        error: dict[str, object] = {"code": "supervision-error"}
+        if os.environ.get("TTS_MORE_SUPERVISION_DEBUG") == "1":
+            error["message"] = str(exc)[:1024]
+        _emit({"error": error, "ok": False})
         return 1
     _emit({"error": {"code": "unsupported-command"}, "ok": False})
     return 2
