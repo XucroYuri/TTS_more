@@ -589,6 +589,7 @@ class HttpCaseObservation:
     prompt_submitted: bool = True
     tts_more: TtsTerminalEvidence | None = None
     termination: TerminationEvidence | None = None
+    audio_root: Path | None = None
 
 
 class HostCaseObservation(_StrictModel):
@@ -3028,6 +3029,7 @@ class HttpReliabilityProbe:
         *,
         transport: httpx.BaseTransport | None = None,
         reference_root: Path,
+        tts_more_root: Path | None = None,
         poll_interval_seconds: float = 0.25,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -3035,6 +3037,11 @@ class HttpReliabilityProbe:
     ) -> None:
         self.transport = transport
         self.reference_root = Path(reference_root).resolve()
+        self.tts_more_root = (
+            Path(tts_more_root).absolute()
+            if tts_more_root is not None
+            else None
+        )
         self.poll_interval_seconds = poll_interval_seconds
         self.monotonic = monotonic
         self.sleep = sleep
@@ -3525,7 +3532,13 @@ class HttpReliabilityProbe:
         if version_id in self._seen_version_ids:
             raise RuntimeError("version id was reused")
         self._seen_version_ids.add(version_id)
-        wav_path = Path(version["audio_path"]) if actual == "completed" and version.get("audio_path") else None
+        wav_path: Path | None = None
+        audio_root: Path | None = None
+        if actual == "completed" and version.get("audio_path"):
+            wav_path, audio_root = _resolve_manifest_audio_path(
+                version["audio_path"],
+                root=self.tts_more_root,
+            )
         self._record_version_and_audio(case, raw_version_id, wav_path)
         if case.action == "terminate-comfyui":
             if (
@@ -3543,6 +3556,7 @@ class HttpReliabilityProbe:
                 version_id=version_id,
                 wav_path=None,
                 comfyui=None,
+                audio_root=None,
                 tts_more=TtsTerminalEvidence(
                     job_status="failed",
                     item_status="failed",
@@ -3593,6 +3607,7 @@ class HttpReliabilityProbe:
                 terminal_history_status=terminal_history_status,
             ),
             tts_more=tts_terminal,
+            audio_root=audio_root,
         )
 
     def release(self) -> None:
@@ -4046,6 +4061,43 @@ def _find_manifest_version(
     return candidates[0]
 
 
+def _resolve_manifest_audio_path(
+    value: Any,
+    *,
+    root: Path | None,
+) -> tuple[Path, Path | None]:
+    if not isinstance(value, str) or not value:
+        raise LiveValidationError("unsafe-audio-output", stage="case")
+    path = Path(value)
+    if root is None:
+        return path, None
+
+    try:
+        lexical_root = Path(root).absolute()
+        trusted_root = lexical_root.resolve(strict=False)
+        if os.path.normcase(os.fspath(lexical_root)) != os.path.normcase(
+            os.fspath(trusted_root)
+        ):
+            raise OSError
+        root_metadata = os.lstat(lexical_root)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or stat.S_ISLNK(root_metadata.st_mode)
+            or getattr(root_metadata, "st_file_attributes", 0) & 0x400
+        ):
+            raise OSError
+        if path.is_absolute() or path.drive or path.root:
+            candidate = path.absolute()
+        else:
+            candidate = (lexical_root / path).absolute()
+        resolved_candidate = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        raise LiveValidationError("unsafe-audio-output", stage="case") from None
+    if not resolved_candidate.is_relative_to(trusted_root):
+        raise LiveValidationError("unsafe-audio-output", stage="case")
+    return candidate, lexical_root
+
+
 def _fault_terminal_evidence(
     case: CasePlan,
     *,
@@ -4456,7 +4508,7 @@ def execute_reliability_validation(
                     raise LiveValidationError("missing-audio-output", stage="case")
                 audio_payload = _read_validated_temporary_audio(
                     http_observation.wav_path,
-                    temporary_root,
+                    http_observation.audio_root or temporary_root,
                 )
                 evidence = evidence.model_copy(
                     update={"audio": _wav_proof_from_bytes(audio_payload)}
@@ -4779,10 +4831,17 @@ def _read_validated_temporary_audio(
 ) -> bytes:
     candidate = Path(path).absolute()
     root = Path(temporary_root).absolute()
-    if not candidate.is_relative_to(root):
-        raise LiveValidationError("unsafe-audio-output", stage="case")
     descriptor: int | None = None
     try:
+        root_metadata = os.lstat(root)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or stat.S_ISLNK(root_metadata.st_mode)
+            or getattr(root_metadata, "st_file_attributes", 0) & 0x400
+        ):
+            raise OSError
+        if not candidate.is_relative_to(root):
+            raise OSError
         relative = candidate.relative_to(root)
         descriptor = reliability_evidence._windows_open_relative_descriptor(
             root,
@@ -6437,7 +6496,10 @@ def _default_probe_factory(
     recorded = host_probe.manifest.owned_processes
     if recorded["comfyui"].pid != args.comfyui_pid or recorded["tts-more"].pid != args.tts_more_pid:
         raise LiveValidationError("host-manifest-pid-mismatch", stage="preflight")
-    http_probe = HttpReliabilityProbe(reference_root=args.fixture.resolve().parent)
+    http_probe = HttpReliabilityProbe(
+        reference_root=args.fixture.resolve().parent,
+        tts_more_root=host_probe.manifest.boundary.repositories["tts-more"],
+    )
     return http_probe, host_probe, host_probe.owned_processes
 
 
