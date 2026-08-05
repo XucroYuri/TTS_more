@@ -46,6 +46,8 @@ Project/
 .omc/
 .omo/
 .omx/
+.claude/
+!.claude/settings.json
 data/**/audio/
 data/projects/*/audio/
 *.wav
