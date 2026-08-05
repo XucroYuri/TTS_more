@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import wave
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -5115,6 +5117,125 @@ def _host_manifest_document(tmp_path: Path) -> dict[str, object]:
     }
     document["launch_roots"] = json.loads(json.dumps(document["owned_processes"]))
     return document
+
+
+def test_private_runner_specifications_bind_explicit_python_for_every_engine(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    document = _host_manifest_document(tmp_path)
+    boundary = document["boundary"]
+    assert isinstance(boundary, dict)
+    registry_path = Path(boundary["private_registry"])
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    resources = registry["resources"]
+    assert isinstance(resources, dict)
+
+    expected: dict[str, Path] = {}
+    for engine, resource_id in (
+        ("gpt-sovits", "gpt-main"),
+        ("indextts", "index-main"),
+        ("cosyvoice", "cosy-main"),
+    ):
+        executable = (tmp_path / "isolated" / engine / "python.exe").resolve()
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"isolated-python")
+        resources[resource_id]["python_executable"] = str(executable)
+        expected[engine] = executable
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+    manifest_path = tmp_path / "host-manifest.json"
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    manifest = reliability_validation.PrivateHostManifest.read(manifest_path)
+
+    specifications = reliability_validation._build_private_runner_specifications(
+        manifest,
+        fixture,
+        validation_root=tmp_path,
+    )
+
+    assert {spec.engine: spec.executable_path for spec in specifications} == expected
+
+
+def test_private_runner_specifications_default_to_source_venv_when_not_configured(
+    tmp_path: Path,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    document = _host_manifest_document(tmp_path)
+    manifest_path = tmp_path / "host-manifest.json"
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    manifest = reliability_validation.PrivateHostManifest.read(manifest_path)
+
+    specifications = reliability_validation._build_private_runner_specifications(
+        manifest,
+        fixture,
+        validation_root=tmp_path,
+    )
+
+    assert {spec.engine: spec.executable_path for spec in specifications} == {
+        engine: (manifest.boundary.repositories[engine] / ".venv" / "Scripts" / "python.exe").resolve()
+        for engine in ("gpt-sovits", "indextts", "cosyvoice")
+    }
+
+
+@pytest.mark.parametrize("mutation", ["symlink", "reparse", "drift"])
+def test_private_runner_specifications_reject_unsafe_explicit_python_without_path_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    fixture = ReliabilityFixture.model_validate(_fixture_document())
+    document = _host_manifest_document(tmp_path)
+    boundary = document["boundary"]
+    assert isinstance(boundary, dict)
+    registry_path = Path(boundary["private_registry"])
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    resources = registry["resources"]
+    assert isinstance(resources, dict)
+    target = (tmp_path / "isolated" / "cosyvoice" / "python.exe").resolve()
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"isolated-python")
+    resources["cosy-main"]["python_executable"] = str(target)
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+    manifest_path = tmp_path / "host-manifest.json"
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    manifest = reliability_validation.PrivateHostManifest.read(manifest_path)
+
+    if mutation in {"symlink", "reparse"}:
+        original_lstat = Path.lstat
+
+        def unsafe_lstat(path: Path):
+            metadata = original_lstat(path)
+            if path == target:
+                return SimpleNamespace(
+                    st_mode=(stat.S_IFLNK if mutation == "symlink" else metadata.st_mode),
+                    st_file_attributes=(0x400 if mutation == "reparse" else 0),
+                )
+            return metadata
+
+        monkeypatch.setattr(Path, "lstat", unsafe_lstat)
+    else:
+        drift_target = (tmp_path / "outside" / "python.exe").resolve()
+        drift_target.parent.mkdir(parents=True)
+        drift_target.write_bytes(b"outside-python")
+        original_resolve = Path.resolve
+
+        def drifting_resolve(path: Path, *args: object, **kwargs: object) -> Path:
+            if path == target:
+                return drift_target
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", drifting_resolve)
+
+    with pytest.raises(ValueError, match="private runner executable is unsafe") as exc_info:
+        reliability_validation._build_private_runner_specifications(
+            manifest,
+            fixture,
+            validation_root=tmp_path,
+        )
+
+    assert str(target) not in str(exc_info.value)
 
 
 def test_capture_boundary_uses_independent_repository_sources_for_provenance(

@@ -203,7 +203,7 @@ TTS More 的 ComfyUI builder 提供三个稳定名称，均复用同一套 `reso
 
 - CosyVoice / IndexTTS：配置 `source_root` 与 `model_dir`。
 - GPT-SoVITS：配置 `source_root`、GPT/SoVITS 权重以及 BERT/CNHuBERT 模型目录。
-- 默认使用各 checkout 的 `.venv`；GPT-SoVITS 也可通过私有 `python_executable` 字段指定兼容解释器。
+- 默认使用各 checkout 的 `.venv`；三个引擎都可通过私有 `python_executable` 字段指定兼容解释器。该字段必须是现有的绝对普通文件，不能是 symlink、junction 或其他 Windows reparse 路径。
 
 ## 参考音频与音色克隆
 

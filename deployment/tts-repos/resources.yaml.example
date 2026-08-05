@@ -3,6 +3,9 @@
 # Copy this file to a machine-local resources.yaml, replace the empty mapping
 # with the resources used on that machine, then set TTS_AUDIO_SUITE_RESOURCES
 # to the copied file. Never commit the populated file.
+# Each engine defaults to <source_root>/.venv/Scripts/python.exe. Set the
+# optional private python_executable field on any engine only for an existing,
+# absolute regular interpreter path (links and Windows reparse paths are rejected).
 version: 1
 resources: {}
 
@@ -27,5 +30,5 @@ resources: {}
 #     bert_path: <bert-model-directory>
 #     cnhubert_path: <cnhubert-model-directory>
 #     version: v2ProPlus
-#     # Optional when the checkout-local .venv is not the intended runtime:
+#     # Optional on any engine when checkout-local .venv is not the intended runtime:
 #     # python_executable: <compatible-python-executable>

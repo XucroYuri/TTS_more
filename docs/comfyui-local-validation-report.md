@@ -137,7 +137,7 @@ $BACKEND_PY = Join-Path $TTS_MORE_ROOT '.venv/Scripts/python.exe'
 
 The private registry must contain exactly one ready entry for each resource ID
 `gpt-sovits-local`, `indextts-local`, and `cosyvoice-local`. Each entry binds
-its official checkout/model path; the GPT entry may also bind a compatible
+its official checkout/model path; any engine entry may also bind a compatible
 private `python_executable`. Do not expose private paths through public
 capabilities or commit the registry. For a single GPU/resource group, use
 `capacity: 1` and a shared group such as `comfyui-local-0`.

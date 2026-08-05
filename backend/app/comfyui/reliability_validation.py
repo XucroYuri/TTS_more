@@ -2045,6 +2045,37 @@ def _verified_private_file(path: Path) -> Path:
     return path
 
 
+def _verified_private_runner_executable(value: Any) -> Path:
+    """Accept an explicit runner interpreter only when its lexical path is stable."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("private runner executable is missing")
+    raw_path = Path(value)
+    if not raw_path.is_absolute():
+        raise ValueError("private runner executable must be absolute")
+    lexical_path = Path(os.path.abspath(os.fspath(raw_path)))
+    current = Path(lexical_path.anchor)
+    try:
+        for index, component in enumerate(lexical_path.parts[1:], start=1):
+            current /= component
+            metadata = current.lstat()
+            is_leaf = index == len(lexical_path.parts) - 1
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0) & 0x400
+                or (is_leaf and not stat.S_ISREG(metadata.st_mode))
+                or (not is_leaf and not stat.S_ISDIR(metadata.st_mode))
+            ):
+                raise OSError
+        resolved_path = lexical_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("private runner executable is unsafe") from None
+    if os.path.normcase(os.fspath(resolved_path)) != os.path.normcase(
+        os.fspath(lexical_path)
+    ):
+        raise ValueError("private runner executable is unsafe")
+    return resolved_path
+
+
 def _build_private_runner_specifications(
     manifest: PrivateHostManifest,
     fixture: ReliabilityFixture,
@@ -2078,9 +2109,9 @@ def _build_private_runner_specifications(
         source_root = _absolute_private_path(resource.get("source_root"))
         if not _same_private_path(source_root, manifest.boundary.repositories[engine]):
             raise ValueError("private runner source root mismatches the boundary")
-        configured_python = resource.get("python_executable") if engine == "gpt-sovits" else None
+        configured_python = resource.get("python_executable")
         executable_path = (
-            _absolute_private_path(configured_python)
+            _verified_private_runner_executable(configured_python)
             if configured_python is not None
             else (source_root / ".venv" / "Scripts" / "python.exe").resolve()
         )
