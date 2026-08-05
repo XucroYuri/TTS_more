@@ -1,0 +1,27 @@
+{
+  "defaultMode": "acceptEdits",
+  "allow": [
+    "Read", "Write", "Edit", "Glob", "Grep",
+    "Bash(git:*)",
+    "Bash(ls:*, find:*, cat:*, head:*, wc:*, grep:*, sort:*)",
+    "Bash(date:*, echo:*, mkdir:*, cp:*, mv:*, rm:*, sleep:*)",
+    "Bash(curl:*)",
+    "Bash(python3:*)",
+    "Bash(pip:*)",
+    "Bash(pip3:*)",
+    "Bash(uv:*)",
+    "Bash(pytest:*)",
+    "Bash(npm:*)",
+    "Bash(npx:*)",
+    "Bash(pnpm:*)",
+    "Bash(bun:*)",
+    "Agent", "WebSearch", "WebFetch", "LSP", "Skill", "TodoWrite", "AskUserQuestion"
+  ],
+  "deny": [
+    "Bash(rm -rf:*)",
+    "Bash(rm -r:*)",
+    "Bash(> /dev:*, > /etc:*)",
+    "Bash(sudo:*)",
+    "Bash(chown:*)"
+  ]
+}
