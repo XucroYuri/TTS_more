@@ -46,8 +46,6 @@ TOKEN_ENV_VAR = "TTS_MORE_API_TOKEN"
 # GET routes that are nonetheless sensitive (network egress / heavy ops) and
 # must be token-gated even though they use GET. Matched as path prefixes.
 _PROTECTED_GET_PREFIXES = (
-    "/api/local-control",
-    "/api/local-portable-services",
     "/api/open-source-tts/detect",
     "/api/services/",  # covers /test, /start, /stop, /start-and-wait, /logs
     "/api/parser/providers/test",
@@ -70,7 +68,7 @@ _OPEN_PREFIXES = (
     "/redoc",
 )
 
-_OPEN_EXACT_PATHS = {"/api/local-control/token"}
+_OPEN_EXACT_PATHS: set[str] = set()
 
 
 def get_configured_token() -> str | None:

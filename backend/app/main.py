@@ -19,13 +19,10 @@ from pydantic import BaseModel
 
 from app.hardware import collect_local_hardware_status
 from app.auth import auth_status_endpoint, install_token_middleware
-from app.local_control import install_local_control
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
-from app.portable_discovery import PortablePackageDiscoverRequest, PortablePackageRegisterRequest, discover_portable_packages, endpoint_from_portable_package, read_portable_package
 from app.portable_locator_mutations import ManagedPortableLocatorMutationError
-from app.portable_services import PortableServiceStore
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key, persist_manifest_delta
@@ -163,11 +160,6 @@ def create_app(
     # Read at app-creation time so tests/processes can override via env.
     app.state.max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(MAX_UPLOAD_BYTES)))
 
-    install_local_control(
-        app,
-        controller_root=portable_controller_root,
-        refresh_services=lambda endpoints: _apply_registry(app, ServiceRegistry(list(endpoints)), store),
-    )
 
     @app.get("/api/auth/status")
     def auth_status() -> dict[str, Any]:
@@ -279,98 +271,6 @@ def create_app(
         return {
             "service": endpoint.model_dump(mode="json"),
             "detect": detect_payload,
-            "settings": public_service_settings(registry, env_file),
-        }
-
-    @app.post("/api/portable-packages/discover")
-    def portable_packages_discover(request: PortablePackageDiscoverRequest) -> dict[str, Any]:
-        packages = discover_portable_packages(
-            portable_controller_root,
-            request.roots,
-            include_siblings=request.include_siblings,
-        )
-        return {"packages": [package.model_dump(mode="json") for package in packages]}
-
-    @app.post("/api/portable-packages/register")
-    def portable_package_register(request: PortablePackageRegisterRequest) -> dict[str, Any]:
-        try:
-            descriptor = read_portable_package(Path(request.package_root))
-            endpoint = endpoint_from_portable_package(descriptor, request)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        def persist_managed_and_publish() -> ServiceRegistry:
-            portable_store = PortableServiceStore(
-                portable_controller_root,
-                services_path=app.state.writable_services_path,
-            )
-            initial_services = (
-                tuple(app.state.service_registry.services)
-                if not portable_store.path.exists()
-                else ()
-            )
-            services = portable_store.replace_component(
-                endpoint,
-                initial_services=initial_services,
-                publish=lambda published: _apply_registry(
-                    app,
-                    ServiceRegistry(list(published)),
-                    store,
-                ),
-            )
-            app.state.services_path = app.state.writable_services_path
-            return ServiceRegistry(list(services))
-
-        def persist_external_and_publish(
-            published_registry: ServiceRegistry,
-        ) -> ServiceRegistry:
-            services = [
-                service
-                for service in published_registry.services
-                if service.service_id != endpoint.service_id
-            ]
-            services.append(endpoint)
-            services.sort(key=lambda service: (service.priority, service.service_id))
-            registry = published_registry.with_services(services)
-            registry.save(
-                app.state.writable_services_path,
-                publish=lambda candidate: _apply_registry(app, candidate, store),
-            )
-            app.state.services_path = app.state.writable_services_path
-            return registry
-
-        try:
-            if endpoint.portable_locator is None:
-                registry = app.state.portable_locator_mutations.run_generic_transaction(
-                    current_published=lambda: app.state.service_registry,
-                    transaction=persist_external_and_publish,
-                )
-            else:
-                registry = app.state.portable_locator_mutations.mutate_component(
-                    descriptor.component,
-                    persist_managed_and_publish,
-                )
-        except ManagedPortableLocatorMutationError as exc:
-            raise _managed_portable_locator_mutation_http_error() from exc
-        except ServicePostCommitError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "code": "PORTABLE_REGISTRATION_PUBLICATION_FAILED",
-                    "message": "portable package registration was persisted but publication failed",
-                },
-            ) from exc
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "PORTABLE_REGISTRATION_STORE_FAILED",
-                    "message": "portable package registration settings are unavailable",
-                },
-            ) from exc
-        return {
-            "package": descriptor.model_dump(mode="json"),
-            "service": endpoint.model_dump(mode="json"),
             "settings": public_service_settings(registry, env_file),
         }
 
