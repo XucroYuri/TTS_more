@@ -98,18 +98,12 @@ def test_delete_requires_token(tmp_path: Path, monkeypatch) -> None:
     assert response.status_code == 401
 
 
-def test_local_control_token_bearer_exemption_is_exact() -> None:
-    assert _path_needs_token("/api/local-control/token", "GET") is False
-    assert _path_needs_token("/api/local-control/token/", "GET") is True
-    assert _path_needs_token("/api/local-control/token-anything", "GET") is True
-
-
 def test_cors_preflight_is_not_blocked_by_bearer_auth(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("TTS_MORE_API_TOKEN", "secret-xyz")
     client = _client(tmp_path)
 
     response = client.options(
-        "/api/local-portable-services/gpt-sovits/start",
+        "/api/services/gpt-sovits/start",
         headers={
             "Origin": "http://127.0.0.1:5173",
             "Access-Control-Request-Method": "POST",

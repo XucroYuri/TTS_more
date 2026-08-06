@@ -22,7 +22,7 @@ from app.auth import auth_status_endpoint, install_token_middleware
 from app.models import Character, EngineName, GenerationManifest, GenerationTask, PROVIDER_ENGINE_DEFAULTS, ParseRevision, ProjectCharacter, ProjectCharacterMode, ReferenceAudioGroup, ReferenceAudioSample, ScriptProject, ScriptRevision
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
-from app.portable_locator_mutations import ManagedPortableLocatorMutationError
+from app.portable_locator_mutations import ManagedPortableLocatorMutationError, PortableLocatorMutationCoordinator
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key, persist_manifest_delta
@@ -153,6 +153,16 @@ def create_app(
     app.state.job_manager = job_manager
     app.state.reference_audio_root = ref_root
     app.state.supervisor = supervisor
+    # The service-routing core guards managed-locator mutations (run_generic_transaction
+    # / publish_without_locator_changes) via this coordinator. The portable import
+    # invalidator is a no-op now that the local portable-package import surface is gone.
+    class _NoopCommitInvalidator:
+        def invalidate_component(self, component: object) -> None: ...
+
+    app.state.portable_locator_mutations = PortableLocatorMutationCoordinator(
+        supervisor,
+        _NoopCommitInvalidator(),
+    )
     app.state.services_path = services_file
     app.state.writable_services_path = writable_services_file
     app.state.parser_config_path = parser_config_file
