@@ -142,7 +142,7 @@ export TTS_MORE_RUN_REAL_TTS=1
 .venv/bin/python -m pytest backend/tests/test_real_tts_validation.py -q
 ```
 
-真实 TTS pytest 不能替代正式 CUDA 认证。Windows 单机只从 [单机 CUDA Runbook](docs/cuda-e2e-single-node.md) 复制命令；四机可信 LAN 见 [分布式 Runbook](docs/cuda-e2e-distributed.md)；门禁和证据语义见 [CUDA 验证契约](docs/cuda-e2e-validation.md)。macOS 和普通 hosted CI 不能签发 Windows CUDA 认证。
+真实 TTS pytest 只在有真实/网络 endpoint、模型和（如适用）GPU 的本机有用；macOS 和普通 hosted CI 无法签发正式硬验证。它会取代真人试听，但仍不能证明目标机器的显存/吞吐行为。
 
 Windows ComfyUI 正式可靠性门禁只使用 [Windows ComfyUI reliability runbook](docs/comfyui-windows-reliability.md) 中的 `scripts/run-windows-comfyui-reliability-supervised.ps1`；内层实现不是权威入口，不能签发或发布正式证据。
 
@@ -215,6 +215,5 @@ git check-ignore -v data/local/services.json .env.local repo/GPT-SoVITS-main
 - [部署方案](docs/deployment.md)
 - [GPT-SoVITS 接入方案](docs/gpt-sovits-integration.md)
 - [CI 架构与真实 TTS 验收](docs/ci-architecture.md)
-- [CUDA 全流程闭环验证](docs/cuda-e2e-validation.md)
 - [开源 TTS 服务接入](docs/open-source-tts-services.md)
 - [发布治理](docs/release-governance.md)

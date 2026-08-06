@@ -1,17 +1,13 @@
-# CI 架构与 CUDA 发布门禁
+# CI 架构
 
-CI 分为无 GPU 快反馈和 Windows CUDA 发布认证两层。完整测试矩阵、runbook 与签核以 [CUDA 全流程闭环验证](cuda-e2e-validation.md) 为准。
+CI 在 GitHub-hosted 无 GPU runner 上提供快反馈：`ci.yml` 在每次 push/PR 跑后端 pytest、前端 Vitest 与生产 build，以及不依赖真实 TTS 模型的拓扑/契约/工件测试。
 
-## 两层门禁
+## 门禁
 
 ```mermaid
 flowchart TD
     Change["push / pull request"] --> Hosted["GitHub-hosted CI\nUbuntu + Windows pytest\nVitest + build"]
-    Candidate["workflow_dispatch / prerelease"] --> GPU["Windows 自托管 CUDA runner"]
-    GPU --> Single["single-clean 或 single-release"]
-    GPU --> Distributed["控制 runner 通过 OpenSSH\n编排三个 GPU worker"]
-    Single & Distributed --> Human["人工听审签核"]
-    Human --> Stable{"稳定发布门禁"}
+    Hosted --> Green{"Hosted 门禁"}
 ```
 
 `.github/workflows/ci.yml` 在普通 hosted runner 上执行：
@@ -20,61 +16,19 @@ flowchart TD
 - 前端 Vitest 与生产 build，Ubuntu；
 - topology、worker 契约、工件传输、资源切换、指标判定和报告生成的无 GPU 测试。
 
-这些测试不 import 真实 TTS 模型，也不证明 CUDA 显存、音质或 LAN 恢复行为。macOS 本地执行同样只能验证硬件无关部分。
-
-`.github/workflows/windows-gpu-validation.yml` 使用：
-
-```yaml
-runs-on: [self-hosted, Windows, X64, cuda, tts-more-gpu]
-```
-
-它支持 `workflow_dispatch`，并监听 release 的 `prereleased`、`published`。稳定版 `published` 的 workflow 要求单机与分布式 job 都成功。人工听审仍由发布记录门禁，不能只看 workflow 绿灯。GPU 门禁不在每次 push/PR 下载模型。
-
-## Runner 角色
-
-### 单机 runner
-
-同一台机器运行应用、三个 worker、CUDA 验证器和 Playwright。三 worker 同时在线，三模型按共享 `cuda-0`、`capacity:1` 顺序加载和卸载。
-
-### 分布式控制 runner
-
-控制 runner 运行应用、验证器和 Playwright，并通过 Windows OpenSSH 登录三个独立 GPU worker。每台 worker 保留轻量 TTS More checkout，只准备一个 TTS repo。控制 runner 使用 `app-only` 配置，远端服务为 `managed:false`，不能由本地 supervisor 管理。
-
-OpenSSH 用户、私钥、远端 checkout 路径和真实 topology 不提交到仓库。host key 必须固定，不能通过关闭校验规避首次连接。
-
-fixture 的 ASR 门禁固定使用 `faster-whisper large-v3`。`backend[dev]` 当前不安装该包，GPU workflow 会在控制环境显式安装 `faster-whisper`；runner 仍需提供可复用的 `large-v3` 模型缓存，否则首次下载时间计入认证准备。
-
-## 执行与工件
-
-本页不复制认证命令。Windows 单机只使用 [单机 Runbook](cuda-e2e-single-node.md)，四机只使用 [分布式 Runbook](cuda-e2e-distributed.md)，状态与证据字段以 [CUDA 验证契约](cuda-e2e-validation.md) 为准。
-
-受控原始证据保存 controller transcript、WAV、远端 worker 日志、GPU UUID、Playwright trace/video 和人工身份，只能留在 runner 本地或受控存储。普通 GitHub artifact 只包含脱敏可共享证据：脱敏 summary、JUnit、聚合 GPU 指标和 hash-only 引用。
-
-## 触发规则
-
-| 事件 | Hosted CI | 单机 CUDA | 分布式 CUDA | 人工听审 |
-|---|---:|---:|---:|---:|
-| 普通 push/PR | 必须 | 不触发 | 不触发 | 不需要 |
-| 手动调试 | 可选 | `workflow_dispatch` | `workflow_dispatch` | 视目标而定 |
-| prerelease | 必须 | workflow 自动运行单机 | 需要显式运行或稳定版运行 | 至少一名；首次认证两名 |
-| stable release | 必须 | 必须引用通过运行 | 必须引用通过运行 | 至少一名 |
-
-第一次设备认证必须执行 `single-clean`，清除 repo/venv 后完整部署并建立 16 GB 性能基线。后续 `single-release` 可以复用模型缓存，但仍重新同步锁定 repo、安装依赖并渲染服务配置。第一次分布式认证通过后，才能把分布式结果设为稳定发布门禁。
+这些测试不 import 真实 TTS 模型，也不证明目标机显存、音质或 LAN 恢复行为。macOS 本地执行同样只能验证硬件无关部分。真实 TTS / ComfyUI 端到端验证需要带模型和（如适用）GPU 的本机或受控环境，不在此 CI 内自动下载模型。
 
 ## Secrets 与本地配置
 
-以下内容只能来自 runner 本地或受保护 secrets：
+以下内容只来自 runner 本地或受保护 secrets，不提交：
 
 - `deployment/app/topology*.local.json`；
 - `deployment/app/repo-paths.local.json`；
 - `data/validation/*.local.json`；
-- SSH 用户、私钥和远端 checkout 路径；
-- 参考音频、GPT 权重路径、模型缓存和审核者身份。
+- 参考音频、GPT 权重路径和模型缓存。
 
-仓库只提交脱敏 topology 示例和代码/测试。运行前使用 `git check-ignore -v` 确认真实文件被忽略，运行后检查日志脱敏。
+仓库只提交脱敏示例和代码/测试。运行前使用 `git check-ignore -v` 确认真实文件被忽略，运行后检查日志脱敏。
 
 ## 发布判定
 
-自动门禁包括服务契约、真实模型能力、每服务 3 条短文本、30 条混合队列、工件传输、音频/ASR 指标、资源与性能、故障恢复和 Playwright。人工门禁按清晰度、音色相似度、情绪/韵律、伪影控制评分。
-
-每个稳定版本必须提供单机运行 URL、分布式运行 URL 和人工记录。任一门禁失败、结果缺失或阈值超限都阻止发布；prerelease 触发本身不代表认证通过。
+自动门禁包括服务契约、前端 build、后端测试和队列/解析/存储等无 GPU 行为。涉及真实模型能力、音频/ASR 指标、资源与性能、故障恢复的证据只能在具备真实模型与硬件的受控环境采集，作为人工验收记录，不由本 CI 签发。

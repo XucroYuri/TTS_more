@@ -10,8 +10,8 @@
 | 2 | GPT-SoVITS 接入能力与上游兼容性 | ✅ 已解决（非侵入式 worker，见 `docs/workers.md`） |
 | 3 | 未合并 feature 分支 | ✅ dev-xu 已合并；两个死分支已删除 |
 | 4 | `frontend/design.md` 过时 | ✅ 已删除 |
-| 5 | Windows CUDA 全流程认证 | 🔬 自动化与文档已建立，待真实单机和四机首次认证 |
-| 6 | macOS 控制面 + LAN Windows CUDA | 📐 补充门禁方案已设计，待真实执行和跨平台编排实现 |
+| 5 | Windows CUDA 全流程认证 | ✅ 已移除——CUDA 验证子系统已整个删除（见下） |
+| 6 | macOS 控制面 + LAN Windows CUDA | ✅ 已移除——CUDA 验证子系统已整个删除 |
 
 ---
 
@@ -70,34 +70,6 @@ rebase 会让 28 个提交逐个撞安全代码（冲突分散），merge 更干
 
 ---
 
-## 5. Windows CUDA 首次认证 🔬
+## 5. Windows CUDA 首次认证 ✅（子系统已移除）
 
-代码侧的 topology、三 worker 工件协议、共享资源切换、CUDA 判定器、报告格式和 runbook 不再列为 TODO。剩余工作必须在真实硬件上完成：
-
-1. 准备 Windows 11/Server、CUDA 12.8、至少 16 GB VRAM 的单机 runner，并注册标签 `[self-hosted, Windows, X64, cuda, tts-more-gpu]`。
-2. 在 runner 本地创建被忽略的 topology、repo 路径确认文件和 validation fixture，准备三服务参考音频及 GPT `v2ProPlus`/`v2Pro` 权重。
-3. 完成第一次 `single-clean`，由两名审核者签核，建立 16 GB 冷加载、短句、warm p95 和显存恢复基线。
-4. 准备一台控制节点和三台独立 GPU worker，配置 Windows OpenSSH、DNS/时间同步、端口与防火墙。
-5. 在真实四机上完成第一次 `distributed` 认证，确认已实现的 30 条重叠检测、远端证据采集和 15 秒故障恢复脚本通过 Windows OpenSSH 实测。
-6. 审核私有 CI 工件的脱敏和访问控制，保存单机/分布式运行 URL 与人工听审记录。
-7. 首次两类认证均通过后，才将其启用为稳定发布的强制门禁。
-
-执行说明见 [CUDA 验证总入口](cuda-e2e-validation.md)、[单机 runbook](cuda-e2e-single-node.md) 和 [四机 runbook](cuda-e2e-distributed.md)。
-
----
-
-## 6. macOS 控制面与 LAN Windows CUDA 📐
-
-已确定两级拓扑：当前 macOS 运行完整应用，一台 Windows GPU 主机承载三个服务用于共享资源组验证；随后使用三台 Windows GPU 主机各承载一个服务完成并行和故障隔离验证。远端控制固定使用密钥认证、host key 固定的 Windows OpenSSH，音频使用 `artifact-transfer`，不依赖共享文件系统。
-
-当前阶段只作为可审计补充门禁。升级为稳定发布门禁前仍需：
-
-1. 抽取跨平台 Python 编排核心，提供 POSIX 和 PowerShell 薄入口；
-2. 去除控制节点必须为 Windows、必须有本地 `nvidia-smi` 的假设；
-3. 为共享 GPU 和三 GPU topology 分别实现加载互斥、UUID 唯一性和性能规则；
-4. 自动完成远端 clean deploy、commit 核对、监控、故障注入和证据回收；
-5. 让一次性 preflight 同时绑定 topology、fixture、commit 和 SSH host key 哈希；
-6. 在真实 LAN 上先完成共享 GPU 补充认证，再完成三 GPU 首次认证和两名审核者签核；
-7. 与 Windows 控制节点的正式结果对比，确认没有未解释差异后再修改发布治理。
-
-完整设计和阶段一操作见 [macOS LAN CUDA 验证](cuda-e2e-macos-lan.md)。
+CUDA 验证/认证子系统（`cuda_validation.py`、单机/四机/macOS CUDA 门禁、`windows-gpu-validation.yml`、cuda-e2e 文档族、前端 cuda e2e）已整体删除。它服务于已废弃的自研 worker 路径，且从未在真实硬件跑通。剩余的真实硬件验收聚焦 ComfyUI + TTS-Audio-Suite 端到端，见 `docs/current-state-and-simplification-plan.md` 的下一阶段建议。

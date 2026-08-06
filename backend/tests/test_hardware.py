@@ -166,6 +166,3 @@ def test_ordinary_gpu_status_sources_do_not_reference_nvidia_smi() -> None:
 
     for source in ordinary_sources:
         assert "nvidia-smi" not in source.read_text(encoding="utf-8").casefold(), source
-
-    assert "nvidia-smi" in (repo_root / "backend" / "app" / "cuda_validation.py").read_text(encoding="utf-8").casefold()
-    assert "nvidia-smi" in (repo_root / "scripts" / "start-cuda-gpu-monitor.ps1").read_text(encoding="utf-8").casefold()

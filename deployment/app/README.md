@@ -37,6 +37,4 @@ scripts/deploy-local-tts.sh --repo-paths deployment/app/repo-paths.local.json
 .\scripts\deploy-local-tts.ps1 -Profile worker-node -Topology deployment\app\topology.four-node-lan.local.json -Node gpt-worker -RepoPaths deployment\app\repo-paths.local.json
 ```
 
-首次 `single-clean` 和首次 `distributed` 用于建立基线。基线批准后，`single-release`、分布式回归和发布工作流必须提供正数 `performance_baseline.warm_p95_seconds`。
-
-本页只说明部署资料。正式命令见 [单机 CUDA Runbook](../../docs/cuda-e2e-single-node.md)、[分布式 CUDA Runbook](../../docs/cuda-e2e-distributed.md) 和 [CUDA 验证契约](../../docs/cuda-e2e-validation.md)。
+本页只说明部署资料。正式命令和部署流程见 `docs/deployment.md` 与 `docs/comfyui-integration.md`。
