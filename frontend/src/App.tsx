@@ -77,7 +77,6 @@ import {
 } from "./api";
 import { defaultLanguage, languageOptions, nextLanguage, normalizeLanguage } from "./i18n";
 import { ReferenceAudioInput } from "./components/ReferenceAudioInput";
-import { LocalPortableServicesPanel } from "./components/LocalPortableServicesPanel";
 import { RoleAvatar } from "./components/RoleAvatar";
 import { ScriptManagerModal } from "./components/ScriptManagerModal";
 import { WaveformPlayer } from "./components/WaveformPlayer";
@@ -1882,7 +1881,6 @@ export default function App() {
 
                         {servicePanelSection === "open-source" && (
                           <div className="tts-access-panel">
-                            <LocalPortableServicesPanel onServicesStatusRefresh={refreshTopology} />
                             <section className="tts-access-card tts-access-primary">
                               <div className="tts-provider-segment" aria-label={t("services.openSourceChooseEngine")}>
                                 {openSourceCatalog.map((item) => (

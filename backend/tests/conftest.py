@@ -10,21 +10,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LEGACY_PORTABLE_TEST_MODULES = {
     "test_prepare_scripts.py",
-    "test_integration_sync.py",
-    "test_portable_control.py",
-    "test_portable_diagnostics.py",
-    "test_portable_discovery.py",
-    "test_portable_file_io.py",
-    "test_portable_first_run_harness.py",
-    "test_portable_install.py",
-    "test_portable_launcher.py",
-    "test_portable_locks.py",
-    "test_portable_migration.py",
-    "test_portable_operations.py",
-    "test_portable_packages.py",
-    "test_portable_python_runtime.py",
-    "test_portable_services.py",
-    "test_portable_start_controller.py",
 }
 
 if str(REPO_ROOT) not in sys.path:
