@@ -11,7 +11,8 @@ import { fetchAuthStatus, getApiToken, setApiToken } from "../api";
  *  - checks ``GET /api/auth/status`` on mount;
  *  - listens for ``tts-more:auth-required`` events (dispatched by api.ts on a
  *    401) and opens a small dialog to enter the token;
- *  - stores the token in localStorage so it persists across reloads.
+ *  - holds the token in memory only (never persisted), so a reload clears it
+ *    and this gate re-prompts when the backend requires auth.
  *
  * When auth is disabled on the backend, this component renders nothing.
  */
@@ -48,8 +49,8 @@ export function TokenGate() {
     setApiToken(draft.trim());
     setOpen(false);
     setDraft("");
-    // Reload so in-flight state is retried with the new token.
-    window.location.reload();
+    // No reload: the token is held in memory only, so a reload would clear it
+    // and immediately re-trigger the gate. Subsequent requests carry the token.
   };
 
   if (!open) {
@@ -96,7 +97,7 @@ export function TokenGate() {
         />
         <div className="token-gate-actions">
           <button type="button" className="primary" onClick={saved} disabled={!draft.trim()}>
-            保存并重载
+            保存
           </button>
         </div>
       </div>

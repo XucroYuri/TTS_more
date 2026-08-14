@@ -1,32 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
 import { getApiToken, setApiToken } from "./api";
 
-// vitest defaults to the node environment (no localStorage). Stub a minimal
-// localStorage so the token helpers can be exercised.
-function makeLocalStorage(): Storage {
-  const store = new Map<string, string>();
-  return {
-    getItem: (key: string) => store.get(key) ?? null,
-    setItem: (key: string, value: string) => store.set(key, value),
-    removeItem: (key: string) => store.delete(key),
-    clear: () => store.clear(),
-    key: (index: number) => Array.from(store.keys())[index] ?? null,
-    get length() {
-      return store.size;
-    },
-  };
-}
-
 describe("api token storage", () => {
+  // The token lives in a module-level variable, so tests share state.
+  // Reset before each test to keep assertions deterministic.
   beforeEach(() => {
-    vi.stubGlobal("localStorage", makeLocalStorage());
-  });
-  afterEach(() => {
-    vi.unstubAllGlobals();
+    setApiToken("");
   });
 
-  it("returns empty string when no token is stored", () => {
+  it("returns empty string when no token is set", () => {
     expect(getApiToken()).toBe("");
   });
 
@@ -41,4 +24,3 @@ describe("api token storage", () => {
     expect(getApiToken()).toBe("");
   });
 });
-

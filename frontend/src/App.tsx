@@ -249,6 +249,11 @@ export default function App() {
   const [activeRoleCandidateId, setActiveRoleCandidateId] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<GenerationJob | null>(null);
   const generationCancellationJobIdRef = useRef<string | null>(null);
+  const isGeneratingRef = useRef(false);
+  const generationRunTokenRef = useRef(0);
+  const lastGenerationProjectIdRef = useRef<string | null>(null);
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
+  const skipNextAutosaveRef = useRef(false);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [preflightResult, setPreflightResult] = useState<GenerationPreflightResponse | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -330,6 +335,10 @@ export default function App() {
   }, [t]);
 
   useEffect(() => {
+    if (lastGenerationProjectIdRef.current !== currentProjectId) {
+      lastGenerationProjectIdRef.current = currentProjectId;
+      generationRunTokenRef.current += 1;
+    }
     if (!currentProjectId) {
       setProject(createEmptyProject());
       setManifest(createEmptyManifest(null));
@@ -343,9 +352,12 @@ export default function App() {
       setSaveState("idle");
       return;
     }
+    let cancelled = false;
     setIsProjectLoaded(false);
     fetchProject(currentProjectId)
       .then((payload) => {
+        if (cancelled) return;
+        skipNextAutosaveRef.current = true;
         setProject(payload);
         setActiveLineId(payload.lines[0]?.id ?? "");
         setExpandedLineId(null);
@@ -355,11 +367,14 @@ export default function App() {
         setIsProjectLoaded(true);
         return fetchProjectCharacters(currentProjectId)
           .then((projectCharactersPayload) => {
+            if (cancelled) return;
+            skipNextAutosaveRef.current = true;
             setProject((current) => ({ ...current, project_characters: projectCharactersPayload.project_characters }));
           })
           .catch(() => undefined);
       })
       .catch(() => {
+        if (cancelled) return;
         setProject(createEmptyProject());
         setActiveLineId("");
         setExpandedLineId(null);
@@ -371,15 +386,26 @@ export default function App() {
         setNotice(t("empty.projectLoadFailed"));
       });
     fetchManifest(currentProjectId)
-      .then(setManifest)
-      .catch(() => setManifest(createEmptyManifest(currentProjectId)));
+      .then((manifestPayload) => {
+        if (!cancelled) setManifest(manifestPayload);
+      })
+      .catch(() => {
+        if (!cancelled) setManifest(createEmptyManifest(currentProjectId));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [currentProjectId, t]);
 
   useEffect(() => {
     if (!isProjectLoaded || !currentProjectId) return;
+    if (skipNextAutosaveRef.current) {
+      skipNextAutosaveRef.current = false;
+      return;
+    }
     setSaveState("saving");
     const handle = window.setTimeout(() => {
-      void saveCurrentProject();
+      saveChainRef.current = saveChainRef.current.then(() => saveCurrentProject());
     }, 700);
     return () => window.clearTimeout(handle);
   }, [characters, currentProjectId, isProjectLoaded, project]);
@@ -1213,6 +1239,10 @@ export default function App() {
       setNotice(t("empty.noProjectAction"));
       return;
     }
+    if (isGeneratingRef.current) return;
+    isGeneratingRef.current = true;
+    generationRunTokenRef.current += 1;
+    const runToken = generationRunTokenRef.current;
     setIsGenerating(true);
     generationCancellationJobIdRef.current = null;
     setNotice(t("notice.generating"));
@@ -1223,17 +1253,21 @@ export default function App() {
       }
       if (tasks.length === 0) return;
       const preflight = await ensureGenerationPreflight(tasks);
+      if (runToken !== generationRunTokenRef.current) return;
       if (preflight.status !== "ready") return;
       const job = await createGenerationJob(currentProjectId, tasks);
+      if (runToken !== generationRunTokenRef.current) return;
       setActiveJob(job);
       setNotice(t("notice.jobQueued", { job: job.job_id }));
-      const finalJob = await pollGenerationJob(job.job_id);
+      const finalJob = await pollGenerationJob(job.job_id, runToken);
+      if (finalJob === null || runToken !== generationRunTokenRef.current) return;
       setActiveJob((current) => reconcileGenerationJobSnapshot(
         current,
         finalJob,
         generationCancellationJobIdRef.current === finalJob.job_id,
       ));
       const nextManifest = await fetchManifest(currentProjectId);
+      if (runToken !== generationRunTokenRef.current) return;
       setManifest(nextManifest);
       const terminalNotice = generationTerminalNotice(finalJob.status);
       if (terminalNotice) {
@@ -1243,6 +1277,7 @@ export default function App() {
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.generationFailed"));
     } finally {
+      isGeneratingRef.current = false;
       setIsGenerating(false);
       generationCancellationJobIdRef.current = null;
     }
@@ -1319,9 +1354,11 @@ export default function App() {
     await runQueue(selectedLines.length > 0 ? selectedLines : filteredLines);
   }
 
-  async function pollGenerationJob(jobId: string): Promise<GenerationJob> {
+  async function pollGenerationJob(jobId: string, runToken: number): Promise<GenerationJob | null> {
     for (let attempt = 0; attempt < 240; attempt += 1) {
+      if (runToken !== generationRunTokenRef.current) return null;
       const job = await fetchGenerationJob(jobId);
+      if (runToken !== generationRunTokenRef.current) return null;
       setActiveJob((current) => reconcileGenerationJobSnapshot(
         current,
         job,
@@ -3042,7 +3079,7 @@ export default function App() {
                       {!canGenerateLine && <span className="line-meta-chip attention">{t("status.needsSetup")}</span>}
                       <span className="row-actions">
                         <button className="icon-button tiny" onClick={(event) => { event.stopPropagation(); playLine(line); }} title={t("actions.playLatest")}><Play size={14} /></button>
-                        <button className="icon-button tiny" disabled={!canGenerateLine} onClick={(event) => { event.stopPropagation(); void runQueue([line]); }} title={canGenerateLine ? t("actions.regenerate") : t("inspector.needsTemporaryBinding")}><RefreshCw size={14} /></button>
+                        <button className="icon-button tiny" disabled={!canGenerateLine || isGenerating} onClick={(event) => { event.stopPropagation(); void runQueue([line]); }} title={canGenerateLine ? t("actions.regenerate") : t("inspector.needsTemporaryBinding")}><RefreshCw size={14} /></button>
                       </span>
                     </div>
                     {queueItem && <div className="line-progress"><span style={{ width: `${Math.round(queueItem.progress * 100)}%` }} /></div>}

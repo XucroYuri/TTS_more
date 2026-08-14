@@ -2,28 +2,19 @@ import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, Gen
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
-const TOKEN_STORAGE_KEY = "tts_more_token";
+/** API token for the optional backend auth (set when the backend has
+ * TTS_MORE_API_TOKEN configured). Held only in a module variable — never
+ * persisted — so an XSS cannot steal it and a page reload clears it. After a
+ * reload the 401 → tts-more:auth-required → TokenGate flow re-prompts for
+ * re-entry. Returns "" when unset. */
+let apiToken = "";
 
-/** Read the optional API token from localStorage (set when the backend has
- * TTS_MORE_API_TOKEN configured). Returns "" when unset. */
 export function getApiToken(): string {
-  try {
-    return localStorage.getItem(TOKEN_STORAGE_KEY) ?? "";
-  } catch {
-    return "";
-  }
+  return apiToken;
 }
 
 export function setApiToken(token: string): void {
-  try {
-    if (token) {
-      localStorage.setItem(TOKEN_STORAGE_KEY, token);
-    } else {
-      localStorage.removeItem(TOKEN_STORAGE_KEY);
-    }
-  } catch {
-    /* ignore storage errors (private mode etc.) */
-  }
+  apiToken = token;
 }
 
 export async function fetchAuthStatus(): Promise<{ auth_required: boolean }> {
