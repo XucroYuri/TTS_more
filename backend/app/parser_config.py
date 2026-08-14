@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.net_guard import EgressError, validate_egress_url
 from app.parser import ParserProviderConfig
 
 
@@ -78,6 +79,8 @@ def public_parser_providers(path: Path, env_path: Path) -> dict[str, list[dict[s
 
 
 def save_parser_providers(path: Path, env_path: Path, payload: ParserProvidersUpdate) -> list[ParserProviderRecord]:
+    for provider in payload.providers:
+        _validate_parser_provider_egress(provider)
     records = _sorted_records(
         [
             ParserProviderRecord(
@@ -99,6 +102,21 @@ def save_parser_providers(path: Path, env_path: Path, payload: ParserProvidersUp
         if provider.api_key:
             set_env_value(env_path, provider.api_key_env, provider.api_key)
     return records
+
+
+def _validate_parser_provider_egress(provider: ParserProviderUpdate) -> None:
+    base_url = provider.base_url.strip()
+    if not base_url:
+        # Empty base_urls are legitimate placeholder values; skip validation.
+        return
+    try:
+        # resolve_dns=False keeps config saves deterministic and network-free;
+        # scheme / literal-IP / forbidden-hostname checks already block the
+        # metadata (169.254.x.x) and internal-address SSRF vectors. DNS-rebinding
+        # is guarded at the point of the actual request (e.g. the test route).
+        validate_egress_url(base_url, allow_loopback=True, resolve_dns=False)
+    except EgressError as exc:
+        raise EgressError(f"provider {provider.name}: {exc}") from exc
 
 
 def set_env_value(path: Path, key: str, value: str) -> None:

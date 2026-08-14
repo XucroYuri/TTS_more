@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -44,6 +45,8 @@ from app.service_store_io import ServicePostCommitError
 DEFAULT_REFERENCE_AUDIO_ROOT = Path("data") / "local" / "reference-audio"
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_RUNTIME_ROOT = Path("data") / ".runtime"
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_repo_lock_path(module_file: Path = Path(__file__)) -> Path:
@@ -215,6 +218,8 @@ def create_app(
             )
         except ManagedPortableLocatorMutationError as exc:
             raise _managed_portable_locator_mutation_http_error() from exc
+        except EgressError as exc:
+            raise HTTPException(status_code=400, detail=f"base_url is not allowed: {exc}") from exc
         if mock_mode:
             registry = _mocked_registry(registry)
         app.state.services_path = app.state.writable_services_path
@@ -432,6 +437,8 @@ def create_app(
     def put_parser_providers(request: ParserProvidersUpdate) -> dict[str, Any]:
         try:
             save_parser_providers(parser_config_file, env_file, request)
+        except EgressError as exc:
+            raise HTTPException(status_code=400, detail=f"base_url is not allowed: {exc}") from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         app.state.parser = _build_parser(parser_config_file)
@@ -515,11 +522,18 @@ def create_app(
         character = next((item for item in characters if item.id == character_id), None)
         if character is None:
             raise HTTPException(status_code=404, detail="character not found")
-        content = await file.read()
+        if file.size is not None and file.size > app.state.max_upload_bytes:
+            raise HTTPException(status_code=413, detail="avatar image exceeds upload limit")
+        content = bytearray()
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > app.state.max_upload_bytes:
+                raise HTTPException(status_code=413, detail="avatar image exceeds upload limit")
         if not content:
             raise HTTPException(status_code=400, detail="avatar image is empty")
-        if len(content) > app.state.max_upload_bytes:
-            raise HTTPException(status_code=413, detail=f"avatar image exceeds upload limit")
 
         output_dir = Path(app.state.store.root) / "character_avatars"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -544,11 +558,18 @@ def create_app(
         character = next((item for item in characters if item.id == character_id), None)
         if character is None:
             raise HTTPException(status_code=404, detail="character not found")
-        content = await file.read()
+        if file.size is not None and file.size > app.state.max_upload_bytes:
+            raise HTTPException(status_code=413, detail="audio file exceeds upload limit")
+        content = bytearray()
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > app.state.max_upload_bytes:
+                raise HTTPException(status_code=413, detail="audio file exceeds upload limit")
         if not content:
             raise HTTPException(status_code=400, detail="audio file is empty")
-        if len(content) > app.state.max_upload_bytes:
-            raise HTTPException(status_code=413, detail=f"audio file exceeds upload limit")
 
         safe_character_id = _safe_upload_name(character_id).removesuffix(Path(_safe_upload_name(character_id)).suffix)
         output_dir = Path(app.state.store.root) / "character_reference_audio" / safe_character_id
@@ -951,11 +972,18 @@ def create_app(
         while output_path.exists():
             output_path = output_dir / f"{output_path.stem}-{counter}{suffix}"
             counter += 1
-        content = await file.read()
+        if file.size is not None and file.size > app.state.max_upload_bytes:
+            raise HTTPException(status_code=413, detail="audio file exceeds upload limit")
+        content = bytearray()
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > app.state.max_upload_bytes:
+                raise HTTPException(status_code=413, detail="audio file exceeds upload limit")
         if not content:
             raise HTTPException(status_code=400, detail="audio file is empty")
-        if len(content) > app.state.max_upload_bytes:
-            raise HTTPException(status_code=413, detail=f"audio file exceeds upload limit")
         output_path.write_bytes(content)
         return {
             "sample": {
@@ -1200,7 +1228,12 @@ def create_app(
             try:
                 route = app.state.service_router.resolve_task(task)
                 key = build_cluster_key(task, route)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "Failed to resolve route for task line %s, falling back to 'unresolved'",
+                    task.line.id,
+                    exc_info=True,
+                )
                 key = "unresolved"
             item = clusters.setdefault(key, {"cluster_key": key, "count": 0, "line_ids": []})
             item["count"] += 1

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import base64
 import hashlib
 import re
 import time
 import uuid
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +25,7 @@ from app.adapters.base import (
 )
 from app.comfyui.output import publish_wav_atomic
 from app.models import EngineName, ProviderType, TTSIntent, TTSServiceEndpoint, VoiceBinding
-from app.net_guard import scrub_error
+from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.portable_endpoint_trust import (
     preflight_service_endpoints,
     require_unique_service_identities,
@@ -32,6 +33,8 @@ from app.portable_endpoint_trust import (
 )
 from app.portable_locator_mutations import require_managed_portable_locators_unchanged
 from app.service_store_io import ServiceDocument, read_service_document, update_service_document
+
+logger = logging.getLogger(__name__)
 
 COMFYUI_TTS_AUDIO_SUITE_CONTRACT = "comfyui-tts-audio-suite-v1"
 COMFYUI_TTS_CONTRACTS = {"comfyui-tts-v1", COMFYUI_TTS_AUDIO_SUITE_CONTRACT}
@@ -486,7 +489,8 @@ class ServiceRouter:
     def _client_ready(self, client: TTSServiceClient) -> bool:
         try:
             return bool(client.health().get("ready"))
-        except Exception:
+        except Exception as exc:
+            logger.warning("Health check failed for service %s", client.endpoint.service_id, exc_info=True)
             return False
 
 
@@ -598,6 +602,34 @@ def _normalize_path_for_compare(value: str) -> str:
     return value.replace("\\", "/").rstrip("/").casefold()
 
 
+def _validate_endpoint_egress(endpoint: TTSServiceEndpoint) -> None:
+    """Reject endpoints whose outbound URLs violate the egress policy.
+
+    Runs once at client construction time so every later httpx call through
+    ``self.endpoint.base_url`` is backed by this validation. Uses
+    ``resolve_dns=False``: construction must not depend on DNS/network state.
+    """
+    base_url = (endpoint.base_url or "").strip()
+    if not base_url:
+        return
+    allow_loopback = endpoint.network_scope in ("localhost", "lan")
+    allow_private = endpoint.network_scope == "lan"
+    urls = [base_url]
+    health_url = (endpoint.health_url or "").strip()
+    if health_url:
+        urls.append(health_url)
+    for url in urls:
+        try:
+            validate_egress_url(
+                url,
+                allow_loopback=allow_loopback,
+                allow_private=allow_private,
+                resolve_dns=False,
+            )
+        except EgressError as exc:
+            raise EgressError(f"service {endpoint.service_id}: {exc}") from exc
+
+
 class MockServiceClient:
     def __init__(self, endpoint: TTSServiceEndpoint) -> None:
         self.endpoint = endpoint
@@ -623,6 +655,7 @@ class MockServiceClient:
 
 class HttpTTSServiceClient:
     def __init__(self, endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> None:
+        _validate_endpoint_egress(endpoint)
         self.endpoint = endpoint
         self.transport = transport
         self._uploaded_references: dict[tuple[str, int, int], tuple[str, float]] = {}
@@ -647,7 +680,8 @@ class HttpTTSServiceClient:
                 response = client.get(self.endpoint.base_url.rstrip("/") + "/capabilities", headers=self._headers())
                 response.raise_for_status()
                 return response.json()
-        except Exception:
+        except Exception as exc:
+            logger.warning("Capabilities request failed for service %s", self.endpoint.service_id, exc_info=True)
             return {"capabilities": self.endpoint.capabilities}
 
     def model_catalog(self, limit: int = 120) -> dict[str, Any]:
@@ -766,6 +800,10 @@ class HttpTTSServiceClient:
             return False
 
     def _upload_reference(self, path: Path) -> str:
+        if _endpoint_accessible_roots(self.endpoint) and not _endpoint_can_access_path(self.endpoint, str(path)):
+            raise ValueError(
+                f"reference path {path} is outside the accessible roots of service {self.endpoint.service_id}"
+            )
         resolved = path.resolve(strict=True)
         stat = resolved.stat()
         cache_key = (str(resolved), stat.st_mtime_ns, stat.st_size)
@@ -1295,7 +1333,21 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
         path = _audio_reference_path(audio_ref)
         if not path:
             raise RuntimeError("Gradio audio output path is empty")
-        url = path if path.startswith(("http://", "https://")) else self.endpoint.base_url.rstrip("/") + _gradio_file_path(path)
+        if path.startswith(("http://", "https://")):
+            parsed = urlsplit(path)
+            endpoint_parsed = urlsplit(self.endpoint.base_url)
+            if (parsed.scheme, parsed.hostname) != (endpoint_parsed.scheme, endpoint_parsed.hostname):
+                raise ValueError(
+                    f"Gradio returned an audio URL on host {parsed.hostname!r}, "
+                    f"but endpoint {self.endpoint.service_id} is configured for host {endpoint_parsed.hostname!r}"
+                )
+            url = validate_egress_url(
+                path,
+                allow_loopback=self.endpoint.network_scope in ("localhost", "lan"),
+                allow_private=self.endpoint.network_scope == "lan",
+            )
+        else:
+            url = self.endpoint.base_url.rstrip("/") + _gradio_file_path(path)
         with httpx.Client(timeout=120.0, transport=self.transport) as client:
             response = client.get(url, headers=self._headers())
             response.raise_for_status()
@@ -1872,6 +1924,7 @@ def _extract_gemini_audio(data: dict[str, Any]) -> bytes:
 
 class ComfyUITTSClient:
     def __init__(self, endpoint: TTSServiceEndpoint, transport: httpx.BaseTransport | None = None) -> None:
+        _validate_endpoint_egress(endpoint)
         from app.comfyui.client import ComfyUIAPIClient
         from app.comfyui.workflow_builder import build_workflow as _build_workflow
 
@@ -1916,7 +1969,8 @@ class ComfyUITTSClient:
                     "progress": progress,
                 }
             )
-        except Exception:
+        except Exception as exc:
+            logger.debug("Progress callback failed for prompt %s", prompt_id, exc_info=True)
             return
 
     def _synthesize_impl(self, request: SynthesisRequest) -> SynthesisResult:
@@ -2059,7 +2113,8 @@ class ComfyUITTSClient:
             raise synthesis_error
         if cleanup_error is not None:
             raise cleanup_error
-        assert result is not None
+        if result is None:
+            raise RuntimeError("ComfyUI synthesis finished without producing a result")
         self._emit_prompt_progress(request, str(result.metadata["prompt_id"]), "completed", 1.0)
         return result
 

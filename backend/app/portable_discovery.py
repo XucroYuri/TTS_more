@@ -126,7 +126,8 @@ def read_portable_package(package_root: Path) -> PortablePackageDescriptor:
         label="portable package manifest",
         retries=2,
     )
-    assert manifest_bytes is not None
+    if manifest_bytes is None:
+        raise ValueError("portable package manifest is missing")
     payload = json.loads(manifest_bytes.decode("utf-8-sig"))
     if not isinstance(payload, dict):
         raise ValueError("portable manifest must be a JSON object")

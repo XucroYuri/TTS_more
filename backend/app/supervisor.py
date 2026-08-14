@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -19,6 +20,9 @@ from app.portable_control import (
 )
 from app.portable_endpoint_trust import trust_resolved_portable_endpoint
 from app.portable_services import resolve_locator
+
+
+logger = logging.getLogger(__name__)
 
 
 def _is_windows() -> bool:
@@ -512,5 +516,6 @@ class ServiceSupervisor:
                 return str(pid) in result.stdout
             os.kill(int(pid), 0)
             return True
-        except Exception:
+        except Exception as exc:
+            logger.debug("Could not verify whether PID %s is running: %s", pid, exc)
             return False

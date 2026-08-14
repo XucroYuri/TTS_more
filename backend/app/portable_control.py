@@ -646,8 +646,14 @@ class PortablePackageController:
         action_id: str,
         tracked: _TrackedAction,
     ) -> dict[str, object]:
-        assert tracked.failure_code is not None
-        assert tracked.failure_reason is not None
+        if tracked.failure_code is None:
+            raise PortableControlError(
+                "PORTABLE_ACTION_INVALID", "blocked portable action has no failure code"
+            )
+        if tracked.failure_reason is None:
+            raise PortableControlError(
+                "PORTABLE_ACTION_INVALID", "blocked portable action has no failure reason"
+            )
         return {
             "status": "blocked",
             "action": tracked.action,
@@ -682,11 +688,18 @@ class PortablePackageController:
                 )
             launcher = _contained_path(root, expected, label=f"{action} launcher")
             launcher_file = _regular_file(launcher, f"{action} launcher", required=True)
-            assert launcher_file is not None
+            if launcher_file is None:
+                raise PortableControlError(
+                    "PORTABLE_LAUNCHER_INVALID",
+                    f"portable {action} launcher could not be established",
+                )
             manifest = _regular_file(
                 root / "package" / "tts-more-package.json", "package manifest", required=True
             )
-            assert manifest is not None
+            if manifest is None:
+                raise PortableControlError(
+                    "PORTABLE_FILE_MISSING", "portable package manifest could not be established"
+                )
             return _ActionContext(
                 root=root,
                 descriptor=fresh,
@@ -1144,7 +1157,8 @@ def _decode_json_object(content: bytes, label: str) -> dict[str, object]:
 
 def _read_json(root: Path, path: Path, label: str) -> dict[str, object]:
     content = _safe_read_control(root, path, max_bytes=_MAX_JSON_BYTES, label=label)
-    assert content is not None
+    if content is None:
+        raise PortableControlError("PORTABLE_FILE_MISSING", f"{label} is missing")
     return _decode_json_object(content, label)
 
 
@@ -1305,7 +1319,8 @@ def _bounded_text(value: object, maximum: int) -> bool:
 def _normalize_iso_timestamp(value: object) -> str | None:
     if not _bounded_text(value, 64):
         return None
-    assert isinstance(value, str)
+    if not isinstance(value, str):
+        raise RuntimeError("_normalize_iso_timestamp requires a bounded string")
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
         if parsed.tzinfo is None or parsed.utcoffset() is None:

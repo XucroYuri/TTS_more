@@ -300,7 +300,8 @@ def evaluate_launcher_failure_context(
         observed_at=observed,
     ):
         try:
-            assert failure_stamp is not None
+            if failure_stamp is None:
+                raise ValueError("launcher failure stamp is unavailable")
             failure = FailureMarker.model_validate_json(
                 _read_current_bytes(output_root / "failure.json", failure_stamp)
             )
@@ -323,7 +324,8 @@ def evaluate_launcher_failure_context(
         observed_at=observed,
     ):
         try:
-            assert summary_stamp is not None
+            if summary_stamp is None:
+                raise ValueError("launcher summary stamp is unavailable")
             summary = read_reliability_summary(
                 _read_current_bytes(
                     output_root / "reliability-summary.json",

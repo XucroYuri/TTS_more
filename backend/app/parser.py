@@ -10,7 +10,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from app.models import Character, ScriptLine
-from app.net_guard import scrub_error
+from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.role_library import slugify_role_name
 
 _WRAPPING_DIALOGUE_QUOTES = "\"'“”‘’「」『』《》"
@@ -519,6 +519,11 @@ class OpenAICompatibleProvider:
         self.config = config
         self.name = config.name
         self.verifier = verifier or ScriptParseVerifier()
+        if config.base_url.strip():
+            try:
+                validate_egress_url(config.base_url, allow_loopback=True, resolve_dns=False)
+            except EgressError as exc:
+                raise EgressError(f"provider {self.name}: {exc}") from exc
 
     def parse(self, text: str) -> ParsedScriptDraft:
         if not self.config.enabled:
@@ -629,6 +634,11 @@ class AnthropicProvider:
         self.config = config
         self.name = config.name
         self.verifier = verifier or ScriptParseVerifier()
+        if config.base_url.strip():
+            try:
+                validate_egress_url(config.base_url, allow_loopback=True, resolve_dns=False)
+            except EgressError as exc:
+                raise EgressError(f"provider {self.name}: {exc}") from exc
 
     def parse(self, text: str) -> ParsedScriptDraft:
         if not self.config.enabled:
