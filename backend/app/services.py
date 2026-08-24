@@ -939,6 +939,13 @@ class GradioWebUIServiceClient(HttpTTSServiceClient):
     def unload(self) -> None:
         return
 
+    def model_samples(self, logs_name: str, limit: int = 120) -> dict[str, Any]:
+        # Gradio WebUI does not expose the worker REST /models/... samples API.
+        # Raising here lets the catalog endpoint fall back to local filesystem
+        # scanning instead of attempting a pointless HTTP request to a port that
+        # only serves the Gradio UI (and would hang until the generic timeout).
+        raise NotImplementedError("Gradio WebUI has no model_samples API")
+
     def health(self) -> dict[str, Any]:
         missing = self._missing_env()
         if missing:
