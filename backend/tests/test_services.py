@@ -5,8 +5,8 @@ from pathlib import Path
 import httpx
 
 from app.adapters.base import SynthesisRequest
-from app.models import EngineName, ScriptLine, TTSServiceEndpoint
-from app.services import ServiceRegistry, ServiceRouter, build_load_signature, _health_timeout_seconds, build_service_client, _gpt_sovits_gradio_logs_candidates, _slugish
+from app.models import EngineName, ProviderType, ScriptLine, TTSServiceEndpoint
+from app.services import GradioWebUIServiceClient, ServiceRegistry, ServiceRouter, build_load_signature, _health_timeout_seconds, build_service_client, _gpt_sovits_gradio_logs_candidates, _slugish
 
 
 class ReadyClient:
@@ -918,6 +918,33 @@ def test_gradio_synthesis_uses_operation_timeout_for_config_fetch(tmp_path: Path
 
     assert result.audio_path.read_bytes() == b"RIFFtimeout"
     assert config_timeouts[0] == 123
+
+
+def test_gradio_model_samples_falls_back_without_http_request() -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="lan-gpt-gradio",
+        engine=EngineName.GPT_SOVITS,
+        provider_type=ProviderType.GPT_SOVITS,
+        api_contract="gradio-gpt-sovits-webui",
+        base_url="http://192.0.2.166:9872",
+        network_scope="lan",
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    client = GradioWebUIServiceClient(endpoint, transport=httpx.MockTransport(handler))
+
+    try:
+        client.model_samples("demo-hero-logs")
+    except NotImplementedError as exc:
+        assert str(exc) == "Gradio WebUI has no model_samples API"
+    else:
+        raise AssertionError("Gradio sample lookup must fall back to local scanning")
+
+    assert requests == []
 
 
 def test_gpt_sovits_load_signature_covers_weights_reference_and_prompt() -> None:
