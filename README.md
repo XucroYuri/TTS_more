@@ -28,7 +28,7 @@ flowchart LR
 ### 1. 获取代码
 
 ```bash
-git clone https://github.com/XucroYuri/TTS_more.git
+git clone REPOSITORY_URL
 cd TTS_more
 ```
 
