@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import threading
 import uuid
@@ -11,7 +12,7 @@ from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, Field
 
-from app.models import ScriptRevision
+from app.models import ParseRevision, ScriptProject, ScriptRevision
 from app.path_safety import validate_windows_component
 from app.semantic_models import (
     AnalysisRun,
@@ -26,6 +27,7 @@ from app.semantic_models import (
     SemanticUtterance,
 )
 from app.semantic_source import validate_source_span
+from app.semantic_projection import SemanticProjectionError, project_confirmed_draft
 from app.storage import ProjectStore, windows_filesystem_path, windows_path_identity
 
 
@@ -149,6 +151,12 @@ class DraftPatchRequest(BaseModel):
     operations: list[DraftOperation]
 
 
+class SemanticConfirmResult(BaseModel):
+    project: ScriptProject
+    semantic_revision: SemanticRevision
+    parse_revision: ParseRevision
+
+
 class SemanticStore:
     _index_locks_guard = threading.Lock()
     _index_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
@@ -256,6 +264,55 @@ class SemanticStore:
     def load_revision(self, revision_id: str) -> SemanticRevision:
         project_id = self._project_for("revisions", revision_id)
         return self._read_model(self._revision_path(project_id, revision_id), SemanticRevision)
+
+    def confirm_draft(
+        self,
+        draft_id: str,
+        expected_version: int,
+        idempotency_key: str,
+    ) -> SemanticConfirmResult:
+        self._validate_idempotency_key(idempotency_key)
+        project_id = self._project_for("drafts", draft_id)
+        with self.project_store.project_lock(project_id):
+            draft = self._read_model(self._draft_path(project_id, draft_id), SemanticAnalysisDraft)
+            if draft.confirmed_revision_id is not None:
+                if draft.confirm_idempotency_key != idempotency_key:
+                    raise SemanticConflictError("draft_confirmed")
+                return self._recover_confirmed(draft)
+
+            if draft.version != expected_version:
+                raise SemanticConflictError("draft_version_conflict")
+            run = self._read_model(
+                self._run_path(project_id, self._run_for_draft(draft_id)),
+                AnalysisRun,
+            )
+            if run.status in {AnalysisRunStatus.QUEUED, AnalysisRunStatus.RUNNING}:
+                raise SemanticConflictError("semantic_run_not_terminal")
+
+            source = self._source_revision(project_id, draft.source_revision_id)
+            self._validate_draft(draft, source)
+            revision_id = self._semantic_revision_id(project_id, draft.id, idempotency_key)
+            semantic_revision = self._create_or_load_revision(draft, revision_id)
+
+            project = self.project_store.load_project(project_id)
+            parse_revision = project_confirmed_draft(project, draft, semantic_revision.id)
+            self.project_store.save_project(project_id, project)
+
+            confirmed = draft.model_copy(
+                update={
+                    "confirmed_revision_id": semantic_revision.id,
+                    "confirmed_parse_revision_id": parse_revision.revision_id,
+                    "confirm_idempotency_key": idempotency_key,
+                    "updated_at": _now(),
+                },
+                deep=True,
+            )
+            self._write_model(self._draft_path(project_id, draft.id), confirmed)
+            return SemanticConfirmResult(
+                project=project,
+                semantic_revision=semantic_revision,
+                parse_revision=parse_revision,
+            )
 
     def interrupt_incomplete_runs(self) -> int:
         index = self._load_index()
@@ -413,6 +470,101 @@ class SemanticStore:
             if revision.revision_id == source_revision_id:
                 return revision
         raise SemanticNotFoundError("source_revision_not_found")
+
+    def _recover_confirmed(self, draft: SemanticAnalysisDraft) -> SemanticConfirmResult:
+        if draft.confirmed_revision_id is None or draft.confirmed_parse_revision_id is None:
+            raise SemanticValidationError("confirmed_draft_incomplete")
+        semantic_revision = self._create_or_load_revision(draft, draft.confirmed_revision_id)
+        project = self.project_store.load_project(draft.project_id)
+        original = copy.deepcopy(project)
+        parse_revision = project_confirmed_draft(project, draft, semantic_revision.id)
+        if parse_revision.revision_id != draft.confirmed_parse_revision_id:
+            raise SemanticProjectionError("parse_revision_collision")
+        if project != original:
+            self.project_store.save_project(draft.project_id, project)
+        return SemanticConfirmResult(
+            project=project,
+            semantic_revision=semantic_revision,
+            parse_revision=parse_revision,
+        )
+
+    def _create_or_load_revision(
+        self,
+        draft: SemanticAnalysisDraft,
+        revision_id: str,
+    ) -> SemanticRevision:
+        expected = self._revision_snapshot(draft, revision_id)
+        path = self._revision_path(draft.project_id, revision_id)
+        with self._index_lock():
+            index = self._load_index()
+            metadata = index["revisions"].get(revision_id)
+            if metadata is not None and (
+                not isinstance(metadata, dict)
+                or metadata.get("project_id") != draft.project_id
+                or metadata.get("draft_id") != draft.id
+            ):
+                raise SemanticValidationError("semantic_revision_collision")
+            if path.exists():
+                revision = self._read_model(path, SemanticRevision)
+                if not self._revision_is_compatible(revision, expected):
+                    raise SemanticValidationError("semantic_revision_collision")
+            else:
+                revision = expected
+                self._write_model(path, revision)
+            if metadata is None:
+                index["revisions"][revision_id] = {
+                    "project_id": draft.project_id,
+                    "draft_id": draft.id,
+                }
+                self._write_index(index)
+            return revision
+
+    @staticmethod
+    def _revision_snapshot(
+        draft: SemanticAnalysisDraft,
+        revision_id: str,
+    ) -> SemanticRevision:
+        return SemanticRevision(
+            id=revision_id,
+            project_id=draft.project_id,
+            source_revision_id=draft.source_revision_id,
+            annotations=copy.deepcopy(draft.annotations),
+            characters=copy.deepcopy(draft.characters),
+            utterances=copy.deepcopy(draft.utterances),
+            unresolved_candidates=copy.deepcopy(draft.unresolved_candidates),
+            warnings=copy.deepcopy(draft.warnings),
+            provider=draft.provider,
+            model=draft.model,
+            prompt_version=draft.prompt_version,
+            contract_version=draft.contract_version,
+        )
+
+    @staticmethod
+    def _revision_is_compatible(
+        existing: SemanticRevision,
+        expected: SemanticRevision,
+    ) -> bool:
+        return existing.model_dump(exclude={"created_at"}) == expected.model_dump(exclude={"created_at"})
+
+    @staticmethod
+    def _semantic_revision_id(
+        project_id: str,
+        draft_id: str,
+        idempotency_key: str,
+    ) -> str:
+        digest = hashlib.sha256(
+            f"{project_id}\0{draft_id}\0{idempotency_key}".encode("utf-8")
+        ).hexdigest()
+        return f"revision-{digest}"
+
+    @staticmethod
+    def _validate_idempotency_key(idempotency_key: str) -> None:
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key.strip()
+            or len(idempotency_key) > 512
+        ):
+            raise SemanticValidationError("invalid_idempotency_key")
 
     def _project_for(self, kind: str, identifier: str) -> str:
         safe_identifier = self._safe_id(identifier)

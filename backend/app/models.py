@@ -569,6 +569,10 @@ class GenerationManifest(BaseModel):
 
 
 def _line_with_revision_uid(line: ScriptLine, parse_revision_id: str) -> ScriptLine:
+    return line_with_revision_uid(line, parse_revision_id)
+
+
+def line_with_revision_uid(line: ScriptLine, parse_revision_id: str) -> ScriptLine:
     if line.line_uid and line.line_uid.startswith(f"{parse_revision_id}:"):
         return line
     return line.model_copy(update={"line_uid": f"{parse_revision_id}:{line.id}"})

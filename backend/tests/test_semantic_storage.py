@@ -487,3 +487,17 @@ def test_project_lock_serializes_same_project_mutations(project_store: ProjectSt
     first_thread.join(2)
     second_thread.join(2)
     assert acquired == ["second"]
+
+
+def test_confirmation_uses_dedicated_marker_write_without_incrementing_edit_version(project_store: ProjectStore) -> None:
+    _storage()
+    store = SemanticStore(project_store)
+    _run, draft = _seed_draft(store)
+
+    result = store.confirm_draft(draft.id, draft.version, "storage-confirm-key")
+
+    confirmed = store.load_draft(draft.id)
+    assert confirmed.version == draft.version
+    assert confirmed.confirmed_revision_id == result.semantic_revision.id
+    assert confirmed.confirmed_parse_revision_id == result.parse_revision.revision_id
+    assert confirmed.confirm_idempotency_key == "storage-confirm-key"
