@@ -1169,6 +1169,168 @@ def test_generate_writes_audio_manifest_under_project_output(tmp_path: Path) -> 
     assert (tmp_path / "Project" / "剧本 Demo" / "output" / "manifest.json").is_file()
 
 
+def test_script_revision_persists_exact_source_hash_and_file_metadata(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "zh"})
+    source = "  第一行\r\n😀 第二行 \r\n"
+
+    response = client.post(
+        "/api/projects/demo/script-revisions",
+        json={
+            "source_markdown": source,
+            "source_filename": "场景 一（最终）.md",
+            "source_media_type": "text/markdown",
+        },
+    )
+
+    assert response.status_code == 200
+    revision = response.json()["revision"]
+    assert revision["source_markdown"] == source
+    assert revision["source_filename"] == "场景 一（最终）.md"
+    assert revision["source_media_type"] == "text/markdown"
+    assert revision["source_sha256"] == "268c518e000bed760cce0df64a724ac41db87e96188426119edd4eb7d5397f24"
+    persisted = client.get("/api/projects/demo/script-revisions").json()["script_revisions"][-1]
+    assert persisted == revision
+
+
+def test_script_revision_paste_persists_null_metadata_and_source_hash(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "zh"})
+
+    response = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "粘贴台词"},
+    )
+
+    assert response.status_code == 200
+    revision = response.json()["revision"]
+    assert revision["source_filename"] is None
+    assert revision["source_media_type"] is None
+    assert revision["source_sha256"] == "b3810edbf4db06cc175246338660384423bcc2fb16ef3b3a13e03d7c557ddafb"
+
+
+def test_script_revision_accepts_plain_text_media_type(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "zh"})
+
+    response = client.post(
+        "/api/projects/demo/script-revisions",
+        json={
+            "source_markdown": "旁白：你好。",
+            "source_filename": "scene.txt",
+            "source_media_type": "text/plain",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["revision"]["source_media_type"] == "text/plain"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"source_filename": "   "},
+        {"source_filename": "x" * 256},
+        {"source_media_type": "   "},
+    ],
+)
+def test_script_revision_rejects_invalid_optional_source_metadata_without_mutation(
+    tmp_path: Path,
+    metadata: dict[str, str],
+) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "zh"})
+    project_path = client.app.state.store.project_path("demo")
+    before = project_path.read_bytes()
+
+    response = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "旁白：你好。", **metadata},
+    )
+
+    assert response.status_code == 422
+    assert project_path.read_bytes() == before
+
+
+def test_script_revision_configured_codepoint_limit_is_inclusive_and_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TTS_MORE_MAX_SCRIPT_CODEPOINTS", "4")
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "zh"})
+    project_dir = client.app.state.store.project_dir("demo")
+    before = {
+        path.relative_to(project_dir): path.read_bytes()
+        for path in project_dir.rglob("*")
+        if path.is_file()
+    }
+
+    rejected = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "甲\r\n😀乙"},
+    )
+
+    assert rejected.status_code == 413
+    assert rejected.json()["detail"] == "source_markdown exceeds 4 code points"
+    after = {
+        path.relative_to(project_dir): path.read_bytes()
+        for path in project_dir.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+    accepted = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "甲\r\n😀"},
+    )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["revision"]["source_markdown"] == "甲\r\n😀"
+
+
+@pytest.mark.parametrize("configured_limit", ["0", "-1", "not-an-integer"])
+def test_create_app_rejects_invalid_script_codepoint_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured_limit: str,
+) -> None:
+    monkeypatch.setenv("TTS_MORE_MAX_SCRIPT_CODEPOINTS", configured_limit)
+
+    with pytest.raises(ValueError, match="TTS_MORE_MAX_SCRIPT_CODEPOINTS must be a positive integer"):
+        create_app(data_root=tmp_path)
+
+
+def test_configured_codepoint_limit_is_injected_into_semantic_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TTS_MORE_MAX_SCRIPT_CODEPOINTS", "4")
+    client = TestClient(create_app(data_root=tmp_path))
+    source = main_module.ScriptRevision(
+        revision_id="script-r001",
+        source_markdown="甲\r\n😀乙",
+    )
+    client.app.state.store.save_project(
+        "demo",
+        main_module.ScriptProject(
+            title="Demo",
+            script_revisions=[source],
+            active_script_revision_id=source.revision_id,
+        ),
+    )
+
+    response = client.post(
+        "/api/projects/demo/analysis-runs",
+        json={"source_revision_id": source.revision_id},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "source_too_large"
+    assert not client.app.state.store.project_semantic_dir("demo").exists()
+    assert not (tmp_path / "semantic" / "index.json").exists()
+
+
 def test_script_revision_api_creates_parse_branch_without_overwriting_manifest(tmp_path: Path) -> None:
     services_path = tmp_path / "services.json"
     services_path.write_text(

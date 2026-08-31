@@ -167,15 +167,18 @@ class SemanticStore:
     _index_locks_guard = threading.Lock()
     _index_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
 
-    def __init__(self, project_store: ProjectStore) -> None:
+    def __init__(self, project_store: ProjectStore, max_source_codepoints: int = 200_000) -> None:
         self.project_store = project_store
+        self.max_source_codepoints = max_source_codepoints
 
     def create_run_and_draft(
         self, project_id: str, source_revision_id: str, *, trace_id: str
     ) -> tuple[AnalysisRun, SemanticAnalysisDraft]:
         safe_project_id = self._safe_project_id(project_id)
         with self.project_store.project_lock(safe_project_id):
-            self._source_revision(safe_project_id, source_revision_id)
+            source_revision = self._source_revision(safe_project_id, source_revision_id)
+            if len(source_revision.source_markdown) > self.max_source_codepoints:
+                raise SemanticValidationError("source_too_large")
             run_id = f"run-{uuid.uuid4().hex}"
             draft_id = f"draft-{uuid.uuid4().hex}"
             run = AnalysisRun(

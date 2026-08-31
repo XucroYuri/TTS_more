@@ -168,6 +168,47 @@ def test_create_run_and_draft_persists_constrained_sidecars_and_reverse_index(pr
     assert index["drafts"][draft.id] == {"project_id": "demo", "run_id": run.id}
 
 
+def test_create_run_and_draft_rejects_legacy_oversized_source_without_writes(tmp_path: Path) -> None:
+    _storage()
+    project_store = ProjectStore(tmp_path)
+    source = ScriptRevision(revision_id="script-r001", source_markdown="甲\r\n😀乙")
+    project_store.save_project(
+        "demo",
+        ScriptProject(
+            title="Oversized legacy source",
+            script_revisions=[source],
+            active_script_revision_id=source.revision_id,
+        ),
+    )
+    store = SemanticStore(project_store, max_source_codepoints=4)
+
+    with pytest.raises(SemanticValidationError, match="source_too_large"):
+        store.create_run_and_draft("demo", source.revision_id, trace_id="trace-oversized")
+
+    assert not project_store.project_semantic_dir("demo").exists()
+    assert not (project_store.root / "semantic" / "index.json").exists()
+
+
+def test_create_run_and_draft_accepts_source_at_exact_codepoint_limit(tmp_path: Path) -> None:
+    _storage()
+    project_store = ProjectStore(tmp_path)
+    source = ScriptRevision(revision_id="script-r001", source_markdown="甲\r\n😀")
+    project_store.save_project(
+        "demo",
+        ScriptProject(
+            title="Exact-limit source",
+            script_revisions=[source],
+            active_script_revision_id=source.revision_id,
+        ),
+    )
+    store = SemanticStore(project_store, max_source_codepoints=4)
+
+    run, draft = store.create_run_and_draft("demo", source.revision_id, trace_id="trace-exact")
+
+    assert store.load_run(run.id).source_revision_id == source.revision_id
+    assert store.load_draft(draft.id).source_revision_id == source.revision_id
+
+
 def test_cross_project_run_creation_keeps_both_reverse_index_mappings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _storage()
     project_store = ProjectStore(tmp_path)

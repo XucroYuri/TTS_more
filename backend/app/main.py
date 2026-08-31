@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from app.hardware import collect_local_hardware_status
 from app.auth import auth_status_endpoint, install_token_middleware
@@ -34,6 +34,7 @@ from app.semantic_executor import SemanticAnalysisExecutor
 from app.semantic_logging import semantic_event_logger
 from app.semantic_provider import AnalysisChunk, SemanticProviderUnavailable, build_semantic_provider
 from app.semantic_routes import build_semantic_router
+from app.semantic_source import sha256_source
 from app.semantic_storage import SemanticStore
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
 from app.services import COMFYUI_TTS_AUDIO_SUITE_CONTRACT, ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
@@ -67,9 +68,21 @@ REPO_LOCK_PATH = _resolve_repo_lock_path()
 AUDIO_UPLOAD_SUFFIXES = AUDIO_SUFFIXES | {".webm", ".aac", ".opus"}
 # Maximum accepted upload size for avatar / reference-audio endpoints.
 MAX_UPLOAD_BYTES = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+MAX_SCRIPT_CODEPOINTS = 200_000
 
 load_dotenv(".env.local")
 load_dotenv(".env")
+
+
+def _max_script_codepoints() -> int:
+    raw_limit = os.environ.get("TTS_MORE_MAX_SCRIPT_CODEPOINTS", str(MAX_SCRIPT_CODEPOINTS))
+    try:
+        limit = int(raw_limit)
+    except ValueError as error:
+        raise ValueError("TTS_MORE_MAX_SCRIPT_CODEPOINTS must be a positive integer") from error
+    if limit <= 0:
+        raise ValueError("TTS_MORE_MAX_SCRIPT_CODEPOINTS must be a positive integer")
+    return limit
 
 
 class ParseScriptRequest(BaseModel):
@@ -99,7 +112,16 @@ class ProjectCharactersUpdate(BaseModel):
 
 class ScriptRevisionCreate(BaseModel):
     source_markdown: str
+    source_filename: str | None = Field(default=None, max_length=255)
+    source_media_type: str | None = Field(default=None, max_length=255)
     summary: str = ""
+
+    @field_validator("source_filename", "source_media_type")
+    @classmethod
+    def validate_optional_source_metadata(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("source metadata must not be blank")
+        return value
 
 
 class ParseRevisionCreate(BaseModel):
@@ -140,8 +162,9 @@ def create_app(
     parser_config_file = Path(parser_config_path) if parser_config_path else store.root / "parser_providers.json"
     env_file = Path(env_path) if env_path else project_root / ".env.local"
     load_dotenv(env_file, override=False)
+    max_script_codepoints = _max_script_codepoints()
     parser = _build_parser(parser_config_file)
-    semantic_store = SemanticStore(store)
+    semantic_store = SemanticStore(store, max_source_codepoints=max_script_codepoints)
     active_semantic_service = (
         semantic_service
         if semantic_service is not None
@@ -904,6 +927,11 @@ def create_app(
     def create_script_revision(project_id: str, request: ScriptRevisionCreate) -> dict[str, Any]:
         if not request.source_markdown.strip():
             raise HTTPException(status_code=400, detail="source_markdown is required")
+        if len(request.source_markdown) > max_script_codepoints:
+            raise HTTPException(
+                status_code=413,
+                detail=f"source_markdown exceeds {max_script_codepoints} code points",
+            )
         try:
             project = store.load_project(project_id)
         except FileNotFoundError as exc:
@@ -911,6 +939,9 @@ def create_app(
         revision = ScriptRevision(
             revision_id=_next_revision_id("script", [item.revision_id for item in project.script_revisions]),
             source_markdown=request.source_markdown,
+            source_filename=request.source_filename,
+            source_media_type=request.source_media_type,
+            source_sha256=sha256_source(request.source_markdown),
             parent_revision_id=project.active_script_revision_id,
             summary=request.summary,
         )
