@@ -388,7 +388,12 @@ export default function App() {
       if (!fallbackProjectId || readActiveAnalysisScope()) return;
       try {
         const fallbackProject = await fetchProject(fallbackProjectId);
-        if (cancelled || analysisRestoreOperationTokenRef.current !== restoreToken || readActiveAnalysisScope()) return;
+        if (
+          cancelled
+          || analysisRestoreOperationTokenRef.current !== restoreToken
+          || analysisCurrentProjectIdRef.current !== fallbackProjectId
+          || readActiveAnalysisScope()
+        ) return;
         const fallbackRevision = fallbackProject.script_revisions?.find(
           (revision) => revision.revision_id === fallbackProject.active_script_revision_id
         );
@@ -1422,6 +1427,18 @@ export default function App() {
     return flushedProject;
   }
 
+  async function drainPendingProjectAutosaves(
+    projectId: string,
+    authoritativeProject: ScriptProject
+  ): Promise<ScriptProject> {
+    let reconciledProject = authoritativeProject;
+    do {
+      const flushedProject = await flushPendingProjectAutosave(projectId, reconciledProject);
+      if (flushedProject) reconciledProject = flushedProject;
+    } while (pendingProjectAutosaveRef.current?.projectId === projectId);
+    return reconciledProject;
+  }
+
   async function saveCurrentProject(
     targetProjectId: string,
     projectSnapshot: ScriptProject,
@@ -1710,6 +1727,7 @@ export default function App() {
     analysisManagerSavingTokenRef.current = operationToken;
     analysisAutosaveBlockedProjectIdRef.current = targetProjectId;
     setIsManagerSaving(true);
+    let createdAuthoritativeProject: ScriptProject | null = null;
     try {
       const currentAutosaveProjectId = analysisCurrentProjectIdRef.current;
       if (currentAutosaveProjectId) await flushPendingProjectAutosave(currentAutosaveProjectId);
@@ -1737,14 +1755,28 @@ export default function App() {
         summary: t("analysis.input.analyze"),
         metadata: analysisSourceFileMetadataRef.current ?? undefined,
         isCurrent,
+        onCreated: async (payload) => {
+          createdAuthoritativeProject = payload.project;
+          createdAuthoritativeProject = await drainPendingProjectAutosaves(
+            targetProjectId,
+            createdAuthoritativeProject
+          );
+          return {
+            ...payload,
+            project: createdAuthoritativeProject
+          };
+        },
         onReady: async (payload) => {
           const latestCurrentProjectId = analysisCurrentProjectIdRef.current;
           if (latestCurrentProjectId && latestCurrentProjectId !== targetProjectId) {
             await flushPendingProjectAutosave(latestCurrentProjectId);
           }
-          const rebasedProject = await flushPendingProjectAutosave(targetProjectId, payload.project);
+          createdAuthoritativeProject = await drainPendingProjectAutosaves(
+            targetProjectId,
+            createdAuthoritativeProject ?? payload.project
+          );
           if (!isCurrent()) return;
-          const readyProject = rebasedProject ?? payload.project;
+          const readyProject = createdAuthoritativeProject;
           setManagedProject(readyProject);
           setManagerTitleDraft(readyProject.title);
           setManagerSourceDraft(payload.script_revision.source_markdown);
@@ -1762,7 +1794,14 @@ export default function App() {
     } catch (error) {
       if (isCurrent()) setNotice(error instanceof Error ? error.message : t("analysis.input.readFailed"));
     } finally {
-      await flushPendingProjectAutosave(targetProjectId);
+      if (createdAuthoritativeProject) {
+        createdAuthoritativeProject = await drainPendingProjectAutosaves(
+          targetProjectId,
+          createdAuthoritativeProject
+        );
+      } else {
+        await flushPendingProjectAutosave(targetProjectId);
+      }
       if (analysisAutosaveBlockedProjectIdRef.current === targetProjectId) {
         analysisAutosaveBlockedProjectIdRef.current = null;
       }

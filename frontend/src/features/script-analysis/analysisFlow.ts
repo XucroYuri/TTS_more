@@ -75,6 +75,9 @@ export interface BeginAnalysisSourceRevisionOptions {
   summary: string;
   metadata?: AnalysisSourceFileMetadata;
   isCurrent: () => boolean;
+  onCreated?: (
+    payload: ScriptRevisionPayload
+  ) => ScriptRevisionPayload | Promise<ScriptRevisionPayload>;
   onReady: (payload: ScriptRevisionPayload) => void | Promise<void>;
   createRevision?: (
     projectId: string,
@@ -94,12 +97,15 @@ export async function beginAnalysisSourceRevision(
         source_media_type: options.metadata.mediaType
       }
     : undefined;
-  const payload = await (options.createRevision ?? createScriptRevision)(
+  const createdPayload = await (options.createRevision ?? createScriptRevision)(
     options.projectId,
     options.source,
     options.summary,
     metadata
   );
+  const payload = options.onCreated
+    ? await options.onCreated(createdPayload)
+    : createdPayload;
   if (!options.isCurrent()) return "stale";
   await options.onReady(payload);
   return "started";

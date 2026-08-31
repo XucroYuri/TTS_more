@@ -671,6 +671,67 @@ describe("App semantic analysis entry", () => {
     expect(apiMocks.createAnalysisRun).not.toHaveBeenCalled();
   });
 
+  it("does not restore a stale fallback project after the current project switches", async () => {
+    const projectAId = "scope-stale-fallback-a";
+    const deletedProjectId = "scope-stale-deleted-b";
+    const projectCId = "scope-stale-current-c";
+    const revisionA = scriptRevision("scope-stale-revision-a", "A：不应迟到挂载", "sha-scope-stale-a");
+    const projectA = scriptProject("Scope stale A", revisionA);
+    const projectC = scriptProject("Scope current C");
+    projectC.lines = [{ id: "scope-c-line", character_id: "c", text: "C 当前 TTS 台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectAId, projectA);
+    backendProjects.set(projectCId, projectC);
+    const runA = completedRun(projectAId, revisionA.revision_id);
+    const draftA = analysisDraft(projectAId, revisionA.revision_id);
+    apiMocks.fetchAnalysisRun.mockImplementation(async () => runA);
+    apiMocks.fetchAnalysisDraft.mockImplementation(async () => draftA);
+    const deletedFetch = deferred<ScriptProject>();
+    const staleFallbackFetch = deferred<ScriptProject>();
+    let projectAFetchCount = 0;
+    apiMocks.fetchProject.mockImplementation(async (projectId: string) => {
+      if (projectId === deletedProjectId) return deletedFetch.promise;
+      if (projectId === projectAId) {
+        projectAFetchCount += 1;
+        if (projectAFetchCount > 2) return staleFallbackFetch.promise;
+      }
+      const stored = backendProjects.get(projectId);
+      if (!stored) throw new Error(`missing project: ${projectId}`);
+      return cloneProject(stored);
+    });
+    const sessionScope = JSON.stringify([projectAId, revisionA.revision_id, revisionA.source_sha256]);
+    const view = await renderApp(projectAId, (storage) => {
+      storage.setItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY, JSON.stringify({
+        [sessionScope]: { runId: runA.id, draftId: runA.draft_id }
+      }));
+      storage.setItem(activeAnalysisScopeStorageKey, JSON.stringify({
+        projectId: deletedProjectId,
+        revisionId: "deleted-stale-revision",
+        sourceSha256: "sha-deleted-stale"
+      }));
+    });
+    await flushAsync(40);
+
+    deletedFetch.reject(new ApiRequestError(404, '{"detail":"Project not found"}', "Project not found"));
+    await flushAsync(40);
+    expect(projectAFetchCount).toBe(3);
+
+    const rowC = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Scope current C"))!;
+    await click(rowC);
+    await flushAsync();
+    await click(view.container.querySelector(".script-manager-inline-actions button.secondary-button")!);
+    await flushAsync(40);
+    expect(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectCId);
+    expect(view.container.textContent).toContain("C 当前 TTS 台词");
+
+    staleFallbackFetch.resolve(cloneProject(projectA));
+    await flushAsync(60);
+
+    expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
+    expect(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectCId);
+    expect(view.container.textContent).toContain("C 当前 TTS 台词");
+  });
+
   it("clears an invalid active revision scope and restores the current project session", async () => {
     const currentProjectId = "scope-invalid-fallback-current";
     const invalidProjectId = "scope-invalid-target";
@@ -1253,6 +1314,116 @@ describe("App semantic analysis entry", () => {
     expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
     expect(backendProjects.get(projectId)?.script_revisions?.map((item) => item.revision_id))
       .toContain(revision.revision_id);
+  });
+
+  it("preserves a server-created revision when source invalidates the operation before onReady", async () => {
+    vi.useFakeTimers();
+    const projectId = "stale-after-create";
+    const project = scriptProject("Stale after create");
+    project.lines = [{ id: "stale-after-create-line", character_id: "narrator", text: "待配置台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    const pendingRevision = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingRevision.promise);
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    const sourceEditor = view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!;
+    await changeReactValueExact(sourceEditor, "甲：即将失效的分析原文");
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    expect(apiMocks.createScriptRevision).toHaveBeenCalledOnce();
+
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+    await changeReactValueExact(sourceEditor, "甲：使旧操作失效的新原文");
+
+    const revision = scriptRevision(
+      "stale-server-revision",
+      "甲：即将失效的分析原文",
+      "sha-stale-server-revision"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectId, cloneProject(serverProject));
+    pendingRevision.resolve({ project: serverProject, script_revision: revision });
+    await flushAsync(60);
+
+    expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(backendProjects.get(projectId)?.script_revisions?.map((item) => item.revision_id))
+      .toContain(revision.revision_id);
+    expect(backendProjects.get(projectId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
+
+    activeViews.splice(activeViews.indexOf(view), 1);
+    await view.cleanup();
+    const remounted = await renderApp(projectId);
+    await flushAsync(40);
+
+    expect(remounted.container.querySelector(".reference-setup-callout")).toBeNull();
+    expect(remounted.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")?.value)
+      .toBe(revision.source_markdown);
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+  });
+
+  it("preserves the latest pending TTS edit while an authoritative rebase save is deferred", async () => {
+    vi.useFakeTimers();
+    const projectId = "second-edit-during-rebase";
+    const project = scriptProject("Second edit during rebase");
+    project.lines = [{ id: "second-edit-line", character_id: "narrator", text: "待配置台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    const pendingRevision = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingRevision.promise);
+    const firstAuthoritativeSave = deferred<void>();
+    let saveCallCount = 0;
+    apiMocks.saveProject.mockImplementation(async (targetProjectId: string, payload: ScriptProject) => {
+      saveCallCount += 1;
+      if (saveCallCount === 1) await firstAuthoritativeSave.promise;
+      backendProjects.set(targetProjectId, cloneProject(payload));
+    });
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：权威保存期间继续编辑"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+    const revision = scriptRevision(
+      "second-edit-server-revision",
+      "甲：权威保存期间继续编辑",
+      "sha-second-edit-server-revision"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectId, cloneProject(serverProject));
+    pendingRevision.resolve({ project: serverProject, script_revision: revision });
+    await flushAsync(40);
+    expect(apiMocks.saveProject).toHaveBeenCalledOnce();
+    expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
+
+    await click(view.container.querySelector(".route-clear-temporary")!);
+    await flushAsync();
+    firstAuthoritativeSave.resolve();
+    await flushAsync(80);
+
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(backendProjects.get(projectId)?.script_revisions?.map((item) => item.revision_id))
+      .toContain(revision.revision_id);
+    expect(backendProjects.get(projectId)?.lines[0]?.temporary_binding ?? null).toBeNull();
   });
 
   it("flushes current project A changes made while managed project B revision creation is deferred", async () => {
