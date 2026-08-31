@@ -101,6 +101,13 @@ class SemanticAnnotation(BaseModel):
     def validate_origin_defaults(self) -> "SemanticAnnotation":
         if self.origin is AnnotationOrigin.AI and self.confidence is None:
             raise ValueError("AI annotations require confidence")
+        if (
+            self.origin is AnnotationOrigin.AI
+            and self.status is ReviewStatus.ACCEPTED
+            and self.confidence is not None
+            and self.confidence < 0.8
+        ):
+            raise ValueError("accepted AI annotations require confidence >= 0.8")
         if self.origin is AnnotationOrigin.HUMAN and "status" not in self.model_fields_set:
             self.status = ReviewStatus.ACCEPTED
         return self
@@ -122,6 +129,13 @@ class CharacterCandidate(BaseModel):
             raise ValueError("canonical_name must be non-empty")
         if self.origin is AnnotationOrigin.AI and self.confidence is None:
             raise ValueError("AI character candidates require confidence")
+        if (
+            self.origin is AnnotationOrigin.AI
+            and self.status is ReviewStatus.ACCEPTED
+            and self.confidence is not None
+            and self.confidence < 0.8
+        ):
+            raise ValueError("accepted AI character candidates require confidence >= 0.8")
         if self.origin is AnnotationOrigin.HUMAN and "status" not in self.model_fields_set:
             self.status = ReviewStatus.ACCEPTED
         return self
@@ -149,6 +163,16 @@ class SemanticUtterance(BaseModel):
 
     @model_validator(mode="after")
     def validate_emotion_fields(self) -> "SemanticUtterance":
+        if UncertaintyCode.SOURCE_ANCHOR_AMBIGUOUS in self.uncertainty_codes:
+            raise ValueError("source_anchor_ambiguous belongs to an unresolved candidate, not an utterance")
+        if self.status is ReviewStatus.ACCEPTED and {
+            UncertaintyCode.SPEAKER_UNKNOWN,
+            UncertaintyCode.SPEAKER_AMBIGUOUS,
+            UncertaintyCode.DIALOGUE_AMBIGUOUS,
+        }.intersection(self.uncertainty_codes):
+            raise ValueError("accepted utterance cannot include unresolved speaker or dialogue uncertainty")
+        if self.emotion_origin is EmotionOrigin.SOURCE_GROUNDED and not self.emotion_evidence_annotation_ids:
+            raise ValueError("source_grounded emotion requires an emotion evidence annotation")
         if self.normalized_emotion is None:
             if self.custom_emotion is not None or self.emotion_intensity is not None:
                 raise ValueError("emotion fields require normalized_emotion")
@@ -209,6 +233,14 @@ class AnalysisRun(BaseModel):
     trace_id: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @model_validator(mode="after")
+    def validate_status_quality(self) -> "AnalysisRun":
+        if self.status is AnalysisRunStatus.COMPLETED and self.quality is None:
+            raise ValueError("completed analysis runs require quality")
+        if self.status is not AnalysisRunStatus.COMPLETED and self.quality is not None:
+            raise ValueError("non-completed analysis runs must not have quality")
+        return self
 
 
 class SemanticAnalysisDraft(BaseModel):

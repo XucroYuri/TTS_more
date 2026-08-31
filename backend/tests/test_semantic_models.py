@@ -186,3 +186,134 @@ def test_semantic_models_expose_exact_enums_and_model_invariants() -> None:
         quality=AnalysisRunQuality.COMPLETE,
     )
     assert run.status == AnalysisRunStatus.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "uncertainty_code",
+    [
+        UncertaintyCode.SPEAKER_UNKNOWN,
+        UncertaintyCode.SPEAKER_AMBIGUOUS,
+        UncertaintyCode.DIALOGUE_AMBIGUOUS,
+    ],
+)
+def test_accepted_utterance_rejects_unresolved_speaker_or_dialogue_uncertainty(
+    uncertainty_code: UncertaintyCode,
+) -> None:
+    _semantic()
+    with pytest.raises(ValueError, match="accepted utterance"):
+        SemanticUtterance(
+            id="utterance-accepted-uncertain",
+            dialogue_annotation_id="dialogue-1",
+            character_candidate_id="character-1",
+            confidence=0.9,
+            uncertainty_codes=[uncertainty_code],
+            status=ReviewStatus.ACCEPTED,
+        )
+
+
+def test_utterance_rejects_source_anchor_ambiguity_in_all_review_states() -> None:
+    _semantic()
+    with pytest.raises(ValueError, match="source_anchor_ambiguous"):
+        SemanticUtterance(
+            id="utterance-anchor-ambiguous",
+            dialogue_annotation_id="dialogue-1",
+            confidence=0.5,
+            uncertainty_codes=[UncertaintyCode.SOURCE_ANCHOR_AMBIGUOUS],
+            status=ReviewStatus.PENDING,
+        )
+
+
+def test_source_grounded_emotion_requires_an_emotion_evidence_annotation() -> None:
+    _semantic()
+    with pytest.raises(ValueError, match="source_grounded"):
+        SemanticUtterance(
+            id="utterance-grounded-without-evidence",
+            dialogue_annotation_id="dialogue-1",
+            normalized_emotion=NormalizedEmotion.HAPPY,
+            emotion_intensity=0.7,
+            emotion_origin=EmotionOrigin.SOURCE_GROUNDED,
+            confidence=0.8,
+        )
+
+
+def test_ai_annotation_acceptance_requires_point_eight_confidence() -> None:
+    _semantic()
+    span = SourceSpan(
+        source_revision_id="script-r001",
+        start_utf16=0,
+        end_utf16=2,
+        text="你好",
+        source_sha256="a" * 64,
+    )
+    with pytest.raises(ValueError, match="0.8"):
+        SemanticAnnotation(
+            id="annotation-low-confidence",
+            kind=AnnotationKind.DIALOGUE,
+            span=span,
+            origin=AnnotationOrigin.AI,
+            confidence=0.79,
+            status=ReviewStatus.ACCEPTED,
+        )
+
+    pending = SemanticAnnotation(
+        id="annotation-pending",
+        kind=AnnotationKind.DIALOGUE,
+        span=span,
+        origin=AnnotationOrigin.AI,
+        confidence=0.79,
+    )
+    assert pending.status == ReviewStatus.PENDING
+
+
+def test_ai_character_acceptance_requires_point_eight_confidence() -> None:
+    _semantic()
+    with pytest.raises(ValueError, match="0.8"):
+        CharacterCandidate(
+            id="character-low-confidence",
+            canonical_name="小品",
+            origin=AnnotationOrigin.AI,
+            confidence=0.79,
+            status=ReviewStatus.ACCEPTED,
+        )
+
+    pending = CharacterCandidate(
+        id="character-pending",
+        canonical_name="小品",
+        origin=AnnotationOrigin.AI,
+        confidence=0.79,
+    )
+    assert pending.status == ReviewStatus.PENDING
+
+
+def test_completed_analysis_run_requires_a_quality() -> None:
+    _semantic()
+    with pytest.raises(ValueError, match="completed.*quality"):
+        AnalysisRun(
+            id="run-completed-without-quality",
+            project_id="demo",
+            source_revision_id="script-r001",
+            draft_id="draft-1",
+            status=AnalysisRunStatus.COMPLETED,
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        AnalysisRunStatus.QUEUED,
+        AnalysisRunStatus.RUNNING,
+        AnalysisRunStatus.FAILED,
+        AnalysisRunStatus.INTERRUPTED,
+    ],
+)
+def test_non_completed_analysis_run_rejects_quality(status: AnalysisRunStatus) -> None:
+    _semantic()
+    with pytest.raises(ValueError, match="non-completed.*quality"):
+        AnalysisRun(
+            id="run-non-completed-with-quality",
+            project_id="demo",
+            source_revision_id="script-r001",
+            draft_id="draft-1",
+            status=status,
+            quality=AnalysisRunQuality.PARTIAL,
+        )
