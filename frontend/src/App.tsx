@@ -91,7 +91,15 @@ import {
   type AnalysisSourceFileMetadata,
   type WorkspaceStage
 } from "./features/script-analysis/analysisFlow";
-import { hasRestorableAnalysisSession } from "./features/script-analysis/useAnalysisDraft";
+import {
+  activeAnalysisScopeForRevision,
+  activeAnalysisScopeMatchesRevision,
+  clearActiveAnalysisScope,
+  clearRestorableAnalysisSession,
+  hasRestorableAnalysisSession,
+  readActiveAnalysisScope,
+  writeActiveAnalysisScope
+} from "./features/script-analysis/useAnalysisDraft";
 import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
 import { generationStatusCounts, generationStatusKey, generationStatusTone, generationTerminalNotice, isTerminalGenerationStatus, reconcileGenerationJobSnapshot, type GenerationStatusTone } from "./lib/generationStatus";
 import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./lib/gptSovitsReference";
@@ -170,6 +178,14 @@ interface ConfirmationDialogState {
   confirmLabel: string;
   cancelLabel: string;
   tone: ConfirmationTone;
+}
+
+interface PendingProjectAutosave {
+  projectId: string;
+  project: ScriptProject;
+  characters: Character[];
+  authorityEpoch: number;
+  timerId: number | null;
 }
 
 function characterName(characters: Character[], id: string): string {
@@ -272,10 +288,14 @@ export default function App() {
   const scriptFileOperationTokenRef = useRef(0);
   const analysisStartOperationTokenRef = useRef(0);
   const analysisManagerSavingTokenRef = useRef<number | null>(null);
+  const analysisRestoreOperationTokenRef = useRef(0);
   const lastGenerationProjectIdRef = useRef<string | null>(null);
   const saveChainRef = useRef<Promise<void>>(Promise.resolve());
   const skipNextAutosaveRef = useRef(false);
-  const projectAuthorityEpochRef = useRef(0);
+  const pendingProjectAutosaveRef = useRef<PendingProjectAutosave | null>(null);
+  const analysisAutosaveBlockedProjectIdRef = useRef<string | null>(null);
+  const projectAuthorityEpochRef = useRef<Map<string, number>>(new Map());
+  const seededAuthoritativeProjectIdRef = useRef<string | null>(null);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [preflightResult, setPreflightResult] = useState<GenerationPreflightResponse | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -357,6 +377,39 @@ export default function App() {
   }, [t]);
 
   useEffect(() => {
+    const scope = readActiveAnalysisScope();
+    if (!scope) return;
+    const restoreToken = analysisRestoreOperationTokenRef.current + 1;
+    analysisRestoreOperationTokenRef.current = restoreToken;
+    let cancelled = false;
+    fetchProject(scope.projectId)
+      .then((payload) => {
+        if (cancelled || analysisRestoreOperationTokenRef.current !== restoreToken) return;
+        const currentScope = readActiveAnalysisScope();
+        if (
+          !currentScope
+          || currentScope.projectId !== scope.projectId
+          || currentScope.revisionId !== scope.revisionId
+          || currentScope.sourceSha256 !== scope.sourceSha256
+        ) return;
+        const sourceRevision = payload.script_revisions?.find((revision) =>
+          activeAnalysisScopeMatchesRevision(scope, scope.projectId, revision)
+        );
+        if (!sourceRevision || !hasRestorableAnalysisSession(scope.projectId, sourceRevision)) {
+          clearActiveAnalysisScope(scope);
+          return;
+        }
+        analysisProjectIdRef.current = scope.projectId;
+        setAnalysisSourceRevision(sourceRevision);
+        setWorkspaceStage("analysis");
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (lastGenerationProjectIdRef.current !== currentProjectId) {
       lastGenerationProjectIdRef.current = currentProjectId;
       generationRunTokenRef.current += 1;
@@ -375,6 +428,23 @@ export default function App() {
       return;
     }
     let cancelled = false;
+    if (seededAuthoritativeProjectIdRef.current) {
+      if (seededAuthoritativeProjectIdRef.current === currentProjectId) {
+        seededAuthoritativeProjectIdRef.current = null;
+        setIsProjectLoaded(true);
+        fetchManifest(currentProjectId)
+          .then((manifestPayload) => {
+            if (!cancelled) setManifest(manifestPayload);
+          })
+          .catch(() => {
+            if (!cancelled) setManifest(createEmptyManifest(currentProjectId));
+          });
+        return () => {
+          cancelled = true;
+        };
+      }
+      seededAuthoritativeProjectIdRef.current = null;
+    }
     setIsProjectLoaded(false);
     fetchProject(currentProjectId)
       .then((payload) => {
@@ -382,7 +452,11 @@ export default function App() {
         const resumableRevision = payload.script_revisions?.find(
           (revision) => revision.revision_id === payload.active_script_revision_id
         );
-        if (resumableRevision && hasRestorableAnalysisSession(currentProjectId, resumableRevision)) {
+        if (
+          !readActiveAnalysisScope()
+          && resumableRevision
+          && hasRestorableAnalysisSession(currentProjectId, resumableRevision)
+        ) {
           analysisProjectIdRef.current = currentProjectId;
           setAnalysisSourceRevision(resumableRevision);
           setWorkspaceStage("analysis");
@@ -437,8 +511,23 @@ export default function App() {
     const autosaveProjectId = currentProjectId;
     const autosaveProject = project;
     const autosaveCharacters = characters;
-    const autosaveAuthorityEpoch = projectAuthorityEpochRef.current;
+    const autosaveAuthorityEpoch = projectAuthorityEpochRef.current.get(autosaveProjectId) ?? 0;
+    const pendingAutosave: PendingProjectAutosave = {
+      projectId: autosaveProjectId,
+      project: autosaveProject,
+      characters: autosaveCharacters,
+      authorityEpoch: autosaveAuthorityEpoch,
+      timerId: null
+    };
+    pendingProjectAutosaveRef.current = pendingAutosave;
+    if (analysisAutosaveBlockedProjectIdRef.current === autosaveProjectId) {
+      return () => {
+        if (pendingProjectAutosaveRef.current === pendingAutosave) pendingProjectAutosaveRef.current = null;
+      };
+    }
     const handle = window.setTimeout(() => {
+      if (pendingProjectAutosaveRef.current !== pendingAutosave) return;
+      pendingProjectAutosaveRef.current = null;
       saveChainRef.current = saveChainRef.current.then(() => saveCurrentProject(
         autosaveProjectId,
         autosaveProject,
@@ -446,7 +535,11 @@ export default function App() {
         autosaveAuthorityEpoch
       ));
     }, 700);
-    return () => window.clearTimeout(handle);
+    pendingAutosave.timerId = handle;
+    return () => {
+      window.clearTimeout(handle);
+      if (pendingProjectAutosaveRef.current === pendingAutosave) pendingProjectAutosaveRef.current = null;
+    };
   }, [characters, currentProjectId, isProjectLoaded, project, workspaceStage]);
 
   useEffect(() => {
@@ -1270,19 +1363,34 @@ export default function App() {
     }
   }
 
+  async function flushPendingProjectAutosave(projectId: string) {
+    const pending = pendingProjectAutosaveRef.current;
+    if (pending?.projectId === projectId) {
+      if (pending.timerId !== null) window.clearTimeout(pending.timerId);
+      pendingProjectAutosaveRef.current = null;
+      saveChainRef.current = saveChainRef.current.then(() => saveCurrentProject(
+        pending.projectId,
+        pending.project,
+        pending.characters,
+        pending.authorityEpoch
+      ));
+    }
+    await saveChainRef.current;
+  }
+
   async function saveCurrentProject(
     targetProjectId: string,
     projectSnapshot: ScriptProject,
     characterSnapshot: Character[],
     authorityEpoch: number
   ) {
-    if (authorityEpoch !== projectAuthorityEpochRef.current) {
+    if (authorityEpoch !== (projectAuthorityEpochRef.current.get(targetProjectId) ?? 0)) {
       setSaveState("saved");
       return;
     }
     try {
       await Promise.all([saveProject(targetProjectId, projectSnapshot), saveCharacters(characterSnapshot)]);
-      if (authorityEpoch !== projectAuthorityEpochRef.current) {
+      if (authorityEpoch !== (projectAuthorityEpochRef.current.get(targetProjectId) ?? 0)) {
         setSaveState("saved");
         setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
         return;
@@ -1556,11 +1664,19 @@ export default function App() {
     const isCurrent = () => operationToken === analysisStartOperationTokenRef.current
       && targetProjectId === analysisManagedProjectIdRef.current;
     analysisManagerSavingTokenRef.current = operationToken;
+    analysisAutosaveBlockedProjectIdRef.current = targetProjectId;
     setIsManagerSaving(true);
     try {
+      await flushPendingProjectAutosave(targetProjectId);
+      if (!isCurrent()) return;
       const confirmed = await confirmRevisionRisk(managedProject);
       if (!confirmed || !isCurrent()) return;
-      projectAuthorityEpochRef.current += 1;
+      await flushPendingProjectAutosave(targetProjectId);
+      if (!isCurrent()) return;
+      projectAuthorityEpochRef.current.set(
+        targetProjectId,
+        (projectAuthorityEpochRef.current.get(targetProjectId) ?? 0) + 1
+      );
       await saveChainRef.current;
       if (!isCurrent()) return;
       if (title !== managedProject.title) {
@@ -1582,6 +1698,7 @@ export default function App() {
             applyManagedProjectToWorkspace(targetProjectId, payload.project);
           }
           analysisProjectIdRef.current = targetProjectId;
+          writeActiveAnalysisScope(targetProjectId, payload.script_revision);
           setAnalysisSourceRevision(payload.script_revision);
           setWorkspaceStage("analysis");
         }
@@ -1590,6 +1707,10 @@ export default function App() {
     } catch (error) {
       if (isCurrent()) setNotice(error instanceof Error ? error.message : t("analysis.input.readFailed"));
     } finally {
+      await flushPendingProjectAutosave(targetProjectId);
+      if (analysisAutosaveBlockedProjectIdRef.current === targetProjectId) {
+        analysisAutosaveBlockedProjectIdRef.current = null;
+      }
       if (analysisManagerSavingTokenRef.current === operationToken) {
         analysisManagerSavingTokenRef.current = null;
         setIsManagerSaving(false);
@@ -1602,8 +1723,10 @@ export default function App() {
     const sourceRevision = analysisSourceRevision;
     if (!targetProjectId || !sourceRevision) return;
     const handoff = buildConfirmedAnalysisHandoff(targetProjectId, serverProject, sourceRevision);
+    const changesCurrentProject = analysisCurrentProjectIdRef.current !== handoff.currentProjectId;
     analysisCurrentProjectIdRef.current = handoff.currentProjectId;
     analysisManagedProjectIdRef.current = handoff.managedProjectId;
+    seededAuthoritativeProjectIdRef.current = changesCurrentProject ? handoff.currentProjectId : null;
     skipNextAutosaveRef.current = true;
     writeStoredProjectId(handoff.currentProjectId);
     setCurrentProjectId(handoff.currentProjectId);
@@ -1620,6 +1743,8 @@ export default function App() {
     setManagerSourceDraft(handoff.managerSourceDraft);
     setSaveState("saved");
     setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+    clearRestorableAnalysisSession(targetProjectId, sourceRevision);
+    clearActiveAnalysisScope(activeAnalysisScopeForRevision(targetProjectId, sourceRevision));
     const summaryRefreshEpoch = analysisStartOperationTokenRef.current;
     analysisProjectIdRef.current = null;
     analysisSourceFileMetadataRef.current = null;
@@ -1639,6 +1764,10 @@ export default function App() {
 
   function cancelScriptAnalysis() {
     analysisStartOperationTokenRef.current += 1;
+    const targetProjectId = analysisProjectIdRef.current;
+    if (targetProjectId && analysisSourceRevision) {
+      clearActiveAnalysisScope(activeAnalysisScopeForRevision(targetProjectId, analysisSourceRevision));
+    }
     analysisProjectIdRef.current = null;
     setAnalysisSourceRevision(null);
     setWorkspaceStage("tts");

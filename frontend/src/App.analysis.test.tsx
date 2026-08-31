@@ -49,6 +49,7 @@ vi.mock("./api", async () => ({
 import App from "./App";
 
 const timestamp = "2026-09-01T00:00:00.000Z";
+const activeAnalysisScopeStorageKey = "tts-more:active-analysis-scope";
 
 initI18n();
 
@@ -804,6 +805,164 @@ describe("App semantic analysis entry", () => {
     expect(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectId);
   });
 
+  it("does not restore a confirmed analysis session after App remount", async () => {
+    const projectId = "confirmed-session-remount";
+    const project = scriptProject("Confirmed session remount");
+    project.lines = [{ id: "old-confirm-line", character_id: "old", text: "确认前台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    const runs = new Map<string, AnalysisRun>();
+    const drafts = new Map<string, SemanticAnalysisDraft>();
+    apiMocks.createAnalysisRun.mockImplementation(async (targetProjectId: string, revisionId: string) => {
+      const run = completedRun(targetProjectId, revisionId);
+      runs.set(run.id, run);
+      drafts.set(run.draft_id, analysisDraft(targetProjectId, revisionId));
+      return { run_id: run.id, draft_id: run.draft_id, status: run.status, trace_id: run.trace_id };
+    });
+    apiMocks.fetchAnalysisRun.mockImplementation(async (runId: string) => runs.get(runId)!);
+    apiMocks.fetchAnalysisDraft.mockImplementation(async (draftId: string) => drafts.get(draftId)!);
+    apiMocks.confirmAnalysisDraft.mockImplementation(async () => {
+      const revision = backendProjects.get(projectId)!.script_revisions![0];
+      const response = semanticConfirmation(projectId, revision, "确认后不应重开分析");
+      backendProjects.set(projectId, cloneProject(response.project));
+      return response;
+    });
+    const view = await renderApp(projectId);
+    await flushAsync();
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：确认后关闭 session"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    await click(view.container.querySelector('[data-action="confirm-open"]')!);
+    await click(view.container.querySelector('[data-action="confirm-submit"]')!);
+    await flushAsync(40);
+    expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
+
+    const persistedSessions = view.dom.window.localStorage.getItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY);
+    activeViews.splice(activeViews.indexOf(view), 1);
+    await view.cleanup();
+    const remounted = await renderApp(projectId, (storage) => {
+      if (persistedSessions) storage.setItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY, persistedSessions);
+    });
+    await flushAsync(40);
+
+    expect(remounted.container.querySelector(".script-analysis-workspace")).toBeNull();
+    expect(remounted.container.textContent).toContain("确认后不应重开分析");
+    expect(apiMocks.createAnalysisRun).toHaveBeenCalledOnce();
+  });
+
+  it("restores managed project B analysis while current TTS project remains A", async () => {
+    const projectAId = "restore-current-a";
+    const projectBId = "restore-analysis-b";
+    const projectA = scriptProject("Restore current A");
+    projectA.lines = [{ id: "restore-a-line", character_id: "a", text: "A 的 TTS 台词", note: "", language: "zh-CN" }];
+    const projectB = scriptProject("Restore analysis B");
+    projectB.lines = [{ id: "restore-b-line", character_id: "b", text: "B 的旧台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectAId, projectA);
+    backendProjects.set(projectBId, projectB);
+    const runs = new Map<string, AnalysisRun>();
+    const drafts = new Map<string, SemanticAnalysisDraft>();
+    apiMocks.createAnalysisRun.mockImplementation(async (projectId: string, revisionId: string) => {
+      const run = completedRun(projectId, revisionId);
+      runs.set(run.id, run);
+      drafts.set(run.draft_id, analysisDraft(projectId, revisionId));
+      return { run_id: run.id, draft_id: run.draft_id, status: run.status, trace_id: run.trace_id };
+    });
+    apiMocks.fetchAnalysisRun.mockImplementation(async (runId: string) => runs.get(runId)!);
+    apiMocks.fetchAnalysisDraft.mockImplementation(async (draftId: string) => drafts.get(draftId)!);
+    const view = await renderApp(projectAId);
+    await flushAsync();
+
+    const rowB = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Restore analysis B"))!;
+    await click(rowB);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "B：跨项目恢复的分析原文"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+    expect(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectAId);
+
+    const persistedSessions = view.dom.window.localStorage.getItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY);
+    const persistedScope = view.dom.window.localStorage.getItem(activeAnalysisScopeStorageKey);
+    activeViews.splice(activeViews.indexOf(view), 1);
+    await view.cleanup();
+    const remounted = await renderApp(projectAId, (storage) => {
+      if (persistedSessions) storage.setItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY, persistedSessions);
+      if (persistedScope) storage.setItem(activeAnalysisScopeStorageKey, persistedScope);
+    });
+    await flushAsync(40);
+
+    expect(remounted.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+    expect(remounted.container.textContent).toContain("B：跨项目恢复的分析原文");
+    expect(remounted.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectAId);
+    expect(apiMocks.createAnalysisRun).toHaveBeenCalledOnce();
+  });
+
+  it("keeps authoritative project B when its redundant post-confirm reload fails", async () => {
+    const projectAId = "confirm-current-a";
+    const projectBId = "confirm-analysis-b";
+    const projectA = scriptProject("Confirm current A");
+    projectA.lines = [{ id: "confirm-a-line", character_id: "a", text: "A 当前台词", note: "", language: "zh-CN" }];
+    const projectB = scriptProject("Confirm analysis B");
+    projectB.lines = [{ id: "confirm-b-old-line", character_id: "b", text: "B 确认前台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectAId, projectA);
+    backendProjects.set(projectBId, projectB);
+    let rejectConfirmedProjectReload = false;
+    apiMocks.fetchProject.mockImplementation(async (projectId: string) => {
+      if (projectId === projectBId && rejectConfirmedProjectReload) {
+        throw new Error("redundant confirmed project reload failed");
+      }
+      const stored = backendProjects.get(projectId);
+      if (!stored) throw new Error(`missing project: ${projectId}`);
+      return cloneProject(stored);
+    });
+    const runs = new Map<string, AnalysisRun>();
+    const drafts = new Map<string, SemanticAnalysisDraft>();
+    apiMocks.createAnalysisRun.mockImplementation(async (projectId: string, revisionId: string) => {
+      const run = completedRun(projectId, revisionId);
+      runs.set(run.id, run);
+      drafts.set(run.draft_id, analysisDraft(projectId, revisionId));
+      return { run_id: run.id, draft_id: run.draft_id, status: run.status, trace_id: run.trace_id };
+    });
+    apiMocks.fetchAnalysisRun.mockImplementation(async (runId: string) => runs.get(runId)!);
+    apiMocks.fetchAnalysisDraft.mockImplementation(async (draftId: string) => drafts.get(draftId)!);
+    apiMocks.confirmAnalysisDraft.mockImplementation(async () => {
+      const revision = backendProjects.get(projectBId)!.script_revisions![0];
+      const response = semanticConfirmation(projectBId, revision, "B 服务端确认权威台词");
+      backendProjects.set(projectBId, cloneProject(response.project));
+      rejectConfirmedProjectReload = true;
+      return response;
+    });
+    const view = await renderApp(projectAId);
+    await flushAsync();
+
+    const rowB = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Confirm analysis B"))!;
+    await click(rowB);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "B：等待跨项目确认"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    await click(view.container.querySelector('[data-action="confirm-open"]')!);
+    await click(view.container.querySelector('[data-action="confirm-submit"]')!);
+    await flushAsync(60);
+
+    expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
+    expect(view.container.textContent).toContain("B 服务端确认权威台词");
+    expect(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectBId);
+  });
+
   it("drains an old in-flight autosave before creating the analysis revision", async () => {
     vi.useFakeTimers();
     const projectId = "late-autosave";
@@ -870,6 +1029,36 @@ describe("App semantic analysis entry", () => {
     expect(backendProjects.get(projectId)?.active_parse_revision_id).toBe(`parse-${projectId}`);
     expect(backendProjects.get(projectId)?.lines[0]?.text).toBe("语义确认权威台词");
     expect(apiMocks.saveProject).toHaveBeenCalledOnce();
+  });
+
+  it("flushes a pending TTS autosave before analysis can replace the project snapshot", async () => {
+    vi.useFakeTimers();
+    const projectId = "pending-autosave";
+    const project = scriptProject("Pending autosave");
+    project.lines = [{ id: "pending-line", character_id: "narrator", text: "旧台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+    expect(view.container.querySelector(".reference-setup-callout")).toBeNull();
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：分析不能丢掉待保存的 TTS 编辑"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+
+    await click(view.container.querySelector('[data-action="cancel-workspace"]')!);
+    await flushAsync();
+
+    expect(view.container.querySelector(".reference-setup-callout")).toBeNull();
+    expect(backendProjects.get(projectId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
   });
 
   it("shows confirmed TTS immediately while the summary refresh remains pending", async () => {

@@ -22,6 +22,7 @@ import type {
 
 export const ANALYSIS_DISMISSED_RUNS_STORAGE_KEY = "tts-more:analysis-dismissed-runs";
 export const ANALYSIS_RUN_SESSIONS_STORAGE_KEY = "tts-more:analysis-run-sessions";
+export const ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY = "tts-more:active-analysis-scope";
 const ANALYSIS_CONFIRM_KEYS_STORAGE_KEY = "tts-more:analysis-confirm-keys";
 const defaultPollIntervalMs = 1_000;
 
@@ -419,6 +420,79 @@ function scopeStorageId(projectId: string, sourceRevision: ScriptRevision): stri
   ]);
 }
 
+export interface ActiveAnalysisScope {
+  projectId: string;
+  revisionId: string;
+  sourceSha256: string | null;
+}
+
+export function activeAnalysisScopeForRevision(
+  projectId: string,
+  sourceRevision: ScriptRevision
+): ActiveAnalysisScope {
+  return {
+    projectId,
+    revisionId: sourceRevision.revision_id,
+    sourceSha256: sourceRevision.source_sha256 ?? null
+  };
+}
+
+export function activeAnalysisScopeMatchesRevision(
+  scope: ActiveAnalysisScope,
+  projectId: string,
+  sourceRevision: ScriptRevision
+): boolean {
+  return scope.projectId === projectId
+    && scope.revisionId === sourceRevision.revision_id
+    && scope.sourceSha256 === (sourceRevision.source_sha256 ?? null);
+}
+
+export function readActiveAnalysisScope(
+  storage: Storage | null = defaultStorage()
+): ActiveAnalysisScope | null {
+  const stored = readObject(storage, ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY);
+  if (Object.keys(stored).length === 0) return null;
+  const projectId = stored.projectId;
+  const revisionId = stored.revisionId;
+  const sourceSha256 = stored.sourceSha256;
+  if (
+    typeof projectId !== "string"
+    || typeof revisionId !== "string"
+    || (sourceSha256 !== null && typeof sourceSha256 !== "string")
+  ) {
+    safeRemove(storage, ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY);
+    return null;
+  }
+  return { projectId, revisionId, sourceSha256 };
+}
+
+export function writeActiveAnalysisScope(
+  projectId: string,
+  sourceRevision: ScriptRevision,
+  storage: Storage | null = defaultStorage()
+): void {
+  const scope = activeAnalysisScopeForRevision(projectId, sourceRevision);
+  writeObject(storage, ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY, {
+    projectId: scope.projectId,
+    revisionId: scope.revisionId,
+    sourceSha256: scope.sourceSha256
+  });
+}
+
+export function clearActiveAnalysisScope(
+  expectedScope: ActiveAnalysisScope,
+  storage: Storage | null = defaultStorage()
+): void {
+  const current = readActiveAnalysisScope(storage);
+  if (
+    current?.projectId === expectedScope.projectId
+    && current.revisionId === expectedScope.revisionId
+    && current.sourceSha256 === expectedScope.sourceSha256
+  ) {
+    safeRemove(storage, ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY);
+  }
+}
+
 function readSession(storage: Storage | null, scopeId: string): AnalysisRunSession | null {
   const sessions = readObject(storage, ANALYSIS_RUN_SESSIONS_STORAGE_KEY);
   const value = sessions[scopeId];
@@ -438,6 +512,14 @@ export function hasRestorableAnalysisSession(
   storage: Storage | null = defaultStorage()
 ): boolean {
   return readSession(storage, scopeStorageId(projectId, sourceRevision)) !== null;
+}
+
+export function clearRestorableAnalysisSession(
+  projectId: string,
+  sourceRevision: ScriptRevision,
+  storage: Storage | null = defaultStorage()
+): void {
+  removeSession(storage, scopeStorageId(projectId, sourceRevision));
 }
 
 function writeSession(
