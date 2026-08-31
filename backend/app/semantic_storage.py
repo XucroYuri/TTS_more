@@ -220,6 +220,26 @@ class SemanticStore:
         with self.project_store.project_lock(project_id):
             self._write_model(self._run_path(project_id, run.id), self._touch(run))
 
+    def transition_incomplete_run_to_interrupted(self, run_id: str) -> AnalysisRun | None:
+        project_id = self._project_for("runs", run_id)
+        with self.project_store.project_lock(project_id):
+            run = self._read_model(self._run_path(project_id, run_id), AnalysisRun)
+            if run.id != run_id or run.project_id != project_id:
+                raise SemanticNotFoundError("run_not_found")
+            if run.status not in {AnalysisRunStatus.QUEUED, AnalysisRunStatus.RUNNING}:
+                return None
+            interrupted = self._touch(
+                run.model_copy(
+                    update={
+                        "status": AnalysisRunStatus.INTERRUPTED,
+                        "quality": None,
+                    },
+                    deep=True,
+                )
+            )
+            self._write_model(self._run_path(project_id, run_id), interrupted)
+            return interrupted
+
     def replace_analysis_result(self, run_id: str, replacement: SemanticAnalysisDraft) -> SemanticAnalysisDraft:
         project_id = self._project_for("runs", run_id)
         with self.project_store.project_lock(project_id):

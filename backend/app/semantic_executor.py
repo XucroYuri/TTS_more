@@ -103,22 +103,10 @@ class SemanticAnalysisExecutor:
         changed = 0
         for run_id in list(index.get("runs", {})):
             try:
-                run = self.store.load_run(run_id)
+                interrupted = self.store.transition_incomplete_run_to_interrupted(run_id)
             except (SemanticStorageError, ValueError, OSError):
                 continue
-            if run.status not in {AnalysisRunStatus.QUEUED, AnalysisRunStatus.RUNNING}:
-                continue
-            interrupted = run.model_copy(
-                update={
-                    "status": AnalysisRunStatus.INTERRUPTED,
-                    "quality": None,
-                    "updated_at": datetime.now(timezone.utc),
-                },
-                deep=True,
-            )
-            try:
-                self.store.save_run(interrupted)
-            except (SemanticStorageError, ValueError, OSError):
+            if interrupted is None:
                 continue
             self.logger.interrupted(
                 run_id=interrupted.id,

@@ -299,6 +299,80 @@ def test_recovery_isolates_missing_or_corrupt_run_records(tmp_path: Path, damage
     assert semantic_store.load_run(completed.id).status is AnalysisRunStatus.COMPLETED
 
 
+@pytest.mark.parametrize(
+    ("terminal_status", "terminal_quality"),
+    [
+        (AnalysisRunStatus.COMPLETED, AnalysisRunQuality.COMPLETE),
+        (AnalysisRunStatus.FAILED, None),
+    ],
+)
+def test_recovery_does_not_overwrite_concurrent_terminal_transition(
+    tmp_path: Path,
+    terminal_status: AnalysisRunStatus,
+    terminal_quality: AnalysisRunQuality | None,
+) -> None:
+    _semantic_api()
+    transition_ready = threading.Event()
+    allow_transition = threading.Event()
+
+    class CoordinatedRecoveryStore(SemanticStore):
+        def load_run(self, run_id: str):
+            run = super().load_run(run_id)
+            transition_ready.set()
+            assert allow_transition.wait(2), "test did not release stale recovery observation"
+            return run
+
+        def transition_incomplete_run_to_interrupted(self, run_id: str):
+            transition_ready.set()
+            assert allow_transition.wait(2), "test did not release atomic recovery transition"
+            return super().transition_incomplete_run_to_interrupted(run_id)
+
+    recovery_project_store = ProjectStore(tmp_path)
+    _seed_project(recovery_project_store)
+    recovery_store = CoordinatedRecoveryStore(recovery_project_store)
+    run, _ = recovery_store.create_run_and_draft("demo", "script-r001", trace_id="trace-race")
+    terminal_store = SemanticStore(ProjectStore(tmp_path))
+    executor = SemanticAnalysisExecutor(
+        recovery_store,
+        recovery_project_store,
+        FakeSemanticService(),
+        semantic_event_logger(tmp_path),
+        max_workers=1,
+    )
+    results: list[int] = []
+    errors: list[BaseException] = []
+
+    def recover() -> None:
+        try:
+            results.append(executor.recover_interrupted())
+        except BaseException as error:  # pragma: no cover - surfaced below
+            errors.append(error)
+
+    recovery_thread = threading.Thread(target=recover, name="semantic-recovery-race")
+    recovery_thread.start()
+    try:
+        assert transition_ready.wait(2), "recovery did not reach the controlled transition boundary"
+        terminal_store.save_run(
+            run.model_copy(
+                update={
+                    "status": terminal_status,
+                    "quality": terminal_quality,
+                    "progress": 1,
+                },
+                deep=True,
+            )
+        )
+    finally:
+        allow_transition.set()
+        recovery_thread.join(2)
+        executor.shutdown()
+
+    assert not recovery_thread.is_alive()
+    assert errors == []
+    assert results == [0]
+    assert terminal_store.load_run(run.id).status is terminal_status
+
+
 def test_executor_rejects_duplicate_nonqueued_and_post_shutdown_submissions(tmp_path: Path) -> None:
     _semantic_api()
     project_store = ProjectStore(tmp_path)
