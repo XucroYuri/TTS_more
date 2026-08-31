@@ -1,0 +1,152 @@
+.source-annotation-pane {
+  display: grid;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.source-annotation-pane__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: #334155;
+  font-size: 0.82rem;
+}
+
+.source-annotation-pane__legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.source-annotation-pane__legend-mark {
+  display: inline-block;
+  min-width: 1.8rem;
+  color: #0f172a;
+  text-align: center;
+}
+
+.source-annotation-pane__legend-mark--speaker,
+.annotation-layer--speaker {
+  text-decoration-line: underline;
+  text-decoration-color: #7c3aed;
+  text-decoration-style: solid;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.12em;
+}
+
+.source-annotation-pane__legend-mark--emotion_evidence,
+.annotation-layer--emotion-evidence {
+  text-decoration-line: underline;
+  text-decoration-color: #d97706;
+  text-decoration-style: wavy;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 0.32em;
+}
+
+.source-annotation-pane__legend-mark--dialogue,
+.source-annotation-pane__segment--dialogue {
+  background: #dbeafe;
+}
+
+.source-annotation-pane__source {
+  min-height: 12rem;
+  padding: 1rem;
+  overflow-wrap: anywhere;
+  color: #172033;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.75rem;
+  line-height: 1.75;
+  user-select: text;
+}
+
+.source-annotation-pane__source:focus-visible {
+  outline: 3px solid rgba(37, 99, 235, 0.35);
+  outline-offset: 2px;
+}
+
+.source-annotation-pane__segment {
+  display: inline;
+  margin: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  text-align: inherit;
+  white-space: inherit;
+  appearance: none;
+  border: 0;
+  border-radius: 0.15rem;
+  cursor: pointer;
+  user-select: text;
+}
+
+.source-annotation-pane__segment:not(.source-annotation-pane__segment--dialogue) {
+  background: transparent;
+}
+
+.source-annotation-pane__segment:hover {
+  filter: brightness(0.96);
+}
+
+.source-annotation-pane__segment:focus-visible,
+.source-annotation-pane__layered-choice:focus-visible,
+.selection-annotation-menu button:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.selection-annotation-menu,
+.source-annotation-pane__layered-dialog {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.75rem;
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 0.65rem;
+}
+
+.selection-annotation-menu__selection {
+  color: #334155;
+  font-size: 0.88rem;
+}
+
+.selection-annotation-menu__actions,
+.source-annotation-pane__layered-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.selection-annotation-menu button,
+.source-annotation-pane__layered-dialog button {
+  min-height: 2.25rem;
+  padding: 0.4rem 0.7rem;
+  color: #172033;
+  background: #ffffff;
+  border: 1px solid #94a3b8;
+  border-radius: 0.45rem;
+  cursor: pointer;
+}
+
+.selection-annotation-menu__button--dialogue {
+  background: #dbeafe;
+  border-color: #60a5fa;
+}
+
+.selection-annotation-menu__button--speaker {
+  border-bottom: 3px solid #7c3aed;
+}
+
+.selection-annotation-menu__button--emotion_evidence {
+  text-decoration: underline wavy #d97706;
+  text-underline-offset: 0.25em;
+}
+
+.source-annotation-pane__layered-close,
+.selection-annotation-menu__cancel {
+  justify-self: start;
+}
