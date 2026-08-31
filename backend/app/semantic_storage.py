@@ -204,17 +204,19 @@ class SemanticStore:
 
     def load_run(self, run_id: str) -> AnalysisRun:
         project_id = self._project_for("runs", run_id)
-        run = self._read_model(self._run_path(project_id, run_id), AnalysisRun)
-        if run.id != run_id or run.project_id != project_id:
-            raise SemanticNotFoundError("run_not_found")
-        return run
+        with self.project_store.project_lock(project_id):
+            run = self._read_model(self._run_path(project_id, run_id), AnalysisRun)
+            if run.id != run_id or run.project_id != project_id:
+                raise SemanticNotFoundError("run_not_found")
+            return run
 
     def load_draft(self, draft_id: str) -> SemanticAnalysisDraft:
         project_id = self._project_for("drafts", draft_id)
-        draft = self._read_model(self._draft_path(project_id, draft_id), SemanticAnalysisDraft)
-        if draft.id != draft_id or draft.project_id != project_id:
-            raise SemanticNotFoundError("draft_not_found")
-        return draft
+        with self.project_store.project_lock(project_id):
+            draft = self._read_model(self._draft_path(project_id, draft_id), SemanticAnalysisDraft)
+            if draft.id != draft_id or draft.project_id != project_id:
+                raise SemanticNotFoundError("draft_not_found")
+            return draft
 
     def save_run(self, run: AnalysisRun) -> None:
         project_id = self._project_for("runs", run.id)
@@ -680,13 +682,14 @@ class SemanticStore:
         return self.project_store.root / "semantic" / "index.json"
 
     def _load_index(self) -> dict[str, dict[str, object]]:
-        path = self._index_path()
-        if not path.exists():
-            return {"runs": {}, "drafts": {}, "revisions": {}}
-        payload = self._read_json(path)
-        if not isinstance(payload, dict):
-            raise SemanticValidationError()
-        return {kind: dict(payload.get(kind, {})) for kind in ("runs", "drafts", "revisions")}
+        with self._index_lock():
+            path = self._index_path()
+            if not path.exists():
+                return {"runs": {}, "drafts": {}, "revisions": {}}
+            payload = self._read_json(path)
+            if not isinstance(payload, dict):
+                raise SemanticValidationError()
+            return {kind: dict(payload.get(kind, {})) for kind in ("runs", "drafts", "revisions")}
 
     def _write_index(self, index: dict[str, dict[str, object]]) -> None:
         self._write_json(self._index_path(), index)

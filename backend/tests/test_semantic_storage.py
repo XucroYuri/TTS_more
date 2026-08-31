@@ -530,6 +530,218 @@ def test_project_lock_serializes_same_project_mutations(project_store: ProjectSt
     assert acquired == ["second"]
 
 
+@pytest.mark.parametrize("artifact_kind", ["run", "draft"])
+def test_public_artifact_readers_wait_for_writer_and_return_complete_replacement(
+    project_store: ProjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+) -> None:
+    _storage()
+    store = SemanticStore(project_store)
+    run, draft = store.create_run_and_draft("demo", "script-r001", trace_id="trace-reader-lock")
+    if artifact_kind == "run":
+        replacement = run.model_copy(
+            update={
+                "status": AnalysisRunStatus.COMPLETED,
+                "quality": AnalysisRunQuality.COMPLETE,
+                "progress": 1,
+            },
+            deep=True,
+        )
+        target_path = project_store.project_semantic_dir("demo") / "runs" / f"{run.id}.json"
+        write_replacement = lambda: store.save_run(replacement)
+        read_artifact = lambda: store.load_run(run.id)
+    else:
+        replacement = draft.model_copy(
+            update={"provider": "serialized-provider", "model": "serialized-model"},
+            deep=True,
+        )
+        target_path = project_store.project_semantic_dir("demo") / "drafts" / f"{draft.id}.json"
+        write_replacement = lambda: store.replace_analysis_result(run.id, replacement)
+        read_artifact = lambda: store.load_draft(draft.id)
+
+    writer_at_boundary = threading.Event()
+    allow_write = threading.Event()
+    reader_next_step = threading.Event()
+    reader_attempted_project_lock = threading.Event()
+    reader_entered_file_read = threading.Event()
+    reader_finished = threading.Event()
+    writer_errors: list[BaseException] = []
+    reader_errors: list[BaseException] = []
+    loaded: list[object] = []
+    original_write_model = store._write_model
+    original_read_model = store._read_model
+    original_project_lock = project_store.project_lock
+
+    def blocked_write_model(path: Path, model: object) -> None:
+        if threading.current_thread().name == "semantic-artifact-writer" and path == target_path:
+            writer_at_boundary.set()
+            assert allow_write.wait(5), "test did not release semantic artifact writer"
+        original_write_model(path, model)
+
+    def observed_read_model(path: Path, model_type: type):
+        if threading.current_thread().name == "semantic-artifact-reader" and path == target_path:
+            reader_entered_file_read.set()
+            reader_next_step.set()
+        return original_read_model(path, model_type)
+
+    def observed_project_lock(project_id: str):
+        if threading.current_thread().name == "semantic-artifact-reader":
+            reader_attempted_project_lock.set()
+            reader_next_step.set()
+        return original_project_lock(project_id)
+
+    monkeypatch.setattr(store, "_write_model", blocked_write_model)
+    monkeypatch.setattr(store, "_read_model", observed_read_model)
+    monkeypatch.setattr(project_store, "project_lock", observed_project_lock)
+
+    def write() -> None:
+        try:
+            write_replacement()
+        except BaseException as error:
+            writer_errors.append(error)
+
+    def read() -> None:
+        try:
+            loaded.append(read_artifact())
+        except BaseException as error:
+            reader_errors.append(error)
+        finally:
+            reader_finished.set()
+
+    writer = threading.Thread(target=write, name="semantic-artifact-writer")
+    reader: threading.Thread | None = None
+    writer.start()
+    try:
+        assert writer_at_boundary.wait(5), "writer did not reach the controlled file boundary"
+        reader = threading.Thread(target=read, name="semantic-artifact-reader")
+        reader.start()
+        assert reader_next_step.wait(5), "reader did not reach its lock-or-read decision"
+        attempted_lock_before_release = reader_attempted_project_lock.is_set()
+        entered_read_before_release = reader_entered_file_read.is_set()
+        finished_before_release = reader_finished.is_set()
+    finally:
+        allow_write.set()
+        writer.join(5)
+        if reader is not None:
+            reader.join(5)
+
+    assert not writer.is_alive()
+    assert reader is not None and not reader.is_alive()
+    assert writer_errors == []
+    assert reader_errors == []
+    assert attempted_lock_before_release is True
+    assert entered_read_before_release is False
+    assert finished_before_release is False
+    assert len(loaded) == 1
+    if artifact_kind == "run":
+        loaded_run = loaded[0]
+        assert loaded_run.id == run.id
+        assert loaded_run.status is AnalysisRunStatus.COMPLETED
+        assert loaded_run.quality is AnalysisRunQuality.COMPLETE
+        assert loaded_run.progress == 1
+    else:
+        loaded_draft = loaded[0]
+        assert loaded_draft.id == draft.id
+        assert loaded_draft.provider == "serialized-provider"
+        assert loaded_draft.model == "serialized-model"
+
+
+def test_index_reader_waits_for_index_writer_and_returns_complete_model(
+    project_store: ProjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _storage()
+    store = SemanticStore(project_store)
+    existing_run, _ = store.create_run_and_draft(
+        "demo", "script-r001", trace_id="trace-existing-index"
+    )
+    index_path = project_store.root / "semantic" / "index.json"
+    writer_at_boundary = threading.Event()
+    allow_index_write = threading.Event()
+    reader_next_step = threading.Event()
+    reader_attempted_index_lock = threading.Event()
+    reader_entered_index_read = threading.Event()
+    reader_finished = threading.Event()
+    writer_errors: list[BaseException] = []
+    reader_errors: list[BaseException] = []
+    created: list[tuple[object, object]] = []
+    loaded: list[object] = []
+    original_write_index = store._write_index
+    original_read_json = store._read_json
+    original_index_lock = store._index_lock
+
+    def blocked_write_index(index: dict[str, dict[str, object]]) -> None:
+        if threading.current_thread().name == "semantic-index-writer":
+            writer_at_boundary.set()
+            assert allow_index_write.wait(5), "test did not release semantic index writer"
+        original_write_index(index)
+
+    def observed_read_json(path: Path):
+        if threading.current_thread().name == "semantic-index-reader" and path == index_path:
+            reader_entered_index_read.set()
+            reader_next_step.set()
+        return original_read_json(path)
+
+    def observed_index_lock():
+        if threading.current_thread().name == "semantic-index-reader":
+            reader_attempted_index_lock.set()
+            reader_next_step.set()
+        return original_index_lock()
+
+    monkeypatch.setattr(store, "_write_index", blocked_write_index)
+    monkeypatch.setattr(store, "_read_json", observed_read_json)
+    monkeypatch.setattr(store, "_index_lock", observed_index_lock)
+
+    def write_index() -> None:
+        try:
+            created.append(
+                store.create_run_and_draft(
+                    "demo", "script-r001", trace_id="trace-concurrent-index"
+                )
+            )
+        except BaseException as error:
+            writer_errors.append(error)
+
+    def read_index() -> None:
+        try:
+            loaded.append(store.load_run(existing_run.id))
+        except BaseException as error:
+            reader_errors.append(error)
+        finally:
+            reader_finished.set()
+
+    writer = threading.Thread(target=write_index, name="semantic-index-writer")
+    reader: threading.Thread | None = None
+    writer.start()
+    try:
+        assert writer_at_boundary.wait(5), "writer did not reach the controlled index boundary"
+        reader = threading.Thread(target=read_index, name="semantic-index-reader")
+        reader.start()
+        assert reader_next_step.wait(5), "reader did not reach its lock-or-read decision"
+        attempted_lock_before_release = reader_attempted_index_lock.is_set()
+        entered_read_before_release = reader_entered_index_read.is_set()
+        finished_before_release = reader_finished.is_set()
+    finally:
+        allow_index_write.set()
+        writer.join(5)
+        if reader is not None:
+            reader.join(5)
+
+    assert not writer.is_alive()
+    assert reader is not None and not reader.is_alive()
+    assert writer_errors == []
+    assert reader_errors == []
+    assert attempted_lock_before_release is True
+    assert entered_read_before_release is False
+    assert finished_before_release is False
+    assert len(loaded) == 1
+    assert loaded[0].id == existing_run.id
+    assert len(created) == 1
+    new_run, new_draft = created[0]
+    assert store.load_run(new_run.id).draft_id == new_draft.id
+
+
 def test_confirmation_uses_dedicated_marker_write_without_incrementing_edit_version(project_store: ProjectStore) -> None:
     _storage()
     store = SemanticStore(project_store)
