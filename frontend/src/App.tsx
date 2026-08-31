@@ -297,6 +297,8 @@ export default function App() {
   const analysisAutosaveBlockedProjectIdRef = useRef<string | null>(null);
   const authorityUnknownProjectIdsRef = useRef<Set<string>>(new Set());
   const preserveManagerSourceDraftProjectIdRef = useRef<string | null>(null);
+  const currentProjectTransitionOperationTokenRef = useRef(0);
+  const currentProjectTransitionChainRef = useRef<Promise<void>>(Promise.resolve());
   const projectAuthorityEpochRef = useRef<Map<string, number>>(new Map());
   const seededAuthoritativeProjectIdRef = useRef<string | null>(null);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
@@ -1674,15 +1676,38 @@ export default function App() {
     }
   }
 
-  function switchProject(projectId: string) {
-    if (projectId === currentProjectId) return;
-    setCurrentProjectId(projectId);
-    writeStoredProjectId(projectId);
-    setSelectedLineIds([]);
-    setExpandedLineId(null);
-    setSelectedHistoryVersions({});
-    setVersionDrafts({});
-    setNotice(t("app.ready"));
+  async function switchProject(projectId: string): Promise<boolean> {
+    const operationToken = currentProjectTransitionOperationTokenRef.current + 1;
+    currentProjectTransitionOperationTokenRef.current = operationToken;
+    const transition = currentProjectTransitionChainRef.current.then(async () => {
+      const previousProjectId = analysisCurrentProjectIdRef.current;
+      if (projectId === previousProjectId) return true;
+      if (previousProjectId) {
+        await flushPendingProjectAutosave(previousProjectId);
+        if (operationToken !== currentProjectTransitionOperationTokenRef.current) return false;
+        if (
+          authorityUnknownProjectIdsRef.current.has(previousProjectId)
+          || pendingProjectAutosaveRef.current?.projectId === previousProjectId
+        ) return false;
+      }
+      if (operationToken !== currentProjectTransitionOperationTokenRef.current) return false;
+      analysisCurrentProjectIdRef.current = projectId;
+      setCurrentProjectId(() => {
+        writeStoredProjectId(projectId);
+        return projectId;
+      });
+      setSelectedLineIds([]);
+      setExpandedLineId(null);
+      setSelectedHistoryVersions({});
+      setVersionDrafts({});
+      setNotice(t("app.ready"));
+      return true;
+    });
+    currentProjectTransitionChainRef.current = transition.then(
+      () => undefined,
+      () => undefined
+    );
+    return transition;
   }
 
   function applyManagedProjectToWorkspace(projectId: string, nextProject: ScriptProject, resetLineState = false) {
@@ -2264,13 +2289,14 @@ export default function App() {
         setManagedProjectId(projectId);
       }}
       onOpenProject={(projectId) => {
-        switchProject(projectId);
-        scriptFileOperationTokenRef.current += 1;
-        analysisStartOperationTokenRef.current += 1;
-        analysisSourceFileMetadataRef.current = null;
-        analysisManagedProjectIdRef.current = projectId;
-        analysisCurrentProjectIdRef.current = projectId;
-        setManagedProjectId(projectId);
+        void (async () => {
+          if (!(await switchProject(projectId))) return;
+          scriptFileOperationTokenRef.current += 1;
+          analysisStartOperationTokenRef.current += 1;
+          analysisSourceFileMetadataRef.current = null;
+          analysisManagedProjectIdRef.current = projectId;
+          setManagedProjectId(projectId);
+        })();
       }}
       onTitleDraftChange={setManagerTitleDraft}
       onSourceDraftChange={updateManagedSourceDraft}

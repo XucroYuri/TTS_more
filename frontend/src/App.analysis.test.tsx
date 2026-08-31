@@ -1865,4 +1865,102 @@ describe("App semantic analysis entry", () => {
     await flushAsync();
     expect(view.container.textContent).toContain("无需等待摘要的确认台词");
   });
+
+  it("keeps an ambiguous revision and pending TTS edit when project switching is retried after recovery", async () => {
+    vi.useFakeTimers();
+    const projectAId = "switch-guard-current-a";
+    const projectBId = "switch-guard-target-b";
+    const projectCId = "switch-guard-latest-c";
+    const projectA = scriptProject("Switch guard current A");
+    projectA.lines = [{ id: "switch-guard-a-line", character_id: "a", text: "A 待保存台词", note: "", language: "zh-CN" }];
+    const projectB = scriptProject("Switch guard target B");
+    projectB.lines = [{ id: "switch-guard-b-line", character_id: "b", text: "B 当前台词", note: "", language: "zh-CN" }];
+    const projectC = scriptProject("Switch guard latest C");
+    projectC.lines = [{ id: "switch-guard-c-line", character_id: "c", text: "C 最新选择台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectAId, projectA);
+    backendProjects.set(projectBId, projectB);
+    backendProjects.set(projectCId, projectC);
+    let authorityUnavailable = false;
+    let deferAuthorityRecovery = false;
+    const authorityRecovery = deferred<ScriptProject>();
+    apiMocks.fetchProject.mockImplementation(async (projectId: string) => {
+      if (projectId === projectAId && authorityUnavailable) {
+        throw new Error("authority temporarily unavailable");
+      }
+      if (projectId === projectAId && deferAuthorityRecovery) return authorityRecovery.promise;
+      const stored = backendProjects.get(projectId);
+      if (!stored) throw new Error(`missing project: ${projectId}`);
+      return cloneProject(stored);
+    });
+    const pendingCreate = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingCreate.promise);
+    const view = await renderApp(projectAId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：服务端已提交但响应丢失"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+
+    const revision = scriptRevision(
+      "switch-guard-server-revision",
+      "甲：服务端已提交但响应丢失",
+      "sha-switch-guard-server-revision"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectAId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectAId, cloneProject(serverProject));
+    authorityUnavailable = true;
+    pendingCreate.reject(new Error("connection lost after commit"));
+    await flushAsync(80);
+    expect(apiMocks.saveProject).not.toHaveBeenCalled();
+
+    const rowB = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Switch guard target B"))!;
+    await click(rowB);
+    await flushAsync();
+    await click(view.container.querySelector(".script-manager-inline-actions button.secondary-button")!);
+    await flushAsync(80);
+
+    expect.soft(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectAId);
+    expect.soft(view.container.textContent).toContain("A 待保存台词");
+
+    authorityUnavailable = false;
+    deferAuthorityRecovery = true;
+    await click(view.container.querySelector(".script-manager-inline-actions button.secondary-button")!);
+    await flushAsync(40);
+    const rowC = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Switch guard latest C"))!;
+    await click(rowC);
+    await flushAsync();
+    await click(view.container.querySelector(".script-manager-inline-actions button.secondary-button")!);
+    await flushAsync(40);
+    deferAuthorityRecovery = false;
+    authorityRecovery.resolve(cloneProject(serverProject));
+    await flushAsync(100);
+    expect(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectCId);
+    expect(view.container.textContent).toContain("C 最新选择台词");
+
+    const rowA = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Switch guard current A"))!;
+    await click(rowA);
+    await flushAsync();
+    await click(view.container.querySelector(".script-manager-inline-actions button.secondary-button")!);
+    await flushAsync(80);
+
+    expect(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectAId);
+    expect(backendProjects.get(projectAId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(backendProjects.get(projectAId)?.script_revisions?.map((item) => item.revision_id))
+      .toContain(revision.revision_id);
+    expect(backendProjects.get(projectAId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
+  });
 });
