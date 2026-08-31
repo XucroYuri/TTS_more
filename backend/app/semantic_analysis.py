@@ -210,6 +210,71 @@ def _unique_chunk_occurrence(chunk: AnalysisChunk, excerpt: str) -> tuple[int, i
     return chunk.start_utf16 + local_start, chunk.start_utf16 + local_end
 
 
+def _has_alias_relationship_evidence(
+    source_text: str,
+    canonical_name: str,
+    alias: str,
+    evidence_excerpts: Iterable[str],
+) -> bool:
+    for evidence in evidence_excerpts:
+        if _unique_occurrence(source_text, evidence) is None:
+            continue
+        canonical_ranges = [
+            (start, start + len(canonical_name))
+            for start in _all_occurrences(evidence, canonical_name)
+        ]
+        if not canonical_ranges:
+            continue
+        for alias_start in _all_occurrences(evidence, alias):
+            alias_end = alias_start + len(alias)
+            if not any(
+                canonical_start <= alias_start and alias_end <= canonical_end
+                for canonical_start, canonical_end in canonical_ranges
+            ):
+                return True
+    return False
+
+
+def _candidate_claims(
+    candidate: UtteranceCandidate,
+    speaker_identities: dict[str, str] | None = None,
+) -> tuple[object, ...]:
+    speaker_key = _name_key(candidate.speaker_name) if candidate.speaker_name else None
+    if speaker_key is not None and speaker_identities is not None:
+        speaker_key = speaker_identities.get(speaker_key, speaker_key)
+    return (
+        speaker_key,
+        candidate.normalized_emotion.value if candidate.normalized_emotion else None,
+        candidate.custom_emotion,
+        candidate.emotion_intensity,
+        candidate.emotion_origin.value,
+        candidate.language,
+        tuple(sorted(code.value for code in candidate.uncertainty_codes)),
+    )
+
+
+def _conflicting_claim_dimensions(
+    candidates: Iterable[UtteranceCandidate],
+    speaker_identities: dict[str, str] | None = None,
+) -> list[str]:
+    claims = [
+        _candidate_claims(candidate, speaker_identities)
+        for candidate in candidates
+    ]
+    if len(claims) < 2:
+        return []
+    dimensions: list[str] = []
+    if len({claim[0] for claim in claims}) > 1:
+        dimensions.append("speaker")
+    if len({claim[1:5] for claim in claims}) > 1:
+        dimensions.append("emotion")
+    if len({claim[5] for claim in claims}) > 1:
+        dimensions.append("language")
+    if len({claim[6] for claim in claims}) > 1:
+        dimensions.append("uncertainty")
+    return dimensions
+
+
 def _source_span(source: ScriptRevision, start_utf16: int, end_utf16: int) -> SourceSpan:
     start = utf16_to_py_index(source.source_markdown, start_utf16)
     end = utf16_to_py_index(source.source_markdown, end_utf16)
@@ -238,6 +303,7 @@ def _warning(
         "source_excerpt_mismatch": "Diagnostic source_excerpt did not match the grounded dialogue context.",
         "character_evidence_mismatch": "Character evidence did not resolve uniquely in the source.",
         "alias_evidence_mismatch": "An explicit alias lacked unambiguous contextual source evidence.",
+        "overlap_candidate_conflict": "Overlapping candidates disagreed on semantic claims; the grounded dialogue remains pending.",
         "missing_quoted_dialogue": "Quoted source text was not covered by a grounded dialogue candidate.",
     }
     return AnalysisWarning(
@@ -328,7 +394,7 @@ class SemanticAnalysisService:
         character_records = self._merge_characters(source_revision, successes, warnings)
         alias_map = self._alias_map(character_records)
 
-        located_by_span: dict[tuple[int, int], tuple[AnalysisChunk, LocatedCandidate]] = {}
+        located_groups: dict[tuple[int, int], list[tuple[AnalysisChunk, LocatedCandidate]]] = {}
         for chunk, response in successes:
             for candidate in response.utterance_candidates:
                 if UncertaintyCode.SOURCE_ANCHOR_AMBIGUOUS in candidate.uncertainty_codes:
@@ -346,9 +412,46 @@ class SemanticAnalysisService:
                     )
                     continue
                 key = (result.start_utf16, result.end_utf16)
-                existing = located_by_span.get(key)
-                if existing is None or candidate.confidence > existing[1].candidate.confidence:
-                    located_by_span[key] = (chunk, result)
+                located_groups.setdefault(key, []).append((chunk, result))
+
+        located_by_span: dict[tuple[int, int], tuple[AnalysisChunk, LocatedCandidate]] = {}
+        for key, group in located_groups.items():
+            selected_chunk, selected = sorted(
+                group,
+                key=lambda item: (
+                    -item[1].candidate.confidence,
+                    item[0].chunk_id,
+                    repr(_candidate_claims(item[1].candidate, alias_map)),
+                ),
+            )[0]
+            dimensions = _conflicting_claim_dimensions(
+                (item[1].candidate for item in group), alias_map
+            )
+            if dimensions:
+                uncertainty = list(selected.candidate.uncertainty_codes)
+                if UncertaintyCode.DIALOGUE_AMBIGUOUS not in uncertainty:
+                    uncertainty.append(UncertaintyCode.DIALOGUE_AMBIGUOUS)
+                selected = selected.model_copy(
+                    update={
+                        "candidate": selected.candidate.model_copy(
+                            update={"uncertainty_codes": uncertainty}
+                        )
+                    }
+                )
+                warnings.append(
+                    _warning(
+                        "overlap_candidate_conflict",
+                        identity=(key, tuple(dimensions)),
+                        details={
+                            "start_utf16": key[0],
+                            "end_utf16": key[1],
+                            "candidate_count": len(group),
+                            "dimensions": dimensions,
+                            "chunk_ids": sorted({item[0].chunk_id for item in group}),
+                        },
+                    )
+                )
+            located_by_span[key] = (selected_chunk, selected)
 
         annotations_by_key: dict[tuple[AnnotationKind, int, int], SemanticAnnotation] = {}
         grounded: list[_GroundedUtterance] = []
@@ -436,7 +539,10 @@ class SemanticAnalysisService:
 
             if candidate.source_excerpt:
                 diagnostic = _unique_chunk_occurrence(chunk, candidate.source_excerpt)
-                if diagnostic is None or candidate.dialogue_excerpt not in candidate.source_excerpt:
+                if diagnostic is None or not (
+                    diagnostic[0] <= located.start_utf16
+                    and located.end_utf16 <= diagnostic[1]
+                ):
                     warnings.append(
                         _warning(
                             "source_excerpt_mismatch",
@@ -575,7 +681,12 @@ class SemanticAnalysisService:
                 if (
                     raw_alias_owners.get(alias_key) == {key}
                     and alias_key not in records
-                    and _all_occurrences(source.source_markdown, alias)
+                    and _has_alias_relationship_evidence(
+                        source.source_markdown,
+                        record.canonical_name,
+                        alias,
+                        record.evidence_excerpts,
+                    )
                 ):
                     visible.append(alias)
                 else:

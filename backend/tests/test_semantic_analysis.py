@@ -42,7 +42,27 @@ class FakeSemanticProvider:
         result = next(self.results)
         if isinstance(result, Exception):
             raise result
-        return result
+        return result.model_copy(
+            update={
+                "chunk_id": chunk.chunk_id,
+                "start_utf16": chunk.start_utf16,
+                "end_utf16": chunk.end_utf16,
+                "overlap_before": chunk.overlap_before,
+                "overlap_after": chunk.overlap_after,
+            }
+        )
+
+
+def _response(**values: object) -> SemanticProviderResponse:
+    chunk = AnalysisChunk.single("")
+    return SemanticProviderResponse(
+        chunk_id=chunk.chunk_id,
+        start_utf16=chunk.start_utf16,
+        end_utf16=chunk.end_utf16,
+        overlap_before=chunk.overlap_before,
+        overlap_after=chunk.overlap_after,
+        **values,
+    )
 
 
 def _source(text: str) -> ScriptRevision:
@@ -156,12 +176,12 @@ def test_service_builds_grounded_layers_controlled_aliases_and_acceptance_truth(
     text = Path(__file__).with_name("fixtures").joinpath("mixed_semantic_script.txt").read_text(encoding="utf-8")
     source = _source(text)
     run, draft = _run_and_draft(source)
-    response = SemanticProviderResponse(
+    response = _response(
         character_candidates=[
             CharacterCandidatePayload(
                 canonical_name="诸葛九九",
                 aliases=["九九"],
-                evidence_excerpts=["诸葛九九", "九九继续"],
+                evidence_excerpts=["诸葛九九：胶布，踩蓝格！\n九九继续"],
                 confidence=0.96,
             ),
             CharacterCandidatePayload(canonical_name="胶布", evidence_excerpts=["胶布（惊喜，大喊）"], confidence=0.94),
@@ -217,11 +237,41 @@ def test_service_builds_grounded_layers_controlled_aliases_and_acceptance_truth(
         validate_source_span(annotation.span, source)
 
 
+@pytest.mark.parametrize(
+    ("text", "evidence_excerpts"),
+    [
+        ("诸葛九九登场。\n九九继续向前。", ["诸葛九九", "九九继续"]),
+        ("诸葛九九登场。", ["诸葛九九"]),
+        ("诸葛九九登场。\n另一场景里，九九继续。", ["诸葛九九登场。"]),
+    ],
+)
+def test_alias_requires_one_unique_relationship_excerpt_with_independent_alias_occurrence(
+    text: str, evidence_excerpts: list[str]
+) -> None:
+    source = _source(text)
+    run, draft = _run_and_draft(source)
+    response = _response(
+        character_candidates=[
+            CharacterCandidatePayload(
+                canonical_name="诸葛九九",
+                aliases=["九九"],
+                evidence_excerpts=evidence_excerpts,
+                confidence=0.95,
+            )
+        ]
+    )
+
+    result = SemanticAnalysisService(FakeSemanticProvider([response])).analyze("demo", source, run, draft)
+
+    assert result.characters[0].aliases == []
+    assert any(item.code == "alias_evidence_mismatch" for item in result.warnings)
+
+
 def test_evidence_mismatches_are_soft_and_block_only_missing_character_or_speaker_truth() -> None:
     text = "甲：保留这句。\n乙：另一句。"
     source = _source(text)
     run, draft = _run_and_draft(source)
-    response = SemanticProviderResponse(
+    response = _response(
         character_candidates=[CharacterCandidatePayload(canonical_name="甲", confidence=0.95)],
         utterance_candidates=[
             _candidate(
@@ -247,11 +297,36 @@ def test_evidence_mismatches_are_soft_and_block_only_missing_character_or_speake
     assert {item.code for item in result.warnings} >= {"speaker_evidence_mismatch", "emotion_evidence_mismatch"}
 
 
+@pytest.mark.parametrize(
+    ("source_excerpt", "expects_warning"),
+    [
+        ("甲：重复台词。前文。", True),
+        ("乙：重复台词。后文。", False),
+    ],
+)
+def test_source_excerpt_must_cover_the_selected_duplicate_occurrence(
+    source_excerpt: str, expects_warning: bool
+) -> None:
+    text = "甲：重复台词。前文。\n乙：重复台词。后文。"
+    source = _source(text)
+    run, draft = _run_and_draft(source)
+    response = _response(
+        utterance_candidates=[
+            _candidate("重复台词。", occurrence_index=1, source_excerpt=source_excerpt)
+        ]
+    )
+
+    result = SemanticAnalysisService(FakeSemanticProvider([response])).analyze("demo", source, run, draft)
+
+    warnings = [item for item in result.warnings if item.code == "source_excerpt_mismatch"]
+    assert bool(warnings) is expects_warning
+
+
 def test_one_character_mutation_is_unresolved_while_other_candidate_succeeds() -> None:
     text = "甲：第一句。\n乙：第二句。"
     source = _source(text)
     run, draft = _run_and_draft(source)
-    response = SemanticProviderResponse(
+    response = _response(
         utterance_candidates=[_candidate("第一句！"), _candidate("第二句。")]
     )
 
@@ -266,7 +341,7 @@ def test_one_character_mutation_is_unresolved_while_other_candidate_succeeds() -
 def test_distinct_bad_candidates_remain_distinct_safe_unresolved_items() -> None:
     source = _source("甲：真实台词。")
     run, draft = _run_and_draft(source)
-    response = SemanticProviderResponse(
+    response = _response(
         utterance_candidates=[_candidate("错误一"), _candidate("错误二")]
     )
 
@@ -281,8 +356,8 @@ def test_overlap_deduplicates_by_span_keeps_highest_confidence_and_source_order(
     text = "甲：前句。\n\n乙：重叠句。\n\n丙：后句。"
     source = _source(text)
     run, draft = _run_and_draft(source)
-    low = SemanticProviderResponse(utterance_candidates=[_candidate("重叠句。", confidence=0.81), _candidate("前句。")])
-    high = SemanticProviderResponse(utterance_candidates=[_candidate("重叠句。", confidence=0.97), _candidate("后句。")])
+    low = _response(utterance_candidates=[_candidate("重叠句。", confidence=0.81), _candidate("前句。")])
+    high = _response(utterance_candidates=[_candidate("重叠句。", confidence=0.97), _candidate("后句。")])
     provider = FakeSemanticProvider([low, high])
 
     result = SemanticAnalysisService(provider, max_chunk_chars=18, overlap_chars=10).analyze("demo", source, run, draft)
@@ -294,12 +369,89 @@ def test_overlap_deduplicates_by_span_keeps_highest_confidence_and_source_order(
     assert len({item.dialogue_annotation_id for item in result.utterances}) == 3
 
 
+@pytest.mark.parametrize("conflict", ["speaker", "emotion"])
+def test_incompatible_overlap_candidates_warn_and_force_dialogue_pending(conflict: str) -> None:
+    text = "甲：前句。\n\n乙：重叠句。\n\n丙：后句。"
+    source = _source(text)
+    run, draft = _run_and_draft(source)
+    first_values: dict[str, object] = {"speaker_name": "甲"}
+    second_values: dict[str, object] = {"speaker_name": "乙"}
+    if conflict == "emotion":
+        first_values = {
+            "speaker_name": "乙",
+            "normalized_emotion": "happy",
+            "emotion_intensity": 0.7,
+            "emotion_origin": "inferred",
+            "uncertainty_codes": ["emotion_inferred"],
+        }
+        second_values = {
+            "speaker_name": "乙",
+            "normalized_emotion": "angry",
+            "emotion_intensity": 0.7,
+            "emotion_origin": "inferred",
+            "uncertainty_codes": ["emotion_inferred"],
+        }
+    characters = [
+        CharacterCandidatePayload(canonical_name="甲", evidence_excerpts=["甲："], confidence=0.95),
+        CharacterCandidatePayload(canonical_name="乙", evidence_excerpts=["乙："], confidence=0.95),
+    ]
+    first = _response(
+        character_candidates=characters,
+        utterance_candidates=[_candidate("重叠句。", confidence=0.90, **first_values)],
+    )
+    second = _response(
+        character_candidates=characters,
+        utterance_candidates=[_candidate("重叠句。", confidence=0.96, **second_values)],
+    )
+
+    result = SemanticAnalysisService(
+        FakeSemanticProvider([first, second]), max_chunk_chars=18, overlap_chars=10
+    ).analyze("demo", source, run, draft)
+
+    assert len(result.utterances) == 1
+    assert result.utterances[0].status is ReviewStatus.PENDING
+    assert UncertaintyCode.DIALOGUE_AMBIGUOUS in result.utterances[0].uncertainty_codes
+    dialogue = next(item for item in result.annotations if item.kind is AnnotationKind.DIALOGUE)
+    assert dialogue.status is ReviewStatus.PENDING
+    conflict_warning = next(item for item in result.warnings if item.code == "overlap_candidate_conflict")
+    assert conflict_warning.details["dimensions"] == [conflict]
+    assert "重叠句" not in str(conflict_warning.details)
+
+
+def test_controlled_alias_speakers_are_compatible_overlap_identity() -> None:
+    text = "诸葛九九：前句。\n九九继续。\n\n诸葛九九：重叠句。\n\n尾声很长很长很长很长。"
+    source = _source(text)
+    run, draft = _run_and_draft(source)
+    character = CharacterCandidatePayload(
+        canonical_name="诸葛九九",
+        aliases=["九九"],
+        evidence_excerpts=["诸葛九九：前句。\n九九继续"],
+        confidence=0.95,
+    )
+    first = _response(
+        character_candidates=[character],
+        utterance_candidates=[_candidate("重叠句。", speaker_name="诸葛九九", confidence=0.90)],
+    )
+    second = _response(
+        character_candidates=[character],
+        utterance_candidates=[_candidate("重叠句。", speaker_name="九九", confidence=0.96)],
+    )
+
+    result = SemanticAnalysisService(
+        FakeSemanticProvider([first, second]), max_chunk_chars=32, overlap_chars=14
+    ).analyze("demo", source, run, draft)
+
+    assert result.utterances[0].status is ReviewStatus.ACCEPTED
+    assert UncertaintyCode.DIALOGUE_AMBIGUOUS not in result.utterances[0].uncertainty_codes
+    assert not any(item.code == "overlap_candidate_conflict" for item in result.warnings)
+
+
 def test_one_failed_chunk_returns_partial_draft_and_preserves_success() -> None:
     text = "甲：第一句。\n\n乙：第二句。"
     source = _source(text)
     run, draft = _run_and_draft(source)
     failure = SemanticProviderUpstream("safe upstream failure")
-    success = SemanticProviderResponse(utterance_candidates=[_candidate("第二句。")])
+    success = _response(utterance_candidates=[_candidate("第二句。")])
     provider = FakeSemanticProvider([failure, success])
 
     result = SemanticAnalysisService(provider, max_chunk_chars=9, overlap_chars=0).analyze("demo", source, run, draft)
@@ -337,7 +489,7 @@ def test_zero_utterances_are_valid_and_missing_quoted_coverage_only_warns() -> N
     source = _source("旁白写道：“别遗漏我。”\n没有其他台词。")
     run, draft = _run_and_draft(source)
 
-    result = SemanticAnalysisService(FakeSemanticProvider([SemanticProviderResponse()])).analyze(
+    result = SemanticAnalysisService(FakeSemanticProvider([_response()])).analyze(
         "demo", source, run, draft
     )
 

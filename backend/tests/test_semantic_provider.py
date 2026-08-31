@@ -12,7 +12,6 @@ from app.semantic_provider import (
     AnalysisChunk,
     CharacterCandidatePayload,
     SemanticProviderContractError,
-    SemanticProviderResponse,
     SemanticProviderTimeout,
     SemanticProviderUnavailable,
     SemanticProviderUpstream,
@@ -83,12 +82,26 @@ def _openai_response(payload: object) -> FakeResponse:
     return FakeResponse({"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}]})
 
 
-def _empty_payload() -> dict[str, list[object]]:
-    return {"character_candidates": [], "utterance_candidates": []}
+def _empty_payload(chunk: AnalysisChunk | None = None) -> dict[str, object]:
+    chunk = chunk or AnalysisChunk.single("文本")
+    return {
+        "character_candidates": [],
+        "utterance_candidates": [],
+        "chunk_id": chunk.chunk_id,
+        "start_utf16": chunk.start_utf16,
+        "end_utf16": chunk.end_utf16,
+        "overlap_before": chunk.overlap_before,
+        "overlap_after": chunk.overlap_after,
+    }
 
 
 def test_strict_payload_contract_accepts_empty_and_rejects_invalid_candidates() -> None:
-    assert decode_semantic_payload(_empty_payload()) == SemanticProviderResponse()
+    decoded = decode_semantic_payload(_empty_payload())
+    assert decoded.character_candidates == []
+    assert decoded.utterance_candidates == []
+
+    with pytest.raises(SemanticProviderContractError):
+        decode_semantic_payload({"character_candidates": [], "utterance_candidates": []})
 
     with pytest.raises(SemanticProviderContractError) as malformed:
         decode_semantic_payload({"character_candidates": [], "utterance_candidates": "not-an-array"})
@@ -125,10 +138,11 @@ def test_openai_adapter_uses_grounded_json_contract_and_runtime_egress_validatio
 
     monkeypatch.setattr("app.semantic_provider.validate_egress_url", validate)
     monkeypatch.setenv("SEMANTIC_TEST_KEY", "sk-not-visible")
-    client = FakeClient(_openai_response(_empty_payload()))
+    chunk = AnalysisChunk.single("只有叙述😀\r\n第二段")
+    client = FakeClient(_openai_response(_empty_payload(chunk)))
     provider = build_semantic_provider(_config(), client=client)
 
-    result = provider.analyze_chunk(AnalysisChunk.single("只有叙述😀\r\n第二段"))
+    result = provider.analyze_chunk(chunk)
 
     assert result.utterance_candidates == []
     assert validations == [
@@ -152,6 +166,7 @@ def test_openai_adapter_uses_grounded_json_contract_and_runtime_egress_validatio
         "leave speaker_name empty",
         "诸葛九九",
         "never infer 王/老王 from substring alone",
+        "all five chunk identity fields",
     ):
         assert requirement in prompt
     assert client.closed is False
@@ -160,25 +175,62 @@ def test_openai_adapter_uses_grounded_json_contract_and_runtime_egress_validatio
 def test_anthropic_adapter_uses_only_dedicated_tool_result(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("app.semantic_provider.validate_egress_url", lambda url, **_kwargs: url)
     monkeypatch.setenv("SEMANTIC_TEST_KEY", "anthropic-secret")
+    chunk = AnalysisChunk.single("叙述")
     response = FakeResponse(
         {
             "content": [
                 {"type": "text", "text": json.dumps(_empty_payload())},
                 {"type": "tool_use", "name": "wrong_tool", "input": {"utterance_candidates": "bad"}},
-                {"type": "tool_use", "name": "emit_semantic_analysis", "input": _empty_payload()},
+                {"type": "tool_use", "name": "emit_semantic_analysis", "input": _empty_payload(chunk)},
             ]
         }
     )
     client = FakeClient(response)
     provider = build_semantic_provider(_config(adapter="anthropic"), client=client)
 
-    assert provider.analyze_chunk(AnalysisChunk.single("叙述")) == SemanticProviderResponse()
+    result = provider.analyze_chunk(chunk)
+    assert result.utterance_candidates == []
     request = client.calls[0]
     assert request["url"] == "https://semantic.example/v1/messages"
     payload = request["json"]
     assert payload["tool_choice"] == {"type": "tool", "name": "emit_semantic_analysis"}  # type: ignore[index]
     assert payload["tools"][0]["name"] == "emit_semantic_analysis"  # type: ignore[index]
+    assert set(payload["tools"][0]["input_schema"]["required"]) >= {  # type: ignore[index]
+        "chunk_id",
+        "start_utf16",
+        "end_utf16",
+        "overlap_before",
+        "overlap_after",
+    }
     assert request["headers"]["x-api-key"] == "anthropic-secret"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("chunk_id", "stale-chunk"),
+        ("start_utf16", 1),
+        ("end_utf16", 999),
+        ("overlap_before", 1),
+        ("overlap_after", 1),
+    ],
+)
+def test_provider_rejects_each_mismatched_response_chunk_identity_as_safe_422(
+    monkeypatch: pytest.MonkeyPatch, field: str, wrong_value: object
+) -> None:
+    monkeypatch.setenv("SEMANTIC_TEST_KEY", "secret-key")
+    monkeypatch.setattr("app.semantic_provider.validate_egress_url", lambda url, **_kwargs: url)
+    chunk = AnalysisChunk.single("文本")
+    payload = _empty_payload(chunk)
+    payload[field] = wrong_value
+    provider = build_semantic_provider(_config(), client=FakeClient(_openai_response(payload)))
+
+    with pytest.raises(SemanticProviderContractError) as error:
+        provider.analyze_chunk(chunk)
+
+    assert error.value.http_status == 422
+    assert error.value.retryable is False
+    assert "secret-key" not in str(error.value)
 
 
 @pytest.mark.parametrize(
@@ -311,7 +363,7 @@ def test_production_client_context_exits_and_closes(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr("app.semantic_provider.httpx.Client", lambda **_kwargs: client)
 
     provider = build_semantic_provider(_config())
-    assert provider.analyze_chunk(AnalysisChunk.single("文本")) == SemanticProviderResponse()
+    assert provider.analyze_chunk(AnalysisChunk.single("文本")).utterance_candidates == []
     assert client.closed is True
 
 

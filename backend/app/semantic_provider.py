@@ -33,6 +33,8 @@ Propose aliases only with contextual evidence under one canonical character. For
 诸葛九九 and 九九 may be related when the source context supports that relationship;
 never infer 王/老王 from substring alone. Anchors must be exact adjacent source text of at most 32
 Unicode characters, and occurrence_index is the zero-based occurrence in this chunk.
+Always echo all five chunk identity fields exactly as supplied: chunk_id, start_utf16,
+end_utf16, overlap_before, and overlap_after. They are required even when both candidate arrays are empty.
 """
 
 
@@ -134,11 +136,11 @@ class UtteranceCandidate(_StrictModel):
 class SemanticProviderResponse(_StrictModel):
     character_candidates: list[CharacterCandidatePayload] = Field(default_factory=list)
     utterance_candidates: list[UtteranceCandidate] = Field(default_factory=list)
-    chunk_id: str | None = None
-    start_utf16: int | None = Field(default=None, ge=0)
-    end_utf16: int | None = Field(default=None, ge=0)
-    overlap_before: int | None = Field(default=None, ge=0)
-    overlap_after: int | None = Field(default=None, ge=0)
+    chunk_id: str
+    start_utf16: int = Field(ge=0)
+    end_utf16: int = Field(ge=0)
+    overlap_before: int = Field(ge=0)
+    overlap_after: int = Field(ge=0)
 
 
 class SemanticProviderError(RuntimeError):
@@ -283,7 +285,26 @@ class _BaseSemanticProvider:
             raise SemanticProviderContractError(
                 _safe_private_free_message("semantic provider returned malformed JSON")
             ) from None
-        return decode_semantic_payload(raw_payload)
+        decoded = decode_semantic_payload(raw_payload)
+        expected_identity = (
+            chunk.chunk_id,
+            chunk.start_utf16,
+            chunk.end_utf16,
+            chunk.overlap_before,
+            chunk.overlap_after,
+        )
+        actual_identity = (
+            decoded.chunk_id,
+            decoded.start_utf16,
+            decoded.end_utf16,
+            decoded.overlap_before,
+            decoded.overlap_after,
+        )
+        if actual_identity != expected_identity:
+            raise SemanticProviderContractError(
+                _safe_private_free_message("semantic provider response chunk identity mismatch")
+            )
+        return decoded
 
     def _endpoint(self) -> str:
         raise NotImplementedError
