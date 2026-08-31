@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import type {
@@ -102,11 +102,19 @@ export function ScriptAnalysisWorkspace({
   const [copyComplete, setCopyComplete] = useState(false);
   const workspaceRef = useRef<HTMLDivElement>(null);
   const confirmationRef = useRef<Promise<unknown> | null>(null);
+  const mountedRef = useRef(true);
   const draft = controller.draft;
   const summary = useMemo(
     () => (draft ? summarizeConfirmableUtterances(draft) : { importable: 0, excluded: 0 }),
     [draft]
   );
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const queueOperations = (operations: DraftOperation[]) => {
     controller.queueOperations(operations);
@@ -191,13 +199,14 @@ export function ScriptAnalysisWorkspace({
     confirmationRef.current = confirmation;
     void confirmation
       .then((result) => {
+        if (!mountedRef.current) return;
         onConfirmed(result.project);
         setConfirmOpen(false);
       })
       .catch(() => undefined)
       .finally(() => {
         if (confirmationRef.current === confirmation) confirmationRef.current = null;
-        setSubmittingConfirmation(false);
+        if (mountedRef.current) setSubmittingConfirmation(false);
       });
   };
 

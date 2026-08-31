@@ -163,6 +163,7 @@ export function AnalysisStageGate({
 }: AnalysisStageGateProps) {
   if (stage === "analysis" && projectId && sourceRevision) {
     return createElement(ScriptAnalysisWorkspace, {
+      key: `${projectId}:${sourceRevision.revision_id}:${sourceRevision.source_sha256 ?? ""}`,
       projectId,
       sourceRevision,
       onConfirmed,

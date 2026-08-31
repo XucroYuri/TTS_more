@@ -91,6 +91,7 @@ import {
   type AnalysisSourceFileMetadata,
   type WorkspaceStage
 } from "./features/script-analysis/analysisFlow";
+import { hasRestorableAnalysisSession } from "./features/script-analysis/useAnalysisDraft";
 import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
 import { generationStatusCounts, generationStatusKey, generationStatusTone, generationTerminalNotice, isTerminalGenerationStatus, reconcileGenerationJobSnapshot, type GenerationStatusTone } from "./lib/generationStatus";
 import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./lib/gptSovitsReference";
@@ -270,9 +271,11 @@ export default function App() {
   const analysisSourceFileMetadataRef = useRef<AnalysisSourceFileMetadata | null>(null);
   const scriptFileOperationTokenRef = useRef(0);
   const analysisStartOperationTokenRef = useRef(0);
+  const analysisManagerSavingTokenRef = useRef<number | null>(null);
   const lastGenerationProjectIdRef = useRef<string | null>(null);
   const saveChainRef = useRef<Promise<void>>(Promise.resolve());
   const skipNextAutosaveRef = useRef(false);
+  const projectAuthorityEpochRef = useRef(0);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [preflightResult, setPreflightResult] = useState<GenerationPreflightResponse | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -376,6 +379,14 @@ export default function App() {
     fetchProject(currentProjectId)
       .then((payload) => {
         if (cancelled) return;
+        const resumableRevision = payload.script_revisions?.find(
+          (revision) => revision.revision_id === payload.active_script_revision_id
+        );
+        if (resumableRevision && hasRestorableAnalysisSession(currentProjectId, resumableRevision)) {
+          analysisProjectIdRef.current = currentProjectId;
+          setAnalysisSourceRevision(resumableRevision);
+          setWorkspaceStage("analysis");
+        }
         skipNextAutosaveRef.current = true;
         setProject(payload);
         setActiveLineId(payload.lines[0]?.id ?? "");
@@ -423,8 +434,17 @@ export default function App() {
       return;
     }
     setSaveState("saving");
+    const autosaveProjectId = currentProjectId;
+    const autosaveProject = project;
+    const autosaveCharacters = characters;
+    const autosaveAuthorityEpoch = projectAuthorityEpochRef.current;
     const handle = window.setTimeout(() => {
-      saveChainRef.current = saveChainRef.current.then(() => saveCurrentProject());
+      saveChainRef.current = saveChainRef.current.then(() => saveCurrentProject(
+        autosaveProjectId,
+        autosaveProject,
+        autosaveCharacters,
+        autosaveAuthorityEpoch
+      ));
     }, 700);
     return () => window.clearTimeout(handle);
   }, [characters, currentProjectId, isProjectLoaded, project, workspaceStage]);
@@ -1037,7 +1057,7 @@ export default function App() {
 
   async function createNewScriptProject() {
     const title = newScriptTitle.trim();
-    const source = newScriptSource.trim();
+    const source = newScriptSource;
     if (!title) {
       setNotice(t("script.newScriptTitleRequired"));
       return;
@@ -1048,7 +1068,7 @@ export default function App() {
     setSaveState("saving");
     try {
       await saveProject(projectId, nextProject);
-      const savedProject = source
+      const savedProject = source.trim()
         ? (await createScriptRevision(projectId, source, t("script.initialScriptRevision"))).project
         : nextProject;
       setCurrentProjectId(projectId);
@@ -1063,7 +1083,7 @@ export default function App() {
       setManagedProjectId(projectId);
       setManagedProject(savedProject);
       setManagerTitleDraft(savedProject.title);
-      setManagerSourceDraft(source || projectToScriptSourceText(savedProject, characters));
+      setManagerSourceDraft(source.trim() ? source : projectToScriptSourceText(savedProject, characters));
       setNewScriptTitle("");
       setNewScriptSource("");
       setSaveState("saved");
@@ -1250,10 +1270,23 @@ export default function App() {
     }
   }
 
-  async function saveCurrentProject() {
-    if (!currentProjectId) return;
+  async function saveCurrentProject(
+    targetProjectId: string,
+    projectSnapshot: ScriptProject,
+    characterSnapshot: Character[],
+    authorityEpoch: number
+  ) {
+    if (authorityEpoch !== projectAuthorityEpochRef.current) {
+      setSaveState("saved");
+      return;
+    }
     try {
-      await Promise.all([saveProject(currentProjectId, project), saveCharacters(characters)]);
+      await Promise.all([saveProject(targetProjectId, projectSnapshot), saveCharacters(characterSnapshot)]);
+      if (authorityEpoch !== projectAuthorityEpochRef.current) {
+        setSaveState("saved");
+        setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+        return;
+      }
       setSaveState("saved");
       setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
       setNotice(t("notice.autoSaved"));
@@ -1474,6 +1507,7 @@ export default function App() {
 
   function updateManagedSourceDraft(value: string) {
     scriptFileOperationTokenRef.current += 1;
+    analysisStartOperationTokenRef.current += 1;
     analysisSourceFileMetadataRef.current = null;
     setManagerSourceDraft(value);
   }
@@ -1493,6 +1527,7 @@ export default function App() {
         : "analysis.input.readFailed"));
       return;
     }
+    analysisStartOperationTokenRef.current += 1;
     analysisSourceFileMetadataRef.current = outcome.metadata;
     setManagerSourceDraft(outcome.source);
     if (outcome.metadata.warning) {
@@ -1516,14 +1551,18 @@ export default function App() {
       setNotice(t("script.sourceRequired"));
       return;
     }
-    const confirmed = await confirmRevisionRisk(managedProject);
-    if (!confirmed || targetProjectId !== analysisManagedProjectIdRef.current) return;
     const operationToken = analysisStartOperationTokenRef.current + 1;
     analysisStartOperationTokenRef.current = operationToken;
     const isCurrent = () => operationToken === analysisStartOperationTokenRef.current
       && targetProjectId === analysisManagedProjectIdRef.current;
+    analysisManagerSavingTokenRef.current = operationToken;
     setIsManagerSaving(true);
     try {
+      const confirmed = await confirmRevisionRisk(managedProject);
+      if (!confirmed || !isCurrent()) return;
+      projectAuthorityEpochRef.current += 1;
+      await saveChainRef.current;
+      if (!isCurrent()) return;
       if (title !== managedProject.title) {
         await saveProject(targetProjectId, { ...managedProject, title });
       }
@@ -1551,7 +1590,10 @@ export default function App() {
     } catch (error) {
       if (isCurrent()) setNotice(error instanceof Error ? error.message : t("analysis.input.readFailed"));
     } finally {
-      if (isCurrent()) setIsManagerSaving(false);
+      if (analysisManagerSavingTokenRef.current === operationToken) {
+        analysisManagerSavingTokenRef.current = null;
+        setIsManagerSaving(false);
+      }
     }
   }
 
@@ -1578,13 +1620,21 @@ export default function App() {
     setManagerSourceDraft(handoff.managerSourceDraft);
     setSaveState("saved");
     setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
-    void refreshProjects(handoff.currentProjectId).finally(() => {
-      if (analysisProjectIdRef.current !== targetProjectId) return;
-      analysisProjectIdRef.current = null;
-      analysisSourceFileMetadataRef.current = null;
-      setAnalysisSourceRevision(null);
-      setWorkspaceStage("tts");
-    });
+    const summaryRefreshEpoch = analysisStartOperationTokenRef.current;
+    analysisProjectIdRef.current = null;
+    analysisSourceFileMetadataRef.current = null;
+    setAnalysisSourceRevision(null);
+    setWorkspaceStage("tts");
+    void fetchProjects()
+      .then((payload) => {
+        if (
+          analysisStartOperationTokenRef.current === summaryRefreshEpoch
+          && analysisCurrentProjectIdRef.current === targetProjectId
+        ) {
+          setProjectSummaries(payload.projects);
+        }
+      })
+      .catch(() => undefined);
   }
 
   function cancelScriptAnalysis() {
@@ -1597,12 +1647,12 @@ export default function App() {
   async function saveManagedScriptRevision() {
     if (!managedProjectId || !managedProject) return;
     const title = managerTitleDraft.trim();
-    const source = managerSourceDraft.trim();
+    const source = managerSourceDraft;
     if (!title) {
       setNotice(t("script.newScriptTitleRequired"));
       return;
     }
-    if (!source) {
+    if (!source.trim()) {
       setNotice(t("script.sourceRequired"));
       return;
     }
@@ -1631,12 +1681,12 @@ export default function App() {
   async function parseManagedScriptRevision() {
     if (!managedProjectId || !managedProject) return;
     const title = managerTitleDraft.trim();
-    const source = managerSourceDraft.trim();
+    const source = managerSourceDraft;
     if (!title) {
       setNotice(t("script.newScriptTitleRequired"));
       return;
     }
-    if (!source) {
+    if (!source.trim()) {
       setNotice(t("script.sourceRequired"));
       return;
     }

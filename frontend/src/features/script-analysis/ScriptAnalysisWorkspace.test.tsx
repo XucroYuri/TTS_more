@@ -1,4 +1,4 @@
-import { act, createElement, type ReactElement } from "react";
+import { act, createElement, StrictMode, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 // @ts-expect-error jsdom ships without declaration files in this project.
 import { JSDOM } from "jsdom";
@@ -1070,6 +1070,37 @@ describe("ScriptAnalysisWorkspace", () => {
     confirmGate.resolve(confirmResponse(currentDraft));
     await flushAsync();
     expect(onConfirmed).toHaveBeenCalledTimes(1);
+    expect(onConfirmed).toHaveBeenCalledWith(confirmedProject);
+  });
+
+  it("forwards confirmation after StrictMode's development effect replay", async () => {
+    const currentDraft = draft();
+    const harness = apiHarness(currentDraft, run());
+    const onConfirmed = vi.fn();
+    const view = await renderElement(
+      createElement(
+        StrictMode,
+        null,
+        createElement(ScriptAnalysisWorkspace, {
+          projectId: "project-task-8",
+          sourceRevision,
+          onConfirmed,
+          onCancel: () => undefined,
+          controllerOptions: {
+            api: harness.api,
+            storage: new MemoryStorage(),
+            pollIntervalMs: 50,
+            createIdempotencyKey: () => "strict-confirm-task-9"
+          }
+        })
+      )
+    );
+    await flushAsync(20);
+    await click(view.container.querySelector('[data-action="confirm-open"]')!);
+    await click(view.container.querySelector('[data-action="confirm-submit"]')!);
+    await flushAsync(20);
+
+    expect(onConfirmed).toHaveBeenCalledOnce();
     expect(onConfirmed).toHaveBeenCalledWith(confirmedProject);
   });
 

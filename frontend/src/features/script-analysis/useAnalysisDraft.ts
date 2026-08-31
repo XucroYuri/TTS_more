@@ -432,6 +432,14 @@ function readSession(storage: Storage | null, scopeId: string): AnalysisRunSessi
   return { runId: candidate.runId, draftId: candidate.draftId };
 }
 
+export function hasRestorableAnalysisSession(
+  projectId: string,
+  sourceRevision: ScriptRevision,
+  storage: Storage | null = defaultStorage()
+): boolean {
+  return readSession(storage, scopeStorageId(projectId, sourceRevision)) !== null;
+}
+
 function writeSession(
   storage: Storage | null,
   scopeId: string,
