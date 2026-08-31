@@ -32,6 +32,10 @@ WINDOWS_LEGACY_FILE_PATH_UNITS = 260
 TRASH_PROJECT_COMPONENT_UNITS = 160
 
 
+class ProjectRevisionAuthorityConflict(RuntimeError):
+    code = "project_revision_authority_conflict"
+
+
 def windows_filesystem_path(path: Path) -> Path:
     if os.name != "nt":
         return path
@@ -195,6 +199,18 @@ class ProjectStore:
         self._write_model(project_dir / "project.json", project)
         self._write_project_materialized_files(project_dir, project)
 
+    def replace_project(self, project_id: str, project: ScriptProject) -> None:
+        safe_id = self._safe_project_id(project_id)
+        with self.project_lock(safe_id):
+            try:
+                current = self.load_project(safe_id)
+            except FileNotFoundError:
+                self.save_project(safe_id, project)
+                return
+            if self._revision_authority(current) != self._revision_authority(project):
+                raise ProjectRevisionAuthorityConflict("project revision authority conflict")
+            self.save_project(safe_id, project)
+
     def load_project(self, project_id: str) -> ScriptProject:
         return self._read_model(self.project_path(project_id), ScriptProject)
 
@@ -215,6 +231,17 @@ class ProjectStore:
             result = mutation(project)
             self.save_project(safe_project_id, project)
             return project, result
+
+    @staticmethod
+    def _revision_authority(
+        project: ScriptProject,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], str | None, str | None]:
+        return (
+            tuple(revision.revision_id for revision in project.script_revisions),
+            tuple(revision.revision_id for revision in project.parse_revisions),
+            project.active_script_revision_id,
+            project.active_parse_revision_id,
+        )
 
     def list_projects(self) -> list[dict[str, object]]:
         projects: list[dict[str, object]] = []

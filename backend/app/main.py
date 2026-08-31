@@ -40,6 +40,7 @@ from app.service_config import ServiceSettingsUpdate, public_service_settings, s
 from app.services import COMFYUI_TTS_AUDIO_SUITE_CONTRACT, ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
 from app.comfyui.workflow_builder import workflow_template_catalog
 from app.storage import (
+    ProjectRevisionAuthorityConflict,
     ProjectStore,
     windows_display_path,
     windows_filesystem_path,
@@ -895,7 +896,13 @@ def create_app(
 
     @app.put("/api/projects/{project_id}")
     def put_project(project_id: str, project: ScriptProject) -> dict[str, str]:
-        store.save_project(project_id, project)
+        try:
+            store.replace_project(project_id, project)
+        except ProjectRevisionAuthorityConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": "project revision authority conflict"},
+            ) from exc
         return {"status": "saved"}
 
     @app.delete("/api/projects/{project_id}")

@@ -999,6 +999,173 @@ def test_project_round_trip_via_api(tmp_path: Path) -> None:
     assert load.json()["project_characters"][0]["library_character_id"] == "alice-lib"
 
 
+def test_put_existing_project_rejects_stale_revision_authority(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    authoritative_project = {
+        "title": "Authority",
+        "default_language": "zh",
+        "active_script_revision_id": "script-r002",
+        "active_parse_revision_id": "parse-r002",
+        "script_revisions": [
+            {"revision_id": "script-r001", "source_markdown": "甲：旧台词", "summary": "old"},
+            {
+                "revision_id": "script-r002",
+                "source_markdown": "甲：新台词",
+                "parent_revision_id": "script-r001",
+                "summary": "new",
+            },
+        ],
+        "parse_revisions": [
+            {
+                "revision_id": "parse-r001",
+                "script_revision_id": "script-r001",
+                "provider": "test",
+                "warnings": [],
+                "project_characters": [],
+                "lines": [{"id": "l001", "line_uid": "parse-r001:l001", "character_id": "alice", "text": "旧台词"}],
+            },
+            {
+                "revision_id": "parse-r002",
+                "script_revision_id": "script-r002",
+                "parent_parse_revision_id": "parse-r001",
+                "provider": "test",
+                "warnings": [],
+                "project_characters": [],
+                "lines": [{"id": "l001", "line_uid": "parse-r002:l001", "character_id": "alice", "text": "新台词"}],
+            },
+        ],
+        "lines": [{"id": "l001", "line_uid": "parse-r002:l001", "character_id": "alice", "text": "新台词"}],
+    }
+    assert client.put("/api/projects/demo", json=authoritative_project).status_code == 200
+    before = client.get("/api/projects/demo").json()
+
+    def authority_bytes(project: dict[str, object]) -> bytes:
+        authority = {
+            "active_script_revision_id": project["active_script_revision_id"],
+            "active_parse_revision_id": project["active_parse_revision_id"],
+            "script_revisions": project["script_revisions"],
+            "parse_revisions": project["parse_revisions"],
+        }
+        return json.dumps(authority, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    stale = json.loads(json.dumps(before))
+    stale["active_script_revision_id"] = "script-r001"
+    stale["active_parse_revision_id"] = "parse-r001"
+    stale["script_revisions"] = stale["script_revisions"][:1]
+    stale["parse_revisions"] = stale["parse_revisions"][:1]
+    stale["lines"] = stale["parse_revisions"][0]["lines"]
+
+    response = client.put("/api/projects/demo", json=stale)
+    after = client.get("/api/projects/demo").json()
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "project_revision_authority_conflict",
+            "message": "project revision authority conflict",
+        }
+    }
+    assert authority_bytes(after) == authority_bytes(before)
+
+
+def test_put_existing_project_serializes_authority_check_with_script_revision_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    setup_client = TestClient(app)
+    assert setup_client.put("/api/projects/demo", json={"title": "Demo", "default_language": "zh"}).status_code == 200
+    stale = setup_client.get("/api/projects/demo").json()
+    store = app.state.store
+    original_save_project = store.save_project
+    writer_at_save_boundary = threading.Event()
+    release_writer = threading.Event()
+    stale_put_entered_save = threading.Event()
+    release_stale_put = threading.Event()
+    writer_responses: list[object] = []
+    put_responses: list[object] = []
+
+    def observed_save_project(project_id: str, project: main_module.ScriptProject) -> None:
+        revision_ids = [revision.revision_id for revision in project.script_revisions]
+        if revision_ids == ["script-r001", "script-r002"]:
+            writer_at_save_boundary.set()
+            assert release_writer.wait(3), "test did not release revision writer"
+        elif revision_ids == ["script-r001"] and writer_at_save_boundary.is_set():
+            stale_put_entered_save.set()
+            assert release_stale_put.wait(3), "test did not release stale PUT"
+        original_save_project(project_id, project)
+
+    monkeypatch.setattr(store, "save_project", observed_save_project)
+    writer_client = TestClient(app, raise_server_exceptions=False)
+    put_client = TestClient(app, raise_server_exceptions=False)
+
+    def create_revision() -> None:
+        writer_responses.append(
+            writer_client.post(
+                "/api/projects/demo/script-revisions",
+                json={"source_markdown": "甲：并发新增台词", "summary": "concurrent"},
+            )
+        )
+
+    def replace_with_stale_snapshot() -> None:
+        put_responses.append(put_client.put("/api/projects/demo", json=stale))
+
+    writer = threading.Thread(target=create_revision, name="revision-writer")
+    stale_put = threading.Thread(target=replace_with_stale_snapshot, name="stale-project-put")
+    writer.start()
+    assert writer_at_save_boundary.wait(3), "revision writer did not reach save boundary"
+    stale_put.start()
+    try:
+        assert not stale_put_entered_save.wait(1), "stale PUT bypassed the held project lock"
+    finally:
+        release_writer.set()
+        release_stale_put.set()
+        writer.join(5)
+        stale_put.join(5)
+
+    assert not writer.is_alive()
+    assert not stale_put.is_alive()
+    assert len(writer_responses) == 1
+    assert writer_responses[0].status_code == 200
+    assert len(put_responses) == 1
+    assert put_responses[0].status_code == 409
+    persisted = setup_client.get("/api/projects/demo").json()
+    assert [revision["revision_id"] for revision in persisted["script_revisions"]] == ["script-r001", "script-r002"]
+    assert persisted["active_script_revision_id"] == "script-r002"
+
+
+def test_put_existing_project_allows_mutable_payload_with_same_revision_authority(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    assert client.put(
+        "/api/projects/demo",
+        json={
+            "title": "Before",
+            "default_language": "zh",
+            "lines": [{"id": "l001", "character_id": "alice", "text": "你好"}],
+        },
+    ).status_code == 200
+    project = client.get("/api/projects/demo").json()
+    binding = {
+        "binding_id": "line-temp-index",
+        "provider_type": "indextts",
+        "service_id": "mock-index",
+        "capabilities": ["reference_audio_voice", "emotion_text"],
+        "config": {"voice": "tmp/ref.wav", "emotion_mode": "emotion_text", "emotion_text": "焦急"},
+    }
+    project["title"] = "After"
+    project["lines"][0]["temporary_binding"] = binding
+    project["parse_revisions"][0]["lines"][0]["temporary_binding"] = binding
+
+    response = client.put("/api/projects/demo", json=project)
+    persisted = client.get("/api/projects/demo").json()
+    normalized_binding = {**binding, "fallback_services": []}
+
+    assert response.status_code == 200
+    assert persisted["title"] == "After"
+    assert persisted["lines"][0]["temporary_binding"] == normalized_binding
+    assert persisted["parse_revisions"][0]["lines"][0]["temporary_binding"] == normalized_binding
+
+
 def test_project_save_creates_title_named_script_and_output_layout(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path))
     project = {
