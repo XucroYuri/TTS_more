@@ -124,6 +124,32 @@ def project_confirmed_draft(
     return revision
 
 
+def validate_confirmed_parse_revision(
+    project: ScriptProject,
+    draft: SemanticAnalysisDraft,
+    semantic_revision_id: str,
+    parse_revision_id: str,
+) -> ParseRevision:
+    expected_parse_revision_id = f"semantic-{semantic_revision_id}"
+    if parse_revision_id != expected_parse_revision_id:
+        raise SemanticProjectionError("parse_revision_collision")
+    existing = next(
+        (revision for revision in project.parse_revisions if revision.revision_id == parse_revision_id),
+        None,
+    )
+    if existing is None:
+        raise SemanticProjectionError("confirmed_parse_revision_missing")
+
+    validation_project = copy.deepcopy(project)
+    validation_project.project_characters = copy.deepcopy(existing.project_characters)
+    validation_project.active_parse_revision_id = existing.revision_id
+    validation_project.lines = copy.deepcopy(existing.lines)
+    validated = project_confirmed_draft(validation_project, draft, semantic_revision_id)
+    if validated != existing:
+        raise SemanticProjectionError("parse_revision_collision")
+    return existing
+
+
 def _require_compatible_parse_revision(
     revision: ParseRevision,
     draft: SemanticAnalysisDraft,

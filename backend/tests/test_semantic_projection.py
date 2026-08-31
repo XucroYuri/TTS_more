@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app.models import ProjectCharacter, ScriptProject, ScriptRevision
+from app.models import ParseRevision, ProjectCharacter, ScriptProject, ScriptRevision
 from app.semantic_models import (
     AnalysisRunQuality,
     AnalysisRunStatus,
@@ -219,6 +219,102 @@ def test_same_key_retry_ignores_stale_version_and_never_duplicates_artifacts(con
     assert len(second.project.parse_revisions) == len(first.project.parse_revisions)
     assert len(second.project.project_characters) == len(first.project.project_characters)
     assert len(second.project.lines) == len(first.project.lines)
+
+
+def test_confirmed_same_key_retry_preserves_unrelated_character_added_later(confirmable_store: tuple[SemanticStore, str]) -> None:
+    _projection()
+    store, draft_id = confirmable_store
+    first = store.confirm_draft(draft_id, 1, "confirm-key-1")
+    project = store.project_store.load_project("demo")
+    project.project_characters.append(ProjectCharacter(project_character_id="later-role", name="后续角色"))
+    store.project_store.save_project("demo", project)
+
+    replay = store.confirm_draft(draft_id, 999, "confirm-key-1")
+
+    assert replay.semantic_revision == first.semantic_revision
+    assert replay.parse_revision == first.parse_revision
+    assert replay.project.active_parse_revision_id == first.parse_revision.revision_id
+    assert any(item.project_character_id == "later-role" for item in replay.project.project_characters)
+    assert len(replay.project.parse_revisions) == len(first.project.parse_revisions)
+
+
+def test_confirmed_same_key_retry_preserves_later_active_parse_revision(confirmable_store: tuple[SemanticStore, str]) -> None:
+    _projection()
+    store, draft_id = confirmable_store
+    first = store.confirm_draft(draft_id, 1, "confirm-key-1")
+    project = store.project_store.load_project("demo")
+    later = ParseRevision(
+        revision_id="parse-later",
+        script_revision_id="script-r001",
+        parent_parse_revision_id=first.parse_revision.revision_id,
+        provider="manual",
+        project_characters=copy.deepcopy(project.project_characters),
+        lines=[],
+    )
+    project.parse_revisions.append(later)
+    project.active_parse_revision_id = later.revision_id
+    project.lines = []
+    store.project_store.save_project("demo", project)
+
+    replay = store.confirm_draft(draft_id, 999, "confirm-key-1")
+
+    assert replay.semantic_revision == first.semantic_revision
+    assert replay.parse_revision == first.parse_revision
+    assert replay.project.active_parse_revision_id == later.revision_id
+    assert [item.revision_id for item in replay.project.parse_revisions].count(first.parse_revision.revision_id) == 1
+    assert [item.revision_id for item in replay.project.parse_revisions].count(later.revision_id) == 1
+
+
+def test_confirmed_same_key_retry_does_not_recreate_missing_semantic_revision(confirmable_store: tuple[SemanticStore, str]) -> None:
+    _projection()
+    store, draft_id = confirmable_store
+    first = store.confirm_draft(draft_id, 1, "confirm-key-1")
+    revision_path = store.project_store.project_semantic_dir("demo") / "revisions" / f"{first.semantic_revision.id}.json"
+    revision_path.unlink()
+    project_before = copy.deepcopy(store.project_store.load_project("demo"))
+
+    with pytest.raises(SemanticValidationError, match="confirmed_artifact_missing"):
+        store.confirm_draft(draft_id, 999, "confirm-key-1")
+
+    assert not revision_path.exists()
+    assert store.project_store.load_project("demo") == project_before
+
+
+def test_confirmed_same_key_retry_does_not_recreate_missing_parse_revision(confirmable_store: tuple[SemanticStore, str]) -> None:
+    _projection()
+    store, draft_id = confirmable_store
+    first = store.confirm_draft(draft_id, 1, "confirm-key-1")
+    project = store.project_store.load_project("demo")
+    project.parse_revisions = [item for item in project.parse_revisions if item.revision_id != first.parse_revision.revision_id]
+    project.active_parse_revision_id = "parse-r001"
+    project.lines = copy.deepcopy(project.parse_revisions[0].lines)
+    store.project_store.save_project("demo", project)
+
+    with pytest.raises(SemanticValidationError, match="confirmed_artifact_missing"):
+        store.confirm_draft(draft_id, 999, "confirm-key-1")
+
+    persisted = store.project_store.load_project("demo")
+    assert all(item.revision_id != first.parse_revision.revision_id for item in persisted.parse_revisions)
+    assert persisted.active_parse_revision_id == "parse-r001"
+
+
+@pytest.mark.parametrize("damage", ["provider", "source", "provenance"])
+def test_confirmed_same_key_retry_rejects_corrupt_parse_identity(confirmable_store: tuple[SemanticStore, str], damage: str) -> None:
+    _projection()
+    store, draft_id = confirmable_store
+    first = store.confirm_draft(draft_id, 1, "confirm-key-1")
+    project = store.project_store.load_project("demo")
+    revision = next(item for item in project.parse_revisions if item.revision_id == first.parse_revision.revision_id)
+    if damage == "provider":
+        revision.provider = "corrupt-provider"
+    elif damage == "source":
+        revision.script_revision_id = "script-corrupt"
+    else:
+        revision.lines[0].semantic_revision_id = "revision-corrupt"
+    store.project_store.save_project("demo", project)
+
+    with pytest.raises(SemanticValidationError, match="confirmed_artifact_mismatch"):
+        store.confirm_draft(draft_id, 999, "confirm-key-1")
 
 
 def test_confirmed_retry_rejects_corrupt_revision_marker_without_creating_artifacts(confirmable_store: tuple[SemanticStore, str]) -> None:

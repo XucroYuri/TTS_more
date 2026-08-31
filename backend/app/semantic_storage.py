@@ -27,7 +27,11 @@ from app.semantic_models import (
     SemanticUtterance,
 )
 from app.semantic_source import validate_source_span
-from app.semantic_projection import SemanticProjectionError, project_confirmed_draft
+from app.semantic_projection import (
+    SemanticProjectionError,
+    project_confirmed_draft,
+    validate_confirmed_parse_revision,
+)
 from app.storage import ProjectStore, windows_filesystem_path, windows_path_identity
 
 
@@ -489,19 +493,46 @@ class SemanticStore:
             or draft.confirmed_parse_revision_id != expected_parse_revision_id
         ):
             raise SemanticValidationError("confirmed_artifact_mismatch")
-        semantic_revision = self._create_or_load_revision(draft, draft.confirmed_revision_id)
+        semantic_revision = self._load_confirmed_revision(draft, draft.confirmed_revision_id)
         project = self.project_store.load_project(draft.project_id)
-        original = copy.deepcopy(project)
-        parse_revision = project_confirmed_draft(project, draft, semantic_revision.id)
-        if parse_revision.revision_id != draft.confirmed_parse_revision_id:
-            raise SemanticProjectionError("parse_revision_collision")
-        if project != original:
-            self.project_store.save_project(draft.project_id, project)
+        try:
+            parse_revision = validate_confirmed_parse_revision(
+                project,
+                draft,
+                semantic_revision.id,
+                draft.confirmed_parse_revision_id,
+            )
+        except SemanticProjectionError as error:
+            if error.code == "confirmed_parse_revision_missing":
+                raise SemanticValidationError("confirmed_artifact_missing") from error
+            raise SemanticValidationError("confirmed_artifact_mismatch") from error
         return SemanticConfirmResult(
             project=project,
             semantic_revision=semantic_revision,
             parse_revision=parse_revision,
         )
+
+    def _load_confirmed_revision(
+        self,
+        draft: SemanticAnalysisDraft,
+        revision_id: str,
+    ) -> SemanticRevision:
+        expected = self._revision_snapshot(draft, revision_id)
+        path = self._revision_path(draft.project_id, revision_id)
+        with self._index_lock():
+            metadata = self._load_index()["revisions"].get(revision_id)
+            if metadata is None or not path.is_file():
+                raise SemanticValidationError("confirmed_artifact_missing")
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("project_id") != draft.project_id
+                or metadata.get("draft_id") != draft.id
+            ):
+                raise SemanticValidationError("confirmed_artifact_mismatch")
+            revision = self._read_model(path, SemanticRevision)
+            if not self._revision_is_compatible(revision, expected):
+                raise SemanticValidationError("confirmed_artifact_mismatch")
+            return revision
 
     def _create_or_load_revision(
         self,
