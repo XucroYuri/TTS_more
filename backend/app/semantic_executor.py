@@ -7,7 +7,6 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
-from app.net_guard import scrub_error
 from app.semantic_logging import SemanticEventLogger
 from app.semantic_models import (
     AnalysisError,
@@ -18,6 +17,15 @@ from app.semantic_models import (
 from app.semantic_provider import SemanticProviderError
 from app.semantic_storage import SemanticStorageError, SemanticStore
 from app.storage import ProjectStore
+
+
+_PROVIDER_ERROR_MESSAGES = {
+    "semantic_contract_invalid": "Semantic provider response failed validation.",
+    "semantic_provider_unavailable": "Semantic analysis provider is unavailable.",
+    "semantic_provider_upstream": "Semantic analysis provider request failed.",
+    "semantic_provider_timeout": "Semantic analysis provider timed out.",
+}
+_PROVIDER_ERROR_FALLBACK = "Semantic analysis provider failed."
 
 
 def _worker_count(explicit: int | None) -> int:
@@ -88,26 +96,40 @@ class SemanticAnalysisExecutor:
             future.add_done_callback(lambda completed, identity=run_id: self._forget(identity, completed))
 
     def recover_interrupted(self) -> int:
-        interrupted: list[AnalysisRun] = []
         try:
             index = self.store._load_index()
-            for run_id in list(index.get("runs", {})):
-                run = self.store.load_run(run_id)
-                if run.status in {AnalysisRunStatus.QUEUED, AnalysisRunStatus.RUNNING}:
-                    interrupted.append(run)
-            changed = self.store.interrupt_incomplete_runs()
         except (SemanticStorageError, ValueError, OSError):
             return 0
-        for run in interrupted:
-            self.logger.interrupted(
-                run_id=run.id,
-                trace_id=run.trace_id,
-                project_id=run.project_id,
-                source_revision_id=run.source_revision_id,
-                draft_id=run.draft_id,
-                status=AnalysisRunStatus.INTERRUPTED.value,
-                progress=run.progress,
+        changed = 0
+        for run_id in list(index.get("runs", {})):
+            try:
+                run = self.store.load_run(run_id)
+            except (SemanticStorageError, ValueError, OSError):
+                continue
+            if run.status not in {AnalysisRunStatus.QUEUED, AnalysisRunStatus.RUNNING}:
+                continue
+            interrupted = run.model_copy(
+                update={
+                    "status": AnalysisRunStatus.INTERRUPTED,
+                    "quality": None,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                deep=True,
             )
+            try:
+                self.store.save_run(interrupted)
+            except (SemanticStorageError, ValueError, OSError):
+                continue
+            self.logger.interrupted(
+                run_id=interrupted.id,
+                trace_id=interrupted.trace_id,
+                project_id=interrupted.project_id,
+                source_revision_id=interrupted.source_revision_id,
+                draft_id=interrupted.draft_id,
+                status=AnalysisRunStatus.INTERRUPTED.value,
+                progress=interrupted.progress,
+            )
+            changed += 1
         return changed
 
     def shutdown(self, wait: bool = True) -> None:
@@ -243,7 +265,7 @@ class SemanticAnalysisExecutor:
             code = exc.code
             http_status = exc.http_status
             retryable = exc.retryable
-            message = scrub_error(exc)
+            message = _PROVIDER_ERROR_MESSAGES.get(str(code), _PROVIDER_ERROR_FALLBACK)
         elif isinstance(exc, (SemanticStorageError, ValueError)):
             code = getattr(exc, "code", "semantic_validation_failed")
             http_status = 422

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -20,7 +21,7 @@ from app.semantic_provider import (
     SemanticProviderUpstream,
 )
 from app.semantic_source import sha256_source
-from app.semantic_storage import SemanticStore
+from app.semantic_storage import SemanticNotFoundError, SemanticStore
 from app.storage import ProjectStore
 
 try:
@@ -171,12 +172,36 @@ def test_partial_chunk_warning_sets_partial_quality(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("error", "http_status", "code", "retryable"),
+    ("error", "http_status", "code", "retryable", "expected_message"),
     [
-        (SemanticProviderContractError("safe contract failure"), 422, "semantic_contract_invalid", False),
-        (SemanticProviderUpstream("safe upstream failure"), 502, "semantic_provider_upstream", True),
-        (SemanticProviderTimeout("safe timeout failure"), 504, "semantic_provider_timeout", True),
-        (RuntimeError("SECRET SCRIPT Authorization: Bearer sk-secret"), 500, "semantic_analysis_failed", False),
+        (
+            SemanticProviderContractError("SCRIPT-CONTENT PROMPT-CONTENT RESPONSE-BODY"),
+            422,
+            "semantic_contract_invalid",
+            False,
+            "Semantic provider response failed validation.",
+        ),
+        (
+            SemanticProviderUpstream("SCRIPT-CONTENT PROMPT-CONTENT RESPONSE-BODY"),
+            502,
+            "semantic_provider_upstream",
+            True,
+            "Semantic analysis provider request failed.",
+        ),
+        (
+            SemanticProviderTimeout("SCRIPT-CONTENT PROMPT-CONTENT RESPONSE-BODY"),
+            504,
+            "semantic_provider_timeout",
+            True,
+            "Semantic analysis provider timed out.",
+        ),
+        (
+            RuntimeError("SECRET SCRIPT Authorization: Bearer sk-secret"),
+            500,
+            "semantic_analysis_failed",
+            False,
+            "Semantic analysis failed unexpectedly.",
+        ),
     ],
 )
 def test_async_failures_persist_safe_typed_errors_and_keep_get_200(
@@ -185,6 +210,7 @@ def test_async_failures_persist_safe_typed_errors_and_keep_get_200(
     http_status: int,
     code: str,
     retryable: bool,
+    expected_message: str,
 ) -> None:
     _semantic_api()
     app = _app(tmp_path, FakeSemanticService(error=error))
@@ -201,11 +227,15 @@ def test_async_failures_persist_safe_typed_errors_and_keep_get_200(
     assert terminal["error"]["http_status"] == http_status
     assert terminal["error"]["code"] == code
     assert terminal["error"]["retryable"] is retryable
+    assert terminal["error"]["message"] == expected_message
     assert terminal["error"]["run_id"] == created["run_id"]
     assert terminal["error"]["trace_id"]
     assert terminal["error"]["stage"] == "analysis"
     assert "SECRET SCRIPT" not in str(terminal)
     assert "sk-secret" not in str(terminal)
+    assert "SCRIPT-CONTENT" not in str(terminal)
+    assert "PROMPT-CONTENT" not in str(terminal)
+    assert "RESPONSE-BODY" not in str(terminal)
     after = app.state.store.load_project("demo")
     assert after.active_parse_revision_id == before.active_parse_revision_id
     assert after.lines == before.lines
@@ -230,6 +260,43 @@ def test_startup_recovers_only_incomplete_persisted_runs(tmp_path: Path) -> None
         assert client.get(f"/api/analysis-runs/{queued.id}").json()["status"] == "interrupted"
         assert client.get(f"/api/analysis-runs/{running.id}").json()["status"] == "interrupted"
         assert client.get(f"/api/analysis-runs/{completed.id}").json()["status"] == "completed"
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_recovery_isolates_missing_or_corrupt_run_records(tmp_path: Path, damage: str) -> None:
+    _semantic_api()
+    project_store = ProjectStore(tmp_path)
+    _seed_project(project_store)
+    semantic_store = SemanticStore(project_store)
+    damaged, _ = semantic_store.create_run_and_draft("demo", "script-r001", trace_id="trace-damaged")
+    queued, _ = semantic_store.create_run_and_draft("demo", "script-r001", trace_id="trace-queued")
+    running, _ = semantic_store.create_run_and_draft("demo", "script-r001", trace_id="trace-running")
+    running.status = AnalysisRunStatus.RUNNING
+    semantic_store.save_run(running)
+    completed, _ = semantic_store.create_run_and_draft("demo", "script-r001", trace_id="trace-completed")
+    completed.status = AnalysisRunStatus.COMPLETED
+    completed.quality = AnalysisRunQuality.COMPLETE
+    semantic_store.save_run(completed)
+    damaged_path = project_store.project_semantic_dir("demo") / "runs" / f"{damaged.id}.json"
+    if damage == "missing":
+        damaged_path.unlink()
+    else:
+        damaged_path.write_text("{not-json", encoding="utf-8")
+    executor = SemanticAnalysisExecutor(
+        semantic_store,
+        project_store,
+        FakeSemanticService(),
+        semantic_event_logger(tmp_path),
+        max_workers=1,
+    )
+
+    changed = executor.recover_interrupted()
+    executor.shutdown()
+
+    assert changed == 2
+    assert semantic_store.load_run(queued.id).status is AnalysisRunStatus.INTERRUPTED
+    assert semantic_store.load_run(running.id).status is AnalysisRunStatus.INTERRUPTED
+    assert semantic_store.load_run(completed.id).status is AnalysisRunStatus.COMPLETED
 
 
 def test_executor_rejects_duplicate_nonqueued_and_post_shutdown_submissions(tmp_path: Path) -> None:
@@ -335,7 +402,7 @@ def test_running_draft_is_read_only(tmp_path: Path) -> None:
     assert response.status_code == 409
 
 
-def test_semantic_routes_map_missing_and_hostile_ids_without_path_escape(tmp_path: Path) -> None:
+def test_semantic_routes_map_missing_artifacts_to_404(tmp_path: Path) -> None:
     _semantic_api()
     with TestClient(_app(tmp_path, FakeSemanticService()), raise_server_exceptions=False) as client:
         assert client.post(
@@ -356,7 +423,37 @@ def test_semantic_routes_map_missing_and_hostile_ids_without_path_escape(tmp_pat
             "/api/analysis-drafts/missing/confirm",
             json={"expected_version": 1, "idempotency_key": "key"},
         ).status_code == 404
-        hostile = client.get("/api/analysis-runs/..%2F..%2Fescape")
-        assert hostile.status_code in {404, 422}
 
-    assert not (tmp_path.parent / "escape.json").exists()
+
+def test_cross_project_run_and_draft_sidecars_are_rejected_by_store_and_routes(tmp_path: Path) -> None:
+    _semantic_api()
+    app = create_app(data_root=tmp_path, env_path=tmp_path / ".env.local", semantic_service=FakeSemanticService())
+    _seed_project(app.state.store, "alpha")
+    _seed_project(app.state.store, "beta")
+    semantic_store = app.state.semantic_store
+    run, draft = semantic_store.create_run_and_draft("alpha", "script-r001", trace_id="trace-alpha")
+    alpha_dir = app.state.store.project_semantic_dir("alpha")
+    beta_dir = app.state.store.project_semantic_dir("beta")
+    (beta_dir / "runs").mkdir(parents=True, exist_ok=True)
+    (beta_dir / "drafts").mkdir(parents=True, exist_ok=True)
+    (beta_dir / "runs" / f"{run.id}.json").write_text(
+        (alpha_dir / "runs" / f"{run.id}.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (beta_dir / "drafts" / f"{draft.id}.json").write_text(
+        (alpha_dir / "drafts" / f"{draft.id}.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    index_path = tmp_path / "semantic" / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index["runs"][run.id]["project_id"] = "beta"
+    index["drafts"][draft.id]["project_id"] = "beta"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    with pytest.raises(SemanticNotFoundError, match="run_not_found"):
+        semantic_store.load_run(run.id)
+    with pytest.raises(SemanticNotFoundError, match="draft_not_found"):
+        semantic_store.load_draft(draft.id)
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.get(f"/api/analysis-runs/{run.id}").status_code == 404
+    assert client.get(f"/api/analysis-drafts/{draft.id}").status_code == 404

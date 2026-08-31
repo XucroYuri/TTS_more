@@ -201,11 +201,17 @@ class SemanticStore:
 
     def load_run(self, run_id: str) -> AnalysisRun:
         project_id = self._project_for("runs", run_id)
-        return self._read_model(self._run_path(project_id, run_id), AnalysisRun)
+        run = self._read_model(self._run_path(project_id, run_id), AnalysisRun)
+        if run.id != run_id or run.project_id != project_id:
+            raise SemanticNotFoundError("run_not_found")
+        return run
 
     def load_draft(self, draft_id: str) -> SemanticAnalysisDraft:
         project_id = self._project_for("drafts", draft_id)
-        return self._read_model(self._draft_path(project_id, draft_id), SemanticAnalysisDraft)
+        draft = self._read_model(self._draft_path(project_id, draft_id), SemanticAnalysisDraft)
+        if draft.id != draft_id or draft.project_id != project_id:
+            raise SemanticNotFoundError("draft_not_found")
+        return draft
 
     def save_run(self, run: AnalysisRun) -> None:
         project_id = self._project_for("runs", run.id)

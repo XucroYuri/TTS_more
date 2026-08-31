@@ -16,6 +16,7 @@ from app.models import Character, GenerationTask, ScriptLine
 from app.main import _layer_service_status, _portable_controller_root, _resolve_repo_lock_path, create_app
 from app.open_source_tts import OpenSourceTTSConfigureRequest
 from app.parser import ParsedScriptDraft, ParserProviderUnavailable, ParserQualityError
+from app.semantic_provider import SemanticProviderResponse
 
 
 class StaticParser:
@@ -157,7 +158,34 @@ def test_parser_provider_config_masks_secret_and_writes_env(tmp_path: Path) -> N
     assert get_response.json()["providers"][0]["key_configured"] is True
 
 
-def test_semantic_service_selects_first_enabled_parser_provider_and_refreshes_after_save(tmp_path: Path) -> None:
+def test_semantic_service_uses_refreshed_parser_provider_for_next_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeConfiguredProvider:
+        def __init__(self, config) -> None:
+            self.name = config.name
+            self.model = config.model
+            self.calls = 0
+
+        def analyze_chunk(self, chunk):
+            self.calls += 1
+            return SemanticProviderResponse(
+                chunk_id=chunk.chunk_id,
+                start_utf16=chunk.start_utf16,
+                end_utf16=chunk.end_utf16,
+                overlap_before=chunk.overlap_before,
+                overlap_after=chunk.overlap_after,
+            )
+
+    built: list[FakeConfiguredProvider] = []
+
+    def build_fake_provider(config):
+        provider = FakeConfiguredProvider(config)
+        built.append(provider)
+        return provider
+
+    monkeypatch.setattr(main_module, "build_semantic_provider", build_fake_provider)
     config_path = tmp_path / "parser_providers.json"
     config_path.write_text(
         json.dumps(
@@ -187,28 +215,55 @@ def test_semantic_service_selects_first_enabled_parser_provider_and_refreshes_af
         parser_config_path=config_path,
         env_path=tmp_path / ".env.local",
     )
-    client = TestClient(app)
-
-    assert app.state.semantic_service.provider.name == "first-provider"
-    response = client.put(
-        "/api/parser/providers",
-        json={
-            "providers": [
-                {
-                    "name": "replacement-provider",
-                    "base_url": "https://replacement.example/v1",
-                    "api_key_env": "REPLACEMENT_API_KEY",
-                    "model": "replacement-model",
-                    "enabled": True,
-                    "priority": 1,
-                }
-            ]
-        },
+    app.state.store.save_project(
+        "demo",
+        main_module.ScriptProject(
+            title="Provider refresh",
+            script_revisions=[main_module.ScriptRevision(revision_id="script-r001", source_markdown="旁白：你好。")],
+            active_script_revision_id="script-r001",
+        ),
     )
 
-    assert response.status_code == 200
-    assert app.state.semantic_service.provider.name == "replacement-provider"
-    assert app.state.semantic_executor._service is app.state.semantic_service
+    with TestClient(app) as client:
+        response = client.put(
+            "/api/parser/providers",
+            json={
+                "providers": [
+                    {
+                        "name": "replacement-provider",
+                        "base_url": "https://replacement.example/v1",
+                        "api_key_env": "REPLACEMENT_API_KEY",
+                        "model": "replacement-model",
+                        "enabled": True,
+                        "priority": 1,
+                    }
+                ]
+            },
+        )
+        assert response.status_code == 200
+        created = client.post(
+            "/api/projects/demo/analysis-runs",
+            json={"source_revision_id": "script-r001"},
+        )
+        assert created.status_code == 202
+        run_id = created.json()["run_id"]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            terminal = client.get(f"/api/analysis-runs/{run_id}").json()
+            if terminal["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("refreshed semantic provider run did not finish")
+        draft = client.get(f"/api/analysis-drafts/{created.json()['draft_id']}").json()
+
+    assert terminal["status"] == "completed"
+    assert terminal["quality"] == "complete"
+    assert draft["provider"] == "replacement-provider"
+    assert draft["model"] == "replacement-model"
+    assert [provider.name for provider in built] == ["first-provider", "replacement-provider"]
+    assert built[0].calls == 0
+    assert built[1].calls == 1
 
 
 def test_no_enabled_semantic_provider_fails_asynchronously_without_blocking_app_startup(tmp_path: Path) -> None:
