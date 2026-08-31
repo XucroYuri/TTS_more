@@ -242,11 +242,16 @@ export interface ScriptLine {
   binding_override?: string | null;
   service_override?: string | null;
   temporary_binding?: VoiceBinding | null;
+  semantic_revision_id?: string | null;
+  utterance_id?: string | null;
 }
 
 export interface ScriptRevision {
   revision_id: string;
   source_markdown: string;
+  source_filename?: string | null;
+  source_media_type?: string | null;
+  source_sha256?: string | null;
   parent_revision_id?: string | null;
   summary?: string;
   created_at: string;
@@ -272,6 +277,194 @@ export interface ScriptProject {
   script_revisions?: ScriptRevision[];
   parse_revisions?: ParseRevision[];
   lines: ScriptLine[];
+}
+
+export type AnnotationKind = "speaker" | "emotion_evidence" | "dialogue";
+export type AnnotationOrigin = "ai" | "human";
+export type ReviewStatus = "pending" | "accepted" | "rejected";
+export type EmotionOrigin = "source_grounded" | "inferred" | "none";
+export type NormalizedEmotion =
+  | "neutral"
+  | "happy"
+  | "excited"
+  | "surprised"
+  | "sad"
+  | "angry"
+  | "fearful"
+  | "disgusted"
+  | "anxious"
+  | "calm"
+  | "serious"
+  | "gentle"
+  | "confused"
+  | "other";
+export type UncertaintyCode =
+  | "speaker_unknown"
+  | "speaker_ambiguous"
+  | "dialogue_ambiguous"
+  | "emotion_inferred"
+  | "emotion_ambiguous"
+  | "source_anchor_ambiguous";
+export type AnalysisRunStatus = "queued" | "running" | "completed" | "failed" | "interrupted";
+export type AnalysisRunQuality = "complete" | "partial";
+
+/** A non-empty source range using browser-native UTF-16 [start, end) offsets. */
+export interface SourceSpan {
+  source_revision_id: string;
+  start_utf16: number;
+  end_utf16: number;
+  text: string;
+  source_sha256: string;
+}
+
+export interface SemanticAnnotation {
+  id: string;
+  kind: AnnotationKind;
+  span: SourceSpan;
+  origin: AnnotationOrigin;
+  confidence: number | null;
+  status: ReviewStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CharacterCandidate {
+  id: string;
+  canonical_name: string;
+  aliases: string[];
+  supporting_annotation_ids: string[];
+  project_character_id: string | null;
+  confidence: number | null;
+  status: ReviewStatus;
+  origin: AnnotationOrigin;
+}
+
+export interface SemanticUtterance {
+  id: string;
+  dialogue_annotation_id: string;
+  speaker_annotation_id: string | null;
+  character_candidate_id: string | null;
+  emotion_evidence_annotation_ids: string[];
+  normalized_emotion: NormalizedEmotion | null;
+  custom_emotion: string | null;
+  emotion_intensity: number | null;
+  emotion_origin: EmotionOrigin;
+  language: string;
+  confidence: number;
+  uncertainty_codes: UncertaintyCode[];
+  status: ReviewStatus;
+}
+
+export interface AnalysisWarning {
+  id: string;
+  code: string;
+  message: string;
+  annotation_id: string | null;
+  utterance_id: string | null;
+  details: Record<string, unknown>;
+}
+
+export interface UnresolvedCandidate {
+  id: string;
+  code: UncertaintyCode;
+  candidate_type: string;
+  message: string;
+  details: Record<string, unknown>;
+}
+
+export interface AnalysisError {
+  code: string;
+  http_status: number;
+  stage: string;
+  message: string;
+  retryable: boolean;
+  run_id: string | null;
+  trace_id: string | null;
+  occurred_at: string;
+  details: Record<string, unknown>;
+}
+
+export interface AnalysisRun {
+  id: string;
+  project_id: string;
+  source_revision_id: string;
+  draft_id: string;
+  status: AnalysisRunStatus;
+  quality: AnalysisRunQuality | null;
+  progress: number;
+  warnings: AnalysisWarning[];
+  error: AnalysisError | null;
+  trace_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SemanticAnalysisDraft {
+  id: string;
+  project_id: string;
+  source_revision_id: string;
+  version: number;
+  annotations: SemanticAnnotation[];
+  characters: CharacterCandidate[];
+  utterances: SemanticUtterance[];
+  unresolved_candidates: UnresolvedCandidate[];
+  warnings: AnalysisWarning[];
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  contract_version: string | null;
+  confirmed_revision_id: string | null;
+  confirmed_parse_revision_id: string | null;
+  confirmed_parse_fingerprint: string | null;
+  confirm_idempotency_key: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SemanticRevision {
+  id: string;
+  project_id: string;
+  source_revision_id: string;
+  annotations: SemanticAnnotation[];
+  characters: CharacterCandidate[];
+  utterances: SemanticUtterance[];
+  unresolved_candidates: UnresolvedCandidate[];
+  warnings: AnalysisWarning[];
+  provider: string | null;
+  model: string | null;
+  prompt_version: string | null;
+  contract_version: string | null;
+  created_at: string;
+}
+
+export type DraftOperation =
+  | { op: "create_annotation"; annotation: SemanticAnnotation }
+  | { op: "replace_annotation"; annotation_id: string; annotation: SemanticAnnotation }
+  | { op: "delete_annotation"; annotation_id: string }
+  | { op: "set_annotation_status"; annotation_id: string; status: ReviewStatus }
+  | { op: "upsert_character"; character: CharacterCandidate }
+  | { op: "set_character_status"; character_id: string; status: ReviewStatus }
+  | { op: "merge_characters"; target_character_id: string; source_character_ids: string[] }
+  | { op: "split_alias"; character_id: string; alias: string; character: CharacterCandidate }
+  | { op: "create_utterance"; utterance: SemanticUtterance }
+  | { op: "update_utterance"; utterance_id: string; utterance: SemanticUtterance }
+  | { op: "delete_utterance"; utterance_id: string }
+  | { op: "set_utterance_status"; utterance_id: string; status: ReviewStatus }
+  | { op: "dismiss_warning"; warning_id: string };
+
+export interface SemanticConfirmResponse {
+  project: ScriptProject;
+  semantic_revision: SemanticRevision;
+  parse_revision: ParseRevision;
+}
+
+export interface SemanticApiErrorDetail {
+  code: string;
+  message: string;
+}
+
+export interface SemanticApiErrorResponse {
+  detail: SemanticApiErrorDetail;
 }
 
 export interface GenerationVersion {

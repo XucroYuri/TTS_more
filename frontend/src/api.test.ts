@@ -24,3 +24,57 @@ describe("api token storage", () => {
     expect(getApiToken()).toBe("");
   });
 });
+
+describe("semantic analysis API request shapes", () => {
+  it("encodes resource ids and sends the authoritative create, patch, and confirm payloads", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const responses = [
+      { run_id: "run-1", draft_id: "draft-1", status: "queued", trace_id: "trace-1" },
+      { id: "run/1" },
+      { id: "draft/1", version: 3 },
+      { id: "draft/1", version: 4 },
+      { semantic_revision: { id: "semantic-1" }, parse_revision: { revision_id: "semantic-semantic-1" }, project: { title: "Demo", default_language: "zh", lines: [] } }
+    ];
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(JSON.stringify(responses.shift()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    try {
+      const api = await import("./api");
+      await api.createAnalysisRun("demo/project", "script-r001");
+      await api.fetchAnalysisRun("run/1");
+      await api.fetchAnalysisDraft("draft/1");
+      await api.patchAnalysisDraft("draft/1", 3, [{ op: "dismiss_warning", warning_id: "warning-1" }]);
+      await api.confirmAnalysisDraft("draft/1", 4, "key-1");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(calls.map(({ url }) => url)).toEqual([
+      "/api/projects/demo%2Fproject/analysis-runs",
+      "/api/analysis-runs/run%2F1",
+      "/api/analysis-drafts/draft%2F1",
+      "/api/analysis-drafts/draft%2F1",
+      "/api/analysis-drafts/draft%2F1/confirm"
+    ]);
+    expect(calls.map(({ init }) => init?.method)).toEqual(["POST", undefined, undefined, "PATCH", "POST"]);
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual({ source_revision_id: "script-r001" });
+    expect(JSON.parse(String(calls[3].init?.body))).toEqual({
+      expected_version: 3,
+      operations: [{ op: "dismiss_warning", warning_id: "warning-1" }]
+    });
+    expect(JSON.parse(String(calls[4].init?.body))).toEqual({
+      expected_version: 4,
+      idempotency_key: "key-1"
+    });
+    expect(calls[0].init?.headers).toEqual({ "Content-Type": "application/json" });
+    expect(calls[3].init?.headers).toEqual({ "Content-Type": "application/json" });
+    expect(calls[4].init?.headers).toEqual({ "Content-Type": "application/json" });
+  });
+});

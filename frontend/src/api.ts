@@ -1,4 +1,5 @@
 import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
+import type { AnalysisRun, AnalysisRunStatus, DraftOperation, SemanticAnalysisDraft, SemanticConfirmResponse } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -385,4 +386,47 @@ export async function freezeProjectCharacter(projectId: string, projectCharacter
 
 export async function unfreezeProjectCharacter(projectId: string, projectCharacterId: string): Promise<{ project_character: ProjectCharacter }> {
   return request(`/api/projects/${projectId}/characters/${encodeURIComponent(projectCharacterId)}/unfreeze`, { method: "POST" });
+}
+
+export async function createAnalysisRun(
+  projectId: string,
+  sourceRevisionId: string
+): Promise<{ run_id: string; draft_id: string; status: AnalysisRunStatus; trace_id: string | null }> {
+  return request(`/api/projects/${encodeURIComponent(projectId)}/analysis-runs`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ source_revision_id: sourceRevisionId })
+  });
+}
+
+export async function fetchAnalysisRun(runId: string): Promise<AnalysisRun> {
+  return request(`/api/analysis-runs/${encodeURIComponent(runId)}`);
+}
+
+export async function fetchAnalysisDraft(draftId: string): Promise<SemanticAnalysisDraft> {
+  return request(`/api/analysis-drafts/${encodeURIComponent(draftId)}`);
+}
+
+export async function patchAnalysisDraft(
+  draftId: string,
+  expectedVersion: number,
+  operations: DraftOperation[]
+): Promise<SemanticAnalysisDraft> {
+  return request(`/api/analysis-drafts/${encodeURIComponent(draftId)}`, {
+    method: "PATCH",
+    headers: jsonHeaders,
+    body: JSON.stringify({ expected_version: expectedVersion, operations })
+  });
+}
+
+export async function confirmAnalysisDraft(
+  draftId: string,
+  expectedVersion: number,
+  idempotencyKey: string
+): Promise<SemanticConfirmResponse> {
+  return request(`/api/analysis-drafts/${encodeURIComponent(draftId)}/confirm`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ expected_version: expectedVersion, idempotency_key: idempotencyKey })
+  });
 }
