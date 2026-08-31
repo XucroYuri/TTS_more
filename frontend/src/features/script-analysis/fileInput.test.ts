@@ -3,20 +3,19 @@ import { describe, expect, it } from "vitest";
 import { readScriptFile } from "./fileInput";
 
 describe("readScriptFile", () => {
-  it("accepts txt and md case-insensitively, removes one leading BOM, and preserves CRLF", async () => {
+  it("accepts md case-insensitively, removes one leading BOM, and preserves CRLF", async () => {
     const markdown = new File(["\uFEFF甲\r\n台词"], "script.Md", { type: "text/markdown" });
     await expect(readScriptFile(markdown)).resolves.toEqual({
       text: "甲\r\n台词",
       filename: "script.Md",
       mediaType: "text/markdown"
     });
+  });
 
-    const text = new File([], "SCRIPT.TXT", { type: "text/plain" });
-    Object.defineProperty(text, "text", {
-      value: async () => "\uFEFF\uFEFF甲\r\n  台词  \r\n"
-    });
+  it("preserves one U+FEFF from a real double-BOM text file", async () => {
+    const text = new File(["\uFEFF\uFEFFx"], "SCRIPT.TXT", { type: "text/plain" });
     await expect(readScriptFile(text)).resolves.toEqual({
-      text: "\uFEFF甲\r\n  台词  \r\n",
+      text: "\uFEFFx",
       filename: "SCRIPT.TXT",
       mediaType: "text/plain"
     });

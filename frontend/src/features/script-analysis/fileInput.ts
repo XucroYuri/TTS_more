@@ -31,8 +31,7 @@ export async function readScriptFile(file: File): Promise<ScriptFileInput> {
     throw new Error("unsupported_script_file");
   }
 
-  const source = await file.text();
-  const text = source.startsWith("\uFEFF") ? source.slice(1) : source;
+  const text = await file.text();
   const result: ScriptFileInput = {
     text,
     filename: file.name,
