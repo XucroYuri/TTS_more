@@ -47,6 +47,7 @@ vi.mock("./api", async () => ({
 }));
 
 import App from "./App";
+import { ApiRequestError } from "./api";
 
 const timestamp = "2026-09-01T00:00:00.000Z";
 const activeAnalysisScopeStorageKey = "tts-more:active-analysis-scope";
@@ -627,6 +628,144 @@ describe("App semantic analysis entry", () => {
     expect(apiMocks.fetchAnalysisRun).not.toHaveBeenCalled();
   });
 
+  it("clears a deleted active scope on 404 and restores the current project session", async () => {
+    const currentProjectId = "scope-fallback-current";
+    const deletedProjectId = "scope-deleted-target";
+    const currentRevision = scriptRevision("scope-fallback-revision", "A：恢复当前分析", "sha-fallback-current");
+    backendProjects.set(currentProjectId, scriptProject("Scope fallback current", currentRevision));
+    const currentRun = completedRun(currentProjectId, currentRevision.revision_id);
+    const currentDraft = analysisDraft(currentProjectId, currentRevision.revision_id);
+    apiMocks.fetchAnalysisRun.mockImplementation(async () => currentRun);
+    apiMocks.fetchAnalysisDraft.mockImplementation(async () => currentDraft);
+    const deletedFetch = deferred<ScriptProject>();
+    apiMocks.fetchProject.mockImplementation(async (projectId: string) => {
+      if (projectId === deletedProjectId) return deletedFetch.promise;
+      const stored = backendProjects.get(projectId);
+      if (!stored) throw new Error(`missing project: ${projectId}`);
+      return cloneProject(stored);
+    });
+    const currentSessionScope = JSON.stringify([
+      currentProjectId,
+      currentRevision.revision_id,
+      currentRevision.source_sha256
+    ]);
+    const view = await renderApp(currentProjectId, (storage) => {
+      storage.setItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY, JSON.stringify({
+        [currentSessionScope]: { runId: currentRun.id, draftId: currentRun.draft_id }
+      }));
+      storage.setItem(activeAnalysisScopeStorageKey, JSON.stringify({
+        projectId: deletedProjectId,
+        revisionId: "deleted-revision",
+        sourceSha256: "sha-deleted"
+      }));
+    });
+    await flushAsync(40);
+    expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
+
+    deletedFetch.reject(new ApiRequestError(404, '{"detail":"Project not found"}', "Project not found"));
+    await flushAsync(60);
+
+    expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+    expect(view.container.textContent).toContain("A：恢复当前分析");
+    expect(view.dom.window.localStorage.getItem(activeAnalysisScopeStorageKey)).toBeNull();
+    expect(apiMocks.createAnalysisRun).not.toHaveBeenCalled();
+  });
+
+  it("clears an invalid active revision scope and restores the current project session", async () => {
+    const currentProjectId = "scope-invalid-fallback-current";
+    const invalidProjectId = "scope-invalid-target";
+    const currentRevision = scriptRevision(
+      "scope-invalid-fallback-revision",
+      "A：恢复无效 scope 后的分析",
+      "sha-invalid-fallback-current"
+    );
+    backendProjects.set(currentProjectId, scriptProject("Invalid scope fallback current", currentRevision));
+    const currentRun = completedRun(currentProjectId, currentRevision.revision_id);
+    const currentDraft = analysisDraft(currentProjectId, currentRevision.revision_id);
+    apiMocks.fetchAnalysisRun.mockImplementation(async () => currentRun);
+    apiMocks.fetchAnalysisDraft.mockImplementation(async () => currentDraft);
+    const invalidFetch = deferred<ScriptProject>();
+    apiMocks.fetchProject.mockImplementation(async (projectId: string) => {
+      if (projectId === invalidProjectId) return invalidFetch.promise;
+      const stored = backendProjects.get(projectId);
+      if (!stored) throw new Error(`missing project: ${projectId}`);
+      return cloneProject(stored);
+    });
+    const currentSessionScope = JSON.stringify([
+      currentProjectId,
+      currentRevision.revision_id,
+      currentRevision.source_sha256
+    ]);
+    const view = await renderApp(currentProjectId, (storage) => {
+      storage.setItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY, JSON.stringify({
+        [currentSessionScope]: { runId: currentRun.id, draftId: currentRun.draft_id }
+      }));
+      storage.setItem(activeAnalysisScopeStorageKey, JSON.stringify({
+        projectId: invalidProjectId,
+        revisionId: "missing-revision",
+        sourceSha256: "sha-missing"
+      }));
+    });
+    await flushAsync(40);
+    expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
+
+    invalidFetch.resolve(scriptProject(
+      "Invalid scope target",
+      scriptRevision("different-revision", "B：已被替换", "sha-different")
+    ));
+    await flushAsync(60);
+
+    expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+    expect(view.container.textContent).toContain("A：恢复无效 scope 后的分析");
+    expect(view.dom.window.localStorage.getItem(activeAnalysisScopeStorageKey)).toBeNull();
+    expect(apiMocks.createAnalysisRun).not.toHaveBeenCalled();
+  });
+
+  it("retains an active analysis scope across a transient target failure", async () => {
+    const currentProjectId = "scope-transient-current";
+    const targetProjectId = "scope-transient-target";
+    const currentRevision = scriptRevision(
+      "scope-transient-current-revision",
+      "A：当前可恢复分析",
+      "sha-transient-current"
+    );
+    backendProjects.set(currentProjectId, scriptProject("Transient scope current", currentRevision));
+    const currentRun = completedRun(currentProjectId, currentRevision.revision_id);
+    const currentDraft = analysisDraft(currentProjectId, currentRevision.revision_id);
+    apiMocks.fetchAnalysisRun.mockImplementation(async () => currentRun);
+    apiMocks.fetchAnalysisDraft.mockImplementation(async () => currentDraft);
+    apiMocks.fetchProject.mockImplementation(async (projectId: string) => {
+      if (projectId === targetProjectId) {
+        throw new ApiRequestError(503, '{"detail":"temporarily unavailable"}', "temporarily unavailable");
+      }
+      const stored = backendProjects.get(projectId);
+      if (!stored) throw new Error(`missing project: ${projectId}`);
+      return cloneProject(stored);
+    });
+    const currentSessionScope = JSON.stringify([
+      currentProjectId,
+      currentRevision.revision_id,
+      currentRevision.source_sha256
+    ]);
+    const expectedScope = {
+      projectId: targetProjectId,
+      revisionId: "scope-transient-revision",
+      sourceSha256: "sha-transient-target"
+    };
+    const view = await renderApp(currentProjectId, (storage) => {
+      storage.setItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY, JSON.stringify({
+        [currentSessionScope]: { runId: currentRun.id, draftId: currentRun.draft_id }
+      }));
+      storage.setItem(activeAnalysisScopeStorageKey, JSON.stringify(expectedScope));
+    });
+    await flushAsync(60);
+
+    expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
+    expect(JSON.parse(view.dom.window.localStorage.getItem(activeAnalysisScopeStorageKey)!)).toEqual(expectedScope);
+    expect(apiMocks.createAnalysisRun).not.toHaveBeenCalled();
+    expect(apiMocks.fetchAnalysisRun).not.toHaveBeenCalled();
+  });
+
   it("ignores a late confirmation from a cancelled workspace after a new analysis starts", async () => {
     const projectAId = "late-a";
     const projectBId = "late-b";
@@ -1059,6 +1198,159 @@ describe("App semantic analysis entry", () => {
 
     expect(view.container.querySelector(".reference-setup-callout")).toBeNull();
     expect(backendProjects.get(projectId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
+  });
+
+  it("preserves a same-project TTS change made while revision creation is deferred", async () => {
+    vi.useFakeTimers();
+    const projectId = "deferred-create-pending-change";
+    const project = scriptProject("Deferred create pending change");
+    project.lines = [{ id: "deferred-line", character_id: "narrator", text: "待配置台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    const pendingRevision = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingRevision.promise);
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：创建 revision 期间仍可能修改 TTS"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    expect(apiMocks.createScriptRevision).toHaveBeenCalledOnce();
+    expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
+
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+    expect(view.container.querySelector(".reference-setup-callout")).toBeNull();
+
+    const revision = scriptRevision(
+      "deferred-create-revision",
+      "甲：创建 revision 期间仍可能修改 TTS",
+      "sha-deferred-create"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectId, cloneProject(serverProject));
+    pendingRevision.resolve({ project: serverProject, script_revision: revision });
+    await flushAsync(40);
+    expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+
+    await click(view.container.querySelector('[data-action="cancel-workspace"]')!);
+    await flushAsync();
+    activeViews.splice(activeViews.indexOf(view), 1);
+    await view.cleanup();
+    const remounted = await renderApp(projectId);
+    await flushAsync(40);
+
+    expect(remounted.container.querySelector(".reference-setup-callout")).toBeNull();
+    expect(backendProjects.get(projectId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(backendProjects.get(projectId)?.script_revisions?.map((item) => item.revision_id))
+      .toContain(revision.revision_id);
+  });
+
+  it("flushes current project A changes made while managed project B revision creation is deferred", async () => {
+    vi.useFakeTimers();
+    const projectAId = "deferred-create-current-a";
+    const projectBId = "deferred-create-target-b";
+    const projectA = scriptProject("Deferred create current A");
+    projectA.lines = [{ id: "deferred-a-line", character_id: "a", text: "A 待配置台词", note: "", language: "zh-CN" }];
+    const projectB = scriptProject("Deferred create target B");
+    projectB.lines = [{ id: "deferred-b-line", character_id: "b", text: "B 旧台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectAId, projectA);
+    backendProjects.set(projectBId, projectB);
+    const pendingRevision = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingRevision.promise);
+    const view = await renderApp(projectAId);
+    await flushAsync(40);
+
+    const rowB = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Deferred create target B"))!;
+    await click(rowB);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "B：创建 revision 期间 A 仍可能修改"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    expect(apiMocks.createScriptRevision).toHaveBeenCalledOnce();
+
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+    expect(view.container.querySelector(".reference-setup-callout")).toBeNull();
+
+    const revision = scriptRevision(
+      "deferred-create-target-revision",
+      "B：创建 revision 期间 A 仍可能修改",
+      "sha-deferred-target"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectBId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectBId, cloneProject(serverProject));
+    pendingRevision.resolve({ project: serverProject, script_revision: revision });
+    await flushAsync(40);
+    expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+
+    await click(view.container.querySelector('[data-action="cancel-workspace"]')!);
+    await flushAsync();
+    activeViews.splice(activeViews.indexOf(view), 1);
+    await view.cleanup();
+    const remounted = await renderApp(projectAId);
+    await flushAsync(40);
+
+    expect(remounted.container.querySelector(".reference-setup-callout")).toBeNull();
+    expect(backendProjects.get(projectAId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
+    expect(backendProjects.get(projectBId)?.active_script_revision_id).toBe(revision.revision_id);
+  });
+
+  it("flushes current project A pending autosave before analyzing managed project B", async () => {
+    vi.useFakeTimers();
+    const projectAId = "pending-current-a";
+    const projectBId = "analysis-target-b";
+    const projectA = scriptProject("Pending current A");
+    projectA.lines = [{ id: "pending-a-line", character_id: "a", text: "A 待保存台词", note: "", language: "zh-CN" }];
+    const projectB = scriptProject("Analysis target B");
+    projectB.lines = [{ id: "target-b-line", character_id: "b", text: "B 旧台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectAId, projectA);
+    backendProjects.set(projectBId, projectB);
+    const view = await renderApp(projectAId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+    expect(view.container.querySelector(".reference-setup-callout")).toBeNull();
+
+    const rowB = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Analysis target B"))!;
+    await click(rowB);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "B：分析前必须先保存 A"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+    await click(view.container.querySelector('[data-action="cancel-workspace"]')!);
+    await flushAsync();
+
+    activeViews.splice(activeViews.indexOf(view), 1);
+    await view.cleanup();
+    const remounted = await renderApp(projectAId);
+    await flushAsync(40);
+
+    expect(remounted.container.querySelector(".reference-setup-callout")).toBeNull();
+    expect(backendProjects.get(projectAId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
   });
 
   it("shows confirmed TTS immediately while the summary refresh remains pending", async () => {

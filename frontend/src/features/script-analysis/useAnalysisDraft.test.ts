@@ -18,10 +18,15 @@ import type {
   SemanticUtterance
 } from "../../types";
 import {
+  ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY,
   ANALYSIS_DISMISSED_RUNS_STORAGE_KEY,
   ANALYSIS_RUN_SESSIONS_STORAGE_KEY,
+  activeAnalysisScopeForRevision,
   applyDraftOperations,
+  clearActiveAnalysisScope,
+  readActiveAnalysisScope,
   useAnalysisDraft,
+  writeActiveAnalysisScope,
   type AnalysisDraftApi,
   type UseAnalysisDraftOptions,
   type UseAnalysisDraftResult
@@ -57,6 +62,41 @@ class MemoryStorage implements Storage {
     this.values.set(key, String(value));
   }
 }
+
+describe("active analysis scope storage", () => {
+  it("rejects corrupt shapes and blank project or revision identities", () => {
+    const storage = new MemoryStorage();
+    const invalidValues = [
+      "{malformed",
+      "[]",
+      JSON.stringify({ projectId: "", revisionId: "revision-1", sourceSha256: null }),
+      JSON.stringify({ projectId: "project-1", revisionId: "   ", sourceSha256: "hash-1" }),
+      JSON.stringify({ projectId: "project-1", revisionId: "revision-1", sourceSha256: 7 })
+    ];
+
+    for (const invalidValue of invalidValues) {
+      storage.setItem(ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY, invalidValue);
+      expect(readActiveAnalysisScope(storage)).toBeNull();
+      expect(storage.getItem(ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY)).toBeNull();
+    }
+  });
+
+  it("does not clear a newer active scope when an older scope finishes late", () => {
+    const storage = new MemoryStorage();
+    const olderRevision = revision("revision-old", "hash-old");
+    const newerRevision = revision("revision-new", "hash-new");
+    const olderScope = activeAnalysisScopeForRevision("project-old", olderRevision);
+    writeActiveAnalysisScope("project-new", newerRevision, storage);
+
+    clearActiveAnalysisScope(olderScope, storage);
+
+    expect(readActiveAnalysisScope(storage)).toEqual({
+      projectId: "project-new",
+      revisionId: "revision-new",
+      sourceSha256: "hash-new"
+    });
+  });
+});
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;

@@ -26,6 +26,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
+  ApiRequestError,
   fetchCharacters,
   fetchProjectCharacters,
   fetchManifest,
@@ -382,6 +383,24 @@ export default function App() {
     const restoreToken = analysisRestoreOperationTokenRef.current + 1;
     analysisRestoreOperationTokenRef.current = restoreToken;
     let cancelled = false;
+    const restoreCurrentProjectFallback = async () => {
+      const fallbackProjectId = analysisCurrentProjectIdRef.current;
+      if (!fallbackProjectId || readActiveAnalysisScope()) return;
+      try {
+        const fallbackProject = await fetchProject(fallbackProjectId);
+        if (cancelled || analysisRestoreOperationTokenRef.current !== restoreToken || readActiveAnalysisScope()) return;
+        const fallbackRevision = fallbackProject.script_revisions?.find(
+          (revision) => revision.revision_id === fallbackProject.active_script_revision_id
+        );
+        if (fallbackRevision && hasRestorableAnalysisSession(fallbackProjectId, fallbackRevision)) {
+          analysisProjectIdRef.current = fallbackProjectId;
+          setAnalysisSourceRevision(fallbackRevision);
+          setWorkspaceStage("analysis");
+        }
+      } catch {
+        // The current-project loader owns its user-visible failure state.
+      }
+    };
     fetchProject(scope.projectId)
       .then((payload) => {
         if (cancelled || analysisRestoreOperationTokenRef.current !== restoreToken) return;
@@ -397,13 +416,23 @@ export default function App() {
         );
         if (!sourceRevision || !hasRestorableAnalysisSession(scope.projectId, sourceRevision)) {
           clearActiveAnalysisScope(scope);
+          void restoreCurrentProjectFallback();
           return;
         }
         analysisProjectIdRef.current = scope.projectId;
         setAnalysisSourceRevision(sourceRevision);
         setWorkspaceStage("analysis");
       })
-      .catch(() => undefined);
+      .catch((error) => {
+        if (
+          cancelled
+          || analysisRestoreOperationTokenRef.current !== restoreToken
+          || !(error instanceof ApiRequestError)
+          || error.status !== 404
+        ) return;
+        clearActiveAnalysisScope(scope);
+        void restoreCurrentProjectFallback();
+      });
     return () => {
       cancelled = true;
     };
@@ -1363,19 +1392,34 @@ export default function App() {
     }
   }
 
-  async function flushPendingProjectAutosave(projectId: string) {
+  async function flushPendingProjectAutosave(
+    projectId: string,
+    authoritativeProject?: ScriptProject
+  ): Promise<ScriptProject | null> {
     const pending = pendingProjectAutosaveRef.current;
+    let flushedProject: ScriptProject | null = null;
     if (pending?.projectId === projectId) {
       if (pending.timerId !== null) window.clearTimeout(pending.timerId);
       pendingProjectAutosaveRef.current = null;
+      flushedProject = authoritativeProject
+        ? {
+            ...pending.project,
+            title: authoritativeProject.title,
+            active_script_revision_id: authoritativeProject.active_script_revision_id,
+            active_parse_revision_id: authoritativeProject.active_parse_revision_id,
+            script_revisions: authoritativeProject.script_revisions,
+            parse_revisions: authoritativeProject.parse_revisions
+          }
+        : pending.project;
       saveChainRef.current = saveChainRef.current.then(() => saveCurrentProject(
         pending.projectId,
-        pending.project,
+        flushedProject!,
         pending.characters,
         pending.authorityEpoch
       ));
     }
     await saveChainRef.current;
+    return flushedProject;
   }
 
   async function saveCurrentProject(
@@ -1667,11 +1711,15 @@ export default function App() {
     analysisAutosaveBlockedProjectIdRef.current = targetProjectId;
     setIsManagerSaving(true);
     try {
-      await flushPendingProjectAutosave(targetProjectId);
+      const currentAutosaveProjectId = analysisCurrentProjectIdRef.current;
+      if (currentAutosaveProjectId) await flushPendingProjectAutosave(currentAutosaveProjectId);
+      if (targetProjectId !== currentAutosaveProjectId) await flushPendingProjectAutosave(targetProjectId);
       if (!isCurrent()) return;
       const confirmed = await confirmRevisionRisk(managedProject);
       if (!confirmed || !isCurrent()) return;
-      await flushPendingProjectAutosave(targetProjectId);
+      const latestCurrentAutosaveProjectId = analysisCurrentProjectIdRef.current;
+      if (latestCurrentAutosaveProjectId) await flushPendingProjectAutosave(latestCurrentAutosaveProjectId);
+      if (targetProjectId !== latestCurrentAutosaveProjectId) await flushPendingProjectAutosave(targetProjectId);
       if (!isCurrent()) return;
       projectAuthorityEpochRef.current.set(
         targetProjectId,
@@ -1689,13 +1737,20 @@ export default function App() {
         summary: t("analysis.input.analyze"),
         metadata: analysisSourceFileMetadataRef.current ?? undefined,
         isCurrent,
-        onReady: (payload) => {
-          setManagedProject(payload.project);
-          setManagerTitleDraft(payload.project.title);
+        onReady: async (payload) => {
+          const latestCurrentProjectId = analysisCurrentProjectIdRef.current;
+          if (latestCurrentProjectId && latestCurrentProjectId !== targetProjectId) {
+            await flushPendingProjectAutosave(latestCurrentProjectId);
+          }
+          const rebasedProject = await flushPendingProjectAutosave(targetProjectId, payload.project);
+          if (!isCurrent()) return;
+          const readyProject = rebasedProject ?? payload.project;
+          setManagedProject(readyProject);
+          setManagerTitleDraft(readyProject.title);
           setManagerSourceDraft(payload.script_revision.source_markdown);
           if (targetProjectId === analysisCurrentProjectIdRef.current) {
             skipNextAutosaveRef.current = true;
-            applyManagedProjectToWorkspace(targetProjectId, payload.project);
+            applyManagedProjectToWorkspace(targetProjectId, readyProject);
           }
           analysisProjectIdRef.current = targetProjectId;
           writeActiveAnalysisScope(targetProjectId, payload.script_revision);

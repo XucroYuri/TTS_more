@@ -75,7 +75,7 @@ export interface BeginAnalysisSourceRevisionOptions {
   summary: string;
   metadata?: AnalysisSourceFileMetadata;
   isCurrent: () => boolean;
-  onReady: (payload: ScriptRevisionPayload) => void;
+  onReady: (payload: ScriptRevisionPayload) => void | Promise<void>;
   createRevision?: (
     projectId: string,
     source: string,
@@ -101,7 +101,7 @@ export async function beginAnalysisSourceRevision(
     metadata
   );
   if (!options.isCurrent()) return "stale";
-  options.onReady(payload);
+  await options.onReady(payload);
   return "started";
 }
 

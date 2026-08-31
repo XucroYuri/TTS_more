@@ -458,6 +458,8 @@ export function readActiveAnalysisScope(
   if (
     typeof projectId !== "string"
     || typeof revisionId !== "string"
+    || projectId.trim().length === 0
+    || revisionId.trim().length === 0
     || (sourceSha256 !== null && typeof sourceSha256 !== "string")
   ) {
     safeRemove(storage, ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY);
