@@ -8,9 +8,10 @@ import shutil
 import threading
 import uuid
 import weakref
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Callable, Iterator, TypeVar
 
 import yaml
 from pydantic import BaseModel
@@ -129,6 +130,8 @@ def _usable_project_directory(path: Path) -> Path:
 class ProjectStore:
     _manifest_locks_guard = threading.Lock()
     _manifest_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
+    _project_locks_guard = threading.Lock()
+    _project_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
     _manifest_update_state = threading.local()
 
     def __init__(self, root: Path) -> None:
@@ -167,6 +170,9 @@ class ProjectStore:
     def project_script_dir(self, project_id: str) -> Path:
         return self.project_dir(project_id) / "script"
 
+    def project_semantic_dir(self, project_id: str) -> Path:
+        return self.project_script_dir(project_id) / "semantic"
+
     def project_output_dir(self, project_id: str) -> Path:
         return self.project_dir(project_id) / "output"
 
@@ -191,6 +197,24 @@ class ProjectStore:
 
     def load_project(self, project_id: str) -> ScriptProject:
         return self._read_model(self.project_path(project_id), ScriptProject)
+
+    @contextmanager
+    def project_lock(self, project_id: str) -> Iterator[None]:
+        lock = self._project_lock_for(self._safe_project_id(project_id))
+        with lock:
+            yield
+
+    def update_project(
+        self,
+        project_id: str,
+        mutation: Callable[[ScriptProject], R],
+    ) -> tuple[ScriptProject, R]:
+        safe_project_id = self._safe_project_id(project_id)
+        with self.project_lock(safe_project_id):
+            project = self.load_project(safe_project_id)
+            result = mutation(project)
+            self.save_project(safe_project_id, project)
+            return project, result
 
     def list_projects(self) -> list[dict[str, object]]:
         projects: list[dict[str, object]] = []
@@ -316,6 +340,15 @@ class ProjectStore:
             if lock is None:
                 lock = threading.RLock()
                 self._manifest_locks[key] = lock
+            return lock
+
+    def _project_lock_for(self, project_id: str) -> threading.RLock:
+        key = self._manifest_lock_key(project_id)
+        with self._project_locks_guard:
+            lock = self._project_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._project_locks[key] = lock
             return lock
 
     def _manifest_lock_key(self, project_id: str) -> str:
