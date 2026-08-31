@@ -9,11 +9,15 @@ import { SourceAnnotationPane, type SourceAnnotationPaneProps } from "./SourceAn
 
 const createdAt = "2026-08-31T08:09:10.000Z";
 
-function revision(source: string): ScriptRevision {
+function revision(
+  source: string,
+  revisionId = "script-r007",
+  sourceSha256 = "sha256-exact-source"
+): ScriptRevision {
   return {
-    revision_id: "script-r007",
+    revision_id: revisionId,
     source_markdown: source,
-    source_sha256: "sha256-exact-source",
+    source_sha256: sourceSha256,
     created_at: "2026-08-31T00:00:00.000Z"
   };
 }
@@ -23,17 +27,19 @@ function annotation(
   kind: AnnotationKind,
   source: string,
   start: number,
-  end: number
+  end: number,
+  revisionId = "script-r007",
+  sourceSha256 = "sha256-exact-source"
 ): SemanticAnnotation {
   return {
     id,
     kind,
     span: {
-      source_revision_id: "script-r007",
+      source_revision_id: revisionId,
       start_utf16: start,
       end_utf16: end,
       text: source.slice(start, end),
-      source_sha256: "sha256-exact-source"
+      source_sha256: sourceSha256
     },
     origin: "ai",
     confidence: 0.9,
@@ -48,6 +54,7 @@ interface RenderedPane {
   container: HTMLElement;
   sourceRoot: HTMLElement;
   root: Root;
+  rerender: (overrides: Partial<SourceAnnotationPaneProps>) => Promise<void>;
   cleanup: () => Promise<void>;
 }
 
@@ -69,7 +76,7 @@ async function renderPane(overrides: Partial<SourceAnnotationPaneProps> = {}): P
   });
 
   const sourceRevision = overrides.sourceRevision ?? revision("胶布：快跑！");
-  const props: SourceAnnotationPaneProps = {
+  let props: SourceAnnotationPaneProps = {
     sourceRevision,
     annotations: [],
     onCreateAnnotation: () => undefined,
@@ -86,6 +93,10 @@ async function renderPane(overrides: Partial<SourceAnnotationPaneProps> = {}): P
     container,
     sourceRoot,
     root,
+    rerender: async (nextOverrides) => {
+      props = { ...props, ...nextOverrides };
+      await act(async () => root.render(createElement(SourceAnnotationPane, props)));
+    },
     cleanup: async () => {
       await act(async () => root.unmount());
       Object.assign(globalThis, {
@@ -143,6 +154,24 @@ function buttonWithText(container: HTMLElement, text: string): HTMLButtonElement
   return button;
 }
 
+async function capturePointerSelection(view: RenderedPane, selectedText: string): Promise<void> {
+  selectVisibleText(view, selectedText);
+  await act(async () => {
+    view.sourceRoot.dispatchEvent(new view.dom.window.MouseEvent("mouseup", { bubbles: true }));
+  });
+}
+
+async function pressKey(view: RenderedPane, key: string, shiftKey = false): Promise<void> {
+  await act(async () => {
+    view.sourceRoot.dispatchEvent(
+      new view.dom.window.KeyboardEvent("keydown", { bubbles: true, key, shiftKey })
+    );
+    view.sourceRoot.dispatchEvent(
+      new view.dom.window.KeyboardEvent("keyup", { bubbles: true, key, shiftKey })
+    );
+  });
+}
+
 async function click(view: RenderedPane, element: Element): Promise<void> {
   await act(async () => {
     element.dispatchEvent(new view.dom.window.MouseEvent("click", { bubbles: true }));
@@ -154,7 +183,7 @@ describe("SourceAnnotationPane", () => {
     ["标记为说话者", "speaker"],
     ["标记为情感证据", "emotion_evidence"],
     ["标记为台词", "dialogue"]
-  ] as const)("creates an accepted human %s annotation from a keyboard-selected DOM range", async (label, kind) => {
+  ] as const)("creates an accepted human %s annotation from a pointer-selected DOM range", async (label, kind) => {
     const onCreateAnnotation = vi.fn();
     const view = await renderPane({
       onCreateAnnotation,
@@ -163,12 +192,7 @@ describe("SourceAnnotationPane", () => {
     });
 
     try {
-      selectVisibleText(view, "快跑！");
-      await act(async () => {
-        view.sourceRoot.dispatchEvent(
-          new view.dom.window.KeyboardEvent("keyup", { bubbles: true, key: "Shift" })
-        );
-      });
+      await capturePointerSelection(view, "快跑！");
 
       const menu = view.container.querySelector('[role="toolbar"]')!;
       expect(menu).not.toBeNull();
@@ -191,6 +215,168 @@ describe("SourceAnnotationPane", () => {
         created_at: createdAt,
         updated_at: createdAt
       });
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it("creates an exact annotation from a real Unicode-safe keyboard selection", async () => {
+    const source = "甲😀台词";
+    const onCreateAnnotation = vi.fn();
+    const view = await renderPane({
+      sourceRevision: revision(source),
+      onCreateAnnotation,
+      createAnnotationId: () => "human-keyboard",
+      now: () => createdAt
+    });
+
+    try {
+      await act(async () => view.sourceRoot.focus());
+      await pressKey(view, "Home");
+      await pressKey(view, "ArrowRight");
+      await pressKey(view, "ArrowRight", true);
+      await pressKey(view, "ArrowRight", true);
+
+      expect(view.dom.window.getSelection()!.toString()).toBe("😀台");
+      expect(view.container.querySelector('[role="toolbar"]')).not.toBeNull();
+      await click(view, buttonWithText(view.container, "标记为台词"));
+
+      expect(onCreateAnnotation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "human-keyboard",
+          kind: "dialogue",
+          span: {
+            source_revision_id: "script-r007",
+            start_utf16: 1,
+            end_utf16: 4,
+            text: "😀台",
+            source_sha256: "sha256-exact-source"
+          }
+        })
+      );
+      expect(view.dom.window.getSelection()!.rangeCount).toBe(0);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it("supports End, ArrowLeft, and Shift+Home and clears native selection on cancel", async () => {
+    const source = "甲😀台词";
+    const view = await renderPane({ sourceRevision: revision(source) });
+
+    try {
+      await act(async () => view.sourceRoot.focus());
+      await pressKey(view, "End");
+      await pressKey(view, "ArrowLeft");
+      await pressKey(view, "Home", true);
+
+      expect(view.dom.window.getSelection()!.toString()).toBe("甲😀台");
+      expect(view.container.querySelector('[role="toolbar"]')).not.toBeNull();
+      await pressKey(view, "ArrowRight", true);
+      expect(view.dom.window.getSelection()!.toString()).toBe("😀台");
+      await click(view, buttonWithText(view.container, "取消 / Cancel"));
+      expect(view.dom.window.getSelection()!.rangeCount).toBe(0);
+      expect(view.container.querySelector('[role="toolbar"]')).toBeNull();
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it("invalidates a captured span and native selection across same-text and changed-text revisions", async () => {
+    const source = "胶布：快跑！";
+    const revisionA = revision(source, "script-a", "sha-a");
+    const revisionB = revision(source, "script-b", "sha-b");
+    const revisionC = revision("胶布：慢跑！", "script-c", "sha-c");
+    const onCreateAnnotation = vi.fn();
+    const view = await renderPane({ sourceRevision: revisionA, onCreateAnnotation });
+
+    try {
+      await capturePointerSelection(view, "快跑！");
+      const staleButton = buttonWithText(view.container, "标记为台词");
+      expect(view.dom.window.getSelection()!.toString()).toBe("快跑！");
+
+      await view.rerender({ sourceRevision: revisionB });
+      await click(view, staleButton);
+      expect(onCreateAnnotation).not.toHaveBeenCalled();
+      expect(view.container.querySelector('[role="toolbar"]')).toBeNull();
+      expect(view.dom.window.getSelection()!.rangeCount).toBe(0);
+
+      await capturePointerSelection(view, "快跑！");
+      expect(view.container.querySelector('[role="toolbar"]')).not.toBeNull();
+      await view.rerender({ sourceRevision: revisionC });
+      expect(view.sourceRoot.textContent).toBe("胶布：慢跑！");
+      expect(view.container.querySelector('[role="toolbar"]')).toBeNull();
+      expect(view.dom.window.getSelection()!.rangeCount).toBe(0);
+      expect(onCreateAnnotation).not.toHaveBeenCalled();
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it("revalidates a captured span identity immediately before annotation creation", async () => {
+    const mutableRevision = revision("胶布：快跑！", "script-a", "sha-a");
+    const onCreateAnnotation = vi.fn();
+    const view = await renderPane({ sourceRevision: mutableRevision, onCreateAnnotation });
+
+    try {
+      await capturePointerSelection(view, "快跑！");
+      mutableRevision.revision_id = "script-b";
+      mutableRevision.source_sha256 = "sha-b";
+      await click(view, buttonWithText(view.container, "标记为台词"));
+
+      expect(onCreateAnnotation).not.toHaveBeenCalled();
+      expect(view.container.querySelector('[role="toolbar"]')).toBeNull();
+      expect(view.dom.window.getSelection()!.rangeCount).toBe(0);
+    } finally {
+      await view.cleanup();
+    }
+  });
+
+  it("clears layered state and filters annotations from another revision or hash", async () => {
+    const source = "角色台词";
+    const revisionA = revision(source, "script-a", "sha-a");
+    const revisionB = revision(source, "script-b", "sha-b");
+    const oldSpeaker = annotation("old-speaker", "speaker", source, 0, 2, "script-a", "sha-a");
+    const oldDialogue = annotation("old-dialogue", "dialogue", source, 0, 4, "script-a", "sha-a");
+    const currentSpeaker = annotation(
+      "current-speaker",
+      "speaker",
+      source,
+      0,
+      2,
+      "script-b",
+      "sha-b"
+    );
+    const onSelectAnnotation = vi.fn();
+    const view = await renderPane({
+      sourceRevision: revisionA,
+      annotations: [oldSpeaker, oldDialogue],
+      onSelectAnnotation
+    });
+
+    try {
+      await click(view, view.sourceRoot.querySelector('[data-annotation-count="2"]')!);
+      expect(view.container.querySelector('[role="dialog"]')).not.toBeNull();
+
+      await view.rerender({
+        sourceRevision: revisionB,
+        annotations: [oldSpeaker, oldDialogue, currentSpeaker]
+      });
+      expect(view.container.querySelector('[role="dialog"]')).toBeNull();
+      const currentButtons = view.sourceRoot.querySelectorAll<HTMLButtonElement>("button");
+      expect(currentButtons).toHaveLength(1);
+      await click(view, currentButtons[0]);
+      expect(onSelectAnnotation).toHaveBeenCalledOnce();
+      expect(onSelectAnnotation).toHaveBeenCalledWith("current-speaker");
+
+      await expect(
+        view.rerender({
+          sourceRevision: revision("新台词", "script-c", "sha-c"),
+          annotations: [oldSpeaker, oldDialogue]
+        })
+      ).resolves.toBeUndefined();
+      expect(view.sourceRoot.textContent).toBe("新台词");
+      expect(view.sourceRoot.querySelectorAll("button")).toHaveLength(0);
     } finally {
       await view.cleanup();
     }

@@ -31,15 +31,53 @@ function isTextNode(node: Node): node is Text {
   return node.nodeType === 3;
 }
 
+function isElementNode(node: Node): node is Element {
+  return node.nodeType === 1;
+}
+
+function isHighSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xd800 && codeUnit <= 0xdbff;
+}
+
+function isLowSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xdc00 && codeUnit <= 0xdfff;
+}
+
+export function isUtf16Boundary(source: string, offset: number): boolean {
+  if (!Number.isInteger(offset) || offset < 0 || offset > source.length) return false;
+  if (offset === 0 || offset === source.length) return true;
+  return !(
+    isHighSurrogate(source.charCodeAt(offset - 1)) && isLowSurrogate(source.charCodeAt(offset))
+  );
+}
+
 function boundaryOffset(
+  root: HTMLElement,
   indexes: TextNodeIndex[],
+  source: string,
   container: Node,
   localOffset: number
 ): number | null {
-  if (!isTextNode(container) || !Number.isInteger(localOffset)) return null;
-  const index = indexes.find((candidate) => candidate.node === container);
-  if (!index || localOffset < 0 || localOffset > container.data.length) return null;
-  return index.startUtf16 + localOffset;
+  if (!Number.isInteger(localOffset)) return null;
+  if (isTextNode(container)) {
+    const index = indexes.find((candidate) => candidate.node === container);
+    if (!index || localOffset < 0 || localOffset > container.data.length) return null;
+    return index.startUtf16 + localOffset;
+  }
+  if (!isElementNode(container) || localOffset < 0 || localOffset > container.childNodes.length) {
+    return null;
+  }
+
+  const prefix = root.ownerDocument.createRange();
+  prefix.selectNodeContents(root);
+  try {
+    prefix.setEnd(container, localOffset);
+  } catch {
+    return null;
+  }
+  const prefixText = prefix.toString();
+  const offset = prefixText.length;
+  return source.slice(0, offset) === prefixText ? offset : null;
 }
 
 /** Converts an exact, non-empty DOM text range below root into UTF-16 offsets. */
@@ -50,12 +88,15 @@ export function domRangeToOffsets(root: HTMLElement, range: Range): SourceOffset
   if (range.collapsed) throw new RangeError("selection_collapsed");
 
   const { nodes, source } = textNodeIndex(root);
-  const startUtf16 = boundaryOffset(nodes, range.startContainer, range.startOffset);
-  const endUtf16 = boundaryOffset(nodes, range.endContainer, range.endOffset);
+  const startUtf16 = boundaryOffset(root, nodes, source, range.startContainer, range.startOffset);
+  const endUtf16 = boundaryOffset(root, nodes, source, range.endContainer, range.endOffset);
   if (startUtf16 === null || endUtf16 === null) {
     throw new RangeError("selection_unmappable");
   }
   if (startUtf16 >= endUtf16) throw new RangeError("selection_unmappable");
+  if (!isUtf16Boundary(source, startUtf16) || !isUtf16Boundary(source, endUtf16)) {
+    throw new RangeError("utf16_surrogate_split");
+  }
 
   const selectedSource = source.slice(startUtf16, endUtf16);
   if (range.toString() !== selectedSource) throw new RangeError("selection_unmappable");

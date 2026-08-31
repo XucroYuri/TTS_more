@@ -73,16 +73,87 @@ describe("domRangeToSourceSpan", () => {
     );
   });
 
-  it("rejects non-text boundary points that cannot be mapped exactly", () => {
+  it("maps exact root, nested button, and nested span element boundaries", () => {
+    const dom = new JSDOM();
+    const document = dom.window.document;
+    const root = document.createElement("div");
+    const first = document.createElement("span");
+    first.append(document.createTextNode("甲"));
+    const nestedButton = document.createElement("button");
+    const emoji = document.createElement("span");
+    emoji.append(document.createTextNode("😀"));
+    const dialogue = document.createElement("span");
+    dialogue.append(document.createTextNode("台"));
+    nestedButton.append(emoji, dialogue);
+    const last = document.createElement("span");
+    last.append(document.createTextNode("词"));
+    root.append(first, nestedButton, last);
+    document.body.append(root);
+
+    const rootBoundaryRange = document.createRange();
+    rootBoundaryRange.setStart(root, 1);
+    rootBoundaryRange.setEnd(root, 2);
+    expect(domRangeToOffsets(root, rootBoundaryRange)).toEqual({ startUtf16: 1, endUtf16: 4 });
+    expect(domRangeToSourceSpan(root, rootBoundaryRange, sourceRevision("甲😀台词")).text).toBe(
+      "😀台"
+    );
+
+    const buttonBoundaryRange = document.createRange();
+    buttonBoundaryRange.setStart(nestedButton, 0);
+    buttonBoundaryRange.setEnd(nestedButton, 2);
+    expect(domRangeToOffsets(root, buttonBoundaryRange)).toEqual({ startUtf16: 1, endUtf16: 4 });
+
+    const spanBoundaryRange = document.createRange();
+    spanBoundaryRange.setStart(emoji, 0);
+    spanBoundaryRange.setEnd(emoji, 1);
+    expect(domRangeToOffsets(root, spanBoundaryRange)).toEqual({ startUtf16: 1, endUtf16: 3 });
+  });
+
+  it("rejects an element boundary with an illegal child offset", () => {
     const dom = new JSDOM();
     const root = renderTextNodes(dom.window.document, ["甲", "台词"]);
-    const range = dom.window.document.createRange();
-    range.setStart(root, 0);
-    range.setEnd(root, 1);
+    const endText = root.lastElementChild!.firstChild!;
+    const invalidRange = {
+      startContainer: root,
+      startOffset: root.childNodes.length + 1,
+      endContainer: endText,
+      endOffset: 1,
+      collapsed: false,
+      toString: () => "甲台"
+    } as unknown as Range;
 
-    expect(() => domRangeToSourceSpan(root, range, sourceRevision("甲台词"))).toThrow(
-      "selection_unmappable"
+    expect(() => domRangeToOffsets(root, invalidRange)).toThrow("selection_unmappable");
+  });
+
+  it.each([
+    ["start", 2, 4],
+    ["end", 1, 2]
+  ])("rejects a %s boundary between an emoji surrogate pair", (_boundary, start, end) => {
+    const dom = new JSDOM();
+    const root = renderTextNodes(dom.window.document, ["A😀B"]);
+    const text = root.firstElementChild!.firstChild!;
+    const range = dom.window.document.createRange();
+    range.setStart(text, start);
+    range.setEnd(text, end);
+
+    expect(() => domRangeToSourceSpan(root, range, sourceRevision("A😀B"))).toThrow(
+      "utf16_surrogate_split"
     );
+  });
+
+  it("accepts source boundaries around a complete emoji", () => {
+    const dom = new JSDOM();
+    const root = renderTextNodes(dom.window.document, ["A😀B"]);
+    const text = root.firstElementChild!.firstChild!;
+    const range = dom.window.document.createRange();
+    range.setStart(text, 1);
+    range.setEnd(text, 3);
+
+    expect(domRangeToSourceSpan(root, range, sourceRevision("A😀B"))).toMatchObject({
+      start_utf16: 1,
+      end_utf16: 3,
+      text: "😀"
+    });
   });
 
   it("rejects a root whose text is not the immutable revision source", () => {

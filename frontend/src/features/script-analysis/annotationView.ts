@@ -1,4 +1,5 @@
 import type { AnnotationKind, SemanticAnnotation } from "../../types";
+import { isUtf16Boundary } from "./selectionOffsets";
 
 export interface AnnotationTextSegment {
   startUtf16: number;
@@ -24,6 +25,9 @@ function validateAnnotation(source: string, annotation: SemanticAnnotation): voi
     start >= end
   ) {
     throw new RangeError("annotation_span_invalid");
+  }
+  if (!isUtf16Boundary(source, start) || !isUtf16Boundary(source, end)) {
+    throw new RangeError("utf16_surrogate_split");
   }
   if (source.slice(start, end) !== text) throw new RangeError("annotation_text_mismatch");
 }

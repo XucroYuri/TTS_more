@@ -119,6 +119,45 @@ describe("splitAnnotatedText", () => {
   });
 
   it.each([
+    ["start", 2, 4],
+    ["end", 1, 2]
+  ])("rejects an annotation %s boundary between an emoji surrogate pair", (_boundary, start, end) => {
+    const source = "A😀B";
+    const invalid = annotation("invalid", "dialogue", source, start, end);
+
+    expect(() => splitAnnotatedText(source, [invalid])).toThrow("utf16_surrogate_split");
+  });
+
+  it("keeps a complete emoji inside one legal annotation segment", () => {
+    const source = "A😀B";
+    const emoji = annotation("emoji", "emotion_evidence", source, 1, 3);
+
+    expect(splitAnnotatedText(source, [emoji])).toEqual([
+      {
+        startUtf16: 0,
+        endUtf16: 1,
+        text: "A",
+        annotationIds: [],
+        annotationKinds: []
+      },
+      {
+        startUtf16: 1,
+        endUtf16: 3,
+        text: "😀",
+        annotationIds: ["emoji"],
+        annotationKinds: ["emotion_evidence"]
+      },
+      {
+        startUtf16: 3,
+        endUtf16: 4,
+        text: "B",
+        annotationIds: [],
+        annotationKinds: []
+      }
+    ]);
+  });
+
+  it.each([
     ["negative start", -1, 1],
     ["past source end", 0, 3],
     ["empty interval", 1, 1],
