@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { getApiToken, setApiToken } from "./api";
+import { getApiToken, patchAnalysisDraft, setApiToken } from "./api";
 
 describe("api token storage", () => {
   // The token lives in a module-level variable, so tests share state.
@@ -76,5 +76,33 @@ describe("semantic analysis API request shapes", () => {
     expect(calls[0].init?.headers).toEqual({ "Content-Type": "application/json" });
     expect(calls[3].init?.headers).toEqual({ "Content-Type": "application/json" });
     expect(calls[4].init?.headers).toEqual({ "Content-Type": "application/json" });
+  });
+
+  it("retains the real HTTP status and response body for semantic conflicts", async () => {
+    const originalFetch = globalThis.fetch;
+    const responseBody = JSON.stringify({
+      detail: { code: "semantic_conflict", message: "semantic state conflict" }
+    });
+    globalThis.fetch = (async () =>
+      new Response(responseBody, {
+        status: 409,
+        statusText: "Conflict",
+        headers: { "Content-Type": "application/json" }
+      })) as typeof fetch;
+
+    let caught: unknown;
+    try {
+      await patchAnalysisDraft("draft-1", 3, []);
+    } catch (error) {
+      caught = error;
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(caught).toMatchObject({
+      name: "ApiRequestError",
+      status: 409,
+      responseBody
+    });
   });
 });

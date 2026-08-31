@@ -44,6 +44,74 @@ export function orderedAnalysisUtterances(
     });
 }
 
+const resolvedAcceptanceUncertainty = new Set([
+  "speaker_unknown",
+  "speaker_ambiguous",
+  "dialogue_ambiguous"
+]);
+
+export function utteranceStatusOperations(
+  draft: SemanticAnalysisDraft,
+  utterance: SemanticUtterance,
+  status: SemanticUtterance["status"]
+): DraftOperation[] {
+  const dialogue = draft.annotations.find(
+    (annotation) => annotation.id === utterance.dialogue_annotation_id
+  );
+  if (!dialogue) return [];
+
+  if (status === "accepted") {
+    const character = draft.characters.find(
+      (candidate) => candidate.id === utterance.character_candidate_id
+    );
+    if (!character || character.status === "rejected") return [];
+    const operations: DraftOperation[] = [];
+    if (dialogue.status !== "accepted") {
+      operations.push({
+        op: "set_annotation_status",
+        annotation_id: dialogue.id,
+        status: "accepted"
+      });
+    }
+    if (character.status === "pending") {
+      operations.push({
+        op: "set_character_status",
+        character_id: character.id,
+        status: "accepted"
+      });
+    }
+    const uncertaintyCodes = utterance.uncertainty_codes.filter(
+      (code) => !resolvedAcceptanceUncertainty.has(code)
+    );
+    if (uncertaintyCodes.length !== utterance.uncertainty_codes.length) {
+      operations.push({
+        op: "update_utterance",
+        utterance_id: utterance.id,
+        utterance: { ...utterance, uncertainty_codes: uncertaintyCodes }
+      });
+    }
+    operations.push({
+      op: "set_utterance_status",
+      utterance_id: utterance.id,
+      status: "accepted"
+    });
+    return operations;
+  }
+
+  return [
+    {
+      op: "set_annotation_status",
+      annotation_id: dialogue.id,
+      status
+    },
+    {
+      op: "set_utterance_status",
+      utterance_id: utterance.id,
+      status
+    }
+  ];
+}
+
 export function AnalysisResultsPane({
   draft,
   filter,
@@ -91,6 +159,12 @@ export function AnalysisResultsPane({
             const emotionEvidence = utterance.emotion_evidence_annotation_ids
               .map((id) => draft.annotations.find((item) => item.id === id)?.span.text)
               .filter((value): value is string => Boolean(value));
+            const assignedCharacter = draft.characters.find(
+              (item) => item.id === utterance.character_candidate_id
+            );
+            const canAccept = Boolean(
+              dialogue && assignedCharacter && assignedCharacter.status !== "rejected"
+            );
 
             return (
               <article
@@ -147,13 +221,12 @@ export function AnalysisResultsPane({
                       type="button"
                       data-utterance-action={status === "accepted" ? "accept" : status === "rejected" ? "reject" : "pending"}
                       data-utterance-id={utterance.id}
-                      disabled={disabled}
+                      disabled={disabled || (status === "accepted" && !canAccept)}
                       aria-pressed={utterance.status === status}
                       onClick={(event) => {
                         event.stopPropagation();
-                        onOperations([
-                          { op: "set_utterance_status", utterance_id: utterance.id, status }
-                        ]);
+                        const operations = utteranceStatusOperations(draft, utterance, status);
+                        if (operations.length > 0) onOperations(operations);
                       }}
                     >
                       {t(`analysis.actions.${status === "accepted" ? "accept" : status === "rejected" ? "reject" : "restore"}`)}

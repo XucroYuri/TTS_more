@@ -463,7 +463,12 @@ function writeConfirmKey(storage: Storage | null, draftId: string, key: string):
 function parseError(error: unknown): ParsedError {
   const errorRecord =
     error && typeof error === "object"
-      ? (error as { message?: unknown; status?: unknown; code?: unknown })
+      ? (error as {
+          message?: unknown;
+          status?: unknown;
+          code?: unknown;
+          responseBody?: unknown;
+        })
       : null;
   const fallbackMessage =
     typeof errorRecord?.message === "string" ? errorRecord.message : String(error);
@@ -471,8 +476,11 @@ function parseError(error: unknown): ParsedError {
     typeof errorRecord?.status === "number" ? errorRecord.status : null;
   const fallbackCode = typeof errorRecord?.code === "string" ? errorRecord.code : null;
 
+  const structuredBody =
+    typeof errorRecord?.responseBody === "string" ? errorRecord.responseBody : fallbackMessage;
+
   try {
-    const parsed: unknown = JSON.parse(fallbackMessage);
+    const parsed: unknown = JSON.parse(structuredBody);
     if (parsed && typeof parsed === "object") {
       const container = parsed as {
         detail?: unknown;
@@ -576,6 +584,10 @@ export function useAnalysisDraft(
   const queueFrozenRef = useRef(false);
   const patchFailedRef = useRef(false);
   const confirmInFlightRef = useRef<Promise<SemanticConfirmResponse> | null>(null);
+  const rebaseInFlightRef = useRef<Promise<void> | null>(null);
+  const confirmKeysRef = useRef<Map<string, string>>(new Map());
+  const activeScopeRef = useRef<string | null>(null);
+  const displayedErrorRunIdRef = useRef<string | null>(null);
 
   const rebuildVisibleDraft = useCallback((queueGeneration: number): void => {
     if (queueGenerationRef.current !== queueGeneration) return;
@@ -624,7 +636,11 @@ export function useAnalysisDraft(
         } catch (error) {
           if (queueGenerationRef.current !== queueGeneration) return;
           const parsed = parseError(error);
-          if (parsed.code === "draft_version_conflict" || parsed.status === 409) {
+          if (
+            parsed.code === "draft_version_conflict" ||
+            parsed.code === "semantic_conflict" ||
+            parsed.status === 409
+          ) {
             const conflict = {
               code: parsed.code ?? "draft_version_conflict",
               message: parsed.message
@@ -652,6 +668,8 @@ export function useAnalysisDraft(
   useEffect(() => {
     const epoch = ++lifecycleEpochRef.current;
     const queueGeneration = ++queueGenerationRef.current;
+    const scopeChanged = activeScopeRef.current !== scopeId;
+    activeScopeRef.current = scopeId;
     let cancelled = false;
     let pollTimer: ReturnType<typeof setTimeout> | null = null;
     let staleFallbackUsed = false;
@@ -673,9 +691,13 @@ export function useAnalysisDraft(
     queueFrozenRef.current = false;
     patchFailedRef.current = false;
     confirmInFlightRef.current = null;
+    rebaseInFlightRef.current = null;
     setRunState(null);
     setDraftState(null);
-    setAnalysisErrorState(null);
+    if (scopeChanged) {
+      displayedErrorRunIdRef.current = null;
+      setAnalysisErrorState(null);
+    }
     setControllerErrorState(null);
     setConflictState(null);
     setIsRunning(true);
@@ -698,6 +720,7 @@ export function useAnalysisDraft(
       setDraftState(loadedDraft);
       setIsReadOnly(!editableRef.current);
       if (loadedDraft.confirm_idempotency_key) {
+        confirmKeysRef.current.set(loadedDraft.id, loadedDraft.confirm_idempotency_key);
         writeConfirmKey(storage, loadedDraft.id, loadedDraft.confirm_idempotency_key);
       }
     };
@@ -729,11 +752,13 @@ export function useAnalysisDraft(
       const terminal = isTerminal(record.status);
       setIsRunning(!terminal);
       if (record.status === "completed") {
+        displayedErrorRunIdRef.current = null;
         setAnalysisErrorState(null);
-      } else {
-        setAnalysisErrorState(
-          record.error && !dismissedRunsRef.current.has(record.id) ? record.error : null
-        );
+      } else if (record.status === "failed" || record.status === "interrupted") {
+        const visibleError =
+          record.error && !dismissedRunsRef.current.has(record.id) ? record.error : null;
+        displayedErrorRunIdRef.current = visibleError ? record.id : null;
+        setAnalysisErrorState(visibleError);
       }
       if (terminal) {
         clearPollTimer();
@@ -749,7 +774,6 @@ export function useAnalysisDraft(
     const createFresh = async (): Promise<void> => {
       setRunState(null);
       setDraftState(null);
-      setAnalysisErrorState(null);
       setControllerErrorState(null);
       setConflictState(null);
       setIsRunning(true);
@@ -873,25 +897,65 @@ export function useAnalysisDraft(
   );
 
   const retryPendingOperations = useCallback((): void => {
-    if (
-      queueFrozenRef.current ||
-      pendingBatchesRef.current.length === 0 ||
-      !serverDraftRef.current
-    ) {
+    const serverDraft = serverDraftRef.current;
+    if (pendingBatchesRef.current.length === 0 || !serverDraft) return;
+    if (queueFrozenRef.current) {
+      if (rebaseInFlightRef.current) return;
+      const queueGeneration = queueGenerationRef.current;
+      let trackedPromise: Promise<void>;
+      const rebase = async () => {
+        setIsSaving(true);
+        setControllerErrorState(null);
+        try {
+          const authoritative = await api.fetchAnalysisDraft(serverDraft.id);
+          if (queueGenerationRef.current !== queueGeneration) return;
+          if (
+            authoritative.id !== serverDraft.id ||
+            authoritative.project_id !== projectId ||
+            authoritative.source_revision_id !== sourceRevision.revision_id ||
+            !Number.isInteger(authoritative.version) ||
+            authoritative.version < serverDraft.version ||
+            authoritative.confirmed_revision_id !== null
+          ) {
+            throw new Error("analysis_rebase_identity_invalid");
+          }
+          let visible = authoritative;
+          for (const batch of pendingBatchesRef.current) {
+            visible = applyDraftOperations(visible, batch.operations);
+          }
+          serverDraftRef.current = authoritative;
+          visibleDraftRef.current = visible;
+          setDraftState(visible);
+          queueFrozenRef.current = false;
+          patchFailedRef.current = false;
+          setConflictState(null);
+          await drainPendingOperations();
+        } catch (error) {
+          if (queueGenerationRef.current !== queueGeneration) return;
+          setControllerErrorState(controllerError("patch", error));
+        } finally {
+          if (queueGenerationRef.current === queueGeneration) setIsSaving(false);
+        }
+      };
+      trackedPromise = rebase().finally(() => {
+        if (rebaseInFlightRef.current === trackedPromise) rebaseInFlightRef.current = null;
+      });
+      rebaseInFlightRef.current = trackedPromise;
       return;
     }
     patchFailedRef.current = false;
     setControllerErrorState(null);
     void drainPendingOperations();
-  }, [drainPendingOperations]);
+  }, [api, drainPendingOperations, projectId, sourceRevision.revision_id]);
 
   const dismissError = useCallback((): void => {
-    const currentRun = runRef.current;
-    if (!currentRun) return;
+    const displayedRunId = displayedErrorRunIdRef.current;
+    if (!displayedRunId) return;
     const dismissed = new Set(dismissedRunsRef.current);
-    dismissed.add(currentRun.id);
+    dismissed.add(displayedRunId);
     dismissedRunsRef.current = dismissed;
     writeDismissedRuns(storage, dismissed);
+    displayedErrorRunIdRef.current = null;
     setAnalysisErrorState(null);
   }, [storage]);
 
@@ -933,8 +997,10 @@ export function useAnalysisDraft(
       }
       const idempotencyKey =
         serverDraft.confirm_idempotency_key ??
+        confirmKeysRef.current.get(serverDraft.id) ??
         readConfirmKey(storage, serverDraft.id) ??
         createIdempotencyKey();
+      confirmKeysRef.current.set(serverDraft.id, idempotencyKey);
       writeConfirmKey(storage, serverDraft.id, idempotencyKey);
       setIsConfirming(true);
       setControllerErrorState(null);

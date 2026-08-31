@@ -460,6 +460,209 @@ def test_draft_patch_and_confirm_routes_enforce_version_validation_and_idempoten
         ).status_code == 409
 
 
+def test_frontend_review_batches_satisfy_real_route_and_store_truth_table(tmp_path: Path) -> None:
+    _semantic_api()
+    source_hash = sha256_source("旁白：你好。")
+    with TestClient(_app(tmp_path, FakeSemanticService())) as client:
+        created = _create_run(client)
+        _wait_for_terminal(client, str(created["run_id"]))
+        draft_id = str(created["draft_id"])
+        endpoint = f"/api/analysis-drafts/{draft_id}"
+
+        create_from_empty = client.patch(
+            endpoint,
+            json={
+                "expected_version": 1,
+                "operations": [
+                    {
+                        "op": "create_annotation",
+                        "annotation": {
+                            "id": "dialogue-human",
+                            "kind": "dialogue",
+                            "span": {
+                                "source_revision_id": "script-r001",
+                                "start_utf16": 3,
+                                "end_utf16": 6,
+                                "text": "你好。",
+                                "source_sha256": source_hash,
+                            },
+                            "origin": "human",
+                            "confidence": None,
+                            "status": "accepted",
+                            "created_at": "2026-09-01T00:00:00Z",
+                            "updated_at": "2026-09-01T00:00:00Z",
+                        },
+                    },
+                    {
+                        "op": "create_utterance",
+                        "utterance": {
+                            "id": "utterance-human",
+                            "dialogue_annotation_id": "dialogue-human",
+                            "speaker_annotation_id": None,
+                            "character_candidate_id": None,
+                            "emotion_evidence_annotation_ids": [],
+                            "normalized_emotion": None,
+                            "custom_emotion": None,
+                            "emotion_intensity": None,
+                            "emotion_origin": "none",
+                            "language": "zh-CN",
+                            "confidence": 1,
+                            "uncertainty_codes": ["speaker_unknown"],
+                            "status": "pending",
+                        },
+                    },
+                ],
+            },
+        )
+        assert create_from_empty.status_code == 200, create_from_empty.text
+        assert create_from_empty.json()["utterances"][0]["status"] == "pending"
+
+        create_pending_dependencies = client.patch(
+            endpoint,
+            json={
+                "expected_version": 2,
+                "operations": [
+                    {
+                        "op": "create_annotation",
+                        "annotation": {
+                            "id": "dialogue-pending",
+                            "kind": "dialogue",
+                            "span": {
+                                "source_revision_id": "script-r001",
+                                "start_utf16": 3,
+                                "end_utf16": 6,
+                                "text": "你好。",
+                                "source_sha256": source_hash,
+                            },
+                            "origin": "human",
+                            "confidence": None,
+                            "status": "pending",
+                            "created_at": "2026-09-01T00:00:00Z",
+                            "updated_at": "2026-09-01T00:00:00Z",
+                        },
+                    },
+                    {
+                        "op": "upsert_character",
+                        "character": {
+                            "id": "character-pending",
+                            "canonical_name": "旁白",
+                            "aliases": [],
+                            "supporting_annotation_ids": [],
+                            "project_character_id": None,
+                            "confidence": None,
+                            "status": "pending",
+                            "origin": "human",
+                        },
+                    },
+                    {
+                        "op": "create_utterance",
+                        "utterance": {
+                            "id": "utterance-pending",
+                            "dialogue_annotation_id": "dialogue-pending",
+                            "speaker_annotation_id": None,
+                            "character_candidate_id": "character-pending",
+                            "emotion_evidence_annotation_ids": [],
+                            "normalized_emotion": None,
+                            "custom_emotion": None,
+                            "emotion_intensity": None,
+                            "emotion_origin": "none",
+                            "language": "zh-CN",
+                            "confidence": 1,
+                            "uncertainty_codes": ["speaker_unknown"],
+                            "status": "pending",
+                        },
+                    },
+                ],
+            },
+        )
+        assert create_pending_dependencies.status_code == 200, create_pending_dependencies.text
+
+        accept_pending = client.patch(
+            endpoint,
+            json={
+                "expected_version": 3,
+                "operations": [
+                    {
+                        "op": "set_annotation_status",
+                        "annotation_id": "dialogue-pending",
+                        "status": "accepted",
+                    },
+                    {
+                        "op": "set_character_status",
+                        "character_id": "character-pending",
+                        "status": "accepted",
+                    },
+                    {
+                        "op": "update_utterance",
+                        "utterance_id": "utterance-pending",
+                        "utterance": {
+                            "id": "utterance-pending",
+                            "dialogue_annotation_id": "dialogue-pending",
+                            "speaker_annotation_id": None,
+                            "character_candidate_id": "character-pending",
+                            "emotion_evidence_annotation_ids": [],
+                            "normalized_emotion": None,
+                            "custom_emotion": None,
+                            "emotion_intensity": None,
+                            "emotion_origin": "none",
+                            "language": "zh-CN",
+                            "confidence": 1,
+                            "uncertainty_codes": [],
+                            "status": "pending",
+                        },
+                    },
+                    {
+                        "op": "set_utterance_status",
+                        "utterance_id": "utterance-pending",
+                        "status": "accepted",
+                    },
+                ],
+            },
+        )
+        assert accept_pending.status_code == 200, accept_pending.text
+        accepted = next(
+            item for item in accept_pending.json()["utterances"] if item["id"] == "utterance-pending"
+        )
+        assert accepted["status"] == "accepted"
+
+        clear_accepted_character = client.patch(
+            endpoint,
+            json={
+                "expected_version": 4,
+                "operations": [
+                    {
+                        "op": "update_utterance",
+                        "utterance_id": "utterance-pending",
+                        "utterance": {
+                            "id": "utterance-pending",
+                            "dialogue_annotation_id": "dialogue-pending",
+                            "speaker_annotation_id": None,
+                            "character_candidate_id": None,
+                            "emotion_evidence_annotation_ids": [],
+                            "normalized_emotion": None,
+                            "custom_emotion": None,
+                            "emotion_intensity": None,
+                            "emotion_origin": "none",
+                            "language": "zh-CN",
+                            "confidence": 1,
+                            "uncertainty_codes": ["speaker_unknown"],
+                            "status": "pending",
+                        },
+                    }
+                ],
+            },
+        )
+        assert clear_accepted_character.status_code == 200, clear_accepted_character.text
+        cleared = next(
+            item
+            for item in clear_accepted_character.json()["utterances"]
+            if item["id"] == "utterance-pending"
+        )
+        assert cleared["character_candidate_id"] is None
+        assert cleared["status"] == "pending"
+        assert cleared["uncertainty_codes"] == ["speaker_unknown"]
+
+
 def test_running_draft_is_read_only(tmp_path: Path) -> None:
     _semantic_api()
     gate = threading.Event()

@@ -722,7 +722,12 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         title: "原文标注"
       },
       review: {
-        title: "分析审阅"
+        title: "分析审阅",
+        partialQuality: "部分结果需人工复核",
+        runWarningsTitle: "运行警告",
+        draftWarningsTitle: "草稿警告",
+        dismissWarning: "关闭警告",
+        unresolvedTitle: "未解决候选"
       },
       filters: {
         label: "分析结果筛选",
@@ -773,6 +778,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       characters: {
         title: "角色与别名",
         empty: "暂无角色候选",
+        newName: "新角色名称",
+        createHuman: "新建人工角色",
         canonicalName: "角色名称",
         aliases: "别名（逗号分隔）",
         splitAlias: "拆分别名",
@@ -801,6 +808,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       },
       confirm: {
         open: "确认并导入",
+        recover: "恢复确认并进入配音",
         title: "确认导入分析结果",
         importCount: "将导入 {{count}} 条台词",
         excludedCount: "{{count}} 条台词因状态、锚点或角色分配未满足条件而排除",
@@ -1625,7 +1633,12 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         title: "Source annotations"
       },
       review: {
-        title: "Analysis review"
+        title: "Analysis review",
+        partialQuality: "Partial results require review",
+        runWarningsTitle: "Run warnings",
+        draftWarningsTitle: "Draft warnings",
+        dismissWarning: "Dismiss warning",
+        unresolvedTitle: "Unresolved candidates"
       },
       filters: {
         label: "Analysis result filters",
@@ -1676,6 +1689,8 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       characters: {
         title: "Characters and aliases",
         empty: "No character candidates",
+        newName: "New character name",
+        createHuman: "Create human character",
         canonicalName: "Character name",
         aliases: "Aliases (comma separated)",
         splitAlias: "Split alias",
@@ -1704,6 +1719,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       },
       confirm: {
         open: "Confirm and import",
+        recover: "Recover confirmation and continue",
         title: "Confirm analysis import",
         importCount: "Import {{count}} utterances",
         excludedCount: "Exclude {{count}} utterances whose status, anchor, or character assignment is not eligible",

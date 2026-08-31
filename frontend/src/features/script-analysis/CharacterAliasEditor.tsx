@@ -39,6 +39,27 @@ function controlledAliases(value: string): string[] {
   return [...new Set(value.split(",").map((alias) => alias.trim()).filter(Boolean))];
 }
 
+export function reassignUtterance(
+  utterance: SemanticUtterance,
+  characterCandidateId: string | null
+): SemanticUtterance {
+  if (characterCandidateId) {
+    return {
+      ...utterance,
+      character_candidate_id: characterCandidateId,
+      uncertainty_codes: utterance.uncertainty_codes.filter(
+        (code) => code !== "speaker_unknown" && code !== "speaker_ambiguous"
+      )
+    };
+  }
+  return {
+    ...utterance,
+    character_candidate_id: null,
+    status: utterance.status === "accepted" ? "pending" : utterance.status,
+    uncertainty_codes: [...new Set([...utterance.uncertainty_codes, "speaker_unknown" as const])]
+  };
+}
+
 export function CharacterAliasEditor({
   characters,
   utterances,
@@ -48,29 +69,72 @@ export function CharacterAliasEditor({
 }: CharacterAliasEditorProps) {
   const { t } = useTranslation();
   const [edits, setEdits] = useState<Record<string, CharacterEdit>>(() => editsFor(characters));
-  const [mergeTarget, setMergeTarget] = useState(characters[0]?.id ?? "");
+  const [newCharacterName, setNewCharacterName] = useState("");
+  const [mergeTarget, setMergeTarget] = useState(
+    characters.find((character) => character.status === "accepted")?.id ?? ""
+  );
   const [mergeSource, setMergeSource] = useState(characters[1]?.id ?? "");
+
+  const acceptedCharacters = useMemo(
+    () => characters.filter((character) => character.status === "accepted"),
+    [characters]
+  );
 
   useEffect(() => {
     setEdits(editsFor(characters));
     setMergeTarget((current) =>
-      characters.some((candidate) => candidate.id === current) ? current : characters[0]?.id ?? ""
+      acceptedCharacters.some((candidate) => candidate.id === current)
+        ? current
+        : acceptedCharacters[0]?.id ?? ""
     );
     setMergeSource((current) =>
       characters.some((candidate) => candidate.id === current)
         ? current
         : characters.find((candidate) => candidate.id !== characters[0]?.id)?.id ?? ""
     );
-  }, [characters]);
-
-  const acceptedCharacters = useMemo(
-    () => characters.filter((character) => character.status !== "rejected"),
-    [characters]
-  );
+  }, [acceptedCharacters, characters]);
 
   return (
     <section className="character-alias-editor" aria-labelledby="analysis-character-title">
       <h2 id="analysis-character-title">{t("analysis.characters.title")}</h2>
+      <div className="character-alias-editor__create">
+        <label>
+          {t("analysis.characters.newName")}
+          <input
+            data-new-character-name
+            value={newCharacterName}
+            disabled={disabled}
+            onInput={(event) => setNewCharacterName(event.currentTarget.value)}
+          />
+        </label>
+        <button
+          type="button"
+          data-character-action="create"
+          disabled={disabled || !newCharacterName.trim()}
+          onClick={() => {
+            const canonicalName = newCharacterName.trim();
+            if (!canonicalName) return;
+            onOperations([
+              {
+                op: "upsert_character",
+                character: {
+                  id: createCharacterId(),
+                  canonical_name: canonicalName,
+                  aliases: [],
+                  supporting_annotation_ids: [],
+                  project_character_id: null,
+                  confidence: null,
+                  status: "accepted",
+                  origin: "human"
+                }
+              }
+            ]);
+            setNewCharacterName("");
+          }}
+        >
+          {t("analysis.characters.createHuman")}
+        </button>
+      </div>
       {characters.length === 0 ? (
         <p className="analysis-empty-state">{t("analysis.characters.empty")}</p>
       ) : (
@@ -229,7 +293,7 @@ export function CharacterAliasEditor({
               disabled={disabled}
               onChange={(event) => setMergeTarget(event.target.value)}
             >
-              {characters.map((character) => (
+              {acceptedCharacters.map((character) => (
                 <option key={character.id} value={character.id}>{character.canonical_name}</option>
               ))}
             </select>
@@ -281,10 +345,7 @@ export function CharacterAliasEditor({
                     {
                       op: "update_utterance",
                       utterance_id: utterance.id,
-                      utterance: {
-                        ...utterance,
-                        character_candidate_id: event.target.value || null
-                      }
+                      utterance: reassignUtterance(utterance, event.target.value || null)
                     }
                   ])
                 }

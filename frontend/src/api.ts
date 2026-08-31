@@ -10,6 +10,18 @@ const jsonHeaders = { "Content-Type": "application/json" };
  * re-entry. Returns "" when unset. */
 let apiToken = "";
 
+export class ApiRequestError extends Error {
+  readonly status: number;
+  readonly responseBody: string;
+
+  constructor(status: number, responseBody: string, message: string) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.responseBody = responseBody;
+  }
+}
+
 export function getApiToken(): string {
   return apiToken;
 }
@@ -37,11 +49,19 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     // a token-entry dialog; the rejected promise still propagates the error.
     window.dispatchEvent(new CustomEvent("tts-more:auth-required"));
     const body = await response.text();
-    throw new Error(body || "API token required");
+    throw new ApiRequestError(
+      response.status,
+      body,
+      body || "API token required"
+    );
   }
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(body || response.statusText);
+    throw new ApiRequestError(
+      response.status,
+      body,
+      body || response.statusText
+    );
   }
   return response.json() as Promise<T>;
 }

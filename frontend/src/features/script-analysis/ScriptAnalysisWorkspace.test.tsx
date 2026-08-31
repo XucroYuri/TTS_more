@@ -122,7 +122,7 @@ function utterance(
     speaker_annotation_id: null,
     character_candidate_id: characterId,
     emotion_evidence_annotation_ids: [],
-    normalized_emotion: "neutral",
+    normalized_emotion: null,
     custom_emotion: null,
     emotion_intensity: null,
     emotion_origin: "none",
@@ -195,7 +195,7 @@ function run(
     source_revision_id: sourceRevision.revision_id,
     draft_id: "draft-task-8",
     status,
-    quality: status === "completed" ? "complete" : "partial",
+    quality: status === "completed" ? "complete" : null,
     progress: status === "completed" ? 1 : 0.7,
     warnings: [],
     error: null,
@@ -379,6 +379,46 @@ async function changeValue(element: HTMLInputElement | HTMLSelectElement, value:
   });
 }
 
+async function selectSourceText(view: RenderedView, selectedText: string): Promise<void> {
+  const sourceRoot = view.container.querySelector<HTMLElement>(".source-annotation-pane__source")!;
+  const walker = view.dom.window.document.createTreeWalker(
+    sourceRoot,
+    view.dom.window.NodeFilter.SHOW_TEXT
+  );
+  const nodes: Text[] = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) nodes.push(node as Text);
+  const exact = nodes.map((node) => node.data).join("");
+  const start = exact.indexOf(selectedText);
+  if (start < 0) throw new Error(`source text not found: ${selectedText}`);
+  const end = start + selectedText.length;
+  let cursor = 0;
+  let startNode!: Text;
+  let endNode!: Text;
+  let startOffset = 0;
+  let endOffset = 0;
+  for (const node of nodes) {
+    const next = cursor + node.data.length;
+    if (!startNode && start >= cursor && start < next) {
+      startNode = node;
+      startOffset = start - cursor;
+    }
+    if (!endNode && end > cursor && end <= next) {
+      endNode = node;
+      endOffset = end - cursor;
+    }
+    cursor = next;
+  }
+  const range = view.dom.window.document.createRange();
+  range.setStart(startNode, startOffset);
+  range.setEnd(endNode, endOffset);
+  const selection = view.dom.window.getSelection()!;
+  selection.removeAllRanges();
+  selection.addRange(range);
+  await act(async () =>
+    sourceRoot.dispatchEvent(new view.dom.window.MouseEvent("mouseup", { bubbles: true }))
+  );
+}
+
 beforeEach(async () => {
   await i18n.changeLanguage("zh-CN");
 });
@@ -421,6 +461,80 @@ describe("AnalysisResultsPane", () => {
     await click(view.container.querySelector('[data-filter="pending"]')!);
     await click(view.container.querySelector('[data-filter="low"]')!);
     expect(onFilterChange.mock.calls.map(([filter]) => filter)).toEqual(["pending", "low"]);
+  });
+
+  it("emits backend-valid atomic truth-table batches for accept, reject, and restore", async () => {
+    const pendingUtterance = utterance("utterance-pending", "dialogue-pending", "character-pending", {
+      status: "pending",
+      uncertainty_codes: ["speaker_unknown", "emotion_inferred"]
+    });
+    const pendingDraft = draft({
+      annotations: [annotation("dialogue-pending", "dialogue", 14, 17, "pending")],
+      characters: [character("character-pending", "丙", { status: "pending" })],
+      utterances: [pendingUtterance]
+    });
+    const onOperations = vi.fn<(operations: DraftOperation[]) => void>();
+    const view = await renderElement(
+      createElement(AnalysisResultsPane, {
+        draft: pendingDraft,
+        filter: "all",
+        onFilterChange: () => undefined,
+        onOperations,
+        onSelectUtterance: () => undefined
+      })
+    );
+
+    await click(view.container.querySelector('[data-utterance-action="accept"]')!);
+    expect(onOperations).toHaveBeenLastCalledWith([
+      {
+        op: "set_annotation_status",
+        annotation_id: "dialogue-pending",
+        status: "accepted"
+      },
+      {
+        op: "set_character_status",
+        character_id: "character-pending",
+        status: "accepted"
+      },
+      {
+        op: "update_utterance",
+        utterance_id: "utterance-pending",
+        utterance: { ...pendingUtterance, uncertainty_codes: ["emotion_inferred"] }
+      },
+      {
+        op: "set_utterance_status",
+        utterance_id: "utterance-pending",
+        status: "accepted"
+      }
+    ]);
+
+    await click(view.container.querySelector('[data-utterance-action="reject"]')!);
+    expect(onOperations).toHaveBeenLastCalledWith([
+      {
+        op: "set_annotation_status",
+        annotation_id: "dialogue-pending",
+        status: "rejected"
+      },
+      {
+        op: "set_utterance_status",
+        utterance_id: "utterance-pending",
+        status: "rejected"
+      }
+    ]);
+
+    await click(view.container.querySelector('[data-utterance-action="pending"]')!);
+    expect(onOperations).toHaveBeenLastCalledWith([
+      {
+        op: "set_annotation_status",
+        annotation_id: "dialogue-pending",
+        status: "pending"
+      },
+      {
+        op: "set_utterance_status",
+        utterance_id: "utterance-pending",
+        status: "pending"
+      }
+    ]);
   });
 });
 
@@ -524,11 +638,102 @@ describe("CharacterAliasEditor", () => {
     );
     expect(onOperations).not.toHaveBeenCalled();
   });
+
+  it("creates human characters and keeps assignment and merge targets dependency-safe", async () => {
+    const acceptedUtterance = utterance("utterance-accepted", "dialogue-1", "character-1");
+    const pendingUtterance = utterance("utterance-pending", "dialogue-3", "character-1", {
+      status: "pending",
+      uncertainty_codes: ["speaker_unknown", "speaker_ambiguous", "emotion_inferred"]
+    });
+    const characters = [
+      character("character-1", "甲"),
+      character("character-2", "乙"),
+      character("character-pending", "丙", { status: "pending" }),
+      character("character-rejected", "丁", { status: "rejected" })
+    ];
+    const onOperations = vi.fn<(operations: DraftOperation[]) => void>();
+    const view = await renderElement(
+      createElement(CharacterAliasEditor, {
+        characters,
+        utterances: [acceptedUtterance, pendingUtterance],
+        onOperations,
+        createCharacterId: () => "character-human-stable"
+      })
+    );
+
+    const assignmentOptions = [
+      ...view.container.querySelector<HTMLSelectElement>(
+        '[data-utterance-character="utterance-accepted"]'
+      )!.options
+    ].map((option) => option.value);
+    expect(assignmentOptions).toEqual(["", "character-1", "character-2"]);
+    const mergeTargets = [
+      ...view.container.querySelector<HTMLSelectElement>('[data-merge-target]')!.options
+    ].map((option) => option.value);
+    expect(mergeTargets).toEqual(["character-1", "character-2"]);
+
+    await changeValue(
+      view.container.querySelector<HTMLSelectElement>(
+        '[data-utterance-character="utterance-accepted"]'
+      )!,
+      ""
+    );
+    expect(onOperations).toHaveBeenLastCalledWith([
+      {
+        op: "update_utterance",
+        utterance_id: "utterance-accepted",
+        utterance: {
+          ...acceptedUtterance,
+          character_candidate_id: null,
+          status: "pending",
+          uncertainty_codes: ["speaker_unknown"]
+        }
+      }
+    ]);
+
+    await changeValue(
+      view.container.querySelector<HTMLSelectElement>(
+        '[data-utterance-character="utterance-pending"]'
+      )!,
+      "character-2"
+    );
+    expect(onOperations).toHaveBeenLastCalledWith([
+      {
+        op: "update_utterance",
+        utterance_id: "utterance-pending",
+        utterance: {
+          ...pendingUtterance,
+          character_candidate_id: "character-2",
+          uncertainty_codes: ["emotion_inferred"]
+        }
+      }
+    ]);
+
+    await changeValue(view.container.querySelector<HTMLInputElement>('[data-new-character-name]')!, "戊");
+    await click(view.container.querySelector('[data-character-action="create"]')!);
+    expect(onOperations).toHaveBeenLastCalledWith([
+      {
+        op: "upsert_character",
+        character: {
+          id: "character-human-stable",
+          canonical_name: "戊",
+          aliases: [],
+          supporting_annotation_ids: [],
+          project_character_id: null,
+          confidence: null,
+          status: "accepted",
+          origin: "human"
+        }
+      }
+    ]);
+  });
 });
 
 describe("ScriptAnalysisWorkspace", () => {
   it("wraps human annotations as create operations and links result/source focus both ways", async () => {
-    const view = await renderWorkspace();
+    const view = await renderWorkspace(draft(), run(), {
+      createUtteranceId: () => "utterance-created-stable"
+    });
     const scrollIntoView = vi.fn();
     Object.defineProperty(view.dom.window.HTMLElement.prototype, "scrollIntoView", {
       configurable: true,
@@ -581,17 +786,132 @@ describe("ScriptAnalysisWorkspace", () => {
     await click([...view.container.querySelectorAll("button")].find((button) => button.textContent === "标记为台词")!);
     await flushAsync();
     const operations = view.patch.mock.calls.at(-1)?.[2];
+    const createdAnnotation = operations?.[0].op === "create_annotation"
+      ? operations[0].annotation
+      : null;
+    expect(createdAnnotation).toEqual(
+      expect.objectContaining({
+        kind: "dialogue",
+        origin: "human",
+        status: "accepted",
+        span: expect.objectContaining({ start_utf16: 14, end_utf16: 17, text: "第三句" })
+      })
+    );
     expect(operations).toEqual([
+      { op: "create_annotation", annotation: createdAnnotation },
       {
-        op: "create_annotation",
-        annotation: expect.objectContaining({
-          kind: "dialogue",
-          origin: "human",
-          status: "accepted",
-          span: expect.objectContaining({ start_utf16: 14, end_utf16: 17, text: "第三句" })
-        })
+        op: "create_utterance",
+        utterance: {
+          id: "utterance-created-stable",
+          dialogue_annotation_id: createdAnnotation?.id,
+          speaker_annotation_id: null,
+          character_candidate_id: null,
+          emotion_evidence_annotation_ids: [],
+          normalized_emotion: null,
+          custom_emotion: null,
+          emotion_intensity: null,
+          emotion_origin: "none",
+          language: "zh-CN",
+          confidence: 1,
+          uncertainty_codes: ["speaker_unknown"],
+          status: "pending"
+        }
       }
     ]);
+  });
+
+  it("builds an empty draft into one importable human utterance through real controls", async () => {
+    const view = await renderWorkspace(
+      draft({ annotations: [], characters: [], utterances: [], warnings: [] }),
+      run(),
+      {
+        createUtteranceId: () => "utterance-human-stable",
+        createCharacterId: () => "character-human-stable"
+      }
+    );
+
+    await selectSourceText(view, "第一句");
+    await click(
+      [...view.container.querySelectorAll("button")].find(
+        (button) => button.textContent === "标记为台词"
+      )!
+    );
+    await flushAsync();
+    expect(view.patch).toHaveBeenCalledTimes(1);
+    const creationBatch = view.patch.mock.calls[0][2];
+    expect(creationBatch.map((operation) => operation.op)).toEqual([
+      "create_annotation",
+      "create_utterance"
+    ]);
+    expect(
+      creationBatch[1].op === "create_utterance" ? creationBatch[1].utterance : null
+    ).toEqual(
+      expect.objectContaining({
+        id: "utterance-human-stable",
+        character_candidate_id: null,
+        confidence: 1,
+        uncertainty_codes: ["speaker_unknown"],
+        status: "pending"
+      })
+    );
+
+    await changeValue(
+      view.container.querySelector<HTMLInputElement>('[data-new-character-name]')!,
+      "人工角色"
+    );
+    await click(view.container.querySelector('[data-character-action="create"]')!);
+    await flushAsync();
+    expect(view.patch.mock.calls[1][2]).toEqual([
+      {
+        op: "upsert_character",
+        character: {
+          id: "character-human-stable",
+          canonical_name: "人工角色",
+          aliases: [],
+          supporting_annotation_ids: [],
+          project_character_id: null,
+          confidence: null,
+          status: "accepted",
+          origin: "human"
+        }
+      }
+    ]);
+
+    await changeValue(
+      view.container.querySelector<HTMLSelectElement>(
+        '[data-utterance-character="utterance-human-stable"]'
+      )!,
+      "character-human-stable"
+    );
+    await flushAsync();
+    const assignment = view.patch.mock.calls[2][2];
+    expect(assignment[0]).toEqual(
+      expect.objectContaining({
+        op: "update_utterance",
+        utterance_id: "utterance-human-stable",
+        utterance: expect.objectContaining({
+          character_candidate_id: "character-human-stable",
+          uncertainty_codes: []
+        })
+      })
+    );
+
+    await click(
+      view.container.querySelector(
+        '[data-utterance-action="accept"][data-utterance-id="utterance-human-stable"]'
+      )!
+    );
+    await flushAsync();
+    expect(view.patch.mock.calls[3][2].at(-1)).toEqual({
+      op: "set_utterance_status",
+      utterance_id: "utterance-human-stable",
+      status: "accepted"
+    });
+
+    await click(view.container.querySelector('[data-action="confirm-open"]')!);
+    expect(view.container.querySelector('[role="dialog"]')?.textContent).toContain(
+      "将导入 1 条台词"
+    );
   });
 
   it("keeps structured 422 failures visible until explicit dismissal and copies diagnostics", async () => {
@@ -658,6 +978,65 @@ describe("ScriptAnalysisWorkspace", () => {
     expect(view.container.querySelector<HTMLButtonElement>('[data-action="confirm-open"]')!.disabled).toBe(false);
   });
 
+  it("renders partial quality, run/draft warnings, and unresolved candidates even when empty", async () => {
+    const view = await renderWorkspace(
+      draft({
+        annotations: [],
+        characters: [],
+        utterances: [],
+        warnings: [
+          {
+            id: "draft-warning",
+            code: "draft_review",
+            message: "Draft warning visible",
+            annotation_id: null,
+            utterance_id: null,
+            details: { source: "draft" }
+          }
+        ],
+        unresolved_candidates: [
+          {
+            id: "unresolved-1",
+            code: "source_anchor_ambiguous",
+            candidate_type: "dialogue",
+            message: "Unresolved source anchor visible",
+            details: { start: 2 }
+          }
+        ]
+      }),
+      run("completed", {
+        quality: "partial",
+        warnings: [
+          {
+            id: "run-warning",
+            code: "chunk_failed",
+            message: "Run warning visible",
+            annotation_id: null,
+            utterance_id: null,
+            details: { chunk: 2 }
+          }
+        ]
+      })
+    );
+
+    expect(view.container.textContent).toContain("部分结果");
+    expect(view.container.textContent).toContain("Run warning visible");
+    expect(view.container.textContent).toContain("Draft warning visible");
+    expect(view.container.textContent).toContain("Unresolved source anchor visible");
+    expect(
+      view.container.querySelector('[data-warning-source="run"] [data-warning-action="dismiss"]')
+    ).toBeNull();
+    await click(
+      view.container.querySelector(
+        '[data-warning-source="draft"] [data-warning-action="dismiss"]'
+      )!
+    );
+    await flushAsync();
+    expect(view.patch.mock.calls.at(-1)?.[2]).toEqual([
+      { op: "dismiss_warning", warning_id: "draft-warning" }
+    ]);
+  });
+
   it("summarizes only accepted, grounded, assigned utterances and confirms once with server project", async () => {
     const currentDraft = draft();
     expect(summarizeConfirmableUtterances(currentDraft)).toEqual({ importable: 2, excluded: 1 });
@@ -700,5 +1079,33 @@ describe("ScriptAnalysisWorkspace", () => {
     await click(view.container.querySelector('[data-action="confirm-cancel"]')!);
     expect(view.container.querySelector('[role="dialog"]')).toBeNull();
     expect(view.confirm).not.toHaveBeenCalled();
+  });
+
+  it("recovers a confirmed draft with the server key and forwards the authoritative project", async () => {
+    const onConfirmed = vi.fn();
+    const view = await renderWorkspace(
+      draft({
+        confirmed_revision_id: "semantic-r8",
+        confirmed_parse_revision_id: "parse-r8",
+        confirmed_parse_fingerprint: "fingerprint-r8",
+        confirm_idempotency_key: "server-confirm-key"
+      }),
+      run(),
+      { onConfirmed }
+    );
+
+    const recovery = view.container.querySelector<HTMLButtonElement>(
+      '[data-action="confirm-recover"]'
+    )!;
+    expect(recovery.disabled).toBe(false);
+    expect(recovery.textContent).toContain("恢复确认");
+    await click(recovery);
+    await flushAsync();
+    expect(view.confirm).toHaveBeenCalledWith(
+      "draft-task-8",
+      3,
+      "server-confirm-key"
+    );
+    expect(onConfirmed).toHaveBeenCalledWith(confirmedProject);
   });
 });

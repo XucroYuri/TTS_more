@@ -425,6 +425,40 @@
   border-color: #fbbf24;
 }
 
+.analysis-review-notice,
+.analysis-review-messages {
+  margin: 0;
+  padding: 0.8rem;
+  color: #78350f;
+  background: #fffbeb;
+  border: 1px solid #fbbf24;
+  border-radius: 0.65rem;
+}
+
+.analysis-review-messages {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.analysis-review-messages > h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.analysis-review-message {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid rgba(180, 83, 9, 0.25);
+}
+
+.analysis-review-message p {
+  margin: 0.25rem 0 0;
+  overflow-wrap: anywhere;
+}
+
 .script-analysis-workspace__actions {
   padding-top: 0.8rem;
   border-top: 1px solid #cbd5e1;

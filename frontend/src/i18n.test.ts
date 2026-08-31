@@ -101,5 +101,13 @@ describe("i18n configuration", () => {
     expect(tText(resources["en-US"], "analysis.errors.copyDiagnostics")).toBe("Copy diagnostics");
     expect(tText(resources["zh-CN"], "analysis.confirm.importCount")).toBe("将导入 {{count}} 条台词");
     expect(tText(resources["en-US"], "analysis.confirm.importCount")).toBe("Import {{count}} utterances");
+    expect(tText(resources["zh-CN"], "analysis.characters.createHuman")).toBe("新建人工角色");
+    expect(tText(resources["en-US"], "analysis.characters.createHuman")).toBe("Create human character");
+    expect(tText(resources["zh-CN"], "analysis.confirm.recover")).toBe("恢复确认并进入配音");
+    expect(tText(resources["en-US"], "analysis.confirm.recover")).toBe("Recover confirmation and continue");
+    expect(tText(resources["zh-CN"], "analysis.review.partialQuality")).toBe("部分结果需人工复核");
+    expect(tText(resources["en-US"], "analysis.review.partialQuality")).toBe("Partial results require review");
+    expect(tText(resources["zh-CN"], "analysis.review.unresolvedTitle")).toBe("未解决候选");
+    expect(tText(resources["en-US"], "analysis.review.unresolvedTitle")).toBe("Unresolved candidates");
   });
 });

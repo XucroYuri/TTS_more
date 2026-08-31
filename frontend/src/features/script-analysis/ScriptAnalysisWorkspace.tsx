@@ -27,6 +27,7 @@ export interface ScriptAnalysisWorkspaceProps {
   onCancel: () => void;
   controllerOptions?: UseAnalysisDraftOptions;
   createCharacterId?: () => string;
+  createUtteranceId?: () => string;
   copyDiagnostics?: (diagnostics: string) => void | Promise<void>;
 }
 
@@ -73,6 +74,16 @@ function runStatusKey(controller: UseAnalysisDraftResult): string {
   return controller.isRunning ? "running" : "failed";
 }
 
+let fallbackUtteranceId = 0;
+
+function defaultCreateUtteranceId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return `utterance-${globalThis.crypto.randomUUID()}`;
+  }
+  fallbackUtteranceId += 1;
+  return `utterance-human-${fallbackUtteranceId}`;
+}
+
 export function ScriptAnalysisWorkspace({
   projectId,
   sourceRevision,
@@ -80,9 +91,10 @@ export function ScriptAnalysisWorkspace({
   onCancel,
   controllerOptions,
   createCharacterId,
+  createUtteranceId = defaultCreateUtteranceId,
   copyDiagnostics
 }: ScriptAnalysisWorkspaceProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const controller = useAnalysisDraft(projectId, sourceRevision, controllerOptions);
   const [filter, setFilter] = useState<AnalysisResultFilter>("all");
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -137,7 +149,28 @@ export function ScriptAnalysisWorkspace({
   };
 
   const handleCreateAnnotation = (annotation: SemanticAnnotation) => {
-    queueOperations([{ op: "create_annotation", annotation }]);
+    const operations: DraftOperation[] = [{ op: "create_annotation", annotation }];
+    if (annotation.kind === "dialogue") {
+      operations.push({
+        op: "create_utterance",
+        utterance: {
+          id: createUtteranceId(),
+          dialogue_annotation_id: annotation.id,
+          speaker_annotation_id: null,
+          character_candidate_id: null,
+          emotion_evidence_annotation_ids: [],
+          normalized_emotion: null,
+          custom_emotion: null,
+          emotion_intensity: null,
+          emotion_origin: "none",
+          language: i18n.resolvedLanguage ?? i18n.language ?? "zh-CN",
+          confidence: 1,
+          uncertainty_codes: ["speaker_unknown"],
+          status: "pending"
+        }
+      });
+    }
+    queueOperations(operations);
   };
 
   const handleCopyDiagnostics = () => {
@@ -244,6 +277,66 @@ export function ScriptAnalysisWorkspace({
         </section>
 
         <section className="script-analysis-workspace__review" aria-label={t("analysis.review.title")}>
+          {controller.run?.quality === "partial" ? (
+            <p className="analysis-review-notice" data-analysis-quality="partial">
+              {t("analysis.review.partialQuality")}
+            </p>
+          ) : null}
+
+          {controller.run?.warnings.length ? (
+            <section className="analysis-review-messages" aria-label={t("analysis.review.runWarningsTitle")}>
+              <h2>{t("analysis.review.runWarningsTitle")}</h2>
+              {controller.run.warnings.map((warning) => (
+                <article
+                  className="analysis-review-message"
+                  data-warning-source="run"
+                  key={warning.id}
+                >
+                  <strong>{warning.code}</strong>
+                  <p>{warning.message}</p>
+                </article>
+              ))}
+            </section>
+          ) : null}
+
+          {draft?.warnings.length ? (
+            <section className="analysis-review-messages" aria-label={t("analysis.review.draftWarningsTitle")}>
+              <h2>{t("analysis.review.draftWarningsTitle")}</h2>
+              {draft.warnings.map((warning) => (
+                <article
+                  className="analysis-review-message"
+                  data-warning-source="draft"
+                  key={warning.id}
+                >
+                  <div>
+                    <strong>{warning.code}</strong>
+                    <p>{warning.message}</p>
+                  </div>
+                  <button
+                    type="button"
+                    data-warning-action="dismiss"
+                    disabled={!isEditable}
+                    onClick={() => queueOperations([{ op: "dismiss_warning", warning_id: warning.id }])}
+                  >
+                    {t("analysis.review.dismissWarning")}
+                  </button>
+                </article>
+              ))}
+            </section>
+          ) : null}
+
+          {draft?.unresolved_candidates.length ? (
+            <section className="analysis-review-messages" data-unresolved-candidates>
+              <h2>{t("analysis.review.unresolvedTitle")}</h2>
+              {draft.unresolved_candidates.map((candidate) => (
+                <article className="analysis-review-message" key={candidate.id}>
+                  <strong>{candidate.code}</strong>
+                  <p>{candidate.message}</p>
+                </article>
+              ))}
+            </section>
+          ) : null}
+
           {!draft ? (
             <p className="analysis-empty-state">
               {controller.isRunning ? t("analysis.results.waiting") : t("analysis.results.unavailable")}
@@ -289,6 +382,16 @@ export function ScriptAnalysisWorkspace({
         >
           {t("analysis.confirm.open")}
         </button>
+        {draft?.confirmed_revision_id ? (
+          <button
+            type="button"
+            data-action="confirm-recover"
+            disabled={submittingConfirmation || controller.isConfirming}
+            onClick={handleConfirm}
+          >
+            {t("analysis.confirm.recover")}
+          </button>
+        ) : null}
       </footer>
 
       {confirmOpen && draft ? (

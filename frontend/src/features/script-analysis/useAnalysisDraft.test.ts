@@ -293,7 +293,7 @@ async function flushMicrotasks(turns = 8): Promise<void> {
 
 async function renderAnalysisHook(
   api: AnalysisDraftApi,
-  storage: Storage,
+  storage: Storage | null,
   initialProjectId = "project-1",
   initialRevision = revision(),
   overrides: Partial<UseAnalysisDraftOptions> = {}
@@ -780,6 +780,105 @@ describe("persistent run errors", () => {
     expect(view.current.run?.id).toBe("run-3");
     expect(view.current.error).toBeNull();
   });
+
+  it("keeps the old error through create failure, queued, and running until completion succeeds", async () => {
+    const create = vi
+      .fn<AnalysisDraftApi["createAnalysisRun"]>()
+      .mockResolvedValueOnce({
+        run_id: "run-old",
+        draft_id: "draft-old",
+        status: "queued",
+        trace_id: "trace-old"
+      })
+      .mockRejectedValueOnce(new Error("create unavailable"))
+      .mockResolvedValueOnce({
+        run_id: "run-new",
+        draft_id: "draft-new",
+        status: "queued",
+        trace_id: "trace-new"
+      });
+    const fetchRun = vi
+      .fn<AnalysisDraftApi["fetchAnalysisRun"]>()
+      .mockResolvedValueOnce(
+        run("failed", {
+          id: "run-old",
+          draft_id: "draft-old",
+          error: analysisError("run-old", 422, "trace-old-error")
+        })
+      )
+      .mockResolvedValueOnce(run("queued", { id: "run-new", draft_id: "draft-new" }))
+      .mockResolvedValueOnce(run("running", { id: "run-new", draft_id: "draft-new" }))
+      .mockResolvedValueOnce(run("completed", { id: "run-new", draft_id: "draft-new" }));
+    const api = makeApi({
+      createAnalysisRun: create,
+      fetchAnalysisRun: fetchRun,
+      fetchAnalysisDraft: vi.fn(async (draftId) => draft(1, { id: draftId }))
+    });
+    const view = await renderAnalysisHook(api, new MemoryStorage());
+    await flushMicrotasks();
+    expect(view.current.error?.trace_id).toBe("trace-old-error");
+
+    await act(async () => view.current.retryAnalysis());
+    await flushMicrotasks();
+    expect(view.current.controllerError?.kind).toBe("create");
+    expect(view.current.error?.trace_id).toBe("trace-old-error");
+
+    await act(async () => view.current.retryAnalysis());
+    await flushMicrotasks();
+    expect(view.current.run?.status).toBe("queued");
+    expect(view.current.error?.trace_id).toBe("trace-old-error");
+
+    await advancePoll();
+    expect(view.current.run?.status).toBe("running");
+    expect(view.current.error?.trace_id).toBe("trace-old-error");
+
+    await advancePoll();
+    expect(view.current.run?.status).toBe("completed");
+    expect(view.current.error).toBeNull();
+  });
+
+  it("dismisses the displayed old error owner while a replacement run is queued", async () => {
+    const storage = new MemoryStorage();
+    const api = makeApi({
+      createAnalysisRun: vi
+        .fn<AnalysisDraftApi["createAnalysisRun"]>()
+        .mockResolvedValueOnce({
+          run_id: "run-old",
+          draft_id: "draft-old",
+          status: "queued",
+          trace_id: "trace-old"
+        })
+        .mockResolvedValueOnce({
+          run_id: "run-new",
+          draft_id: "draft-new",
+          status: "queued",
+          trace_id: "trace-new"
+        }),
+      fetchAnalysisRun: vi
+        .fn<AnalysisDraftApi["fetchAnalysisRun"]>()
+        .mockResolvedValueOnce(
+          run("failed", {
+            id: "run-old",
+            draft_id: "draft-old",
+            error: analysisError("run-old", 422, "trace-old-error")
+          })
+        )
+        .mockResolvedValueOnce(run("queued", { id: "run-new", draft_id: "draft-new" })),
+      fetchAnalysisDraft: vi.fn(async (draftId) => draft(1, { id: draftId }))
+    });
+    const view = await renderAnalysisHook(api, storage);
+    await flushMicrotasks();
+    await act(async () => view.current.retryAnalysis());
+    await flushMicrotasks();
+    expect(view.current.run?.id).toBe("run-new");
+    expect(view.current.error?.run_id).toBe("run-old");
+
+    await act(async () => view.current.dismissError());
+    expect(view.current.error).toBeNull();
+    expect(JSON.parse(storage.getItem(ANALYSIS_DISMISSED_RUNS_STORAGE_KEY)!)).toEqual([
+      "run-old"
+    ]);
+  });
 });
 
 describe("serial optimistic draft patches", () => {
@@ -837,13 +936,25 @@ describe("serial optimistic draft patches", () => {
     expect(view.current.isSaving).toBe(false);
   });
 
-  it("freezes on a JSON-encoded 409 while preserving visible edits and pending operations", async () => {
-    const patch = vi.fn(async () => {
-      throw new Error(
-        '{"detail":{"code":"draft_version_conflict","message":"semantic state conflict"}}'
-      );
+  it("rebases a typed semantic 409 on the latest draft without hiding the local overlay", async () => {
+    const latestDraft = deferred<SemanticAnalysisDraft>();
+    const conflictError = Object.assign(new Error("semantic state conflict"), {
+      status: 409,
+      responseBody:
+        '{"detail":{"code":"semantic_conflict","message":"semantic state conflict"}}'
     });
-    const api = makeApi({ patchAnalysisDraft: patch });
+    const patch = vi
+      .fn<AnalysisDraftApi["patchAnalysisDraft"]>()
+      .mockRejectedValueOnce(conflictError)
+      .mockImplementationOnce(async (_draftId, expectedVersion, operations) => ({
+        ...applyDraftOperations(draft(expectedVersion), operations),
+        version: expectedVersion + 1
+      }));
+    const fetchDraft = vi
+      .fn<AnalysisDraftApi["fetchAnalysisDraft"]>()
+      .mockResolvedValueOnce(draft())
+      .mockReturnValueOnce(latestDraft.promise);
+    const api = makeApi({ patchAnalysisDraft: patch, fetchAnalysisDraft: fetchDraft });
     const view = await renderAnalysisHook(api, new MemoryStorage());
     await flushMicrotasks();
 
@@ -855,14 +966,59 @@ describe("serial optimistic draft patches", () => {
     await flushMicrotasks();
 
     expect(view.current.draft?.utterances[0].status).toBe("pending");
-    expect(view.current.conflict?.code).toBe("draft_version_conflict");
+    expect(view.current.conflict?.code).toBe("semantic_conflict");
     expect(view.current.pendingOperationBatches).toBe(1);
     expect(view.current.isSaving).toBe(false);
-    expect(vi.mocked(api.fetchAnalysisDraft)).toHaveBeenCalledOnce();
+    expect(fetchDraft).toHaveBeenCalledOnce();
 
     await act(async () => view.current.retryPendingOperations());
     await flushMicrotasks();
+    expect(fetchDraft).toHaveBeenCalledTimes(2);
+    expect(view.current.draft?.utterances[0].status).toBe("pending");
+
+    await act(async () => latestDraft.resolve(draft(7)));
+    await flushMicrotasks();
+    expect(patch).toHaveBeenCalledTimes(2);
+    expect(patch.mock.calls[1][1]).toBe(7);
+    expect(view.current.conflict).toBeNull();
+    expect(view.current.pendingOperationBatches).toBe(0);
+    expect(view.current.draft?.version).toBe(8);
+    expect(view.current.draft?.utterances[0].status).toBe("pending");
+  });
+
+  it("keeps the queue frozen and the local edit visible when a conflict rebase cannot apply", async () => {
+    const conflictError = Object.assign(new Error("semantic state conflict"), {
+      status: 409,
+      responseBody:
+        '{"detail":{"code":"semantic_conflict","message":"semantic state conflict"}}'
+    });
+    const patch = vi
+      .fn<AnalysisDraftApi["patchAnalysisDraft"]>()
+      .mockRejectedValueOnce(conflictError);
+    const fetchDraft = vi
+      .fn<AnalysisDraftApi["fetchAnalysisDraft"]>()
+      .mockResolvedValueOnce(draft())
+      .mockResolvedValueOnce(draft(7, { utterances: [] }));
+    const view = await renderAnalysisHook(
+      makeApi({ patchAnalysisDraft: patch, fetchAnalysisDraft: fetchDraft }),
+      new MemoryStorage()
+    );
+    await flushMicrotasks();
+
+    await act(async () => {
+      view.current.queueOperations([
+        { op: "set_utterance_status", utterance_id: "utterance-1", status: "pending" }
+      ]);
+    });
+    await flushMicrotasks();
+    expect(view.current.draft?.utterances[0].status).toBe("pending");
+
+    await act(async () => view.current.retryPendingOperations());
+    await flushMicrotasks();
+    expect(fetchDraft).toHaveBeenCalledTimes(2);
     expect(patch).toHaveBeenCalledOnce();
+    expect(view.current.conflict?.code).toBe("semantic_conflict");
+    expect(view.current.pendingOperationBatches).toBe(1);
     expect(view.current.draft?.utterances[0].status).toBe("pending");
   });
 
@@ -1020,5 +1176,49 @@ describe("confirmation", () => {
     await flushMicrotasks();
     await expect(serverReload.current.confirm()).resolves.toEqual(confirmResponse());
     expect(serverConfirm).toHaveBeenCalledWith("draft-1", 3, "server-key-authoritative");
+  });
+
+  it("reuses one in-memory idempotency key across response-loss retries without storage", async () => {
+    const createKey = vi
+      .fn<() => string>()
+      .mockReturnValueOnce("memory-key-stable")
+      .mockReturnValueOnce("must-not-be-used");
+    const confirm = vi.fn<AnalysisDraftApi["confirmAnalysisDraft"]>(async () => {
+      throw new Error("response lost");
+    });
+    const view = await renderAnalysisHook(
+      makeApi({ confirmAnalysisDraft: confirm }),
+      null,
+      "project-1",
+      revision(),
+      { createIdempotencyKey: createKey }
+    );
+    await flushMicrotasks();
+
+    let firstError: unknown;
+    let secondError: unknown;
+    await act(async () => {
+      try {
+        await view.current.confirm();
+      } catch (error) {
+        firstError = error;
+      }
+    });
+    await act(async () => {
+      try {
+        await view.current.confirm();
+      } catch (error) {
+        secondError = error;
+      }
+    });
+    expect(firstError).toBeInstanceOf(Error);
+    expect(secondError).toBeInstanceOf(Error);
+    expect((firstError as Error).message).toBe("response lost");
+    expect((secondError as Error).message).toBe("response lost");
+    expect(confirm.mock.calls.map((call) => call[2])).toEqual([
+      "memory-key-stable",
+      "memory-key-stable"
+    ]);
+    expect(createKey).toHaveBeenCalledOnce();
   });
 });
