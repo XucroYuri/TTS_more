@@ -295,6 +295,8 @@ export default function App() {
   const skipNextAutosaveRef = useRef(false);
   const pendingProjectAutosaveRef = useRef<PendingProjectAutosave | null>(null);
   const analysisAutosaveBlockedProjectIdRef = useRef<string | null>(null);
+  const authorityUnknownProjectIdsRef = useRef<Set<string>>(new Set());
+  const preserveManagerSourceDraftProjectIdRef = useRef<string | null>(null);
   const projectAuthorityEpochRef = useRef<Map<string, number>>(new Map());
   const seededAuthoritativeProjectIdRef = useRef<string | null>(null);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
@@ -561,13 +563,8 @@ export default function App() {
     }
     const handle = window.setTimeout(() => {
       if (pendingProjectAutosaveRef.current !== pendingAutosave) return;
-      pendingProjectAutosaveRef.current = null;
-      saveChainRef.current = saveChainRef.current.then(() => saveCurrentProject(
-        autosaveProjectId,
-        autosaveProject,
-        autosaveCharacters,
-        autosaveAuthorityEpoch
-      ));
+      pendingAutosave.timerId = null;
+      void flushPendingProjectAutosave(autosaveProjectId);
     }, 700);
     pendingAutosave.timerId = handle;
     return () => {
@@ -811,9 +808,13 @@ export default function App() {
     projectPromise
       .then((payload) => {
         if (cancelled) return;
+        const preserveManagerSourceDraft = preserveManagerSourceDraftProjectIdRef.current === managedProjectId;
+        if (preserveManagerSourceDraft) preserveManagerSourceDraftProjectIdRef.current = null;
         setManagedProject(payload);
         setManagerTitleDraft(payload.title);
-        setManagerSourceDraft(activeScriptSourceText(payload) ?? projectToScriptSourceText(payload, characters));
+        if (!preserveManagerSourceDraft) {
+          setManagerSourceDraft(activeScriptSourceText(payload) ?? projectToScriptSourceText(payload, characters));
+        }
       })
       .catch(() => {
         if (cancelled) return;
@@ -1406,15 +1407,24 @@ export default function App() {
     if (pending?.projectId === projectId) {
       if (pending.timerId !== null) window.clearTimeout(pending.timerId);
       pendingProjectAutosaveRef.current = null;
-      flushedProject = authoritativeProject
-        ? {
-            ...pending.project,
-            title: authoritativeProject.title,
-            active_script_revision_id: authoritativeProject.active_script_revision_id,
-            active_parse_revision_id: authoritativeProject.active_parse_revision_id,
-            script_revisions: authoritativeProject.script_revisions,
-            parse_revisions: authoritativeProject.parse_revisions
+      let resolvedAuthority = authoritativeProject;
+      const recoveringUnknownAuthority = !resolvedAuthority
+        && authorityUnknownProjectIdsRef.current.has(projectId);
+      if (recoveringUnknownAuthority) {
+        await saveChainRef.current;
+        try {
+          resolvedAuthority = await fetchProject(projectId);
+        } catch (error) {
+          if (!pendingProjectAutosaveRef.current) {
+            pendingProjectAutosaveRef.current = { ...pending, timerId: null };
           }
+          setSaveState("error");
+          setNotice(error instanceof Error ? error.message : t("notice.autoSaveFailed"));
+          return null;
+        }
+      }
+      flushedProject = resolvedAuthority
+        ? mergeAuthoritativeProjectStructure(pending.project, resolvedAuthority)
         : pending.project;
       saveChainRef.current = saveChainRef.current.then(() => saveCurrentProject(
         pending.projectId,
@@ -1424,6 +1434,11 @@ export default function App() {
       ));
     }
     await saveChainRef.current;
+    if (flushedProject && !authoritativeProject && authorityUnknownProjectIdsRef.current.has(projectId)) {
+      flushedProject = await drainPendingProjectAutosaves(projectId, flushedProject);
+      authorityUnknownProjectIdsRef.current.delete(projectId);
+      applyAuthoritativeProjectStructure(projectId, flushedProject);
+    }
     return flushedProject;
   }
 
@@ -1437,6 +1452,38 @@ export default function App() {
       if (flushedProject) reconciledProject = flushedProject;
     } while (pendingProjectAutosaveRef.current?.projectId === projectId);
     return reconciledProject;
+  }
+
+  function applyAuthoritativeProjectStructure(
+    projectId: string,
+    authoritativeProject: ScriptProject
+  ): void {
+    if (analysisCurrentProjectIdRef.current === projectId) {
+      if (analysisManagedProjectIdRef.current === projectId) {
+        preserveManagerSourceDraftProjectIdRef.current = projectId;
+      }
+      skipNextAutosaveRef.current = true;
+      setProject((current) => mergeAuthoritativeProjectStructure(current, authoritativeProject));
+    }
+    if (analysisManagedProjectIdRef.current === projectId) {
+      setManagedProject((current) => current
+        ? mergeAuthoritativeProjectStructure(current, authoritativeProject)
+        : current);
+    }
+  }
+
+  function mergeAuthoritativeProjectStructure(
+    current: ScriptProject,
+    authoritativeProject: ScriptProject
+  ): ScriptProject {
+    return {
+      ...current,
+      title: authoritativeProject.title,
+      active_script_revision_id: authoritativeProject.active_script_revision_id,
+      active_parse_revision_id: authoritativeProject.active_parse_revision_id,
+      script_revisions: authoritativeProject.script_revisions,
+      parse_revisions: authoritativeProject.parse_revisions
+    };
   }
 
   async function saveCurrentProject(
@@ -1728,6 +1775,7 @@ export default function App() {
     analysisAutosaveBlockedProjectIdRef.current = targetProjectId;
     setIsManagerSaving(true);
     let createdAuthoritativeProject: ScriptProject | null = null;
+    let createAttempted = false;
     try {
       const currentAutosaveProjectId = analysisCurrentProjectIdRef.current;
       if (currentAutosaveProjectId) await flushPendingProjectAutosave(currentAutosaveProjectId);
@@ -1749,6 +1797,8 @@ export default function App() {
         await saveProject(targetProjectId, { ...managedProject, title });
       }
       if (!isCurrent()) return;
+      createAttempted = true;
+      authorityUnknownProjectIdsRef.current.add(targetProjectId);
       await beginAnalysisSourceRevision({
         projectId: targetProjectId,
         source,
@@ -1756,11 +1806,13 @@ export default function App() {
         metadata: analysisSourceFileMetadataRef.current ?? undefined,
         isCurrent,
         onCreated: async (payload) => {
+          authorityUnknownProjectIdsRef.current.delete(targetProjectId);
           createdAuthoritativeProject = payload.project;
           createdAuthoritativeProject = await drainPendingProjectAutosaves(
             targetProjectId,
             createdAuthoritativeProject
           );
+          applyAuthoritativeProjectStructure(targetProjectId, createdAuthoritativeProject);
           return {
             ...payload,
             project: createdAuthoritativeProject
@@ -1775,6 +1827,7 @@ export default function App() {
             targetProjectId,
             createdAuthoritativeProject ?? payload.project
           );
+          applyAuthoritativeProjectStructure(targetProjectId, createdAuthoritativeProject);
           if (!isCurrent()) return;
           const readyProject = createdAuthoritativeProject;
           setManagedProject(readyProject);
@@ -1792,6 +1845,19 @@ export default function App() {
       });
       if (isCurrent()) await refreshProjects();
     } catch (error) {
+      if (createAttempted && !createdAuthoritativeProject) {
+        try {
+          createdAuthoritativeProject = await fetchProject(targetProjectId);
+          authorityUnknownProjectIdsRef.current.delete(targetProjectId);
+          createdAuthoritativeProject = await drainPendingProjectAutosaves(
+            targetProjectId,
+            createdAuthoritativeProject
+          );
+          applyAuthoritativeProjectStructure(targetProjectId, createdAuthoritativeProject);
+        } catch {
+          // An attempted create has an ambiguous server outcome. Keep stale writes blocked.
+        }
+      }
       if (isCurrent()) setNotice(error instanceof Error ? error.message : t("analysis.input.readFailed"));
     } finally {
       if (createdAuthoritativeProject) {
@@ -1799,7 +1865,8 @@ export default function App() {
           targetProjectId,
           createdAuthoritativeProject
         );
-      } else {
+        applyAuthoritativeProjectStructure(targetProjectId, createdAuthoritativeProject);
+      } else if (!createAttempted) {
         await flushPendingProjectAutosave(targetProjectId);
       }
       if (analysisAutosaveBlockedProjectIdRef.current === targetProjectId) {

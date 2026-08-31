@@ -1370,6 +1370,294 @@ describe("App semantic analysis entry", () => {
     expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
   });
 
+  it("keeps a reconciled revision in live state before a later same-mount autosave", async () => {
+    vi.useFakeTimers();
+    const projectId = "stale-live-authority";
+    const project = scriptProject("Stale live authority");
+    project.lines = [{ id: "stale-live-line", character_id: "narrator", text: "待配置台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    const pendingRevision = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingRevision.promise);
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    const sourceEditor = view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!;
+    await changeReactValueExact(sourceEditor, "甲：提交后会失效");
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+    await changeReactValueExact(sourceEditor, "甲：使旧操作失效的新原文");
+
+    const revision = scriptRevision(
+      "stale-live-server-revision",
+      "甲：提交后会失效",
+      "sha-stale-live-server-revision"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectId, cloneProject(serverProject));
+    pendingRevision.resolve({ project: serverProject, script_revision: revision });
+    await flushAsync(60);
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+
+    await click(view.container.querySelector(".route-clear-temporary")!);
+    await flushAsync();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(701);
+    });
+    await flushAsync(60);
+
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(backendProjects.get(projectId)?.script_revisions?.map((item) => item.revision_id))
+      .toContain(revision.revision_id);
+    expect(backendProjects.get(projectId)?.lines[0]?.temporary_binding ?? null).toBeNull();
+  });
+
+  it("refetches authority after an ambiguous create rejection before saving pending edits", async () => {
+    vi.useFakeTimers();
+    const projectId = "ambiguous-create-refetch";
+    const project = scriptProject("Ambiguous create refetch");
+    project.lines = [{ id: "ambiguous-line", character_id: "narrator", text: "待配置台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    const pendingCreate = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingCreate.promise);
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：响应丢失但服务端已提交"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+
+    const revision = scriptRevision(
+      "ambiguous-server-revision",
+      "甲：响应丢失但服务端已提交",
+      "sha-ambiguous-server-revision"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectId, cloneProject(serverProject));
+    pendingCreate.reject(new Error("connection lost after commit"));
+    await flushAsync(80);
+
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(backendProjects.get(projectId)?.script_revisions?.map((item) => item.revision_id))
+      .toContain(revision.revision_id);
+    expect(backendProjects.get(projectId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
+  });
+
+  it("blocks later autosaves while ambiguous create authority cannot be refetched", async () => {
+    vi.useFakeTimers();
+    const projectId = "ambiguous-create-unavailable";
+    const project = scriptProject("Ambiguous create unavailable");
+    project.lines = [{ id: "ambiguous-unavailable-line", character_id: "narrator", text: "待配置台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    let rejectAuthorityFetch = false;
+    apiMocks.fetchProject.mockImplementation(async (targetProjectId: string) => {
+      if (targetProjectId === projectId && rejectAuthorityFetch) {
+        throw new Error("authority temporarily unavailable");
+      }
+      const stored = backendProjects.get(targetProjectId);
+      if (!stored) throw new Error(`missing project: ${targetProjectId}`);
+      return cloneProject(stored);
+    });
+    const pendingCreate = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingCreate.promise);
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：权威暂时不可读取"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+
+    const revision = scriptRevision(
+      "ambiguous-unavailable-revision",
+      "甲：权威暂时不可读取",
+      "sha-ambiguous-unavailable-revision"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectId, cloneProject(serverProject));
+    rejectAuthorityFetch = true;
+    pendingCreate.reject(new Error("connection lost after commit"));
+    await flushAsync(80);
+
+    expect(apiMocks.saveProject).not.toHaveBeenCalled();
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+
+    await click(view.container.querySelector(".route-clear-temporary")!);
+    await flushAsync();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(701);
+    });
+    await flushAsync(60);
+
+    expect(apiMocks.saveProject).not.toHaveBeenCalled();
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(backendProjects.get(projectId)?.script_revisions?.map((item) => item.revision_id))
+      .toContain(revision.revision_id);
+  });
+
+  it("refetches unknown authority before a later autosave once the server recovers", async () => {
+    vi.useFakeTimers();
+    const projectId = "ambiguous-create-recover-later";
+    const project = scriptProject("Ambiguous create recover later");
+    project.lines = [{ id: "ambiguous-recover-line", character_id: "narrator", text: "待配置台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    let rejectAuthorityFetch = false;
+    apiMocks.fetchProject.mockImplementation(async (targetProjectId: string) => {
+      if (targetProjectId === projectId && rejectAuthorityFetch) {
+        throw new Error("authority temporarily unavailable");
+      }
+      const stored = backendProjects.get(targetProjectId);
+      if (!stored) throw new Error(`missing project: ${targetProjectId}`);
+      return cloneProject(stored);
+    });
+    const pendingCreate = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingCreate.promise);
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：服务恢复后安全保存"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+
+    const revision = scriptRevision(
+      "ambiguous-recover-revision",
+      "甲：服务恢复后安全保存",
+      "sha-ambiguous-recover-revision"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectId, cloneProject(serverProject));
+    rejectAuthorityFetch = true;
+    pendingCreate.reject(new Error("connection lost after commit"));
+    await flushAsync(80);
+    expect(apiMocks.saveProject).not.toHaveBeenCalled();
+
+    rejectAuthorityFetch = false;
+    await click(view.container.querySelector(".route-clear-temporary")!);
+    await flushAsync();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(701);
+    });
+    await flushAsync(80);
+
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(backendProjects.get(projectId)?.script_revisions?.map((item) => item.revision_id))
+      .toContain(revision.revision_id);
+    expect(backendProjects.get(projectId)?.lines[0]?.temporary_binding ?? null).toBeNull();
+  });
+
+  it("keeps unknown authority guarded while another edit arrives during recovery", async () => {
+    vi.useFakeTimers();
+    const projectId = "ambiguous-create-recovery-race";
+    const project = scriptProject("Ambiguous create recovery race");
+    project.lines = [{ id: "ambiguous-race-line", character_id: "narrator", text: "待配置台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    let ambiguousRecoveryStarted = false;
+    let recoveryFetchCount = 0;
+    const delayedRecoveryFetch = deferred<ScriptProject>();
+    apiMocks.fetchProject.mockImplementation(async (targetProjectId: string) => {
+      if (targetProjectId === projectId && ambiguousRecoveryStarted) {
+        recoveryFetchCount += 1;
+        if (recoveryFetchCount === 1) throw new Error("authority temporarily unavailable");
+        if (recoveryFetchCount === 2) return delayedRecoveryFetch.promise;
+      }
+      const stored = backendProjects.get(targetProjectId);
+      if (!stored) throw new Error(`missing project: ${targetProjectId}`);
+      return cloneProject(stored);
+    });
+    const pendingCreate = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingCreate.promise);
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：恢复期间继续编辑"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+
+    const revision = scriptRevision(
+      "ambiguous-race-revision",
+      "甲：恢复期间继续编辑",
+      "sha-ambiguous-race-revision"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectId, cloneProject(serverProject));
+    ambiguousRecoveryStarted = true;
+    pendingCreate.reject(new Error("connection lost after commit"));
+    await flushAsync(80);
+
+    await click(view.container.querySelector(".route-clear-temporary")!);
+    await flushAsync();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(701);
+    });
+    await flushAsync(40);
+    expect(recoveryFetchCount).toBe(2);
+    expect(apiMocks.saveProject).not.toHaveBeenCalled();
+
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+    delayedRecoveryFetch.resolve(cloneProject(serverProject));
+    await flushAsync(80);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(701);
+    });
+    await flushAsync(80);
+
+    expect(backendProjects.get(projectId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(backendProjects.get(projectId)?.script_revisions?.map((item) => item.revision_id))
+      .toContain(revision.revision_id);
+    expect(backendProjects.get(projectId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
+  });
+
   it("preserves the latest pending TTS edit while an authoritative rebase save is deferred", async () => {
     vi.useFakeTimers();
     const projectId = "second-edit-during-rebase";
