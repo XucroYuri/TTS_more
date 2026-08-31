@@ -178,11 +178,44 @@ export async function testParserProvider(provider: Omit<ParserProviderDraft, "ke
   });
 }
 
+function projectForSave(project: ScriptProject): ScriptProject {
+  const activeParseRevisionId = project.active_parse_revision_id;
+  const activeParseRevision = project.parse_revisions?.find(
+    (revision) => revision.revision_id === activeParseRevisionId
+  );
+  if (!activeParseRevisionId || !activeParseRevision || !project.parse_revisions) return project;
+
+  const editedLinesByIdentity = new Map<string, ScriptProject["lines"][number]>();
+  project.lines.forEach((line) => {
+    if (line.line_uid) {
+      editedLinesByIdentity.set(line.line_uid, line);
+      return;
+    }
+    editedLinesByIdentity.set(`${activeParseRevisionId}:${line.id}`, line);
+    editedLinesByIdentity.set(line.id, line);
+  });
+
+  return {
+    ...project,
+    parse_revisions: project.parse_revisions.map((revision) => {
+      if (revision !== activeParseRevision) return revision;
+      return {
+        ...revision,
+        lines: revision.lines.map((line) => {
+          const identity = line.line_uid || `${activeParseRevisionId}:${line.id}`;
+          const editedLine = editedLinesByIdentity.get(identity);
+          return editedLine ? { ...line, ...editedLine } : line;
+        })
+      };
+    })
+  };
+}
+
 export async function saveProject(projectId: string, project: ScriptProject): Promise<void> {
   await request(`/api/projects/${projectId}`, {
     method: "PUT",
     headers: jsonHeaders,
-    body: JSON.stringify(project)
+    body: JSON.stringify(projectForSave(project))
   });
 }
 

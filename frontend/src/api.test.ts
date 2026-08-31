@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { getApiToken, patchAnalysisDraft, setApiToken } from "./api";
-import { createScriptRevision } from "./api";
+import { createScriptRevision, saveProject } from "./api";
+import type { ScriptProject } from "./types";
 
 describe("api token storage", () => {
   // The token lives in a module-level variable, so tests share state.
@@ -160,5 +161,194 @@ describe("semantic analysis API request shapes", () => {
       status: 409,
       responseBody
     });
+  });
+});
+
+describe("project save request shape", () => {
+  it("writes top-level TTS edits into only the active parse revision without mutating the project", async () => {
+    const originalFetch = globalThis.fetch;
+    let requestBody: ScriptProject | undefined;
+    const previousBinding = {
+      binding_id: "line-temp-index",
+      provider_type: "indextts" as const,
+      service_id: "mock-index",
+      fallback_services: [],
+      capabilities: ["reference_audio_voice", "emotion_text"],
+      config: { voice: "old.wav", emotion_text: "tense" }
+    };
+    const project: ScriptProject = {
+      title: "Demo",
+      default_language: "zh",
+      active_script_revision_id: "script-r002",
+      active_parse_revision_id: "parse-r002",
+      lines: [
+        {
+          id: "l002",
+          line_uid: "parse-r002:l002",
+          character_id: "role-2",
+          text: "edited second line",
+          note: "",
+          temporary_binding: null
+        },
+        {
+          id: "l001",
+          line_uid: "parse-r002:l001",
+          character_id: "role-1",
+          text: "edited first line",
+          note: "new direction"
+        }
+      ],
+      parse_revisions: [
+        {
+          revision_id: "parse-r001",
+          script_revision_id: "script-r001",
+          provider: "legacy",
+          warnings: [],
+          project_characters: [],
+          lines: [
+            {
+              id: "l001",
+              line_uid: "parse-r001:l001",
+              character_id: "role-1",
+              text: "inactive revision line",
+              note: ""
+            }
+          ],
+          created_at: "2026-08-31T00:00:00.000Z"
+        },
+        {
+          revision_id: "parse-r002",
+          script_revision_id: "script-r002",
+          provider: "semantic",
+          warnings: ["keep warning"],
+          project_characters: [],
+          lines: [
+            {
+              id: "l001",
+              line_uid: "parse-r002:l001",
+              character_id: "role-1",
+              text: "stale first line",
+              note: "old direction"
+            },
+            {
+              id: "l002",
+              line_uid: "parse-r002:l002",
+              character_id: "role-2",
+              text: "stale second line",
+              note: "",
+              temporary_binding: previousBinding
+            },
+            {
+              id: "l999",
+              line_uid: "parse-r002:l999",
+              character_id: "role-extra",
+              text: "revision-only line",
+              note: "preserve me"
+            }
+          ],
+          created_at: "2026-09-01T00:00:00.000Z"
+        }
+      ]
+    };
+    const originalProject = structuredClone(project);
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as ScriptProject;
+      return new Response(JSON.stringify({ status: "saved" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    try {
+      await saveProject("demo", project);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(requestBody?.parse_revisions?.[0]).toEqual(originalProject.parse_revisions?.[0]);
+    expect(requestBody?.parse_revisions?.[1].lines).toEqual([
+      {
+        id: "l001",
+        line_uid: "parse-r002:l001",
+        character_id: "role-1",
+        text: "edited first line",
+        note: "new direction"
+      },
+      {
+        id: "l002",
+        line_uid: "parse-r002:l002",
+        character_id: "role-2",
+        text: "edited second line",
+        note: "",
+        temporary_binding: null
+      },
+      {
+        id: "l999",
+        line_uid: "parse-r002:l999",
+        character_id: "role-extra",
+        text: "revision-only line",
+        note: "preserve me"
+      }
+    ]);
+    expect(project).toEqual(originalProject);
+  });
+
+  it("matches legacy top-level lines without line_uid to the active revision identity", async () => {
+    const originalFetch = globalThis.fetch;
+    let requestBody: ScriptProject | undefined;
+    const project: ScriptProject = {
+      title: "Legacy",
+      default_language: "zh",
+      active_parse_revision_id: "parse-r003",
+      lines: [
+        { id: "legacy-1", character_id: "role-1", text: "edited legacy text", note: "" }
+      ],
+      parse_revisions: [
+        {
+          revision_id: "parse-r003",
+          script_revision_id: "script-r001",
+          provider: "legacy",
+          warnings: [],
+          project_characters: [],
+          lines: [
+            {
+              id: "legacy-1",
+              line_uid: "parse-r003:legacy-1",
+              character_id: "role-1",
+              text: "stale legacy text",
+              note: ""
+            }
+          ],
+          created_at: "2026-09-01T00:00:00.000Z"
+        }
+      ]
+    };
+    const originalProject = structuredClone(project);
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body)) as ScriptProject;
+      return new Response(JSON.stringify({ status: "saved" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    try {
+      await saveProject("legacy", project);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(requestBody?.parse_revisions?.[0].lines).toEqual([
+      {
+        id: "legacy-1",
+        line_uid: "parse-r003:legacy-1",
+        character_id: "role-1",
+        text: "edited legacy text",
+        note: ""
+      }
+    ]);
+    expect(project).toEqual(originalProject);
   });
 });
