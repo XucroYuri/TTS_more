@@ -194,11 +194,16 @@ export async function fetchScriptRevisions(projectId: string): Promise<{ script_
   return request(`/api/projects/${encodeURIComponent(projectId)}/script-revisions`);
 }
 
-export async function createScriptRevision(projectId: string, sourceMarkdown: string, summary = ""): Promise<{ project: ScriptProject; script_revision: ScriptRevision }> {
+export async function createScriptRevision(
+  projectId: string,
+  sourceMarkdown: string,
+  summary = "",
+  metadata?: { source_filename?: string | null; source_media_type?: string | null }
+): Promise<{ project: ScriptProject; script_revision: ScriptRevision }> {
   return request(`/api/projects/${encodeURIComponent(projectId)}/script-revisions`, {
     method: "POST",
     headers: jsonHeaders,
-    body: JSON.stringify({ source_markdown: sourceMarkdown, summary })
+    body: JSON.stringify({ source_markdown: sourceMarkdown, summary, ...metadata })
   });
 }
 

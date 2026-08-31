@@ -81,6 +81,16 @@ import { RoleAvatar } from "./components/RoleAvatar";
 import { ScriptManagerModal } from "./components/ScriptManagerModal";
 import { WaveformPlayer } from "./components/WaveformPlayer";
 import { TokenGate } from "./components/TokenGate";
+import {
+  AnalysisStageGate,
+  activeScriptSourceText,
+  beginAnalysisSourceRevision,
+  buildConfirmedAnalysisHandoff,
+  readAnalysisScriptFile,
+  shouldAutosaveWorkspace,
+  type AnalysisSourceFileMetadata,
+  type WorkspaceStage
+} from "./features/script-analysis/analysisFlow";
 import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
 import { generationStatusCounts, generationStatusKey, generationStatusTone, generationTerminalNotice, isTerminalGenerationStatus, reconcileGenerationJobSnapshot, type GenerationStatusTone } from "./lib/generationStatus";
 import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./lib/gptSovitsReference";
@@ -110,6 +120,7 @@ import type {
   RuntimeMode,
   ScriptLine,
   ScriptProject,
+  ScriptRevision,
   VoiceBinding,
   VoiceCandidates,
   VoiceProfile,
@@ -174,6 +185,8 @@ export default function App() {
   const [projectSummaries, setProjectSummaries] = useState<ProjectSummary[]>([]);
   const [characters, setCharacters] = useState<Character[]>([]);
   const [project, setProject] = useState<ScriptProject>(() => createEmptyProject());
+  const [workspaceStage, setWorkspaceStage] = useState<WorkspaceStage>("tts");
+  const [analysisSourceRevision, setAnalysisSourceRevision] = useState<ScriptRevision | null>(null);
   const [manifest, setManifest] = useState<GenerationManifest>(() => createEmptyManifest(null));
   const [services, setServices] = useState<WorkerHealth[]>([]);
   const [runtime, setRuntime] = useState<RuntimeMode | null>(null);
@@ -251,6 +264,12 @@ export default function App() {
   const generationCancellationJobIdRef = useRef<string | null>(null);
   const isGeneratingRef = useRef(false);
   const generationRunTokenRef = useRef(0);
+  const analysisProjectIdRef = useRef<string | null>(null);
+  const analysisManagedProjectIdRef = useRef<string | null>(managedProjectId);
+  const analysisCurrentProjectIdRef = useRef<string | null>(currentProjectId);
+  const analysisSourceFileMetadataRef = useRef<AnalysisSourceFileMetadata | null>(null);
+  const scriptFileOperationTokenRef = useRef(0);
+  const analysisStartOperationTokenRef = useRef(0);
   const lastGenerationProjectIdRef = useRef<string | null>(null);
   const saveChainRef = useRef<Promise<void>>(Promise.resolve());
   const skipNextAutosaveRef = useRef(false);
@@ -398,7 +417,7 @@ export default function App() {
   }, [currentProjectId, t]);
 
   useEffect(() => {
-    if (!isProjectLoaded || !currentProjectId) return;
+    if (!shouldAutosaveWorkspace(workspaceStage) || !isProjectLoaded || !currentProjectId) return;
     if (skipNextAutosaveRef.current) {
       skipNextAutosaveRef.current = false;
       return;
@@ -408,7 +427,7 @@ export default function App() {
       saveChainRef.current = saveChainRef.current.then(() => saveCurrentProject());
     }, 700);
     return () => window.clearTimeout(handle);
-  }, [characters, currentProjectId, isProjectLoaded, project]);
+  }, [characters, currentProjectId, isProjectLoaded, project, workspaceStage]);
 
   useEffect(() => {
     if (selectedParserProviderIndex >= parserProviders.length) {
@@ -619,6 +638,17 @@ export default function App() {
   }, [currentProjectId, projectRows]);
 
   useEffect(() => {
+    analysisManagedProjectIdRef.current = managedProjectId;
+    scriptFileOperationTokenRef.current += 1;
+    analysisStartOperationTokenRef.current += 1;
+    analysisSourceFileMetadataRef.current = null;
+  }, [managedProjectId]);
+
+  useEffect(() => {
+    analysisCurrentProjectIdRef.current = currentProjectId;
+  }, [currentProjectId]);
+
+  useEffect(() => {
     if (!managedProjectId) {
       setManagedProject(null);
       setManagerTitleDraft("");
@@ -636,7 +666,7 @@ export default function App() {
         if (cancelled) return;
         setManagedProject(payload);
         setManagerTitleDraft(payload.title);
-        setManagerSourceDraft(projectToScriptSourceText(payload, characters));
+        setManagerSourceDraft(activeScriptSourceText(payload) ?? projectToScriptSourceText(payload, characters));
       })
       .catch(() => {
         if (cancelled) return;
@@ -1442,6 +1472,128 @@ export default function App() {
     }
   }
 
+  function updateManagedSourceDraft(value: string) {
+    scriptFileOperationTokenRef.current += 1;
+    analysisSourceFileMetadataRef.current = null;
+    setManagerSourceDraft(value);
+  }
+
+  async function selectManagedScriptFile(file: File) {
+    const operationToken = scriptFileOperationTokenRef.current + 1;
+    scriptFileOperationTokenRef.current = operationToken;
+    const targetProjectId = analysisManagedProjectIdRef.current;
+    const currentSource = managerSourceDraft;
+    const isCurrent = () => operationToken === scriptFileOperationTokenRef.current
+      && targetProjectId === analysisManagedProjectIdRef.current;
+    const outcome = await readAnalysisScriptFile(file, currentSource, isCurrent);
+    if (outcome.status === "stale") return;
+    if (outcome.status === "error") {
+      setNotice(t(outcome.errorCode === "unsupported_script_file"
+        ? "analysis.input.unsupportedFile"
+        : "analysis.input.readFailed"));
+      return;
+    }
+    analysisSourceFileMetadataRef.current = outcome.metadata;
+    setManagerSourceDraft(outcome.source);
+    if (outcome.metadata.warning) {
+      setNotice(t("analysis.input.largeFileWarning", {
+        count: outcome.metadata.warning.codePointCount,
+        limit: outcome.metadata.warning.limit
+      }));
+    }
+  }
+
+  async function analyzeManagedScriptRevision() {
+    if (!managedProjectId || !managedProject) return;
+    const targetProjectId = managedProjectId;
+    const title = managerTitleDraft.trim();
+    const source = managerSourceDraft;
+    if (!title) {
+      setNotice(t("script.newScriptTitleRequired"));
+      return;
+    }
+    if (!source.trim()) {
+      setNotice(t("script.sourceRequired"));
+      return;
+    }
+    const confirmed = await confirmRevisionRisk(managedProject);
+    if (!confirmed || targetProjectId !== analysisManagedProjectIdRef.current) return;
+    const operationToken = analysisStartOperationTokenRef.current + 1;
+    analysisStartOperationTokenRef.current = operationToken;
+    const isCurrent = () => operationToken === analysisStartOperationTokenRef.current
+      && targetProjectId === analysisManagedProjectIdRef.current;
+    setIsManagerSaving(true);
+    try {
+      if (title !== managedProject.title) {
+        await saveProject(targetProjectId, { ...managedProject, title });
+      }
+      if (!isCurrent()) return;
+      await beginAnalysisSourceRevision({
+        projectId: targetProjectId,
+        source,
+        summary: t("analysis.input.analyze"),
+        metadata: analysisSourceFileMetadataRef.current ?? undefined,
+        isCurrent,
+        onReady: (payload) => {
+          setManagedProject(payload.project);
+          setManagerTitleDraft(payload.project.title);
+          setManagerSourceDraft(payload.script_revision.source_markdown);
+          if (targetProjectId === analysisCurrentProjectIdRef.current) {
+            skipNextAutosaveRef.current = true;
+            applyManagedProjectToWorkspace(targetProjectId, payload.project);
+          }
+          analysisProjectIdRef.current = targetProjectId;
+          setAnalysisSourceRevision(payload.script_revision);
+          setWorkspaceStage("analysis");
+        }
+      });
+      if (isCurrent()) await refreshProjects();
+    } catch (error) {
+      if (isCurrent()) setNotice(error instanceof Error ? error.message : t("analysis.input.readFailed"));
+    } finally {
+      if (isCurrent()) setIsManagerSaving(false);
+    }
+  }
+
+  function applyConfirmedAnalysisProject(serverProject: ScriptProject) {
+    const targetProjectId = analysisProjectIdRef.current;
+    const sourceRevision = analysisSourceRevision;
+    if (!targetProjectId || !sourceRevision) return;
+    const handoff = buildConfirmedAnalysisHandoff(targetProjectId, serverProject, sourceRevision);
+    analysisCurrentProjectIdRef.current = handoff.currentProjectId;
+    analysisManagedProjectIdRef.current = handoff.managedProjectId;
+    skipNextAutosaveRef.current = true;
+    writeStoredProjectId(handoff.currentProjectId);
+    setCurrentProjectId(handoff.currentProjectId);
+    setProject(handoff.project);
+    setActiveLineId(handoff.activeLineId);
+    setExpandedLineId(handoff.expandedLineId);
+    setSelectedLineIds(handoff.selectedLineIds);
+    setSelectedHistoryVersions(handoff.selectedHistoryVersions);
+    setVersionDrafts(handoff.versionDrafts);
+    setLineTextDrafts(handoff.lineTextDrafts);
+    setManagedProjectId(handoff.managedProjectId);
+    setManagedProject(handoff.managedProject);
+    setManagerTitleDraft(handoff.managerTitleDraft);
+    setManagerSourceDraft(handoff.managerSourceDraft);
+    setSaveState("saved");
+    setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+    void refreshProjects(handoff.currentProjectId).finally(() => {
+      if (analysisProjectIdRef.current !== targetProjectId) return;
+      analysisProjectIdRef.current = null;
+      analysisSourceFileMetadataRef.current = null;
+      setAnalysisSourceRevision(null);
+      setWorkspaceStage("tts");
+    });
+  }
+
+  function cancelScriptAnalysis() {
+    analysisStartOperationTokenRef.current += 1;
+    analysisProjectIdRef.current = null;
+    setAnalysisSourceRevision(null);
+    setWorkspaceStage("tts");
+  }
+
   async function saveManagedScriptRevision() {
     if (!managedProjectId || !managedProject) return;
     const title = managerTitleDraft.trim();
@@ -1763,25 +1915,39 @@ export default function App() {
       deletingProjectId={deletingProjectId}
       onClose={() => undefined}
       onSearchTextChange={setManagerSearchText}
-      onSelectProject={setManagedProjectId}
+      onSelectProject={(projectId) => {
+        if (projectId === analysisManagedProjectIdRef.current) return;
+        scriptFileOperationTokenRef.current += 1;
+        analysisStartOperationTokenRef.current += 1;
+        analysisSourceFileMetadataRef.current = null;
+        analysisManagedProjectIdRef.current = projectId;
+        setManagedProjectId(projectId);
+      }}
       onOpenProject={(projectId) => {
         switchProject(projectId);
+        scriptFileOperationTokenRef.current += 1;
+        analysisStartOperationTokenRef.current += 1;
+        analysisSourceFileMetadataRef.current = null;
+        analysisManagedProjectIdRef.current = projectId;
+        analysisCurrentProjectIdRef.current = projectId;
         setManagedProjectId(projectId);
       }}
       onTitleDraftChange={setManagerTitleDraft}
-      onSourceDraftChange={setManagerSourceDraft}
+      onSourceDraftChange={updateManagedSourceDraft}
       onNewScriptTitleChange={setNewScriptTitle}
       onNewScriptSourceChange={setNewScriptSource}
       onCreateScript={() => void createNewScriptProject()}
       onRenameScript={() => void renameManagedProject()}
       onSaveRevision={() => void saveManagedScriptRevision()}
       onParseRevision={() => void parseManagedScriptRevision()}
+      onAnalyzeScript={() => void analyzeManagedScriptRevision()}
+      onScriptFileSelected={(file) => void selectManagedScriptFile(file)}
       onDeleteScript={() => void deleteManagedProject()}
     />
   );
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${workspaceStage === "analysis" ? "app-shell-analysis" : ""}`}>
       <TokenGate />
       <aside className="sidebar">
         <div className="brand-row">
@@ -1798,7 +1964,15 @@ export default function App() {
 
       </aside>
 
-      <main className="workspace">
+      <main className={`workspace ${workspaceStage === "analysis" ? "workspace-analysis" : ""}`}>
+        <AnalysisStageGate
+          stage={workspaceStage}
+          projectId={analysisProjectIdRef.current}
+          sourceRevision={analysisSourceRevision}
+          onConfirmed={applyConfirmedAnalysisProject}
+          onCancel={cancelScriptAnalysis}
+          ttsWorkbench={(
+            <>
         <header className="topbar">
           <div className="toolbar topbar-toolbar">
             <span className={`notice ${toasts.length > 0 ? `notice-${toasts[toasts.length - 1].level}` : ""}`} title={notice}>{notice || t("app.ready")}</span>
@@ -3639,6 +3813,9 @@ export default function App() {
             )}
           </aside>
         </section>
+            </>
+          )}
+        />
       </main>
       {confirmationDialog && (
         <div className="confirm-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) resolveConfirmation(false); }}>

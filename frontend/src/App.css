@@ -8222,3 +8222,50 @@ h3 {
   .portable-import-confirm-actions > *,
   .portable-import-result button { width: 100%; }
 }
+
+/* Task 9: semantic analysis entry and explicit workspace stage. */
+.script-manager-file-input {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px dashed var(--geist-border);
+  border-radius: var(--radius-sm);
+  color: var(--geist-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.script-manager-file-input:hover,
+.script-manager-file-input:focus-within {
+  border-color: var(--geist-primary);
+  color: var(--geist-primary);
+}
+
+.script-manager-file-input input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.app-shell-analysis {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.app-shell-analysis > .sidebar {
+  display: none;
+}
+
+.workspace-analysis {
+  min-width: 0;
+  overflow: auto;
+}
+
+.workspace-analysis > .script-analysis-workspace {
+  min-height: 100vh;
+}

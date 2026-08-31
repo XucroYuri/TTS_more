@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { getApiToken, patchAnalysisDraft, setApiToken } from "./api";
+import { createScriptRevision } from "./api";
 
 describe("api token storage", () => {
   // The token lives in a module-level variable, so tests share state.
@@ -26,6 +27,61 @@ describe("api token storage", () => {
 });
 
 describe("semantic analysis API request shapes", () => {
+  it("preserves exact source text and includes optional upload metadata in script revisions", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(JSON.stringify({
+        project: { title: "Demo", default_language: "zh", lines: [] },
+        script_revision: {
+          revision_id: "script-r009",
+          source_markdown: "\r\n  \u7532\uff1a\u5feb\u8dd1\uff01  \r\n",
+          source_filename: "scene.Md",
+          source_media_type: "text/markdown",
+          source_sha256: "268c518e000bed760cce0df64a724ac41db87e96188426119edd4eb7d5397f24",
+          created_at: "2026-09-01T00:00:00.000Z"
+        }
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    try {
+      const uploaded = await createScriptRevision(
+        "demo/project",
+        "\r\n  \u7532\uff1a\u5feb\u8dd1\uff01  \r\n",
+        "Analyze source",
+        { source_filename: "scene.Md", source_media_type: "text/markdown" }
+      );
+      expect(uploaded.script_revision).toMatchObject({
+        source_markdown: "\r\n  \u7532\uff1a\u5feb\u8dd1\uff01  \r\n",
+        source_filename: "scene.Md",
+        source_media_type: "text/markdown",
+        source_sha256: "268c518e000bed760cce0df64a724ac41db87e96188426119edd4eb7d5397f24"
+      });
+      await createScriptRevision("demo/project", "  pasted source  ", "Analyze paste");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(calls.map(({ url }) => url)).toEqual([
+      "/api/projects/demo%2Fproject/script-revisions",
+      "/api/projects/demo%2Fproject/script-revisions"
+    ]);
+    expect(JSON.parse(String(calls[0].init?.body))).toEqual({
+      source_markdown: "\r\n  \u7532\uff1a\u5feb\u8dd1\uff01  \r\n",
+      summary: "Analyze source",
+      source_filename: "scene.Md",
+      source_media_type: "text/markdown"
+    });
+    expect(JSON.parse(String(calls[1].init?.body))).toEqual({
+      source_markdown: "  pasted source  ",
+      summary: "Analyze paste"
+    });
+  });
+
   it("encodes resource ids and sends the authoritative create, patch, and confirm payloads", async () => {
     const originalFetch = globalThis.fetch;
     const calls: Array<{ url: string; init?: RequestInit }> = [];

@@ -718,6 +718,13 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     analysis: {
       title: "语义分析审阅",
       subtitle: "核对原文锚点、角色别名、情绪与可导入台词。",
+      input: {
+        analyze: "分析剧本",
+        upload: "上传 .txt / .md",
+        unsupportedFile: "仅支持 .txt 和 .md 剧本文件",
+        readFailed: "无法读取剧本文件",
+        largeFileWarning: "剧本共 {{count}} 个字符，超过建议上限 {{limit}}"
+      },
       source: {
         title: "原文标注"
       },
@@ -1629,6 +1636,13 @@ export const resources: Record<AppLanguage, TranslationTree> = {
     analysis: {
       title: "Semantic analysis review",
       subtitle: "Review source anchors, character aliases, emotions, and importable utterances.",
+      input: {
+        analyze: "Analyze script",
+        upload: "Upload .txt / .md",
+        unsupportedFile: "Only .txt and .md script files are supported",
+        readFailed: "Could not read the script file",
+        largeFileWarning: "The script has {{count}} characters, above the recommended limit of {{limit}}"
+      },
       source: {
         title: "Source annotations"
       },

@@ -1,5 +1,5 @@
 import { Edit3, FileText, FolderOpen, List, Loader2, Plus, Save, Search, Trash2, Wand2, X } from "lucide-react";
-import { type KeyboardEvent, type ReactNode, useId, useMemo, useState } from "react";
+import { type ChangeEvent, type KeyboardEvent, type ReactNode, useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { filterAndSortProjectSummaries, projectPreviewStats } from "../lib/scriptManagement";
@@ -34,6 +34,8 @@ interface ScriptManagerModalProps {
   onRenameScript: () => void;
   onSaveRevision: () => void;
   onParseRevision: () => void;
+  onAnalyzeScript: () => void;
+  onScriptFileSelected: (file: File) => void;
   onDeleteScript: () => void;
 }
 
@@ -68,6 +70,8 @@ export function ScriptManagerModal({
   onRenameScript,
   onSaveRevision,
   onParseRevision,
+  onAnalyzeScript,
+  onScriptFileSelected,
   onDeleteScript
 }: ScriptManagerModalProps) {
   const { t } = useTranslation();
@@ -84,6 +88,23 @@ export function ScriptManagerModal({
   const selectedIsCurrent = Boolean(selectedProjectId && selectedProjectId === currentProjectId);
   const busy = isCreatingScript || isSavingScript || isParsingScript || Boolean(deletingProjectId);
   const isInline = variant === "inline";
+  const handleScriptFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    if (file) onScriptFileSelected(file);
+    event.currentTarget.value = "";
+  };
+  const scriptFileInput = (
+    <label className="script-manager-file-input">
+      <span>{t("analysis.input.upload")}</span>
+      <input
+        data-action="script-file-input"
+        type="file"
+        accept=".txt,.md,text/plain,text/markdown"
+        onChange={handleScriptFileChange}
+        disabled={!selectedProjectId || isSelectedProjectLoading || busy}
+      />
+    </label>
+  );
 
   if (!open) return null;
 
@@ -209,6 +230,7 @@ export function ScriptManagerModal({
                   placeholder={editingExistingScript ? t("script.emptySourcePreview") : t("script.newScriptSourcePlaceholder")}
                 />
               </label>
+              {editingExistingScript ? scriptFileInput : null}
               <div className="script-manager-inline-actions">
                 {editingExistingScript ? (
                   <>
@@ -220,7 +242,10 @@ export function ScriptManagerModal({
                     <button className="secondary-button" type="button" onClick={onSaveRevision} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
                       {isSavingScript ? <Loader2 className="spin" size={14} /> : <Save size={14} />} {t("script.saveRevision")}
                     </button>
-                    <button className="primary-button" type="button" onClick={onParseRevision} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
+                    <button className="primary-button" data-action="analyze-script" type="button" onClick={onAnalyzeScript} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
+                      {isSavingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {t("analysis.input.analyze")}
+                    </button>
+                    <button className="secondary-button" data-action="legacy-parse-script" type="button" onClick={onParseRevision} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
                       {isParsingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {t("script.parseRevision")}
                     </button>
                     <button className="secondary-button danger-button" type="button" onClick={onDeleteScript} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
@@ -342,11 +367,15 @@ export function ScriptManagerModal({
                 <span>{t("script.currentSource")}</span>
                 <textarea className="script-manager-source-editor" value={sourceDraft} onChange={(event) => onSourceDraftChange(event.target.value)} disabled={!selectedProjectId || isSelectedProjectLoading} rows={8} />
               </label>
+              {scriptFileInput}
               <div className="script-manager-action-grid">
                 <button className="secondary-button" type="button" onClick={onSaveRevision} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
                   {isSavingScript ? <Loader2 className="spin" size={14} /> : <Save size={14} />} {t("script.saveRevision")}
                 </button>
-                <button className="primary-button" type="button" onClick={onParseRevision} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
+                <button className="primary-button" data-action="analyze-script" type="button" onClick={onAnalyzeScript} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
+                  {isSavingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {t("analysis.input.analyze")}
+                </button>
+                <button className="secondary-button" data-action="legacy-parse-script" type="button" onClick={onParseRevision} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
                   {isParsingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {t("script.parseRevision")}
                 </button>
               </div>

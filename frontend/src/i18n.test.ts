@@ -95,6 +95,16 @@ describe("i18n configuration", () => {
   });
 
   it("ships a complete independent semantic-analysis review namespace", () => {
+    expect(tText(resources["zh-CN"], "analysis.input.analyze")).toBe("\u5206\u6790\u5267\u672c");
+    expect(tText(resources["en-US"], "analysis.input.analyze")).toBe("Analyze script");
+    expect(tText(resources["zh-CN"], "analysis.input.upload")).toBe("\u4e0a\u4f20 .txt / .md");
+    expect(tText(resources["en-US"], "analysis.input.upload")).toBe("Upload .txt / .md");
+    expect(tText(resources["zh-CN"], "analysis.input.unsupportedFile")).toBe("\u4ec5\u652f\u6301 .txt \u548c .md \u5267\u672c\u6587\u4ef6");
+    expect(tText(resources["en-US"], "analysis.input.unsupportedFile")).toBe("Only .txt and .md script files are supported");
+    expect(tText(resources["zh-CN"], "analysis.input.readFailed")).toBe("\u65e0\u6cd5\u8bfb\u53d6\u5267\u672c\u6587\u4ef6");
+    expect(tText(resources["en-US"], "analysis.input.readFailed")).toBe("Could not read the script file");
+    expect(tText(resources["zh-CN"], "analysis.input.largeFileWarning")).toBe("\u5267\u672c\u5171 {{count}} \u4e2a\u5b57\u7b26\uff0c\u8d85\u8fc7\u5efa\u8bae\u4e0a\u9650 {{limit}}");
+    expect(tText(resources["en-US"], "analysis.input.largeFileWarning")).toBe("The script has {{count}} characters, above the recommended limit of {{limit}}");
     expect(tText(resources["zh-CN"], "analysis.filters.lowConfidence")).toBe("低置信度");
     expect(tText(resources["en-US"], "analysis.filters.lowConfidence")).toBe("Low confidence");
     expect(tText(resources["zh-CN"], "analysis.errors.copyDiagnostics")).toBe("复制诊断信息");
