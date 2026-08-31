@@ -715,6 +715,132 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       inspectorIdle: "等待台词",
       noActiveLineHint: "选择一个剧本和台词后，这里会显示当前行配置和历史版本参数。"
     },
+    analysis: {
+      title: "语义分析审阅",
+      subtitle: "核对原文锚点、角色别名、情绪与可导入台词。",
+      source: {
+        title: "原文标注"
+      },
+      review: {
+        title: "分析审阅"
+      },
+      filters: {
+        label: "分析结果筛选",
+        all: "全部",
+        pending: "待确认",
+        lowConfidence: "低置信度"
+      },
+      results: {
+        title: "台词分析结果",
+        empty: "暂无分析结果",
+        waiting: "分析正在进行，完成后可在这里审阅。",
+        unavailable: "分析结果暂不可用，可重试分析。",
+        unassigned: "未分配角色",
+        missingDialogue: "台词锚点缺失",
+        reviewActions: "台词审阅操作"
+      },
+      fields: {
+        speaker: "说话人",
+        emotionEvidence: "情绪证据",
+        emotion: "情绪",
+        confidence: "置信度",
+        uncertainty: "不确定项"
+      },
+      badges: {
+        inferred: "推断"
+      },
+      status: {
+        pending: "待确认",
+        accepted: "已接受",
+        rejected: "已拒绝"
+      },
+      runStatus: {
+        queued: "排队中",
+        running: "分析中",
+        completed: "已完成",
+        failed: "分析失败",
+        interrupted: "已中断"
+      },
+      actions: {
+        accept: "接受",
+        reject: "拒绝",
+        restore: "恢复待确认",
+        save: "保存修改",
+        merge: "合并角色",
+        retry: "重试",
+        cancel: "取消"
+      },
+      characters: {
+        title: "角色与别名",
+        empty: "暂无角色候选",
+        canonicalName: "角色名称",
+        aliases: "别名（逗号分隔）",
+        splitAlias: "拆分别名",
+        mergeTarget: "保留角色",
+        mergeSource: "并入角色",
+        assignments: "台词角色分配"
+      },
+      errors: {
+        runTitle: "分析运行失败",
+        controllerTitle: "分析工作区出错",
+        conflictTitle: "草稿版本冲突",
+        conflictGuidance: "本地修改仍保留。请检查冲突后重试保存；不会自动覆盖本地编辑。",
+        code: "错误代码",
+        httpStatus: "HTTP 状态",
+        stage: "阶段",
+        message: "错误信息",
+        traceId: "追踪 ID",
+        copyDiagnostics: "复制诊断信息",
+        copied: "诊断信息已复制",
+        dismiss: "关闭错误"
+      },
+      save: {
+        saving: "正在保存修改…",
+        pending: "{{count}} 组修改待保存",
+        saved: "草稿已同步"
+      },
+      confirm: {
+        open: "确认并导入",
+        title: "确认导入分析结果",
+        importCount: "将导入 {{count}} 条台词",
+        excludedCount: "{{count}} 条台词因状态、锚点或角色分配未满足条件而排除",
+        authoritative: "确认后将采用服务器返回的项目作为权威结果。",
+        confirming: "正在确认…",
+        submit: "确认导入"
+      },
+      common: {
+        none: "无"
+      },
+      annotationKind: {
+        speaker: "说话人",
+        emotionEvidence: "情绪证据",
+        dialogue: "台词"
+      },
+      emotion: {
+        neutral: "中性",
+        happy: "开心",
+        excited: "兴奋",
+        surprised: "惊讶",
+        sad: "悲伤",
+        angry: "愤怒",
+        fearful: "恐惧",
+        disgusted: "厌恶",
+        anxious: "焦虑",
+        calm: "平静",
+        serious: "严肃",
+        gentle: "温柔",
+        confused: "困惑",
+        other: "其他"
+      },
+      uncertainty: {
+        speakerUnknown: "说话人未知",
+        speakerAmbiguous: "说话人有歧义",
+        dialogueAmbiguous: "台词有歧义",
+        emotionInferred: "情绪为推断",
+        emotionAmbiguous: "情绪有歧义",
+        sourceAnchorAmbiguous: "原文锚点有歧义"
+      }
+    },
     queue: {
       title: "队列",
       polling: "轮询中",
@@ -1491,6 +1617,132 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       noActiveLine: "No line selected",
       inspectorIdle: "Waiting for lines",
       noActiveLineHint: "Select a script and line to edit the current line config and version parameters."
+    },
+    analysis: {
+      title: "Semantic analysis review",
+      subtitle: "Review source anchors, character aliases, emotions, and importable utterances.",
+      source: {
+        title: "Source annotations"
+      },
+      review: {
+        title: "Analysis review"
+      },
+      filters: {
+        label: "Analysis result filters",
+        all: "All",
+        pending: "Pending",
+        lowConfidence: "Low confidence"
+      },
+      results: {
+        title: "Utterance analysis results",
+        empty: "No analysis results",
+        waiting: "Analysis is running. Review will be available when it finishes.",
+        unavailable: "Analysis results are unavailable. Retry the analysis.",
+        unassigned: "Unassigned character",
+        missingDialogue: "Dialogue anchor missing",
+        reviewActions: "Utterance review actions"
+      },
+      fields: {
+        speaker: "Speaker",
+        emotionEvidence: "Emotion evidence",
+        emotion: "Emotion",
+        confidence: "Confidence",
+        uncertainty: "Uncertainty"
+      },
+      badges: {
+        inferred: "Inferred"
+      },
+      status: {
+        pending: "Pending",
+        accepted: "Accepted",
+        rejected: "Rejected"
+      },
+      runStatus: {
+        queued: "Queued",
+        running: "Analyzing",
+        completed: "Completed",
+        failed: "Analysis failed",
+        interrupted: "Interrupted"
+      },
+      actions: {
+        accept: "Accept",
+        reject: "Reject",
+        restore: "Restore to pending",
+        save: "Save changes",
+        merge: "Merge characters",
+        retry: "Retry",
+        cancel: "Cancel"
+      },
+      characters: {
+        title: "Characters and aliases",
+        empty: "No character candidates",
+        canonicalName: "Character name",
+        aliases: "Aliases (comma separated)",
+        splitAlias: "Split alias",
+        mergeTarget: "Keep character",
+        mergeSource: "Merge character",
+        assignments: "Utterance character assignments"
+      },
+      errors: {
+        runTitle: "Analysis run failed",
+        controllerTitle: "Analysis workspace error",
+        conflictTitle: "Draft version conflict",
+        conflictGuidance: "Local changes are still visible. Review the conflict and retry saving; local edits will not be overwritten automatically.",
+        code: "Error code",
+        httpStatus: "HTTP status",
+        stage: "Stage",
+        message: "Message",
+        traceId: "Trace ID",
+        copyDiagnostics: "Copy diagnostics",
+        copied: "Diagnostics copied",
+        dismiss: "Dismiss error"
+      },
+      save: {
+        saving: "Saving changes…",
+        pending: "{{count}} change batches pending",
+        saved: "Draft synchronized"
+      },
+      confirm: {
+        open: "Confirm and import",
+        title: "Confirm analysis import",
+        importCount: "Import {{count}} utterances",
+        excludedCount: "Exclude {{count}} utterances whose status, anchor, or character assignment is not eligible",
+        authoritative: "After confirmation, the server response becomes the authoritative project.",
+        confirming: "Confirming…",
+        submit: "Confirm import"
+      },
+      common: {
+        none: "None"
+      },
+      annotationKind: {
+        speaker: "Speaker",
+        emotionEvidence: "Emotion evidence",
+        dialogue: "Dialogue"
+      },
+      emotion: {
+        neutral: "Neutral",
+        happy: "Happy",
+        excited: "Excited",
+        surprised: "Surprised",
+        sad: "Sad",
+        angry: "Angry",
+        fearful: "Fearful",
+        disgusted: "Disgusted",
+        anxious: "Anxious",
+        calm: "Calm",
+        serious: "Serious",
+        gentle: "Gentle",
+        confused: "Confused",
+        other: "Other"
+      },
+      uncertainty: {
+        speakerUnknown: "Speaker unknown",
+        speakerAmbiguous: "Speaker ambiguous",
+        dialogueAmbiguous: "Dialogue ambiguous",
+        emotionInferred: "Emotion inferred",
+        emotionAmbiguous: "Emotion ambiguous",
+        sourceAnchorAmbiguous: "Source anchor ambiguous"
+      }
     },
     queue: {
       title: "Queue",

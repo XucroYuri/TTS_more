@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { defaultLanguage, languageOptions, nextLanguage, normalizeLanguage, resources, tText } from "./i18n";
 
+function leafKeyPaths(value: unknown, prefix = ""): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [prefix];
+  return Object.entries(value as Record<string, unknown>)
+    .flatMap(([key, child]) => leafKeyPaths(child, prefix ? `${prefix}.${key}` : key))
+    .sort();
+}
+
 describe("i18n configuration", () => {
   it("defaults to Simplified Chinese", () => {
     expect(defaultLanguage).toBe("zh-CN");
@@ -81,5 +88,18 @@ describe("i18n configuration", () => {
     expect(tText(resources["en-US"], "script.parseRevision")).toBe("Extract lines");
     expect(tText(resources["en-US"], "inspector.method.indextts")).toBe("Index");
     expect(tText(resources["en-US"], "inspector.createIndexTemporary")).toBe("Set temporary voice");
+  });
+
+  it("keeps every Simplified Chinese and English translation leaf in lockstep", () => {
+    expect(leafKeyPaths(resources["zh-CN"])).toEqual(leafKeyPaths(resources["en-US"]));
+  });
+
+  it("ships a complete independent semantic-analysis review namespace", () => {
+    expect(tText(resources["zh-CN"], "analysis.filters.lowConfidence")).toBe("低置信度");
+    expect(tText(resources["en-US"], "analysis.filters.lowConfidence")).toBe("Low confidence");
+    expect(tText(resources["zh-CN"], "analysis.errors.copyDiagnostics")).toBe("复制诊断信息");
+    expect(tText(resources["en-US"], "analysis.errors.copyDiagnostics")).toBe("Copy diagnostics");
+    expect(tText(resources["zh-CN"], "analysis.confirm.importCount")).toBe("将导入 {{count}} 条台词");
+    expect(tText(resources["en-US"], "analysis.confirm.importCount")).toBe("Import {{count}} utterances");
   });
 });
