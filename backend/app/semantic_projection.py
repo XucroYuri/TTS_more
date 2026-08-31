@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 
 from app.models import ParseRevision, ProjectCharacter, ScriptLine, ScriptProject, line_with_revision_uid
 from app.semantic_models import CharacterCandidate, ReviewStatus, SemanticAnalysisDraft
@@ -11,6 +12,16 @@ class SemanticProjectionError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def parse_revision_fingerprint(revision: ParseRevision) -> str:
+    canonical_payload = json.dumps(
+        revision.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical_payload).hexdigest()
 
 
 def _deterministic_project_character_id(candidate: CharacterCandidate) -> str:
@@ -129,6 +140,7 @@ def validate_confirmed_parse_revision(
     draft: SemanticAnalysisDraft,
     semantic_revision_id: str,
     parse_revision_id: str,
+    expected_fingerprint: str,
 ) -> ParseRevision:
     expected_parse_revision_id = f"semantic-{semantic_revision_id}"
     if parse_revision_id != expected_parse_revision_id:
@@ -139,13 +151,7 @@ def validate_confirmed_parse_revision(
     )
     if existing is None:
         raise SemanticProjectionError("confirmed_parse_revision_missing")
-
-    validation_project = copy.deepcopy(project)
-    validation_project.project_characters = copy.deepcopy(existing.project_characters)
-    validation_project.active_parse_revision_id = existing.revision_id
-    validation_project.lines = copy.deepcopy(existing.lines)
-    validated = project_confirmed_draft(validation_project, draft, semantic_revision_id)
-    if validated != existing:
+    if parse_revision_fingerprint(existing) != expected_fingerprint:
         raise SemanticProjectionError("parse_revision_collision")
     return existing
 

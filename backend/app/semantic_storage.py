@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import threading
 import uuid
 import weakref
@@ -29,6 +30,7 @@ from app.semantic_models import (
 from app.semantic_source import validate_source_span
 from app.semantic_projection import (
     SemanticProjectionError,
+    parse_revision_fingerprint,
     project_confirmed_draft,
     validate_confirmed_parse_revision,
 )
@@ -231,6 +233,7 @@ class SemanticStore:
                     "updated_at": _now(),
                     "confirmed_revision_id": None,
                     "confirmed_parse_revision_id": None,
+                    "confirmed_parse_fingerprint": None,
                     "confirm_idempotency_key": None,
                 },
                 deep=True,
@@ -306,6 +309,7 @@ class SemanticStore:
                 update={
                     "confirmed_revision_id": semantic_revision.id,
                     "confirmed_parse_revision_id": parse_revision.revision_id,
+                    "confirmed_parse_fingerprint": parse_revision_fingerprint(parse_revision),
                     "confirm_idempotency_key": idempotency_key,
                     "updated_at": _now(),
                 },
@@ -493,6 +497,11 @@ class SemanticStore:
             or draft.confirmed_parse_revision_id != expected_parse_revision_id
         ):
             raise SemanticValidationError("confirmed_artifact_mismatch")
+        if (
+            not isinstance(draft.confirmed_parse_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", draft.confirmed_parse_fingerprint) is None
+        ):
+            raise SemanticValidationError("confirmed_artifact_mismatch")
         semantic_revision = self._load_confirmed_revision(draft, draft.confirmed_revision_id)
         project = self.project_store.load_project(draft.project_id)
         try:
@@ -501,6 +510,7 @@ class SemanticStore:
                 draft,
                 semantic_revision.id,
                 draft.confirmed_parse_revision_id,
+                draft.confirmed_parse_fingerprint,
             )
         except SemanticProjectionError as error:
             if error.code == "confirmed_parse_revision_missing":

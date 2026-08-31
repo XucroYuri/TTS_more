@@ -259,6 +259,7 @@ class SemanticAnalysisDraft(BaseModel):
     contract_version: str | None = None
     confirmed_revision_id: str | None = None
     confirmed_parse_revision_id: str | None = None
+    confirmed_parse_fingerprint: str | None = None
     confirm_idempotency_key: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -206,6 +206,19 @@ def test_confirmation_persists_immutable_metadata_and_projection(confirmable_sto
     assert stored.confirmed_revision_id == result.semantic_revision.id
     assert stored.confirmed_parse_revision_id == result.parse_revision.revision_id
     assert stored.confirm_idempotency_key == "confirm-key-1"
+    canonical_payload = json.dumps(
+        result.parse_revision.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert stored.confirmed_parse_fingerprint == hashlib.sha256(canonical_payload).hexdigest()
+
+
+def test_legacy_draft_defaults_confirmed_parse_fingerprint_to_none() -> None:
+    assert "confirmed_parse_fingerprint" in SemanticAnalysisDraft.model_fields
+    legacy = SemanticAnalysisDraft(id="legacy-draft", project_id="demo", source_revision_id="script-r001")
+    assert legacy.confirmed_parse_fingerprint is None
 
 
 def test_same_key_retry_ignores_stale_version_and_never_duplicates_artifacts(confirmable_store: tuple[SemanticStore, str]) -> None:
@@ -263,6 +276,83 @@ def test_confirmed_same_key_retry_preserves_later_active_parse_revision(confirma
     assert replay.project.active_parse_revision_id == later.revision_id
     assert [item.revision_id for item in replay.project.parse_revisions].count(first.parse_revision.revision_id) == 1
     assert [item.revision_id for item in replay.project.parse_revisions].count(later.revision_id) == 1
+
+
+@pytest.mark.parametrize("snapshot_damage", ["unreferenced", "explicit_binding"])
+def test_confirmed_same_key_retry_rejects_historical_character_snapshot_tampering(
+    confirmable_store: tuple[SemanticStore, str],
+    snapshot_damage: str,
+) -> None:
+    _projection()
+    store, draft_id = confirmable_store
+    project = store.project_store.load_project("demo")
+    project.project_characters.append(ProjectCharacter(project_character_id="historical-unused", name="历史未使用角色"))
+    store.project_store.save_project("demo", project)
+    first = store.confirm_draft(draft_id, 1, "confirm-key-1")
+    project = store.project_store.load_project("demo")
+    revision = next(item for item in project.parse_revisions if item.revision_id == first.parse_revision.revision_id)
+    target_id = "historical-unused" if snapshot_damage == "unreferenced" else "bound"
+    target = next(item for item in revision.project_characters if item.project_character_id == target_id)
+    target.name = "被篡改的历史角色"
+    store.project_store.save_project("demo", project)
+
+    with pytest.raises(SemanticValidationError, match="confirmed_artifact_mismatch"):
+        store.confirm_draft(draft_id, 999, "confirm-key-1")
+
+
+def test_confirmed_same_key_retry_rejects_historical_parent_changed_to_another_existing_revision(
+    confirmable_store: tuple[SemanticStore, str],
+) -> None:
+    _projection()
+    store, draft_id = confirmable_store
+    first = store.confirm_draft(draft_id, 1, "confirm-key-1")
+    project = store.project_store.load_project("demo")
+    later = ParseRevision(
+        revision_id="parse-later-parent",
+        script_revision_id="script-r001",
+        parent_parse_revision_id=first.parse_revision.revision_id,
+        provider="manual",
+        project_characters=copy.deepcopy(project.project_characters),
+        lines=[],
+    )
+    project.parse_revisions.append(later)
+    original = next(item for item in project.parse_revisions if item.revision_id == first.parse_revision.revision_id)
+    original.parent_parse_revision_id = later.revision_id
+    project.active_parse_revision_id = later.revision_id
+    project.lines = []
+    store.project_store.save_project("demo", project)
+
+    with pytest.raises(SemanticValidationError, match="confirmed_artifact_mismatch"):
+        store.confirm_draft(draft_id, 999, "confirm-key-1")
+
+
+@pytest.mark.parametrize("fingerprint", [None, "not-a-sha256-fingerprint"])
+def test_confirmed_same_key_retry_rejects_missing_or_invalid_fingerprint_without_side_effects(
+    confirmable_store: tuple[SemanticStore, str],
+    fingerprint: str | None,
+) -> None:
+    _projection()
+    store, draft_id = confirmable_store
+    store.confirm_draft(draft_id, 1, "confirm-key-1")
+    draft_path = store.project_store.project_semantic_dir("demo") / "drafts" / f"{draft_id}.json"
+    payload = json.loads(draft_path.read_text(encoding="utf-8"))
+    if fingerprint is None:
+        payload.pop("confirmed_parse_fingerprint", None)
+    else:
+        payload["confirmed_parse_fingerprint"] = fingerprint
+    draft_path.write_text(json.dumps(payload), encoding="utf-8")
+    project_before = copy.deepcopy(store.project_store.load_project("demo"))
+    index_path = store.project_store.root / "semantic" / "index.json"
+    index_before = index_path.read_bytes()
+    revisions_dir = store.project_store.project_semantic_dir("demo") / "revisions"
+    revisions_before = {path.name: path.read_bytes() for path in revisions_dir.glob("*.json")}
+
+    with pytest.raises(SemanticValidationError, match="confirmed_artifact_mismatch"):
+        store.confirm_draft(draft_id, 999, "confirm-key-1")
+
+    assert store.project_store.load_project("demo") == project_before
+    assert index_path.read_bytes() == index_before
+    assert {path.name: path.read_bytes() for path in revisions_dir.glob("*.json")} == revisions_before
 
 
 def test_confirmed_same_key_retry_does_not_recreate_missing_semantic_revision(confirmable_store: tuple[SemanticStore, str]) -> None:
@@ -497,7 +587,9 @@ def test_retry_recovers_project_materialized_before_draft_marker(confirmable_sto
     recovered = store.confirm_draft(draft_id, 1, "recover-project")
     assert len(recovered.project.parse_revisions) == 2
     assert len({line.line_uid for line in recovered.project.lines}) == len(recovered.project.lines)
-    assert store.load_draft(draft_id).confirmed_parse_revision_id == recovered.parse_revision.revision_id
+    confirmed = store.load_draft(draft_id)
+    assert confirmed.confirmed_parse_revision_id == recovered.parse_revision.revision_id
+    assert confirmed.confirmed_parse_fingerprint is not None
 
 
 def test_invalid_source_span_causes_no_project_or_confirmation_mutation(confirmable_store: tuple[SemanticStore, str]) -> None:
