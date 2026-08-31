@@ -29,6 +29,12 @@ from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key, persist_manifest_delta
 from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
 from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
+from app.semantic_analysis import SemanticAnalysisService
+from app.semantic_executor import SemanticAnalysisExecutor
+from app.semantic_logging import semantic_event_logger
+from app.semantic_provider import AnalysisChunk, SemanticProviderUnavailable, build_semantic_provider
+from app.semantic_routes import build_semantic_router
+from app.semantic_storage import SemanticStore
 from app.service_config import ServiceSettingsUpdate, public_service_settings, save_service_settings
 from app.services import COMFYUI_TTS_AUDIO_SUITE_CONTRACT, ServiceRegistry, ServiceRouter, build_load_signature, require_remote_artifact_transfer
 from app.comfyui.workflow_builder import workflow_template_catalog
@@ -114,6 +120,7 @@ def create_app(
     env_path: Path | str | None = None,
     static_root: Path | str | None = None,
     controller_root: Path | str | None = None,
+    semantic_service: SemanticAnalysisService | Any | None = None,
 ) -> FastAPI:
     app = FastAPI(title="TTS More Orchestrator", version="0.1.0")
     app.add_middleware(
@@ -134,6 +141,19 @@ def create_app(
     env_file = Path(env_path) if env_path else project_root / ".env.local"
     load_dotenv(env_file, override=False)
     parser = _build_parser(parser_config_file)
+    semantic_store = SemanticStore(store)
+    active_semantic_service = (
+        semantic_service
+        if semantic_service is not None
+        else _build_semantic_service(parser_config_file)
+    )
+    semantic_logger = semantic_event_logger(store.root)
+    semantic_executor = SemanticAnalysisExecutor(
+        semantic_store,
+        store,
+        active_semantic_service,
+        semantic_logger,
+    )
     services_file, writable_services_file = _resolve_service_settings_paths(store.root, Path(services_path) if services_path else None)
     service_registry = _load_service_registry(services_file)
     service_router = ServiceRouter(service_registry)
@@ -150,6 +170,10 @@ def create_app(
 
     app.state.store = store
     app.state.parser = parser
+    app.state.semantic_store = semantic_store
+    app.state.semantic_service = active_semantic_service
+    app.state.semantic_executor = semantic_executor
+    app.state.semantic_event_logger = semantic_logger
     app.state.service_registry = service_registry
     app.state.service_router = service_router
     app.state.queue = queue
@@ -172,6 +196,10 @@ def create_app(
     app.state.env_path = env_file
     # Read at app-creation time so tests/processes can override via env.
     app.state.max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(MAX_UPLOAD_BYTES)))
+
+    app.include_router(build_semantic_router(store, semantic_store, semantic_executor, semantic_logger))
+    app.router.add_event_handler("startup", semantic_executor.recover_interrupted)
+    app.router.add_event_handler("shutdown", semantic_executor.shutdown)
 
 
     @app.get("/api/auth/status")
@@ -442,6 +470,8 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         app.state.parser = _build_parser(parser_config_file)
+        app.state.semantic_service = _build_semantic_service(parser_config_file)
+        app.state.semantic_executor.set_service(app.state.semantic_service)
         return public_parser_providers(parser_config_file, env_file)
 
     @app.post("/api/parser/providers/test")
@@ -1335,6 +1365,27 @@ def _build_parser(config_path: Path | None = None) -> MultiProviderParser:
             for item in json.loads(raw):
                 providers.append(build_parser_provider(ParserProviderConfig.model_validate(item)))
     return MultiProviderParser(providers)
+
+
+class _DisabledSemanticProvider:
+    name = "disabled"
+    model = "disabled"
+
+    def analyze_chunk(self, _chunk: AnalysisChunk):
+        raise SemanticProviderUnavailable("no enabled semantic parser provider")
+
+
+def _build_semantic_service(config_path: Path) -> SemanticAnalysisService:
+    try:
+        selected = next((record for record in load_parser_providers(config_path) if record.enabled), None)
+        if selected is None:
+            return SemanticAnalysisService(_DisabledSemanticProvider())
+        config = ParserProviderConfig.model_validate(selected.model_dump(mode="python"))
+        return SemanticAnalysisService(build_semantic_provider(config))
+    except Exception:
+        # Invalid or temporarily unavailable saved configuration must not prevent
+        # local app startup. Its submitted run records the typed async failure.
+        return SemanticAnalysisService(_DisabledSemanticProvider())
 
 
 def _load_service_registry(path: Path) -> ServiceRegistry:

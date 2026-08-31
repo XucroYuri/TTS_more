@@ -157,6 +157,91 @@ def test_parser_provider_config_masks_secret_and_writes_env(tmp_path: Path) -> N
     assert get_response.json()["providers"][0]["key_configured"] is True
 
 
+def test_semantic_service_selects_first_enabled_parser_provider_and_refreshes_after_save(tmp_path: Path) -> None:
+    config_path = tmp_path / "parser_providers.json"
+    config_path.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "later-provider",
+                    "base_url": "https://later.example/v1",
+                    "api_key_env": "LATER_API_KEY",
+                    "model": "later-model",
+                    "enabled": True,
+                    "priority": 20,
+                },
+                {
+                    "name": "first-provider",
+                    "base_url": "https://first.example/v1",
+                    "api_key_env": "FIRST_API_KEY",
+                    "model": "first-model",
+                    "enabled": True,
+                    "priority": 10,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    app = create_app(
+        data_root=tmp_path,
+        parser_config_path=config_path,
+        env_path=tmp_path / ".env.local",
+    )
+    client = TestClient(app)
+
+    assert app.state.semantic_service.provider.name == "first-provider"
+    response = client.put(
+        "/api/parser/providers",
+        json={
+            "providers": [
+                {
+                    "name": "replacement-provider",
+                    "base_url": "https://replacement.example/v1",
+                    "api_key_env": "REPLACEMENT_API_KEY",
+                    "model": "replacement-model",
+                    "enabled": True,
+                    "priority": 1,
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    assert app.state.semantic_service.provider.name == "replacement-provider"
+    assert app.state.semantic_executor._service is app.state.semantic_service
+
+
+def test_no_enabled_semantic_provider_fails_asynchronously_without_blocking_app_startup(tmp_path: Path) -> None:
+    app = create_app(data_root=tmp_path, env_path=tmp_path / ".env.local")
+    app.state.store.save_project(
+        "demo",
+        main_module.ScriptProject(
+            title="No provider",
+            script_revisions=[main_module.ScriptRevision(revision_id="script-r001", source_markdown="旁白：你好。")],
+            active_script_revision_id="script-r001",
+        ),
+    )
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/projects/demo/analysis-runs",
+            json={"source_revision_id": "script-r001"},
+        )
+        assert created.status_code == 202
+        run_id = created.json()["run_id"]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            terminal = client.get(f"/api/analysis-runs/{run_id}").json()
+            if terminal["status"] == "failed":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("disabled semantic provider run did not fail")
+
+    assert terminal["error"]["http_status"] == 502
+    assert terminal["error"]["code"] == "semantic_provider_unavailable"
+
+
 def test_parser_provider_test_reports_missing_key(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path, env_path=tmp_path / ".env.local"))
 
