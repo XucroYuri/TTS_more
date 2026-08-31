@@ -146,6 +146,12 @@ def _seed_draft(store: "SemanticStore"):
     return run, store.load_draft(draft.id)
 
 
+def _persist_draft_for_test(project_store: ProjectStore, draft) -> None:
+    """Build an on-disk legacy/confirmed fixture without exposing a write API."""
+    path = project_store.project_semantic_dir(draft.project_id) / "drafts" / f"{draft.id}.json"
+    path.write_text(draft.model_dump_json(indent=2), encoding="utf-8")
+
+
 def test_create_run_and_draft_persists_constrained_sidecars_and_reverse_index(project_store: ProjectStore) -> None:
     _storage()
     store = SemanticStore(project_store)
@@ -160,6 +166,50 @@ def test_create_run_and_draft_persists_constrained_sidecars_and_reverse_index(pr
     index = json.loads((project_store.root / "semantic" / "index.json").read_text(encoding="utf-8"))
     assert index["runs"][run.id]["project_id"] == "demo"
     assert index["drafts"][draft.id] == {"project_id": "demo", "run_id": run.id}
+
+
+def test_cross_project_run_creation_keeps_both_reverse_index_mappings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _storage()
+    project_store = ProjectStore(tmp_path)
+    for project_id in ("one", "two"):
+        source = ScriptRevision(revision_id="script-r001", source_markdown="台词", source_sha256=sha256_source("台词"))
+        project_store.save_project(project_id, ScriptProject(title=project_id, script_revisions=[source], active_script_revision_id=source.revision_id))
+    first = SemanticStore(project_store)
+    second = SemanticStore(ProjectStore(tmp_path))
+    barrier = threading.Barrier(2)
+    original_first = first._load_index
+    original_second = second._load_index
+
+    def synchronize_index_load(load):
+        def synchronized():
+            index = load()
+            try:
+                barrier.wait(timeout=0.3)
+            except threading.BrokenBarrierError:
+                pass
+            return index
+        return synchronized
+
+    monkeypatch.setattr(first, "_load_index", synchronize_index_load(original_first))
+    monkeypatch.setattr(second, "_load_index", synchronize_index_load(original_second))
+    created: list[tuple[str, object, object]] = []
+
+    def create(store: SemanticStore, project_id: str) -> None:
+        run, draft = store.create_run_and_draft(project_id, "script-r001", trace_id=project_id)
+        created.append((project_id, run, draft))
+
+    threads = [threading.Thread(target=create, args=(first, "one")), threading.Thread(target=create, args=(second, "two"))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(3)
+        assert not thread.is_alive()
+
+    index = json.loads((tmp_path / "semantic" / "index.json").read_text(encoding="utf-8"))
+    assert len(created) == 2
+    for project_id, run, draft in created:
+        assert index["runs"][run.id]["project_id"] == project_id
+        assert index["drafts"][draft.id] == {"project_id": project_id, "run_id": run.id}
 
 
 @pytest.mark.parametrize("project_id", ["../escape", "..", "CON", "demo/../../escape"])
@@ -240,7 +290,7 @@ def test_confirmed_draft_rejects_patch(project_store: ProjectStore) -> None:
     store = SemanticStore(project_store)
     _run, draft = _seed_terminal(store)
     confirmed = draft.model_copy(update={"confirmed_revision_id": "semantic-1"})
-    store.save_draft(confirmed)
+    _persist_draft_for_test(project_store, confirmed)
 
     with pytest.raises(SemanticConflictError, match="draft_confirmed"):
         store.patch_draft(draft.id, 1, [])
@@ -287,7 +337,7 @@ def test_create_replace_upsert_update_merge_split_and_dismiss_commands(project_s
     new_character = _character("character-2", aliases=["小品", "阿品"], status=ReviewStatus.PENDING)
     new_utterance = _utterance("utterance-2", status=ReviewStatus.PENDING).model_copy(update={"dialogue_annotation_id": "dialogue-2", "character_candidate_id": "character-2"})
     draft = draft.model_copy(update={"warnings": [AnalysisWarning(id="warning-1", code="warning", message="review")]})
-    store.save_draft(draft)
+    _persist_draft_for_test(project_store, draft)
 
     patched = store.patch_draft(
         draft.id,
@@ -348,6 +398,17 @@ def test_full_reference_validation_rejects_wrong_kinds_and_duplicates(project_st
         )
 
 
+@pytest.mark.parametrize("status", [ReviewStatus.PENDING, ReviewStatus.ACCEPTED, ReviewStatus.REJECTED])
+def test_all_utterance_statuses_reject_nonempty_dangling_character_references(project_store: ProjectStore, status: ReviewStatus) -> None:
+    _storage()
+    store = SemanticStore(project_store)
+    _run, draft = _seed_draft(store)
+    dangling = _utterance(status=status).model_copy(update={"character_candidate_id": "missing-character"})
+
+    with pytest.raises(SemanticValidationError, match="semantic_draft_invalid"):
+        store.patch_draft(draft.id, draft.version, [UpdateUtterance(op="update_utterance", utterance_id="utterance-1", utterance=dangling)])
+
+
 def test_worker_replacement_preserves_identity_and_rejects_confirmed_or_user_edited_drafts(project_store: ProjectStore) -> None:
     _storage()
     store = SemanticStore(project_store)
@@ -361,7 +422,7 @@ def test_worker_replacement_preserves_identity_and_rejects_confirmed_or_user_edi
     edited = store.patch_draft(draft.id, saved.version, [])
     with pytest.raises(ReplaceAnalysisResultError, match="semantic_draft_invalid"):
         store.replace_analysis_result(run.id, replacement)
-    store.save_draft(edited.model_copy(update={"confirmed_revision_id": "semantic-1"}))
+    _persist_draft_for_test(project_store, edited.model_copy(update={"confirmed_revision_id": "semantic-1"}))
     with pytest.raises(ReplaceAnalysisResultError, match="draft_confirmed"):
         store.replace_analysis_result(run.id, replacement)
 

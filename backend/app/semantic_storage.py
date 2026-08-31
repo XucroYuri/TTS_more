@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import json
+import threading
 import uuid
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
@@ -24,7 +26,7 @@ from app.semantic_models import (
     SemanticUtterance,
 )
 from app.semantic_source import validate_source_span
-from app.storage import ProjectStore
+from app.storage import ProjectStore, windows_filesystem_path, windows_path_identity
 
 
 class SemanticStorageError(ValueError):
@@ -148,6 +150,9 @@ class DraftPatchRequest(BaseModel):
 
 
 class SemanticStore:
+    _index_locks_guard = threading.Lock()
+    _index_locks: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
+
     def __init__(self, project_store: ProjectStore) -> None:
         self.project_store = project_store
 
@@ -173,10 +178,11 @@ class SemanticStore:
             )
             self._write_model(self._run_path(safe_project_id, run_id), run)
             self._write_model(self._draft_path(safe_project_id, draft_id), draft)
-            index = self._load_index()
-            index["runs"][run_id] = {"project_id": safe_project_id, "draft_id": draft_id}
-            index["drafts"][draft_id] = {"project_id": safe_project_id, "run_id": run_id}
-            self._write_index(index)
+            with self._index_lock():
+                index = self._load_index()
+                index["runs"][run_id] = {"project_id": safe_project_id, "draft_id": draft_id}
+                index["drafts"][draft_id] = {"project_id": safe_project_id, "run_id": run_id}
+                self._write_index(index)
             return run, draft
 
     def load_run(self, run_id: str) -> AnalysisRun:
@@ -193,14 +199,6 @@ class SemanticStore:
             raise SemanticValidationError()
         with self.project_store.project_lock(project_id):
             self._write_model(self._run_path(project_id, run.id), self._touch(run))
-
-    def save_draft(self, draft: SemanticAnalysisDraft) -> None:
-        project_id = self._project_for("drafts", draft.id)
-        if project_id != draft.project_id:
-            raise SemanticValidationError()
-        with self.project_store.project_lock(project_id):
-            self._validate_draft(draft, self._source_revision(project_id, draft.source_revision_id))
-            self._write_model(self._draft_path(project_id, draft.id), self._touch(draft))
 
     def replace_analysis_result(self, run_id: str, replacement: SemanticAnalysisDraft) -> SemanticAnalysisDraft:
         project_id = self._project_for("runs", run_id)
@@ -395,6 +393,8 @@ class SemanticStore:
                     if evidence is None or evidence.kind is not AnnotationKind.EMOTION_EVIDENCE:
                         raise ValueError("invalid emotion reference")
                 character = characters.get(utterance.character_candidate_id) if utterance.character_candidate_id else None
+                if utterance.character_candidate_id is not None and character is None:
+                    raise ValueError("invalid character reference")
                 if utterance.status is ReviewStatus.ACCEPTED:
                     if dialogue.status is not ReviewStatus.ACCEPTED or character is None or character.status is not ReviewStatus.ACCEPTED:
                         raise ValueError("accepted utterance dependencies")
@@ -453,6 +453,15 @@ class SemanticStore:
 
     def _write_index(self, index: dict[str, dict[str, object]]) -> None:
         self._write_json(self._index_path(), index)
+
+    def _index_lock(self) -> threading.RLock:
+        root_key = windows_path_identity(windows_filesystem_path(self.project_store.root).resolve(strict=False))
+        with self._index_locks_guard:
+            lock = self._index_locks.get(root_key)
+            if lock is None:
+                lock = threading.RLock()
+                self._index_locks[root_key] = lock
+            return lock
 
     @staticmethod
     def _unique(items: list[object]) -> None:
