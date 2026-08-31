@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from app.models import Character, EngineName, GenerationManifest, GenerationVersion, LineGenerationHistory, ProjectCharacter, ProjectCharacterMode, ProviderType, ReferenceAudioGroup, ReferenceAudioSample, ScriptLine, ScriptProject, TTSServiceEndpoint, VoiceBinding
+from app.models import Character, EngineName, GenerationManifest, GenerationVersion, LineGenerationHistory, ProjectCharacter, ProjectCharacterMode, ProviderType, ReferenceAudioGroup, ReferenceAudioSample, ScriptLine, ScriptProject, ScriptRevision, TTSServiceEndpoint, VoiceBinding
 from app.storage import ProjectStore
 
 
@@ -89,6 +89,17 @@ def test_script_line_can_hold_temporary_voice_binding() -> None:
 
     assert line.temporary_binding == binding
     assert line.temporary_binding.config["voice"] == "tmp/ref.wav"
+
+
+def test_legacy_script_models_load_without_semantic_fields() -> None:
+    revision = ScriptRevision(revision_id="script-r001", source_markdown="甲：你好")
+    line = ScriptLine(id="line-001", character_id="char-1", text="你好")
+
+    assert revision.source_filename is None
+    assert revision.source_media_type is None
+    assert revision.source_sha256 is None
+    assert line.semantic_revision_id is None
+    assert line.utterance_id is None
 
 
 def test_cosyvoice_endpoint_defaults_to_core_engine_and_worker_contract() -> None:

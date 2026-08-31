@@ -381,6 +381,8 @@ class ScriptLine(BaseModel):
     binding_override: str | None = None
     service_override: str | None = None
     temporary_binding: VoiceBinding | None = None
+    semantic_revision_id: str | None = None
+    utterance_id: str | None = None
 
     @model_validator(mode="after")
     def populate_line_uid(self) -> "ScriptLine":
@@ -392,6 +394,9 @@ class ScriptLine(BaseModel):
 class ScriptRevision(BaseModel):
     revision_id: str
     source_markdown: str
+    source_filename: str | None = None
+    source_media_type: str | None = None
+    source_sha256: str | None = None
     parent_revision_id: str | None = None
     summary: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
