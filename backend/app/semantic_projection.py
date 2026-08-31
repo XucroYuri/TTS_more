@@ -105,7 +105,7 @@ def project_confirmed_draft(
         None,
     )
     if existing is not None:
-        _require_compatible_parse_revision(existing, draft, lines, project.project_characters)
+        _require_compatible_parse_revision(existing, draft, lines, project)
         project.active_parse_revision_id = existing.revision_id
         project.lines = copy.deepcopy(existing.lines)
         return existing
@@ -128,16 +128,25 @@ def _require_compatible_parse_revision(
     revision: ParseRevision,
     draft: SemanticAnalysisDraft,
     lines: list[ScriptLine],
-    project_characters: list[ProjectCharacter],
+    project: ScriptProject,
 ) -> None:
     if (
         revision.provider != "semantic-confirmed"
         or revision.script_revision_id != draft.source_revision_id
         or revision.lines != lines
+        or revision.project_characters != project.project_characters
     ):
         raise SemanticProjectionError("parse_revision_collision")
-    snapshot = {character.project_character_id: character for character in revision.project_characters}
-    referenced_ids = {line.character_id for line in lines}
-    current = {character.project_character_id: character for character in project_characters}
-    if any(identifier not in snapshot or snapshot[identifier] != current.get(identifier) for identifier in referenced_ids):
+    parse_revision_ids = {item.revision_id for item in project.parse_revisions}
+    if project.active_parse_revision_id == revision.revision_id:
+        if (
+            revision.parent_parse_revision_id is None
+            or revision.parent_parse_revision_id == revision.revision_id
+            or revision.parent_parse_revision_id not in parse_revision_ids
+        ):
+            raise SemanticProjectionError("parse_revision_collision")
+    elif (
+        project.active_parse_revision_id not in parse_revision_ids
+        or revision.parent_parse_revision_id != project.active_parse_revision_id
+    ):
         raise SemanticProjectionError("parse_revision_collision")

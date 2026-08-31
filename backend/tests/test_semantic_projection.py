@@ -186,6 +186,18 @@ def test_confirmation_persists_immutable_metadata_and_projection(confirmable_sto
     assert len(result.semantic_revision.unresolved_candidates) == len(result.semantic_revision.warnings) == 1
     assert (result.semantic_revision.provider, result.semantic_revision.model) == ("openai", "semantic-model")
     assert (result.semantic_revision.prompt_version, result.semantic_revision.contract_version) == ("prompt-v3", "contract-v2")
+    pending_annotation = next(item for item in result.semantic_revision.annotations if item.id == "dialogue-pending")
+    rejected_annotation = next(item for item in result.semantic_revision.annotations if item.id == "dialogue-rejected")
+    pending_character = next(item for item in result.semantic_revision.characters if item.id == "candidate-pending")
+    rejected_character = next(item for item in result.semantic_revision.characters if item.id == "candidate-rejected")
+    pending_utterance = next(item for item in result.semantic_revision.utterances if item.id == "utterance-pending")
+    rejected_utterance = next(item for item in result.semantic_revision.utterances if item.id == "utterance-rejected")
+    assert (pending_annotation.status, pending_annotation.span.text) == (ReviewStatus.PENDING, "保留。")
+    assert (rejected_annotation.status, rejected_annotation.span.text) == (ReviewStatus.REJECTED, "拒绝：保留。")
+    assert (pending_character.status, pending_character.canonical_name) == (ReviewStatus.PENDING, "待定")
+    assert (rejected_character.status, rejected_character.canonical_name) == (ReviewStatus.REJECTED, "拒绝")
+    assert (pending_utterance.status, pending_utterance.dialogue_annotation_id) == (ReviewStatus.PENDING, "dialogue-pending")
+    assert (rejected_utterance.status, rejected_utterance.dialogue_annotation_id) == (ReviewStatus.REJECTED, "dialogue-rejected")
     assert result.parse_revision.revision_id == f"semantic-{result.semantic_revision.id}"
     assert result.project.active_parse_revision_id == result.parse_revision.revision_id
     assert result.project.lines == result.parse_revision.lines
@@ -207,6 +219,94 @@ def test_same_key_retry_ignores_stale_version_and_never_duplicates_artifacts(con
     assert len(second.project.parse_revisions) == len(first.project.parse_revisions)
     assert len(second.project.project_characters) == len(first.project.project_characters)
     assert len(second.project.lines) == len(first.project.lines)
+
+
+def test_confirmed_retry_rejects_corrupt_revision_marker_without_creating_artifacts(confirmable_store: tuple[SemanticStore, str]) -> None:
+    _projection()
+    store, draft_id = confirmable_store
+    store.confirm_draft(draft_id, 1, "confirm-key-1")
+    draft_path = store.project_store.project_semantic_dir("demo") / "drafts" / f"{draft_id}.json"
+    confirmed = store.load_draft(draft_id)
+    confirmed.confirmed_revision_id = "revision-corrupt-marker"
+    draft_path.write_text(confirmed.model_dump_json(indent=2), encoding="utf-8")
+    revisions_dir = store.project_store.project_semantic_dir("demo") / "revisions"
+    artifacts_before = {path.name: path.read_bytes() for path in revisions_dir.glob("*.json")}
+    index_before = (store.project_store.root / "semantic" / "index.json").read_bytes()
+    project_before = copy.deepcopy(store.project_store.load_project("demo"))
+
+    with pytest.raises(SemanticValidationError, match="confirmed_artifact_mismatch"):
+        store.confirm_draft(draft_id, 999, "confirm-key-1")
+
+    assert {path.name: path.read_bytes() for path in revisions_dir.glob("*.json")} == artifacts_before
+    assert (store.project_store.root / "semantic" / "index.json").read_bytes() == index_before
+    assert store.project_store.load_project("demo") == project_before
+
+
+def test_confirmed_retry_rejects_corrupt_parse_marker_before_recreating_missing_revision(confirmable_store: tuple[SemanticStore, str]) -> None:
+    _projection()
+    store, draft_id = confirmable_store
+    result = store.confirm_draft(draft_id, 1, "confirm-key-1")
+    draft_path = store.project_store.project_semantic_dir("demo") / "drafts" / f"{draft_id}.json"
+    confirmed = store.load_draft(draft_id)
+    confirmed.confirmed_parse_revision_id = "semantic-corrupt-marker"
+    draft_path.write_text(confirmed.model_dump_json(indent=2), encoding="utf-8")
+    revision_path = store.project_store.project_semantic_dir("demo") / "revisions" / f"{result.semantic_revision.id}.json"
+    revision_path.unlink()
+    index_path = store.project_store.root / "semantic" / "index.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    del index["revisions"][result.semantic_revision.id]
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    index_before = index_path.read_bytes()
+    project_before = copy.deepcopy(store.project_store.load_project("demo"))
+
+    with pytest.raises(SemanticValidationError, match="confirmed_artifact_mismatch"):
+        store.confirm_draft(draft_id, 999, "confirm-key-1")
+
+    assert not revision_path.exists()
+    assert index_path.read_bytes() == index_before
+    assert store.project_store.load_project("demo") == project_before
+
+
+def test_existing_parse_revision_rejects_wrong_parent_on_first_projection_collision() -> None:
+    _projection()
+    project = _project()
+    revision = project_confirmed_draft(project, _draft(), "revision-parent")
+    project.active_parse_revision_id = "parse-r001"
+    project.lines = copy.deepcopy(project.parse_revisions[0].lines)
+    revision.parent_parse_revision_id = None
+
+    with pytest.raises(SemanticProjectionError, match="parse_revision_collision"):
+        project_confirmed_draft(project, _draft(), "revision-parent")
+
+
+def test_existing_active_parse_revision_rejects_self_parent_during_marker_window_recovery() -> None:
+    _projection()
+    project = _project()
+    revision = project_confirmed_draft(project, _draft(), "revision-self-parent")
+    revision.parent_parse_revision_id = revision.revision_id
+
+    with pytest.raises(SemanticProjectionError, match="parse_revision_collision"):
+        project_confirmed_draft(project, _draft(), "revision-self-parent")
+
+
+@pytest.mark.parametrize("snapshot_damage", ["extra", "missing", "mutated"])
+def test_existing_parse_revision_requires_complete_character_snapshot(snapshot_damage: str) -> None:
+    _projection()
+    project = _project()
+    project.project_characters.append(ProjectCharacter(project_character_id="unused", name="未使用角色"))
+    revision = project_confirmed_draft(project, _draft(), "revision-snapshot")
+    project.active_parse_revision_id = "parse-r001"
+    project.lines = copy.deepcopy(project.parse_revisions[0].lines)
+    if snapshot_damage == "extra":
+        revision.project_characters.append(ProjectCharacter(project_character_id="extra", name="额外角色"))
+    elif snapshot_damage == "missing":
+        revision.project_characters = [item for item in revision.project_characters if item.project_character_id != "unused"]
+    else:
+        unused = next(item for item in revision.project_characters if item.project_character_id == "unused")
+        unused.name = "被篡改角色"
+
+    with pytest.raises(SemanticProjectionError, match="parse_revision_collision"):
+        project_confirmed_draft(project, _draft(), "revision-snapshot")
 
 
 def test_confirmation_conflicts_for_different_key_or_initial_stale_version(confirmable_store: tuple[SemanticStore, str]) -> None:

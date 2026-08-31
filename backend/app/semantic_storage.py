@@ -472,8 +472,23 @@ class SemanticStore:
         raise SemanticNotFoundError("source_revision_not_found")
 
     def _recover_confirmed(self, draft: SemanticAnalysisDraft) -> SemanticConfirmResult:
-        if draft.confirmed_revision_id is None or draft.confirmed_parse_revision_id is None:
-            raise SemanticValidationError("confirmed_draft_incomplete")
+        if not isinstance(draft.confirm_idempotency_key, str):
+            raise SemanticValidationError("confirmed_artifact_mismatch")
+        try:
+            self._validate_idempotency_key(draft.confirm_idempotency_key)
+        except SemanticValidationError as error:
+            raise SemanticValidationError("confirmed_artifact_mismatch") from error
+        expected_revision_id = self._semantic_revision_id(
+            draft.project_id,
+            draft.id,
+            draft.confirm_idempotency_key,
+        )
+        expected_parse_revision_id = f"semantic-{expected_revision_id}"
+        if (
+            draft.confirmed_revision_id != expected_revision_id
+            or draft.confirmed_parse_revision_id != expected_parse_revision_id
+        ):
+            raise SemanticValidationError("confirmed_artifact_mismatch")
         semantic_revision = self._create_or_load_revision(draft, draft.confirmed_revision_id)
         project = self.project_store.load_project(draft.project_id)
         original = copy.deepcopy(project)
