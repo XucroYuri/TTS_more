@@ -1,5 +1,6 @@
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import subprocess
 import threading
@@ -1191,6 +1192,102 @@ def test_script_revision_persists_exact_source_hash_and_file_metadata(tmp_path: 
     assert revision["source_sha256"] == "268c518e000bed760cce0df64a724ac41db87e96188426119edd4eb7d5397f24"
     persisted = client.get("/api/projects/demo/script-revisions").json()["script_revisions"][-1]
     assert persisted == revision
+
+
+def test_concurrent_script_revision_posts_are_serialized_without_lost_updates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    setup_client = TestClient(app)
+    setup_client.put("/api/projects/demo", json={"title": "Demo", "default_language": "zh"})
+    store = app.state.store
+    start_barrier = threading.Barrier(2)
+    unlocked_load_barrier = threading.Barrier(2)
+    lock_state = threading.local()
+    original_project_lock = store.project_lock
+    original_load_project = store.load_project
+
+    @contextmanager
+    def observed_project_lock(project_id: str):
+        with original_project_lock(project_id):
+            lock_state.held = True
+            try:
+                yield
+            finally:
+                lock_state.held = False
+
+    def synchronize_only_unlocked_loads(project_id: str):
+        project = original_load_project(project_id)
+        if not getattr(lock_state, "held", False):
+            unlocked_load_barrier.wait(timeout=5)
+        return project
+
+    requests = {
+        "first": {
+            "source_markdown": "  第一版\r\n😀 A  ",
+            "source_filename": "并发 A.md",
+            "source_media_type": "text/markdown",
+            "summary": "first",
+        },
+        "second": {
+            "source_markdown": "第二版\r\n乙：台词\r\n",
+            "source_filename": "scene-b.txt",
+            "source_media_type": "text/plain",
+            "summary": "second",
+        },
+    }
+    clients = {key: TestClient(app, raise_server_exceptions=False) for key in requests}
+    responses: dict[str, object] = {}
+    errors: list[BaseException] = []
+    response_lock = threading.Lock()
+
+    def create_revision(key: str) -> None:
+        try:
+            start_barrier.wait(timeout=5)
+            response = clients[key].post(
+                "/api/projects/demo/script-revisions",
+                json=requests[key],
+            )
+            with response_lock:
+                responses[key] = response
+        except BaseException as error:
+            with response_lock:
+                errors.append(error)
+
+    with monkeypatch.context() as concurrent_patch:
+        concurrent_patch.setattr(store, "project_lock", observed_project_lock)
+        concurrent_patch.setattr(store, "load_project", synchronize_only_unlocked_loads)
+        threads = [threading.Thread(target=create_revision, args=(key,)) for key in requests]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+            assert not thread.is_alive()
+
+    assert errors == []
+    assert set(responses) == set(requests)
+    assert [responses[key].status_code for key in sorted(responses)] == [200, 200]
+    returned = {responses[key].json()["revision"]["source_markdown"]: responses[key].json()["revision"] for key in responses}
+    assert sorted(revision["revision_id"] for revision in returned.values()) == ["script-r002", "script-r003"]
+
+    expected_hashes = {
+        "  第一版\r\n😀 A  ": "42f5a7c09fa4c5c14c40a295858ba50ffea696ffc99ab6f948dec63564084f23",
+        "第二版\r\n乙：台词\r\n": "19b947ee7aef124748394434d4af92088e1b12cd39ae20691d134baf4fb37e74",
+    }
+    final_payload = setup_client.get("/api/projects/demo/script-revisions").json()
+    persisted = {revision["source_markdown"]: revision for revision in final_payload["script_revisions"][1:]}
+    assert set(persisted) == set(expected_hashes)
+    for key, request in requests.items():
+        source = request["source_markdown"]
+        assert returned[source]["source_filename"] == request["source_filename"]
+        assert returned[source]["source_media_type"] == request["source_media_type"]
+        assert returned[source]["source_sha256"] == expected_hashes[source]
+        assert persisted[source] == returned[source]
+    by_id = {revision["revision_id"]: revision for revision in persisted.values()}
+    assert by_id["script-r002"]["parent_revision_id"] == "script-r001"
+    assert by_id["script-r003"]["parent_revision_id"] == "script-r002"
+    assert final_payload["active_script_revision_id"] == "script-r003"
 
 
 def test_script_revision_paste_persists_null_metadata_and_source_hash(tmp_path: Path) -> None:

@@ -932,22 +932,25 @@ def create_app(
                 status_code=413,
                 detail=f"source_markdown exceeds {max_script_codepoints} code points",
             )
+
+        def append_revision(project: ScriptProject) -> ScriptRevision:
+            revision = ScriptRevision(
+                revision_id=_next_revision_id("script", [item.revision_id for item in project.script_revisions]),
+                source_markdown=request.source_markdown,
+                source_filename=request.source_filename,
+                source_media_type=request.source_media_type,
+                source_sha256=sha256_source(request.source_markdown),
+                parent_revision_id=project.active_script_revision_id,
+                summary=request.summary,
+            )
+            project.script_revisions.append(revision)
+            project.active_script_revision_id = revision.revision_id
+            return revision
+
         try:
-            project = store.load_project(project_id)
+            project, revision = store.update_project(project_id, append_revision)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
-        revision = ScriptRevision(
-            revision_id=_next_revision_id("script", [item.revision_id for item in project.script_revisions]),
-            source_markdown=request.source_markdown,
-            source_filename=request.source_filename,
-            source_media_type=request.source_media_type,
-            source_sha256=sha256_source(request.source_markdown),
-            parent_revision_id=project.active_script_revision_id,
-            summary=request.summary,
-        )
-        project.script_revisions.append(revision)
-        project.active_script_revision_id = revision.revision_id
-        store.save_project(project_id, project)
         revision_payload = revision.model_dump(mode="json")
         return {"revision": revision_payload, "script_revision": revision_payload, "project": project.model_dump(mode="json")}
 
