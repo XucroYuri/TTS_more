@@ -227,8 +227,8 @@ def _has_alias_relationship_evidence(
             continue
         for alias_start in _all_occurrences(evidence, alias):
             alias_end = alias_start + len(alias)
-            if not any(
-                canonical_start <= alias_start and alias_end <= canonical_end
+            if any(
+                alias_end <= canonical_start or alias_start >= canonical_end
                 for canonical_start, canonical_end in canonical_ranges
             ):
                 return True

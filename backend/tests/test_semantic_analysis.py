@@ -267,6 +267,35 @@ def test_alias_requires_one_unique_relationship_excerpt_with_independent_alias_o
     assert any(item.code == "alias_evidence_mismatch" for item in result.warnings)
 
 
+def test_partially_overlapping_alias_evidence_does_not_map_speaker() -> None:
+    source = _source("老王叔：台词。")
+    run, draft = _run_and_draft(source)
+    response = _response(
+        character_candidates=[
+            CharacterCandidatePayload(
+                canonical_name="老王",
+                aliases=["王叔"],
+                evidence_excerpts=["老王叔"],
+                confidence=0.95,
+            )
+        ],
+        utterance_candidates=[
+            _candidate(
+                "台词。",
+                speaker_name="王叔",
+                speaker_evidence_excerpt="王叔",
+            )
+        ],
+    )
+
+    result = SemanticAnalysisService(FakeSemanticProvider([response])).analyze("demo", source, run, draft)
+
+    assert result.characters[0].aliases == []
+    assert any(item.code == "alias_evidence_mismatch" for item in result.warnings)
+    assert result.utterances[0].character_candidate_id is None
+    assert result.utterances[0].status is ReviewStatus.PENDING
+
+
 def test_evidence_mismatches_are_soft_and_block_only_missing_character_or_speaker_truth() -> None:
     text = "甲：保留这句。\n乙：另一句。"
     source = _source(text)
