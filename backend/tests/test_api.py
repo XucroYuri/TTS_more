@@ -1166,6 +1166,178 @@ def test_put_existing_project_allows_mutable_payload_with_same_revision_authorit
     assert persisted["parse_revisions"][0]["lines"][0]["temporary_binding"] == normalized_binding
 
 
+def _immutable_authority_project() -> dict[str, object]:
+    return {
+        "title": "Immutable authority",
+        "default_language": "zh",
+        "active_script_revision_id": "script-r002",
+        "active_parse_revision_id": "parse-r002",
+        "script_revisions": [
+            {
+                "revision_id": "script-r001",
+                "source_markdown": "甲：旧台词",
+                "source_filename": "old.md",
+                "source_media_type": "text/markdown",
+                "source_sha256": "1" * 64,
+                "parent_revision_id": None,
+                "summary": "old",
+                "created_at": "2026-01-01T00:00:00Z",
+            },
+            {
+                "revision_id": "script-r002",
+                "source_markdown": "甲：新台词",
+                "source_filename": "new.md",
+                "source_media_type": "text/markdown",
+                "source_sha256": "2" * 64,
+                "parent_revision_id": "script-r001",
+                "summary": "new",
+                "created_at": "2026-01-02T00:00:00Z",
+            },
+        ],
+        "parse_revisions": [
+            {
+                "revision_id": "parse-r001",
+                "script_revision_id": "script-r001",
+                "parent_parse_revision_id": None,
+                "provider": "provider-old",
+                "warnings": ["old warning"],
+                "project_characters": [],
+                "lines": [
+                    {
+                        "id": "l001",
+                        "line_uid": "parse-r001:l001",
+                        "character_id": "alice",
+                        "text": "旧台词",
+                    }
+                ],
+                "created_at": "2026-01-01T00:01:00Z",
+            },
+            {
+                "revision_id": "parse-r002",
+                "script_revision_id": "script-r002",
+                "parent_parse_revision_id": "parse-r001",
+                "provider": "provider-new",
+                "warnings": [],
+                "project_characters": [],
+                "lines": [
+                    {
+                        "id": "l001",
+                        "line_uid": "parse-r002:l001",
+                        "character_id": "alice",
+                        "text": "新台词",
+                    }
+                ],
+                "created_at": "2026-01-02T00:01:00Z",
+            },
+        ],
+        "lines": [
+            {
+                "id": "l001",
+                "line_uid": "parse-r002:l001",
+                "character_id": "alice",
+                "text": "新台词",
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("source_markdown", "甲：篡改后的新台词"),
+        ("source_sha256", "f" * 64),
+        ("parent_revision_id", None),
+    ],
+)
+def test_put_existing_project_rejects_changed_script_revision_content(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    client = TestClient(app)
+    assert client.put("/api/projects/demo", json=_immutable_authority_project()).status_code == 200
+    before = app.state.store.project_path("demo").read_bytes()
+    incoming = client.get("/api/projects/demo").json()
+    incoming["script_revisions"][1][field] = replacement
+
+    response = client.put("/api/projects/demo", json=incoming)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "project_revision_authority_conflict"
+    assert app.state.store.project_path("demo").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("script_revision_id", "script-r001"),
+        ("parent_parse_revision_id", None),
+        ("provider", "provider-tampered"),
+        ("warnings", ["tampered warning"]),
+        ("created_at", "2026-01-03T00:00:00Z"),
+    ],
+)
+def test_put_existing_project_rejects_changed_active_parse_immutable_fields(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    client = TestClient(app)
+    assert client.put("/api/projects/demo", json=_immutable_authority_project()).status_code == 200
+    before = app.state.store.project_path("demo").read_bytes()
+    incoming = client.get("/api/projects/demo").json()
+    incoming["parse_revisions"][1][field] = replacement
+
+    response = client.put("/api/projects/demo", json=incoming)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "project_revision_authority_conflict"
+    assert app.state.store.project_path("demo").read_bytes() == before
+
+
+def test_put_existing_project_rejects_changed_inactive_parse_content(tmp_path: Path) -> None:
+    app = create_app(data_root=tmp_path)
+    client = TestClient(app)
+    assert client.put("/api/projects/demo", json=_immutable_authority_project()).status_code == 200
+    before = app.state.store.project_path("demo").read_bytes()
+    incoming = client.get("/api/projects/demo").json()
+    incoming["parse_revisions"][0]["lines"][0]["text"] = "被篡改的历史台词"
+
+    response = client.put("/api/projects/demo", json=incoming)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "project_revision_authority_conflict"
+    assert app.state.store.project_path("demo").read_bytes() == before
+
+
+def test_put_existing_project_rejects_changed_legacy_synthetic_r001_content(tmp_path: Path) -> None:
+    app = create_app(data_root=tmp_path)
+    client = TestClient(app)
+    assert client.put(
+        "/api/projects/demo",
+        json={
+            "title": "Legacy",
+            "default_language": "zh",
+            "lines": [{"id": "l001", "character_id": "alice", "text": "旧台词"}],
+        },
+    ).status_code == 200
+    before = app.state.store.project_path("demo").read_bytes()
+    incoming = client.get("/api/projects/demo").json()
+    assert incoming["script_revisions"][0]["revision_id"] == "script-r001"
+    assert incoming["parse_revisions"][0]["provider"] == "legacy"
+    incoming["script_revisions"][0]["source_markdown"] = "alice: 被篡改的台词"
+    incoming["parse_revisions"][0]["lines"][0]["text"] = "被篡改的台词"
+    incoming["lines"][0]["text"] = "被篡改的台词"
+
+    response = client.put("/api/projects/demo", json=incoming)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "project_revision_authority_conflict"
+    assert app.state.store.project_path("demo").read_bytes() == before
+
+
 def test_project_save_creates_title_named_script_and_output_layout(tmp_path: Path) -> None:
     client = TestClient(create_app(data_root=tmp_path))
     project = {
@@ -1455,6 +1627,208 @@ def test_concurrent_script_revision_posts_are_serialized_without_lost_updates(
     assert by_id["script-r002"]["parent_revision_id"] == "script-r001"
     assert by_id["script-r003"]["parent_revision_id"] == "script-r002"
     assert final_payload["active_script_revision_id"] == "script-r003"
+
+
+def test_parse_revision_commit_preserves_script_revision_created_while_provider_runs(tmp_path: Path) -> None:
+    parse_started = threading.Event()
+    release_parse = threading.Event()
+
+    class BlockingParser:
+        def parse(self, _text: str) -> ParsedScriptDraft:
+            parse_started.set()
+            assert release_parse.wait(5), "test did not release parser"
+            return ParsedScriptDraft(
+                provider="blocking-parser",
+                lines=[{"id": "l001", "character_id": "alice", "text": "解析结果"}],
+            )
+
+    app = create_app(data_root=tmp_path)
+    setup_client = TestClient(app)
+    assert setup_client.put(
+        "/api/projects/demo",
+        json={"title": "Concurrent parse", "default_language": "zh"},
+    ).status_code == 200
+    app.state.parser = BlockingParser()
+    parse_client = TestClient(app, raise_server_exceptions=False)
+    parse_responses: list[object] = []
+
+    def create_parse_revision() -> None:
+        parse_responses.append(
+            parse_client.post(
+                "/api/projects/demo/parse-revisions",
+                json={"script_revision_id": "script-r001"},
+            )
+        )
+
+    parse_thread = threading.Thread(target=create_parse_revision, name="blocking-parse")
+    parse_thread.start()
+    assert parse_started.wait(5), "parser did not start"
+    try:
+        script_response = setup_client.post(
+            "/api/projects/demo/script-revisions",
+            json={"source_markdown": "甲：并发新增台词", "summary": "concurrent"},
+        )
+    finally:
+        release_parse.set()
+        parse_thread.join(5)
+
+    assert not parse_thread.is_alive()
+    assert script_response.status_code == 200
+    assert len(parse_responses) == 1
+    assert parse_responses[0].status_code == 200
+    persisted = setup_client.get("/api/projects/demo").json()
+    assert [revision["revision_id"] for revision in persisted["script_revisions"]] == ["script-r001", "script-r002"]
+    assert [revision["revision_id"] for revision in persisted["parse_revisions"]] == ["parse-r001", "parse-r002"]
+    assert persisted["parse_revisions"][1]["parent_parse_revision_id"] == "parse-r001"
+
+
+def test_activate_revision_preserves_concurrent_script_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    setup_client = TestClient(app)
+    assert setup_client.put(
+        "/api/projects/demo",
+        json={"title": "Concurrent activation", "default_language": "zh"},
+    ).status_code == 200
+    store = app.state.store
+    original_project_lock = store.project_lock
+    original_load_project = store.load_project
+    lock_state = threading.local()
+    activation_loaded = threading.Event()
+    script_post_finished = threading.Event()
+    activation_responses: list[object] = []
+
+    @contextmanager
+    def observed_project_lock(project_id: str):
+        with original_project_lock(project_id):
+            lock_state.held = True
+            try:
+                yield
+            finally:
+                lock_state.held = False
+
+    def coordinated_load(project_id: str):
+        project = original_load_project(project_id)
+        if not activation_loaded.is_set():
+            activation_loaded.set()
+            if not getattr(lock_state, "held", False):
+                assert script_post_finished.wait(5), "script POST did not finish"
+        return project
+
+    monkeypatch.setattr(store, "project_lock", observed_project_lock)
+    monkeypatch.setattr(store, "load_project", coordinated_load)
+    activate_client = TestClient(app, raise_server_exceptions=False)
+
+    def activate_revision() -> None:
+        activation_responses.append(
+            activate_client.post(
+                "/api/projects/demo/activate-revision",
+                json={"script_revision_id": "script-r001"},
+            )
+        )
+
+    activate_thread = threading.Thread(target=activate_revision, name="revision-activator")
+    activate_thread.start()
+    assert activation_loaded.wait(5), "activation did not load the project"
+    try:
+        script_response = setup_client.post(
+            "/api/projects/demo/script-revisions",
+            json={"source_markdown": "甲：激活期间新增", "summary": "concurrent"},
+        )
+    finally:
+        script_post_finished.set()
+        activate_thread.join(5)
+
+    assert not activate_thread.is_alive()
+    assert script_response.status_code == 200
+    assert len(activation_responses) == 1
+    assert activation_responses[0].status_code == 200
+    persisted = setup_client.get("/api/projects/demo").json()
+    assert [revision["revision_id"] for revision in persisted["script_revisions"]] == ["script-r001", "script-r002"]
+    assert persisted["active_script_revision_id"] == "script-r002"
+
+
+def test_project_character_update_preserves_concurrent_script_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    setup_client = TestClient(app)
+    assert setup_client.put(
+        "/api/projects/demo",
+        json={
+            "title": "Concurrent character",
+            "default_language": "zh",
+            "lines": [{"id": "l001", "character_id": "alice", "text": "你好"}],
+        },
+    ).status_code == 200
+    store = app.state.store
+    original_project_lock = store.project_lock
+    original_load_project = store.load_project
+    lock_state = threading.local()
+    character_update_loaded = threading.Event()
+    script_post_finished = threading.Event()
+    character_responses: list[object] = []
+
+    @contextmanager
+    def observed_project_lock(project_id: str):
+        with original_project_lock(project_id):
+            lock_state.held = True
+            try:
+                yield
+            finally:
+                lock_state.held = False
+
+    def coordinated_load(project_id: str):
+        project = original_load_project(project_id)
+        if not character_update_loaded.is_set():
+            character_update_loaded.set()
+            if not getattr(lock_state, "held", False):
+                assert script_post_finished.wait(5), "script POST did not finish"
+        return project
+
+    monkeypatch.setattr(store, "project_lock", observed_project_lock)
+    monkeypatch.setattr(store, "load_project", coordinated_load)
+    character_client = TestClient(app, raise_server_exceptions=False)
+
+    def update_character() -> None:
+        character_responses.append(
+            character_client.put(
+                "/api/projects/demo/characters",
+                json={
+                    "project_characters": [
+                        {
+                            "project_character_id": "alice",
+                            "name": "爱丽丝",
+                            "match_status": "manual",
+                        }
+                    ]
+                },
+            )
+        )
+
+    character_thread = threading.Thread(target=update_character, name="character-updater")
+    character_thread.start()
+    assert character_update_loaded.wait(5), "character update did not load the project"
+    try:
+        script_response = setup_client.post(
+            "/api/projects/demo/script-revisions",
+            json={"source_markdown": "爱丽丝：并发新增", "summary": "concurrent"},
+        )
+    finally:
+        script_post_finished.set()
+        character_thread.join(5)
+
+    assert not character_thread.is_alive()
+    assert script_response.status_code == 200
+    assert len(character_responses) == 1
+    assert character_responses[0].status_code == 200
+    persisted = setup_client.get("/api/projects/demo").json()
+    assert [revision["revision_id"] for revision in persisted["script_revisions"]] == ["script-r001", "script-r002"]
+    assert persisted["active_script_revision_id"] == "script-r002"
+    assert persisted["project_characters"][0]["name"] == "爱丽丝"
 
 
 def test_script_revision_paste_persists_null_metadata_and_source_hash(tmp_path: Path) -> None:

@@ -16,7 +16,7 @@ from typing import Callable, Iterator, TypeVar
 import yaml
 from pydantic import BaseModel
 
-from app.models import Character, GenerationManifest, ScriptProject
+from app.models import Character, GenerationManifest, ParseRevision, ScriptProject
 from app.path_safety import (
     WINDOWS_RESERVED_NAMES,
     encode_windows_component,
@@ -207,7 +207,7 @@ class ProjectStore:
             except FileNotFoundError:
                 self.save_project(safe_id, project)
                 return
-            if self._revision_authority(current) != self._revision_authority(project):
+            if not self._same_revision_authority(current, project):
                 raise ProjectRevisionAuthorityConflict("project revision authority conflict")
             self.save_project(safe_id, project)
 
@@ -233,14 +233,37 @@ class ProjectStore:
             return project, result
 
     @staticmethod
-    def _revision_authority(
-        project: ScriptProject,
-    ) -> tuple[tuple[str, ...], tuple[str, ...], str | None, str | None]:
+    def _same_revision_authority(current: ScriptProject, incoming: ScriptProject) -> bool:
+        if current.active_script_revision_id != incoming.active_script_revision_id:
+            return False
+        if current.active_parse_revision_id != incoming.active_parse_revision_id:
+            return False
+        if current.script_revisions != incoming.script_revisions:
+            return False
+        if len(current.parse_revisions) != len(incoming.parse_revisions):
+            return False
+        for current_revision, incoming_revision in zip(current.parse_revisions, incoming.parse_revisions, strict=True):
+            if current_revision.revision_id != incoming_revision.revision_id:
+                return False
+            if current_revision.revision_id != current.active_parse_revision_id:
+                if current_revision != incoming_revision:
+                    return False
+                continue
+            if ProjectStore._parse_revision_immutable_authority(
+                current_revision
+            ) != ProjectStore._parse_revision_immutable_authority(incoming_revision):
+                return False
+        return True
+
+    @staticmethod
+    def _parse_revision_immutable_authority(revision: ParseRevision) -> tuple[object, ...]:
         return (
-            tuple(revision.revision_id for revision in project.script_revisions),
-            tuple(revision.revision_id for revision in project.parse_revisions),
-            project.active_script_revision_id,
-            project.active_parse_revision_id,
+            revision.revision_id,
+            revision.script_revision_id,
+            revision.parent_parse_revision_id,
+            revision.provider,
+            tuple(revision.warnings),
+            revision.created_at,
         )
 
     def list_projects(self) -> list[dict[str, object]]:

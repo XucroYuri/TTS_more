@@ -976,59 +976,81 @@ def create_app(
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ParserQualityError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        revision_id = _next_revision_id("parse", [item.revision_id for item in project.parse_revisions])
-        project_characters = [
-            ProjectCharacter(
-                project_character_id=character.id,
-                name=character.name,
-                library_character_id=None,
-                match_status="unmatched",
+
+        class ScriptRevisionMissingAtCommit(Exception):
+            pass
+
+        def append_parse_revision(latest: ScriptProject) -> ParseRevision:
+            latest_script_revision = next(
+                (item for item in latest.script_revisions if item.revision_id == request.script_revision_id),
+                None,
             )
-            for character in draft.characters
-        ]
-        lines = [line.model_copy(update={"line_uid": f"{revision_id}:{line.id}"}) for line in draft.lines]
-        draft_project = project.model_copy(
-            deep=True,
-            update={"project_characters": project_characters, "lines": lines},
-        )
-        project_characters = match_project_characters(draft_project, store.load_characters(), force=True)
-        revision = ParseRevision(
-            revision_id=revision_id,
-            script_revision_id=script_revision.revision_id,
-            parent_parse_revision_id=project.active_parse_revision_id,
-            provider=draft.provider,
-            warnings=draft.warnings,
-            project_characters=project_characters,
-            lines=lines,
-        )
-        project.parse_revisions.append(revision)
-        project.active_script_revision_id = script_revision.revision_id
-        project.active_parse_revision_id = revision.revision_id
-        project.project_characters = project_characters
-        project.lines = lines
-        store.save_project(project_id, project)
+            if latest_script_revision is None:
+                raise ScriptRevisionMissingAtCommit
+            revision_id = _next_revision_id("parse", [item.revision_id for item in latest.parse_revisions])
+            project_characters = [
+                ProjectCharacter(
+                    project_character_id=character.id,
+                    name=character.name,
+                    library_character_id=None,
+                    match_status="unmatched",
+                )
+                for character in draft.characters
+            ]
+            lines = [line.model_copy(update={"line_uid": f"{revision_id}:{line.id}"}) for line in draft.lines]
+            draft_project = latest.model_copy(
+                deep=True,
+                update={"project_characters": project_characters, "lines": lines},
+            )
+            project_characters = match_project_characters(draft_project, store.load_characters(), force=True)
+            revision = ParseRevision(
+                revision_id=revision_id,
+                script_revision_id=latest_script_revision.revision_id,
+                parent_parse_revision_id=latest.active_parse_revision_id,
+                provider=draft.provider,
+                warnings=draft.warnings,
+                project_characters=project_characters,
+                lines=lines,
+            )
+            latest.parse_revisions.append(revision)
+            latest.active_script_revision_id = latest_script_revision.revision_id
+            latest.active_parse_revision_id = revision.revision_id
+            latest.project_characters = project_characters
+            latest.lines = lines
+            return revision
+
+        try:
+            project, revision = store.update_project(project_id, append_parse_revision)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except ScriptRevisionMissingAtCommit as exc:
+            raise HTTPException(status_code=404, detail="script revision not found") from exc
         revision_payload = revision.model_dump(mode="json")
         return {"revision": revision_payload, "parse_revision": revision_payload, "project": project.model_dump(mode="json")}
 
     @app.post("/api/projects/{project_id}/activate-revision")
     def activate_revision(project_id: str, request: ActivateRevisionRequest) -> dict[str, Any]:
+        def apply_activation(project: ScriptProject) -> None:
+            if request.script_revision_id:
+                if not any(item.revision_id == request.script_revision_id for item in project.script_revisions):
+                    raise HTTPException(status_code=404, detail="script revision not found")
+                project.active_script_revision_id = request.script_revision_id
+            if request.parse_revision_id:
+                parse_revision = next(
+                    (item for item in project.parse_revisions if item.revision_id == request.parse_revision_id),
+                    None,
+                )
+                if parse_revision is None:
+                    raise HTTPException(status_code=404, detail="parse revision not found")
+                project.active_parse_revision_id = parse_revision.revision_id
+                project.active_script_revision_id = parse_revision.script_revision_id
+                project.project_characters = parse_revision.project_characters
+                project.lines = parse_revision.lines
+
         try:
-            project = store.load_project(project_id)
+            project, _ = store.update_project(project_id, apply_activation)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
-        if request.script_revision_id:
-            if not any(item.revision_id == request.script_revision_id for item in project.script_revisions):
-                raise HTTPException(status_code=404, detail="script revision not found")
-            project.active_script_revision_id = request.script_revision_id
-        if request.parse_revision_id:
-            parse_revision = next((item for item in project.parse_revisions if item.revision_id == request.parse_revision_id), None)
-            if parse_revision is None:
-                raise HTTPException(status_code=404, detail="parse revision not found")
-            project.active_parse_revision_id = parse_revision.revision_id
-            project.active_script_revision_id = parse_revision.script_revision_id
-            project.project_characters = parse_revision.project_characters
-            project.lines = parse_revision.lines
-        store.save_project(project_id, project)
         return {"project": project.model_dump(mode="json")}
 
     @app.post("/api/projects/{project_id}/reference-audio/upload")
@@ -1066,15 +1088,17 @@ def create_app(
 
     @app.get("/api/projects/{project_id}/characters")
     def get_project_characters(project_id: str) -> dict[str, Any]:
+        library = store.load_characters()
+
+        def refresh_matches(project: ScriptProject) -> None:
+            project_characters = match_project_characters(project, library)
+            if project.project_characters != project_characters:
+                project.project_characters = project_characters
+
         try:
-            project = store.load_project(project_id)
+            project, _ = store.update_project(project_id, refresh_matches)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
-        library = store.load_characters()
-        project_characters = match_project_characters(project, library)
-        if project.project_characters != project_characters:
-            project.project_characters = project_characters
-            store.save_project(project_id, project)
         return {
             "project_characters": [item.model_dump(mode="json") for item in project.project_characters],
             "characters": [character.model_dump(mode="json") for character in resolve_project_characters(project, library)],
@@ -1082,29 +1106,38 @@ def create_app(
 
     @app.put("/api/projects/{project_id}/characters")
     def put_project_characters(project_id: str, request: ProjectCharactersUpdate) -> dict[str, Any]:
+        def apply_project_characters(project: ScriptProject) -> None:
+            project.project_characters = request.project_characters
+            active_parse = next(
+                (item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id),
+                None,
+            )
+            if active_parse is not None:
+                active_parse.project_characters = project.project_characters
+
         try:
-            project = store.load_project(project_id)
+            project, _ = store.update_project(project_id, apply_project_characters)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
-        project.project_characters = request.project_characters
-        active_parse = next((item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id), None)
-        if active_parse is not None:
-            active_parse.project_characters = project.project_characters
-        store.save_project(project_id, project)
         return {"project_characters": [item.model_dump(mode="json") for item in project.project_characters]}
 
     @app.post("/api/projects/{project_id}/characters/rematch")
     def rematch_project_characters(project_id: str) -> dict[str, Any]:
+        library = store.load_characters()
+
+        def rematch(project: ScriptProject) -> None:
+            project.project_characters = match_project_characters(project, library, force=True)
+            active_parse = next(
+                (item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id),
+                None,
+            )
+            if active_parse is not None:
+                active_parse.project_characters = project.project_characters
+
         try:
-            project = store.load_project(project_id)
+            project, _ = store.update_project(project_id, rematch)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
-        library = store.load_characters()
-        project.project_characters = match_project_characters(project, library, force=True)
-        active_parse = next((item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id), None)
-        if active_parse is not None:
-            active_parse.project_characters = project.project_characters
-        store.save_project(project_id, project)
         return {
             "project_characters": [item.model_dump(mode="json") for item in project.project_characters],
             "characters": [character.model_dump(mode="json") for character in resolve_project_characters(project, library)],
@@ -1112,31 +1145,40 @@ def create_app(
 
     @app.post("/api/projects/{project_id}/characters/{project_character_id}/freeze")
     def freeze_character(project_id: str, project_character_id: str) -> dict[str, Any]:
+        library = store.load_characters()
+
+        def freeze(project: ScriptProject) -> ProjectCharacter:
+            return freeze_project_character(project, project_character_id, library)
+
         try:
-            project = store.load_project(project_id)
-            project_character = freeze_project_character(project, project_character_id, store.load_characters())
+            _, project_character = store.update_project(project_id, freeze)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="project character not found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        store.save_project(project_id, project)
         return {"project_character": project_character.model_dump(mode="json")}
 
     @app.post("/api/projects/{project_id}/characters/{project_character_id}/unfreeze")
     def unfreeze_character(project_id: str, project_character_id: str) -> dict[str, Any]:
+        def unfreeze(project: ScriptProject) -> ProjectCharacter:
+            for index, project_character in enumerate(project.project_characters):
+                if project_character.project_character_id == project_character_id:
+                    next_character = project_character.model_copy(
+                        update={"mode": ProjectCharacterMode.REFERENCE, "character_snapshot": None}
+                    )
+                    project.project_characters[index] = next_character
+                    return next_character
+            raise KeyError(project_character_id)
+
         try:
-            project = store.load_project(project_id)
+            _, project_character = store.update_project(project_id, unfreeze)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
-        for index, project_character in enumerate(project.project_characters):
-            if project_character.project_character_id == project_character_id:
-                next_character = project_character.model_copy(update={"mode": ProjectCharacterMode.REFERENCE, "character_snapshot": None})
-                project.project_characters[index] = next_character
-                store.save_project(project_id, project)
-                return {"project_character": next_character.model_dump(mode="json")}
-        raise HTTPException(status_code=404, detail="project character not found")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project character not found") from exc
+        return {"project_character": project_character.model_dump(mode="json")}
 
     @app.get("/api/projects/{project_id}/manifest")
     def get_manifest(project_id: str) -> dict[str, Any]:
