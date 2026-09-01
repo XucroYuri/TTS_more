@@ -169,6 +169,30 @@ def test_openai_adapter_uses_grounded_json_contract_and_runtime_egress_validatio
         "all five chunk identity fields",
     ):
         assert requirement in prompt
+    contract_prompt = payload["messages"][1]["content"]  # type: ignore[index]
+    assert "Return exactly one JSON object matching this schema" in contract_prompt
+    schema_marker = "JSON_SCHEMA="
+    schema_text = contract_prompt.split(schema_marker, 1)[1].split("\nCHUNK_METADATA=", 1)[0]
+    transmitted_schema = json.loads(schema_text)
+    assert transmitted_schema["additionalProperties"] is False
+    assert set(transmitted_schema["required"]) == {
+        "chunk_id",
+        "start_utf16",
+        "end_utf16",
+        "overlap_before",
+        "overlap_after",
+    }
+    assert transmitted_schema["properties"]["character_candidates"]["type"] == "array"
+    assert transmitted_schema["properties"]["utterance_candidates"]["type"] == "array"
+    assert transmitted_schema["$defs"]["EmotionOrigin"]["enum"] == ["source_grounded", "inferred", "none"]
+    assert transmitted_schema["$defs"]["UncertaintyCode"]["enum"] == [
+        "speaker_unknown",
+        "speaker_ambiguous",
+        "dialogue_ambiguous",
+        "emotion_inferred",
+        "emotion_ambiguous",
+        "source_anchor_ambiguous",
+    ]
     assert client.closed is False
 
 

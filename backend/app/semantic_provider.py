@@ -327,6 +327,11 @@ class OpenAISemanticProvider(_BaseSemanticProvider):
         return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     def _payload(self, chunk: AnalysisChunk) -> dict[str, Any]:
+        schema_text = json.dumps(
+            _semantic_schema(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return {
             "model": self.config.model,
             "messages": [
@@ -334,8 +339,10 @@ class OpenAISemanticProvider(_BaseSemanticProvider):
                 {
                     "role": "user",
                     "content": (
-                        "Analyze this exact chunk. Echo its chunk metadata in the JSON result.\n"
-                        f"chunk_id={chunk.chunk_id}; start_utf16={chunk.start_utf16}; "
+                        "Analyze this exact chunk. Return exactly one JSON object matching this schema. "
+                        "Do not add keys outside the schema. Use the exact enum strings and chunk identity values.\n"
+                        f"JSON_SCHEMA={schema_text}\n"
+                        f"CHUNK_METADATA=chunk_id={chunk.chunk_id}; start_utf16={chunk.start_utf16}; "
                         f"end_utf16={chunk.end_utf16}; overlap_before={chunk.overlap_before}; "
                         f"overlap_after={chunk.overlap_after}\n```text\n{chunk.text}\n```"
                     ),
