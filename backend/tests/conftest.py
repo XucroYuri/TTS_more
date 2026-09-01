@@ -18,9 +18,16 @@ if str(REPO_ROOT) not in sys.path:
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """Keep retired portable-package coverage out of the default product gate."""
+    run_legacy = os.environ.get("TTS_MORE_RUN_LEGACY_PORTABLE") == "1"
     for item in items:
         if Path(str(item.fspath)).name in LEGACY_PORTABLE_TEST_MODULES:
             item.add_marker(pytest.mark.legacy_portable)
+            if not run_legacy:
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason="retired portable-package suite; set TTS_MORE_RUN_LEGACY_PORTABLE=1 to run explicitly"
+                    )
+                )
 
 
 def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:

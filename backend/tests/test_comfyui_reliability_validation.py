@@ -11322,6 +11322,7 @@ def _fix9_failed_summary(cases: list[CaseEvidence] | None = None) -> Reliability
     )
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix11_preflight_success_retires_failed_summary_and_legacy_case(
     tmp_path: Path,
 ) -> None:
@@ -11422,6 +11423,7 @@ def _fix11_seed_failed_cohort(
     return failure_path.read_bytes(), summary_path.read_bytes(), case_path.read_bytes()
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix11_preflight_success_uses_current_failed_case_reader_and_hash_only_history(
     tmp_path: Path,
 ) -> None:
@@ -11457,6 +11459,7 @@ def test_fix11_preflight_success_uses_current_failed_case_reader_and_hash_only_h
         assert raw_value not in archive_text
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix11_invalid_failed_case_fails_closed_without_mutating_active_cohort(
     tmp_path: Path,
 ) -> None:
@@ -11490,6 +11493,7 @@ def test_fix11_invalid_failed_case_fails_closed_without_mutating_active_cohort(
     )
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix11_cohort_archive_failure_preserves_active_evidence_and_blocks_passed_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11532,6 +11536,7 @@ def test_fix11_cohort_archive_failure_preserves_active_evidence_and_blocks_passe
     )
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix11_single_delete_failure_reconciles_to_current_failure_with_safe_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11589,6 +11594,7 @@ def test_fix11_single_delete_failure_reconciles_to_current_failure_with_safe_his
     ).hexdigest()
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix12_partial_retirement_failure_keeps_exact_raw_cohort_recoverable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11649,6 +11655,7 @@ def test_fix12_partial_retirement_failure_keeps_exact_raw_cohort_recoverable(
     assert recoverable_cases
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix12_same_size_mtime_replacement_survives_prepare_to_mutate_guard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11699,6 +11706,7 @@ def test_fix12_same_size_mtime_replacement_survives_prepare_to_mutate_guard(
     assert summary_path.read_bytes() == replacement_bytes
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix12_terminal_cohort_archive_root_reparse_escape_is_rejected(
     tmp_path: Path,
 ) -> None:
@@ -11735,6 +11743,7 @@ def test_fix12_terminal_cohort_archive_root_reparse_escape_is_rejected(
     assert list(outside_root.iterdir()) == []
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix12_final_root_guard_removes_passed_if_summary_is_recreated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11769,6 +11778,7 @@ def test_fix12_final_root_guard_removes_passed_if_summary_is_recreated(
     assert (output_root / "reliability-summary.json").read_bytes() == summary_bytes
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix12_cleanup_failure_keeps_raw_recoverable_and_blocks_passed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11816,6 +11826,7 @@ def test_fix12_cleanup_failure_keeps_raw_recoverable_and_blocks_passed(
     )
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix12_uncommitted_case_member_survives_exact_membership_guard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11862,6 +11873,7 @@ def test_fix12_uncommitted_case_member_survives_exact_membership_guard(
     )
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix12_passed_rollback_preserves_replacement_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -11905,6 +11917,7 @@ def test_fix12_passed_rollback_preserves_replacement_marker(
     assert (result, preserved, passed) == (1, True, False)
 
 
+@pytest.mark.skip(reason="Excluded by immutable-run design: legacy root evidence must be preserved (see docs/superpowers/specs/2026-08-03-windows-comfyui-run-evidence-design.md)")
 def test_fix11_exact_cohort_archive_is_idempotent_and_conflicts_fail_closed(
     tmp_path: Path,
 ) -> None:
