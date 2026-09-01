@@ -9,11 +9,15 @@ from app.parser import (
     MultiProviderParser,
     OpenAICompatibleProvider,
     ParsedScriptDraft,
+    ParserDiagnosticIssue,
+    ParserDiagnosticRecord,
     ParserProviderConfig,
     ParserProviderUnavailable,
     ParserQualityError,
     ScriptParseVerifier,
+    _decode_anthropic_tool_input,
     _draft_from_provider_payload,
+    _tag_diagnostic_phase,
     chat_completions_url,
     parser_contract_probe_messages,
 )
@@ -136,8 +140,112 @@ def test_provider_payload_rejects_missing_source_text() -> None:
         ],
     }
 
-    with pytest.raises(ParserQualityError, match="line 1 missing source_text"):
+    with pytest.raises(ParserQualityError, match="line 1 missing source_text") as exc_info:
         _draft_from_provider_payload("llm-test", payload)
+
+    assert [item.model_dump(mode="json") for item in exc_info.value.diagnostics] == [
+        {
+            "stage": "normalize",
+            "attempt_phase": None,
+            "issues": [
+                {"type": "missing_field", "path": "provider.payload.lines.*.source_text"},
+                {"type": "partial_normalization_scan", "path": "provider.payload.lines.*"},
+            ],
+            "counts": {
+                "raw_line_item_count": 1,
+                "processed_line_item_count": 1,
+                "normalized_line_count": 0,
+                "dropped_non_object_count": 0,
+                "dropped_missing_speaker_count": 0,
+                "dropped_empty_text_count": 0,
+                "dropped_non_dialogue_role_count": 0,
+            },
+        }
+    ]
+
+
+def test_quality_error_normalizes_mapping_diagnostics_before_phase_tagging() -> None:
+    error = ParserQualityError(
+        "contract failed",
+        diagnostics=[
+            {
+                "stage": "verify",
+                "issues": [{"type": "quality_contract_violation", "path": "verifier.contract"}],
+            }
+        ],  # type: ignore[list-item]
+    )
+
+    _tag_diagnostic_phase(error, "repair")
+
+    assert [item.model_dump(mode="json") for item in error.diagnostics] == [
+        {
+            "stage": "verify",
+            "attempt_phase": "repair",
+            "issues": [{"type": "quality_contract_violation", "path": "verifier.contract"}],
+            "counts": {},
+        }
+    ]
+
+
+def test_provider_payload_reports_empty_text_path_before_missing_source_failure() -> None:
+    payload = {
+        "characters": [{"id": "narrator", "name": "NARRATOR"}],
+        "lines": [
+            {
+                "character_id": "narrator",
+                "text": "",
+                "source_text": "",
+                "source_excerpt": "NARRATOR:",
+            }
+        ],
+    }
+
+    with pytest.raises(ParserQualityError, match="line 1 missing source_text") as exc_info:
+        _draft_from_provider_payload("llm-test", payload)
+
+    assert exc_info.value.diagnostics[0].issues == [
+        ParserDiagnosticIssue(type="missing_field", path="provider.payload.lines.*.source_text"),
+        ParserDiagnosticIssue(type="normalized_line_dropped", path="provider.payload.lines.*.text"),
+        ParserDiagnosticIssue(type="partial_normalization_scan", path="provider.payload.lines.*"),
+    ]
+
+
+def test_provider_payload_marks_prefix_counts_when_later_line_fails() -> None:
+    payload = {
+        "characters": [{"id": "narrator", "name": "NARRATOR"}],
+        "lines": [
+            {
+                "character_id": "narrator",
+                "text": "First.",
+                "source_text": "First.",
+                "source_excerpt": "NARRATOR: First.",
+            },
+            {
+                "character_id": "narrator",
+                "text": "Second.",
+                "source_excerpt": "NARRATOR: Second.",
+            },
+            "not-an-object",
+        ],
+    }
+
+    with pytest.raises(ParserQualityError, match="line 2 missing source_text") as exc_info:
+        _draft_from_provider_payload("llm-test", payload)
+
+    diagnostic = exc_info.value.diagnostics[0].model_dump(mode="json")
+    assert diagnostic["issues"] == [
+        {"type": "missing_field", "path": "provider.payload.lines.*.source_text"},
+        {"type": "partial_normalization_scan", "path": "provider.payload.lines.*"},
+    ]
+    assert diagnostic["counts"] == {
+        "raw_line_item_count": 3,
+        "processed_line_item_count": 2,
+        "normalized_line_count": 1,
+        "dropped_non_object_count": 0,
+        "dropped_missing_speaker_count": 0,
+        "dropped_empty_text_count": 0,
+        "dropped_non_dialogue_role_count": 0,
+    }
 
 
 def test_provider_payload_rejects_missing_source_excerpt() -> None:
@@ -175,6 +283,10 @@ def test_provider_payload_keeps_source_evidence_out_of_serialized_draft() -> Non
 
     assert draft.source_evidence["l001"].source_text == "Hello."
     assert "source_evidence" not in draft.model_dump(mode="json")
+    assert "diagnostic_counts" not in draft.model_dump(mode="json")
+    assert "normalization_issues" not in draft.model_dump(mode="json")
+    assert "diagnostic_counts" not in draft.model_dump_json()
+    assert "normalization_issues" not in draft.model_dump_json()
 
 
 def test_script_parse_verifier_rejects_out_of_order_dialogue() -> None:
@@ -193,8 +305,72 @@ def test_script_parse_verifier_rejects_out_of_order_dialogue() -> None:
 def test_script_parse_verifier_rejects_missing_recognizable_dialogue() -> None:
     draft = make_draft(lines=[ScriptLine(id="l001", character_id="narrator", text="First line.", language="en")])
 
-    with pytest.raises(ParserQualityError, match="missing dialogue lines: expected at least 2, got 1"):
+    with pytest.raises(ParserQualityError, match="missing dialogue lines: expected at least 2, got 1") as exc_info:
         ScriptParseVerifier().verify("NARRATOR: First line.\nNARRATOR: Second line.", draft)
+
+    diagnostic = exc_info.value.diagnostics[0].model_dump(mode="json")
+    assert diagnostic["stage"] == "verify"
+    assert diagnostic["attempt_phase"] is None
+    assert {tuple(sorted(issue.items())) for issue in diagnostic["issues"]} >= {
+        tuple(sorted({"type": "missing_dialogue_coverage", "path": "verifier.dialogue_coverage"}.items()))
+    }
+    assert diagnostic["counts"] == {
+        "normalized_line_count": 1,
+        "reference_candidate_count": 2,
+        "reference_colon_candidate_count": 2,
+        "reference_markdown_candidate_count": 0,
+    }
+
+
+def test_verifier_reports_provider_field_paths_for_normalized_line_drops() -> None:
+    raw_lines: list[object] = [
+        {
+            "character_id": "narrator",
+            "text": f"Line {index}.",
+            "source_text": f"Line {index}.",
+            "source_excerpt": f"NARRATOR: Line {index}.",
+        }
+        for index in range(1, 10)
+    ]
+    raw_lines.extend(
+        [
+            {
+                "text": f"Line {index}.",
+                "source_text": f"Line {index}.",
+                "source_excerpt": f"NARRATOR: Line {index}.",
+            }
+            for index in range(10, 12)
+        ]
+    )
+    raw_lines.extend(["not-an-object"] * 3)
+    payload = {
+        "characters": [{"id": "narrator", "name": "NARRATOR"}],
+        "lines": raw_lines,
+    }
+    draft = _draft_from_provider_payload("llm-test", payload)
+    source = "\n".join(f"NARRATOR: Line {index}." for index in range(1, 15))
+
+    with pytest.raises(ParserQualityError, match="expected at least 14, got 9") as exc_info:
+        ScriptParseVerifier().verify(source, draft)
+
+    diagnostics = [item.model_dump(mode="json") for item in exc_info.value.diagnostics]
+    assert [item["stage"] for item in diagnostics] == ["normalize", "verify"]
+    assert diagnostics[0]["issues"] == [
+        {"type": "normalized_line_dropped", "path": "provider.payload.lines.*.speaker"},
+        {"type": "normalized_line_dropped", "path": "provider.payload.lines.*"},
+    ]
+    assert diagnostics[0]["counts"] == {
+        "raw_line_item_count": 14,
+        "processed_line_item_count": 14,
+        "normalized_line_count": 9,
+        "dropped_non_object_count": 3,
+        "dropped_missing_speaker_count": 2,
+        "dropped_empty_text_count": 0,
+        "dropped_non_dialogue_role_count": 0,
+    }
+    assert diagnostics[1]["issues"] == [
+        {"type": "missing_dialogue_coverage", "path": "verifier.dialogue_coverage"}
+    ]
 
 
 def test_script_parse_verifier_rejects_fabricated_source_excerpt_not_in_source() -> None:
@@ -726,6 +902,48 @@ def test_multi_provider_parser_does_not_fallback_after_quality_failure() -> None
         MultiProviderParser([BadQualityProvider()]).parse("旁白: 天亮了。")
 
 
+def test_multi_provider_parser_preserves_structured_quality_diagnostics() -> None:
+    error = ParserQualityError(
+        "missing dialogue lines: expected at least 2, got 1",
+        diagnostics=[
+            ParserDiagnosticRecord(
+                stage="verify",
+                attempt_phase="repair",
+                issues=[
+                    ParserDiagnosticIssue(
+                        type="missing_dialogue_coverage",
+                        path="verifier.dialogue_coverage",
+                    )
+                ],
+                counts={"reference_candidate_count": 2, "normalized_line_count": 1},
+            )
+        ],
+    )
+
+    class BadQualityProvider:
+        name = "bad-quality"
+
+        def parse(self, _text: str):
+            raise error
+
+    with pytest.raises(ParserQualityError, match="bad-quality: missing dialogue lines") as exc_info:
+        MultiProviderParser([BadQualityProvider()]).parse("旁白: 天亮了。")
+
+    assert exc_info.value.reason_codes == ["missing_dialogue_coverage"]
+    assert len(exc_info.value.diagnostics) == 1
+    assert exc_info.value.diagnostics[0].provider_index == 0
+    assert exc_info.value.diagnostics[0].issues == [
+        ParserDiagnosticIssue(
+            type="missing_dialogue_coverage",
+            path="verifier.dialogue_coverage",
+        )
+    ]
+    assert exc_info.value.diagnostics[0].counts == {
+        "reference_candidate_count": 2,
+        "normalized_line_count": 1,
+    }
+
+
 def test_openai_provider_accepts_valid_llm_output_without_repair(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_TEST_KEY", "sk-test")
     calls: list[dict[str, object]] = []
@@ -912,8 +1130,168 @@ def test_openai_provider_raises_quality_error_when_repair_is_still_invalid(monke
         ParserProviderConfig(name="openai-test", base_url="https://example.invalid", api_key_env="OPENAI_TEST_KEY", model="fake")
     )
 
-    with pytest.raises(ParserQualityError, match="SFX"):
+    with pytest.raises(ParserQualityError, match="SFX") as exc_info:
         provider.parse("> **SFX**: Rain hits metal.")
+
+    diagnostics = [item.model_dump(mode="json") for item in exc_info.value.diagnostics]
+    assert [item["attempt_phase"] for item in diagnostics] == ["initial", "repair"]
+    assert all(item["stage"] == "normalize" for item in diagnostics)
+    assert all(
+        item["issues"] == [{"type": "non_dialogue_role", "path": "provider.payload.characters.*"}]
+        for item in diagnostics
+    )
+    assert all(item["counts"]["raw_line_item_count"] == 1 for item in diagnostics)
+    assert all(item["counts"]["normalized_line_count"] == 0 for item in diagnostics)
+    assert all(item["counts"]["dropped_non_dialogue_role_count"] == 1 for item in diagnostics)
+
+
+@pytest.mark.parametrize(
+    ("response_payload", "expected_message"),
+    [
+        ({"choices": [{"message": {"content": "[]"}}]}, "parser response must be a JSON object"),
+        ({"choices": [{"message": {"content": "not-json"}}]}, "parser response was not valid JSON"),
+        ({}, "parser response envelope was invalid"),
+    ],
+)
+def test_openai_provider_tags_initial_decode_response_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    response_payload: dict[str, object],
+    expected_message: str,
+) -> None:
+    monkeypatch.setenv("OPENAI_TEST_KEY", "sk-test")
+    calls = 0
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return response_payload
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            return None
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, *_args: object, **_kwargs: object) -> FakeResponse:
+            nonlocal calls
+            calls += 1
+            return FakeResponse()
+
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
+    provider = OpenAICompatibleProvider(
+        ParserProviderConfig(
+            name="openai-test",
+            base_url="https://example.invalid",
+            api_key_env="OPENAI_TEST_KEY",
+            model="fake",
+        )
+    )
+
+    with pytest.raises(ParserQualityError, match=expected_message) as exc_info:
+        provider.parse("旁白: 天亮了。")
+
+    assert calls == 1
+    assert [item.model_dump(mode="json") for item in exc_info.value.diagnostics] == [
+        {
+            "stage": "decode",
+            "attempt_phase": "initial",
+            "issues": [{"type": "invalid_type", "path": "provider.payload"}],
+            "counts": {},
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("repair_payload", "expected_message"),
+    [
+        ({"choices": [{"message": {"content": "[]"}}]}, "parser response must be a JSON object"),
+        ({"choices": [{"message": {"content": "not-json"}}]}, "parser response was not valid JSON"),
+        ({}, "parser response envelope was invalid"),
+    ],
+)
+def test_openai_provider_keeps_repair_decode_response_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    repair_payload: dict[str, object],
+    expected_message: str,
+) -> None:
+    monkeypatch.setenv("OPENAI_TEST_KEY", "sk-test")
+    response_payloads = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "characters": [{"id": "sfx", "name": "SFX"}],
+                                "lines": [
+                                    {
+                                        "character_id": "sfx",
+                                        "text": "Rain hits metal.",
+                                        "source_text": "Rain hits metal.",
+                                        "source_excerpt": "SFX: Rain hits metal.",
+                                    }
+                                ],
+                            }
+                        )
+                    }
+                }
+            ]
+        },
+        repair_payload,
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return self.payload
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            self.calls = 0
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, *_args: object, **_kwargs: object) -> FakeResponse:
+            response = FakeResponse(response_payloads[self.calls])
+            self.calls += 1
+            return response
+
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
+    provider = OpenAICompatibleProvider(
+        ParserProviderConfig(
+            name="openai-test",
+            base_url="https://example.invalid",
+            api_key_env="OPENAI_TEST_KEY",
+            model="fake",
+        )
+    )
+
+    with pytest.raises(ParserQualityError, match=expected_message) as exc_info:
+        provider.parse("SFX: Rain hits metal.")
+
+    diagnostics = [item.model_dump(mode="json") for item in exc_info.value.diagnostics]
+    assert [item["attempt_phase"] for item in diagnostics] == ["initial", "repair"]
+    assert diagnostics[-1] == {
+        "stage": "decode",
+        "attempt_phase": "repair",
+        "issues": [{"type": "invalid_type", "path": "provider.payload"}],
+        "counts": {},
+    }
 
 
 def test_chat_completions_url_normalizes_kwjm_root_and_legacy_v1_base() -> None:
@@ -1070,6 +1448,120 @@ def test_anthropic_provider_posts_messages_tool_contract(monkeypatch: pytest.Mon
     assert payload["model"] == "claude-fable-5"
     assert payload["tool_choice"] == {"type": "tool", "name": "emit_tts_parse"}
     assert payload["tools"][0]["name"] == "emit_tts_parse"
+
+
+@pytest.mark.parametrize(
+    ("response_payload", "expected_message", "issue_type", "issue_path"),
+    [
+        ({"content": []}, "did not include emit_tts_parse", "missing_field", "provider.payload"),
+        ([], "anthropic response envelope was invalid", "invalid_type", "provider.payload"),
+        (
+            {"content": None},
+            "anthropic response content must be a list",
+            "invalid_type",
+            "provider.payload.content",
+        ),
+    ],
+)
+def test_anthropic_provider_tags_initial_decode_error(
+    monkeypatch: pytest.MonkeyPatch,
+    response_payload: object,
+    expected_message: str,
+    issue_type: str,
+    issue_path: str,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_TEST_KEY", "sk-ant-test")
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> object:
+            return response_payload
+
+    class FakeClient:
+        def __init__(self, *, timeout: float) -> None:
+            return None
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, *_args: object, **_kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+    monkeypatch.setattr("app.parser.httpx.Client", FakeClient)
+    provider = AnthropicProvider(
+        ParserProviderConfig(
+            name="anthropic-test",
+            base_url="https://api.anthropic.com",
+            api_key_env="ANTHROPIC_TEST_KEY",
+            model="claude-fable-5",
+            adapter="anthropic",
+        )
+    )
+
+    with pytest.raises(ParserQualityError, match=expected_message) as exc_info:
+        provider.parse("旁白: 天亮了。")
+
+    assert [item.model_dump(mode="json") for item in exc_info.value.diagnostics] == [
+        {
+            "stage": "decode",
+            "attempt_phase": "initial",
+            "issues": [{"type": issue_type, "path": issue_path}],
+            "counts": {},
+        }
+    ]
+
+
+def test_anthropic_provider_keeps_invalid_repair_content_diagnostic() -> None:
+    provider = AnthropicProvider(
+        ParserProviderConfig(
+            name="anthropic-test",
+            base_url="https://api.anthropic.com",
+            api_key_env="ANTHROPIC_TEST_KEY",
+            model="claude-fable-5",
+            adapter="anthropic",
+        )
+    )
+    responses: list[dict[str, object]] = [
+        {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "emit_tts_parse",
+                    "input": {
+                        "characters": [{"id": "sfx", "name": "SFX"}],
+                        "lines": [
+                            {
+                                "character_id": "sfx",
+                                "text": "Rain hits metal.",
+                                "source_text": "Rain hits metal.",
+                                "source_excerpt": "SFX: Rain hits metal.",
+                            }
+                        ],
+                    },
+                }
+            ]
+        },
+        {"content": None},
+    ]
+
+    def fake_post_json(_api_key: str, _messages: list[dict[str, str]]) -> dict[str, object]:
+        return _decode_anthropic_tool_input(responses.pop(0))
+
+    provider._post_json = fake_post_json  # type: ignore[method-assign]
+
+    with pytest.raises(ParserQualityError, match="content must be a list") as exc_info:
+        provider._parse_with_key("SFX: Rain hits metal.", "sk-ant-test")
+
+    diagnostics = exc_info.value.diagnostics
+    assert [item.attempt_phase for item in diagnostics] == ["initial", "repair"]
+    assert diagnostics[-1].issues == [
+        ParserDiagnosticIssue(type="invalid_type", path="provider.payload.content")
+    ]
 
 
 def test_anthropic_provider_repairs_with_explicit_repair_message(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -21,12 +21,27 @@ class LineSourceEvidence(BaseModel):
     source_excerpt: str = ""
 
 
+class ParserDiagnosticIssue(BaseModel):
+    type: str
+    path: str
+
+
+class ParserDiagnosticRecord(BaseModel):
+    stage: str
+    attempt_phase: str | None = None
+    provider_index: int | None = Field(default=None, exclude=True, repr=False)
+    issues: list[ParserDiagnosticIssue] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+
+
 class ParsedScriptDraft(BaseModel):
     provider: str
     characters: list[Character] = Field(default_factory=list)
     lines: list[ScriptLine] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     source_evidence: dict[str, LineSourceEvidence] = Field(default_factory=dict, exclude=True)
+    diagnostic_counts: dict[str, int] = Field(default_factory=dict, exclude=True, repr=False)
+    normalization_issues: list[ParserDiagnosticIssue] = Field(default_factory=list, exclude=True, repr=False)
 
 
 class ParserProbeResult(BaseModel):
@@ -64,10 +79,69 @@ class ParserProviderUnavailable(RuntimeError):
 class ParserQualityError(RuntimeError):
     """A string-compatible contract error with safe, machine-readable categories."""
 
-    def __init__(self, message: str, *, reason_codes: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_codes: list[str] | None = None,
+        diagnostics: list[ParserDiagnosticRecord | dict[str, Any]] | None = None,
+    ) -> None:
         super().__init__(message)
         self.reason_codes = reason_codes or _reason_codes_for_message(message)
         self.reasons = self.reason_codes
+        self.diagnostics: list[ParserDiagnosticRecord] = []
+        for diagnostic in diagnostics or []:
+            try:
+                normalized = (
+                    diagnostic.model_copy(deep=True)
+                    if isinstance(diagnostic, ParserDiagnosticRecord)
+                    else ParserDiagnosticRecord.model_validate(diagnostic)
+                )
+            except (TypeError, ValueError):
+                continue
+            self.diagnostics.append(normalized)
+
+
+def _diagnostic_record(
+    stage: str,
+    issue_type: str,
+    path: str,
+    counts: dict[str, int] | None = None,
+) -> ParserDiagnosticRecord:
+    return ParserDiagnosticRecord(
+        stage=stage,
+        issues=[ParserDiagnosticIssue(type=issue_type, path=path)],
+        counts=dict(counts or {}),
+    )
+
+
+def _tag_diagnostic_phase(exc: ParserQualityError, phase: str) -> ParserQualityError:
+    for diagnostic in exc.diagnostics:
+        if diagnostic.attempt_phase is None:
+            diagnostic.attempt_phase = phase
+    return exc
+
+
+def _normalization_diagnostic(
+    issue_type: str,
+    path: str,
+    counts: dict[str, int],
+    *,
+    partial_scan: bool,
+    related_issues: list[ParserDiagnosticIssue] | None = None,
+) -> ParserDiagnosticRecord:
+    diagnostic = _diagnostic_record("normalize", issue_type, path, counts)
+    for issue in related_issues or []:
+        if issue not in diagnostic.issues:
+            diagnostic.issues.append(issue.model_copy(deep=True))
+    if partial_scan:
+        diagnostic.issues.append(
+            ParserDiagnosticIssue(
+                type="partial_normalization_scan",
+                path="provider.payload.lines.*",
+            )
+        )
+    return diagnostic
 
 
 def chat_completions_url(base_url: str) -> str:
@@ -554,17 +628,34 @@ def _finalize_lines(
 
 class ScriptParseVerifier:
     def verify(self, source_text: str, draft: ParsedScriptDraft) -> ParsedScriptDraft:
+        normalization_diagnostics = _draft_normalization_diagnostics(draft)
         alias_reasons = _canonicalize_short_name_characters(draft, source_text)
         if alias_reasons:
-            raise ParserQualityError("; ".join(alias_reasons), reason_codes=_reason_codes_for_reasons(alias_reasons))
+            raise ParserQualityError(
+                "; ".join(alias_reasons),
+                reason_codes=_reason_codes_for_reasons(alias_reasons),
+                diagnostics=[
+                    *normalization_diagnostics,
+                    _diagnostic_record(
+                        "verify",
+                        "ambiguous_short_name_alias",
+                        "verifier.characters",
+                        draft.diagnostic_counts,
+                    )
+                ],
+            )
         reasons = _quality_reasons(draft, source_text)
         if reasons:
-            raise ParserQualityError("; ".join(reasons), reason_codes=_reason_codes_for_reasons(reasons))
+            raise ParserQualityError(
+                "; ".join(reasons),
+                reason_codes=_reason_codes_for_reasons(reasons),
+                diagnostics=[*normalization_diagnostics, _quality_diagnostic(draft, source_text, reasons)],
+            )
         return draft
 
 
-def _reference_dialogue_texts(text: str) -> list[str]:
-    dialogue_lines: list[str] = []
+def _reference_dialogue_candidates(text: str) -> list[tuple[str, str]]:
+    dialogue_lines: list[tuple[str, str]] = []
     raw_lines = text.splitlines()
     index = 0
     while index < len(raw_lines):
@@ -587,7 +678,7 @@ def _reference_dialogue_texts(text: str) -> list[str]:
                 line_text = leading_note.group("text").strip()
             cleaned = _clean_dialogue(line_text)
             if cleaned:
-                dialogue_lines.append(cleaned)
+                dialogue_lines.append(("colon", cleaned))
             index += 1
             continue
         speaker = _markdown_speaker(raw)
@@ -606,10 +697,14 @@ def _reference_dialogue_texts(text: str) -> list[str]:
                 dialogue.append(_clean_dialogue(candidate))
                 index += 1
             if dialogue:
-                dialogue_lines.append(" ".join(dialogue))
+                dialogue_lines.append(("markdown", " ".join(dialogue)))
             continue
         index += 1
     return dialogue_lines
+
+
+def _reference_dialogue_texts(text: str) -> list[str]:
+    return [candidate for _detector, candidate in _reference_dialogue_candidates(text)]
 
 
 def _canonicalize_short_name_characters(draft: ParsedScriptDraft, source_text: str) -> list[str]:
@@ -705,11 +800,16 @@ class OpenAICompatibleProvider:
         url = chat_completions_url(self.config.base_url)
         decoded: dict[str, Any]
         with httpx.Client(timeout=self.config.timeout_seconds) as client:
-            decoded = self._post_json(client, url, headers, messages)
+            try:
+                decoded = self._post_json(client, url, headers, messages)
+            except ParserQualityError as initial_error:
+                _tag_diagnostic_phase(initial_error, "initial")
+                raise
             try:
                 draft = _draft_from_provider_payload(self.name, decoded)
                 return self.verifier.verify(text, draft)
             except ParserQualityError as first_error:
+                _tag_diagnostic_phase(first_error, "initial")
                 repair_messages = [
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {
@@ -722,9 +822,14 @@ class OpenAICompatibleProvider:
                         ),
                     },
                 ]
-                repaired = self._post_json(client, url, headers, repair_messages)
-                draft = _draft_from_provider_payload(self.name, repaired)
-                self.verifier.verify(text, draft)
+                try:
+                    repaired = self._post_json(client, url, headers, repair_messages)
+                    draft = _draft_from_provider_payload(self.name, repaired)
+                    self.verifier.verify(text, draft)
+                except ParserQualityError as repair_error:
+                    _tag_diagnostic_phase(repair_error, "repair")
+                    repair_error.diagnostics = [*first_error.diagnostics, *repair_error.diagnostics]
+                    raise
                 draft.warnings = [f"LLM output repaired after quality failure: {first_error}", *draft.warnings]
                 return draft
 
@@ -751,7 +856,19 @@ class OpenAICompatibleProvider:
         }
         response = client.post(url, headers=headers, json=payload)
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
+        try:
+            response_payload = response.json()
+            content = response_payload["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise ParserQualityError(
+                "parser response envelope was invalid",
+                diagnostics=[_diagnostic_record("decode", "invalid_type", "provider.payload")],
+            ) from exc
+        if type(content) is not str:
+            raise ParserQualityError(
+                "parser response envelope was invalid",
+                diagnostics=[_diagnostic_record("decode", "invalid_type", "provider.payload")],
+            )
         return _decode_json_content(content)
 
 
@@ -823,14 +940,19 @@ class AnthropicProvider:
         return ParserProbeResult(draft=draft, content_preview=json.dumps(decoded, ensure_ascii=False)[:120])
 
     def _parse_with_key(self, text: str, api_key: str) -> ParsedScriptDraft:
-        decoded = self._post_json(
-            api_key,
-            [{"role": "user", "content": f"Script:\n```text\n{text}\n```"}],
-        )
+        try:
+            decoded = self._post_json(
+                api_key,
+                [{"role": "user", "content": f"Script:\n```text\n{text}\n```"}],
+            )
+        except ParserQualityError as initial_error:
+            _tag_diagnostic_phase(initial_error, "initial")
+            raise
         try:
             draft = _draft_from_provider_payload(self.name, decoded)
             return self.verifier.verify(text, draft)
         except ParserQualityError as first_error:
+            _tag_diagnostic_phase(first_error, "initial")
             repair_messages = [
                 {
                     "role": "user",
@@ -842,12 +964,17 @@ class AnthropicProvider:
                     ),
                 }
             ]
-            repaired = self._post_json(
-                api_key,
-                repair_messages,
-            )
-            draft = _draft_from_provider_payload(self.name, repaired)
-            self.verifier.verify(text, draft)
+            try:
+                repaired = self._post_json(
+                    api_key,
+                    repair_messages,
+                )
+                draft = _draft_from_provider_payload(self.name, repaired)
+                self.verifier.verify(text, draft)
+            except ParserQualityError as repair_error:
+                _tag_diagnostic_phase(repair_error, "repair")
+                repair_error.diagnostics = [*first_error.diagnostics, *repair_error.diagnostics]
+                raise
             draft.warnings = [f"LLM output repaired after quality failure: {first_error}", *draft.warnings]
             return draft
 
@@ -869,7 +996,19 @@ class AnthropicProvider:
         with httpx.Client(timeout=self.config.timeout_seconds) as client:
             response = client.post(anthropic_messages_url(self.config.base_url), headers=headers, json=payload)
             response.raise_for_status()
-            return _decode_anthropic_tool_input(response.json())
+            try:
+                response_payload = response.json()
+            except (ValueError, TypeError) as exc:
+                raise ParserQualityError(
+                    "anthropic response envelope was invalid",
+                    diagnostics=[_diagnostic_record("decode", "invalid_type", "provider.payload")],
+                ) from exc
+            if type(response_payload) is not dict:
+                raise ParserQualityError(
+                    "anthropic response envelope was invalid",
+                    diagnostics=[_diagnostic_record("decode", "invalid_type", "provider.payload")],
+                )
+            return _decode_anthropic_tool_input(response_payload)
 
 
 def build_parser_provider(config: ParserProviderConfig, verifier: ScriptParseVerifier | None = None) -> ParserProvider:
@@ -881,30 +1020,68 @@ def build_parser_provider(config: ParserProviderConfig, verifier: ScriptParseVer
 def _decode_json_content(content: str) -> dict[str, Any]:
     try:
         decoded = json.loads(content)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as initial_error:
         stripped = re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
         start = stripped.find("{")
         end = stripped.rfind("}")
         if start < 0 or end < start:
-            raise
-        decoded = json.loads(stripped[start : end + 1])
+            raise ParserQualityError(
+                "parser response was not valid JSON",
+                diagnostics=[_diagnostic_record("decode", "invalid_type", "provider.payload")],
+            ) from initial_error
+        try:
+            decoded = json.loads(stripped[start : end + 1])
+        except json.JSONDecodeError as extracted_error:
+            raise ParserQualityError(
+                "parser response was not valid JSON",
+                diagnostics=[_diagnostic_record("decode", "invalid_type", "provider.payload")],
+            ) from extracted_error
     if not isinstance(decoded, dict):
-        raise ParserQualityError("parser response must be a JSON object")
+        raise ParserQualityError(
+            "parser response must be a JSON object",
+            diagnostics=[_diagnostic_record("decode", "invalid_type", "provider.payload")],
+        )
     return decoded
 
 
 def _decode_anthropic_tool_input(payload: dict[str, Any]) -> dict[str, Any]:
-    for item in payload.get("content", []):
+    content = payload.get("content", [])
+    if type(content) is not list:
+        raise ParserQualityError(
+            "anthropic response content must be a list",
+            diagnostics=[
+                _diagnostic_record(
+                    "decode",
+                    "invalid_type",
+                    "provider.payload.content",
+                )
+            ],
+        )
+    for item in content:
         if isinstance(item, dict) and item.get("type") == "tool_use" and item.get("name") == "emit_tts_parse":
             tool_input = item.get("input")
             if isinstance(tool_input, dict):
                 return tool_input
-    raise ParserQualityError("anthropic response did not include emit_tts_parse tool input")
+    raise ParserQualityError(
+        "anthropic response did not include emit_tts_parse tool input",
+        diagnostics=[_diagnostic_record("decode", "missing_field", "provider.payload")],
+    )
 
 
 def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> ParsedScriptDraft:
     warnings = [str(item) for item in payload.get("warnings", [])]
     records: list[dict[str, str]] = []
+    normalization_issues: list[ParserDiagnosticIssue] = []
+    raw_lines = payload.get("lines", [])
+    diagnostic_counts = {
+        "raw_line_item_count": len(raw_lines) if isinstance(raw_lines, list) else 0,
+        "processed_line_item_count": 0,
+        "normalized_line_count": 0,
+        "dropped_non_object_count": 0,
+        "dropped_missing_speaker_count": 0,
+        "dropped_empty_text_count": 0,
+        "dropped_non_dialogue_role_count": 0,
+    }
     raw_characters = payload.get("characters", [])
     names_by_key: dict[str, str] = {}
     non_dialogue_names: list[str] = []
@@ -927,27 +1104,91 @@ def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> Pars
             raise ParserQualityError(
                 f"ambiguous short-name character alias {short_name}",
                 reason_codes=["ambiguous_short_name_alias"],
+                diagnostics=[
+                    _normalization_diagnostic(
+                        "ambiguous_short_name_alias",
+                        "provider.payload.characters.*",
+                        diagnostic_counts,
+                        partial_scan=True,
+                    )
+                ],
             )
         if len(candidates) == 1:
             canonical_name = candidates[0]
             for key, name in list(names_by_key.items()):
                 if name == short_name:
                     names_by_key[key] = canonical_name
-    raw_lines = payload.get("lines", [])
     if not isinstance(raw_lines, list):
-        raise ParserQualityError("lines must be a list")
+        raise ParserQualityError(
+            "lines must be a list",
+            diagnostics=[
+                _normalization_diagnostic(
+                    "invalid_type",
+                    "provider.payload.lines",
+                    diagnostic_counts,
+                    partial_scan=True,
+                )
+            ],
+        )
     for index, item in enumerate(raw_lines, start=1):
+        diagnostic_counts["processed_line_item_count"] = index
         if not isinstance(item, dict):
+            diagnostic_counts["dropped_non_object_count"] += 1
+            _append_diagnostic_issue(
+                normalization_issues,
+                "normalized_line_dropped",
+                "provider.payload.lines.*",
+            )
             continue
         text = _clean_dialogue(item.get("text") or item.get("dialogue"))
+        if not text:
+            diagnostic_counts["dropped_empty_text_count"] += 1
+            _append_diagnostic_issue(
+                normalization_issues,
+                "normalized_line_dropped",
+                "provider.payload.lines.*.text",
+            )
         source_text = _clean_markup(item.get("source_text", ""))
         source_excerpt = _clean_source_excerpt(item.get("source_excerpt", ""))
         if not source_text:
-            raise ParserQualityError(f"line {index} missing source_text")
+            raise ParserQualityError(
+                f"line {index} missing source_text",
+                diagnostics=[
+                    _normalization_diagnostic(
+                        "missing_field",
+                        "provider.payload.lines.*.source_text",
+                        diagnostic_counts,
+                        partial_scan=True,
+                        related_issues=normalization_issues,
+                    )
+                ],
+            )
         if not source_excerpt:
-            raise ParserQualityError(f"line {index} missing source_excerpt")
+            raise ParserQualityError(
+                f"line {index} missing source_excerpt",
+                diagnostics=[
+                    _normalization_diagnostic(
+                        "missing_field",
+                        "provider.payload.lines.*.source_excerpt",
+                        diagnostic_counts,
+                        partial_scan=True,
+                        related_issues=normalization_issues,
+                    )
+                ],
+            )
         if source_text and _source_fidelity_text(source_text) != _source_fidelity_text(text):
-            raise ParserQualityError("source_text does not match text")
+            raise ParserQualityError(
+                "source_text does not match text",
+                diagnostics=[
+                    _normalization_diagnostic(
+                        "source_text_mismatch",
+                        "provider.payload.lines.*.source_text",
+                        diagnostic_counts,
+                        partial_scan=True,
+                        related_issues=normalization_issues,
+                    )
+                ],
+            )
         raw_character = _clean_markup(
             item.get("character_id")
             or item.get("speaker_id")
@@ -956,8 +1197,22 @@ def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> Pars
             or item.get("name")
         )
         name = names_by_key.get(raw_character) or names_by_key.get(slugify_name(raw_character)) or raw_character
-        if _is_non_dialogue_role(name):
+        if not name:
+            diagnostic_counts["dropped_missing_speaker_count"] += 1
+            _append_diagnostic_issue(
+                normalization_issues,
+                "normalized_line_dropped",
+                "provider.payload.lines.*.speaker",
+            )
+        is_non_dialogue_role = _is_non_dialogue_role(name)
+        if is_non_dialogue_role:
             non_dialogue_names.append(name)
+            diagnostic_counts["dropped_non_dialogue_role_count"] += 1
+            _append_diagnostic_issue(
+                normalization_issues,
+                "normalized_line_dropped",
+                "provider.payload.lines.*.speaker",
+            )
         records.append(
             {
                 "speaker": name,
@@ -968,13 +1223,39 @@ def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> Pars
                 "source_excerpt": source_excerpt,
             }
         )
+        if name and text and not is_non_dialogue_role:
+            diagnostic_counts["normalized_line_count"] += 1
     draft = _finalize_lines(provider, records, warnings)
+    diagnostic_counts["normalized_line_count"] = len(draft.lines)
+    draft.diagnostic_counts = diagnostic_counts
+    draft.normalization_issues = normalization_issues
     alias_reasons = _canonicalize_short_name_characters(draft, "")
     if alias_reasons:
-        raise ParserQualityError("; ".join(alias_reasons), reason_codes=_reason_codes_for_reasons(alias_reasons))
+        raise ParserQualityError(
+            "; ".join(alias_reasons),
+            reason_codes=_reason_codes_for_reasons(alias_reasons),
+            diagnostics=[
+                _diagnostic_record(
+                    "normalize",
+                    "ambiguous_short_name_alias",
+                    "provider.payload.characters.*",
+                    diagnostic_counts,
+                )
+            ],
+        )
     reasons = _payload_reasons(non_dialogue_names)
     if reasons:
-        raise ParserQualityError("; ".join(reasons))
+        raise ParserQualityError(
+            "; ".join(reasons),
+            diagnostics=[
+                _diagnostic_record(
+                    "normalize",
+                    "non_dialogue_role",
+                    "provider.payload.characters.*",
+                    diagnostic_counts,
+                )
+            ],
+        )
     return draft
 
 
@@ -1085,15 +1366,79 @@ def _quality_reasons(draft: ParsedScriptDraft, source_text: str) -> list[str]:
     return list(dict.fromkeys(reasons))
 
 
+_QUALITY_DIAGNOSTIC_PATHS = {
+    "missing_dialogue_coverage": "verifier.dialogue_coverage",
+    "missing_quoted_dialogue_coverage": "verifier.quoted_dialogue_coverage",
+    "text_not_in_source_order": "verifier.lines.*.text",
+    "source_text_mismatch": "verifier.lines.*.source_text",
+    "source_excerpt_not_traceable": "verifier.lines.*.source_excerpt",
+    "source_excerpt_missing_source_text": "verifier.lines.*.source_excerpt",
+    "speaker_anchor_mismatch": "verifier.lines.*.speaker",
+    "ambiguous_short_name_alias": "verifier.characters",
+    "unknown_character": "verifier.lines.*.character_id",
+    "non_dialogue_role": "verifier.characters.*",
+    "quality_contract_violation": "verifier.contract",
+}
+
+
+def _quality_diagnostic(
+    draft: ParsedScriptDraft,
+    source_text: str,
+    reasons: list[str],
+) -> ParserDiagnosticRecord:
+    candidates = _reference_dialogue_candidates(source_text)
+    counts = dict(draft.diagnostic_counts)
+    counts.update(
+        {
+            "normalized_line_count": len(draft.lines),
+            "reference_candidate_count": len(candidates),
+            "reference_colon_candidate_count": sum(1 for detector, _text in candidates if detector == "colon"),
+            "reference_markdown_candidate_count": sum(
+                1 for detector, _text in candidates if detector == "markdown"
+            ),
+        }
+    )
+    issues = [
+        ParserDiagnosticIssue(
+            type=code,
+            path=_QUALITY_DIAGNOSTIC_PATHS.get(code, "verifier.contract"),
+        )
+        for code in _reason_codes_for_reasons(reasons)
+    ]
+    return ParserDiagnosticRecord(stage="verify", issues=issues, counts=counts)
+
+
+def _append_diagnostic_issue(
+    issues: list[ParserDiagnosticIssue],
+    issue_type: str,
+    path: str,
+) -> None:
+    issue = ParserDiagnosticIssue(type=issue_type, path=path)
+    if issue not in issues:
+        issues.append(issue)
+
+
+def _draft_normalization_diagnostics(draft: ParsedScriptDraft) -> list[ParserDiagnosticRecord]:
+    if not draft.normalization_issues:
+        return []
+    return [
+        ParserDiagnosticRecord(
+            stage="normalize",
+            issues=[issue.model_copy(deep=True) for issue in draft.normalization_issues],
+            counts=dict(draft.diagnostic_counts),
+        )
+    ]
+
+
 class MultiProviderParser:
     def __init__(self, providers: list[ParserProvider]) -> None:
         self.providers = providers
 
     def parse(self, text: str) -> ParsedScriptDraft:
-        quality_errors: list[str] = []
+        quality_errors: list[tuple[int, str, ParserQualityError]] = []
         availability_errors: list[str] = []
         attempted_provider = False
-        for provider in self.providers:
+        for provider_index, provider in enumerate(self.providers):
             if not _provider_enabled(provider):
                 continue
             attempted_provider = True
@@ -1101,13 +1446,35 @@ class MultiProviderParser:
                 draft = provider.parse(text)
                 return draft
             except ParserQualityError as exc:
-                quality_errors.append(f"{provider.name}: {exc}")
+                for diagnostic in exc.diagnostics:
+                    if diagnostic.provider_index is None:
+                        diagnostic.provider_index = provider_index
+                quality_errors.append((provider_index, provider.name, exc))
             except ParserProviderUnavailable as exc:
                 availability_errors.append(f"{provider.name}: {exc}")
             except Exception as exc:
                 availability_errors.append(f"{provider.name}: {scrub_error(exc, getattr(provider.config, 'base_url', None))}")
         if quality_errors:
-            raise ParserQualityError("; ".join(quality_errors))
+            reason_codes = list(
+                dict.fromkeys(
+                    code
+                    for _provider_index, _provider_name, error in quality_errors
+                    for code in error.reason_codes
+                )
+            )
+            diagnostics = [
+                diagnostic
+                for _provider_index, _provider_name, error in quality_errors
+                for diagnostic in error.diagnostics
+            ]
+            raise ParserQualityError(
+                "; ".join(
+                    f"{provider_name}: {error}"
+                    for _provider_index, provider_name, error in quality_errors
+                ),
+                reason_codes=reason_codes,
+                diagnostics=diagnostics,
+            )
         if attempted_provider and availability_errors:
             raise ParserProviderUnavailable("; ".join(availability_errors))
         raise ParserProviderUnavailable("no enabled parser providers")

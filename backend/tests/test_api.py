@@ -16,7 +16,13 @@ from app.adapters.base import SynthesisCancelled
 from app.models import Character, GenerationTask, ScriptLine
 from app.main import _layer_service_status, _portable_controller_root, _resolve_repo_lock_path, create_app
 from app.open_source_tts import OpenSourceTTSConfigureRequest
-from app.parser import ParsedScriptDraft, ParserProviderUnavailable, ParserQualityError
+from app.parser import (
+    ParsedScriptDraft,
+    ParserDiagnosticIssue,
+    ParserDiagnosticRecord,
+    ParserProviderUnavailable,
+    ParserQualityError,
+)
 from app.semantic_provider import SemanticProviderResponse
 
 
@@ -516,6 +522,22 @@ def test_parse_script_returns_422_when_parser_quality_gate_fails(tmp_path: Path)
     assert "SFX" in response.text
 
 
+def test_parse_script_never_serializes_internal_diagnostic_counts(tmp_path: Path) -> None:
+    draft = ParsedScriptDraft(
+        provider="test-parser",
+        lines=[{"id": "l001", "character_id": "narrator", "text": "Hello."}],
+        diagnostic_counts={"raw_line_item_count": 1, "normalized_line_count": 1},
+    )
+    client = TestClient(create_app(data_root=tmp_path))
+    client.app.state.parser = StaticParser(draft)
+
+    response = client.post("/api/parse-script", json={"text": "NARRATOR: Hello."})
+
+    assert response.status_code == 200
+    assert "diagnostic_counts" not in response.json()
+    assert "normalization_issues" not in response.json()
+
+
 def test_parse_script_reports_enabled_llm_unavailable_without_rule_fallback(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("TTS_MORE_TEST_MISSING_KEY", raising=False)
     parser_config_path = tmp_path / "parser_providers.json"
@@ -710,6 +732,70 @@ def test_create_parse_revision_logs_safe_failure_categories(
     assert "secret script body" not in rendered
     assert "api-key-should-not-appear" not in rendered
     assert "Authorization" not in rendered
+
+
+def test_create_parse_revision_logs_only_allowlisted_field_diagnostics(tmp_path: Path) -> None:
+    error = ParserQualityError(
+        "missing dialogue lines: expected at least 2, got 1",
+        diagnostics=[
+            ParserDiagnosticRecord(
+                stage="verify",
+                attempt_phase="repair",
+                provider_index=0,
+                issues=[
+                    ParserDiagnosticIssue(
+                        type="missing_dialogue_coverage",
+                        path="verifier.dialogue_coverage",
+                    ),
+                    ParserDiagnosticIssue(
+                        type="secret script body",
+                        path="api-key-should-not-appear",
+                    ),
+                ],
+                counts={
+                    "raw_line_item_count": 2,
+                    "normalized_line_count": 1,
+                    "secret script body": 99,
+                },
+            )
+        ],
+    )
+
+    class FailingParser:
+        def parse(self, _text: str) -> ParsedScriptDraft:
+            raise error
+
+    client = TestClient(create_app(data_root=tmp_path), raise_server_exceptions=False)
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "en"})
+    script_revision = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "secret script body", "summary": ""},
+    ).json()["revision"]
+    client.app.state.parser = FailingParser()
+
+    response = client.post(
+        "/api/projects/demo/parse-revisions",
+        json={"script_revision_id": script_revision["revision_id"]},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "missing dialogue lines: expected at least 2, got 1"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "parse-attempts.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-1]["diagnostics"] == [
+        {
+            "stage": "verify",
+            "attempt_phase": "repair",
+            "provider_index": 0,
+            "issues": [{"type": "missing_dialogue_coverage", "path": "verifier.dialogue_coverage"}],
+            "counts": {"raw_line_item_count": 2, "normalized_line_count": 1},
+        }
+    ]
+    rendered = json.dumps(events[-1], ensure_ascii=False)
+    assert "secret script body" not in rendered
+    assert "api-key-should-not-appear" not in rendered
 
 
 def test_create_app_does_not_duplicate_parse_log_handlers(tmp_path: Path) -> None:

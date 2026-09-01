@@ -24,7 +24,13 @@ from app.models import Character, EngineName, GenerationManifest, GenerationTask
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
 from app.portable_locator_mutations import ManagedPortableLocatorMutationError, PortableLocatorMutationCoordinator
-from app.parse_logging import log_parse_event, parse_attempt_logger, parser_metadata, quality_reason_codes
+from app.parse_logging import (
+    log_parse_event,
+    parse_attempt_logger,
+    parser_metadata,
+    quality_reason_codes,
+    safe_parser_diagnostics,
+)
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key, persist_manifest_delta
@@ -1011,6 +1017,7 @@ def create_app(
                 http_status=422,
                 failure_category="quality_rejected",
                 reason_codes=quality_reason_codes(exc),
+                diagnostics=safe_parser_diagnostics(exc),
             )
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception:
