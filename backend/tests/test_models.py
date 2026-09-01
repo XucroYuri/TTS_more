@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from app.models import Character, EngineName, GenerationManifest, GenerationVersion, LineGenerationHistory, ProjectCharacter, ProjectCharacterMode, ProviderType, ReferenceAudioGroup, ReferenceAudioSample, ScriptLine, ScriptProject, ScriptRevision, TTSServiceEndpoint, VoiceBinding
+from app.voice_matching_models import VoiceSelectionSnapshot
 from app.storage import ProjectStore
 
 
@@ -100,6 +101,22 @@ def test_legacy_script_models_load_without_semantic_fields() -> None:
     assert revision.source_sha256 is None
     assert line.semantic_revision_id is None
     assert line.utterance_id is None
+    assert line.voice_selection is None
+
+
+def test_script_line_can_store_a_path_free_voice_selection_snapshot() -> None:
+    selection = VoiceSelectionSnapshot(
+        catalog_version="catalog-v1",
+        candidate_id="voice-001:ref-001",
+        resource_id="voice-001",
+        reference_asset_id="ref-001",
+        score=81.5,
+        speed_factor=1.0,
+    )
+
+    line = ScriptLine(id="l001", character_id="alice", text="hello", voice_selection=selection)
+
+    assert line.voice_selection == selection
 
 
 def test_cosyvoice_endpoint_defaults_to_core_engine_and_worker_contract() -> None:

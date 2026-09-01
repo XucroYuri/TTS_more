@@ -7,6 +7,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .voice_matching_models import VoiceSelectionSnapshot
+
 
 class EngineName(str, Enum):
     GPT_SOVITS = "gpt-sovits"
@@ -383,6 +385,7 @@ class ScriptLine(BaseModel):
     temporary_binding: VoiceBinding | None = None
     semantic_revision_id: str | None = None
     utterance_id: str | None = None
+    voice_selection: VoiceSelectionSnapshot | None = None
 
     @model_validator(mode="after")
     def populate_line_uid(self) -> "ScriptLine":
