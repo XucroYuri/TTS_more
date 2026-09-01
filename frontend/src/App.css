@@ -4262,6 +4262,40 @@ h3 {
   min-width: 0;
 }
 
+.script-manager-parse-error {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--geist-red-300, #fca5a5);
+  border-radius: var(--radius-sm);
+  background: var(--geist-red-100, #fef2f2);
+  color: var(--geist-red-800, #b42318);
+}
+
+.script-manager-parse-error > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.script-manager-parse-error strong,
+.script-manager-parse-error p {
+  margin: 0;
+}
+
+.script-manager-parse-error p {
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.script-manager-inline .script-manager-parse-error {
+  margin: 0;
+}
+
 .script-manager-head strong {
   color: var(--geist-primary);
   font-size: 16px;

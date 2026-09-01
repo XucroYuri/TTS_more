@@ -62,7 +62,12 @@ class ParserProviderUnavailable(RuntimeError):
 
 
 class ParserQualityError(RuntimeError):
-    pass
+    """A string-compatible contract error with safe, machine-readable categories."""
+
+    def __init__(self, message: str, *, reason_codes: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.reason_codes = reason_codes or _reason_codes_for_message(message)
+        self.reasons = self.reason_codes
 
 
 def chat_completions_url(base_url: str) -> str:
@@ -154,11 +159,13 @@ Rules:
 - The text field must be copied from source_text exactly except for removing wrapping quote marks and moving a leading parenthetical into note.
 - Put parentheticals such as （压低声音）, (urgent whisper), or leading dialogue parentheticals in note without parentheses.
 - Reuse the same character_id for repeated display names. Use lowercase kebab-case ids.
+- Use each character's canonical full name as its display name. A short name may appear in the source evidence, but do not create a separate character for it.
+- Treat a speaker as established only by an explicit speaker anchor: an independent Markdown speaker block, a clean NAME: dialogue label, or a clear NAME said/说/问道 attribution. Do not infer a speaker from narrative setup, action description, or nearby prose.
 - Accept Chinese colon lines like 角色（括注）: 台词, Markdown screenplay blocks like **CHARACTER** / (parenthetical) / dialogue, prose quotes with speaker attribution, interview speaker labels, and news quotes attributed to named speakers.
 """
 _REPAIR_PROMPT = """Repair the previous JSON so it satisfies the TTS dialogue extraction contract.
 
-Return JSON only. Remove non-TTS rows, restore missing dialogue from the script, keep original order, use valid character references, keep parentheticals in note, include source_text and source_excerpt for every line, and keep text copied exactly from source_text. Do not rewrite, translate, summarize, or normalize punctuation.
+Return JSON only. Remove non-TTS rows, restore missing dialogue from the script, keep original order, use valid character references, keep parentheticals in note, include source_text and source_excerpt for every line, and keep text copied exactly from source_text. Use canonical full name display names and include a clear speaker anchor in source_excerpt when one exists. Do not treat narrative/action prose as a speaker label. Do not rewrite, translate, summarize, or normalize punctuation.
 """
 _CONTRACT_PROBE_SCRIPT = "**NARRATOR**\n(calm)\nHello from the contract test."
 
@@ -303,6 +310,26 @@ _AMBIGUOUS_SPEAKER_REFERENTS = {
     "their",
     "theirs",
 }
+_SPEAKER_ACTION_MARKERS = (
+    "沉默",
+    "皱",
+    "抬",
+    "看",
+    "走",
+    "转",
+    "停",
+    "朝",
+    "望",
+    "听",
+    "笑",
+    "哭",
+    "点头",
+    "说",
+    "表示",
+    "补充",
+    "问道",
+    "回应",
+)
 
 
 def _normalize_attributed_speaker(raw: str) -> str | None:
@@ -364,7 +391,49 @@ def _quoted_dialogue_candidates(source_text: str) -> list[str]:
     return ordered
 
 
-def _source_excerpt_speaker(source_excerpt: str, source_text: str) -> str | None:
+def _is_explicit_speaker_anchor(speaker: str, character_names: set[str]) -> bool:
+    cleaned = _clean_markup(speaker)
+    if any(cleaned.casefold() == name.casefold() for name in character_names):
+        return True
+    if any(marker in cleaned for marker in _SPEAKER_ACTION_MARKERS):
+        return False
+    return bool(re.fullmatch(r"[\u4e00-\u9fff]{2,4}", cleaned)) or bool(
+        re.fullmatch(r"[A-Z][A-Za-z]*(?:[ .'-][A-Z][A-Za-z]*){0,4}", cleaned)
+    )
+
+
+def _is_clean_colon_speaker_label(speaker: str, character_names: set[str]) -> bool:
+    cleaned = _clean_markup(speaker)
+    if not cleaned or re.search(r"[,，。；;\n]", cleaned) or any(marker in cleaned for marker in _SPEAKER_ACTION_MARKERS):
+        return False
+    return all(
+        cleaned == name or _is_controlled_short_name_alias(name, cleaned)
+        for name in character_names
+        if name in cleaned
+    )
+
+
+def _is_controlled_short_name_alias(short_name: str, full_name: str) -> bool:
+    return bool(
+        re.fullmatch(r"[\u4e00-\u9fff]{2,}", short_name)
+        and re.fullmatch(r"[\u4e00-\u9fff]{3,}", full_name)
+        and len(short_name) < len(full_name)
+        and (full_name.startswith(short_name) or full_name.endswith(short_name))
+    )
+
+
+def _is_contextual_prose_speaker(raw_speaker: str, normalized_speaker: str, character_names: set[str]) -> bool:
+    if re.search(r"[,，]\s*$", raw_speaker):
+        return True
+    return any(
+        name in raw_speaker
+        and normalized_speaker.casefold() != name.casefold()
+        and not _is_controlled_short_name_alias(name, normalized_speaker)
+        for name in character_names
+    )
+
+
+def _source_excerpt_speaker(source_excerpt: str, source_text: str, character_names: set[str]) -> str | None:
     excerpt = _source_fidelity_source(source_excerpt)
     needle = _source_fidelity_text(source_text)
     if not excerpt or not needle:
@@ -378,18 +447,35 @@ def _source_excerpt_speaker(source_excerpt: str, source_text: str) -> str | None
         for match in pattern.finditer(excerpt):
             quote = _source_fidelity_text(match.group("quote"))
             if quote == needle:
-                return _normalize_attributed_speaker(match.group("speaker"))
+                raw_speaker = match.group("speaker")
+                speaker = _normalize_attributed_speaker(raw_speaker)
+                if (
+                    speaker
+                    and not _is_contextual_prose_speaker(raw_speaker, speaker, character_names)
+                    and _is_explicit_speaker_anchor(speaker, character_names)
+                ):
+                    return speaker
 
     line_match = _LINE_RE.match(excerpt)
     if line_match:
         speaker = _clean_markup(line_match.group("speaker"))
         line_text = _source_fidelity_text(line_match.group("text"))
-        if speaker and not _is_non_dialogue_role(speaker) and line_text.find(needle) >= 0:
+        if (
+            speaker
+            and not _is_non_dialogue_role(speaker)
+            and _is_clean_colon_speaker_label(speaker, character_names)
+            and line_text.find(needle) >= 0
+        ):
             return speaker
     return None
 
 
-def _speaker_matches_character(expected_speaker: str, character_id: str, character_name: str) -> bool:
+def _speaker_matches_character(
+    expected_speaker: str,
+    character_id: str,
+    character_name: str,
+    character_names: set[str],
+) -> bool:
     expected = _clean_markup(expected_speaker)
     actual_name = _clean_markup(character_name or character_id)
     if not expected:
@@ -397,7 +483,16 @@ def _speaker_matches_character(expected_speaker: str, character_id: str, charact
     if expected.casefold() == actual_name.casefold() or expected.casefold() == character_id.casefold():
         return True
     expected_slug = slugify_name(expected)
-    return expected_slug == character_id or expected_slug == slugify_name(actual_name)
+    if expected_slug == character_id or expected_slug == slugify_name(actual_name):
+        return True
+    if not _is_controlled_short_name_alias(expected, actual_name):
+        return False
+    alias_matches = [
+        name
+        for name in character_names
+        if _is_controlled_short_name_alias(expected, name)
+    ]
+    return alias_matches == [actual_name]
 
 
 def _ordered_coverage_count(expected: list[str], actual: list[str]) -> int:
@@ -459,9 +554,12 @@ def _finalize_lines(
 
 class ScriptParseVerifier:
     def verify(self, source_text: str, draft: ParsedScriptDraft) -> ParsedScriptDraft:
+        alias_reasons = _canonicalize_short_name_characters(draft, source_text)
+        if alias_reasons:
+            raise ParserQualityError("; ".join(alias_reasons), reason_codes=_reason_codes_for_reasons(alias_reasons))
         reasons = _quality_reasons(draft, source_text)
         if reasons:
-            raise ParserQualityError("; ".join(reasons))
+            raise ParserQualityError("; ".join(reasons), reason_codes=_reason_codes_for_reasons(reasons))
         return draft
 
 
@@ -512,6 +610,74 @@ def _reference_dialogue_texts(text: str) -> list[str]:
             continue
         index += 1
     return dialogue_lines
+
+
+def _canonicalize_short_name_characters(draft: ParsedScriptDraft, source_text: str) -> list[str]:
+    """Merge only unique Chinese prefix/suffix aliases into canonical character names."""
+    names_by_id = {character.id: character.name for character in draft.characters}
+    targets_by_alias_id: dict[str, str] = {}
+    reasons: list[str] = []
+
+    for character in draft.characters:
+        candidates = [
+            other.name
+            for other in draft.characters
+            if other.id != character.id and _is_controlled_short_name_alias(character.name, other.name)
+        ]
+        if len(candidates) == 1:
+            targets_by_alias_id[character.id] = candidates[0]
+        elif len(candidates) > 1:
+            reasons.append(f"ambiguous short-name character alias {character.name}")
+
+    if source_text:
+        source_candidates_by_alias_id: dict[str, set[str]] = {}
+        for line in draft.lines:
+            evidence = draft.source_evidence.get(line.id)
+            if not evidence:
+                continue
+            anchor = _source_excerpt_speaker(
+                evidence.source_excerpt,
+                evidence.source_text or line.text,
+                set(names_by_id.values()),
+            )
+            actual_name = names_by_id.get(line.character_id)
+            if anchor and actual_name and _is_controlled_short_name_alias(actual_name, anchor):
+                source_candidates_by_alias_id.setdefault(line.character_id, set()).add(anchor)
+        for alias_id, candidates in source_candidates_by_alias_id.items():
+            if len(candidates) == 1:
+                targets_by_alias_id[alias_id] = next(iter(candidates))
+            else:
+                reasons.append(f"ambiguous short-name character alias {names_by_id[alias_id]}")
+
+    if reasons:
+        return list(dict.fromkeys(reasons))
+    if not targets_by_alias_id:
+        return []
+
+    existing_ids_by_name = {character.name: character.id for character in draft.characters}
+    target_ids = {
+        alias_id: existing_ids_by_name.get(full_name, slugify_name(full_name))
+        for alias_id, full_name in targets_by_alias_id.items()
+    }
+    for line in draft.lines:
+        if line.character_id in target_ids:
+            line.character_id = target_ids[line.character_id]
+
+    normalized_characters: list[Character] = []
+    seen_ids: set[str] = set()
+    for character in draft.characters:
+        if character.id in targets_by_alias_id:
+            full_name = targets_by_alias_id[character.id]
+            target_id = target_ids[character.id]
+            if target_id not in seen_ids:
+                normalized_characters.append(Character(id=target_id, name=full_name))
+                seen_ids.add(target_id)
+            continue
+        if character.id not in seen_ids:
+            normalized_characters.append(character)
+            seen_ids.add(character.id)
+    draft.characters = normalized_characters
+    return []
 
 
 class OpenAICompatibleProvider:
@@ -754,6 +920,19 @@ def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> Pars
             raw_id = _clean_markup(item.get("id") or slugify_name(name))
             names_by_key[raw_id] = name
             names_by_key[slugify_name(name)] = name
+    declared_names = set(names_by_key.values())
+    for short_name in declared_names:
+        candidates = [name for name in declared_names if _is_controlled_short_name_alias(short_name, name)]
+        if len(candidates) > 1:
+            raise ParserQualityError(
+                f"ambiguous short-name character alias {short_name}",
+                reason_codes=["ambiguous_short_name_alias"],
+            )
+        if len(candidates) == 1:
+            canonical_name = candidates[0]
+            for key, name in list(names_by_key.items()):
+                if name == short_name:
+                    names_by_key[key] = canonical_name
     raw_lines = payload.get("lines", [])
     if not isinstance(raw_lines, list):
         raise ParserQualityError("lines must be a list")
@@ -790,6 +969,9 @@ def _draft_from_provider_payload(provider: str, payload: dict[str, Any]) -> Pars
             }
         )
     draft = _finalize_lines(provider, records, warnings)
+    alias_reasons = _canonicalize_short_name_characters(draft, "")
+    if alias_reasons:
+        raise ParserQualityError("; ".join(alias_reasons), reason_codes=_reason_codes_for_reasons(alias_reasons))
     reasons = _payload_reasons(non_dialogue_names)
     if reasons:
         raise ParserQualityError("; ".join(reasons))
@@ -801,6 +983,38 @@ def _payload_reasons(raw_non_dialogue_names: list[str]) -> list[str]:
     for name in raw_non_dialogue_names:
         reasons.append(f"non-dialogue role {name} is not allowed")
     return reasons
+
+
+def _reason_codes_for_reasons(reasons: list[str]) -> list[str]:
+    codes: list[str] = []
+    for reason in reasons:
+        if "missing dialogue lines" in reason:
+            codes.append("missing_dialogue_coverage")
+        elif "missing quoted dialogue coverage" in reason:
+            codes.append("missing_quoted_dialogue_coverage")
+        elif "text is not an exact source match" in reason:
+            codes.append("text_not_in_source_order")
+        elif "source_text does not match text" in reason:
+            codes.append("source_text_mismatch")
+        elif "source_excerpt is not traceable" in reason:
+            codes.append("source_excerpt_not_traceable")
+        elif "source_excerpt does not contain source_text" in reason:
+            codes.append("source_excerpt_missing_source_text")
+        elif "source_excerpt speaker" in reason:
+            codes.append("speaker_anchor_mismatch")
+        elif "ambiguous short-name character alias" in reason:
+            codes.append("ambiguous_short_name_alias")
+        elif "unknown character" in reason:
+            codes.append("unknown_character")
+        elif "non-dialogue role" in reason:
+            codes.append("non_dialogue_role")
+        else:
+            codes.append("quality_contract_violation")
+    return list(dict.fromkeys(codes))
+
+
+def _reason_codes_for_message(message: str) -> list[str]:
+    return _reason_codes_for_reasons([reason for reason in message.split("; ") if reason])
 
 
 def _quality_reasons(draft: ParsedScriptDraft, source_text: str) -> list[str]:
@@ -853,9 +1067,18 @@ def _quality_reasons(draft: ParsedScriptDraft, source_text: str) -> list[str]:
                 reasons.append(f"{line.id} source_excerpt is not traceable in source")
             if excerpt and needle and excerpt.find(needle) < 0:
                 reasons.append(f"{line.id} source_excerpt does not contain source_text")
-            expected_speaker = _source_excerpt_speaker(evidence.source_excerpt, evidence.source_text or line.text)
+            expected_speaker = _source_excerpt_speaker(
+                evidence.source_excerpt,
+                evidence.source_text or line.text,
+                set(character_names_by_id.values()),
+            )
             actual_character = character_names_by_id.get(line.character_id, line.character_id)
-            if expected_speaker and not _speaker_matches_character(expected_speaker, line.character_id, actual_character):
+            if expected_speaker and not _speaker_matches_character(
+                expected_speaker,
+                line.character_id,
+                actual_character,
+                set(character_names_by_id.values()),
+            ):
                 reasons.append(
                     f"{line.id} source_excerpt speaker {expected_speaker} does not match character {actual_character}"
                 )

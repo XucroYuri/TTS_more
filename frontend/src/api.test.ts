@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { getApiToken, patchAnalysisDraft, setApiToken } from "./api";
+import { apiErrorMessage, getApiToken, patchAnalysisDraft, setApiToken } from "./api";
 import { createScriptRevision, saveProject } from "./api";
 import type { ScriptProject } from "./types";
 
@@ -24,6 +24,18 @@ describe("api token storage", () => {
     setApiToken("secret-abc");
     setApiToken("");
     expect(getApiToken()).toBe("");
+  });
+});
+
+describe("API error messages", () => {
+  it("uses FastAPI string detail instead of raw JSON", () => {
+    expect(apiErrorMessage('{"detail":"Source text is required"}', "Unprocessable Entity")).toBe("Source text is required");
+  });
+
+  it("normalizes FastAPI validation details and retains plain-text fallbacks", () => {
+    expect(apiErrorMessage('{"detail":[{"loc":["body","source_markdown"],"msg":"Field required"}]}', "Unprocessable Entity"))
+      .toBe("body.source_markdown: Field required");
+    expect(apiErrorMessage("Gateway unavailable", "Bad Gateway")).toBe("Gateway unavailable");
   });
 });
 

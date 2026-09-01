@@ -618,6 +618,236 @@ def test_create_parse_revision_provider_unavailable_does_not_mutate_project(tmp_
     assert after["lines"] == before["lines"]
 
 
+def test_create_parse_revision_records_safe_structured_attempt_events(tmp_path: Path) -> None:
+    class SuccessfulParser:
+        providers = [
+            SimpleNamespace(
+                name="test-parser",
+                config=SimpleNamespace(enabled=True, model="safe-test-model"),
+            )
+        ]
+
+        def parse(self, _text: str) -> ParsedScriptDraft:
+            return ParsedScriptDraft(provider="test-parser", lines=[{"id": "l001", "character_id": "narrator", "text": "Hello"}])
+
+    client = TestClient(create_app(data_root=tmp_path), raise_server_exceptions=False)
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "en"})
+    script_revision = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "secret script body", "summary": ""},
+    ).json()["revision"]
+    client.app.state.parser = SuccessfulParser()
+
+    response = client.post(
+        "/api/projects/demo/parse-revisions",
+        json={"script_revision_id": script_revision["revision_id"]},
+    )
+
+    assert response.status_code == 200
+    log_path = tmp_path / "logs" / "parse-attempts.jsonl"
+    events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["event"] for event in events] == ["started", "succeeded"]
+    assert events[0]["project_id"] == "demo"
+    assert events[0]["script_revision_id"] == script_revision["revision_id"]
+    assert events[0]["source_length"] == len("secret script body")
+    assert events[0]["attempt_id"] == events[1]["attempt_id"]
+    assert events[1]["provider"] == "test-parser"
+    assert events[1]["model"] == "safe-test-model"
+    assert isinstance(events[1]["elapsed_ms"], int)
+    assert "secret script body" not in log_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("exception", "expected_status", "failure_category", "expected_reason_codes"),
+    [
+        (ParserProviderUnavailable("Authorization: Bearer api-key-should-not-appear"), 503, "provider_unavailable", ["provider_unavailable"]),
+        (
+            ParserQualityError(
+                "the whole secret script body must not appear",
+                reason_codes=["missing_dialogue_coverage", "ambiguous_short_name_alias", "untrusted-content"],
+            ),
+            422,
+            "quality_rejected",
+            ["missing_dialogue_coverage", "ambiguous_short_name_alias"],
+        ),
+        (RuntimeError("api-key-should-not-appear"), 500, "unexpected", ["unexpected"]),
+    ],
+)
+def test_create_parse_revision_logs_safe_failure_categories(
+    tmp_path: Path,
+    exception: Exception,
+    expected_status: int,
+    failure_category: str,
+    expected_reason_codes: list[str],
+) -> None:
+    class FailingParser:
+        def parse(self, _text: str) -> ParsedScriptDraft:
+            raise exception
+
+    client = TestClient(create_app(data_root=tmp_path), raise_server_exceptions=False)
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "en"})
+    script_revision = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "secret script body", "summary": ""},
+    ).json()["revision"]
+    client.app.state.parser = FailingParser()
+
+    response = client.post(
+        "/api/projects/demo/parse-revisions",
+        json={"script_revision_id": script_revision["revision_id"]},
+    )
+
+    assert response.status_code == expected_status
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "parse-attempts.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    failed = events[-1]
+    assert failed["event"] == "failed"
+    assert failed["failure_category"] == failure_category
+    assert failed["reason_codes"] == expected_reason_codes
+    rendered = json.dumps(failed)
+    assert "secret script body" not in rendered
+    assert "api-key-should-not-appear" not in rendered
+    assert "Authorization" not in rendered
+
+
+def test_create_app_does_not_duplicate_parse_log_handlers(tmp_path: Path) -> None:
+    first = create_app(data_root=tmp_path)
+    second = create_app(data_root=tmp_path)
+
+    assert first.state.parse_attempt_logger is second.state.parse_attempt_logger
+    assert len(first.state.parse_attempt_logger.handlers) == 1
+
+
+def test_create_parse_revision_logs_failed_when_project_save_fails(tmp_path: Path, monkeypatch) -> None:
+    class SuccessfulParser:
+        def parse(self, _text: str) -> ParsedScriptDraft:
+            return ParsedScriptDraft(provider="test-parser", lines=[{"id": "l001", "character_id": "narrator", "text": "Hello"}])
+
+    client = TestClient(create_app(data_root=tmp_path), raise_server_exceptions=False)
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "en"})
+    script_revision = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "script body", "summary": ""},
+    ).json()["revision"]
+    client.app.state.parser = SuccessfulParser()
+
+    def fail_save(*_args, **_kwargs) -> None:
+        raise OSError("persistence failed")
+
+    monkeypatch.setattr(client.app.state.store, "save_project", fail_save)
+
+    response = client.post(
+        "/api/projects/demo/parse-revisions",
+        json={"script_revision_id": script_revision["revision_id"]},
+    )
+
+    assert response.status_code == 500
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "parse-attempts.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["event"] for event in events] == ["started", "failed"]
+    assert events[-1]["failure_category"] == "unexpected"
+
+
+def test_create_parse_revision_marks_multiple_unknown_provider_attempts(tmp_path: Path) -> None:
+    class MultiProviderStub:
+        providers = [
+            SimpleNamespace(name="first-provider", config=SimpleNamespace(enabled=True, model="first-model")),
+            SimpleNamespace(name="second-provider", config=SimpleNamespace(enabled=True, model="second-model")),
+        ]
+
+        def parse(self, _text: str) -> ParsedScriptDraft:
+            return ParsedScriptDraft(provider="second-provider", lines=[{"id": "l001", "character_id": "narrator", "text": "Hello"}])
+
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "en"})
+    script_revision = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "script body", "summary": ""},
+    ).json()["revision"]
+    client.app.state.parser = MultiProviderStub()
+
+    response = client.post(
+        "/api/projects/demo/parse-revisions",
+        json={"script_revision_id": script_revision["revision_id"]},
+    )
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "parse-attempts.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[0]["provider"] == "multiple"
+    assert events[0]["model"] == "multiple"
+    assert events[1]["provider"] == "second-provider"
+    assert events[1]["model"] == "second-model"
+
+
+def test_create_parse_revision_matches_unicode_provider_name_before_output_sanitization(tmp_path: Path) -> None:
+    class MultiProviderStub:
+        providers = [
+            SimpleNamespace(name="开物 基模", config=SimpleNamespace(enabled=True, model="first-model")),
+            SimpleNamespace(name="开物/基模", config=SimpleNamespace(enabled=True, model="second-model")),
+        ]
+
+        def parse(self, _text: str) -> ParsedScriptDraft:
+            return ParsedScriptDraft(provider="开物/基模", lines=[{"id": "l001", "character_id": "narrator", "text": "Hello"}])
+
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "en"})
+    script_revision = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "script body", "summary": ""},
+    ).json()["revision"]
+    client.app.state.parser = MultiProviderStub()
+
+    response = client.post(
+        "/api/projects/demo/parse-revisions",
+        json={"script_revision_id": script_revision["revision_id"]},
+    )
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "parse-attempts.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[0]["provider"] == "multiple"
+    assert events[1]["provider"] == "开物-基模"
+    assert events[1]["model"] == "second-model"
+
+
+def test_parse_attempt_log_handler_is_delayed_and_closed_after_write(tmp_path: Path) -> None:
+    class SuccessfulParser:
+        def parse(self, _text: str) -> ParsedScriptDraft:
+            return ParsedScriptDraft(provider="test-parser", lines=[{"id": "l001", "character_id": "narrator", "text": "Hello"}])
+
+    app = create_app(data_root=tmp_path)
+    log_path = tmp_path / "logs" / "parse-attempts.jsonl"
+    handler = app.state.parse_attempt_logger.handlers[0]
+    assert not log_path.exists()
+    assert handler.stream is None
+
+    client = TestClient(app)
+    client.put("/api/projects/demo", json={"title": "Demo", "default_language": "en"})
+    script_revision = client.post(
+        "/api/projects/demo/script-revisions",
+        json={"source_markdown": "script body", "summary": ""},
+    ).json()["revision"]
+    client.app.state.parser = SuccessfulParser()
+
+    response = client.post(
+        "/api/projects/demo/parse-revisions",
+        json={"script_revision_id": script_revision["revision_id"]},
+    )
+
+    assert response.status_code == 200
+    assert log_path.exists()
+    assert handler.stream is None
+
+
 def test_services_status_marks_stopped_local_endpoint_as_blocked(tmp_path: Path) -> None:
     services_path = tmp_path / "services.json"
     services_path.write_text(

@@ -28,6 +28,7 @@ data/real-validation/
 data/validation/
 data/validation/windows-reliability/
 data/parser_providers.json
+data/logs/parse-attempts.jsonl*
 data/cache/
 data/cache/portable/
 data/runtime/portable/

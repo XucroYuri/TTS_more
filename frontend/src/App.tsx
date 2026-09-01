@@ -79,7 +79,7 @@ import {
 import { defaultLanguage, languageOptions, nextLanguage, normalizeLanguage } from "./i18n";
 import { ReferenceAudioInput } from "./components/ReferenceAudioInput";
 import { RoleAvatar } from "./components/RoleAvatar";
-import { ScriptManagerModal } from "./components/ScriptManagerModal";
+import { canStartScriptParse, isCurrentScriptParseOperation, reduceScriptParseError, ScriptManagerModal, type ScriptParseError } from "./components/ScriptManagerModal";
 import { WaveformPlayer } from "./components/WaveformPlayer";
 import { TokenGate } from "./components/TokenGate";
 import {
@@ -262,6 +262,7 @@ export default function App() {
   const [managerSourceDraft, setManagerSourceDraft] = useState("");
   const [isManagerSaving, setIsManagerSaving] = useState(false);
   const [isManagerParsing, setIsManagerParsing] = useState(false);
+  const [scriptParseError, setScriptParseError] = useState<ScriptParseError | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [isProjectLoaded, setIsProjectLoaded] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -283,6 +284,9 @@ export default function App() {
   const generationCancellationJobIdRef = useRef<string | null>(null);
   const isGeneratingRef = useRef(false);
   const generationRunTokenRef = useRef(0);
+  const scriptParseOperationTokenRef = useRef(0);
+  const managedProjectIdRef = useRef<string | null>(managedProjectId);
+  const currentProjectIdRef = useRef<string | null>(currentProjectId);
   const analysisProjectIdRef = useRef<string | null>(null);
   const analysisManagedProjectIdRef = useRef<string | null>(managedProjectId);
   const analysisCurrentProjectIdRef = useRef<string | null>(currentProjectId);
@@ -785,6 +789,10 @@ export default function App() {
   }, [currentProjectId, projectRows]);
 
   useEffect(() => {
+    managedProjectIdRef.current = managedProjectId;
+  }, [managedProjectId]);
+
+  useEffect(() => {
     analysisManagedProjectIdRef.current = managedProjectId;
     scriptFileOperationTokenRef.current += 1;
     analysisStartOperationTokenRef.current += 1;
@@ -792,8 +800,16 @@ export default function App() {
   }, [managedProjectId]);
 
   useEffect(() => {
+    currentProjectIdRef.current = currentProjectId;
+  }, [currentProjectId]);
+
+  useEffect(() => {
     analysisCurrentProjectIdRef.current = currentProjectId;
   }, [currentProjectId]);
+
+  useEffect(() => {
+    setScriptParseError((current) => reduceScriptParseError(current, { type: "project-selected", projectId: managedProjectId }));
+  }, [managedProjectId]);
 
   useEffect(() => {
     if (!managedProjectId) {
@@ -1169,18 +1185,23 @@ export default function App() {
     }
   }
 
-  async function refreshProjects(preferredProjectId?: string | null) {
+  async function refreshProjects(preferredProjectId?: string | null, canApply: () => boolean = () => true) {
     try {
       const payload = await fetchProjects();
+      if (!canApply()) return;
       setProjectSummaries(payload.projects);
       setCurrentProjectId((current) => {
+        if (!canApply()) return current;
         const preferred = preferredProjectId !== undefined ? preferredProjectId : current ?? readStoredProjectId();
         const next = selectStartupProjectId(payload.projects, preferred);
+        currentProjectIdRef.current = next;
         writeStoredProjectId(next);
         return next;
       });
     } catch {
+      if (!canApply()) return;
       setProjectSummaries([]);
+      currentProjectIdRef.current = null;
       setCurrentProjectId(null);
       writeStoredProjectId(null);
     }
@@ -1202,6 +1223,7 @@ export default function App() {
       const savedProject = source.trim()
         ? (await createScriptRevision(projectId, source, t("script.initialScriptRevision"))).project
         : nextProject;
+      currentProjectIdRef.current = projectId;
       setCurrentProjectId(projectId);
       writeStoredProjectId(projectId);
       setProject(savedProject);
@@ -1211,6 +1233,7 @@ export default function App() {
       setSelectedLineIds([]);
       setSelectedHistoryVersions({});
       setVersionDrafts({});
+      managedProjectIdRef.current = projectId;
       setManagedProjectId(projectId);
       setManagedProject(savedProject);
       setManagerTitleDraft(savedProject.title);
@@ -1712,7 +1735,10 @@ export default function App() {
         ) return false;
       }
       if (operationToken !== currentProjectTransitionOperationTokenRef.current) return false;
+      scriptParseOperationTokenRef.current += 1;
+      currentProjectIdRef.current = projectId;
       analysisCurrentProjectIdRef.current = projectId;
+      setIsManagerParsing(false);
       setCurrentProjectId(() => {
         writeStoredProjectId(projectId);
         return projectId;
@@ -1732,7 +1758,7 @@ export default function App() {
   }
 
   function applyManagedProjectToWorkspace(projectId: string, nextProject: ScriptProject, resetLineState = false) {
-    if (projectId !== currentProjectId) return;
+    if (projectId !== currentProjectIdRef.current) return;
     setProject(nextProject);
     if (resetLineState) {
       setActiveLineId(nextProject.lines[0]?.id ?? "");
@@ -2016,6 +2042,7 @@ export default function App() {
 
   async function parseManagedScriptRevision() {
     if (!managedProjectId || !managedProject) return;
+    const targetProjectId = managedProjectId;
     const title = managerTitleDraft.trim();
     const source = managerSourceDraft;
     if (!title) {
@@ -2026,25 +2053,41 @@ export default function App() {
       setNotice(t("script.sourceRequired"));
       return;
     }
-    if (!(await confirmRevisionRisk(managedProject))) return;
+    const confirmed = await confirmRevisionRisk(managedProject);
+    if (!canStartScriptParse({ confirmed, targetProjectId, managedProjectId: managedProjectIdRef.current })) return;
+    const operationToken = scriptParseOperationTokenRef.current + 1;
+    scriptParseOperationTokenRef.current = operationToken;
+    const isCurrentOperation = () => isCurrentScriptParseOperation({
+      operationToken,
+      activeOperationToken: scriptParseOperationTokenRef.current,
+      targetProjectId,
+      managedProjectId: managedProjectIdRef.current,
+      currentProjectId: currentProjectIdRef.current
+    });
     setIsManagerParsing(true);
+    setScriptParseError((current) => reduceScriptParseError(current, { type: "started" }));
     setNotice(t("parser.parsing"));
     try {
       if (title !== managedProject.title) {
-        await saveProject(managedProjectId, { ...managedProject, title });
+        await saveProject(targetProjectId, { ...managedProject, title });
       }
-      const scriptPayload = await createScriptRevision(managedProjectId, source, t("script.parseRevision"));
-      const parsePayload = await createParseRevision(managedProjectId, scriptPayload.script_revision.revision_id);
+      const scriptPayload = await createScriptRevision(targetProjectId, source, t("script.parseRevision"));
+      const parsePayload = await createParseRevision(targetProjectId, scriptPayload.script_revision.revision_id);
+      if (!isCurrentOperation()) return;
       setManagedProject(parsePayload.project);
       setManagerTitleDraft(parsePayload.project.title);
       setManagerSourceDraft(projectToScriptSourceText(parsePayload.project, characters));
-      applyManagedProjectToWorkspace(managedProjectId, parsePayload.project, true);
+      applyManagedProjectToWorkspace(targetProjectId, parsePayload.project, true);
+      setScriptParseError((current) => reduceScriptParseError(current, { type: "succeeded" }));
       setNotice(t("script.parseApplied"));
-      await refreshProjects(currentProjectId);
+      await refreshProjects(currentProjectIdRef.current, isCurrentOperation);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : t("parser.parseFailed"));
+      if (!isCurrentOperation()) return;
+      const message = error instanceof Error ? error.message : t("parser.parseFailed");
+      setScriptParseError((current) => reduceScriptParseError(current, { type: "failed", error: { projectId: targetProjectId, message } }));
+      setNotice(message);
     } finally {
-      setIsManagerParsing(false);
+      if (isCurrentOperation()) setIsManagerParsing(false);
     }
   }
 
@@ -2068,9 +2111,11 @@ export default function App() {
     setDeletingProjectId(managedProjectId);
     try {
       await deleteProject(managedProjectId);
+      managedProjectIdRef.current = nextManagedProjectId;
       setManagedProjectId(nextManagedProjectId);
       setManagedProject(null);
       if (deletedCurrentProject) {
+        currentProjectIdRef.current = nextCurrentProjectId;
         setCurrentProjectId(nextCurrentProjectId);
         writeStoredProjectId(nextCurrentProjectId);
         if (!nextCurrentProjectId) {
@@ -2298,15 +2343,19 @@ export default function App() {
       isCreatingScript={isCreatingScript}
       isSavingScript={isManagerSaving}
       isParsingScript={isManagerParsing}
+      parseError={scriptParseError?.projectId === managedProjectId ? scriptParseError : null}
       deletingProjectId={deletingProjectId}
       onClose={() => undefined}
       onSearchTextChange={setManagerSearchText}
       onSelectProject={(projectId) => {
         if (projectId === analysisManagedProjectIdRef.current) return;
+        scriptParseOperationTokenRef.current += 1;
         scriptFileOperationTokenRef.current += 1;
         analysisStartOperationTokenRef.current += 1;
         analysisSourceFileMetadataRef.current = null;
         analysisManagedProjectIdRef.current = projectId;
+        managedProjectIdRef.current = projectId;
+        setIsManagerParsing(false);
         setManagedProjectId(projectId);
       }}
       onOpenProject={(projectId) => {
@@ -2316,6 +2365,7 @@ export default function App() {
           analysisStartOperationTokenRef.current += 1;
           analysisSourceFileMetadataRef.current = null;
           analysisManagedProjectIdRef.current = projectId;
+          managedProjectIdRef.current = projectId;
           setManagedProjectId(projectId);
         })();
       }}
@@ -2329,6 +2379,7 @@ export default function App() {
       onParseRevision={() => void parseManagedScriptRevision()}
       onAnalyzeScript={() => void analyzeManagedScriptRevision()}
       onScriptFileSelected={(file) => void selectManagedScriptFile(file)}
+      onDismissParseError={() => setScriptParseError((current) => reduceScriptParseError(current, { type: "dismissed" }))}
       onDeleteScript={() => void deleteManagedProject()}
     />
   );

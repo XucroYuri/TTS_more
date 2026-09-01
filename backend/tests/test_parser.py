@@ -436,6 +436,220 @@ def test_script_parse_verifier_accepts_context_prefixed_chinese_speaker_with_ver
     ScriptParseVerifier().verify("随后，周明补充：“别回头。”", draft)
 
 
+def test_script_parse_verifier_does_not_treat_prose_action_prefix_as_speaker_anchor() -> None:
+    draft = make_draft(
+        characters=[Character(id="zhuge-jiujiu", name="诸葛九九")],
+        lines=[ScriptLine(id="l001", character_id="zhuge-jiujiu", text="我来了。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“我来了。”",
+                source_excerpt="风声掠过，诸葛九九沉默片刻，说：“我来了。”",
+            )
+        },
+    )
+
+    ScriptParseVerifier().verify("风声掠过，诸葛九九沉默片刻，说：“我来了。”", draft)
+
+
+def test_script_parse_verifier_accepts_unique_terminal_short_name_alias() -> None:
+    draft = make_draft(
+        characters=[Character(id="zhuge-jiujiu", name="诸葛九九")],
+        lines=[ScriptLine(id="l001", character_id="zhuge-jiujiu", text="我来了。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“我来了。”",
+                source_excerpt="九九说：“我来了。”",
+            )
+        },
+    )
+
+    ScriptParseVerifier().verify("九九说：“我来了。”", draft)
+
+
+def test_script_parse_verifier_rejects_ambiguous_short_name_alias() -> None:
+    draft = make_draft(
+        characters=[
+            Character(id="zhuge-jiujiu", name="诸葛九九"),
+            Character(id="wang-jiujiu", name="王九九"),
+        ],
+        lines=[ScriptLine(id="l001", character_id="zhuge-jiujiu", text="我来了。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“我来了。”",
+                source_excerpt="九九说：“我来了。”",
+            )
+        },
+    )
+
+    with pytest.raises(ParserQualityError, match="speaker 九九 does not match character 诸葛九九"):
+        ScriptParseVerifier().verify("九九说：“我来了。”", draft)
+
+
+def test_script_parse_verifier_rejects_wrong_single_character_colon_label() -> None:
+    draft = make_draft(
+        characters=[Character(id="yi", name="乙")],
+        lines=[ScriptLine(id="l001", character_id="yi", text="台词。", language="zh")],
+        source_evidence={"l001": LineSourceEvidence(source_text="台词。", source_excerpt="甲：台词。")},
+    )
+
+    with pytest.raises(ParserQualityError, match="speaker 甲 does not match character 乙"):
+        ScriptParseVerifier().verify("甲：台词。", draft)
+
+
+def test_script_parse_verifier_rejects_wrong_cjk_extension_colon_label() -> None:
+    draft = make_draft(
+        characters=[Character(id="yi", name="乙")],
+        lines=[ScriptLine(id="l001", character_id="yi", text="台词。", language="zh")],
+        source_evidence={"l001": LineSourceEvidence(source_text="台词。", source_excerpt="𠀀：台词。")},
+    )
+
+    with pytest.raises(ParserQualityError, match="speaker 𠀀 does not match character 乙"):
+        ScriptParseVerifier().verify("𠀀：台词。", draft)
+
+
+def test_script_parse_verifier_downgrades_prose_attribute_after_contextual_subject() -> None:
+    draft = make_draft(
+        characters=[Character(id="narrator", name="旁白")],
+        lines=[ScriptLine(id="l001", character_id="narrator", text="别过来。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“别过来。”",
+                source_excerpt="装备党面色惨白，声音颤抖，说：“别过来。”",
+            )
+        },
+    )
+
+    ScriptParseVerifier().verify("装备党面色惨白，声音颤抖，说：“别过来。”", draft)
+
+
+def test_script_parse_verifier_downgrades_prose_attribute_after_narrative_object() -> None:
+    draft = make_draft(
+        characters=[Character(id="narrator", name="旁白")],
+        lines=[ScriptLine(id="l001", character_id="narrator", text="别过来。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“别过来。”",
+                source_excerpt="胶布被阴影遮住，声音颤抖，说：“别过来。”",
+            )
+        },
+    )
+
+    ScriptParseVerifier().verify("胶布被阴影遮住，声音颤抖，说：“别过来。”", draft)
+
+
+def test_script_parse_verifier_rejects_contextual_named_prose_speaker_mismatch() -> None:
+    draft = make_draft(
+        characters=[Character(id="zhou-ming", name="周明")],
+        lines=[ScriptLine(id="l001", character_id="zhou-ming", text="先撤离。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“先撤离。”",
+                source_excerpt="记者会上，林夏说：“先撤离。”",
+            )
+        },
+    )
+
+    with pytest.raises(ParserQualityError, match="speaker 林夏 does not match character 周明"):
+        ScriptParseVerifier().verify("记者会上，林夏说：“先撤离。”", draft)
+
+
+def test_script_parse_verifier_downgrades_colon_label_with_known_character_action_suffix() -> None:
+    draft = make_draft(
+        characters=[Character(id="equipment", name="装备党")],
+        lines=[ScriptLine(id="l001", character_id="equipment", text="别过来。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="“别过来。”",
+                source_excerpt="**装备党**声音洪亮且带着一丝决绝：“别过来。”",
+            )
+        },
+    )
+
+    ScriptParseVerifier().verify("**装备党**声音洪亮且带着一丝决绝：“别过来。”", draft)
+
+
+def test_provider_payload_unifies_unique_short_name_character_to_canonical_full_name() -> None:
+    payload = {
+        "characters": [
+            {"id": "zhuge", "name": "诸葛九九"},
+            {"id": "jiujiu", "name": "九九"},
+        ],
+        "lines": [
+            {"id": "l001", "character_id": "zhuge", "text": "第一句。", "source_text": "第一句。", "source_excerpt": "诸葛九九：第一句。"},
+            {"id": "l002", "character_id": "jiujiu", "text": "第二句。", "source_text": "第二句。", "source_excerpt": "九九：第二句。"},
+        ],
+    }
+
+    draft = _draft_from_provider_payload("llm-test", payload)
+    verified = ScriptParseVerifier().verify("诸葛九九：第一句。\n九九：第二句。", draft)
+
+    assert [character.name for character in verified.characters] == ["诸葛九九"]
+    assert {line.character_id for line in verified.lines} == {verified.characters[0].id}
+
+
+def test_verifier_canonicalizes_short_character_from_unique_full_source_speaker_anchor() -> None:
+    draft = make_draft(
+        characters=[Character(id="jiujiu", name="九九")],
+        lines=[ScriptLine(id="l001", character_id="jiujiu", text="我来了。", language="zh")],
+        source_evidence={
+            "l001": LineSourceEvidence(
+                source_text="我来了。",
+                source_excerpt="诸葛九九：我来了。",
+            )
+        },
+    )
+
+    verified = ScriptParseVerifier().verify("诸葛九九：我来了。", draft)
+
+    assert [character.name for character in verified.characters] == ["诸葛九九"]
+    assert verified.lines[0].character_id == verified.characters[0].id
+
+
+def test_provider_payload_rejects_ambiguous_short_name_character_alias() -> None:
+    payload = {
+        "characters": [
+            {"id": "zhuge", "name": "诸葛九九"},
+            {"id": "wang", "name": "王九九"},
+            {"id": "jiujiu", "name": "九九"},
+        ],
+        "lines": [
+            {"id": "l001", "character_id": "jiujiu", "text": "台词。", "source_text": "台词。", "source_excerpt": "九九：台词。"},
+        ],
+    }
+
+    with pytest.raises(ParserQualityError, match="ambiguous short-name character alias 九九") as exc_info:
+        _draft_from_provider_payload("llm-test", payload)
+
+    assert exc_info.value.reason_codes == ["ambiguous_short_name_alias"]
+
+
+def test_provider_payload_does_not_unify_internal_substring_character_name() -> None:
+    payload = {
+        "characters": [
+            {"id": "zhuge", "name": "诸葛九九"},
+            {"id": "internal", "name": "葛九"},
+        ],
+        "lines": [
+            {"id": "l001", "character_id": "internal", "text": "台词。", "source_text": "台词。", "source_excerpt": "葛九：台词。"},
+        ],
+    }
+
+    draft = _draft_from_provider_payload("llm-test", payload)
+
+    assert [character.name for character in draft.characters] == ["葛九"]
+
+
+def test_parser_quality_error_preserves_message_and_exposes_safe_reason_codes() -> None:
+    draft = make_draft(lines=[ScriptLine(id="l001", character_id="narrator", text="Invented.", language="en")])
+
+    with pytest.raises(ParserQualityError) as exc_info:
+        ScriptParseVerifier().verify("NARRATOR: Hello.\nNARRATOR: Again.", draft)
+
+    assert "l001 text is not an exact source match" in str(exc_info.value)
+    assert exc_info.value.reason_codes == ["missing_dialogue_coverage", "text_not_in_source_order"]
+    assert all("Invented" not in reason for reason in exc_info.value.reason_codes)
+
+
 def test_parser_contract_prompt_requires_agentic_source_fidelity_audit() -> None:
     messages = parser_contract_probe_messages()
 
@@ -459,6 +673,16 @@ def test_repair_prompt_requires_exact_source_evidence() -> None:
     assert "source_excerpt" in prompt
     assert "exact" in prompt
     assert "do not rewrite" in prompt
+
+
+def test_parser_prompts_require_canonical_names_and_explicit_speaker_anchors() -> None:
+    from app.parser import _REPAIR_PROMPT
+
+    prompts = f"{parser_contract_probe_messages()[0]['content']}\n{_REPAIR_PROMPT}".lower()
+
+    assert "canonical full name" in prompts
+    assert "speaker anchor" in prompts
+    assert "narrative" in prompts
 
 
 def test_multi_provider_parser_requires_enabled_llm_provider_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:

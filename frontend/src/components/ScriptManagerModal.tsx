@@ -5,6 +5,43 @@ import { useTranslation } from "react-i18next";
 import { filterAndSortProjectSummaries, projectPreviewStats } from "../lib/scriptManagement";
 import type { ProjectSummary, ScriptProject } from "../types";
 
+export interface ScriptParseError {
+  projectId: string;
+  message: string;
+}
+
+export type ScriptParseErrorEvent =
+  | { type: "failed"; error: ScriptParseError }
+  | { type: "started" | "succeeded" | "dismissed" }
+  | { type: "project-selected"; projectId: string | null };
+
+export function reduceScriptParseError(current: ScriptParseError | null, event: ScriptParseErrorEvent): ScriptParseError | null {
+  if (event.type === "failed") return event.error;
+  if (event.type === "project-selected") return current?.projectId === event.projectId ? current : null;
+  return null;
+}
+
+export interface ScriptParseOperation {
+  operationToken: number;
+  activeOperationToken: number;
+  targetProjectId: string;
+  managedProjectId: string | null;
+  currentProjectId: string | null;
+}
+
+export function isCurrentScriptParseOperation(operation: ScriptParseOperation): boolean {
+  return operation.operationToken === operation.activeOperationToken
+    && operation.targetProjectId === operation.managedProjectId;
+}
+
+export function canStartScriptParse({ confirmed, targetProjectId, managedProjectId }: {
+  confirmed: boolean;
+  targetProjectId: string;
+  managedProjectId: string | null;
+}): boolean {
+  return confirmed && targetProjectId === managedProjectId;
+}
+
 interface ScriptManagerModalProps {
   open: boolean;
   variant?: "modal" | "inline";
@@ -21,6 +58,7 @@ interface ScriptManagerModalProps {
   isCreatingScript: boolean;
   isSavingScript: boolean;
   isParsingScript: boolean;
+  parseError: ScriptParseError | null;
   deletingProjectId: string | null;
   onClose: () => void;
   onSearchTextChange: (value: string) => void;
@@ -36,6 +74,7 @@ interface ScriptManagerModalProps {
   onParseRevision: () => void;
   onAnalyzeScript: () => void;
   onScriptFileSelected: (file: File) => void;
+  onDismissParseError: () => void;
   onDeleteScript: () => void;
 }
 
@@ -57,6 +96,7 @@ export function ScriptManagerModal({
   isCreatingScript,
   isSavingScript,
   isParsingScript,
+  parseError,
   deletingProjectId,
   onClose,
   onSearchTextChange,
@@ -72,6 +112,7 @@ export function ScriptManagerModal({
   onParseRevision,
   onAnalyzeScript,
   onScriptFileSelected,
+  onDismissParseError,
   onDeleteScript
 }: ScriptManagerModalProps) {
   const { t } = useTranslation();
@@ -104,6 +145,17 @@ export function ScriptManagerModal({
         disabled={!selectedProjectId || isSelectedProjectLoading || busy}
       />
     </label>
+  );
+  const parseErrorPanel = parseError && (
+    <section className="script-manager-parse-error" role="alert" aria-live="assertive">
+      <div>
+        <strong>{t("script.parseErrorTitle")}</strong>
+        <p>{parseError.message}</p>
+      </div>
+      <button className="icon-button small" type="button" onClick={onDismissParseError} aria-label={t("script.dismissParseError")} title={t("script.dismissParseError")}>
+        <X size={14} />
+      </button>
+    </section>
   );
 
   if (!open) return null;
@@ -162,6 +214,8 @@ export function ScriptManagerModal({
             </button>
           ))}
         </div>
+
+        {parseErrorPanel}
 
         <div className="script-manager-body">
           <div className="script-manager-inline-track" data-active-drawer={inlineDrawerTab}>
@@ -274,6 +328,8 @@ export function ScriptManagerModal({
           </div>
           <button className="icon-button small" type="button" onClick={onClose} title={t("actions.close")}><X size={14} /></button>
         </header>
+
+        {parseErrorPanel}
 
         <div className="script-manager-body">
           <aside className="script-manager-list-panel">

@@ -22,6 +22,30 @@ export class ApiRequestError extends Error {
   }
 }
 
+export function apiErrorMessage(body: string, fallback: string): string {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (parsed && typeof parsed === "object" && "detail" in parsed) {
+      const detail = (parsed as { detail?: unknown }).detail;
+      if (typeof detail === "string" && detail.trim()) return detail;
+      if (Array.isArray(detail)) {
+        const messages = detail.map((item) => {
+          if (typeof item === "string") return item;
+          if (!item || typeof item !== "object") return "";
+          const validation = item as { loc?: unknown; msg?: unknown };
+          const location = Array.isArray(validation.loc) ? validation.loc.map(String).join(".") : "";
+          const message = typeof validation.msg === "string" ? validation.msg : "";
+          return location && message ? `${location}: ${message}` : message || location;
+        }).filter(Boolean);
+        if (messages.length) return messages.join("; ");
+      }
+    }
+  } catch {
+    // Non-JSON error bodies use the plain-text fallback below.
+  }
+  return body || fallback;
+}
+
 export function getApiToken(): string {
   return apiToken;
 }
@@ -52,7 +76,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     throw new ApiRequestError(
       response.status,
       body,
-      body || "API token required"
+      apiErrorMessage(body, "API token required")
     );
   }
   if (!response.ok) {
@@ -60,7 +84,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     throw new ApiRequestError(
       response.status,
       body,
-      body || response.statusText
+      apiErrorMessage(body, response.statusText)
     );
   }
   return response.json() as Promise<T>;

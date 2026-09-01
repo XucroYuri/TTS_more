@@ -24,6 +24,7 @@ from app.models import Character, EngineName, GenerationManifest, GenerationTask
 from app.net_guard import EgressError, scrub_error, validate_egress_url
 from app.open_source_tts import OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, configure_open_source_tts, detect_open_source_tts, open_source_catalog
 from app.portable_locator_mutations import ManagedPortableLocatorMutationError, PortableLocatorMutationCoordinator
+from app.parse_logging import log_parse_event, parse_attempt_logger, parser_metadata, quality_reason_codes
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key, persist_manifest_delta
@@ -218,6 +219,7 @@ def create_app(
     app.state.writable_services_path = writable_services_file
     app.state.parser_config_path = parser_config_file
     app.state.env_path = env_file
+    app.state.parse_attempt_logger = parse_attempt_logger(store.root)
     # Read at app-creation time so tests/processes can override via env.
     app.state.max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(MAX_UPLOAD_BYTES)))
 
@@ -970,12 +972,60 @@ def create_app(
         script_revision = next((item for item in project.script_revisions if item.revision_id == request.script_revision_id), None)
         if script_revision is None:
             raise HTTPException(status_code=404, detail="script revision not found")
+        attempt_id = uuid.uuid4().hex
+        started_at = time.perf_counter()
+        event_base = {
+            "attempt_id": attempt_id,
+            "project_id": project_id,
+            "script_revision_id": script_revision.revision_id,
+            "source_length": len(script_revision.source_markdown),
+        }
+        event_base.update(parser_metadata(app.state.parser))
+        log_parse_event(
+            app.state.parse_attempt_logger,
+            **event_base,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            event="started",
+        )
         try:
             draft = app.state.parser.parse(script_revision.source_markdown)
         except ParserProviderUnavailable as exc:
+            log_parse_event(
+                app.state.parse_attempt_logger,
+                **event_base,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                event="failed",
+                elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                http_status=503,
+                failure_category="provider_unavailable",
+                reason_codes=["provider_unavailable"],
+            )
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except ParserQualityError as exc:
+            log_parse_event(
+                app.state.parse_attempt_logger,
+                **event_base,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                event="failed",
+                elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                http_status=422,
+                failure_category="quality_rejected",
+                reason_codes=quality_reason_codes(exc),
+            )
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception:
+            log_parse_event(
+                app.state.parse_attempt_logger,
+                **event_base,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                event="failed",
+                elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                http_status=500,
+                failure_category="unexpected",
+                reason_codes=["unexpected"],
+            )
+            raise
+        event_base.update(parser_metadata(app.state.parser, getattr(draft, "provider", event_base["provider"])))
 
         class ScriptRevisionMissingAtCommit(Exception):
             pass
@@ -1025,6 +1075,27 @@ def create_app(
             raise HTTPException(status_code=404, detail="project not found") from exc
         except ScriptRevisionMissingAtCommit as exc:
             raise HTTPException(status_code=404, detail="script revision not found") from exc
+        except Exception:
+            log_parse_event(
+                app.state.parse_attempt_logger,
+                **event_base,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                event="failed",
+                elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                http_status=500,
+                failure_category="unexpected",
+                reason_codes=["unexpected"],
+            )
+            raise
+        log_parse_event(
+            app.state.parse_attempt_logger,
+            **event_base,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            event="succeeded",
+            elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+            http_status=200,
+            reason_codes=[],
+        )
         revision_payload = revision.model_dump(mode="json")
         return {"revision": revision_payload, "parse_revision": revision_payload, "project": project.model_dump(mode="json")}
 
