@@ -1,7 +1,11 @@
+import pytest
+from pydantic import ValidationError
+
 from app.voice_matching import estimate_target_duration, rank_voice_candidates
 from app.voice_matching_models import (
     CatalogSnapshot,
     ReferenceAssetRecord,
+    VoiceMatchPolicy,
     VoiceMatchRequest,
     VoiceResourceRecord,
 )
@@ -122,3 +126,15 @@ def test_unconfirmed_generic_resource_is_not_eligible() -> None:
     )
 
     assert rank_voice_candidates(request, catalog).candidates == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("auto_fill_threshold", 79.9), ("explicit_emotion_minimum", 21.9)],
+)
+def test_voice_match_policy_rejects_values_below_mandatory_auto_fill_floors(
+    field: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValidationError):
+        VoiceMatchPolicy(**{field: value})

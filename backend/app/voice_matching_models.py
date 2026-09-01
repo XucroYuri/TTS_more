@@ -122,8 +122,8 @@ class VoiceSelectionSnapshot(StrictVoiceModel):
 
 
 class VoiceMatchPolicy(StrictVoiceModel):
-    auto_fill_threshold: float = Field(default=80, ge=0, le=100)
-    explicit_emotion_minimum: float = Field(default=22, ge=0, le=30)
+    auto_fill_threshold: float = Field(default=80, ge=80, le=100)
+    explicit_emotion_minimum: float = Field(default=22, ge=22, le=30)
     speed_min: float = Field(default=0.85, ge=0.85, le=1.20)
     speed_max: float = Field(default=1.20, ge=0.85, le=1.20)
 
