@@ -152,6 +152,7 @@ import type {
 
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 type SaveState = "idle" | "saving" | "saved" | "error";
+type ProjectSaveOutcome = "saved" | "stale" | "failed";
 type ServicePanelSection = "overview" | "open-source" | "tts" | "llm" | "resources" | "roles";
 type ConfirmationTone = "warning" | "danger" | "info";
 const KWJM_TESTING_INDEX = -1;
@@ -1404,40 +1405,57 @@ export default function App() {
     projectId: string,
     authoritativeProject?: ScriptProject
   ): Promise<ScriptProject | null> {
-    const pending = pendingProjectAutosaveRef.current;
-    let flushedProject: ScriptProject | null = null;
-    if (pending?.projectId === projectId) {
+    const pending = pendingProjectAutosaveRef.current?.projectId === projectId
+      ? pendingProjectAutosaveRef.current
+      : null;
+    if (pending) {
       if (pending.timerId !== null) window.clearTimeout(pending.timerId);
       pendingProjectAutosaveRef.current = null;
-      let resolvedAuthority = authoritativeProject;
-      const recoveringUnknownAuthority = !resolvedAuthority
-        && authorityUnknownProjectIdsRef.current.has(projectId);
-      if (recoveringUnknownAuthority) {
-        await saveChainRef.current;
-        try {
-          resolvedAuthority = await fetchProject(projectId);
-        } catch (error) {
-          if (!pendingProjectAutosaveRef.current) {
-            pendingProjectAutosaveRef.current = { ...pending, timerId: null };
-          }
-          setSaveState("error");
-          setNotice(error instanceof Error ? error.message : t("notice.autoSaveFailed"));
-          return null;
+    }
+    let resolvedAuthority = authoritativeProject;
+    const recoveringUnknownAuthority = !resolvedAuthority
+      && authorityUnknownProjectIdsRef.current.has(projectId);
+    if (recoveringUnknownAuthority) {
+      await saveChainRef.current;
+      try {
+        resolvedAuthority = await fetchProject(projectId);
+      } catch (error) {
+        if (pending && !pendingProjectAutosaveRef.current) {
+          pendingProjectAutosaveRef.current = { ...pending, timerId: null };
         }
+        setSaveState("error");
+        setNotice(error instanceof Error ? error.message : t("notice.autoSaveFailed"));
+        return null;
       }
+    }
+    let flushedProject: ScriptProject | null = null;
+    let saveOutcome: ProjectSaveOutcome | null = null;
+    if (pending) {
       flushedProject = resolvedAuthority
         ? mergeAuthoritativeProjectStructure(pending.project, resolvedAuthority)
         : pending.project;
-      saveChainRef.current = saveChainRef.current.then(() => saveCurrentProject(
-        pending.projectId,
-        flushedProject!,
-        pending.characters,
-        pending.authorityEpoch
-      ));
+      saveChainRef.current = saveChainRef.current.then(async () => {
+        saveOutcome = await saveCurrentProject(
+          pending.projectId,
+          flushedProject!,
+          pending.characters,
+          pending.authorityEpoch
+        );
+      });
     }
     await saveChainRef.current;
-    if (flushedProject && !authoritativeProject && authorityUnknownProjectIdsRef.current.has(projectId)) {
-      flushedProject = await drainPendingProjectAutosaves(projectId, flushedProject);
+    if (saveOutcome === "failed") {
+      if (!pendingProjectAutosaveRef.current && pending?.projectId === projectId) {
+        pendingProjectAutosaveRef.current = { ...pending, timerId: null };
+      }
+      return null;
+    }
+    if (recoveringUnknownAuthority && resolvedAuthority) {
+      flushedProject = await drainPendingProjectAutosaves(
+        projectId,
+        flushedProject ?? resolvedAuthority
+      );
+      if (pendingProjectAutosaveRef.current?.projectId === projectId) return null;
       authorityUnknownProjectIdsRef.current.delete(projectId);
       applyAuthoritativeProjectStructure(projectId, flushedProject);
     }
@@ -1451,7 +1469,8 @@ export default function App() {
     let reconciledProject = authoritativeProject;
     do {
       const flushedProject = await flushPendingProjectAutosave(projectId, reconciledProject);
-      if (flushedProject) reconciledProject = flushedProject;
+      if (!flushedProject) break;
+      reconciledProject = flushedProject;
     } while (pendingProjectAutosaveRef.current?.projectId === projectId);
     return reconciledProject;
   }
@@ -1493,25 +1512,27 @@ export default function App() {
     projectSnapshot: ScriptProject,
     characterSnapshot: Character[],
     authorityEpoch: number
-  ) {
+  ): Promise<ProjectSaveOutcome> {
     if (authorityEpoch !== (projectAuthorityEpochRef.current.get(targetProjectId) ?? 0)) {
       setSaveState("saved");
-      return;
+      return "stale";
     }
     try {
       await Promise.all([saveProject(targetProjectId, projectSnapshot), saveCharacters(characterSnapshot)]);
       if (authorityEpoch !== (projectAuthorityEpochRef.current.get(targetProjectId) ?? 0)) {
         setSaveState("saved");
         setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
-        return;
+        return "stale";
       }
       setSaveState("saved");
       setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
       setNotice(t("notice.autoSaved"));
       await refreshProjects();
+      return "saved";
     } catch (error) {
       setSaveState("error");
       setNotice(error instanceof Error ? error.message : t("notice.autoSaveFailed"));
+      return "failed";
     }
   }
 

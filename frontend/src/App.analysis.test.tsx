@@ -1963,4 +1963,169 @@ describe("App semantic analysis entry", () => {
       .toContain(revision.revision_id);
     expect(backendProjects.get(projectAId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
   });
+
+  it.each([
+    {
+      label: "a 409 conflict",
+      createSaveError: () => new ApiRequestError(409, '{"detail":"revision conflict"}', "revision conflict"),
+      expectedNotice: "revision conflict"
+    },
+    {
+      label: "a network error",
+      createSaveError: () => new TypeError("network unavailable"),
+      expectedNotice: "network unavailable"
+    }
+  ])("keeps protected project edits after $label until a retry saves them", async ({ createSaveError, expectedNotice }) => {
+    vi.useFakeTimers();
+    const projectAId = `switch-save-failure-a-${expectedNotice.replaceAll(" ", "-")}`;
+    const projectBId = `switch-save-failure-b-${expectedNotice.replaceAll(" ", "-")}`;
+    const projectA = scriptProject("Switch save failure A");
+    projectA.lines = [{ id: "switch-save-failure-a-line", character_id: "a", text: "A 待安全保存台词", note: "", language: "zh-CN" }];
+    const projectB = scriptProject("Switch save failure B");
+    projectB.lines = [{ id: "switch-save-failure-b-line", character_id: "b", text: "B 目标台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectAId, projectA);
+    backendProjects.set(projectBId, projectB);
+    let authorityUnavailable = false;
+    apiMocks.fetchProject.mockImplementation(async (projectId: string) => {
+      if (projectId === projectAId && authorityUnavailable) {
+        throw new Error("authority temporarily unavailable");
+      }
+      const stored = backendProjects.get(projectId);
+      if (!stored) throw new Error(`missing project: ${projectId}`);
+      return cloneProject(stored);
+    });
+    const pendingCreate = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingCreate.promise);
+    const view = await renderApp(projectAId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：PUT 失败也不能丢"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+    await click(view.container.querySelector(".reference-setup-callout button")!);
+    await flushAsync();
+
+    const revision = scriptRevision(
+      `switch-save-failure-revision-${expectedNotice.replaceAll(" ", "-")}`,
+      "甲：PUT 失败也不能丢",
+      `sha-switch-save-failure-${expectedNotice.replaceAll(" ", "-")}`
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectAId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectAId, cloneProject(serverProject));
+    authorityUnavailable = true;
+    pendingCreate.reject(new Error("connection lost after commit"));
+    await flushAsync(80);
+
+    authorityUnavailable = false;
+    apiMocks.saveProject.mockRejectedValueOnce(createSaveError());
+    const rowB = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Switch save failure B"))!;
+    await click(rowB);
+    await flushAsync();
+    await click(view.container.querySelector(".script-manager-inline-actions button.secondary-button")!);
+    await flushAsync(100);
+
+    expect.soft(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectAId);
+    expect.soft(view.container.textContent).toContain("A 待安全保存台词");
+    expect.soft(view.container.querySelector(".notice")?.textContent).toContain(expectedNotice);
+
+    if (view.dom.window.localStorage.getItem("tts-more.currentProjectId") === projectAId) {
+      await click(view.container.querySelector(".script-manager-inline-actions button.secondary-button")!);
+      await flushAsync(100);
+    }
+    expect(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectBId);
+
+    const rowA = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Switch save failure A"))!;
+    await click(rowA);
+    await flushAsync();
+    await click(view.container.querySelector(".script-manager-inline-actions button.secondary-button")!);
+    await flushAsync(80);
+
+    expect(backendProjects.get(projectAId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(backendProjects.get(projectAId)?.script_revisions?.map((item) => item.revision_id))
+      .toContain(revision.revision_id);
+    expect(backendProjects.get(projectAId)?.lines[0]?.temporary_binding?.provider_type).toBe("indextts");
+  });
+
+  it("recovers unknown revision authority without a pending TTS edit before switching projects", async () => {
+    vi.useFakeTimers();
+    const projectAId = "switch-no-pending-current-a";
+    const projectBId = "switch-no-pending-target-b";
+    const projectA = scriptProject("Switch no pending A");
+    projectA.lines = [{ id: "switch-no-pending-a-line", character_id: "a", text: "A 未修改台词", note: "", language: "zh-CN" }];
+    const projectB = scriptProject("Switch no pending B");
+    projectB.lines = [{ id: "switch-no-pending-b-line", character_id: "b", text: "B 目标台词", note: "", language: "zh-CN" }];
+    backendProjects.set(projectAId, projectA);
+    backendProjects.set(projectBId, projectB);
+    let authorityUnavailable = false;
+    apiMocks.fetchProject.mockImplementation(async (projectId: string) => {
+      if (projectId === projectAId && authorityUnavailable) {
+        throw new Error("authority temporarily unavailable");
+      }
+      const stored = backendProjects.get(projectId);
+      if (!stored) throw new Error(`missing project: ${projectId}`);
+      return cloneProject(stored);
+    });
+    const pendingCreate = deferred<{ project: ScriptProject; script_revision: ScriptRevision }>();
+    apiMocks.createScriptRevision.mockImplementation(() => pendingCreate.promise);
+    const view = await renderApp(projectAId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector(".script-manager-row")!);
+    await flushAsync();
+    await changeReactValueExact(
+      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
+      "甲：没有 TTS pending 也要恢复权威"
+    );
+    await click(view.container.querySelector('[data-action="analyze-script"]')!);
+    await flushAsync(40);
+
+    const revision = scriptRevision(
+      "switch-no-pending-server-revision",
+      "甲：没有 TTS pending 也要恢复权威",
+      "sha-switch-no-pending-server-revision"
+    );
+    const serverProject: ScriptProject = {
+      ...cloneProject(backendProjects.get(projectAId)!),
+      active_script_revision_id: revision.revision_id,
+      script_revisions: [revision]
+    };
+    backendProjects.set(projectAId, cloneProject(serverProject));
+    authorityUnavailable = true;
+    pendingCreate.reject(new Error("connection lost after commit"));
+    await flushAsync(80);
+    expect(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectAId);
+
+    authorityUnavailable = false;
+    const rowB = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Switch no pending B"))!;
+    await click(rowB);
+    await flushAsync();
+    await click(view.container.querySelector(".script-manager-inline-actions button.secondary-button")!);
+    await flushAsync(100);
+
+    expect(view.dom.window.localStorage.getItem("tts-more.currentProjectId")).toBe(projectBId);
+    expect(view.container.textContent).toContain("B 目标台词");
+
+    const rowA = [...view.container.querySelectorAll<HTMLElement>(".script-manager-row")]
+      .find((row) => row.textContent?.includes("Switch no pending A"))!;
+    await click(rowA);
+    await flushAsync();
+    await click(view.container.querySelector(".script-manager-inline-actions button.secondary-button")!);
+    await flushAsync(80);
+
+    expect(backendProjects.get(projectAId)?.active_script_revision_id).toBe(revision.revision_id);
+    expect(view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")?.value)
+      .toBe(revision.source_markdown);
+  });
 });
