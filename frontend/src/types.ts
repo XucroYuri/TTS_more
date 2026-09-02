@@ -244,6 +244,120 @@ export interface ScriptLine {
   temporary_binding?: VoiceBinding | null;
   semantic_revision_id?: string | null;
   utterance_id?: string | null;
+  voice_selection?: VoiceSelectionSnapshot | null;
+}
+
+export type VoiceCatalogState = "ready" | "partial" | "failed";
+export type VoiceResourceState = "ready" | "unavailable" | "incompatible" | "reload_required";
+
+export interface VoiceCatalogDiagnostic {
+  code: string;
+  field_path: string;
+}
+
+export interface VoiceResourceRecord {
+  resource_id: string;
+  character_id: string;
+  character_aliases: string[];
+  reference_asset_ids: string[];
+  languages: string[];
+  generic_pool: boolean;
+  confirmed: boolean;
+  metadata_score: number;
+  engine_type: string;
+  state: VoiceResourceState;
+  service_id?: string | null;
+  weight_artifact_ids: string[];
+  mapping_origin: "plugin" | "manual" | "declared" | "unknown";
+  fingerprint: string;
+}
+
+export interface VoiceReferenceAssetRecord {
+  reference_asset_id: string;
+  character_id: string;
+  character_aliases: string[];
+  language: string;
+  emotion: string;
+  prompt_text: string;
+  duration_seconds?: number | null;
+  generic_pool: boolean;
+  confirmed: boolean;
+  metadata_score: number;
+  fingerprint: string;
+  character_origin: "confirmed" | "declared" | "filename" | "inferred" | "unknown";
+  character_confidence: number;
+  emotion_origin: "confirmed" | "declared" | "filename" | "inferred" | "unknown";
+  emotion_confidence: number;
+  language_origin: "confirmed" | "declared" | "filename" | "inferred" | "unknown";
+  compatible_resource_ids: string[];
+}
+
+export interface VoiceCatalogPublicView {
+  state: VoiceCatalogState;
+  catalog_version?: string | null;
+  resources: VoiceResourceRecord[];
+  references: VoiceReferenceAssetRecord[];
+  diagnostics: VoiceCatalogDiagnostic[];
+  counts: { resources: number; references: number; weights: number };
+}
+
+export interface VoiceCatalogSyncStatus {
+  state: VoiceCatalogState;
+  catalog_version?: string | null;
+  resource_count: number;
+  reference_count: number;
+  weight_count: number;
+  diagnostics: VoiceCatalogDiagnostic[];
+}
+
+export interface VoiceScoreBreakdown {
+  character: number;
+  emotion: number;
+  duration: number;
+  language: number;
+  metadata: number;
+}
+
+export interface VoiceCandidate {
+  candidate_id: string;
+  resource_id: string;
+  reference_asset_id: string;
+  score: number;
+  score_breakdown: VoiceScoreBreakdown;
+  auto_fill_eligible: boolean;
+  speed_factor: number;
+  engine_type: string;
+  target_duration_seconds?: number | null;
+  reasons: string[];
+  blockers: string[];
+  catalog_version: string;
+}
+
+export interface VoiceRecommendation {
+  line_id: string;
+  catalog_version: string;
+  candidates: VoiceCandidate[];
+  blockers: string[];
+}
+
+export interface VoiceSelectionSnapshot {
+  catalog_version: string;
+  candidate_id: string;
+  resource_id: string;
+  reference_asset_id: string;
+  score: number;
+  speed_factor: number;
+  line_id: string;
+  source: "automatic" | "manual" | "role_binding" | "manual_identity_override";
+  resource_fingerprint: string;
+  reference_fingerprint: string;
+  emotion?: string | null;
+  target_duration_seconds?: number | null;
+  prompt_text: string;
+  reference_language: string;
+  text_language: string;
+  inference_parameters: Record<string, unknown>;
+  selected_at: string;
 }
 
 export interface ScriptRevision {

@@ -640,6 +640,60 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         manual: "查看音色加载详情"
       }
     },
+    voiceMatching: {
+      catalogEyebrow: "Portable 资产目录",
+      catalogTitle: "自动音色资产",
+      sync: "扫描并同步",
+      syncing: "正在扫描…",
+      catalogUnavailable: "尚未建立资产目录",
+      catalogState: {
+        ready: "目录就绪",
+        partial: "部分可用",
+        failed: "目录不可用"
+      },
+      resourceCount: "{{count}} 个可用资源",
+      referenceCount: "{{count}} 个参考音频",
+      weightCount: "{{count}} 个权重",
+      diagnostics: "{{count}} 项安全诊断",
+      resourceState: {
+        ready: "可用",
+        unavailable: "未注册",
+        incompatible: "能力不兼容",
+        reload_required: "需要重载"
+      },
+      candidateEyebrow: "角色 / 情绪 / 时长匹配",
+      candidateTitle: "推荐声音方案",
+      loadingCandidates: "正在计算候选…",
+      noCandidates: "暂时没有可用候选，请先同步资产或完成资源映射。",
+      blocked: "无法自动推荐：{{reason}}",
+      selectCandidate: "选择此方案",
+      selected: "已选择",
+      clearSelection: "取消选择",
+      autoFillEligible: "可自动填充",
+      seconds: "{{value}} 秒",
+      selectionSource: {
+        automatic: "自动选择",
+        manual: "人工选择",
+        role_binding: "角色绑定",
+        manual_identity_override: "人工身份确认"
+      },
+      score: {
+        character: "角色",
+        emotion: "情绪",
+        duration: "时长",
+        language: "语言"
+      },
+      reason: {
+        character_exact: "角色完全匹配",
+        emotion_exact: "情绪完全匹配",
+        language_exact: "语言匹配",
+        duration_close: "时长接近"
+      },
+      syncFailed: "资产同步失败",
+      recommendationFailed: "声音推荐失败",
+      selectionFailed: "保存声音方案失败",
+      selectionCleared: "已取消当前声音方案"
+    },
     validation: {
       title: "真实 TTS 验收",
       menu: "真实验收",
@@ -1559,6 +1613,60 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         error: "Voice loading failed",
         manual: "View voice loading details"
       }
+    },
+    voiceMatching: {
+      catalogEyebrow: "Portable asset catalog",
+      catalogTitle: "Automatic voice assets",
+      sync: "Scan and sync",
+      syncing: "Scanning…",
+      catalogUnavailable: "No asset catalog yet",
+      catalogState: {
+        ready: "Catalog ready",
+        partial: "Partially available",
+        failed: "Catalog unavailable"
+      },
+      resourceCount: "{{count}} resources",
+      referenceCount: "{{count}} references",
+      weightCount: "{{count}} weights",
+      diagnostics: "{{count}} safe diagnostics",
+      resourceState: {
+        ready: "Ready",
+        unavailable: "Unregistered",
+        incompatible: "Incompatible",
+        reload_required: "Reload required"
+      },
+      candidateEyebrow: "Role / emotion / duration match",
+      candidateTitle: "Recommended voice plans",
+      loadingCandidates: "Ranking candidates…",
+      noCandidates: "No usable candidates. Sync assets or finish resource mapping first.",
+      blocked: "Automatic recommendation blocked: {{reason}}",
+      selectCandidate: "Select this plan",
+      selected: "Selected",
+      clearSelection: "Clear selection",
+      autoFillEligible: "Auto-fill eligible",
+      seconds: "{{value}} sec",
+      selectionSource: {
+        automatic: "Automatic selection",
+        manual: "Manual selection",
+        role_binding: "Role binding",
+        manual_identity_override: "Manual identity confirmation"
+      },
+      score: {
+        character: "Role",
+        emotion: "Emotion",
+        duration: "Duration",
+        language: "Language"
+      },
+      reason: {
+        character_exact: "Exact role match",
+        emotion_exact: "Exact emotion match",
+        language_exact: "Language match",
+        duration_close: "Similar duration"
+      },
+      syncFailed: "Asset sync failed",
+      recommendationFailed: "Voice recommendation failed",
+      selectionFailed: "Failed to save voice plan",
+      selectionCleared: "Current voice plan cleared"
     },
     validation: {
       title: "Real TTS Validation",

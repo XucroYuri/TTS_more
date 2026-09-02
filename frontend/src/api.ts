@@ -1,4 +1,4 @@
-import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, WorkerHealth } from "./types";
+import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, VoiceCatalogPublicView, VoiceCatalogSyncStatus, VoiceRecommendation, VoiceSelectionSnapshot, WorkerHealth } from "./types";
 import type { AnalysisRun, AnalysisRunStatus, DraftOperation, SemanticAnalysisDraft, SemanticConfirmResponse } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -172,6 +172,40 @@ export async function fetchServiceLoadState(serviceId: string): Promise<ServiceL
 
 export async function fetchVoiceCandidates(): Promise<VoiceCandidates> {
   return request("/api/resources/voice-candidates?limit=80");
+}
+
+export async function fetchVoiceCatalog(): Promise<VoiceCatalogPublicView> {
+  return request("/api/voice-assets/catalog");
+}
+
+export async function syncVoiceCatalog(): Promise<VoiceCatalogSyncStatus> {
+  return request("/api/voice-assets/catalog/sync", { method: "POST" });
+}
+
+export async function recommendVoices(projectId: string, lineIds: string[]): Promise<{ recommendations: VoiceRecommendation[] }> {
+  return request(`/api/projects/${encodeURIComponent(projectId)}/voice-recommendations`, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ line_ids: lineIds })
+  });
+}
+
+export async function selectVoiceCandidate(projectId: string, lineId: string, candidateId: string): Promise<{ selection: VoiceSelectionSnapshot }> {
+  return request(`/api/projects/${encodeURIComponent(projectId)}/lines/${encodeURIComponent(lineId)}/voice-selection`, {
+    method: "PUT",
+    headers: jsonHeaders,
+    body: JSON.stringify({ candidate_id: candidateId })
+  });
+}
+
+export async function clearVoiceSelection(projectId: string, lineId: string): Promise<{ status: string }> {
+  return request(`/api/projects/${encodeURIComponent(projectId)}/lines/${encodeURIComponent(lineId)}/voice-selection`, {
+    method: "DELETE"
+  });
+}
+
+export function referenceAudioUrl(assetId: string): string {
+  return `/api/voice-assets/references/${encodeURIComponent(assetId)}/audio`;
 }
 
 export async function parseScript(text: string): Promise<ParsedDraft> {

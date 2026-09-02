@@ -27,6 +27,7 @@ import { useTranslation } from "react-i18next";
 
 import {
   ApiRequestError,
+  clearVoiceSelection,
   fetchCharacters,
   fetchProjectCharacters,
   fetchManifest,
@@ -50,6 +51,7 @@ import {
   fetchQueueStatus,
   generationPreflight,
   fetchVoiceCandidates,
+  fetchVoiceCatalog,
   fetchLogsCandidates,
   freezeProjectCharacter,
   createGenerationJob,
@@ -60,16 +62,20 @@ import {
   deleteGenerationVersion,
   importRoleLibraryCandidate,
   reloadServiceSettings,
+  recommendVoices,
+  referenceAudioUrl,
   runRealValidation,
   saveCharacters,
   saveParserProviders,
   scanCharacterLibrary,
   saveProject,
+  selectVoiceCandidate,
   startAndWaitService,
   startService,
   stopService,
   testParserProvider,
   testService,
+  syncVoiceCatalog,
   unfreezeProjectCharacter,
   deleteCharacterLibraryItem,
   uploadCharacterAvatar,
@@ -82,6 +88,8 @@ import { RoleAvatar } from "./components/RoleAvatar";
 import { canStartScriptParse, isCurrentScriptParseOperation, reduceScriptParseError, ScriptManagerModal, type ScriptParseError } from "./components/ScriptManagerModal";
 import { WaveformPlayer } from "./components/WaveformPlayer";
 import { TokenGate } from "./components/TokenGate";
+import { VoiceAssetStatusPanel } from "./features/voice-matching/VoiceAssetStatusPanel";
+import { VoiceCandidatePanel } from "./features/voice-matching/VoiceCandidatePanel";
 import {
   AnalysisStageGate,
   activeScriptSourceText,
@@ -132,7 +140,9 @@ import type {
   ScriptProject,
   ScriptRevision,
   VoiceBinding,
+  VoiceCatalogPublicView,
   VoiceCandidates,
+  VoiceRecommendation,
   VoiceProfile,
   WorkerHealth,
   GenerationJob,
@@ -198,6 +208,29 @@ function avatarFallback(name: string): string {
   return name.trim().slice(0, 1).toLocaleUpperCase() || "?";
 }
 
+function mergeVoiceSelectionAuthority(
+  current: ScriptProject,
+  authoritative: ScriptProject,
+  lineId: string
+): ScriptProject {
+  const authoritativeLine = authoritative.lines.find((line) => line.id === lineId);
+  if (!authoritativeLine) return current;
+  const mergeLine = (line: ScriptLine): ScriptLine => line.id === lineId
+    ? {
+        ...line,
+        voice_selection: authoritativeLine.voice_selection ?? null,
+        temporary_binding: authoritativeLine.temporary_binding ?? null
+      }
+    : line;
+  return {
+    ...current,
+    lines: current.lines.map(mergeLine),
+    parse_revisions: current.parse_revisions?.map((revision) => revision.revision_id === current.active_parse_revision_id
+      ? { ...revision, lines: revision.lines.map(mergeLine) }
+      : revision)
+  };
+}
+
 export default function App() {
   const { t, i18n } = useTranslation();
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(() => readStoredProjectId());
@@ -210,6 +243,14 @@ export default function App() {
   const [services, setServices] = useState<WorkerHealth[]>([]);
   const [runtime, setRuntime] = useState<RuntimeMode | null>(null);
   const [voiceCandidates, setVoiceCandidates] = useState<VoiceCandidates | null>(null);
+  const [voiceCatalog, setVoiceCatalog] = useState<VoiceCatalogPublicView | null>(null);
+  const [voiceCatalogError, setVoiceCatalogError] = useState<string | null>(null);
+  const [isSyncingVoiceCatalog, setIsSyncingVoiceCatalog] = useState(false);
+  const [voiceRecommendations, setVoiceRecommendations] = useState<Record<string, VoiceRecommendation>>({});
+  const [voiceRecommendationLoadingLineId, setVoiceRecommendationLoadingLineId] = useState<string | null>(null);
+  const [voiceRecommendationError, setVoiceRecommendationError] = useState<string | null>(null);
+  const [voiceRecommendationEpoch, setVoiceRecommendationEpoch] = useState(0);
+  const [selectingVoiceCandidateId, setSelectingVoiceCandidateId] = useState<string | null>(null);
   const [activeLineId, setActiveLineId] = useState("");
   const [expandedLineId, setExpandedLineId] = useState<string | null>(null);
   const [selectedHistoryVersions, setSelectedHistoryVersions] = useState<Record<string, string>>({});
@@ -306,6 +347,9 @@ export default function App() {
   const currentProjectTransitionChainRef = useRef<Promise<void>>(Promise.resolve());
   const projectAuthorityEpochRef = useRef<Map<string, number>>(new Map());
   const seededAuthoritativeProjectIdRef = useRef<string | null>(null);
+  const voiceCatalogRequestTokenRef = useRef(0);
+  const voiceRecommendationRequestTokenRef = useRef(0);
+  const voiceRecommendationCacheRef = useRef<Set<string>>(new Set());
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [preflightResult, setPreflightResult] = useState<GenerationPreflightResponse | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -378,6 +422,7 @@ export default function App() {
   useEffect(() => {
     setNotice(t("app.ready"));
     void refreshTopology();
+    void refreshVoiceCatalog();
     void refreshOpenSourceCatalog();
     void refreshProjects();
     void refreshParserProviders();
@@ -654,6 +699,7 @@ export default function App() {
   const activeModelSelectedSample = activeModelSamples.find((sample) => sample.sample_id === activeModelSampleId) ?? activeModelSamples[0] ?? (activeModelCatalogItem ? firstReferenceSampleFromModel(activeModelCatalogItem) : null);
   const preflightByLine = useMemo(() => new Map((preflightResult?.items ?? []).map((item) => [item.line_uid ?? item.line_id, item])), [preflightResult]);
   const activeLine = useMemo(() => project.lines.find((line) => line.id === activeLineId) ?? project.lines[0], [activeLineId, project.lines]);
+  const activeVoiceRecommendation = activeLine ? voiceRecommendations[activeLine.id] ?? null : null;
   const activeRoleRow = useMemo(
     () => activeLine ? projectRoleRows.find((role) => role.id === activeLine.character_id) : undefined,
     [activeLine, projectRoleRows]
@@ -719,6 +765,51 @@ export default function App() {
   useEffect(() => {
     setRouteSettingsOpen(false);
   }, [activeLine?.id, activeGenerationMethod]);
+
+  useEffect(() => {
+    setVoiceRecommendationError(null);
+  }, [activeLine?.id]);
+
+  useEffect(() => {
+    const projectId = currentProjectId;
+    const lineId = activeLine?.id;
+    const catalogVersion = voiceCatalog?.catalog_version;
+    if (!projectId || !lineId || !catalogVersion || !isProjectLoaded || workspaceStage !== "tts") return;
+    const cacheKey = `${projectId}|${lineId}|${catalogVersion}`;
+    if (voiceRecommendationCacheRef.current.has(cacheKey)) return;
+    voiceRecommendationCacheRef.current.add(cacheKey);
+    const requestToken = voiceRecommendationRequestTokenRef.current + 1;
+    voiceRecommendationRequestTokenRef.current = requestToken;
+    let cancelled = false;
+    setVoiceRecommendationLoadingLineId(lineId);
+    setVoiceRecommendationError(null);
+    void (async () => {
+      try {
+        await flushPendingProjectAutosave(projectId);
+        const payload = await recommendVoices(projectId, [lineId]);
+        if (cancelled || voiceRecommendationRequestTokenRef.current !== requestToken) return;
+        const recommendation = payload.recommendations.find((item) => item.line_id === lineId);
+        if (recommendation) {
+          setVoiceRecommendations((current) => ({ ...current, [lineId]: recommendation }));
+        }
+        const authoritativeProject = await fetchProject(projectId);
+        if (cancelled || voiceRecommendationRequestTokenRef.current !== requestToken) return;
+        setProject((current) => mergeVoiceSelectionAuthority(current, authoritativeProject, lineId));
+      } catch (error) {
+        voiceRecommendationCacheRef.current.delete(cacheKey);
+        if (!cancelled && voiceRecommendationRequestTokenRef.current === requestToken) {
+          setVoiceRecommendationError(error instanceof Error ? error.message : t("voiceMatching.recommendationFailed"));
+        }
+      } finally {
+        if (!cancelled && voiceRecommendationRequestTokenRef.current === requestToken) {
+          setVoiceRecommendationLoadingLineId(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeLine?.id, currentProjectId, isProjectLoaded, voiceCatalog?.catalog_version, voiceRecommendationEpoch, workspaceStage]);
 
   const activeLogsReferenceRequest = useMemo(
     () => logsReferenceRequest(activeProvider, activeServiceId, activeBindingConfig),
@@ -1103,6 +1194,72 @@ export default function App() {
       setOpenSourceCatalog(payload.providers);
     } catch {
       setOpenSourceCatalog([]);
+    }
+  }
+
+  async function refreshVoiceCatalog() {
+    const requestToken = voiceCatalogRequestTokenRef.current + 1;
+    voiceCatalogRequestTokenRef.current = requestToken;
+    try {
+      const payload = await fetchVoiceCatalog();
+      if (voiceCatalogRequestTokenRef.current !== requestToken) return;
+      setVoiceCatalog(payload);
+      setVoiceCatalogError(null);
+    } catch (error) {
+      if (voiceCatalogRequestTokenRef.current !== requestToken) return;
+      setVoiceCatalogError(error instanceof Error ? error.message : t("voiceMatching.catalogUnavailable"));
+    }
+  }
+
+  async function runVoiceCatalogSync() {
+    setIsSyncingVoiceCatalog(true);
+    setVoiceCatalogError(null);
+    try {
+      await syncVoiceCatalog();
+      voiceRecommendationCacheRef.current.clear();
+      voiceRecommendationRequestTokenRef.current += 1;
+      setVoiceRecommendations({});
+      await refreshVoiceCatalog();
+      setVoiceRecommendationEpoch((current) => current + 1);
+    } catch (error) {
+      setVoiceCatalogError(error instanceof Error ? error.message : t("voiceMatching.syncFailed"));
+    } finally {
+      setIsSyncingVoiceCatalog(false);
+    }
+  }
+
+  async function chooseVoiceCandidate(candidateId: string) {
+    if (!currentProjectId || !activeLine) return;
+    const projectId = currentProjectId;
+    const lineId = activeLine.id;
+    setSelectingVoiceCandidateId(candidateId);
+    try {
+      await flushPendingProjectAutosave(projectId);
+      await selectVoiceCandidate(projectId, lineId, candidateId);
+      const authoritativeProject = await fetchProject(projectId);
+      setProject((current) => mergeVoiceSelectionAuthority(current, authoritativeProject, lineId));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("voiceMatching.selectionFailed"));
+    } finally {
+      setSelectingVoiceCandidateId(null);
+    }
+  }
+
+  async function clearActiveVoiceSelection() {
+    if (!currentProjectId || !activeLine) return;
+    const projectId = currentProjectId;
+    const lineId = activeLine.id;
+    setSelectingVoiceCandidateId("__clear__");
+    try {
+      await flushPendingProjectAutosave(projectId);
+      await clearVoiceSelection(projectId, lineId);
+      const authoritativeProject = await fetchProject(projectId);
+      setProject((current) => mergeVoiceSelectionAuthority(current, authoritativeProject, lineId));
+      setNotice(t("voiceMatching.selectionCleared"));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("voiceMatching.selectionFailed"));
+    } finally {
+      setSelectingVoiceCandidateId(null);
     }
   }
 
@@ -2989,6 +3146,12 @@ export default function App() {
 
                         {servicePanelSection === "resources" && (
                           <div className="queue-workbench">
+                            <VoiceAssetStatusPanel
+                              catalog={voiceCatalog}
+                              syncing={isSyncingVoiceCatalog}
+                              error={voiceCatalogError}
+                              onSync={() => void runVoiceCatalogSync()}
+                            />
                             <section className={`queue-status-card ${queueHasWork ? "has-work" : "is-empty"}`}>
                               <div className="queue-status-head">
                                 <div>
@@ -4200,6 +4363,17 @@ export default function App() {
                     )}
                   </section>
                 )}
+
+                <VoiceCandidatePanel
+                  recommendation={activeVoiceRecommendation}
+                  selection={activeLine.voice_selection}
+                  loading={voiceRecommendationLoadingLineId === activeLine.id}
+                  error={voiceRecommendationError}
+                  selectingCandidateId={selectingVoiceCandidateId}
+                  referenceAudioUrl={referenceAudioUrl}
+                  onSelect={(candidateId) => void chooseVoiceCandidate(candidateId)}
+                  onClear={() => void clearActiveVoiceSelection()}
+                />
 
                 <section className={`inspector-generate-dock inspector-speech-workbench tone-${activeInspectorDiagnostics.tone}`}>
                   <div className="speech-workbench-line">

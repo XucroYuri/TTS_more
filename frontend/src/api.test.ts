@@ -1,6 +1,17 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { apiErrorMessage, getApiToken, patchAnalysisDraft, setApiToken } from "./api";
+import {
+  apiErrorMessage,
+  clearVoiceSelection,
+  fetchVoiceCatalog,
+  getApiToken,
+  patchAnalysisDraft,
+  recommendVoices,
+  referenceAudioUrl,
+  selectVoiceCandidate,
+  setApiToken,
+  syncVoiceCatalog
+} from "./api";
 import { createScriptRevision, saveProject } from "./api";
 import type { ScriptProject } from "./types";
 
@@ -36,6 +47,49 @@ describe("API error messages", () => {
     expect(apiErrorMessage('{"detail":[{"loc":["body","source_markdown"],"msg":"Field required"}]}', "Unprocessable Entity"))
       .toBe("body.source_markdown: Field required");
     expect(apiErrorMessage("Gateway unavailable", "Bad Gateway")).toBe("Gateway unavailable");
+  });
+});
+
+describe("voice matching API request shapes", () => {
+  it("uses path-free catalog, recommendation, selection, and clear routes", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const responses = [
+      { state: "ready", catalog_version: "catalog-v1", resources: [], references: [], diagnostics: [], counts: { resources: 0, references: 0, weights: 0 } },
+      { state: "ready", catalog_version: "catalog-v1", resource_count: 0, reference_count: 0, weight_count: 0, diagnostics: [] },
+      { recommendations: [] },
+      { selection: { candidate_id: "candidate/1" } },
+      { status: "cleared" }
+    ];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(JSON.stringify(responses.shift()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    try {
+      await fetchVoiceCatalog();
+      await syncVoiceCatalog();
+      await recommendVoices("demo/project", ["line/1"]);
+      await selectVoiceCandidate("demo/project", "line/1", "candidate/1");
+      await clearVoiceSelection("demo/project", "line/1");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(calls.map(({ url }) => url)).toEqual([
+      "/api/voice-assets/catalog",
+      "/api/voice-assets/catalog/sync",
+      "/api/projects/demo%2Fproject/voice-recommendations",
+      "/api/projects/demo%2Fproject/lines/line%2F1/voice-selection",
+      "/api/projects/demo%2Fproject/lines/line%2F1/voice-selection"
+    ]);
+    expect(calls.map(({ init }) => init?.method)).toEqual([undefined, "POST", "POST", "PUT", "DELETE"]);
+    expect(JSON.parse(String(calls[2].init?.body))).toEqual({ line_ids: ["line/1"] });
+    expect(JSON.parse(String(calls[3].init?.body))).toEqual({ candidate_id: "candidate/1" });
+    expect(referenceAudioUrl("reference/1")).toBe("/api/voice-assets/references/reference%2F1/audio");
   });
 });
 
