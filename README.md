@@ -117,6 +117,17 @@ scripts/update.sh --force-reset-repos --repo-paths deployment/app/repo-paths.loc
 
 旧的 `tts-more-v1` worker、Gradio WebUI 和 portable package 路线只作为历史迁移路径保留，不是当前推荐部署方式。完整 ComfyUI 部署步骤见 [ComfyUI 部署指南](docs/comfyui-integration.md#从零部署指南)。
 
+### 6. 自动音色匹配
+
+GPT-SoVITS Portable 可以继续作为模型与参考音频的资产来源，但不再启动它自己的 WebUI。把本机资产根目录写入 ComfyUI 服务的 `default_params.voice_asset_root`，或设置环境变量 `TTS_MORE_GPT_SOVITS_PORTABLE_ROOT`，然后在工作台顶部打开“队列/资源”，点击“扫描并同步”。系统会：
+
+1. 只读取受支持的权重、参考音频和同名元数据，不复制模型文件；
+2. 根据角色、情绪、语言和目标时长返回可解释的候选方案；
+3. 允许人工选择或取消，并把所选 `resource_id`、参考资产与安全参数送入 ComfyUI；
+4. 在资源未注册、能力不兼容或身份不确定时停止自动填充，而不是猜测音色身份。
+
+若资源页显示“部分可用”，先检查诊断中的字段路径。尤其是 GPT/SoVITS 权重对必须由 ComfyUI `resources.yaml` 或服务配置提供稳定映射；系统不会根据文件名自动猜配。详细配置与验收方法见 [自动音色目录与推荐](docs/comfyui-integration.md#自动音色目录与推荐)。
+
 当前阶段边界、理论验证和剩余真实机器验收项见 [当前阶段说明与简化计划](docs/current-state-and-simplification-plan.md) 与 [理论可用性验证](docs/theoretical-usability-validation.md)。
 
 ## 验证

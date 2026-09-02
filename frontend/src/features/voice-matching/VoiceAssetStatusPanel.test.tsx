@@ -57,7 +57,7 @@ describe("VoiceAssetStatusPanel", () => {
     await act(async () => root.render(createElement(VoiceAssetStatusPanel, { catalog, syncing: false, onSync })));
 
     const text = dom.window.document.body.textContent ?? "";
-    expect(text).toContain("1 个可用资源");
+    expect(text).toContain("1 个资源");
     expect(text).toContain("2 个权重");
     expect(text).toContain("需要重载");
     expect(text).toContain("voice_resource_reload_required");

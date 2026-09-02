@@ -49,6 +49,39 @@ export TTS_AUDIO_SUITE_RESOURCES="$(pwd)/resources.yaml"
 curl http://127.0.0.1:8188/api/tts-audio-suite/v1/capabilities
 ```
 
+## 自动音色目录与推荐
+
+自动匹配的输入只有四类：已解析的说话角色、情绪、台词目标时长，以及运营人员明确注册的 ComfyUI 资源。Portable 目录仅作为只读资产来源，不作为新的推理服务。
+
+在对应 ComfyUI 服务的本机配置中增加资产根目录：
+
+```json
+{
+  "default_params": {
+    "resource_id": "gpt-sovits-local",
+    "voice_asset_root": "E:\\path\\to\\GPT-SoVITS-Portable"
+  }
+}
+```
+
+也可以使用环境变量 `TTS_MORE_GPT_SOVITS_PORTABLE_ROOT`。保存后调用 `POST /api/settings/services/reload`，再调用 `POST /api/voice-assets/catalog/sync`，或在工作台“队列/资源”面板点击“扫描并同步”。目录状态含义如下：
+
+| 状态 | 含义 | 下一步 |
+|:---|:---|:---|
+| `ready` | 至少一个资源已完成能力与资产映射 | 可以请求推荐并生成 |
+| `partial` | 扫描成功，但部分权重、参考音频或资源尚未安全映射 | 按诊断字段路径补资源注册 |
+| `failed` | 根目录不可读或扫描失败 | 修正本机路径和权限后重试 |
+
+推荐接口只返回可生成的 Top-K 候选及各维度分数。自动填充还要同时满足身份、情绪、语言和时长阈值；人工选择会保存为项目级选择，但不会篡改全局角色库。提交生成时，后端再次解析所选候选并构建 ComfyUI workflow，前端传入的任意本机路径都不会成为可信参数。
+
+### 为什么不按文件名自动配对权重
+
+GPT 权重与 SoVITS 权重是一个可执行资源对。相似文件名只能说明“可能相关”，不能证明它们属于同一角色、同一训练版本或相同预处理链。错误配对会生成错误角色声音，严重时还会导致模型加载失败。因此 TTS More 只接受运营人员或 ComfyUI 资源注册表确认过的稳定 `resource_id`；未确认的权重仍会被统计并显示诊断，但不会进入候选或生成。
+
+### 当前兼容性验收基线
+
+2026-09-02 在本机 ComfyUI 端点验证了 TTS-Audio-Suite v5.7.0。`/object_info` 已包含 `TTSExternalGPTSovitsEngine`、`TTSExternalIndexTTSEngine`、`TTSExternalCosyVoiceEngine`、`TTSExternalAudioAsset`、`UnifiedTTSTextNode` 和 `SaveAudio`，并包含当前 workflow builder 所需输入字段；capabilities 也报告 GPT-SoVITS 资源 ready。因此无需额外下载插件。后续只在上述节点确实缺失、且版本升级不能恢复时，才安装或更新插件。
+
 ## 快速开始
 
 在 TTS More 工作台的 `接入 → TTS 服务` 页面添加 ComfyUI 端点。配置完成后，系统会将信息写入 `services.json`。

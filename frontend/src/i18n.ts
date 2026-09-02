@@ -651,7 +651,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         partial: "部分可用",
         failed: "目录不可用"
       },
-      resourceCount: "{{count}} 个可用资源",
+      resourceCount: "{{count}} 个资源",
       referenceCount: "{{count}} 个参考音频",
       weightCount: "{{count}} 个权重",
       diagnostics: "{{count}} 项安全诊断",

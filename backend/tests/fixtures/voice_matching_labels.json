@@ -1,0 +1,23 @@
+{
+  "catalog_version": "fixture-v1",
+  "characters": [
+    { "id": "诸葛九九", "aliases": ["九九"], "emotions": ["neutral", "happy", "angry"] },
+    { "id": "胶布", "aliases": [], "emotions": ["neutral", "excited", "sad"] },
+    { "id": "幽灵", "aliases": [], "emotions": ["neutral", "calm", "angry"] },
+    { "id": "装备党", "aliases": [], "emotions": ["neutral", "disgusted", "excited"] }
+  ],
+  "cases": [
+    { "line_id": "line-01", "character_id": "诸葛九九", "aliases": ["九九"], "emotion": "neutral", "expected_reference_asset_id": "ref-诸葛九九-neutral" },
+    { "line_id": "line-02", "character_id": "九九", "aliases": ["诸葛九九"], "emotion": "happy", "expected_reference_asset_id": "ref-诸葛九九-happy" },
+    { "line_id": "line-03", "character_id": "诸葛九九", "aliases": ["九九"], "emotion": "angry", "expected_reference_asset_id": "ref-诸葛九九-angry" },
+    { "line_id": "line-04", "character_id": "胶布", "aliases": [], "emotion": "neutral", "expected_reference_asset_id": "ref-胶布-neutral" },
+    { "line_id": "line-05", "character_id": "胶布", "aliases": [], "emotion": "excited", "expected_reference_asset_id": "ref-胶布-excited" },
+    { "line_id": "line-06", "character_id": "胶布", "aliases": [], "emotion": "sad", "expected_reference_asset_id": "ref-胶布-sad" },
+    { "line_id": "line-07", "character_id": "幽灵", "aliases": [], "emotion": "neutral", "expected_reference_asset_id": "ref-幽灵-neutral" },
+    { "line_id": "line-08", "character_id": "幽灵", "aliases": [], "emotion": "calm", "expected_reference_asset_id": "ref-幽灵-calm" },
+    { "line_id": "line-09", "character_id": "幽灵", "aliases": [], "emotion": "angry", "expected_reference_asset_id": "ref-幽灵-angry" },
+    { "line_id": "line-10", "character_id": "装备党", "aliases": [], "emotion": "neutral", "expected_reference_asset_id": "ref-装备党-neutral" },
+    { "line_id": "line-11", "character_id": "装备党", "aliases": [], "emotion": "disgusted", "expected_reference_asset_id": "ref-装备党-disgusted" },
+    { "line_id": "line-12", "character_id": "装备党", "aliases": [], "emotion": "excited", "expected_reference_asset_id": "ref-装备党-excited" }
+  ]
+}
