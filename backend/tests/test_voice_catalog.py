@@ -84,6 +84,29 @@ def test_portable_scanner_discovers_assets_without_pairing_weights(tmp_path: Pat
     assert reference.duration_seconds == pytest.approx(1.2)
 
 
+def test_portable_scanner_prefers_wav32k_from_variable_training_task_folders(tmp_path: Path) -> None:
+    root = _portable_fixture(tmp_path / "portable")
+    first = root / "logs" / "task-alpha" / "5-wav32k" / "[九九开心_中文]第一句.wav"
+    second = root / "logs" / "任意训练任务-2026" / "5-wav32k" / "[九九平静_中文]第二句.wav"
+    ignored = root / "logs" / "task-alpha" / "eval" / "not-a-reference.wav"
+    _write_silent_wav(first)
+    _write_silent_wav(second)
+    _write_silent_wav(ignored)
+
+    scan = PortableAssetScanner().scan("portable", root)
+
+    assert len(scan.reference_assets) == 2
+    assert set(scan.reference_locations) == {
+        item.reference_asset_id for item in scan.reference_assets
+    }
+    assert {
+        location.relative_path for location in scan.reference_locations.values()
+    } == {
+        "logs/task-alpha/5-wav32k/[九九开心_中文]第一句.wav",
+        "logs/任意训练任务-2026/5-wav32k/[九九平静_中文]第二句.wav",
+    }
+
+
 def test_catalog_store_publishes_one_complete_snapshot_atomically(tmp_path: Path) -> None:
     store = VoiceCatalogStore(tmp_path / "voice_matching")
     snapshot = CatalogSnapshot(version="v1")

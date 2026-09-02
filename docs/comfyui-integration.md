@@ -66,6 +66,8 @@ curl http://127.0.0.1:8188/api/tts-audio-suite/v1/capabilities
 
 也可以使用环境变量 `TTS_MORE_GPT_SOVITS_PORTABLE_ROOT`。保存后调用 `POST /api/settings/services/reload`，再调用 `POST /api/voice-assets/catalog/sync`，或在工作台“队列/资源”面板点击“扫描并同步”。目录状态含义如下：
 
+Portable 根目录中的权重继续从 `GPT_weights*` 和 `SoVITS_weights*` 发现；参考音频优先从 `logs/<训练任务>/5-wav32k` 发现，其中训练任务文件夹名称可以变化。只有不存在任何这种训练任务目录时，才回退到旧的 `参考音频` 子目录。`voice_asset_root` 因此仍配置为 Portable 根目录，而不是单独配置成 `logs`。
+
 | 状态 | 含义 | 下一步 |
 |:---|:---|:---|
 | `ready` | 至少一个资源已完成能力与资产映射 | 可以请求推荐并生成 |

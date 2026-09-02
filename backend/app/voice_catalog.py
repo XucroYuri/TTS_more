@@ -249,57 +249,68 @@ class PortableAssetScanner:
         dict[str, ReferenceLocation],
         list[CatalogDiagnostic],
     ]:
-        reference_root = root / "参考音频"
-        if not reference_root.is_dir():
+        logs_root = root / "logs"
+        reference_roots: list[Path] = []
+        if logs_root.is_dir():
+            for task_dir in sorted(logs_root.iterdir(), key=lambda item: item.name.casefold()):
+                candidate = task_dir / "5-wav32k"
+                if task_dir.is_dir() and candidate.is_dir():
+                    reference_roots.append(candidate)
+        if not reference_roots:
+            legacy_root = root / "参考音频"
+            if legacy_root.is_dir():
+                reference_roots = [legacy_root]
+        if not reference_roots:
             return [], {}, [CatalogDiagnostic(code="reference_audio_root_missing", field_path=root_id)]
-        metadata = _read_json_object(reference_root / "audio_metadata.json")
         assets: list[ReferenceAssetRecord] = []
         locations: dict[str, ReferenceLocation] = {}
         diagnostics: list[CatalogDiagnostic] = []
-        for path in sorted(reference_root.rglob("*"), key=lambda item: item.as_posix().casefold()):
-            if not path.is_file() or path.suffix.casefold() not in _AUDIO_EXTENSIONS:
-                continue
-            relative_to_reference = path.relative_to(reference_root).as_posix()
-            relative_to_root = path.relative_to(root).as_posix()
-            raw = metadata.get(relative_to_reference, metadata.get(path.name, {}))
-            item = raw if isinstance(raw, dict) else {}
-            character = str(item.get("character") or _character_from_filename(path.name)).strip()
-            emotion = str(item.get("emotion") or "neutral").strip()
-            prompt_text = str(item.get("text_override") or item.get("text") or _prompt_from_filename(path.name)).strip()
-            fingerprint = _content_fingerprint(path)
-            asset_id = _stable_id("reference", root_id, relative_to_root, fingerprint)
-            duration = _measured_wav_duration(path)
-            if duration is None:
-                diagnostics.append(
-                    CatalogDiagnostic(code="reference_duration_unavailable", field_path=asset_id)
+        for reference_root in reference_roots:
+            metadata = _read_json_object(reference_root / "audio_metadata.json")
+            for path in sorted(reference_root.rglob("*"), key=lambda item: item.as_posix().casefold()):
+                if not path.is_file() or path.suffix.casefold() not in _AUDIO_EXTENSIONS:
+                    continue
+                relative_to_reference = path.relative_to(reference_root).as_posix()
+                relative_to_root = path.relative_to(root).as_posix()
+                raw = metadata.get(relative_to_reference, metadata.get(path.name, {}))
+                item = raw if isinstance(raw, dict) else {}
+                character = str(item.get("character") or _character_from_filename(path.name)).strip()
+                emotion = str(item.get("emotion") or "neutral").strip()
+                prompt_text = str(item.get("text_override") or item.get("text") or _prompt_from_filename(path.name)).strip()
+                fingerprint = _content_fingerprint(path)
+                asset_id = _stable_id("reference", root_id, relative_to_root, fingerprint)
+                duration = _measured_wav_duration(path)
+                if duration is None:
+                    diagnostics.append(
+                        CatalogDiagnostic(code="reference_duration_unavailable", field_path=asset_id)
+                    )
+                assets.append(
+                    ReferenceAssetRecord(
+                        reference_asset_id=asset_id,
+                        character_id=character or "unknown",
+                        language=_normalize_language(item.get("lang") or item.get("language")),
+                        emotion=emotion or "neutral",
+                        prompt_text=prompt_text,
+                        duration_seconds=duration,
+                        confirmed=False,
+                        metadata_score=5 if item else 2,
+                        fingerprint=fingerprint,
+                        character_origin="declared" if item.get("character") else "filename",
+                        character_confidence=1 if item.get("character") else 0.5,
+                        emotion_origin="declared" if item.get("emotion") else "unknown",
+                        emotion_confidence=1 if item.get("emotion") else 0,
+                        language_origin=(
+                            "declared"
+                            if item.get("lang") or item.get("language")
+                            else "unknown"
+                        ),
+                    )
                 )
-            assets.append(
-                ReferenceAssetRecord(
-                    reference_asset_id=asset_id,
-                    character_id=character or "unknown",
-                    language=_normalize_language(item.get("lang") or item.get("language")),
-                    emotion=emotion or "neutral",
-                    prompt_text=prompt_text,
-                    duration_seconds=duration,
-                    confirmed=False,
-                    metadata_score=5 if item else 2,
+                locations[asset_id] = ReferenceLocation(
+                    root_id=root_id,
+                    relative_path=relative_to_root,
                     fingerprint=fingerprint,
-                    character_origin="declared" if item.get("character") else "filename",
-                    character_confidence=1 if item.get("character") else 0.5,
-                    emotion_origin="declared" if item.get("emotion") else "unknown",
-                    emotion_confidence=1 if item.get("emotion") else 0,
-                    language_origin=(
-                        "declared"
-                        if item.get("lang") or item.get("language")
-                        else "unknown"
-                    ),
                 )
-            )
-            locations[asset_id] = ReferenceLocation(
-                root_id=root_id,
-                relative_path=relative_to_root,
-                fingerprint=fingerprint,
-            )
         return assets, locations, diagnostics
 
 
