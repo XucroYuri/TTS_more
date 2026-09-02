@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -23,12 +24,21 @@ def _normalized_emotion(value: str) -> str:
 class ReferenceAssetRecord(StrictVoiceModel):
     reference_asset_id: str = Field(min_length=1)
     character_id: str = Field(min_length=1)
+    character_aliases: list[str] = Field(default_factory=list)
     language: str = Field(default="zh", min_length=1)
     emotion: str = "neutral"
+    prompt_text: str = ""
     duration_seconds: float | None = Field(default=None, gt=0)
     generic_pool: bool = False
     confirmed: bool = False
     metadata_score: float = Field(default=5, ge=0, le=5)
+    fingerprint: str = ""
+    character_origin: Literal["confirmed", "declared", "filename", "inferred", "unknown"] = "declared"
+    character_confidence: float = Field(default=1, ge=0, le=1)
+    emotion_origin: Literal["confirmed", "declared", "filename", "inferred", "unknown"] = "declared"
+    emotion_confidence: float = Field(default=1, ge=0, le=1)
+    language_origin: Literal["confirmed", "declared", "filename", "inferred", "unknown"] = "declared"
+    compatible_resource_ids: list[str] = Field(default_factory=list)
 
     @field_validator("emotion")
     @classmethod
@@ -39,11 +49,18 @@ class ReferenceAssetRecord(StrictVoiceModel):
 class VoiceResourceRecord(StrictVoiceModel):
     resource_id: str = Field(min_length=1)
     character_id: str = Field(min_length=1)
+    character_aliases: list[str] = Field(default_factory=list)
     reference_asset_ids: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
     generic_pool: bool = False
     confirmed: bool = False
     metadata_score: float = Field(default=5, ge=0, le=5)
+    engine_type: str = "gpt-sovits"
+    state: Literal["ready", "unavailable", "incompatible", "reload_required"] = "ready"
+    service_id: str | None = None
+    weight_artifact_ids: list[str] = Field(default_factory=list)
+    mapping_origin: Literal["plugin", "manual", "declared", "unknown"] = "unknown"
+    fingerprint: str = ""
 
 
 class CatalogSnapshot(StrictVoiceModel):
@@ -103,6 +120,11 @@ class VoiceCandidate(StrictVoiceModel):
     score_breakdown: VoiceScoreBreakdown
     auto_fill_eligible: bool
     speed_factor: float = Field(ge=0.85, le=1.20)
+    engine_type: str = "gpt-sovits"
+    target_duration_seconds: float | None = Field(default=None, ge=0)
+    reasons: list[str] = Field(default_factory=list)
+    blockers: list[str] = Field(default_factory=list)
+    catalog_version: str = ""
 
 
 class VoiceRecommendation(StrictVoiceModel):
@@ -119,6 +141,20 @@ class VoiceSelectionSnapshot(StrictVoiceModel):
     reference_asset_id: str = Field(min_length=1)
     score: float = Field(ge=0, le=100)
     speed_factor: float = Field(ge=0.85, le=1.20)
+    line_id: str = ""
+    source: Literal["automatic", "manual", "role_binding", "manual_identity_override"] = "manual"
+    resource_fingerprint: str = ""
+    reference_fingerprint: str = ""
+    emotion: str | None = None
+    target_duration_seconds: float | None = Field(default=None, ge=0)
+    prompt_text: str = ""
+    reference_language: str = "zh"
+    text_language: str = "zh"
+    inference_parameters: dict[str, object] = Field(default_factory=dict)
+    selected_at: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        min_length=1,
+    )
 
 
 class VoiceMatchPolicy(StrictVoiceModel):

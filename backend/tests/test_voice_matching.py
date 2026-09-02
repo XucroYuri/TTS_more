@@ -138,3 +138,105 @@ def test_voice_match_policy_rejects_values_below_mandatory_auto_fill_floors(
 ) -> None:
     with pytest.raises(ValidationError):
         VoiceMatchPolicy(**{field: value})
+
+
+def test_unready_comfyui_resource_is_never_ranked() -> None:
+    request = match_request(character_id="九九", aliases=["诸葛九九"])
+    catalog = catalog_with(resource_character="九九", reference_character="九九").model_copy(
+        update={
+            "resources": [
+                VoiceResourceRecord(
+                    resource_id="voice-001",
+                    character_id="九九",
+                    reference_asset_ids=["ref-001"],
+                    state="reload_required",
+                )
+            ]
+        }
+    )
+
+    result = rank_voice_candidates(request, catalog)
+
+    assert result.candidates == []
+    assert result.blockers == ["no_eligible_voice_candidate"]
+
+
+def test_low_confidence_inferred_character_cannot_drive_candidate() -> None:
+    request = match_request(character_id="九九", aliases=["诸葛九九"])
+    catalog = catalog_with(resource_character="九九", reference_character="九九").model_copy(
+        update={
+            "reference_assets": [
+                ReferenceAssetRecord(
+                    reference_asset_id="ref-001",
+                    character_id="九九",
+                    character_origin="inferred",
+                    character_confidence=0.89,
+                )
+            ]
+        }
+    )
+
+    assert rank_voice_candidates(request, catalog).candidates == []
+
+
+def test_controlled_resource_and_reference_aliases_match_named_character() -> None:
+    request = match_request(character_id="诸葛九九", aliases=[])
+    catalog = CatalogSnapshot(
+        version="catalog-v1",
+        resources=[
+            VoiceResourceRecord(
+                resource_id="voice-001",
+                character_id="九九",
+                character_aliases=["诸葛九九"],
+                reference_asset_ids=["ref-001"],
+            )
+        ],
+        reference_assets=[
+            ReferenceAssetRecord(
+                reference_asset_id="ref-001",
+                character_id="九九",
+                character_aliases=["诸葛九九"],
+            )
+        ],
+    )
+
+    result = rank_voice_candidates(request, catalog)
+
+    assert result.candidates[0].resource_id == "voice-001"
+
+
+def test_ambiguous_alias_across_two_characters_blocks_automatic_matching() -> None:
+    request = match_request(character_id="小九", aliases=[])
+    catalog = CatalogSnapshot(
+        version="catalog-v1",
+        resources=[
+            VoiceResourceRecord(
+                resource_id="voice-a",
+                character_id="诸葛九九",
+                character_aliases=["小九"],
+                reference_asset_ids=["ref-a"],
+            ),
+            VoiceResourceRecord(
+                resource_id="voice-b",
+                character_id="王九九",
+                character_aliases=["小九"],
+                reference_asset_ids=["ref-b"],
+            ),
+        ],
+        reference_assets=[
+            ReferenceAssetRecord(
+                reference_asset_id="ref-a",
+                character_id="诸葛九九",
+                character_aliases=["小九"],
+            ),
+            ReferenceAssetRecord(
+                reference_asset_id="ref-b",
+                character_id="王九九",
+                character_aliases=["小九"],
+            ),
+        ],
+    )
+
+    result = rank_voice_candidates(request, catalog)
+
+    assert result.candidates == []

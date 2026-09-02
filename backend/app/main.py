@@ -56,6 +56,17 @@ from app.storage import (
 )
 from app.supervisor import ServiceSupervisor
 from app.service_store_io import ServicePostCommitError
+from app.voice_catalog import (
+    VoiceCatalogError,
+    VoiceCatalogService,
+    VoiceCatalogStore,
+    configured_voice_asset_roots,
+)
+from app.voice_matching_routes import build_voice_matching_router
+from app.voice_metadata_inference import (
+    VoiceMetadataUnavailable,
+    build_voice_metadata_inferrer,
+)
 
 DEFAULT_REFERENCE_AUDIO_ROOT = Path("data") / "local" / "reference-audio"
 DEFAULT_DATA_ROOT = Path("data")
@@ -151,6 +162,7 @@ def create_app(
     static_root: Path | str | None = None,
     controller_root: Path | str | None = None,
     semantic_service: SemanticAnalysisService | Any | None = None,
+    voice_catalog_service: VoiceCatalogService | None = None,
 ) -> FastAPI:
     app = FastAPI(title="TTS More Orchestrator", version="0.1.0")
     app.add_middleware(
@@ -188,6 +200,18 @@ def create_app(
     services_file, writable_services_file = _resolve_service_settings_paths(store.root, Path(services_path) if services_path else None)
     service_registry = _load_service_registry(services_file)
     service_router = ServiceRouter(service_registry)
+    if voice_catalog_service is None:
+        try:
+            metadata_inferrer = build_voice_metadata_inferrer(parser_config_file)
+        except VoiceMetadataUnavailable:
+            metadata_inferrer = None
+        voice_catalog_service = VoiceCatalogService(
+            store=VoiceCatalogStore(store.root / "voice_matching"),
+            roots=configured_voice_asset_roots(service_registry),
+            metadata_inferrer=metadata_inferrer,
+            registry=service_registry,
+            clients=service_router.clients,
+        )
     queue = ServiceGenerationQueue(service_router)
     job_manager = GenerationJobManager(queue, store)
     ref_root = Path(reference_audio_root)
@@ -207,6 +231,7 @@ def create_app(
     app.state.semantic_event_logger = semantic_logger
     app.state.service_registry = service_registry
     app.state.service_router = service_router
+    app.state.voice_catalog = voice_catalog_service
     app.state.queue = queue
     app.state.job_manager = job_manager
     app.state.reference_audio_root = ref_root
@@ -230,6 +255,7 @@ def create_app(
     app.state.max_upload_bytes = int(os.environ.get("TTS_MORE_MAX_UPLOAD_BYTES", str(MAX_UPLOAD_BYTES)))
 
     app.include_router(build_semantic_router(store, semantic_store, semantic_executor, semantic_logger))
+    app.include_router(build_voice_matching_router(voice_catalog_service, store))
     app.router.add_event_handler("startup", semantic_executor.recover_interrupted)
     app.router.add_event_handler("shutdown", semantic_executor.shutdown)
 
@@ -504,6 +530,12 @@ def create_app(
         app.state.parser = _build_parser(parser_config_file)
         app.state.semantic_service = _build_semantic_service(parser_config_file)
         app.state.semantic_executor.set_service(app.state.semantic_service)
+        try:
+            app.state.voice_catalog.metadata_inferrer = build_voice_metadata_inferrer(
+                parser_config_file
+            )
+        except VoiceMetadataUnavailable:
+            app.state.voice_catalog.metadata_inferrer = None
         return public_parser_providers(parser_config_file, env_file)
 
     @app.post("/api/parser/providers/test")
@@ -1303,7 +1335,13 @@ def create_app(
     @app.post("/api/generate")
     def generate(request: GenerateRequest) -> dict[str, Any]:
         try:
-            tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks, app.state.service_registry)
+            tasks = _enrich_tasks_for_project(
+                store,
+                request.project_id,
+                request.tasks,
+                app.state.service_registry,
+                app.state.voice_catalog,
+            )
             _validate_generation_tasks(tasks, app.state.service_registry)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1321,14 +1359,26 @@ def create_app(
 
     @app.post("/api/jobs/generation")
     def create_generation_job(request: GenerateRequest) -> dict[str, Any]:
-        tasks = _prepare_tasks_for_async_job(store, request.project_id, request.tasks, app.state.service_registry)
+        tasks = _prepare_tasks_for_async_job(
+            store,
+            request.project_id,
+            request.tasks,
+            app.state.service_registry,
+            app.state.voice_catalog,
+        )
         job = app.state.job_manager.submit(request.project_id, tasks)
         return job.model_dump(mode="json")
 
     @app.post("/api/generation/preflight")
     def generation_preflight(request: GenerateRequest) -> dict[str, Any]:
         try:
-            tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks, app.state.service_registry)
+            tasks = _enrich_tasks_for_project(
+                store,
+                request.project_id,
+                request.tasks,
+                app.state.service_registry,
+                app.state.voice_catalog,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         items = [_preflight_task(app.state.service_router, supervisor, app.state.queue, task) for task in tasks]
@@ -1361,7 +1411,13 @@ def create_app(
     @app.post("/api/validation/real-tts/run")
     def run_real_tts_validation(request: GenerateRequest) -> dict[str, Any]:
         try:
-            tasks = _enrich_tasks_for_project(store, request.project_id, request.tasks, app.state.service_registry)
+            tasks = _enrich_tasks_for_project(
+                store,
+                request.project_id,
+                request.tasks,
+                app.state.service_registry,
+                app.state.voice_catalog,
+            )
             _validate_generation_tasks(tasks, app.state.service_registry)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1401,7 +1457,15 @@ def create_app(
                 parameters={},
             )
             try:
-                runnable.append(_enrich_tasks_for_project(store, project_id, [base_task], app.state.service_registry)[0])
+                runnable.append(
+                    _enrich_tasks_for_project(
+                        store,
+                        project_id,
+                        [base_task],
+                        app.state.service_registry,
+                        app.state.voice_catalog,
+                    )[0]
+                )
             except ValueError as exc:
                 blocked.append({"line_id": line.id, "line_uid": line.line_uid or line.id, "character_id": line.character_id, "reason": str(exc)})
         tasks = [task for _ in range(repeat_count) for task in runnable]
@@ -1568,6 +1632,10 @@ def _apply_registry(app: FastAPI, registry: ServiceRegistry, store: ProjectStore
     app.state.service_router = router
     app.state.queue = queue
     app.state.job_manager = GenerationJobManager(queue, store)
+    if hasattr(app.state, "voice_catalog"):
+        app.state.voice_catalog.registry = registry
+        app.state.voice_catalog.clients = router.clients
+        app.state.voice_catalog.roots = configured_voice_asset_roots(registry)
 
 
 def _managed_portable_locator_mutation_http_error() -> HTTPException:
@@ -2052,6 +2120,7 @@ def _enrich_tasks_for_project(
     project_id: str,
     tasks: list[GenerationTask],
     service_registry: ServiceRegistry,
+    voice_catalog: VoiceCatalogService | None = None,
 ) -> list[GenerationTask]:
     try:
         project = store.load_project(project_id)
@@ -2070,6 +2139,8 @@ def _enrich_tasks_for_project(
                 line_updates["language"] = stored_line.language
             if line.temporary_binding is None and stored_line.temporary_binding:
                 line_updates["temporary_binding"] = stored_line.temporary_binding
+            if line.voice_selection is None and stored_line.voice_selection:
+                line_updates["voice_selection"] = stored_line.voice_selection
             if line_updates:
                 line = line.model_copy(update=line_updates)
                 task = task.model_copy(update={"line": line})
@@ -2080,6 +2151,11 @@ def _enrich_tasks_for_project(
             "_script_revision_id": project.active_script_revision_id,
             "_parse_revision_id": project.active_parse_revision_id,
         }
+        if line.voice_selection is not None and voice_catalog is not None:
+            try:
+                voice_catalog.validate_selection(line.voice_selection)
+            except VoiceCatalogError as exc:
+                raise ValueError(exc.code) from exc
         if line.temporary_binding is not None:
             binding = line.temporary_binding
             parameters = {**binding.config, **task.parameters, **revision_parameters, "binding_source": "temporary"}
@@ -2139,11 +2215,18 @@ def _prepare_tasks_for_async_job(
     project_id: str,
     tasks: list[GenerationTask],
     service_registry: ServiceRegistry,
+    voice_catalog: VoiceCatalogService | None = None,
 ) -> list[GenerationTask]:
     output: list[GenerationTask] = []
     for task in tasks:
         try:
-            enriched_tasks = _enrich_tasks_for_project(store, project_id, [task], service_registry)
+            enriched_tasks = _enrich_tasks_for_project(
+                store,
+                project_id,
+                [task],
+                service_registry,
+                voice_catalog,
+            )
         except ValueError as exc:
             output.append(_prefailed_task(task, str(exc)))
             continue

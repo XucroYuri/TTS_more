@@ -53,8 +53,18 @@ def rank_voice_candidates(
     catalog: CatalogSnapshot,
     policy: VoiceMatchPolicy = DEFAULT_POLICY,
 ) -> VoiceRecommendation:
-    eligible = [pair for pair in catalog.candidate_pairs() if _passes_identity_gates(request, pair)]
-    scored = [_score_candidate(request, pair, policy) for pair in eligible]
+    ambiguous_names = _ambiguous_identity_names(catalog)
+    eligible = [
+        pair
+        for pair in catalog.candidate_pairs()
+        if _passes_identity_gates(request, pair, ambiguous_names)
+    ]
+    scored = [
+        _score_candidate(request, pair, policy).model_copy(
+            update={"catalog_version": catalog.version}
+        )
+        for pair in eligible
+    ]
     scored.sort(key=lambda item: (-item.score, -item.score_breakdown.metadata, item.candidate_id))
     return VoiceRecommendation(
         line_id=request.line_id,
@@ -67,8 +77,15 @@ def rank_voice_candidates(
 def _passes_identity_gates(
     request: VoiceMatchRequest,
     pair: tuple[VoiceResourceRecord, ReferenceAssetRecord],
+    ambiguous_names: set[str],
 ) -> bool:
     resource, asset = pair
+    if resource.state != "ready":
+        return False
+    if asset.character_origin == "inferred" and asset.character_confidence < 0.90:
+        return False
+    if asset.emotion_origin == "inferred" and asset.emotion_confidence < 0.75:
+        return False
     if request.is_generic:
         return (
             resource.generic_pool
@@ -77,7 +94,41 @@ def _passes_identity_gates(
             and asset.confirmed
         )
     names = {request.character_id, *request.character_aliases}
-    return resource.character_id in names and asset.character_id in names
+    return _record_identity_matches(
+        request.character_id,
+        names,
+        resource.character_id,
+        set(resource.character_aliases),
+        ambiguous_names,
+    ) and _record_identity_matches(
+        request.character_id,
+        names,
+        asset.character_id,
+        set(asset.character_aliases),
+        ambiguous_names,
+    )
+
+
+def _ambiguous_identity_names(catalog: CatalogSnapshot) -> set[str]:
+    owners: dict[str, set[str]] = {}
+    records = [*catalog.resources, *catalog.reference_assets]
+    for record in records:
+        for name in {record.character_id, *record.character_aliases}:
+            owners.setdefault(name, set()).add(record.character_id)
+    return {name for name, identities in owners.items() if len(identities) > 1}
+
+
+def _record_identity_matches(
+    request_character_id: str,
+    request_names: set[str],
+    record_character_id: str,
+    record_aliases: set[str],
+    ambiguous_names: set[str],
+) -> bool:
+    if request_character_id == record_character_id:
+        return True
+    matches = request_names & {record_character_id, *record_aliases}
+    return any(name not in ambiguous_names for name in matches)
 
 
 def _score_candidate(
@@ -110,6 +161,15 @@ def _score_candidate(
         score_breakdown=breakdown,
         auto_fill_eligible=auto_fill,
         speed_factor=speed_factor,
+        engine_type=resource.engine_type,
+        target_duration_seconds=request.target_duration_seconds,
+        reasons=[
+            "character_identity_eligible",
+            f"emotion_score:{emotion:g}",
+            f"duration_score:{duration:g}",
+            f"language_score:{language:g}",
+        ],
+        catalog_version="",
     )
 
 
