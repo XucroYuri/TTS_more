@@ -304,6 +304,21 @@ def build_load_signature(endpoint: TTSServiceEndpoint, parameters: dict[str, Any
             f"speed={parameters.get('speed', '')}",
             f"seed={parameters.get('seed', '')}",
         ]
+        if any(
+            parameters.get(key)
+            for key in (
+                "training_task",
+                "gpt_weights_relative_path",
+                "sovits_weights_relative_path",
+            )
+        ):
+            parts.extend(
+                [
+                    f"training_task={parameters.get('training_task', '')}",
+                    f"gpt_weights_relative_path={parameters.get('gpt_weights_relative_path', '')}",
+                    f"sovits_weights_relative_path={parameters.get('sovits_weights_relative_path', '')}",
+                ]
+            )
         return "|".join(parts)
     if endpoint.provider_type == ProviderType.GPT_SOVITS or endpoint.engine == EngineName.GPT_SOVITS:
         parts = [

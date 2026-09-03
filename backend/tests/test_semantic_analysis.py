@@ -514,8 +514,8 @@ def test_all_structural_failures_raise_422_and_all_upstream_or_timeout_propagate
     assert propagated.value is timeout
 
 
-def test_zero_utterances_are_valid_and_missing_quoted_coverage_only_warns() -> None:
-    source = _source("旁白写道：“别遗漏我。”\n没有其他台词。")
+def test_missing_quoted_dialogue_ignores_unattributed_onomatopoeia() -> None:
+    source = _source("门外一声“唰”，灯灭了。")
     run, draft = _run_and_draft(source)
 
     result = SemanticAnalysisService(FakeSemanticProvider([_response()])).analyze(
@@ -524,6 +524,74 @@ def test_zero_utterances_are_valid_and_missing_quoted_coverage_only_warns() -> N
 
     assert result.utterances == []
     assert result.annotations == []
-    assert any(item.code == "missing_quoted_dialogue" for item in result.warnings)
+    assert not any(item.code == "missing_quoted_dialogue" for item in result.warnings)
+
+
+def test_missing_quoted_dialogue_warns_for_attributed_quote_with_utf16_span() -> None:
+    source = _source("旁白😀写道：“别遗漏我。”")
+    run, draft = _run_and_draft(source)
+
+    result = SemanticAnalysisService(FakeSemanticProvider([_response()])).analyze(
+        "demo", source, run, draft
+    )
+
+    warning = next(item for item in result.warnings if item.code == "missing_quoted_dialogue")
+
+    assert warning.id == "warning-7507c1392006902536c2f9e9"
+    assert warning.details == {"start_utf16": 8, "end_utf16": 13}
+
+
+def test_missing_quoted_dialogue_warns_once_when_quote_matches_multiple_attribution_patterns() -> None:
+    source = _source("旁白写道：“别遗漏我。”旁白说")
+    run, draft = _run_and_draft(source)
+
+    result = SemanticAnalysisService(FakeSemanticProvider([_response()])).analyze(
+        "demo", source, run, draft
+    )
+
+    warnings = [item for item in result.warnings if item.code == "missing_quoted_dialogue"]
+
+    assert len(warnings) == 1
+    assert warnings[0].details == {"start_utf16": 6, "end_utf16": 11}
+
+
+def test_missing_quoted_dialogue_does_not_warn_when_attributed_quote_is_covered() -> None:
+    source = _source("旁白写道：“别遗漏我。”")
+    run, draft = _run_and_draft(source)
+
+    result = SemanticAnalysisService(
+        FakeSemanticProvider([_response(utterance_candidates=[_candidate("别遗漏我。")])])
+    ).analyze("demo", source, run, draft)
+
+    assert [(item.kind, item.span.start_utf16, item.span.end_utf16) for item in result.annotations] == [
+        (AnnotationKind.DIALOGUE, 6, 11)
+    ]
+    assert not any(item.code == "missing_quoted_dialogue" for item in result.warnings)
     assert run.status is AnalysisRunStatus.RUNNING
     assert run.quality is None
+
+
+def test_attributed_quoted_dialogue_keeps_grounded_emotion_evidence() -> None:
+    source = _source("旁白（平静）写道：“别遗漏我。”")
+    run, draft = _run_and_draft(source)
+    response = _response(
+        utterance_candidates=[
+            _candidate(
+                "别遗漏我。",
+                emotion_evidence_excerpts=["平静"],
+                normalized_emotion="calm",
+                emotion_intensity=0.7,
+                emotion_origin="source_grounded",
+            )
+        ]
+    )
+
+    result = SemanticAnalysisService(FakeSemanticProvider([response])).analyze("demo", source, run, draft)
+
+    assert result.utterances[0].emotion_origin.value == "source_grounded"
+    assert len(result.utterances[0].emotion_evidence_annotation_ids) == 1
+    assert [(item.kind, item.span.text) for item in result.annotations] == [
+        (AnnotationKind.EMOTION_EVIDENCE, "平静"),
+        (AnnotationKind.DIALOGUE, "别遗漏我。"),
+    ]
+    assert not any(item.code in {"emotion_evidence_mismatch", "missing_quoted_dialogue"} for item in result.warnings)

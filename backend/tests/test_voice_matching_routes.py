@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import wave
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.models import Character, ProjectCharacter, ScriptLine, ScriptProject
 from app.storage import ProjectStore
-from app.voice_catalog import ReferenceLocation, VoiceCatalogService, VoiceCatalogStore
+from app.voice_catalog import (
+    ReferenceLocation,
+    VoiceCatalogError,
+    VoiceCatalogService,
+    VoiceCatalogStore,
+)
 from app.voice_matching_models import (
     CatalogSnapshot,
     ReferenceAssetRecord,
     VoiceResourceRecord,
+    VoiceSelectionSnapshot,
+    WeightArtifactRecord,
 )
 
 
@@ -27,6 +36,12 @@ def _write_wav(path: Path) -> str:
     import hashlib
 
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _weight_fingerprint(root_id: str, relative_path: str, path: Path) -> str:
+    stat = path.stat()
+    value = f"{root_id}\0{relative_path}\0{stat.st_size}\0{stat.st_mtime_ns}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _ready_catalog(data_root: Path, asset_root: Path) -> VoiceCatalogService:
@@ -113,6 +128,86 @@ def _project(data_root: Path) -> None:
     )
 
 
+def _dynamic_catalog(data_root: Path, asset_root: Path) -> VoiceCatalogService:
+    gpt_relative = "GPT_weights_v2ProPlus/task-a-e50.ckpt"
+    sovits_relative = "SoVITS_weights_v2ProPlus/task-a_e24_s360.pth"
+    (asset_root / gpt_relative).parent.mkdir(parents=True)
+    (asset_root / sovits_relative).parent.mkdir(parents=True)
+    (asset_root / gpt_relative).write_bytes(b"gpt")
+    (asset_root / sovits_relative).write_bytes(b"sovits")
+    reference_path = asset_root / "logs" / "task-a" / "5-wav32k" / "九九-惊喜.wav"
+    fingerprint = _write_wav(reference_path)
+    reference = ReferenceAssetRecord(
+        reference_asset_id="ref-task-a",
+        character_id="诸葛九九",
+        character_aliases=["九九"],
+        language="zh",
+        emotion="惊喜",
+        prompt_text="真的太好了",
+        duration_seconds=1.2,
+        confirmed=True,
+        fingerprint=fingerprint,
+        character_origin="confirmed",
+        emotion_origin="confirmed",
+        language_origin="confirmed",
+        training_task="task-a",
+        root_id="portable",
+    )
+    resource = VoiceResourceRecord(
+        resource_id="gpt-sovits-local",
+        character_id="诸葛九九",
+        character_aliases=["九九"],
+        reference_asset_ids=[reference.reference_asset_id],
+        languages=["zh"],
+        confirmed=True,
+        state="ready",
+        service_id="comfy-gpt",
+        mapping_origin="plugin",
+        fingerprint="dynamic-resource-v1",
+        supports_dynamic_weights=True,
+        compatible_root_ids=["portable"],
+    )
+    gpt_path = asset_root / gpt_relative
+    sovits_path = asset_root / sovits_relative
+    weights = [
+        WeightArtifactRecord(
+            artifact_id="weight-gpt-a",
+            root_id="portable",
+            relative_path=gpt_relative,
+            kind="gpt",
+            character_id="诸葛九九",
+            training_task="task-a",
+            fingerprint=_weight_fingerprint("portable", gpt_relative, gpt_path),
+        ),
+        WeightArtifactRecord(
+            artifact_id="weight-sovits-a",
+            root_id="portable",
+            relative_path=sovits_relative,
+            kind="sovits",
+            character_id="诸葛九九",
+            training_task="task-a",
+            fingerprint=_weight_fingerprint("portable", sovits_relative, sovits_path),
+        ),
+    ]
+    catalog_store = VoiceCatalogStore(data_root / "voice_matching")
+    catalog_store.publish(
+        CatalogSnapshot(
+            version="dynamic-catalog-v1",
+            resources=[resource],
+            reference_assets=[reference],
+            weight_artifacts=weights,
+        ),
+        reference_locations={
+            reference.reference_asset_id: ReferenceLocation(
+                root_id="portable",
+                relative_path=reference_path.relative_to(asset_root).as_posix(),
+                fingerprint=fingerprint,
+            )
+        },
+    )
+    return VoiceCatalogService(store=catalog_store, roots={"portable": asset_root})
+
+
 def test_catalog_routes_hide_paths_and_preview_by_asset_id(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     asset_root = tmp_path / "portable"
@@ -164,6 +259,63 @@ def test_high_confidence_recommendation_autofills_without_generating(tmp_path: P
     assert saved_line["temporary_binding"]["config"]["resource_id"] == "九九-v1"
     assert saved_line["temporary_binding"]["config"]["prompt_text"] == "真的太好了"
     assert client.get("/api/queue/status").json()["queued"] == 0
+
+
+def test_dynamic_recommendation_persists_weight_pair_and_same_task_reference(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    asset_root = tmp_path / "portable"
+    _project(data_root)
+    service = _dynamic_catalog(data_root, asset_root)
+    client = TestClient(create_app(data_root=data_root, voice_catalog_service=service))
+
+    response = client.post(
+        "/api/projects/project-1/voice-recommendations",
+        json={"line_ids": ["line-1"]},
+    )
+
+    assert response.status_code == 200
+    candidate = response.json()["recommendations"][0]["candidates"][0]
+    assert candidate["training_task"] == "task-a"
+    assert candidate["gpt_weight_artifact_id"] == "weight-gpt-a"
+    assert candidate["sovits_weight_artifact_id"] == "weight-sovits-a"
+    saved_line = client.get("/api/projects/project-1").json()["lines"][0]
+    selection = saved_line["voice_selection"]
+    assert selection["inference_parameters"]["engine"] == "gpt-sovits"
+    assert selection["inference_parameters"]["training_task"] == "task-a"
+    assert selection["inference_parameters"]["gpt_weight_artifact_id"] == "weight-gpt-a"
+    assert selection["inference_parameters"]["sovits_weight_artifact_id"] == "weight-sovits-a"
+    assert selection["inference_parameters"]["gpt_weight_fingerprint"]
+    assert selection["inference_parameters"]["sovits_weight_fingerprint"]
+    config = saved_line["temporary_binding"]["config"]
+    assert config["training_task"] == "task-a"
+    assert config["voice_asset_root_id"] == "portable"
+    assert config["gpt_weights_relative_path"] == "GPT_weights_v2ProPlus/task-a-e50.ckpt"
+    assert config["sovits_weights_relative_path"] == "SoVITS_weights_v2ProPlus/task-a_e24_s360.pth"
+
+
+def test_dynamic_selection_rejects_weight_replaced_after_selection(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    asset_root = tmp_path / "portable"
+    _project(data_root)
+    service = _dynamic_catalog(data_root, asset_root)
+    client = TestClient(create_app(data_root=data_root, voice_catalog_service=service))
+    response = client.post(
+        "/api/projects/project-1/voice-recommendations",
+        json={"line_ids": ["line-1"]},
+    )
+    assert response.status_code == 200
+    saved_line = client.get("/api/projects/project-1").json()["lines"][0]
+    selection = VoiceSelectionSnapshot.model_validate(saved_line["voice_selection"])
+    service.validate_selection(selection)
+
+    (asset_root / "GPT_weights_v2ProPlus/task-a-e50.ckpt").write_bytes(
+        b"replacement-weight"
+    )
+
+    with pytest.raises(VoiceCatalogError) as captured:
+        service.validate_selection(selection)
+    assert captured.value.code == "voice_asset_changed"
+    assert captured.value.field_path == "weight_artifacts.gpt"
 
 
 def test_manual_selection_uses_server_candidate_and_can_be_cleared(tmp_path: Path) -> None:

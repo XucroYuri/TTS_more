@@ -8296,10 +8296,12 @@ h3 {
 }
 
 .workspace-analysis {
+  grid-template-rows: minmax(0, 1fr);
   min-width: 0;
-  overflow: auto;
+  overflow: hidden;
 }
 
 .workspace-analysis > .script-analysis-workspace {
-  min-height: 100vh;
+  min-height: 0;
+  height: 100%;
 }

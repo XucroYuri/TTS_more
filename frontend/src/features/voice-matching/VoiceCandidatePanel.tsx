@@ -89,6 +89,15 @@ export function VoiceCandidatePanel({
                   {candidate.target_duration_seconds != null && <span>{t("voiceMatching.seconds", { value: candidate.target_duration_seconds.toFixed(1) })}</span>}
                   {candidate.auto_fill_eligible && <span className="voice-auto-fill">{t("voiceMatching.autoFillEligible")}</span>}
                 </div>
+                {candidate.training_task && (
+                  <div className="voice-dynamic-weight-summary">
+                    <span>{t("voiceMatching.trainingTask")}</span>
+                    <strong>{candidate.training_task}</strong>
+                    {candidate.gpt_weight_artifact_id && candidate.sovits_weight_artifact_id && (
+                      <span className="voice-dynamic-pair-ready">{t("voiceMatching.dynamicPairReady")}</span>
+                    )}
+                  </div>
+                )}
                 {(candidate.reasons.length > 0 || candidate.blockers.length > 0) && (
                   <div className="voice-reason-list">
                     {candidate.reasons.map((reason) => <span key={reason}>{t(`voiceMatching.reason.${reason}`, { defaultValue: reason })}</span>)}

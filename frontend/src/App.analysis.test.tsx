@@ -23,6 +23,8 @@ const apiMocks = vi.hoisted(() => ({
   fetchOpenSourceTTSCatalog: vi.fn(),
   fetchRuntimeMode: vi.fn(),
   fetchVoiceCandidates: vi.fn(),
+  fetchLogsReferenceAudio: vi.fn(),
+  fetchGptSovitsModelSamples: vi.fn(),
   fetchQueueStatus: vi.fn(),
   fetchProjects: vi.fn(),
   fetchProject: vi.fn(),
@@ -223,6 +225,18 @@ function resetApiDefaults(): void {
     services: []
   }));
   apiMocks.fetchVoiceCandidates.mockImplementation(async () => null);
+  apiMocks.fetchLogsReferenceAudio.mockImplementation(async () => ({
+    service_id: null,
+    logs_name: "",
+    samples: [],
+    diagnostics: []
+  }));
+  apiMocks.fetchGptSovitsModelSamples.mockImplementation(async () => ({
+    service_id: null,
+    logs_name: "",
+    samples: [],
+    diagnostics: []
+  }));
   apiMocks.fetchQueueStatus.mockImplementation(async () => null);
   apiMocks.fetchProjects.mockImplementation(async () => ({
     projects: [...backendProjects].map(([projectId, project]) => projectSummary(projectId, project))
@@ -265,6 +279,7 @@ async function renderApp(
   const previousNode = globalThis.Node;
   const previousEvent = globalThis.Event;
   const previousFile = globalThis.File;
+  const previousGetComputedStyle = globalThis.getComputedStyle;
   const globals = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
   const previousActEnvironment = globals.IS_REACT_ACT_ENVIRONMENT;
   Object.assign(globalThis, {
@@ -274,6 +289,7 @@ async function renderApp(
     Node: dom.window.Node,
     Event: dom.window.Event,
     File: dom.window.File,
+    getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
     IS_REACT_ACT_ENVIRONMENT: true
   });
   if (storedProjectId) dom.window.localStorage.setItem("tts-more.currentProjectId", storedProjectId);
@@ -294,6 +310,7 @@ async function renderApp(
         Node: previousNode,
         Event: previousEvent,
         File: previousFile,
+        getComputedStyle: previousGetComputedStyle,
         IS_REACT_ACT_ENVIRONMENT: previousActEnvironment
       });
     }
@@ -314,7 +331,7 @@ async function click(element: Element): Promise<void> {
   });
 }
 
-async function changeReactValueExact(element: HTMLInputElement | HTMLTextAreaElement, value: string): Promise<void> {
+async function changeReactValueExact(element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, value: string): Promise<void> {
   const reactPropsKey = Object.keys(element).find((key) => key.startsWith("__reactProps$"));
   if (!reactPropsKey) throw new Error("React props were not attached to the field");
   const props = (element as unknown as Record<string, { onChange?: (event: { target: { value: string } }) => void }>)[reactPropsKey];
@@ -333,6 +350,145 @@ afterEach(async () => {
 });
 
 describe("App semantic analysis entry", () => {
+  it("loads portable logs references when a GPT-SoVITS binding has no logs_name", async () => {
+    const projectId = "project-gpt-logs-root";
+    const project = scriptProject("GPT logs root");
+    project.lines = [{
+      id: "gpt-line",
+      character_id: "jiu-jiu",
+      text: "听幽灵的，再等等……",
+      note: "",
+      language: "zh-CN",
+      temporary_binding: {
+        binding_id: "line-temp-gpt-sovits",
+        provider_type: "gpt-sovits",
+        service_id: "local-gpt",
+        fallback_services: [],
+        capabilities: ["tts", "reference_audio_voice"],
+        config: {}
+      }
+    }];
+    backendProjects.set(projectId, project);
+    apiMocks.fetchServicesStatus.mockResolvedValue({
+      services: [{
+        service_id: "local-gpt",
+        engine: "gpt-sovits",
+        provider_type: "gpt-sovits",
+        api_contract: "gpt-sovits-api-v2",
+        ready: true,
+        enabled: true,
+        state: "ready",
+        capabilities: ["tts", "reference_audio_voice", "model_catalog"]
+      }],
+      hardware: {}
+    });
+    apiMocks.fetchLogsReferenceAudio.mockResolvedValue({
+      service_id: "local-gpt",
+      logs_name: "",
+      samples: [{
+        sample_id: "task-alpha:jiu-jiu.wav",
+        display_label: "九九：听幽灵的，再等等……",
+        path: "E:\\portable\\logs\\task-alpha\\5-wav32k\\jiu-jiu.wav",
+        text: "听幽灵的，再等等……",
+        text_source: "name2text",
+        character: "九九",
+        emotion: "平静",
+        remark: "",
+        prompt_lang: "zh",
+        source: "logs",
+        logs_name: "task-alpha"
+      }],
+      diagnostics: []
+    });
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    const picker = view.container.querySelector<HTMLSelectElement>(".logs-reference-picker select")!;
+
+    expect(picker).not.toBeNull();
+    expect(picker.disabled).toBe(false);
+    expect(picker.textContent).toContain("九九：听幽灵的，再等等……");
+    expect(apiMocks.fetchLogsReferenceAudio).toHaveBeenCalledWith({
+      serviceId: "local-gpt",
+      logsName: "",
+      gptWeightsPath: "",
+      sovitsWeightsPath: ""
+    });
+    expect(apiMocks.fetchGptSovitsModelSamples).not.toHaveBeenCalled();
+  });
+
+  it("scopes portable logs to the sole auto-route ComfyUI GPT-SoVITS service", async () => {
+    vi.useFakeTimers();
+    const projectId = "project-gpt-auto-route-logs";
+    const project = scriptProject("GPT auto-route logs");
+    project.lines = [{
+      id: "gpt-auto-line",
+      character_id: "jiu-jiu",
+      text: "再等等……",
+      note: "",
+      language: "zh-CN",
+      temporary_binding: {
+        binding_id: "line-temp-gpt-sovits",
+        provider_type: "gpt-sovits",
+        service_id: null,
+        fallback_services: [],
+        capabilities: ["tts", "reference_audio_voice"],
+        config: {}
+      }
+    }];
+    backendProjects.set(projectId, project);
+    apiMocks.fetchServicesStatus.mockResolvedValue({
+      services: [{
+        service_id: "local-gpt-comfy",
+        engine: "gpt-sovits",
+        provider_type: "gpt-sovits",
+        api_contract: "comfyui-tts-audio-suite-v1",
+        base_url: "http://127.0.0.1:8188",
+        ready: true,
+        enabled: true,
+        state: "ready",
+        capabilities: ["tts", "reference_audio_voice", "comfyui"]
+      }],
+      hardware: {}
+    });
+    apiMocks.fetchLogsReferenceAudio.mockResolvedValue({
+      service_id: "local-gpt-comfy",
+      logs_name: "",
+      samples: [{
+        sample_id: "task-alpha:auto.wav",
+        display_label: "九九：自动路由参考",
+        path: "E:\\portable\\logs\\task-alpha\\5-wav32k\\auto.wav",
+        text: "自动路由参考",
+        text_source: "name2text",
+        character: "九九",
+        emotion: "平静",
+        remark: "",
+        prompt_lang: "zh",
+        source: "logs",
+        logs_name: "task-alpha"
+      }],
+      diagnostics: []
+    });
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    const picker = view.container.querySelector<HTMLSelectElement>(".logs-reference-picker select")!;
+    expect(picker.disabled).toBe(false);
+    expect(apiMocks.fetchLogsReferenceAudio).toHaveBeenCalledWith({
+      serviceId: "local-gpt-comfy",
+      logsName: "",
+      gptWeightsPath: "",
+      sovitsWeightsPath: ""
+    });
+    await changeReactValueExact(picker, "task-alpha:auto.wav");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(701);
+    });
+    await flushAsync(40);
+    expect(backendProjects.get(projectId)?.lines[0]?.temporary_binding?.config.logs_reference_service_id)
+      .toBe("local-gpt-comfy");
+  });
+
   it("passes a new project's exact leading/trailing whitespace and CRLF to its initial revision", async () => {
     const exactSource = "  第一行\r\n😀 第二行 \r\n";
     const view = await renderApp();
@@ -608,7 +764,10 @@ describe("App semantic analysis entry", () => {
     await flushAsync(40);
 
     expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
-    expect(view.container.querySelector('[data-analysis-error="run"]')?.textContent).toContain("trace-resume-422");
+    const errorDialog = view.container.querySelector<HTMLElement>('[data-analysis-error="run"]')!;
+    expect(errorDialog.textContent).not.toContain("trace-resume-422");
+    await click(errorDialog.querySelector('[data-error-action="details"]')!);
+    expect(errorDialog.textContent).toContain("trace-resume-422");
     expect(apiMocks.createAnalysisRun).not.toHaveBeenCalled();
     expect(apiMocks.fetchAnalysisRun).toHaveBeenCalledWith("run-resume");
   });

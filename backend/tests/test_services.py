@@ -978,6 +978,38 @@ def test_gpt_sovits_load_signature_covers_weights_reference_and_prompt() -> None
     )
 
 
+def test_comfyui_load_signature_distinguishes_dynamic_weight_pairs() -> None:
+    endpoint = TTSServiceEndpoint(
+        service_id="local-gpt",
+        engine=EngineName.GPT_SOVITS,
+        provider_type="gpt-sovits",
+        api_contract="comfyui-tts-audio-suite-v1",
+        base_url="http://127.0.0.1:8188",
+        default_params={"resource_id": "gpt-sovits-local"},
+    )
+
+    first = build_load_signature(
+        endpoint,
+        {
+            "training_task": "task-a",
+            "gpt_weights_relative_path": "GPT_weights/task-a-e50.ckpt",
+            "sovits_weights_relative_path": "SoVITS_weights/task-a_e24_s360.pth",
+        },
+    )
+    second = build_load_signature(
+        endpoint,
+        {
+            "training_task": "task-b",
+            "gpt_weights_relative_path": "GPT_weights/task-b-e50.ckpt",
+            "sovits_weights_relative_path": "SoVITS_weights/task-b_e24_s360.pth",
+        },
+    )
+
+    assert first != second
+    assert "training_task=task-a" in first
+    assert "gpt_weights_relative_path=GPT_weights/task-a-e50.ckpt" in first
+
+
 def test_gpt_sovits_api_v2_exposes_model_catalog_and_samples() -> None:
     endpoint = TTSServiceEndpoint(
         service_id="api-gpt",

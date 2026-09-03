@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.models import ScriptRevision
 from app.net_guard import scrub_error
+from app.parser import attributed_quote_spans
 from app.semantic_models import (
     AnalysisRun,
     AnalysisWarning,
@@ -770,17 +771,15 @@ class SemanticAnalysisService:
             if item.kind is AnnotationKind.DIALOGUE
         }
         warnings: list[AnalysisWarning] = []
-        patterns = [r"“([^”\r\n]+)”", r'"([^"\r\n]+)"', r"「([^」\r\n]+)」", r"『([^』\r\n]+)』", r"‘([^’\r\n]+)’"]
-        for pattern in patterns:
-            for match in re.finditer(pattern, source.source_markdown):
-                start_utf16 = py_index_to_utf16(source.source_markdown, match.start(1))
-                end_utf16 = py_index_to_utf16(source.source_markdown, match.end(1))
-                if (start_utf16, end_utf16) not in covered:
-                    warnings.append(
-                        _warning(
-                            "missing_quoted_dialogue",
-                            identity=(start_utf16, end_utf16),
-                            details={"start_utf16": start_utf16, "end_utf16": end_utf16},
-                        )
+        for start, end in attributed_quote_spans(source.source_markdown):
+            start_utf16 = py_index_to_utf16(source.source_markdown, start)
+            end_utf16 = py_index_to_utf16(source.source_markdown, end)
+            if (start_utf16, end_utf16) not in covered:
+                warnings.append(
+                    _warning(
+                        "missing_quoted_dialogue",
+                        identity=(start_utf16, end_utf16),
+                        details={"start_utf16": start_utf16, "end_utf16": end_utf16},
                     )
+                )
         return warnings

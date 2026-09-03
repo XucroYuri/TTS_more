@@ -7,12 +7,17 @@ import type {
   ScriptProject,
   ScriptRevision,
   SemanticAnalysisDraft,
-  SemanticAnnotation,
-  SemanticUtterance
+  SemanticUtterance,
+  UnresolvedCandidate
 } from "../../types";
 import { AnalysisResultsPane, type AnalysisResultFilter } from "./AnalysisResultsPane";
+import {
+  AnalysisBlockingDialog,
+  AnalysisLoadingState,
+  AnalysisNotifications
+} from "./AnalysisWorkspaceChrome";
 import { CharacterAliasEditor } from "./CharacterAliasEditor";
-import { SourceAnnotationPane } from "./SourceAnnotationPane";
+import { SourceAnnotationPane, type AnnotationEdit } from "./SourceAnnotationPane";
 import {
   useAnalysisDraft,
   type UseAnalysisDraftOptions,
@@ -120,6 +125,14 @@ export function ScriptAnalysisWorkspace({
     controller.queueOperations(operations);
   };
 
+  const revealElement = (element: HTMLElement | null | undefined) => {
+    if (!element) return;
+    element.scrollIntoView?.({ block: "center" });
+    element.focus();
+    element.classList.add("is-linked-focus");
+    globalThis.setTimeout(() => element.classList.remove("is-linked-focus"), 1600);
+  };
+
   const focusResultForAnnotation = (annotationId: string) => {
     if (!draft) return;
     const utterance = draft.utterances.find(
@@ -134,8 +147,7 @@ export function ScriptAnalysisWorkspace({
       const card = workspaceRef.current?.querySelector<HTMLElement>(
         `[data-utterance-id="${utterance.id}"]`
       );
-      card?.scrollIntoView?.({ block: "center" });
-      card?.focus();
+      revealElement(card);
     };
     focus();
     if (!workspaceRef.current?.querySelector(`[data-utterance-id="${utterance.id}"]`)) {
@@ -152,33 +164,70 @@ export function ScriptAnalysisWorkspace({
     const sourceSegment = workspaceRef.current?.querySelector<HTMLElement>(
       `.source-annotation-pane__segment[data-start-utf16="${dialogue.span.start_utf16}"]`
     );
-    sourceSegment?.scrollIntoView?.({ block: "center" });
-    sourceSegment?.focus();
+    revealElement(sourceSegment);
   };
 
-  const handleCreateAnnotation = (annotation: SemanticAnnotation) => {
-    const operations: DraftOperation[] = [{ op: "create_annotation", annotation }];
-    if (annotation.kind === "dialogue") {
-      operations.push({
-        op: "create_utterance",
-        utterance: {
-          id: createUtteranceId(),
-          dialogue_annotation_id: annotation.id,
-          speaker_annotation_id: null,
-          character_candidate_id: null,
-          emotion_evidence_annotation_ids: [],
-          normalized_emotion: null,
-          custom_emotion: null,
-          emotion_intensity: null,
-          emotion_origin: "none",
-          language: i18n.resolvedLanguage ?? i18n.language ?? "zh-CN",
-          confidence: 1,
-          uncertainty_codes: ["speaker_unknown"],
-          status: "pending"
-        }
-      });
+  const handleApplyAnnotations = ({
+    createdAnnotations,
+    deletedAnnotationIds
+  }: AnnotationEdit) => {
+    const operations: DraftOperation[] = deletedAnnotationIds.map((annotationId) => ({
+      op: "delete_annotation",
+      annotation_id: annotationId
+    }));
+    createdAnnotations.forEach((annotation) => {
+      operations.push({ op: "create_annotation", annotation });
+      if (annotation.kind === "dialogue") {
+        operations.push({
+          op: "create_utterance",
+          utterance: {
+            id: createUtteranceId(),
+            dialogue_annotation_id: annotation.id,
+            speaker_annotation_id: null,
+            character_candidate_id: null,
+            emotion_evidence_annotation_ids: [],
+            normalized_emotion: null,
+            custom_emotion: null,
+            emotion_intensity: null,
+            emotion_origin: "none",
+            language: i18n.resolvedLanguage ?? i18n.language ?? "zh-CN",
+            confidence: 1,
+            uncertainty_codes: ["speaker_unknown"],
+            status: "pending"
+          }
+        });
+      }
+    });
+    if (operations.length > 0) queueOperations(operations);
+  };
+
+  const focusUnresolvedCandidate = (candidate: UnresolvedCandidate) => {
+    const utteranceId = candidate.details.utterance_id;
+    if (typeof utteranceId === "string") {
+      const utterance = draft?.utterances.find((item) => item.id === utteranceId);
+      if (utterance) focusSourceForUtterance(utterance);
+      revealElement(
+        workspaceRef.current?.querySelector<HTMLElement>(`[data-utterance-id="${utteranceId}"]`)
+      );
+      return;
     }
-    queueOperations(operations);
+    const annotationId = candidate.details.annotation_id;
+    if (typeof annotationId === "string") {
+      focusResultForAnnotation(annotationId);
+      return;
+    }
+    const rawStart = candidate.details.start_utf16 ?? candidate.details.start;
+    if (typeof rawStart === "number") {
+      revealElement(
+        workspaceRef.current?.querySelector<HTMLElement>(
+          `.source-annotation-pane__segment[data-start-utf16="${rawStart}"]`
+        ) ?? workspaceRef.current?.querySelector<HTMLElement>(".source-annotation-pane__source")
+      );
+      return;
+    }
+    revealElement(
+      workspaceRef.current?.querySelector<HTMLElement>(".source-annotation-pane__source")
+    );
   };
 
   const handleCopyDiagnostics = () => {
@@ -211,68 +260,79 @@ export function ScriptAnalysisWorkspace({
   };
 
   const isEditable = Boolean(draft) && !controller.isRunning && !controller.isReadOnly;
+  const visibleWarnings = draft?.warnings ?? controller.run?.warnings ?? [];
+  const annotationLabels = {
+    kindLabels: {
+      speaker: t("analysis.annotationKind.speaker"),
+      emotion_evidence: t("analysis.annotationKind.emotionEvidence"),
+      dialogue: t("analysis.annotationKind.dialogue")
+    },
+    sourceRegionLabel: t("analysis.source.regionLabel"),
+    legendLabel: t("analysis.source.legendLabel"),
+    selectionDialogLabel: t("analysis.source.selectionDialog"),
+    applySelection: t("analysis.actions.apply"),
+    closeSelection: t("analysis.actions.close")
+  };
 
   return (
     <div className="script-analysis-workspace" ref={workspaceRef} data-testid="script-analysis-workspace">
-      <header className="script-analysis-workspace__header">
-        <div>
-          <h1>{t("analysis.title")}</h1>
-          <p>{t("analysis.subtitle")}</p>
-        </div>
-        <span className={`analysis-run-status analysis-run-status--${runStatusKey(controller)}`}>
-          {t(`analysis.runStatus.${runStatusKey(controller)}`)}
-        </span>
-      </header>
-
-      {controller.error ? (
-        <section className="analysis-error-panel" role="alert" data-analysis-error="run">
-          <h2>{t("analysis.errors.runTitle")}</h2>
-          <dl>
-            <div><dt>{t("analysis.errors.code")}</dt><dd>{controller.error.code}</dd></div>
-            <div><dt>{t("analysis.errors.httpStatus")}</dt><dd>{controller.error.http_status}</dd></div>
-            <div><dt>{t("analysis.errors.stage")}</dt><dd>{controller.error.stage}</dd></div>
-            <div><dt>{t("analysis.errors.message")}</dt><dd>{controller.error.message}</dd></div>
-            <div><dt>{t("analysis.errors.traceId")}</dt><dd>{controller.error.trace_id ?? t("analysis.common.none")}</dd></div>
-          </dl>
-          <div className="analysis-error-panel__actions">
-            <button type="button" data-error-action="copy" onClick={handleCopyDiagnostics}>
-              {copyComplete ? t("analysis.errors.copied") : t("analysis.errors.copyDiagnostics")}
-            </button>
-            <button type="button" data-error-action="dismiss" onClick={controller.dismissError}>
-              {t("analysis.errors.dismiss")}
-            </button>
+      <header className="script-analysis-workspace__topbar">
+        <div className="script-analysis-workspace__title">
+          <div>
+            <h1>{t("analysis.title")}</h1>
+            <p>{t("analysis.subtitle")}</p>
           </div>
-        </section>
-      ) : null}
+          <span className={`analysis-run-status analysis-run-status--${runStatusKey(controller)}`}>
+            {t(`analysis.runStatus.${runStatusKey(controller)}`)}
+          </span>
+          {controller.run?.quality === "partial" ? (
+            <span className="analysis-partial-status" data-analysis-quality="partial">
+              {t("analysis.review.partialQuality")}
+            </span>
+          ) : null}
+        </div>
 
-      {controller.conflict ? (
-        <section className="analysis-error-panel analysis-error-panel--conflict" role="alert" data-analysis-error="conflict">
-          <h2>{t("analysis.errors.conflictTitle")}</h2>
-          <p>{controller.conflict.message}</p>
-          <p>{t("analysis.errors.conflictGuidance")}</p>
-          <button type="button" data-error-action="retry" onClick={controller.retryPendingOperations}>
-            {t("analysis.actions.retry")}
+        <div className="script-analysis-workspace__topbar-actions">
+          <AnalysisNotifications
+            warnings={visibleWarnings}
+            warningSource={draft ? "draft" : "run"}
+            unresolved={draft?.unresolved_candidates ?? []}
+            disabled={!isEditable}
+            onDismissWarning={(warningId) =>
+              queueOperations([{ op: "dismiss_warning", warning_id: warningId }])
+            }
+            onLocateUnresolved={focusUnresolvedCandidate}
+          />
+          <span className="analysis-save-status" aria-live="polite">
+            {controller.isSaving
+              ? t("analysis.save.saving")
+              : controller.pendingOperationBatches > 0
+                ? t("analysis.save.pending", { count: controller.pendingOperationBatches })
+                : t("analysis.save.saved")}
+          </span>
+          {draft?.confirmed_revision_id ? (
+            <button
+              type="button"
+              data-action="confirm-recover"
+              disabled={submittingConfirmation || controller.isConfirming}
+              onClick={handleConfirm}
+            >
+              {t("analysis.confirm.recover")}
+            </button>
+          ) : null}
+          <button type="button" data-action="cancel-workspace" onClick={onCancel}>
+            {t("analysis.actions.cancel")}
           </button>
-        </section>
-      ) : null}
-
-      {controller.controllerError && !controller.conflict ? (
-        <section className="analysis-error-panel" role="alert" data-analysis-error="controller">
-          <h2>{t("analysis.errors.controllerTitle")}</h2>
-          <p>{controller.controllerError.code ? `${controller.controllerError.code}: ` : ""}{controller.controllerError.message}</p>
           <button
             type="button"
-            data-error-action="retry"
-            onClick={
-              controller.controllerError.kind === "patch"
-                ? controller.retryPendingOperations
-                : controller.retryAnalysis
-            }
+            data-action="confirm-open"
+            disabled={!isEditable}
+            onClick={() => setConfirmOpen(true)}
           >
-            {t("analysis.actions.retry")}
+            {t("analysis.confirm.open")}
           </button>
-        </section>
-      ) : null}
+        </div>
+      </header>
 
       <main className="script-analysis-workspace__panes">
         <section className="script-analysis-workspace__source" aria-labelledby="analysis-source-title">
@@ -280,76 +340,19 @@ export function ScriptAnalysisWorkspace({
           <SourceAnnotationPane
             sourceRevision={sourceRevision}
             annotations={draft?.annotations ?? []}
-            onCreateAnnotation={handleCreateAnnotation}
+            onApplyAnnotations={handleApplyAnnotations}
             onSelectAnnotation={focusResultForAnnotation}
+            labels={annotationLabels}
           />
         </section>
 
         <section className="script-analysis-workspace__review" aria-label={t("analysis.review.title")}>
-          {controller.run?.quality === "partial" ? (
-            <p className="analysis-review-notice" data-analysis-quality="partial">
-              {t("analysis.review.partialQuality")}
-            </p>
-          ) : null}
-
-          {controller.run?.warnings.length ? (
-            <section className="analysis-review-messages" aria-label={t("analysis.review.runWarningsTitle")}>
-              <h2>{t("analysis.review.runWarningsTitle")}</h2>
-              {controller.run.warnings.map((warning) => (
-                <article
-                  className="analysis-review-message"
-                  data-warning-source="run"
-                  key={warning.id}
-                >
-                  <strong>{warning.code}</strong>
-                  <p>{warning.message}</p>
-                </article>
-              ))}
-            </section>
-          ) : null}
-
-          {draft?.warnings.length ? (
-            <section className="analysis-review-messages" aria-label={t("analysis.review.draftWarningsTitle")}>
-              <h2>{t("analysis.review.draftWarningsTitle")}</h2>
-              {draft.warnings.map((warning) => (
-                <article
-                  className="analysis-review-message"
-                  data-warning-source="draft"
-                  key={warning.id}
-                >
-                  <div>
-                    <strong>{warning.code}</strong>
-                    <p>{warning.message}</p>
-                  </div>
-                  <button
-                    type="button"
-                    data-warning-action="dismiss"
-                    disabled={!isEditable}
-                    onClick={() => queueOperations([{ op: "dismiss_warning", warning_id: warning.id }])}
-                  >
-                    {t("analysis.review.dismissWarning")}
-                  </button>
-                </article>
-              ))}
-            </section>
-          ) : null}
-
-          {draft?.unresolved_candidates.length ? (
-            <section className="analysis-review-messages" data-unresolved-candidates>
-              <h2>{t("analysis.review.unresolvedTitle")}</h2>
-              {draft.unresolved_candidates.map((candidate) => (
-                <article className="analysis-review-message" key={candidate.id}>
-                  <strong>{candidate.code}</strong>
-                  <p>{candidate.message}</p>
-                </article>
-              ))}
-            </section>
-          ) : null}
-
           {!draft ? (
-            <p className="analysis-empty-state">
-              {controller.isRunning ? t("analysis.results.waiting") : t("analysis.results.unavailable")}
-            </p>
+            controller.isRunning ? (
+              <AnalysisLoadingState progress={controller.run?.progress ?? 0} />
+            ) : (
+              <p className="analysis-empty-state">{t("analysis.results.unavailable")}</p>
+            )
           ) : (
             <>
               <AnalysisResultsPane
@@ -362,7 +365,6 @@ export function ScriptAnalysisWorkspace({
               />
               <CharacterAliasEditor
                 characters={draft.characters}
-                utterances={draft.utterances}
                 onOperations={queueOperations}
                 createCharacterId={createCharacterId}
                 disabled={!isEditable}
@@ -372,36 +374,40 @@ export function ScriptAnalysisWorkspace({
         </section>
       </main>
 
-      <footer className="script-analysis-workspace__actions">
-        <span aria-live="polite">
-          {controller.isSaving
-            ? t("analysis.save.saving")
-            : controller.pendingOperationBatches > 0
-              ? t("analysis.save.pending", { count: controller.pendingOperationBatches })
-              : t("analysis.save.saved")}
-        </span>
-        <button type="button" data-action="cancel-workspace" onClick={onCancel}>
-          {t("analysis.actions.cancel")}
-        </button>
-        <button
-          type="button"
-          data-action="confirm-open"
-          disabled={!isEditable}
-          onClick={() => setConfirmOpen(true)}
-        >
-          {t("analysis.confirm.open")}
-        </button>
-        {draft?.confirmed_revision_id ? (
-          <button
-            type="button"
-            data-action="confirm-recover"
-            disabled={submittingConfirmation || controller.isConfirming}
-            onClick={handleConfirm}
-          >
-            {t("analysis.confirm.recover")}
-          </button>
-        ) : null}
-      </footer>
+      {controller.error ? (
+        <AnalysisBlockingDialog
+          kind="run"
+          title={t("analysis.errors.runTitle")}
+          description={t("analysis.errors.runDescription")}
+          error={controller.error}
+          onCopyDiagnostics={handleCopyDiagnostics}
+          copyComplete={copyComplete}
+          onDismiss={controller.dismissError}
+          onRetry={controller.retryAnalysis}
+        />
+      ) : null}
+
+      {controller.conflict ? (
+        <AnalysisBlockingDialog
+          kind="conflict"
+          title={t("analysis.errors.conflictTitle")}
+          description={t("analysis.errors.conflictGuidance")}
+          onRetry={controller.retryPendingOperations}
+        />
+      ) : null}
+
+      {controller.controllerError && !controller.conflict ? (
+        <AnalysisBlockingDialog
+          kind="controller"
+          title={t("analysis.errors.controllerTitle")}
+          description={t("analysis.errors.controllerDescription")}
+          onRetry={
+            controller.controllerError.kind === "patch"
+              ? controller.retryPendingOperations
+              : controller.retryAnalysis
+          }
+        />
+      ) : null}
 
       {confirmOpen && draft ? (
         <div className="analysis-confirm-backdrop">

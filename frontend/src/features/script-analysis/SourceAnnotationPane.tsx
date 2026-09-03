@@ -22,17 +22,28 @@ import "./script-analysis.css";
 export interface SourceAnnotationPaneProps {
   sourceRevision: ScriptRevision;
   annotations: SemanticAnnotation[];
-  onCreateAnnotation: (annotation: SemanticAnnotation) => void;
+  onCreateAnnotation?: (annotation: SemanticAnnotation) => void;
+  onDeleteAnnotation?: (annotationId: string) => void;
+  onApplyAnnotations?: (change: AnnotationEdit) => void;
   onSelectAnnotation: (annotationId: string) => void;
   createAnnotationId?: () => string;
   now?: () => string;
   labels?: AnnotationPaneLabelOverrides;
 }
 
-interface ActiveLayeredSegment {
-  startUtf16: number;
-  endUtf16: number;
+export interface AnnotationEdit {
+  createdAnnotations: SemanticAnnotation[];
+  deletedAnnotationIds: string[];
+}
+
+interface ActiveAnnotationEditor {
+  span: SourceSpan;
   annotationIds: string[];
+}
+
+interface MenuAnchor {
+  left: number;
+  top: number;
 }
 
 interface KeyboardCaret {
@@ -168,6 +179,8 @@ export function SourceAnnotationPane({
   sourceRevision,
   annotations,
   onCreateAnnotation,
+  onDeleteAnnotation,
+  onApplyAnnotations,
   onSelectAnnotation,
   createAnnotationId = defaultCreateAnnotationId,
   now = () => new Date().toISOString(),
@@ -175,8 +188,9 @@ export function SourceAnnotationPane({
 }: SourceAnnotationPaneProps) {
   const sourceRootRef = useRef<HTMLDivElement>(null);
   const [selectedSpan, setSelectedSpan] = useState<SourceSpan | null>(null);
-  const [activeLayeredSegment, setActiveLayeredSegment] =
-    useState<ActiveLayeredSegment | null>(null);
+  const [activeAnnotationEditor, setActiveAnnotationEditor] =
+    useState<ActiveAnnotationEditor | null>(null);
+  const [menuAnchor, setMenuAnchor] = useState<MenuAnchor | null>(null);
   const keyboardCaretRef = useRef<KeyboardCaret>({ anchorUtf16: 0, focusUtf16: 0 });
   const previousSourceIdentityRef = useRef({
     revisionId: sourceRevision.revision_id,
@@ -216,6 +230,7 @@ export function SourceAnnotationPane({
       focusUtf16: keyboardCaretRef.current.focusUtf16
     };
     setSelectedSpan(null);
+    setMenuAnchor(null);
   }, [clearNativeSelection]);
 
   useLayoutEffect(() => {
@@ -233,7 +248,8 @@ export function SourceAnnotationPane({
     clearNativeSelection();
     keyboardCaretRef.current = { anchorUtf16: 0, focusUtf16: 0 };
     setSelectedSpan(null);
-    setActiveLayeredSegment(null);
+    setActiveAnnotationEditor(null);
+    setMenuAnchor(null);
   }, [
     clearNativeSelection,
     sourceRevision.revision_id,
@@ -255,7 +271,18 @@ export function SourceAnnotationPane({
         focusUtf16: span.end_utf16
       };
       setSelectedSpan(span);
-      setActiveLayeredSegment(null);
+      setActiveAnnotationEditor(null);
+      const range = selection.getRangeAt(0) as Range & { getBoundingClientRect?: () => DOMRect };
+      const rect = range.getBoundingClientRect?.();
+      const viewport = root.ownerDocument.defaultView;
+      setMenuAnchor(
+        rect
+          ? {
+              left: Math.max(12, Math.min(rect.left, (viewport?.innerWidth ?? 1280) - 360)),
+              top: Math.max(12, Math.min(rect.bottom + 8, (viewport?.innerHeight ?? 720) - 180))
+            }
+          : null
+      );
     } catch {
       setSelectedSpan(null);
     }
@@ -269,7 +296,8 @@ export function SourceAnnotationPane({
       keyboardCaretRef.current = { anchorUtf16: 0, focusUtf16: 0 };
       setNativeSourceRange(root, sourceRevision.source_markdown, 0, 0);
       setSelectedSpan(null);
-      setActiveLayeredSegment(null);
+      setActiveAnnotationEditor(null);
+      setMenuAnchor(null);
     },
     [sourceRevision.source_markdown]
   );
@@ -305,7 +333,7 @@ export function SourceAnnotationPane({
       const startUtf16 = Math.min(anchorUtf16, focusUtf16);
       const endUtf16 = Math.max(anchorUtf16, focusUtf16);
       const range = setNativeSourceRange(root, source, startUtf16, endUtf16);
-      setActiveLayeredSegment(null);
+      setActiveAnnotationEditor(null);
       if (!range || startUtf16 === endUtf16) {
         setSelectedSpan(null);
         return;
@@ -319,45 +347,97 @@ export function SourceAnnotationPane({
     [clearSelectedSpan, sourceRevision]
   );
 
-  const createAnnotation = useCallback(
-    (kind: AnnotationKind) => {
-      if (!selectedSpan) return;
-      if (!spanMatchesSourceRevision(selectedSpan, sourceRevision)) {
+  const applyKinds = useCallback(
+    (kinds: AnnotationKind[]) => {
+      const span = activeAnnotationEditor?.span ?? selectedSpan;
+      if (!span) return;
+      if (!spanMatchesSourceRevision(span, sourceRevision)) {
         clearSelectedSpan();
+        setActiveAnnotationEditor(null);
         return;
       }
+
+      const existingAnnotations = (activeAnnotationEditor?.annotationIds ?? [])
+        .map((annotationId) => annotationsById.get(annotationId))
+        .filter((annotation): annotation is SemanticAnnotation => Boolean(annotation));
+      const selectedKinds = new Set(kinds);
+      const existingKinds = new Set(existingAnnotations.map((annotation) => annotation.kind));
       const timestamp = now();
-      onCreateAnnotation({
-        id: createAnnotationId(),
-        kind,
-        span: selectedSpan,
-        origin: "human",
-        confidence: null,
-        status: "accepted",
-        created_at: timestamp,
-        updated_at: timestamp
-      });
+      const createdAnnotations = kinds
+        .filter((kind) => !existingKinds.has(kind))
+        .map((kind) => ({
+          id: createAnnotationId(),
+          kind,
+          span,
+          origin: "human" as const,
+          confidence: null,
+          status: "accepted" as const,
+          created_at: timestamp,
+          updated_at: timestamp
+        }));
+      const deletedAnnotationIds = existingAnnotations
+        .filter((annotation) => !selectedKinds.has(annotation.kind))
+        .map((annotation) => annotation.id);
+
+      if (onApplyAnnotations) {
+        onApplyAnnotations({ createdAnnotations, deletedAnnotationIds });
+      } else {
+        deletedAnnotationIds.forEach((annotationId) => onDeleteAnnotation?.(annotationId));
+        createdAnnotations.forEach((annotation) => onCreateAnnotation?.(annotation));
+      }
       clearSelectedSpan();
+      setActiveAnnotationEditor(null);
     },
-    [clearSelectedSpan, createAnnotationId, now, onCreateAnnotation, selectedSpan, sourceRevision]
+    [
+      activeAnnotationEditor,
+      annotationsById,
+      clearSelectedSpan,
+      createAnnotationId,
+      now,
+      onApplyAnnotations,
+      onCreateAnnotation,
+      onDeleteAnnotation,
+      selectedSpan,
+      sourceRevision
+    ]
   );
 
   const openSegment = useCallback(
-    (segment: AnnotationTextSegment) => {
+    (segment: AnnotationTextSegment, target: HTMLElement) => {
       setSelectedSpan(null);
-      if (segment.annotationIds.length === 1) {
-        onSelectAnnotation(segment.annotationIds[0]);
-        setActiveLayeredSegment(null);
-        return;
-      }
-      setActiveLayeredSegment({
-        startUtf16: segment.startUtf16,
-        endUtf16: segment.endUtf16,
+      const prioritizedAnnotationId =
+        segment.annotationIds.find(
+          (annotationId) => annotationsById.get(annotationId)?.kind === "dialogue"
+        ) ?? segment.annotationIds[0];
+      if (prioritizedAnnotationId) onSelectAnnotation(prioritizedAnnotationId);
+      setActiveAnnotationEditor({
+        span: {
+          source_revision_id: sourceRevision.revision_id,
+          source_sha256: sourceRevision.source_sha256 ?? "",
+          start_utf16: segment.startUtf16,
+          end_utf16: segment.endUtf16,
+          text: sourceRevision.source_markdown.slice(segment.startUtf16, segment.endUtf16)
+        },
         annotationIds: segment.annotationIds
       });
+      const rect = target.getBoundingClientRect();
+      const viewport = target.ownerDocument.defaultView;
+      setMenuAnchor({
+        left: Math.max(12, Math.min(rect.left, (viewport?.innerWidth ?? 1280) - 360)),
+        top: Math.max(12, Math.min(rect.bottom + 8, (viewport?.innerHeight ?? 720) - 180))
+      });
     },
-    [onSelectAnnotation]
+    [annotationsById, onSelectAnnotation, sourceRevision]
   );
+
+  const editorSpan = activeAnnotationEditor?.span ?? selectedSpan;
+  const editorKinds = activeAnnotationEditor
+    ? [...new Set(
+        activeAnnotationEditor.annotationIds
+          .map((annotationId) => annotationsById.get(annotationId)?.kind)
+          .filter((kind): kind is AnnotationKind => Boolean(kind))
+      )]
+    : [];
 
   return (
     <section className="source-annotation-pane">
@@ -402,7 +482,7 @@ export function SourceAnnotationPane({
               data-start-utf16={segment.startUtf16}
               data-end-utf16={segment.endUtf16}
               aria-label={`${segment.text}: ${kindLabels.join(", ")}`}
-              onClick={() => openSegment(segment)}
+              onClick={(event) => openSegment(segment, event.currentTarget)}
             >
               {annotationLayerText(segment.text, segment.annotationKinds)}
             </button>
@@ -410,48 +490,19 @@ export function SourceAnnotationPane({
         })}
       </div>
 
-      {selectedSpan ? (
+      {editorSpan ? (
         <SelectionAnnotationMenu
-          span={selectedSpan}
+          key={`${editorSpan.start_utf16}:${editorSpan.end_utf16}:${activeAnnotationEditor ? "edit" : "new"}`}
+          span={editorSpan}
+          initialKinds={editorKinds}
+          anchor={menuAnchor}
           labels={labelOverrides}
-          onSelectKind={createAnnotation}
-          onCancel={clearSelectedSpan}
+          onApply={applyKinds}
+          onCancel={() => {
+            clearSelectedSpan();
+            setActiveAnnotationEditor(null);
+          }}
         />
-      ) : null}
-
-      {activeLayeredSegment ? (
-        <div
-          className="source-annotation-pane__layered-dialog"
-          role="dialog"
-          aria-label={labels.layeredDialogLabel}
-        >
-          <div className="source-annotation-pane__layered-list">
-            {activeLayeredSegment.annotationIds.map((annotationId) => {
-              const annotation = annotationsById.get(annotationId);
-              if (!annotation) return null;
-              return (
-                <button
-                  key={annotation.id}
-                  type="button"
-                  className="source-annotation-pane__layered-choice"
-                  onClick={() => {
-                    onSelectAnnotation(annotation.id);
-                    setActiveLayeredSegment(null);
-                  }}
-                >
-                  {labels.kindLabels[annotation.kind]} · {annotation.id}
-                </button>
-              );
-            })}
-          </div>
-          <button
-            type="button"
-            className="source-annotation-pane__layered-close"
-            onClick={() => setActiveLayeredSegment(null)}
-          >
-            {labels.closeLayeredDialog}
-          </button>
-        </div>
       ) : null}
     </section>
   );

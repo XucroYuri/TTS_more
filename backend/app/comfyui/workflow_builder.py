@@ -142,7 +142,22 @@ def build_gpt_sovits_workflow(params: dict[str, Any]) -> dict[str, Any]:
         "top_p": float(params.get("top_p", 1.0)),
         "temperature": float(params.get("temperature", 1.0)),
     }
-    return _base_workflow("gpt-sovits", params, inputs)
+    dynamic_fields = {
+        "training_task": str(params.get("training_task", "")).strip(),
+        "gpt_weights_relative_path": str(
+            params.get("gpt_weights_relative_path", "")
+        ).strip(),
+        "sovits_weights_relative_path": str(
+            params.get("sovits_weights_relative_path", "")
+        ).strip(),
+    }
+    if any(dynamic_fields.values()) and not all(dynamic_fields.values()):
+        raise ValueError("complete dynamic GPT/SoVITS weight pair is required")
+    workflow = _base_workflow("gpt-sovits", params, inputs)
+    if all(dynamic_fields.values()):
+        workflow["1"]["class_type"] = "TTSMoreDynamicGPTSovitsEngine"
+        workflow["1"]["inputs"].update(dynamic_fields)
+    return workflow
 
 
 def workflow_template_catalog() -> list[dict[str, Any]]:

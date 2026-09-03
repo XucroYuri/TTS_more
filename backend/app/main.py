@@ -35,6 +35,7 @@ from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProv
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key, persist_manifest_delta
 from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
+from app.gpt_sovits_selection import training_task_from_weight
 from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
 from app.semantic_analysis import SemanticAnalysisService
 from app.semantic_executor import SemanticAnalysisExecutor
@@ -778,6 +779,7 @@ def create_app(
             logs_roots = [
                 *_configured_weight_roots_for_service(characters, "logs_root", app.state.service_registry, service_id),
                 *_configured_weight_roots_for_service(characters, "logs_roots", app.state.service_registry, service_id),
+                *_configured_voice_logs_roots(app.state.service_registry, service_id),
             ]
         else:
             gpt_roots = _configured_weight_roots(characters, "gpt_weights_root", app.state.service_registry)
@@ -785,6 +787,7 @@ def create_app(
             logs_roots = [
                 *_configured_weight_roots(characters, "logs_root", app.state.service_registry),
                 *_configured_weight_roots(characters, "logs_roots", app.state.service_registry),
+                *_configured_voice_logs_roots(app.state.service_registry),
             ]
         return {
             "models": scan_gpt_sovits_model_catalog_candidates(
@@ -836,23 +839,153 @@ def create_app(
         sovits_weights_path: str | None = None,
         limit: int = 120,
     ) -> dict[str, Any]:
-        del gpt_weights_path, sovits_weights_path
         characters = store.load_characters()
+        resolved_training_task = ""
+        diagnostics: list[dict[str, str]] = []
         if service_id:
+            try:
+                service = app.state.service_registry.get(service_id)
+            except KeyError:
+                return {
+                    "service_id": service_id,
+                    "logs_name": logs_name,
+                    "resolved_training_task": "",
+                    "samples": [],
+                    "diagnostics": [{
+                        "status": "service_not_found",
+                        "field_path": "service_id",
+                    }],
+                }
             logs_roots = [
                 *_configured_weight_roots_for_service(characters, "logs_root", app.state.service_registry, service_id),
                 *_configured_weight_roots_for_service(characters, "logs_roots", app.state.service_registry, service_id),
+                *_configured_voice_logs_roots(app.state.service_registry, service_id),
             ]
             if not logs_roots:
                 return {
                     "service_id": service_id,
                     "logs_name": logs_name,
+                    "resolved_training_task": "",
                     "samples": [],
                     "diagnostics": [{
                         "status": "service_logs_roots_missing",
                         "detail": f"service {service_id!r} has no configured logs_roots; reference audio samples are service-scoped",
                     }],
                 }
+            if gpt_weights_path or sovits_weights_path:
+                if not gpt_weights_path or not sovits_weights_path:
+                    return {
+                        "service_id": service_id,
+                        "logs_name": logs_name,
+                        "resolved_training_task": "",
+                        "samples": [],
+                        "diagnostics": [{
+                            "status": "dynamic_weight_pair_incomplete",
+                            "field_path": "weight_pair",
+                        }],
+                    }
+                portable_root_raw = str(service.default_params.get("voice_asset_root") or "").strip()
+                if not portable_root_raw:
+                    return {
+                        "service_id": service_id,
+                        "logs_name": logs_name,
+                        "resolved_training_task": "",
+                        "samples": [],
+                        "diagnostics": [{
+                            "status": "service_voice_asset_root_missing",
+                            "field_path": "service_id",
+                        }],
+                    }
+                try:
+                    portable_root = Path(portable_root_raw).resolve(strict=True)
+                except OSError:
+                    return {
+                        "service_id": service_id,
+                        "logs_name": logs_name,
+                        "resolved_training_task": "",
+                        "samples": [],
+                        "diagnostics": [{
+                            "status": "service_voice_asset_root_unavailable",
+                            "field_path": "service_id",
+                        }],
+                    }
+
+                resolved_weights: dict[str, Path] = {}
+                for field_name, raw_value, suffixes in (
+                    ("gpt_weights_path", gpt_weights_path, {".ckpt"}),
+                    ("sovits_weights_path", sovits_weights_path, {".pth", ".safetensors"}),
+                ):
+                    requested = Path(str(raw_value))
+                    candidate = requested if requested.is_absolute() else portable_root / requested
+                    try:
+                        resolved = candidate.resolve(strict=True)
+                    except OSError:
+                        return {
+                            "service_id": service_id,
+                            "logs_name": logs_name,
+                            "resolved_training_task": "",
+                            "samples": [],
+                            "diagnostics": [{
+                                "status": "dynamic_weight_path_unsafe",
+                                "field_path": field_name,
+                            }],
+                        }
+                    if not windows_path_is_within(resolved, portable_root) or not resolved.is_file():
+                        return {
+                            "service_id": service_id,
+                            "logs_name": logs_name,
+                            "resolved_training_task": "",
+                            "samples": [],
+                            "diagnostics": [{
+                                "status": "dynamic_weight_path_unsafe",
+                                "field_path": field_name,
+                            }],
+                        }
+                    if resolved.suffix.casefold() not in suffixes:
+                        return {
+                            "service_id": service_id,
+                            "logs_name": logs_name,
+                            "resolved_training_task": "",
+                            "samples": [],
+                            "diagnostics": [{
+                                "status": "dynamic_weight_type_invalid",
+                                "field_path": field_name,
+                            }],
+                        }
+                    resolved_weights[field_name] = resolved
+
+                gpt_task = training_task_from_weight(resolved_weights["gpt_weights_path"], "gpt")
+                sovits_task = training_task_from_weight(resolved_weights["sovits_weights_path"], "sovits")
+                if not gpt_task or not sovits_task:
+                    return {
+                        "service_id": service_id,
+                        "logs_name": logs_name,
+                        "resolved_training_task": "",
+                        "samples": [],
+                        "diagnostics": [{
+                            "status": "weight_training_task_unresolved",
+                            "field_path": "weight_pair",
+                        }],
+                    }
+                if gpt_task != sovits_task:
+                    return {
+                        "service_id": service_id,
+                        "logs_name": logs_name,
+                        "resolved_training_task": "",
+                        "samples": [],
+                        "diagnostics": [{
+                            "status": "weight_pair_training_task_mismatch",
+                            "field_path": "weight_pair",
+                        }],
+                    }
+                resolved_training_task = gpt_task
+                if logs_name and logs_name.casefold() != resolved_training_task:
+                    diagnostics.append({
+                        "status": "logs_name_overridden_by_weight_pair",
+                        "field_path": "logs_name",
+                    })
+                logs_name = resolved_training_task
+                logs_roots = [portable_root / "logs"]
         else:
             logs_roots = [
                 *_configured_weight_roots(characters, "logs_root", app.state.service_registry),
@@ -862,6 +995,8 @@ def create_app(
         return {
             **payload,
             "service_id": service_id,
+            "resolved_training_task": resolved_training_task,
+            "diagnostics": [*diagnostics, *(payload.get("diagnostics") or [])],
         }
 
     @app.get("/api/character-library/common-logs-presets")
@@ -1525,6 +1660,7 @@ def create_app(
                 *extra_safe,
                 *_confined_weight_roots(store.load_characters(), "logs_root", app.state.service_registry, project_root, extra_safe),
                 *_confined_weight_roots(store.load_characters(), "logs_roots", app.state.service_registry, project_root, extra_safe),
+                *_configured_voice_logs_roots(app.state.service_registry),
             ],
         )
         if not audio_path.is_file():
@@ -2029,6 +2165,8 @@ def _configured_weight_roots(characters: list[Character], key: str, service_regi
     if service_registry is not None:
         for service in service_registry.services:
             add(service.default_params.get(key))
+        for root in _configured_voice_weight_roots(service_registry, key):
+            add(root)
     return roots
 
 
@@ -2096,6 +2234,69 @@ def _configured_weight_roots_for_service(characters: list[Character], key: str, 
             service = None
         if service is not None:
             add(service.default_params.get(key))
+        for root in _configured_voice_weight_roots(service_registry, key, service_id):
+            add(root)
+    return roots
+
+
+def _configured_voice_weight_roots(
+    service_registry: ServiceRegistry | None,
+    key: str,
+    service_id: str | None = None,
+) -> list[Path]:
+    if service_registry is None:
+        return []
+    directory_prefix = {
+        "gpt_weights_root": "gpt_weights",
+        "sovits_weights_root": "sovits_weights",
+    }.get(key)
+    if directory_prefix is None:
+        return []
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for service in service_registry.services:
+        if service_id is not None and service.service_id != service_id:
+            continue
+        portable_root = str(service.default_params.get("voice_asset_root") or "").strip()
+        if not portable_root:
+            continue
+        try:
+            candidates = sorted(
+                (
+                    child
+                    for child in Path(portable_root).iterdir()
+                    if child.is_dir() and child.name.casefold().startswith(directory_prefix)
+                ),
+                key=lambda child: child.name.casefold(),
+            )
+        except OSError:
+            continue
+        for candidate in candidates:
+            marker = str(candidate.resolve(strict=False))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            roots.append(candidate)
+    return roots
+
+
+def _configured_voice_logs_roots(service_registry: ServiceRegistry | None, service_id: str | None = None) -> list[Path]:
+    if service_registry is None:
+        return []
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for service in service_registry.services:
+        if service_id is not None and service.service_id != service_id:
+            continue
+        portable_root = str(service.default_params.get("voice_asset_root") or "").strip()
+        if not portable_root:
+            continue
+        logs_root = Path(portable_root) / "logs"
+        marker = str(logs_root.resolve(strict=False))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        roots.append(logs_root)
     return roots
 
 

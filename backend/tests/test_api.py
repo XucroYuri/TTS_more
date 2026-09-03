@@ -1179,6 +1179,268 @@ def test_logs_reference_audio_lists_samples_with_prompt_text(tmp_path: Path) -> 
     assert payload["samples"][0]["display_label"].startswith("mentor_001")
 
 
+def test_logs_reference_audio_reads_all_portable_training_tasks_without_logs_name(tmp_path: Path) -> None:
+    portable_root = tmp_path / "GPT-SoVITS-Portable"
+    logs_root = portable_root / "logs"
+    first_wav_dir = logs_root / "task-alpha" / "5-wav32k"
+    second_wav_dir = logs_root / "任意训练任务-2026" / "5-wav32k" / "nested"
+    first_wav_dir.mkdir(parents=True)
+    second_wav_dir.mkdir(parents=True)
+    (logs_root / "startup").mkdir()
+    first_sample = first_wav_dir / "alpha.wav"
+    second_sample = second_wav_dir / "beta.wav"
+    first_nested_sample = first_wav_dir / "a" / "shared.wav"
+    second_nested_sample = first_wav_dir / "b" / "shared.wav"
+    first_nested_sample.parent.mkdir()
+    second_nested_sample.parent.mkdir()
+    first_sample.write_bytes(b"RIFFalpha")
+    second_sample.write_bytes(b"RIFFbeta")
+    first_nested_sample.write_bytes(b"RIFFshared-a")
+    second_nested_sample.write_bytes(b"RIFFshared-b")
+    (logs_root / "task-alpha" / "2-name2text.txt").write_text(
+        "alpha.wav\tunused\tzh\t第一条参考音频\n"
+        "a/shared.wav\tunused\tzh\t嵌套甲参考音频\n"
+        "b/shared.wav\tunused\tzh\t嵌套乙参考音频\n",
+        encoding="utf-8",
+    )
+    (logs_root / "任意训练任务-2026" / "2-name2text.txt").write_text(
+        "beta.wav\tunused\tzh\t第二条参考音频\n",
+        encoding="utf-8",
+    )
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps(
+            [
+                {
+                    "service_id": "local-gpt",
+                    "display_name": "GPT-SoVITS",
+                    "engine": "gpt-sovits",
+                    "provider_type": "gpt-sovits",
+                    "api_contract": "comfyui-tts-audio-suite-v1",
+                    "base_url": "http://127.0.0.1:8188",
+                    "mode": "external",
+                    "network_scope": "localhost",
+                    "resource_group": "local-gpu",
+                    "capabilities": ["tts", "reference_audio_voice"],
+                    "default_params": {"voice_asset_root": str(portable_root)},
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path / "data", services_path=services_path))
+
+    response = client.get(
+        "/api/character-library/logs-reference-audio",
+        params={"service_id": "local-gpt"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["logs_name"] == ""
+    samples = payload["samples"]
+    assert {sample["logs_name"] for sample in samples} == {"task-alpha", "任意训练任务-2026"}
+    assert {sample["path"] for sample in samples} == {
+        str(first_sample),
+        str(second_sample),
+        str(first_nested_sample),
+        str(second_nested_sample),
+    }
+    assert {sample["path"]: sample["text"] for sample in samples} == {
+        str(first_sample): "第一条参考音频",
+        str(second_sample): "第二条参考音频",
+        str(first_nested_sample): "嵌套甲参考音频",
+        str(second_nested_sample): "嵌套乙参考音频",
+    }
+    assert len({sample["sample_id"] for sample in samples}) == len(samples)
+    assert payload["diagnostics"] == []
+    audio_response = client.get("/api/audio", params={"path": str(first_sample)})
+    assert audio_response.status_code == 200
+    assert audio_response.content == b"RIFFalpha"
+
+
+def test_logs_reference_audio_rejects_logs_name_outside_service_root(tmp_path: Path) -> None:
+    portable_root = tmp_path / "GPT-SoVITS-Portable"
+    logs_root = portable_root / "logs"
+    outside_wav_dir = portable_root / "outside-task" / "5-wav32k"
+    outside_wav_dir.mkdir(parents=True)
+    (outside_wav_dir / "outside.wav").write_bytes(b"RIFFoutside")
+    logs_root.mkdir()
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps(
+            [{
+                "service_id": "local-gpt",
+                "engine": "gpt-sovits",
+                "provider_type": "gpt-sovits",
+                "api_contract": "comfyui-tts-audio-suite-v1",
+                "base_url": "http://127.0.0.1:8188",
+                "mode": "external",
+                "network_scope": "localhost",
+                "capabilities": ["tts", "reference_audio_voice"],
+                "default_params": {"voice_asset_root": str(portable_root)},
+            }]
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path, services_path=services_path))
+
+    response = client.get(
+        "/api/character-library/logs-reference-audio",
+        params={"service_id": "local-gpt", "logs_name": "../outside-task"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["samples"] == []
+
+
+def test_logs_reference_audio_uses_exact_training_task_from_weight_pair(tmp_path: Path) -> None:
+    portable_root = tmp_path / "GPT-SoVITS-Portable"
+    gpt_root = portable_root / "GPT_weights_v2ProPlus"
+    sovits_root = portable_root / "SoVITS_weights_v2ProPlus"
+    first_logs = portable_root / "logs" / "task-a" / "5-wav32k"
+    other_logs = portable_root / "logs" / "task-b" / "5-wav32k"
+    for directory in (gpt_root, sovits_root, first_logs, other_logs):
+        directory.mkdir(parents=True)
+    gpt = gpt_root / "task-a-e50.ckpt"
+    sovits = sovits_root / "task-a_e24_s360.pth"
+    gpt.write_bytes(b"gpt")
+    sovits.write_bytes(b"sovits")
+    selected_audio = first_logs / "selected.wav"
+    other_audio = other_logs / "other.wav"
+    selected_audio.write_bytes(b"RIFFselected")
+    other_audio.write_bytes(b"RIFFother")
+    (first_logs.parent / "2-name2text.txt").write_text(
+        "selected.wav\tphoneme\tzh\t同任务参考原文\n",
+        encoding="utf-8",
+    )
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps([
+            {
+                "service_id": "local-gpt",
+                "engine": "gpt-sovits",
+                "provider_type": "gpt-sovits",
+                "api_contract": "comfyui-tts-audio-suite-v1",
+                "base_url": "http://127.0.0.1:8188",
+                "mode": "external",
+                "network_scope": "localhost",
+                "capabilities": ["tts", "reference_audio_voice"],
+                "default_params": {"voice_asset_root": str(portable_root)},
+            }
+        ]),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path / "data", services_path=services_path))
+
+    response = client.get(
+        "/api/character-library/logs-reference-audio",
+        params={
+            "service_id": "local-gpt",
+            "logs_name": "task-b",
+            "gpt_weights_path": str(gpt),
+            "sovits_weights_path": str(sovits),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["resolved_training_task"] == "task-a"
+    assert payload["logs_name"] == "task-a"
+    assert [sample["path"] for sample in payload["samples"]] == [str(selected_audio)]
+    assert payload["samples"][0]["text"] == "同任务参考原文"
+    assert payload["diagnostics"] == [{
+        "status": "logs_name_overridden_by_weight_pair",
+        "field_path": "logs_name",
+    }]
+
+
+def test_logs_reference_audio_rejects_mismatched_weight_training_tasks(tmp_path: Path) -> None:
+    portable_root = tmp_path / "GPT-SoVITS-Portable"
+    gpt = portable_root / "GPT_weights_v2ProPlus" / "task-a-e50.ckpt"
+    sovits = portable_root / "SoVITS_weights_v2ProPlus" / "task-b_e24_s360.pth"
+    gpt.parent.mkdir(parents=True)
+    sovits.parent.mkdir(parents=True)
+    (portable_root / "logs").mkdir()
+    gpt.write_bytes(b"gpt")
+    sovits.write_bytes(b"sovits")
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps([{
+            "service_id": "local-gpt",
+            "engine": "gpt-sovits",
+            "provider_type": "gpt-sovits",
+            "api_contract": "comfyui-tts-audio-suite-v1",
+            "base_url": "http://127.0.0.1:8188",
+            "mode": "external",
+            "network_scope": "localhost",
+            "capabilities": ["tts"],
+            "default_params": {"voice_asset_root": str(portable_root)},
+        }]),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path / "data", services_path=services_path))
+
+    response = client.get(
+        "/api/character-library/logs-reference-audio",
+        params={
+            "service_id": "local-gpt",
+            "gpt_weights_path": str(gpt),
+            "sovits_weights_path": str(sovits),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["samples"] == []
+    assert payload["diagnostics"] == [{
+        "status": "weight_pair_training_task_mismatch",
+        "field_path": "weight_pair",
+    }]
+
+
+def test_logs_reference_audio_rejects_weight_outside_service_asset_root(tmp_path: Path) -> None:
+    portable_root = tmp_path / "GPT-SoVITS-Portable"
+    portable_root.mkdir()
+    outside = tmp_path / "outside-e50.ckpt"
+    sovits = portable_root / "SoVITS_weights" / "outside_e24_s360.pth"
+    outside.write_bytes(b"gpt")
+    sovits.parent.mkdir()
+    sovits.write_bytes(b"sovits")
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps([{
+            "service_id": "local-gpt",
+            "engine": "gpt-sovits",
+            "provider_type": "gpt-sovits",
+            "api_contract": "comfyui-tts-audio-suite-v1",
+            "base_url": "http://127.0.0.1:8188",
+            "mode": "external",
+            "network_scope": "localhost",
+            "capabilities": ["tts"],
+            "default_params": {"voice_asset_root": str(portable_root)},
+        }]),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path / "data", services_path=services_path))
+
+    response = client.get(
+        "/api/character-library/logs-reference-audio",
+        params={
+            "service_id": "local-gpt",
+            "gpt_weights_path": str(outside),
+            "sovits_weights_path": str(sovits),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["diagnostics"] == [{
+        "status": "dynamic_weight_path_unsafe",
+        "field_path": "gpt_weights_path",
+    }]
+
+
 def test_logs_reference_audio_is_scoped_to_requested_service(tmp_path: Path) -> None:
     logs_root = tmp_path / "logs"
     wav_dir = logs_root / "demo-mentor-logs" / "5-wav32k"
@@ -4370,6 +4632,115 @@ def test_logs_candidates_include_weight_roots_declared_by_service(tmp_path: Path
     by_name = {item["name"]: item for item in response.json()["candidates"]}
     assert by_name["主角"]["logs_name"] == "demo-hero-logs"
     assert by_name["主角"]["recommended_gpt_weights_path"].endswith("demo-hero-logs-e50.ckpt")
+
+
+def test_voice_candidates_derive_versioned_weight_roots_from_voice_asset_root(tmp_path: Path) -> None:
+    portable_root = tmp_path / "GPT-SoVITS-Portable"
+    gpt_v2_root = portable_root / "GPT_weights_v2ProPlus"
+    gpt_v3_root = portable_root / "GPT_weights_v3"
+    sovits_root = portable_root / "SoVITS_weights_v2ProPlus"
+    gpt_v2_root.mkdir(parents=True)
+    gpt_v3_root.mkdir()
+    sovits_root.mkdir()
+    (gpt_v2_root / "1九九-配音员-情绪补充-e40.ckpt").write_bytes(b"gpt-old")
+    (gpt_v3_root / "1九九-配音员-情绪补充-e50.ckpt").write_bytes(b"gpt-new")
+    (sovits_root / "1九九-配音员-情绪补充_e20_s300.pth").write_bytes(b"sovits-old")
+    (sovits_root / "1九九-配音员-情绪补充_e24_s360.pth").write_bytes(b"sovits-new")
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps(
+            [
+                {
+                    "service_id": "local-gpt-sovits",
+                    "display_name": "GPT-SoVITS",
+                    "engine": "gpt-sovits",
+                    "provider_type": "gpt-sovits",
+                    "api_contract": "comfyui-tts-audio-suite-v1",
+                    "base_url": "http://127.0.0.1:8188",
+                    "mode": "external",
+                    "network_scope": "localhost",
+                    "enabled": True,
+                    "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice"],
+                    "default_params": {"voice_asset_root": str(portable_root)},
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path / "data", services_path=services_path))
+
+    response = client.get("/api/resources/voice-candidates?limit=80")
+
+    assert response.status_code == 200
+    payload = response.json()["gpt_sovits"]
+    assert {item["name"] for item in payload["gpt_weights"]} == {
+        "1九九-配音员-情绪补充-e40.ckpt",
+        "1九九-配音员-情绪补充-e50.ckpt",
+    }
+    assert {item["name"] for item in payload["sovits_weights"]} == {
+        "1九九-配音员-情绪补充_e20_s300.pth",
+        "1九九-配音员-情绪补充_e24_s360.pth",
+    }
+
+
+def test_model_catalog_matches_portable_weights_to_dynamic_logs_task(tmp_path: Path) -> None:
+    portable_root = tmp_path / "GPT-SoVITS-Portable"
+    gpt_root = portable_root / "GPT_weights_v2ProPlus"
+    sovits_root = portable_root / "SoVITS_weights_v2ProPlus"
+    logs_root = portable_root / "logs"
+    logs_name = "1九九-配音员-情绪补充-2r"
+    wav_dir = logs_root / logs_name / "5-wav32k"
+    gpt_root.mkdir(parents=True)
+    sovits_root.mkdir()
+    wav_dir.mkdir(parents=True)
+    (gpt_root / f"{logs_name}-e40.ckpt").write_bytes(b"gpt-old")
+    (gpt_root / f"{logs_name}-e50.ckpt").write_bytes(b"gpt-new")
+    (sovits_root / f"{logs_name}_e20_s300.pth").write_bytes(b"sovits-old")
+    (sovits_root / f"{logs_name}_e24_s360.pth").write_bytes(b"sovits-new")
+    (wav_dir / "九九-01.wav").write_bytes(b"wav")
+    (logs_root / logs_name / "2-name2text.txt").write_text(
+        "九九-01.wav\tphoneme\t[1]\t那就好办多了！跟我来！\n",
+        encoding="utf-8",
+    )
+    services_path = tmp_path / "services.json"
+    services_path.write_text(
+        json.dumps(
+            [
+                {
+                    "service_id": "local-gpt-sovits",
+                    "display_name": "GPT-SoVITS",
+                    "engine": "gpt-sovits",
+                    "provider_type": "gpt-sovits",
+                    "api_contract": "comfyui-tts-audio-suite-v1",
+                    "base_url": "http://127.0.0.1:8188",
+                    "mode": "external",
+                    "network_scope": "localhost",
+                    "enabled": True,
+                    "capabilities": ["tts", "trained_weights_voice", "reference_audio_voice"],
+                    "default_params": {"voice_asset_root": str(portable_root)},
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=tmp_path / "data", services_path=services_path))
+
+    response = client.get(
+        "/api/model-catalog/gpt-sovits",
+        params={"service_id": "local-gpt-sovits", "include_gradio": False, "include_api": False},
+    )
+
+    assert response.status_code == 200
+    model = response.json()["models"][0]
+    assert model["name"] == "九九"
+    assert len(model["gpt_weights"]) == 2
+    assert len(model["sovits_weights"]) == 2
+    assert model["recommended_gpt_weights_path"].endswith(f"{logs_name}-e50.ckpt")
+    assert model["recommended_sovits_weights_path"].endswith(f"{logs_name}_e24_s360.pth")
+    assert model["sample_count"] == 1
+    assert model["reference_audio_groups"][0]["samples"][0]["text"] == "那就好办多了！跟我来！"
 
 
 def test_logs_candidates_include_reference_audio_from_gpt_sovits_logs_root(tmp_path: Path) -> None:

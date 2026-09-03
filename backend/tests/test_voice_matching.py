@@ -8,6 +8,7 @@ from app.voice_matching_models import (
     VoiceMatchPolicy,
     VoiceMatchRequest,
     VoiceResourceRecord,
+    WeightArtifactRecord,
 )
 
 
@@ -78,6 +79,39 @@ def test_explicit_emotion_neutral_fallback_is_not_auto_fill() -> None:
 
     assert result.candidates[0].score_breakdown.emotion == 12
     assert result.candidates[0].auto_fill_eligible is False
+
+
+def test_unknown_emotion_metadata_can_use_deterministic_neutral_fallback() -> None:
+    request = match_request(character_id="九九", emotion="calm").model_copy(
+        update={"target_duration_seconds": 1.0}
+    )
+    catalog = catalog_with(
+        resource_character="九九",
+        reference_character="九九",
+        emotion="neutral",
+    ).model_copy(
+        update={
+            "reference_assets": [
+                ReferenceAssetRecord(
+                    reference_asset_id="ref-001",
+                    character_id="九九",
+                    language="zh",
+                    emotion="neutral",
+                    emotion_origin="unknown",
+                    emotion_confidence=0,
+                    duration_seconds=1.0,
+                    metadata_score=5,
+                    confirmed=True,
+                )
+            ]
+        }
+    )
+
+    result = rank_voice_candidates(request, catalog)
+
+    assert result.candidates[0].score == 82
+    assert result.candidates[0].auto_fill_eligible is True
+    assert "emotion_metadata_unavailable_fallback" in result.candidates[0].reasons
 
 
 def test_generic_character_can_enter_confirmed_generic_pool() -> None:
@@ -240,3 +274,97 @@ def test_ambiguous_alias_across_two_characters_blocks_automatic_matching() -> No
     result = rank_voice_candidates(request, catalog)
 
     assert result.candidates == []
+
+
+def test_dynamic_candidates_never_cross_training_task_reference_pools() -> None:
+    request = match_request(character_id="九九", emotion="happy")
+    request = request.model_copy(update={"target_duration_seconds": 2.0})
+    catalog = CatalogSnapshot(
+        version="catalog-v1",
+        resources=[
+            VoiceResourceRecord(
+                resource_id="gpt-sovits-local",
+                character_id="九九",
+                state="ready",
+                confirmed=True,
+                supports_dynamic_weights=True,
+                compatible_root_ids=["portable"],
+            )
+        ],
+        weight_artifacts=[
+            WeightArtifactRecord(
+                artifact_id="gpt-a",
+                root_id="portable",
+                relative_path="GPT_weights/task-a-e50.ckpt",
+                kind="gpt",
+                character_id="九九",
+                training_task="task-a",
+                fingerprint="gpt-a-fingerprint",
+            ),
+            WeightArtifactRecord(
+                artifact_id="sovits-a",
+                root_id="portable",
+                relative_path="SoVITS_weights/task-a_e24_s360.pth",
+                kind="sovits",
+                character_id="九九",
+                training_task="task-a",
+                fingerprint="sovits-a-fingerprint",
+            ),
+            WeightArtifactRecord(
+                artifact_id="gpt-b",
+                root_id="portable",
+                relative_path="GPT_weights/task-b-e50.ckpt",
+                kind="gpt",
+                character_id="九九",
+                training_task="task-b",
+                fingerprint="gpt-b-fingerprint",
+            ),
+            WeightArtifactRecord(
+                artifact_id="sovits-b",
+                root_id="portable",
+                relative_path="SoVITS_weights/task-b_e24_s360.pth",
+                kind="sovits",
+                character_id="九九",
+                training_task="task-b",
+                fingerprint="sovits-b-fingerprint",
+            ),
+        ],
+        reference_assets=[
+            ReferenceAssetRecord(
+                reference_asset_id="ref-a-happy",
+                character_id="九九",
+                language="zh",
+                emotion="happy",
+                prompt_text="参考原文甲",
+                duration_seconds=2.0,
+                confirmed=True,
+                training_task="task-a",
+                root_id="portable",
+            ),
+            ReferenceAssetRecord(
+                reference_asset_id="ref-b-neutral",
+                character_id="九九",
+                language="zh",
+                emotion="neutral",
+                prompt_text="参考原文乙",
+                duration_seconds=4.0,
+                confirmed=True,
+                training_task="task-b",
+                root_id="portable",
+            ),
+        ],
+    )
+
+    result = rank_voice_candidates(request, catalog)
+
+    assert result.candidates[0].reference_asset_id == "ref-a-happy"
+    assert result.candidates[0].training_task == "task-a"
+    assert result.candidates[0].gpt_weight_artifact_id == "gpt-a"
+    assert result.candidates[0].sovits_weight_artifact_id == "sovits-a"
+    assert {
+        (item.training_task, item.reference_asset_id)
+        for item in result.candidates
+    } == {
+        ("task-a", "ref-a-happy"),
+        ("task-b", "ref-b-neutral"),
+    }

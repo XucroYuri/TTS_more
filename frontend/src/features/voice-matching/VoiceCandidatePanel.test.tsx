@@ -26,7 +26,10 @@ const recommendation: VoiceRecommendation = {
     target_duration_seconds: 2.8,
     reasons: ["character_exact", "emotion_exact"],
     blockers: [],
-    catalog_version: "catalog-v1"
+    catalog_version: "catalog-v1",
+    training_task: number === 1 ? "1九九-许珺雯-25111925情绪补充-2r" : null,
+    gpt_weight_artifact_id: number === 1 ? "gpt-weight-1" : null,
+    sovits_weight_artifact_id: number === 1 ? "sovits-weight-1" : null
   }))
 };
 
@@ -46,7 +49,7 @@ const selection: VoiceSelectionSnapshot = {
   prompt_text: "",
   reference_language: "zh",
   text_language: "zh",
-  inference_parameters: {},
+  inference_parameters: { training_task: "1九九-许珺雯-25111925情绪补充-2r" },
   selected_at: "2026-09-02T00:00:00Z"
 };
 
@@ -87,6 +90,8 @@ describe("VoiceCandidatePanel", () => {
     expect(text).toContain("情绪 28");
     expect(text).toContain("1.05×");
     expect(text).toContain("2.8 秒");
+    expect(text).toContain("训练任务：1九九-许珺雯-25111925情绪补充-2r");
+    expect(text).toContain("GPT/SoVITS 权重已配对");
     expect(text).not.toContain("candidate-4");
     expect(dom.window.document.querySelector('audio[src="/preview/reference-1"]')).not.toBeNull();
 

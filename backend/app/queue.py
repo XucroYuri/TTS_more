@@ -750,6 +750,21 @@ def build_cluster_key(task: GenerationTask, route: ServiceRoute) -> str:
             f"speed={params.get('speed', '')}",
             f"seed={params.get('seed', '')}",
         ]
+        if any(
+            params.get(key)
+            for key in (
+                "training_task",
+                "gpt_weights_relative_path",
+                "sovits_weights_relative_path",
+            )
+        ):
+            parts.extend(
+                [
+                    f"training_task={params.get('training_task', '')}",
+                    f"gpt_weights_relative_path={params.get('gpt_weights_relative_path', '')}",
+                    f"sovits_weights_relative_path={params.get('sovits_weights_relative_path', '')}",
+                ]
+            )
         return "|".join(parts)
     if provider == ProviderType.GPT_SOVITS or task.engine == EngineName.GPT_SOVITS:
         parts = [

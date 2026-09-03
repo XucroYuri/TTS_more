@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from app import parser
 from app.parser import (
     AnthropicProvider,
     LineSourceEvidence,
@@ -38,6 +39,12 @@ def make_draft(
         lines=lines or [ScriptLine(id="l001", character_id="narrator", text="Hello.", language="en")],
         source_evidence=source_evidence or {},
     )
+
+
+def test_attributed_quote_spans_returns_quote_span_once_for_overlapping_patterns() -> None:
+    source = "旁白写道：“别遗漏我。”旁白说"
+
+    assert parser.attributed_quote_spans(source) == [(6, 11)]
 
 
 def test_script_parse_verifier_accepts_llm_draft_with_traceable_dialogue() -> None:

@@ -270,6 +270,8 @@ export interface VoiceResourceRecord {
   weight_artifact_ids: string[];
   mapping_origin: "plugin" | "manual" | "declared" | "unknown";
   fingerprint: string;
+  supports_dynamic_weights?: boolean;
+  compatible_root_ids?: string[];
 }
 
 export interface VoiceReferenceAssetRecord {
@@ -290,6 +292,8 @@ export interface VoiceReferenceAssetRecord {
   emotion_confidence: number;
   language_origin: "confirmed" | "declared" | "filename" | "inferred" | "unknown";
   compatible_resource_ids: string[];
+  training_task?: string | null;
+  root_id?: string | null;
 }
 
 export interface VoiceCatalogPublicView {
@@ -331,6 +335,9 @@ export interface VoiceCandidate {
   reasons: string[];
   blockers: string[];
   catalog_version: string;
+  training_task?: string | null;
+  gpt_weight_artifact_id?: string | null;
+  sovits_weight_artifact_id?: string | null;
 }
 
 export interface VoiceRecommendation {

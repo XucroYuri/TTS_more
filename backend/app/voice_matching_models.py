@@ -39,6 +39,8 @@ class ReferenceAssetRecord(StrictVoiceModel):
     emotion_confidence: float = Field(default=1, ge=0, le=1)
     language_origin: Literal["confirmed", "declared", "filename", "inferred", "unknown"] = "declared"
     compatible_resource_ids: list[str] = Field(default_factory=list)
+    training_task: str | None = None
+    root_id: str | None = None
 
     @field_validator("emotion")
     @classmethod
@@ -61,12 +63,25 @@ class VoiceResourceRecord(StrictVoiceModel):
     weight_artifact_ids: list[str] = Field(default_factory=list)
     mapping_origin: Literal["plugin", "manual", "declared", "unknown"] = "unknown"
     fingerprint: str = ""
+    supports_dynamic_weights: bool = False
+    compatible_root_ids: list[str] = Field(default_factory=list)
+
+
+class WeightArtifactRecord(StrictVoiceModel):
+    artifact_id: str = Field(min_length=1)
+    root_id: str = Field(min_length=1)
+    relative_path: str = Field(min_length=1)
+    kind: Literal["gpt", "sovits"]
+    character_id: str = Field(min_length=1)
+    training_task: str = Field(min_length=1)
+    fingerprint: str = Field(min_length=1)
 
 
 class CatalogSnapshot(StrictVoiceModel):
     version: str = Field(min_length=1)
     resources: list[VoiceResourceRecord] = Field(default_factory=list)
     reference_assets: list[ReferenceAssetRecord] = Field(default_factory=list)
+    weight_artifacts: list[WeightArtifactRecord] = Field(default_factory=list)
 
     def candidate_pairs(self) -> list[tuple[VoiceResourceRecord, ReferenceAssetRecord]]:
         assets_by_id = {asset.reference_asset_id: asset for asset in self.reference_assets}
@@ -125,6 +140,9 @@ class VoiceCandidate(StrictVoiceModel):
     reasons: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
     catalog_version: str = ""
+    training_task: str | None = None
+    gpt_weight_artifact_id: str | None = None
+    sovits_weight_artifact_id: str | None = None
 
 
 class VoiceRecommendation(StrictVoiceModel):

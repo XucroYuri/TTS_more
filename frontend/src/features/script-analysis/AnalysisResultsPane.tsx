@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { DraftOperation, SemanticAnalysisDraft, SemanticUtterance } from "../../types";
@@ -19,8 +19,8 @@ function sourceOrder(draft: SemanticAnalysisDraft, utterance: SemanticUtterance)
     (candidate) => candidate.id === utterance.dialogue_annotation_id
   );
   return annotation
-    ? [annotation.span.start_utf16, annotation.span.end_utf16, utterance.id] as const
-    : [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, utterance.id] as const;
+    ? ([annotation.span.start_utf16, annotation.span.end_utf16, utterance.id] as const)
+    : ([Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, utterance.id] as const);
 }
 
 export function orderedAnalysisUtterances(
@@ -49,6 +49,27 @@ const resolvedAcceptanceUncertainty = new Set([
   "speaker_ambiguous",
   "dialogue_ambiguous"
 ]);
+
+export function reassignUtterance(
+  utterance: SemanticUtterance,
+  characterCandidateId: string | null
+): SemanticUtterance {
+  if (characterCandidateId) {
+    return {
+      ...utterance,
+      character_candidate_id: characterCandidateId,
+      uncertainty_codes: utterance.uncertainty_codes.filter(
+        (code) => code !== "speaker_unknown" && code !== "speaker_ambiguous"
+      )
+    };
+  }
+  return {
+    ...utterance,
+    character_candidate_id: null,
+    status: utterance.status === "accepted" ? "pending" : utterance.status,
+    uncertainty_codes: [...new Set([...utterance.uncertainty_codes, "speaker_unknown" as const])]
+  };
+}
 
 export function utteranceStatusOperations(
   draft: SemanticAnalysisDraft,
@@ -112,6 +133,12 @@ export function utteranceStatusOperations(
   ];
 }
 
+function reviewAction(status: SemanticUtterance["status"]) {
+  if (status === "accepted") return "accept";
+  if (status === "rejected") return "reject";
+  return "pending";
+}
+
 export function AnalysisResultsPane({
   draft,
   filter,
@@ -121,7 +148,17 @@ export function AnalysisResultsPane({
   disabled = false
 }: AnalysisResultsPaneProps) {
   const { t } = useTranslation();
+  const [openDetailsId, setOpenDetailsId] = useState<string | null>(null);
   const utterances = useMemo(() => orderedAnalysisUtterances(draft, filter), [draft, filter]);
+  const acceptedCharacters = useMemo(
+    () => draft.characters.filter((character) => character.status === "accepted"),
+    [draft.characters]
+  );
+  const filterCounts = {
+    all: draft.utterances.length,
+    pending: draft.utterances.filter((utterance) => utterance.status === "pending").length,
+    low: draft.utterances.filter((utterance) => utterance.confidence < 0.8).length
+  };
 
   return (
     <section className="analysis-results-pane" aria-labelledby="analysis-results-title">
@@ -136,7 +173,8 @@ export function AnalysisResultsPane({
               aria-pressed={filter === value}
               onClick={() => onFilterChange(value)}
             >
-              {t(`analysis.filters.${value === "low" ? "lowConfidence" : value}`)}
+              {t(`analysis.filters.${value === "low" ? "lowConfidence" : value}`)}{" "}
+              <span>{filterCounts[value]}</span>
             </button>
           ))}
         </div>
@@ -150,21 +188,17 @@ export function AnalysisResultsPane({
             const dialogue = draft.annotations.find(
               (item) => item.id === utterance.dialogue_annotation_id
             );
-            const speakerAnnotation = draft.annotations.find(
-              (item) => item.id === utterance.speaker_annotation_id
-            );
             const character = draft.characters.find(
               (item) => item.id === utterance.character_candidate_id
             );
             const emotionEvidence = utterance.emotion_evidence_annotation_ids
               .map((id) => draft.annotations.find((item) => item.id === id)?.span.text)
               .filter((value): value is string => Boolean(value));
-            const assignedCharacter = draft.characters.find(
-              (item) => item.id === utterance.character_candidate_id
-            );
-            const canAccept = Boolean(
-              dialogue && assignedCharacter && assignedCharacter.status !== "rejected"
-            );
+            const canAccept = Boolean(dialogue && character && character.status !== "rejected");
+            const emotion = utterance.normalized_emotion
+              ? t(`analysis.emotion.${utterance.normalized_emotion}`)
+              : t("analysis.common.none");
+            const detailsOpen = openDetailsId === utterance.id;
 
             return (
               <article
@@ -175,64 +209,139 @@ export function AnalysisResultsPane({
                 onClick={() => onSelectUtterance(utterance)}
               >
                 <header className="analysis-result-card__header">
-                  <strong>{character?.canonical_name ?? speakerAnnotation?.span.text ?? t("analysis.results.unassigned")}</strong>
-                  <span className={`analysis-status analysis-status--${utterance.status}`}>
-                    {t(`analysis.status.${utterance.status}`)}
-                  </span>
+                  <label className="analysis-result-card__speaker">
+                    <span className="analysis-result-card__field-label">
+                      {t("analysis.fields.speaker")}
+                    </span>
+                    <select
+                      data-utterance-character={utterance.id}
+                      value={
+                        acceptedCharacters.some(
+                          (candidate) => candidate.id === utterance.character_candidate_id
+                        )
+                          ? utterance.character_candidate_id ?? ""
+                          : ""
+                      }
+                      disabled={disabled}
+                      onClick={(event) => event.stopPropagation()}
+                      onChange={(event) => {
+                        event.stopPropagation();
+                        onOperations([
+                          {
+                            op: "update_utterance",
+                            utterance_id: utterance.id,
+                            utterance: reassignUtterance(utterance, event.target.value || null)
+                          }
+                        ]);
+                      }}
+                    >
+                      <option value="">{t("analysis.results.unassigned")}</option>
+                      {acceptedCharacters.map((candidate) => (
+                        <option key={candidate.id} value={candidate.id}>
+                          {candidate.canonical_name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <div
+                    className="analysis-review-actions"
+                    aria-label={t("analysis.results.reviewActions")}
+                  >
+                    {(["accepted", "pending", "rejected"] as const).map((status) => {
+                      const action = reviewAction(status);
+                      return (
+                        <button
+                          key={status}
+                          type="button"
+                          data-utterance-action={action}
+                          data-utterance-id={utterance.id}
+                          disabled={disabled || (status === "accepted" && !canAccept)}
+                          aria-pressed={utterance.status === status}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            const operations = utteranceStatusOperations(draft, utterance, status);
+                            if (operations.length > 0) onOperations(operations);
+                          }}
+                        >
+                          {t(
+                            `analysis.actions.${
+                              status === "accepted"
+                                ? "accept"
+                                : status === "rejected"
+                                  ? "reject"
+                                  : "restore"
+                            }`
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </header>
+
                 <blockquote className="analysis-result-card__dialogue">
                   {dialogue?.span.text ?? t("analysis.results.missingDialogue")}
                 </blockquote>
-                <dl className="analysis-result-card__details">
-                  <div>
-                    <dt>{t("analysis.fields.speaker")}</dt>
-                    <dd>{speakerAnnotation?.span.text ?? character?.canonical_name ?? t("analysis.results.unassigned")}</dd>
-                  </div>
-                  <div>
-                    <dt>{t("analysis.fields.emotionEvidence")}</dt>
-                    <dd>{emotionEvidence.join("、") || t("analysis.common.none")}</dd>
-                  </div>
-                  <div>
-                    <dt>{t("analysis.fields.emotion")}</dt>
-                    <dd>
-                      {utterance.normalized_emotion ?? t("analysis.common.none")}
-                      {utterance.custom_emotion ? ` · ${utterance.custom_emotion}` : ""}
-                      {utterance.emotion_intensity === null ? "" : ` · ${utterance.emotion_intensity}`}
-                      {utterance.emotion_origin === "inferred" ? (
-                        <span className="analysis-badge analysis-badge--inferred">
-                          {t("analysis.badges.inferred")}
-                        </span>
-                      ) : null}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>{t("analysis.fields.confidence")}</dt>
-                    <dd>{Math.round(utterance.confidence * 100)}%</dd>
-                  </div>
-                  <div>
-                    <dt>{t("analysis.fields.uncertainty")}</dt>
-                    <dd>{utterance.uncertainty_codes.join(", ") || t("analysis.common.none")}</dd>
-                  </div>
-                </dl>
-                <div className="analysis-review-actions" aria-label={t("analysis.results.reviewActions")}>
-                  {(["accepted", "pending", "rejected"] as const).map((status) => (
-                    <button
-                      key={status}
-                      type="button"
-                      data-utterance-action={status === "accepted" ? "accept" : status === "rejected" ? "reject" : "pending"}
-                      data-utterance-id={utterance.id}
-                      disabled={disabled || (status === "accepted" && !canAccept)}
-                      aria-pressed={utterance.status === status}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        const operations = utteranceStatusOperations(draft, utterance, status);
-                        if (operations.length > 0) onOperations(operations);
-                      }}
-                    >
-                      {t(`analysis.actions.${status === "accepted" ? "accept" : status === "rejected" ? "reject" : "restore"}`)}
-                    </button>
-                  ))}
+
+                <div className="analysis-result-card__summary">
+                  <span>
+                    <span className="analysis-result-card__field-label">
+                      {t("analysis.fields.emotion")}
+                    </span>
+                    <strong>{emotion}</strong>
+                    {utterance.custom_emotion ? ` · ${utterance.custom_emotion}` : ""}
+                    {utterance.emotion_origin === "inferred" ? (
+                      <span className="analysis-badge analysis-badge--inferred">
+                        {t("analysis.badges.inferred")}
+                      </span>
+                    ) : null}
+                  </span>
+                  <span>
+                    <span className="analysis-result-card__field-label">
+                      {t("analysis.fields.confidence")}
+                    </span>
+                    <strong>{Math.round(utterance.confidence * 100)}%</strong>
+                  </span>
+                  <button
+                    type="button"
+                    data-utterance-action="details"
+                    aria-expanded={detailsOpen}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setOpenDetailsId(detailsOpen ? null : utterance.id);
+                    }}
+                  >
+                    {t("analysis.actions.details")}
+                  </button>
                 </div>
+
+                {detailsOpen ? (
+                  <aside
+                    className="analysis-result-card__popover"
+                    aria-label={t("analysis.results.detailsTitle")}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    <dl>
+                      <div>
+                        <dt>{t("analysis.fields.emotionEvidence")}</dt>
+                        <dd>{emotionEvidence.join("、") || t("analysis.common.none")}</dd>
+                      </div>
+                      <div>
+                        <dt>{t("analysis.fields.emotionIntensity")}</dt>
+                        <dd>
+                          {utterance.emotion_intensity === null
+                            ? t("analysis.common.none")
+                            : utterance.emotion_intensity}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>{t("analysis.fields.uncertainty")}</dt>
+                        <dd>
+                          {utterance.uncertainty_codes.join(", ") || t("analysis.common.none")}
+                        </dd>
+                      </div>
+                    </dl>
+                  </aside>
+                ) : null}
               </article>
             );
           })}

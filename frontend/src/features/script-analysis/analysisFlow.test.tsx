@@ -540,7 +540,14 @@ describe("analysis stage gate", () => {
     }));
     await flushAsync();
 
-    expect(view.container.querySelector('[data-analysis-error="run"]')?.textContent).toContain("trace-422");
+    const errorDialog = view.container.querySelector<HTMLElement>('[data-analysis-error="run"]')!;
+    expect(errorDialog.textContent).not.toContain("trace-422");
+    await act(async () => {
+      errorDialog
+        .querySelector('[data-error-action="details"]')!
+        .dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    });
+    expect(errorDialog.textContent).toContain("trace-422");
     expect(view.container.querySelector(".script-manager-parse-error")).toBeNull();
     expect(view.container.querySelector(".workbench-grid")).toBeNull();
   });

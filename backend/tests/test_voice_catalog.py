@@ -84,6 +84,40 @@ def test_portable_scanner_discovers_assets_without_pairing_weights(tmp_path: Pat
     assert reference.duration_seconds == pytest.approx(1.2)
 
 
+def test_catalog_service_restores_weight_count_from_persisted_snapshot(tmp_path: Path) -> None:
+    root = _portable_fixture(tmp_path / "portable")
+    scan = PortableAssetScanner().scan("portable", root)
+    store = VoiceCatalogStore(tmp_path / "catalog")
+    store.publish(
+        CatalogSnapshot(
+            version="persisted-v1",
+            resources=scan.resource_records,
+            reference_assets=scan.reference_assets,
+            weight_artifacts=scan.weight_artifacts,
+        ),
+        reference_locations=scan.reference_locations,
+    )
+
+    restarted = VoiceCatalogService(store=store, roots={"portable": root})
+
+    assert restarted.public_view()["counts"]["weights"] == 2
+
+
+def test_portable_scanner_extracts_exact_training_task_from_each_weight_kind(tmp_path: Path) -> None:
+    root = tmp_path / "portable"
+    (root / "GPT_weights_v2ProPlus").mkdir(parents=True)
+    (root / "SoVITS_weights_v2ProPlus").mkdir(parents=True)
+    (root / "参考音频").mkdir()
+    (root / "GPT_weights_v2ProPlus" / "角色-A-e50.ckpt").write_bytes(b"gpt")
+    (root / "SoVITS_weights_v2ProPlus" / "角色-A_e24_s360.pth").write_bytes(b"sovits")
+    _write_silent_wav(root / "参考音频" / "legacy.wav")
+
+    scan = PortableAssetScanner().scan("portable", root)
+
+    assert {item.training_task for item in scan.weight_artifacts} == {"角色-a"}
+    assert scan.reference_assets[0].training_task is None
+
+
 def test_portable_scanner_prefers_wav32k_from_variable_training_task_folders(tmp_path: Path) -> None:
     root = _portable_fixture(tmp_path / "portable")
     first = root / "logs" / "task-alpha" / "5-wav32k" / "[九九开心_中文]第一句.wav"
@@ -92,6 +126,10 @@ def test_portable_scanner_prefers_wav32k_from_variable_training_task_folders(tmp
     _write_silent_wav(first)
     _write_silent_wav(second)
     _write_silent_wav(ignored)
+    (first.parents[1] / "2-name2text.txt").write_text(
+        f"{first.name}\tphones\t[2, 2, 1]\t第一句原文\n",
+        encoding="utf-8",
+    )
 
     scan = PortableAssetScanner().scan("portable", root)
 
@@ -105,6 +143,29 @@ def test_portable_scanner_prefers_wav32k_from_variable_training_task_folders(tmp
         "logs/task-alpha/5-wav32k/[九九开心_中文]第一句.wav",
         "logs/任意训练任务-2026/5-wav32k/[九九平静_中文]第二句.wav",
     }
+    assert {item.training_task for item in scan.reference_assets} == {
+        "task-alpha",
+        "任意训练任务-2026",
+    }
+    first_record = next(item for item in scan.reference_assets if item.training_task == "task-alpha")
+    assert first_record.character_id == "task"
+    assert first_record.prompt_text == "第一句原文"
+    assert first_record.language == "zh"
+    assert first_record.language_origin == "inferred"
+
+
+def test_catalog_snapshot_persists_discovered_weight_artifacts(tmp_path: Path) -> None:
+    root = _portable_fixture(tmp_path / "portable")
+    service = VoiceCatalogService(
+        store=VoiceCatalogStore(tmp_path / "voice_matching"),
+        roots={"portable": root},
+    )
+
+    service.sync()
+
+    snapshot = service.store.load_current()
+    assert snapshot is not None
+    assert {item.training_task for item in snapshot.weight_artifacts} == {"九九"}
 
 
 def test_catalog_store_publishes_one_complete_snapshot_atomically(tmp_path: Path) -> None:
@@ -235,6 +296,72 @@ class _CapabilityClient:
                 }
             ],
         }
+
+
+class _DynamicCapabilityClient:
+    def capabilities(self) -> dict[str, object]:
+        return {
+            "contract_version": "tts-audio-suite-v1",
+            "resources": [
+                {
+                    "resource_id": "gpt-sovits-local",
+                    "engine": "gpt-sovits",
+                    "ready": True,
+                }
+            ],
+        }
+
+
+def test_dynamic_comfyui_resource_exposes_only_exact_root_task_pools(tmp_path: Path) -> None:
+    root = _portable_fixture(tmp_path / "portable")
+    logs_reference = root / "logs" / "九九" / "5-wav32k" / "【配音员】九九-惊喜.wav"
+    _write_silent_wav(logs_reference)
+    (logs_reference.parents[1] / "2-name2text.txt").write_text(
+        f"{logs_reference.name}\tphones\tzh\t真的太好了\n",
+        encoding="utf-8",
+    )
+    endpoint = TTSServiceEndpoint(
+        service_id="comfy-gpt",
+        display_name="Comfy GPT-SoVITS",
+        engine=EngineName.GPT_SOVITS,
+        provider_type=ProviderType.GPT_SOVITS,
+        api_contract="comfyui-tts-audio-suite-v1",
+        base_url="http://127.0.0.1:8188",
+        mode="external",
+        managed=False,
+        enabled=True,
+        capabilities=["tts", "trained_weights_voice", "reference_audio_voice"],
+        default_params={
+            "resource_id": "gpt-sovits-local",
+            "voice_asset_root": str(root),
+            "dynamic_weights": True,
+        },
+    )
+    service = VoiceCatalogService(
+        store=VoiceCatalogStore(tmp_path / "voice_matching"),
+        roots={"portable": root},
+        registry=ServiceRegistry([endpoint]),
+        clients={"comfy-gpt": _DynamicCapabilityClient()},
+    )
+
+    status = service.sync()
+    snapshot = service.store.load_current()
+
+    assert status.state == "ready"
+    resource = snapshot.resources[0]
+    assert resource.state == "ready"
+    assert resource.supports_dynamic_weights is True
+    assert resource.compatible_root_ids == ["portable"]
+    assert set(resource.weight_artifact_ids) == {
+        item.artifact_id for item in snapshot.weight_artifacts
+    }
+    assert resource.reference_asset_ids == [
+        next(
+            item.reference_asset_id
+            for item in snapshot.reference_assets
+            if item.training_task == "九九"
+        )
+    ]
 
 
 def test_only_ready_explicit_comfyui_resource_becomes_candidate(tmp_path: Path) -> None:

@@ -1,49 +1,31 @@
+import { useEffect, useState } from "react";
+
 import type { AnnotationKind, SourceSpan } from "../../types";
 
 export interface AnnotationPaneLabels {
   kindLabels: Record<AnnotationKind, string>;
-  markLabels: Record<AnnotationKind, string>;
-  markAriaLabels: Record<AnnotationKind, string>;
   sourceRegionLabel: string;
   legendLabel: string;
-  selectionToolbarLabel: string;
-  selectedTextPrefix: string;
-  layeredDialogLabel: string;
-  closeLayeredDialog: string;
-  cancelSelection: string;
+  selectionDialogLabel: string;
+  applySelection: string;
+  closeSelection: string;
 }
 
 export const defaultAnnotationPaneLabels: AnnotationPaneLabels = {
   kindLabels: {
-    speaker: "说话者 / Speaker",
-    emotion_evidence: "情感证据 / Emotion evidence",
-    dialogue: "台词 / Dialogue"
+    speaker: "说话者",
+    emotion_evidence: "情感证据",
+    dialogue: "台词"
   },
-  markLabels: {
-    speaker: "标记为说话者",
-    emotion_evidence: "标记为情感证据",
-    dialogue: "标记为台词"
-  },
-  markAriaLabels: {
-    speaker: "标记为说话者 / Mark as speaker",
-    emotion_evidence: "标记为情感证据 / Mark as emotion evidence",
-    dialogue: "标记为台词 / Mark as dialogue"
-  },
-  sourceRegionLabel: "剧本原文 / Script source",
-  legendLabel: "标注图例 / Annotation legend",
-  selectionToolbarLabel: "创建原文标注 / Create source annotation",
-  selectedTextPrefix: "已选择 / Selected",
-  layeredDialogLabel: "该片段的标注 / Annotations on this text",
-  closeLayeredDialog: "关闭 / Close",
-  cancelSelection: "取消 / Cancel"
+  sourceRegionLabel: "剧本原文",
+  legendLabel: "标注图例",
+  selectionDialogLabel: "编辑原文标注",
+  applySelection: "应用",
+  closeSelection: "关闭"
 };
 
-export type AnnotationPaneLabelOverrides = Partial<
-  Omit<AnnotationPaneLabels, "kindLabels" | "markLabels" | "markAriaLabels">
-> & {
+export type AnnotationPaneLabelOverrides = Partial<Omit<AnnotationPaneLabels, "kindLabels">> & {
   kindLabels?: Partial<Record<AnnotationKind, string>>;
-  markLabels?: Partial<Record<AnnotationKind, string>>;
-  markAriaLabels?: Partial<Record<AnnotationKind, string>>;
 };
 
 export function resolveAnnotationPaneLabels(
@@ -52,18 +34,15 @@ export function resolveAnnotationPaneLabels(
   return {
     ...defaultAnnotationPaneLabels,
     ...overrides,
-    kindLabels: { ...defaultAnnotationPaneLabels.kindLabels, ...overrides?.kindLabels },
-    markLabels: { ...defaultAnnotationPaneLabels.markLabels, ...overrides?.markLabels },
-    markAriaLabels: {
-      ...defaultAnnotationPaneLabels.markAriaLabels,
-      ...overrides?.markAriaLabels
-    }
+    kindLabels: { ...defaultAnnotationPaneLabels.kindLabels, ...overrides?.kindLabels }
   };
 }
 
 export interface SelectionAnnotationMenuProps {
   span: SourceSpan;
-  onSelectKind: (kind: AnnotationKind) => void;
+  initialKinds?: AnnotationKind[];
+  anchor?: { left: number; top: number } | null;
+  onApply: (kinds: AnnotationKind[]) => void;
   onCancel: () => void;
   labels?: AnnotationPaneLabelOverrides;
 }
@@ -72,30 +51,65 @@ const annotationKinds: AnnotationKind[] = ["speaker", "emotion_evidence", "dialo
 
 export function SelectionAnnotationMenu({
   span,
-  onSelectKind,
+  initialKinds = [],
+  anchor = null,
+  onApply,
   onCancel,
   labels: labelOverrides
 }: SelectionAnnotationMenuProps) {
   const labels = resolveAnnotationPaneLabels(labelOverrides);
+  const [selectedKinds, setSelectedKinds] = useState<Set<AnnotationKind>>(
+    () => new Set(initialKinds)
+  );
+
+  useEffect(() => {
+    setSelectedKinds(new Set(initialKinds));
+  }, [initialKinds]);
+
+  const toggleKind = (kind: AnnotationKind) => {
+    setSelectedKinds((current) => {
+      const next = new Set(current);
+      if (next.has(kind)) next.delete(kind);
+      else next.add(kind);
+      return next;
+    });
+  };
+
   return (
-    <div className="selection-annotation-menu" role="toolbar" aria-label={labels.selectionToolbarLabel}>
-      <span className="selection-annotation-menu__selection">
-        {labels.selectedTextPrefix}: “{span.text}”
-      </span>
-      <div className="selection-annotation-menu__actions">
+    <div
+      className="selection-annotation-menu"
+      role="dialog"
+      aria-label={labels.selectionDialogLabel}
+      data-selection-start={span.start_utf16}
+      data-selection-end={span.end_utf16}
+      style={anchor ? { left: anchor.left, top: anchor.top } : undefined}
+    >
+      <div className="selection-annotation-menu__types">
         {annotationKinds.map((kind) => (
-          <button
+          <label
             key={kind}
-            type="button"
-            className={`selection-annotation-menu__button selection-annotation-menu__button--${kind}`}
-            aria-label={labels.markAriaLabels[kind]}
-            onClick={() => onSelectKind(kind)}
+            className={`selection-annotation-menu__type selection-annotation-menu__type--${kind}`}
           >
-            {labels.markLabels[kind]}
-          </button>
+            <input
+              type="checkbox"
+              value={kind}
+              checked={selectedKinds.has(kind)}
+              onChange={() => toggleKind(kind)}
+            />
+            <span>{labels.kindLabels[kind]}</span>
+          </label>
         ))}
-        <button type="button" className="selection-annotation-menu__cancel" onClick={onCancel}>
-          {labels.cancelSelection}
+      </div>
+      <div className="selection-annotation-menu__actions">
+        <button type="button" className="selection-annotation-menu__close" onClick={onCancel}>
+          {labels.closeSelection}
+        </button>
+        <button
+          type="button"
+          className="selection-annotation-menu__apply"
+          onClick={() => onApply(annotationKinds.filter((kind) => selectedKinds.has(kind)))}
+        >
+          {labels.applySelection}
         </button>
       </div>
     </div>

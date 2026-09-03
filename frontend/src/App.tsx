@@ -811,17 +811,24 @@ export default function App() {
     };
   }, [activeLine?.id, currentProjectId, isProjectLoaded, voiceCatalog?.catalog_version, voiceRecommendationEpoch, workspaceStage]);
 
+  const activeLogsReferenceServiceId = useMemo(() => {
+    if (activeServiceId) return activeServiceId;
+    const candidates = routableProviderServices(services, activeProvider);
+    return candidates.length === 1 ? candidates[0]?.service_id ?? "" : "";
+  }, [activeProvider, activeServiceId, services]);
   const activeLogsReferenceRequest = useMemo(
-    () => logsReferenceRequest(activeProvider, activeServiceId, activeBindingConfig),
-    [activeBindingConfig, activeProvider, activeServiceId]
+    () => activeLogsReferenceServiceId ? logsReferenceRequest(activeProvider, activeLogsReferenceServiceId, activeBindingConfig) : null,
+    [activeBindingConfig, activeLogsReferenceServiceId, activeProvider]
   );
   const activeLogsReferencePayload = activeLogsReferenceRequest ? logsReferenceAudio[activeLogsReferenceRequest.key] : undefined;
   const activeLogsReferenceSamples = activeLogsReferencePayload?.samples ?? [];
-  const activeLogsReferenceSample = selectedLogsReferenceSample(activeLogsReferenceSamples, activeBindingConfig, { serviceId: activeServiceId });
-  const activeReferenceAudioPath = activeProvider === "gpt-sovits" ? activeLogsReferenceSample?.path ?? stringConfig(activeBindingConfig.ref_audio_path) : "";
-  const activeReferenceAudioLabel = activeLogsReferenceSample?.display_label || shortPath(activeReferenceAudioPath) || t("inspector.referenceAudio");
+  const activeLogsReferenceSample = selectedLogsReferenceSample(activeLogsReferenceSamples, activeBindingConfig, { serviceId: activeLogsReferenceServiceId });
   const staleLogsReferenceServiceId = stringConfig(activeBindingConfig.logs_reference_service_id);
-  const isLogsReferenceFromOtherService = Boolean(activeProvider === "gpt-sovits" && staleLogsReferenceServiceId && activeServiceId && staleLogsReferenceServiceId !== activeServiceId);
+  const isLogsReferenceFromOtherService = Boolean(activeProvider === "gpt-sovits" && staleLogsReferenceServiceId && staleLogsReferenceServiceId !== activeLogsReferenceServiceId);
+  const activeReferenceAudioPath = activeProvider === "gpt-sovits"
+    ? activeLogsReferenceSample?.path ?? (isLogsReferenceFromOtherService ? "" : stringConfig(activeBindingConfig.ref_audio_path))
+    : "";
+  const activeReferenceAudioLabel = activeLogsReferenceSample?.display_label || shortPath(activeReferenceAudioPath) || t("inspector.referenceAudio");
   const candidateReferenceGroups = useMemo(
     () => trustedBackupReferenceGroups(activeLine, resolvedCharacters),
     [activeLine, resolvedCharacters]
@@ -1100,10 +1107,9 @@ export default function App() {
     if (!activeLogsReferenceRequest) return;
     if (logsReferenceAudio[activeLogsReferenceRequest.key]) return;
     setLoadingLogsReferenceKey(activeLogsReferenceRequest.key);
-    const referenceService = (activeLogsReferenceRequest.serviceId ? serviceById.get(activeLogsReferenceRequest.serviceId) : undefined)
-      ?? activeRouteServices.find(isGptSovitsApiV2Service);
-    const referenceServiceId = activeLogsReferenceRequest.serviceId || referenceService?.service_id || null;
-    const referenceRequest = isGptSovitsApiV2Service(referenceService)
+    const referenceService = activeLogsReferenceRequest.serviceId ? serviceById.get(activeLogsReferenceRequest.serviceId) : undefined;
+    const referenceServiceId = activeLogsReferenceRequest.serviceId || null;
+    const referenceRequest = isGptSovitsApiV2Service(referenceService) && Boolean(activeLogsReferenceRequest.logsName)
       ? fetchGptSovitsModelSamples({
         serviceId: referenceServiceId,
         logsName: activeLogsReferenceRequest.logsName,
@@ -1127,7 +1133,7 @@ export default function App() {
         }
       })))
       .finally(() => setLoadingLogsReferenceKey((current) => (current === activeLogsReferenceRequest.key ? null : current)));
-  }, [activeLogsReferenceRequest, activeRouteServices, logsReferenceAudio, serviceById, t]);
+  }, [activeLogsReferenceRequest, logsReferenceAudio, serviceById, t]);
 
   useEffect(() => {
     if (!activeModelCatalogItem || !activeModelSamplesKey) return;
@@ -4944,7 +4950,7 @@ export default function App() {
   }
 
   function applyLogsReferenceSample(sample: LogsReferenceAudioSample) {
-    updateActiveBindingConfig(applyLogsReferenceSampleToConfig(activeBindingConfig, sample, { serviceId: activeServiceId }));
+    updateActiveBindingConfig(applyLogsReferenceSampleToConfig(activeBindingConfig, sample, { serviceId: activeLogsReferenceServiceId }));
     setNotice(t("notice.logsReferenceApplied"));
   }
 
@@ -5172,7 +5178,6 @@ function referencePathForProvider(provider: string, config: Record<string, unkno
 function logsReferenceRequest(provider: ProviderType, serviceId: string | null | undefined, config: Record<string, unknown>) {
   if (provider !== "gpt-sovits") return null;
   const logsName = stringConfig(config.logs_name);
-  if (!logsName) return null;
   const gptWeightsPath = stringConfig(config.gpt_weights_path);
   const sovitsWeightsPath = stringConfig(config.sovits_weights_path);
   const key = [serviceId ?? "", logsName, gptWeightsPath, sovitsWeightsPath].join("|");

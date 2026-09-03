@@ -5,6 +5,8 @@ from __future__ import annotations
 import statistics
 from collections.abc import Sequence
 
+from .gpt_sovits_selection import DynamicWeightPair, pair_dynamic_weights
+
 from .voice_matching_models import (
     CatalogSnapshot,
     DEFAULT_POLICY,
@@ -54,16 +56,34 @@ def rank_voice_candidates(
     policy: VoiceMatchPolicy = DEFAULT_POLICY,
 ) -> VoiceRecommendation:
     ambiguous_names = _ambiguous_identity_names(catalog)
-    eligible = [
-        pair
-        for pair in catalog.candidate_pairs()
-        if _passes_identity_gates(request, pair, ambiguous_names)
-    ]
+    eligible: list[
+        tuple[VoiceResourceRecord, ReferenceAssetRecord, DynamicWeightPair | None]
+    ] = []
+    for resource, asset in catalog.candidate_pairs():
+        if resource.supports_dynamic_weights:
+            continue
+        pair = (resource, asset)
+        if _passes_identity_gates(request, pair, ambiguous_names):
+            eligible.append((resource, asset, None))
+    for resource in catalog.resources:
+        if not resource.supports_dynamic_weights:
+            continue
+        for weight_pair in pair_dynamic_weights(catalog, resource):
+            for asset in catalog.reference_assets:
+                if (
+                    asset.training_task != weight_pair.training_task
+                    or asset.root_id != weight_pair.root_id
+                    or not asset.prompt_text.strip()
+                ):
+                    continue
+                pair = (resource, asset)
+                if _passes_identity_gates(request, pair, ambiguous_names):
+                    eligible.append((resource, asset, weight_pair))
     scored = [
-        _score_candidate(request, pair, policy).model_copy(
+        _score_candidate(request, (resource, asset), policy, weight_pair).model_copy(
             update={"catalog_version": catalog.version}
         )
-        for pair in eligible
+        for resource, asset, weight_pair in eligible
     ]
     scored.sort(key=lambda item: (-item.score, -item.score_breakdown.metadata, item.candidate_id))
     return VoiceRecommendation(
@@ -94,13 +114,14 @@ def _passes_identity_gates(
             and asset.confirmed
         )
     names = {request.character_id, *request.character_aliases}
-    return _record_identity_matches(
+    resource_matches = resource.supports_dynamic_weights or _record_identity_matches(
         request.character_id,
         names,
         resource.character_id,
         set(resource.character_aliases),
         ambiguous_names,
-    ) and _record_identity_matches(
+    )
+    return resource_matches and _record_identity_matches(
         request.character_id,
         names,
         asset.character_id,
@@ -135,6 +156,7 @@ def _score_candidate(
     request: VoiceMatchRequest,
     pair: tuple[VoiceResourceRecord, ReferenceAssetRecord],
     policy: VoiceMatchPolicy,
+    weight_pair: DynamicWeightPair | None = None,
 ) -> VoiceCandidate:
     resource, asset = pair
     character = 15 if request.is_generic else 35
@@ -150,11 +172,33 @@ def _score_candidate(
         metadata=metadata,
     )
     explicit_emotion = request.emotion not in (None, "neutral")
+    unknown_emotion_fallback = bool(
+        explicit_emotion
+        and asset.emotion_origin == "unknown"
+        and asset.emotion == "neutral"
+    )
     auto_fill = breakdown.total >= policy.auto_fill_threshold and (
-        not explicit_emotion or emotion >= policy.explicit_emotion_minimum
+        not explicit_emotion
+        or emotion >= policy.explicit_emotion_minimum
+        or unknown_emotion_fallback
+    )
+    reasons = [
+        "character_identity_eligible",
+        f"emotion_score:{emotion:g}",
+        f"duration_score:{duration:g}",
+        f"language_score:{language:g}",
+    ]
+    if unknown_emotion_fallback:
+        reasons.append("emotion_metadata_unavailable_fallback")
+    dynamic_identity = (
+        f":{weight_pair.gpt_weight_artifact_id}:{weight_pair.sovits_weight_artifact_id}"
+        if weight_pair
+        else ""
     )
     return VoiceCandidate(
-        candidate_id=f"{resource.resource_id}:{asset.reference_asset_id}",
+        candidate_id=(
+            f"{resource.resource_id}{dynamic_identity}:{asset.reference_asset_id}"
+        ),
         resource_id=resource.resource_id,
         reference_asset_id=asset.reference_asset_id,
         score=breakdown.total,
@@ -163,13 +207,15 @@ def _score_candidate(
         speed_factor=speed_factor,
         engine_type=resource.engine_type,
         target_duration_seconds=request.target_duration_seconds,
-        reasons=[
-            "character_identity_eligible",
-            f"emotion_score:{emotion:g}",
-            f"duration_score:{duration:g}",
-            f"language_score:{language:g}",
-        ],
+        reasons=reasons,
         catalog_version="",
+        training_task=weight_pair.training_task if weight_pair else None,
+        gpt_weight_artifact_id=(
+            weight_pair.gpt_weight_artifact_id if weight_pair else None
+        ),
+        sovits_weight_artifact_id=(
+            weight_pair.sovits_weight_artifact_id if weight_pair else None
+        ),
     )
 
 

@@ -160,8 +160,6 @@ def scan_gpt_sovits_model_catalog_candidates(
 def scan_logs_reference_audio_samples(logs_roots: list[Path], logs_name: str, limit: int = 120) -> dict[str, Any]:
     diagnostics: list[dict[str, str]] = []
     samples: list[dict[str, Any]] = []
-    if not logs_name.strip():
-        return {"logs_name": logs_name, "samples": samples, "diagnostics": [{"status": "missing_logs_name", "detail": "logs_name is required"}]}
 
     for logs_dir in _matching_logs_dirs(logs_roots, logs_name):
         wav_dir = logs_dir / "5-wav32k"
@@ -170,11 +168,21 @@ def scan_logs_reference_audio_samples(logs_roots: list[Path], logs_name: str, li
             continue
         text_records = _read_gpt_sovits_name2text_records(logs_dir / "2-name2text.txt")
         metadata = _read_audio_metadata(logs_dir / "audio_metadata.json")
-        for path in sorted(wav_dir.iterdir(), key=lambda item: item.name.lower()):
+        for path in sorted(wav_dir.rglob("*"), key=lambda item: str(item.relative_to(wav_dir)).lower()):
             if not path.is_file() or path.suffix.lower() not in AUDIO_SUFFIXES:
                 continue
-            record = text_records.get(path.name) or text_records.get(path.stem) or {}
-            meta = metadata.get(path.name) if isinstance(metadata.get(path.name), dict) else {}
+            relative_path = path.relative_to(wav_dir)
+            relative_key = relative_path.as_posix()
+            native_relative_key = str(relative_path)
+            record = (
+                text_records.get(relative_key)
+                or text_records.get(native_relative_key)
+                or text_records.get(path.name)
+                or text_records.get(path.stem)
+                or {}
+            )
+            raw_meta = metadata.get(relative_key) or metadata.get(native_relative_key) or metadata.get(path.name)
+            meta = raw_meta if isinstance(raw_meta, dict) else {}
             sidecar_sample = _reference_sample(path)
             text = str(meta.get("text_override") or sidecar_sample.text or record.get("text") or "").strip()
             text_source = _logs_text_source(meta, sidecar_sample, record)
@@ -184,7 +192,7 @@ def scan_logs_reference_audio_samples(logs_roots: list[Path], logs_name: str, li
             prompt_lang = _normalize_prompt_lang(meta.get("lang") or record.get("lang")) or _infer_prompt_lang(text) or "zh"
             samples.append(
                 {
-                    "sample_id": f"{logs_dir.name}:{path.name}",
+                    "sample_id": f"{logs_dir.name}:{relative_key}",
                     "display_label": _logs_reference_display_label(path.name, text, character, emotion, remark),
                     "path": str(path),
                     "text": text,
@@ -553,15 +561,32 @@ def _read_audio_metadata(path: Path) -> dict[str, Any]:
 def _matching_logs_dirs(logs_roots: list[Path], logs_name: str) -> list[Path]:
     output: list[Path] = []
     normalized = _normalize(logs_name)
+    if normalized and (logs_name.strip() in {".", ".."} or "/" in logs_name or "\\" in logs_name or Path(logs_name).is_absolute()):
+        return output
     seen: set[str] = set()
     for root in logs_roots:
         if not root.exists() or not root.is_dir():
             continue
-        direct = root / logs_name
-        candidates = [direct] if direct.is_dir() else []
-        candidates.extend(child for child in root.iterdir() if child.is_dir() and _normalize(child.name) == normalized)
+        try:
+            resolved_root = root.resolve()
+        except OSError:
+            continue
+        if normalized:
+            direct = root / logs_name
+            candidates = [direct] if direct.is_dir() else []
+            candidates.extend(child for child in root.iterdir() if child.is_dir() and _normalize(child.name) == normalized)
+        else:
+            candidates = sorted(
+                (child for child in root.iterdir() if child.is_dir() and (child / "5-wav32k").is_dir()),
+                key=lambda child: child.name.lower(),
+            )
         for candidate in candidates:
-            marker = str(candidate.resolve())
+            try:
+                resolved_candidate = candidate.resolve()
+                resolved_candidate.relative_to(resolved_root)
+            except (OSError, ValueError):
+                continue
+            marker = str(resolved_candidate)
             if marker in seen:
                 continue
             seen.add(marker)

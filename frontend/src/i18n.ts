@@ -668,9 +668,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       blocked: "无法自动推荐：{{reason}}",
       selectCandidate: "选择此方案",
       selected: "已选择",
-      clearSelection: "取消选择",
-      autoFillEligible: "可自动填充",
-      seconds: "{{value}} 秒",
+        clearSelection: "取消选择",
+        autoFillEligible: "可自动填充",
+        trainingTask: "训练任务：",
+        dynamicPairReady: "GPT/SoVITS 权重已配对",
+        seconds: "{{value}} 秒",
       selectionSource: {
         automatic: "自动选择",
         manual: "人工选择",
@@ -782,7 +784,10 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         largeFileWarning: "剧本共 {{count}} 个字符，超过建议上限 {{limit}}"
       },
       source: {
-        title: "原文标注"
+        title: "原文标注",
+        regionLabel: "剧本原文",
+        legendLabel: "标注图例",
+        selectionDialog: "编辑原文标注"
       },
       review: {
         title: "分析审阅",
@@ -805,11 +810,13 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         unavailable: "分析结果暂不可用，可重试分析。",
         unassigned: "未分配角色",
         missingDialogue: "台词锚点缺失",
-        reviewActions: "台词审阅操作"
+        reviewActions: "台词审阅操作",
+        detailsTitle: "台词诊断详情"
       },
       fields: {
         speaker: "说话人",
         emotionEvidence: "情绪证据",
+        emotionIntensity: "情绪强度",
         emotion: "情绪",
         confidence: "置信度",
         uncertainty: "不确定项"
@@ -836,10 +843,16 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         save: "保存修改",
         merge: "合并角色",
         retry: "重试",
-        cancel: "取消"
+        cancel: "取消",
+        details: "详情",
+        diagnostics: "查看诊断",
+        apply: "应用",
+        close: "关闭"
       },
       characters: {
         title: "角色与别名",
+        create: "新建角色",
+        reviewActions: "角色审阅操作",
         empty: "暂无角色候选",
         newName: "新角色名称",
         createHuman: "新建人工角色",
@@ -852,7 +865,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       },
       errors: {
         runTitle: "分析运行失败",
+        runDescription: "本次分析未能完成。你可以查看安全诊断后调整配置或重试。",
         controllerTitle: "分析工作区出错",
+        controllerDescription: "工作区操作未能完成，本地修改会继续保留。请重试。",
         conflictTitle: "草稿版本冲突",
         conflictGuidance: "本地修改仍保留。请检查冲突后重试保存；不会自动覆盖本地编辑。",
         code: "错误代码",
@@ -871,7 +886,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       },
       confirm: {
         open: "确认并导入",
-        recover: "恢复确认并进入配音",
+        recover: "恢复上次已确认版本",
         title: "确认导入分析结果",
         importCount: "将导入 {{count}} 条台词",
         excludedCount: "{{count}} 条台词因状态、锚点或角色分配未满足条件而排除",
@@ -883,7 +898,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         none: "无"
       },
       annotationKind: {
-        speaker: "说话人",
+        speaker: "说话者",
         emotionEvidence: "情绪证据",
         dialogue: "台词"
       },
@@ -910,6 +925,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         emotionInferred: "情绪为推断",
         emotionAmbiguous: "情绪有歧义",
         sourceAnchorAmbiguous: "原文锚点有歧义"
+      },
+      diagnostics: {
+        reviewRequired: "需要人工复核",
+        emotionEvidenceMismatch: "情感证据未唯一匹配",
+        missingQuotedDialogue: "引号内台词尚未覆盖"
       }
     },
     queue: {
@@ -1642,9 +1662,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       blocked: "Automatic recommendation blocked: {{reason}}",
       selectCandidate: "Select this plan",
       selected: "Selected",
-      clearSelection: "Clear selection",
-      autoFillEligible: "Auto-fill eligible",
-      seconds: "{{value}} sec",
+        clearSelection: "Clear selection",
+        autoFillEligible: "Auto-fill eligible",
+        trainingTask: "Training task: ",
+        dynamicPairReady: "GPT/SoVITS weights paired",
+        seconds: "{{value}} sec",
       selectionSource: {
         automatic: "Automatic selection",
         manual: "Manual selection",
@@ -1756,7 +1778,10 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         largeFileWarning: "The script has {{count}} characters, above the recommended limit of {{limit}}"
       },
       source: {
-        title: "Source annotations"
+        title: "Source annotations",
+        regionLabel: "Script source",
+        legendLabel: "Annotation legend",
+        selectionDialog: "Edit source annotations"
       },
       review: {
         title: "Analysis review",
@@ -1779,11 +1804,13 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         unavailable: "Analysis results are unavailable. Retry the analysis.",
         unassigned: "Unassigned character",
         missingDialogue: "Dialogue anchor missing",
-        reviewActions: "Utterance review actions"
+        reviewActions: "Utterance review actions",
+        detailsTitle: "Utterance diagnostic details"
       },
       fields: {
         speaker: "Speaker",
         emotionEvidence: "Emotion evidence",
+        emotionIntensity: "Emotion intensity",
         emotion: "Emotion",
         confidence: "Confidence",
         uncertainty: "Uncertainty"
@@ -1810,10 +1837,16 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         save: "Save changes",
         merge: "Merge characters",
         retry: "Retry",
-        cancel: "Cancel"
+        cancel: "Cancel",
+        details: "Details",
+        diagnostics: "View diagnostics",
+        apply: "Apply",
+        close: "Close"
       },
       characters: {
         title: "Characters and aliases",
+        create: "New character",
+        reviewActions: "Character review actions",
         empty: "No character candidates",
         newName: "New character name",
         createHuman: "Create human character",
@@ -1826,7 +1859,9 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       },
       errors: {
         runTitle: "Analysis run failed",
+        runDescription: "This analysis could not finish. Review the safe diagnostics, adjust the configuration, or retry.",
         controllerTitle: "Analysis workspace error",
+        controllerDescription: "The workspace action could not finish. Local edits remain available; retry when ready.",
         conflictTitle: "Draft version conflict",
         conflictGuidance: "Local changes are still visible. Review the conflict and retry saving; local edits will not be overwritten automatically.",
         code: "Error code",
@@ -1845,7 +1880,7 @@ export const resources: Record<AppLanguage, TranslationTree> = {
       },
       confirm: {
         open: "Confirm and import",
-        recover: "Recover confirmation and continue",
+        recover: "Restore last confirmed version",
         title: "Confirm analysis import",
         importCount: "Import {{count}} utterances",
         excludedCount: "Exclude {{count}} utterances whose status, anchor, or character assignment is not eligible",
@@ -1884,6 +1919,11 @@ export const resources: Record<AppLanguage, TranslationTree> = {
         emotionInferred: "Emotion inferred",
         emotionAmbiguous: "Emotion ambiguous",
         sourceAnchorAmbiguous: "Source anchor ambiguous"
+      },
+      diagnostics: {
+        reviewRequired: "Needs manual review",
+        emotionEvidenceMismatch: "Emotion evidence did not match uniquely",
+        missingQuotedDialogue: "Quoted dialogue is not yet covered"
       }
     },
     queue: {

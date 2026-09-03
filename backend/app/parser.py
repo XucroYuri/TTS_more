@@ -448,21 +448,22 @@ def _source_excerpt_markdown_speaker(source_excerpt: str, source_text: str) -> s
     return None
 
 
-def _quoted_dialogue_candidates(source_text: str) -> list[str]:
-    matches: list[tuple[int, str]] = []
+def attributed_quote_spans(source_text: str) -> list[tuple[int, int]]:
+    """Return deduplicated Python spans for quotes with explicit speaker attribution."""
+
+    spans: set[tuple[int, int]] = set()
     for pattern in _ATTRIBUTED_QUOTE_PATTERNS:
         for match in pattern.finditer(source_text):
-            quote = _source_fidelity_text(match.group("quote"))
-            if quote:
-                matches.append((match.start("quote"), quote))
-    ordered: list[str] = []
-    seen: set[tuple[int, str]] = set()
-    for item in sorted(matches):
-        if item in seen:
-            continue
-        seen.add(item)
-        ordered.append(item[1])
-    return ordered
+            spans.add((match.start("quote"), match.end("quote")))
+    return sorted(spans)
+
+
+def _quoted_dialogue_candidates(source_text: str) -> list[str]:
+    return [
+        quote
+        for start, end in attributed_quote_spans(source_text)
+        if (quote := _source_fidelity_text(source_text[start:end]))
+    ]
 
 
 def _is_explicit_speaker_anchor(speaker: str, character_names: set[str]) -> bool:

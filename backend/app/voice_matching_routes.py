@@ -19,10 +19,12 @@ from .voice_catalog import (
 )
 from .voice_matching import estimate_target_duration, rank_voice_candidates
 from .voice_matching_models import (
+    CatalogSnapshot,
     VoiceCandidate,
     VoiceMatchRequest,
     VoiceRecommendation,
     VoiceSelectionSnapshot,
+    WeightArtifactRecord,
 )
 
 
@@ -135,6 +137,19 @@ def _selection_for_candidate(
         for item in snapshot.reference_assets
         if item.reference_asset_id == candidate.reference_asset_id
     )
+    weight_pair = _weight_pair_for_candidate(snapshot, resource, reference, candidate)
+    inference_parameters: dict[str, object] = {"engine": resource.engine_type}
+    if weight_pair is not None:
+        gpt_weight, sovits_weight = weight_pair
+        inference_parameters.update(
+            {
+                "training_task": gpt_weight.training_task,
+                "gpt_weight_artifact_id": gpt_weight.artifact_id,
+                "sovits_weight_artifact_id": sovits_weight.artifact_id,
+                "gpt_weight_fingerprint": gpt_weight.fingerprint,
+                "sovits_weight_fingerprint": sovits_weight.fingerprint,
+            }
+        )
     return VoiceSelectionSnapshot(
         catalog_version=snapshot.version,
         candidate_id=candidate.candidate_id,
@@ -151,15 +166,61 @@ def _selection_for_candidate(
         prompt_text=reference.prompt_text,
         reference_language=reference.language,
         text_language=line.language or "zh",
-        inference_parameters={"engine": resource.engine_type},
+        inference_parameters=inference_parameters,
     )
+
+
+def _weight_pair_for_candidate(
+    snapshot: CatalogSnapshot,
+    resource,
+    reference,
+    candidate: VoiceCandidate,
+) -> tuple[WeightArtifactRecord, WeightArtifactRecord] | None:
+    artifact_ids = (
+        candidate.gpt_weight_artifact_id,
+        candidate.sovits_weight_artifact_id,
+    )
+    if artifact_ids == (None, None):
+        return None
+    if None in artifact_ids or not resource.supports_dynamic_weights:
+        raise HTTPException(status_code=409, detail="dynamic weight pair is incomplete")
+    artifacts = {item.artifact_id: item for item in snapshot.weight_artifacts}
+    gpt_weight = artifacts.get(artifact_ids[0])
+    sovits_weight = artifacts.get(artifact_ids[1])
+    if (
+        gpt_weight is None
+        or sovits_weight is None
+        or gpt_weight.kind != "gpt"
+        or sovits_weight.kind != "sovits"
+    ):
+        raise HTTPException(status_code=409, detail="dynamic weight pair is unavailable")
+    if (
+        gpt_weight.root_id != sovits_weight.root_id
+        or gpt_weight.training_task != sovits_weight.training_task
+        or candidate.training_task != gpt_weight.training_task
+        or reference.root_id != gpt_weight.root_id
+        or reference.training_task != gpt_weight.training_task
+        or gpt_weight.root_id not in resource.compatible_root_ids
+    ):
+        raise HTTPException(status_code=409, detail="dynamic weight pair scope mismatch")
+    return gpt_weight, sovits_weight
 
 
 def _binding_for_selection(
     selection: VoiceSelectionSnapshot,
     service_id: str,
     staged_reference: str,
+    weight_pair: tuple[WeightArtifactRecord, WeightArtifactRecord] | None = None,
 ) -> VoiceBinding:
+    dynamic_config: dict[str, object] = {}
+    if weight_pair is not None:
+        gpt_weight, sovits_weight = weight_pair
+        dynamic_config = {
+            "training_task": gpt_weight.training_task,
+            "voice_asset_root_id": gpt_weight.root_id,
+            "gpt_weights_relative_path": gpt_weight.relative_path,
+            "sovits_weights_relative_path": sovits_weight.relative_path,
+        }
     return VoiceBinding(
         binding_id=f"voice-match-{selection.line_id}",
         provider_type=ProviderType.GPT_SOVITS,
@@ -177,6 +238,7 @@ def _binding_for_selection(
             "_voice_catalog_version": selection.catalog_version,
             "_voice_resource_fingerprint": selection.resource_fingerprint,
             "_voice_reference_fingerprint": selection.reference_fingerprint,
+            **dynamic_config,
         },
     )
 
@@ -200,8 +262,19 @@ def _save_candidate(
     selection = _selection_for_candidate(line, candidate, source, service)
     snapshot = service.store.load_current()
     resource = next(item for item in snapshot.resources if item.resource_id == selection.resource_id)
+    reference = next(
+        item
+        for item in snapshot.reference_assets
+        if item.reference_asset_id == selection.reference_asset_id
+    )
+    weight_pair = _weight_pair_for_candidate(snapshot, resource, reference, candidate)
     staged = service.stage_reference(project_id, selection, store)
-    binding = _binding_for_selection(selection, resource.service_id or "", str(staged))
+    binding = _binding_for_selection(
+        selection,
+        resource.service_id or "",
+        str(staged),
+        weight_pair,
+    )
     _replace_line(
         project,
         line.model_copy(

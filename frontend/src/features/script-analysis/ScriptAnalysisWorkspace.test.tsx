@@ -379,6 +379,12 @@ async function changeValue(element: HTMLInputElement | HTMLSelectElement, value:
   });
 }
 
+async function blur(element: HTMLElement) {
+  await act(async () => {
+    element.dispatchEvent(new window.FocusEvent("focusout", { bubbles: true }));
+  });
+}
+
 async function selectSourceText(view: RenderedView, selectedText: string): Promise<void> {
   const sourceRoot = view.container.querySelector<HTMLElement>(".source-annotation-pane__source")!;
   const walker = view.dom.window.document.createTreeWalker(
@@ -429,7 +435,7 @@ afterEach(async () => {
 });
 
 describe("AnalysisResultsPane", () => {
-  it("sorts by dialogue source span, filters deterministically, and renders all review evidence", async () => {
+  it("renders compact cards with counted filters, localized summaries, and on-demand diagnostics", async () => {
     const onFilterChange = vi.fn();
     const view = await renderElement(
       createElement(AnalysisResultsPane, {
@@ -449,18 +455,70 @@ describe("AnalysisResultsPane", () => {
     const lowCard = view.container.querySelector<HTMLElement>('[data-utterance-id="utterance-2"]')!;
     expect(lowCard.textContent).toContain("乙");
     expect(lowCard.textContent).toContain("第二句");
-    expect(lowCard.textContent).toContain("第");
-    expect(lowCard.textContent).toContain("other");
+    expect(lowCard.textContent).toContain("其他");
     expect(lowCard.textContent).toContain("低沉");
-    expect(lowCard.textContent).toContain("0.6");
     expect(lowCard.textContent).toContain("推断");
     expect(lowCard.textContent).toContain("50%");
-    expect(lowCard.textContent).toContain("emotion_inferred");
-    expect(lowCard.textContent).toContain("已接受");
+    expect(lowCard.textContent).not.toContain("emotion_inferred");
+    expect(lowCard.textContent).not.toContain("已接受");
+    expect(lowCard.querySelector(".analysis-status")).toBeNull();
+    const actions = lowCard.querySelector(".analysis-result-card__header .analysis-review-actions")!;
+    expect(actions.querySelectorAll("button")).toHaveLength(3);
+    expect(
+      actions.querySelector<HTMLButtonElement>('[data-utterance-action="accept"]')!.getAttribute(
+        "aria-pressed"
+      )
+    ).toBe("true");
+
+    const filterText = [...view.container.querySelectorAll<HTMLButtonElement>("[data-filter]")].map(
+      (button) => button.textContent
+    );
+    expect(filterText).toEqual(["全部 3", "待确认 1", "低置信度 1"]);
+
+    await click(lowCard.querySelector('[data-utterance-action="details"]')!);
+    const details = lowCard.querySelector<HTMLElement>(".analysis-result-card__popover")!;
+    expect(details.textContent).toContain("第");
+    expect(details.textContent).toContain("emotion_inferred");
+    expect(details.textContent).toContain("0.6");
 
     await click(view.container.querySelector('[data-filter="pending"]')!);
     await click(view.container.querySelector('[data-filter="low"]')!);
     expect(onFilterChange.mock.calls.map(([filter]) => filter)).toEqual(["pending", "low"]);
+  });
+
+  it("keeps character reassignment inside each dialogue card after removing the assignment list", async () => {
+    const currentDraft = draft();
+    const onOperations = vi.fn<(operations: DraftOperation[]) => void>();
+    const view = await renderElement(
+      createElement(AnalysisResultsPane, {
+        draft: currentDraft,
+        filter: "all",
+        onFilterChange: () => undefined,
+        onOperations,
+        onSelectUtterance: () => undefined
+      })
+    );
+
+    const selector = view.container.querySelector<HTMLSelectElement>(
+      '[data-utterance-character="utterance-3"]'
+    )!;
+    expect([...selector.options].map((option) => option.value)).toEqual([
+      "",
+      "character-1",
+      "character-2"
+    ]);
+    await changeValue(selector, "character-2");
+    expect(onOperations).toHaveBeenLastCalledWith([
+      {
+        op: "update_utterance",
+        utterance_id: "utterance-3",
+        utterance: {
+          ...currentDraft.utterances[0],
+          character_candidate_id: "character-2",
+          uncertainty_codes: []
+        }
+      }
+    ]);
   });
 
   it("emits backend-valid atomic truth-table batches for accept, reject, and restore", async () => {
@@ -539,7 +597,7 @@ describe("AnalysisResultsPane", () => {
 });
 
 describe("CharacterAliasEditor", () => {
-  it("emits complete controlled operations for status, edit, merge, split, and reassignment", async () => {
+  it("uses pressed review actions and autosaves inline name and alias edits on blur", async () => {
     const onOperations = vi.fn<(operations: DraftOperation[]) => void>();
     const currentDraft = draft();
     const view = await renderElement(
@@ -551,24 +609,29 @@ describe("CharacterAliasEditor", () => {
       })
     );
 
-    await click(view.container.querySelector('[data-character-action="reject"][data-character-id="character-1"]')!);
+    const card = view.container.querySelector<HTMLElement>('[data-character-id="character-1"]')!;
+    expect(card.querySelector(".analysis-status")).toBeNull();
+    expect(card.querySelectorAll(".character-alias-card__header .analysis-review-actions button")).toHaveLength(3);
+    expect(
+      card.querySelector<HTMLButtonElement>('[data-character-action="accept"]')!.getAttribute(
+        "aria-pressed"
+      )
+    ).toBe("true");
+
+    await click(card.querySelector('[data-character-action="reject"]')!);
     expect(onOperations).toHaveBeenLastCalledWith([
       { op: "set_character_status", character_id: "character-1", status: "rejected" }
     ]);
-    await click(view.container.querySelector('[data-character-action="restore"][data-character-id="character-1"]')!);
+    await click(card.querySelector('[data-character-action="restore"]')!);
     expect(onOperations).toHaveBeenLastCalledWith([
       { op: "set_character_status", character_id: "character-1", status: "pending" }
     ]);
 
-    await changeValue(
-      view.container.querySelector<HTMLInputElement>('[data-character-name="character-1"]')!,
-      "甲改名"
-    );
-    await changeValue(
-      view.container.querySelector<HTMLInputElement>('[data-character-aliases="character-1"]')!,
-      "阿甲, 老甲, 王"
-    );
-    await click(view.container.querySelector('[data-character-action="save"][data-character-id="character-1"]')!);
+    const nameInput = card.querySelector<HTMLInputElement>('[data-character-name="character-1"]')!;
+    const aliasesInput = card.querySelector<HTMLInputElement>('[data-character-aliases="character-1"]')!;
+    await changeValue(nameInput, "甲改名");
+    await changeValue(aliasesInput, "阿甲, 老甲, 王");
+    await blur(aliasesInput);
     expect(onOperations).toHaveBeenLastCalledWith([
       {
         op: "upsert_character",
@@ -577,17 +640,6 @@ describe("CharacterAliasEditor", () => {
           canonical_name: "甲改名",
           aliases: ["阿甲", "老甲", "王"]
         }
-      }
-    ]);
-
-    await changeValue(view.container.querySelector<HTMLSelectElement>('[data-merge-target]')!, "character-1");
-    await changeValue(view.container.querySelector<HTMLSelectElement>('[data-merge-source]')!, "character-2");
-    await click(view.container.querySelector('[data-character-action="merge"]')!);
-    expect(onOperations).toHaveBeenLastCalledWith([
-      {
-        op: "merge_characters",
-        target_character_id: "character-1",
-        source_character_ids: ["character-2"]
       }
     ]);
 
@@ -609,19 +661,9 @@ describe("CharacterAliasEditor", () => {
         }
       }
     ]);
-
-    await changeValue(
-      view.container.querySelector<HTMLSelectElement>('[data-utterance-character="utterance-1"]')!,
-      "character-2"
-    );
-    expect(onOperations).toHaveBeenLastCalledWith([
-      {
-        op: "update_utterance",
-        utterance_id: "utterance-1",
-        utterance: { ...currentDraft.utterances[1], character_candidate_id: "character-2" }
-      }
-    ]);
-    expect(onOperations).toHaveBeenCalledTimes(6);
+    expect(view.container.querySelector('[data-character-action="save"]')).toBeNull();
+    expect(view.container.querySelector('[data-character-action="merge"]')).toBeNull();
+    expect(view.container.querySelector('[data-utterance-character]')).toBeNull();
   });
 
   it("never infers a merge merely because one controlled alias contains another", async () => {
@@ -639,12 +681,7 @@ describe("CharacterAliasEditor", () => {
     expect(onOperations).not.toHaveBeenCalled();
   });
 
-  it("creates human characters and keeps assignment and merge targets dependency-safe", async () => {
-    const acceptedUtterance = utterance("utterance-accepted", "dialogue-1", "character-1");
-    const pendingUtterance = utterance("utterance-pending", "dialogue-3", "character-1", {
-      status: "pending",
-      uncertainty_codes: ["speaker_unknown", "speaker_ambiguous", "emotion_inferred"]
-    });
+  it("creates human characters from a compact section popover", async () => {
     const characters = [
       character("character-1", "甲"),
       character("character-2", "乙"),
@@ -655,60 +692,14 @@ describe("CharacterAliasEditor", () => {
     const view = await renderElement(
       createElement(CharacterAliasEditor, {
         characters,
-        utterances: [acceptedUtterance, pendingUtterance],
+        utterances: [],
         onOperations,
         createCharacterId: () => "character-human-stable"
       })
     );
 
-    const assignmentOptions = [
-      ...view.container.querySelector<HTMLSelectElement>(
-        '[data-utterance-character="utterance-accepted"]'
-      )!.options
-    ].map((option) => option.value);
-    expect(assignmentOptions).toEqual(["", "character-1", "character-2"]);
-    const mergeTargets = [
-      ...view.container.querySelector<HTMLSelectElement>('[data-merge-target]')!.options
-    ].map((option) => option.value);
-    expect(mergeTargets).toEqual(["character-1", "character-2"]);
-
-    await changeValue(
-      view.container.querySelector<HTMLSelectElement>(
-        '[data-utterance-character="utterance-accepted"]'
-      )!,
-      ""
-    );
-    expect(onOperations).toHaveBeenLastCalledWith([
-      {
-        op: "update_utterance",
-        utterance_id: "utterance-accepted",
-        utterance: {
-          ...acceptedUtterance,
-          character_candidate_id: null,
-          status: "pending",
-          uncertainty_codes: ["speaker_unknown"]
-        }
-      }
-    ]);
-
-    await changeValue(
-      view.container.querySelector<HTMLSelectElement>(
-        '[data-utterance-character="utterance-pending"]'
-      )!,
-      "character-2"
-    );
-    expect(onOperations).toHaveBeenLastCalledWith([
-      {
-        op: "update_utterance",
-        utterance_id: "utterance-pending",
-        utterance: {
-          ...pendingUtterance,
-          character_candidate_id: "character-2",
-          uncertainty_codes: ["emotion_inferred"]
-        }
-      }
-    ]);
-
+    expect(view.container.querySelector('[data-new-character-name]')).toBeNull();
+    await click(view.container.querySelector('[data-character-action="open-create"]')!);
     await changeValue(view.container.querySelector<HTMLInputElement>('[data-new-character-name]')!, "戊");
     await click(view.container.querySelector('[data-character-action="create"]')!);
     expect(onOperations).toHaveBeenLastCalledWith([
@@ -726,6 +717,7 @@ describe("CharacterAliasEditor", () => {
         }
       }
     ]);
+    expect(view.container.querySelector('[data-new-character-name]')).toBeNull();
   });
 });
 
@@ -783,7 +775,11 @@ describe("ScriptAnalysisWorkspace", () => {
     selection.removeAllRanges();
     selection.addRange(range);
     await act(async () => sourceRoot.dispatchEvent(new view.dom.window.MouseEvent("mouseup", { bubbles: true })));
-    await click([...view.container.querySelectorAll("button")].find((button) => button.textContent === "标记为台词")!);
+    const annotationMenu = view.container.querySelector<HTMLElement>(".selection-annotation-menu")!;
+    await click(
+      annotationMenu.querySelector<HTMLInputElement>('input[value="dialogue"]')!.closest("label")!
+    );
+    await click([...annotationMenu.querySelectorAll("button")].find((button) => button.textContent === "应用")!);
     await flushAsync();
     const operations = view.patch.mock.calls.at(-1)?.[2];
     const createdAnnotation = operations?.[0].op === "create_annotation"
@@ -820,6 +816,32 @@ describe("ScriptAnalysisWorkspace", () => {
     ]);
   });
 
+  it("submits multi-kind source edits as one atomic draft batch", async () => {
+    const view = await renderWorkspace(draft(), run(), {
+      createUtteranceId: () => "utterance-created-atomic"
+    });
+
+    await selectSourceText(view, "第三句");
+    const menu = view.container.querySelector<HTMLElement>(".selection-annotation-menu")!;
+    await click(menu.querySelector<HTMLInputElement>('input[value="speaker"]')!.closest("label")!);
+    await click(menu.querySelector<HTMLInputElement>('input[value="dialogue"]')!.closest("label")!);
+    await click([...menu.querySelectorAll("button")].find((button) => button.textContent === "应用")!);
+    await flushAsync();
+
+    expect(view.patch).toHaveBeenCalledTimes(1);
+    const operations = view.patch.mock.calls[0][2];
+    expect(operations.map((operation) => operation.op)).toEqual([
+      "create_annotation",
+      "create_annotation",
+      "create_utterance"
+    ]);
+    expect(
+      operations
+        .filter((operation) => operation.op === "create_annotation")
+        .map((operation) => operation.annotation.kind)
+    ).toEqual(["speaker", "dialogue"]);
+  });
+
   it("builds an empty draft into one importable human utterance through real controls", async () => {
     const view = await renderWorkspace(
       draft({ annotations: [], characters: [], utterances: [], warnings: [] }),
@@ -831,11 +853,11 @@ describe("ScriptAnalysisWorkspace", () => {
     );
 
     await selectSourceText(view, "第一句");
+    const annotationMenu = view.container.querySelector<HTMLElement>(".selection-annotation-menu")!;
     await click(
-      [...view.container.querySelectorAll("button")].find(
-        (button) => button.textContent === "标记为台词"
-      )!
+      annotationMenu.querySelector<HTMLInputElement>('input[value="dialogue"]')!.closest("label")!
     );
+    await click([...annotationMenu.querySelectorAll("button")].find((button) => button.textContent === "应用")!);
     await flushAsync();
     expect(view.patch).toHaveBeenCalledTimes(1);
     const creationBatch = view.patch.mock.calls[0][2];
@@ -855,6 +877,7 @@ describe("ScriptAnalysisWorkspace", () => {
       })
     );
 
+    await click(view.container.querySelector('[data-character-action="open-create"]')!);
     await changeValue(
       view.container.querySelector<HTMLInputElement>('[data-new-character-name]')!,
       "人工角色"
@@ -928,17 +951,22 @@ describe("ScriptAnalysisWorkspace", () => {
     };
     const copyDiagnostics = vi.fn(async (_value: string) => undefined);
     const view = await renderWorkspace(draft(), run("failed", { error }), { copyDiagnostics });
-    const alert = view.container.querySelector<HTMLElement>('[data-analysis-error="run"]')!;
-    expect(alert.textContent).toContain("semantic_contract_invalid");
-    expect(alert.textContent).toContain("422");
-    expect(alert.textContent).toContain("validation");
-    expect(alert.textContent).toContain("模型输出不符合契约");
-    expect(alert.textContent).toContain("trace-422");
-    await click(alert.querySelector('[data-error-action="copy"]')!);
+    const dialog = view.container.querySelector<HTMLElement>('[role="dialog"][data-analysis-error="run"]')!;
+    expect(dialog).not.toBeNull();
+    expect(dialog.textContent).toContain("分析运行失败");
+    expect(dialog.textContent).not.toContain("semantic_contract_invalid");
+    expect(dialog.textContent).not.toContain("trace-422");
+    expect(dialog.querySelector('[data-error-action="retry"]')).not.toBeNull();
+    await click(dialog.querySelector('[data-error-action="details"]')!);
+    expect(dialog.textContent).toContain("semantic_contract_invalid");
+    expect(dialog.textContent).toContain("422");
+    expect(dialog.textContent).toContain("validation");
+    expect(dialog.textContent).toContain("trace-422");
+    await click(dialog.querySelector('[data-error-action="copy"]')!);
     expect(JSON.parse(copyDiagnostics.mock.calls[0][0])).toEqual(
       expect.objectContaining({ code: "semantic_contract_invalid", http_status: 422, trace_id: "trace-422" })
     );
-    await click(alert.querySelector('[data-error-action="dismiss"]')!);
+    await click(dialog.querySelector('[data-error-action="dismiss"]')!);
     expect(view.container.querySelector('[data-analysis-error="run"]')).toBeNull();
   });
 
@@ -960,7 +988,7 @@ describe("ScriptAnalysisWorkspace", () => {
     await flushAsync();
     const card = view.container.querySelector<HTMLElement>('[data-utterance-id="utterance-1"]')!;
     expect(card.textContent).toContain("待确认");
-    const conflict = view.container.querySelector<HTMLElement>('[data-analysis-error="conflict"]')!;
+    const conflict = view.container.querySelector<HTMLElement>('[role="dialog"][data-analysis-error="conflict"]')!;
     expect(conflict.textContent).toContain("版本冲突");
     expect(conflict.textContent).toContain("重试");
     await click(conflict.querySelector('[data-error-action="retry"]')!);
@@ -978,7 +1006,32 @@ describe("ScriptAnalysisWorkspace", () => {
     expect(view.container.querySelector<HTMLButtonElement>('[data-action="confirm-open"]')!.disabled).toBe(false);
   });
 
-  it("renders partial quality, run/draft warnings, and unresolved candidates even when empty", async () => {
+  it("keeps page actions and save state in the sticky top bar without a bottom action row", async () => {
+    const view = await renderWorkspace();
+    const topbar = view.container.querySelector<HTMLElement>(".script-analysis-workspace__topbar")!;
+    expect(topbar.querySelector('[data-action="cancel-workspace"]')).not.toBeNull();
+    expect(topbar.querySelector('[data-action="confirm-open"]')).not.toBeNull();
+    expect(topbar.textContent).toContain("草稿已同步");
+    expect(view.container.querySelector(".script-analysis-workspace__actions")).toBeNull();
+    expect(topbar.querySelector('[data-action="confirm-recover"]')).toBeNull();
+  });
+
+  it("keeps exact source available while rendering analysis progress and skeleton result cards", async () => {
+    const view = await renderWorkspace(
+      draft(),
+      run("running", { progress: 0.4, quality: null })
+    );
+
+    expect(
+      view.container.querySelector<HTMLElement>(".source-annotation-pane__source")!.textContent
+    ).toBe(sourceRevision.source_markdown);
+    expect(view.container.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe(
+      "40"
+    );
+    expect(view.container.querySelectorAll(".analysis-result-skeleton").length).toBeGreaterThan(2);
+  });
+
+  it("uses the loaded draft warning as the single visible source and submits its dismissal", async () => {
     const view = await renderWorkspace(
       draft({
         annotations: [],
@@ -986,7 +1039,7 @@ describe("ScriptAnalysisWorkspace", () => {
         utterances: [],
         warnings: [
           {
-            id: "draft-warning",
+            id: "shared-warning",
             code: "draft_review",
             message: "Draft warning visible",
             annotation_id: null,
@@ -1008,9 +1061,9 @@ describe("ScriptAnalysisWorkspace", () => {
         quality: "partial",
         warnings: [
           {
-            id: "run-warning",
+            id: "shared-warning",
             code: "chunk_failed",
-            message: "Run warning visible",
+            message: "Historical run warning hidden",
             annotation_id: null,
             utterance_id: null,
             details: { chunk: 2 }
@@ -1020,12 +1073,27 @@ describe("ScriptAnalysisWorkspace", () => {
     );
 
     expect(view.container.textContent).toContain("部分结果");
-    expect(view.container.textContent).toContain("Run warning visible");
-    expect(view.container.textContent).toContain("Draft warning visible");
-    expect(view.container.textContent).toContain("Unresolved source anchor visible");
-    expect(
-      view.container.querySelector('[data-warning-source="run"] [data-warning-action="dismiss"]')
-    ).toBeNull();
+    expect(view.container.textContent).not.toContain("Draft warning visible");
+    expect(view.container.textContent).not.toContain("Historical run warning hidden");
+    expect(view.container.textContent).not.toContain("Unresolved source anchor visible");
+    const warningButton = view.container.querySelector<HTMLButtonElement>(
+      '[data-notification="warnings"]'
+    )!;
+    const unresolvedButton = view.container.querySelector<HTMLButtonElement>(
+      '[data-notification="unresolved"]'
+    )!;
+    expect(warningButton.textContent).toContain("1");
+    expect(unresolvedButton.textContent).toContain("1");
+    await click(warningButton);
+    expect(view.container.textContent).not.toContain("Draft warning visible");
+    expect(view.container.textContent).toContain("需要人工复核");
+    expect(view.container.querySelectorAll('[data-warning-source="draft"]')).toHaveLength(1);
+    expect(view.container.querySelectorAll('[data-warning-source="run"]')).toHaveLength(0);
+    await click(unresolvedButton);
+    expect(view.container.textContent).not.toContain("Draft warning visible");
+    expect(view.container.textContent).not.toContain("Unresolved source anchor visible");
+    expect(view.container.textContent).toContain("原文锚点有歧义");
+    await click(warningButton);
     await click(
       view.container.querySelector(
         '[data-warning-source="draft"] [data-warning-action="dismiss"]'
@@ -1033,8 +1101,113 @@ describe("ScriptAnalysisWorkspace", () => {
     );
     await flushAsync();
     expect(view.patch.mock.calls.at(-1)?.[2]).toEqual([
-      { op: "dismiss_warning", warning_id: "draft-warning" }
+      { op: "dismiss_warning", warning_id: "shared-warning" }
     ]);
+  });
+
+  it("does not revive historical run warnings when the loaded draft has none", async () => {
+    const view = await renderWorkspace(
+      draft({ annotations: [], characters: [], utterances: [], warnings: [] }),
+      run("completed", {
+        warnings: [
+          {
+            id: "historical-warning",
+            code: "chunk_failed",
+            message: "Historical run warning hidden",
+            annotation_id: null,
+            utterance_id: null,
+            details: { chunk: 2 }
+          }
+        ]
+      })
+    );
+
+    expect(view.container.textContent).not.toContain("Historical run warning hidden");
+    expect(view.container.querySelectorAll('[data-warning-source]')).toHaveLength(0);
+    expect(view.container.querySelector('[data-notification="warnings"]')).toBeNull();
+  });
+
+  it("falls back to the source region when an unresolved backend candidate has no exact offset", async () => {
+    const view = await renderWorkspace(
+      draft({
+        unresolved_candidates: [
+          {
+            id: "unresolved-backend-shape",
+            code: "source_anchor_ambiguous",
+            candidate_type: "utterance",
+            message: "Dialogue candidate could not be uniquely grounded in the source chunk.",
+            details: { chunk_id: "chunk-7", occurrence_count: 2 }
+          }
+        ]
+      })
+    );
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(view.dom.window.HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView
+    });
+
+    await click(view.container.querySelector('[data-notification="unresolved"]')!);
+    await click(view.container.querySelector('[data-unresolved-action="locate"]')!);
+
+    const source = view.container.querySelector<HTMLElement>(".source-annotation-pane__source")!;
+    expect(view.dom.window.document.activeElement).toBe(source);
+    expect(scrollIntoView).toHaveBeenCalledOnce();
+  });
+
+  it("shows run warnings read-only until the matching draft has loaded", async () => {
+    const pendingDraft = deferred<SemanticAnalysisDraft>();
+    const harness = apiHarness(
+      draft(),
+      run("completed", {
+        warnings: [
+          {
+            id: "run-warning",
+            code: "chunk_failed",
+            message: "Run warning visible before draft load",
+            annotation_id: null,
+            utterance_id: null,
+            details: { chunk: 2 }
+          }
+        ]
+      })
+    );
+    harness.api.fetchAnalysisDraft = vi.fn<AnalysisDraftApi["fetchAnalysisDraft"]>(
+      () => pendingDraft.promise
+    );
+    const view = await renderElement(
+      createElement(ScriptAnalysisWorkspace, {
+        projectId: "project-task-8",
+        sourceRevision,
+        onConfirmed: () => undefined,
+        onCancel: () => undefined,
+        controllerOptions: {
+          api: harness.api,
+          storage: new MemoryStorage(),
+          pollIntervalMs: 50,
+          createIdempotencyKey: () => "confirm-task-8"
+        }
+      })
+    );
+    await flushAsync();
+
+    const warningButton = view.container.querySelector<HTMLButtonElement>(
+      '[data-notification="warnings"]'
+    )!;
+    await click(warningButton);
+    const runWarning = view.container.querySelector<HTMLElement>('[data-warning-source="run"]')!;
+    expect(runWarning.textContent).not.toContain("Run warning visible before draft load");
+    expect(runWarning.textContent).toContain("需要人工复核");
+    expect(runWarning.querySelector('[data-warning-action="dismiss"]')).toBeNull();
+
+    await act(async () => {
+      pendingDraft.resolve(draft({ warnings: [] }));
+      await Promise.resolve();
+    });
+    await flushAsync();
+
+    expect(view.container.textContent).not.toContain("Run warning visible before draft load");
+    expect(view.container.querySelectorAll('[data-warning-source]')).toHaveLength(0);
   });
 
   it("summarizes only accepted, grounded, assigned utterances and confirms once with server project", async () => {
@@ -1129,7 +1302,7 @@ describe("ScriptAnalysisWorkspace", () => {
       '[data-action="confirm-recover"]'
     )!;
     expect(recovery.disabled).toBe(false);
-    expect(recovery.textContent).toContain("恢复确认");
+    expect(recovery.textContent).toContain("恢复上次已确认版本");
     await click(recovery);
     await flushAsync();
     expect(view.confirm).toHaveBeenCalledWith(
