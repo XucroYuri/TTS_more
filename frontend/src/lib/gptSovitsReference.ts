@@ -1,5 +1,28 @@
 import type { LogsReferenceAudioSample } from "../types";
 
+export const CATALOG_STAGED_REFERENCE_OPTION = "__catalog_reference__";
+const CATALOG_WEIGHT_OPTION_PREFIX = "__catalog_weight__:";
+
+export function selectedDynamicWeightOption(
+  config: Record<string, unknown>,
+  kind: "gpt" | "sovits"
+): { value: string; relativePath: string } {
+  const directPath = stringValue(config[`${kind}_weights_path`]);
+  if (directPath) return { value: directPath, relativePath: "" };
+  const relativePath = stringValue(config[`${kind}_weights_relative_path`]);
+  return relativePath
+    ? { value: `${CATALOG_WEIGHT_OPTION_PREFIX}${kind}`, relativePath }
+    : { value: "", relativePath: "" };
+}
+
+export function selectedLogsReferenceOptionValue(
+  sample: LogsReferenceAudioSample | undefined,
+  config: Record<string, unknown>
+): string {
+  if (sample) return sample.sample_id;
+  return stringValue(config.ref_audio_path) ? CATALOG_STAGED_REFERENCE_OPTION : "";
+}
+
 export function applyLogsReferenceSampleToConfig(
   currentConfig: Record<string, unknown>,
   sample: LogsReferenceAudioSample,

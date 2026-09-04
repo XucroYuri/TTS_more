@@ -1,4 +1,5 @@
-import type { GenerationManifest, LineHistory, ParserProviderConfig, RuntimeMode, ScriptLine, VoiceCandidates, WorkerHealth } from "../types";
+import type { GenerationManifest, LineHistory, ParserProviderConfig, RuntimeMode, ScriptLine, VoiceCatalogPublicView, WorkerHealth } from "../types";
+import { voiceCatalogReady } from "../features/voice-matching/voiceReadiness";
 
 export type LineStatusFilter = "all" | "not-generated" | "queued" | "loading" | "running" | "finalizing" | "cancelling" | "completed" | "failed" | "cancelled";
 
@@ -84,7 +85,7 @@ export function routableProviderServices(services: WorkerHealth[], provider: str
 export function validationRunState(
   runtime: Pick<RuntimeMode, "service_mode"> | null,
   services: WorkerHealth[],
-  candidates: Pick<VoiceCandidates, "ready"> | null,
+  catalog: Pick<VoiceCatalogPublicView, "state" | "resources"> | null,
   _manifest: GenerationManifest | null,
   isValidating: boolean,
   isGenerating: boolean
@@ -102,7 +103,7 @@ export function validationRunState(
     }
     return { disabled: true, reasonKey: "validation.reason.serviceMissing", serviceId: missingProvider.provider };
   }
-  if (!candidates?.ready) return { disabled: true, reasonKey: "validation.reason.resourcesNotReady" };
+  if (!voiceCatalogReady(catalog)) return { disabled: true, reasonKey: "validation.reason.resourcesNotReady" };
   return { disabled: false, reasonKey: null };
 }
 
@@ -149,7 +150,7 @@ export function standardProjectName(name: string): string {
 
 export function serviceTopbarSummary(
   services: WorkerHealth[],
-  candidates: Pick<VoiceCandidates, "ready"> | null,
+  catalog: Pick<VoiceCatalogPublicView, "state" | "resources"> | null,
   parserProviders: Array<Pick<ParserProviderConfig, "enabled" | "key_configured">> = []
 ): ServiceTopbarSummary {
   const localCoverage = coreProviderCoverage(services);
@@ -157,7 +158,7 @@ export function serviceTopbarSummary(
   const localReady = localCoverage.filter((item) => item.operational).length;
   const paidReady = paidServices.filter(isServiceOperational).length;
   const parserReady = parserProviders.filter((provider) => provider.enabled && provider.key_configured).length;
-  const resourcesReady = Boolean(candidates?.ready);
+  const resourcesReady = voiceCatalogReady(catalog);
   const local = { ready: localReady, total: localCoverage.length, tone: groupTone(localReady, localCoverage.length) };
   const paid = { ready: paidReady, total: paidServices.length, tone: groupTone(paidReady, paidServices.length) };
   const parser = { ready: parserReady, total: parserProviders.length, tone: groupTone(parserReady, parserProviders.length) };

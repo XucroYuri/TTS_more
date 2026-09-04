@@ -1,0 +1,10 @@
+.queue-panel-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.queue-status-card,
+.queue-status-card .queue-job-card {
+  color: #0f172a;
+}

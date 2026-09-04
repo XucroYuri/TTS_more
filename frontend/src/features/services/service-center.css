@@ -1,0 +1,4 @@
+.service-modal[role="dialog"]:focus-within {
+  outline: 2px solid rgba(37, 99, 235, 0.3);
+  outline-offset: 2px;
+}

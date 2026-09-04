@@ -702,6 +702,77 @@ def test_semantic_routes_map_missing_artifacts_to_404(tmp_path: Path) -> None:
         ).status_code == 404
 
 
+def test_analysis_review_session_returns_confirmed_ids_without_rerunning_analysis(
+    tmp_path: Path,
+) -> None:
+    _semantic_api()
+    service = FakeSemanticService()
+    with TestClient(_app(tmp_path, service)) as client:
+        created = _create_run(client)
+        _wait_for_terminal(client, str(created["run_id"]))
+        confirmed = client.post(
+            f"/api/analysis-drafts/{created['draft_id']}/confirm",
+            json={"expected_version": 1, "idempotency_key": "review-session-key"},
+        )
+        assert confirmed.status_code == 200, confirmed.text
+        calls_before_lookup = service.calls
+
+        response = client.get(
+            "/api/projects/demo/analysis-review-session",
+            params={"source_revision_id": "script-r001"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "run_id": created["run_id"],
+            "draft_id": created["draft_id"],
+            "source_revision_id": "script-r001",
+        }
+        assert service.calls == calls_before_lookup
+
+
+def test_analysis_review_session_allows_omitting_source_revision_filter(
+    tmp_path: Path,
+) -> None:
+    _semantic_api()
+    with TestClient(_app(tmp_path, FakeSemanticService())) as client:
+        created = _create_run(client)
+        _wait_for_terminal(client, str(created["run_id"]))
+        confirmed = client.post(
+            f"/api/analysis-drafts/{created['draft_id']}/confirm",
+            json={"expected_version": 1, "idempotency_key": "unfiltered-review-key"},
+        )
+        assert confirmed.status_code == 200, confirmed.text
+
+        response = client.get("/api/projects/demo/analysis-review-session")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "run_id": created["run_id"],
+        "draft_id": created["draft_id"],
+        "source_revision_id": "script-r001",
+    }
+
+
+def test_analysis_review_session_returns_structured_not_found(
+    tmp_path: Path,
+) -> None:
+    _semantic_api()
+    with TestClient(_app(tmp_path, FakeSemanticService())) as client:
+        response = client.get(
+            "/api/projects/demo/analysis-review-session",
+            params={"source_revision_id": "script-r001"},
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {
+            "code": "analysis_review_not_found",
+            "message": "semantic artifact not found",
+        }
+    }
+
+
 def test_cross_project_run_and_draft_sidecars_are_rejected_by_store_and_routes(tmp_path: Path) -> None:
     _semantic_api()
     app = create_app(data_root=tmp_path, env_path=tmp_path / ".env.local", semantic_service=FakeSemanticService())

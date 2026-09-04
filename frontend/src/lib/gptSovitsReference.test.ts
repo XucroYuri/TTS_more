@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./gptSovitsReference";
+import {
+  CATALOG_STAGED_REFERENCE_OPTION,
+  applyLogsReferenceSampleToConfig,
+  selectedDynamicWeightOption,
+  selectedLogsReferenceOptionValue,
+  selectedLogsReferenceSample,
+} from "./gptSovitsReference";
 
 describe("GPT-SoVITS logs reference helpers", () => {
   const sample = {
@@ -41,5 +47,31 @@ describe("GPT-SoVITS logs reference helpers", () => {
 
     expect(selectedLogsReferenceSample([sample], config, { serviceId: "lan-gpt-a" })).toEqual(sample);
     expect(selectedLogsReferenceSample([sample], config, { serviceId: "lan-gpt-b" })).toBeUndefined();
+  });
+
+  it("keeps catalog-relative weights visible without replacing the secure binding", () => {
+    expect(selectedDynamicWeightOption({
+      gpt_weights_relative_path: "GPT_weights_v2ProPlus/task/model.ckpt"
+    }, "gpt")).toEqual({
+      value: "__catalog_weight__:gpt",
+      relativePath: "GPT_weights_v2ProPlus/task/model.ckpt"
+    });
+
+    expect(selectedDynamicWeightOption({
+      gpt_weights_path: "D:/legacy/model.ckpt",
+      gpt_weights_relative_path: "GPT_weights_v2ProPlus/task/model.ckpt"
+    }, "gpt")).toEqual({
+      value: "D:/legacy/model.ckpt",
+      relativePath: ""
+    });
+  });
+
+  it("keeps a staged catalog reference visible until a logs sample is chosen", () => {
+    expect(selectedLogsReferenceOptionValue(undefined, {
+      ref_audio_path: "D:/staged/reference.wav"
+    })).toBe(CATALOG_STAGED_REFERENCE_OPTION);
+    expect(selectedLogsReferenceOptionValue(sample, {
+      ref_audio_path: "D:/staged/reference.wav"
+    })).toBe(sample.sample_id);
   });
 });

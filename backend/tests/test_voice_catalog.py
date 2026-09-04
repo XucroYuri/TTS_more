@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import wave
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from app.voice_catalog import (
     VoiceCatalogError,
     VoiceCatalogService,
     VoiceCatalogStore,
+    configured_voice_asset_roots,
 )
 from app.voice_metadata_inference import (
     VoiceMetadataInferenceResult,
@@ -101,6 +103,26 @@ def test_catalog_service_restores_weight_count_from_persisted_snapshot(tmp_path:
     restarted = VoiceCatalogService(store=store, roots={"portable": root})
 
     assert restarted.public_view()["counts"]["weights"] == 2
+
+
+def test_resolve_weight_rejects_artifact_changed_after_sync(tmp_path: Path) -> None:
+    root = _portable_fixture(tmp_path / "portable")
+    service = VoiceCatalogService(
+        store=VoiceCatalogStore(tmp_path / "voice_matching"),
+        roots={"portable": root},
+    )
+    service.sync()
+    snapshot = service.store.load_current()
+    assert snapshot is not None
+    artifact = snapshot.weight_artifacts[0]
+    path = service.resolve_weight(artifact.artifact_id)
+    path.write_bytes(b"changed-after-sync")
+
+    with pytest.raises(VoiceCatalogError) as captured:
+        service.resolve_weight(artifact.artifact_id)
+
+    assert captured.value.code == "voice_asset_changed"
+    assert captured.value.field_path == "weight_artifacts"
 
 
 def test_portable_scanner_extracts_exact_training_task_from_each_weight_kind(tmp_path: Path) -> None:
@@ -362,6 +384,82 @@ def test_dynamic_comfyui_resource_exposes_only_exact_root_task_pools(tmp_path: P
             if item.training_task == "九九"
         )
     ]
+
+
+def test_dynamic_comfyui_resource_supports_separate_weight_and_logs_roots(
+    tmp_path: Path,
+) -> None:
+    model_root = tmp_path / "model"
+    portable_root = tmp_path / "portable"
+    (model_root / "GPT_weights_v2ProPlus").mkdir(parents=True)
+    (model_root / "SoVITS_weights_v2ProPlus").mkdir(parents=True)
+    (model_root / "GPT_weights_v2ProPlus" / "task-a-e50.ckpt").write_bytes(b"gpt")
+    (model_root / "SoVITS_weights_v2ProPlus" / "task-a_e24_s360.pth").write_bytes(
+        b"sovits"
+    )
+    reference = portable_root / "logs" / "task-a" / "5-wav32k" / "九九-惊喜.wav"
+    _write_silent_wav(reference)
+    (reference.parents[1] / "2-name2text.txt").write_text(
+        f"{reference.name}\tphones\tzh\t真的太好了\n",
+        encoding="utf-8",
+    )
+    linked_reference = model_root / "logs" / "task-a" / "5-wav32k" / reference.name
+    linked_reference.parent.mkdir(parents=True)
+    os.link(reference, linked_reference)
+    (linked_reference.parents[1] / "2-name2text.txt").write_text(
+        f"{linked_reference.name}\tphones\tzh\t真的太好了\n",
+        encoding="utf-8",
+    )
+    endpoint = TTSServiceEndpoint(
+        service_id="comfy-gpt",
+        display_name="Comfy GPT-SoVITS",
+        engine=EngineName.GPT_SOVITS,
+        provider_type=ProviderType.GPT_SOVITS,
+        api_contract="comfyui-tts-audio-suite-v1",
+        base_url="http://127.0.0.1:8188",
+        mode="external",
+        managed=False,
+        enabled=True,
+        capabilities=["tts", "trained_weights_voice", "reference_audio_voice"],
+        default_params={
+            "resource_id": "gpt-sovits-local",
+            "voice_asset_root": str(model_root),
+            "logs_root": str(portable_root / "logs"),
+            "dynamic_weights": True,
+        },
+    )
+    registry = ServiceRegistry([endpoint])
+    service = VoiceCatalogService(
+        store=VoiceCatalogStore(tmp_path / "voice_matching"),
+        roots=configured_voice_asset_roots(registry),
+        registry=registry,
+        clients={"comfy-gpt": _DynamicCapabilityClient()},
+    )
+
+    assert set(service.roots.values()) == {model_root, portable_root / "logs"}
+
+    status = service.sync()
+    snapshot = service.store.load_current()
+
+    assert status.state in {"ready", "partial"}
+    assert snapshot is not None
+    assert len(snapshot.reference_assets) == 1
+    resource = snapshot.resources[0]
+    assert resource.state == "ready"
+    assert len(resource.weight_artifact_ids) == 2
+    assert len(resource.reference_asset_ids) == 1
+    reference_record = next(
+        item
+        for item in snapshot.reference_assets
+        if item.reference_asset_id == resource.reference_asset_ids[0]
+    )
+    weight_root_ids = {
+        item.root_id
+        for item in snapshot.weight_artifacts
+        if item.artifact_id in resource.weight_artifact_ids
+    }
+    assert reference_record.root_id not in weight_root_ids
+    assert service.resolve_reference(reference_record.reference_asset_id) == reference
 
 
 def test_only_ready_explicit_comfyui_resource_becomes_candidate(tmp_path: Path) -> None:

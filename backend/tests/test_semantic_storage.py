@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from app.models import ScriptProject, ScriptRevision
+import app.semantic_storage as semantic_storage_module
+from app.models import Character, ScriptProject, ScriptRevision
 from app.semantic_models import (
     AnalysisRunQuality,
     AnalysisRunStatus,
@@ -72,6 +74,64 @@ def project_store(tmp_path: Path) -> ProjectStore:
     )
     store.save_project("demo", project)
     return store
+
+
+def test_no_op_project_update_skips_persistence(
+    project_store: ProjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = project_store.load_project("demo")
+    writes: list[str] = []
+    monkeypatch.setattr(
+        project_store,
+        "save_project",
+        lambda project_id, _project: writes.append(project_id),
+    )
+
+    saved, result = project_store.update_project("demo", lambda _project: "unchanged")
+
+    assert result == "unchanged"
+    assert saved == original
+    assert writes == []
+
+
+def test_unchanged_project_replacement_skips_persistence(
+    project_store: ProjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = project_store.load_project("demo")
+    writes: list[str] = []
+    monkeypatch.setattr(
+        project_store,
+        "save_project",
+        lambda project_id, _project: writes.append(project_id),
+    )
+
+    project_store.replace_project("demo", original.model_copy(deep=True))
+
+    assert writes == []
+
+
+def test_unchanged_character_library_skips_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ProjectStore(tmp_path)
+    characters = [Character(id="role-1", name="九九")]
+    store.save_characters(characters)
+    writes: list[object] = []
+    monkeypatch.setattr(
+        store,
+        "_write_json",
+        lambda _path, payload: writes.append(payload),
+    )
+
+    changed = store.save_characters_if_changed(
+        [characters[0].model_copy(deep=True)]
+    )
+
+    assert changed is False
+    assert writes == []
 
 
 def _span(text: str, start: int, end: int) -> SourceSpan:
@@ -754,3 +814,85 @@ def test_confirmation_uses_dedicated_marker_write_without_incrementing_edit_vers
     assert confirmed.confirmed_revision_id == result.semantic_revision.id
     assert confirmed.confirmed_parse_revision_id == result.parse_revision.revision_id
     assert confirmed.confirm_idempotency_key == "storage-confirm-key"
+
+
+def test_latest_confirmed_review_session_ignores_newer_unconfirmed_drafts(
+    project_store: ProjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _storage()
+    store = SemanticStore(project_store)
+    current_time = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    monkeypatch.setattr(semantic_storage_module, "_now", lambda: current_time[0])
+
+    older_run, older_draft = _seed_draft(store)
+    store.confirm_draft(older_draft.id, older_draft.version, "older-confirm-key")
+    current_time[0] = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    latest_run, latest_draft = _seed_draft(store)
+    store.confirm_draft(latest_draft.id, latest_draft.version, "latest-confirm-key")
+    current_time[0] = datetime(2026, 1, 3, tzinfo=timezone.utc)
+    _seed_draft(store)
+
+    loaded_run, loaded_draft = store.load_latest_confirmed_review_session(
+        "demo",
+        "script-r001",
+    )
+
+    assert (loaded_run.id, loaded_draft.id) == (latest_run.id, latest_draft.id)
+    assert (loaded_run.id, loaded_draft.id) != (older_run.id, older_draft.id)
+
+
+def test_confirmed_review_session_lookup_is_scoped_to_project_and_source_revision(
+    project_store: ProjectStore,
+) -> None:
+    _storage()
+    store = SemanticStore(project_store)
+    _run, draft = _seed_draft(store)
+    store.confirm_draft(draft.id, draft.version, "scope-confirm-key")
+
+    for project_id, source_revision_id in (
+        ("other-project", "script-r001"),
+        ("demo", "script-r999"),
+    ):
+        with pytest.raises(SemanticNotFoundError) as raised:
+            store.load_latest_confirmed_review_session(project_id, source_revision_id)
+
+        assert raised.value.code == "analysis_review_not_found"
+
+
+def test_latest_confirmed_review_session_without_revision_filter_falls_back_to_older_source(
+    project_store: ProjectStore,
+) -> None:
+    _storage()
+    store = SemanticStore(project_store)
+    confirmed_run, confirmed_draft = _seed_draft(store)
+    store.confirm_draft(
+        confirmed_draft.id,
+        confirmed_draft.version,
+        "older-source-confirm-key",
+    )
+    current_source = "旁白：这是当前但尚未确认的版本。"
+    project = project_store.load_project("demo")
+    project.script_revisions.append(
+        ScriptRevision(
+            revision_id="script-r020",
+            source_markdown=current_source,
+            source_sha256=sha256_source(current_source),
+        )
+    )
+    project.active_script_revision_id = "script-r020"
+    project_store.save_project("demo", project)
+    current_run, _current_draft = store.create_run_and_draft(
+        "demo",
+        "script-r020",
+        trace_id="trace-current-unconfirmed",
+    )
+    current_run.status = AnalysisRunStatus.COMPLETED
+    current_run.quality = AnalysisRunQuality.COMPLETE
+    store.save_run(current_run)
+
+    loaded_run, loaded_draft = store.load_latest_confirmed_review_session("demo")
+
+    assert loaded_run.id == confirmed_run.id
+    assert loaded_draft.id == confirmed_draft.id
+    assert loaded_run.source_revision_id == "script-r001"

@@ -64,23 +64,18 @@ export interface GenerationMethodRouteLabels {
 
 export interface LineFilterToolbarLabels {
   filtersMore: string;
-  selectedLines: (count: number) => string;
-  visibleLines: (count: number) => string;
   status: (status: string) => string;
 }
 
 export interface LineFilterToolbarInput {
   providerFilter: string;
   statusFilter: string;
-  selectedLineCount: number;
-  filteredLineCount: number;
   labels: LineFilterToolbarLabels;
 }
 
 export interface LineFilterToolbarState {
   hasFilters: boolean;
   title: string;
-  countLabel: string;
   activeBadgeVisible: boolean;
   clearButtonVisible: boolean;
 }
@@ -239,7 +234,6 @@ export function lineFilterToolbarState(input: LineFilterToolbarInput): LineFilte
   return {
     hasFilters,
     title: hasFilters ? titleParts.join(" · ") : input.labels.filtersMore,
-    countLabel: input.selectedLineCount > 0 ? input.labels.selectedLines(input.selectedLineCount) : input.labels.visibleLines(input.filteredLineCount),
     activeBadgeVisible: hasFilters,
     clearButtonVisible: hasFilters
   };
@@ -270,7 +264,7 @@ export function lineWorkbenchControlsState(input: LineWorkbenchControlsInput): L
   return {
     filtersVisible: true,
     roleStripVisible: true,
-    generationVisible: input.isGenerating || hasMatches,
+    generationVisible: input.isGenerating || input.selectedLineCount > 0,
     clearFiltersVisible: !hasMatches,
     emptyState: hasMatches ? null : "no_matches"
   };

@@ -42,7 +42,6 @@ describe("i18n configuration", () => {
   });
 
   it("keeps production workstation labels fully localized", () => {
-    expect(tText(resources["zh-CN"], "topbar.roleLibrary")).toBe("角色");
     expect(tText(resources["zh-CN"], "topbar.llmConfig")).toBe("解析");
     expect(tText(resources["zh-CN"], "characters.libraryManager")).toBe("角色库");
     expect(tText(resources["zh-CN"], "characters.bindToProjectRole")).toBe("用于当前项目");
@@ -63,10 +62,11 @@ describe("i18n configuration", () => {
     expect(tText(resources["zh-CN"], "script.drawer.list")).toBe("剧本列表");
     expect(tText(resources["zh-CN"], "script.workspaceTitle")).toBe("剧本");
     expect(tText(resources["zh-CN"], "script.workspaceHint")).toBe("选择剧本，或直接在下方新建。");
-    expect(tText(resources["zh-CN"], "script.parseRevision")).toBe("提取台词");
+    expect(tText(resources["zh-CN"], "script.analyze")).toBe("开始分析");
+    expect(tText(resources["zh-CN"], "app.reviewConfirmedAnnotations")).toBe("返回分析结果");
+    expect(tText(resources["zh-CN"], "inspector.voiceConfiguration")).toBe("配音配置");
     expect(tText(resources["zh-CN"], "inspector.method.gpt")).toBe("GPT");
     expect(tText(resources["zh-CN"], "inspector.createIndexTemporary")).toBe("设为临时音色");
-    expect(tText(resources["en-US"], "topbar.roleLibrary")).toBe("Roles");
     expect(tText(resources["en-US"], "characters.libraryManager")).toBe("Character");
     expect(tText(resources["en-US"], "characters.bindToProjectRole")).toBe("Use in this project");
     expect(tText(resources["en-US"], "services.ttsAccessTitle")).toBe("Add TTS service");
@@ -85,7 +85,7 @@ describe("i18n configuration", () => {
     expect(tText(resources["en-US"], "script.drawer.preview")).toBe("Preview");
     expect(tText(resources["en-US"], "script.workspaceTitle")).toBe("Scripts");
     expect(tText(resources["en-US"], "script.workspaceHint")).toBe("Select a script, or create one below.");
-    expect(tText(resources["en-US"], "script.parseRevision")).toBe("Extract lines");
+    expect(tText(resources["en-US"], "script.parseRevision")).toBe("Legacy parse");
     expect(tText(resources["en-US"], "inspector.method.indextts")).toBe("Index");
     expect(tText(resources["en-US"], "inspector.createIndexTemporary")).toBe("Set temporary voice");
   });

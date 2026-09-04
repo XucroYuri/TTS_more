@@ -37,6 +37,12 @@ class DraftConfirmRequest(BaseModel):
     idempotency_key: str
 
 
+class AnalysisReviewSessionResponse(BaseModel):
+    run_id: str
+    draft_id: str
+    source_revision_id: str
+
+
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, (SemanticNotFoundError, FileNotFoundError)):
         return HTTPException(status_code=404, detail={"code": getattr(exc, "code", "semantic_not_found"), "message": "semantic artifact not found"})
@@ -54,6 +60,27 @@ def build_semantic_router(
     logger: SemanticEventLogger,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
+
+    @router.get(
+        "/projects/{project_id}/analysis-review-session",
+        response_model=AnalysisReviewSessionResponse,
+    )
+    def get_analysis_review_session(
+        project_id: str,
+        source_revision_id: str | None = None,
+    ) -> AnalysisReviewSessionResponse:
+        try:
+            run, draft = semantic_store.load_latest_confirmed_review_session(
+                project_id,
+                source_revision_id,
+            )
+            return AnalysisReviewSessionResponse(
+                run_id=run.id,
+                draft_id=draft.id,
+                source_revision_id=run.source_revision_id,
+            )
+        except Exception as exc:
+            raise _http_error(exc) from exc
 
     @router.post(
         "/projects/{project_id}/analysis-runs",

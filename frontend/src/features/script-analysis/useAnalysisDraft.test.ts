@@ -20,11 +20,15 @@ import type {
 import {
   ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY,
   ANALYSIS_DISMISSED_RUNS_STORAGE_KEY,
+  ANALYSIS_REVIEW_SESSIONS_STORAGE_KEY,
   ANALYSIS_RUN_SESSIONS_STORAGE_KEY,
   activeAnalysisScopeForRevision,
   applyDraftOperations,
+  archiveRestorableAnalysisSession,
   clearActiveAnalysisScope,
+  hasReviewableAnalysisSession,
   readActiveAnalysisScope,
+  restoreReviewableAnalysisSession,
   useAnalysisDraft,
   writeActiveAnalysisScope,
   type AnalysisDraftApi,
@@ -94,6 +98,29 @@ describe("active analysis scope storage", () => {
       projectId: "project-new",
       revisionId: "revision-new",
       sourceSha256: "hash-new"
+    });
+  });
+
+  it("archives confirmed sessions for explicit review without making them auto-restorable", () => {
+    const storage = new MemoryStorage();
+    const sourceRevision = revision();
+    const scopeId = JSON.stringify(["project-1", sourceRevision.revision_id, sourceRevision.source_sha256]);
+    storage.setItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY, JSON.stringify({
+      [scopeId]: { runId: "run-1", draftId: "draft-1" }
+    }));
+
+    archiveRestorableAnalysisSession("project-1", sourceRevision, storage);
+
+    expect(hasReviewableAnalysisSession("project-1", sourceRevision, storage)).toBe(true);
+    expect(JSON.parse(storage.getItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY) ?? "{}")).toEqual({});
+    expect(JSON.parse(storage.getItem(ANALYSIS_REVIEW_SESSIONS_STORAGE_KEY) ?? "{}")).toEqual({
+      [scopeId]: { runId: "run-1", draftId: "draft-1" }
+    });
+
+    expect(restoreReviewableAnalysisSession("project-1", sourceRevision, storage)).toBe(true);
+    expect(hasReviewableAnalysisSession("project-1", sourceRevision, storage)).toBe(false);
+    expect(JSON.parse(storage.getItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY) ?? "{}")).toEqual({
+      [scopeId]: { runId: "run-1", draftId: "draft-1" }
     });
   });
 });
@@ -608,6 +635,39 @@ describe("analysis run restoration and polling", () => {
     expect(unavailable.current.controllerError?.code).toBe("semantic_internal_error");
     expect(unavailable.current.controllerError?.message).toContain("temporarily unavailable");
     expect(vi.mocked(unavailableApi.createAnalysisRun)).not.toHaveBeenCalled();
+  });
+
+  it("never creates a replacement run when a review-only session is stale", async () => {
+    const storage = new MemoryStorage();
+    const seeded = await renderAnalysisHook(makeApi(), storage);
+    await flushMicrotasks();
+    await seeded.cleanup();
+
+    const reviewApi = makeApi({
+      createAnalysisRun: vi.fn(async () => {
+        throw new Error("review-only mode must not create a new analysis run");
+      }),
+      fetchAnalysisRun: vi.fn(async () => {
+        throw new Error('{"detail":{"code":"run_not_found","message":"not found"}}');
+      })
+    });
+    const review = await renderAnalysisHook(
+      reviewApi,
+      storage,
+      "project-1",
+      revision(),
+      { mode: "review" }
+    );
+    await flushMicrotasks();
+
+    expect(vi.mocked(reviewApi.createAnalysisRun)).not.toHaveBeenCalled();
+    expect(review.current.isRunning).toBe(false);
+    expect(review.current.controllerError?.code).toBe("analysis_review_not_found");
+
+    await act(async () => review.current.retryAnalysis());
+    await flushMicrotasks();
+    expect(vi.mocked(reviewApi.createAnalysisRun)).not.toHaveBeenCalled();
+    expect(review.current.controllerError?.code).toBe("analysis_review_not_found");
   });
 
   it("never overlaps polls and stops after terminal state while fetching the draft once", async () => {

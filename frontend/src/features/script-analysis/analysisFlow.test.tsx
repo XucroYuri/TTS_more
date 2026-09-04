@@ -18,6 +18,7 @@ import {
   beginAnalysisSourceRevision,
   buildConfirmedAnalysisHandoff,
   readAnalysisScriptFile,
+  reviewConfirmedAnalysis,
   shouldAutosaveWorkspace,
   type WorkspaceStage
 } from "./analysisFlow";
@@ -34,6 +35,16 @@ const sourceRevision: ScriptRevision = {
 };
 
 initI18n();
+
+describe("reviewConfirmedAnalysis", () => {
+  it("reuses the exact active revision identity", () => {
+    expect(reviewConfirmedAnalysis(projectId, sourceRevision)).toEqual({
+      projectId,
+      revisionId: sourceRevision.revision_id,
+      sourceSha256: sourceRevision.source_sha256
+    });
+  });
+});
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();

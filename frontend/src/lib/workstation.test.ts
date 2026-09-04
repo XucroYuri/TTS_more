@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { GenerationManifest, RuntimeMode, ScriptLine, VoiceCandidates, WorkerHealth } from "../types";
+import type { GenerationManifest, RuntimeMode, ScriptLine, VoiceCatalogPublicView, WorkerHealth } from "../types";
 import { filterScriptLines, lineHistoryForLine, lineStatus, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState } from "./workstation";
 
 const lines: ScriptLine[] = [
@@ -18,11 +18,28 @@ const services: WorkerHealth[] = [
 const realRuntime: RuntimeMode = { service_mode: "real", data_root: "data", runtime_root: "data/.runtime", services: [] };
 const mockRuntime: RuntimeMode = { ...realRuntime, service_mode: "mock" };
 
-const readyCandidates: VoiceCandidates = {
-  ready: true,
-  reference_audio: { path: "refs", exists: true, is_dir: true, groups: [] },
-  gpt_sovits: { gpt_weights: [], sovits_weights: [], diagnostics: [] },
-  indextts: { reference_audio: [], model: { path: "checkpoints", ready: true, missing: [] }, diagnostics: [] }
+const readyCatalog: VoiceCatalogPublicView = {
+  state: "partial",
+  catalog_version: "catalog-v1",
+  resources: [{
+    resource_id: "voice-ready",
+    character_id: "九九",
+    character_aliases: [],
+    reference_asset_ids: ["ref-1"],
+    languages: ["zh"],
+    generic_pool: false,
+    confirmed: true,
+    metadata_score: 5,
+    engine_type: "gpt-sovits",
+    state: "ready",
+    service_id: "local-gpt-sovits",
+    weight_artifact_ids: [],
+    mapping_origin: "plugin",
+    fingerprint: "ready"
+  }],
+  references: [],
+  diagnostics: [],
+  counts: { resources: 1, references: 0, weights: 0 }
 };
 
 const emptyManifest: GenerationManifest = { project_id: "validation", lines: {} };
@@ -32,7 +49,7 @@ describe("workstation helpers", () => {
     const state = validationRunState(
       mockRuntime,
       services,
-      readyCandidates,
+      readyCatalog,
       emptyManifest,
       false,
       false
@@ -46,7 +63,7 @@ describe("workstation helpers", () => {
     const state = validationRunState(
       realRuntime,
       services,
-      readyCandidates,
+      readyCatalog,
       emptyManifest,
       false,
       false
@@ -59,7 +76,7 @@ describe("workstation helpers", () => {
     const state = validationRunState(
       realRuntime,
       [{ ...services[0], ready: false }, services[1]],
-      { ...readyCandidates, ready: false },
+      { ...readyCatalog, resources: [] },
       emptyManifest,
       false,
       false
@@ -123,7 +140,7 @@ describe("workstation helpers", () => {
         { service_id: "openai-tts", engine: "commercial", provider_type: "openai", ready: false, base_url: "https://api.openai.com/v1", capabilities: ["paid_provider"], key_configured: false },
         { service_id: "gemini-tts", engine: "commercial", provider_type: "gemini", ready: true, base_url: "https://generativelanguage.googleapis.com/v1beta", capabilities: ["paid_provider"], key_configured: true },
       ],
-      readyCandidates,
+      readyCatalog,
       [
         { enabled: true, key_configured: true },
         { enabled: true, key_configured: false },
@@ -143,7 +160,7 @@ describe("workstation helpers", () => {
         ...services,
         { service_id: "openai-tts", engine: "commercial", provider_type: "openai", ready: false, base_url: "https://api.openai.com/v1", capabilities: ["paid_provider"], key_configured: false },
       ],
-      readyCandidates,
+      readyCatalog,
       [{ enabled: true, key_configured: false }]
     );
 
@@ -165,7 +182,7 @@ describe("workstation helpers", () => {
         { service_id: "lan-index", engine: "indextts", provider_type: "indextts", ready: true, enabled: true, base_url: "http://192.0.2.166:7860", network_scope: "lan", capabilities: ["gradio_webui"] },
         { service_id: "lan-cosyvoice", engine: "cosyvoice", provider_type: "cosyvoice", ready: true, enabled: true, base_url: "http://192.0.2.166:50000", network_scope: "lan", capabilities: ["gradio_webui"] }
       ],
-      readyCandidates,
+      readyCatalog,
       []
     );
 

@@ -182,11 +182,18 @@ export async function syncVoiceCatalog(): Promise<VoiceCatalogSyncStatus> {
   return request("/api/voice-assets/catalog/sync", { method: "POST" });
 }
 
-export async function recommendVoices(projectId: string, lineIds: string[]): Promise<{ recommendations: VoiceRecommendation[] }> {
+export async function recommendVoices(
+  projectId: string,
+  lineIds: string[],
+  options?: { applyAutomatic?: boolean }
+): Promise<{ recommendations: VoiceRecommendation[] }> {
   return request(`/api/projects/${encodeURIComponent(projectId)}/voice-recommendations`, {
     method: "POST",
     headers: jsonHeaders,
-    body: JSON.stringify({ line_ids: lineIds })
+    body: JSON.stringify({
+      line_ids: lineIds,
+      apply_automatic: options?.applyAutomatic ?? false
+    })
   });
 }
 
@@ -513,6 +520,18 @@ export async function createAnalysisRun(
     headers: jsonHeaders,
     body: JSON.stringify({ source_revision_id: sourceRevisionId })
   });
+}
+
+export async function fetchAnalysisReviewSession(
+  projectId: string,
+  sourceRevisionId?: string
+): Promise<{ run_id: string; draft_id: string; source_revision_id: string }> {
+  const path = `/api/projects/${encodeURIComponent(projectId)}/analysis-review-session`;
+  return request(
+    sourceRevisionId === undefined
+      ? path
+      : `${path}?source_revision_id=${encodeURIComponent(sourceRevisionId)}`
+  );
 }
 
 export async function fetchAnalysisRun(runId: string): Promise<AnalysisRun> {

@@ -1,0 +1,55 @@
+.voice-config-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  justify-content: flex-end;
+  background: rgb(0 0 0 / 24%);
+}
+
+.voice-config-drawer {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(560px, 94vw);
+  height: 100%;
+  border-left: 1px solid var(--geist-gray-200);
+  background: var(--geist-bg);
+  box-shadow: -16px 0 40px rgb(0 0 0 / 14%);
+  animation: voice-config-enter 160ms ease-out;
+}
+
+.voice-config-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 52px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--geist-gray-200);
+}
+
+.voice-config-body {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-height: 0;
+  padding: 14px;
+  overflow: auto;
+}
+
+.voice-config-section {
+  display: grid;
+  gap: 10px;
+}
+
+.voice-config-section > h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+@keyframes voice-config-enter {
+  from { transform: translateX(24px); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-config-drawer { animation: none; }
+}

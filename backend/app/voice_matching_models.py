@@ -8,6 +8,14 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+VoiceBlockerCode = Literal[
+    "no_role_mapping",
+    "no_eligible_voice_candidate",
+    "voice_assets_unavailable",
+    "service_offline",
+]
+
+
 class StrictVoiceModel(BaseModel):
     """Base contract for persisted matching data and API payloads."""
 
@@ -149,7 +157,7 @@ class VoiceRecommendation(StrictVoiceModel):
     line_id: str = Field(min_length=1)
     catalog_version: str = Field(min_length=1)
     candidates: list[VoiceCandidate] = Field(default_factory=list)
-    blockers: list[str] = Field(default_factory=list)
+    blockers: list[VoiceBlockerCode] = Field(default_factory=list)
 
 
 class VoiceSelectionSnapshot(StrictVoiceModel):

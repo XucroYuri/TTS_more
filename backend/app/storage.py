@@ -209,6 +209,8 @@ class ProjectStore:
                 return
             if not self._same_revision_authority(current, project):
                 raise ProjectRevisionAuthorityConflict("project revision authority conflict")
+            if current.model_dump(mode="json") == project.model_dump(mode="json"):
+                return
             self.save_project(safe_id, project)
 
     def load_project(self, project_id: str) -> ScriptProject:
@@ -228,8 +230,10 @@ class ProjectStore:
         safe_project_id = self._safe_project_id(project_id)
         with self.project_lock(safe_project_id):
             project = self.load_project(safe_project_id)
+            before = project.model_dump(mode="json")
             result = mutation(project)
-            self.save_project(safe_project_id, project)
+            if project.model_dump(mode="json") != before:
+                self.save_project(safe_project_id, project)
             return project, result
 
     @staticmethod
@@ -421,6 +425,17 @@ class ProjectStore:
 
     def save_characters(self, characters: list[Character]) -> None:
         self._write_json(self.writable_characters_path(), [c.model_dump(mode="json") for c in characters])
+
+    def save_characters_if_changed(self, characters: list[Character]) -> bool:
+        validated = [Character.model_validate(character) for character in characters]
+        next_payload = [character.model_dump(mode="json") for character in validated]
+        current_payload = [
+            character.model_dump(mode="json") for character in self.load_characters()
+        ]
+        if next_payload == current_payload:
+            return False
+        self.save_characters(validated)
+        return True
 
     def load_characters(self) -> list[Character]:
         path = self.characters_path()

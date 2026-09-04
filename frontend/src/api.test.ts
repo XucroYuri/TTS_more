@@ -87,7 +87,10 @@ describe("voice matching API request shapes", () => {
       "/api/projects/demo%2Fproject/lines/line%2F1/voice-selection"
     ]);
     expect(calls.map(({ init }) => init?.method)).toEqual([undefined, "POST", "POST", "PUT", "DELETE"]);
-    expect(JSON.parse(String(calls[2].init?.body))).toEqual({ line_ids: ["line/1"] });
+      expect(JSON.parse(String(calls[2].init?.body))).toEqual({
+        line_ids: ["line/1"],
+        apply_automatic: false
+      });
     expect(JSON.parse(String(calls[3].init?.body))).toEqual({ candidate_id: "candidate/1" });
     expect(referenceAudioUrl("reference/1")).toBe("/api/voice-assets/references/reference%2F1/audio");
   });
@@ -199,6 +202,27 @@ describe("semantic analysis API request shapes", () => {
     expect(calls[0].init?.headers).toEqual({ "Content-Type": "application/json" });
     expect(calls[3].init?.headers).toEqual({ "Content-Type": "application/json" });
     expect(calls[4].init?.headers).toEqual({ "Content-Type": "application/json" });
+  });
+
+  it("fetches the latest confirmed analysis review session with an encoded project id", async () => {
+    const originalFetch = globalThis.fetch;
+    let requestedUrl = "";
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requestedUrl = String(input);
+      return new Response(JSON.stringify({ run_id: "run-1", draft_id: "draft-1", source_revision_id: "script/revision-1" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    try {
+      const api = await import("./api");
+      await api.fetchAnalysisReviewSession("demo/project");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(requestedUrl).toBe("/api/projects/demo%2Fproject/analysis-review-session");
   });
 
   it("retains the real HTTP status and response body for semantic conflicts", async () => {

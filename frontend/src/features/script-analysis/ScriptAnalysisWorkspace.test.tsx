@@ -722,6 +722,34 @@ describe("CharacterAliasEditor", () => {
 });
 
 describe("ScriptAnalysisWorkspace", () => {
+  it("marks confirmed source annotations as read-only and does not offer edit menus", async () => {
+    const view = await renderWorkspace(
+      draft({
+        confirmed_revision_id: "semantic-confirmed-read-only",
+        confirmed_parse_revision_id: "parse-confirmed-read-only",
+        confirmed_parse_fingerprint: "confirmed-read-only-fingerprint",
+        confirm_idempotency_key: "confirmed-read-only-key"
+      })
+    );
+
+    expect(view.container.textContent).toContain("已确认结果为只读");
+    const sourceRoot = view.container.querySelector<HTMLElement>(
+      ".source-annotation-pane__source"
+    )!;
+    expect(sourceRoot.getAttribute("aria-readonly")).toBe("true");
+
+    await click(
+      view.container.querySelector<HTMLElement>(
+        '.source-annotation-pane__segment[data-start-utf16="2"]'
+      )!
+    );
+    expect(view.container.querySelector(".selection-annotation-menu")).toBeNull();
+
+    await selectSourceText(view, "第三句");
+    expect(view.container.querySelector(".selection-annotation-menu")).toBeNull();
+    expect(view.patch).not.toHaveBeenCalled();
+  });
+
   it("wraps human annotations as create operations and links result/source focus both ways", async () => {
     const view = await renderWorkspace(draft(), run(), {
       createUtteranceId: () => "utterance-created-stable"

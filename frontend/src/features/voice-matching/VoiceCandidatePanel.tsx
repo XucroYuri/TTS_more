@@ -2,6 +2,7 @@ import { CheckCircle2, Loader2, Sparkles, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import type { VoiceCandidate, VoiceRecommendation, VoiceSelectionSnapshot } from "../../types";
+import { voiceBlockerAction } from "./voiceReadiness";
 import "./voice-matching.css";
 
 interface VoiceCandidatePanelProps {
@@ -13,6 +14,8 @@ interface VoiceCandidatePanelProps {
   referenceAudioUrl: (assetId: string) => string;
   onSelect: (candidateId: string) => void;
   onClear: () => void;
+  onSyncAssets?: () => void;
+  onOpenServices?: () => void;
 }
 
 function candidateDetail(candidate: VoiceCandidate) {
@@ -27,10 +30,19 @@ export function VoiceCandidatePanel({
   selectingCandidateId,
   referenceAudioUrl,
   onSelect,
-  onClear
+  onClear,
+  onSyncAssets,
+  onOpenServices
 }: VoiceCandidatePanelProps) {
   const { t } = useTranslation();
   const candidates = recommendation?.candidates.slice(0, 3) ?? [];
+  const blocker = recommendation?.blockers[0] ?? null;
+  const blockerAction = blocker ? voiceBlockerAction(blocker) : null;
+  const blockerActionCallback = blockerAction === "sync-assets"
+    ? onSyncAssets
+    : blockerAction === "open-services"
+      ? onOpenServices
+      : undefined;
 
   return (
     <section className="voice-candidate-panel" aria-label={t("voiceMatching.candidateTitle")}>
@@ -57,10 +69,17 @@ export function VoiceCandidatePanel({
 
       {loading && <div className="voice-panel-empty"><Loader2 className="spin" size={15} />{t("voiceMatching.loadingCandidates")}</div>}
       {!loading && error && <p className="voice-panel-error" role="alert">{error}</p>}
-      {!loading && !error && recommendation?.blockers.map((blocker) => (
-        <p className="voice-candidate-blocker" key={blocker}>{t("voiceMatching.blocked", { reason: blocker })}</p>
-      ))}
-      {!loading && !error && candidates.length === 0 && <p className="voice-panel-empty">{t("voiceMatching.noCandidates")}</p>}
+      {!loading && !error && blocker && (
+        <div className="voice-candidate-blocker" role="status">
+          <span>{t(`voiceMatching.blocker.${blocker}`, { defaultValue: t("voiceMatching.blocked", { reason: blocker }) })}</span>
+          {blockerAction && blockerActionCallback && (
+            <button className="secondary-button compact-button" type="button" onClick={blockerActionCallback}>
+              {t(`voiceMatching.blockerAction.${blockerAction}`)}
+            </button>
+          )}
+        </div>
+      )}
+      {!loading && !error && !blocker && candidates.length === 0 && <p className="voice-panel-empty">{t("voiceMatching.noCandidates")}</p>}
 
       {!loading && candidates.length > 0 && (
         <div className="voice-candidate-list">

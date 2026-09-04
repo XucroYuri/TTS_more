@@ -639,6 +639,7 @@ h3 {
   padding: 4px 6px;
   border: 1px solid var(--geist-gray-200);
   border-radius: var(--radius-sm);
+  text-align: left;
   background: var(--geist-bg);
 }
 
@@ -4327,6 +4328,12 @@ h3 {
   border-right: 1px solid var(--geist-gray-200);
 }
 
+.script-manager-list-tools {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
 .script-manager-search {
   display: flex;
   align-items: center;
@@ -4367,8 +4374,32 @@ h3 {
   padding: 9px 10px;
   border: 1px solid var(--geist-gray-200);
   border-radius: var(--radius-sm);
-  text-align: left;
   background: var(--geist-bg);
+}
+
+.script-manager-row-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  gap: 6px;
+}
+
+.script-manager-row-delete {
+  display: grid;
+  place-items: center;
+  align-self: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--geist-gray-900);
+  background: transparent;
+}
+
+.script-manager-row-delete:hover,
+.script-manager-row-delete:focus-visible {
+  border-color: var(--geist-red-500);
+  color: var(--geist-red-700);
+  outline: none;
 }
 
 .script-manager-row span {
@@ -5141,23 +5172,6 @@ h3 {
   padding: var(--space-3);
   border-bottom: 1px solid var(--geist-alpha-200);
   background: var(--geist-bg);
-}
-
-.line-toolbar-count {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 58px;
-  min-height: 32px;
-  padding: 0 9px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  color: var(--geist-gray-900);
-  background: var(--geist-bg-subtle);
-  font-size: 12px;
-  font-weight: 650;
-  line-height: 16px;
-  white-space: nowrap;
 }
 
 .line-filter-menu {
@@ -7739,7 +7753,6 @@ h3 {
     grid-template-columns: 1fr;
   }
 
-  .line-toolbar-count,
   .line-filter-menu > summary,
   .task-actions,
   .task-actions .primary-button,
@@ -8270,6 +8283,22 @@ h3 {
   color: var(--geist-secondary);
   cursor: pointer;
   font-size: 12px;
+}
+
+.script-manager-drop-zone {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  min-height: 0;
+  padding: 3px;
+  border: 1px dashed transparent;
+  border-radius: var(--radius-sm);
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+
+.script-manager-drop-zone.is-dragging {
+  border-color: var(--geist-primary);
+  background: var(--geist-blue-100);
 }
 
 .script-manager-file-input:hover,

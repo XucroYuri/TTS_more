@@ -44,3 +44,9 @@ export function nextProjectAfterDelete(projects: ProjectSummary[], deletedProjec
   const nextIndex = Math.max(0, index - 1);
   return remaining[nextIndex].project_id;
 }
+
+export function analysisAction(project: ScriptProject | null | undefined, draft: string): "analyze" | "reanalyze" {
+  if (!project) return "analyze";
+  const hasSemanticResult = project.lines.some((line) => Boolean(line.semantic_revision_id));
+  return hasSemanticResult && draft !== projectPreviewStats(project).activeSourceMarkdown ? "reanalyze" : "analyze";
+}

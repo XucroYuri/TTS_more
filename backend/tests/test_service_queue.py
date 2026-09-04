@@ -12,7 +12,12 @@ from app.adapters.base import SynthesisCancelled, SynthesisRequest, SynthesisRes
 from app.comfyui.output import TEMPORARY_WAV_NAME_UNITS
 from app.models import EngineName, GenerationManifest, GenerationTask, GenerationVersion, ProviderType, ScriptLine, TTSServiceEndpoint
 from app.path_safety import windows_utf16_units
-from app.queue import GenerationJobManager, ServiceGenerationQueue, WINDOWS_MAX_OUTPUT_PATH_UNITS
+from app.queue import (
+    GenerationJobManager,
+    ServiceGenerationQueue,
+    WINDOWS_MAX_OUTPUT_PATH_UNITS,
+    _generation_output_path,
+)
 from app.services import ServiceRoute
 from app.storage import ProjectStore
 
@@ -1621,6 +1626,64 @@ def test_fix_round_3_output_path_fails_before_synthesis_when_root_exhausts_windo
         )
 
     assert not any(call.startswith("synthesize:") for call in client.calls)
+
+
+def test_compact_output_path_recovers_when_readable_layout_exceeds_budget(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path
+    while windows_utf16_units(str(output_root.resolve(strict=False))) < 185:
+        output_root = output_root / "budget-segment"
+    client = RecordingServiceClient(
+        endpoint("safe-service", EngineName.GPT_SOVITS, "gpu-a")
+    )
+    route = ServiceRoute(endpoint=client.endpoint, client=client)
+    first_task = task(
+        "safe-line-one",
+        EngineName.GPT_SOVITS,
+        "safe-profile",
+        "safe-service",
+    )
+    second_task = task(
+        "safe-line-two",
+        EngineName.GPT_SOVITS,
+        "safe-profile",
+        "safe-service",
+    )
+
+    first = _generation_output_path(
+        output_root,
+        first_task,
+        route,
+        "v001",
+        "job-1",
+    )
+    repeated = _generation_output_path(
+        output_root,
+        first_task,
+        route,
+        "v001",
+        "job-1",
+    )
+    second = _generation_output_path(
+        output_root,
+        second_task,
+        route,
+        "v001",
+        "job-1",
+    )
+
+    assert first.parent == output_root / "_g"
+    assert first.suffix == ".wav"
+    assert first == repeated
+    assert first != second
+    assert windows_utf16_units(str(first.resolve(strict=False))) <= WINDOWS_MAX_OUTPUT_PATH_UNITS
+    assert (
+        windows_utf16_units(str(first.parent.resolve(strict=False)))
+        + windows_utf16_units("\\")
+        + TEMPORARY_WAV_NAME_UNITS
+        <= WINDOWS_MAX_OUTPUT_PATH_UNITS
+    )
 
 
 def test_fix_round_5_output_path_reserves_atomic_wav_temp_name_budget(tmp_path: Path) -> None:

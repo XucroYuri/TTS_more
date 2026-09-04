@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 from types import SimpleNamespace
+import wave
 
 from fastapi.testclient import TestClient
 import httpx
@@ -13,7 +14,7 @@ import pytest
 
 import app.main as main_module
 from app.adapters.base import SynthesisCancelled
-from app.models import Character, GenerationTask, ScriptLine
+from app.models import Character, GenerationTask, ScriptLine, ScriptProject
 from app.main import _layer_service_status, _portable_controller_root, _resolve_repo_lock_path, create_app
 from app.open_source_tts import OpenSourceTTSConfigureRequest
 from app.parser import (
@@ -24,6 +25,8 @@ from app.parser import (
     ParserQualityError,
 )
 from app.semantic_provider import SemanticProviderResponse
+from app.voice_catalog import PortableAssetScanner, VoiceCatalogService, VoiceCatalogStore
+from app.voice_matching_models import CatalogSnapshot, VoiceResourceRecord
 
 
 class StaticParser:
@@ -1575,6 +1578,89 @@ def test_project_round_trip_via_api(tmp_path: Path) -> None:
     assert load.status_code == 200
     assert load.json()["title"] == "demo"
     assert load.json()["project_characters"][0]["library_character_id"] == "alice-lib"
+
+
+def test_unchanged_project_put_does_not_write_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    client = TestClient(app)
+    payload = {
+        "title": "稳定项目",
+        "lines": [{"id": "line-1", "character_id": "九九", "text": "你好"}],
+    }
+    assert client.put("/api/projects/demo", json=payload).status_code == 200
+    canonical = client.get("/api/projects/demo").json()
+    writes: list[str] = []
+    original_save = app.state.store.save_project
+
+    def tracked_save(project_id: str, project: ScriptProject) -> None:
+        writes.append(project_id)
+        original_save(project_id, project)
+
+    monkeypatch.setattr(app.state.store, "save_project", tracked_save)
+
+    response = client.put("/api/projects/demo", json=canonical)
+
+    assert response.status_code == 200
+    assert writes == []
+
+
+def test_project_character_get_is_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    app.state.store.save_characters([Character(id="role-1", name="九九")])
+    app.state.store.save_project(
+        "demo",
+        ScriptProject(
+            title="角色匹配",
+            lines=[ScriptLine(id="line-1", character_id="九九", text="你好")],
+        ),
+    )
+    writes: list[str] = []
+    original_save = app.state.store.save_project
+
+    def tracked_save(project_id: str, project: ScriptProject) -> None:
+        writes.append(project_id)
+        original_save(project_id, project)
+
+    monkeypatch.setattr(app.state.store, "save_project", tracked_save)
+    client = TestClient(app)
+
+    first = client.get("/api/projects/demo/characters")
+    second = client.get("/api/projects/demo/characters")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["project_characters"][0]["library_character_id"] == "role-1"
+    assert writes == []
+
+
+def test_unchanged_character_put_does_not_write_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(data_root=tmp_path)
+    client = TestClient(app)
+    assert client.put(
+        "/api/characters",
+        json=[{"id": "role-1", "name": "九九"}],
+    ).status_code == 200
+    canonical = client.get("/api/characters").json()
+    writes: list[object] = []
+    monkeypatch.setattr(
+        app.state.store,
+        "_write_json",
+        lambda _path, payload: writes.append(payload),
+    )
+
+    response = client.put("/api/characters", json=canonical)
+
+    assert response.status_code == 200
+    assert writes == []
 
 
 def test_put_existing_project_rejects_stale_revision_authority(tmp_path: Path) -> None:
@@ -4670,8 +4756,10 @@ def test_voice_candidates_derive_versioned_weight_roots_from_voice_asset_root(tm
     )
     client = TestClient(create_app(data_root=tmp_path / "data", services_path=services_path))
 
+    sync_response = client.post("/api/voice-assets/catalog/sync")
     response = client.get("/api/resources/voice-candidates?limit=80")
 
+    assert sync_response.status_code == 200
     assert response.status_code == 200
     payload = response.json()["gpt_sovits"]
     assert {item["name"] for item in payload["gpt_weights"]} == {
@@ -4682,6 +4770,70 @@ def test_voice_candidates_derive_versioned_weight_roots_from_voice_asset_root(tm
         "1九九-配音员-情绪补充_e20_s300.pth",
         "1九九-配音员-情绪补充_e24_s360.pth",
     }
+
+
+def test_legacy_voice_candidates_are_projected_from_canonical_catalog(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "model"
+    (root / "GPT_weights_v2ProPlus").mkdir(parents=True)
+    (root / "SoVITS_weights_v2ProPlus").mkdir()
+    (root / "GPT_weights_v2ProPlus" / "九九-e10.ckpt").write_bytes(b"gpt")
+    (root / "SoVITS_weights_v2ProPlus" / "九九_e8_s120.pth").write_bytes(b"sovits")
+    reference = root / "logs" / "九九-task" / "5-wav32k" / "[九九开心_中文]测试.wav"
+    reference.parent.mkdir(parents=True)
+    with wave.open(str(reference), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16_000)
+        handle.writeframes(b"\0\0" * 1_600)
+
+    scan = PortableAssetScanner().scan("portable", root)
+    resource = VoiceResourceRecord(
+        resource_id="gpt-sovits-local",
+        character_id="九九",
+        character_aliases=["诸葛九九"],
+        reference_asset_ids=[item.reference_asset_id for item in scan.reference_assets],
+        languages=["zh"],
+        confirmed=True,
+        state="ready",
+        weight_artifact_ids=[item.artifact_id for item in scan.weight_artifacts],
+        supports_dynamic_weights=True,
+        compatible_root_ids=["portable"],
+    )
+    catalog_store = VoiceCatalogStore(tmp_path / "voice_matching")
+    catalog_store.publish(
+        CatalogSnapshot(
+            version="catalog-v1",
+            resources=[resource],
+            reference_assets=scan.reference_assets,
+            weight_artifacts=scan.weight_artifacts,
+        ),
+        reference_locations=scan.reference_locations,
+    )
+    catalog_service = VoiceCatalogService(
+        store=catalog_store,
+        roots={"portable": root},
+    )
+    client = TestClient(
+        create_app(
+            data_root=tmp_path / "data",
+            voice_catalog_service=catalog_service,
+        )
+    )
+    response = client.get("/api/resources/voice-candidates?limit=80")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ready"] is True
+    assert payload["runtimes"] == {}
+    assert [item["name"] for item in payload["gpt_sovits"]["gpt_weights"]] == [
+        "九九-e10.ckpt"
+    ]
+    assert [item["name"] for item in payload["gpt_sovits"]["sovits_weights"]] == [
+        "九九_e8_s120.pth"
+    ]
+    assert payload["reference_audio"]["groups"][0]["audio_count"] == 1
 
 
 def test_model_catalog_matches_portable_weights_to_dynamic_logs_task(tmp_path: Path) -> None:

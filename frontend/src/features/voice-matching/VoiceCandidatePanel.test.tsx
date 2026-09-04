@@ -104,4 +104,36 @@ describe("VoiceCandidatePanel", () => {
     await act(async () => clearButton?.click());
     expect(onClear).toHaveBeenCalledOnce();
   });
+
+  it("shows a neutral no-match message without a role-mapping action", async () => {
+    const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: "http://localhost" });
+    Object.assign(globalThis, {
+      window: dom.window,
+      document: dom.window.document,
+      HTMLElement: dom.window.HTMLElement,
+      Node: dom.window.Node,
+      Event: dom.window.Event,
+      IS_REACT_ACT_ENVIRONMENT: true
+    });
+    const root = createRoot(dom.window.document.getElementById("root")!);
+    views.push({ root, dom });
+    await act(async () => root.render(createElement(VoiceCandidatePanel, {
+      recommendation: {
+        line_id: "line-1",
+        catalog_version: "catalog-v1",
+        candidates: [],
+        blockers: ["no_role_mapping", "voice_assets_unavailable"]
+      },
+      loading: false,
+      selectingCandidateId: null,
+      referenceAudioUrl: (assetId: string) => `/preview/${assetId}`,
+      onSelect: vi.fn(),
+      onClear: vi.fn()
+    })));
+
+    const text = dom.window.document.body.textContent ?? "";
+    expect(text).toContain("暂未自动识别到可用音色");
+    expect(text).not.toContain("声音资产目录尚未准备好");
+    expect(text).not.toContain("关联角色");
+  });
 });

@@ -1,46 +1,10 @@
 import { Edit3, FileText, FolderOpen, List, Loader2, Plus, Save, Search, Trash2, Wand2, X } from "lucide-react";
-import { type ChangeEvent, type KeyboardEvent, type ReactNode, useId, useMemo, useState } from "react";
+import { type ChangeEvent, type DragEvent, type KeyboardEvent, type ReactNode, useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { filterAndSortProjectSummaries, projectPreviewStats } from "../lib/scriptManagement";
+import { analysisAction, filterAndSortProjectSummaries, projectPreviewStats } from "../lib/scriptManagement";
+import { selectDroppedMarkdown, type ScriptFileOrigin, type ScriptFileTarget } from "../features/script-analysis/fileInput";
 import type { ProjectSummary, ScriptProject } from "../types";
-
-export interface ScriptParseError {
-  projectId: string;
-  message: string;
-}
-
-export type ScriptParseErrorEvent =
-  | { type: "failed"; error: ScriptParseError }
-  | { type: "started" | "succeeded" | "dismissed" }
-  | { type: "project-selected"; projectId: string | null };
-
-export function reduceScriptParseError(current: ScriptParseError | null, event: ScriptParseErrorEvent): ScriptParseError | null {
-  if (event.type === "failed") return event.error;
-  if (event.type === "project-selected") return current?.projectId === event.projectId ? current : null;
-  return null;
-}
-
-export interface ScriptParseOperation {
-  operationToken: number;
-  activeOperationToken: number;
-  targetProjectId: string;
-  managedProjectId: string | null;
-  currentProjectId: string | null;
-}
-
-export function isCurrentScriptParseOperation(operation: ScriptParseOperation): boolean {
-  return operation.operationToken === operation.activeOperationToken
-    && operation.targetProjectId === operation.managedProjectId;
-}
-
-export function canStartScriptParse({ confirmed, targetProjectId, managedProjectId }: {
-  confirmed: boolean;
-  targetProjectId: string;
-  managedProjectId: string | null;
-}): boolean {
-  return confirmed && targetProjectId === managedProjectId;
-}
 
 interface ScriptManagerModalProps {
   open: boolean;
@@ -57,8 +21,6 @@ interface ScriptManagerModalProps {
   newScriptSource: string;
   isCreatingScript: boolean;
   isSavingScript: boolean;
-  isParsingScript: boolean;
-  parseError: ScriptParseError | null;
   deletingProjectId: string | null;
   onClose: () => void;
   onSearchTextChange: (value: string) => void;
@@ -68,14 +30,13 @@ interface ScriptManagerModalProps {
   onSourceDraftChange: (value: string) => void;
   onNewScriptTitleChange: (value: string) => void;
   onNewScriptSourceChange: (value: string) => void;
+  onStartCreateScript: () => void;
   onCreateScript: () => void;
   onRenameScript: () => void;
   onSaveRevision: () => void;
-  onParseRevision: () => void;
   onAnalyzeScript: () => void;
-  onScriptFileSelected: (file: File) => void;
-  onDismissParseError: () => void;
-  onDeleteScript: () => void;
+  onScriptFileSelected: (file: File, target: ScriptFileTarget, origin: ScriptFileOrigin) => void;
+  onDeleteScript: (projectId: string) => void;
 }
 
 type InlineDrawerTab = "list" | "edit";
@@ -95,8 +56,6 @@ export function ScriptManagerModal({
   newScriptSource,
   isCreatingScript,
   isSavingScript,
-  isParsingScript,
-  parseError,
   deletingProjectId,
   onClose,
   onSearchTextChange,
@@ -106,18 +65,18 @@ export function ScriptManagerModal({
   onSourceDraftChange,
   onNewScriptTitleChange,
   onNewScriptSourceChange,
+  onStartCreateScript,
   onCreateScript,
   onRenameScript,
   onSaveRevision,
-  onParseRevision,
   onAnalyzeScript,
   onScriptFileSelected,
-  onDismissParseError,
   onDeleteScript
 }: ScriptManagerModalProps) {
   const { t } = useTranslation();
   const drawerBaseId = useId();
   const [inlineDrawerTab, setInlineDrawerTab] = useState<InlineDrawerTab>("list");
+  const [isDraggingScript, setIsDraggingScript] = useState(false);
   const visibleProjects = useMemo(() => filterAndSortProjectSummaries(projects, searchText), [projects, searchText]);
   const selectedSummary = projects.find((project) => project.project_id === selectedProjectId) ?? null;
   const stats = projectPreviewStats(selectedProject);
@@ -127,11 +86,12 @@ export function ScriptManagerModal({
   const parseRevisionCount = selectedProject ? stats.parseRevisionCount : selectedSummary?.parse_revision_count ?? 0;
   const selectedTitle = titleDraft || selectedProject?.title || selectedSummary?.title || selectedProjectId || "";
   const selectedIsCurrent = Boolean(selectedProjectId && selectedProjectId === currentProjectId);
-  const busy = isCreatingScript || isSavingScript || isParsingScript || Boolean(deletingProjectId);
+  const busy = isCreatingScript || isSavingScript || Boolean(deletingProjectId);
   const isInline = variant === "inline";
+  const scriptFileTarget: ScriptFileTarget = selectedProjectId ? "existing" : "new";
   const handleScriptFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
-    if (file) onScriptFileSelected(file);
+    if (file) onScriptFileSelected(file, scriptFileTarget, "picker");
     event.currentTarget.value = "";
   };
   const scriptFileInput = (
@@ -142,21 +102,11 @@ export function ScriptManagerModal({
         type="file"
         accept=".txt,.md,text/plain,text/markdown"
         onChange={handleScriptFileChange}
-        disabled={!selectedProjectId || isSelectedProjectLoading || busy}
+        disabled={(scriptFileTarget === "existing" && isSelectedProjectLoading) || busy}
       />
     </label>
   );
-  const parseErrorPanel = parseError && (
-    <section className="script-manager-parse-error" role="alert" aria-live="assertive">
-      <div>
-        <strong>{t("script.parseErrorTitle")}</strong>
-        <p>{parseError.message}</p>
-      </div>
-      <button className="icon-button small" type="button" onClick={onDismissParseError} aria-label={t("script.dismissParseError")} title={t("script.dismissParseError")}>
-        <X size={14} />
-      </button>
-    </section>
-  );
+  const analysisLabel = t(`script.${analysisAction(selectedProject, sourceDraft)}`);
 
   if (!open) return null;
 
@@ -169,6 +119,12 @@ export function ScriptManagerModal({
     const handleInlineProjectSelect = (projectId: string) => {
       onSelectProject(projectId);
       setInlineDrawerTab("edit");
+    };
+    const handleScriptDrop = (event: DragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      setIsDraggingScript(false);
+      const selection = selectDroppedMarkdown(Array.from(event.dataTransfer.files));
+      if (selection.kind === "accepted") onScriptFileSelected(selection.file, scriptFileTarget, "drop");
     };
     const handleInlineTabKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
       const tabOrder: InlineDrawerTab[] = ["list", "edit"];
@@ -215,8 +171,6 @@ export function ScriptManagerModal({
           ))}
         </div>
 
-        {parseErrorPanel}
-
         <div className="script-manager-body">
           <div className="script-manager-inline-track" data-active-drawer={inlineDrawerTab}>
             <aside
@@ -227,26 +181,41 @@ export function ScriptManagerModal({
               aria-hidden={inlineDrawerTab !== "list"}
               inert={inlineDrawerTab !== "list" ? true : undefined}
             >
-              <label className="script-manager-search">
-                <Search size={14} />
-                <input value={searchText} onChange={(event) => onSearchTextChange(event.target.value)} placeholder={t("script.searchScripts")} />
-              </label>
+              <div className="script-manager-list-tools">
+                <label className="script-manager-search">
+                  <Search size={14} />
+                  <input value={searchText} onChange={(event) => onSearchTextChange(event.target.value)} placeholder={t("script.searchScripts")} />
+                </label>
+                <button className="secondary-button compact-button" data-action="add-script" type="button" onClick={() => { onStartCreateScript(); setInlineDrawerTab("edit"); }} disabled={busy}>
+                  <Plus size={13} /> {t("script.addScript")}
+                </button>
+              </div>
               <div className="script-manager-list" role="listbox" aria-label={t("script.existingScripts")}>
                 {visibleProjects.map((project) => (
-                  <button
-                    className={`script-manager-row ${project.project_id === selectedProjectId ? "active" : ""}`}
+                  <div
+                    className={`script-manager-row-shell ${project.project_id === selectedProjectId ? "active" : ""}`}
                     key={project.project_id}
-                    onClick={() => handleInlineProjectSelect(project.project_id)}
                     role="option"
-                    type="button"
                     aria-selected={project.project_id === selectedProjectId}
                   >
-                    <span>
-                      <strong>{project.title || project.project_id}</strong>
-                      {project.project_id === currentProjectId && <small>{t("app.currentProject")}</small>}
-                    </span>
-                    <em>{t("script.projectRowMeta", { lines: project.line_count, revisions: project.parse_revision_count ?? 0 })}</em>
-                  </button>
+                    <button className={`script-manager-row ${project.project_id === selectedProjectId ? "active" : ""}`} type="button" onClick={() => handleInlineProjectSelect(project.project_id)}>
+                      <span>
+                        <strong>{project.title || project.project_id}</strong>
+                        {project.project_id === currentProjectId && <small>{t("app.currentProject")}</small>}
+                      </span>
+                      <em>{t("script.projectRowMeta", { lines: project.line_count, revisions: project.parse_revision_count ?? 0 })}</em>
+                    </button>
+                    <button
+                      className="script-manager-row-delete"
+                      data-action={`delete-script-${project.project_id}`}
+                      type="button"
+                      aria-label={t("script.deleteScriptNamed", { title: project.title || project.project_id })}
+                      onClick={() => onDeleteScript(project.project_id)}
+                      disabled={Boolean(deletingProjectId)}
+                    >
+                      {deletingProjectId === project.project_id ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
+                    </button>
+                  </div>
                 ))}
                 {visibleProjects.length === 0 && (
                   <div className="empty-row project-empty-state">
@@ -274,17 +243,26 @@ export function ScriptManagerModal({
                   placeholder={t("script.newScriptTitlePlaceholder")}
                 />
               </label>
-              <label className="script-manager-source-field">
-                <span>{t("script.currentSource")}</span>
-                <textarea
-                  className="script-manager-source-editor"
-                  value={editingExistingScript ? sourceDraft : newScriptSource}
-                  onChange={(event) => editingExistingScript ? onSourceDraftChange(event.target.value) : onNewScriptSourceChange(event.target.value)}
-                  disabled={editingExistingScript && isSelectedProjectLoading}
-                  placeholder={editingExistingScript ? t("script.emptySourcePreview") : t("script.newScriptSourcePlaceholder")}
-                />
-              </label>
-              {editingExistingScript ? scriptFileInput : null}
+              <div
+                className={`script-manager-drop-zone ${isDraggingScript ? "is-dragging" : ""}`}
+                data-action="script-drop-zone"
+                onDragEnter={(event) => { event.preventDefault(); setIsDraggingScript(true); }}
+                onDragOver={(event) => event.preventDefault()}
+                onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setIsDraggingScript(false); }}
+                onDrop={handleScriptDrop}
+              >
+                <label className="script-manager-source-field">
+                  <span>{t("script.currentSource")}</span>
+                  <textarea
+                    className="script-manager-source-editor"
+                    value={editingExistingScript ? sourceDraft : newScriptSource}
+                    onChange={(event) => editingExistingScript ? onSourceDraftChange(event.target.value) : onNewScriptSourceChange(event.target.value)}
+                    disabled={editingExistingScript && isSelectedProjectLoading}
+                    placeholder={editingExistingScript ? t("script.emptySourcePreview") : t("script.newScriptSourcePlaceholder")}
+                  />
+                </label>
+                {scriptFileInput}
+              </div>
               <div className="script-manager-inline-actions">
                 {editingExistingScript ? (
                   <>
@@ -297,13 +275,7 @@ export function ScriptManagerModal({
                       {isSavingScript ? <Loader2 className="spin" size={14} /> : <Save size={14} />} {t("script.saveRevision")}
                     </button>
                     <button className="primary-button" data-action="analyze-script" type="button" onClick={onAnalyzeScript} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
-                      {isSavingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {t("analysis.input.analyze")}
-                    </button>
-                    <button className="secondary-button" data-action="legacy-parse-script" type="button" onClick={onParseRevision} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
-                      {isParsingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {t("script.parseRevision")}
-                    </button>
-                    <button className="secondary-button danger-button" type="button" onClick={onDeleteScript} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
-                      {deletingProjectId ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />} {t("script.deleteScript")}
+                      {isSavingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {analysisLabel}
                     </button>
                   </>
                 ) : (
@@ -328,8 +300,6 @@ export function ScriptManagerModal({
           </div>
           <button className="icon-button small" type="button" onClick={onClose} title={t("actions.close")}><X size={14} /></button>
         </header>
-
-        {parseErrorPanel}
 
         <div className="script-manager-body">
           <aside className="script-manager-list-panel">
@@ -429,21 +399,11 @@ export function ScriptManagerModal({
                   {isSavingScript ? <Loader2 className="spin" size={14} /> : <Save size={14} />} {t("script.saveRevision")}
                 </button>
                 <button className="primary-button" data-action="analyze-script" type="button" onClick={onAnalyzeScript} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
-                  {isSavingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {t("analysis.input.analyze")}
-                </button>
-                <button className="secondary-button" data-action="legacy-parse-script" type="button" onClick={onParseRevision} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
-                  {isParsingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {t("script.parseRevision")}
+                  {isSavingScript ? <Loader2 className="spin" size={14} /> : <Wand2 size={14} />} {analysisLabel}
                 </button>
               </div>
             </section>
 
-            <section className="script-manager-card danger">
-              <strong>{t("script.dangerZone")}</strong>
-              <span>{t("script.deleteScriptHint")}</span>
-              <button className="secondary-button danger-button" type="button" onClick={onDeleteScript} disabled={!selectedProjectId || isSelectedProjectLoading || busy}>
-                {deletingProjectId ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />} {t("script.deleteScript")}
-              </button>
-            </section>
           </aside>
         </div>
       </section>

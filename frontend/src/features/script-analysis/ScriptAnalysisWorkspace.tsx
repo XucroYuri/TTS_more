@@ -336,10 +336,18 @@ export function ScriptAnalysisWorkspace({
 
       <main className="script-analysis-workspace__panes">
         <section className="script-analysis-workspace__source" aria-labelledby="analysis-source-title">
-          <h2 id="analysis-source-title">{t("analysis.source.title")}</h2>
+          <h2 id="analysis-source-title">
+            {t("analysis.source.title")}
+            {draft && controller.isReadOnly ? (
+              <span className="analysis-save-status" role="status">
+                {" · "}{t("analysis.source.confirmedReadOnly")}
+              </span>
+            ) : null}
+          </h2>
           <SourceAnnotationPane
             sourceRevision={sourceRevision}
             annotations={draft?.annotations ?? []}
+            disabled={!isEditable}
             onApplyAnnotations={handleApplyAnnotations}
             onSelectAnnotation={focusResultForAnnotation}
             labels={annotationLabels}

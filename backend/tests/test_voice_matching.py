@@ -1,7 +1,11 @@
 import pytest
 from pydantic import ValidationError
 
-from app.voice_matching import estimate_target_duration, rank_voice_candidates
+from app.voice_matching import (
+    classify_empty_recommendation,
+    estimate_target_duration,
+    rank_voice_candidates,
+)
 from app.voice_matching_models import (
     CatalogSnapshot,
     ReferenceAssetRecord,
@@ -192,7 +196,7 @@ def test_unready_comfyui_resource_is_never_ranked() -> None:
     result = rank_voice_candidates(request, catalog)
 
     assert result.candidates == []
-    assert result.blockers == ["no_eligible_voice_candidate"]
+    assert result.blockers == ["service_offline"]
 
 
 def test_low_confidence_inferred_character_cannot_drive_candidate() -> None:
@@ -285,6 +289,7 @@ def test_dynamic_candidates_never_cross_training_task_reference_pools() -> None:
             VoiceResourceRecord(
                 resource_id="gpt-sovits-local",
                 character_id="九九",
+                reference_asset_ids=["ref-a-happy", "ref-b-neutral"],
                 state="ready",
                 confirmed=True,
                 supports_dynamic_weights=True,
@@ -368,3 +373,99 @@ def test_dynamic_candidates_never_cross_training_task_reference_pools() -> None:
         ("task-a", "ref-a-happy"),
         ("task-b", "ref-b-neutral"),
     }
+
+
+def test_dynamic_candidate_allows_registered_reference_from_separate_logs_root() -> None:
+    catalog = CatalogSnapshot(
+        version="catalog-v1",
+        resources=[
+            VoiceResourceRecord(
+                resource_id="gpt-sovits-local",
+                character_id="九九",
+                reference_asset_ids=["ref-a"],
+                state="ready",
+                confirmed=True,
+                supports_dynamic_weights=True,
+                compatible_root_ids=["model-root"],
+            )
+        ],
+        weight_artifacts=[
+            WeightArtifactRecord(
+                artifact_id="gpt-a",
+                root_id="model-root",
+                relative_path="GPT_weights/task-a-e50.ckpt",
+                kind="gpt",
+                character_id="九九",
+                training_task="task-a",
+                fingerprint="gpt-a-fingerprint",
+            ),
+            WeightArtifactRecord(
+                artifact_id="sovits-a",
+                root_id="model-root",
+                relative_path="SoVITS_weights/task-a_e24_s360.pth",
+                kind="sovits",
+                character_id="九九",
+                training_task="task-a",
+                fingerprint="sovits-a-fingerprint",
+            ),
+        ],
+        reference_assets=[
+            ReferenceAssetRecord(
+                reference_asset_id="ref-a",
+                character_id="九九",
+                language="zh",
+                emotion="neutral",
+                prompt_text="参考原文",
+                duration_seconds=1.0,
+                confirmed=True,
+                training_task="task-a",
+                root_id="logs-root",
+            )
+        ],
+    )
+
+    result = rank_voice_candidates(match_request(), catalog)
+
+    assert result.blockers == []
+    assert result.candidates[0].reference_asset_id == "ref-a"
+    assert result.candidates[0].gpt_weight_artifact_id == "gpt-a"
+    assert result.candidates[0].sovits_weight_artifact_id == "sovits-a"
+
+
+def test_blocker_reports_voice_assets_unavailable_for_empty_catalog() -> None:
+    assert classify_empty_recommendation(
+        match_request(),
+        CatalogSnapshot(version="catalog-v1"),
+    ) == "voice_assets_unavailable"
+
+
+def test_blocker_reports_service_offline_for_matching_unavailable_resource() -> None:
+    catalog = catalog_with(
+        resource_character="九九",
+        reference_character="九九",
+    ).model_copy(
+        update={
+            "resources": [
+                VoiceResourceRecord(
+                    resource_id="voice-001",
+                    character_id="九九",
+                    reference_asset_ids=["ref-001"],
+                    state="unavailable",
+                )
+            ]
+        }
+    )
+
+    assert classify_empty_recommendation(match_request(), catalog) == "service_offline"
+
+
+def test_blocker_keeps_identity_mismatch_as_no_eligible_candidate() -> None:
+    catalog = catalog_with(
+        resource_character="可莉",
+        reference_character="可莉",
+    )
+
+    assert (
+        classify_empty_recommendation(match_request(), catalog)
+        == "no_eligible_voice_candidate"
+    )

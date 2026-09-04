@@ -50,21 +50,16 @@ describe("workbench view helpers", () => {
   it("summarizes line filters without exposing inactive controls", () => {
     const labels = {
       filtersMore: "筛选",
-      selectedLines: (count: number) => `已选 ${count}`,
-      visibleLines: (count: number) => `可见 ${count}`,
       status: (status: string) => `状态:${status}`
     };
 
     expect(lineFilterToolbarState({
       providerFilter: "all",
       statusFilter: "all",
-      selectedLineCount: 0,
-      filteredLineCount: 12,
       labels
     })).toEqual({
       hasFilters: false,
       title: "筛选",
-      countLabel: "可见 12",
       activeBadgeVisible: false,
       clearButtonVisible: false
     });
@@ -72,13 +67,10 @@ describe("workbench view helpers", () => {
     expect(lineFilterToolbarState({
       providerFilter: "indextts",
       statusFilter: "completed",
-      selectedLineCount: 2,
-      filteredLineCount: 5,
       labels
     })).toEqual({
       hasFilters: true,
       title: "indextts · 状态:completed",
-      countLabel: "已选 2",
       activeBadgeVisible: true,
       clearButtonVisible: true
     });
@@ -86,8 +78,6 @@ describe("workbench view helpers", () => {
     expect(lineFilterToolbarState({
       providerFilter: "all",
       statusFilter: "not-generated",
-      selectedLineCount: 0,
-      filteredLineCount: 3,
       labels
     }).title).toBe("状态:not generated");
   });
@@ -133,6 +123,14 @@ describe("workbench view helpers", () => {
       clearFiltersVisible: true,
       emptyState: "no_matches"
     });
+
+    expect(lineWorkbenchControlsState({
+      hasProject: true,
+      totalLineCount: 8,
+      filteredLineCount: 3,
+      selectedLineCount: 0,
+      isGenerating: false
+    }).generationVisible).toBe(false);
 
     expect(lineWorkbenchControlsState({
       hasProject: true,

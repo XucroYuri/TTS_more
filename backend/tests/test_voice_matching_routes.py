@@ -128,14 +128,20 @@ def _project(data_root: Path) -> None:
     )
 
 
-def _dynamic_catalog(data_root: Path, asset_root: Path) -> VoiceCatalogService:
+def _dynamic_catalog(
+    data_root: Path,
+    asset_root: Path,
+    reference_asset_root: Path | None = None,
+) -> VoiceCatalogService:
     gpt_relative = "GPT_weights_v2ProPlus/task-a-e50.ckpt"
     sovits_relative = "SoVITS_weights_v2ProPlus/task-a_e24_s360.pth"
     (asset_root / gpt_relative).parent.mkdir(parents=True)
     (asset_root / sovits_relative).parent.mkdir(parents=True)
     (asset_root / gpt_relative).write_bytes(b"gpt")
     (asset_root / sovits_relative).write_bytes(b"sovits")
-    reference_path = asset_root / "logs" / "task-a" / "5-wav32k" / "九九-惊喜.wav"
+    reference_root = reference_asset_root or asset_root
+    reference_root_id = "reference-root" if reference_asset_root is not None else "portable"
+    reference_path = reference_root / "logs" / "task-a" / "5-wav32k" / "九九-惊喜.wav"
     fingerprint = _write_wav(reference_path)
     reference = ReferenceAssetRecord(
         reference_asset_id="ref-task-a",
@@ -151,7 +157,7 @@ def _dynamic_catalog(data_root: Path, asset_root: Path) -> VoiceCatalogService:
         emotion_origin="confirmed",
         language_origin="confirmed",
         training_task="task-a",
-        root_id="portable",
+        root_id=reference_root_id,
     )
     resource = VoiceResourceRecord(
         resource_id="gpt-sovits-local",
@@ -199,13 +205,16 @@ def _dynamic_catalog(data_root: Path, asset_root: Path) -> VoiceCatalogService:
         ),
         reference_locations={
             reference.reference_asset_id: ReferenceLocation(
-                root_id="portable",
-                relative_path=reference_path.relative_to(asset_root).as_posix(),
+                root_id=reference_root_id,
+                relative_path=reference_path.relative_to(reference_root).as_posix(),
                 fingerprint=fingerprint,
             )
         },
     )
-    return VoiceCatalogService(store=catalog_store, roots={"portable": asset_root})
+    roots = {"portable": asset_root}
+    if reference_asset_root is not None:
+        roots[reference_root_id] = reference_root
+    return VoiceCatalogService(store=catalog_store, roots=roots)
 
 
 def test_catalog_routes_hide_paths_and_preview_by_asset_id(tmp_path: Path) -> None:
@@ -239,12 +248,24 @@ def test_catalog_routes_hide_paths_and_preview_by_asset_id(tmp_path: Path) -> No
     assert confirmed.json()["reference"]["emotion_origin"] == "confirmed"
 
 
-def test_high_confidence_recommendation_autofills_without_generating(tmp_path: Path) -> None:
+def test_high_confidence_recommendation_is_read_only_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     data_root = tmp_path / "data"
     asset_root = tmp_path / "portable"
     _project(data_root)
     service = _ready_catalog(data_root, asset_root)
-    client = TestClient(create_app(data_root=data_root, voice_catalog_service=service))
+    app = create_app(data_root=data_root, voice_catalog_service=service)
+    client = TestClient(app)
+    save_calls: list[str] = []
+    original_save = app.state.store.save_project
+
+    def tracked_save(project_id: str, project: ScriptProject) -> None:
+        save_calls.append(project_id)
+        original_save(project_id, project)
+
+    monkeypatch.setattr(app.state.store, "save_project", tracked_save)
 
     response = client.post(
         "/api/projects/project-1/voice-recommendations",
@@ -255,10 +276,85 @@ def test_high_confidence_recommendation_autofills_without_generating(tmp_path: P
     recommendation = response.json()["recommendations"][0]
     assert recommendation["candidates"][0]["auto_fill_eligible"] is True
     saved_line = client.get("/api/projects/project-1").json()["lines"][0]
+    assert saved_line["voice_selection"] is None
+    assert save_calls == []
+    assert client.get("/api/queue/status").json()["queued"] == 0
+
+
+def test_high_confidence_recommendation_applies_once_when_explicitly_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "data"
+    asset_root = tmp_path / "portable"
+    _project(data_root)
+    service = _ready_catalog(data_root, asset_root)
+    app = create_app(data_root=data_root, voice_catalog_service=service)
+    client = TestClient(app)
+    save_calls: list[str] = []
+    original_save = app.state.store.save_project
+
+    def tracked_save(project_id: str, project: ScriptProject) -> None:
+        save_calls.append(project_id)
+        original_save(project_id, project)
+
+    monkeypatch.setattr(app.state.store, "save_project", tracked_save)
+
+    response = client.post(
+        "/api/projects/project-1/voice-recommendations",
+        json={"line_ids": ["line-1"], "apply_automatic": True},
+    )
+
+    assert response.status_code == 200
+    saved_line = client.get("/api/projects/project-1").json()["lines"][0]
     assert saved_line["voice_selection"]["source"] == "automatic"
     assert saved_line["temporary_binding"]["config"]["resource_id"] == "九九-v1"
     assert saved_line["temporary_binding"]["config"]["prompt_text"] == "真的太好了"
+    assert save_calls == ["project-1"]
     assert client.get("/api/queue/status").json()["queued"] == 0
+
+
+def test_recommendation_reports_no_role_mapping_before_ranking(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    asset_root = tmp_path / "portable"
+    _project(data_root)
+    store = ProjectStore(data_root)
+    project = store.load_project("project-1")
+    project.project_characters[0].library_character_id = "missing-character"
+    store.save_project("project-1", project)
+    service = _ready_catalog(data_root, asset_root)
+    client = TestClient(create_app(data_root=data_root, voice_catalog_service=service))
+
+    response = client.post(
+        "/api/projects/project-1/voice-recommendations",
+        json={"line_ids": ["line-1"]},
+    )
+
+    assert response.status_code == 200
+    recommendation = response.json()["recommendations"][0]
+    assert recommendation["candidates"] == []
+    assert recommendation["blockers"] == ["no_role_mapping"]
+
+
+def test_recommendation_returns_structured_catalog_unavailable_error(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    _project(data_root)
+    service = VoiceCatalogService(
+        store=VoiceCatalogStore(data_root / "voice_matching"),
+        roots={},
+    )
+    client = TestClient(create_app(data_root=data_root, voice_catalog_service=service))
+
+    response = client.post(
+        "/api/projects/project-1/voice-recommendations",
+        json={"line_ids": ["line-1"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "voice_assets_unavailable",
+        "stage": "voice_recommendation",
+    }
 
 
 def test_dynamic_recommendation_persists_weight_pair_and_same_task_reference(tmp_path: Path) -> None:
@@ -270,7 +366,7 @@ def test_dynamic_recommendation_persists_weight_pair_and_same_task_reference(tmp
 
     response = client.post(
         "/api/projects/project-1/voice-recommendations",
-        json={"line_ids": ["line-1"]},
+        json={"line_ids": ["line-1"], "apply_automatic": True},
     )
 
     assert response.status_code == 200
@@ -293,6 +389,31 @@ def test_dynamic_recommendation_persists_weight_pair_and_same_task_reference(tmp
     assert config["sovits_weights_relative_path"] == "SoVITS_weights_v2ProPlus/task-a_e24_s360.pth"
 
 
+def test_dynamic_recommendation_stages_reference_from_separate_logs_root(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    _project(data_root)
+    service = _dynamic_catalog(
+        data_root,
+        tmp_path / "model",
+        reference_asset_root=tmp_path / "portable",
+    )
+    client = TestClient(create_app(data_root=data_root, voice_catalog_service=service))
+
+    response = client.post(
+        "/api/projects/project-1/voice-recommendations",
+        json={"line_ids": ["line-1"], "apply_automatic": True},
+    )
+
+    assert response.status_code == 200
+    saved_line = client.get("/api/projects/project-1").json()["lines"][0]
+    assert saved_line["voice_selection"]["source"] == "automatic"
+    staged_reference = Path(saved_line["temporary_binding"]["config"]["ref_audio_path"])
+    assert staged_reference.is_file()
+    assert staged_reference.is_relative_to(tmp_path / "Project")
+
+
 def test_dynamic_selection_rejects_weight_replaced_after_selection(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     asset_root = tmp_path / "portable"
@@ -301,7 +422,7 @@ def test_dynamic_selection_rejects_weight_replaced_after_selection(tmp_path: Pat
     client = TestClient(create_app(data_root=data_root, voice_catalog_service=service))
     response = client.post(
         "/api/projects/project-1/voice-recommendations",
-        json={"line_ids": ["line-1"]},
+        json={"line_ids": ["line-1"], "apply_automatic": True},
     )
     assert response.status_code == 200
     saved_line = client.get("/api/projects/project-1").json()["lines"][0]

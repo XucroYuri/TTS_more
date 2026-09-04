@@ -1,0 +1,8 @@
+.role-library-workbench[aria-label="角色库"] {
+  color: #0f172a;
+}
+
+.role-library-workbench[aria-label="角色库"] small,
+.role-library-workbench[aria-label="角色库"] .section-help {
+  color: #475569;
+}

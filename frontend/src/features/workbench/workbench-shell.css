@@ -1,0 +1,21 @@
+.workbench-shell-header {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.workbench-stage-nav {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.workbench-stage-nav button[aria-current="step"] {
+  color: #0f172a;
+  border-color: #94a3b8;
+  background: #ffffff;
+}
+
+.workbench-notifications {
+  display: grid;
+  gap: 0.5rem;
+  color: #334155;
+}

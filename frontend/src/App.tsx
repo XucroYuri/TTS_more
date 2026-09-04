@@ -1,5 +1,6 @@
 import {
   AlertCircle,
+  ArrowLeft,
   Bot,
   CheckCircle2,
   Cpu,
@@ -29,6 +30,7 @@ import {
   ApiRequestError,
   clearVoiceSelection,
   fetchCharacters,
+  fetchAnalysisReviewSession,
   fetchProjectCharacters,
   fetchManifest,
   fetchGptSovitsModelCatalog,
@@ -56,7 +58,6 @@ import {
   freezeProjectCharacter,
   createGenerationJob,
   cancelGenerationJob,
-  createParseRevision,
   createScriptRevision,
   deleteProject,
   deleteGenerationVersion,
@@ -85,33 +86,56 @@ import {
 import { defaultLanguage, languageOptions, nextLanguage, normalizeLanguage } from "./i18n";
 import { ReferenceAudioInput } from "./components/ReferenceAudioInput";
 import { RoleAvatar } from "./components/RoleAvatar";
-import { canStartScriptParse, isCurrentScriptParseOperation, reduceScriptParseError, ScriptManagerModal, type ScriptParseError } from "./components/ScriptManagerModal";
+import { ScriptManagerModal } from "./components/ScriptManagerModal";
 import { WaveformPlayer } from "./components/WaveformPlayer";
 import { TokenGate } from "./components/TokenGate";
 import { VoiceAssetStatusPanel } from "./features/voice-matching/VoiceAssetStatusPanel";
 import { VoiceCandidatePanel } from "./features/voice-matching/VoiceCandidatePanel";
+import { voiceCatalogReady } from "./features/voice-matching/voiceReadiness";
+import { QueuePanel } from "./features/queue/QueuePanel";
+import { RoleLibraryPanel } from "./features/roles/RoleLibraryPanel";
+import { useRoleLibraryController } from "./features/roles/useRoleLibraryController";
+import { workspaceSnapshotKey } from "./features/workbench/useWorkspacePersistence";
+import { ServiceCenter } from "./features/services/ServiceCenter";
+import { LineWorkspace } from "./features/line-workspace/LineWorkspace";
+import { WorkbenchShell } from "./features/workbench/WorkbenchShell";
+import { VoiceInspector } from "./features/voice-matching/VoiceInspector";
+import { VoiceConfigurationDrawer } from "./features/voice-matching/VoiceConfigurationDrawer";
 import {
   AnalysisStageGate,
   activeScriptSourceText,
   beginAnalysisSourceRevision,
   buildConfirmedAnalysisHandoff,
   readAnalysisScriptFile,
+  reviewConfirmedAnalysis,
   shouldAutosaveWorkspace,
   type AnalysisSourceFileMetadata,
   type WorkspaceStage
 } from "./features/script-analysis/analysisFlow";
+import { scriptTitleFromFilename, type ScriptFileTarget } from "./features/script-analysis/fileInput";
 import {
   activeAnalysisScopeForRevision,
   activeAnalysisScopeMatchesRevision,
+  archiveRestorableAnalysisSession,
   clearActiveAnalysisScope,
-  clearRestorableAnalysisSession,
   hasRestorableAnalysisSession,
   readActiveAnalysisScope,
   writeActiveAnalysisScope
 } from "./features/script-analysis/useAnalysisDraft";
+import {
+  analysisScopeStorageId,
+  defaultAnalysisStorage,
+  writeAnalysisRunSession
+} from "./features/script-analysis/analysisSessionStorage";
 import { generationFailureView, generationVersionTags, groupGenerationVersions, newestPlayableVersion, versionToInspectorDraft, type InspectorVersionDraft } from "./lib/generationHistory";
 import { generationStatusCounts, generationStatusKey, generationStatusTone, generationTerminalNotice, isTerminalGenerationStatus, reconcileGenerationJobSnapshot, type GenerationStatusTone } from "./lib/generationStatus";
-import { applyLogsReferenceSampleToConfig, selectedLogsReferenceSample } from "./lib/gptSovitsReference";
+import {
+  CATALOG_STAGED_REFERENCE_OPTION,
+  applyLogsReferenceSampleToConfig,
+  selectedDynamicWeightOption,
+  selectedLogsReferenceOptionValue,
+  selectedLogsReferenceSample,
+} from "./lib/gptSovitsReference";
 import { formatScriptNote } from "./lib/lineNote";
 import { firstReferenceSampleFromModel, gptSovitsProjectBindingFromModel } from "./lib/modelCatalog";
 import { ensureProjectCharacters, freezeProjectCharacterLocally, projectCharacterRows, resolveProjectCharacters } from "./lib/projectCharacters";
@@ -119,7 +143,7 @@ import { bindingCompleteness, catalogServiceOptions, roleLibraryBindingRows, rol
 import { buildGenerationTask, lineBinding, lineEngine, lineProfile, lineServiceId } from "./lib/routing";
 import { createDefaultParserProviderDraft, KWJM_API_KEY_ENV, KWJM_BASE_URL, KWJM_BASE_URL_PLACEHOLDER, KWJM_MODEL, KWJM_PROVIDER_NAME, normalizeParserProviderDrafts, parserProviderKeyState, toParserProviderSavePayload, upsertKwjmParserProvider } from "./lib/parserConfig";
 import { createEmptyManifest, createEmptyProject, createProjectId, readStoredProjectId, selectStartupProjectId, writeStoredProjectId } from "./lib/projectStartup";
-import { filterAndSortProjectSummaries, nextProjectAfterDelete } from "./lib/scriptManagement";
+import { filterAndSortProjectSummaries, nextProjectAfterDelete, projectPreviewStats } from "./lib/scriptManagement";
 import { projectToScriptSourceText } from "./lib/scriptSource";
 import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
@@ -181,6 +205,14 @@ const INDEX_EMOTION_MODE_OPTIONS = [
 ] as const;
 
 type CosyVoiceMode = (typeof COSY_VOICE_MODE_OPTIONS)[number]["id"];
+
+interface PendingProjectAutosave {
+  projectId: string;
+  project: ScriptProject;
+  characters: Character[];
+  authorityEpoch: number;
+  timerId: number | null;
+}
 type IndexEmotionMode = (typeof INDEX_EMOTION_MODE_OPTIONS)[number]["id"];
 
 interface ConfirmationDialogState {
@@ -190,14 +222,6 @@ interface ConfirmationDialogState {
   confirmLabel: string;
   cancelLabel: string;
   tone: ConfirmationTone;
-}
-
-interface PendingProjectAutosave {
-  projectId: string;
-  project: ScriptProject;
-  characters: Character[];
-  authorityEpoch: number;
-  timerId: number | null;
 }
 
 function characterName(characters: Character[], id: string): string {
@@ -239,6 +263,7 @@ export default function App() {
   const [project, setProject] = useState<ScriptProject>(() => createEmptyProject());
   const [workspaceStage, setWorkspaceStage] = useState<WorkspaceStage>("tts");
   const [analysisSourceRevision, setAnalysisSourceRevision] = useState<ScriptRevision | null>(null);
+  const [isReturningToAnalysis, setIsReturningToAnalysis] = useState(false);
   const [manifest, setManifest] = useState<GenerationManifest>(() => createEmptyManifest(null));
   const [services, setServices] = useState<WorkerHealth[]>([]);
   const [runtime, setRuntime] = useState<RuntimeMode | null>(null);
@@ -257,6 +282,7 @@ export default function App() {
   const [versionDrafts, setVersionDrafts] = useState<Record<string, InspectorVersionDraft & { version_id: string }>>({});
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
   const [routeSettingsOpen, setRouteSettingsOpen] = useState(false);
+  const [isVoiceConfigurationOpen, setIsVoiceConfigurationOpen] = useState(false);
   const [selectedLineIds, setSelectedLineIds] = useState<string[]>([]);
   const [lineTextDrafts, setLineTextDrafts] = useState<Record<string, string>>({});
   const [parserProviders, setParserProviders] = useState<ParserProviderDraft[]>([]);
@@ -302,8 +328,6 @@ export default function App() {
   const [managerTitleDraft, setManagerTitleDraft] = useState("");
   const [managerSourceDraft, setManagerSourceDraft] = useState("");
   const [isManagerSaving, setIsManagerSaving] = useState(false);
-  const [isManagerParsing, setIsManagerParsing] = useState(false);
-  const [scriptParseError, setScriptParseError] = useState<ScriptParseError | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
   const [isProjectLoaded, setIsProjectLoaded] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -325,10 +349,10 @@ export default function App() {
   const generationCancellationJobIdRef = useRef<string | null>(null);
   const isGeneratingRef = useRef(false);
   const generationRunTokenRef = useRef(0);
-  const scriptParseOperationTokenRef = useRef(0);
   const managedProjectIdRef = useRef<string | null>(managedProjectId);
   const currentProjectIdRef = useRef<string | null>(currentProjectId);
   const analysisProjectIdRef = useRef<string | null>(null);
+  const analysisConfirmedReviewRef = useRef(false);
   const analysisManagedProjectIdRef = useRef<string | null>(managedProjectId);
   const analysisCurrentProjectIdRef = useRef<string | null>(currentProjectId);
   const analysisSourceFileMetadataRef = useRef<AnalysisSourceFileMetadata | null>(null);
@@ -338,14 +362,20 @@ export default function App() {
   const analysisRestoreOperationTokenRef = useRef(0);
   const lastGenerationProjectIdRef = useRef<string | null>(null);
   const saveChainRef = useRef<Promise<void>>(Promise.resolve());
-  const skipNextAutosaveRef = useRef(false);
   const pendingProjectAutosaveRef = useRef<PendingProjectAutosave | null>(null);
+  const workspaceBaselineByProjectRef = useRef<Map<string, string>>(new Map());
   const analysisAutosaveBlockedProjectIdRef = useRef<string | null>(null);
   const authorityUnknownProjectIdsRef = useRef<Set<string>>(new Set());
   const preserveManagerSourceDraftProjectIdRef = useRef<string | null>(null);
   const currentProjectTransitionOperationTokenRef = useRef(0);
   const currentProjectTransitionChainRef = useRef<Promise<void>>(Promise.resolve());
   const projectAuthorityEpochRef = useRef<Map<string, number>>(new Map());
+  const projectRef = useRef(project);
+  const charactersRef = useRef(characters);
+  const isProjectLoadedRef = useRef(isProjectLoaded);
+  projectRef.current = project;
+  charactersRef.current = characters;
+  isProjectLoadedRef.current = isProjectLoaded;
   const seededAuthoritativeProjectIdRef = useRef<string | null>(null);
   const voiceCatalogRequestTokenRef = useRef(0);
   const voiceRecommendationRequestTokenRef = useRef(0);
@@ -410,6 +440,33 @@ export default function App() {
     setConfirmationDialog(null);
   }
 
+  function markWorkspaceAuthoritative(
+    projectId: string,
+    projectSnapshot: ScriptProject,
+    characterSnapshot: Character[]
+  ): void {
+    workspaceBaselineByProjectRef.current.set(
+      projectId,
+      workspaceSnapshotKey({
+        projectId,
+        project: projectSnapshot,
+        characters: characterSnapshot
+      })
+    );
+  }
+
+  function workspaceMatchesAuthoritativeBaseline(
+    projectId: string,
+    projectSnapshot: ScriptProject,
+    characterSnapshot: Character[]
+  ): boolean {
+    return workspaceBaselineByProjectRef.current.get(projectId) === workspaceSnapshotKey({
+      projectId,
+      project: projectSnapshot,
+      characters: characterSnapshot
+    });
+  }
+
   useEffect(() => () => {
     confirmationResolverRef.current?.(false);
   }, []);
@@ -427,7 +484,13 @@ export default function App() {
     void refreshProjects();
     void refreshParserProviders();
     fetchCharacters()
-      .then(setCharacters)
+      .then((payload) => {
+        setCharacters(payload);
+        const projectId = analysisCurrentProjectIdRef.current;
+        if (projectId && isProjectLoadedRef.current) {
+          markWorkspaceAuthoritative(projectId, projectRef.current, payload);
+        }
+      })
       .catch(() => setCharacters([]));
   }, [t]);
 
@@ -549,21 +612,32 @@ export default function App() {
           setAnalysisSourceRevision(resumableRevision);
           setWorkspaceStage("analysis");
         }
-        skipNextAutosaveRef.current = true;
         setProject(payload);
         setActiveLineId(payload.lines[0]?.id ?? "");
         setExpandedLineId(null);
         setSelectedHistoryVersions({});
         setVersionDrafts({});
         setLineTextDrafts({});
-        setIsProjectLoaded(true);
         return fetchProjectCharacters(currentProjectId)
           .then((projectCharactersPayload) => {
             if (cancelled) return;
-            skipNextAutosaveRef.current = true;
-            setProject((current) => ({ ...current, project_characters: projectCharactersPayload.project_characters }));
+            const hydratedProject = {
+              ...payload,
+              project_characters: projectCharactersPayload.project_characters
+            };
+            markWorkspaceAuthoritative(
+              currentProjectId,
+              hydratedProject,
+              charactersRef.current
+            );
+            setProject(hydratedProject);
+            setIsProjectLoaded(true);
           })
-          .catch(() => undefined);
+          .catch(() => {
+            if (cancelled) return;
+            markWorkspaceAuthoritative(currentProjectId, payload, charactersRef.current);
+            setIsProjectLoaded(true);
+          });
       })
       .catch(() => {
         if (cancelled) return;
@@ -591,10 +665,7 @@ export default function App() {
 
   useEffect(() => {
     if (!shouldAutosaveWorkspace(workspaceStage) || !isProjectLoaded || !currentProjectId) return;
-    if (skipNextAutosaveRef.current) {
-      skipNextAutosaveRef.current = false;
-      return;
-    }
+    if (workspaceMatchesAuthoritativeBaseline(currentProjectId, project, characters)) return;
     setSaveState("saving");
     const autosaveProjectId = currentProjectId;
     const autosaveProject = project;
@@ -636,14 +707,22 @@ export default function App() {
     [characters, project]
   );
   const projectCharacters = projectWithCharacters.project_characters ?? [];
+  const currentSourceRevision = useMemo(
+    () => project.script_revisions?.find((revision) => revision.revision_id === project.active_script_revision_id) ?? null,
+    [project.active_script_revision_id, project.script_revisions]
+  );
   const resolvedCharacters = useMemo(() => resolveProjectCharacters(projectWithCharacters, characters), [characters, projectWithCharacters]);
   const projectRoleRows = useMemo(() => projectCharacterRows(projectWithCharacters, characters), [characters, projectWithCharacters]);
 
-  const filteredLibraryCharacters = useMemo(() => {
-    const query = roleLibrarySearch.trim().toLocaleLowerCase();
-    if (!query) return characters;
-    return characters.filter((character) => characterMatchValues(character).join(" ").toLocaleLowerCase().includes(query));
-  }, [characters, roleLibrarySearch]);
+  const roleLibraryController = useRoleLibraryController({
+    characters,
+    projectCharacters,
+    search: roleLibrarySearch,
+    onSaveProjectCharacters: (nextProjectCharacters) => {
+      setProject((current) => projectWithProjectCharacters(current, nextProjectCharacters));
+    }
+  });
+  const filteredLibraryCharacters = roleLibraryController.filteredCharacters;
   const filteredRoleCandidates = useMemo(() => {
     const query = roleLibrarySearch.trim().toLocaleLowerCase();
     if (!query) return roleLibraryCandidates;
@@ -792,9 +871,6 @@ export default function App() {
         if (recommendation) {
           setVoiceRecommendations((current) => ({ ...current, [lineId]: recommendation }));
         }
-        const authoritativeProject = await fetchProject(projectId);
-        if (cancelled || voiceRecommendationRequestTokenRef.current !== requestToken) return;
-        setProject((current) => mergeVoiceSelectionAuthority(current, authoritativeProject, lineId));
       } catch (error) {
         voiceRecommendationCacheRef.current.delete(cacheKey);
         if (!cancelled && voiceRecommendationRequestTokenRef.current === requestToken) {
@@ -823,6 +899,9 @@ export default function App() {
   const activeLogsReferencePayload = activeLogsReferenceRequest ? logsReferenceAudio[activeLogsReferenceRequest.key] : undefined;
   const activeLogsReferenceSamples = activeLogsReferencePayload?.samples ?? [];
   const activeLogsReferenceSample = selectedLogsReferenceSample(activeLogsReferenceSamples, activeBindingConfig, { serviceId: activeLogsReferenceServiceId });
+  const activeGptWeightOption = selectedDynamicWeightOption(activeBindingConfig, "gpt");
+  const activeSovitsWeightOption = selectedDynamicWeightOption(activeBindingConfig, "sovits");
+  const activeLogsReferenceOptionValue = selectedLogsReferenceOptionValue(activeLogsReferenceSample, activeBindingConfig);
   const staleLogsReferenceServiceId = stringConfig(activeBindingConfig.logs_reference_service_id);
   const isLogsReferenceFromOtherService = Boolean(activeProvider === "gpt-sovits" && staleLogsReferenceServiceId && staleLogsReferenceServiceId !== activeLogsReferenceServiceId);
   const activeReferenceAudioPath = activeProvider === "gpt-sovits"
@@ -835,10 +914,10 @@ export default function App() {
   );
   const showBackupReferenceSource = inspectorBackupReferenceVisible(activeProvider, candidateReferenceGroups.length);
   const validationState = useMemo(
-    () => validationRunState(runtime, services, voiceCandidates, manifest, isValidating, isGenerating),
-    [runtime, services, voiceCandidates, manifest, isValidating, isGenerating]
+    () => validationRunState(runtime, services, voiceCatalog, manifest, isValidating, isGenerating),
+    [runtime, services, voiceCatalog, manifest, isValidating, isGenerating]
   );
-  const validationSteps = useMemo(() => buildValidationSteps(runtime, services, voiceCandidates, manifest, t), [runtime, services, voiceCandidates, manifest, t]);
+  const validationSteps = useMemo(() => buildValidationSteps(runtime, services, voiceCatalog, manifest, t), [runtime, services, voiceCatalog, manifest, t]);
   const filteredLines = useMemo(
     () =>
       filterScriptLines(project.lines, manifest, {
@@ -857,12 +936,8 @@ export default function App() {
   const lineToolbarState = lineFilterToolbarState({
     providerFilter,
     statusFilter,
-    selectedLineCount: selectedLineIds.length,
-    filteredLineCount: filteredLines.length,
     labels: {
       filtersMore: t("filters.more"),
-      selectedLines: (count) => t("table.selectedLines", { count }),
-      visibleLines: (count) => t("table.visibleLines", { count }),
       status: (status) => statusText(status, t)
     }
   });
@@ -874,7 +949,6 @@ export default function App() {
     isGenerating
   });
   const lineFilterTitle = lineToolbarState.title;
-  const visibleLineLabel = lineToolbarState.countLabel;
   const selectedLanguage = normalizeLanguage(i18n.resolvedLanguage ?? i18n.language ?? defaultLanguage);
   const selectedLanguageLabel = languageOptions.find((option) => option.value === selectedLanguage)?.label ?? selectedLanguage;
   const projectRows = useMemo<ProjectSummary[]>(() => projectSummaries, [projectSummaries]);
@@ -904,10 +978,6 @@ export default function App() {
   useEffect(() => {
     analysisCurrentProjectIdRef.current = currentProjectId;
   }, [currentProjectId]);
-
-  useEffect(() => {
-    setScriptParseError((current) => reduceScriptParseError(current, { type: "project-selected", projectId: managedProjectId }));
-  }, [managedProjectId]);
 
   useEffect(() => {
     if (!managedProjectId) {
@@ -999,7 +1069,7 @@ export default function App() {
   const activeServiceContract = activeService?.api_contract ?? activeProvider;
   const localServiceCount = useMemo(() => visibleServices.filter((service) => ["gpt-sovits", "indextts"].includes(service.provider_type ?? service.engine)), [visibleServices]);
   const paidServiceCount = useMemo(() => visibleServices.filter((service) => service.capabilities?.includes("paid_provider")), [visibleServices]);
-  const serviceSummary = useMemo(() => serviceTopbarSummary(visibleServices, voiceCandidates, parserProviders), [parserProviders, visibleServices, voiceCandidates]);
+  const serviceSummary = useMemo(() => serviceTopbarSummary(visibleServices, voiceCatalog, parserProviders), [parserProviders, visibleServices, voiceCatalog]);
   const serviceHealthItems = useMemo(() => serviceTopbarHealthItems(serviceSummary), [serviceSummary]);
   const selectedConfigService = useMemo(
     () => ttsServices.find((service) => service.service_id === expandedServiceConfigId) ?? ttsServices[0],
@@ -1045,7 +1115,6 @@ export default function App() {
       ? queueProcessedItems / queueTotalItems
       : 0;
   const queueProgressPercent = Math.round(Math.max(0, Math.min(1, queueProgressRatio)) * 100);
-  const queueHasWork = queueTotalItems > 0 || queueJobs.length > 0;
   const activeJobCancellationRequested = Boolean(
     activeJob
     && (
@@ -1242,7 +1311,13 @@ export default function App() {
       await flushPendingProjectAutosave(projectId);
       await selectVoiceCandidate(projectId, lineId, candidateId);
       const authoritativeProject = await fetchProject(projectId);
-      setProject((current) => mergeVoiceSelectionAuthority(current, authoritativeProject, lineId));
+      const mergedProject = mergeVoiceSelectionAuthority(
+        projectRef.current,
+        authoritativeProject,
+        lineId
+      );
+      markWorkspaceAuthoritative(projectId, mergedProject, charactersRef.current);
+      setProject(mergedProject);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("voiceMatching.selectionFailed"));
     } finally {
@@ -1259,7 +1334,13 @@ export default function App() {
       await flushPendingProjectAutosave(projectId);
       await clearVoiceSelection(projectId, lineId);
       const authoritativeProject = await fetchProject(projectId);
-      setProject((current) => mergeVoiceSelectionAuthority(current, authoritativeProject, lineId));
+      const mergedProject = mergeVoiceSelectionAuthority(
+        projectRef.current,
+        authoritativeProject,
+        lineId
+      );
+      markWorkspaceAuthoritative(projectId, mergedProject, charactersRef.current);
+      setProject(mergedProject);
       setNotice(t("voiceMatching.selectionCleared"));
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("voiceMatching.selectionFailed"));
@@ -1388,6 +1469,7 @@ export default function App() {
       currentProjectIdRef.current = projectId;
       setCurrentProjectId(projectId);
       writeStoredProjectId(projectId);
+      markWorkspaceAuthoritative(projectId, savedProject, charactersRef.current);
       setProject(savedProject);
       setManifest(createEmptyManifest(projectId));
       setActiveLineId("");
@@ -1668,8 +1750,12 @@ export default function App() {
       if (analysisManagedProjectIdRef.current === projectId) {
         preserveManagerSourceDraftProjectIdRef.current = projectId;
       }
-      skipNextAutosaveRef.current = true;
-      setProject((current) => mergeAuthoritativeProjectStructure(current, authoritativeProject));
+      const mergedProject = mergeAuthoritativeProjectStructure(
+        projectRef.current,
+        authoritativeProject
+      );
+      markWorkspaceAuthoritative(projectId, mergedProject, charactersRef.current);
+      setProject(mergedProject);
     }
     if (analysisManagedProjectIdRef.current === projectId) {
       setManagedProject((current) => current
@@ -1709,6 +1795,11 @@ export default function App() {
         setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
         return "stale";
       }
+      markWorkspaceAuthoritative(
+        targetProjectId,
+        projectSnapshot,
+        characterSnapshot
+      );
       setSaveState("saved");
       setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
       setNotice(t("notice.autoSaved"));
@@ -1838,7 +1929,8 @@ export default function App() {
   }
 
   async function runSelectedQueue() {
-    await runQueue(selectedLines.length > 0 ? selectedLines : filteredLines);
+    if (selectedLines.length === 0) return;
+    await runQueue(selectedLines);
   }
 
   async function pollGenerationJob(jobId: string, runToken: number): Promise<GenerationJob | null> {
@@ -1897,10 +1989,8 @@ export default function App() {
         ) return false;
       }
       if (operationToken !== currentProjectTransitionOperationTokenRef.current) return false;
-      scriptParseOperationTokenRef.current += 1;
       currentProjectIdRef.current = projectId;
       analysisCurrentProjectIdRef.current = projectId;
-      setIsManagerParsing(false);
       setCurrentProjectId(() => {
         writeStoredProjectId(projectId);
         return projectId;
@@ -1921,6 +2011,7 @@ export default function App() {
 
   function applyManagedProjectToWorkspace(projectId: string, nextProject: ScriptProject, resetLineState = false) {
     if (projectId !== currentProjectIdRef.current) return;
+    markWorkspaceAuthoritative(projectId, nextProject, charactersRef.current);
     setProject(nextProject);
     if (resetLineState) {
       setActiveLineId(nextProject.lines[0]?.id ?? "");
@@ -1962,13 +2053,25 @@ export default function App() {
     setManagerSourceDraft(value);
   }
 
-  async function selectManagedScriptFile(file: File) {
+  async function selectManagedScriptFile(file: File, target: ScriptFileTarget) {
     const operationToken = scriptFileOperationTokenRef.current + 1;
     scriptFileOperationTokenRef.current = operationToken;
-    const targetProjectId = analysisManagedProjectIdRef.current;
-    const currentSource = managerSourceDraft;
+    const targetProjectId = target === "existing" ? analysisManagedProjectIdRef.current : null;
+    const currentSource = target === "existing" ? managerSourceDraft : newScriptSource;
+    const persistedSource = target === "existing" ? projectPreviewStats(managedProject).activeSourceMarkdown : "";
+    if (currentSource !== persistedSource && currentSource.trim()) {
+      const confirmed = await requestConfirmation({
+        title: t("script.replaceSourceTitle"),
+        body: t("script.replaceSourceBody", { filename: file.name }),
+        detail: t("script.replaceSourceDetail"),
+        confirmLabel: t("script.replaceSourceConfirm"),
+        cancelLabel: t("actions.cancel"),
+        tone: "warning"
+      });
+      if (!confirmed) return;
+    }
     const isCurrent = () => operationToken === scriptFileOperationTokenRef.current
-      && targetProjectId === analysisManagedProjectIdRef.current;
+      && (target === "new" || targetProjectId === analysisManagedProjectIdRef.current);
     const outcome = await readAnalysisScriptFile(file, currentSource, isCurrent);
     if (outcome.status === "stale") return;
     if (outcome.status === "error") {
@@ -1979,7 +2082,12 @@ export default function App() {
     }
     analysisStartOperationTokenRef.current += 1;
     analysisSourceFileMetadataRef.current = outcome.metadata;
-    setManagerSourceDraft(outcome.source);
+    if (target === "existing") {
+      setManagerSourceDraft(outcome.source);
+    } else {
+      setNewScriptSource(outcome.source);
+      setNewScriptTitle((current) => current.trim() ? current : scriptTitleFromFilename(file.name));
+    }
     if (outcome.metadata.warning) {
       setNotice(t("analysis.input.largeFileWarning", {
         count: outcome.metadata.warning.codePointCount,
@@ -2068,7 +2176,6 @@ export default function App() {
           setManagerTitleDraft(readyProject.title);
           setManagerSourceDraft(payload.script_revision.source_markdown);
           if (targetProjectId === analysisCurrentProjectIdRef.current) {
-            skipNextAutosaveRef.current = true;
             applyManagedProjectToWorkspace(targetProjectId, readyProject);
           }
           analysisProjectIdRef.current = targetProjectId;
@@ -2122,9 +2229,13 @@ export default function App() {
     analysisCurrentProjectIdRef.current = handoff.currentProjectId;
     analysisManagedProjectIdRef.current = handoff.managedProjectId;
     seededAuthoritativeProjectIdRef.current = changesCurrentProject ? handoff.currentProjectId : null;
-    skipNextAutosaveRef.current = true;
     writeStoredProjectId(handoff.currentProjectId);
     setCurrentProjectId(handoff.currentProjectId);
+    markWorkspaceAuthoritative(
+      handoff.currentProjectId,
+      handoff.project,
+      charactersRef.current
+    );
     setProject(handoff.project);
     setActiveLineId(handoff.activeLineId);
     setExpandedLineId(handoff.expandedLineId);
@@ -2138,13 +2249,39 @@ export default function App() {
     setManagerSourceDraft(handoff.managerSourceDraft);
     setSaveState("saved");
     setLastSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
-    clearRestorableAnalysisSession(targetProjectId, sourceRevision);
+    archiveRestorableAnalysisSession(targetProjectId, sourceRevision);
     clearActiveAnalysisScope(activeAnalysisScopeForRevision(targetProjectId, sourceRevision));
+    analysisConfirmedReviewRef.current = false;
     const summaryRefreshEpoch = analysisStartOperationTokenRef.current;
     analysisProjectIdRef.current = null;
     analysisSourceFileMetadataRef.current = null;
     setAnalysisSourceRevision(null);
     setWorkspaceStage("tts");
+    const confirmedLineIds = handoff.project.lines.map((line) => line.id);
+    if (confirmedLineIds.length > 0) {
+      void recommendVoices(handoff.currentProjectId, confirmedLineIds, { applyAutomatic: true })
+        .then(async (payload) => {
+          if (analysisCurrentProjectIdRef.current !== handoff.currentProjectId) return;
+          setVoiceRecommendations(Object.fromEntries(
+            payload.recommendations.map((recommendation) => [recommendation.line_id, recommendation])
+          ));
+          const authoritativeProject = await fetchProject(handoff.currentProjectId);
+          if (analysisCurrentProjectIdRef.current !== handoff.currentProjectId) return;
+          markWorkspaceAuthoritative(
+            handoff.currentProjectId,
+            authoritativeProject,
+            charactersRef.current
+          );
+          setProject(authoritativeProject);
+        })
+        .catch((error) => {
+          if (analysisCurrentProjectIdRef.current === handoff.currentProjectId) {
+            setVoiceRecommendationError(
+              error instanceof Error ? error.message : t("voiceMatching.recommendationFailed")
+            );
+          }
+        });
+    }
     void fetchProjects()
       .then((payload) => {
         if (
@@ -2161,11 +2298,65 @@ export default function App() {
     analysisStartOperationTokenRef.current += 1;
     const targetProjectId = analysisProjectIdRef.current;
     if (targetProjectId && analysisSourceRevision) {
+      if (analysisConfirmedReviewRef.current) {
+        archiveRestorableAnalysisSession(targetProjectId, analysisSourceRevision);
+      }
       clearActiveAnalysisScope(activeAnalysisScopeForRevision(targetProjectId, analysisSourceRevision));
     }
+    analysisConfirmedReviewRef.current = false;
     analysisProjectIdRef.current = null;
     setAnalysisSourceRevision(null);
     setWorkspaceStage("tts");
+  }
+
+  async function reviewConfirmedAnnotations() {
+    if (!currentProjectId || !currentSourceRevision || isReturningToAnalysis) return;
+    const targetProjectId = currentProjectId;
+    const expectedActiveRevisionId = currentSourceRevision.revision_id;
+    let targetRevision = currentSourceRevision;
+    const operationToken = analysisStartOperationTokenRef.current + 1;
+    analysisStartOperationTokenRef.current = operationToken;
+    setIsReturningToAnalysis(true);
+    try {
+      const session = await fetchAnalysisReviewSession(targetProjectId);
+      if (
+        analysisStartOperationTokenRef.current !== operationToken
+        || analysisCurrentProjectIdRef.current !== targetProjectId
+        || projectRef.current.active_script_revision_id !== expectedActiveRevisionId
+      ) return;
+      const recoveredRevision = projectRef.current.script_revisions?.find(
+        (revision) => revision.revision_id === session.source_revision_id
+      );
+      if (!recoveredRevision) throw new Error(t("app.analysisResultUnavailable"));
+      targetRevision = recoveredRevision;
+      writeAnalysisRunSession(
+        defaultAnalysisStorage(),
+        analysisScopeStorageId(targetProjectId, targetRevision),
+        { runId: session.run_id, draftId: session.draft_id }
+      );
+      if (
+        analysisStartOperationTokenRef.current !== operationToken
+        || analysisCurrentProjectIdRef.current !== targetProjectId
+        || projectRef.current.active_script_revision_id !== expectedActiveRevisionId
+      ) return;
+      const scope = reviewConfirmedAnalysis(targetProjectId, targetRevision);
+      analysisProjectIdRef.current = scope.projectId;
+      analysisConfirmedReviewRef.current = true;
+      setAnalysisSourceRevision(targetRevision);
+      writeActiveAnalysisScope(targetProjectId, targetRevision);
+      setWorkspaceStage("analysis");
+    } catch (error) {
+      setNotice(
+        error instanceof ApiRequestError && error.status === 404
+          ? t("app.analysisResultUnavailable")
+          : error instanceof Error
+            ? error.message
+            : t("app.analysisResultUnavailable"),
+        { level: "warning" }
+      );
+    } finally {
+      if (analysisStartOperationTokenRef.current === operationToken) setIsReturningToAnalysis(false);
+    }
   }
 
   async function saveManagedScriptRevision() {
@@ -2202,60 +2393,19 @@ export default function App() {
     }
   }
 
-  async function parseManagedScriptRevision() {
-    if (!managedProjectId || !managedProject) return;
-    const targetProjectId = managedProjectId;
-    const title = managerTitleDraft.trim();
-    const source = managerSourceDraft;
-    if (!title) {
-      setNotice(t("script.newScriptTitleRequired"));
-      return;
-    }
-    if (!source.trim()) {
-      setNotice(t("script.sourceRequired"));
-      return;
-    }
-    const confirmed = await confirmRevisionRisk(managedProject);
-    if (!canStartScriptParse({ confirmed, targetProjectId, managedProjectId: managedProjectIdRef.current })) return;
-    const operationToken = scriptParseOperationTokenRef.current + 1;
-    scriptParseOperationTokenRef.current = operationToken;
-    const isCurrentOperation = () => isCurrentScriptParseOperation({
-      operationToken,
-      activeOperationToken: scriptParseOperationTokenRef.current,
-      targetProjectId,
-      managedProjectId: managedProjectIdRef.current,
-      currentProjectId: currentProjectIdRef.current
-    });
-    setIsManagerParsing(true);
-    setScriptParseError((current) => reduceScriptParseError(current, { type: "started" }));
-    setNotice(t("parser.parsing"));
-    try {
-      if (title !== managedProject.title) {
-        await saveProject(targetProjectId, { ...managedProject, title });
-      }
-      const scriptPayload = await createScriptRevision(targetProjectId, source, t("script.parseRevision"));
-      const parsePayload = await createParseRevision(targetProjectId, scriptPayload.script_revision.revision_id);
-      if (!isCurrentOperation()) return;
-      setManagedProject(parsePayload.project);
-      setManagerTitleDraft(parsePayload.project.title);
-      setManagerSourceDraft(projectToScriptSourceText(parsePayload.project, characters));
-      applyManagedProjectToWorkspace(targetProjectId, parsePayload.project, true);
-      setScriptParseError((current) => reduceScriptParseError(current, { type: "succeeded" }));
-      setNotice(t("script.parseApplied"));
-      await refreshProjects(currentProjectIdRef.current, isCurrentOperation);
-    } catch (error) {
-      if (!isCurrentOperation()) return;
-      const message = error instanceof Error ? error.message : t("parser.parseFailed");
-      setScriptParseError((current) => reduceScriptParseError(current, { type: "failed", error: { projectId: targetProjectId, message } }));
-      setNotice(message);
-    } finally {
-      if (isCurrentOperation()) setIsManagerParsing(false);
-    }
+  function startCreatingScript() {
+    scriptFileOperationTokenRef.current += 1;
+    analysisStartOperationTokenRef.current += 1;
+    analysisSourceFileMetadataRef.current = null;
+    analysisManagedProjectIdRef.current = null;
+    managedProjectIdRef.current = null;
+    setManagedProjectId(null);
+    setManagedProject(null);
   }
 
-  async function deleteManagedProject() {
-    if (!managedProjectId) return;
-    const title = managerTitleDraft.trim() || managedProject?.title || managedProjectId;
+  async function deleteManagedProject(projectId: string) {
+    const summary = projectRows.find((item) => item.project_id === projectId);
+    const title = summary?.title || projectId;
     const confirmed = await requestConfirmation({
       title: t("script.deleteScriptTitle"),
       body: t("script.deleteScriptBody", { title }),
@@ -2267,15 +2417,21 @@ export default function App() {
     if (!confirmed) return;
     const allRows = filterAndSortProjectSummaries(projectRows, "");
     const visibleRows = filterAndSortProjectSummaries(projectRows, managerSearchText);
-    const nextCurrentProjectId = nextProjectAfterDelete(allRows, managedProjectId, currentProjectId);
-    const nextManagedProjectId = nextProjectAfterDelete(visibleRows, managedProjectId, managedProjectId) ?? nextCurrentProjectId;
-    const deletedCurrentProject = managedProjectId === currentProjectId;
-    setDeletingProjectId(managedProjectId);
+    const nextCurrentProjectId = nextProjectAfterDelete(allRows, projectId, currentProjectId);
+    const deletingSelectedProject = projectId === managedProjectId;
+    const nextManagedProjectId = deletingSelectedProject
+      ? nextProjectAfterDelete(visibleRows, projectId, managedProjectId) ?? nextCurrentProjectId
+      : managedProjectId;
+    const deletedCurrentProject = projectId === currentProjectId;
+    setDeletingProjectId(projectId);
     try {
-      await deleteProject(managedProjectId);
-      managedProjectIdRef.current = nextManagedProjectId;
-      setManagedProjectId(nextManagedProjectId);
-      setManagedProject(null);
+      await deleteProject(projectId);
+      if (deletingSelectedProject) {
+        managedProjectIdRef.current = nextManagedProjectId;
+        analysisManagedProjectIdRef.current = nextManagedProjectId;
+        setManagedProjectId(nextManagedProjectId);
+        setManagedProject(null);
+      }
       if (deletedCurrentProject) {
         currentProjectIdRef.current = nextCurrentProjectId;
         setCurrentProjectId(nextCurrentProjectId);
@@ -2504,20 +2660,16 @@ export default function App() {
       newScriptSource={newScriptSource}
       isCreatingScript={isCreatingScript}
       isSavingScript={isManagerSaving}
-      isParsingScript={isManagerParsing}
-      parseError={scriptParseError?.projectId === managedProjectId ? scriptParseError : null}
       deletingProjectId={deletingProjectId}
       onClose={() => undefined}
       onSearchTextChange={setManagerSearchText}
       onSelectProject={(projectId) => {
         if (projectId === analysisManagedProjectIdRef.current) return;
-        scriptParseOperationTokenRef.current += 1;
         scriptFileOperationTokenRef.current += 1;
         analysisStartOperationTokenRef.current += 1;
         analysisSourceFileMetadataRef.current = null;
         analysisManagedProjectIdRef.current = projectId;
         managedProjectIdRef.current = projectId;
-        setIsManagerParsing(false);
         setManagedProjectId(projectId);
       }}
       onOpenProject={(projectId) => {
@@ -2535,21 +2687,57 @@ export default function App() {
       onSourceDraftChange={updateManagedSourceDraft}
       onNewScriptTitleChange={setNewScriptTitle}
       onNewScriptSourceChange={setNewScriptSource}
+      onStartCreateScript={startCreatingScript}
       onCreateScript={() => void createNewScriptProject()}
       onRenameScript={() => void renameManagedProject()}
       onSaveRevision={() => void saveManagedScriptRevision()}
-      onParseRevision={() => void parseManagedScriptRevision()}
       onAnalyzeScript={() => void analyzeManagedScriptRevision()}
-      onScriptFileSelected={(file) => void selectManagedScriptFile(file)}
-      onDismissParseError={() => setScriptParseError((current) => reduceScriptParseError(current, { type: "dismissed" }))}
-      onDeleteScript={() => void deleteManagedProject()}
+      onScriptFileSelected={(file, target) => void selectManagedScriptFile(file, target)}
+      onDeleteScript={(projectId) => void deleteManagedProject(projectId)}
     />
   );
 
+  const appOverlays = (
+    <>
+      {confirmationDialog && (
+        <div className="confirm-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) resolveConfirmation(false); }}>
+          <section className={`confirm-modal tone-${confirmationDialog.tone}`} role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+            <div className="confirm-modal-icon">
+              <AlertCircle size={18} />
+            </div>
+            <div className="confirm-modal-copy">
+              <h2 id="confirm-modal-title">{confirmationDialog.title}</h2>
+              <p>{confirmationDialog.body}</p>
+              {confirmationDialog.detail && <small>{confirmationDialog.detail}</small>}
+            </div>
+            <div className="confirm-modal-actions">
+              <button className="secondary-button" type="button" onClick={() => resolveConfirmation(false)}>{confirmationDialog.cancelLabel}</button>
+              <button className="primary-button" type="button" onClick={() => resolveConfirmation(true)}>{confirmationDialog.confirmLabel}</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {toasts.length > 0 && (
+        <div className="toast-stack" role="region" aria-label="通知" aria-live="polite">
+          {toasts.map((toast) => (
+            <div key={toast.id} className={`toast toast-${toast.level}`} role="status">
+              <span className="toast-message">{toast.message}</span>
+              <button className="toast-close" type="button" aria-label="关闭通知" onClick={() => removeToast(toast.id)}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+
   return (
-    <div className={`app-shell ${workspaceStage === "analysis" ? "app-shell-analysis" : ""}`}>
+    <>
       <TokenGate />
-      <aside className="sidebar">
+      <WorkbenchShell
+        stage={workspaceStage}
+        overlays={appOverlays}
+        sidebar={(
+          <>
         <div className="brand-row">
           <div className="brand-mark"><Mic2 size={17} /></div>
           <div>
@@ -2561,42 +2749,33 @@ export default function App() {
         <section className="panel compact parser-panel script-workspace-panel">
           {scriptManagerPane}
         </section>
-
-      </aside>
-
-      <main className={`workspace ${workspaceStage === "analysis" ? "workspace-analysis" : ""}`}>
+          </>
+        )}
+      >
         <AnalysisStageGate
           stage={workspaceStage}
           projectId={analysisProjectIdRef.current}
           sourceRevision={analysisSourceRevision}
           onConfirmed={applyConfirmedAnalysisProject}
           onCancel={cancelScriptAnalysis}
+          controllerOptions={{
+            mode: analysisConfirmedReviewRef.current ? "review" : "analyze"
+          }}
           ttsWorkbench={(
             <>
         <header className="topbar">
           <div className="toolbar topbar-toolbar">
             <span className={`notice ${toasts.length > 0 ? `notice-${toasts[toasts.length - 1].level}` : ""}`} title={notice}>{notice || t("app.ready")}</span>
             <button
-              className={`topbar-action-button menu-trigger ${servicePanelSection === "roles" && isTopologyMenuOpen ? "active" : ""}`}
-              onClick={() => {
-                setServicePanelSection("roles");
-                setIsTopologyMenuOpen(true);
-              }}
-              title={t("characters.libraryManager")}
+              className="topbar-action-button"
+              data-action="review-confirmed-annotations"
+              disabled={!currentProjectId || !currentSourceRevision || isReturningToAnalysis}
+              onClick={() => void reviewConfirmedAnnotations()}
+              title={t("app.reviewConfirmedAnnotationsHint")}
+              type="button"
             >
-              <Library size={15} />
-              <span className="menu-trigger-label">{t("topbar.roleLibrary")}</span>
-            </button>
-            <button
-              className={`topbar-action-button menu-trigger ${servicePanelSection === "resources" && isTopologyMenuOpen ? "active" : ""}`}
-              onClick={() => {
-                setServicePanelSection("resources");
-                setIsTopologyMenuOpen(true);
-              }}
-              title={t("services.resourceQueueTitle")}
-            >
-              <History size={15} />
-              <span className="menu-trigger-label">{t("topbar.resourceQueue")}</span>
+              {isReturningToAnalysis ? <Loader2 className="spin" size={15} /> : <ArrowLeft size={15} />}
+              <span className="menu-trigger-label">{t("app.reviewConfirmedAnnotations")}</span>
             </button>
             <div className="topbar-menu-wrap topbar-config-actions">
               <button
@@ -2634,22 +2813,16 @@ export default function App() {
                 </span>
               </button>
               {isTopologyMenuOpen && (
-                <div className="service-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsTopologyMenuOpen(false); }}>
-                  <div className={`service-modal ${topologyModalClass}`} role="dialog" aria-modal="true" aria-label={topologyModalTitle}>
-                    <header className="service-modal-head">
-                      <div>
-                        <strong>{topologyModalTitle}</strong>
-                        <span>{topologyModalDescription}</span>
-                      </div>
-                      <div className="service-modal-actions">
-                        <button className="icon-button small" onClick={() => void refreshTopology(true)} title={t("actions.refresh")}>
-                          {isRefreshingTopology ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
-                        </button>
-                        <button className="icon-button small" onClick={() => setIsTopologyMenuOpen(false)} title={t("actions.close")}><X size={14} /></button>
-                      </div>
-                    </header>
-
-                    <div className="service-modal-body">
+                <ServiceCenter
+                  title={topologyModalTitle}
+                  description={topologyModalDescription}
+                  className={topologyModalClass}
+                  refreshing={isRefreshingTopology}
+                  refreshLabel={t("actions.refresh")}
+                  closeLabel={t("actions.close")}
+                  onRefresh={() => void refreshTopology(true)}
+                  onClose={() => setIsTopologyMenuOpen(false)}
+                >
                       <section className="service-modal-content">
                         {servicePanelSection === "overview" && (
                           <div className="service-section-stack">
@@ -2666,9 +2839,9 @@ export default function App() {
                                 <span>{t("services.parserReady")}</span>
                                 <strong>{serviceSummary.parser.ready}/{serviceSummary.parser.total}</strong>
                               </div>
-                              <div className={`overview-card state-${voiceCandidates?.ready ? "ready" : "attention"}`}>
+                              <div className={`overview-card state-${serviceSummary.resources.ready ? "ready" : "attention"}`}>
                                 <span>{t("services.resourceReady")}</span>
-                                <strong>{voiceCandidates?.ready ? t("status.ready") : t("status.needsMapping")}</strong>
+                                <strong>{serviceSummary.resources.ready ? t("status.ready") : t("status.needsMapping")}</strong>
                               </div>
                               <div className={`overview-card state-${queueStatus?.running ? "running" : "ready"}`}>
                                 <span>{t("queue.title")}</span>
@@ -3155,70 +3328,26 @@ export default function App() {
                               error={voiceCatalogError}
                               onSync={() => void runVoiceCatalogSync()}
                             />
-                            <section className={`queue-status-card ${queueHasWork ? "has-work" : "is-empty"}`}>
-                              <div className="queue-status-head">
-                                <div>
-                                  <strong><History size={15} /> {t("queue.title")}</strong>
-                                  <span>{queueHasWork ? t("queue.processedRatio", { processed: queueProcessedItems, total: queueTotalItems }) : t("queue.noJobs")}</span>
-                                </div>
-                                <StatusPill tone={queueVisibleTone} label={queueVisibleStatusLabel} />
-                              </div>
-
-                              {queueHasWork && (
-                                <>
-                                  <div className="queue-progress-row">
-                                    <strong>{queueProgressPercent}%</strong>
-                                    <div className="queue-dispatch-bar" aria-label={t("queue.progressLabel", { percent: queueProgressPercent })}>
-                                      <span style={{ width: `${queueProgressPercent}%` }} />
-                                    </div>
-                                  </div>
-                                  <div className="queue-count-strip" aria-label={t("queue.countSummary")}>
-                                    <span><strong>{queueQueuedItems}</strong>{t("filters.queued")}</span>
-                                    <span><strong>{queueRunningItems}</strong>{t("filters.running")}</span>
-                                    <span><strong>{queueCompletedItems}</strong>{t("status.completed")}</span>
-                                    <span><strong>{queueFailedItems}</strong>{t("status.failed")}</span>
-                                    <span><strong>{queueCancelledItems}</strong>{t("status.cancelled")}</span>
-                                  </div>
-                                </>
-                              )}
-
-                              {queueJobs.length > 0 && (
-                                <details className="queue-job-details" open={Boolean(queueActiveJob)}>
-                                  <summary>
-                                    <span>{t("queue.recentJobs")}</span>
-                                    <small>{t("queue.itemCount", { count: queueJobs.length })}</small>
-                                  </summary>
-                                  <div className="queue-job-list">
-                                    {queueJobs.slice(0, 5).map((job) => {
-                                      const jobPercent = Math.round(Math.max(0, Math.min(1, job.progress)) * 100);
-                                      const promptItem = job.items.find((item) => item.external_status || item.external_job_id);
-                                      return (
-                                        <article className={`queue-job-card state-${generationStatusTone(job.status)}`} key={job.job_id}>
-                                          <div>
-                                            <strong>{job.job_id}</strong>
-                                            <span>{t("queue.itemCount", { count: job.items.length })}</span>
-                                          </div>
-                                          <div className="queue-job-meta">
-                                            <StatusPill tone={generationStatusTone(job.status)} label={t(generationStatusKey(job.status))} />
-                                            {promptItem?.external_status && (
-                                              <span className="line-meta-chip neutral" title={promptItem.external_job_id ?? ""}>
-                                                {t("queue.promptStatus", { status: statusText(promptItem.external_status, t) })}
-                                              </span>
-                                            )}
-                                            <span>{jobPercent}%</span>
-                                          </div>
-                                        </article>
-                                      );
-                                    })}
-                                  </div>
-                                </details>
-                              )}
-                            </section>
+                            <QueuePanel
+                              jobs={queueJobs}
+                              activeJob={queueActiveJob}
+                              queued={queueQueuedItems}
+                              running={queueRunningItems}
+                              completed={queueCompletedItems}
+                              failed={queueFailedItems}
+                              cancelled={queueCancelledItems}
+                              total={queueTotalItems}
+                              processed={queueProcessedItems}
+                              progressPercent={queueProgressPercent}
+                              statusLabel={queueVisibleStatusLabel}
+                              statusTone={queueVisibleTone}
+                              externalStatusLabel={(status) => statusText(status, t)}
+                            />
                           </div>
                         )}
 
                         {servicePanelSection === "roles" && (
-                          <div className="role-library-workbench">
+                          <RoleLibraryPanel>
                             <section className="role-library-rail">
                               <div className="role-library-title-block">
                                 <strong>{t("characters.currentScriptRoles")}</strong>
@@ -3662,12 +3791,10 @@ export default function App() {
                                 </div>
                               )}
                             </section>
-                          </div>
+                          </RoleLibraryPanel>
                         )}
                       </section>
-                    </div>
-                  </div>
-                </div>
+                </ServiceCenter>
               )}
             </div>
             <button className="language-select language-toggle" onClick={() => void cycleLanguage()} title={selectedLanguageLabel}>
@@ -3677,15 +3804,15 @@ export default function App() {
           </div>
         </header>
 
-        <section className="workbench-grid">
-          <div className="lines-panel">
+        <LineWorkspace
+          lineList={(
+            <>
             {lineWorkbenchState.filtersVisible && (
             <div className="filters-row">
               <label className="search-field">
                 <Search size={15} />
                 <input value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder={t("filters.search")} />
               </label>
-              <span className="line-toolbar-count">{visibleLineLabel}</span>
               <details className="line-filter-menu">
                 <summary title={lineFilterTitle}>
                   <SlidersHorizontal size={14} />
@@ -3745,8 +3872,8 @@ export default function App() {
                     <X size={15} /> {activeJobCancellationRequested ? t("status.cancelling") : t("actions.cancel")}
                   </button>
                 ) : (
-                  <button className="primary-button" onClick={() => void runSelectedQueue()} disabled={isGenerating || filteredLines.length === 0}>
-                    <RefreshCw size={15} /> {selectedLineIds.length > 0 ? t("app.queueSelected") : t("app.queueFiltered")}
+                  <button className="primary-button" onClick={() => void runSelectedQueue()} disabled={isGenerating || selectedLineIds.length === 0}>
+                    <RefreshCw size={15} /> {t("app.queueSelected")}
                   </button>
                 )}
               </div>
@@ -3818,7 +3945,12 @@ export default function App() {
                   >
                     <div className="line-primary-row">
                       <label className="line-check" onClick={(event) => event.stopPropagation()}>
-                        <input type="checkbox" checked={selected} onChange={() => setSelectedLineIds((current) => toggleLineSelection(current, line.id))} />
+                        <input
+                          type="checkbox"
+                          aria-label={`${t("actions.select")} · ${characterName(resolvedCharacters, line.character_id)} · ${line.text}`}
+                          checked={selected}
+                          onChange={() => setSelectedLineIds((current) => toggleLineSelection(current, line.id))}
+                        />
                       </label>
                       <div className="line-speaker">
                         <RoleAvatar avatarPath={roleRow?.avatarPath} fallback={roleRow?.avatarFallback ?? avatarFallback(characterName(resolvedCharacters, line.character_id))} size="md" />
@@ -3900,9 +4032,10 @@ export default function App() {
                 </div>
               )}
             </div>
-          </div>
-
-          <aside className={`inspector inspector-${activeInspectorMode}`}>
+            </>
+          )}
+          inspector={(
+            <VoiceInspector mode={activeInspectorMode}>
             {activeLine && (
               <div className="inspector-stack">
                 {inspectorVersionContextVisible(activeInspectorMode, selectedHistoryVersion?.version_id) && selectedHistoryVersion && activeVersionDraft ? (
@@ -3938,6 +4071,25 @@ export default function App() {
                     {selectedHistoryVersion.error && <p className="selected-version-error">{selectedHistoryVersion.error}</p>}
                   </section>
                 ) : null}
+
+                <section className="inspector-card resident-voice-summary">
+                  <div>
+                    <span>{t("inspector.currentVoice")}</span>
+                    <strong title={activeProfileLabel}>{activeProfileLabel}</strong>
+                  </div>
+                  <button className="secondary-button compact-button" type="button" onClick={() => setIsVoiceConfigurationOpen(true)}>
+                    {t("inspector.voiceConfiguration")}
+                  </button>
+                </section>
+
+                <VoiceConfigurationDrawer
+                  open={isVoiceConfigurationOpen}
+                  title={t("inspector.voiceConfiguration")}
+                  closeLabel={t("actions.close")}
+                  onClose={() => setIsVoiceConfigurationOpen(false)}
+                >
+                  <section className="voice-config-section">
+                    <h3>{t("inspector.soundAndModels")}</h3>
 
                 {activeInspectorSections.includes("config") && (
                   <section className="inspector-card inspector-config-card">
@@ -4140,15 +4292,21 @@ export default function App() {
                                 <div className="gpt-resource-column">
                                   <label className="resource-field">
                                     <span>{t("inspector.gptWeights")}</span>
-                                    <select value={stringConfig(activeBindingConfig.gpt_weights_path)} onChange={(event) => updateActiveBindingConfig({ gpt_weights_path: event.target.value || undefined })}>
+                                    <select value={activeGptWeightOption.value} onChange={(event) => updateActiveBindingConfig({ gpt_weights_path: event.target.value || undefined })}>
                                       <option value="">{t("inspector.autoDefault")}</option>
+                                      {activeGptWeightOption.relativePath && (
+                                        <option value={activeGptWeightOption.value}>{shortPath(activeGptWeightOption.relativePath)}</option>
+                                      )}
                                       {voiceCandidates?.gpt_sovits.gpt_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
                                     </select>
                                   </label>
                                   <label className="resource-field">
                                     <span>{t("inspector.sovitsWeights")}</span>
-                                    <select value={stringConfig(activeBindingConfig.sovits_weights_path)} onChange={(event) => updateActiveBindingConfig({ sovits_weights_path: event.target.value || undefined })}>
+                                    <select value={activeSovitsWeightOption.value} onChange={(event) => updateActiveBindingConfig({ sovits_weights_path: event.target.value || undefined })}>
                                       <option value="">{t("inspector.autoDefault")}</option>
+                                      {activeSovitsWeightOption.relativePath && (
+                                        <option value={activeSovitsWeightOption.value}>{shortPath(activeSovitsWeightOption.relativePath)}</option>
+                                      )}
                                       {voiceCandidates?.gpt_sovits.sovits_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
                                     </select>
                                   </label>
@@ -4159,7 +4317,7 @@ export default function App() {
                                     <label className="resource-field">
                                       <span>{t("inspector.logsReferenceAudio")}</span>
                                       <select
-                                        value={activeLogsReferenceSample?.sample_id ?? ""}
+                                        value={activeLogsReferenceOptionValue}
                                         disabled={!activeLogsReferenceRequest || loadingLogsReferenceKey === activeLogsReferenceRequest?.key}
                                         onChange={(event) => {
                                           const sample = activeLogsReferenceSamples.find((item) => item.sample_id === event.target.value);
@@ -4167,6 +4325,9 @@ export default function App() {
                                         }}
                                       >
                                         <option value="">{activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
+                                        {!activeLogsReferenceSample && activeReferenceAudioPath && (
+                                          <option value={CATALOG_STAGED_REFERENCE_OPTION}>{activeReferenceAudioLabel}</option>
+                                        )}
                                         {activeLogsReferenceSamples.map((sample) => (
                                           <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
                                         ))}
@@ -4366,6 +4527,32 @@ export default function App() {
                     )}
                   </section>
                 )}
+                  </section>
+                  <section className="voice-config-section">
+                    <h3>{t("inspector.resourcesAndRuntime")}</h3>
+                    <VoiceAssetStatusPanel
+                      catalog={voiceCatalog}
+                      syncing={isSyncingVoiceCatalog}
+                      error={voiceCatalogError}
+                      onSync={() => void runVoiceCatalogSync()}
+                    />
+                    <QueuePanel
+                      jobs={queueJobs}
+                      activeJob={queueActiveJob}
+                      queued={queueQueuedItems}
+                      running={queueRunningItems}
+                      completed={queueCompletedItems}
+                      failed={queueFailedItems}
+                      cancelled={queueCancelledItems}
+                      total={queueTotalItems}
+                      processed={queueProcessedItems}
+                      progressPercent={queueProgressPercent}
+                      statusLabel={queueVisibleStatusLabel}
+                      statusTone={queueVisibleTone}
+                      externalStatusLabel={(status) => statusText(status, t)}
+                    />
+                  </section>
+                </VoiceConfigurationDrawer>
 
                 <VoiceCandidatePanel
                   recommendation={activeVoiceRecommendation}
@@ -4376,6 +4563,8 @@ export default function App() {
                   referenceAudioUrl={referenceAudioUrl}
                   onSelect={(candidateId) => void chooseVoiceCandidate(candidateId)}
                   onClear={() => void clearActiveVoiceSelection()}
+                  onSyncAssets={() => void runVoiceCatalogSync()}
+                  onOpenServices={() => setIsVoiceConfigurationOpen(true)}
                 />
 
                 <section className={`inspector-generate-dock inspector-speech-workbench tone-${activeInspectorDiagnostics.tone}`}>
@@ -4426,41 +4615,14 @@ export default function App() {
                 {!lineWorkbenchState.emptyState && <span>{t("empty.noActiveLineHint")}</span>}
               </div>
             )}
-          </aside>
-        </section>
+            </VoiceInspector>
+          )}
+        />
             </>
           )}
         />
-      </main>
-      {confirmationDialog && (
-        <div className="confirm-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) resolveConfirmation(false); }}>
-          <section className={`confirm-modal tone-${confirmationDialog.tone}`} role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
-            <div className="confirm-modal-icon">
-              <AlertCircle size={18} />
-            </div>
-            <div className="confirm-modal-copy">
-              <h2 id="confirm-modal-title">{confirmationDialog.title}</h2>
-              <p>{confirmationDialog.body}</p>
-              {confirmationDialog.detail && <small>{confirmationDialog.detail}</small>}
-            </div>
-            <div className="confirm-modal-actions">
-              <button className="secondary-button" type="button" onClick={() => resolveConfirmation(false)}>{confirmationDialog.cancelLabel}</button>
-              <button className="primary-button" type="button" onClick={() => resolveConfirmation(true)}>{confirmationDialog.confirmLabel}</button>
-            </div>
-          </section>
-        </div>
-      )}
-      {toasts.length > 0 && (
-        <div className="toast-stack" role="region" aria-label="通知" aria-live="polite">
-          {toasts.map((toast) => (
-            <div key={toast.id} className={`toast toast-${toast.level}`} role="status">
-              <span className="toast-message">{toast.message}</span>
-              <button className="toast-close" type="button" aria-label="关闭通知" onClick={() => removeToast(toast.id)}>×</button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
+      </WorkbenchShell>
+    </>
   );
 
   function focusFirstLineForCharacter(characterId: string) {
@@ -4670,21 +4832,7 @@ export default function App() {
 
   function applyLibraryCharacterToProjectRole(character: Character | null) {
     if (!activeProjectCharacter || !character) return;
-    setProject((current) => {
-      const nextProjectCharacters = ensureProjectCharacters(current, characters).map((item) =>
-        item.project_character_id === activeProjectCharacter.project_character_id
-          ? {
-              ...item,
-              library_character_id: character.id,
-              mode: "reference" as const,
-              character_snapshot: null,
-              project_binding: null,
-              match_status: "matched" as const
-            }
-          : item
-      );
-      return projectWithProjectCharacters(current, nextProjectCharacters);
-    });
+    roleLibraryController.mapProjectRole(activeProjectCharacter.project_character_id, character.id);
     setActiveLibraryCharacterId(character.id);
     setActiveRoleCandidateId(null);
     setActiveModelCatalogId(null);
@@ -5403,7 +5551,7 @@ function isStoppedManagedService(service: WorkerHealth): boolean {
 function buildValidationSteps(
   runtime: RuntimeMode | null,
   services: WorkerHealth[],
-  candidates: VoiceCandidates | null,
+  catalog: VoiceCatalogPublicView | null,
   manifest: GenerationManifest,
   t: Translate
 ): Array<{ id: "mode" | "services" | "resources" | "generation"; label: string; state: "ready" | "attention" | "done" }> {
@@ -5412,10 +5560,11 @@ function buildValidationSteps(
   const completed = Object.values(manifest.lines)
     .flatMap((history) => history.versions)
     .filter((version) => version.status === "completed" && coreLocalProviders.has(version.provider_type ?? version.engine)).length;
+  const resourcesReady = voiceCatalogReady(catalog);
   return [
     { id: "mode", label: statusText(runtime?.service_mode ?? "real", t), state: runtime?.service_mode === "real" ? "done" : "attention" },
     { id: "services", label: `${localReady}/${localCoverage.length}`, state: localReady === localCoverage.length ? "done" : "attention" },
-    { id: "resources", label: candidates?.ready ? t("status.ready") : t("status.needsMapping"), state: candidates?.ready ? "done" : "attention" },
+    { id: "resources", label: resourcesReady ? t("status.ready") : t("status.needsMapping"), state: resourcesReady ? "done" : "attention" },
     { id: "generation", label: `${completed}/${coreLocalProviders.size}`, state: completed >= coreLocalProviders.size ? "done" : "ready" }
   ];
 }

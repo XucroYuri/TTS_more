@@ -4,12 +4,17 @@ import { createScriptRevision } from "../../api";
 import type { ScriptProject, ScriptRevision } from "../../types";
 import { readScriptFile, type ScriptFileInput } from "./fileInput";
 import { ScriptAnalysisWorkspace } from "./ScriptAnalysisWorkspace";
+import { activeAnalysisScopeForRevision, type ActiveAnalysisScope } from "./analysisSessionStorage";
 import type { UseAnalysisDraftOptions } from "./useAnalysisDraft";
 
 export type WorkspaceStage = "tts" | "analysis";
 
 export function shouldAutosaveWorkspace(stage: WorkspaceStage): boolean {
   return stage === "tts";
+}
+
+export function reviewConfirmedAnalysis(projectId: string, sourceRevision: ScriptRevision): ActiveAnalysisScope {
+  return activeAnalysisScopeForRevision(projectId, sourceRevision);
 }
 
 export function activeScriptSourceText(

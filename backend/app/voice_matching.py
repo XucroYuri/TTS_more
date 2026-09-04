@@ -13,6 +13,7 @@ from .voice_matching_models import (
     DurationEstimate,
     ReferenceAssetRecord,
     VoiceCandidate,
+    VoiceBlockerCode,
     VoiceMatchPolicy,
     VoiceMatchRequest,
     VoiceRecommendation,
@@ -22,6 +23,25 @@ from .voice_matching_models import (
 
 
 _DEFAULT_RATES = {"zh": 4.5, "ja": 5.0, "en": 14.0}
+
+
+def classify_empty_recommendation(
+    request: VoiceMatchRequest,
+    catalog: CatalogSnapshot,
+) -> VoiceBlockerCode:
+    """Explain an empty ranking without weakening identity eligibility gates."""
+    if not catalog.resources or not catalog.reference_assets:
+        return "voice_assets_unavailable"
+    identity_names = {request.character_id, *request.character_aliases}
+    matching_resources = [
+        item
+        for item in catalog.resources
+        if item.character_id in identity_names
+        or bool(identity_names & set(item.character_aliases))
+    ]
+    if matching_resources and all(item.state != "ready" for item in matching_resources):
+        return "service_offline"
+    return "no_eligible_voice_candidate"
 
 
 def estimate_target_duration(
@@ -71,8 +91,8 @@ def rank_voice_candidates(
         for weight_pair in pair_dynamic_weights(catalog, resource):
             for asset in catalog.reference_assets:
                 if (
-                    asset.training_task != weight_pair.training_task
-                    or asset.root_id != weight_pair.root_id
+                    asset.reference_asset_id not in resource.reference_asset_ids
+                    or asset.training_task != weight_pair.training_task
                     or not asset.prompt_text.strip()
                 ):
                     continue
@@ -90,7 +110,7 @@ def rank_voice_candidates(
         line_id=request.line_id,
         catalog_version=catalog.version,
         candidates=scored[:3],
-        blockers=[] if scored else ["no_eligible_voice_candidate"],
+        blockers=[] if scored else [classify_empty_recommendation(request, catalog)],
     )
 
 

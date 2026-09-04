@@ -289,7 +289,7 @@ class PortableAssetScanner:
         dict[str, ReferenceLocation],
         list[CatalogDiagnostic],
     ]:
-        logs_root = root / "logs"
+        logs_root = root if root.name.casefold() == "logs" else root / "logs"
         reference_roots: list[Path] = []
         if logs_root.is_dir():
             for task_dir in sorted(logs_root.iterdir(), key=lambda item: item.name.casefold()):
@@ -508,6 +508,10 @@ class VoiceCatalogService:
                 for scan in scans
                 for asset_id, location in scan.reference_locations.items()
             }
+            references, locations = self._deduplicate_physical_references(
+                references,
+                locations,
+            )
             diagnostics.extend(item for scan in scans for item in scan.diagnostics)
             inference_cache = self.store.load_inference_cache()
             references, inference_cache, inference_diagnostics = self._apply_metadata_inference(
@@ -569,6 +573,49 @@ class VoiceCatalogService:
                 diagnostics=diagnostics,
             )
             return self._last_status
+
+    def _deduplicate_physical_references(
+        self,
+        references: list[ReferenceAssetRecord],
+        locations: dict[str, ReferenceLocation],
+    ) -> tuple[list[ReferenceAssetRecord], dict[str, ReferenceLocation]]:
+        configured_logs = {
+            os.path.normcase(os.path.abspath(os.fspath(path)))
+            for endpoint in self.registry.services
+            for path in _configured_logs_asset_roots(endpoint)
+        } if self.registry is not None else set()
+        preferred_root_ids = {
+            root_id
+            for root_id, root in self.roots.items()
+            if os.path.normcase(os.path.abspath(os.fspath(root))) in configured_logs
+        }
+        selected: dict[tuple[object, ...], tuple[tuple[bool, str], ReferenceAssetRecord]] = {}
+        for reference in references:
+            location = locations.get(reference.reference_asset_id)
+            root = self.roots.get(location.root_id) if location is not None else None
+            try:
+                resolved = (root / location.relative_path).resolve(strict=True)
+                stat = resolved.stat()
+                identity: tuple[object, ...] = (
+                    ("inode", stat.st_dev, stat.st_ino)
+                    if stat.st_ino
+                    else ("path", os.path.normcase(os.path.abspath(os.fspath(resolved))))
+                )
+            except (OSError, TypeError):
+                identity = ("asset", reference.reference_asset_id)
+            priority = (
+                location is None or location.root_id not in preferred_root_ids,
+                reference.reference_asset_id,
+            )
+            current = selected.get(identity)
+            if current is None or priority < current[0]:
+                selected[identity] = (priority, reference)
+        deduplicated = [item[1] for item in selected.values()]
+        return deduplicated, {
+            item.reference_asset_id: locations[item.reference_asset_id]
+            for item in deduplicated
+            if item.reference_asset_id in locations
+        }
 
     def public_view(self) -> dict[str, object]:
         snapshot = self.store.load_current()
@@ -655,7 +702,6 @@ class VoiceCatalogService:
             or gpt_artifact.root_id != sovits_artifact.root_id
             or gpt_artifact.training_task != training_task
             or sovits_artifact.training_task != training_task
-            or reference.root_id != gpt_artifact.root_id
             or reference.training_task != training_task
             or gpt_artifact.root_id not in resource.compatible_root_ids
             or gpt_artifact.fingerprint != expected_gpt_fingerprint
@@ -931,6 +977,18 @@ class VoiceCatalogService:
                 and os.path.normcase(os.path.abspath(os.fspath(root_path)))
                 == configured_identity
             ]
+            configured_logs_identities = {
+                os.path.normcase(os.path.abspath(os.fspath(path)))
+                for path in _configured_logs_asset_roots(endpoint)
+            }
+            reference_root_ids = {
+                root_id
+                for root_id, root_path in self.roots.items()
+                if os.path.normcase(os.path.abspath(os.fspath(root_path)))
+                in configured_logs_identities
+            }
+            if not reference_root_ids:
+                reference_root_ids = set(compatible_root_ids)
             character = str(
                 raw.get("character")
                 or endpoint.default_params.get("character_id")
@@ -958,15 +1016,16 @@ class VoiceCatalogService:
                     kinds_by_scope.setdefault(
                         (artifact.root_id, artifact.training_task), set()
                     ).add(artifact.kind)
-                complete_scopes = {
-                    scope
+                complete_tasks = {
+                    scope[1]
                     for scope, kinds in kinds_by_scope.items()
                     if kinds == {"gpt", "sovits"}
                 }
                 reference_ids = [
                     item.reference_asset_id
                     for item in references
-                    if (item.root_id, item.training_task) in complete_scopes
+                    if item.root_id in reference_root_ids
+                    and item.training_task in complete_tasks
                     and item.prompt_text.strip()
                 ]
                 character = character or "dynamic"
@@ -1150,6 +1209,62 @@ class VoiceCatalogService:
             resource_mappings=mappings,
         )
 
+    def resolve_weight(self, artifact_id: str) -> Path:
+        snapshot = self.store.load_current()
+        artifact = (
+            next(
+                (
+                    item
+                    for item in snapshot.weight_artifacts
+                    if item.artifact_id == artifact_id
+                ),
+                None,
+            )
+            if snapshot is not None
+            else None
+        )
+        if artifact is None:
+            raise VoiceCatalogError("voice_weight_not_found", "artifact_id")
+        root = self.roots.get(artifact.root_id)
+        if root is None:
+            raise VoiceCatalogError(
+                "voice_asset_root_unavailable",
+                artifact.root_id,
+            )
+        try:
+            resolved_root = root.resolve(strict=True)
+            candidate = (resolved_root / artifact.relative_path).resolve(strict=False)
+        except OSError as exc:
+            raise VoiceCatalogError(
+                "voice_weight_not_found",
+                "artifact_id",
+            ) from exc
+        if not windows_path_is_within(candidate, resolved_root):
+            raise VoiceCatalogError(
+                "voice_asset_path_unsafe",
+                "weight_artifacts",
+            )
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise VoiceCatalogError(
+                "voice_weight_not_found",
+                "artifact_id",
+            ) from exc
+        if (
+            _file_stat_fingerprint(
+                artifact.root_id,
+                artifact.relative_path,
+                resolved,
+            )
+            != artifact.fingerprint
+        ):
+            raise VoiceCatalogError(
+                "voice_asset_changed",
+                "weight_artifacts",
+            )
+        return resolved
+
     def resolve_reference(self, asset_id: str) -> Path:
         location = self.store.load_reference_locations().get(asset_id)
         if location is None:
@@ -1176,20 +1291,38 @@ class VoiceCatalogService:
 def configured_voice_asset_roots(registry: Any) -> dict[str, Path]:
     roots: dict[str, Path] = {}
     identities: set[str] = set()
-    for endpoint in sorted(registry.services, key=lambda item: item.service_id):
-        raw = str(endpoint.default_params.get("voice_asset_root") or "").strip()
-        if not raw:
-            continue
-        path = Path(raw)
+
+    def add_root(root_id: str, path: Path) -> None:
         identity = os.path.normcase(os.path.abspath(os.fspath(path)))
         if identity in identities:
-            continue
-        roots[f"service-{endpoint.service_id}"] = path
+            return
+        roots[root_id] = path
         identities.add(identity)
+
+    for endpoint in sorted(registry.services, key=lambda item: item.service_id):
+        raw = str(endpoint.default_params.get("voice_asset_root") or "").strip()
+        if raw:
+            add_root(f"service-{endpoint.service_id}", Path(raw))
+        for index, path in enumerate(_configured_logs_asset_roots(endpoint), start=1):
+            suffix = "" if index == 1 else f"-{index}"
+            add_root(f"service-{endpoint.service_id}-logs{suffix}", path)
     fallback = os.environ.get("TTS_MORE_GPT_SOVITS_PORTABLE_ROOT", "").strip()
     if fallback:
-        path = Path(fallback)
-        identity = os.path.normcase(os.path.abspath(os.fspath(path)))
-        if identity not in identities:
-            roots["portable-env"] = path
+        add_root("portable-env", Path(fallback))
+    return roots
+
+
+def _configured_logs_asset_roots(endpoint: Any) -> list[Path]:
+    values: list[str] = []
+    single = endpoint.default_params.get("logs_root")
+    multiple = endpoint.default_params.get("logs_roots")
+    if isinstance(single, str) and single.strip():
+        values.append(single.strip())
+    if isinstance(multiple, (list, tuple)):
+        values.extend(str(item).strip() for item in multiple if str(item).strip())
+    elif isinstance(multiple, str) and multiple.strip():
+        values.append(multiple.strip())
+    roots: list[Path] = []
+    for value in values:
+        roots.append(Path(value))
     return roots

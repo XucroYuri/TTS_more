@@ -11,19 +11,44 @@ import type {
   AnalysisError,
   AnalysisRun,
   AnalysisRunStatus,
-  CharacterCandidate,
   DraftOperation,
   ScriptRevision,
   SemanticAnalysisDraft,
-  SemanticAnnotation,
-  SemanticConfirmResponse,
-  SemanticUtterance
+  SemanticConfirmResponse
 } from "../../types";
+import { parseAnalysisError } from "./analysisErrors";
+import { applyQueuedDraftOperations } from "./analysisOperationQueue";
+import {
+  analysisScopeStorageId,
+  defaultAnalysisStorage,
+  readAnalysisConfirmKey,
+  readAnalysisRunSession,
+  readDismissedAnalysisRuns,
+  removeAnalysisRunSession,
+  writeAnalysisConfirmKey,
+  writeAnalysisRunSession,
+  writeDismissedAnalysisRuns
+} from "./analysisSessionStorage";
 
-export const ANALYSIS_DISMISSED_RUNS_STORAGE_KEY = "tts-more:analysis-dismissed-runs";
-export const ANALYSIS_RUN_SESSIONS_STORAGE_KEY = "tts-more:analysis-run-sessions";
-export const ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY = "tts-more:active-analysis-scope";
-const ANALYSIS_CONFIRM_KEYS_STORAGE_KEY = "tts-more:analysis-confirm-keys";
+export { applyDraftOperations } from "./analysisOperationQueue";
+export {
+  ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY,
+  ANALYSIS_DISMISSED_RUNS_STORAGE_KEY,
+  ANALYSIS_REVIEW_SESSIONS_STORAGE_KEY,
+  ANALYSIS_RUN_SESSIONS_STORAGE_KEY,
+  activeAnalysisScopeForRevision,
+  activeAnalysisScopeMatchesRevision,
+  archiveRestorableAnalysisSession,
+  clearActiveAnalysisScope,
+  clearRestorableAnalysisSession,
+  hasRestorableAnalysisSession,
+  hasReviewableAnalysisSession,
+  readActiveAnalysisScope,
+  restoreReviewableAnalysisSession,
+  writeActiveAnalysisScope,
+  type ActiveAnalysisScope
+} from "./analysisSessionStorage";
+
 const defaultPollIntervalMs = 1_000;
 
 export interface AnalysisDraftApi {
@@ -66,6 +91,7 @@ export interface UseAnalysisDraftOptions {
   storage?: Storage | null;
   pollIntervalMs?: number;
   createIdempotencyKey?: () => string;
+  mode?: "analyze" | "review";
 }
 
 export interface UseAnalysisDraftResult {
@@ -86,20 +112,9 @@ export interface UseAnalysisDraftResult {
   confirm: () => Promise<SemanticConfirmResponse>;
 }
 
-interface AnalysisRunSession {
-  runId: string;
-  draftId: string;
-}
-
 interface PendingOperationBatch {
   id: number;
   operations: DraftOperation[];
-}
-
-interface ParsedError {
-  code: string | null;
-  message: string;
-  status: number | null;
 }
 
 export const defaultAnalysisDraftApi: AnalysisDraftApi = {
@@ -110,235 +125,6 @@ export const defaultAnalysisDraftApi: AnalysisDraftApi = {
   confirmAnalysisDraft
 };
 
-function cloneAnnotation(item: SemanticAnnotation): SemanticAnnotation {
-  return { ...item, span: { ...item.span } };
-}
-
-function cloneCharacter(item: CharacterCandidate): CharacterCandidate {
-  return {
-    ...item,
-    aliases: [...item.aliases],
-    supporting_annotation_ids: [...item.supporting_annotation_ids]
-  };
-}
-
-function cloneUtterance(item: SemanticUtterance): SemanticUtterance {
-  return {
-    ...item,
-    emotion_evidence_annotation_ids: [...item.emotion_evidence_annotation_ids],
-    uncertainty_codes: [...item.uncertainty_codes]
-  };
-}
-
-function operationError(message: string): Error {
-  return new Error(`analysis_operation_invalid:${message}`);
-}
-
-function findIndex<T extends { id: string }>(items: T[], id: string): number {
-  const index = items.findIndex((item) => item.id === id);
-  if (index < 0) throw operationError(`missing:${id}`);
-  return index;
-}
-
-function ensureMissing<T extends { id: string }>(items: T[], id: string): void {
-  if (items.some((item) => item.id === id)) throw operationError(`duplicate:${id}`);
-}
-
-function uniqueStrings(values: string[]): string[] {
-  return [...new Set(values)];
-}
-
-/**
- * Applies the backend's controlled draft-operation semantics to an immutable
- * client overlay. The server response remains authoritative after each PATCH;
- * this reducer only keeps later local batches visible while earlier batches
- * are in flight.
- */
-export function applyDraftOperations(
-  sourceDraft: SemanticAnalysisDraft,
-  operations: DraftOperation[]
-): SemanticAnalysisDraft {
-  const next: SemanticAnalysisDraft = {
-    ...sourceDraft,
-    annotations: sourceDraft.annotations.map(cloneAnnotation),
-    characters: sourceDraft.characters.map(cloneCharacter),
-    utterances: sourceDraft.utterances.map(cloneUtterance),
-    unresolved_candidates: sourceDraft.unresolved_candidates.map((item) => ({
-      ...item,
-      details: { ...item.details }
-    })),
-    warnings: sourceDraft.warnings.map((item) => ({ ...item, details: { ...item.details } }))
-  };
-
-  for (const operation of operations) {
-    switch (operation.op) {
-      case "create_annotation": {
-        ensureMissing(next.annotations, operation.annotation.id);
-        next.annotations.push(cloneAnnotation(operation.annotation));
-        break;
-      }
-      case "replace_annotation": {
-        if (operation.annotation_id !== operation.annotation.id) {
-          throw operationError("annotation_id_mismatch");
-        }
-        next.annotations[findIndex(next.annotations, operation.annotation_id)] = cloneAnnotation(
-          operation.annotation
-        );
-        break;
-      }
-      case "delete_annotation": {
-        const index = findIndex(next.annotations, operation.annotation_id);
-        const [removed] = next.annotations.splice(index, 1);
-        if (removed.kind === "dialogue") {
-          next.utterances = next.utterances.filter(
-            (item) => item.dialogue_annotation_id !== removed.id
-          );
-        } else if (removed.kind === "speaker") {
-          next.utterances = next.utterances.map((item) =>
-            item.speaker_annotation_id === removed.id
-              ? { ...item, speaker_annotation_id: null }
-              : item
-          );
-          next.characters = next.characters.map((item) => ({
-            ...item,
-            supporting_annotation_ids: item.supporting_annotation_ids.filter(
-              (supportId) => supportId !== removed.id
-            )
-          }));
-        } else {
-          next.utterances = next.utterances.map((item) => ({
-            ...item,
-            emotion_evidence_annotation_ids: item.emotion_evidence_annotation_ids.filter(
-              (evidenceId) => evidenceId !== removed.id
-            )
-          }));
-        }
-        break;
-      }
-      case "set_annotation_status": {
-        const index = findIndex(next.annotations, operation.annotation_id);
-        const current = next.annotations[index];
-        next.annotations[index] = { ...current, status: operation.status };
-        if (current.kind === "dialogue" && operation.status === "rejected") {
-          next.utterances = next.utterances.map((item) =>
-            item.dialogue_annotation_id === current.id ? { ...item, status: "rejected" } : item
-          );
-        } else if (current.kind === "dialogue" && operation.status === "pending") {
-          next.utterances = next.utterances.map((item) =>
-            item.dialogue_annotation_id === current.id && item.status === "accepted"
-              ? { ...item, status: "pending" }
-              : item
-          );
-        }
-        break;
-      }
-      case "upsert_character": {
-        const index = next.characters.findIndex((item) => item.id === operation.character.id);
-        if (index < 0) next.characters.push(cloneCharacter(operation.character));
-        else next.characters[index] = cloneCharacter(operation.character);
-        break;
-      }
-      case "set_character_status": {
-        const index = findIndex(next.characters, operation.character_id);
-        next.characters[index] = { ...next.characters[index], status: operation.status };
-        if (operation.status === "rejected") {
-          next.utterances = next.utterances.map((item) =>
-            item.character_candidate_id === operation.character_id
-              ? { ...item, status: "rejected" }
-              : item
-          );
-        } else if (operation.status === "pending") {
-          next.utterances = next.utterances.map((item) =>
-            item.character_candidate_id === operation.character_id && item.status === "accepted"
-              ? { ...item, status: "pending" }
-              : item
-          );
-        }
-        break;
-      }
-      case "merge_characters": {
-        if (
-          operation.source_character_ids.includes(operation.target_character_id) ||
-          new Set(operation.source_character_ids).size !== operation.source_character_ids.length
-        ) {
-          throw operationError("character_merge_invalid");
-        }
-        const targetIndex = findIndex(next.characters, operation.target_character_id);
-        const sources = operation.source_character_ids.map(
-          (sourceId) => next.characters[findIndex(next.characters, sourceId)]
-        );
-        const target = next.characters[targetIndex];
-        next.characters[targetIndex] = {
-          ...target,
-          aliases: uniqueStrings([
-            ...target.aliases,
-            ...sources.flatMap((source) => source.aliases)
-          ]),
-          supporting_annotation_ids: uniqueStrings([
-            ...target.supporting_annotation_ids,
-            ...sources.flatMap((source) => source.supporting_annotation_ids)
-          ])
-        };
-        const sourceIds = new Set(operation.source_character_ids);
-        next.characters = next.characters.filter((item) => !sourceIds.has(item.id));
-        next.utterances = next.utterances.map((item) =>
-          item.character_candidate_id && sourceIds.has(item.character_candidate_id)
-            ? { ...item, character_candidate_id: operation.target_character_id }
-            : item
-        );
-        break;
-      }
-      case "split_alias": {
-        const sourceIndex = findIndex(next.characters, operation.character_id);
-        const source = next.characters[sourceIndex];
-        if (!source.aliases.includes(operation.alias)) {
-          throw operationError("character_alias_missing");
-        }
-        ensureMissing(next.characters, operation.character.id);
-        next.characters[sourceIndex] = {
-          ...source,
-          aliases: source.aliases.filter((alias) => alias !== operation.alias)
-        };
-        next.characters.push(cloneCharacter(operation.character));
-        break;
-      }
-      case "create_utterance": {
-        ensureMissing(next.utterances, operation.utterance.id);
-        next.utterances.push(cloneUtterance(operation.utterance));
-        break;
-      }
-      case "update_utterance": {
-        if (operation.utterance_id !== operation.utterance.id) {
-          throw operationError("utterance_id_mismatch");
-        }
-        next.utterances[findIndex(next.utterances, operation.utterance_id)] = cloneUtterance(
-          operation.utterance
-        );
-        break;
-      }
-      case "delete_utterance": {
-        findIndex(next.utterances, operation.utterance_id);
-        next.utterances = next.utterances.filter(
-          (item) => item.id !== operation.utterance_id
-        );
-        break;
-      }
-      case "set_utterance_status": {
-        const index = findIndex(next.utterances, operation.utterance_id);
-        next.utterances[index] = { ...next.utterances[index], status: operation.status };
-        break;
-      }
-      case "dismiss_warning": {
-        findIndex(next.warnings, operation.warning_id);
-        next.warnings = next.warnings.filter((item) => item.id !== operation.warning_id);
-        break;
-      }
-    }
-  }
-
-  return next;
-}
-
 function defaultIdempotencyKey(): string {
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
@@ -346,280 +132,16 @@ function defaultIdempotencyKey(): string {
   return `confirm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function defaultStorage(): Storage | null {
-  try {
-    return typeof window === "undefined" ? null : window.localStorage;
-  } catch {
-    return null;
-  }
-}
-
-function safeRemove(storage: Storage | null, key: string): void {
-  try {
-    storage?.removeItem(key);
-  } catch {
-    // Persistence is best-effort; controller state remains usable in memory.
-  }
-}
-
-function readObject(storage: Storage | null, key: string): Record<string, unknown> {
-  if (!storage) return {};
-  try {
-    const raw = storage.getItem(key);
-    if (!raw) return {};
-    const parsed: unknown = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("storage_shape_invalid");
-    }
-    return parsed as Record<string, unknown>;
-  } catch {
-    safeRemove(storage, key);
-    return {};
-  }
-}
-
-function writeObject(storage: Storage | null, key: string, value: Record<string, unknown>): void {
-  if (!storage) return;
-  try {
-    storage.setItem(key, JSON.stringify(value));
-  } catch {
-    // Local persistence failures must not break editing in the current tab.
-  }
-}
-
-function readDismissedRuns(storage: Storage | null): Set<string> {
-  if (!storage) return new Set();
-  try {
-    const raw = storage.getItem(ANALYSIS_DISMISSED_RUNS_STORAGE_KEY);
-    if (!raw) return new Set();
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
-      throw new Error("dismissed_runs_invalid");
-    }
-    return new Set(parsed);
-  } catch {
-    safeRemove(storage, ANALYSIS_DISMISSED_RUNS_STORAGE_KEY);
-    return new Set();
-  }
-}
-
-function writeDismissedRuns(storage: Storage | null, runIds: Set<string>): void {
-  if (!storage) return;
-  try {
-    storage.setItem(ANALYSIS_DISMISSED_RUNS_STORAGE_KEY, JSON.stringify([...runIds]));
-  } catch {
-    // Dismissal still applies to the mounted controller when storage is unavailable.
-  }
-}
-
-function scopeStorageId(projectId: string, sourceRevision: ScriptRevision): string {
-  return JSON.stringify([
-    projectId,
-    sourceRevision.revision_id,
-    sourceRevision.source_sha256 ?? null
-  ]);
-}
-
-export interface ActiveAnalysisScope {
-  projectId: string;
-  revisionId: string;
-  sourceSha256: string | null;
-}
-
-export function activeAnalysisScopeForRevision(
-  projectId: string,
-  sourceRevision: ScriptRevision
-): ActiveAnalysisScope {
-  return {
-    projectId,
-    revisionId: sourceRevision.revision_id,
-    sourceSha256: sourceRevision.source_sha256 ?? null
-  };
-}
-
-export function activeAnalysisScopeMatchesRevision(
-  scope: ActiveAnalysisScope,
-  projectId: string,
-  sourceRevision: ScriptRevision
-): boolean {
-  return scope.projectId === projectId
-    && scope.revisionId === sourceRevision.revision_id
-    && scope.sourceSha256 === (sourceRevision.source_sha256 ?? null);
-}
-
-export function readActiveAnalysisScope(
-  storage: Storage | null = defaultStorage()
-): ActiveAnalysisScope | null {
-  const stored = readObject(storage, ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY);
-  if (Object.keys(stored).length === 0) return null;
-  const projectId = stored.projectId;
-  const revisionId = stored.revisionId;
-  const sourceSha256 = stored.sourceSha256;
-  if (
-    typeof projectId !== "string"
-    || typeof revisionId !== "string"
-    || projectId.trim().length === 0
-    || revisionId.trim().length === 0
-    || (sourceSha256 !== null && typeof sourceSha256 !== "string")
-  ) {
-    safeRemove(storage, ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY);
-    return null;
-  }
-  return { projectId, revisionId, sourceSha256 };
-}
-
-export function writeActiveAnalysisScope(
-  projectId: string,
-  sourceRevision: ScriptRevision,
-  storage: Storage | null = defaultStorage()
-): void {
-  const scope = activeAnalysisScopeForRevision(projectId, sourceRevision);
-  writeObject(storage, ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY, {
-    projectId: scope.projectId,
-    revisionId: scope.revisionId,
-    sourceSha256: scope.sourceSha256
-  });
-}
-
-export function clearActiveAnalysisScope(
-  expectedScope: ActiveAnalysisScope,
-  storage: Storage | null = defaultStorage()
-): void {
-  const current = readActiveAnalysisScope(storage);
-  if (
-    current?.projectId === expectedScope.projectId
-    && current.revisionId === expectedScope.revisionId
-    && current.sourceSha256 === expectedScope.sourceSha256
-  ) {
-    safeRemove(storage, ACTIVE_ANALYSIS_SCOPE_STORAGE_KEY);
-  }
-}
-
-function readSession(storage: Storage | null, scopeId: string): AnalysisRunSession | null {
-  const sessions = readObject(storage, ANALYSIS_RUN_SESSIONS_STORAGE_KEY);
-  const value = sessions[scopeId];
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const candidate = value as { runId?: unknown; draftId?: unknown };
-  if (typeof candidate.runId !== "string" || typeof candidate.draftId !== "string") {
-    delete sessions[scopeId];
-    writeObject(storage, ANALYSIS_RUN_SESSIONS_STORAGE_KEY, sessions);
-    return null;
-  }
-  return { runId: candidate.runId, draftId: candidate.draftId };
-}
-
-export function hasRestorableAnalysisSession(
-  projectId: string,
-  sourceRevision: ScriptRevision,
-  storage: Storage | null = defaultStorage()
-): boolean {
-  return readSession(storage, scopeStorageId(projectId, sourceRevision)) !== null;
-}
-
-export function clearRestorableAnalysisSession(
-  projectId: string,
-  sourceRevision: ScriptRevision,
-  storage: Storage | null = defaultStorage()
-): void {
-  removeSession(storage, scopeStorageId(projectId, sourceRevision));
-}
-
-function writeSession(
-  storage: Storage | null,
-  scopeId: string,
-  session: AnalysisRunSession
-): void {
-  const sessions = readObject(storage, ANALYSIS_RUN_SESSIONS_STORAGE_KEY);
-  sessions[scopeId] = session;
-  writeObject(storage, ANALYSIS_RUN_SESSIONS_STORAGE_KEY, sessions);
-}
-
-function removeSession(storage: Storage | null, scopeId: string): void {
-  const sessions = readObject(storage, ANALYSIS_RUN_SESSIONS_STORAGE_KEY);
-  if (!(scopeId in sessions)) return;
-  delete sessions[scopeId];
-  writeObject(storage, ANALYSIS_RUN_SESSIONS_STORAGE_KEY, sessions);
-}
-
-function readConfirmKey(storage: Storage | null, draftId: string): string | null {
-  const keys = readObject(storage, ANALYSIS_CONFIRM_KEYS_STORAGE_KEY);
-  return typeof keys[draftId] === "string" ? (keys[draftId] as string) : null;
-}
-
-function writeConfirmKey(storage: Storage | null, draftId: string, key: string): void {
-  const keys = readObject(storage, ANALYSIS_CONFIRM_KEYS_STORAGE_KEY);
-  keys[draftId] = key;
-  writeObject(storage, ANALYSIS_CONFIRM_KEYS_STORAGE_KEY, keys);
-}
-
-function parseError(error: unknown): ParsedError {
-  const errorRecord =
-    error && typeof error === "object"
-      ? (error as {
-          message?: unknown;
-          status?: unknown;
-          code?: unknown;
-          responseBody?: unknown;
-        })
-      : null;
-  const fallbackMessage =
-    typeof errorRecord?.message === "string" ? errorRecord.message : String(error);
-  const fallbackStatus =
-    typeof errorRecord?.status === "number" ? errorRecord.status : null;
-  const fallbackCode = typeof errorRecord?.code === "string" ? errorRecord.code : null;
-
-  const structuredBody =
-    typeof errorRecord?.responseBody === "string" ? errorRecord.responseBody : fallbackMessage;
-
-  try {
-    const parsed: unknown = JSON.parse(structuredBody);
-    if (parsed && typeof parsed === "object") {
-      const container = parsed as {
-        detail?: unknown;
-        code?: unknown;
-        message?: unknown;
-        status?: unknown;
-      };
-      const detail = container.detail;
-      if (detail && typeof detail === "object" && !Array.isArray(detail)) {
-        const structured = detail as { code?: unknown; message?: unknown; http_status?: unknown };
-        return {
-          code: typeof structured.code === "string" ? structured.code : fallbackCode,
-          message:
-            typeof structured.message === "string" ? structured.message : fallbackMessage,
-          status:
-            typeof structured.http_status === "number"
-              ? structured.http_status
-              : fallbackStatus
-        };
-      }
-      if (typeof detail === "string") {
-        return { code: fallbackCode, message: detail, status: fallbackStatus };
-      }
-      return {
-        code: typeof container.code === "string" ? container.code : fallbackCode,
-        message:
-          typeof container.message === "string" ? container.message : fallbackMessage,
-        status: typeof container.status === "number" ? container.status : fallbackStatus
-      };
-    }
-  } catch {
-    // Plain text and already-normalized Error messages use the fallback below.
-  }
-
-  return { code: fallbackCode, message: fallbackMessage, status: fallbackStatus };
-}
-
 function controllerError(
   kind: AnalysisControllerError["kind"],
   error: unknown
 ): AnalysisControllerError {
-  const parsed = parseError(error);
+  const parsed = parseAnalysisError(error);
   return { kind, code: parsed.code, message: parsed.message };
 }
 
 function notFoundError(error: unknown): boolean {
-  const parsed = parseError(error);
+  const parsed = parseAnalysisError(error);
   return (
     parsed.status === 404 ||
     parsed.code === "semantic_not_found" ||
@@ -632,6 +154,15 @@ function staleSessionError(code: "run_not_found" | "draft_not_found"): Error {
   return new Error(JSON.stringify({ detail: { code, message: "stored analysis session is stale" } }));
 }
 
+function reviewSessionUnavailableError(): Error {
+  return new Error(JSON.stringify({
+    detail: {
+      code: "analysis_review_not_found",
+      message: "confirmed analysis result is unavailable"
+    }
+  }));
+}
+
 function isTerminal(status: AnalysisRunStatus): boolean {
   return status === "completed" || status === "failed" || status === "interrupted";
 }
@@ -642,13 +173,14 @@ export function useAnalysisDraft(
   options: UseAnalysisDraftOptions = {}
 ): UseAnalysisDraftResult {
   const api = options.api ?? defaultAnalysisDraftApi;
-  const storage = options.storage === undefined ? defaultStorage() : options.storage;
+  const storage = options.storage === undefined ? defaultAnalysisStorage() : options.storage;
   const pollIntervalMs = options.pollIntervalMs ?? defaultPollIntervalMs;
   const createIdempotencyKey = options.createIdempotencyKey ?? defaultIdempotencyKey;
+  const mode = options.mode ?? "analyze";
   const sourceIdentity = `${sourceRevision.revision_id}\u0000${
     sourceRevision.source_sha256 ?? ""
   }`;
-  const scopeId = scopeStorageId(projectId, sourceRevision);
+  const scopeId = analysisScopeStorageId(projectId, sourceRevision);
 
   const [runState, setRunState] = useState<AnalysisRun | null>(null);
   const [draftState, setDraftState] = useState<SemanticAnalysisDraft | null>(null);
@@ -685,10 +217,7 @@ export function useAnalysisDraft(
     if (queueGenerationRef.current !== queueGeneration) return;
     const serverDraft = serverDraftRef.current;
     if (!serverDraft) return;
-    let visible = serverDraft;
-    for (const batch of pendingBatchesRef.current) {
-      visible = applyDraftOperations(visible, batch.operations);
-    }
+    const visible = applyQueuedDraftOperations(serverDraft, pendingBatchesRef.current);
     visibleDraftRef.current = visible;
     setDraftState(visible);
   }, []);
@@ -727,7 +256,7 @@ export function useAnalysisDraft(
           setControllerErrorState(null);
         } catch (error) {
           if (queueGenerationRef.current !== queueGeneration) return;
-          const parsed = parseError(error);
+          const parsed = parseAnalysisError(error);
           if (
             parsed.code === "draft_version_conflict" ||
             parsed.code === "semantic_conflict" ||
@@ -776,7 +305,7 @@ export function useAnalysisDraft(
     serverDraftRef.current = null;
     visibleDraftRef.current = null;
     editableRef.current = false;
-    dismissedRunsRef.current = readDismissedRuns(storage);
+    dismissedRunsRef.current = readDismissedAnalysisRuns(storage);
     pendingBatchesRef.current = [];
     nextBatchIdRef.current = 1;
     patchInFlightRef.current = null;
@@ -813,7 +342,7 @@ export function useAnalysisDraft(
       setIsReadOnly(!editableRef.current);
       if (loadedDraft.confirm_idempotency_key) {
         confirmKeysRef.current.set(loadedDraft.id, loadedDraft.confirm_idempotency_key);
-        writeConfirmKey(storage, loadedDraft.id, loadedDraft.confirm_idempotency_key);
+        writeAnalysisConfirmKey(storage, loadedDraft.id, loadedDraft.confirm_idempotency_key);
       }
     };
 
@@ -868,11 +397,16 @@ export function useAnalysisDraft(
       setDraftState(null);
       setControllerErrorState(null);
       setConflictState(null);
+      if (mode === "review") {
+        setIsRunning(false);
+        setControllerErrorState(controllerError("attach", reviewSessionUnavailableError()));
+        return;
+      }
       setIsRunning(true);
       try {
         const created = await api.createAnalysisRun(projectId, sourceRevision.revision_id);
         if (!active()) return;
-        writeSession(storage, scopeId, {
+        writeAnalysisRunSession(storage, scopeId, {
           runId: created.run_id,
           draftId: created.draft_id
         });
@@ -889,7 +423,7 @@ export function useAnalysisDraft(
     const fallbackFromStaleSession = async (): Promise<void> => {
       if (staleFallbackUsed) throw staleSessionError("run_not_found");
       staleFallbackUsed = true;
-      removeSession(storage, scopeId);
+      removeAnalysisRunSession(storage, scopeId);
       await createFresh();
     };
 
@@ -916,7 +450,7 @@ export function useAnalysisDraft(
     };
 
     const attachOrCreate = async (): Promise<void> => {
-      const session = readSession(storage, scopeId);
+      const session = readAnalysisRunSession(storage, scopeId);
       if (!session) {
         await createFresh();
         return;
@@ -954,6 +488,7 @@ export function useAnalysisDraft(
   }, [
     analysisRetry,
     api,
+    mode,
     pollIntervalMs,
     projectId,
     scopeId,
@@ -1011,10 +546,7 @@ export function useAnalysisDraft(
           ) {
             throw new Error("analysis_rebase_identity_invalid");
           }
-          let visible = authoritative;
-          for (const batch of pendingBatchesRef.current) {
-            visible = applyDraftOperations(visible, batch.operations);
-          }
+          const visible = applyQueuedDraftOperations(authoritative, pendingBatchesRef.current);
           serverDraftRef.current = authoritative;
           visibleDraftRef.current = visible;
           setDraftState(visible);
@@ -1046,13 +578,13 @@ export function useAnalysisDraft(
     const dismissed = new Set(dismissedRunsRef.current);
     dismissed.add(displayedRunId);
     dismissedRunsRef.current = dismissed;
-    writeDismissedRuns(storage, dismissed);
+    writeDismissedAnalysisRuns(storage, dismissed);
     displayedErrorRunIdRef.current = null;
     setAnalysisErrorState(null);
   }, [storage]);
 
   const retryAnalysis = useCallback((): void => {
-    removeSession(storage, scopeId);
+    removeAnalysisRunSession(storage, scopeId);
     setAnalysisRetry((value) => value + 1);
   }, [scopeId, storage]);
 
@@ -1090,10 +622,10 @@ export function useAnalysisDraft(
       const idempotencyKey =
         serverDraft.confirm_idempotency_key ??
         confirmKeysRef.current.get(serverDraft.id) ??
-        readConfirmKey(storage, serverDraft.id) ??
+        readAnalysisConfirmKey(storage, serverDraft.id) ??
         createIdempotencyKey();
       confirmKeysRef.current.set(serverDraft.id, idempotencyKey);
-      writeConfirmKey(storage, serverDraft.id, idempotencyKey);
+      writeAnalysisConfirmKey(storage, serverDraft.id, idempotencyKey);
       setIsConfirming(true);
       setControllerErrorState(null);
       try {

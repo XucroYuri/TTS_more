@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -32,6 +33,47 @@ WINDOWS_MAX_OUTPUT_PATH_UNITS = 259
 OUTPUT_DIRECTORY_COMPONENT_UNITS = 22
 OUTPUT_NAMESPACE_UNITS = 18
 OUTPUT_FILENAME_MAX_UNITS = 120
+
+
+def _compact_generation_output_path(
+    output_dir: Path,
+    task: GenerationTask,
+    version_id: str,
+    output_namespace: str | None,
+) -> Path:
+    root_resolved = output_dir.resolve(strict=False)
+    parent = output_dir / "_g"
+    parent_resolved = parent.resolve(strict=False)
+    try:
+        parent_resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError("generation output path escapes the configured output root") from exc
+    identity = "\0".join(
+        (
+            _task_line_uid(task),
+            task.engine.value,
+            task.service_id or "",
+            task.profile,
+            version_id,
+            output_namespace or "",
+        )
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    compact = parent / f"{digest}.wav"
+    compact_resolved = compact.resolve(strict=False)
+    parent_has_temp_budget = (
+        windows_utf16_units(str(parent_resolved))
+        + windows_utf16_units(os.sep)
+        + TEMPORARY_WAV_NAME_UNITS
+        <= WINDOWS_MAX_OUTPUT_PATH_UNITS
+    )
+    if (
+        parent_has_temp_budget
+        and windows_utf16_units(str(compact_resolved))
+        <= WINDOWS_MAX_OUTPUT_PATH_UNITS
+    ):
+        return compact
+    raise ValueError("output root exhausts the Windows path budget")
 
 
 def _generation_output_path(
@@ -73,16 +115,24 @@ def _generation_output_path(
         )
         suffix = f"_{namespace_component}{suffix}"
 
+    parent_units = windows_utf16_units(str(parent_resolved))
+    separator_units = windows_utf16_units(os.sep)
+    parent_has_temp_budget = (
+        parent_units + separator_units + TEMPORARY_WAV_NAME_UNITS
+        <= WINDOWS_MAX_OUTPUT_PATH_UNITS
+    )
     remaining_path_units = (
-        WINDOWS_MAX_OUTPUT_PATH_UNITS
-        - windows_utf16_units(str(parent_resolved))
-        - windows_utf16_units(os.sep)
-        - TEMPORARY_WAV_NAME_UNITS
+        WINDOWS_MAX_OUTPUT_PATH_UNITS - parent_units - separator_units
     )
     filename_units = min(OUTPUT_FILENAME_MAX_UNITS, remaining_path_units)
     line_units = filename_units - windows_utf16_units(suffix)
-    if line_units < 18:
-        raise ValueError("output root exhausts the Windows path budget")
+    if not parent_has_temp_budget or line_units < 18:
+        return _compact_generation_output_path(
+            output_dir,
+            task,
+            version_id,
+            output_namespace,
+        )
     line_component = encode_windows_component(
         _task_line_uid(task),
         max_units=line_units,
@@ -95,7 +145,12 @@ def _generation_output_path(
     except ValueError as exc:
         raise ValueError("generation output path escapes the configured output root") from exc
     if windows_utf16_units(str(output_resolved)) > WINDOWS_MAX_OUTPUT_PATH_UNITS:
-        raise ValueError("generation output exceeds the Windows path budget")
+        return _compact_generation_output_path(
+            output_dir,
+            task,
+            version_id,
+            output_namespace,
+        )
     return output_path
 
 

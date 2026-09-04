@@ -34,7 +34,7 @@ from app.parse_logging import (
 from app.parser import MultiProviderParser, OpenAICompatibleProvider, ParserProviderConfig, ParserProviderUnavailable, ParserQualityError, build_parser_provider
 from app.parser_config import ParserProviderUpdate, ParserProvidersUpdate, load_parser_providers, public_parser_providers, save_parser_providers
 from app.queue import GenerationJobManager, ServiceGenerationQueue, build_cluster_key, persist_manifest_delta
-from app.resources import AUDIO_SUFFIXES, collect_voice_candidates, scan_reference_audio_groups
+from app.resources import AUDIO_SUFFIXES, scan_reference_audio_groups
 from app.gpt_sovits_selection import training_task_from_weight
 from app.role_library import candidate_to_character, common_logs_presets, freeze_project_character, match_project_characters, referenced_projects, resolve_project_characters, scan_gpt_sovits_model_catalog_candidates, scan_logs_index_candidates, scan_logs_reference_audio_samples, scan_role_library_candidates
 from app.semantic_analysis import SemanticAnalysisService
@@ -63,6 +63,7 @@ from app.voice_catalog import (
     VoiceCatalogStore,
     configured_voice_asset_roots,
 )
+from app.voice_catalog_compat import build_legacy_voice_candidates_view
 from app.voice_matching_routes import build_voice_matching_router
 from app.voice_metadata_inference import (
     VoiceMetadataUnavailable,
@@ -394,12 +395,8 @@ def create_app(
 
     @app.get("/api/startup/checks")
     def startup_checks() -> dict[str, Any]:
-        resources = collect_voice_candidates(
-            reference_audio_root=ref_root,
-            gpt_weights_roots=_configured_weight_roots(store.load_characters(), "gpt_weights_root", app.state.service_registry),
-            sovits_weights_roots=_configured_weight_roots(store.load_characters(), "sovits_weights_root", app.state.service_registry),
-            indextts_model_dir=_indextts_model_dir(),
-            runtime_checks=_runtime_checks(app.state.service_registry),
+        resources = build_legacy_voice_candidates_view(
+            app.state.voice_catalog,
             limit=20,
         )
         return {
@@ -434,13 +431,9 @@ def create_app(
 
     @app.get("/api/resources/voice-candidates")
     def voice_candidates(limit: int = 80) -> dict[str, Any]:
-        return collect_voice_candidates(
-            reference_audio_root=ref_root,
-            gpt_weights_roots=_configured_weight_roots(store.load_characters(), "gpt_weights_root", app.state.service_registry),
-            sovits_weights_roots=_configured_weight_roots(store.load_characters(), "sovits_weights_root", app.state.service_registry),
-            indextts_model_dir=_indextts_model_dir(),
-            runtime_checks=_runtime_checks(app.state.service_registry),
-            limit=limit,
+        return build_legacy_voice_candidates_view(
+            app.state.voice_catalog,
+            limit=max(1, min(limit, 500)),
         )
 
     @app.post("/api/services/{service_id}/start")
@@ -605,7 +598,7 @@ def create_app(
 
     @app.put("/api/characters")
     def put_characters(characters: list[Character]) -> dict[str, str]:
-        store.save_characters(characters)
+        store.save_characters_if_changed(characters)
         return {"status": "saved"}
 
     @app.post("/api/characters/{character_id}/avatar/upload")
@@ -1334,16 +1327,11 @@ def create_app(
     @app.get("/api/projects/{project_id}/characters")
     def get_project_characters(project_id: str) -> dict[str, Any]:
         library = store.load_characters()
-
-        def refresh_matches(project: ScriptProject) -> None:
-            project_characters = match_project_characters(project, library)
-            if project.project_characters != project_characters:
-                project.project_characters = project_characters
-
         try:
-            project, _ = store.update_project(project_id, refresh_matches)
+            project = store.load_project(project_id).model_copy(deep=True)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
+        project.project_characters = match_project_characters(project, library)
         return {
             "project_characters": [item.model_dump(mode="json") for item in project.project_characters],
             "characters": [character.model_dump(mode="json") for character in resolve_project_characters(project, library)],

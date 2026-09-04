@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ProjectSummary, ScriptProject } from "../types";
-import { filterAndSortProjectSummaries, nextProjectAfterDelete, projectPreviewStats } from "./scriptManagement";
+import { analysisAction, filterAndSortProjectSummaries, nextProjectAfterDelete, projectPreviewStats } from "./scriptManagement";
 
 const projects: ProjectSummary[] = [
   {
@@ -72,5 +72,20 @@ describe("script management helpers", () => {
     expect(nextProjectAfterDelete(projects, "untimed", "untimed")).toBe("blackridge");
     expect(nextProjectAfterDelete(projects, "blackridge", "alpha-script")).toBe("alpha-script");
     expect(nextProjectAfterDelete([projects[1]], "blackridge", "blackridge")).toBeNull();
+  });
+
+  it("labels changed semantic work as reanalysis", () => {
+    const source = { revision_id: "source-1", source_markdown: "甲：原稿", created_at: "2026-09-04T00:00:00Z" };
+    const project: ScriptProject = {
+      title: "语义稿",
+      default_language: "zh",
+      active_script_revision_id: source.revision_id,
+      script_revisions: [source],
+      parse_revisions: [],
+      lines: [{ id: "line-1", character_id: "甲", text: "原稿", note: "", semantic_revision_id: "semantic-1" }]
+    };
+    expect(analysisAction(project, "甲：原稿")).toBe("analyze");
+    expect(analysisAction(project, "甲：修改稿")).toBe("reanalyze");
+    expect(analysisAction({ ...project, lines: [] }, "甲：修改稿")).toBe("analyze");
   });
 });

@@ -13,7 +13,10 @@ import type {
   SemanticAnalysisDraft,
   SemanticConfirmResponse
 } from "./types";
-import { ANALYSIS_RUN_SESSIONS_STORAGE_KEY } from "./features/script-analysis/useAnalysisDraft";
+import {
+  ANALYSIS_REVIEW_SESSIONS_STORAGE_KEY,
+  ANALYSIS_RUN_SESSIONS_STORAGE_KEY
+} from "./features/script-analysis/useAnalysisDraft";
 
 const apiMocks = vi.hoisted(() => ({
   fetchAuthStatus: vi.fn(),
@@ -37,6 +40,7 @@ const apiMocks = vi.hoisted(() => ({
   createScriptRevision: vi.fn(),
   createParseRevision: vi.fn(),
   createAnalysisRun: vi.fn(),
+  fetchAnalysisReviewSession: vi.fn(),
   fetchAnalysisRun: vi.fn(),
   fetchAnalysisDraft: vi.fn(),
   patchAnalysisDraft: vi.fn(),
@@ -507,7 +511,7 @@ describe("App semantic analysis entry", () => {
     expect(apiMocks.createScriptRevision.mock.calls[0][1]).toBe(exactSource);
   });
 
-  it("passes exact source bytes through save-revision and legacy parse entry points", async () => {
+  it("passes exact source bytes through save-revision and exposes no legacy parse entry", async () => {
     const projectId = "project-exact-existing";
     const project = scriptProject("Exact existing");
     project.lines = [{ id: "old-line", character_id: "narrator", text: "旧台词", note: "", language: "zh-CN" }];
@@ -526,30 +530,7 @@ describe("App semantic analysis entry", () => {
     await flushAsync();
     expect(apiMocks.createScriptRevision.mock.calls[0][1]).toBe(exactSaveSource);
 
-    apiMocks.createScriptRevision.mockClear();
-    const exactParseSource = "  旧解析入口\r\n仍须精确 \r\n";
-    await changeReactValueExact(
-      view.container.querySelector<HTMLTextAreaElement>(".script-manager-source-editor")!,
-      exactParseSource
-    );
-    apiMocks.createParseRevision.mockImplementation(async (targetProjectId: string, revisionId: string) => {
-      const current = backendProjects.get(targetProjectId)!;
-      return {
-        project: current,
-        parse_revision: {
-          revision_id: "parse-legacy-exact",
-          script_revision_id: revisionId,
-          provider: "legacy-fake",
-          warnings: [],
-          project_characters: [],
-          lines: current.lines,
-          created_at: timestamp
-        }
-      };
-    });
-    await click(view.container.querySelector('[data-action="legacy-parse-script"]')!);
-    await flushAsync();
-    expect(apiMocks.createScriptRevision.mock.calls[0][1]).toBe(exactParseSource);
+    expect(view.container.querySelector('[data-action="legacy-parse-script"]')).toBeNull();
   });
 
   it("single-flights two synchronous Analyze clicks before revision creation begins", async () => {
@@ -688,6 +669,8 @@ describe("App semantic analysis entry", () => {
     await act(async () => {
       fileInput.dispatchEvent(new view.dom.window.Event("change", { bubbles: true }));
     });
+    expect(view.container.querySelector(".confirm-modal")?.textContent).toContain("覆盖当前草稿");
+    await click(view.container.querySelector(".confirm-modal-actions .primary-button")!);
     await click(view.container.querySelector('[data-action="analyze-script"]')!);
     await flushAsync();
     fileRead.resolve("文件中的新文本");
@@ -785,6 +768,37 @@ describe("App semantic analysis entry", () => {
     expect(view.container.textContent).toContain("继续留在 TTS");
     expect(apiMocks.createAnalysisRun).not.toHaveBeenCalled();
     expect(apiMocks.fetchAnalysisRun).not.toHaveBeenCalled();
+  });
+
+  it("does not write hydrated workspace data and saves one later user edit", async () => {
+    const projectId = "project-hydration-baseline";
+    const project = scriptProject("Hydration baseline");
+    project.lines = [{
+      id: "baseline-line",
+      character_id: "narrator",
+      text: "保持只读加载",
+      note: "",
+      language: "zh-CN"
+    }];
+    backendProjects.set(projectId, project);
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 750));
+    });
+
+    expect(apiMocks.saveProject).not.toHaveBeenCalled();
+    expect(apiMocks.saveCharacters).not.toHaveBeenCalled();
+
+    const methodTabs = view.container.querySelectorAll(".generation-method-tab");
+    expect(methodTabs.length).toBeGreaterThan(1);
+    await click(methodTabs[1]);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 750));
+    });
+
+    expect(apiMocks.saveProject).toHaveBeenCalledOnce();
+    expect(apiMocks.saveCharacters).toHaveBeenCalledOnce();
   });
 
   it("clears a deleted active scope on 404 and restores the current project session", async () => {
@@ -1202,16 +1216,88 @@ describe("App semantic analysis entry", () => {
     expect(view.container.querySelector(".script-analysis-workspace")).toBeNull();
 
     const persistedSessions = view.dom.window.localStorage.getItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY);
+    const persistedReviewSessions = view.dom.window.localStorage.getItem(ANALYSIS_REVIEW_SESSIONS_STORAGE_KEY);
     activeViews.splice(activeViews.indexOf(view), 1);
     await view.cleanup();
     const remounted = await renderApp(projectId, (storage) => {
       if (persistedSessions) storage.setItem(ANALYSIS_RUN_SESSIONS_STORAGE_KEY, persistedSessions);
+      if (persistedReviewSessions) storage.setItem(ANALYSIS_REVIEW_SESSIONS_STORAGE_KEY, persistedReviewSessions);
     });
     await flushAsync(40);
 
     expect(remounted.container.querySelector(".script-analysis-workspace")).toBeNull();
     expect(remounted.container.textContent).toContain("确认后不应重开分析");
+    const confirmedRun = [...runs.values()][0];
+    apiMocks.fetchAnalysisReviewSession.mockResolvedValue({
+      run_id: confirmedRun.id,
+      draft_id: confirmedRun.draft_id,
+      source_revision_id: confirmedRun.source_revision_id
+    });
+    await click(remounted.container.querySelector('[data-action="review-confirmed-annotations"]')!);
+    await flushAsync(40);
+    expect(remounted.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+    expect(apiMocks.fetchAnalysisReviewSession).toHaveBeenCalledWith(projectId);
     expect(apiMocks.createAnalysisRun).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a return-to-analysis button visible and restores a confirmed server session without rerunning analysis", async () => {
+    const projectId = "server-review-return";
+    const analyzedRevision = scriptRevision("script-review-return", "甲：保留分析结果");
+    const currentRevision = scriptRevision("script-current-edit", "乙：当前配音编辑版本");
+    const project = scriptProject("Server review return", currentRevision);
+    project.script_revisions = [analyzedRevision, currentRevision];
+    project.lines = [{ id: "confirmed-line", character_id: "speaker", text: "保留分析结果", note: "", language: "zh-CN" }];
+    backendProjects.set(projectId, project);
+    const run = completedRun(projectId, analyzedRevision.revision_id);
+    const draft = {
+      ...analysisDraft(projectId, analyzedRevision.revision_id),
+      confirmed_revision_id: "semantic-review-return"
+    };
+    apiMocks.fetchAnalysisReviewSession.mockResolvedValue({
+      run_id: run.id,
+      draft_id: draft.id,
+      source_revision_id: analyzedRevision.revision_id
+    });
+    apiMocks.fetchAnalysisRun.mockResolvedValue(run);
+    apiMocks.fetchAnalysisDraft.mockResolvedValue(draft);
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    const returnButton = view.container.querySelector<HTMLButtonElement>('[data-action="review-confirmed-annotations"]');
+    expect(returnButton).not.toBeNull();
+    expect(returnButton?.textContent).toContain("返回分析结果");
+    expect(returnButton?.disabled).toBe(false);
+
+    await click(returnButton!);
+    await flushAsync(40);
+
+    expect(apiMocks.fetchAnalysisReviewSession).toHaveBeenCalledWith(projectId);
+    expect(apiMocks.createAnalysisRun).not.toHaveBeenCalled();
+    expect(view.container.querySelector(".script-analysis-workspace")).not.toBeNull();
+    expect(view.container.textContent).toContain("甲：保留分析结果");
+  });
+
+  it("never starts a new analysis when a returned review session disappears", async () => {
+    const projectId = "stale-server-review-return";
+    const analyzedRevision = scriptRevision("script-stale-review", "甲：已确认但随后被清理");
+    backendProjects.set(projectId, scriptProject("Stale server review", analyzedRevision));
+    apiMocks.fetchAnalysisReviewSession.mockResolvedValue({
+      run_id: "run-stale-review",
+      draft_id: "draft-stale-review",
+      source_revision_id: analyzedRevision.revision_id
+    });
+    apiMocks.fetchAnalysisRun.mockRejectedValue(
+      new Error('{"detail":{"code":"run_not_found","message":"not found"}}')
+    );
+    const view = await renderApp(projectId);
+    await flushAsync(40);
+
+    await click(view.container.querySelector('[data-action="review-confirmed-annotations"]')!);
+    await flushAsync(40);
+
+    expect(apiMocks.fetchAnalysisReviewSession).toHaveBeenCalledWith(projectId);
+    expect(apiMocks.createAnalysisRun).not.toHaveBeenCalled();
+    expect(view.container.querySelector('[data-analysis-error="controller"]')).not.toBeNull();
   });
 
   it("restores managed project B analysis while current TTS project remains A", async () => {

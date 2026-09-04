@@ -1,8 +1,20 @@
 import { describe, expect, it } from "vitest";
 
-import { readScriptFile } from "./fileInput";
+import { readScriptFile, scriptTitleFromFilename, selectDroppedMarkdown } from "./fileInput";
 
 describe("readScriptFile", () => {
+  it("accepts exactly one markdown file from a drop", () => {
+    expect(selectDroppedMarkdown([])).toEqual({ kind: "rejected", reason: "single_markdown_required" });
+    expect(selectDroppedMarkdown([new File(["x"], "a.txt")])).toEqual({ kind: "rejected", reason: "markdown_required" });
+    const file = new File(["甲：快跑"], "scene.MD", { type: "text/markdown" });
+    expect(selectDroppedMarkdown([file])).toEqual({ kind: "accepted", file });
+    expect(scriptTitleFromFilename("scene.final.md")).toBe("scene.final");
+  });
+
+  it("rejects empty script files", async () => {
+    await expect(readScriptFile(new File(["  \r\n"], "empty.md"))).rejects.toThrow("empty_script_file");
+  });
+
   it("accepts md case-insensitively, removes one leading BOM, and preserves CRLF", async () => {
     const markdown = new File(["\uFEFF甲\r\n台词"], "script.Md", { type: "text/markdown" });
     await expect(readScriptFile(markdown)).resolves.toEqual({

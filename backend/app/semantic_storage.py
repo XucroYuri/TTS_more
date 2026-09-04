@@ -218,6 +218,70 @@ class SemanticStore:
                 raise SemanticNotFoundError("draft_not_found")
             return draft
 
+    def load_latest_confirmed_review_session(
+        self,
+        project_id: str,
+        source_revision_id: str | None = None,
+    ) -> tuple[AnalysisRun, SemanticAnalysisDraft]:
+        safe_project_id = self._safe_project_id(project_id)
+        index = self._load_index()
+        candidates: list[tuple[AnalysisRun, SemanticAnalysisDraft]] = []
+        with self.project_store.project_lock(safe_project_id):
+            for draft_id, draft_metadata in index["drafts"].items():
+                if (
+                    not isinstance(draft_metadata, dict)
+                    or draft_metadata.get("project_id") != safe_project_id
+                    or not isinstance(draft_metadata.get("run_id"), str)
+                ):
+                    continue
+                run_id = draft_metadata["run_id"]
+                run_metadata = index["runs"].get(run_id)
+                if (
+                    not isinstance(run_metadata, dict)
+                    or run_metadata.get("project_id") != safe_project_id
+                    or run_metadata.get("draft_id") != draft_id
+                ):
+                    continue
+                try:
+                    safe_run_id = self._safe_id(run_id)
+                    safe_draft_id = self._safe_id(draft_id)
+                    run = self._read_model(
+                        self._run_path(safe_project_id, safe_run_id),
+                        AnalysisRun,
+                    )
+                    draft = self._read_model(
+                        self._draft_path(safe_project_id, safe_draft_id),
+                        SemanticAnalysisDraft,
+                    )
+                except (SemanticNotFoundError, ValueError):
+                    continue
+                if (
+                    run.id != safe_run_id
+                    or run.project_id != safe_project_id
+                    or run.draft_id != safe_draft_id
+                    or draft.id != safe_draft_id
+                    or draft.project_id != safe_project_id
+                    or run.source_revision_id != draft.source_revision_id
+                    or (
+                        source_revision_id is not None
+                        and run.source_revision_id != source_revision_id
+                    )
+                    or draft.confirmed_revision_id is None
+                    or run.status in {AnalysisRunStatus.QUEUED, AnalysisRunStatus.RUNNING}
+                ):
+                    continue
+                candidates.append((run, draft))
+        if not candidates:
+            raise SemanticNotFoundError("analysis_review_not_found")
+        return max(
+            candidates,
+            key=lambda candidate: (
+                candidate[1].updated_at,
+                candidate[0].created_at,
+                candidate[0].id,
+            ),
+        )
+
     def save_run(self, run: AnalysisRun) -> None:
         project_id = self._project_for("runs", run.id)
         if project_id != run.project_id:

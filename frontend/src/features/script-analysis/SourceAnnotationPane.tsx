@@ -22,6 +22,7 @@ import "./script-analysis.css";
 export interface SourceAnnotationPaneProps {
   sourceRevision: ScriptRevision;
   annotations: SemanticAnnotation[];
+  disabled?: boolean;
   onCreateAnnotation?: (annotation: SemanticAnnotation) => void;
   onDeleteAnnotation?: (annotationId: string) => void;
   onApplyAnnotations?: (change: AnnotationEdit) => void;
@@ -178,6 +179,7 @@ function previousCodePointBoundary(source: string, offset: number): number {
 export function SourceAnnotationPane({
   sourceRevision,
   annotations,
+  disabled = false,
   onCreateAnnotation,
   onDeleteAnnotation,
   onApplyAnnotations,
@@ -258,6 +260,12 @@ export function SourceAnnotationPane({
   ]);
 
   const captureSelection = useCallback(() => {
+    if (disabled) {
+      setSelectedSpan(null);
+      setActiveAnnotationEditor(null);
+      setMenuAnchor(null);
+      return;
+    }
     const root = sourceRootRef.current;
     const selection = root?.ownerDocument.defaultView?.getSelection();
     if (!root || !selection || selection.rangeCount !== 1 || selection.isCollapsed) {
@@ -286,10 +294,11 @@ export function SourceAnnotationPane({
     } catch {
       setSelectedSpan(null);
     }
-  }, [sourceRevision]);
+  }, [disabled, sourceRevision]);
 
   const initializeKeyboardCaret = useCallback(
     (event: ReactFocusEvent<HTMLDivElement>) => {
+      if (disabled) return;
       if (event.target !== event.currentTarget) return;
       const root = sourceRootRef.current;
       if (!root) return;
@@ -299,11 +308,12 @@ export function SourceAnnotationPane({
       setActiveAnnotationEditor(null);
       setMenuAnchor(null);
     },
-    [sourceRevision.source_markdown]
+    [disabled, sourceRevision.source_markdown]
   );
 
   const handleKeyboardSelection = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (disabled) return;
       if (event.target !== event.currentTarget) return;
       if (!["Home", "End", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
       const root = sourceRootRef.current;
@@ -344,11 +354,16 @@ export function SourceAnnotationPane({
         clearSelectedSpan();
       }
     },
-    [clearSelectedSpan, sourceRevision]
+    [clearSelectedSpan, disabled, sourceRevision]
   );
 
   const applyKinds = useCallback(
     (kinds: AnnotationKind[]) => {
+      if (disabled) {
+        clearSelectedSpan();
+        setActiveAnnotationEditor(null);
+        return;
+      }
       const span = activeAnnotationEditor?.span ?? selectedSpan;
       if (!span) return;
       if (!spanMatchesSourceRevision(span, sourceRevision)) {
@@ -393,6 +408,7 @@ export function SourceAnnotationPane({
       annotationsById,
       clearSelectedSpan,
       createAnnotationId,
+      disabled,
       now,
       onApplyAnnotations,
       onCreateAnnotation,
@@ -410,6 +426,11 @@ export function SourceAnnotationPane({
           (annotationId) => annotationsById.get(annotationId)?.kind === "dialogue"
         ) ?? segment.annotationIds[0];
       if (prioritizedAnnotationId) onSelectAnnotation(prioritizedAnnotationId);
+      if (disabled) {
+        setActiveAnnotationEditor(null);
+        setMenuAnchor(null);
+        return;
+      }
       setActiveAnnotationEditor({
         span: {
           source_revision_id: sourceRevision.revision_id,
@@ -427,10 +448,10 @@ export function SourceAnnotationPane({
         top: Math.max(12, Math.min(rect.bottom + 8, (viewport?.innerHeight ?? 720) - 180))
       });
     },
-    [annotationsById, onSelectAnnotation, sourceRevision]
+    [annotationsById, disabled, onSelectAnnotation, sourceRevision]
   );
 
-  const editorSpan = activeAnnotationEditor?.span ?? selectedSpan;
+  const editorSpan = disabled ? null : activeAnnotationEditor?.span ?? selectedSpan;
   const editorKinds = activeAnnotationEditor
     ? [...new Set(
         activeAnnotationEditor.annotationIds
@@ -461,6 +482,7 @@ export function SourceAnnotationPane({
         role="region"
         aria-label={labels.sourceRegionLabel}
         aria-readonly="true"
+        aria-disabled={disabled}
         tabIndex={0}
         style={{ whiteSpace: "pre-wrap" }}
         onFocus={initializeKeyboardCaret}

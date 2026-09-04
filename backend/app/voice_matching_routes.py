@@ -8,8 +8,14 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import ProviderType, ScriptLine, ScriptProject, VoiceBinding
-from .role_library import resolve_project_characters
+from .models import (
+    ProjectCharacterMode,
+    ProviderType,
+    ScriptLine,
+    ScriptProject,
+    VoiceBinding,
+)
+from .role_library import match_project_characters, resolve_project_characters
 from .storage import ProjectStore
 from .voice_catalog import (
     ReferenceMetadataOverride,
@@ -51,6 +57,7 @@ class _StrictRequest(BaseModel):
 
 class VoiceRecommendationRequest(_StrictRequest):
     line_ids: list[str] = Field(default_factory=list, max_length=500)
+    apply_automatic: bool = False
 
 
 class VoiceSelectionRequest(_StrictRequest):
@@ -65,7 +72,25 @@ def _line_and_character(
     line = next((item for item in project.lines if item.id == line_id), None)
     if line is None:
         raise HTTPException(status_code=404, detail="line not found")
-    characters = resolve_project_characters(project, store.load_characters())
+    library = store.load_characters()
+    mappings = match_project_characters(project, library)
+    mapping = next(
+        (item for item in mappings if item.project_character_id == line.character_id),
+        None,
+    )
+    if mapping is None:
+        return line, None
+    has_snapshot = (
+        mapping.mode == ProjectCharacterMode.SNAPSHOT
+        and mapping.character_snapshot is not None
+    )
+    has_library_character = bool(
+        mapping.library_character_id
+        and any(item.id == mapping.library_character_id for item in library)
+    )
+    if not has_snapshot and not has_library_character:
+        return line, None
+    characters = resolve_project_characters(project, library)
     character = next((item for item in characters if item.id == line.character_id), None)
     return line, character
 
@@ -85,8 +110,20 @@ def _recommend_line(
 ) -> VoiceRecommendation:
     snapshot = service.store.load_current()
     if snapshot is None:
-        raise HTTPException(status_code=409, detail="voice catalog is unavailable")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "voice_assets_unavailable",
+                "stage": "voice_recommendation",
+            },
+        )
     line, character = _line_and_character(project, line_id, store)
+    if character is None:
+        return VoiceRecommendation(
+            line_id=line.id,
+            catalog_version=snapshot.version,
+            blockers=["no_role_mapping"],
+        )
     language = line.language or project.default_language or "zh"
     emotion = _normalized_emotion(line.note)
     estimate = estimate_target_duration(line.text, language, emotion)
@@ -130,7 +167,13 @@ def _selection_for_candidate(
 ) -> VoiceSelectionSnapshot:
     snapshot = service.store.load_current()
     if snapshot is None:
-        raise HTTPException(status_code=409, detail="voice catalog is unavailable")
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "voice_assets_unavailable",
+                "stage": "voice_recommendation",
+            },
+        )
     resource = next(item for item in snapshot.resources if item.resource_id == candidate.resource_id)
     reference = next(
         item
@@ -198,7 +241,7 @@ def _weight_pair_for_candidate(
         gpt_weight.root_id != sovits_weight.root_id
         or gpt_weight.training_task != sovits_weight.training_task
         or candidate.training_task != gpt_weight.training_task
-        or reference.root_id != gpt_weight.root_id
+        or reference.reference_asset_id not in resource.reference_asset_ids
         or reference.training_task != gpt_weight.training_task
         or gpt_weight.root_id not in resource.compatible_root_ids
     ):
@@ -343,10 +386,15 @@ def build_voice_matching_router(
         if any(line_id not in known_ids for line_id in line_ids):
             raise HTTPException(status_code=404, detail="line not found")
         recommendations: list[VoiceRecommendation] = []
+        changed = False
         for line_id in line_ids:
             recommendation = _recommend_line(project, line_id, store, service)
             recommendations.append(recommendation)
-            if recommendation.candidates and recommendation.candidates[0].auto_fill_eligible:
+            if (
+                request.apply_automatic
+                and recommendation.candidates
+                and recommendation.candidates[0].auto_fill_eligible
+            ):
                 line, _ = _line_and_character(project, line_id, store)
                 if line.voice_selection is None or line.voice_selection.source == "automatic":
                     _save_candidate(
@@ -358,7 +406,9 @@ def build_voice_matching_router(
                         store,
                         service,
                     )
-        store.save_project(project_id, project)
+                    changed = True
+        if changed:
+            store.save_project(project_id, project)
         return {
             "recommendations": [item.model_dump(mode="json") for item in recommendations]
         }
