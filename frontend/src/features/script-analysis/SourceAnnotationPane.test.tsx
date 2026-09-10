@@ -179,13 +179,12 @@ async function click(view: RenderedPane, element: Element): Promise<void> {
 }
 
 describe("SourceAnnotationPane", () => {
-  it("applies multiple annotation kinds in one batch without echoing the selected source", async () => {
+  it("offers and creates only dialogue without echoing the selected source", async () => {
     const onCreateAnnotation = vi.fn();
     const view = await renderPane({
       onCreateAnnotation,
       createAnnotationId: vi
         .fn<() => string>()
-        .mockReturnValueOnce("human-speaker")
         .mockReturnValueOnce("human-dialogue"),
       now: () => createdAt
     });
@@ -197,18 +196,16 @@ describe("SourceAnnotationPane", () => {
       expect(menu).not.toBeNull();
       expect(menu.textContent).not.toContain("快跑！");
       const checkboxes = menu.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
-      expect(checkboxes).toHaveLength(3);
+      expect(checkboxes).toHaveLength(1);
+      expect(checkboxes[0].value).toBe("dialogue");
 
       await click(view, checkboxes[0].closest("label")!);
-      await click(view, checkboxes[2].closest("label")!);
       await click(view, buttonWithText(menu, "应用"));
 
       expect(onCreateAnnotation.mock.calls.map(([item]) => item.kind)).toEqual([
-        "speaker",
         "dialogue"
       ]);
       expect(onCreateAnnotation.mock.calls.map(([item]) => item.span.text)).toEqual([
-        "快跑！",
         "快跑！"
       ]);
       expect(view.container.querySelector(".selection-annotation-menu")).toBeNull();
@@ -217,10 +214,11 @@ describe("SourceAnnotationPane", () => {
     }
   });
 
-  it("opens the same multi-select editor for existing annotations and removes unchecked kinds", async () => {
+  it("removes only dialogue while preserving overlapping speaker and emotion evidence", async () => {
     const source = "角色台词";
     const annotations = [
       annotation("speaker-1", "speaker", source, 0, 4),
+      annotation("emotion-1", "emotion_evidence", source, 0, 2),
       annotation("dialogue-1", "dialogue", source, 0, 4)
     ];
     const onDeleteAnnotation = vi.fn();
@@ -233,29 +231,28 @@ describe("SourceAnnotationPane", () => {
     });
 
     try {
-      await click(view, view.sourceRoot.querySelector('[data-annotation-count="2"]')!);
+      await click(view, view.sourceRoot.querySelector('[data-annotation-count="1"]')!);
 
       const menu = view.container.querySelector<HTMLElement>(".selection-annotation-menu")!;
       expect(menu).not.toBeNull();
       const speaker = menu.querySelector<HTMLInputElement>('input[value="speaker"]')!;
       const dialogue = menu.querySelector<HTMLInputElement>('input[value="dialogue"]')!;
-      expect(speaker.checked).toBe(true);
+      expect(speaker).toBeNull();
+      expect(menu.querySelector('input[value="emotion_evidence"]')).toBeNull();
       expect(dialogue.checked).toBe(true);
       expect(onSelectAnnotation).toHaveBeenCalledWith("dialogue-1");
 
-      await click(view, speaker.closest("label")!);
+      await click(view, dialogue.closest("label")!);
       await click(view, buttonWithText(menu, "应用"));
 
       expect(onDeleteAnnotation).toHaveBeenCalledOnce();
-      expect(onDeleteAnnotation).toHaveBeenCalledWith("speaker-1");
+      expect(onDeleteAnnotation).toHaveBeenCalledWith("dialogue-1");
     } finally {
       await view.cleanup();
     }
   });
 
   it.each([
-    ["说话者", "speaker"],
-    ["情感证据", "emotion_evidence"],
     ["台词", "dialogue"]
   ] as const)("creates an accepted human %s annotation from a pointer-selected DOM range", async (_label, kind) => {
     const onCreateAnnotation = vi.fn();
@@ -413,15 +410,15 @@ describe("SourceAnnotationPane", () => {
     }
   });
 
-  it("clears layered state and filters annotations from another revision or hash", async () => {
+  it("clears editor state and filters dialogues from another revision or hash", async () => {
     const source = "角色台词";
     const revisionA = revision(source, "script-a", "sha-a");
     const revisionB = revision(source, "script-b", "sha-b");
     const oldSpeaker = annotation("old-speaker", "speaker", source, 0, 2, "script-a", "sha-a");
     const oldDialogue = annotation("old-dialogue", "dialogue", source, 0, 4, "script-a", "sha-a");
-    const currentSpeaker = annotation(
-      "current-speaker",
-      "speaker",
+    const currentDialogue = annotation(
+      "current-dialogue",
+      "dialogue",
       source,
       0,
       2,
@@ -436,12 +433,12 @@ describe("SourceAnnotationPane", () => {
     });
 
     try {
-      await click(view, view.sourceRoot.querySelector('[data-annotation-count="2"]')!);
+      await click(view, view.sourceRoot.querySelector('[data-annotation-count="1"]')!);
       expect(view.container.querySelector('[role="dialog"]')).not.toBeNull();
 
       await view.rerender({
         sourceRevision: revisionB,
-        annotations: [oldSpeaker, oldDialogue, currentSpeaker]
+        annotations: [oldSpeaker, oldDialogue, currentDialogue]
       });
       expect(view.container.querySelector('[role="dialog"]')).toBeNull();
       const currentButtons = view.sourceRoot.querySelectorAll<HTMLButtonElement>("button");
@@ -449,7 +446,7 @@ describe("SourceAnnotationPane", () => {
       onSelectAnnotation.mockClear();
       await click(view, currentButtons[0]);
       expect(onSelectAnnotation).toHaveBeenCalledOnce();
-      expect(onSelectAnnotation).toHaveBeenCalledWith("current-speaker");
+      expect(onSelectAnnotation).toHaveBeenCalledWith("current-dialogue");
 
       await expect(
         view.rerender({
@@ -478,18 +475,19 @@ describe("SourceAnnotationPane", () => {
       expect(view.sourceRoot.style.whiteSpace).toBe("pre-wrap");
       expect(view.sourceRoot.tabIndex).toBe(0);
       expect(view.sourceRoot.getAttribute("aria-readonly")).toBe("true");
-      expect(view.container.textContent).toContain("说话者");
-      expect(view.container.textContent).toContain("情感证据");
+      expect(view.container.textContent).not.toContain("说话者");
+      expect(view.container.textContent).not.toContain("情感证据");
       expect(view.container.textContent).toContain("台词");
-      expect(view.container.querySelector(".annotation-layer--speaker")).not.toBeNull();
-      expect(view.container.querySelector(".annotation-layer--emotion-evidence")).not.toBeNull();
+      expect(view.container.querySelector(".annotation-layer--speaker")).toBeNull();
+      expect(view.container.querySelector(".annotation-layer--emotion-evidence")).toBeNull();
+      expect(view.sourceRoot.querySelectorAll("button")).toHaveLength(1);
       expect(view.container.querySelector(".source-annotation-pane__segment--dialogue")).not.toBeNull();
     } finally {
       await view.cleanup();
     }
   });
 
-  it("prechecks every annotation kind and prioritizes dialogue focus for a layered segment", async () => {
+  it("keeps dialogue intact and exposes no emotion editor when evidence overlaps", async () => {
     const source = "角色（惊喜）：台词";
     const annotations = [
       annotation("emotion-1", "emotion_evidence", source, 3, 5),
@@ -503,13 +501,14 @@ describe("SourceAnnotationPane", () => {
     });
 
     try {
-      const layered = view.container.querySelector<HTMLButtonElement>('[data-annotation-count="2"]')!;
+      const layered = view.container.querySelector<HTMLButtonElement>('[data-annotation-count="1"]')!;
       expect(layered.tagName).toBe("BUTTON");
+      expect(layered.textContent).toBe(source.slice(3, 9));
       await click(view, layered);
 
       const chooser = view.container.querySelector<HTMLElement>('.selection-annotation-menu')!;
       expect(chooser).not.toBeNull();
-      expect(chooser.querySelector<HTMLInputElement>('input[value="emotion_evidence"]')!.checked).toBe(true);
+      expect(chooser.querySelector('input[value="emotion_evidence"]')).toBeNull();
       expect(chooser.querySelector<HTMLInputElement>('input[value="dialogue"]')!.checked).toBe(true);
       expect(onSelectAnnotation).toHaveBeenCalledWith("dialogue-1");
     } finally {

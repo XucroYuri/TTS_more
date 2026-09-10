@@ -5,8 +5,7 @@ import {
   useRef,
   useState,
   type FocusEvent as ReactFocusEvent,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type ReactNode
+  type KeyboardEvent as ReactKeyboardEvent
 } from "react";
 
 import type { AnnotationKind, ScriptRevision, SemanticAnnotation, SourceSpan } from "../../types";
@@ -14,6 +13,7 @@ import { splitAnnotatedText, type AnnotationTextSegment } from "./annotationView
 import { domRangeToSourceSpan, isUtf16Boundary } from "./selectionOffsets";
 import {
   resolveAnnotationPaneLabels,
+  sourceAnnotationKinds,
   SelectionAnnotationMenu,
   type AnnotationPaneLabelOverrides
 } from "./SelectionAnnotationMenu";
@@ -65,19 +65,6 @@ function defaultCreateAnnotationId(): string {
   }
   fallbackAnnotationSequence += 1;
   return `annotation-${Date.now()}-${fallbackAnnotationSequence}`;
-}
-
-function annotationLayerText(text: string, kinds: AnnotationKind[]): ReactNode {
-  let content: ReactNode = text;
-  if (kinds.includes("speaker")) {
-    content = <span className="annotation-layer annotation-layer--speaker">{content}</span>;
-  }
-  if (kinds.includes("emotion_evidence")) {
-    content = (
-      <span className="annotation-layer annotation-layer--emotion-evidence">{content}</span>
-    );
-  }
-  return content;
 }
 
 function segmentClassName(segment: AnnotationTextSegment): string {
@@ -203,7 +190,7 @@ export function SourceAnnotationPane({
   const groundedAnnotations = useMemo(
     () =>
       annotations.filter((annotation) =>
-        spanMatchesSourceRevision(annotation.span, sourceRevision)
+        annotation.kind === "dialogue" && spanMatchesSourceRevision(annotation.span, sourceRevision)
       ),
     [
       annotations,
@@ -375,10 +362,11 @@ export function SourceAnnotationPane({
       const existingAnnotations = (activeAnnotationEditor?.annotationIds ?? [])
         .map((annotationId) => annotationsById.get(annotationId))
         .filter((annotation): annotation is SemanticAnnotation => Boolean(annotation));
-      const selectedKinds = new Set(kinds);
+      const allowedKinds = kinds.filter((kind) => sourceAnnotationKinds.includes(kind));
+      const selectedKinds = new Set(allowedKinds);
       const existingKinds = new Set(existingAnnotations.map((annotation) => annotation.kind));
       const timestamp = now();
-      const createdAnnotations = kinds
+      const createdAnnotations = allowedKinds
         .filter((kind) => !existingKinds.has(kind))
         .map((kind) => ({
           id: createAnnotationId(),
@@ -463,7 +451,7 @@ export function SourceAnnotationPane({
   return (
     <section className="source-annotation-pane">
       <ul className="source-annotation-pane__legend" aria-label={labels.legendLabel}>
-        {(Object.keys(labels.kindLabels) as AnnotationKind[]).map((kind) => (
+        {sourceAnnotationKinds.map((kind) => (
           <li key={kind} className="source-annotation-pane__legend-item">
             <span
               className={`source-annotation-pane__legend-mark source-annotation-pane__legend-mark--${kind}`}
@@ -506,7 +494,7 @@ export function SourceAnnotationPane({
               aria-label={`${segment.text}: ${kindLabels.join(", ")}`}
               onClick={(event) => openSegment(segment, event.currentTarget)}
             >
-              {annotationLayerText(segment.text, segment.annotationKinds)}
+              {segment.text}
             </button>
           );
         })}

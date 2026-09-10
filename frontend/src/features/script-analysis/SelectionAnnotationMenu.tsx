@@ -47,7 +47,7 @@ export interface SelectionAnnotationMenuProps {
   labels?: AnnotationPaneLabelOverrides;
 }
 
-const annotationKinds: AnnotationKind[] = ["speaker", "emotion_evidence", "dialogue"];
+export const sourceAnnotationKinds: readonly AnnotationKind[] = ["dialogue"];
 
 export function SelectionAnnotationMenu({
   span,
@@ -85,7 +85,7 @@ export function SelectionAnnotationMenu({
       style={anchor ? { left: anchor.left, top: anchor.top } : undefined}
     >
       <div className="selection-annotation-menu__types">
-        {annotationKinds.map((kind) => (
+        {sourceAnnotationKinds.map((kind) => (
           <label
             key={kind}
             className={`selection-annotation-menu__type selection-annotation-menu__type--${kind}`}
@@ -107,7 +107,7 @@ export function SelectionAnnotationMenu({
         <button
           type="button"
           className="selection-annotation-menu__apply"
-          onClick={() => onApply(annotationKinds.filter((kind) => selectedKinds.has(kind)))}
+          onClick={() => onApply(sourceAnnotationKinds.filter((kind) => selectedKinds.has(kind)))}
         >
           {labels.applySelection}
         </button>

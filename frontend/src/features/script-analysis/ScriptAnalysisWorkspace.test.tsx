@@ -844,14 +844,15 @@ describe("ScriptAnalysisWorkspace", () => {
     ]);
   });
 
-  it("submits multi-kind source edits as one atomic draft batch", async () => {
+  it("submits dialogue-only source edits and their utterance as one atomic draft batch", async () => {
     const view = await renderWorkspace(draft(), run(), {
       createUtteranceId: () => "utterance-created-atomic"
     });
 
     await selectSourceText(view, "第三句");
     const menu = view.container.querySelector<HTMLElement>(".selection-annotation-menu")!;
-    await click(menu.querySelector<HTMLInputElement>('input[value="speaker"]')!.closest("label")!);
+    expect(menu.querySelector('input[value="speaker"]')).toBeNull();
+    expect(menu.querySelector('input[value="emotion_evidence"]')).toBeNull();
     await click(menu.querySelector<HTMLInputElement>('input[value="dialogue"]')!.closest("label")!);
     await click([...menu.querySelectorAll("button")].find((button) => button.textContent === "应用")!);
     await flushAsync();
@@ -860,14 +861,13 @@ describe("ScriptAnalysisWorkspace", () => {
     const operations = view.patch.mock.calls[0][2];
     expect(operations.map((operation) => operation.op)).toEqual([
       "create_annotation",
-      "create_annotation",
       "create_utterance"
     ]);
     expect(
       operations
         .filter((operation) => operation.op === "create_annotation")
         .map((operation) => operation.annotation.kind)
-    ).toEqual(["speaker", "dialogue"]);
+    ).toEqual(["dialogue"]);
   });
 
   it("builds an empty draft into one importable human utterance through real controls", async () => {
