@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   CATALOG_STAGED_REFERENCE_OPTION,
   applyLogsReferenceSampleToConfig,
+  referenceAudioSamplesForCharacter,
   selectedDynamicWeightOption,
   selectedLogsReferenceOptionValue,
   selectedLogsReferenceSample,
@@ -73,5 +74,31 @@ describe("GPT-SoVITS logs reference helpers", () => {
     expect(selectedLogsReferenceOptionValue(sample, {
       ref_audio_path: "D:/staged/reference.wav"
     })).toBe(sample.sample_id);
+  });
+
+  it("lists the current character reference audio and excludes other roles", () => {
+    const character = {
+      id: "ghost",
+      name: "幽灵",
+      aliases: ["心辰"],
+      notes: "",
+      fallback_profiles: [],
+      reference_audio_groups: [{
+        id: "xin-chen-logs",
+        name: "心辰 logs",
+        paths: [],
+        samples: [{ path: "E:\\logs\\心辰\\5-wav32k\\xinchen-01.wav", text: "是谁？", text_source: "sidecar" as const }]
+      }]
+    };
+    const otherRole = { ...sample, sample_id: "other", character: "九九", path: "E:\\logs\\九九\\other.wav" };
+    const matchingRole = { ...sample, sample_id: "matching", character: "心辰TTS", path: "E:\\logs\\心辰\\xinchen-02.wav" };
+
+    const result = referenceAudioSamplesForCharacter(character, [otherRole, matchingRole]);
+
+    expect(result.map((item) => item.path)).toEqual([
+      "E:\\logs\\心辰\\5-wav32k\\xinchen-01.wav",
+      "E:\\logs\\心辰\\xinchen-02.wav"
+    ]);
+    expect(result[0]?.display_label).toBe("幽灵 · 是谁？");
   });
 });

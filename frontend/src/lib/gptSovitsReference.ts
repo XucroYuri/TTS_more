@@ -1,4 +1,4 @@
-import type { LogsReferenceAudioSample } from "../types";
+import type { Character, LogsReferenceAudioSample } from "../types";
 
 export const CATALOG_STAGED_REFERENCE_OPTION = "__catalog_reference__";
 const CATALOG_WEIGHT_OPTION_PREFIX = "__catalog_weight__:";
@@ -50,6 +50,96 @@ export function selectedLogsReferenceSample(
   const sampleId = stringValue(config.logs_reference_sample_id);
   const refPath = stringValue(config.ref_audio_path);
   return samples.find((sample) => sample.sample_id === sampleId) ?? samples.find((sample) => sample.path === refPath);
+}
+
+export function referenceAudioSamplesForCharacter(
+  character: Character | undefined,
+  logsSamples: LogsReferenceAudioSample[],
+  logsName = ""
+): LogsReferenceAudioSample[] {
+  if (!character) return [];
+  const identities = [
+    character.id,
+    character.name,
+    ...(character.aliases ?? []),
+    ...(character.nicknames ?? []),
+    ...(character.match_names ?? [])
+  ].map(normalizeIdentity).filter(Boolean);
+  const output: LogsReferenceAudioSample[] = [];
+  const seenPaths = new Set<string>();
+  let roleSampleIndex = 0;
+
+  const append = (sample: LogsReferenceAudioSample) => {
+    const pathKey = normalizePath(sample.path);
+    if (!pathKey || seenPaths.has(pathKey)) return;
+    seenPaths.add(pathKey);
+    output.push(sample);
+  };
+
+  for (const group of character.reference_audio_groups ?? []) {
+    for (const sample of group.samples ?? []) {
+      append({
+        sample_id: `role:${character.id}:${roleSampleIndex++}`,
+        display_label: sample.text ? `${character.name} · ${sample.text}` : `${character.name} · ${fileName(sample.path)}`,
+        path: sample.path,
+        text: sample.text ?? "",
+        text_source: sample.text_source ?? "none",
+        character: character.name,
+        prompt_lang: "zh",
+        source: "role_library",
+        logs_name: logsName || undefined,
+      });
+    }
+    for (const path of [...(group.copied_paths ?? []), ...(group.paths ?? [])]) {
+      if (!isAudioPath(path)) continue;
+      append({
+        sample_id: `role:${character.id}:${roleSampleIndex++}`,
+        display_label: `${character.name} · ${fileName(path)}`,
+        path,
+        text: "",
+        text_source: "none",
+        character: character.name,
+        prompt_lang: "zh",
+        source: "role_library",
+        logs_name: logsName || undefined,
+      });
+    }
+  }
+
+  const matchingLogsSamples = logsSamples.filter((sample) => {
+    const sampleIdentity = normalizeIdentity(sample.character ?? "");
+    return sampleIdentity
+      ? identities.some((identity) => identitiesMatch(identity, sampleIdentity))
+      : Boolean(logsName);
+  });
+  const logsSamplesToAppend = matchingLogsSamples.length > 0 || output.length > 0 || logsName
+    ? matchingLogsSamples
+    : logsSamples;
+  for (const sample of logsSamplesToAppend) {
+    append(sample);
+  }
+  return output;
+}
+
+function identitiesMatch(left: string, right: string): boolean {
+  if (left === right) return true;
+  return left.length >= 2 && right.length >= 2 && (left.includes(right) || right.includes(left));
+}
+
+function normalizeIdentity(value: string): string {
+  return value.replace(/[\s_\-.]+/g, "").toLocaleLowerCase();
+}
+
+function normalizePath(value: string): string {
+  return value.replaceAll("\\", "/").toLocaleLowerCase();
+}
+
+function fileName(value: string): string {
+  return value.split(/[\\/]/).filter(Boolean).at(-1) ?? value;
+}
+
+function isAudioPath(value: string): boolean {
+  return /\.(aac|flac|m4a|mp3|ogg|opus|wav|webm)$/i.test(value);
 }
 
 function stringValue(value: unknown): string {

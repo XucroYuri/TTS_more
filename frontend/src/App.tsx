@@ -134,6 +134,7 @@ import { generationStatusCounts, generationStatusKey, generationStatusTone, gene
 import {
   CATALOG_STAGED_REFERENCE_OPTION,
   applyLogsReferenceSampleToConfig,
+  referenceAudioSamplesForCharacter,
   selectedDynamicWeightOption,
   selectedLogsReferenceOptionValue,
   selectedLogsReferenceSample,
@@ -780,6 +781,10 @@ export default function App() {
   const activeModelSelectedSample = activeModelSamples.find((sample) => sample.sample_id === activeModelSampleId) ?? activeModelSamples[0] ?? (activeModelCatalogItem ? firstReferenceSampleFromModel(activeModelCatalogItem) : null);
   const preflightByLine = useMemo(() => new Map((preflightResult?.items ?? []).map((item) => [item.line_uid ?? item.line_id, item])), [preflightResult]);
   const activeLine = useMemo(() => project.lines.find((line) => line.id === activeLineId) ?? project.lines[0], [activeLineId, project.lines]);
+  const activeLineCharacter = useMemo(
+    () => activeLine ? resolvedCharacters.find((character) => character.id === activeLine.character_id) : undefined,
+    [activeLine, resolvedCharacters]
+  );
   const activeVoiceRecommendation = activeLine ? voiceRecommendations[activeLine.id] ?? null : null;
   const activeRoleRow = useMemo(
     () => activeLine ? projectRoleRows.find((role) => role.id === activeLine.character_id) : undefined,
@@ -888,7 +893,15 @@ export default function App() {
     [activeBindingConfig, activeLogsReferenceServiceId, activeProvider]
   );
   const activeLogsReferencePayload = activeLogsReferenceRequest ? logsReferenceAudio[activeLogsReferenceRequest.key] : undefined;
-  const activeLogsReferenceSamples = activeLogsReferencePayload?.samples ?? [];
+  const fetchedLogsReferenceSamples = activeLogsReferencePayload?.samples ?? [];
+  const activeLogsReferenceSamples = useMemo(
+    () => referenceAudioSamplesForCharacter(
+      activeLineCharacter,
+      fetchedLogsReferenceSamples,
+      activeLogsReferenceRequest?.logsName ?? ""
+    ),
+    [activeLineCharacter, activeLogsReferenceRequest?.logsName, fetchedLogsReferenceSamples]
+  );
   const activeLogsReferenceSample = selectedLogsReferenceSample(activeLogsReferenceSamples, activeBindingConfig, { serviceId: activeLogsReferenceServiceId });
   const activeGptWeightOption = selectedDynamicWeightOption(activeBindingConfig, "gpt");
   const activeSovitsWeightOption = selectedDynamicWeightOption(activeBindingConfig, "sovits");
@@ -4332,13 +4345,13 @@ export default function App() {
                                       <span>{t("inspector.logsReferenceAudio")}</span>
                                       <select
                                         value={activeLogsReferenceOptionValue}
-                                        disabled={!activeLogsReferenceRequest || loadingLogsReferenceKey === activeLogsReferenceRequest?.key}
+                                        disabled={activeLogsReferenceSamples.length === 0 && (!activeLogsReferenceRequest || loadingLogsReferenceKey === activeLogsReferenceRequest?.key)}
                                         onChange={(event) => {
                                           const sample = activeLogsReferenceSamples.find((item) => item.sample_id === event.target.value);
                                           if (sample) applyLogsReferenceSample(sample);
                                         }}
                                       >
-                                        <option value="">{activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
+                                        <option value="">{activeLogsReferenceSamples.length > 0 || activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
                                         {!activeLogsReferenceSample && activeReferenceAudioPath && (
                                           <option value={CATALOG_STAGED_REFERENCE_OPTION}>{activeReferenceAudioLabel}</option>
                                         )}
@@ -4618,16 +4631,16 @@ export default function App() {
 
                       <div className="logs-reference-picker">
                         <label className="resource-field">
-                          <span>{t("inspector.logsReferenceAudio")}</span>
+                          <span>{t("inspector.roleReferenceAudio", { role: activeLineCharacter?.name ?? t("status.unassigned") })}</span>
                           <select
                             value={activeLogsReferenceOptionValue}
-                            disabled={!activeLogsReferenceRequest || loadingLogsReferenceKey === activeLogsReferenceRequest?.key}
+                            disabled={activeLogsReferenceSamples.length === 0 && (!activeLogsReferenceRequest || loadingLogsReferenceKey === activeLogsReferenceRequest?.key)}
                             onChange={(event) => {
                               const sample = activeLogsReferenceSamples.find((item) => item.sample_id === event.target.value);
                               if (sample) applyLogsReferenceSample(sample);
                             }}
                           >
-                            <option value="">{activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
+                            <option value="">{activeLogsReferenceSamples.length > 0 || activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
                             {!activeLogsReferenceSample && activeReferenceAudioPath && (
                               <option value={CATALOG_STAGED_REFERENCE_OPTION}>{activeReferenceAudioLabel}</option>
                             )}
