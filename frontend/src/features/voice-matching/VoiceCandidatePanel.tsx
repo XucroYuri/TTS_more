@@ -1,4 +1,5 @@
-import { CheckCircle2, Loader2, Sparkles, Trash2 } from "lucide-react";
+import { Loader2, Sparkles, Trash2 } from "lucide-react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { VoiceCandidate, VoiceRecommendation, VoiceSelectionSnapshot } from "../../types";
@@ -13,6 +14,7 @@ interface VoiceCandidatePanelProps {
   selectingCandidateId: string | null;
   referenceAudioUrl: (assetId: string) => string;
   onSelect: (candidateId: string) => void;
+  onConfirmIdentity: (candidateId: string) => void;
   onClear: () => void;
   onSyncAssets?: () => void;
   onOpenServices?: () => void;
@@ -30,12 +32,19 @@ export function VoiceCandidatePanel({
   selectingCandidateId,
   referenceAudioUrl,
   onSelect,
+  onConfirmIdentity,
   onClear,
   onSyncAssets,
   onOpenServices
 }: VoiceCandidatePanelProps) {
   const { t } = useTranslation();
-  const candidates = recommendation?.candidates.slice(0, 3) ?? [];
+  const [rejectedCandidateIds, setRejectedCandidateIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    setRejectedCandidateIds(new Set());
+  }, [recommendation?.line_id, recommendation?.catalog_version]);
+  const candidates = (recommendation?.candidates ?? [])
+    .filter((candidate) => !rejectedCandidateIds.has(candidate.candidate_id))
+    .slice(0, 3);
   const blocker = recommendation?.blockers[0] ?? null;
   const blockerAction = blocker ? voiceBlockerAction(blocker) : null;
   const blockerActionCallback = blockerAction === "sync-assets"
@@ -58,15 +67,6 @@ export function VoiceCandidatePanel({
         )}
       </div>
 
-      {selection && (
-        <div className="voice-selection-summary">
-          <CheckCircle2 size={15} />
-          <span>{t(`voiceMatching.selectionSource.${selection.source}`)}</span>
-          <strong>{selection.resource_id}</strong>
-          <span>{selection.score.toFixed(1)}</span>
-        </div>
-      )}
-
       {loading && <div className="voice-panel-empty"><Loader2 className="spin" size={15} />{t("voiceMatching.loadingCandidates")}</div>}
       {!loading && error && <p className="voice-panel-error" role="alert">{error}</p>}
       {!loading && !error && blocker && (
@@ -88,7 +88,7 @@ export function VoiceCandidatePanel({
             const selected = selection?.candidate_id === candidate.candidate_id;
             const selecting = selectingCandidateId === candidate.candidate_id;
             return (
-              <article className={`voice-candidate-card ${selected ? "selected" : ""}`} key={candidate.candidate_id}>
+              <article className={`voice-candidate-card ${selected ? "selected" : ""} ${candidate.requires_identity_confirmation ? "needs-confirmation" : ""}`} key={candidate.candidate_id}>
                 <div className="voice-candidate-topline">
                   <div>
                     <span className="voice-candidate-rank">#{index + 1}</span>
@@ -117,22 +117,41 @@ export function VoiceCandidatePanel({
                     )}
                   </div>
                 )}
-                {(candidate.reasons.length > 0 || candidate.blockers.length > 0) && (
-                  <div className="voice-reason-list">
-                    {candidate.reasons.map((reason) => <span key={reason}>{t(`voiceMatching.reason.${reason}`, { defaultValue: reason })}</span>)}
-                    {candidate.blockers.map((blocker) => <span className="blocked" key={blocker}>{blocker}</span>)}
-                  </div>
-                )}
                 <audio className="voice-reference-audio" controls preload="none" src={referenceAudioUrl(candidate.reference_asset_id)} />
-                <button
-                  className={selected ? "secondary-button compact-button" : "primary-button compact-button"}
-                  type="button"
-                  disabled={selected || Boolean(selectingCandidateId) || candidate.blockers.length > 0}
-                  onClick={() => onSelect(candidate.candidate_id)}
-                >
-                  {selecting ? <Loader2 className="spin" size={13} /> : selected ? <CheckCircle2 size={13} /> : null}
-                  {selected ? t("voiceMatching.selected") : t("voiceMatching.selectCandidate")}
-                </button>
+                {candidate.requires_identity_confirmation ? (
+                  <div className="voice-identity-confirmation" role="group" aria-label={t("voiceMatching.fuzzyConfirmationQuestion")}>
+                    <strong>{t("voiceMatching.fuzzyConfirmationQuestion")}</strong>
+                    <div>
+                      <button
+                        className="primary-button compact-button"
+                        type="button"
+                        disabled={Boolean(selectingCandidateId) || candidate.blockers.length > 0}
+                        onClick={() => onConfirmIdentity(candidate.candidate_id)}
+                      >
+                        {selecting && <Loader2 className="spin" size={13} />}
+                        {t("voiceMatching.confirmIdentityAccurate")}
+                      </button>
+                      <button
+                        className="secondary-button compact-button"
+                        type="button"
+                        disabled={Boolean(selectingCandidateId)}
+                        onClick={() => setRejectedCandidateIds((current) => new Set([...current, candidate.candidate_id]))}
+                      >
+                        {t("voiceMatching.confirmIdentityInaccurate")}
+                      </button>
+                    </div>
+                  </div>
+                ) : !selected ? (
+                  <button
+                    className="primary-button compact-button"
+                    type="button"
+                    disabled={Boolean(selectingCandidateId) || candidate.blockers.length > 0}
+                    onClick={() => onSelect(candidate.candidate_id)}
+                  >
+                    {selecting && <Loader2 className="spin" size={13} />}
+                    {t("voiceMatching.selectCandidate")}
+                  </button>
+                ) : null}
               </article>
             );
           })}

@@ -4506,6 +4506,106 @@ def test_character_library_scan_import_and_delete_guard(tmp_path: Path) -> None:
     assert "demo" in delete_response.json()["detail"]
 
 
+def test_character_library_confirmed_import_adds_alias_and_links_project_role(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put(
+        "/api/projects/demo",
+        json={
+            "title": "demo",
+            "project_characters": [
+                {
+                    "project_character_id": "jiao-bu",
+                    "name": "胶布",
+                    "library_character_id": None,
+                    "mode": "reference",
+                    "match_status": "unmatched",
+                }
+            ],
+            "lines": [{"id": "l001", "character_id": "jiao-bu", "text": "救命！"}],
+        },
+    )
+    candidate = {
+        "id": "jiao-bu-t-t-s-xin",
+        "name": "胶布TTS新",
+        "logs_name": "胶布TTS新-20260611",
+        "recommended_gpt_weights_path": "E:/voice/GPT_weights/胶布TTS新-20260611-e50.ckpt",
+        "recommended_sovits_weights_path": "E:/voice/SoVITS_weights/胶布TTS新-20260611_e24_s240.pth",
+        "gpt_weights": [{"name": "gpt", "path": "E:/voice/GPT_weights/胶布TTS新-20260611-e50.ckpt"}],
+        "sovits_weights": [{"name": "sovits", "path": "E:/voice/SoVITS_weights/胶布TTS新-20260611_e24_s240.pth"}],
+        "reference_audio_groups": [
+            {
+                "id": "glue-logs",
+                "name": "glue logs",
+                "paths": ["E:/voice/logs/胶布TTS新-20260611/5-wav32k"],
+                "samples": [
+                    {
+                        "path": "E:/voice/logs/胶布TTS新-20260611/5-wav32k/ref.wav",
+                        "text": "参考文本",
+                        "text_source": "sidecar",
+                    }
+                ],
+            }
+        ],
+    }
+
+    response = client.post(
+        "/api/character-library/import",
+        json={
+            "candidate": candidate,
+            "project_id": "demo",
+            "project_character_id": "jiao-bu",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "胶布" in payload["character"]["aliases"]
+    assert payload["project_character"]["library_character_id"] == "jiao-bu-t-t-s-xin"
+    assert payload["project_character"]["match_status"] == "matched"
+    persisted = client.get("/api/projects/demo").json()["project_characters"][0]
+    assert persisted["library_character_id"] == "jiao-bu-t-t-s-xin"
+    rematched = client.post("/api/projects/demo/characters/rematch").json()["project_characters"][0]
+    assert rematched["name"] == "胶布"
+    assert rematched["library_character_id"] == "jiao-bu-t-t-s-xin"
+
+
+def test_character_library_incomplete_candidate_is_not_auto_linked(tmp_path: Path) -> None:
+    client = TestClient(create_app(data_root=tmp_path))
+    client.put(
+        "/api/projects/demo",
+        json={
+            "title": "demo",
+            "project_characters": [
+                {"project_character_id": "ghost", "name": "幽灵", "mode": "reference"}
+            ],
+            "lines": [{"id": "l001", "character_id": "ghost", "text": "安静。"}],
+        },
+    )
+
+    response = client.post(
+        "/api/character-library/import",
+        json={
+            "candidate": {"id": "ghost", "name": "幽灵", "logs_name": "幽灵"},
+            "project_id": "demo",
+            "project_character_id": "ghost",
+        },
+    )
+
+    assert response.status_code == 409
+    assert client.get("/api/character-library").json()["characters"] == []
+    assert client.get("/api/projects/demo").json()["project_characters"][0]["library_character_id"] is None
+
+    imported_only = client.post(
+        "/api/character-library/import",
+        json={"candidate": {"id": "ghost", "name": "幽灵", "logs_name": "幽灵"}},
+    )
+    assert imported_only.status_code == 200
+    assert imported_only.json()["character"]["library_status"] == "partial"
+    rematched = client.post("/api/projects/demo/characters/rematch").json()["project_characters"][0]
+    assert rematched["library_character_id"] is None
+    assert rematched["match_status"] == "unmatched"
+
+
 def test_character_library_logs_candidates_merge_weights_refs_and_sidecar_text(tmp_path: Path) -> None:
     reference_root = tmp_path / "refs"
     gpt_root = tmp_path / "gpt"

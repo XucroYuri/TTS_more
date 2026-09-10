@@ -307,7 +307,10 @@ def match_project_characters(project: ScriptProject, library: list[Character], f
         return project.project_characters
     output: list[ProjectCharacter] = []
     seen: set[str] = set()
-    by_name = _library_lookup(library)
+    by_id = {character.id: character for character in library}
+    by_name = _library_lookup(
+        [character for character in library if character.library_status == "confirmed"]
+    )
     existing_by_id = {item.project_character_id: item for item in project.project_characters}
     existing_by_name = {_normalize(item.name): item for item in project.project_characters}
     for line in project.lines:
@@ -316,11 +319,20 @@ def match_project_characters(project: ScriptProject, library: list[Character], f
         seen.add(line.character_id)
         existing = existing_by_id.get(line.character_id) or existing_by_name.get(_normalize(line.character_id))
         display_name = existing.name if existing else line.character_id
-        character = by_name.get(_normalize(display_name)) or by_name.get(_normalize(line.character_id))
+        character = (
+            by_id.get(existing.library_character_id or "")
+            if existing and existing.library_character_id
+            else None
+        ) or by_name.get(_normalize(display_name)) or by_name.get(_normalize(line.character_id))
+        matched_name = (
+            display_name
+            if character and existing and existing.library_character_id == character.id
+            else character.name if character else display_name
+        )
         output.append(
             ProjectCharacter(
                 project_character_id=line.character_id,
-                name=character.name if character else display_name,
+                name=matched_name,
                 library_character_id=character.id if character else None,
                 mode=ProjectCharacterMode.REFERENCE,
                 project_binding=existing.project_binding if existing else None,

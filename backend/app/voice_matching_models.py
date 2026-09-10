@@ -151,6 +151,8 @@ class VoiceCandidate(StrictVoiceModel):
     training_task: str | None = None
     gpt_weight_artifact_id: str | None = None
     sovits_weight_artifact_id: str | None = None
+    identity_match: Literal["strict", "folder_fuzzy"] = "strict"
+    requires_identity_confirmation: bool = False
 
 
 class VoiceRecommendation(StrictVoiceModel):

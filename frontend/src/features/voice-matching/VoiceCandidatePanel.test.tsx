@@ -81,11 +81,15 @@ describe("VoiceCandidatePanel", () => {
       selectingCandidateId: null,
       referenceAudioUrl: (assetId: string) => `/preview/${assetId}`,
       onSelect,
+      onConfirmIdentity: vi.fn(),
       onClear
     })));
 
     const text = dom.window.document.body.textContent ?? "";
-    expect(text).toContain("自动选择");
+    expect(text).not.toContain("自动选择");
+    expect(text).not.toContain("已选择");
+    expect(text).not.toContain("角色完全匹配");
+    expect(dom.window.document.querySelector(".voice-candidate-card.selected")).not.toBeNull();
     expect(text).toContain("角色 35");
     expect(text).toContain("情绪 28");
     expect(text).toContain("1.05×");
@@ -128,6 +132,7 @@ describe("VoiceCandidatePanel", () => {
       selectingCandidateId: null,
       referenceAudioUrl: (assetId: string) => `/preview/${assetId}`,
       onSelect: vi.fn(),
+      onConfirmIdentity: vi.fn(),
       onClear: vi.fn()
     })));
 
@@ -135,5 +140,51 @@ describe("VoiceCandidatePanel", () => {
     expect(text).toContain("暂未自动识别到可用音色");
     expect(text).not.toContain("声音资产目录尚未准备好");
     expect(text).not.toContain("关联角色");
+  });
+
+  it("asks for confirmation instead of allowing direct selection for a fuzzy folder candidate", async () => {
+    const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: "http://localhost" });
+    Object.assign(globalThis, {
+      window: dom.window,
+      document: dom.window.document,
+      HTMLElement: dom.window.HTMLElement,
+      Node: dom.window.Node,
+      Event: dom.window.Event,
+      IS_REACT_ACT_ENVIRONMENT: true
+    });
+    const root = createRoot(dom.window.document.getElementById("root")!);
+    views.push({ root, dom });
+    const onConfirmIdentity = vi.fn();
+    const fuzzyRecommendation: VoiceRecommendation = {
+      ...recommendation,
+      candidates: [{
+        ...recommendation.candidates[0],
+        score_breakdown: { ...recommendation.candidates[0].score_breakdown, character: 35 },
+        auto_fill_eligible: false,
+        identity_match: "folder_fuzzy",
+        requires_identity_confirmation: true,
+        reasons: ["folder_name_fuzzy_match"],
+        training_task: "xxx-胶布tts"
+      }]
+    };
+
+    await act(async () => root.render(createElement(VoiceCandidatePanel, {
+      recommendation: fuzzyRecommendation,
+      loading: false,
+      selectingCandidateId: null,
+      referenceAudioUrl: (assetId: string) => `/preview/${assetId}`,
+      onSelect: vi.fn(),
+      onConfirmIdentity,
+      onClear: vi.fn()
+    })));
+
+    const text = dom.window.document.body.textContent ?? "";
+    expect(text).toContain("角色 35");
+    expect(text).toContain("暂未搜索合适音色，推测音色是否准确？");
+    expect(text).not.toContain("选择此方案");
+    const confirmButton = [...dom.window.document.querySelectorAll("button")]
+      .find((button) => button.textContent?.includes("准确，写入角色映射"));
+    await act(async () => confirmButton?.click());
+    expect(onConfirmIdentity).toHaveBeenCalledWith("candidate-1");
   });
 });

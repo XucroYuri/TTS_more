@@ -11,7 +11,6 @@
 
 .voice-panel-heading,
 .voice-candidate-topline,
-.voice-selection-summary,
 .voice-catalog-summary,
 .voice-resource-state-row {
   display: flex;
@@ -36,26 +35,25 @@
 .voice-panel-empty { display: flex; align-items: center; gap: 7px; margin: 0; color: #475569; font-size: 12px; }
 .voice-panel-error,
 .voice-candidate-blocker { margin: 0; color: #b91c1c; font-size: 12px; overflow-wrap: anywhere; }
-.voice-selection-summary { justify-content: flex-start; padding: 8px 10px; border-radius: 9px; background: #ecfdf5; color: #166534; font-size: 12px; }
-.voice-selection-summary strong { overflow-wrap: anywhere; }
 .voice-candidate-list { display: grid; gap: 10px; }
 .voice-candidate-card { display: grid; gap: 9px; padding: 11px; border: 1px solid #dbe3ef; border-radius: 11px; background: #f8fafc; }
 .voice-candidate-card.selected { border-color: #16a34a; background: #f0fdf4; }
+.voice-candidate-card.needs-confirmation { border-color: #f59e0b; background: #fffbeb; }
 .voice-candidate-topline > div { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .voice-candidate-topline strong { overflow-wrap: anywhere; }
 .voice-candidate-rank { color: #1d4ed8; font-size: 11px; }
 .voice-candidate-score { font-size: 18px; color: #0f172a; }
 .voice-score-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; font-size: 11px; color: #475569; }
-.voice-candidate-meta,
-.voice-reason-list { display: flex; gap: 6px; flex-wrap: wrap; }
+.voice-candidate-meta { display: flex; gap: 6px; flex-wrap: wrap; }
 .voice-candidate-meta span,
-.voice-reason-list span { padding: 2px 6px; border-radius: 6px; background: #eef2f7; color: #475569; font-size: 10px; }
+.voice-candidate-meta span { padding: 2px 6px; border-radius: 6px; background: #eef2f7; color: #475569; font-size: 10px; }
 .voice-candidate-meta .voice-auto-fill { color: #166534; background: #dcfce7; }
 .voice-dynamic-weight-summary { display: grid; gap: 3px; padding: 7px 8px; border-radius: 8px; background: #eff6ff; font-size: 10px; color: #1d4ed8; }
 .voice-dynamic-weight-summary strong { color: #0f172a; overflow-wrap: anywhere; }
 .voice-dynamic-pair-ready { color: #166534; }
-.voice-reason-list span.blocked { color: #b91c1c; }
 .voice-reference-audio { width: 100%; height: 30px; }
+.voice-identity-confirmation { display: grid; gap: 7px; padding: 9px; border-radius: 9px; background: #fef3c7; color: #92400e; font-size: 12px; }
+.voice-identity-confirmation > div { display: flex; gap: 7px; flex-wrap: wrap; }
 
 @media (max-width: 800px) {
   .voice-score-grid { grid-template-columns: 1fr; }

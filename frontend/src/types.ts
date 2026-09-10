@@ -338,6 +338,8 @@ export interface VoiceCandidate {
   training_task?: string | null;
   gpt_weight_artifact_id?: string | null;
   sovits_weight_artifact_id?: string | null;
+  identity_match?: "strict" | "folder_fuzzy";
+  requires_identity_confirmation?: boolean;
 }
 
 export interface VoiceRecommendation {
@@ -345,6 +347,14 @@ export interface VoiceRecommendation {
   catalog_version: string;
   candidates: VoiceCandidate[];
   blockers: string[];
+}
+
+export interface VoiceIdentityConfirmationResponse {
+  character: Character;
+  characters: Character[];
+  project_character: ProjectCharacter;
+  project: ScriptProject;
+  recommendation: VoiceRecommendation;
 }
 
 export interface VoiceSelectionSnapshot {
@@ -650,6 +660,7 @@ export interface ParserProviderConfig {
   model: string;
   enabled: boolean;
   timeout_seconds: number;
+  use_environment_proxy?: boolean;
   priority: number;
   key_configured: boolean;
 }

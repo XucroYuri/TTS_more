@@ -16,7 +16,7 @@ from typing import Any, Literal
 from pydantic import Field
 
 from .storage import windows_path_is_within
-from .gpt_sovits_selection import training_task_from_weight
+from .gpt_sovits_selection import normalize_training_task, training_task_from_weight
 from .voice_matching_models import (
     CatalogSnapshot,
     ReferenceAssetRecord,
@@ -307,7 +307,7 @@ class PortableAssetScanner:
         diagnostics: list[CatalogDiagnostic] = []
         for reference_root in reference_roots:
             training_task = (
-                reference_root.parent.name
+                normalize_training_task(reference_root.parent.name)
                 if reference_root.name.casefold() == "5-wav32k"
                 and reference_root.parent.parent == logs_root
                 else None

@@ -140,6 +140,21 @@ def test_portable_scanner_extracts_exact_training_task_from_each_weight_kind(tmp
     assert scan.reference_assets[0].training_task is None
 
 
+def test_portable_scanner_normalizes_logs_task_like_weight_task(tmp_path: Path) -> None:
+    root = tmp_path / "portable"
+    (root / "GPT_weights_v2ProPlus").mkdir(parents=True)
+    (root / "SoVITS_weights_v2ProPlus").mkdir(parents=True)
+    (root / "GPT_weights_v2ProPlus" / "胶布TTS新-20260611-e50.ckpt").write_bytes(b"gpt")
+    (root / "SoVITS_weights_v2ProPlus" / "胶布TTS新-20260611_e24_s240.pth").write_bytes(b"sovits")
+    reference = root / "logs" / "胶布TTS新-20260611" / "5-wav32k" / "胶布TTS新_01.wav"
+    _write_silent_wav(reference)
+
+    scan = PortableAssetScanner().scan("portable", root)
+
+    assert {item.training_task for item in scan.weight_artifacts} == {"胶布tts新-20260611"}
+    assert {item.training_task for item in scan.reference_assets} == {"胶布tts新-20260611"}
+
+
 def test_portable_scanner_prefers_wav32k_from_variable_training_task_folders(tmp_path: Path) -> None:
     root = _portable_fixture(tmp_path / "portable")
     first = root / "logs" / "task-alpha" / "5-wav32k" / "[九九开心_中文]第一句.wav"

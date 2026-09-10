@@ -5783,6 +5783,14 @@ h3 {
   grid-template-columns: 24px minmax(0, 1fr);
 }
 
+.waveform-player.compact.has-download {
+  grid-template-columns: 24px minmax(0, 1fr) 28px;
+}
+
+.waveform-download {
+  text-decoration: none;
+}
+
 .waveform-player.compact .waveform-canvas {
   max-height: 28px;
 }
@@ -6635,6 +6643,88 @@ h3 {
 
 .gpt-manual-reference-card .audio-input-actions .icon-compact {
   min-height: 30px;
+}
+
+.inspector-manual-reference-card {
+  gap: 0;
+  padding: 0;
+  border-color: var(--geist-gray-300);
+}
+
+.manual-reference-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-3);
+  cursor: pointer;
+  list-style: none;
+}
+
+.manual-reference-summary::-webkit-details-marker {
+  display: none;
+}
+
+.manual-reference-summary-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.manual-reference-summary-copy strong {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.manual-reference-summary-copy > span {
+  color: var(--geist-gray-900);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.manual-reference-chevron {
+  transition: transform 160ms ease;
+}
+
+.inspector-manual-reference-card[open] .manual-reference-chevron {
+  transform: rotate(180deg);
+}
+
+.manual-reference-body {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 0 var(--space-3) var(--space-3);
+}
+
+.manual-reference-weight-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.manual-reference-source {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--geist-gray-200);
+  border-radius: var(--radius-sm);
+  background: var(--geist-bg-subtle);
+}
+
+.manual-reference-source span {
+  color: var(--geist-gray-900);
+  font-size: 11px;
+}
+
+.manual-reference-source strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 17px;
 }
 
 .fallback-reference-source {
@@ -7549,6 +7639,7 @@ h3 {
   .gpt-resource-summary-grid,
   .gpt-resource-control-grid,
   .gpt-manual-reference-card,
+  .manual-reference-weight-grid,
   .voice-route-grid,
   .voice-route-summary,
   .active-reference-player,

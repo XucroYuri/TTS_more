@@ -244,7 +244,10 @@ class _BaseSemanticProvider:
         if self._client is not None:
             return self._request(self._client, endpoint, api_key, chunk)
         try:
-            with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            with httpx.Client(
+                timeout=self.config.timeout_seconds,
+                trust_env=self.config.use_environment_proxy,
+            ) as client:
                 return self._request(client, endpoint, api_key, chunk)
         except SemanticProviderError:
             raise

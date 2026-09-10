@@ -29,6 +29,7 @@ export function createDefaultParserProviderDraft(index = 0): ParserProviderDraft
     model: "gpt-5.5",
     enabled: true,
     timeout_seconds: 45,
+    use_environment_proxy: true,
     priority: index > 0 ? 100 + index : 10,
     key_configured: false,
     api_key: "",
@@ -45,6 +46,7 @@ export function upsertKwjmParserProvider(providers: ParserProviderDraft[], apiKe
     model: KWJM_MODEL,
     enabled: true,
     timeout_seconds: 45,
+    use_environment_proxy: false,
     priority: 200,
     key_configured: false,
     api_key: "",
@@ -80,6 +82,7 @@ export function normalizeParserProviderDraft<T extends ParserProviderDraftLike>(
     ...provider,
     key_configured: provider.key_configured ?? false,
     adapter: normalizeParserProviderAdapter(provider.adapter),
+    use_environment_proxy: provider.use_environment_proxy ?? !isKwjmProvider(provider),
   };
 }
 

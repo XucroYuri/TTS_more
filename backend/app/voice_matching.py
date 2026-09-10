@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import statistics
+import unicodedata
 from collections.abc import Sequence
+from typing import Literal
 
 from .gpt_sovits_selection import DynamicWeightPair, pair_dynamic_weights
+from .role_library import slugify_role_name
 
 from .voice_matching_models import (
     CatalogSnapshot,
@@ -114,6 +117,106 @@ def rank_voice_candidates(
     )
 
 
+def rank_fuzzy_folder_candidates(
+    request: VoiceMatchRequest,
+    catalog: CatalogSnapshot,
+    policy: VoiceMatchPolicy = DEFAULT_POLICY,
+) -> VoiceRecommendation:
+    """Rank complete dynamic tasks whose folder name resembles the role identity.
+
+    This is a confirmation-only fallback. It deliberately does not relax the
+    ordinary identity gates or make a candidate eligible for automatic fill.
+    """
+    if request.is_generic:
+        return VoiceRecommendation(
+            line_id=request.line_id,
+            catalog_version=catalog.version,
+            blockers=[classify_empty_recommendation(request, catalog)],
+        )
+    identity_tokens = _fuzzy_identity_tokens(
+        [request.character_id, *request.character_aliases]
+    )
+    eligible: list[
+        tuple[VoiceResourceRecord, ReferenceAssetRecord, DynamicWeightPair]
+    ] = []
+    for resource in catalog.resources:
+        if resource.state != "ready" or not resource.supports_dynamic_weights:
+            continue
+        for weight_pair in pair_dynamic_weights(catalog, resource):
+            if not _folder_fuzzy_matches(weight_pair.training_task, identity_tokens):
+                continue
+            for asset in catalog.reference_assets:
+                if (
+                    asset.reference_asset_id not in resource.reference_asset_ids
+                    or asset.training_task != weight_pair.training_task
+                    or not asset.prompt_text.strip()
+                    or (
+                        asset.emotion_origin == "inferred"
+                        and asset.emotion_confidence < 0.75
+                    )
+                ):
+                    continue
+                eligible.append((resource, asset, weight_pair))
+    scored = [
+        _score_candidate(
+            request,
+            (resource, asset),
+            policy,
+            weight_pair,
+            character_score=35,
+            identity_match="folder_fuzzy",
+        ).model_copy(update={"catalog_version": catalog.version})
+        for resource, asset, weight_pair in eligible
+    ]
+    scored.sort(
+        key=lambda item: (-item.score, -item.score_breakdown.metadata, item.candidate_id)
+    )
+    return VoiceRecommendation(
+        line_id=request.line_id,
+        catalog_version=catalog.version,
+        candidates=scored[:3],
+        blockers=[] if scored else [classify_empty_recommendation(request, catalog)],
+    )
+
+
+def _fuzzy_identity_tokens(values: Sequence[str]) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        for candidate in (value, slugify_role_name(value)):
+            token = _compact_identity(candidate)
+            if _is_safe_fuzzy_token(token):
+                tokens.add(token)
+    return tokens
+
+
+def _folder_fuzzy_matches(folder_name: str, identity_tokens: set[str]) -> bool:
+    if not identity_tokens:
+        return False
+    folder_tokens = {
+        _compact_identity(folder_name),
+        _compact_identity(slugify_role_name(folder_name)),
+    }
+    return any(
+        token in folder_token
+        for token in identity_tokens
+        for folder_token in folder_tokens
+        if folder_token
+    )
+
+
+def _compact_identity(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(char for char in normalized if char.isalnum())
+
+
+def _is_safe_fuzzy_token(value: str) -> bool:
+    if not value:
+        return False
+    if value.isascii():
+        return len(value) >= 4
+    return len(value) >= 2
+
+
 def _passes_identity_gates(
     request: VoiceMatchRequest,
     pair: tuple[VoiceResourceRecord, ReferenceAssetRecord],
@@ -177,9 +280,12 @@ def _score_candidate(
     pair: tuple[VoiceResourceRecord, ReferenceAssetRecord],
     policy: VoiceMatchPolicy,
     weight_pair: DynamicWeightPair | None = None,
+    *,
+    character_score: float | None = None,
+    identity_match: Literal["strict", "folder_fuzzy"] = "strict",
 ) -> VoiceCandidate:
     resource, asset = pair
-    character = 15 if request.is_generic else 35
+    character = character_score if character_score is not None else (15 if request.is_generic else 35)
     emotion = _emotion_score(request.emotion, asset.emotion)
     duration, speed_factor = _duration_score(request.target_duration_seconds, asset.duration_seconds, policy)
     language = 10 if request.language.casefold() == asset.language.casefold() else 0
@@ -197,7 +303,7 @@ def _score_candidate(
         and asset.emotion_origin == "unknown"
         and asset.emotion == "neutral"
     )
-    auto_fill = breakdown.total >= policy.auto_fill_threshold and (
+    auto_fill = identity_match == "strict" and breakdown.total >= policy.auto_fill_threshold and (
         not explicit_emotion
         or emotion >= policy.explicit_emotion_minimum
         or unknown_emotion_fallback
@@ -210,6 +316,8 @@ def _score_candidate(
     ]
     if unknown_emotion_fallback:
         reasons.append("emotion_metadata_unavailable_fallback")
+    if identity_match == "folder_fuzzy":
+        reasons[0] = "folder_name_fuzzy_match"
     dynamic_identity = (
         f":{weight_pair.gpt_weight_artifact_id}:{weight_pair.sovits_weight_artifact_id}"
         if weight_pair
@@ -236,6 +344,8 @@ def _score_candidate(
         sovits_weight_artifact_id=(
             weight_pair.sovits_weight_artifact_id if weight_pair else None
         ),
+        identity_match=identity_match,
+        requires_identity_confirmation=identity_match == "folder_fuzzy",
     )
 
 

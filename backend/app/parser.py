@@ -70,6 +70,7 @@ class ParserProviderConfig(BaseModel):
     enabled: bool = True
     timeout_seconds: float = 45.0
     adapter: ParserAdapterName = "openai-compatible"
+    use_environment_proxy: bool = True
 
 
 class ParserProviderUnavailable(RuntimeError):
@@ -800,7 +801,10 @@ class OpenAICompatibleProvider:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         url = chat_completions_url(self.config.base_url)
         decoded: dict[str, Any]
-        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+        with httpx.Client(
+            timeout=self.config.timeout_seconds,
+            trust_env=self.config.use_environment_proxy,
+        ) as client:
             try:
                 decoded = self._post_json(client, url, headers, messages)
             except ParserQualityError as initial_error:
@@ -837,7 +841,10 @@ class OpenAICompatibleProvider:
     def probe(self, api_key: str) -> ParserProbeResult:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         url = chat_completions_url(self.config.base_url)
-        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+        with httpx.Client(
+            timeout=self.config.timeout_seconds,
+            trust_env=self.config.use_environment_proxy,
+        ) as client:
             decoded = self._post_json(client, url, headers, parser_contract_probe_messages())
         draft = self.verifier.verify(_CONTRACT_PROBE_SCRIPT, _draft_from_provider_payload(self.name, decoded))
         return ParserProbeResult(draft=draft, content_preview=json.dumps(decoded, ensure_ascii=False)[:120])
@@ -994,7 +1001,10 @@ class AnthropicProvider:
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         }
-        with httpx.Client(timeout=self.config.timeout_seconds) as client:
+        with httpx.Client(
+            timeout=self.config.timeout_seconds,
+            trust_env=self.config.use_environment_proxy,
+        ) as client:
             response = client.post(anthropic_messages_url(self.config.base_url), headers=headers, json=payload)
             response.raise_for_status()
             try:

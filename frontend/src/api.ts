@@ -1,4 +1,4 @@
-import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, VoiceCatalogPublicView, VoiceCatalogSyncStatus, VoiceRecommendation, VoiceSelectionSnapshot, WorkerHealth } from "./types";
+import type { CatalogProvider, Character, DemoValidationPlan, GenerationJob, GenerationManifest, GenerationPreflightResponse, GenerationTask, GPTSoVITSModelCatalogResponse, LogsReferenceAudioResponse, OpenSourceTTSCatalogItem, OpenSourceTTSConfigureRequest, OpenSourceTTSDetectRequest, OpenSourceTTSDetectResponse, ParseRevision, ParsedDraft, ParserProviderDraft, ParserProviderTestResponse, ParserProvidersResponse, ParserProvidersSavePayload, ProjectCharactersResponse, ProjectCharacter, ProjectSummary, QueueStatus, ReferenceAudioGroup, RoleLibraryCandidate, RoleLibraryScanResponse, RuntimeMode, ScriptProject, ScriptRevision, ServiceActionResult, ServiceLoadState, ServiceLogResponse, ServiceSettingsPayload, ServiceSettingsResponse, VoiceCandidates, VoiceCatalogPublicView, VoiceCatalogSyncStatus, VoiceIdentityConfirmationResponse, VoiceRecommendation, VoiceSelectionSnapshot, WorkerHealth } from "./types";
 import type { AnalysisRun, AnalysisRunStatus, DraftOperation, SemanticAnalysisDraft, SemanticConfirmResponse } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -200,6 +200,18 @@ export async function recommendVoices(
 export async function selectVoiceCandidate(projectId: string, lineId: string, candidateId: string): Promise<{ selection: VoiceSelectionSnapshot }> {
   return request(`/api/projects/${encodeURIComponent(projectId)}/lines/${encodeURIComponent(lineId)}/voice-selection`, {
     method: "PUT",
+    headers: jsonHeaders,
+    body: JSON.stringify({ candidate_id: candidateId })
+  });
+}
+
+export async function confirmVoiceCandidateIdentity(
+  projectId: string,
+  lineId: string,
+  candidateId: string
+): Promise<VoiceIdentityConfirmationResponse> {
+  return request(`/api/projects/${encodeURIComponent(projectId)}/lines/${encodeURIComponent(lineId)}/voice-identity-confirmation`, {
+    method: "POST",
     headers: jsonHeaders,
     body: JSON.stringify({ candidate_id: candidateId })
   });
@@ -475,11 +487,18 @@ export async function fetchGptSovitsModelSamples(options: { serviceId?: string |
   return request(`/api/model-catalog/gpt-sovits/samples?${params.toString()}`);
 }
 
-export async function importRoleLibraryCandidate(candidate: RoleLibraryCandidate): Promise<{ character: Character }> {
+export async function importRoleLibraryCandidate(
+  candidate: RoleLibraryCandidate,
+  project?: { projectId: string; projectCharacterId: string }
+): Promise<{ character: Character; project_character?: ProjectCharacter | null }> {
   return request("/api/character-library/import", {
     method: "POST",
     headers: jsonHeaders,
-    body: JSON.stringify({ candidate })
+    body: JSON.stringify({
+      candidate,
+      project_id: project?.projectId,
+      project_character_id: project?.projectCharacterId
+    })
   });
 }
 

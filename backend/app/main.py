@@ -125,6 +125,8 @@ class RoleLibraryScanRequest(BaseModel):
 
 class RoleLibraryImportRequest(BaseModel):
     candidate: dict[str, Any]
+    project_id: str | None = None
+    project_character_id: str | None = None
 
 
 class ProjectCharactersUpdate(BaseModel):
@@ -999,10 +1001,89 @@ def create_app(
     @app.post("/api/character-library/import")
     def import_character_library_candidate(request: RoleLibraryImportRequest) -> dict[str, Any]:
         character = candidate_to_character(request.candidate)
-        characters = [item for item in store.load_characters() if item.id != character.id]
+        project_character: ProjectCharacter | None = None
+        target_project: ScriptProject | None = None
+        if bool(request.project_id) != bool(request.project_character_id):
+            raise HTTPException(status_code=422, detail="project_id and project_character_id must be provided together")
+        if request.project_id and request.project_character_id:
+            try:
+                target_project = store.load_project(request.project_id)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="project not found") from exc
+            project_character = next(
+                (
+                    item
+                    for item in target_project.project_characters
+                    if item.project_character_id == request.project_character_id
+                ),
+                None,
+            )
+            if project_character is None:
+                raise HTTPException(status_code=404, detail="project character not found")
+            if character.library_status != "confirmed" or not _candidate_has_consistent_training_task(request.candidate):
+                raise HTTPException(
+                    status_code=409,
+                    detail="candidate cannot be linked automatically until GPT, SoVITS, and logs reference assets resolve to one training task",
+                )
+            character = character.model_copy(
+                update={
+                    "aliases": list(dict.fromkeys([*character.aliases, project_character.name])),
+                }
+            )
+
+        existing_characters = store.load_characters()
+        existing_match = _find_existing_character_for_candidate(existing_characters, request.candidate, character)
+        if existing_match is not None:
+            character = character.model_copy(
+                update={
+                    "id": existing_match.id,
+                    "aliases": list(dict.fromkeys([*existing_match.aliases, *character.aliases])),
+                    "nicknames": list(dict.fromkeys([*existing_match.nicknames, *character.nicknames])),
+                    "match_names": list(dict.fromkeys([*existing_match.match_names, *character.match_names])),
+                    "avatar_path": existing_match.avatar_path or character.avatar_path,
+                }
+            )
+        characters = [item for item in existing_characters if item.id != character.id]
         characters.append(character)
         store.save_characters(characters)
-        return {"character": character.model_dump(mode="json")}
+
+        if target_project is not None and project_character is not None:
+            def link_imported_character(project: ScriptProject) -> ProjectCharacter:
+                linked: ProjectCharacter | None = None
+                project.project_characters = [
+                    item.model_copy(
+                        update={
+                            "library_character_id": character.id,
+                            "mode": ProjectCharacterMode.REFERENCE,
+                            "character_snapshot": None,
+                            "project_binding": None,
+                            "match_confidence": 1.0,
+                            "match_status": "matched",
+                        }
+                    )
+                    if item.project_character_id == request.project_character_id
+                    else item
+                    for item in project.project_characters
+                ]
+                linked = next(
+                    item
+                    for item in project.project_characters
+                    if item.project_character_id == request.project_character_id
+                )
+                active_parse = next(
+                    (item for item in project.parse_revisions if item.revision_id == project.active_parse_revision_id),
+                    None,
+                )
+                if active_parse is not None:
+                    active_parse.project_characters = project.project_characters
+                return linked
+
+            _, project_character = store.update_project(request.project_id, link_imported_character)
+
+        return {
+            "character": character.model_dump(mode="json"),
+            "project_character": project_character.model_dump(mode="json") if project_character else None,
+        }
 
     @app.post("/api/character-library/import-common-presets")
     def import_common_logs_preset_characters(service_id: str | None = None, replace_existing: bool = False) -> dict[str, Any]:
@@ -2634,6 +2715,17 @@ def _identity_key(value: Any) -> str:
     if value is None:
         return ""
     return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value).casefold())
+
+
+def _candidate_has_consistent_training_task(candidate: dict[str, Any]) -> bool:
+    logs_name = str(candidate.get("logs_name") or "").strip().casefold()
+    gpt_path = str(candidate.get("recommended_gpt_weights_path") or "").strip()
+    sovits_path = str(candidate.get("recommended_sovits_weights_path") or "").strip()
+    if not logs_name or not gpt_path or not sovits_path:
+        return False
+    gpt_task = training_task_from_weight(Path(gpt_path), "gpt")
+    sovits_task = training_task_from_weight(Path(sovits_path), "sovits")
+    return bool(gpt_task and sovits_task and gpt_task == sovits_task == logs_name)
 
 
 app = create_app()

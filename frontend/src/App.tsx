@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Bot,
   CheckCircle2,
+  ChevronDown,
   Cpu,
   FileText,
   History,
@@ -45,6 +46,7 @@ import {
   fetchServiceLoadState,
   saveServiceSettings,
   configureOpenSourceTTS,
+  confirmVoiceCandidateIdentity,
   detectOpenSourceTTS,
   fetchServiceLogs,
   fetchServices,
@@ -149,7 +151,7 @@ import { summarizeLineHistory } from "./lib/status";
 import { coreLocalProviders, coreProviderCoverage, filterScriptLines, isServiceOperational, lineHistoryForLine, routableProviderServices, serviceTopbarHealthItems, serviceTopbarSummary, standardProjectName, toggleLineSelection, validationRunState, type LineStatusFilter } from "./lib/workstation";
 import { buildComfyUIEndpointRequest, ttsAudioSuiteContractForProvider } from "./lib/ttsAccess";
 import { createToast, inferToastLevel, shouldToastNotice, toastDuration, type Toast, type ToastLevel, type ToastOptions } from "./lib/toast";
-import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, inspectorVersionContextVisible, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, lineWorkbenchControlsState, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
+import { generationMethodForProvider, generationMethodOptions, generationMethodRouteLabels, historyPlayerSummary, inspectorBackupReferenceVisible, inspectorDiagnosticsState, inspectorPanelMode, inspectorSections, lineCardSecondaryBadges, lineFilterToolbarState, lineFocusTransition, lineWorkbenchControlsState, preflightFallbackAction, preflightLineLabelKey, preflightLineTone, preflightLoadLabelKey, preflightLoadTone, roleAccentClass, shouldRequestRevisionConfirmation, trustedBackupReferenceGroups, type GenerationMethodId, type LineCardSecondaryBadge } from "./lib/workbenchView";
 import type {
   Character,
   CharacterReferenceAudioGroup,
@@ -788,17 +790,6 @@ export default function App() {
     () => activeVersions.find((version) => version.version_id === selectedHistoryVersions[activeLine?.id ?? ""]),
     [activeLine?.id, activeVersions, selectedHistoryVersions]
   );
-  const selectedHistoryVersionTags = useMemo(
-    () => {
-      if (!selectedHistoryVersion) return null;
-      const service = selectedHistoryVersion.service_id ? services.find((item) => item.service_id === selectedHistoryVersion.service_id) : undefined;
-      return generationVersionTags(
-        selectedHistoryVersion,
-        selectedHistoryVersion.service_id ? serviceDisplayName(service ?? ({ engine: selectedHistoryVersion.engine, display_name: selectedHistoryVersion.service_id, ready: false } as WorkerHealth)) : undefined
-      );
-    },
-    [selectedHistoryVersion, services]
-  );
   const activeVersionDraft = activeLine ? versionDrafts[activeLine.id] : undefined;
   const activeInspectorMode = inspectorPanelMode(selectedHistoryVersion?.version_id);
   const activeSummary = useMemo(() => summarizeLineHistory(activeLine ? lineHistoryForLine(manifest, activeLine) : undefined), [activeLine, manifest]);
@@ -1320,6 +1311,30 @@ export default function App() {
       setProject(mergedProject);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("voiceMatching.selectionFailed"));
+    } finally {
+      setSelectingVoiceCandidateId(null);
+    }
+  }
+
+  async function confirmFuzzyVoiceIdentity(candidateId: string) {
+    if (!currentProjectId || !activeLine) return;
+    const projectId = currentProjectId;
+    const lineId = activeLine.id;
+    setSelectingVoiceCandidateId(candidateId);
+    try {
+      await flushPendingProjectAutosave(projectId);
+      const payload = await confirmVoiceCandidateIdentity(projectId, lineId, candidateId);
+      voiceRecommendationCacheRef.current.clear();
+      setVoiceRecommendations((current) => ({
+        ...current,
+        [lineId]: payload.recommendation
+      }));
+      setCharacters(payload.characters);
+      markWorkspaceAuthoritative(projectId, payload.project, payload.characters);
+      setProject(payload.project);
+      setNotice(t("voiceMatching.identityConfirmed"));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("voiceMatching.identityConfirmationFailed"));
     } finally {
       setSelectingVoiceCandidateId(null);
     }
@@ -1851,7 +1866,7 @@ export default function App() {
       if (terminalNotice) {
         setNotice(t(terminalNotice.key), { level: terminalNotice.level });
       }
-      await refreshTopology();
+      void refreshTopology();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.generationFailed"));
     } finally {
@@ -3487,6 +3502,10 @@ export default function App() {
                                           onClick={() => {
                                             setActiveRoleCandidateId(candidate.id);
                                             setActiveModelCatalogId(null);
+                                            setActiveProjectRoleId(
+                                              suggestedProjectRoleId(candidate, projectCharacters)
+                                              ?? activeProjectRoleId
+                                            );
                                           }}
                                         >
                                           <span className="candidate-strip-title">
@@ -3599,13 +3618,42 @@ export default function App() {
                                       <strong>{activeRoleCandidate.name}</strong>
                                       <span>{activeRoleCandidate.logs_name ?? activeRoleCandidate.id}</span>
                                     </div>
-                                    <button className="primary-button compact-button" onClick={() => void importCandidate(activeRoleCandidate)}>{t("characters.importCandidate")}</button>
                                   </div>
                                   <div className="role-detail-metrics">
                                     <div><span>GPT</span><strong>{activeRoleCandidate.gpt_weights?.length ?? 0}</strong></div>
                                     <div><span>SoVITS</span><strong>{activeRoleCandidate.sovits_weights?.length ?? 0}</strong></div>
                                     <div><span>Ref</span><strong>{activeRoleCandidate.reference_audio_groups?.reduce((sum, group) => sum + (group.samples?.length ?? 0), 0) ?? 0}</strong></div>
                                   </div>
+                                  <section className="role-config-card">
+                                    <div className="role-config-head">
+                                      <strong>{t("characters.candidateProjectRole")}</strong>
+                                      <select value={activeProjectCharacter?.project_character_id ?? ""} onChange={(event) => setActiveProjectRoleId(event.target.value || null)}>
+                                        {projectRoleRows.map((role) => (
+                                          <option value={role.id} key={role.id}>{role.name}</option>
+                                        ))}
+                                      </select>
+                                    </div>
+                                    <div className="role-detail-card">
+                                      <span>{t("characters.candidateAssociation")}</span>
+                                      <strong>
+                                        {roleCandidateHasCompleteTrainingTask(activeRoleCandidate)
+                                          ? t("characters.completeTrainingTask")
+                                          : t("characters.incompleteTrainingTask")}
+                                      </strong>
+                                      <small>
+                                        {roleCandidateHasCompleteTrainingTask(activeRoleCandidate)
+                                          ? t("characters.completeTrainingTaskHint", { role: activeProjectCharacter?.name ?? t("status.unassigned") })
+                                          : t("characters.incompleteTrainingTaskHint")}
+                                      </small>
+                                    </div>
+                                    <div className="role-model-actions">
+                                      <button className="primary-button compact-button" onClick={() => void importCandidate(activeRoleCandidate)}>
+                                        {roleCandidateHasCompleteTrainingTask(activeRoleCandidate) && activeProjectCharacter
+                                          ? t("characters.importAndLinkCandidate")
+                                          : t("characters.importCandidate")}
+                                      </button>
+                                    </div>
+                                  </section>
                                   <div className="role-detail-card">
                                     <span>{t("characters.sourceService")}</span>
                                     <strong>{serviceDisplayName(serviceById.get(activeRoleCandidate.service_id ?? "") ?? ({ engine: "gpt-sovits", display_name: activeRoleCandidate.service_id ?? t("services.noService"), ready: false } as WorkerHealth))}</strong>
@@ -4038,40 +4086,6 @@ export default function App() {
             <VoiceInspector mode={activeInspectorMode}>
             {activeLine && (
               <div className="inspector-stack">
-                {inspectorVersionContextVisible(activeInspectorMode, selectedHistoryVersion?.version_id) && selectedHistoryVersion && activeVersionDraft ? (
-                  <section className="inspector-card selected-version-card">
-                    <div className="selected-version-head">
-                      <div>
-                        <span>{t("inspector.selectedVersion")}</span>
-                        <strong>{selectedHistoryVersion.version_id} · {providerLabel(selectedHistoryVersion.provider_type ?? selectedHistoryVersion.engine)}</strong>
-                      </div>
-                      <button className="secondary-button compact-button" onClick={() => clearSelectedHistoryVersion(activeLine.id)}>{t("inspector.returnToCurrentBinding")}</button>
-                    </div>
-
-                    <div className="version-param-grid">
-                      <div>
-                        <span>{t("inspector.service")}</span>
-                        <strong>{selectedHistoryVersionTags?.service ?? selectedHistoryVersion.service_id ?? t("inspector.autoRoute")}</strong>
-                      </div>
-                      <div>
-                        <span>{t("inspector.configScheme")}</span>
-                        <strong>{selectedHistoryVersionTags?.config ?? selectedHistoryVersion.binding_id ?? selectedHistoryVersion.profile}</strong>
-                      </div>
-                      <div>
-                        <span>{t("inspector.verificationLevel")}</span>
-                        <strong>{selectedHistoryVersionTags ? t(`history.verification.${selectedHistoryVersionTags.verification}`) : String(selectedHistoryVersion.metadata?.load_verification_level ?? selectedHistoryVersion.metadata?.verification_level ?? t("status.unset"))}</strong>
-                      </div>
-                    </div>
-
-                    <details className="version-param-details">
-                      <summary>{t("inspector.parameterSnapshot")}</summary>
-                      <pre>{formatVersionParameters(activeVersionDraft.parameters ?? selectedHistoryVersion.parameters ?? {})}</pre>
-                    </details>
-
-                    {selectedHistoryVersion.error && <p className="selected-version-error">{selectedHistoryVersion.error}</p>}
-                  </section>
-                ) : null}
-
                 <section className="inspector-card resident-voice-summary">
                   <div>
                     <span>{t("inspector.currentVoice")}</span>
@@ -4562,10 +4576,107 @@ export default function App() {
                   selectingCandidateId={selectingVoiceCandidateId}
                   referenceAudioUrl={referenceAudioUrl}
                   onSelect={(candidateId) => void chooseVoiceCandidate(candidateId)}
+                  onConfirmIdentity={(candidateId) => void confirmFuzzyVoiceIdentity(candidateId)}
                   onClear={() => void clearActiveVoiceSelection()}
                   onSyncAssets={() => void runVoiceCatalogSync()}
                   onOpenServices={() => setIsVoiceConfigurationOpen(true)}
                 />
+
+                {activeProvider === "gpt-sovits" && (
+                  <details className="inspector-card inspector-manual-reference-card">
+                    <summary className="manual-reference-summary">
+                      <span className="manual-reference-summary-copy">
+                        <strong><Mic2 size={15} /> {t("inspector.manualReferenceSetup")}</strong>
+                        <span>{t("inspector.manualReferenceSetupHint")}</span>
+                      </span>
+                      <ChevronDown className="manual-reference-chevron" size={16} />
+                    </summary>
+
+                    <div className="manual-reference-body">
+                      <div className="manual-reference-weight-grid">
+                        <label className="resource-field">
+                          <span>{t("inspector.gptWeights")}</span>
+                          <select value={activeGptWeightOption.value} onChange={(event) => updateActiveBindingConfig({ gpt_weights_path: event.target.value || undefined })}>
+                            <option value="">{t("inspector.autoDefault")}</option>
+                            {activeGptWeightOption.relativePath && (
+                              <option value={activeGptWeightOption.value}>{shortPath(activeGptWeightOption.relativePath)}</option>
+                            )}
+                            {voiceCandidates?.gpt_sovits.gpt_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
+                          </select>
+                        </label>
+                        <label className="resource-field">
+                          <span>{t("inspector.sovitsWeights")}</span>
+                          <select value={activeSovitsWeightOption.value} onChange={(event) => updateActiveBindingConfig({ sovits_weights_path: event.target.value || undefined })}>
+                            <option value="">{t("inspector.autoDefault")}</option>
+                            {activeSovitsWeightOption.relativePath && (
+                              <option value={activeSovitsWeightOption.value}>{shortPath(activeSovitsWeightOption.relativePath)}</option>
+                            )}
+                            {voiceCandidates?.gpt_sovits.sovits_weights.map((item) => <option value={item.path} key={item.path}>{item.name}</option>)}
+                          </select>
+                        </label>
+                      </div>
+
+                      <div className="logs-reference-picker">
+                        <label className="resource-field">
+                          <span>{t("inspector.logsReferenceAudio")}</span>
+                          <select
+                            value={activeLogsReferenceOptionValue}
+                            disabled={!activeLogsReferenceRequest || loadingLogsReferenceKey === activeLogsReferenceRequest?.key}
+                            onChange={(event) => {
+                              const sample = activeLogsReferenceSamples.find((item) => item.sample_id === event.target.value);
+                              if (sample) applyLogsReferenceSample(sample);
+                            }}
+                          >
+                            <option value="">{activeLogsReferenceRequest ? t("status.unset") : t("inspector.logsReferenceNeedsLogs")}</option>
+                            {!activeLogsReferenceSample && activeReferenceAudioPath && (
+                              <option value={CATALOG_STAGED_REFERENCE_OPTION}>{activeReferenceAudioLabel}</option>
+                            )}
+                            {activeLogsReferenceSamples.map((sample) => (
+                              <option value={sample.sample_id} key={sample.sample_id}>{sample.display_label}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <button
+                          className="icon-button"
+                          type="button"
+                          disabled={!activeLogsReferenceRequest}
+                          onClick={() => {
+                            if (!activeLogsReferenceRequest) return;
+                            setLogsReferenceAudio((current) => {
+                              const next = { ...current };
+                              delete next[activeLogsReferenceRequest.key];
+                              return next;
+                            });
+                          }}
+                          title={t("inspector.refreshLogsReference")}
+                        >
+                          <RefreshCw size={14} />
+                        </button>
+                      </div>
+
+                      {activeLogsReferenceSample && (
+                        <div className="manual-reference-source">
+                          <span>{t("inspector.textSource")}: {activeLogsReferenceSample.text_source || t("status.unset")}</span>
+                          <strong>{activeLogsReferenceSample.text || t("inspector.emptyPromptText")}</strong>
+                        </div>
+                      )}
+
+                      <div className="gpt-manual-reference-card">
+                        <label className="resource-field manual-reference-text-field">
+                          <span>{t("inspector.promptText")}</span>
+                          <textarea value={stringConfig(activeBindingConfig.prompt_text)} onChange={(event) => updateActiveBindingConfig({ prompt_text: event.target.value })} placeholder={t("inspector.promptPlaceholder")} rows={3} />
+                        </label>
+                        <div className="manual-reference-audio-field">
+                          <ReferenceAudioInput
+                            label={t("inspector.referenceAudio")}
+                            value={stringConfig(activeBindingConfig.ref_audio_path)}
+                            onUpload={(file) => uploadLineReference(file, "ref_audio_path")}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </details>
+                )}
 
                 <section className={`inspector-generate-dock inspector-speech-workbench tone-${activeInspectorDiagnostics.tone}`}>
                   <div className="speech-workbench-line">
@@ -4597,7 +4708,13 @@ export default function App() {
                         <span>{t("inspector.generatedResult")}</span>
                         <strong>{activePlayableVersion.version_id}</strong>
                       </div>
-                      <WaveformPlayer audioPath={activePlayableVersion.audio_path} label={activePlayableVersion.version_id} compact />
+                      <WaveformPlayer
+                        audioPath={activePlayableVersion.audio_path}
+                        label={activePlayableVersion.version_id}
+                        compact
+                        downloadLabel={t("actions.downloadAudio")}
+                        downloadName={fileNameFromPath(activePlayableVersion.audio_path, `${activePlayableVersion.version_id}.wav`)}
+                      />
                     </div>
                   )}
                   <div className="generate-dock-actions">
@@ -4907,20 +5024,67 @@ export default function App() {
   }
 
   async function importCandidate(candidate: RoleLibraryCandidate) {
+    const canLinkToProject = Boolean(
+      currentProjectId
+      && activeProjectCharacter
+      && roleCandidateHasCompleteTrainingTask(candidate)
+    );
+    const confirmed = await requestConfirmation({
+      title: t("characters.importCandidateTitle"),
+      body: canLinkToProject
+        ? t("characters.importCandidateAndLinkBody", {
+            candidate: candidate.name,
+            role: activeProjectCharacter?.name ?? ""
+          })
+        : t("characters.importCandidateOnlyBody", { candidate: candidate.name }),
+      detail: canLinkToProject
+        ? t("characters.importCandidateAndLinkDetail", {
+            logs: candidate.logs_name ?? candidate.name,
+            role: activeProjectCharacter?.name ?? ""
+          })
+        : t("characters.importCandidateOnlyDetail", {
+            logs: candidate.logs_name ?? candidate.name
+          }),
+      confirmLabel: canLinkToProject ? t("characters.importAndLinkCandidate") : t("characters.importCandidate"),
+      cancelLabel: t("actions.cancel"),
+      tone: "info"
+    });
+    if (!confirmed) return;
     setNotice(t("notice.importingRole"));
     try {
-      const payload = await importRoleLibraryCandidate(candidate);
-      setCharacters((current) => [...current.filter((character) => character.id !== payload.character.id), payload.character]);
+      if (currentProjectId) await flushPendingProjectAutosave(currentProjectId);
+      const projectTarget = canLinkToProject && currentProjectId && activeProjectCharacter
+        ? { projectId: currentProjectId, projectCharacterId: activeProjectCharacter.project_character_id }
+        : undefined;
+      const payload = await importRoleLibraryCandidate(candidate, projectTarget);
+      const nextCharacters = [
+        ...charactersRef.current.filter((character) => character.id !== payload.character.id),
+        payload.character
+      ];
+      setCharacters(nextCharacters);
       setRoleLibraryCandidates((current) => current.filter((item) => item.id !== candidate.id));
       setActiveRoleCandidateId(null);
       setActiveLibraryCharacterId(payload.character.id);
-      setProject((current) => projectWithProjectCharacters(current, ensureProjectCharacters(current, characters).map((item) =>
-          normalizeRoleToken(item.name) === normalizeRoleToken(payload.character.name)
-            ? { ...item, library_character_id: payload.character.id, mode: "reference", character_snapshot: null }
-            : item
-        ))
-      );
-      setNotice(t("notice.roleImported"));
+      if (payload.project_character && currentProjectId) {
+        const targetLineIds = projectRef.current.lines
+          .filter((line) => line.character_id === payload.project_character?.project_character_id)
+          .map((line) => line.id);
+        if (targetLineIds.length > 0) {
+          const recommendationPayload = await recommendVoices(currentProjectId, targetLineIds, { applyAutomatic: true });
+          setVoiceRecommendations((current) => ({
+            ...current,
+            ...Object.fromEntries(
+              recommendationPayload.recommendations.map((recommendation) => [recommendation.line_id, recommendation])
+            )
+          }));
+        }
+        const authoritativeProject = await fetchProject(currentProjectId);
+        markWorkspaceAuthoritative(currentProjectId, authoritativeProject, nextCharacters);
+        setProject(authoritativeProject);
+        setNotice(t("notice.roleImportedAndMatched", { role: payload.project_character.name }));
+      } else {
+        setNotice(t("notice.roleImported"));
+      }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("notice.roleImportFailed"));
     }
@@ -5162,6 +5326,43 @@ function characterMatchValues(character: Character): string[] {
 
 function normalizeRoleToken(value: string): string {
   return value.replace(/\s+/g, "").toLocaleLowerCase();
+}
+
+function roleCandidateHasCompleteTrainingTask(candidate: RoleLibraryCandidate): boolean {
+  const hasReference = Boolean(
+    candidate.recommended_ref_audio_path
+    || candidate.reference_audio_groups?.some((group) => (group.samples?.length ?? 0) > 0)
+  );
+  return Boolean(
+    candidate.logs_name
+    && candidate.recommended_gpt_weights_path
+    && candidate.recommended_sovits_weights_path
+    && hasReference
+  );
+}
+
+function suggestedProjectRoleId(
+  candidate: RoleLibraryCandidate,
+  projectCharacters: ProjectCharacter[]
+): string | null {
+  const candidateTokens = [candidate.name, ...(candidate.aliases ?? [])]
+    .map(normalizeRoleToken)
+    .filter(Boolean);
+  let best: { id: string; score: number } | null = null;
+  for (const projectCharacter of projectCharacters) {
+    const roleToken = normalizeRoleToken(projectCharacter.name);
+    if (!roleToken) continue;
+    const score = candidateTokens.reduce((current, token) => {
+      if (token === roleToken) return Math.max(current, 100);
+      if (roleToken.length >= 2 && token.includes(roleToken)) return Math.max(current, 80);
+      if (token.length >= 2 && roleToken.includes(token)) return Math.max(current, 70);
+      return current;
+    }, 0);
+    if (score > 0 && (!best || score > best.score)) {
+      best = { id: projectCharacter.project_character_id, score };
+    }
+  }
+  return best?.id ?? null;
 }
 
 function buildRunnableTasks(lines: ScriptLine[], characters: Character[]): { tasks: GenerationTask[]; blocked: ScriptLine[] } {
@@ -5496,11 +5697,6 @@ function summarizeConfigValue(value: unknown): string {
   return String(value);
 }
 
-function formatVersionParameters(parameters: Record<string, unknown>): string {
-  if (Object.keys(parameters).length === 0) return "{}";
-  return JSON.stringify(parameters, null, 2);
-}
-
 function compactSignature(signature: string): string {
   const parts = signature.split("|").filter(Boolean);
   if (parts.length <= 2) return signature;
@@ -5514,6 +5710,10 @@ function shortPath(value: string): string {
   const parts = value.split(/[\\/]/).filter(Boolean);
   if (parts.length <= 2) return value;
   return `${parts.at(-2)} / ${parts.at(-1)}`;
+}
+
+function fileNameFromPath(value: string, fallback: string): string {
+  return value.split(/[\\/]/).filter(Boolean).at(-1)?.trim() || fallback;
 }
 
 function shortRevisionId(value: string): string {
@@ -5787,7 +5987,12 @@ function LineHistoryPanel({
                   </button>
                 </div>
                 {player.playable && player.audioPath ? (
-                  <WaveformPlayer audioPath={player.audioPath} label={`${t("history.waveformLabel")} ${player.versionId}`} />
+                  <WaveformPlayer
+                    audioPath={player.audioPath}
+                    label={`${t("history.waveformLabel")} ${player.versionId}`}
+                    downloadLabel={t("actions.downloadAudio")}
+                    downloadName={fileNameFromPath(player.audioPath, `${player.versionId}.wav`)}
+                  />
                 ) : version.error ? (
                   <FailureHistoryMessage version={version} t={t} />
                 ) : (

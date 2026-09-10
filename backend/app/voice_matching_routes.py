@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import re
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
@@ -9,13 +11,20 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .models import (
+    Character,
+    ProjectCharacter,
     ProjectCharacterMode,
     ProviderType,
     ScriptLine,
     ScriptProject,
     VoiceBinding,
 )
-from .role_library import match_project_characters, resolve_project_characters
+from .role_library import (
+    candidate_to_character,
+    match_project_characters,
+    resolve_project_characters,
+    slugify_role_name,
+)
 from .storage import ProjectStore
 from .voice_catalog import (
     ReferenceMetadataOverride,
@@ -23,7 +32,11 @@ from .voice_catalog import (
     VoiceCatalogError,
     VoiceCatalogService,
 )
-from .voice_matching import estimate_target_duration, rank_voice_candidates
+from .voice_matching import (
+    estimate_target_duration,
+    rank_fuzzy_folder_candidates,
+    rank_voice_candidates,
+)
 from .voice_matching_models import (
     CatalogSnapshot,
     VoiceCandidate,
@@ -118,43 +131,214 @@ def _recommend_line(
             },
         )
     line, character = _line_and_character(project, line_id, store)
-    if character is None:
-        return VoiceRecommendation(
-            line_id=line.id,
-            catalog_version=snapshot.version,
-            blockers=["no_role_mapping"],
-        )
+    project_character = next(
+        (
+            item
+            for item in project.project_characters
+            if item.project_character_id == line.character_id
+        ),
+        None,
+    )
     language = line.language or project.default_language or "zh"
     emotion = _normalized_emotion(line.note)
     estimate = estimate_target_duration(line.text, language, emotion)
-    aliases: list[str] = []
+    aliases: list[str] = [project_character.name] if project_character is not None else []
     is_generic = False
     if character is not None:
         aliases = list(
             dict.fromkeys(
-                [character.name, *character.aliases, *character.nicknames, *character.match_names]
+                [
+                    *aliases,
+                    character.name,
+                    *character.aliases,
+                    *character.nicknames,
+                    *character.match_names,
+                ]
             )
         )
         is_generic = any(tag.strip().casefold() in _GENERIC_TAGS for tag in character.tags)
-    recommendation = rank_voice_candidates(
-        VoiceMatchRequest(
-            line_id=line.id,
-            character_id=line.character_id,
-            character_aliases=aliases,
-            is_generic=is_generic,
-            text=line.text,
-            language=language,
-            emotion=emotion,
-            target_duration_seconds=max(0.001, estimate.target_seconds),
-        ),
-        snapshot,
+    match_request = VoiceMatchRequest(
+        line_id=line.id,
+        character_id=line.character_id,
+        character_aliases=aliases,
+        is_generic=is_generic,
+        text=line.text,
+        language=language,
+        emotion=emotion,
+        target_duration_seconds=max(0.001, estimate.target_seconds),
     )
+    recommendation = (
+        rank_voice_candidates(match_request, snapshot)
+        if character is not None
+        else VoiceRecommendation(
+            line_id=line.id,
+            catalog_version=snapshot.version,
+            blockers=["no_role_mapping"],
+        )
+    )
+    if not recommendation.candidates:
+        fuzzy = rank_fuzzy_folder_candidates(match_request, snapshot)
+        if fuzzy.candidates:
+            recommendation = fuzzy
     return recommendation.model_copy(
         update={
             "candidates": [
                 candidate.model_copy(update={"catalog_version": snapshot.version})
                 for candidate in recommendation.candidates
             ]
+        }
+    )
+
+
+def _identity_key(value: object) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+
+def _find_character_for_confirmed_folder(
+    characters: list[Character],
+    training_task: str,
+    asset_identities: list[str],
+) -> Character | None:
+    task_key = _identity_key(training_task)
+    for character in characters:
+        if task_key and task_key in {
+            _identity_key(value) for value in character.match_names
+        }:
+            return character
+    identity_keys = {_identity_key(value) for value in asset_identities}
+    identity_keys.discard("")
+    for character in characters:
+        values = [
+            character.id,
+            character.name,
+            *character.aliases,
+            *character.nicknames,
+            *character.match_names,
+        ]
+        if identity_keys.intersection(_identity_key(value) for value in values):
+            return character
+    return None
+
+
+def _character_from_confirmed_folder(
+    project_character: ProjectCharacter,
+    candidate: VoiceCandidate,
+    snapshot: CatalogSnapshot,
+    service: VoiceCatalogService,
+) -> Character:
+    if (
+        not candidate.training_task
+        or not candidate.gpt_weight_artifact_id
+        or not candidate.sovits_weight_artifact_id
+    ):
+        raise HTTPException(status_code=409, detail="fuzzy candidate has no complete training task")
+    resource = next(
+        (item for item in snapshot.resources if item.resource_id == candidate.resource_id),
+        None,
+    )
+    selected_reference = next(
+        (
+            item
+            for item in snapshot.reference_assets
+            if item.reference_asset_id == candidate.reference_asset_id
+        ),
+        None,
+    )
+    if resource is None or selected_reference is None:
+        raise HTTPException(status_code=409, detail="fuzzy candidate assets are unavailable")
+    pair = _weight_pair_for_candidate(snapshot, resource, selected_reference, candidate)
+    if pair is None:
+        raise HTTPException(status_code=409, detail="fuzzy candidate weight pair is unavailable")
+    gpt_path = service.resolve_weight(pair[0].artifact_id)
+    sovits_path = service.resolve_weight(pair[1].artifact_id)
+    reference_path = service.resolve_reference(selected_reference.reference_asset_id)
+    task_references = [
+        item
+        for item in snapshot.reference_assets
+        if item.reference_asset_id in resource.reference_asset_ids
+        and item.training_task == candidate.training_task
+    ]
+    asset_identities = list(
+        dict.fromkeys(
+            [
+                selected_reference.character_id,
+                *selected_reference.character_aliases,
+                *(item.character_id for item in task_references),
+                *(alias for item in task_references for alias in item.character_aliases),
+            ]
+        )
+    )
+    role_id = slugify_role_name(candidate.training_task)
+    character = candidate_to_character(
+        {
+            "id": role_id,
+            "name": selected_reference.character_id or project_character.name,
+            "aliases": list(
+                dict.fromkeys([project_character.name, project_character.project_character_id, *asset_identities])
+            ),
+            "match_names": [candidate.training_task],
+            "logs_id": role_id,
+            "logs_name": candidate.training_task,
+            "service_id": resource.service_id or "local-gpt-sovits",
+            "gpt_weights": [str(gpt_path)],
+            "sovits_weights": [str(sovits_path)],
+            "recommended_gpt_weights_path": str(gpt_path),
+            "recommended_sovits_weights_path": str(sovits_path),
+            "reference_audio_groups": [
+                {
+                    "id": f"{role_id}-confirmed-folder",
+                    "name": candidate.training_task,
+                    "paths": [str(reference_path)],
+                    "samples": [
+                        {
+                            "path": str(reference_path),
+                            "text": selected_reference.prompt_text,
+                            "text_source": "manual",
+                            "duration_seconds": selected_reference.duration_seconds,
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    mapping = {
+        "training_task": candidate.training_task,
+        "resource_id": candidate.resource_id,
+        "root_id": pair[0].root_id,
+        "gpt_weight_artifact_id": pair[0].artifact_id,
+        "sovits_weight_artifact_id": pair[1].artifact_id,
+        "reference_asset_id": selected_reference.reference_asset_id,
+        "confirmed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "confirmed_for_project_role": project_character.name,
+    }
+    return character.model_copy(
+        update={
+            "source_assets": {
+                **character.source_assets,
+                "folder_mappings": [mapping],
+            }
+        }
+    )
+
+
+def _merge_confirmed_folder_character(
+    existing: Character,
+    candidate: Character,
+) -> Character:
+    existing_mappings = existing.source_assets.get("folder_mappings", [])
+    candidate_mappings = candidate.source_assets.get("folder_mappings", [])
+    return candidate.model_copy(
+        update={
+            "id": existing.id,
+            "aliases": list(dict.fromkeys([*existing.aliases, *candidate.aliases])),
+            "nicknames": list(dict.fromkeys([*existing.nicknames, *candidate.nicknames])),
+            "match_names": list(dict.fromkeys([*existing.match_names, *candidate.match_names])),
+            "avatar_path": existing.avatar_path or candidate.avatar_path,
+            "source_assets": {
+                **existing.source_assets,
+                **candidate.source_assets,
+                "folder_mappings": [*existing_mappings, *candidate_mappings],
+            },
         }
     )
 
@@ -430,6 +614,14 @@ def build_voice_matching_router(
         )
         if candidate is None:
             raise HTTPException(status_code=409, detail="candidate is no longer eligible")
+        if candidate.requires_identity_confirmation:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "voice_identity_confirmation_required",
+                    "stage": "voice_selection",
+                },
+            )
         line, _ = _line_and_character(project, line_id, store)
         selection = _save_candidate(
             project_id,
@@ -442,6 +634,119 @@ def build_voice_matching_router(
         )
         store.save_project(project_id, project)
         return {"selection": selection.model_dump(mode="json")}
+
+    @router.post(
+        "/api/projects/{project_id}/lines/{line_id}/voice-identity-confirmation"
+    )
+    def confirm_fuzzy_identity(
+        project_id: str,
+        line_id: str,
+        request: VoiceSelectionRequest,
+    ) -> dict[str, object]:
+        try:
+            project = store.load_project(project_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        recommendation = _recommend_line(project, line_id, store, service)
+        candidate = next(
+            (
+                item
+                for item in recommendation.candidates
+                if item.candidate_id == request.candidate_id
+            ),
+            None,
+        )
+        if candidate is None or not candidate.requires_identity_confirmation:
+            raise HTTPException(
+                status_code=409,
+                detail="candidate no longer requires identity confirmation",
+            )
+        project_character = next(
+            (
+                item
+                for item in project.project_characters
+                if item.project_character_id
+                == next(line for line in project.lines if line.id == line_id).character_id
+            ),
+            None,
+        )
+        if project_character is None:
+            raise HTTPException(status_code=404, detail="project character not found")
+        snapshot = service.store.load_current()
+        if snapshot is None or snapshot.version != candidate.catalog_version:
+            raise HTTPException(status_code=409, detail="candidate catalog is stale")
+        try:
+            character = _character_from_confirmed_folder(
+                project_character,
+                candidate,
+                snapshot,
+                service,
+            )
+        except VoiceCatalogError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "field_path": exc.field_path},
+            ) from exc
+        existing_characters = store.load_characters()
+        task_references = [
+            item
+            for item in snapshot.reference_assets
+            if item.training_task == candidate.training_task
+        ]
+        existing = _find_character_for_confirmed_folder(
+            existing_characters,
+            candidate.training_task or "",
+            [
+                identity
+                for item in task_references
+                for identity in [item.character_id, *item.character_aliases]
+            ],
+        )
+        if existing is not None:
+            character = _merge_confirmed_folder_character(existing, character)
+        characters = [item for item in existing_characters if item.id != character.id]
+        characters.append(character)
+        store.save_characters(characters)
+
+        project.project_characters = [
+            item.model_copy(
+                update={
+                    "library_character_id": character.id,
+                    "mode": ProjectCharacterMode.REFERENCE,
+                    "character_snapshot": None,
+                    "project_binding": None,
+                    "match_confidence": 1.0,
+                    "match_status": "manual",
+                }
+            )
+            if item.project_character_id == project_character.project_character_id
+            else item
+            for item in project.project_characters
+        ]
+        linked = next(
+            item
+            for item in project.project_characters
+            if item.project_character_id == project_character.project_character_id
+        )
+        active_parse = next(
+            (
+                item
+                for item in project.parse_revisions
+                if item.revision_id == project.active_parse_revision_id
+            ),
+            None,
+        )
+        if active_parse is not None:
+            active_parse.project_characters = project.project_characters
+        store.save_project(project_id, project)
+        refreshed = _recommend_line(project, line_id, store, service)
+        return {
+            "character": character.model_dump(mode="json"),
+            "characters": [item.model_dump(mode="json") for item in characters],
+            "project_character": linked.model_dump(mode="json"),
+            "project": project.model_dump(mode="json"),
+            "recommendation": refreshed.model_dump(mode="json"),
+        }
 
     @router.delete("/api/projects/{project_id}/lines/{line_id}/voice-selection")
     def clear(project_id: str, line_id: str) -> dict[str, str]:

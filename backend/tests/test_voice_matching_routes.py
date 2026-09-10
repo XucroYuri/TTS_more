@@ -336,6 +336,102 @@ def test_recommendation_reports_no_role_mapping_before_ranking(tmp_path: Path) -
     assert recommendation["blockers"] == ["no_role_mapping"]
 
 
+def test_fuzzy_folder_candidate_requires_confirmation_then_persists_role_mapping(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    asset_root = tmp_path / "portable"
+    _project(data_root)
+    store = ProjectStore(data_root)
+    store.save_characters([])
+    project = store.load_project("project-1")
+    project.project_characters = [
+        ProjectCharacter(
+            project_character_id="jiao-bu",
+            name="胶布",
+            library_character_id=None,
+            match_status="unmatched",
+        )
+    ]
+    project.lines = [
+        ScriptLine(
+            id="line-1",
+            character_id="jiao-bu",
+            text="真的太好了",
+            note="惊喜",
+            language="zh",
+        )
+    ]
+    store.save_project("project-1", project)
+    service = _dynamic_catalog(data_root, asset_root)
+    current = service.store.load_current()
+    task_name = "xxx-胶布tts"
+    service.store.publish(
+        current.model_copy(
+            update={
+                "reference_assets": [
+                    item.model_copy(
+                        update={
+                            "character_id": "训练音色",
+                            "character_aliases": [],
+                            "training_task": task_name,
+                        }
+                    )
+                    for item in current.reference_assets
+                ],
+                "weight_artifacts": [
+                    item.model_copy(
+                        update={
+                            "character_id": "训练音色",
+                            "training_task": task_name,
+                        }
+                    )
+                    for item in current.weight_artifacts
+                ],
+            }
+        ),
+        reference_locations=service.store.load_reference_locations(),
+    )
+    client = TestClient(create_app(data_root=data_root, voice_catalog_service=service))
+
+    response = client.post(
+        "/api/projects/project-1/voice-recommendations",
+        json={"line_ids": ["line-1"], "apply_automatic": True},
+    )
+
+    assert response.status_code == 200
+    candidate = response.json()["recommendations"][0]["candidates"][0]
+    assert candidate["score_breakdown"]["character"] == 35
+    assert candidate["auto_fill_eligible"] is False
+    assert candidate["identity_match"] == "folder_fuzzy"
+    assert candidate["requires_identity_confirmation"] is True
+    assert client.get("/api/projects/project-1").json()["lines"][0]["voice_selection"] is None
+    blocked_selection = client.put(
+        "/api/projects/project-1/lines/line-1/voice-selection",
+        json={"candidate_id": candidate["candidate_id"]},
+    )
+    assert blocked_selection.status_code == 409
+    assert blocked_selection.json()["detail"]["code"] == "voice_identity_confirmation_required"
+
+    confirmed = client.post(
+        "/api/projects/project-1/lines/line-1/voice-identity-confirmation",
+        json={"candidate_id": candidate["candidate_id"]},
+    )
+
+    assert confirmed.status_code == 200
+    payload = confirmed.json()
+    assert payload["project_character"]["library_character_id"] == payload["character"]["id"]
+    assert payload["project_character"]["match_status"] == "manual"
+    assert task_name in payload["character"]["match_names"]
+    assert "胶布" in payload["character"]["aliases"]
+    mapping = payload["character"]["source_assets"]["folder_mappings"][0]
+    assert mapping["training_task"] == task_name
+    refreshed = payload["recommendation"]["candidates"][0]
+    assert refreshed["identity_match"] == "strict"
+    assert refreshed["requires_identity_confirmation"] is False
+    assert refreshed["score_breakdown"]["character"] == 35
+
+
 def test_recommendation_returns_structured_catalog_unavailable_error(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     _project(data_root)

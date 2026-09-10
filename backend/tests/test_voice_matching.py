@@ -4,6 +4,7 @@ from pydantic import ValidationError
 from app.voice_matching import (
     classify_empty_recommendation,
     estimate_target_duration,
+    rank_fuzzy_folder_candidates,
     rank_voice_candidates,
 )
 from app.voice_matching_models import (
@@ -469,3 +470,105 @@ def test_blocker_keeps_identity_mismatch_as_no_eligible_candidate() -> None:
         classify_empty_recommendation(match_request(), catalog)
         == "no_eligible_voice_candidate"
     )
+
+
+@pytest.mark.parametrize("training_task", ["胶布tts", "xxx-胶布", "jiaobu-v2"])
+def test_fuzzy_folder_fallback_matches_chinese_and_pinyin_names(
+    training_task: str,
+) -> None:
+    request = match_request(character_id="jiao-bu", aliases=["胶布"]).model_copy(
+        update={"target_duration_seconds": 1.0}
+    )
+    catalog = CatalogSnapshot(
+        version="catalog-v1",
+        resources=[
+            VoiceResourceRecord(
+                resource_id="gpt-sovits-local",
+                character_id="未识别音色",
+                reference_asset_ids=["ref-glue"],
+                state="ready",
+                confirmed=True,
+                supports_dynamic_weights=True,
+                compatible_root_ids=["portable"],
+            )
+        ],
+        weight_artifacts=[
+            WeightArtifactRecord(
+                artifact_id="gpt-glue",
+                root_id="portable",
+                relative_path="GPT_weights/glue-e50.ckpt",
+                kind="gpt",
+                character_id="未识别音色",
+                training_task=training_task,
+                fingerprint="gpt-fingerprint",
+            ),
+            WeightArtifactRecord(
+                artifact_id="sovits-glue",
+                root_id="portable",
+                relative_path="SoVITS_weights/glue_e24_s360.pth",
+                kind="sovits",
+                character_id="未识别音色",
+                training_task=training_task,
+                fingerprint="sovits-fingerprint",
+            ),
+        ],
+        reference_assets=[
+            ReferenceAssetRecord(
+                reference_asset_id="ref-glue",
+                character_id="未识别音色",
+                language="zh",
+                emotion="neutral",
+                prompt_text="测试参考音频",
+                duration_seconds=1.0,
+                confirmed=True,
+                training_task=training_task,
+                root_id="portable",
+            )
+        ],
+    )
+
+    result = rank_fuzzy_folder_candidates(request, catalog)
+
+    assert result.blockers == []
+    assert result.candidates[0].score_breakdown.character == 35
+    assert result.candidates[0].auto_fill_eligible is False
+    assert result.candidates[0].identity_match == "folder_fuzzy"
+    assert result.candidates[0].requires_identity_confirmation is True
+
+
+def test_fuzzy_folder_fallback_requires_complete_gpt_sovits_pair() -> None:
+    request = match_request(character_id="jiao-bu", aliases=["胶布"])
+    catalog = CatalogSnapshot(
+        version="catalog-v1",
+        resources=[
+            VoiceResourceRecord(
+                resource_id="gpt-sovits-local",
+                character_id="未识别音色",
+                reference_asset_ids=["ref-glue"],
+                supports_dynamic_weights=True,
+                compatible_root_ids=["portable"],
+            )
+        ],
+        weight_artifacts=[
+            WeightArtifactRecord(
+                artifact_id="gpt-glue",
+                root_id="portable",
+                relative_path="GPT_weights/glue-e50.ckpt",
+                kind="gpt",
+                character_id="未识别音色",
+                training_task="胶布tts",
+                fingerprint="gpt-fingerprint",
+            )
+        ],
+        reference_assets=[
+            ReferenceAssetRecord(
+                reference_asset_id="ref-glue",
+                character_id="未识别音色",
+                prompt_text="测试参考音频",
+                training_task="胶布tts",
+                root_id="portable",
+            )
+        ],
+    )
+
+    assert rank_fuzzy_folder_candidates(request, catalog).candidates == []

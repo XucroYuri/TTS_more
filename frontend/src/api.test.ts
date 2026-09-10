@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   apiErrorMessage,
   clearVoiceSelection,
+  confirmVoiceCandidateIdentity,
   fetchVoiceCatalog,
   getApiToken,
   patchAnalysisDraft,
@@ -59,6 +60,7 @@ describe("voice matching API request shapes", () => {
       { state: "ready", catalog_version: "catalog-v1", resource_count: 0, reference_count: 0, weight_count: 0, diagnostics: [] },
       { recommendations: [] },
       { selection: { candidate_id: "candidate/1" } },
+      { character: {}, characters: [], project_character: {}, project: {}, recommendation: {} },
       { status: "cleared" }
     ];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -74,6 +76,7 @@ describe("voice matching API request shapes", () => {
       await syncVoiceCatalog();
       await recommendVoices("demo/project", ["line/1"]);
       await selectVoiceCandidate("demo/project", "line/1", "candidate/1");
+      await confirmVoiceCandidateIdentity("demo/project", "line/1", "candidate/1");
       await clearVoiceSelection("demo/project", "line/1");
     } finally {
       globalThis.fetch = originalFetch;
@@ -84,14 +87,16 @@ describe("voice matching API request shapes", () => {
       "/api/voice-assets/catalog/sync",
       "/api/projects/demo%2Fproject/voice-recommendations",
       "/api/projects/demo%2Fproject/lines/line%2F1/voice-selection",
+      "/api/projects/demo%2Fproject/lines/line%2F1/voice-identity-confirmation",
       "/api/projects/demo%2Fproject/lines/line%2F1/voice-selection"
     ]);
-    expect(calls.map(({ init }) => init?.method)).toEqual([undefined, "POST", "POST", "PUT", "DELETE"]);
+    expect(calls.map(({ init }) => init?.method)).toEqual([undefined, "POST", "POST", "PUT", "POST", "DELETE"]);
       expect(JSON.parse(String(calls[2].init?.body))).toEqual({
         line_ids: ["line/1"],
         apply_automatic: false
       });
     expect(JSON.parse(String(calls[3].init?.body))).toEqual({ candidate_id: "candidate/1" });
+    expect(JSON.parse(String(calls[4].init?.body))).toEqual({ candidate_id: "candidate/1" });
     expect(referenceAudioUrl("reference/1")).toBe("/api/voice-assets/references/reference%2F1/audio");
   });
 });
